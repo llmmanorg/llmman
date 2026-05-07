@@ -25,7 +25,7 @@ pub struct ModelFiles {
 }
 
 /// Load model files from a local directory (no network required).
-pub fn load_local_model(path: &std::path::Path) -> Result<ModelFiles> {
+pub fn load_local_model(path: &std::path::Path, gguf_file: Option<&str>) -> Result<ModelFiles> {
     tracing::info!("Loading model from local path: {}", path.display());
 
     let config_path = path.join("config.json");
@@ -49,6 +49,23 @@ pub fn load_local_model(path: &std::path::Path) -> Result<ModelFiles> {
         } else {
             None
         }
+    };
+
+    if let Some(gguf_file) = gguf_file {
+        let gguf_path = path.join(gguf_file);
+        anyhow::ensure!(
+            gguf_path.exists(),
+            "{} not found in {}",
+            gguf_file,
+            path.display()
+        );
+        return Ok(ModelFiles {
+            config_path,
+            tokenizer_path,
+            tokenizer_config_path,
+            weight_paths: vec![],
+            gguf_path: Some(gguf_path),
+        });
     };
 
     // Prefer model.safetensors, then scan for shards
@@ -97,7 +114,7 @@ pub fn download_model(
         || model_id.starts_with("../")
         || as_path.exists()
     {
-        return load_local_model(as_path);
+        return load_local_model(as_path, gguf_file);
     }
 
     // ── OCI model resolution ────────────────────────────────────────────
