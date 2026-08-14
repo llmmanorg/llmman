@@ -684,7 +684,14 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	return updateIndex(layoutDir, ref, manifestDesc)
 }
 
-// llmman_inspect fetches and returns the raw manifest JSON for a remote reference.
+// llmman_inspect fetches and returns the raw (exact-bytes, not
+// pretty-printed) manifest JSON for a remote reference. Byte-exactness
+// matters here: `cmd::sign --remote` hashes this response itself to
+// derive the manifest's digest for the OCI referrer `subject` it
+// attaches, and that must match the digest the registry already has —
+// re-indenting (as this used to do unconditionally) would silently
+// produce a different digest. Pretty-printing for human display is now
+// `cmd::inspect`'s job instead (see its own comment).
 //
 //export llmman_inspect
 func llmman_inspect(cRef *C.char) *C.char {
@@ -709,13 +716,7 @@ func llmman_inspect(cRef *C.char) *C.char {
 	if err != nil {
 		return errResp(fmt.Errorf("read manifest: %w", err))
 	}
-
-	// Pretty-print
-	var buf bytes.Buffer
-	if err := json.Indent(&buf, data, "", "  "); err != nil {
-		return okResp(string(data))
-	}
-	return okResp(buf.String())
+	return okResp(string(data))
 }
 
 // llmman_transfer transfers an image directly from source to destination,

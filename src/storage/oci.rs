@@ -65,6 +65,11 @@ pub struct Manifest {
     pub layers: Vec<Descriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<std::collections::HashMap<String, String>>,
+    /// OCI 1.1 `subject` — set on a signature (or other) manifest to mark
+    /// it as a *referrer* of another manifest, identified by digest. See
+    /// `cmd::sign`, the only producer of this field today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<Descriptor>,
 }
 
 /// `application/vnd.cncf.model.config.v1+json` — the CNCF Model Format Spec
@@ -450,6 +455,7 @@ impl OciStore {
             config: config_desc,
             layers,
             annotations: manifest_annotations,
+            subject: None,
         };
         let manifest_desc = self.write_manifest(&manifest)?;
         self.tag(manifest_desc.clone(), reference)?;

@@ -8,9 +8,7 @@ package main
 import "C"
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -594,11 +592,13 @@ func llmman_inspect(cRef *C.char) *C.char {
 		return errResp(fmt.Errorf("fetch manifest: %w", err))
 	}
 
-	var buf bytes.Buffer
-	if err := json.Indent(&buf, manifestData, "", "  "); err != nil {
-		return okResp(string(manifestData))
-	}
-	return okResp(buf.String())
+	// Not pretty-printed: `cmd::sign --remote` hashes this response itself
+	// to derive the manifest's digest for the OCI referrer `subject` it
+	// attaches, which must match the digest already on the registry — see
+	// backend_docker.go's llmman_inspect for the docker-backend twin of
+	// this same comment. Pretty-printing for human display is now
+	// `cmd::inspect`'s job instead.
+	return okResp(string(manifestData))
 }
 
 // llmman_transfer transfers an image directly from source to destination,

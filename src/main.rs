@@ -64,6 +64,8 @@ enum Commands {
     Serve(cmd::serve::ServeArgs),
     /// Create a new local tag pointing to an existing image
     Tag(cmd::tag::TagArgs),
+    /// Sign an image with a cosign-compatible Sigstore signature
+    Sign(cmd::sign::SignArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +117,7 @@ fn main() {
         Commands::Inspect(a)  => cmd::inspect::run(a),
         Commands::Serve(a)    => cmd::serve::run(a),
         Commands::Tag(a)      => cmd::tag::run(a),
+        Commands::Sign(a)     => cmd::sign::run(a),
     };
     if let Err(e) = result {
         eprintln!("Error: {:#}", e);
