@@ -292,12 +292,16 @@ jobs:
     # windows-2025/windows-11-arm runs that setup+build overhead alone
     # (checkout, toolchains, npm installs, cargo build) already consumes
     # 5-8 of those minutes on Windows, before any of tests/launch_e2e.rs's
-    # own three tests even start — and each of those three can, in the
-    # worst case, legitimately need up to TIMEOUT (600s each for its own
-    # warm_model()/launch calls; only the first test pays warm_model()'s
-    # cost, per WARM's own Once). 45 leaves real headroom for that
-    # worst case across every platform, not just the fastest one.
-    timeout-minutes: 45
+    # own three tests even start. Those three tests run serialized
+    # (--test-threads=1 + lock_serial()), so the real worst case sums all
+    # three's own retry budgets, not just one: claude and codex each cap
+    # at DEFAULT_MAX_ATTEMPTS * TIMEOUT (3 * 600s = 30 min), opencode at
+    # OPENCODE_MAX_ATTEMPTS * TIMEOUT (4 * 600s = 40 min, bumped after CI
+    # run 32376290299 exhausted 3/3 attempts on two platforms at once for
+    # opencode specifically) — 8 + 30 + 40 + 30 = 108 minutes. 120 leaves
+    # real headroom for that worst case across every platform, not just
+    # the fastest one.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:

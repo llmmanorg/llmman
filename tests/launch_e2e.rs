@@ -549,12 +549,24 @@ fn run_launch(
 /// `llmman launch <integration> ...` invocation, against a fresh `HOME`
 /// each time, before giving up — see that function's own doc comment for
 /// why this exists at all.
-const MAX_ATTEMPTS: u32 = 3;
+const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+
+/// `opencode`-only override: CI run 32376290299 (PR #256) hit the
+/// endless-agent-loop failure mode (see `launch_and_assert`'s doc comment)
+/// on two independent platforms (Windows/docker, Linux/podman) in the very
+/// same run, for `opencode` specifically — `DEFAULT_MAX_ATTEMPTS` isn't
+/// reliably enough headroom for it. `claude`/`codex` have never been
+/// observed hitting this failure mode, so they keep the default rather
+/// than everyone paying for a bigger worst-case retry budget. See ci.yml's
+/// `timeout-minutes` comment on the E2E job, which this changes the
+/// worst-case budget for.
+const OPENCODE_MAX_ATTEMPTS: u32 = 4;
 
 /// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
 /// (via [`run_launch`], against a fresh temp `HOME` each attempt) and
 /// asserts it succeeded and that the model's real answer shows up in
-/// stdout — retrying up to [`MAX_ATTEMPTS`] times, but *only* for the
+/// stdout — retrying up to `max_attempts` times (see
+/// `DEFAULT_MAX_ATTEMPTS`/`OPENCODE_MAX_ATTEMPTS`), but *only* for the
 /// two failure shapes small-model sampling variance alone can produce:
 ///
 ///   - the launch exited successfully and merely didn't happen to answer
@@ -588,18 +600,18 @@ const MAX_ATTEMPTS: u32 = 3;
 /// to the same red result while masking nothing — which keeps this from
 /// hiding the actual API-compat bugs this suite exists to catch (see
 /// that same doc comment).
-fn launch_and_assert(integration: &str, extra_args: &[&str]) {
+fn launch_and_assert(integration: &str, extra_args: &[&str], max_attempts: u32) {
     let mut last_failure = None;
-    for attempt in 1..=MAX_ATTEMPTS {
+    for attempt in 1..=max_attempts {
         let home = fresh_home(integration);
         let output = match run_launch(&home, integration, extra_args) {
             Ok(output) => output,
             Err(timed_out) => {
                 eprintln!(
-                    "[test] {integration}: attempt {attempt}/{MAX_ATTEMPTS} timed out \
+                    "[test] {integration}: attempt {attempt}/{max_attempts} timed out \
                      (small-model sampling variance can degenerate into an endless agent \
                      loop — see launch_and_assert's own doc comment); {}\n{}",
-                    if attempt < MAX_ATTEMPTS { "retrying with a fresh HOME" } else { "giving up" },
+                    if attempt < max_attempts { "retrying with a fresh HOME" } else { "giving up" },
                     timed_out.message
                 );
                 last_failure = Some(timed_out.message);
@@ -618,10 +630,10 @@ fn launch_and_assert(integration: &str, extra_args: &[&str]) {
             return;
         }
         eprintln!(
-            "[test] {integration}: attempt {attempt}/{MAX_ATTEMPTS} succeeded but the reply \
+            "[test] {integration}: attempt {attempt}/{max_attempts} succeeded but the reply \
              didn't contain \"pong\" (small-model sampling variance — see launch_and_assert's \
              own doc comment); {}",
-            if attempt < MAX_ATTEMPTS { "retrying with a fresh HOME" } else { "giving up" }
+            if attempt < max_attempts { "retrying with a fresh HOME" } else { "giving up" }
         );
         last_failure = Some(format!(
             "expected {integration}'s reply to contain \"pong\"\n\
@@ -629,7 +641,7 @@ fn launch_and_assert(integration: &str, extra_args: &[&str]) {
         ));
     }
     let last_failure = last_failure.expect("loop runs at least once, so this is always set");
-    panic!("{integration} failed all {MAX_ATTEMPTS} attempts; last failure:\n{last_failure}");
+    panic!("{integration} failed all {max_attempts} attempts; last failure:\n{last_failure}");
 }
 
 #[test]
@@ -649,7 +661,7 @@ fn launch_claude_with_model() {
     // `-p`/`--print`: Claude Code's non-interactive one-shot mode — the
     // scriptable equivalent of typing a message into the interactive TUI
     // `llmman launch claude --model qwen3.5:0.8b` would otherwise open.
-    launch_and_assert("claude", &["-p", PROMPT]);
+    launch_and_assert("claude", &["-p", PROMPT], DEFAULT_MAX_ATTEMPTS);
 }
 
 #[test]
@@ -674,7 +686,11 @@ fn launch_opencode_with_model() {
     // step in one environment during development; keep this on so a CI
     // failure's logs show exactly what opencode was doing right up to a
     // timeout, instead of just the banner and silence.
-    launch_and_assert("opencode", &["run", PROMPT, "--print-logs", "--log-level", "DEBUG"]);
+    launch_and_assert(
+        "opencode",
+        &["run", PROMPT, "--print-logs", "--log-level", "DEBUG"],
+        OPENCODE_MAX_ATTEMPTS,
+    );
 }
 
 #[test]
@@ -692,6 +708,6 @@ fn launch_codex_with_model() {
     }
 
     // `exec <prompt>`: codex's non-interactive one-shot mode.
-    launch_and_assert("codex", &["exec", PROMPT]);
+    launch_and_assert("codex", &["exec", PROMPT], DEFAULT_MAX_ATTEMPTS);
 }
 
