@@ -354,7 +354,7 @@ func hfGet(ctx context.Context, client *http.Client, url, token string, dst any)
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != 200 {
-			return fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
+			return newHTTPStatusError("GET "+url, resp)
 		}
 		body, err = io.ReadAll(resp.Body)
 		return err
@@ -971,6 +971,9 @@ func downloadHFBlobAttempts(ctx context.Context, client *http.Client, url, token
 	for attempt := 0; attempt < dlMaxAttempts; attempt++ {
 		if attempt > 0 {
 			delay := retryDelay(attempt)
+			if ra, ok := retryAfter(lastErr); ok {
+				delay = ra
+			}
 			fmt.Fprintf(os.Stderr, "\n[llmman] retrying %s (attempt %d/%d, wait %v)\n",
 				filepath.Base(file.Path), attempt+1, dlMaxAttempts, delay)
 			select {
@@ -1042,7 +1045,7 @@ func downloadAttempt(ctx context.Context, client *http.Client, url, token, layou
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 && resp.StatusCode != 206 {
-		return ocispec.Descriptor{}, fmt.Errorf("download %s: HTTP %d", file.Path, resp.StatusCode)
+		return ocispec.Descriptor{}, newHTTPStatusError("download "+file.Path, resp)
 	}
 	if startOffset > 0 && resp.StatusCode == 200 {
 		// Server ignored Range header — restart from zero.

@@ -5,12 +5,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -391,6 +394,72 @@ func (sw *stallWriter) finalSpeed() float64 {
 	return float64(sw.total) / elapsed
 }
 
+// httpStatusError wraps a non-2xx HTTP response so retryStream can react
+// to more than just "was this permanent" (isHTTP4xx's job): specifically,
+// a server-supplied Retry-After (RFC 9110 §10.2.3), mirroring
+// huggingface_hub's own handling of it on a 429 (utils/_http.py
+// _http_backoff_base). Its Error() string preserves the exact
+// "<prefix>: HTTP <code>" shape every existing fmt.Errorf(...) call site
+// already produced, including the substring isHTTP4xx greps for.
+type httpStatusError struct {
+	prefix        string
+	statusCode    int
+	retryAfter    time.Duration // valid only if hasRetryAfter
+	hasRetryAfter bool
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s: HTTP %d", e.prefix, e.statusCode)
+}
+
+// newHTTPStatusError builds an httpStatusError for a non-2xx resp, with
+// prefix reproducing what the call site's own fmt.Errorf used to put
+// before "HTTP %d" (e.g. "GET https://...", "download foo.gguf").
+func newHTTPStatusError(prefix string, resp *http.Response) error {
+	e := &httpStatusError{prefix: prefix, statusCode: resp.StatusCode}
+	e.retryAfter, e.hasRetryAfter = parseRetryAfter(resp.Header)
+	return e
+}
+
+// retryAfterCap bounds how long retryStream will ever honor a
+// server-supplied Retry-After for. huggingface_hub trusts it completely
+// (sleeps exactly that long — see _http_backoff_base); here, an
+// unbounded wait on one blob could eat most of a CI job's own time
+// budget (e.g. llmman-publisher's transfer.yml 360-minute ceiling), so
+// this caps it well short of that instead.
+const retryAfterCap = 5 * time.Minute
+
+// parseRetryAfter parses a Retry-After header's delay-seconds form (e.g.
+// "Retry-After: 30"), reporting ok=false if the header is absent,
+// negative, or malformed. Doesn't parse the HTTP-date form
+// ("Wed, 21 Oct 2015 07:28:00 GMT") — huggingface_hub's own
+// _parse_retry_after doesn't either, and every 429 seen from
+// huggingface.co uses delay-seconds. Caps secs before converting to a
+// Duration so an absurd value (e.g. 1e18) can't overflow int64 nanoseconds.
+func parseRetryAfter(h http.Header) (d time.Duration, ok bool) {
+	secs, err := strconv.Atoi(strings.TrimSpace(h.Get("Retry-After")))
+	if err != nil || secs < 0 {
+		return 0, false
+	}
+	if capSecs := int(retryAfterCap / time.Second); secs > capSecs {
+		secs = capSecs
+	}
+	return time.Duration(secs) * time.Second, true
+}
+
+// retryAfter returns the Retry-After duration attached to err by
+// newHTTPStatusError, or (0, false) if err isn't one of those (including
+// err == nil, on retryStream's very first attempt). A zero-second
+// Retry-After ("retry immediately") is a valid, distinct result — hence
+// the separate ok, rather than overloading 0 to also mean "absent".
+func retryAfter(err error) (time.Duration, bool) {
+	var hse *httpStatusError
+	if !errors.As(err, &hse) || !hse.hasRetryAfter {
+		return 0, false
+	}
+	return hse.retryAfter, true
+}
+
 // isHTTP4xx returns true for permanent HTTP client errors (no point retrying).
 func isHTTP4xx(err error) bool {
 	if err == nil {
@@ -406,20 +475,24 @@ func isHTTP4xx(err error) bool {
 }
 
 // retryStream calls attempt up to dlMaxAttempts times with exponential
-// backoff (2s, 4s, ...) between tries, stopping immediately (no further
-// retries) once isPermanent reports the most recent error isn't worth
-// retrying (e.g. a 404 — see isHTTP4xx). Every attempt is expected to
-// restart its work entirely from scratch: unlike downloadHFBlob's local
-// .part-file resume, there's no partial state to pick up from here (see
-// the callers' own comments for why) — this only saves the operator from
-// having to notice a transient failure and manually re-run the whole
-// command, it doesn't avoid re-sending bytes a failed attempt already
-// sent.
+// backoff (2s, 4s, ...) between tries — or the previous attempt's
+// Retry-After (capped at retryAfterCap), if it had one — stopping
+// immediately (no further retries) once isPermanent reports the most
+// recent error isn't worth retrying (e.g. a 404 — see isHTTP4xx). Every
+// attempt is expected to restart its work entirely from scratch: unlike
+// downloadHFBlob's local .part-file resume, there's no partial state to
+// pick up from here (see the callers' own comments for why) — this only
+// saves the operator from having to notice a transient failure and
+// manually re-run the whole command, it doesn't avoid re-sending bytes a
+// failed attempt already sent.
 func retryStream(ctx context.Context, label string, isPermanent func(error) bool, attempt func() error) error {
 	var lastErr error
 	for i := 0; i < dlMaxAttempts; i++ {
 		if i > 0 {
 			delay := retryDelay(i)
+			if ra, ok := retryAfter(lastErr); ok {
+				delay = ra
+			}
 			fmt.Fprintf(os.Stderr, "\n[llmman] retrying %s (attempt %d/%d, wait %v)\n", label, i+1, dlMaxAttempts, delay)
 			select {
 			case <-ctx.Done():

@@ -484,7 +484,7 @@ func streamHFGet(ctx context.Context, client *http.Client, url, token string, pu
 		}
 		if resp.StatusCode != 200 && resp.StatusCode != 206 {
 			resp.Body.Close()
-			return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
+			return nil, newHTTPStatusError("GET "+url, resp)
 		}
 		return newStallReadCloser(resp.Body, dlStallTimeout, cancel), nil
 	})
@@ -509,7 +509,7 @@ func hfGetBytes(ctx context.Context, client *http.Client, url, token string, bar
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 && resp.StatusCode != 206 {
-		return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
+		return nil, newHTTPStatusError("GET "+url, resp)
 	}
 	sr := newStallReadCloser(resp.Body, dlStallTimeout, cancel)
 	defer sr.Close()
