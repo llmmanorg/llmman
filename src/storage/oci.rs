@@ -8,19 +8,32 @@
 //! ```text
 //! <store-root>/
 //!   oci-layout             {"imageLayoutVersion":"1.0.0"}
-//!   index.json             OCI image index
+//!   manifests/<...>/<tag>  one small JSON OCI descriptor (mediaType/
+//!                          digest/size) per stored reference, pointing at
+//!                          the manifest blob under blobs/ — see
+//!                          `ref_path_segments`. One file per model,
+//!                          mirroring Ollama's per-model manifest layout,
+//!                          rather than a single shared index.json (a
+//!                          breaking change from older llmman versions —
+//!                          no migration is provided; re-pull instead).
 //!   blobs/
 //!     sha256/
-//!       <hex>              one file per blob
+//!       <hex>              one file per blob — config, layers, and each
+//!                          manifest's own raw JSON bytes
 //! ```
 
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256};
+
+/// Per-process counter used only to make `OciStore::write_ref`'s temp
+/// file name unique across concurrent writers — see there.
+static WRITE_REF_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Minimal OCI spec types (no external crate needed)
@@ -34,24 +47,6 @@ pub struct Descriptor {
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<std::collections::HashMap<String, String>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Index {
-    pub schema_version: u32,
-    pub media_type: String,
-    pub manifests: Vec<Descriptor>,
-}
-
-impl Default for Index {
-    fn default() -> Self {
-        Self {
-            schema_version: 2,
-            media_type: "application/vnd.oci.image.index.v1+json".into(),
-            manifests: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,18 +121,14 @@ impl OciStore {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         fs::create_dir_all(root.join("blobs").join("sha256"))?;
+        fs::create_dir_all(root.join("manifests"))?;
 
         // Write oci-layout marker if absent
         let marker = root.join("oci-layout");
         if !marker.exists() {
             fs::write(&marker, r#"{"imageLayoutVersion":"1.0.0"}"#)?;
         }
-        // Create empty index if absent
-        let index_path = root.join("index.json");
-        if !index_path.exists() {
-            let idx = Index::default();
-            fs::write(&index_path, serde_json::to_string_pretty(&idx)?)?;
-        }
+
         Ok(Self { root })
     }
 
@@ -147,19 +138,74 @@ impl OciStore {
     }
 
     // ------------------------------------------------------------------
-    // Index
+    // Per-model manifest references
     // ------------------------------------------------------------------
+    //
+    // Each tagged/pulled/built model gets its own small JSON file (an OCI
+    // `Descriptor`) recording which manifest blob it points to — see the
+    // module doc comment. `ref_path` derives the file's path directly
+    // from the reference, so the common lookup is an O(1) read, no index
+    // to scan. `find`/`remove` fall back to a `list_refs` scan through
+    // `matching_index` only for a reference spelled differently than it
+    // was stored (see `ref_matches_precise`).
 
-    pub fn read_index(&self) -> anyhow::Result<Index> {
-        let data = fs::read(self.root.join("index.json")).context("read index.json")?;
-        serde_json::from_slice(&data).context("parse index.json")
+    /// The path `reference`'s manifest-pointer file lives (or would live)
+    /// at, under `manifests/` — see `ref_path_segments`.
+    fn ref_path(&self, reference: &str) -> PathBuf {
+        let mut path = self.root.join("manifests");
+        for seg in ref_path_segments(reference) {
+            path.push(seg);
+        }
+        path
     }
 
-    fn write_index(&self, idx: &Index) -> anyhow::Result<()> {
-        let tmp = self.root.join("index.json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(idx)?)?;
-        fs::rename(tmp, self.root.join("index.json"))?;
+    fn read_ref(&self, reference: &str) -> anyhow::Result<Descriptor> {
+        let data = fs::read(self.ref_path(reference))
+            .with_context(|| format!("read manifest ref {reference}"))?;
+        serde_json::from_slice(&data).context("parse manifest ref")
+    }
+
+    fn write_ref(&self, reference: &str, desc: &Descriptor) -> anyhow::Result<()> {
+        let path = self.ref_path(reference);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // A uniquely-named temp file (pid + a per-process counter), not
+        // a fixed one: two concurrent writers of the same reference must
+        // not truncate/interleave each other's write. Appended as a
+        // suffix, not via `with_extension` (which would eat whatever
+        // follows the last '.' in a dotted tag, e.g. ".../0.8b" becoming
+        // ".../0.tmp").
+        let n = WRITE_REF_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(format!(".{}.{n}.tmp", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        if let Err(e) = fs::write(&tmp, serde_json::to_string_pretty(desc)?) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = fs::rename(&tmp, &path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
+    }
+
+    fn remove_ref(&self, reference: &str) -> anyhow::Result<()> {
+        fs::remove_file(self.ref_path(reference))
+            .with_context(|| format!("remove manifest ref {reference}"))
+    }
+
+    /// Every stored manifest descriptor, read from `manifests/` — each
+    /// still carries its own reference name in its
+    /// `org.opencontainers.image.ref.name` annotation. A single
+    /// unreadable or unparsable entry is skipped rather than failing the
+    /// whole walk.
+    fn list_refs(&self) -> Vec<Descriptor> {
+        let root = self.root.join("manifests");
+        let mut out = Vec::new();
+        collect_refs(&root, &mut out);
+        out
     }
 
     // ------------------------------------------------------------------
@@ -258,8 +304,13 @@ impl OciStore {
     // Tag operations
     // ------------------------------------------------------------------
 
-    /// Add a reference to `index.json`, replacing any prior entry with the same ref name.
-    /// The full `reference` string is stored in the annotation so `list` shows it verbatim.
+    /// Records that `reference` now points at `desc`, replacing any prior
+    /// entry stored under that exact reference. The full `reference`
+    /// string is stored in the annotation so `list` shows it verbatim —
+    /// see `ref_path_segments` for how it's also encoded (with some loss:
+    /// a tagless reference and its `:latest` spelling collapse to the
+    /// same file, same as `ref_matches_precise` already treats them) into
+    /// the file's own path.
     pub fn tag(&self, mut desc: Descriptor, reference: &str) -> anyhow::Result<()> {
         let mut ann = desc.annotations.take().unwrap_or_default();
         ann.insert(
@@ -267,20 +318,22 @@ impl OciStore {
             reference.to_string(),
         );
         desc.annotations = Some(ann);
-
-        let mut idx = self.read_index()?;
-        match matching_index(&idx.manifests, reference) {
-            Some(i) => idx.manifests[i] = desc,
-            None => idx.manifests.push(desc),
-        }
-        self.write_index(&idx)
+        self.write_ref(reference, &desc)
     }
 
-    /// Find the descriptor for `reference` in the index — see `matching_index`.
+    /// Find the descriptor stored for `reference` — see this type's own
+    /// doc comment on the fast path (`read_ref`) and its fallback
+    /// (`matching_index` over every stored reference).
     pub fn find(&self, reference: &str) -> anyhow::Result<Descriptor> {
-        let idx = self.read_index()?;
-        matching_index(&idx.manifests, reference)
-            .map(|i| idx.manifests[i].clone())
+        if self.ref_path(reference).exists() {
+            // Present but unparsable is a broken store, not a typo —
+            // surface that error rather than falling through to "not
+            // found".
+            return self.read_ref(reference);
+        }
+        let refs = self.list_refs();
+        matching_index(&refs, reference)
+            .map(|i| refs[i].clone())
             .ok_or_else(|| anyhow!("image not found: {}", reference))
     }
 
@@ -301,9 +354,8 @@ impl OciStore {
     // ------------------------------------------------------------------
 
     pub fn list(&self) -> anyhow::Result<Vec<ImageSummary>> {
-        let idx = self.read_index()?;
-        Ok(idx
-            .manifests
+        let refs = self.list_refs();
+        Ok(refs
             .into_iter()
             .map(|m| {
                 let reference = m
@@ -330,14 +382,20 @@ impl OciStore {
     }
 
     /// Remove the same single entry `find` would return for `reference`
-    /// (see `matching_index`). Does not GC blobs.
+    /// (see `find`'s own doc comment on its fast path and fallback).
+    /// Does not GC blobs.
     pub fn remove(&self, reference: &str) -> anyhow::Result<()> {
-        let mut idx = self.read_index()?;
-        let Some(i) = matching_index(&idx.manifests, reference) else {
+        if self.remove_ref(reference).is_ok() {
+            return Ok(());
+        }
+        let refs = self.list_refs();
+        let Some(i) = matching_index(&refs, reference) else {
             return Err(anyhow!("image not found: {}", reference));
         };
-        idx.manifests.remove(i);
-        self.write_index(&idx)
+        let Some(name) = stored_ref_name(&refs[i]) else {
+            return Err(anyhow!("image not found: {}", reference));
+        };
+        self.remove_ref(name)
     }
 
     // ------------------------------------------------------------------
@@ -503,7 +561,7 @@ fn classify_model_layer(rel_path: &str) -> &'static str {
 /// `:latest` appended). The tag-only branch is unambiguous only when
 /// `reference` is a bare tag that's unique across stored tags — two
 /// different repos sharing the same tag (e.g. both `:0.8b`) can still
-/// both match here, same as `ref_matches_bare_tag_heuristic` below.
+/// both match here.
 fn ref_matches_precise(desc: &Descriptor, reference: &str) -> bool {
     let Some(stored) = stored_ref_name(desc) else {
         return false;
@@ -521,43 +579,12 @@ fn ref_matches_precise(desc: &Descriptor, reference: &str) -> bool {
     false
 }
 
-/// The podman backend can only ever store a bare tag here, never a full
-/// reference (see backend_podman.go's pullToLayout) — match it against
-/// `reference`'s own tag component instead. Deliberately weaker/lower
-/// priority than `ref_matches_precise`: comparing only a tag substring,
-/// with no repository info, can false-positive against an unrelated
-/// entry (e.g. every tagless reference defaults to "latest"), so `find`
-/// only consults this once nothing in the index matches precisely.
-///
-/// Known limitation: two different repos pulled via podman that happen
-/// to share the same bare tag are indistinguishable once stored this way.
-fn ref_matches_bare_tag_heuristic(desc: &Descriptor, reference: &str) -> bool {
-    let Some(stored) = stored_ref_name(desc) else {
-        return false;
-    };
-    !stored.contains('/') && stored == tag_from_ref(reference)
-}
-
-/// The index of the entry in `manifests` that `find`/`tag`/`remove` should
+/// The index of the entry in `manifests` that `find`/`remove` should
 /// treat as matching `reference`, or `None`.
-///
-/// Two full passes, not one pass with per-entry fallbacks: two different
-/// entries can each satisfy a different strategy for the same
-/// `reference`, and only iteration order would decide the winner
-/// otherwise. Regression this fixes: an unrelated model stored under a
-/// bare "latest" tag could hijack an unrelated tagless reference (which
-/// also defaults to "latest"), including on a second lookup of a
-/// reference already canonicalized to `...:latest` by a first call. A
-/// precise match anywhere in the index now always wins.
 fn matching_index(manifests: &[Descriptor], reference: &str) -> Option<usize> {
     manifests
         .iter()
         .position(|m| ref_matches_precise(m, reference))
-        .or_else(|| {
-            manifests
-                .iter()
-                .position(|m| ref_matches_bare_tag_heuristic(m, reference))
-        })
 }
 
 fn stored_ref_name(desc: &Descriptor) -> Option<&str> {
@@ -565,6 +592,73 @@ fn stored_ref_name(desc: &Descriptor) -> Option<&str> {
         .as_ref()
         .and_then(|a| a.get("org.opencontainers.image.ref.name"))
         .map(|s| s.as_str())
+}
+
+/// Splits `reference` into the path segments used to lay it out under
+/// `manifests/` — one directory per "/"-delimited path segment, with an
+/// explicit (defaulted, if absent — see `default_tag`) tag as the final
+/// segment. Mirrors Ollama's `model.Name.Filepath()`
+/// (`types/model/name.go`: `{host}/{namespace}/{model}/{tag}`),
+/// generalized to also cover llmman's broader reference space
+/// (HuggingFace-style `host/owner/repo:tag` references — already the same
+/// shape — and non-registry sources, which `default_tag` already knows to
+/// leave untouched since they never carry a tag).
+///
+/// Each segment is sanitized for safe use as a single path component: an
+/// empty, "." or ".." segment (e.g. an empty tag from "repo:") becomes
+/// "__" instead, since any of those would otherwise produce a malformed
+/// or unintended path — see `sanitize_ref_segment`.
+fn ref_path_segments(reference: &str) -> Vec<String> {
+    let tagged = default_tag(reference);
+    let (name, tag): (&str, &str) = match tagged.rfind(':') {
+        Some(pos) if pos > tagged.rfind('/').unwrap_or(0) => (&tagged[..pos], &tagged[pos + 1..]),
+        _ => (tagged.as_str(), "latest"),
+    };
+    name.split('/')
+        .filter(|s| !s.is_empty())
+        .map(sanitize_ref_segment)
+        .chain(std::iter::once(sanitize_ref_segment(tag)))
+        .collect()
+}
+
+/// Neutralizes characters that would be unsafe or misleading as a single
+/// path segment: a literal `:` or `\` (a Windows path separator, or a
+/// drive-letter colon, that could otherwise land inside what's meant to
+/// be one segment — e.g. an absolute Windows path, or a URI scheme's
+/// `://`) becomes `_`, and a segment that's exactly `..` is neutralized,
+/// so no reference can ever escape the `manifests/` tree it's rooted
+/// under.
+fn sanitize_ref_segment(s: &str) -> String {
+    if s.is_empty() || s == "." || s == ".." {
+        return "__".to_string();
+    }
+    s.replace([':', '\\'], "_")
+}
+
+/// Recursively collects every manifest-pointer file under `dir` into
+/// `out` — see `OciStore::list_refs`.
+fn collect_refs(dir: &Path, out: &mut Vec<Descriptor>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return; // an unreadable subtree must not hide every other model
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_refs(&path, out);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+            continue; // an in-progress or abandoned write — see write_ref
+        }
+        let Ok(data) = fs::read(&path) else { continue };
+        if let Ok(desc) = serde_json::from_slice::<Descriptor>(&data) {
+            out.push(desc);
+        }
+    }
 }
 
 /// Appends `:latest` to `reference` if it has no tag, so a tag-less
@@ -640,8 +734,8 @@ mod tests {
         }
     }
 
-    /// The docker/containerd backend's own writer (shared_oci.go's
-    /// updateIndex) always stores the full reference it was called with.
+    /// The docker/containerd backend's own writer (go-shim/manifest_ref.go's
+    /// writeManifestRef) always stores the full reference it was called with.
     #[test]
     fn ref_matches_precise_a_full_reference_stored_verbatim() {
         let d = desc_with_ref("docker.io/ai/qwen3.5:0.8b");
@@ -699,38 +793,14 @@ mod tests {
         assert!(!ref_matches_precise(&d, "docker.io/ai/qwen3.5:0.8b"));
     }
 
-    /// Regression test: the podman backend's OCI-layout writer
-    /// (go.podman.io/image, via the `oci:<dir>:<tag>` reference shape —
-    /// see backend_podman.go's pullToLayout) can only ever store a bare
-    /// tag here, never a full reference — a real pull otherwise
-    /// succeeded but the model could never be found again afterward
-    /// (`resolve model ...: image not found`) until this matched.
+    /// An unrelated model stored under a bare "latest" tag must not
+    /// hijack a precisely-matching tagless reference (which also
+    /// defaults to "latest").
     #[test]
-    fn ref_matches_bare_tag_heuristic_matches_a_bare_tag_stored_by_the_podman_backend() {
-        let d = desc_with_ref("0.8b");
-        assert!(ref_matches_bare_tag_heuristic(
-            &d,
-            "docker.io/ai/qwen3.5:0.8b"
-        ));
-        assert!(!ref_matches_bare_tag_heuristic(
-            &d,
-            "docker.io/ai/qwen3.5:1.5b"
-        ));
-        // An exact bare-tag match is ref_matches_precise's job instead,
-        // via matching_index's two-tier priority.
-        assert_eq!(matching_index(&[d], "0.8b"), Some(0));
-    }
-
-    /// Regression: an unrelated model stored under a bare "latest" tag
-    /// must not hijack a precisely-matching tagless reference (which also
-    /// defaults to "latest"), whether that reference is still tagless or
-    /// already canonicalized to `...:latest` by a prior lookup — earlier
-    /// index position must not decide the winner either way.
-    #[test]
-    fn matching_index_prefers_a_precise_match_over_an_unrelated_bare_latest_regardless_of_order() {
+    fn matching_index_prefers_a_precise_match_over_an_unrelated_bare_latest() {
         let unrelated_bare_latest = desc_with_ref("latest");
         let inferact = desc_with_ref("hf.co/Inferact/Qwen3.8-27B-NVFP4:latest");
-        let manifests = vec![unrelated_bare_latest.clone(), inferact.clone()];
+        let manifests = vec![unrelated_bare_latest, inferact.clone()];
 
         let i = matching_index(&manifests, "hf.co/Inferact/Qwen3.8-27B-NVFP4")
             .expect("must find a match");
@@ -739,26 +809,12 @@ mod tests {
         let i = matching_index(&manifests, "hf.co/Inferact/Qwen3.8-27B-NVFP4:latest")
             .expect("must find a match");
         assert_eq!(manifests[i].digest, inferact.digest);
-
-        // No more specific match anywhere: the bare-tag heuristic still
-        // applies as a last resort.
-        let only_bare_latest = vec![unrelated_bare_latest.clone()];
-        assert_eq!(
-            matching_index(&only_bare_latest, "docker.io/ai/qwen3.5:latest"),
-            Some(0)
-        );
-        assert_eq!(matching_index(&only_bare_latest, "latest"), Some(0));
     }
 
     #[test]
     fn tag_from_ref_extracts_the_tag_after_the_last_slash() {
         assert_eq!(tag_from_ref("docker.io/ai/qwen3.5:0.8b"), "0.8b");
         assert_eq!(tag_from_ref("docker.io/ai/qwen3.5"), "latest");
-        // A bare tag with no slash and no colon (podman's own stored
-        // shape) has nothing to extract from — falls back to "latest",
-        // which is why ref_matches_bare_tag_heuristic exists as its own
-        // dedicated check above rather than reusing this for both
-        // directions.
         assert_eq!(tag_from_ref("0.8b"), "latest");
     }
 
@@ -771,5 +827,280 @@ mod tests {
         assert_eq!(tag_from_ref("example.com:5000/ns/model"), "latest");
         assert_eq!(tag_from_ref("example.com:5000/ns/model:tag"), "tag");
         assert_eq!(tag_from_ref("localhost:11434/library/mistral:7b"), "7b");
+    }
+
+    // ---------------------------------------------------------------
+    // One-file-per-model storage (OciStore itself)
+    // ---------------------------------------------------------------
+
+    fn temp_store_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "llmman-oci-test-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn ref_path_segments_mirrors_ollama_host_namespace_model_tag() {
+        assert_eq!(
+            ref_path_segments("docker.io/ai/qwen3.5:0.8b"),
+            vec!["docker.io", "ai", "qwen3.5", "0.8b"]
+        );
+        assert_eq!(
+            ref_path_segments("docker.io/ai/qwen3.5"),
+            vec!["docker.io", "ai", "qwen3.5", "latest"]
+        );
+    }
+
+    #[test]
+    fn ref_path_segments_sanitizes_unsafe_characters() {
+        // A URI-scheme source's "://" and a bare ".." must never produce
+        // a path component that could escape manifests/ or break on
+        // Windows.
+        assert_eq!(
+            ref_path_segments("s3://bucket/key"),
+            vec!["s3_", "bucket", "key", "latest"]
+        );
+        assert_eq!(
+            ref_path_segments("../../etc/passwd"),
+            vec!["__", "__", "etc", "passwd", "latest"]
+        );
+        // An empty tag ("repo:") must not vanish: an empty final segment
+        // would collapse into the repo directory itself.
+        assert_eq!(
+            ref_path_segments("docker.io/ai/x:"),
+            vec!["docker.io", "ai", "x", "__"]
+        );
+    }
+
+    /// Core regression test for this change: two different references
+    /// must resolve to two different files, so a torn write to one
+    /// model's manifest file can never affect any other model's own file
+    /// — unlike the old shared index.json, where every model's entry
+    /// lived in the same file.
+    #[test]
+    fn tag_and_find_round_trip_one_file_per_model() {
+        let dir = temp_store_dir("round-trip");
+        let store = OciStore::open(&dir).unwrap();
+
+        store
+            .tag(desc_with_ref("unused"), "docker.io/ai/qwen3.5:0.8b")
+            .unwrap();
+        store
+            .tag(desc_with_ref("unused"), "docker.io/ai/gemma4:latest")
+            .unwrap();
+
+        let a = store.ref_path("docker.io/ai/qwen3.5:0.8b");
+        let b = store.ref_path("docker.io/ai/gemma4:latest");
+        assert_ne!(a, b, "distinct references must live at distinct paths");
+        assert!(a.is_file());
+        assert!(b.is_file());
+
+        let found = store.find("docker.io/ai/qwen3.5:0.8b").unwrap();
+        assert_eq!(
+            found.annotations.unwrap()["org.opencontainers.image.ref.name"],
+            "docker.io/ai/qwen3.5:0.8b"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_ref_is_atomic_and_leaves_no_tmp_file() {
+        let dir = temp_store_dir("atomic");
+        let store = OciStore::open(&dir).unwrap();
+        store
+            .tag(desc_with_ref("unused"), "docker.io/ai/gemma4:latest")
+            .unwrap();
+
+        let path = store.ref_path("docker.io/ai/gemma4:latest");
+        assert!(path.is_file());
+        let leftover_tmp = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().extension().is_some_and(|ext| ext == "tmp"));
+        assert!(
+            !leftover_tmp,
+            "no .tmp file should survive a successful write"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn list_and_remove_work_across_many_models() {
+        let dir = temp_store_dir("list-remove");
+        let store = OciStore::open(&dir).unwrap();
+        for i in 0..5 {
+            store
+                .tag(
+                    desc_with_ref("unused"),
+                    &format!("docker.io/ai/model-{i}:latest"),
+                )
+                .unwrap();
+        }
+
+        let images = store.list().unwrap();
+        assert_eq!(images.len(), 5);
+
+        store.remove("docker.io/ai/model-2:latest").unwrap();
+        let images = store.list().unwrap();
+        assert_eq!(images.len(), 4);
+        assert!(!images
+            .iter()
+            .any(|i| i.reference == "docker.io/ai/model-2:latest"));
+
+        assert!(store.remove("docker.io/ai/model-2:latest").is_err());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regression test: one unreadable directory under manifests/ must
+    /// not hide every other model from `list`.
+    #[test]
+    #[cfg(unix)]
+    fn list_skips_an_unreadable_subtree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_store_dir("unreadable-subtree");
+        let store = OciStore::open(&dir).unwrap();
+        store
+            .tag(desc_with_ref("unused"), "docker.io/ai/ok:latest")
+            .unwrap();
+
+        let blocked = dir.join("manifests").join("unreadable");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0)).unwrap();
+
+        let images = store.list().unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].reference, "docker.io/ai/ok:latest");
+
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Concurrent writers of *distinct* references must never lose an
+    /// entry — the whole point of one file per model is that there's no
+    /// shared read-modify-write cycle left for them to race on at all,
+    /// unlike the old shared index.json (see this repo's git history).
+    #[test]
+    fn concurrent_tag_calls_across_distinct_refs_lose_nothing() {
+        let dir = temp_store_dir("concurrent");
+        let store = std::sync::Arc::new(OciStore::open(&dir).unwrap());
+
+        let handles: Vec<_> = (0..25)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store
+                        .tag(
+                            desc_with_ref("unused"),
+                            &format!("docker.io/ai/model-{i}:latest"),
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let images = store.list().unwrap();
+        assert_eq!(images.len(), 25);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regression test: two concurrent writers of the *same* reference
+    /// must each produce a valid, parsable file — never a truncated or
+    /// interleaved one from racing on a shared temp file name.
+    #[test]
+    fn concurrent_writes_to_the_same_ref_never_corrupt_it() {
+        let dir = temp_store_dir("concurrent-same-ref");
+        let store = std::sync::Arc::new(OciStore::open(&dir).unwrap());
+
+        let handles: Vec<_> = (0..25)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    let mut desc = desc_with_ref("unused");
+                    desc.digest = format!("sha256:{i:064x}");
+                    store.tag(desc, "docker.io/ai/same:latest").unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Whichever writer's rename won last, the result must be one
+        // complete, valid entry — not a parse failure from interleaved
+        // bytes.
+        assert!(store.find("docker.io/ai/same:latest").is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regression test for a real bug: `Path::with_extension("tmp")`
+    /// replaces whatever follows the last '.' in the file name — for a
+    /// tag like "0.8b" that turns the temp path into ".../0.tmp",
+    /// clobbering another tag's temp file (e.g. "0.5b" would collide on
+    /// the same ".../0.tmp"). write_ref must append ".tmp" as a suffix
+    /// instead.
+    #[test]
+    fn tag_with_a_dot_does_not_collide_with_a_different_tag() {
+        let dir = temp_store_dir("dotted-tag");
+        let store = OciStore::open(&dir).unwrap();
+        store
+            .tag(desc_with_ref("unused"), "docker.io/ai/x:0.8b")
+            .unwrap();
+        store
+            .tag(desc_with_ref("unused"), "docker.io/ai/x:0.5b")
+            .unwrap();
+
+        let images = store.list().unwrap();
+        assert_eq!(images.len(), 2, "distinct dotted tags must not collide");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regression test: an empty tag ("repo:") must not clobber the
+    /// repo's own directory, or every subsequent tag of that repo would
+    /// fail.
+    #[test]
+    fn tag_with_an_empty_tag_does_not_break_other_tags() {
+        let dir = temp_store_dir("empty-tag");
+        let store = OciStore::open(&dir).unwrap();
+        store
+            .tag(desc_with_ref("unused"), "docker.io/ai/x:")
+            .unwrap();
+        store
+            .tag(desc_with_ref("unused"), "docker.io/ai/x:latest")
+            .unwrap();
+
+        assert!(store.find("docker.io/ai/x:latest").is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A corrupt (present but unparsable) ref file must not look like a
+    /// typo — `find` should surface the parse error, not "not found".
+    #[test]
+    fn find_distinguishes_a_corrupt_ref_from_a_missing_one() {
+        let dir = temp_store_dir("corrupt-ref");
+        let store = OciStore::open(&dir).unwrap();
+        let path = store.ref_path("docker.io/ai/broken:latest");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not json").unwrap();
+
+        let err = store.find("docker.io/ai/broken:latest").unwrap_err();
+        assert!(!err.to_string().contains("not found"), "got: {err}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

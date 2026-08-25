@@ -413,27 +413,24 @@ func llmman_push(cLayoutDir, cRef *C.char) *C.char {
 	ref := C.GoString(cRef)
 	progressReset(ref, "retrieving manifest")
 	defer progressDone(ref)
-	if _, err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), ref); err != nil {
+	if _, err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), ref, findManifestForPush); err != nil {
 		return errResp(err)
 	}
 	return okResp("")
 }
 
 // pushToRegistry is llmman_push's implementation, factored out so
-// llmman_transfer's staging-directory fallback (see transferViaStaging in
-// transfer.go) can reuse it without going through CGO. Returns whether
-// anything was actually pushed — false if every layer, the config, and
-// the manifest were all already present at the destination by digest
-// (e.g. re-running a transfer/push for content that hasn't changed since
-// the last one).
-func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, err error) {
-	// Locate the manifest in the local index
-	idx, err := readIndexLocked(layoutDir)
-	if err != nil {
-		return false, fmt.Errorf("read OCI index: %w", err)
-	}
-	tag := tagFromRef(ref)
-	manifestDesc, err := findManifestDesc(idx, tag)
+// llmman_transfer's staging-directory fallback (transferViaStaging, in
+// transfer_common.go) can reuse it without going through CGO. find
+// resolves ref to its local manifest — findManifestForPush (exact match
+// only) for a direct user push, or findManifestForTransfer (also allows
+// a single-entry fallback, safe only for a staging directory known to
+// hold exactly the one just-pulled model) for transferViaStaging.
+// Returns whether anything was actually pushed — false if every layer,
+// the config, and the manifest were all already present at the
+// destination by digest.
+func pushToRegistry(ctx context.Context, layoutDir, ref string, find func(string, string) (ocispec.Descriptor, error)) (changed bool, err error) {
+	manifestDesc, err := find(layoutDir, ref)
 	if err != nil {
 		return false, err
 	}
@@ -576,11 +573,16 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 		return fmt.Errorf("write manifest blob: %w", err)
 	}
 
-	// Decode manifest to learn about layers and config
+	// Decode manifest to learn about layers and config.
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
-		// Could be an image index — store and return
-		return updateIndex(layoutDir, ref, manifestDesc)
+		return fmt.Errorf("parse manifest: %w", err)
+	}
+	if manifest.Config.Digest == "" {
+		// A valid image index unmarshals above without error (unknown
+		// fields are ignored), just with a zero-value Config — store the
+		// descriptor as-is rather than fetching a zero-digest "config".
+		return writeManifestRef(layoutDir, ref, manifestDesc)
 	}
 
 	// Fetch config
@@ -681,7 +683,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	}
 	prog.Wait()
 
-	return updateIndex(layoutDir, ref, manifestDesc)
+	return writeManifestRef(layoutDir, ref, manifestDesc)
 }
 
 // llmman_inspect fetches and returns the raw manifest JSON for a remote reference.

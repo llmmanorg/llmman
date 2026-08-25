@@ -14,17 +14,28 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
+	specs "github.com/opencontainers/image-spec/specs-go"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
 	commonauth "go.podman.io/common/pkg/auth"
 	"go.podman.io/image/v5/copy"
+	"go.podman.io/image/v5/manifest"
 	"go.podman.io/image/v5/signature"
 	"go.podman.io/image/v5/transports/alltransports"
 	"go.podman.io/image/v5/types"
 )
+
+// scratchTag is the tag used inside the throwaway, single-manifest OCI
+// layout directories pullToLayout/pushToRegistry hand to go.podman.io/image's
+// "oci:" transport (see their own comments) — it never leaves that
+// ephemeral directory, so its exact value doesn't matter beyond being a
+// valid tag string.
+const scratchTag = "llmman-scratch"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -83,20 +94,39 @@ func llmman_push(cLayoutDir, cRef *C.char) *C.char {
 	ref := C.GoString(cRef)
 	progressReset(ref, "retrieving manifest")
 	defer progressDone(ref)
-	if _, err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), ref); err != nil {
+	if _, err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), ref, findManifestForPush); err != nil {
 		return errResp(err)
 	}
 	return okResp("")
 }
 
 // pushToRegistry is llmman_push's implementation, factored out so
-// llmman_transfer's staging-directory fallback (see transfer_podman.go)
-// can reuse it without going through CGO.
-func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, err error) {
-	tag := tagFromRef(ref)
+// llmman_transfer's staging-directory fallback (transferViaStaging, in
+// transfer_common.go) can reuse it without going through CGO. find
+// resolves ref to its local manifest — see backend_docker.go's
+// pushToRegistry for what the two possible values do.
+//
+// The push source handed to go.podman.io/image is a throwaway OCI layout
+// holding only an index.json naming the one manifest to push — not
+// layoutDir itself, whose index.json go.podman.io/image would otherwise
+// manage opaquely in exactly the single-shared-file format this whole
+// change replaces llmman's long-term store with something else instead
+// of. It needs no blob files of its own: sharedBlobDirOpts points the
+// source straight at layoutDir/blobs, so every blob (manifest included)
+// is read from the real store directly.
+func pushToRegistry(ctx context.Context, layoutDir, ref string, find func(string, string) (ocispec.Descriptor, error)) (changed bool, err error) {
+	manifestDesc, err := find(layoutDir, ref)
+	if err != nil {
+		return false, err
+	}
 
-	// Source: OCI layout directory
-	srcStr := fmt.Sprintf("oci:%s:%s", layoutDir, tag)
+	scratchDir, cleanup, err := buildScratchOCILayout(layoutDir, manifestDesc)
+	if err != nil {
+		return false, fmt.Errorf("prepare push source: %w", err)
+	}
+	defer cleanup()
+
+	srcStr := fmt.Sprintf("oci:%s:%s", scratchDir, scratchTag)
 	srcRef, err := alltransports.ParseImageName(srcStr)
 	if err != nil {
 		return false, fmt.Errorf("parse src ref %q: %w", srcStr, err)
@@ -106,8 +136,7 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 	// already defaults a tagless ref to :latest internally, but
 	// normalizing here too keeps this consistent with the docker/
 	// containerd backend (whose resolver has no such default — see
-	// backend_docker.go's pushToRegistry) and the local index.json tag
-	// lookup above, which effectively assumes the same thing.
+	// backend_docker.go's pushToRegistry).
 	dstStr := "docker://" + normalizeTag(ref)
 	dstRef, err := alltransports.ParseImageName(dstStr)
 	if err != nil {
@@ -121,10 +150,53 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 	defer pctx.Destroy()
 
 	progressSetStatus(ref, "pushing")
-	if err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pushing", "Pushed", &copy.Options{}, &changed, ref); err != nil {
+	if _, err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pushing", "Pushed", &copy.Options{
+		SourceCtx: sharedBlobDirOpts(layoutDir),
+	}, &changed, ref); err != nil {
 		return false, fmt.Errorf("copy image: %w", err)
 	}
 	return changed, nil
+}
+
+// buildScratchOCILayout assembles a throwaway OCI layout directory whose
+// only job is naming manifestDesc under scratchTag for go.podman.io/image's
+// "oci:" source transport to resolve — see pushToRegistry's own doc
+// comment on why, and on why no blob files need to be staged into it.
+// Created inside layoutDir so any same-filesystem operation
+// go.podman.io/image performs between it and layoutDir/blobs (see
+// sharedBlobDirOpts) can't hit a cross-device error.
+func buildScratchOCILayout(layoutDir string, manifestDesc ocispec.Descriptor) (dir string, cleanup func(), err error) {
+	dir, err = os.MkdirTemp(layoutDir, ".llmman-push-*")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup = func() { os.RemoveAll(dir) }
+
+	if err := os.WriteFile(filepath.Join(dir, "oci-layout"), []byte(`{"imageLayoutVersion":"1.0.0"}`), 0o644); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	idx := scratchIndex(manifestDesc)
+	data, err := json.MarshalIndent(idx, "", "  ")
+	if err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "index.json"), data, 0o644); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return dir, cleanup, nil
+}
+
+// sharedBlobDirOpts points go.podman.io/image's "oci:" transport at
+// layoutDir/blobs as its shared blob directory: reads/writes of any
+// blob (including the manifest itself, which is also content-addressed)
+// go straight to/from the real store, skipping any blob already there —
+// restoring the pre-scratch-layout "already present"/Cached behavior for
+// pulls — without ever staging a copy of it under a scratch directory.
+func sharedBlobDirOpts(layoutDir string) *types.SystemContext {
+	return &types.SystemContext{OCISharedBlobDirPath: filepath.Join(layoutDir, "blobs")}
 }
 
 // llmman_pull pulls an image from a registry into a local OCI layout directory.
@@ -161,7 +233,9 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 		return pullHF(ctx, ref, layoutDir, progressKey)
 	}
 
-	tag := tagFromRef(ref)
+	if err := ensureLayout(layoutDir); err != nil {
+		return fmt.Errorf("init OCI layout: %w", err)
+	}
 
 	// Source: Docker registry
 	srcStr := "docker://" + ref
@@ -170,13 +244,19 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 		return fmt.Errorf("parse src ref %q: %w", srcStr, err)
 	}
 
-	// Ensure the OCI layout directory exists
-	if err := os.MkdirAll(layoutDir, 0o755); err != nil {
-		return fmt.Errorf("create layout dir: %w", err)
+	// Destination: a throwaway scratch OCI layout, not layoutDir itself —
+	// see buildScratchOCILayout's doc comment. sharedBlobDirOpts makes
+	// every blob (including the manifest) land directly in
+	// layoutDir/blobs, reusing anything already cached there instead of
+	// re-downloading it, so there's nothing to adopt out of scratchDir
+	// afterward and its own index.json is never read.
+	scratchDir, err := os.MkdirTemp(layoutDir, ".llmman-pull-*")
+	if err != nil {
+		return fmt.Errorf("create scratch dir: %w", err)
 	}
+	defer os.RemoveAll(scratchDir)
 
-	// Destination: OCI layout directory
-	dstStr := fmt.Sprintf("oci:%s:%s", layoutDir, tag)
+	dstStr := fmt.Sprintf("oci:%s:%s", scratchDir, scratchTag)
 	dstRef, err := alltransports.ParseImageName(dstStr)
 	if err != nil {
 		return fmt.Errorf("parse dst ref %q: %w", dstStr, err)
@@ -189,12 +269,42 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	defer pctx.Destroy()
 
 	progressSetStatus(progressKey, "pulling")
-	if err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pulling", "Pulled", &copy.Options{
+	manifestData, err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pulling", "Pulled", &copy.Options{
 		MaxParallelDownloads: 6,
-	}, nil, progressKey); err != nil {
+		DestinationCtx:       sharedBlobDirOpts(layoutDir),
+	}, nil, progressKey)
+	if err != nil {
 		return fmt.Errorf("copy image: %w", err)
 	}
-	return nil
+
+	dgst, err := manifest.Digest(manifestData)
+	if err != nil {
+		return fmt.Errorf("digest manifest: %w", err)
+	}
+	manifestDesc := ocispec.Descriptor{
+		MediaType: manifest.GuessMIMEType(manifestData),
+		Digest:    dgst,
+		Size:      int64(len(manifestData)),
+	}
+	return writeManifestRef(layoutDir, ref, manifestDesc)
+}
+
+// scratchIndex builds the minimal, valid OCI image index go.podman.io/image's
+// "oci:" transport needs to resolve a single manifest by scratchTag — see
+// buildScratchOCILayout.
+func scratchIndex(manifestDesc ocispec.Descriptor) ocispec.Index {
+	return ocispec.Index{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: ocispec.MediaTypeImageIndex,
+		Manifests: []ocispec.Descriptor{{
+			MediaType: manifestDesc.MediaType,
+			Digest:    manifestDesc.Digest,
+			Size:      manifestDesc.Size,
+			Annotations: map[string]string{
+				ocispec.AnnotationRefName: scratchTag,
+			},
+		}},
+	}
 }
 
 // copyImageMu serializes the actual copy.Image call across every
@@ -239,16 +349,27 @@ var copyImageMu sync.Mutex
 // transfer_docker.go's non-resumable registry-push path, for the same
 // underlying reason: copy.Image (like that path) has no protocol-level
 // way to resume a partial blob.
-func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options, changed *bool, progressKey string) error {
+// The returned []byte is copy.Image's own copiedManifest — the exact
+// bytes it wrote to dst — which pullToLayout uses directly instead of
+// ever reading dst's own index.json back out again (see
+// adoptScratchPull). Callers that don't need it (pushToRegistry,
+// podmanTransferOCI) simply discard it.
+func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options, changed *bool, progressKey string) ([]byte, error) {
 	// Held for the whole retry sequence, not just one attempt — see this
 	// mutex's own doc comment on why the actual data transfer is kept
 	// fully serialized across every concurrent pull/push in this process.
 	copyImageMu.Lock()
 	defer copyImageMu.Unlock()
 
-	return retryStream(ctx, progressKey, isHTTP4xx, func() error {
-		return copyImageAttempt(ctx, pctx, dst, src, present, pastTense, opts, changed, progressKey)
+	var manifestData []byte
+	err := retryStream(ctx, progressKey, isHTTP4xx, func() error {
+		data, err := copyImageAttempt(ctx, pctx, dst, src, present, pastTense, opts, changed, progressKey)
+		if err == nil {
+			manifestData = data
+		}
+		return err
 	})
+	return manifestData, err
 }
 
 // copyImageAttempt runs a single copy.Image call with an mpb bar per
@@ -293,7 +414,7 @@ func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, d
 // full expected size on disk, yet the pull never returned, which a
 // per-artifact check (rather than the aggregate one) is what's actually
 // needed to catch.
-func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options, changed *bool, progressKey string) error {
+func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options, changed *bool, progressKey string) ([]byte, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -487,7 +608,7 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 	opts.Progress = ch
 	opts.ProgressInterval = 200 * time.Millisecond
 
-	_, err := copy.Image(ctx, pctx, dst, src, opts)
+	manifestData, err := copy.Image(ctx, pctx, dst, src, opts)
 	close(ch)
 	<-progDone
 
@@ -565,9 +686,9 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 	stalled := stalledArtifact
 	mu.Unlock()
 	if err != nil && stalled != "" {
-		return fmt.Errorf("stalled: artifact %s made no progress for over %v: %w", stalled, dlStallTimeout, err)
+		return nil, fmt.Errorf("stalled: artifact %s made no progress for over %v: %w", stalled, dlStallTimeout, err)
 	}
-	return err
+	return manifestData, err
 }
 
 // llmman_inspect fetches and returns the raw manifest JSON for a remote reference.

@@ -38,7 +38,12 @@ func transferViaStaging(ctx context.Context, source, destination string) (change
 	if err := pullToLayout(ctx, source, tmp); err != nil {
 		return false, err
 	}
-	return pushToRegistry(ctx, tmp, destination)
+	// findManifestForTransfer, not findManifestForPush: tmp is a fresh
+	// directory holding exactly the one model just pulled, under
+	// whatever ref pullToLayout normalized source to — which destination
+	// may not match verbatim (that's the whole point of a transfer) — so
+	// its single-entry fallback is safe here specifically.
+	return pushToRegistry(ctx, tmp, destination, findManifestForTransfer)
 }
 
 type transferSourceKind int

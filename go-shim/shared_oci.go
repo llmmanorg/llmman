@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
@@ -18,7 +17,6 @@ import (
 
 	"github.com/containerd/containerd/v2/core/content"
 	digest "github.com/opencontainers/go-digest"
-	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
@@ -145,78 +143,6 @@ func writeBlobStream(layoutDir, mediaType string, r io.Reader, size int64, dgst 
 func blobExists(layoutDir string, desc ocispec.Descriptor) bool {
 	fi, err := os.Stat(blobPath(layoutDir, desc.Digest))
 	return err == nil && fi.Size() == desc.Size
-}
-
-// readIndex reads index.json from an OCI layout directory.
-func readIndex(layoutDir string) (ocispec.Index, error) {
-	data, err := os.ReadFile(filepath.Join(layoutDir, "index.json"))
-	if err != nil {
-		return ocispec.Index{}, err
-	}
-	var idx ocispec.Index
-	return idx, json.Unmarshal(data, &idx)
-}
-
-func readIndexLocked(layoutDir string) (ocispec.Index, error) {
-	lock, err := lockIndex(layoutDir)
-	if err != nil {
-		return ocispec.Index{}, err
-	}
-	defer lock.release()
-	return readIndex(layoutDir)
-}
-
-// writeIndex writes index.json to an OCI layout directory.
-func writeIndex(layoutDir string, idx ocispec.Index) error {
-	data, err := json.MarshalIndent(idx, "", "  ")
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(layoutDir, "index.json")
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
-}
-
-// ensureLayout initialises the OCI layout marker files if not present.
-func ensureLayout(layoutDir string) error {
-	if err := os.MkdirAll(layoutDir, 0o755); err != nil {
-		return err
-	}
-	markerPath := filepath.Join(layoutDir, "oci-layout")
-	if _, err := os.Stat(markerPath); os.IsNotExist(err) {
-		if err := os.WriteFile(markerPath, []byte(`{"imageLayoutVersion":"1.0.0"}`), 0o644); err != nil {
-			return err
-		}
-	}
-	indexPath := filepath.Join(layoutDir, "index.json")
-	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
-		idx := ocispec.Index{
-			Versioned: specs.Versioned{SchemaVersion: 2},
-			MediaType: ocispec.MediaTypeImageIndex,
-		}
-		return writeIndex(layoutDir, idx)
-	}
-	return nil
-}
-
-// findManifestDesc looks up the manifest descriptor for a ref name in the index.
-func findManifestDesc(idx ocispec.Index, refName string) (ocispec.Descriptor, error) {
-	for _, m := range idx.Manifests {
-		if m.Annotations != nil && m.Annotations[ocispec.AnnotationRefName] == refName {
-			return m, nil
-		}
-	}
-	if len(idx.Manifests) == 1 {
-		return idx.Manifests[0], nil
-	}
-	return ocispec.Descriptor{}, fmt.Errorf("no manifest found for %q", refName)
 }
 
 // ---------------------------------------------------------------------------
@@ -628,39 +554,4 @@ func dedupBlobFetch(dedupKey, progressKey string, size int64, fetch func() (ocis
 		progressAddCompleted(progressKey, size)
 	}
 	return v.(ocispec.Descriptor), nil
-}
-
-// updateIndex adds or replaces the manifest entry in index.json with an
-// exclusive advisory lock to prevent concurrent corruption.
-func updateIndex(layoutDir, ref string, manifestDesc ocispec.Descriptor) error {
-	lock, err := lockIndex(layoutDir)
-	if err != nil {
-		return err
-	}
-	defer lock.release()
-
-	idx, err := readIndex(layoutDir)
-	if err != nil {
-		idx = ocispec.Index{
-			Versioned: specs.Versioned{SchemaVersion: 2},
-			MediaType: ocispec.MediaTypeImageIndex,
-		}
-	}
-	if manifestDesc.Annotations == nil {
-		manifestDesc.Annotations = map[string]string{}
-	}
-	manifestDesc.Annotations[ocispec.AnnotationRefName] = ref
-
-	replaced := false
-	for i, m := range idx.Manifests {
-		if m.Annotations != nil && m.Annotations[ocispec.AnnotationRefName] == ref {
-			idx.Manifests[i] = manifestDesc
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		idx.Manifests = append(idx.Manifests, manifestDesc)
-	}
-	return writeIndex(layoutDir, idx)
 }

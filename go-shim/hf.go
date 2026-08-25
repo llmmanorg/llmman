@@ -681,42 +681,36 @@ func parseHFRef(ref string) (host, owner, repo, tag string, err error) {
 // cachedLayerName returns the GGUF filename for ref if it is fully cached in
 // the local OCI store (manifest blob + all layer blobs present), or "" if not.
 func cachedLayerName(layoutDir, ref string) string {
-	idx, err := readIndexLocked(layoutDir)
+	m, err := readManifestRef(layoutDir, ref)
 	if err != nil {
 		return ""
 	}
-	for _, m := range idx.Manifests {
-		if m.Annotations[ocispec.AnnotationRefName] != ref {
-			continue
-		}
-		if !blobExists(layoutDir, m) {
-			return ""
-		}
-		data, err := readBlob(layoutDir, m.Digest)
-		if err != nil {
-			return ""
-		}
-		var manifest ocispec.Manifest
-		if err := json.Unmarshal(data, &manifest); err != nil {
-			return ""
-		}
-		for _, layer := range manifest.Layers {
-			if !blobExists(layoutDir, layer) {
-				return ""
-			}
-		}
-		// All blobs present — return a filename from the first layer annotation.
-		if len(manifest.Layers) > 0 {
-			ann := manifest.Layers[0].Annotations
-			for _, key := range []string{modelspec.AnnotationFilepath, ocispec.AnnotationTitle} {
-				if name := ann[key]; name != "" {
-					return filepath.Base(name)
-				}
-			}
-		}
-		return ref
+	if !blobExists(layoutDir, m) {
+		return ""
 	}
-	return ""
+	data, err := readBlob(layoutDir, m.Digest)
+	if err != nil {
+		return ""
+	}
+	var manifest ocispec.Manifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return ""
+	}
+	for _, layer := range manifest.Layers {
+		if !blobExists(layoutDir, layer) {
+			return ""
+		}
+	}
+	// All blobs present — return a filename from the first layer annotation.
+	if len(manifest.Layers) > 0 {
+		ann := manifest.Layers[0].Annotations
+		for _, key := range []string{modelspec.AnnotationFilepath, ocispec.AnnotationTitle} {
+			if name := ann[key]; name != "" {
+				return filepath.Base(name)
+			}
+		}
+	}
+	return ref
 }
 
 // reportCached prints "Cached <label>" and returns true if ref is already
@@ -916,7 +910,7 @@ func storeSafetensorsAsOCI(layoutDir, ref, modelRepo string, meta modelMeta, lay
 	if err != nil {
 		return err
 	}
-	return updateIndex(layoutDir, ref, manifestDesc)
+	return writeManifestRef(layoutDir, ref, manifestDesc)
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,7 +1146,7 @@ func storeGGUFAsOCI(layoutDir, ref, modelRepo string, meta modelMeta, filepathAn
 	if err != nil {
 		return err
 	}
-	return updateIndex(layoutDir, ref, manifestDesc)
+	return writeManifestRef(layoutDir, ref, manifestDesc)
 }
 
 // ---------------------------------------------------------------------------
