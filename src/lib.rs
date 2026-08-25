@@ -16,6 +16,7 @@ pub mod shortnames;
 pub mod storage;
 pub mod thinking;
 pub mod webui;
+pub mod xet_fetch;
 
 use std::path::PathBuf;
 

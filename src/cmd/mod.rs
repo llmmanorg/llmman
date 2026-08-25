@@ -17,3 +17,4 @@ pub mod show;
 pub mod stop;
 pub mod tag;
 pub mod transfer;
+pub mod xet_fetch;

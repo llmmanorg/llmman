@@ -38,6 +38,16 @@ zip        = { version = "2", default-features = false, features = ["deflate"] }
 libloading = "0.8"
 multer     = "3"
 
+# Real Xet-protocol downloads for HuggingFace files too large for the
+# plain-HTTP path to reliably serve — see src/xet_fetch.rs. Exact-pinned
+# (not "1.6") since these are xet-core's own internal workspace crates,
+# not independently semver-stable APIs, despite being on crates.io.
+hf-xet         = "=1.6.0"
+xet-client     = "=1.6.0"
+xet-data       = { version = "=1.6.0", default-features = false, features = ["rustls-tls"] }
+xet-runtime    = "=1.6.0"
+reqwest-middleware = "0.5"
+
 [features]
 default = ["docker"]
 docker = []
