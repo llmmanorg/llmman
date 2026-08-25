@@ -65,3 +65,10 @@ pytest
 `tests/test_install_integration.py` additionally exercises the real
 `vllm.config.model.ModelConfig` hook, and is skipped automatically if
 vLLM isn't installed in the current environment.
+
+`tests/test_e2e.py` goes further: a real `llmman` binary resolving a
+real `oci://` reference, no mocks — plus, when `vllm` is installed, a
+real `vllm serve oci://qwen3.5:0.8b-safetensors` process, never
+pre-resolved by the test itself, proving this plugin's entry point is
+actually discovered by a real vLLM startup. Excluded from a plain
+`pytest` run; run with `pytest -m e2e`.

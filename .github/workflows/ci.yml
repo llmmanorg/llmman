@@ -26,6 +26,9 @@ env:
   # than each duplicating the full "llama-<release>-bin-..." filename
   # independently.
   LLAMA_CPP_RELEASE: b10293
+  # vLLM version the e2e job's "Install vLLM (CPU, e2e)" step installs,
+  # for vllm-plugin/tests/test_e2e.py's real `vllm serve` test.
+  VLLM_VERSION: "0.27.1"
 
 jobs:
   build:
@@ -293,9 +296,13 @@ jobs:
   # (same runners, same msvc-arch/rustflags choices), so the launch/env/
   # config plumbing this actually exercises gets checked on every
   # platform/architecture llmman ships a binary for, not just a subset.
+  #
+  # Also runs vllm-plugin/tests/test_e2e.py (Linux x86_64/aarch64 and
+  # macOS aarch64, both `matrix.backend` entries) against this job's own
+  # installed `llmman` binary and a real (CPU-only) `vllm serve`.
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/opencode/codex/hermes/openclaw) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/opencode/codex/hermes/openclaw, vllm-plugin) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the two
@@ -316,7 +323,12 @@ jobs:
     # Windows). Exhausting every attempt doesn't fail this job either way
     # (see launch_and_assert's own doc comment) — a run can still
     # legitimately take this long in wall-clock time before giving up.
-    timeout-minutes: 180
+    #
+    # +90 on top of that 180 (270 total) for the vllm-plugin steps'
+    # own per-step budgets below: up to 60 min for "Install vLLM (CPU,
+    # e2e)" (a from-source build on macOS) plus up to 30 min for
+    # "pytest -m e2e (vllm-plugin)".
+    timeout-minutes: 270
     strategy:
       fail-fast: false
       matrix:
@@ -367,6 +379,17 @@ jobs:
             llama-asset: macos-arm64.tar.gz
             backend: docker
             feature-flags: ""
+
+          # ── macOS aarch64 (Apple Silicon, podman backend) ────────────────
+          # Same reasoning as the Linux podman entries above; `build`
+          # already compiles this backend for macOS, but nothing
+          # previously ran it against a real registry there.
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            go-os: darwin
+            llama-asset: macos-arm64.tar.gz
+            backend: podman
+            feature-flags: "--no-default-features --features podman"
 
           # ── Windows x86_64 (docker backend) ──────────────────────────────
           # lld-link, not MSVC link.exe — see the `build` job's own comment
@@ -815,6 +838,78 @@ jobs:
         run: cargo test --release --target ${{ matrix.target }} ${{ matrix.feature-flags }} --test launch_e2e -- --test-threads=1 --nocapture
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+
+      # ── vllm-plugin e2e (Linux + macOS) ──────────────────────────────────
+      # `vllm-plugin/tests/test_e2e.py` against this job's own installed
+      # `llmman` binary and a real CPU-only `vllm serve`. Excludes
+      # Windows: no vLLM CPU wheel/backend exists for it.
+      #
+      # Uses a venv, not the bare system python3 (Ubuntu 24.04's is PEP
+      # 668-locked). Both vllm-plugin and vllm (next step) install into
+      # this same venv so the plugin's entry point (see pyproject.toml)
+      # is actually discoverable by the vllm process.
+      - name: Set up Python (vllm-plugin e2e)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install vllm-plugin (e2e)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/vllm-plugin-venv"
+          "$RUNNER_TEMP/vllm-plugin-venv/bin/pip" install -e ./vllm-plugin pytest
+          echo "$RUNNER_TEMP/vllm-plugin-venv/bin" >> "$GITHUB_PATH"
+
+      # No GPU assumed, so this installs vLLM's CPU platform, not the
+      # default CUDA wheel. Linux has prebuilt CPU wheels; macOS Apple
+      # Silicon doesn't, so that leg builds from source instead
+      # (cmake/ninja/Xcode assumed present on the macos-15 runner image).
+      # LD_PRELOAD (x86_64 only): vLLM's CPU wheel needs Intel OpenMP
+      # preloaded; located via a glob scoped to this venv.
+      - name: Install vLLM (CPU, e2e)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/vllm-plugin-venv"
+
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            src="$RUNNER_TEMP/vllm-source"
+            git clone --branch "v${VLLM_VERSION}" --depth 1 https://github.com/vllm-project/vllm.git "$src"
+            "$venv/bin/pip" install -r "$src/requirements/cpu.txt"
+            "$venv/bin/pip" install -e "$src"
+          else
+            case "${{ matrix.target }}" in
+              x86_64-*) arch=x86_64 ;;
+              aarch64-*) arch=aarch64 ;;
+              *) echo "unhandled target for vLLM CPU wheel: ${{ matrix.target }}" >&2; exit 1 ;;
+            esac
+            wheel="vllm-${VLLM_VERSION}+cpu-cp38-abi3-manylinux_2_34_${arch}.whl"
+            "$venv/bin/pip" install \
+              "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/$wheel" \
+              --extra-index-url https://download.pytorch.org/whl/cpu
+
+            if [ "$arch" = "x86_64" ]; then
+              iomp=$("$venv/bin/python3" -c "import glob, sysconfig; m = glob.glob(sysconfig.get_paths()['purelib'] + '/**/libiomp5.so', recursive=True); print(m[0] if m else '')")
+              if [ -n "$iomp" ]; then
+                echo "LD_PRELOAD=$iomp" >> "$GITHUB_ENV"
+              else
+                echo "::warning::libiomp5.so not found under $venv; LD_PRELOAD not set for vLLM CPU (x86_64)"
+              fi
+            fi
+          fi
+
+      # LLMMAN_BIN isn't needed: `llmman` is already on PATH (added to
+      # $GITHUB_PATH by "Install llmman (via install script)" above).
+      - name: pytest -m e2e (vllm-plugin)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        timeout-minutes: 30
+        run: pytest -m e2e -v
+        working-directory: vllm-plugin
 
       # `llmman serve`'s own stdout/stderr never reach the test's own logs
       # above at all — see daemon::ensure_server's doc comment on why it's

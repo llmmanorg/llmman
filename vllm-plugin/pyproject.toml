@@ -27,3 +27,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "e2e: exercises a real llmman binary/registry pull (see tests/test_e2e.py). Excluded by default; run with `pytest -m e2e`.",
+]
+# A plain `pytest` must not pull ~740MB or need llmman installed by
+# default. CI passes its own `-m e2e` on the command line, which
+# overrides this.
+addopts = "-m 'not e2e'"
