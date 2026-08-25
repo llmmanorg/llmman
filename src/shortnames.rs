@@ -85,17 +85,21 @@ fn aliases() -> &'static HashMap<String, String> {
 
 /// Returns true if `reference` already carries an explicit registry host:
 /// it has a "/" (so there's an actual leading path component to examine),
-/// and that first component contains a dot or equals "localhost". Requiring
-/// a "/" here matters: without one, a slash-less reference like
-/// "qwen3.5:0.8B" would otherwise be misread as "already has host qwen3.5"
-/// just because its dotted version number contains a '.', when there's no
-/// host/path structure there at all — leaving it neither hf.co- nor
-/// docker.io/ai-prefixed, so it reaches the Go shim raw and dead-ends in
-/// its HuggingFace-only parser with a misleading error instead of either
-/// default ever being applied.
+/// and that first component contains a dot or colon (a "host:port" form,
+/// e.g. "localhost:5000" — a real repository name never contains a colon
+/// itself, matching docker/distribution's own reference grammar) or
+/// equals "localhost" outright. Requiring a "/" here matters: without
+/// one, a slash-less reference like "qwen3.5:0.8B" would otherwise be
+/// misread as "already has host qwen3.5:0.8B" just because its tag
+/// separator is a colon, when there's no host/path structure there at
+/// all — leaving it neither hf.co- nor docker.io/ai-prefixed, so it
+/// reaches the Go shim raw and dead-ends in its HuggingFace-only parser
+/// with a misleading error instead of either default ever being applied.
 fn has_host(reference: &str) -> bool {
     match reference.split_once('/') {
-        Some((first, _)) => first.contains('.') || first.eq_ignore_ascii_case("localhost"),
+        Some((first, _)) => {
+            first.contains('.') || first.contains(':') || first.eq_ignore_ascii_case("localhost")
+        }
         None => false,
     }
 }
@@ -314,5 +318,19 @@ mod tests {
         assert!(has_host("hf.co/foo/bar"));
         assert!(has_host("localhost/foo"));
         assert!(!has_host("unsloth/Qwen3.5-0.8B-GGUF"));
+    }
+
+    #[test]
+    // Regression: "localhost:PORT/..." (a local test registry) was
+    // mistaken for a host-less reference, since neither the dot check
+    // nor the exact "localhost" match recognized it — "resolve" then
+    // wrongly prepended "hf.co/", producing "hf.co/localhost:PORT/...".
+    fn has_host_recognizes_an_explicit_port() {
+        assert!(has_host("localhost:5000/foo/bar"));
+        assert!(has_host("registry.example.com:5000/foo"));
+        assert_eq!(
+            resolve("localhost:5000/foo/bar:tag"),
+            "localhost:5000/foo/bar:tag"
+        );
     }
 }

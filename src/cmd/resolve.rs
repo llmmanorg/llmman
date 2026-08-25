@@ -92,7 +92,19 @@ pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
         let layout_dir = store_path
             .to_str()
             .context("store path is not valid UTF-8")?;
-        crate::ffi::pull(&reference, layout_dir).with_context(|| format!("pulling {reference}"))?;
+        tokio::runtime::Runtime::new()
+            .context("start tokio runtime")?
+            .block_on(async {
+                match crate::hf::classify(&reference).await {
+                    crate::hf::ClassifiedRef::Hf(hf_ref) => {
+                        crate::hf::pull::pull(&hf_ref, &store_path, &reference).await
+                    }
+                    crate::hf::ClassifiedRef::Other(normalized) => {
+                        crate::ffi::pull(&normalized, layout_dir)
+                    }
+                }
+            })
+            .with_context(|| format!("pulling {reference}"))?;
     }
 
     let resolved = resolve_model(&store_path, &cache_path, &reference)

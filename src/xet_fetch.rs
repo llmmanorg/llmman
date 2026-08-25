@@ -1,6 +1,6 @@
 //! Real Xet-protocol downloads for HuggingFace files, via `hf-xet`
-//! (huggingface/xet-core). `huggingface_hub`'s own client refuses to
-//! fetch any file over 50GB through a plain HTTP GET at all
+//! (huggingface/xet-core, Apache-2.0). `huggingface_hub`'s own client
+//! refuses to fetch any file over 50GB through a plain HTTP GET at all
 //! (`file_download.py`: "Install `hf_xet` ... for xet-powered
 //! downloads."), requiring this protocol instead.
 //!
@@ -9,41 +9,28 @@
 //! works in practice past that threshold too — but it leans on a
 //! CloudFront/S3-fronted CAS bridge `huggingface_hub` doesn't trust at
 //! that scale, with none of this protocol's real advantages: no
-//! chunk-level dedup or resume (a dropped connection at byte 200GB of
-//! 244GB restarts the whole file).
+//! chunk-level dedup or resume.
 //!
 //! This module reconstructs a Xet-backed file the way `hf_xet` itself
-//! would, via its published Rust crates (`hf-xet` plus the lower-level
-//! `xet-client`/`xet-data`/`xet-runtime`, all Apache-2.0, from
-//! <https://github.com/huggingface/xet-core>) rather than reimplementing
-//! the CAS protocol. It's invoked from a hidden CLI subcommand
-//! (`llmman __xet-fetch`, see `cmd::xet_fetch`) rather than linked into
-//! the Go shim directly: all of llmman's HF download logic lives in Go
-//! today (one coarse FFI call per `transfer`/`pull` — see `ffi.rs`), and
-//! `hf-xet` is Rust-only, so self-exec avoids a new Go→Rust call
-//! boundary just for this.
+//! would and streams it to a writer — no local disk, no full-file
+//! buffering — via `hf-xet`'s `xet_session::XetDownloadStreamGroup`
+//! streaming API. Called directly from `crate::hf`'s fetch path (a
+//! normal function call, no subprocess/FFI, since the caller is
+//! already Rust).
 //!
-//! `xet-client`/`xet-data`/`xet-runtime` are direct dependencies (not
-//! just transitive, via `hf-xet`) because the auth plumbing needed here
-//! — [`DirectRefreshRouteTokenRefresher`], [`BearerCredentialHelper`],
-//! [`XetFileInfo`] — isn't re-exported through `hf-xet`'s public
-//! modules. All four are pinned to one xet-core release: they're
-//! xet-core's own internal workspace crates, not independently
-//! semver-stable APIs, despite being on crates.io.
+//! `hf-xet`'s `xet_session` module is the only dependency needed: it
+//! re-exports `XetFileInfo`/`HeaderMap` directly, no need to depend on
+//! `xet-client`/`xet-data`/`xet-runtime` separately.
 
-use std::path::Path;
-use std::sync::Arc;
+use std::io::Write;
 
 use anyhow::{Context, Result};
-use xet_client::cas_client::auth::{DirectRefreshRouteTokenRefresher, TokenRefresher};
-use xet_client::hub_client::{BearerCredentialHelper, CasJWTInfo};
-use xet_data::processing::XetFileInfo;
-use xet_runtime::core::XetContext;
+use xet::xet_session::{header, HeaderMap, XetFileInfo, XetSessionBuilder};
 
 /// Identifies and authenticates one Xet-backed HuggingFace file — just
 /// the fields the Go shim's own header-parsing already extracts
 /// (`X-Xet-Hash`, `X-Linked-Size`, `X-Linked-Etag`) plus the repo/revision
-/// it already knows, so wiring Go up to call this needs no extra HTTP call.
+/// it already knows.
 pub struct XetFileRef {
     /// HuggingFace endpoint, e.g. "https://huggingface.co" (see `hf::endpoint()`).
     pub endpoint: String,
@@ -63,16 +50,16 @@ pub struct XetFileRef {
     /// `hf-xet` verify the reconstructed content.
     pub sha256: Option<String>,
     /// Bearer token for the Hub API, used only to fetch/refresh the
-    /// short-lived Xet CAS token below (never sent to CAS itself).
-    /// `None` for an anonymous request.
+    /// short-lived Xet CAS token (never sent to CAS itself). `None` for
+    /// an anonymous request.
     pub hf_token: Option<String>,
 }
 
 impl XetFileRef {
-    /// The Hub API URL that hands out (and later refreshes) a short-lived
-    /// Xet CAS access token — mirrors `huggingface_hub`'s
-    /// `xet_connection_info_refresh_url`, and matches the resolve
-    /// response's own `Link: <...>; rel="xet-auth"` header.
+    /// The Hub API URL that hands out (and, via `with_token_refresh_url`,
+    /// later refreshes) a short-lived Xet CAS access token — mirrors
+    /// `huggingface_hub`'s `xet_connection_info_refresh_url`, and matches
+    /// the resolve response's own `Link: <...>; rel="xet-auth"` header.
     fn refresh_route(&self) -> String {
         format!(
             "{}/api/{}/{}/xet-read-token/{}",
@@ -84,61 +71,45 @@ impl XetFileRef {
     }
 }
 
-/// Downloads `file` to `dest_path` by reconstructing it from Xet CAS
-/// chunks. `dest_path`'s parent directory must already exist.
-///
-/// Installs a [`DirectRefreshRouteTokenRefresher`] so a transfer slow
-/// enough to outlive its first CAS token's expiry — plausible at the
-/// sizes this exists for — gets a fresh one automatically mid-download.
-pub async fn fetch_to_path(file: &XetFileRef, dest_path: &Path) -> Result<()> {
-    let ctx = XetContext::default().context("initialize xet runtime context")?;
+/// Streams `file`'s reconstructed content to `w`, chunk by chunk, with no
+/// local disk touched and no full-file buffering — suitable for a
+/// multi-hundred-GB file. `with_token_refresh_url` handles both the
+/// initial CAS token fetch and any later refresh a long-running stream
+/// needs, so this needs no upfront token round trip of its own.
+pub async fn stream_to_writer(file: &XetFileRef, w: &mut impl Write) -> Result<()> {
+    let session = XetSessionBuilder::new()
+        .build()
+        .context("create xet session")?;
 
-    let http_client =
-        reqwest_middleware::ClientBuilder::new(reqwest_middleware::reqwest::Client::new()).build();
-    let cred_helper = file
-        .hf_token
-        .clone()
-        .map(|t| BearerCredentialHelper::new(t, "llmman") as Arc<_>);
-    let refresher = Arc::new(DirectRefreshRouteTokenRefresher::new(
-        ctx.clone(),
-        file.refresh_route(),
-        http_client,
-        cred_helper,
-    ));
+    let mut headers = HeaderMap::new();
+    if let Some(token) = &file.hf_token {
+        let value = format!("Bearer {token}")
+            .parse()
+            .context("build Authorization header")?;
+        headers.insert(header::AUTHORIZATION, value);
+    }
 
-    // download_async needs a concrete CAS endpoint up front; this one
-    // eager call gets it (cas_url) along with an initial token, so the
-    // refresher above only has to handle *later* refreshes.
-    let CasJWTInfo {
-        cas_url,
-        exp,
-        access_token,
-    } = refresher
-        .get_cas_jwt()
+    let group = session
+        .new_download_stream_group()
+        .context("create xet download stream group")?
+        .with_token_refresh_url(file.refresh_route(), headers)
+        .build()
         .await
-        .context("fetch initial Xet CAS access token")?;
+        .context("authenticate xet download")?;
 
     let xet_file_info = match &file.sha256 {
         Some(sha256) => XetFileInfo::new_with_sha256(file.hash.clone(), file.size, sha256.clone()),
         None => XetFileInfo::new(file.hash.clone(), file.size),
     };
 
-    let dest_path_str = dest_path
-        .to_str()
-        .context("destination path is not valid UTF-8")?
-        .to_string();
+    let mut stream = group
+        .download_stream(xet_file_info, None)
+        .await
+        .context("start xet download stream")?;
 
-    xet::legacy::data_client::download_async(
-        &ctx,
-        vec![(xet_file_info, dest_path_str)],
-        Some(cas_url),
-        Some((access_token, exp)),
-        Some(refresher as Arc<dyn TokenRefresher>),
-        None,
-        None,
-    )
-    .await
-    .context("xet download")?;
+    while let Some(chunk) = stream.next().await.context("read xet download stream")? {
+        w.write_all(&chunk).context("write downloaded chunk")?;
+    }
 
     Ok(())
 }
@@ -198,16 +169,13 @@ mod tests {
         assert_eq!(strip_etag_quotes("unquoted"), "unquoted");
     }
 
-    /// Real download of a small (~450KB), genuinely Xet-backed file —
-    /// hf-internal-testing/tiny-random-gpt2's model.safetensors. Needs
-    /// real network access (same convention as hf.rs's Go-side
+    /// Real streaming download of a small (~450KB), genuinely Xet-backed
+    /// file — hf-internal-testing/tiny-random-gpt2's model.safetensors.
+    /// Needs real network access (same convention as hf.rs's Go-side
     /// equivalent, hfheadmetadata_test.go). hash/size/sha256 came from:
     ///   curl -sI -H 'Accept-Encoding: identity' <resolve URL>
     #[tokio::test]
-    async fn fetch_to_path_downloads_a_real_small_xet_backed_file() {
-        let dir = tempfile_dir();
-        let dest = dir.join("model.safetensors");
-
+    async fn stream_to_writer_downloads_a_real_small_xet_backed_file() {
         let file = XetFileRef {
             endpoint: crate::hf::endpoint(),
             repo_type: "models".to_string(),
@@ -221,9 +189,10 @@ mod tests {
             hf_token: crate::hf::token(),
         };
 
-        fetch_to_path(&file, &dest).await.expect("fetch_to_path");
-
-        let data = std::fs::read(&dest).expect("read downloaded file");
+        let mut data = Vec::new();
+        stream_to_writer(&file, &mut data)
+            .await
+            .expect("stream_to_writer");
         assert_eq!(data.len(), 453_864);
 
         use sha2::Digest;
@@ -241,10 +210,7 @@ mod tests {
     /// hf-xet's own local hash validation being tested — still needs
     /// network access for that token exchange.
     #[tokio::test]
-    async fn fetch_to_path_rejects_an_invalid_hash_cleanly() {
-        let dir = tempfile_dir();
-        let dest = dir.join("out.bin");
-
+    async fn stream_to_writer_rejects_an_invalid_hash_cleanly() {
         let file = XetFileRef {
             endpoint: crate::hf::endpoint(),
             repo_type: "models".to_string(),
@@ -256,19 +222,13 @@ mod tests {
             hf_token: crate::hf::token(),
         };
 
-        let err = fetch_to_path(&file, &dest)
+        let mut sink = Vec::new();
+        let err = stream_to_writer(&file, &mut sink)
             .await
             .expect_err("an invalid hash must not succeed");
         assert!(
             format!("{err:#}").contains("hash"),
             "expected the error to mention the bad hash, got: {err:#}"
         );
-    }
-
-    fn tempfile_dir() -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("llmman-xet-fetch-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
     }
 }

@@ -15,7 +15,7 @@ func TestHFHeadMetadataFollowsRepoRenameRedirect(t *testing.T) {
 	client := hfAPIClient()
 	url := "https://huggingface.co/deepreinforce-ai/Ornith-1.0-35B/resolve/main/model-00001-of-00016.safetensors"
 
-	dgst, size, ok, err := hfHeadMetadata(ctx, client, url, "")
+	dgst, size, _, ok, err := hfHeadMetadata(ctx, client, url, "")
 	if err != nil {
 		t.Fatalf("hfHeadMetadata: %v", err)
 	}
@@ -37,7 +37,7 @@ func TestHFHeadMetadataOrdinaryRepoStillWorks(t *testing.T) {
 	client := hfAPIClient()
 	url := "https://huggingface.co/unsloth/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-Q8_0.gguf"
 
-	dgst, size, ok, err := hfHeadMetadata(ctx, client, url, "")
+	dgst, size, _, ok, err := hfHeadMetadata(ctx, client, url, "")
 	if err != nil {
 		t.Fatalf("hfHeadMetadata: %v", err)
 	}

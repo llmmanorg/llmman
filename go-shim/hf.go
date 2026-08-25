@@ -198,10 +198,11 @@ func hfTokenPath() string {
 }
 
 // hfHeadMetadata performs a HEAD request against a HuggingFace file's
-// /resolve/ URL and reports the file's real content digest and size,
-// without downloading the body — mirroring huggingface_hub's own
-// get_hf_file_metadata(). This is what makes streaming a HuggingFace file
-// straight into a registry push possible at all: containerd/OCI registry
+// /resolve/ URL and reports the file's real content digest, size, and
+// (if present) Xet hash (X-Xet-Hash), without downloading the body —
+// mirroring huggingface_hub's own get_hf_file_metadata(). This is what
+// makes streaming a HuggingFace file straight into a registry push
+// possible at all: containerd/OCI registry
 // pushes require the blob's digest to be known *before* any bytes are
 // sent (see backend_docker.go's llmman_transfer), and for a large,
 // LFS-tracked file (virtually every real GGUF/safetensors weight file)
@@ -220,7 +221,7 @@ func hfTokenPath() string {
 // headroom, not a limit ever expected to actually bind.
 const hfHeadMetadataMaxHops = 5
 
-func hfHeadMetadata(ctx context.Context, client *http.Client, target, token string) (dgst digest.Digest, size int64, ok bool, err error) {
+func hfHeadMetadata(ctx context.Context, client *http.Client, target, token string) (dgst digest.Digest, size int64, xetHash string, ok bool, err error) {
 	// Do NOT let http.Client itself follow redirects: huggingface.co sets
 	// X-Linked-Etag/X-Linked-Size on its own redirecting response
 	// (pointing at the real content's sha256/size before it hands off to
@@ -261,7 +262,7 @@ func hfHeadMetadata(ctx context.Context, client *http.Client, target, token stri
 	for hop := 0; hop < hfHeadMetadataMaxHops; hop++ {
 		req, err := http.NewRequestWithContext(ctx, "HEAD", target, nil)
 		if err != nil {
-			return "", 0, false, err
+			return "", 0, "", false, err
 		}
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
@@ -270,15 +271,16 @@ func hfHeadMetadata(ctx context.Context, client *http.Client, target, token stri
 
 		resp, err := noRedirect.Do(req)
 		if err != nil {
-			return "", 0, false, fmt.Errorf("HEAD %s: %w", target, err)
+			return "", 0, "", false, fmt.Errorf("HEAD %s: %w", target, err)
 		}
 		resp.Body.Close()
 		if resp.StatusCode != 200 && (resp.StatusCode < 300 || resp.StatusCode >= 400) {
-			return "", 0, false, fmt.Errorf("HEAD %s: HTTP %d", target, resp.StatusCode)
+			return "", 0, "", false, fmt.Errorf("HEAD %s: HTTP %d", target, resp.StatusCode)
 		}
 
 		xLinkedEtag := resp.Header.Get("X-Linked-Etag")
 		xLinkedSize := resp.Header.Get("X-Linked-Size")
+		xXetHash := resp.Header.Get("X-Xet-Hash")
 		isRedirect := resp.StatusCode >= 300 && resp.StatusCode < 400
 		if isRedirect && xLinkedEtag == "" && xLinkedSize == "" {
 			loc := resp.Header.Get("Location")
@@ -315,12 +317,12 @@ func hfHeadMetadata(ctx context.Context, client *http.Client, target, token stri
 		etag = strings.TrimPrefix(etag, "W/")
 		etag = strings.Trim(etag, `"`)
 		if len(etag) != 64 {
-			return "", size, false, nil // not a sha256 — not LFS, caller should buffer instead
+			return "", size, xXetHash, false, nil // not a sha256 — not LFS, caller should buffer instead
 		}
 
-		return digest.NewDigestFromEncoded(digest.SHA256, strings.ToLower(etag)), size, true, nil
+		return digest.NewDigestFromEncoded(digest.SHA256, strings.ToLower(etag)), size, xXetHash, true, nil
 	}
-	return "", 0, false, nil
+	return "", 0, "", false, nil
 }
 
 func parseInt64(s string) (int64, error) {

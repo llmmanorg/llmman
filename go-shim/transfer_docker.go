@@ -364,7 +364,7 @@ func streamHFFileToRegistry(
 	annotations := map[string]string{modelspec.AnnotationFilepath: filepath.Base(file.Path)}
 	label := filepath.Base(file.Path)
 
-	dgst, size, digestOK, headErr := hfHeadMetadata(ctx, client, url, token)
+	dgst, size, _, digestOK, headErr := hfHeadMetadata(ctx, client, url, token)
 	if headErr == nil && digestOK {
 		desc := ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: size, Annotations: annotations}
 		short := shortDigest(dgst)

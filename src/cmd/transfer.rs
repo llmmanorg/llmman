@@ -1,6 +1,8 @@
+use anyhow::Context;
 use clap::Args;
 
 use crate::ffi;
+use crate::hf::ClassifiedRef;
 
 #[derive(Args, Debug)]
 pub struct TransferArgs {
@@ -42,11 +44,26 @@ pub struct TransferArgs {
 /// and `inspect --remote`) rather than through a running `llmman serve`
 /// daemon (like `pull`/`push`): a transfer never touches the daemon's
 /// persistent store, so there's no shared state to coordinate.
+///
+/// A HuggingFace source is now handled entirely in Rust — see
+/// `crate::hf::transfer` — since `hf-xet` (needed for files too large
+/// for a plain HTTP GET to reliably serve) is Rust-only; everything else
+/// (an actual OCI registry, or one of the `ms://`/`ngc://`/`s3://`/
+/// `gs://`/local-path sources) still goes through the Go shim exactly as
+/// before.
 pub fn run(args: &TransferArgs) -> anyhow::Result<()> {
     let source = crate::shortnames::resolve(&args.source);
     let destination = crate::shortnames::resolve(&args.destination);
 
-    let changed = ffi::transfer(&source, &destination)?;
+    let rt = tokio::runtime::Runtime::new().context("start tokio runtime")?;
+    let changed = rt.block_on(async {
+        match crate::hf::classify(&source).await {
+            ClassifiedRef::Hf(reference) => {
+                crate::hf::transfer::transfer(&reference, &destination).await
+            }
+            ClassifiedRef::Other(normalized) => ffi::transfer(&normalized, &destination),
+        }
+    })?;
 
     if changed {
         println!("Transferred {source} to {destination}");

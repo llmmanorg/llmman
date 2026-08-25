@@ -27,6 +27,23 @@ extern "C" {
     fn llmman_progress(key: *const c_char) -> *mut c_char;
 }
 
+// go-shim/push_stream.go is `!podman`-only: containerd's docker.Resolver
+// has a per-blob streaming push primitive, podman's copy.Image doesn't
+// (see `crate::hf::transfer`'s doc comment for its podman fallback).
+#[cfg(feature = "docker")]
+extern "C" {
+    fn llmman_push_session_open(destination: *const c_char) -> *mut c_char;
+    fn llmman_push_session_close(session: i64) -> *mut c_char;
+    fn llmman_push_stream_open(
+        session: i64,
+        media_type: *const c_char,
+        digest: *const c_char,
+        size: i64,
+        annotations_json: *const c_char,
+    ) -> *mut c_char;
+    fn llmman_push_stream_wait(handle: i64) -> *mut c_char;
+}
+
 // ---------------------------------------------------------------------------
 // Windows-only: manual Go runtime bootstrap
 // ---------------------------------------------------------------------------
@@ -199,6 +216,103 @@ pub fn transfer(source: &str, destination: &str) -> anyhow::Result<bool> {
     let d = cstr(destination)?;
     let data = consume(unsafe { llmman_transfer(s.as_ptr(), d.as_ptr()) })?;
     Ok(data == "changed")
+}
+
+/// A registry destination resolved once via [`push_session_open`] and
+/// shared by every [`push_stream_open`] call within one transfer —
+/// resolving a destination negotiates auth (and, for a non-HTTPS-only
+/// host, containerd's HTTPS-then-HTTP-fallback probe), neither of which
+/// is free to redo per blob. Releases itself (best-effort) on `Drop`, so
+/// an early `?` return partway through a transfer can't leak it.
+#[cfg(feature = "docker")]
+pub struct PushSession(i64);
+
+#[cfg(feature = "docker")]
+pub fn push_session_open(destination: &str) -> anyhow::Result<PushSession> {
+    #[derive(Deserialize)]
+    struct Result_ {
+        session: i64,
+    }
+    let d = cstr(destination)?;
+    let data = consume(unsafe { llmman_push_session_open(d.as_ptr()) })?;
+    let result: Result_ =
+        serde_json::from_str(&data).context("decode push_session_open response")?;
+    Ok(PushSession(result.session))
+}
+
+#[cfg(feature = "docker")]
+impl Drop for PushSession {
+    fn drop(&mut self) {
+        if let Err(e) = consume(unsafe { llmman_push_session_close(self.0) }) {
+            eprintln!("[llmman] close push session: {e:#}");
+        }
+    }
+}
+
+/// The write end of a pipe Go created for one streamed blob/manifest
+/// push (see go-shim/push_stream.go), plus the handle to collect its
+/// outcome with [`push_stream_wait`]. `fd` is a raw POSIX fd on Unix or
+/// a raw Windows `HANDLE` widened to `u64` — Go, not this side, creates
+/// the pipe (see `crate::hf::transfer`'s doc comment for why). Once
+/// wrapped in a `File` (`from_raw_fd`/`from_raw_handle`), `fd` itself is
+/// a stale value — don't read it again.
+#[cfg(feature = "docker")]
+#[must_use = "must be passed to push_stream_wait, or the Go-side handle and its goroutine leak"]
+pub struct PushStream {
+    pub fd: u64,
+    handle: i64,
+}
+
+#[cfg(feature = "docker")]
+#[derive(Deserialize)]
+struct PushStreamOpenResult {
+    fd: u64,
+    handle: i64,
+}
+
+/// Starts pushing one blob (or the final manifest — the registry tells
+/// them apart by `media_type`, not anything passed here) within
+/// `session` (see [`push_session_open`]). `digest` is `"sha256:<hex>"`.
+/// `annotations_json` is an optional JSON object (`""` for none).
+/// Returns immediately with the write end of a pipe to stream the
+/// content into; see [`push_stream_wait`].
+#[cfg(feature = "docker")]
+pub fn push_stream_open(
+    session: &PushSession,
+    media_type: &str,
+    digest: &str,
+    size: i64,
+    annotations_json: &str,
+) -> anyhow::Result<PushStream> {
+    let m = cstr(media_type)?;
+    let g = cstr(digest)?;
+    let a = cstr(annotations_json)?;
+    let data = consume(unsafe {
+        llmman_push_stream_open(session.0, m.as_ptr(), g.as_ptr(), size, a.as_ptr())
+    })?;
+    let result: PushStreamOpenResult =
+        serde_json::from_str(&data).context("decode push_stream_open response")?;
+    Ok(PushStream {
+        fd: result.fd,
+        handle: result.handle,
+    })
+}
+
+/// Blocks until the streamed push started by [`push_stream_open`]
+/// finishes — the caller must have already finished writing and closed
+/// its own end of `stream.fd` before calling this, or it hangs waiting
+/// for an EOF that will never come. Returns whether the destination
+/// didn't already have this exact blob (by digest).
+#[cfg(feature = "docker")]
+pub fn push_stream_wait(stream: PushStream) -> anyhow::Result<bool> {
+    #[derive(Deserialize)]
+    struct WaitResult {
+        changed: bool,
+    }
+    let data = consume(unsafe { llmman_push_stream_wait(stream.handle) })?;
+    let result: WaitResult =
+        serde_json::from_str(&data).context("decode push_stream_wait response")?;
+    Ok(result.changed)
 }
 
 /// A byte-level snapshot of one particular pull/push (identified by

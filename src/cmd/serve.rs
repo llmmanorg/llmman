@@ -1832,6 +1832,10 @@ async fn acquire_load_lock(model: &str) -> LoadLockGuard {
 ///
 /// Must be called from a blocking context (`spawn_blocking`): blocks the
 /// current thread on model's lock, not just this async task.
+///
+/// A HuggingFace reference now pulls entirely in Rust (`crate::hf::pull`,
+/// see its own doc comment for why) straight into the local OCI layout;
+/// everything else still goes through the Go shim exactly as before.
 fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<()> {
     let lock = model_lock(model);
     let result = (|| {
@@ -1845,7 +1849,19 @@ fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<
         let layout_dir = store_path
             .to_str()
             .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
-        crate::ffi::pull(model, layout_dir)
+        // Safe from a spawn_blocking'd OS thread: this reuses the
+        // current (already-running) tokio runtime rather than trying to
+        // start a second, nested one.
+        tokio::runtime::Handle::current().block_on(async {
+            match crate::hf::classify(model).await {
+                crate::hf::ClassifiedRef::Hf(reference) => {
+                    crate::hf::pull::pull(&reference, store_path, model).await
+                }
+                crate::hf::ClassifiedRef::Other(normalized) => {
+                    crate::ffi::pull(&normalized, layout_dir)
+                }
+            }
+        })
     })();
     drop(lock);
     release_model_lock(model);
@@ -3131,14 +3147,32 @@ fn stream_ffi_progress(
                         Some((Bytes::from(line + "\n"), None))
                     }
                     _ = sleep(Duration::from_millis(200)) => {
-                        let line = match crate::ffi::progress(&model) {
-                            Ok(p) if p.total > 0 => serde_json::json!({
-                                "status": if p.status.is_empty() { format!("{verb}ing {model}") } else { p.status },
-                                "total": p.total.max(0),
-                                "completed": p.completed.clamp(0, p.total),
-                            }),
-                            Ok(p) if !p.status.is_empty() => serde_json::json!({"status": p.status}),
-                            _ => serde_json::json!({"status": format!("{verb}ing {model}")}),
+                        // A HuggingFace pull tracks its own progress natively
+                        // (crate::hf::progress) rather than through the Go
+                        // shim's — check that first, since only one of the
+                        // two will ever actually be tracking `model` for a
+                        // given task.
+                        let rust_snap = crate::hf::progress::poll(&model);
+                        let go_snap = (rust_snap.total == 0).then(|| crate::ffi::progress(&model).ok()).flatten();
+                        let (status, total, completed) = if rust_snap.total > 0 {
+                            (rust_snap.status, rust_snap.total, rust_snap.completed)
+                        } else if !rust_snap.status.is_empty() {
+                            (rust_snap.status, 0, 0)
+                        } else if let Some(p) = &go_snap {
+                            (p.status.clone(), p.total, p.completed)
+                        } else {
+                            (String::new(), 0, 0)
+                        };
+                        let line = if total > 0 {
+                            serde_json::json!({
+                                "status": if status.is_empty() { format!("{verb}ing {model}") } else { status },
+                                "total": total.max(0),
+                                "completed": completed.clamp(0, total),
+                            })
+                        } else if !status.is_empty() {
+                            serde_json::json!({"status": status})
+                        } else {
+                            serde_json::json!({"status": format!("{verb}ing {model}")})
                         };
                         Some((Bytes::from(line.to_string() + "\n"), Some(task)))
                     }
