@@ -33,9 +33,9 @@ enum Commands {
     Push(cmd::push::PushArgs),
     /// Pull an image from a registry to the local store
     Pull(cmd::pull::PullArgs),
-    /// Pull (if needed) and extract a model to a local path, printing its
-    /// location as JSON — for external tools (e.g. a vLLM plugin) that want
-    /// to load the model themselves rather than through `llmman serve`.
+    /// Pull (if needed) and print a model's local path as JSON (internal,
+    /// used by the vllm-llmman plugin)
+    #[command(hide = true)]
     Resolve(cmd::resolve::ResolveArgs),
     /// Transfer an image directly from one location to another (e.g. HuggingFace to an OCI registry)
     Transfer(cmd::transfer::TransferArgs),
@@ -50,14 +50,10 @@ enum Commands {
     Rm(cmd::rm::RmArgs),
     /// Stop (unload) a running model
     Stop(cmd::stop::StopArgs),
-    /// Show the manifest of a local (or remote with --remote) image
-    Inspect(cmd::inspect::InspectArgs),
     /// Show a local model's architecture, parameters, license, and template
     Show(cmd::show::ShowArgs),
     /// Start an inference server (Ollama, OpenAI, Anthropic compatible APIs)
     Serve(cmd::serve::ServeArgs),
-    /// Create a new local tag pointing to an existing image
-    Tag(cmd::tag::TagArgs),
     /// Probe the local host's GPU/accelerator support (internal diagnostic)
     #[command(hide = true)]
     GpuDiscover(cmd::gpu_discover::GpuDiscoverArgs),
@@ -114,10 +110,8 @@ fn main() {
         Commands::Cp(a) => cmd::cp::run(a),
         Commands::Rm(a) => cmd::rm::run(a),
         Commands::Stop(a) => cmd::stop::run(a),
-        Commands::Inspect(a) => cmd::inspect::run(a),
         Commands::Show(a) => cmd::show::run(a),
         Commands::Serve(a) => cmd::serve::run(a),
-        Commands::Tag(a) => cmd::tag::run(a),
         Commands::GpuDiscover(a) => cmd::gpu_discover::run(a),
     };
     if let Err(e) = result {

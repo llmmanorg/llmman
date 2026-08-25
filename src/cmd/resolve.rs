@@ -1,15 +1,12 @@
 //! `llmman resolve` — pull (if needed) and extract a model reference to a
 //! local path, printing the result as one line of JSON on stdout.
 //!
-//! Unlike `llmman pull` (a thin client of `llmman serve`'s daemon) this
-//! runs entirely in-process and never starts a daemon or an inference
-//! backend of its own — it exists for external tools that want to load
-//! the model themselves. The motivating consumer is a vLLM plugin
-//! (see `vllm-llmman` in the llmman project) that shells out to this
-//! subcommand so `vllm serve oci://<ref>` can pull a CNCF ModelPack
-//! image instead of a HuggingFace repo, then hand the extracted directory
-//! (or `.gguf` file) to vLLM exactly as if it had been a local path all
-//! along.
+//! Hidden from `--help` (`main.rs`'s `Commands::Resolve`): it's not a
+//! user-facing subcommand, just an internal hook for the `vllm-llmman`
+//! plugin, which shells out to it so `vllm serve oci://<ref>` can pull a
+//! CNCF ModelPack image and hand vLLM the extracted path directly.
+//! Unlike `llmman pull` (a client of `llmman serve`'s daemon), this runs
+//! in-process and never starts a daemon or backend of its own.
 //!
 //! Output contract (stdout, on success, exactly one line):
 //! ```json

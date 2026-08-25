@@ -1,7 +1,6 @@
 pub mod build;
 pub mod cp;
 pub mod gpu_discover;
-pub mod inspect;
 pub mod launch;
 pub mod list;
 pub mod login;
@@ -15,5 +14,4 @@ pub mod run;
 pub mod serve;
 pub mod show;
 pub mod stop;
-pub mod tag;
 pub mod transfer;

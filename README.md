@@ -12,7 +12,6 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 | `launch`  | Launch an integration (Claude Code, OpenCode, …) |
 | `run`     | Run a model interactively or with a one-shot prompt |
 | `pull`    | Pull a model from a registry or HuggingFace |
-| `resolve` | Pull (if needed) and print the local path of a model, as JSON — for other tools to consume |
 | `list`    | List locally stored models |
 | `ps`      | List models currently loaded |
 | `stop`    | Stop (unload) a running model |
@@ -21,8 +20,6 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 | `transfer` | Transfer an image directly from one location to another (e.g. HuggingFace to an OCI registry) |
 | `cp`      | Copy a local image to a new reference |
 | `rm`      | Remove a local image |
-| `tag`     | Create a new local tag pointing to an existing image |
-| `inspect` | Show the manifest of a local or remote image |
 | `show`    | Show a local model's architecture, parameters, license, and template |
 | `login`   | Log in to a container registry |
 | `logout`  | Log out from a container registry |
@@ -143,22 +140,10 @@ Short names work wherever a model reference is accepted.
 ### Use with vLLM directly
 
 `llmman serve` already spawns `vllm` itself as a backend for safetensors
-models. `llmman resolve` is the inverse: it pulls and extracts a model
-without starting any server, printing the resulting local path so another
-tool can load it instead. This is what the
-[`vllm-llmman`](https://pypi.org/project/vllm-llmman/) vLLM plugin uses so
-`vllm serve oci://<reference>` can pull a CNCF ModelPack image
-directly, instead of a HuggingFace repo:
-
-```
-llmman resolve ghcr.io/org/model:tag
-{"reference":"ghcr.io/org/model:tag","path":"/home/you/.local/share/llmman/store/cache/<digest>","format":"safetensors"}
-```
-
-`format` is `"safetensors"` (a directory) or `"gguf"` (a single file).
-`--no-pull` fails instead of pulling if the reference isn't already in the
-local store; `--cache` overrides the extracted-file cache location, and
-`LLMMAN_MODELS` overrides the store location below.
+models. The [`vllm-llmman`](https://pypi.org/project/vllm-llmman/) plugin
+is the inverse: install it alongside `vllm` and `vllm serve
+oci://<reference>` pulls a CNCF ModelPack image directly, instead of a
+HuggingFace repo.
 
 ## Store location
 
@@ -170,12 +155,12 @@ Default locations:
 | Windows | `%LOCALAPPDATA%\llmman\store` |
 
 Set `LLMMAN_MODELS` to change this (matching Ollama's `OLLAMA_MODELS`).
-Commands that read or write the local store directly (`list`, `rm`, `tag`,
-`inspect`, `build`, `resolve`, `serve`) all honor it. Commands that go
-through the background daemon instead (`pull`, `push`, `run`, `launch`,
-`ps`) always use whichever store the daemon was started with — set
-`LLMMAN_MODELS` before `llmman serve` to change it for all of them.
-`transfer`, `login`, and `logout` never touch a local store at all.
+Commands that read or write the local store directly (`list`, `rm`,
+`build`, `serve`) all honor it. Commands that go through the background
+daemon instead (`pull`, `push`, `run`, `launch`, `ps`) always use whichever
+store the daemon was started with — set `LLMMAN_MODELS` before
+`llmman serve` to change it for all of them. `transfer`, `login`, and
+`logout` never touch a local store at all.
 
 The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), readable by `docker` and `podman`.
 
