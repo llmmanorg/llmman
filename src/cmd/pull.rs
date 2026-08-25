@@ -13,9 +13,8 @@ pub struct PullArgs {
 /// other Ollama-API client use, so bare-name resolution (shortnames::
 /// resolve_ollama_api) and the model store are always the daemon's.
 ///
-/// This intentionally has no `--store` override anymore: the daemon always
-/// uses its own default store (see `llmman serve --store` to change that
-/// store for the daemon itself, which then applies to every client).
+/// No store override of its own: set `LLMMAN_MODELS` before starting
+/// `llmman serve` to change the daemon's store for every client.
 pub fn run(args: &PullArgs) -> anyhow::Result<()> {
     crate::daemon::ensure_server("")?;
     crate::daemon::stream_progress("/api/pull", &args.reference)?;

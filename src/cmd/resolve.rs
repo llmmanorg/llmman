@@ -42,11 +42,6 @@ pub struct ResolveArgs {
     #[arg(value_name = "REFERENCE")]
     pub reference: String,
 
-    /// Local OCI store directory (overrides the default; see
-    /// `llmman serve --store`'s doc comment for the platform default)
-    #[arg(long)]
-    pub store: Option<PathBuf>,
-
     /// Directory extracted model files are cached under (defaults to
     /// `<store>/cache`)
     #[arg(long)]
@@ -74,7 +69,7 @@ struct ResolveOutput<'a> {
 pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
     let reference = crate::shortnames::resolve_ollama_api(&args.reference);
 
-    let store_path = crate::default_store(args.store.as_deref())?;
+    let store_path = crate::default_store()?;
     let cache_path = args
         .cache
         .clone()

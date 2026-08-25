@@ -209,7 +209,7 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     }
     let exe = std::env::current_exe().context("could not resolve own executable")?;
 
-    let log_path = crate::default_store(None)
+    let log_path = crate::default_store()
         .ok()
         .and_then(|store| store.parent().map(|p| p.join("serve.log")));
 

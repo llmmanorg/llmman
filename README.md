@@ -106,6 +106,8 @@ Daemon-wide `llama-server` tuning, set before `llmman serve` starts:
 | `LLMMAN_CONTEXT_LENGTH` | Context size (`--ctx-size`) for every model this daemon loads. Defaults to a VRAM-tiered value when unset. |
 | `LLMMAN_FLASH_ATTENTION` | Flash Attention mode (`--flash-attn`): `on`, `off`, or `auto` (llama-server's own default). Also accepts `1`/`0`/`true`/`false`, matching Ollama's `OLLAMA_FLASH_ATTENTION`. |
 | `LLMMAN_KV_CACHE_TYPE` | KV-cache quantization (`--cache-type-k`/`--cache-type-v`), e.g. `f16` (default), `q8_0`, `q4_0` — trades output quality for memory at long context lengths, matching Ollama's `OLLAMA_KV_CACHE_TYPE`. |
+| `LLMMAN_MODELS` | Local store directory, overriding the default below — matching Ollama's `OLLAMA_MODELS`. `pull`/`push`/`run`/etc. go through the daemon and always use whichever store it was started with. |
+| `LLMMAN_TMPDIR` | Staging directory for `llama-server` release downloads, overriding the default `tmp` subdirectory of the install root — matching Ollama's `OLLAMA_TMPDIR`. |
 
 ### Benchmark
 
@@ -152,7 +154,8 @@ llmman resolve ghcr.io/org/model:tag
 
 `format` is `"safetensors"` (a directory) or `"gguf"` (a single file).
 `--no-pull` fails instead of pulling if the reference isn't already in the
-local store; `--store`/`--cache` override the default locations below.
+local store; `--cache` overrides the extracted-file cache location, and
+`LLMMAN_MODELS` overrides the store location below.
 
 ## Store location
 
@@ -163,7 +166,13 @@ Default locations:
 | Linux, macOS | `~/.local/share/llmman/store` |
 | Windows | `%LOCALAPPDATA%\llmman\store` |
 
-Commands that read or write the local store directly (`list`, `rm`, `tag`, `inspect`, `build`, `resolve`, `serve`) accept `--store <DIR>` to override it. Commands that go through the background daemon instead (`pull`, `push`, `run`, `launch`, `ps`) always use whichever store that daemon was started with — pass `--store` to `llmman serve` to change it for all of them. `transfer`, `login`, and `logout` never touch a local store at all.
+Set `LLMMAN_MODELS` to change this (matching Ollama's `OLLAMA_MODELS`).
+Commands that read or write the local store directly (`list`, `rm`, `tag`,
+`inspect`, `build`, `resolve`, `serve`) all honor it. Commands that go
+through the background daemon instead (`pull`, `push`, `run`, `launch`,
+`ps`) always use whichever store the daemon was started with — set
+`LLMMAN_MODELS` before `llmman serve` to change it for all of them.
+`transfer`, `login`, and `logout` never touch a local store at all.
 
 The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), readable by `docker` and `podman`.
 

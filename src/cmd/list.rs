@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use clap::Args;
 
 use crate::fmt::{human_size, relative_time, short_id};
@@ -11,9 +9,6 @@ pub struct ListArgs {
     /// Only show images whose repository (ignoring tag) matches this reference
     #[arg(value_name = "REFERENCE")]
     pub reference: Option<String>,
-    /// Local store directory (overrides default)
-    #[arg(long, value_name = "DIR")]
-    pub store: Option<PathBuf>,
     /// Format output using a Go-template-style expression, e.g. --format="{{.ID}}".
     /// Available fields: .ID, .Digest, .Name, .Repository, .Tag, .Size, .Modified
     #[arg(long, value_name = "TEMPLATE")]
@@ -21,7 +16,7 @@ pub struct ListArgs {
 }
 
 pub fn run(args: &ListArgs) -> anyhow::Result<()> {
-    let store_root = crate::default_store(args.store.as_deref())?;
+    let store_root = crate::default_store()?;
     let store = OciStore::open(&store_root)?;
     let mut images = store.list()?;
 

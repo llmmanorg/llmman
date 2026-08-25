@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use clap::Args;
 
 use crate::ffi;
@@ -14,10 +12,6 @@ pub struct InspectArgs {
     /// Inspect a remote registry image instead of the local store
     #[arg(long)]
     pub remote: bool,
-
-    /// Local store directory (overrides default)
-    #[arg(long, value_name = "DIR")]
-    pub store: Option<PathBuf>,
 }
 
 pub fn run(args: &InspectArgs) -> anyhow::Result<()> {
@@ -29,13 +23,13 @@ pub fn run(args: &InspectArgs) -> anyhow::Result<()> {
         let json = ffi::inspect_remote(&reference)?;
         println!("{}", json);
     } else {
-        inspect_local(args, &reference)?;
+        inspect_local(&reference)?;
     }
     Ok(())
 }
 
-fn inspect_local(args: &InspectArgs, reference: &str) -> anyhow::Result<()> {
-    let store_root = crate::default_store(args.store.as_deref())?;
+fn inspect_local(reference: &str) -> anyhow::Result<()> {
+    let store_root = crate::default_store()?;
     let store = OciStore::open(&store_root)?;
     let desc = store.find(reference)?;
 

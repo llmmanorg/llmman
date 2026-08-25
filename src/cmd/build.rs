@@ -19,14 +19,10 @@ pub struct BuildArgs {
     /// Key=value labels to embed in the image config
     #[arg(short, long, value_name = "KEY=VALUE")]
     pub label: Vec<String>,
-
-    /// Local store directory (overrides default)
-    #[arg(long, value_name = "DIR")]
-    pub store: Option<PathBuf>,
 }
 
 pub fn run(args: &BuildArgs) -> anyhow::Result<()> {
-    let store_root = crate::default_store(args.store.as_deref())?;
+    let store_root = crate::default_store()?;
     let store = OciStore::open(&store_root)?;
 
     let labels: HashMap<String, String> = args

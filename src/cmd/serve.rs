@@ -37,13 +37,6 @@ pub struct ServeArgs {
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Local store directory (overrides the default). Every client of this
-    /// daemon — the CLI's `pull`/`push`/`run`/`list`/etc. and any Ollama-API
-    /// HTTP client — shares whichever store the daemon was started with;
-    /// there is no per-client override.
-    #[arg(long, value_name = "DIR")]
-    pub store: Option<PathBuf>,
-
     /// Run llama-server in a container (docker or podman) instead of as a
     /// local process — Linux only. Auto-selects the matching
     /// ghcr.io/ggml-org/llama.cpp:server-<backend> image for whatever GPU
@@ -3617,7 +3610,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     } else {
         None
     };
-    let store_path = default_store(_args.store.as_deref())?;
+    let store_path = default_store()?;
     let cache_path = store_path.parent().unwrap_or(&store_path).join("cache");
     std::fs::create_dir_all(&cache_path)?;
     // See storage::repair's own doc comment — matches Ollama's own

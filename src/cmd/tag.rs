@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use clap::Args;
 
 use crate::storage::OciStore;
@@ -13,14 +11,10 @@ pub struct TagArgs {
     /// New reference to create
     #[arg(value_name = "TARGET")]
     pub target: String,
-
-    /// Local store directory (overrides default)
-    #[arg(long, value_name = "DIR")]
-    pub store: Option<PathBuf>,
 }
 
 pub fn run(args: &TagArgs) -> anyhow::Result<()> {
-    let store_root = crate::default_store(args.store.as_deref())?;
+    let store_root = crate::default_store()?;
     let store = OciStore::open(&store_root)?;
 
     // resolve_ollama_api, not resolve: SOURCE must match how the model is

@@ -14,15 +14,14 @@ pub mod shortnames;
 pub mod storage;
 pub mod webui;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-/// Return the path to the default local OCI store, or a caller-supplied override.
-///
-/// Linux and macOS both use `~/.local/share/llmman/store`.
-/// Windows uses `%LOCALAPPDATA%\llmman\store`.
-pub fn default_store(override_path: Option<&Path>) -> anyhow::Result<PathBuf> {
-    if let Some(p) = override_path {
-        return Ok(p.to_path_buf());
+/// Path to the local OCI store, from `LLMMAN_MODELS` (mirrors Ollama's
+/// `OLLAMA_MODELS`) or else `~/.local/share/llmman/store`
+/// (`%LOCALAPPDATA%\llmman\store` on Windows).
+pub fn default_store() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = models_dir_from_env() {
+        return Ok(dir);
     }
     #[cfg(not(target_os = "windows"))]
     let base = dirs::home_dir()
@@ -33,4 +32,35 @@ pub fn default_store(override_path: Option<&Path>) -> anyhow::Result<PathBuf> {
     let base = dirs::data_local_dir()
         .ok_or_else(|| anyhow::anyhow!("could not determine local data directory"))?;
     Ok(base.join("llmman").join("store"))
+}
+
+fn models_dir_from_env() -> Option<PathBuf> {
+    parse_env_path(std::env::var("LLMMAN_MODELS").ok().as_deref())
+}
+
+/// Split out from [`models_dir_from_env`] for testing without touching
+/// the real environment. Blank values count as unset.
+fn parse_env_path(value: Option<&str>) -> Option<PathBuf> {
+    let trimmed = value?.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_env_path_returns_none_when_unset_or_blank() {
+        assert_eq!(parse_env_path(None), None);
+        assert_eq!(parse_env_path(Some("")), None);
+        assert_eq!(parse_env_path(Some("   ")), None);
+    }
+
+    #[test]
+    fn parse_env_path_trims_and_returns_the_given_path() {
+        assert_eq!(
+            parse_env_path(Some("  /custom/store  ")),
+            Some(PathBuf::from("/custom/store"))
+        );
+    }
 }

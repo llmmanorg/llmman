@@ -247,10 +247,44 @@ fn install_dir(tag: &str, label: &str) -> Result<PathBuf> {
     Ok(install_root()?.join(tag).join(label))
 }
 
+/// Staging directory for a downloaded release archive, before it's
+/// extracted into [`install_dir`]. From `LLMMAN_TMPDIR` (mirrors Ollama's
+/// `OLLAMA_TMPDIR`) or else a `tmp` subdirectory of [`install_root`].
+fn tmp_dir() -> Result<PathBuf> {
+    if let Some(dir) = tmp_dir_from_env() {
+        return Ok(dir);
+    }
+    Ok(install_root()?.join("tmp"))
+}
+
+fn tmp_dir_from_env() -> Option<PathBuf> {
+    parse_tmp_dir(std::env::var("LLMMAN_TMPDIR").ok().as_deref())
+}
+
+/// Split out from [`tmp_dir_from_env`] for testing without touching the
+/// real environment. Blank values count as unset.
+fn parse_tmp_dir(value: Option<&str>) -> Option<PathBuf> {
+    let trimmed = value?.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// Includes our own pid in the filename so two `llmman` processes
+/// downloading the same asset at once (e.g. two concurrent `--pull-bin`
+/// runs) never share a staging path.
 fn tmp_path(name: &str) -> Result<PathBuf> {
-    let dir = install_root()?.join("tmp");
+    let dir = tmp_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    Ok(dir.join(name))
+    Ok(dir.join(format!("{name}.tmp-{}", std::process::id())))
+}
+
+/// Removes the staging file on drop, so a failed download or extraction
+/// (an early `?` return) doesn't leave the archive behind.
+struct RemoveOnDrop<'a>(&'a Path);
+
+impl Drop for RemoveOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
 }
 
 /// Recursively searches `dir` for a file literally named `name` — used to
@@ -286,6 +320,30 @@ fn progress_bar(total: u64, label: &str) -> Option<ProgressBar> {
     Some(pb)
 }
 
+/// Opens `dest` for writing without ever following an existing symlink
+/// there — `LLMMAN_TMPDIR` can point at a shared directory, and asset
+/// names are predictable, so a planted symlink must not redirect a
+/// download onto an arbitrary path. Retries once after unlinking a
+/// pre-existing entry (a stale file from an earlier run, or an attacker's
+/// symlink — either way, safe to remove and recreate).
+fn create_new_file(dest: &Path) -> Result<std::fs::File> {
+    let open = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dest)
+    };
+    match open() {
+        Ok(f) => Ok(f),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(dest)
+                .with_context(|| format!("remove stale {}", dest.display()))?;
+            open().with_context(|| format!("create {}", dest.display()))
+        }
+        Err(e) => Err(e).with_context(|| format!("create {}", dest.display())),
+    }
+}
+
 fn download_to_file(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -302,8 +360,7 @@ fn download_to_file(
     let total = resp.content_length().unwrap_or(0);
     let pb = progress_bar(total, label);
 
-    let mut file =
-        std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+    let mut file = create_new_file(dest)?;
     let mut buf = [0u8; 1 << 16];
     let mut downloaded = 0u64;
     loop {
@@ -452,10 +509,9 @@ fn try_ensure_from_network(
         query.label, asset.name
     );
     let tmp = tmp_path(&asset.name)?;
+    let _cleanup = RemoveOnDrop(&tmp);
     download_to_file(&client, &asset.browser_download_url, &tmp, &asset.name)?;
-    let extracted = extract(&tmp, &asset.name, &dest);
-    let _ = std::fs::remove_file(&tmp);
-    extracted?;
+    extract(&tmp, &asset.name, &dest)?;
 
     if let Some(companion_substr) = &query.companion_must_contain {
         match find_asset(&release, companion_substr) {
@@ -463,15 +519,14 @@ fn try_ensure_from_network(
                 let companion = companion.clone();
                 eprintln!("[llmman] downloading {}", companion.name);
                 let tmp2 = tmp_path(&companion.name)?;
+                let _cleanup = RemoveOnDrop(&tmp2);
                 download_to_file(
                     &client,
                     &companion.browser_download_url,
                     &tmp2,
                     &companion.name,
                 )?;
-                let extracted = extract(&tmp2, &companion.name, &dest);
-                let _ = std::fs::remove_file(&tmp2);
-                extracted?;
+                extract(&tmp2, &companion.name, &dest)?;
             }
             None => eprintln!(
                 "[llmman] warning: expected companion asset containing {companion_substr:?} \
@@ -546,6 +601,44 @@ fn newest_cached(label: &str, bin_name: &str) -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_tmp_dir_returns_none_when_unset_or_blank() {
+        assert_eq!(parse_tmp_dir(None), None);
+        assert_eq!(parse_tmp_dir(Some("")), None);
+        assert_eq!(parse_tmp_dir(Some("   ")), None);
+    }
+
+    #[test]
+    fn parse_tmp_dir_trims_and_returns_the_given_path() {
+        assert_eq!(
+            parse_tmp_dir(Some("  /custom/tmp  ")),
+            Some(PathBuf::from("/custom/tmp"))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_new_file_never_writes_through_a_planted_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-create-new-file-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        let dest = dir.join("dest");
+        std::fs::write(&victim, b"do not touch").unwrap();
+        symlink(&victim, &dest).unwrap();
+
+        create_new_file(&dest).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+        assert!(dest.is_file() && !dest.is_symlink());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn find_asset_matches_only_the_intended_substring() {
