@@ -14,13 +14,28 @@ runtime. See vLLM's `vllm/config/model.py` (`__post_init__`, line ~565)
 and `vllm/transformers_utils/runai_utils.py` for the method being
 wrapped.
 
-`_make_patched` is a pure function (no vLLM import) so it's unit
-testable against a stub object; `install()` is the only piece that
-actually touches `vllm.config.model.ModelConfig`.
+vLLM 0.27 added a second, *earlier* HuggingFace touchpoint:
+`EngineArgs.create_engine_config` calls `maybe_override_with_speculators`
+directly on the raw `model`/`tokenizer` strings, before `ModelConfig` (and
+therefore `maybe_pull_model_tokenizer_for_runai`) is ever constructed. It
+guards this with `is_cloud_storage()`, which it uses to skip `s3://`/
+`gs://`/`az://` — but that helper doesn't know about `oci://`, so an
+unpatched vLLM 0.27+ calls `PretrainedConfig.get_config_dict("oci://...")`
+and blows up before our other patch gets a chance to run. See vLLM's
+`vllm/engine/arg_utils.py` (`create_engine_config`, line ~1917) and
+`vllm/transformers_utils/config.py` (`maybe_override_with_speculators`).
+We wrap that function for `oci://` `model` refs, short-circuiting
+speculators config loading so the real resolution still happens later,
+inside `maybe_pull_model_tokenizer_for_runai`.
+
+Both `_make_patched` and `_make_patched_speculators` are pure functions
+(no vLLM import) so they're unit testable against stubs/fakes; `install()`
+is the only piece that actually touches vLLM's modules.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Callable, Protocol
 
@@ -80,12 +95,53 @@ def _make_patched(original: OriginalHook) -> OriginalHook:
     return patched
 
 
+SpeculatorsHook = Callable[..., tuple[str, "str | None", "dict[str, Any] | None"]]
+
+
+def _make_patched_speculators(original: SpeculatorsHook) -> SpeculatorsHook:
+    """Build the replacement for
+    `vllm.engine.arg_utils.maybe_override_with_speculators`. Delegates to
+    `original` unchanged whenever `model` isn't an `oci://` reference, so
+    every existing (HuggingFace, and `s3://`/`gs://`/`az://` via
+    `is_cloud_storage`) code path keeps working exactly as before.
+
+    Only checks `model`, not `tokenizer`: `original` only ever reads
+    speculators config from `model` (via `PretrainedConfig.
+    get_config_dict(model, ...)`) — an `oci://` `tokenizer` alongside a
+    real HF `model` is not this crash and must still go through
+    `original`'s real speculators detection for that model (see vLLM's
+    `vllm/transformers_utils/config.py`).
+
+    vLLM's only call site (`create_engine_config`) passes every argument
+    by keyword, but `original`'s own signature (`model, tokenizer,
+    trust_remote_code, revision=None, ...`) allows positional calls too.
+    Binding against that real signature via `inspect.signature`, rather
+    than hand-rolling `patched`'s own parameter list, means any calling
+    convention `original` itself accepts keeps working here unchanged.
+    """
+    signature = inspect.signature(original)
+
+    def patched(*args: Any, **kwargs: Any) -> tuple[str, "str | None", "dict[str, Any] | None"]:
+        bound = signature.bind(*args, **kwargs)
+        model = bound.arguments["model"]
+        if is_oci_ref(model):
+            tokenizer = bound.arguments.get("tokenizer")
+            vllm_speculative_config = bound.arguments.get("vllm_speculative_config")
+            return model, tokenizer, vllm_speculative_config
+        return original(*args, **kwargs)
+
+    patched.__name__ = getattr(original, "__name__", "maybe_override_with_speculators")
+    patched.__doc__ = original.__doc__
+    patched.__signature__ = signature
+    return patched
+
+
 def install() -> None:
-    """Idempotently monkeypatch `vllm.config.model.ModelConfig` in the
-    current process. Safe to call more than once (plugins may be loaded
-    more than once per process — see `load_general_plugins`'s own
-    warning) and safe to call from multiple processes (API server,
-    engine core, workers all load `vllm.general_plugins` independently).
+    """Idempotently monkeypatch vLLM in the current process. Safe to call
+    more than once (plugins may be loaded more than once per process —
+    see `load_general_plugins`'s own warning) and safe to call from
+    multiple processes (API server, engine core, workers all load
+    `vllm.general_plugins` independently).
     """
     from vllm.config.model import ModelConfig
 
@@ -95,3 +151,12 @@ def install() -> None:
     original = ModelConfig.maybe_pull_model_tokenizer_for_runai
     ModelConfig.maybe_pull_model_tokenizer_for_runai = _make_patched(original)
     setattr(ModelConfig, _PATCHED_ATTR, True)
+
+    # Older vLLM releases don't have this speculators touchpoint at all;
+    # only patch it when present.
+    import vllm.engine.arg_utils as arg_utils
+
+    original_speculators = getattr(arg_utils, "maybe_override_with_speculators", None)
+    if original_speculators is not None and not getattr(arg_utils, _PATCHED_ATTR, False):
+        arg_utils.maybe_override_with_speculators = _make_patched_speculators(original_speculators)
+        setattr(arg_utils, _PATCHED_ATTR, True)

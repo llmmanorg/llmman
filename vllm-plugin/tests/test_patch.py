@@ -86,3 +86,101 @@ def test_resolves_tokenizer_only_when_model_is_not_oci(monkeypatch):
     assert cfg.model == "meta-llama/Llama-3-8B"  # untouched, not an oci:// ref
     assert cfg.tokenizer == "/cache/tok"
     assert cfg.model_weights is None
+
+
+def _fake_speculators_hook(calls):
+    """A stand-in for the real `vllm.transformers_utils.config.
+    maybe_override_with_speculators`, matching its actual signature
+    (`model, tokenizer, trust_remote_code, revision=None,
+    vllm_speculative_config=None, hf_token=None`) exactly — required
+    because `_make_patched_speculators` binds against `original`'s own
+    `inspect.signature()`, not a hand-rolled parameter list, so a fake
+    with a different signature (e.g. a bare `lambda *a, **k`) would
+    exercise a call it can never actually see in production.
+    """
+
+    def original(
+        model,
+        tokenizer=None,
+        trust_remote_code=False,
+        revision=None,
+        vllm_speculative_config=None,
+        hf_token=None,
+    ):
+        calls.append((model, tokenizer, trust_remote_code, revision, vllm_speculative_config, hf_token))
+        return model, tokenizer, vllm_speculative_config
+
+    return original
+
+
+def test_speculators_delegates_to_original_for_non_oci_refs():
+    calls = []
+    patched = _patch._make_patched_speculators(_fake_speculators_hook(calls))
+
+    result = patched(
+        model="meta-llama/Llama-3-8B",
+        tokenizer="meta-llama/Llama-3-8B",
+        revision=None,
+        trust_remote_code=False,
+        vllm_speculative_config=None,
+        hf_token=None,
+    )
+
+    assert calls == [("meta-llama/Llama-3-8B", "meta-llama/Llama-3-8B", False, None, None, None)]
+    assert result == ("meta-llama/Llama-3-8B", "meta-llama/Llama-3-8B", None)
+
+
+def test_speculators_delegates_to_original_when_called_positionally():
+    """Same real signature vLLM's own function has
+    (`model, tokenizer, trust_remote_code, ...`); `create_engine_config`
+    calls it with keywords today, but nothing here should assume that's
+    the only calling convention `original` itself supports.
+    """
+    calls = []
+    patched = _patch._make_patched_speculators(_fake_speculators_hook(calls))
+
+    result = patched("meta-llama/Llama-3-8B", "meta-llama/Llama-3-8B", False)
+
+    assert calls == [("meta-llama/Llama-3-8B", "meta-llama/Llama-3-8B", False, None, None, None)]
+    assert result == ("meta-llama/Llama-3-8B", "meta-llama/Llama-3-8B", None)
+
+
+def test_speculators_short_circuits_for_an_oci_model_without_calling_original():
+    def must_not_delegate(model, tokenizer=None, trust_remote_code=False, revision=None, vllm_speculative_config=None, hf_token=None):
+        pytest.fail("must not delegate")
+
+    patched = _patch._make_patched_speculators(must_not_delegate)
+
+    result = patched(
+        model="oci://ghcr.io/org/model:tag",
+        tokenizer="oci://ghcr.io/org/model:tag",
+        revision=None,
+        trust_remote_code=False,
+        vllm_speculative_config={"already": "set"},
+        hf_token=None,
+    )
+
+    assert result == (
+        "oci://ghcr.io/org/model:tag",
+        "oci://ghcr.io/org/model:tag",
+        {"already": "set"},
+    )
+
+
+def test_speculators_delegates_when_only_tokenizer_is_oci():
+    """`original` only ever reads speculators config from `model`
+    (see `_make_patched_speculators`'s docstring) — an `oci://`
+    `tokenizer` alongside a real HF `model` isn't the crash this patch
+    exists for, and must still go through real speculators detection.
+    """
+    calls = []
+    patched = _patch._make_patched_speculators(_fake_speculators_hook(calls))
+
+    result = patched(
+        model="meta-llama/Llama-3-8B",
+        tokenizer="oci://ghcr.io/org/tok:tag",
+        vllm_speculative_config=None,
+    )
+
+    assert calls == [("meta-llama/Llama-3-8B", "oci://ghcr.io/org/tok:tag", False, None, None, None)]
+    assert result == ("meta-llama/Llama-3-8B", "oci://ghcr.io/org/tok:tag", None)
