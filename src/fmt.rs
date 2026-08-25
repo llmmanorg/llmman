@@ -30,6 +30,25 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// Human-scaled parameter/element count (e.g. "7.2B", "600.0M",
+/// "125.0K") — used by `llmman show` to render a GGUF/safetensors model's
+/// total parameter count, mirroring `ollama show`'s own
+/// `format.HumanNumber`.
+pub fn human_count(n: u64) -> String {
+    const B: u64 = 1_000_000_000;
+    const M: u64 = 1_000_000;
+    const K: u64 = 1_000;
+    if n >= B {
+        format!("{:.1}B", n as f64 / B as f64)
+    } else if n >= M {
+        format!("{:.1}M", n as f64 / M as f64)
+    } else if n >= K {
+        format!("{:.1}K", n as f64 / K as f64)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Relative-time string ("5 minutes ago", "yesterday", ...) for a duration
 /// expressed in seconds-in-the-past. Shared core of [`relative_time`] and
 /// [`relative_time_rfc3339`], which just compute `secs` differently.
@@ -124,6 +143,17 @@ mod tests {
         assert_eq!(human_size(1_500), "1.5 kB");
         assert_eq!(human_size(1_500_000), "1.5 MB");
         assert_eq!(human_size(1_500_000_000), "1.5 GB");
+    }
+
+    #[test]
+    fn human_count_picks_the_right_unit() {
+        assert_eq!(human_count(512), "512");
+        assert_eq!(human_count(999), "999");
+        assert_eq!(human_count(1_000), "1.0K");
+        assert_eq!(human_count(1_500), "1.5K");
+        assert_eq!(human_count(7_200_000_000), "7.2B");
+        assert_eq!(human_count(600_000_000), "600.0M");
+        assert_eq!(human_count(999_999_999), "1000.0M");
     }
 
     #[test]

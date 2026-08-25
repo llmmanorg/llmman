@@ -44,14 +44,23 @@ enum Commands {
     List(cmd::list::ListArgs),
     /// List models currently loaded by a running `llmman serve`
     Ps(cmd::ps::PsArgs),
+    /// Copy a local image to a new reference
+    Cp(cmd::cp::CpArgs),
     /// Remove a local image
     Rm(cmd::rm::RmArgs),
+    /// Stop (unload) a running model
+    Stop(cmd::stop::StopArgs),
     /// Show the manifest of a local (or remote with --remote) image
     Inspect(cmd::inspect::InspectArgs),
+    /// Show a local model's architecture, parameters, license, and template
+    Show(cmd::show::ShowArgs),
     /// Start an inference server (Ollama, OpenAI, Anthropic compatible APIs)
     Serve(cmd::serve::ServeArgs),
     /// Create a new local tag pointing to an existing image
     Tag(cmd::tag::TagArgs),
+    /// Probe the local host's GPU/accelerator support (internal diagnostic)
+    #[command(hide = true)]
+    GpuDiscover(cmd::gpu_discover::GpuDiscoverArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -102,10 +111,14 @@ fn main() {
         Commands::Transfer(a) => cmd::transfer::run(a),
         Commands::List(a) => cmd::list::run(a),
         Commands::Ps(a) => cmd::ps::run(a),
+        Commands::Cp(a) => cmd::cp::run(a),
         Commands::Rm(a) => cmd::rm::run(a),
+        Commands::Stop(a) => cmd::stop::run(a),
         Commands::Inspect(a) => cmd::inspect::run(a),
+        Commands::Show(a) => cmd::show::run(a),
         Commands::Serve(a) => cmd::serve::run(a),
         Commands::Tag(a) => cmd::tag::run(a),
+        Commands::GpuDiscover(a) => cmd::gpu_discover::run(a),
     };
     if let Err(e) = result {
         eprintln!("Error: {:#}", e);

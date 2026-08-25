@@ -2338,6 +2338,154 @@ async fn post_chat(
 // generic driver; build_chunk supplies just that piece.
 // ---------------------------------------------------------------------------
 
+/// Fallback content/thinking separation for a backend that hands back raw
+/// `<think>...</think>` or gpt-oss-style harmony channel tokens as plain
+/// `content` text, instead of already splitting them into a structured
+/// `reasoning_content`/`thinking` delta field the way `oai_chunk_to_content`
+/// prefers. One instance is created per streamed response (see
+/// `stream_ollama`) and fed every chunk's `content` in order, so it can
+/// buffer across a token boundary that splits a tag mid-way exactly like
+/// `thinking::Parser`/`harmony::HarmonyMessageHandler` themselves already
+/// do internally.
+enum RawContentExtractor {
+    /// No backend-structured thinking has been seen yet, and not enough
+    /// raw content has arrived yet to decide a mode from — the `String`
+    /// buffers everything seen so far. Kept buffered (rather than decided
+    /// per-chunk) because a real streamed response can hand this the
+    /// first token of a tag one byte at a time, and e.g. a lone `"<"` is
+    /// a prefix of every candidate tag below, not evidence of any one of
+    /// them in particular.
+    Undetermined(String),
+    /// A backend already supplied structured thinking on some earlier
+    /// chunk of this stream — never scan raw content again, even if a
+    /// later chunk's `content` happens to contain literal tag-like text
+    /// as part of genuine output.
+    Passthrough,
+    Harmony(Box<crate::harmony::HarmonyMessageHandler>),
+    PlainThink(Box<crate::thinking::Parser>),
+}
+
+/// Every raw-token prefix `RawContentExtractor::Undetermined` can still be
+/// waiting to disambiguate between — gpt-oss harmony's two possible
+/// stream-start spellings (see the `<|channel|>` case below) and a plain
+/// `<think>` tag.
+const CANDIDATE_TAGS: [&str; 3] = ["<|start|>", "<|channel|>", "<think>"];
+
+impl RawContentExtractor {
+    fn new() -> Self {
+        RawContentExtractor::Undetermined(String::new())
+    }
+
+    /// Returns the (content, thinking) to actually emit for this chunk,
+    /// given what the backend itself already reported.
+    fn process(
+        &mut self,
+        content: String,
+        backend_thinking: Option<String>,
+    ) -> (String, Option<String>) {
+        if backend_thinking.is_some() {
+            // `flush` first: if this transition happens straight out of
+            // `Undetermined` (an earlier chunk was still a strict prefix
+            // of a candidate tag — e.g. a lone `"<"` — when this chunk
+            // turned out to carry backend-structured thinking instead),
+            // whatever was buffered for disambiguation must still reach
+            // the client; it otherwise has no other path out once `self`
+            // is overwritten below. A no-op on every other variant (see
+            // `flush`'s own doc comment).
+            let buffered = self.flush();
+            *self = RawContentExtractor::Passthrough;
+            return (buffered + &content, backend_thinking);
+        }
+        match self {
+            RawContentExtractor::Passthrough => (content, None),
+            RawContentExtractor::Harmony(h) => {
+                let (c, t, tool) = h.add_content(&content);
+                (c, non_empty_thinking(t, tool))
+            }
+            RawContentExtractor::PlainThink(p) => {
+                let (t, c) = p.add_content(&content);
+                (c, (!t.is_empty()).then_some(t))
+            }
+            RawContentExtractor::Undetermined(buf) => {
+                buf.push_str(&content);
+                let trimmed = buf.trim_start();
+                if trimmed.is_empty()
+                    || CANDIDATE_TAGS
+                        .iter()
+                        .any(|tag| tag.starts_with(trimmed) && trimmed.len() < tag.len())
+                {
+                    // Still ambiguous (whitespace only so far, or a
+                    // strict prefix of a candidate tag that could still
+                    // go either way) — keep buffering, nothing to emit
+                    // yet.
+                    return (String::new(), None);
+                }
+                let buffered = std::mem::take(buf);
+                let trimmed_starts_with = |tag: &str| buffered.trim_start().starts_with(tag);
+                if trimmed_starts_with("<|start|>") || trimmed_starts_with("<|channel|>") {
+                    let mut h = crate::harmony::HarmonyMessageHandler::new();
+                    // A raw completion stream from a chat-templated
+                    // request typically never re-emits the assistant's
+                    // own `<|start|>assistant` preamble (the template
+                    // already sent it as part of the *prompt*, before
+                    // generation started) — only what follows it, i.e.
+                    // `<|channel|>...`. HarmonyParser's own state machine
+                    // requires having seen a `<|start|>` before it will
+                    // recognize anything after it as a header (see
+                    // `harmony::HarmonyParser`'s `LookingForMessageStart`
+                    // state) — priming it here is exactly what
+                    // `add_implicit_start`'s own doc comment describes.
+                    // Not primed for a stream that already starts with a
+                    // literal `<|start|>` itself, which needs no help
+                    // finding its own message boundary.
+                    if trimmed_starts_with("<|channel|>") {
+                        h.parser.add_implicit_start();
+                    }
+                    let (c, t, tool) = h.add_content(&buffered);
+                    let thinking = non_empty_thinking(t, tool);
+                    *self = RawContentExtractor::Harmony(Box::new(h));
+                    (c, thinking)
+                } else {
+                    let mut p = crate::thinking::Parser::new("<think>", "</think>");
+                    let (t, c) = p.add_content(&buffered);
+                    *self = RawContentExtractor::PlainThink(Box::new(p));
+                    (c, (!t.is_empty()).then_some(t))
+                }
+            }
+        }
+    }
+
+    /// Drains whatever `Undetermined` is still holding back for
+    /// disambiguation — called once the stream is `done` (see
+    /// `stream_ollama`), so a reply that ends while still a strict prefix
+    /// of a candidate tag (e.g. the very last byte generated is a lone
+    /// `"<"`) still reaches the client instead of being silently dropped.
+    /// A no-op for every other variant: `Harmony`/`PlainThink` only ever
+    /// hold back a *candidate closing/end tag* this same way internally,
+    /// which real Ollama's own `thinking.Parser` (this module's `PlainThink`
+    /// is a direct port of it) has the identical characteristic for and
+    /// never flushes either — not a new gap this fallback introduces.
+    fn flush(&mut self) -> String {
+        match self {
+            RawContentExtractor::Undetermined(buf) => std::mem::take(buf),
+            _ => String::new(),
+        }
+    }
+}
+
+/// Folds a harmony tool-call channel's raw argument text (`tool`) into
+/// the same "thinking" bucket as real reasoning text (`thinking`) — there
+/// being no structured-tool-call plumbing wired to this raw-token fallback
+/// path (see `RawContentExtractor`'s own doc comment: this only ever
+/// engages when a backend hands back literal, unparsed harmony tokens in
+/// the first place), hiding a stray tool call's raw JSON in "thinking"
+/// rather than ever showing it in the user-visible `content` field is the
+/// safer failure mode of the two.
+fn non_empty_thinking(thinking: String, tool: String) -> Option<String> {
+    let combined = thinking + &tool;
+    (!combined.is_empty()).then_some(combined)
+}
+
 /// `build_chunk`'s `tool_calls` parameter is only ever `Some` on the final
 /// (`done`) chunk of an `/api/chat` response that made one or more tool
 /// calls — `/api/generate` (no tool-calling support in real Ollama
@@ -2354,6 +2502,7 @@ async fn stream_ollama<T: Serialize + Send + 'static>(
     let resp = post_chat(&client, &url, &oai_req).await?;
 
     let tool_calls_acc = std::cell::RefCell::new(std::collections::BTreeMap::new());
+    let content_extractor = std::cell::RefCell::new(RawContentExtractor::new());
     let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
         // Moved into this closure purely to keep it alive — see
         // ActivityGuard's doc comment — until the stream itself is
@@ -2364,6 +2513,15 @@ async fn stream_ollama<T: Serialize + Send + 'static>(
             .and_then(|payload| {
                 accumulate_tool_call_deltas(payload, &tool_calls_acc);
                 let (content, thinking, done) = oai_chunk_to_content(payload)?;
+                let (mut content, thinking) =
+                    content_extractor.borrow_mut().process(content, thinking);
+                if done {
+                    // Idempotent even across the two `done` chunks
+                    // real Ollama's stream can produce (see below):
+                    // `flush` drains via `mem::take`, so the second call
+                    // just returns an already-empty string.
+                    content.push_str(&content_extractor.borrow_mut().flush());
+                }
                 // llama-server's SSE stream signals "done" twice — once on
                 // the chunk carrying a real finish_reason, then again on
                 // the trailing literal "[DONE]" line — so `done` here can
@@ -4871,6 +5029,169 @@ mod tests {
         // Malformed JSON and an empty choices array are skipped, not fatal.
         assert_eq!(oai_chunk_to_content("not json"), None);
         assert_eq!(oai_chunk_to_content(r#"{"choices":[]}"#), None);
+    }
+
+    #[test]
+    fn raw_content_extractor_passes_plain_content_through_untouched() {
+        let mut ext = RawContentExtractor::new();
+        assert_eq!(
+            ext.process("hello there".into(), None),
+            ("hello there".into(), None)
+        );
+        assert_eq!(
+            ext.process(" friend".into(), None),
+            (" friend".into(), None)
+        );
+    }
+
+    /// Once a backend has ever supplied structured `thinking` on a
+    /// stream, raw content must never be scanned again — even if it
+    /// later happens to contain literal `<think>` text as part of a
+    /// genuine reply (e.g. the model discussing the tag itself).
+    #[test]
+    fn raw_content_extractor_locks_into_passthrough_once_backend_thinking_seen() {
+        let mut ext = RawContentExtractor::new();
+        assert_eq!(
+            ext.process(String::new(), Some("reasoning".into())),
+            (String::new(), Some("reasoning".into()))
+        );
+        assert_eq!(
+            ext.process("<think>literal text</think>".into(), None),
+            ("<think>literal text</think>".into(), None)
+        );
+    }
+
+    /// Regression test: a chunk still buffered in `Undetermined` (a
+    /// strict prefix of a candidate tag, e.g. a lone `"<"`) must not be
+    /// silently dropped when a *later* chunk turns out to carry
+    /// backend-structured thinking instead — that transition previously
+    /// overwrote `self` with `Passthrough` without ever draining it.
+    #[test]
+    fn raw_content_extractor_recovers_a_buffered_prefix_when_backend_thinking_appears_later() {
+        let mut ext = RawContentExtractor::new();
+        // "<" alone is a strict prefix of every candidate tag, so it's
+        // held back rather than emitted.
+        assert_eq!(ext.process("<".into(), None), (String::new(), None));
+        // The backend now reports structured thinking on this chunk —
+        // the buffered "<" must be prepended to this chunk's own content,
+        // not lost.
+        assert_eq!(
+            ext.process("hello".into(), Some("reasoning".into())),
+            ("<hello".into(), Some("reasoning".into()))
+        );
+        // Now locked into Passthrough: a later flush has nothing left to
+        // recover.
+        assert_eq!(ext.flush(), "");
+    }
+
+    #[test]
+    fn raw_content_extractor_falls_back_to_plain_think_tags() {
+        let mut ext = RawContentExtractor::new();
+        let (c1, t1) = ext.process("<think>".into(), None);
+        assert_eq!((c1, t1), (String::new(), None));
+        let (c2, t2) = ext.process("hmm".into(), None);
+        assert_eq!((c2, t2), (String::new(), Some("hmm".into())));
+        let (c3, t3) = ext.process("</think>answer".into(), None);
+        assert_eq!((c3, t3), ("answer".into(), None));
+    }
+
+    #[test]
+    fn raw_content_extractor_falls_back_to_harmony_channels() {
+        let mut ext = RawContentExtractor::new();
+        let (content, thinking) = ext.process(
+            "<|start|>assistant<|channel|>analysis<|message|>thinking...<|end|>\
+             <|start|>assistant<|channel|>final<|message|>the answer<|end|>"
+                .into(),
+            None,
+        );
+        assert_eq!(content, "the answer");
+        assert_eq!(thinking, Some("thinking...".into()));
+    }
+
+    #[test]
+    fn raw_content_extractor_leaves_content_without_any_tag_untouched() {
+        let mut ext = RawContentExtractor::new();
+        let (content, thinking) = ext.process("just a normal reply".into(), None);
+        assert_eq!(content, "just a normal reply");
+        assert_eq!(thinking, None);
+    }
+
+    /// Regression test: a real streamed response hands this one token (or
+    /// even one byte) at a time — the very first chunk of a harmony
+    /// stream is never the whole `"<|channel|>..."` string at once, just
+    /// its first byte, which is also a valid prefix of `<|start|>` and
+    /// `<think>`. `Undetermined` must buffer across calls instead of
+    /// deciding (wrongly, into `PlainThink`) from that first ambiguous
+    /// byte alone.
+    #[test]
+    fn raw_content_extractor_buffers_across_calls_to_classify_a_token_split_harmony_stream() {
+        let mut ext = RawContentExtractor::new();
+        let whole = "<|start|>assistant<|channel|>analysis<|message|>thinking...<|end|>\
+             <|start|>assistant<|channel|>final<|message|>the answer<|end|>";
+        let mut content = String::new();
+        let mut thinking = String::new();
+        for ch in whole.chars() {
+            let mut buf = [0u8; 4];
+            let (c, t) = ext.process(ch.encode_utf8(&mut buf).to_string(), None);
+            content.push_str(&c);
+            if let Some(t) = t {
+                thinking.push_str(&t);
+            }
+        }
+        assert_eq!(content, "the answer");
+        assert_eq!(thinking, "thinking...");
+    }
+
+    /// Regression test: llama-server's own chat template already emits
+    /// the assistant's `<|start|>assistant` preamble as part of the
+    /// *prompt*, so a real raw completion stream for a gpt-oss-style
+    /// model routinely starts directly at `<|channel|>`, never repeating
+    /// `<|start|>` itself. Without priming the harmony parser via
+    /// `add_implicit_start` for exactly this case, `HarmonyParser` would
+    /// sit in `LookingForMessageStart` forever and never emit anything.
+    #[test]
+    fn raw_content_extractor_primes_harmony_when_a_stream_starts_mid_message() {
+        let mut ext = RawContentExtractor::new();
+        let (content, thinking) = ext.process(
+            "<|channel|>analysis<|message|>thinking...<|end|>\
+             <|start|>assistant<|channel|>final<|message|>the answer<|end|>"
+                .into(),
+            None,
+        );
+        assert_eq!(content, "the answer");
+        assert_eq!(thinking, Some("thinking...".into()));
+    }
+
+    /// Regression test: a reply that ends while `Undetermined` is still
+    /// holding back a strict prefix of a candidate tag (here, the whole
+    /// reply is just a lone `"<"`) must not silently lose that text —
+    /// `flush` (called by `stream_ollama` on its `done` chunk) drains it.
+    #[test]
+    fn raw_content_extractor_flush_recovers_a_buffered_prefix_at_stream_end() {
+        let mut ext = RawContentExtractor::new();
+        let (content, thinking) = ext.process("<".into(), None);
+        assert_eq!(content, "");
+        assert_eq!(thinking, None);
+        assert_eq!(ext.flush(), "<");
+        // Idempotent: a second flush (mirroring the two `done` chunks a
+        // real stream can produce) must not resurrect it.
+        assert_eq!(ext.flush(), "");
+    }
+
+    /// `flush` is a no-op once a mode has been decided — that buffering
+    /// is `thinking::Parser`/`harmony::HarmonyMessageHandler`'s own
+    /// internal concern (see `RawContentExtractor::flush`'s own doc
+    /// comment on why this mirrors real Ollama's own, identical
+    /// limitation rather than a new gap).
+    #[test]
+    fn raw_content_extractor_flush_is_a_no_op_once_a_mode_is_decided() {
+        let mut ext = RawContentExtractor::new();
+        ext.process("just a normal reply".into(), None);
+        assert_eq!(ext.flush(), "");
+
+        let mut ext = RawContentExtractor::new();
+        ext.process(String::new(), Some("reasoning".into()));
+        assert_eq!(ext.flush(), "");
     }
 
     /// Ported from ollama's api/client_test.go (TestClientStream): SSE

@@ -5,6 +5,8 @@ pub mod container;
 pub mod daemon;
 pub mod ffi;
 pub mod fmt;
+pub mod gguf;
+pub mod harmony;
 pub mod hf;
 pub mod hostgpu;
 pub mod llama_release;
@@ -12,6 +14,7 @@ pub mod modelpack;
 pub mod oauth;
 pub mod shortnames;
 pub mod storage;
+pub mod thinking;
 pub mod webui;
 
 use std::path::PathBuf;

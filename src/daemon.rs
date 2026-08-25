@@ -626,6 +626,26 @@ pub fn ensure_model_pulled(reference: &str) -> anyhow::Result<()> {
     stream_progress("/api/pull", reference)
 }
 
+/// POSTs the Ollama unload sentinel (`{"model": reference, "keep_alive":
+/// 0}`, no `prompt` field — i.e. an empty prompt) to `/api/generate` —
+/// see `cmd::serve`'s `handle_ollama_generate` for the server side that
+/// reads this exact shape as an immediate-unload request, mirroring real
+/// Ollama's own `ollama stop` (`cmd/cmd.go`'s `loadOrUnloadModel`). Used
+/// by `llmman stop`.
+pub fn unload(reference: &str) -> anyhow::Result<()> {
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("{SERVER}/api/generate"))
+        .json(&serde_json::json!({"model": reference, "keep_alive": 0}))
+        .send()
+        .with_context(|| format!("request /api/generate (unload) for {reference}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!("stop {reference}: server returned {status}: {body}");
+    }
+    Ok(())
+}
+
 /// A plain `GET {SERVER}{path}` returning the parsed JSON body — for
 /// callers (currently just `ps`) that don't need `stream_progress`'s
 /// newline-delimited-JSON streaming, just a single request/response.

@@ -15,12 +15,15 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 | `resolve` | Pull (if needed) and print the local path of a model, as JSON — for other tools to consume |
 | `list`    | List locally stored models |
 | `ps`      | List models currently loaded |
+| `stop`    | Stop (unload) a running model |
 | `build`   | Package model files into a local OCI image |
 | `push`    | Push a local image to a registry |
 | `transfer` | Transfer an image directly from one location to another (e.g. HuggingFace to an OCI registry) |
+| `cp`      | Copy a local image to a new reference |
 | `rm`      | Remove a local image |
 | `tag`     | Create a new local tag pointing to an existing image |
 | `inspect` | Show the manifest of a local or remote image |
+| `show`    | Show a local model's architecture, parameters, license, and template |
 | `login`   | Log in to a container registry |
 | `logout`  | Log out from a container registry |
 
