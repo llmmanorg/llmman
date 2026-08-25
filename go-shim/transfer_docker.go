@@ -473,6 +473,11 @@ func streamHFGet(ctx context.Context, client *http.Client, url, token string, pu
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
+		// See downloadAttempt's identical header in hf.go: some HF CDNs
+		// 400 a full-object GET with no Range at all past a few tens of
+		// GB, which isHTTP4xx treats as permanent — every retry would
+		// just repeat the same failure otherwise.
+		req.Header.Set("Range", "bytes=0-")
 		resp, err := client.Do(req)
 		if err != nil {
 			return nil, err
@@ -495,12 +500,15 @@ func hfGetBytes(ctx context.Context, client *http.Client, url, token string, bar
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	// See streamHFGet's identical header — simpler to always send this
+	// than to branch by file size.
+	req.Header.Set("Range", "bytes=0-")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != 200 && resp.StatusCode != 206 {
 		return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
 	}
 	sr := newStallReadCloser(resp.Body, dlStallTimeout, cancel)

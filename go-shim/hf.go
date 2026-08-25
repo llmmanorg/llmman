@@ -1028,9 +1028,12 @@ func downloadAttempt(ctx context.Context, client *http.Client, url, token, layou
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	if startOffset > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startOffset))
-	}
+	// Always send a Range header, even for a fresh download at byte 0 —
+	// some HF CDNs (seen on a CloudFront/S3-fronted Xet-CAS bridge) 400 a
+	// full-object GET with no Range at all past a few tens of GB, which
+	// isHTTP4xx treats as permanent, so every retry just repeats the same
+	// failure. The same origin serves "bytes=0-" fine as a 206.
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startOffset))
 
 	resp, err := client.Do(req)
 	if err != nil {
