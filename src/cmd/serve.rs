@@ -961,12 +961,13 @@ struct OAIChatRequest {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
-    // llama-server's own default (1.0) disables repetition penalty
-    // entirely — unlike Ollama, whose default is 1.1 (see
-    // DEFAULT_REPEAT_PENALTY's doc comment). Every caller below sends
-    // this explicitly rather than omitting it, so llmman's actual runtime
-    // behavior matches Ollama's documented default instead of silently
-    // falling back to llama-server's much more repetition-prone one.
+    // Resolved to `DEFAULT_REPEAT_PENALTY` by `post_chat` — the one
+    // function every typed request (`/api/chat`, `/api/generate`, the
+    // Anthropic Messages API) actually goes through to reach
+    // llama-server — whenever a construction site below leaves this
+    // `None`, so the outgoing request always carries an explicit value
+    // instead of silently omitting the field. See
+    // `DEFAULT_REPEAT_PENALTY`'s doc comment for the value itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     repeat_penalty: Option<f32>,
     // See think_to_chat_template_kwargs. Omitted entirely (rather than
@@ -983,15 +984,37 @@ struct OAIChatRequest {
     response_format: Option<serde_json::Value>,
 }
 
-/// Ollama's documented default for `repeat_penalty` (see
-/// docs/modelfile.mdx's PARAMETER table: "Default: 1.1"). llama-server's
-/// own built-in default is 1.0 — repetition penalty fully disabled —
-/// which measurably risks small/quantized models (observed firsthand with
-/// qwen3.5:0.8b's "thinking" mode) looping on the same handful of
-/// reasoning sentences indefinitely, since nothing then discourages the
-/// sampler from repeating exact prior tokens. Used as the fallback
-/// whenever a caller doesn't supply its own `options.repeat_penalty`.
-const DEFAULT_REPEAT_PENALTY: f32 = 1.1;
+/// Ollama's actual default for `repeat_penalty`: `DefaultOptions()` in
+/// ollama's `api/types.go` sets `RepeatPenalty: 1.0`, and its own
+/// `docs/modelfile.mdx` PARAMETER table documents the same thing
+/// ("Default: 1.0, disabled") — a previous version of this comment
+/// misread that table's rightmost *example-invocation* column
+/// (`repeat_penalty 1.1`) as the default and picked 1.1 here on that
+/// basis. 1.0 also happens to be llama-server's own raw default, so this
+/// constant now agrees with both; the only thing it still buys over
+/// omitting the field is that llmman always sends an explicit value,
+/// matching ollama's own behavior of always forwarding an already-
+/// resolved `Options.RepeatPenalty` rather than an unset one.
+///
+/// This intentionally restores the repetition-loop risk this constant
+/// was originally raised to 1.1 to work around: `qwen3.5:0.8b`'s
+/// "thinking" mode was observed looping on the same handful of reasoning
+/// sentences indefinitely at repeat_penalty=1.0, consuming the whole
+/// response on invisible reasoning tokens and never emitting visible
+/// content (see docker/sandboxes#5109 and PR #273). That tradeoff was
+/// made deliberately here to keep llmman's default numerically identical
+/// to ollama's instead of silently diverging from it — if that
+/// regression resurfaces, the fix belongs in a model-specific override or
+/// a different sampler parameter, not by re-diverging this constant from
+/// ollama's own value.
+///
+/// Used as the fallback whenever a caller doesn't supply its own
+/// `options.repeat_penalty` — applied in exactly two places: `post_chat`
+/// (every typed request: `/api/chat`, `/api/generate`, the Anthropic
+/// Messages API) and `apply_default_repeat_penalty` (the raw OpenAI-
+/// passthrough generation routes: chat completions, legacy completions,
+/// the Responses API).
+const DEFAULT_REPEAT_PENALTY: f32 = 1.0;
 
 #[derive(Debug, Deserialize)]
 struct OAIChunk {
@@ -2198,7 +2221,7 @@ async fn proxy(
 async fn collect_completion(
     _shared_client: &Client,
     url: &str,
-    oai: OAIChatRequest,
+    mut oai: OAIChatRequest,
 ) -> Result<String, AppError> {
     // Use a fresh client per request.  The shared client's connection pool is
     // polluted by the many health-check GETs in wait_for_ready; reusing those
@@ -2206,7 +2229,7 @@ async fn collect_completion(
     // when llama-server has already closed the idle connection on its end.
     let client = reqwest::Client::new();
 
-    let resp = post_chat(&client, url, &oai).await?;
+    let resp = post_chat(&client, url, &mut oai).await?;
     let raw = resp.bytes().await.context("read llama-server response")?;
     eprintln!("[llmman] llama-server raw {} bytes", raw.len());
     if raw.is_empty() {
@@ -2306,15 +2329,33 @@ fn oai_chunk_to_content(payload: &str) -> Option<(String, Option<String>, bool)>
 // Shared "POST an OpenAI chat request, fail on non-2xx" helper
 // ---------------------------------------------------------------------------
 
+/// Sets `repeat_penalty` to `DEFAULT_REPEAT_PENALTY` on `oai_req` unless a
+/// construction site already resolved one from the caller's own request.
+/// `post_chat` is the *only* place this is called — and, in turn, the only
+/// function any typed request (`/api/chat`, `/api/generate`, the Anthropic
+/// Messages API) actually goes through to reach llama-server (see its own
+/// doc comment) — so none of those three construction sites need to
+/// remember to apply this default themselves the way they used to.
+fn apply_default_repeat_penalty_typed(oai_req: &mut OAIChatRequest) {
+    if oai_req.repeat_penalty.is_none() {
+        oai_req.repeat_penalty = Some(DEFAULT_REPEAT_PENALTY);
+    }
+}
+
 /// POSTs oai_req to url and returns the still-streaming response, converting
 /// a non-2xx status into an AppError carrying the backend's error body.
-/// Shared by every route that streams llama-server's OpenAI-style SSE output
-/// back out in some other shape (stream_ollama, stream_anthropic below).
+/// The *only* function that actually sends an `OAIChatRequest` to
+/// llama-server — every caller (`collect_completion`, `stream_ollama`,
+/// `stream_anthropic`, and `handle_anthropic_messages`'s non-streaming
+/// branch) goes through this one function, which is what lets
+/// `apply_default_repeat_penalty_typed` above resolve `repeat_penalty`
+/// exactly once instead of at every construction site.
 async fn post_chat(
     client: &Client,
     url: &str,
-    oai_req: &OAIChatRequest,
+    oai_req: &mut OAIChatRequest,
 ) -> Result<reqwest::Response, AppError> {
+    apply_default_repeat_penalty_typed(oai_req);
     let resp = client
         .post(url)
         .json(oai_req)
@@ -2345,13 +2386,13 @@ async fn post_chat(
 async fn stream_ollama<T: Serialize + Send + 'static>(
     client: Client,
     url: String,
-    oai_req: OAIChatRequest,
+    mut oai_req: OAIChatRequest,
     activity: ActivityGuard,
     build_chunk: impl Fn(String, Option<String>, Option<Vec<OllamaToolCall>>, bool) -> T
         + Send
         + 'static,
 ) -> Result<Response, AppError> {
-    let resp = post_chat(&client, &url, &oai_req).await?;
+    let resp = post_chat(&client, &url, &mut oai_req).await?;
 
     let tool_calls_acc = std::cell::RefCell::new(std::collections::BTreeMap::new());
     let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
@@ -2399,11 +2440,11 @@ async fn stream_ollama<T: Serialize + Send + 'static>(
 async fn stream_anthropic(
     client: Client,
     url: String,
-    oai_req: OAIChatRequest,
+    mut oai_req: OAIChatRequest,
     model: String,
     activity: ActivityGuard,
 ) -> Result<Response, AppError> {
-    let resp = post_chat(&client, &url, &oai_req).await?;
+    let resp = post_chat(&client, &url, &mut oai_req).await?;
 
     let msg_id = gen_id();
     let preamble = {
@@ -2993,7 +3034,10 @@ async fn handle_ollama_chat(
         temperature: opt_f64(&req.options, "temperature"),
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
-        repeat_penalty: opt_f64(&req.options, "repeat_penalty").or(Some(DEFAULT_REPEAT_PENALTY)),
+        // No `.or(Some(DEFAULT_REPEAT_PENALTY))` here — post_chat (the
+        // only place this request actually reaches llama-server) resolves
+        // that default itself now. See apply_default_repeat_penalty_typed.
+        repeat_penalty: opt_f64(&req.options, "repeat_penalty"),
         chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
         tools: req.tools.clone(),
         response_format: format_to_response_format(&req.format),
@@ -3094,7 +3138,10 @@ async fn handle_ollama_generate(
         temperature: opt_f64(&req.options, "temperature"),
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
-        repeat_penalty: opt_f64(&req.options, "repeat_penalty").or(Some(DEFAULT_REPEAT_PENALTY)),
+        // No `.or(Some(DEFAULT_REPEAT_PENALTY))` here — post_chat (the
+        // only place this request actually reaches llama-server) resolves
+        // that default itself now. See apply_default_repeat_penalty_typed.
+        repeat_penalty: opt_f64(&req.options, "repeat_penalty"),
         chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
         tools: None,
         response_format: format_to_response_format(&req.format),
@@ -3145,36 +3192,30 @@ async fn handle_openai_models(
 /// OpenAI-shaped chat/completions request body) unless the caller already
 /// supplied its own value. Every other entry point — `/api/chat`,
 /// `/api/generate`, and the Anthropic Messages API — already forwards this
-/// same default to llama-server (see `DEFAULT_REPEAT_PENALTY`'s doc
-/// comment for why its own raw 1.0 default measurably risks a
-/// small/quantized model looping on repeated reasoning tokens instead of
-/// ever emitting visible content); a plain OpenAI-compatible client has no
-/// llmman-specific reason to know about that risk, so `proxy_openai`
-/// applies it here too, keeping every API surface's behavior consistent
-/// instead of leaving this one raw-passthrough path the sole exception.
+/// same default to llama-server via `post_chat` (see
+/// `DEFAULT_REPEAT_PENALTY`'s doc comment for the value itself); a plain
+/// OpenAI-compatible client has no llmman-specific reason to know it
+/// should set this itself, so `proxy_openai_generation` applies it here
+/// too, keeping every generation-capable API surface's behavior
+/// consistent instead of leaving this one raw-passthrough path the sole
+/// exception.
 fn apply_default_repeat_penalty(req: &mut serde_json::Value) {
     if req.get("repeat_penalty").is_none() {
         req["repeat_penalty"] = serde_json::json!(DEFAULT_REPEAT_PENALTY);
     }
 }
 
-/// Shared body of every plain OpenAI-passthrough route: parse just enough
-/// of the request to find `model`, make sure it's loaded, rewrite `model`
-/// to its canonical name (see `ensure_model`), then proxy through to the
-/// backend's equivalent endpoint. `llama_path` is the only thing that
-/// differs between handle_openai_chat/completions/embeddings/responses*
-/// below. `default_repeat_penalty` is true for the generation endpoints
-/// (chat completions, legacy completions, and the Responses API Codex
-/// uses — see `apply_default_repeat_penalty`) and false for embeddings and
-/// the Responses token-counting endpoint, neither of which generate
-/// anything a repeat penalty could apply to.
-async fn proxy_openai(
+/// Shared setup for every plain OpenAI-passthrough route: parse just
+/// enough of the request to find `model`, make sure it's loaded, rewrite
+/// `model` to its canonical name (see `ensure_model`), and open an
+/// activity guard for it. `proxy_openai_generation` and
+/// `proxy_openai_passthrough` below each finish shaping the parsed body
+/// their own way (the former also defaults `repeat_penalty`, the latter
+/// doesn't) before actually proxying it through.
+async fn resolve_openai_request(
     state: &AppState,
-    headers: &HeaderMap,
     body: Bytes,
-    llama_path: &str,
-    default_repeat_penalty: bool,
-) -> Result<Response, AppError> {
+) -> Result<(serde_json::Value, u16, ActivityGuard), AppError> {
     let mut req: serde_json::Value =
         serde_json::from_slice(&body).context("parse OpenAI request body")?;
     let model = req["model"].as_str().unwrap_or("").to_string();
@@ -3187,9 +3228,42 @@ async fn proxy_openai(
     // instant one OpenAI-compatible request comes in.
     let activity = begin_activity(state, &model, None).await;
     req["model"] = serde_json::Value::String(model);
-    if default_repeat_penalty {
-        apply_default_repeat_penalty(&mut req);
-    }
+    Ok((req, port, activity))
+}
+
+/// OpenAI-passthrough for the endpoints that actually generate tokens —
+/// chat completions, legacy completions, and the Responses API endpoint
+/// Codex uses. Always defaults `repeat_penalty` (see
+/// `apply_default_repeat_penalty`) rather than taking a bool flag callers
+/// could forget to set: whether a route defaults this is now a choice of
+/// *which function* it calls (this one, or `proxy_openai_passthrough`
+/// below for the two non-generation routes), not an easily-mis-set
+/// argument at the call site.
+async fn proxy_openai_generation(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Bytes,
+    llama_path: &str,
+) -> Result<Response, AppError> {
+    let (mut req, port, activity) = resolve_openai_request(state, body).await?;
+    apply_default_repeat_penalty(&mut req);
+    let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
+    let url = format!("http://127.0.0.1:{port}{llama_path}");
+    proxy(&state.0.client, &url, headers, body, activity).await
+}
+
+/// OpenAI-passthrough for the routes that don't generate anything a
+/// repeat penalty could apply to — embeddings, and the Responses
+/// token-counting endpoint. Same model-loading/canonicalization as
+/// `proxy_openai_generation` (see `resolve_openai_request`), minus the
+/// `repeat_penalty` default.
+async fn proxy_openai_passthrough(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Bytes,
+    llama_path: &str,
+) -> Result<Response, AppError> {
+    let (req, port, activity) = resolve_openai_request(state, body).await?;
     let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
     let url = format!("http://127.0.0.1:{port}{llama_path}");
     proxy(&state.0.client, &url, headers, body, activity).await
@@ -3200,7 +3274,7 @@ async fn handle_openai_chat(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    proxy_openai(&state, &headers, body, "/v1/chat/completions", true).await
+    proxy_openai_generation(&state, &headers, body, "/v1/chat/completions").await
 }
 
 async fn handle_openai_completions(
@@ -3208,7 +3282,7 @@ async fn handle_openai_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    proxy_openai(&state, &headers, body, "/v1/completions", true).await
+    proxy_openai_generation(&state, &headers, body, "/v1/completions").await
 }
 
 async fn handle_openai_embeddings(
@@ -3216,7 +3290,7 @@ async fn handle_openai_embeddings(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    proxy_openai(&state, &headers, body, "/v1/embeddings", false).await
+    proxy_openai_passthrough(&state, &headers, body, "/v1/embeddings").await
 }
 
 // -- OpenAI Audio Transcriptions API (/v1/audio/transcriptions) -------------
@@ -3225,7 +3299,7 @@ async fn handle_openai_embeddings(
 // be loaded with mtmd audio support via a companion --mmproj — see
 // ModelPath::mmproj), so this is a plain pass-through like
 // handle_openai_responses. The request body is multipart/form-data, not
-// JSON, so proxy_openai's "parse as JSON to find model" doesn't apply —
+// JSON, so resolve_openai_request's "parse as JSON to find model" doesn't apply —
 // multipart_text_field below extracts just the model field instead.
 
 /// Axum's own default `DefaultBodyLimit` (2 MiB) is well under a typical
@@ -3275,7 +3349,7 @@ async fn handle_openai_transcriptions(
     };
     let (model, port) = ensure_model(&state, &model).await?;
     // No `keep_alive` field on this API surface either — see
-    // proxy_openai's own comment on the same choice.
+    // resolve_openai_request's own comment on the same choice.
     let activity = begin_activity(&state, &model, None).await;
     let url = format!("http://127.0.0.1:{port}/v1/audio/transcriptions");
     proxy(&state.0.client, &url, &headers, body, activity).await
@@ -3300,7 +3374,7 @@ async fn handle_openai_responses(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let body = sanitize_responses_request(body)?;
-    proxy_openai(&state, &headers, body, "/v1/responses", true).await
+    proxy_openai_generation(&state, &headers, body, "/v1/responses").await
 }
 
 async fn handle_openai_responses_input_tokens(
@@ -3311,7 +3385,7 @@ async fn handle_openai_responses_input_tokens(
     // A token-counting call, not a generation request — repeat_penalty has
     // nothing to apply to here.
     let body = sanitize_responses_request(body)?;
-    proxy_openai(&state, &headers, body, "/v1/responses/input_tokens", false).await
+    proxy_openai_passthrough(&state, &headers, body, "/v1/responses/input_tokens").await
 }
 
 /// Applies both `/v1/responses` request-shape workarounds below and
@@ -3473,13 +3547,13 @@ async fn handle_anthropic_messages(
     let (canonical_model, port) = ensure_model(&state, &req.model).await?;
     // The Anthropic Messages API has no `keep_alive` field of its own —
     // `None` leaves it untouched, same as the OpenAI-compatible surface
-    // (see proxy_openai's own comment on why).
+    // (see resolve_openai_request's own comment on why).
     let activity = begin_activity(&state, &canonical_model, None).await;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
 
     let messages = build_anthropic_messages(&req);
 
-    let oai = OAIChatRequest {
+    let mut oai = OAIChatRequest {
         model: canonical_model,
         messages,
         stream: req.stream,
@@ -3487,8 +3561,11 @@ async fn handle_anthropic_messages(
         top_p: req.top_p,
         max_tokens: req.max_tokens,
         // The Anthropic Messages API has no repeat_penalty concept of its
-        // own to read an override from — see DEFAULT_REPEAT_PENALTY.
-        repeat_penalty: Some(DEFAULT_REPEAT_PENALTY),
+        // own to read an override from, so this is always `None` here —
+        // post_chat (the only place this request actually reaches
+        // llama-server) resolves DEFAULT_REPEAT_PENALTY itself. See
+        // apply_default_repeat_penalty_typed.
+        repeat_penalty: None,
         // Nor a `think` override — see think_to_chat_template_kwargs.
         chat_template_kwargs: None,
         tools: None,
@@ -3498,14 +3575,11 @@ async fn handle_anthropic_messages(
     if req.stream {
         stream_anthropic(state.0.client.clone(), url, oai, req.model, activity).await
     } else {
-        let resp = state
-            .0
-            .client
-            .post(&url)
-            .json(&oai)
-            .send()
-            .await
-            .context("send to llama-server")?;
+        // Goes through post_chat like every other typed request (see its
+        // own doc comment) rather than posting directly, so this branch
+        // also gets repeat_penalty defaulted instead of needing its own
+        // copy of that logic.
+        let resp = post_chat(&state.0.client, &url, &mut oai).await?;
         let body: serde_json::Value = resp.json().await.context("parse llama-server response")?;
         let content = body["choices"][0]["message"]["content"]
             .as_str()
@@ -3970,7 +4044,8 @@ mod tests {
         );
     }
 
-    // -- apply_default_repeat_penalty (/v1/chat/completions, /v1/completions) --
+    // -- apply_default_repeat_penalty (/v1/chat/completions, /v1/completions,
+    //    /v1/responses — the raw OpenAI-passthrough generation routes) -----
 
     #[test]
     fn apply_default_repeat_penalty_sets_default_when_absent() {
@@ -3984,9 +4059,46 @@ mod tests {
 
     #[test]
     fn apply_default_repeat_penalty_preserves_an_explicit_value() {
-        let mut req = serde_json::json!({"model": "qwen3.5:0.8b", "repeat_penalty": 1.0});
+        // Deliberately not DEFAULT_REPEAT_PENALTY's own value (1.0) — this
+        // has to prove the caller's *explicit* choice survives, which a
+        // value indistinguishable from the default couldn't.
+        let mut req = serde_json::json!({"model": "qwen3.5:0.8b", "repeat_penalty": 1.3});
         apply_default_repeat_penalty(&mut req);
-        assert_eq!(req["repeat_penalty"], serde_json::json!(1.0));
+        assert_eq!(req["repeat_penalty"], serde_json::json!(1.3));
+    }
+
+    // -- apply_default_repeat_penalty_typed (every typed request — /api/chat,
+    //    /api/generate, the Anthropic Messages API — via post_chat) --------
+
+    fn oai_chat_request_with_repeat_penalty(repeat_penalty: Option<f32>) -> OAIChatRequest {
+        OAIChatRequest {
+            model: "qwen3.5:0.8b".into(),
+            messages: vec![],
+            stream: true,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            repeat_penalty,
+            chat_template_kwargs: None,
+            tools: None,
+            response_format: None,
+        }
+    }
+
+    #[test]
+    fn apply_default_repeat_penalty_typed_sets_default_when_absent() {
+        let mut oai = oai_chat_request_with_repeat_penalty(None);
+        apply_default_repeat_penalty_typed(&mut oai);
+        assert_eq!(oai.repeat_penalty, Some(DEFAULT_REPEAT_PENALTY));
+    }
+
+    #[test]
+    fn apply_default_repeat_penalty_typed_preserves_an_explicit_value() {
+        // Same rationale as apply_default_repeat_penalty_preserves_an_explicit_value
+        // above — 1.3 rather than DEFAULT_REPEAT_PENALTY's own 1.0.
+        let mut oai = oai_chat_request_with_repeat_penalty(Some(1.3));
+        apply_default_repeat_penalty_typed(&mut oai);
+        assert_eq!(oai.repeat_penalty, Some(1.3));
     }
 
     // -- OllamaMessage -> OAIMessage (vision, tool calls, tool results) -----
