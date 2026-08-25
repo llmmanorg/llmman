@@ -44,7 +44,7 @@ pub fn is_hf_host(server: &str) -> bool {
 
 /// The HuggingFace Hub API base URL, honoring `HF_ENDPOINT` — same
 /// override the official client and the Go shim's `hfEndpoint` both accept.
-pub fn endpoint() -> String {
+fn endpoint() -> String {
     std::env::var("HF_ENDPOINT")
         .ok()
         .filter(|v| !v.is_empty())

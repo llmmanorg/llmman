@@ -61,10 +61,6 @@ enum Commands {
     /// Probe the local host's GPU/accelerator support (internal diagnostic)
     #[command(hide = true)]
     GpuDiscover(cmd::gpu_discover::GpuDiscoverArgs),
-    /// Download one Xet-backed HuggingFace file via hf-xet (internal; see
-    /// crate::xet_fetch's own doc comment)
-    #[command(name = "__xet-fetch", hide = true)]
-    XetFetch(cmd::xet_fetch::XetFetchArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +119,6 @@ fn main() {
         Commands::Serve(a) => cmd::serve::run(a),
         Commands::Tag(a) => cmd::tag::run(a),
         Commands::GpuDiscover(a) => cmd::gpu_discover::run(a),
-        Commands::XetFetch(a) => cmd::xet_fetch::run(a),
     };
     if let Err(e) = result {
         eprintln!("Error: {:#}", e);
