@@ -111,6 +111,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let shim_dir = manifest_dir.join("go-shim");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
     // Determine backend build tags from Cargo features.
     // For the podman backend we add two extra tags to avoid pulling in C library
@@ -127,7 +128,14 @@ fn main() {
 
     // Always build natively — each platform's CI runner builds its own binary.
     // CGO requires the host C toolchain, which is always present on native runners.
-    let lib_name = if target_os == "windows" {
+    //
+    // Only *-pc-windows-msvc uses the MSVC "NAME.lib" naming; *-pc-windows-gnu
+    // is a GNU-ABI target like Linux/macOS and needs "libNAME.a". The final
+    // link step (mingw's ld) tolerates either name on a GNU target, but the
+    // `llmman` lib crate's own compilation checks a `#[link(kind =
+    // "static")]` dependency's presence itself first, by each target's
+    // canonical name, with no such leniency.
+    let lib_name = if target_os == "windows" && target_env == "msvc" {
         "llmman_shim.lib"
     } else {
         "libllmman_shim.a"
