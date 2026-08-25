@@ -3148,16 +3148,39 @@ async fn handle_openai_models(
     Ok(Json(serde_json::json!({ "object": "list", "data": data })))
 }
 
+/// Sets `repeat_penalty` to `DEFAULT_REPEAT_PENALTY` on `req` (an
+/// OpenAI-shaped chat/completions request body) unless the caller already
+/// supplied its own value. Every other entry point — `/api/chat`,
+/// `/api/generate`, and the Anthropic Messages API — already forwards this
+/// same default to llama-server (see `DEFAULT_REPEAT_PENALTY`'s doc
+/// comment for why its own raw 1.0 default measurably risks a
+/// small/quantized model looping on repeated reasoning tokens instead of
+/// ever emitting visible content); a plain OpenAI-compatible client has no
+/// llmman-specific reason to know about that risk, so `proxy_openai`
+/// applies it here too, keeping every API surface's behavior consistent
+/// instead of leaving this one raw-passthrough path the sole exception.
+fn apply_default_repeat_penalty(req: &mut serde_json::Value) {
+    if req.get("repeat_penalty").is_none() {
+        req["repeat_penalty"] = serde_json::json!(DEFAULT_REPEAT_PENALTY);
+    }
+}
+
 /// Shared body of every plain OpenAI-passthrough route: parse just enough
 /// of the request to find `model`, make sure it's loaded, rewrite `model`
 /// to its canonical name (see `ensure_model`), then proxy through to the
 /// backend's equivalent endpoint. `llama_path` is the only thing that
-/// differs between handle_openai_chat/completions/embeddings below.
+/// differs between handle_openai_chat/completions/embeddings/responses*
+/// below. `default_repeat_penalty` is true for the generation endpoints
+/// (chat completions, legacy completions, and the Responses API Codex
+/// uses — see `apply_default_repeat_penalty`) and false for embeddings and
+/// the Responses token-counting endpoint, neither of which generate
+/// anything a repeat penalty could apply to.
 async fn proxy_openai(
     state: &AppState,
     headers: &HeaderMap,
     body: Bytes,
     llama_path: &str,
+    default_repeat_penalty: bool,
 ) -> Result<Response, AppError> {
     let mut req: serde_json::Value =
         serde_json::from_slice(&body).context("parse OpenAI request body")?;
@@ -3171,6 +3194,9 @@ async fn proxy_openai(
     // instant one OpenAI-compatible request comes in.
     let activity = begin_activity(state, &model, None).await;
     req["model"] = serde_json::Value::String(model);
+    if default_repeat_penalty {
+        apply_default_repeat_penalty(&mut req);
+    }
     let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
     let url = format!("http://127.0.0.1:{port}{llama_path}");
     proxy(&state.0.client, &url, headers, body, activity).await
@@ -3181,7 +3207,7 @@ async fn handle_openai_chat(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    proxy_openai(&state, &headers, body, "/v1/chat/completions").await
+    proxy_openai(&state, &headers, body, "/v1/chat/completions", true).await
 }
 
 async fn handle_openai_completions(
@@ -3189,7 +3215,7 @@ async fn handle_openai_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    proxy_openai(&state, &headers, body, "/v1/completions").await
+    proxy_openai(&state, &headers, body, "/v1/completions", true).await
 }
 
 async fn handle_openai_embeddings(
@@ -3197,7 +3223,7 @@ async fn handle_openai_embeddings(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    proxy_openai(&state, &headers, body, "/v1/embeddings").await
+    proxy_openai(&state, &headers, body, "/v1/embeddings", false).await
 }
 
 // -- OpenAI Audio Transcriptions API (/v1/audio/transcriptions) -------------
@@ -3281,7 +3307,7 @@ async fn handle_openai_responses(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let body = sanitize_responses_request(body)?;
-    proxy_openai(&state, &headers, body, "/v1/responses").await
+    proxy_openai(&state, &headers, body, "/v1/responses", true).await
 }
 
 async fn handle_openai_responses_input_tokens(
@@ -3289,8 +3315,10 @@ async fn handle_openai_responses_input_tokens(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
+    // A token-counting call, not a generation request — repeat_penalty has
+    // nothing to apply to here.
     let body = sanitize_responses_request(body)?;
-    proxy_openai(&state, &headers, body, "/v1/responses/input_tokens").await
+    proxy_openai(&state, &headers, body, "/v1/responses/input_tokens", false).await
 }
 
 /// Applies both `/v1/responses` request-shape workarounds below and
@@ -3947,6 +3975,25 @@ mod tests {
             format_to_response_format(&Some(serde_json::json!("text"))),
             None
         );
+    }
+
+    // -- apply_default_repeat_penalty (/v1/chat/completions, /v1/completions) --
+
+    #[test]
+    fn apply_default_repeat_penalty_sets_default_when_absent() {
+        let mut req = serde_json::json!({"model": "qwen3.5:0.8b", "messages": []});
+        apply_default_repeat_penalty(&mut req);
+        assert_eq!(
+            req["repeat_penalty"],
+            serde_json::json!(DEFAULT_REPEAT_PENALTY)
+        );
+    }
+
+    #[test]
+    fn apply_default_repeat_penalty_preserves_an_explicit_value() {
+        let mut req = serde_json::json!({"model": "qwen3.5:0.8b", "repeat_penalty": 1.0});
+        apply_default_repeat_penalty(&mut req);
+        assert_eq!(req["repeat_penalty"], serde_json::json!(1.0));
     }
 
     // -- OllamaMessage -> OAIMessage (vision, tool calls, tool results) -----
