@@ -242,11 +242,13 @@ def test_vllm_serve_resolves_and_serves_a_real_oci_reference(tmp_path):
     real `ModelConfig` for an `oci://` reference during vLLM's own
     startup is what triggers the pull.
 
-    `--dtype float16`: the one dtype vLLM's CPU platform supports on
-    every OS in ci.yml's matrix (bf16 isn't supported on macOS CPU).
-    `--enforce-eager`: skips CUDA-graph startup work that doesn't apply
-    on CPU. `--max-model-len 1024`: bounds the CPU KV-cache for this
-    test's tiny prompt/reply.
+    `--dtype bfloat16`: MODEL_SAFETENSORS' own native dtype, and a hard
+    requirement, not just a preference — Qwen3.5's CPU Gated DeltaNet
+    kernel asserts BF16 input and crashes on any real forward pass with
+    float16 (which still loads and passes `/health` fine). `--enforce-
+    eager`: skips CUDA-graph startup work that doesn't apply on CPU.
+    `--max-model-len 1024`: bounds the CPU KV-cache for this test's
+    tiny prompt/reply.
     """
     pytest.importorskip("vllm")
     binary = shutil.which("vllm")
@@ -267,7 +269,7 @@ def test_vllm_serve_resolves_and_serves_a_real_oci_reference(tmp_path):
         "--port",
         str(port),
         "--dtype",
-        "float16",
+        "bfloat16",
         "--enforce-eager",
         "--max-model-len",
         "1024",
@@ -296,7 +298,15 @@ def test_vllm_serve_resolves_and_serves_a_real_oci_reference(tmp_path):
 
     try:
         _wait_for_health(port, VLLM_STARTUP_TIMEOUT, proc, log_path)
-        reply = _chat(port, PROMPT)
+        try:
+            reply = _chat(port, PROMPT)
+        except Exception as e:
+            # Unlike _wait_for_health, urlopen's own errors carry no
+            # server-side context — attach the log tail like it does.
+            pytest.fail(
+                f"chat request to vllm serve failed: {e!r}\n"
+                f"--- {log_path} tail ---\n{_tail(log_path)}"
+            )
         assert "pong" in reply.lower(), (
             f'expected the served model\'s reply to contain "pong", got: {reply!r}\n'
             f"--- {log_path} tail ---\n{_tail(log_path)}"
