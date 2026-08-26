@@ -218,11 +218,17 @@ def _terminate(proc: subprocess.Popen) -> None:
     `ProcessLookupError` is the actual signal the whole group is gone
     (a process group only disappears once empty) — the reliable stop
     condition here, unlike `proc.poll()`.
+
+    Also tolerates `PermissionError`: seen flakily on macOS CI when
+    `proc` has already exited/been reaped and its pid got recycled for
+    an unrelated process before this runs, so `killpg` raises EPERM
+    instead of ESRCH. Either way there's no pid left we can reliably
+    signal, so treat it like `ProcessLookupError`.
     """
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(proc.pid, sig)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             break
         try:
             proc.wait(timeout=15)
