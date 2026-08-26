@@ -378,6 +378,83 @@ fn find_binary(dir: &Path, name: &str) -> Option<PathBuf> {
 /// plain throttled text instead of redrawing a client-style progress bar.
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long a `.downloading` marker stays credible without being touched.
+/// A live download refreshes it every [`PROGRESS_LOG_INTERVAL`], so a
+/// marker older than this belongs to a download whose process died
+/// without running the guard's Drop (e.g. a SIGKILLed daemon).
+const DOWNLOAD_MARKER_STALE_AFTER: Duration = Duration::from_secs(60);
+
+/// The download-in-progress marker: a fixed path under [`install_root`]
+/// that both the downloading daemon (writer) and a client polling it
+/// (reader, see `daemon::ensure_server`) can derive independently.
+fn download_marker_path() -> Result<PathBuf> {
+    Ok(install_root()?.join(".downloading"))
+}
+
+/// Whether some process is currently mid-download of a llama-server
+/// release: the marker exists and was touched recently enough to belong
+/// to a live download rather than a crashed one.
+pub fn download_in_progress() -> bool {
+    download_marker_path().is_ok_and(|path| marker_is_fresh(&path, DOWNLOAD_MARKER_STALE_AFTER))
+}
+
+/// Split out from [`download_in_progress`] so tests can drive the path
+/// and threshold directly.
+fn marker_is_fresh(path: &Path, stale_after: Duration) -> bool {
+    let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return false;
+    };
+    // A backwards clock step can leave mtime in the future; that still
+    // means "touched just now", so count it as fresh.
+    std::time::SystemTime::now()
+        .duration_since(mtime)
+        .map_or(true, |age| age < stale_after)
+}
+
+/// Creates the marker on construction and removes it on drop, so success
+/// and every early `?` return both clear it. Best-effort throughout: a
+/// marker failure must never fail the download itself.
+struct DownloadMarker(Option<PathBuf>);
+
+impl DownloadMarker {
+    fn create() -> DownloadMarker {
+        match download_marker_path() {
+            Ok(p) => Self::create_at(p),
+            Err(_) => DownloadMarker(None),
+        }
+    }
+
+    /// The path-taking constructor behind [`DownloadMarker::create`], so
+    /// tests can run the guard's lifecycle against a temp path instead of
+    /// the real install root.
+    fn create_at(path: PathBuf) -> DownloadMarker {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        DownloadMarker(std::fs::write(&path, b"").ok().map(|_| path))
+    }
+
+    /// Refreshes the marker's mtime so a reader can tell this live
+    /// download from a crashed one whose Drop never ran.
+    fn touch(&self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::write(path, b"");
+        }
+    }
+}
+
+impl Drop for DownloadMarker {
+    fn drop(&mut self) {
+        // With two concurrent downloads (pid-suffixed staging paths allow
+        // them), the first finisher removes the shared marker and the
+        // survivor's next touch recreates it within PROGRESS_LOG_INTERVAL;
+        // that short unprotected window is accepted.
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Opens `dest` for writing without ever following an existing symlink
 /// there — `LLMMAN_TMPDIR` can point at a shared directory, and asset
 /// names are predictable, so a planted symlink must not redirect a
@@ -407,6 +484,7 @@ fn download_to_file(
     url: &str,
     dest: &Path,
     label: &str,
+    marker: &DownloadMarker,
 ) -> Result<()> {
     let mut resp = client
         .get(url)
@@ -416,7 +494,6 @@ fn download_to_file(
         anyhow::bail!("download {url} returned {}", resp.status());
     }
     let total = resp.content_length().unwrap_or(0);
-
     let mut file = create_new_file(dest)?;
     let mut buf = [0u8; 1 << 16];
     let mut downloaded = 0u64;
@@ -428,13 +505,16 @@ fn download_to_file(
         }
         file.write_all(&buf[..n]).context("write downloaded data")?;
         downloaded += n as u64;
-        if total > 0 && last_logged.elapsed() >= PROGRESS_LOG_INTERVAL {
-            eprintln!(
-                "[llmman] downloading {label}: {} / {} ({}%)",
-                human_size(downloaded),
-                human_size(total),
-                downloaded.saturating_mul(100) / total
-            );
+        if last_logged.elapsed() >= PROGRESS_LOG_INTERVAL {
+            marker.touch();
+            if total > 0 {
+                eprintln!(
+                    "[llmman] downloading {label}: {} / {} ({}%)",
+                    human_size(downloaded),
+                    human_size(total),
+                    downloaded.saturating_mul(100) / total
+                );
+            }
             last_logged = Instant::now();
         }
     }
@@ -574,9 +654,23 @@ fn try_ensure_from_network(
         "[llmman] downloading llama-server ({}) {tag}: {}",
         query.label, asset.name
     );
+    // One marker for everything from here to the end of the function, so
+    // a client that gave up waiting for this daemon (see ensure_server's
+    // timeout path) knows not to kill it mid-download or mid-extract; the
+    // downloads' progress loops keep it fresh. Extraction of a large
+    // archive can outlive the last touch by more than the staleness
+    // window; that residual gap is accepted.
+    let marker = DownloadMarker::create();
     let tmp = tmp_path(&asset.name)?;
     let _cleanup = RemoveOnDrop(&tmp);
-    download_to_file(&client, &asset.browser_download_url, &tmp, &asset.name)?;
+    download_to_file(
+        &client,
+        &asset.browser_download_url,
+        &tmp,
+        &asset.name,
+        &marker,
+    )?;
+    marker.touch();
     extract(&tmp, &asset.name, &dest)?;
 
     if let Some(companion_substr) = &query.companion_must_contain {
@@ -591,7 +685,9 @@ fn try_ensure_from_network(
                     &companion.browser_download_url,
                     &tmp2,
                     &companion.name,
+                    &marker,
                 )?;
+                marker.touch();
                 extract(&tmp2, &companion.name, &dest)?;
             }
             None => eprintln!(
@@ -792,6 +888,64 @@ mod tests {
         assert_eq!(parse_pointer_tag("  b10621  "), Some("b10621"));
         assert_eq!(parse_pointer_tag(""), None);
         assert_eq!(parse_pointer_tag("\n  \n"), None);
+    }
+
+    #[test]
+    fn marker_is_fresh_is_false_for_an_absent_file() {
+        let path =
+            std::env::temp_dir().join(format!("llmman-marker-absent-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(!marker_is_fresh(&path, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn marker_is_fresh_is_true_for_a_just_written_file() {
+        let path = std::env::temp_dir().join(format!("llmman-marker-fresh-{}", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        let fresh = marker_is_fresh(&path, Duration::from_secs(60));
+        let _ = std::fs::remove_file(&path);
+        assert!(fresh);
+    }
+
+    #[test]
+    fn marker_is_fresh_is_false_for_a_stale_mtime() {
+        let path = std::env::temp_dir().join(format!("llmman-marker-stale-{}", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        drop(file);
+        let fresh = marker_is_fresh(&path, Duration::from_secs(60));
+        let _ = std::fs::remove_file(&path);
+        assert!(!fresh);
+    }
+
+    /// The guard's whole lifecycle: created on construction, refreshed by
+    /// touch, removed on drop. Runs against a temp path via create_at, not
+    /// the real install root, so a genuinely live download's marker is
+    /// never deleted by the test.
+    #[test]
+    fn download_marker_creates_touches_and_removes_the_marker() {
+        let path = std::env::temp_dir().join(format!(
+            "llmman-marker-lifecycle-{}/.downloading",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let marker = DownloadMarker::create_at(path.clone());
+        assert!(path.is_file(), "marker not created at {}", path.display());
+        // Backdate the mtime so the freshness assertion below can only
+        // pass because of the touch, not the recent creation.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        assert!(!marker_is_fresh(&path, Duration::from_secs(60)));
+        marker.touch();
+        assert!(marker_is_fresh(&path, Duration::from_secs(60)));
+        drop(marker);
+        assert!(!path.exists(), "marker not removed on drop");
     }
 
     #[test]

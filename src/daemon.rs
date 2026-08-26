@@ -434,31 +434,42 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
         // auto-download failing) instead of polling a dead port for 60s.
         bail_if_exited(&mut child, log_path.as_deref())?;
     }
+    // The last in-loop probe is up to 500ms stale by now; a daemon that
+    // bound in that window is a healthy start, not a timeout. Same shape
+    // as the in-loop success path: prove the daemon survived the accept
+    // before reporting Ok.
+    if server_alive() {
+        bail_if_exited(&mut child, log_path.as_deref())?;
+        return Ok(());
+    }
     // The daemon may have exited right after the final poll above: check
     // once more so that narrow window still reports the exit status
     // instead of the generic timeout.
     bail_if_exited(&mut child, log_path.as_deref())?;
-    // The last in-loop probe is up to 500ms stale by now; a daemon that
-    // bound in that window is a healthy start, not a timeout.
-    if server_alive() {
-        return Ok(());
+    // Timed out with the daemon alive but not listening. If startup is
+    // mid-way through llama-server's one-time auto-download (which can
+    // far exceed this budget; see llama_release's 30-minute HTTP budget),
+    // killing the daemon would discard the partial download (no resume,
+    // pid-specific staging files) and make every retry start from zero.
+    // Leave it running and say so instead.
+    if crate::llama_release::download_in_progress() {
+        anyhow::bail!(
+            "llmman serve did not start within 60s: startup is still downloading \
+             llama-server. The daemon was left running so the download can finish; \
+             retry this command once it does{}",
+            log_tail(log_path.as_deref())
+        );
     }
-    // Timed out with the daemon alive but not listening: stop it before
-    // reporting failure, rather than leave a half-started daemon running
-    // detached after the user was told the start failed. TERM the group
-    // first, then escalate to a group KILL after a short grace (like
-    // stop_stale_daemon, so a slow-to-exit child is actually reaped too),
-    // then wait so no zombie outlives this call. The message must say the
-    // daemon was stopped: a slow first run (llama-server's one-time
-    // download can exceed this budget) would otherwise converge on a
-    // plain retry, and now it will not.
-    signal_group(child.id(), false);
-    std::thread::sleep(Duration::from_millis(500));
-    signal_group(child.id(), true);
+    // Otherwise stop it before reporting failure, rather than leave a
+    // half-started daemon running detached after the user was told the
+    // start failed, then wait so no zombie outlives this call. The
+    // message must say the daemon was stopped, or the failure would read
+    // as retryable against a daemon that is no longer there.
+    stop_group(child.id());
     let _ = child.wait();
     anyhow::bail!(
         "llmman serve did not start within 60s and was stopped; run 'llmman serve' in the \
-         foreground to watch what startup is doing (e.g. a first-time llama-server download){}",
+         foreground to watch what startup is doing{}",
         log_tail(log_path.as_deref())
     )
 }
@@ -470,21 +481,24 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
 /// form that could hit an innocent reused process. Failures are ignored;
 /// an already-empty group is the common case.
 #[cfg(unix)]
-fn signal_group(pid: u32, force: bool) {
+fn signal_group(pid: u32, force: bool) -> bool {
     let signal = if force { "-KILL" } else { "-TERM" };
     // Stdio nulled: an already-empty group makes kill print "No such
     // process", which would land in front of the real startup error.
-    let _ = Command::new("kill")
+    // kill's exit status reports whether the signal found anyone, which
+    // is what lets stop_group skip a pointless escalation.
+    Command::new("kill")
         .args([signal, &format!("-{pid}")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Windows equivalent: taskkill's /T already targets the whole process
 /// tree, and fails harmlessly on an already-dead pid.
 #[cfg(windows)]
-fn signal_group(pid: u32, force: bool) {
+fn signal_group(pid: u32, force: bool) -> bool {
     let mut args = vec!["/PID".to_string(), pid.to_string(), "/T".to_string()];
     if force {
         args.push("/F".to_string());
@@ -496,6 +510,23 @@ fn signal_group(pid: u32, force: bool) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+    // taskkill's exit codes don't reliably separate "no such pid" from
+    // "needs /F" (a windowless process rejects the graceful form), so
+    // always report possible survivors and let stop_group escalate.
+    true
+}
+
+/// Best-effort stop of the daemon's whole process group: TERM first, then
+/// escalate to a group KILL after a short grace so a slow-to-exit child
+/// is actually stopped too (the same two phases as stop_stale_daemon).
+/// The escalation is skipped when the TERM found nothing to signal (an
+/// already-empty group), which keeps bail_if_exited's fast-fail path free
+/// of the grace sleep.
+fn stop_group(pid: u32) {
+    if signal_group(pid, false) {
+        std::thread::sleep(Duration::from_millis(500));
+        signal_group(pid, true);
+    }
 }
 
 /// Bails with the daemon's exit status (and its log tail) if the freshly
@@ -519,12 +550,14 @@ fn bail_if_exited(
         return Ok(());
     }
     // The daemon may have spawned a llama-server before dying, and that
-    // child shares the daemon's process group (see detach), so signal the
+    // child shares the daemon's process group (see detach), so stop the
     // group rather than orphan a loaded model. The leader itself is dead
     // and reaped by now; only the group form of the signal is meaningful
     // (see signal_group on why there is deliberately no single-pid
-    // fallback here).
-    signal_group(pid, false);
+    // fallback here). stop_group only pays its grace sleep when the TERM
+    // actually found a survivor, so the common childless fast-fail stays
+    // fast.
+    stop_group(pid);
     // Reading the log now needs no explicit sync: a daemon that fails via
     // its error-exit path reports on stderr, which Rust never buffers,
     // and that fd is redirected straight to the log file, so the reason
@@ -1094,6 +1127,9 @@ mod tests {
     fn log_tail_missing_file_points_at_path() {
         let path =
             std::env::temp_dir().join(format!("llmman-log-tail-missing-{}", std::process::id()));
+        // A crashed prior run could have left the file behind; make sure
+        // the missing-file branch is actually the one under test.
+        let _ = std::fs::remove_file(&path);
         let tail = log_tail(Some(&path));
         assert!(tail.contains("see "), "got: {tail}");
         assert!(tail.contains(&path.display().to_string()), "got: {tail}");
