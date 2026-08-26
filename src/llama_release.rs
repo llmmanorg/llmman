@@ -25,12 +25,12 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
+use crate::fmt::human_size;
 use crate::hostgpu::HostGpu;
 
 const REPO_API: &str = "https://api.github.com/repos/ggml-org/llama.cpp";
@@ -304,21 +304,10 @@ fn find_binary(dir: &Path, name: &str) -> Option<PathBuf> {
 // Download + extract
 // ---------------------------------------------------------------------------
 
-fn progress_bar(total: u64, label: &str) -> Option<ProgressBar> {
-    if total == 0 {
-        return None;
-    }
-    let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{msg:<20} [{bar:32.cyan/blue}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12}",
-        )
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("=> "),
-    );
-    pb.set_message(label.to_string());
-    Some(pb)
-}
+/// Minimum gap between "still downloading" log lines — this runs inside
+/// `llmman serve` (stdio often redirected to a log file), so it logs
+/// plain throttled text instead of redrawing a client-style progress bar.
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Opens `dest` for writing without ever following an existing symlink
 /// there — `LLMMAN_TMPDIR` can point at a shared directory, and asset
@@ -358,11 +347,11 @@ fn download_to_file(
         anyhow::bail!("download {url} returned {}", resp.status());
     }
     let total = resp.content_length().unwrap_or(0);
-    let pb = progress_bar(total, label);
 
     let mut file = create_new_file(dest)?;
     let mut buf = [0u8; 1 << 16];
     let mut downloaded = 0u64;
+    let mut last_logged = Instant::now();
     loop {
         let n = resp.read(&mut buf).context("read download stream")?;
         if n == 0 {
@@ -370,13 +359,17 @@ fn download_to_file(
         }
         file.write_all(&buf[..n]).context("write downloaded data")?;
         downloaded += n as u64;
-        if let Some(pb) = &pb {
-            pb.set_position(downloaded);
+        if total > 0 && last_logged.elapsed() >= PROGRESS_LOG_INTERVAL {
+            eprintln!(
+                "[llmman] downloading {label}: {} / {} ({}%)",
+                human_size(downloaded),
+                human_size(total),
+                downloaded.saturating_mul(100) / total
+            );
+            last_logged = Instant::now();
         }
     }
-    if let Some(pb) = pb {
-        pb.finish_and_clear();
-    }
+    eprintln!("[llmman] downloaded {label}: {}", human_size(downloaded));
     Ok(())
 }
 
