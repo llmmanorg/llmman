@@ -36,7 +36,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
 
-use crate::daemon::SERVER;
+use crate::daemon;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -554,7 +554,7 @@ async fn chat_submit_async(
     tokio::pin!(ctrl_c);
 
     let send = client
-        .post(format!("{SERVER}/api/chat"))
+        .post(format!("{}/api/chat", daemon::server()))
         .json(&ChatReq {
             model,
             messages,

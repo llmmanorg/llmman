@@ -1,5 +1,6 @@
 //! Shared client-side helpers for talking to a local `llmman serve`
-//! instance over its Ollama-protocol HTTP API (127.0.0.1:17434).
+//! instance over its Ollama-protocol HTTP API — `http://127.0.0.1:17434`
+//! by default, overridable via `LLMMAN_HOST`.
 //!
 //! Used by any CLI subcommand that acts as a client of that API rather than
 //! calling the FFI/model-management logic directly — currently `pull`,
@@ -10,21 +11,143 @@
 
 use std::io::BufRead;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Context;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
-/// The fixed loopback origin `llmman serve` always binds to (see
-/// cmd::serve's own doc comment on why this isn't configurable).
-pub const SERVER: &str = "http://127.0.0.1:17434";
+/// Default bind host/port when `LLMMAN_HOST` is unset/blank.
+const DEFAULT_HOST: &str = "127.0.0.1";
+const DEFAULT_PORT: u16 = 17434;
 
-/// Quick synchronous reachability check — none of this module's callers
-/// run inside an async runtime, so a plain TCP connect attempt is enough
-/// (no need to actually round-trip an HTTP request just to check liveness).
+/// `(scheme, host, port)` parsed from `LLMMAN_HOST`, cached for the
+/// process's life.
+static PARSED_HOST: OnceLock<(String, String, u16)> = OnceLock::new();
+
+fn parsed_host() -> &'static (String, String, u16) {
+    PARSED_HOST.get_or_init(|| parse_host(std::env::var("LLMMAN_HOST").ok().as_deref()))
+}
+
+/// Parses `[scheme://]host[:port][/path]` — a bare host, `host:port`, or
+/// nothing at all also work. `path` is discarded (unused). An explicit
+/// `http://`/`https://` scheme shifts the default port to 80/443 when no
+/// port is given; anything else keeps `DEFAULT_PORT`. A missing/
+/// unparseable host or port falls back to its own default, independently.
+fn parse_host(value: Option<&str>) -> (String, String, u16) {
+    let raw = value.unwrap_or("");
+    let trimmed = raw.trim().trim_matches(|c| c == '"' || c == '\'');
+
+    let mut default_port = DEFAULT_PORT;
+    let (scheme, hostport) = match trimmed.split_once("://") {
+        Some((scheme, rest)) => {
+            match scheme {
+                "http" => default_port = 80,
+                "https" => default_port = 443,
+                _ => {}
+            }
+            (scheme.to_string(), rest)
+        }
+        None => ("http".to_string(), trimmed),
+    };
+
+    // Drop a trailing path, if any (e.g. "host:port/some/path") — never used.
+    let hostport = hostport.split_once('/').map_or(hostport, |(h, _)| h);
+
+    let (host, port) = split_host_port(hostport);
+    let port = port
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(default_port);
+    let host = host.unwrap_or_else(|| DEFAULT_HOST.to_string());
+    (scheme, host, port)
+}
+
+/// Minimal `net.SplitHostPort` equivalent for what `parse_host` can pass
+/// in: empty, a bare host, `host:port`, or a bracketed IPv6 literal
+/// (`[::1]` or `[::1]:port`). A bare multi-colon literal (e.g. `::1`) is
+/// kept whole with no port rather than guessed at.
+fn split_host_port(hostport: &str) -> (Option<String>, Option<&str>) {
+    if hostport.is_empty() {
+        return (None, None);
+    }
+    if let Some(rest) = hostport.strip_prefix('[') {
+        return match rest.split_once(']') {
+            Some((host, after)) => {
+                let port = after.strip_prefix(':').filter(|p| !p.is_empty());
+                (Some(host.to_string()), port)
+            }
+            None => (Some(hostport.to_string()), None), // malformed bracket; keep as one host
+        };
+    }
+    match hostport.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && !port.is_empty() => {
+            (Some(host.to_string()), Some(port))
+        }
+        _ => (Some(hostport.to_string()), None),
+    }
+}
+
+/// Renders `host:port`, bracketing `host` if it's an IPv6 literal.
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// The `http://host:port` origin every client in this process talks to.
+/// Always `http` (`llmman serve` has no TLS support) and built from
+/// `connect_addr`, not the raw configured host, so a wildcard bind
+/// (`0.0.0.0`/`[::]`) still gets a host clients can actually reach.
+pub fn server() -> String {
+    format!("http://{}", connect_addr())
+}
+
+/// The bare `host:port` `llmman serve`'s own listener binds — the raw
+/// configured host, since a wildcard bind (`0.0.0.0`/`::`) is meaningful
+/// here, unlike for `connect_addr`.
+pub fn bind_addr() -> String {
+    let (_, host, port) = parsed_host();
+    format_host_port(host, *port)
+}
+
+/// The bare `host:port` a client should *connect* to — like `bind_addr`,
+/// but a wildcard host is rewritten to loopback first, since a client
+/// can't connect to "every interface".
+fn connect_addr() -> String {
+    let (_, host, port) = parsed_host();
+    format_host_port(connectable_host(host), *port)
+}
+
+/// Rewrites a wildcard host (any `is_unspecified` IP, e.g. `0.0.0.0`/`::`)
+/// to its loopback equivalent, by value rather than by exact spelling —
+/// so an expanded IPv6 form (`0:0:0:0:0:0:0:0`) is caught too.
+fn connectable_host(host: &str) -> &str {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => {
+            if ip.is_ipv4() {
+                "127.0.0.1"
+            } else {
+                "::1"
+            }
+        }
+        _ => host,
+    }
+}
+
+/// Quick reachability check with a short timeout — a plain TCP connect
+/// attempt is enough (no need to round-trip an HTTP request), but with
+/// `LLMMAN_HOST` possibly pointing at a remote, unreachable address, an
+/// unbounded `TcpStream::connect` could hang far longer than any caller
+/// (`ensure_server`, `ps`) wants to wait.
 pub fn server_alive() -> bool {
-    std::net::TcpStream::connect("127.0.0.1:17434").is_ok()
+    use std::net::ToSocketAddrs;
+    let Ok(mut addrs) = connect_addr().to_socket_addrs() else {
+        return false;
+    };
+    addrs.any(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok())
 }
 
 /// The daemon's self-identity from GET /api/version — the identity fields
@@ -39,6 +162,25 @@ struct DaemonIdentity {
     exe: Option<String>,
     #[serde(default)]
     pid: Option<u32>,
+}
+
+/// Whether the configured host is this machine — a remote one's PID
+/// belongs to another machine, so spawning/killing based on it must be
+/// skipped.
+fn host_is_local() -> bool {
+    let (_, host, _) = parsed_host();
+    is_local_host(host)
+}
+
+/// By value rather than by exact spelling, same as `connectable_host` —
+/// a loopback or unspecified IP (in any form) is local; a bare
+/// "localhost" is too, since it always resolves to one.
+fn is_local_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
 }
 
 /// Returns the running daemon's identity if it should be stopped and
@@ -64,7 +206,7 @@ fn stale_daemon() -> Option<DaemonIdentity> {
         .timeout(Some(Duration::from_secs(2)))
         .build()
         .ok()?
-        .get(format!("{SERVER}/api/version"))
+        .get(format!("{}/api/version", server()))
         .send()
         .ok()?;
     if !resp.status().is_success() {
@@ -104,8 +246,9 @@ fn stop_stale_daemon(identity: &DaemonIdentity) -> anyhow::Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "a stale llmman serve daemon is still holding 127.0.0.1:17434 after being asked to stop; \
-         stop it manually (e.g. pkill -f 'llmman serve') and retry"
+        "a stale llmman serve daemon is still holding {} after being asked to stop; \
+         stop it manually (e.g. pkill -f 'llmman serve') and retry",
+        bind_addr()
     )
 }
 
@@ -199,6 +342,11 @@ fn kill_daemon(identity: &DaemonIdentity, _force: bool) {
 /// integration it's about to hand off to).
 pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     if server_alive() {
+        // A remote LLMMAN_HOST: reuse whatever's there, and never touch
+        // its PID (see host_is_local) or spawn a "replacement" over it.
+        if !host_is_local() {
+            return Ok(());
+        }
         // Reuse the running daemon — unless it outlived its own install
         // (see stale_daemon): reusing that one means serving with a
         // long-obsolete build whose llama-server (and bug fixes) are gone.
@@ -206,6 +354,11 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
             None => return Ok(()),
             Some(identity) => stop_stale_daemon(&identity)?,
         }
+    } else if !host_is_local() {
+        anyhow::bail!(
+            "LLMMAN_HOST={} is unreachable, and llmman can't start a daemon on a remote host",
+            server()
+        );
     }
     let exe = std::env::current_exe().context("could not resolve own executable")?;
 
@@ -482,7 +635,7 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
         .build()
         .context("build http client")?;
     let resp = client
-        .post(format!("{SERVER}{path}"))
+        .post(format!("{}{path}", server()))
         .json(&serde_json::json!({"model": reference}))
         .send()
         .with_context(|| format!("request {path} for {reference}"))?;
@@ -602,7 +755,7 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
 /// no download/pull side effects.
 fn model_exists(reference: &str) -> anyhow::Result<bool> {
     let resp = reqwest::blocking::Client::new()
-        .post(format!("{SERVER}/api/show"))
+        .post(format!("{}/api/show", server()))
         .json(&serde_json::json!({"model": reference}))
         .send()
         .with_context(|| format!("request /api/show for {reference}"))?;
@@ -634,7 +787,7 @@ pub fn ensure_model_pulled(reference: &str) -> anyhow::Result<()> {
 /// by `llmman stop`.
 pub fn unload(reference: &str) -> anyhow::Result<()> {
     let resp = reqwest::blocking::Client::new()
-        .post(format!("{SERVER}/api/generate"))
+        .post(format!("{}/api/generate", server()))
         .json(&serde_json::json!({"model": reference, "keep_alive": 0}))
         .send()
         .with_context(|| format!("request /api/generate (unload) for {reference}"))?;
@@ -646,11 +799,11 @@ pub fn unload(reference: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A plain `GET {SERVER}{path}` returning the parsed JSON body — for
+/// A plain `GET {server()}{path}` returning the parsed JSON body — for
 /// callers (currently just `ps`) that don't need `stream_progress`'s
 /// newline-delimited-JSON streaming, just a single request/response.
 pub fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T> {
-    let resp = reqwest::blocking::get(format!("{SERVER}{path}"))
+    let resp = reqwest::blocking::get(format!("{}{path}", server()))
         .with_context(|| format!("request {path}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -659,4 +812,148 @@ pub fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T>
     }
     resp.json()
         .with_context(|| format!("parse response from {path}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unset/blank `LLMMAN_HOST` — the common case — resolves to the
+    /// documented default.
+    #[test]
+    fn parse_host_defaults_when_unset_or_blank() {
+        assert_eq!(
+            parse_host(None),
+            ("http".to_string(), "127.0.0.1".to_string(), 17434)
+        );
+        assert_eq!(
+            parse_host(Some("  ")),
+            ("http".to_string(), "127.0.0.1".to_string(), 17434)
+        );
+    }
+
+    #[test]
+    fn parse_host_accepts_a_bare_host() {
+        assert_eq!(
+            parse_host(Some("0.0.0.0")),
+            ("http".to_string(), "0.0.0.0".to_string(), 17434)
+        );
+    }
+
+    #[test]
+    fn parse_host_accepts_a_bare_host_and_port() {
+        assert_eq!(
+            parse_host(Some("0.0.0.0:8080")),
+            ("http".to_string(), "0.0.0.0".to_string(), 8080)
+        );
+    }
+
+    #[test]
+    fn parse_host_accepts_an_explicit_scheme() {
+        assert_eq!(
+            parse_host(Some("https://example.com:9999")),
+            ("https".to_string(), "example.com".to_string(), 9999)
+        );
+    }
+
+    /// An explicit `http://`/`https://` scheme with no port shifts the
+    /// *default* port to 80/443.
+    #[test]
+    fn parse_host_shifts_default_port_for_http_and_https_schemes() {
+        assert_eq!(
+            parse_host(Some("http://example.com")),
+            ("http".to_string(), "example.com".to_string(), 80)
+        );
+        assert_eq!(
+            parse_host(Some("https://example.com")),
+            ("https".to_string(), "example.com".to_string(), 443)
+        );
+    }
+
+    /// A non-http(s) scheme (or none at all) keeps llmman's own default
+    /// port rather than shifting to 80.
+    #[test]
+    fn parse_host_keeps_default_port_for_other_schemes() {
+        assert_eq!(
+            parse_host(Some("grpc://example.com")),
+            ("grpc".to_string(), "example.com".to_string(), 17434)
+        );
+    }
+
+    #[test]
+    fn parse_host_accepts_a_bracketed_ipv6_literal_with_port() {
+        assert_eq!(
+            parse_host(Some("[::1]:8080")),
+            ("http".to_string(), "::1".to_string(), 8080)
+        );
+    }
+
+    #[test]
+    fn parse_host_accepts_a_bare_ipv6_literal_with_no_port() {
+        assert_eq!(
+            parse_host(Some("::1")),
+            ("http".to_string(), "::1".to_string(), 17434)
+        );
+    }
+
+    /// An out-of-range/unparseable port falls back to the default port,
+    /// keeping whatever host was given.
+    #[test]
+    fn parse_host_falls_back_to_default_port_when_unparseable() {
+        assert_eq!(
+            parse_host(Some("example.com:not-a-port")),
+            ("http".to_string(), "example.com".to_string(), 17434)
+        );
+        assert_eq!(
+            parse_host(Some("example.com:99999")),
+            ("http".to_string(), "example.com".to_string(), 17434)
+        );
+    }
+
+    #[test]
+    fn parse_host_trims_whitespace_and_surrounding_quotes() {
+        assert_eq!(
+            parse_host(Some("  \"0.0.0.0:8080\"  ")),
+            ("http".to_string(), "0.0.0.0".to_string(), 8080)
+        );
+    }
+
+    #[test]
+    fn parse_host_drops_a_trailing_path() {
+        assert_eq!(
+            parse_host(Some("example.com:8080/some/path")),
+            ("http".to_string(), "example.com".to_string(), 8080)
+        );
+    }
+
+    #[test]
+    fn format_host_port_brackets_ipv6_literals() {
+        assert_eq!(format_host_port("::1", 17434), "[::1]:17434");
+        assert_eq!(format_host_port("127.0.0.1", 17434), "127.0.0.1:17434");
+        assert_eq!(format_host_port("example.com", 17434), "example.com:17434");
+    }
+
+    #[test]
+    fn connectable_host_rewrites_wildcard_hosts_to_loopback() {
+        assert_eq!(connectable_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(connectable_host("::"), "::1");
+        assert_eq!(connectable_host("0:0:0:0:0:0:0:0"), "::1"); // expanded IPv6 form
+        assert_eq!(connectable_host("example.com"), "example.com");
+    }
+
+    #[test]
+    fn is_local_host_only_accepts_loopback_and_wildcard_hosts() {
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "0:0:0:0:0:0:0:1", // expanded IPv6 loopback
+            "localhost",
+            "0.0.0.0",
+            "::",
+        ] {
+            assert!(is_local_host(host), "{host} should be local");
+        }
+        assert!(!is_local_host("example.com"));
+        assert!(!is_local_host("192.168.1.5"));
+    }
 }

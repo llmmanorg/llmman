@@ -10,7 +10,7 @@ use std::process::Command;
 use anyhow::Context;
 use clap::Args;
 
-use crate::daemon::SERVER;
+use crate::daemon;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -230,11 +230,12 @@ fn launch_claude(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     }
     args.extend_from_slice(extra_args);
 
+    let server = daemon::server();
     exec_with_env(
         &bin,
         &args,
         &[
-            ("ANTHROPIC_BASE_URL", SERVER),
+            ("ANTHROPIC_BASE_URL", server.as_str()),
             ("ANTHROPIC_API_KEY", "llmman"),
         ],
     )
@@ -259,7 +260,7 @@ fn launch_opencode(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 }
 
 fn opencode_config(model: &str) -> String {
-    let base_url = format!("{SERVER}/v1");
+    let base_url = format!("{}/v1", daemon::server());
     serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
         "provider": {
@@ -336,7 +337,7 @@ fn write_codex_config() -> anyhow::Result<()> {
     }
 
     let profile_path = config_dir.join("llmman.config.toml");
-    let contents = format!("openai_base_url = \"{SERVER}/v1\"\n");
+    let contents = format!("openai_base_url = \"{}/v1\"\n", daemon::server());
     // Avoid rewriting (and bumping the mtime of) a file that's already
     // correct.
     if std::fs::read_to_string(&profile_path).ok().as_deref() != Some(contents.as_str()) {
@@ -373,11 +374,12 @@ fn strip_legacy_llmman_profile(existing: &str) -> String {
 
 /// aider: set OPENAI_API_KEY and OPENAI_BASE_URL.
 fn launch_aider(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let base_url = format!("{}/v1", daemon::server());
     let mut args: Vec<String> = Vec::new();
     if !model.is_empty() {
         args.extend(["--model".to_string(), format!("openai/{model}")]);
     }
-    args.extend(["--openai-api-base".to_string(), format!("{SERVER}/v1")]);
+    args.extend(["--openai-api-base".to_string(), base_url.clone()]);
     args.extend_from_slice(extra_args);
 
     exec_with_env(
@@ -385,7 +387,7 @@ fn launch_aider(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
         &args,
         &[
             ("OPENAI_API_KEY", "llmman"),
-            ("OPENAI_BASE_URL", &format!("{SERVER}/v1")),
+            ("OPENAI_BASE_URL", base_url.as_str()),
         ],
     )
 }
@@ -396,7 +398,7 @@ fn launch_copilot(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
         anyhow::anyhow!("gh (GitHub CLI) is not installed — https://cli.github.com")
     })?;
 
-    let base_url = format!("{SERVER}/v1");
+    let base_url = format!("{}/v1", daemon::server());
     let mut args = vec!["copilot".to_string()];
     if !model.is_empty() {
         args.extend(["--model".to_string(), model.to_string()]);
@@ -418,11 +420,12 @@ fn launch_gemini(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     }
     args.extend_from_slice(extra_args);
 
+    let base_url = format!("{}/v1", daemon::server());
     exec_with_env(
         &bin,
         &args,
         &[
-            ("GEMINI_BASE_URL", &format!("{SERVER}/v1")),
+            ("GEMINI_BASE_URL", base_url.as_str()),
             ("GEMINI_API_KEY", "llmman"),
         ],
     )
@@ -437,7 +440,8 @@ fn launch_simple(
 ) -> anyhow::Result<()> {
     let bin = find_on_path(binary)
         .ok_or_else(|| anyhow::anyhow!("{binary} is not installed — {install_hint}"))?;
-    exec_with_env(&bin, extra_args, &[("OLLAMA_HOST", SERVER)])
+    let server = daemon::server();
+    exec_with_env(&bin, extra_args, &[("OLLAMA_HOST", server.as_str())])
 }
 
 /// hermes: writes its own `~/.hermes/config.yaml` provider entry
@@ -496,7 +500,7 @@ fn write_hermes_config(model: &str) -> anyhow::Result<()> {
     // keyword (`null`, `true`, ...) or contain metacharacters (`:`, `#`,
     // ...) still parses back as the literal string it is.
     let model = yaml_quote(model);
-    let base_url = yaml_quote(&format!("{SERVER}/v1"));
+    let base_url = yaml_quote(&format!("{}/v1", daemon::server()));
     let ours = format!(
         "model:\n  provider: llmman\n  default: {model}\n  base_url: {base_url}\n  api_key: llmman\n\
          providers:\n  llmman:\n    name: llmman\n    api: {base_url}\n    default_model: {model}\n    models:\n      - {model}\n"
@@ -592,7 +596,7 @@ fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
                 "--auth-choice",
                 "ollama",
                 "--custom-base-url",
-                &format!("{SERVER}/v1"),
+                &format!("{}/v1", daemon::server()),
                 "--custom-model-id",
                 effective_model,
                 "--skip-health",
@@ -620,7 +624,7 @@ fn exec_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> 
 
     // Inherit the current environment and overlay OLLAMA_HOST + integration vars.
     let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
-    env.insert("OLLAMA_HOST".to_string(), SERVER.to_string());
+    env.insert("OLLAMA_HOST".to_string(), daemon::server());
     for (k, v) in extra_env {
         env.insert(k.to_string(), v.to_string());
     }

@@ -65,7 +65,7 @@ Start the inference server. Uses `llama-server` from [llama.cpp](https://github.
 llmman serve
 ```
 
-The server listens on `127.0.0.1:17434` and exposes:
+The server listens on `127.0.0.1:17434` by default, overridable via `LLMMAN_HOST`, and exposes:
 
 | API | Endpoints |
 |-----|-----------|
@@ -99,10 +99,11 @@ An idle, unused model is automatically unloaded after `keep_alive`
 `LLMMAN_KEEP_ALIVE`), and `llmman ps`/`/api/ps` reports each model's
 `expires_at`.
 
-Daemon-wide `llama-server` tuning, set before `llmman serve` starts:
+Daemon-wide settings, set before `llmman serve` starts:
 
 | Variable | Effect |
 |----------|--------|
+| `LLMMAN_HOST` | `[host][:port]` `llmman serve` binds to. Every `llmman` client in the same environment connects to it too, rewriting a wildcard host to loopback first. Defaults to `127.0.0.1:17434`. |
 | `LLMMAN_CONTEXT_LENGTH` | Context size (`--ctx-size`) for every model this daemon loads. Defaults to a VRAM-tiered value when unset. |
 | `LLMMAN_FLASH_ATTENTION` | Flash Attention mode (`--flash-attn`): `on`, `off`, or `auto` (llama-server's own default). Also accepts `1`/`0`/`true`/`false`, matching Ollama's `OLLAMA_FLASH_ATTENTION`. |
 | `LLMMAN_KV_CACHE_TYPE` | KV-cache quantization (`--cache-type-k`/`--cache-type-v`), e.g. `f16` (default), `q8_0`, `q4_0` — trades output quality for memory at long context lengths, matching Ollama's `OLLAMA_KV_CACHE_TYPE`. |

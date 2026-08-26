@@ -30,7 +30,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
 
-use llmman::daemon::{self, SERVER};
+use llmman::daemon;
 use llmman::shortnames;
 
 // ---------------------------------------------------------------------------
@@ -150,8 +150,8 @@ fn run(args: &Args) -> anyhow::Result<()> {
     // instead of a raw connection-refused a few requests in.
     if !daemon::server_alive() {
         anyhow::bail!(
-            "llmman serve is not running on 127.0.0.1:17434 — start it first (`llmman serve`), \
-             then retry"
+            "llmman serve is not running on {} — start it first (`llmman serve`), then retry",
+            daemon::bind_addr()
         );
     }
     if args.verbose {
@@ -520,7 +520,7 @@ async fn one_request(
 ) -> anyhow::Result<Sample> {
     let start = Instant::now();
     let resp = client
-        .post(format!("{SERVER}/v1/chat/completions"))
+        .post(format!("{}/v1/chat/completions", daemon::server()))
         .json(&BenchRequest {
             model,
             messages: [BenchMessage {
@@ -612,7 +612,7 @@ async fn one_request(
 /// `unloadModel` — a failed unload shouldn't fail the whole run.
 async fn unload_model(client: &Client, model: &str) {
     let _ = client
-        .post(format!("{SERVER}/api/generate"))
+        .post(format!("{}/api/generate", daemon::server()))
         .json(&serde_json::json!({ "model": model, "keep_alive": 0 }))
         .send()
         .await;

@@ -23,8 +23,9 @@
 //! store) is assumed available and NOT treated as skippable: a pull
 //! failure is a real failure here, not an environment-setup gap.
 //!
-//! `llmman serve` is a process-wide singleton bound to a fixed loopback
-//! port (127.0.0.1:17434 — see `daemon::SERVER`), so these tests can't
+//! `llmman serve` is a process-wide singleton bound to a single loopback
+//! port (127.0.0.1:17434 by default, or wherever `LLMMAN_HOST` points —
+//! see `daemon::server`/`daemon::bind_addr`), so these tests can't
 //! isolate their own daemon instance from each other or from one already
 //! running on the machine: `llmman launch` (via `daemon::ensure_server`)
 //! just reuses whatever's already listening there, preloaded with
