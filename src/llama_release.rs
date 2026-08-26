@@ -81,6 +81,76 @@ fn fetch_release(client: &reqwest::blocking::Client, version: Option<&str>) -> R
         .with_context(|| format!("parse release metadata from {url}"))
 }
 
+/// Name of the pointer asset llama.cpp attaches to its stable semver
+/// releases (e.g. `v0.3.0`): a one-line text file containing the tag of
+/// the promoted `b<number>` build that carries the actual binaries.
+const NIGHTLY_POINTER: &str = "nightly-tag.txt";
+
+/// Returns the pointer asset if `release` is one of llama.cpp's semver
+/// pointer releases rather than a `b<number>` binary release. The pointer
+/// must be the release's sole asset: a release carrying binaries alongside
+/// a pointer file is a binary release and must be used as-is, not
+/// dereferenced away (or refused) just because the pointer exists.
+fn pointer_asset(release: &Release) -> Option<&Asset> {
+    if release.assets.len() != 1 {
+        return None;
+    }
+    release.assets.iter().find(|a| a.name == NIGHTLY_POINTER)
+}
+
+/// Parses the tag out of a downloaded `nightly-tag.txt`: trims
+/// surrounding whitespace (the file ends in a newline) and rejects an
+/// empty result.
+fn parse_pointer_tag(content: &str) -> Option<&str> {
+    let trimmed = content.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+/// Fetches release metadata like [`fetch_release`], then dereferences
+/// llama.cpp's new pointer scheme: since the `b<number>` binary releases
+/// were all marked prerelease, `releases/latest` resolves to a stable
+/// semver release (e.g. `v0.3.0`) whose only asset is [`NIGHTLY_POINTER`],
+/// naming the `b<number>` release that actually carries the binaries.
+/// One hop only: a pointer chain longer than that is a publishing bug
+/// upstream and gets reported rather than followed.
+fn resolve_release(client: &reqwest::blocking::Client, version: Option<&str>) -> Result<Release> {
+    let release = fetch_release(client, version)?;
+    let Some(pointer) = pointer_asset(&release) else {
+        return Ok(release);
+    };
+    let pointer_tag = &release.tag_name;
+    let content = fetch_text(client, &pointer.browser_download_url).with_context(|| {
+        format!("download {NIGHTLY_POINTER} from pointer release {pointer_tag}")
+    })?;
+    let tag = parse_pointer_tag(&content).ok_or_else(|| {
+        anyhow!("pointer release {pointer_tag}'s {NIGHTLY_POINTER} is empty")
+    })?;
+    let dereferenced = fetch_release(client, Some(tag)).with_context(|| {
+        format!("pointer release {pointer_tag} names tag {tag}, but fetching that release failed")
+    })?;
+    if pointer_asset(&dereferenced).is_some() {
+        anyhow::bail!(
+            "pointer release {pointer_tag} names tag {tag}, which is itself \
+             only a {NIGHTLY_POINTER} pointer release (refusing to follow a \
+             pointer chain)"
+        );
+    }
+    Ok(dereferenced)
+}
+
+/// Downloads `url` as plain text, for the small [`NIGHTLY_POINTER`] file.
+fn fetch_text(client: &reqwest::blocking::Client, url: &str) -> Result<String> {
+    let resp = client
+        .get(url)
+        .header("user-agent", "llmman")
+        .send()
+        .with_context(|| format!("query {url}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("download {url} returned {}", resp.status());
+    }
+    resp.text().with_context(|| format!("read body of {url}"))
+}
+
 fn find_asset<'a>(release: &'a Release, must_contain: &str) -> Option<&'a Asset> {
     release
         .assets
@@ -428,6 +498,10 @@ pub struct Resolved {
 /// when given, fetches that exact release tag (e.g. "b10360") instead of
 /// whatever is currently latest — once cached under that tag it is never
 /// re-fetched, so pinning also makes this fully reproducible across runs.
+/// Only a `b<number>` pin gets that guarantee: pinning a semver pointer
+/// tag (e.g. "v0.3.0") re-resolves through the network each run, since the
+/// cache keys on the `b<number>` tag it dereferences to (see
+/// `resolve_release`) and the pointer file is mutable upstream.
 ///
 /// Blocking (network + disk I/O) — callers on an async runtime must run
 /// this via `tokio::task::spawn_blocking` (see `cmd::serve`'s
@@ -484,7 +558,7 @@ fn try_ensure_from_network(
     bin_name: &str,
 ) -> Result<Resolved> {
     let client = http_client()?;
-    let release = fetch_release(&client, pinned_version)?;
+    let release = resolve_release(&client, pinned_version)?;
     let tag = release.tag_name.clone();
     let dest = install_dir(&tag, &query.label)?;
 
@@ -674,6 +748,55 @@ mod tests {
             "llama-b10360-bin-ubuntu-rocm-7.14-x64.tar.gz"
         );
         assert!(find_asset(&release, "-bin-win-cpu-x64.zip").is_none());
+    }
+
+    #[test]
+    fn pointer_asset_detects_a_semver_pointer_release() {
+        let pointer_release = Release {
+            tag_name: "v0.3.0".into(),
+            assets: vec![Asset {
+                name: "nightly-tag.txt".into(),
+                browser_download_url: String::new(),
+            }],
+        };
+        assert_eq!(
+            pointer_asset(&pointer_release).map(|a| a.name.as_str()),
+            Some("nightly-tag.txt")
+        );
+
+        let binary_release = Release {
+            tag_name: "b10621".into(),
+            assets: vec![Asset {
+                name: "llama-b10621-bin-ubuntu-vulkan-x64.tar.gz".into(),
+                browser_download_url: String::new(),
+            }],
+        };
+        assert_eq!(pointer_asset(&binary_release).map(|a| a.name.as_str()), None);
+
+        // A release carrying binaries alongside a pointer file is a binary
+        // release, not a pointer release (see pointer_asset's doc comment).
+        let mixed_release = Release {
+            tag_name: "b10621".into(),
+            assets: vec![
+                Asset {
+                    name: "nightly-tag.txt".into(),
+                    browser_download_url: String::new(),
+                },
+                Asset {
+                    name: "llama-b10621-bin-ubuntu-vulkan-x64.tar.gz".into(),
+                    browser_download_url: String::new(),
+                },
+            ],
+        };
+        assert_eq!(pointer_asset(&mixed_release).map(|a| a.name.as_str()), None);
+    }
+
+    #[test]
+    fn parse_pointer_tag_trims_and_rejects_blank_content() {
+        assert_eq!(parse_pointer_tag("b10621\n"), Some("b10621"));
+        assert_eq!(parse_pointer_tag("  b10621  "), Some("b10621"));
+        assert_eq!(parse_pointer_tag(""), None);
+        assert_eq!(parse_pointer_tag("\n  \n"), None);
     }
 
     #[test]
