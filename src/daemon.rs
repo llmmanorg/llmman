@@ -416,15 +416,54 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
         }
     }
     detach(&mut cmd);
-    cmd.spawn().context("spawn llmman serve")?;
+    let mut child = cmd.spawn().context("spawn llmman serve")?;
 
     for _ in 0..120 {
         std::thread::sleep(Duration::from_millis(500));
         if server_alive() {
             return Ok(());
         }
+        // The daemon is in its own process group but still our child, so
+        // try_wait catches an immediate startup failure (e.g. llama-server
+        // auto-download failing) instead of polling a dead port for 60s.
+        if let Some(status) = child.try_wait().context("wait on llmman serve")? {
+            anyhow::bail!(
+                "llmman serve exited during startup ({status}){}",
+                log_tail(log_path.as_deref())
+            );
+        }
     }
-    anyhow::bail!("llmman serve did not start within 60s")
+    // The daemon may have exited right after the final poll above: check
+    // once more so that narrow window still reports the exit status
+    // instead of the generic timeout.
+    if let Some(status) = child.try_wait().context("wait on llmman serve")? {
+        anyhow::bail!(
+            "llmman serve exited during startup ({status}){}",
+            log_tail(log_path.as_deref())
+        );
+    }
+    anyhow::bail!(
+        "llmman serve did not start within 60s{}",
+        log_tail(log_path.as_deref())
+    )
+}
+
+/// The last few lines of the daemon's log, formatted for appending to an
+/// error message; empty if there's no log path, just a pointer to the
+/// path if the file is unreadable or has no content.
+fn log_tail(log_path: Option<&std::path::Path>) -> String {
+    let Some(path) = log_path else {
+        return String::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return format!(" (see {})", path.display());
+    };
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return format!(" (see {})", path.display());
+    }
+    let tail = &lines[lines.len().saturating_sub(5)..];
+    format!("; last lines of {}:\n{}", path.display(), tail.join("\n"))
 }
 
 /// Puts the about-to-be-spawned child in its own process group (Unix) or
@@ -955,5 +994,29 @@ mod tests {
         }
         assert!(!is_local_host("example.com"));
         assert!(!is_local_host("192.168.1.5"));
+    }
+
+    #[test]
+    fn log_tail_none_path_is_empty() {
+        assert_eq!(log_tail(None), "");
+    }
+
+    #[test]
+    fn log_tail_missing_file_points_at_path() {
+        let path = std::env::temp_dir().join(format!("llmman-log-tail-missing-{}", std::process::id()));
+        let tail = log_tail(Some(&path));
+        assert!(tail.contains("see "), "got: {tail}");
+        assert!(tail.contains(&path.display().to_string()), "got: {tail}");
+    }
+
+    #[test]
+    fn log_tail_returns_last_five_nonempty_lines() {
+        let path = std::env::temp_dir().join(format!("llmman-log-tail-{}", std::process::id()));
+        std::fs::write(&path, "one\ntwo\n\nthree\nfour\nfive\nsix\n").unwrap();
+        let tail = log_tail(Some(&path));
+        std::fs::remove_file(&path).unwrap();
+        assert!(tail.contains("last lines of"), "got: {tail}");
+        assert!(!tail.contains("one"), "got: {tail}");
+        assert!(tail.contains("two\nthree\nfour\nfive\nsix"), "got: {tail}");
     }
 }

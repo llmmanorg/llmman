@@ -974,7 +974,7 @@ mod tests {
 
         let blocked = dir.join("manifests").join("unreadable");
         std::fs::create_dir_all(&blocked).unwrap();
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0)).unwrap();
 
         let images = store.list().unwrap();
         assert_eq!(images.len(), 1);
