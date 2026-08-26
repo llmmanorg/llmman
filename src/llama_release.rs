@@ -61,6 +61,26 @@ fn http_client() -> Result<reqwest::blocking::Client> {
         .context("build http client")
 }
 
+/// Shared GET plumbing for [`fetch_release`] and [`fetch_text`]: sends the
+/// request with the `user-agent` header GitHub requires and turns a
+/// non-success status into an error prefixed with `what` (the callers'
+/// pre-existing messages differ only in that prefix).
+fn http_get(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    what: &str,
+) -> Result<reqwest::blocking::Response> {
+    let resp = client
+        .get(url)
+        .header("user-agent", "llmman")
+        .send()
+        .with_context(|| format!("query {url}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("{what} {url} returned {}", resp.status());
+    }
+    Ok(resp)
+}
+
 /// Fetches release metadata for `version` (an exact tag, e.g. "b10360"),
 /// or the latest release if `None` — mirroring how a caller of Ollama's
 /// own installer can pin `OLLAMA_VERSION` instead of always taking latest.
@@ -69,15 +89,8 @@ fn fetch_release(client: &reqwest::blocking::Client, version: Option<&str>) -> R
         Some(v) => format!("{REPO_API}/releases/tags/{v}"),
         None => format!("{REPO_API}/releases/latest"),
     };
-    let resp = client
-        .get(&url)
-        .header("user-agent", "llmman")
-        .send()
-        .with_context(|| format!("query {url}"))?;
-    if !resp.status().is_success() {
-        anyhow::bail!("GitHub API {url} returned {}", resp.status());
-    }
-    resp.json::<Release>()
+    http_get(client, &url, "GitHub API")?
+        .json::<Release>()
         .with_context(|| format!("parse release metadata from {url}"))
 }
 
@@ -114,17 +127,31 @@ fn parse_pointer_tag(content: &str) -> Option<&str> {
 /// One hop only: a pointer chain longer than that is a publishing bug
 /// upstream and gets reported rather than followed.
 fn resolve_release(client: &reqwest::blocking::Client, version: Option<&str>) -> Result<Release> {
-    let release = fetch_release(client, version)?;
+    resolve_release_with(
+        |v| fetch_release(client, v),
+        |url| fetch_text(client, url),
+        version,
+    )
+}
+
+/// The dereference logic behind [`resolve_release`], with the two network
+/// fetches injected as closures so tests can drive it in memory.
+fn resolve_release_with(
+    fetch_release_fn: impl Fn(Option<&str>) -> Result<Release>,
+    fetch_text_fn: impl Fn(&str) -> Result<String>,
+    version: Option<&str>,
+) -> Result<Release> {
+    let release = fetch_release_fn(version)?;
     let Some(pointer) = pointer_asset(&release) else {
         return Ok(release);
     };
     let pointer_tag = &release.tag_name;
-    let content = fetch_text(client, &pointer.browser_download_url).with_context(|| {
+    let content = fetch_text_fn(&pointer.browser_download_url).with_context(|| {
         format!("download {NIGHTLY_POINTER} from pointer release {pointer_tag}")
     })?;
     let tag = parse_pointer_tag(&content)
         .ok_or_else(|| anyhow!("pointer release {pointer_tag}'s {NIGHTLY_POINTER} is empty"))?;
-    let dereferenced = fetch_release(client, Some(tag)).with_context(|| {
+    let dereferenced = fetch_release_fn(Some(tag)).with_context(|| {
         format!("pointer release {pointer_tag} names tag {tag}, but fetching that release failed")
     })?;
     if pointer_asset(&dereferenced).is_some() {
@@ -139,15 +166,9 @@ fn resolve_release(client: &reqwest::blocking::Client, version: Option<&str>) ->
 
 /// Downloads `url` as plain text, for the small [`NIGHTLY_POINTER`] file.
 fn fetch_text(client: &reqwest::blocking::Client, url: &str) -> Result<String> {
-    let resp = client
-        .get(url)
-        .header("user-agent", "llmman")
-        .send()
-        .with_context(|| format!("query {url}"))?;
-    if !resp.status().is_success() {
-        anyhow::bail!("download {url} returned {}", resp.status());
-    }
-    resp.text().with_context(|| format!("read body of {url}"))
+    http_get(client, url, "download")?
+        .text()
+        .with_context(|| format!("read body of {url}"))
 }
 
 fn find_asset<'a>(release: &'a Release, must_contain: &str) -> Option<&'a Asset> {
@@ -792,6 +813,137 @@ mod tests {
         assert_eq!(parse_pointer_tag("  b10621  "), Some("b10621"));
         assert_eq!(parse_pointer_tag(""), None);
         assert_eq!(parse_pointer_tag("\n  \n"), None);
+    }
+
+    fn pointer_release(tag: &str) -> Release {
+        Release {
+            tag_name: tag.into(),
+            assets: vec![Asset {
+                name: NIGHTLY_POINTER.into(),
+                browser_download_url: format!("https://example.invalid/{tag}/{NIGHTLY_POINTER}"),
+            }],
+        }
+    }
+
+    fn binary_release(tag: &str) -> Release {
+        Release {
+            tag_name: tag.into(),
+            assets: vec![Asset {
+                name: format!("llama-{tag}-bin-ubuntu-x64.tar.gz"),
+                browser_download_url: String::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn resolve_release_with_dereferences_a_pointer_release() {
+        let metadata_fetches = std::cell::RefCell::new(Vec::new());
+        let release = resolve_release_with(
+            |v| {
+                metadata_fetches.borrow_mut().push(v.map(str::to_owned));
+                Ok(match v {
+                    None => pointer_release("v0.3.0"),
+                    Some("b10621") => binary_release("b10621"),
+                    Some(other) => panic!("unexpected tag fetch: {other}"),
+                })
+            },
+            |_url| Ok("b10621\n".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(release.tag_name, "b10621");
+        assert_eq!(
+            *metadata_fetches.borrow(),
+            vec![None, Some("b10621".to_owned())]
+        );
+    }
+
+    #[test]
+    fn resolve_release_with_refuses_a_pointer_chain() {
+        let err = resolve_release_with(
+            |v| {
+                Ok(match v {
+                    None => pointer_release("v0.3.0"),
+                    Some(tag) => pointer_release(tag),
+                })
+            },
+            |_url| Ok("b10621\n".into()),
+            None,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("v0.3.0"), "missing pointer tag in: {msg}");
+        assert!(msg.contains("b10621"), "missing dereferenced tag in: {msg}");
+        assert!(msg.contains("pointer chain"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn resolve_release_with_rejects_a_blank_pointer_file() {
+        let err = resolve_release_with(
+            |_v| Ok(pointer_release("v0.3.0")),
+            |_url| Ok("\n  \n".into()),
+            None,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("v0.3.0"), "missing pointer tag in: {msg}");
+        assert!(msg.contains("is empty"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn resolve_release_with_contextualizes_a_failed_dereferenced_fetch() {
+        let err = resolve_release_with(
+            |v| match v {
+                None => Ok(pointer_release("v0.3.0")),
+                Some(_) => Err(anyhow!("boom")),
+            },
+            |_url| Ok("b10621\n".into()),
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(
+                "pointer release v0.3.0 names tag b10621, but fetching that release failed"
+            ),
+            "unexpected message: {msg}"
+        );
+        assert!(msg.contains("boom"), "missing root cause in: {msg}");
+    }
+
+    #[test]
+    fn resolve_release_with_passes_a_binary_release_through() {
+        let text_fetches = std::cell::Cell::new(0);
+        let release = resolve_release_with(
+            |_v| Ok(binary_release("b10621")),
+            |_url| {
+                text_fetches.set(text_fetches.get() + 1);
+                Ok(String::new())
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(release.tag_name, "b10621");
+        assert_eq!(text_fetches.get(), 0);
+    }
+
+    #[test]
+    fn resolve_release_with_passes_a_pinned_binary_tag_through() {
+        let text_fetches = std::cell::Cell::new(0);
+        let release = resolve_release_with(
+            |v| {
+                assert_eq!(v, Some("b10360"));
+                Ok(binary_release("b10360"))
+            },
+            |_url| {
+                text_fetches.set(text_fetches.get() + 1);
+                Ok(String::new())
+            },
+            Some("b10360"),
+        )
+        .unwrap();
+        assert_eq!(release.tag_name, "b10360");
+        assert_eq!(text_fetches.get(), 0);
     }
 
     #[test]
