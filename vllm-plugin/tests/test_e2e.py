@@ -17,7 +17,9 @@ aarch64. That ordering matters for the two lightweight tests below:
 `launch_e2e.rs`'s `warm_model()` has already pulled `MODEL` into the
 default store, so `resolve()` here hits a warm cache instead of a
 second ~740MB download. The `vllm serve` test pays its own separate
-pull instead (see its own docstring).
+pull instead (see its own docstring). That test runs on vLLM's CPU
+platform on Linux and vllm-metal's Metal-GPU platform on macOS (see
+ci.yml's "Install vLLM (e2e)" step).
 
 Every test here skips (not fails) when its own prerequisite (`llmman`,
 `vllm`) isn't available, same as `tests/launch_e2e.rs`.
@@ -31,6 +33,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -67,9 +70,9 @@ PROMPT = "Reply with exactly the single word: pong"
 # oci://... argument.
 SERVED_MODEL_NAME = "vllm-llmman-e2e"
 
-# Generous: a cold ~1.7GB pull plus real CPU weight loading, no GPU
-# assumed anywhere. 1.5x launch_e2e.rs's own TIMEOUT (600s) for CPU-only
-# inference and a larger checkout.
+# Generous: a cold ~1.7GB pull plus real weight loading. 1.5x
+# launch_e2e.rs's own TIMEOUT (600s) for CPU-only inference and a
+# larger checkout.
 VLLM_STARTUP_TIMEOUT = 900
 
 
@@ -242,13 +245,25 @@ def test_vllm_serve_resolves_and_serves_a_real_oci_reference(tmp_path):
     real `ModelConfig` for an `oci://` reference during vLLM's own
     startup is what triggers the pull.
 
-    `--dtype bfloat16`: MODEL_SAFETENSORS' own native dtype, and a hard
-    requirement, not just a preference — Qwen3.5's CPU Gated DeltaNet
-    kernel asserts BF16 input and crashes on any real forward pass with
-    float16 (which still loads and passes `/health` fine). `--enforce-
-    eager`: skips CUDA-graph startup work that doesn't apply on CPU.
-    `--max-model-len 1024`: bounds the CPU KV-cache for this test's
-    tiny prompt/reply.
+    Two different real backends here, same test, same assertions:
+
+    - Linux: vLLM's own CPU platform. `--dtype bfloat16`: a hard
+      requirement, not just a preference — Qwen3.5's CPU Gated DeltaNet
+      kernel asserts BF16 and crashes on a real forward pass with
+      float16 (which still loads and passes `/health` fine).
+      `--enforce-eager`: skips CUDA-graph startup work that doesn't
+      apply on CPU.
+    - macOS: vllm-metal's Metal-GPU platform (see ci.yml's "Install vLLM
+      (e2e)" step) instead of vLLM's own CPU backend, which hung
+      indefinitely on macOS CI runners regardless of `--dtype`. Flags/
+      env here are lifted from vllm-metal's own CI smoke test
+      (scripts/test.sh) for this same model family: no `--dtype`/
+      `--enforce-eager`; `--max-num-seqs 1` plus
+      `VLLM_METAL_MEMORY_FRACTION` bound GDN linear-attention state
+      under a CI runner's limited Metal memory.
+
+    `--max-model-len 1024`: bounds the KV-cache either way, for this
+    test's tiny prompt/reply.
     """
     pytest.importorskip("vllm")
     binary = shutil.which("vllm")
@@ -268,16 +283,20 @@ def test_vllm_serve_resolves_and_serves_a_real_oci_reference(tmp_path):
         "127.0.0.1",
         "--port",
         str(port),
-        "--dtype",
-        "bfloat16",
-        "--enforce-eager",
         "--max-model-len",
         "1024",
     ]
     env = dict(os.environ)
-    # Bounds vLLM CPU's own KV-cache arena, well under its default
-    # sizing heuristic, to avoid OOM on a shared/constrained CI runner.
-    env.setdefault("VLLM_CPU_KVCACHE_SPACE", "4")
+    if sys.platform == "darwin":
+        cmd += ["--max-num-seqs", "1"]
+        env.setdefault("GLOO_SOCKET_IFNAME", "lo0")
+        env.setdefault("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        env.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.8")
+    else:
+        cmd += ["--dtype", "bfloat16", "--enforce-eager"]
+        # Bounds vLLM CPU's own KV-cache arena, well under its default
+        # sizing heuristic, to avoid OOM on a shared/constrained CI runner.
+        env.setdefault("VLLM_CPU_KVCACHE_SPACE", "4")
 
     log_file = open(log_path, "wb")
     try:

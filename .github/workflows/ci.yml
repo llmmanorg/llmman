@@ -26,9 +26,14 @@ env:
   # than each duplicating the full "llama-<release>-bin-..." filename
   # independently.
   LLAMA_CPP_RELEASE: b10293
-  # vLLM version the e2e job's "Install vLLM (CPU, e2e)" step installs,
-  # for vllm-plugin/tests/test_e2e.py's real `vllm serve` test.
+  # vLLM version the e2e job's "Install vLLM (e2e)" step installs, for
+  # vllm-plugin/tests/test_e2e.py's real `vllm serve` test.
   VLLM_VERSION: "0.27.1"
+  # vllm-metal (github.com/vllm-project/vllm-metal), macOS's Metal-GPU
+  # vLLM platform below, has no stable release channel — only several-
+  # a-day nightlies — so this pins one verified build instead of
+  # floating on "latest" in a release-gating job. Bump deliberately.
+  VLLM_METAL_VERSION: "0.3.0.dev20260825040033"
 
 jobs:
   build:
@@ -299,7 +304,8 @@ jobs:
   #
   # Also runs vllm-plugin/tests/test_e2e.py (Linux x86_64/aarch64 and
   # macOS aarch64, both `matrix.backend` entries) against this job's own
-  # installed `llmman` binary and a real (CPU-only) `vllm serve`.
+  # installed `llmman` binary and a real `vllm serve` — CPU-only on
+  # Linux, Metal-GPU-backed (via vllm-metal) on macOS.
   # --------------------------------------------------------------------------
   e2e:
     name: E2E (launch claude/opencode/codex/hermes/openclaw, vllm-plugin) — ${{ matrix.target }} (${{ matrix.backend }})
@@ -325,9 +331,9 @@ jobs:
     # legitimately take this long in wall-clock time before giving up.
     #
     # +90 on top of that 180 (270 total) for the vllm-plugin steps'
-    # own per-step budgets below: up to 60 min for "Install vLLM (CPU,
-    # e2e)" (a from-source build on macOS) plus up to 30 min for
-    # "pytest -m e2e (vllm-plugin)".
+    # own per-step budgets below: up to 60 min for "Install vLLM (e2e)"
+    # (wheel downloads, but a slow/retried one on a bad connection) plus
+    # up to 30 min for "pytest -m e2e (vllm-plugin)".
     timeout-minutes: 270
     strategy:
       fail-fast: false
@@ -841,8 +847,9 @@ jobs:
 
       # ── vllm-plugin e2e (Linux + macOS) ──────────────────────────────────
       # `vllm-plugin/tests/test_e2e.py` against this job's own installed
-      # `llmman` binary and a real CPU-only `vllm serve`. Excludes
-      # Windows: no vLLM CPU wheel/backend exists for it.
+      # `llmman` binary and a real `vllm serve` — CPU-only on Linux,
+      # Metal-GPU-backed (via vllm-metal) on macOS. Excludes Windows: no
+      # vLLM CPU wheel/backend exists for it.
       #
       # Uses a venv, not the bare system python3 (Ubuntu 24.04's is PEP
       # 668-locked). Both vllm-plugin and vllm (next step) install into
@@ -863,13 +870,18 @@ jobs:
           "$RUNNER_TEMP/vllm-plugin-venv/bin/pip" install -e ./vllm-plugin pytest
           echo "$RUNNER_TEMP/vllm-plugin-venv/bin" >> "$GITHUB_PATH"
 
-      # No GPU assumed, so this installs vLLM's CPU platform, not the
-      # default CUDA wheel. Linux has prebuilt CPU wheels; macOS Apple
-      # Silicon doesn't, so that leg builds from source instead
-      # (cmake/ninja/Xcode assumed present on the macos-15 runner image).
-      # LD_PRELOAD (x86_64 only): vLLM's CPU wheel needs Intel OpenMP
-      # preloaded; located via a glob scoped to this venv.
-      - name: Install vLLM (CPU, e2e)
+      # No GPU assumed on Linux, so that leg installs vLLM's CPU wheel,
+      # not the default CUDA one. macOS installs that same upstream
+      # "+cpu" wheel (a GitHub release asset since v0.26.0; PyPI still
+      # has none) plus vllm-metal on top, which overrides vLLM's
+      # CpuPlatform autodetection with a real Metal-GPU MetalPlatform via
+      # its own `vllm.platform_plugins` entry point — building vLLM's
+      # CPU backend from source on macOS instead (this job's prior
+      # approach) hung forever inside its own CPU worker, regardless of
+      # --dtype (see git history).
+      # LD_PRELOAD (Linux x86_64 only): vLLM's CPU wheel needs Intel
+      # OpenMP preloaded; located via a glob scoped to this venv.
+      - name: Install vLLM (e2e)
         if: runner.os == 'Linux' || runner.os == 'macOS'
         timeout-minutes: 60
         shell: bash
@@ -878,10 +890,10 @@ jobs:
           venv="$RUNNER_TEMP/vllm-plugin-venv"
 
           if [ "${{ runner.os }}" = "macOS" ]; then
-            src="$RUNNER_TEMP/vllm-source"
-            git clone --branch "v${VLLM_VERSION}" --depth 1 https://github.com/vllm-project/vllm.git "$src"
-            "$venv/bin/pip" install -r "$src/requirements/cpu.txt"
-            "$venv/bin/pip" install -e "$src"
+            "$venv/bin/pip" install \
+              "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl"
+            "$venv/bin/pip" install \
+              "https://github.com/vllm-project/vllm-metal/releases/download/v${VLLM_METAL_VERSION}/vllm_metal-${VLLM_METAL_VERSION}-cp312-cp312-macosx_15_0_arm64.whl"
           else
             case "${{ matrix.target }}" in
               x86_64-*) arch=x86_64 ;;
