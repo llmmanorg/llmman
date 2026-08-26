@@ -1003,7 +1003,8 @@ mod tests {
 
     #[test]
     fn log_tail_missing_file_points_at_path() {
-        let path = std::env::temp_dir().join(format!("llmman-log-tail-missing-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("llmman-log-tail-missing-{}", std::process::id()));
         let tail = log_tail(Some(&path));
         assert!(tail.contains("see "), "got: {tail}");
         assert!(tail.contains(&path.display().to_string()), "got: {tail}");
