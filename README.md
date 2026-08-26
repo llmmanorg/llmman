@@ -110,22 +110,6 @@ Daemon-wide settings, set before `llmman serve` starts:
 | `LLMMAN_MODELS` | Local store directory, overriding the default below — matching Ollama's `OLLAMA_MODELS`. `pull`/`push`/`run`/etc. go through the daemon and always use whichever store it was started with. |
 | `LLMMAN_TMPDIR` | Staging directory for `llama-server` release downloads, overriding the default `tmp` subdirectory of the install root — matching Ollama's `OLLAMA_TMPDIR`. |
 
-### Benchmark
-
-`llmman-bench` is a separate binary (`cargo build --bin llmman-bench`), the llmman equivalent of Ollama's own standalone `ollama-bench` tool — not a subcommand of `llmman`, and it doesn't start `llmman serve` for you either; start that first:
-
-```
-llmman serve &
-llmman-bench -m gemma4 --epochs 5
-```
-
-```
-MODEL   PREFILL tok/s  DECODE tok/s  TTFT   TOTAL  PROMPT tok  COMPLETION tok
-gemma4         1302.3         241.0  0.02s  1.26s          24             300
-```
-
-Compare multiple models in one run with a comma-separated list (`-m gemma4,qwen3`), control the generated response length with `--max-tokens`, and target a specific prompt length with `--prompt-tokens` instead of the default story prompt. `--format csv` prints machine-readable output instead of the table above, and `--output <file>` writes results to a file instead of stdout. `--seed`, `--warmup`, `--epochs` (default 6), `-v`/`--verbose`, and `--debug` mirror `ollama-bench`, including retrying a timed epoch that comes back short of `--max-tokens` and varying the prompt on every request so the backend's KV-cache can't turn a "cold" prefill measurement into a cache hit. Each benchmarked model is unloaded once its run finishes, same as `ollama-bench`.
-
 ### Launch an integration
 
 Point an integration at a model in one step. `llmman launch` starts `serve` in the background if it isn't already running (preloading the requested model), then sets the right environment variables and execs the integration:
