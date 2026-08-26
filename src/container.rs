@@ -223,6 +223,9 @@ pub fn pull_image(ociman: ContainerManager, llama_cpp_version: Option<&str>) -> 
 ///
 /// `split_mode`, when given, forwards `--split-mode <mode>`.
 ///
+/// `num_parallel`, when given, forwards `--parallel <n>` — see
+/// `cmd::serve::num_parallel_from_env`'s doc comment.
+///
 /// `mmproj_path`, when given, forwards `--mmproj <path>`, mounted as its
 /// own `/mmproj` read-only volume (it's extracted into a different cache
 /// directory than `model_path`, so it can't share that mount).
@@ -237,6 +240,7 @@ pub fn spawn(
     kv_cache_type: Option<&str>,
     context_shift: bool,
     split_mode: Option<&str>,
+    num_parallel: Option<u32>,
 ) -> Result<tokio::process::Child> {
     let backend = detect_backend();
     let image = backend.image_ref(llama_cpp_version);
@@ -294,6 +298,14 @@ pub fn spawn(
             args.push(format!("{var}={val}"));
         }
     }
+    // Same as above, for llama.cpp's own env-configurable arguments —
+    // see LLAMA_CPP_ENV_PASSTHROUGH_VARS's doc comment.
+    for var in crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS {
+        if let Ok(val) = std::env::var(var) {
+            args.push("-e".into());
+            args.push(format!("{var}={val}"));
+        }
+    }
     args.push(image);
     args.extend([
         "-m".into(),
@@ -333,7 +345,12 @@ pub fn spawn(
         args.push("--split-mode".into());
         args.push(mode.to_string());
     }
+    if let Some(n) = num_parallel {
+        args.push("--parallel".into());
+        args.push(n.to_string());
+    }
 
+    crate::debug_log!("spawning {} {}", ociman.binary(), args.join(" "));
     tokio::process::Command::new(ociman.binary())
         .args(&args)
         .stdin(std::process::Stdio::null())

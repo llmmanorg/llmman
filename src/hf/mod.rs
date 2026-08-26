@@ -70,6 +70,30 @@ fn hf_home() -> PathBuf {
         .join("huggingface")
 }
 
+/// Matches Ollama's own default for `OLLAMA_MAX_TRANSFER_STREAMS`.
+const DEFAULT_MAX_TRANSFER_STREAMS: usize = 4;
+
+/// Maximum number of a safetensors repo's files [`pull::pull`] downloads
+/// concurrently, from `LLMMAN_MAX_TRANSFER_STREAMS` (mirrors Ollama's
+/// `OLLAMA_MAX_TRANSFER_STREAMS`). No effect on GGUF transfers, which
+/// stay sequential.
+pub fn max_transfer_streams() -> usize {
+    parse_max_transfer_streams(std::env::var("LLMMAN_MAX_TRANSFER_STREAMS").ok().as_deref())
+}
+
+/// Unset/blank/unparseable falls back to the default. An explicit `0`
+/// is clamped to `1` (sequential), not bumped up to the default — same
+/// as Ollama's own `max(1, envconfig.MaxTransferStreams())` — since `0`
+/// would otherwise deadlock `buffer_unordered` (nothing would poll) and
+/// an operator explicitly minimizing concurrency shouldn't get more of
+/// it than unset would.
+fn parse_max_transfer_streams(value: Option<&str>) -> usize {
+    match value.map(str::trim).and_then(|v| v.parse::<usize>().ok()) {
+        None => DEFAULT_MAX_TRANSFER_STREAMS,
+        Some(n) => n.max(1),
+    }
+}
+
 /// Path to the active-token file, honoring `HF_TOKEN_PATH`.
 pub fn token_path() -> PathBuf {
     if let Ok(p) = std::env::var("HF_TOKEN_PATH") {
@@ -376,6 +400,22 @@ mod tests {
         assert!(!is_hf_host("registry.example.com"));
         assert!(!is_hf_host("docker.io"));
         assert!(!is_hf_host("modelscope.cn"));
+    }
+
+    #[test]
+    fn parse_max_transfer_streams_defaults_to_four_on_unset_or_unparseable() {
+        assert_eq!(parse_max_transfer_streams(None), 4);
+        assert_eq!(parse_max_transfer_streams(Some("")), 4);
+        assert_eq!(parse_max_transfer_streams(Some("garbage")), 4);
+        assert_eq!(parse_max_transfer_streams(Some("8")), 8);
+        assert_eq!(parse_max_transfer_streams(Some(" 2 ")), 2);
+    }
+
+    #[test]
+    fn parse_max_transfer_streams_clamps_an_explicit_zero_to_one() {
+        // Matches Ollama's own max(1, ...) — an explicit 0 means
+        // "minimize concurrency", not "same as unset".
+        assert_eq!(parse_max_transfer_streams(Some("0")), 1);
     }
 
     #[test]

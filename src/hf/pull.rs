@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use sha2::{Digest as _, Sha256};
 
 use super::api::{self, HfFile};
@@ -135,28 +136,47 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
             if to_download.is_empty() {
                 anyhow::bail!("no model files found in repository {owner}/{repo}");
             }
-            let mut layers = Vec::new();
-            for f in &to_download {
-                let mut d = download_layer(
-                    &dl_client,
-                    &head_client,
-                    &endpoint,
-                    &owner,
-                    &repo,
-                    &commit,
-                    f,
-                    token.as_deref(),
-                    layout_dir,
-                    progress_key,
-                )
-                .await?;
-                d.media_type = api::safetensors_media_type(&f.path).to_string();
-                d.annotations = Some(BTreeMap::from([(
-                    oci::ANNOTATION_FILEPATH.to_string(),
-                    f.path.clone(),
-                )]));
-                layers.push(d);
-            }
+            // Concurrent, bounded by LLMMAN_MAX_TRANSFER_STREAMS (the
+            // GGUF branch above stays sequential). Indexed so `layers`'
+            // order doesn't depend on finish order.
+            let max_streams = super::max_transfer_streams();
+            let mut indexed_layers: Vec<(usize, Descriptor)> =
+                stream::iter(to_download.iter().enumerate())
+                    .map(|(i, f)| {
+                        let dl_client = &dl_client;
+                        let head_client = &head_client;
+                        let endpoint = &endpoint;
+                        let owner = &owner;
+                        let repo = &repo;
+                        let commit = &commit;
+                        let token = token.as_deref();
+                        async move {
+                            let mut d = download_layer(
+                                dl_client,
+                                head_client,
+                                endpoint,
+                                owner,
+                                repo,
+                                commit,
+                                f,
+                                token,
+                                layout_dir,
+                                progress_key,
+                            )
+                            .await?;
+                            d.media_type = api::safetensors_media_type(&f.path).to_string();
+                            d.annotations = Some(BTreeMap::from([(
+                                oci::ANNOTATION_FILEPATH.to_string(),
+                                f.path.clone(),
+                            )]));
+                            Ok::<(usize, Descriptor), anyhow::Error>((i, d))
+                        }
+                    })
+                    .buffer_unordered(max_streams)
+                    .try_collect()
+                    .await?;
+            indexed_layers.sort_by_key(|(i, _)| *i);
+            let layers: Vec<Descriptor> = indexed_layers.into_iter().map(|(_, d)| d).collect();
             oci::build_cncf_manifest(layout_dir, &meta, &format!("{owner}/{repo}"), "", layers)?
         }
     };
@@ -166,6 +186,43 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
 
 fn basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+/// Deletes its `.part` path on drop unless [`disarm`](Self::disarm) was
+/// called first — so a concurrent download cancelled mid-flight (a
+/// sibling in the same `buffer_unordered` batch failing first) still
+/// cleans up its temp file, not just a normal error return.
+struct TmpFileGuard<'a>(&'a Path, bool);
+
+impl TmpFileGuard<'_> {
+    fn disarm(&mut self) {
+        self.1 = false;
+    }
+}
+
+impl Drop for TmpFileGuard<'_> {
+    fn drop(&mut self) {
+        if self.1 {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+}
+
+/// Moves `tmp_path` to `dest` in the content-addressed blob store.
+/// Returns `false` (not moved) if `dest` already had this content — a
+/// concurrent sibling download of identical bytes can win the rename
+/// first now that safetensors files download in parallel; POSIX
+/// overwrites silently, but Windows can error, so `dest` is rechecked
+/// rather than failing the whole pull over that race.
+fn move_into_place(tmp_path: &Path, dest: &Path) -> Result<bool> {
+    if dest.exists() {
+        return Ok(false);
+    }
+    match std::fs::rename(tmp_path, dest) {
+        Ok(()) => Ok(true),
+        Err(_) if dest.exists() => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("move downloaded blob to {}", dest.display())),
+    }
 }
 
 /// Downloads one file straight into `layout_dir`'s content-addressed
@@ -223,6 +280,7 @@ async fn download_layer(
         std::process::id(),
         sanitize(&file.path)
     ));
+    let mut tmp_guard = TmpFileGuard(&tmp_path, true);
 
     let req = FetchRequest {
         url,
@@ -285,7 +343,7 @@ async fn download_layer(
                 }
             }
         }
-        let _ = std::fs::remove_file(&tmp_path);
+        // tmp_guard's drop removes tmp_path.
         return Err(last_err.unwrap()).with_context(|| {
             format!(
                 "download {} failed after {} attempts",
@@ -299,11 +357,11 @@ async fn download_layer(
     std::fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join(digest.trim_start_matches("sha256:"));
     let total = std::fs::metadata(&tmp_path)?.len() as i64;
-    if !dest.exists() {
-        std::fs::rename(&tmp_path, &dest)?;
-    } else {
-        let _ = std::fs::remove_file(&tmp_path);
+    if move_into_place(&tmp_path, &dest)? {
+        tmp_guard.disarm(); // already moved away; nothing left to clean up
     }
+    // else: same content already at `dest` — tmp_guard's drop removes
+    // this now-redundant copy.
 
     Ok(Descriptor {
         media_type: oci::MEDIA_TYPE_MODEL_WEIGHT_RAW.to_string(),
@@ -340,5 +398,85 @@ impl Write for HashingProgressWriter<'_> {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.file.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tmp_file_guard_removes_the_file_on_drop_by_default() {
+        let dir = std::env::temp_dir().join(format!("llmman-tmpguard-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("armed.part");
+        std::fs::write(&path, b"partial").unwrap();
+
+        {
+            let _guard = TmpFileGuard(&path, true);
+        }
+        assert!(
+            !path.exists(),
+            "an armed guard must remove its file on drop"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tmp_file_guard_leaves_the_file_alone_once_disarmed() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-tmpguard-test-disarm-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("disarmed.part");
+        std::fs::write(&path, b"done").unwrap();
+
+        {
+            let mut guard = TmpFileGuard(&path, true);
+            guard.disarm();
+        }
+        assert!(path.exists(), "a disarmed guard must not remove its file");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn move_into_place_moves_the_file_when_dest_is_absent() {
+        let dir = std::env::temp_dir().join(format!("llmman-move-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("a.part");
+        let dest = dir.join("dest");
+        std::fs::write(&tmp, b"content").unwrap();
+
+        assert!(move_into_place(&tmp, &dest).unwrap());
+        assert!(!tmp.exists());
+        assert!(dest.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression test: a concurrent sibling download of identical
+    /// content winning the rename first (`dest` already exists) must
+    /// not be treated as an error — the caller's own `.part` file is
+    /// just redundant, not a failure.
+    #[test]
+    fn move_into_place_tolerates_a_destination_that_already_exists() {
+        let dir =
+            std::env::temp_dir().join(format!("llmman-move-test-existing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("a.part");
+        let dest = dir.join("dest");
+        std::fs::write(&tmp, b"content").unwrap();
+        std::fs::write(&dest, b"content").unwrap(); // a sibling already won
+
+        assert!(!move_into_place(&tmp, &dest).unwrap());
+        assert!(
+            tmp.exists(),
+            "move_into_place itself must leave the redundant tmp file for the caller's guard to clean up"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

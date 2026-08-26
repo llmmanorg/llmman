@@ -48,7 +48,21 @@ pub enum HostGpu {
 
 /// Detects the best available accelerator on this host, in priority order
 /// CUDA > ROCm > Vulkan > CPU on Linux/Windows, or Metal > CPU on macOS.
+///
+/// A non-empty `LLMMAN_LLM_LIBRARY` (mirrors Ollama's
+/// `OLLAMA_LLM_LIBRARY`) bypasses every probe below — see
+/// [`llm_library_override`]. Doesn't affect [`detect_with_vram`]'s own
+/// VRAM sizing, which always probes the real hardware. Two paths that
+/// pick a backend without calling this at all are therefore also
+/// unaffected: an already-on-`PATH` `llama-server` binary (its backend
+/// is whatever it was built with, not llmman's to change), and macOS's
+/// own local-binary release download (llama.cpp publishes exactly one
+/// asset per macOS architecture — the arm64 one is always Metal-capable
+/// — so there's no separate choice to override there either).
 pub fn detect() -> HostGpu {
+    if let Some(forced) = llm_library_override() {
+        return forced;
+    }
     #[cfg(target_os = "macos")]
     {
         detect_macos()
@@ -63,7 +77,62 @@ pub fn detect() -> HostGpu {
     }
 }
 
+/// [`detect`]'s `LLMMAN_LLM_LIBRARY` override. Accepts (case-insensitive)
+/// `cpu`, `cuda`/`cuda12`, `cuda13`, `rocm`, `vulkan`, `metal`. Unset,
+/// blank, or unrecognized falls through to real autodetection.
+fn llm_library_override() -> Option<HostGpu> {
+    parse_llm_library(std::env::var("LLMMAN_LLM_LIBRARY").ok().as_deref())
+}
+
+fn parse_llm_library(value: Option<&str>) -> Option<HostGpu> {
+    let v = value?.trim();
+    if v.is_empty() {
+        return None;
+    }
+    match v.to_ascii_lowercase().as_str() {
+        "cpu" | "none" => Some(HostGpu::None),
+        "cuda" | "cuda12" | "cuda_v12" => Some(HostGpu::Cuda { major: 12 }),
+        "cuda13" | "cuda_v13" => Some(HostGpu::Cuda { major: 13 }),
+        "rocm" => Some(HostGpu::Rocm),
+        "vulkan" => Some(HostGpu::Vulkan),
+        "metal" => Some(HostGpu::Metal),
+        _ => None,
+    }
+}
+
 const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Bytes of VRAM to hold back from [`default_ctx_size`]'s tiering, from
+/// `LLMMAN_GPU_OVERHEAD` (mirrors Ollama's `OLLAMA_GPU_OVERHEAD`).
+/// Subtracted once from the combined total, not per GPU — llmman only
+/// probes one combined VRAM figure. Unset/blank/unparseable is `0`.
+pub fn gpu_overhead_bytes() -> u64 {
+    parse_gpu_overhead(std::env::var("LLMMAN_GPU_OVERHEAD").ok().as_deref())
+}
+
+fn parse_gpu_overhead(value: Option<&str>) -> u64 {
+    value
+        .map(str::trim)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Whether integrated GPUs count during Vulkan probing, from
+/// `LLMMAN_IGPU_ENABLE` (mirrors Ollama's `OLLAMA_IGPU_ENABLE`).
+/// Defaults to disabled, same as Ollama — an integrated GPU is usually a
+/// worse pick than the discrete/CPU fallback.
+pub fn igpu_enabled() -> bool {
+    parse_igpu_enabled(std::env::var("LLMMAN_IGPU_ENABLE").ok().as_deref())
+}
+
+fn parse_igpu_enabled(value: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        Some(v) if !v.is_empty() => {
+            matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        }
+        _ => false,
+    }
+}
 
 /// VRAM-tiered context-size default (used by `cmd::serve` when
 /// `LLMMAN_CONTEXT_LENGTH` isn't set). Below a 47GiB VRAM threshold,
@@ -82,9 +151,10 @@ pub fn default_ctx_size_for(vram_bytes: u64) -> Option<u32> {
     }
 }
 
-/// [`default_ctx_size_for`] applied to [`detect_with_vram`]'s live probe.
+/// [`default_ctx_size_for`] applied to [`detect_with_vram`]'s live probe,
+/// less [`gpu_overhead_bytes`] (floors at 0, never underflows).
 pub fn default_ctx_size() -> Option<u32> {
-    default_ctx_size_for(detect_with_vram().1)
+    default_ctx_size_for(detect_with_vram().1.saturating_sub(gpu_overhead_bytes()))
 }
 
 /// The hidden re-exec argument `main()` checks for, before anything else,
@@ -409,7 +479,7 @@ fn detect_cuda() -> Option<(HostGpu, u64)> {
                     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
                     device,
                 );
-                eprintln!("[llmman] CUDA device {index} compute capability: {major}.{minor}");
+                crate::debug_log!("CUDA device {index} compute capability: {major}.{minor}");
 
                 if let Some(cu_device_total_mem) = &cu_device_total_mem {
                     let mut bytes: u64 = 0;
@@ -478,13 +548,16 @@ fn detect_rocm() -> Option<u64> {
 // ---------------------------------------------------------------------------
 // Vulkan — mirrors vulkan/probe.c: vkCreateInstance,
 // vkEnumeratePhysicalDevices, vkGetPhysicalDeviceProperties (skip
-// VK_PHYSICAL_DEVICE_TYPE_CPU, require apiVersion >= 1.2),
+// VK_PHYSICAL_DEVICE_TYPE_CPU always, and _INTEGRATED_GPU unless
+// LLMMAN_IGPU_ENABLE is set — llmman's own addition, not in probe.c —
+// and require apiVersion >= 1.2),
 // vkGetPhysicalDeviceQueueFamilyProperties (require a queue family with
 // both COMPUTE and TRANSFER bits set).
 // ---------------------------------------------------------------------------
 
 const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: i32 = 1;
 const VK_SUCCESS: i32 = 0;
+const VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: i32 = 1;
 const VK_PHYSICAL_DEVICE_TYPE_CPU: i32 = 4;
 const VK_QUEUE_COMPUTE_BIT: u32 = 0x2;
 const VK_QUEUE_TRANSFER_BIT: u32 = 0x4;
@@ -625,6 +698,9 @@ unsafe fn detect_vulkan_inner(lib: &Library) -> Option<Option<u64>> {
                 if device_type == VK_PHYSICAL_DEVICE_TYPE_CPU {
                     continue;
                 }
+                if device_type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && !igpu_enabled() {
+                    continue;
+                }
                 if api_version < vk_make_api_version(0, 1, 2, 0) {
                     continue;
                 }
@@ -695,6 +771,73 @@ mod tests {
         assert_eq!(default_ctx_size_for(46 * GIB), Some(32768));
         assert_eq!(default_ctx_size_for(47 * GIB), None);
         assert_eq!(default_ctx_size_for(80 * GIB), None);
+    }
+
+    #[test]
+    fn parse_llm_library_recognizes_every_documented_name_case_insensitively() {
+        assert_eq!(parse_llm_library(Some("cpu")), Some(HostGpu::None));
+        assert_eq!(parse_llm_library(Some("CPU")), Some(HostGpu::None));
+        assert_eq!(parse_llm_library(Some("none")), Some(HostGpu::None));
+        assert_eq!(
+            parse_llm_library(Some("cuda")),
+            Some(HostGpu::Cuda { major: 12 })
+        );
+        assert_eq!(
+            parse_llm_library(Some("cuda12")),
+            Some(HostGpu::Cuda { major: 12 })
+        );
+        assert_eq!(
+            parse_llm_library(Some("CUDA13")),
+            Some(HostGpu::Cuda { major: 13 })
+        );
+        assert_eq!(parse_llm_library(Some("rocm")), Some(HostGpu::Rocm));
+        assert_eq!(parse_llm_library(Some("Vulkan")), Some(HostGpu::Vulkan));
+        assert_eq!(parse_llm_library(Some("metal")), Some(HostGpu::Metal));
+    }
+
+    #[test]
+    fn parse_llm_library_falls_through_to_autodetection_when_unset_blank_or_unknown() {
+        assert_eq!(parse_llm_library(None), None);
+        assert_eq!(parse_llm_library(Some("")), None);
+        assert_eq!(parse_llm_library(Some("   ")), None);
+        assert_eq!(parse_llm_library(Some("intel-arc")), None);
+    }
+
+    #[test]
+    fn parse_gpu_overhead_defaults_to_zero_on_anything_unparseable() {
+        assert_eq!(parse_gpu_overhead(None), 0);
+        assert_eq!(parse_gpu_overhead(Some("")), 0);
+        assert_eq!(parse_gpu_overhead(Some("not-a-number")), 0);
+        assert_eq!(parse_gpu_overhead(Some("1073741824")), 1073741824);
+        assert_eq!(parse_gpu_overhead(Some(" 512 ")), 512);
+    }
+
+    #[test]
+    fn default_ctx_size_for_with_overhead_subtracted_can_drop_a_tier() {
+        // A host with 47GiB VRAM would defer to the model's own trained
+        // context; a 1GiB LLMMAN_GPU_OVERHEAD knocks it back under the
+        // 47GiB threshold into the capped 32768 tier.
+        let vram = 47 * GIB;
+        let overhead = 1 * GIB;
+        assert_eq!(default_ctx_size_for(vram), None);
+        assert_eq!(
+            default_ctx_size_for(vram.saturating_sub(overhead)),
+            Some(32768)
+        );
+    }
+
+    #[test]
+    fn parse_igpu_enabled_recognizes_truthy_spellings_only() {
+        assert!(!parse_igpu_enabled(None));
+        assert!(!parse_igpu_enabled(Some("")));
+        assert!(!parse_igpu_enabled(Some("0")));
+        assert!(!parse_igpu_enabled(Some("false")));
+        assert!(!parse_igpu_enabled(Some("no")));
+        assert!(!parse_igpu_enabled(Some("off")));
+        assert!(parse_igpu_enabled(Some("1")));
+        assert!(parse_igpu_enabled(Some("true")));
+        assert!(parse_igpu_enabled(Some("YES")));
+        assert!(parse_igpu_enabled(Some("on")));
     }
 
     #[test]

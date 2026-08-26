@@ -31,7 +31,37 @@ use crate::webui;
 // CLI args
 // ---------------------------------------------------------------------------
 
+/// `llmman serve --help`'s "Environment Variables:" section — mirrors
+/// `ollama serve -h`'s equivalent section. Static text, not built from
+/// live values like Ollama's (llmman's env vars mostly configure the
+/// daemon, not the CLI process printing `--help`).
+const SERVE_ENV_HELP: &str = "\
+Environment Variables:
+      LLMMAN_DEBUG                   Show additional debug information (e.g. LLMMAN_DEBUG=1)
+      LLMMAN_HOST                    [host][:port] to bind (default \"127.0.0.1:17434\")
+      LLMMAN_CONTEXT_LENGTH          Context length to use unless otherwise specified (default: VRAM-tiered)
+      LLMMAN_KEEP_ALIVE              The duration that models stay loaded in memory (default \"5m\")
+      LLMMAN_MAX_LOADED_MODELS       Maximum number of loaded models (default: unbounded)
+      LLMMAN_MAX_TRANSFER_STREAMS    Maximum parallel transfer streams for safetensors model pulls (default 4)
+      LLMMAN_MAX_QUEUE               Maximum number of queued requests (default 512)
+      LLMMAN_MODELS                  The path to the models directory
+      LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only)
+      LLMMAN_NOPRUNE                 Do not prune model blobs on startup
+      LLMMAN_ORIGINS                 A comma separated list of allowed CORS origins
+      LLMMAN_SCHED_SPREAD            Always schedule model across all GPUs
+      LLMMAN_FLASH_ATTENTION         Enable flash attention
+      LLMMAN_KV_CACHE_TYPE           Quantization type for the K/V cache (default: f16)
+      LLMMAN_LLM_LIBRARY             Set backend (cpu/cuda/cuda13/rocm/vulkan/metal) to bypass GPU autodetection
+      LLMMAN_GPU_OVERHEAD            Reserve a portion of VRAM (bytes)
+      LLMMAN_IGPU_ENABLE             Enable integrated GPUs
+      LLMMAN_LOAD_TIMEOUT            How long to allow model loads to stall before giving up (default \"10m\")
+      LLMMAN_TMPDIR                  Staging directory for llama-server release downloads
+      LLAMA_ARG_FIT                  Enable llama.cpp automatic fit of unset memory options (default \"on\")
+      LLAMA_ARG_FIT_TARGET           Target free VRAM margin per device for llama.cpp fit (MiB)
+";
+
 #[derive(Args, Debug)]
+#[command(after_help = SERVE_ENV_HELP)]
 pub struct ServeArgs {
     /// Model to pre-load immediately on startup (e.g. hf.co/unsloth/Qwen3.5-0.8B-GGUF:latest)
     #[arg(value_name = "MODEL")]
@@ -192,6 +222,81 @@ fn parse_sched_spread(value: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// `--parallel <n>` for every `llama-server` this daemon spawns (GGUF
+/// models only — vllm/mlx_lm.server handle concurrency their own way,
+/// with no equivalent flag), from `LLMMAN_NUM_PARALLEL`. Mirrors
+/// Ollama's `OLLAMA_NUM_PARALLEL`; unset leaves llama-server's own
+/// default of 1 untouched.
+fn num_parallel_from_env() -> Option<u32> {
+    parse_num_parallel(std::env::var("LLMMAN_NUM_PARALLEL").ok().as_deref())
+}
+
+/// `0` is rejected, same as llama-server's own `--parallel` validation.
+fn parse_num_parallel(value: Option<&str>) -> Option<u32> {
+    let n: u32 = value?.trim().parse().ok()?;
+    (n != 0).then_some(n)
+}
+
+/// The `--ctx-size` value to actually forward to llama-server: `ctx_size`
+/// (the per-request context every other computation — retries, error
+/// messages, `LLMMAN_CONTEXT_LENGTH` itself — is expressed in) times
+/// `num_parallel`. llama-server splits one `--ctx-size` evenly across
+/// every `--parallel` slot rather than giving each its own full amount,
+/// so forwarding `ctx_size` unscaled would silently divide a request's
+/// real context by `num_parallel`; Ollama avoids exactly this by
+/// launching with `NumCtx * numParallel` (`llm/llama_server.go`).
+/// Callers should only ever pass a non-`None` `num_parallel` alongside
+/// a `Some` `ctx_size` — see `ensure_model`'s own `num_parallel`
+/// fallback, which drops it to `None` otherwise (nothing safe to scale
+/// against).
+fn backend_ctx_size(ctx_size: Option<u32>, num_parallel: Option<u32>) -> Option<u32> {
+    ctx_size.map(|c| c.saturating_mul(num_parallel.unwrap_or(1)))
+}
+
+/// `num_parallel` unless `ctx_size` is `None` (a high-VRAM host
+/// deferring to the model's own trained context, nothing safe to scale
+/// against — see `backend_ctx_size`'s doc comment), in which case
+/// `None`: forwarding `--parallel` unscaled would silently divide that
+/// trained context across slots instead.
+fn effective_num_parallel(ctx_size: Option<u32>, num_parallel: Option<u32>) -> Option<u32> {
+    ctx_size.and(num_parallel)
+}
+
+/// Matches Ollama's own default for `OLLAMA_MAX_QUEUE`.
+const DEFAULT_MAX_QUEUE: usize = 512;
+
+/// Maximum number of requests [`ensure_model`] admits at once before
+/// rejecting with a 503, from `LLMMAN_MAX_QUEUE` (mirrors Ollama's
+/// `OLLAMA_MAX_QUEUE`). See [`try_admit`].
+fn max_queue_from_env() -> usize {
+    parse_max_queue(std::env::var("LLMMAN_MAX_QUEUE").ok().as_deref())
+}
+
+/// Unlike most other `parse_*` functions here, `0` is a real value (see
+/// `try_admit_against`'s doc comment), not "unset".
+fn parse_max_queue(value: Option<&str>) -> usize {
+    match value.map(str::trim) {
+        Some(v) if !v.is_empty() => v.parse().unwrap_or(DEFAULT_MAX_QUEUE),
+        _ => DEFAULT_MAX_QUEUE,
+    }
+}
+
+/// Maximum number of models [`ensure_model`] keeps loaded at once, from
+/// `LLMMAN_MAX_LOADED_MODELS` (mirrors Ollama's `OLLAMA_MAX_LOADED_MODELS`,
+/// but as one flat daemon-wide total, not per-GPU — llmman has no
+/// per-model memory estimate to size a per-GPU figure against). `0` =
+/// unbounded. See [`enforce_max_loaded_models`].
+fn max_loaded_models_from_env() -> usize {
+    parse_max_loaded_models(std::env::var("LLMMAN_MAX_LOADED_MODELS").ok().as_deref())
+}
+
+fn parse_max_loaded_models(value: Option<&str>) -> usize {
+    value
+        .map(str::trim)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Which local engine backs a resolved `ModelPath::SafeTensors`
 /// directory: `mlx_lm.server` (see `spawn_mlx_server`) when this host is
 /// Apple Silicon macOS (`crate::hostgpu::detect() == HostGpu::Metal`)
@@ -218,30 +323,7 @@ fn use_mlx_for_safetensors() -> bool {
         && which_binary("mlx_lm.server").is_ok()
 }
 
-/// Explicit `--context-shift`/`--no-context-shift` override from
-/// `LLMMAN_CONTEXT_SHIFT`, or `None` if unset/empty/unparseable — in
-/// which case [`supports_context_shift`]'s per-model default applies
-/// instead, same as leaving Ollama's own `--think`-style env vars unset
-/// defers to its per-model `supportsContextShift`.
-fn context_shift_override_from_env() -> Option<bool> {
-    parse_context_shift(std::env::var("LLMMAN_CONTEXT_SHIFT").ok().as_deref())
-}
-
-/// [`context_shift_override_from_env`]'s parsing, split out so it's
-/// testable without mutating the real process environment.
-fn parse_context_shift(value: Option<&str>) -> Option<bool> {
-    let v = value?.trim();
-    if v.is_empty() {
-        return None;
-    }
-    Some(!matches!(
-        v.to_ascii_lowercase().as_str(),
-        "0" | "false" | "no" | "off"
-    ))
-}
-
-/// Whether `model_ref` gets `--context-shift` by default, absent an
-/// explicit `LLMMAN_CONTEXT_SHIFT` override. Enabled except for
+/// Whether `model_ref` gets `--context-shift`. Enabled except for
 /// DeepSeek-family ("deepseek2" architecture) models, mirroring Ollama's
 /// own `supportsContextShift` (`server/sched.go`) — their MLA-compressed
 /// KV cache can't be shifted the way llama-server expects. Ollama
@@ -251,14 +333,6 @@ fn parse_context_shift(value: Option<&str>) -> Option<bool> {
 /// instead.
 fn supports_context_shift(model_ref: &str) -> bool {
     !model_ref.to_ascii_lowercase().contains("deepseek")
-}
-
-/// Resolves the `--context-shift`/`--no-context-shift` value to spawn
-/// `model_ref` with: `env_override` (see
-/// [`context_shift_override_from_env`]) when set, else
-/// [`supports_context_shift`]'s per-model default.
-fn resolve_context_shift(model_ref: &str, env_override: Option<bool>) -> bool {
-    env_override.unwrap_or_else(|| supports_context_shift(model_ref))
 }
 
 // ---------------------------------------------------------------------------
@@ -358,16 +432,18 @@ struct Inner {
     // every spawn_llama_server/container::spawn call, local or
     // containerized.
     kv_cache_type: Option<String>,
-    // See context_shift_override_from_env's doc comment — resolved
-    // per-model (see resolve_context_shift) rather than forwarded
-    // verbatim, unlike this struct's other passthrough fields.
-    context_shift_override: Option<bool>,
     // See sched_spread_from_env's doc comment — this is only the
     // *initial* value passed to spawn_llama_server/container::spawn;
     // ensure_model's OOM retry loop may relax an explicit `"none"` to
     // `"layer"` for that one load if the restriction itself looks like
     // the cause.
     split_mode: Option<&'static str>,
+    // See num_parallel_from_env's doc comment.
+    num_parallel: Option<u32>,
+    // See max_queue_from_env's doc comment; enforced by try_admit.
+    max_queue: usize,
+    // See max_loaded_models_from_env's doc comment.
+    max_loaded_models: usize,
     store_path: PathBuf,
     cache_path: PathBuf,
     client: Client,
@@ -375,6 +451,13 @@ struct Inner {
 
 struct ModelManager {
     running: HashMap<String, RunningModel>,
+    // Loads admitted by `enforce_max_loaded_models` but not yet in
+    // `running` (still pulling/spawning/waiting-for-ready, or already
+    // failed and about to release their slot) — counted alongside
+    // `running.len()` when checking `LLMMAN_MAX_LOADED_MODELS`, so two
+    // concurrent loads of two *different* new models can't both pass
+    // that check and overshoot the cap.
+    pending_loads: usize,
 }
 
 /// Everything `handle_ps` (and, transitively, `llmman ps`) needs to know
@@ -1196,18 +1279,29 @@ fn finalize_tool_calls(
 // Error type
 // ---------------------------------------------------------------------------
 
-struct AppError(anyhow::Error);
+#[derive(Debug)]
+struct AppError(anyhow::Error, StatusCode);
 
 impl<E: Into<anyhow::Error>> From<E> for AppError {
     fn from(e: E) -> Self {
-        Self(e.into())
+        Self(e.into(), StatusCode::INTERNAL_SERVER_ERROR)
+    }
+}
+
+impl AppError {
+    /// Builds an `AppError` with its own status code, instead of the
+    /// plain 500 every `?`/`From` conversion above produces — used by
+    /// `ensure_model`'s admission-control checks (`LLMMAN_MAX_QUEUE`/
+    /// `LLMMAN_MAX_LOADED_MODELS`), which need `503`.
+    fn status(status: StatusCode, message: impl Into<String>) -> Self {
+        Self(anyhow!(message.into()), status)
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let body = serde_json::json!({ "error": format!("{:#}", self.0) });
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+        (self.1, Json(body)).into_response()
     }
 }
 
@@ -1373,31 +1467,17 @@ fn parse_keep_alive_str(s: &str) -> Option<Option<Duration>> {
     matched_any.then_some(Some(total))
 }
 
-/// Directly sets a running model's `keep_alive` deadline and resets its
-/// idle clock to now, without touching `in_flight` — used by a load-only
-/// `/api/generate` request (empty prompt, not the unload sentinel), which
-/// wants to set/refresh a model's `keep_alive` without itself counting as
-/// an in-flight generation. A no-op if the model isn't (or is no longer)
-/// running.
-async fn refresh_activity(state: &AppState, model_key: &str, keep_alive: Option<Duration>) {
-    let mut mgr = state.0.manager.lock().await;
-    if let Some(m) = mgr.running.get_mut(model_key) {
-        m.last_active = Instant::now();
-        m.last_active_wall = chrono::Utc::now();
-        m.keep_alive = keep_alive;
-    }
-}
-
-/// Held for the duration of one `/api/chat`, `/api/generate`, `/v1/*`, or
-/// `/v1/messages` request against `model_key`. While at least one
-/// `ActivityGuard` for a model is outstanding, `reap_idle_models` will
-/// never unload it — regardless of how long its `keep_alive` deadline has
-/// already passed — so a generation slower than its own `keep_alive`
-/// can't be killed mid-stream. On drop (successful completion, client
-/// disconnect, or panic) it resets the idle clock to now and, if this
-/// request carried an explicit `keep_alive` override, records it for the
-/// *next* idle check — mirroring Ollama's own runner refcounting
-/// (llm/server.go) at a coarser, whole-model granularity.
+/// Represents `ensure_model`'s own `in_flight` claim (see its doc
+/// comment), from the moment it's first made inside `ensure_model`
+/// until this guard drops. While outstanding, `reap_idle_models`/
+/// `LLMMAN_MAX_LOADED_MODELS` eviction will never touch this model —
+/// including in the gap between `ensure_model` resolving it and a
+/// caller actually starting to use it, since whichever stack frame the
+/// guard is currently sitting in still drops (and releases) it even if
+/// that caller's task is cancelled there. On drop it also resets the
+/// idle clock and, if this request carried an explicit `keep_alive`
+/// override, records it for the next idle check — mirroring Ollama's
+/// own runner refcounting (llm/server.go) at a coarser granularity.
 ///
 /// Must be moved into (captured by) whatever `Stream`/`Body` backs the
 /// actual HTTP response — see `stream_ollama`, `stream_anthropic`, and
@@ -1417,6 +1497,19 @@ struct ActivityGuard {
     /// resolve an explicit value (a request's own `keep_alive`, or the
     /// daemon default when it's absent) via `resolve_keep_alive`.
     keep_alive: Option<Option<Duration>>,
+}
+
+impl ActivityGuard {
+    /// Constructs the guard for a model `ensure_model` has just claimed
+    /// (`in_flight` already incremented by the caller, under the
+    /// manager lock) — never call this without having done that first.
+    fn new(state: &AppState, model_key: &str) -> Self {
+        Self {
+            state: state.clone(),
+            model_key: model_key.to_string(),
+            keep_alive: None,
+        }
+    }
 }
 
 impl Drop for ActivityGuard {
@@ -1446,26 +1539,22 @@ impl Drop for ActivityGuard {
     }
 }
 
-/// Marks `model_key` as having one more in-flight request and returns the
-/// guard that un-marks it (and starts its idle clock) on drop — see
-/// [`ActivityGuard`]. Applies a `Some` `keep_alive` override immediately
-/// too (not just on drop), so a model can't be reaped while this request
-/// is still waiting on something upstream of actually streaming a
-/// response; a `None` override never touches `keep_alive` at all, here or
-/// on drop, exactly as if this request hadn't happened (`last_active` is
-/// still always refreshed, both here and on drop, regardless). A no-op
-/// (the returned guard's drop will be too) if `model_key` isn't found —
-/// defensive only; every caller obtains it from `ensure_model`
+/// Applies `keep_alive` to the model `guard` already claims (see
+/// [`ActivityGuard`]), immediately (not just on drop) so it can't be
+/// reaped while this request is still waiting on something upstream of
+/// actually streaming a response. A `None` override never touches
+/// `keep_alive` at all, here or on drop, exactly as if this request
+/// hadn't happened (`last_active` is still always refreshed, both here
+/// and on drop, regardless). A no-op if `guard`'s model isn't found —
+/// defensive only; every caller obtains `guard` from `ensure_model`
 /// immediately beforehand.
 async fn begin_activity(
-    state: &AppState,
-    model_key: &str,
+    mut guard: ActivityGuard,
     keep_alive: Option<Option<Duration>>,
 ) -> ActivityGuard {
     {
-        let mut mgr = state.0.manager.lock().await;
-        if let Some(m) = mgr.running.get_mut(model_key) {
-            m.in_flight += 1;
+        let mut mgr = guard.state.0.manager.lock().await;
+        if let Some(m) = mgr.running.get_mut(&guard.model_key) {
             m.last_active = Instant::now();
             m.last_active_wall = chrono::Utc::now();
             if let Some(kx) = keep_alive {
@@ -1473,10 +1562,23 @@ async fn begin_activity(
             }
         }
     }
-    ActivityGuard {
-        state: state.clone(),
-        model_key: model_key.to_string(),
-        keep_alive,
+    guard.keep_alive = keep_alive;
+    guard
+}
+
+/// Applies `keep_alive` to the model `guard` already claims, then
+/// releases the claim immediately — used by a load-only `/api/generate`
+/// request (or the CLI `--model` pre-load), which shouldn't hold it open
+/// like a real generation would. `guard` itself does the actual release
+/// on drop, same as always, so this stays cancellation-safe too: even a
+/// task dropped mid-lock-wait here still drops `guard` and releases the
+/// claim, whether or not this update ever landed.
+async fn refresh_activity(guard: ActivityGuard, keep_alive: Option<Duration>) {
+    let mut mgr = guard.state.0.manager.lock().await;
+    if let Some(m) = mgr.running.get_mut(&guard.model_key) {
+        m.last_active = Instant::now();
+        m.last_active_wall = chrono::Utc::now();
+        m.keep_alive = keep_alive;
     }
 }
 
@@ -1588,6 +1690,7 @@ async fn spawn_llama_server(
     kv_cache_type: Option<&str>,
     context_shift: bool,
     split_mode: Option<&str>,
+    num_parallel: Option<u32>,
 ) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args([
@@ -1635,6 +1738,10 @@ async fn spawn_llama_server(
     if let Some(mode) = split_mode {
         cmd.args(["--split-mode", mode]);
     }
+    // See num_parallel_from_env's doc comment.
+    if let Some(n) = num_parallel {
+        cmd.args(["--parallel", &n.to_string()]);
+    }
     // See GPU_VISIBLE_DEVICE_VARS's own doc comment — already inherited
     // by default, forwarded explicitly here for clarity.
     for var in GPU_VISIBLE_DEVICE_VARS {
@@ -1642,6 +1749,13 @@ async fn spawn_llama_server(
             cmd.env(var, val);
         }
     }
+    // See LLAMA_CPP_ENV_PASSTHROUGH_VARS's doc comment.
+    for var in LLAMA_CPP_ENV_PASSTHROUGH_VARS {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+    crate::debug_log!("spawning {}: {:?}", bin.display(), cmd);
     // Piped (not inherited) so a startup crash's own explanation — e.g. a
     // dynamic linker's "error while loading shared libraries" — can be
     // captured into `tail` and surfaced by `wait_for_ready`, not just
@@ -1684,13 +1798,6 @@ async fn spawn_vllm_server(
         "--served-model-name",
         model_name,
     ]);
-    // vllm's default --gpu-memory-utilization (0.9 of the *device's
-    // total* memory) routinely exceeds what's actually free on a
-    // unified-memory host or any box already running other GPU
-    // workloads, so it refuses to start. Let a user work around it.
-    if let Ok(extra) = std::env::var("LLMMAN_VLLM_ARGS") {
-        cmd.args(extra.split_whitespace());
-    }
     // Own process group so ModelProcess's Drop impl can kill vllm's whole
     // worker tree, not just this one pid, without also killing ourselves.
     #[cfg(unix)]
@@ -1753,19 +1860,47 @@ fn which_binary(name: &str) -> anyhow::Result<PathBuf> {
     find_on_path(name).ok_or_else(|| anyhow::anyhow!("{name} not found on PATH"))
 }
 
-/// Polls `process`'s `/health` endpoint until it reports ready, bailing
-/// out immediately — instead of only after the full 600s deadline below —
-/// the moment `process` itself has already exited. Without this check, a
-/// backend that crashes on startup (a missing shared library, a bad
-/// model, an out-of-memory abort, ...) left `llmman launch`/any HTTP
-/// client hanging for up to 10 minutes on a port nothing was ever going
-/// to answer on again, with the real reason sitting only in `serve.log`
-/// (see `ModelProcess::is_alive`'s doc comment on the same non-blocking
-/// `try_wait` this reuses). `stderr_tail`, when given (currently only for
-/// a local llama-server child — see `spawn_llama_server`), lets that
-/// reason be included right in the error instead of just "the process
-/// exited", so it reaches whatever's actually waiting on this (a chat UI
-/// via the HTTP response), not only the log file.
+/// [`wait_for_ready`]'s default deadline — longer than Ollama's own 5m
+/// default since vllm can take several minutes to load a large model.
+/// Overridable via `LLMMAN_LOAD_TIMEOUT`.
+const DEFAULT_LOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// `None` = wait forever, from an `LLMMAN_LOAD_TIMEOUT` of 0 or
+/// negative (mirrors Ollama's `OLLAMA_LOAD_TIMEOUT`).
+fn load_timeout_from_env() -> Option<Duration> {
+    match std::env::var("LLMMAN_LOAD_TIMEOUT") {
+        Ok(v) => parse_load_timeout(&v).unwrap_or(Some(DEFAULT_LOAD_TIMEOUT)),
+        Err(_) => Some(DEFAULT_LOAD_TIMEOUT),
+    }
+}
+
+/// Reuses [`parse_keep_alive_str`]'s duration syntax, but unlike
+/// keep_alive, a zero value also means "forever" here (matches
+/// `OLLAMA_LOAD_TIMEOUT`'s documented behavior). Unlike a plain
+/// delegation, a leading `-` is only treated as "forever" once the
+/// magnitude after it actually parses as a duration —
+/// `parse_keep_alive_str`'s own dash-prefix shortcut accepts any
+/// `"-..."` unconditionally, which would otherwise make a typo like
+/// `LLMMAN_LOAD_TIMEOUT=-garbage` disable the timeout forever instead of
+/// falling back to the documented default.
+fn parse_load_timeout(value: &str) -> Option<Option<Duration>> {
+    let trimmed = value.trim();
+    if let Some(magnitude) = trimmed.strip_prefix('-') {
+        return parse_keep_alive_str(magnitude).map(|_| None);
+    }
+    Some(match parse_keep_alive_str(trimmed)? {
+        Some(d) if d.is_zero() => None,
+        other => other,
+    })
+}
+
+/// Poll interval between `/health` checks in [`wait_for_ready`].
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Polls `process`'s `/health` endpoint until ready, bailing out early
+/// if `process` itself exits first (so a crash-on-startup doesn't hang
+/// the caller for the whole deadline). `stderr_tail`, when given (local
+/// llama-server only), includes the crash reason in the error.
 async fn wait_for_ready(
     client: &Client,
     port: u16,
@@ -1773,12 +1908,18 @@ async fn wait_for_ready(
     stderr_tail: Option<&OutputTail>,
 ) -> anyhow::Result<()> {
     let url = format!("http://127.0.0.1:{port}/health");
-    // vllm can take several minutes to load large models.
-    let deadline = Instant::now() + Duration::from_secs(600);
+    // `None` = wait forever (LLMMAN_LOAD_TIMEOUT of 0 or negative, or a
+    // value so large that adding it to `Instant::now()` would overflow
+    // — `checked_add`, not `+`, so a huge-but-validly-parsed timeout
+    // can't panic the request task).
+    let load_timeout = load_timeout_from_env();
+    let deadline = load_timeout.and_then(|d| Instant::now().checked_add(d));
     loop {
-        if Instant::now() > deadline {
+        let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        if remaining.is_some_and(|r| r.is_zero()) {
             return Err(anyhow!(
-                "inference server on port {port} did not become ready within 600s"
+                "inference server on port {port} did not become ready within {:?}",
+                load_timeout.unwrap_or_default()
             ));
         }
         if !process.is_alive() {
@@ -1793,22 +1934,29 @@ async fn wait_for_ready(
                 None => anyhow!("inference server on port {port} exited before becoming ready"),
             });
         }
-        if let Ok(resp) = client.get(&url).send().await {
-            // llama-server: 200 + {"status":"ok"}   vllm: 200 + {}
-            // mlx_lm.server: 200 + {"status":"ok"} — but, unlike the other
-            // two, this only means its HTTP listener itself is up, not
-            // that any model has finished loading (mlx_lm.server never
-            // preloads one at all here — see spawn_mlx_server's doc
-            // comment on why). Its own request-handling path still waits
-            // out that load before answering, so this is only ever a
-            // "the process didn't crash outright" check for that engine,
-            // not a full readiness one — an intentional, documented
-            // trade-off, not an oversight.
+        // Bound the request by POLL_INTERVAL, not the full remaining
+        // deadline — otherwise a /health that connects but then stalls
+        // could occupy up to the whole deadline (or forever, if unset)
+        // without rechecking process liveness or the deadline.
+        let bound = remaining.map_or(POLL_INTERVAL, |r| r.min(POLL_INTERVAL));
+        let attempt_start = Instant::now();
+        if let Ok(resp) = client.get(&url).timeout(bound).send().await {
+            // llama-server/vllm: 200 once loaded. mlx_lm.server: 200 as
+            // soon as its listener is up, not once a model is loaded
+            // (see spawn_mlx_server) — an accepted, documented gap for
+            // that one engine only.
             if resp.status().is_success() {
                 return Ok(());
             }
         }
-        sleep(Duration::from_millis(500)).await;
+        // Only the unused remainder of one POLL_INTERVAL — not another
+        // full one on top of whatever the attempt above already took —
+        // so a consistently-stalling /health still gets rechecked every
+        // POLL_INTERVAL, not every 2x that. Still never past the
+        // overall deadline either.
+        let sleep_for = POLL_INTERVAL.saturating_sub(attempt_start.elapsed());
+        let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        sleep(remaining.map_or(sleep_for, |r| sleep_for.min(r))).await;
     }
 }
 
@@ -1979,11 +2127,17 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
 }
 
 /// Is `model_ref` already running and alive? See `ModelProcess::is_alive`.
-async fn check_running(state: &AppState, model_ref: &str) -> Option<u16> {
+/// If so, claims it (`in_flight += 1`, under the same lock as the
+/// liveness check) and returns the same [`ActivityGuard`] `ensure_model`
+/// itself would, so eviction can never see this model as idle, and the
+/// claim always has an owner, from this moment until the caller's own
+/// `begin_activity`/`refresh_activity` takes over.
+async fn check_running(state: &AppState, model_ref: &str) -> Option<(u16, ActivityGuard)> {
     let mut mgr = state.0.manager.lock().await;
     if let Some(m) = mgr.running.get_mut(model_ref) {
         if m.process.is_alive() {
-            return Some(m.port);
+            m.in_flight += 1;
+            return Some((m.port, ActivityGuard::new(state, model_ref)));
         }
         eprintln!(
             "[llmman] {model_ref} was marked running on port {} but its process has exited — reloading",
@@ -2025,6 +2179,172 @@ async fn evict_other_models(state: &AppState, model_ref: &str) -> bool {
         running.process.stop_and_wait().await;
     }
     any
+}
+
+/// Releases a `pending_loads` reservation on drop — see
+/// [`enforce_max_loaded_models`]. Mirrors [`ActivityGuard`]'s
+/// Drop-can't-be-async workaround.
+struct PendingLoadGuard {
+    state: AppState,
+    armed: bool,
+}
+
+impl std::fmt::Debug for PendingLoadGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLoadGuard")
+            .field("armed", &self.armed)
+            .finish()
+    }
+}
+
+impl Drop for PendingLoadGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = self.state.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.pending_loads = mgr.pending_loads.saturating_sub(1);
+        });
+    }
+}
+
+/// Reserves a loaded-model slot for a brand-new load, enforcing
+/// `LLMMAN_MAX_LOADED_MODELS` (`0` = unbounded). Counts
+/// `running.len() + pending_loads`, holding the reservation until the
+/// caller's load finishes — closes a race where two concurrent loads of
+/// different models could both pass a plain `running.len()` check.
+///
+/// At the cap, evicts the least-recently-active idle model — reserving
+/// this caller's own slot in the same locked step as removing it, so a
+/// concurrent caller can't steal that room while the eviction's
+/// `stop_and_wait` is still in flight. If the cap is only exceeded by
+/// other reservations (not real running models), waits for one to
+/// resolve instead of evicting a fine model. Returns 503 if nothing can
+/// be freed.
+async fn enforce_max_loaded_models(
+    state: &AppState,
+    max_loaded: usize,
+) -> Result<PendingLoadGuard, AppError> {
+    if max_loaded == 0 {
+        return Ok(PendingLoadGuard {
+            state: state.clone(),
+            armed: false,
+        });
+    }
+    loop {
+        let mut mgr = state.0.manager.lock().await;
+        if mgr.running.len() + mgr.pending_loads < max_loaded {
+            mgr.pending_loads += 1;
+            return Ok(PendingLoadGuard {
+                state: state.clone(),
+                armed: true,
+            });
+        }
+        if mgr.running.len() < max_loaded {
+            // Capacity is only used up by other loads' reservations,
+            // not real running models — wait for one to resolve rather
+            // than evicting a model that's still fine.
+            drop(mgr);
+            sleep(POLL_INTERVAL).await;
+            continue;
+        }
+        let victim = mgr
+            .running
+            .iter()
+            .filter(|(_, m)| m.in_flight == 0)
+            .min_by_key(|(_, m)| m.last_active)
+            .map(|(k, _)| k.clone());
+        let Some(victim) = victim else {
+            return Err(AppError::status(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "max loaded models ({max_loaded}) reached, and every loaded model is busy — try again"
+                ),
+            ));
+        };
+        // Reserve this caller's own slot atomically with removing the
+        // victim, under the same lock — otherwise a concurrent caller
+        // could see the room this eviction is about to free and steal
+        // it while `stop_and_wait` below is still in flight, briefly
+        // running one backend over the configured cap.
+        mgr.pending_loads += 1;
+        let mut running = mgr
+            .running
+            .remove(&victim)
+            .expect("victim key was just looked up under this same lock");
+        drop(mgr); // release the lock before the (possibly slow) stop below
+        eprintln!(
+            "[llmman] evicting {victim} to free a loaded-model slot (LLMMAN_MAX_LOADED_MODELS={max_loaded})"
+        );
+        running.process.stop_and_wait().await;
+        return Ok(PendingLoadGuard {
+            state: state.clone(),
+            armed: true,
+        });
+    }
+}
+
+/// Ollama's own `ErrMaxQueue` message text (`server/sched.go`), reused
+/// verbatim so clients matching on it see the same thing from llmman.
+const MAX_QUEUE_ERROR: &str = "server busy, please try again.  maximum pending requests exceeded";
+
+/// How many callers are currently past `ensure_model`'s own already-
+/// loaded fast path at once — admission control for `LLMMAN_MAX_QUEUE`,
+/// mirroring Ollama's `pendingReqCh`. Released the moment `ensure_model`
+/// returns (same point Ollama's own channel slot frees, not once
+/// generation finishes).
+static PENDING_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII admission guard for whichever counter admitted it (real callers
+/// always get [`PENDING_REQUESTS`] via [`try_admit`]; tests can use
+/// their own dedicated `static`, via [`try_admit_against`], to stay
+/// isolated from other parallel tests).
+struct QueueGuard(&'static std::sync::atomic::AtomicUsize);
+
+impl Drop for QueueGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Admits one more caller past `max_queue` against `counter`, or rejects
+/// with a 503 carrying [`MAX_QUEUE_ERROR`]. `0` is treated as `1`: it
+/// matches Ollama's own `make(chan T, 0)` unbuffered `pendingReqCh`,
+/// which still hands a request directly to its always-listening
+/// consumer goroutine rather than rejecting every single one outright
+/// — a one-in-flight-at-a-time cap is the closest llmman gets to that
+/// same direct handoff, having no consumer-goroutine equivalent of its
+/// own. Not "unbounded" either way. `fetch_update` (not a plain
+/// increment-then-check) so rejected callers never inflate the counter.
+fn try_admit_against(
+    counter: &'static std::sync::atomic::AtomicUsize,
+    max_queue: usize,
+) -> Result<QueueGuard, AppError> {
+    let cap = max_queue.max(1);
+    let admitted = counter
+        .fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |n| (n < cap).then_some(n + 1),
+        )
+        .is_ok();
+    if admitted {
+        Ok(QueueGuard(counter))
+    } else {
+        Err(AppError::status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            MAX_QUEUE_ERROR,
+        ))
+    }
+}
+
+fn try_admit(max_queue: usize) -> Result<QueueGuard, AppError> {
+    try_admit_against(&PENDING_REQUESTS, max_queue)
 }
 
 /// If `model_ref` would be served by `Engine::Mlx` were it loaded right
@@ -2083,14 +2403,27 @@ async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<String> {
     is_safetensors.then_some(model_ref)
 }
 
-/// Ensures `model_ref` is loaded and returns `(canonical_ref, port)`. The
-/// canonical name is what it's actually registered under with its backend
-/// (`--served-model-name`), which can differ from a tagless `model_ref`
-/// (e.g. `hf.co/owner/repo` canonicalizes to `...:latest`). Callers must
-/// forward this canonical name, not their own input, as the "model" field
-/// sent to the backend — vllm validates it strictly and 404s otherwise
-/// (llama-server doesn't, so this went unnoticed for GGUF models).
-async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16), AppError> {
+/// Ensures `model_ref` is loaded and returns `(canonical_ref, port,
+/// guard)`. The canonical name is what it's actually registered under
+/// with its backend (`--served-model-name`), which can differ from a
+/// tagless `model_ref` (e.g. `hf.co/owner/repo` canonicalizes to
+/// `...:latest`). Callers must forward this canonical name, not their
+/// own input, as the "model" field sent to the backend — vllm validates
+/// it strictly and 404s otherwise (llama-server doesn't, so this went
+/// unnoticed for GGUF models).
+///
+/// `guard` is an already-claimed [`ActivityGuard`] — every successful
+/// return (a cache hit via [`check_running`], or a fresh load's own
+/// insert below) claims one `in_flight` unit first, so a concurrent
+/// `LLMMAN_MAX_LOADED_MODELS` eviction can never see this model as
+/// idle. Pass `guard` on to [`begin_activity`]/[`refresh_activity`],
+/// which take over the claim rather than adding a second one; dropping
+/// it any other way (including the whole task being cancelled) still
+/// releases it correctly.
+async fn ensure_model(
+    state: &AppState,
+    model_ref: &str,
+) -> Result<(String, u16, ActivityGuard), AppError> {
     let model_ref = crate::shortnames::resolve_ollama_api(model_ref);
     // Default the tag before the lock below: otherwise two concurrent
     // first-pulls of e.g. "gemma4" and "gemma4:latest" take different
@@ -2099,16 +2432,24 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
     let model_ref = canonical_ref(&state.0.store_path, &model_ref);
     let model_ref = model_ref.as_str();
 
-    if let Some(port) = check_running(state, model_ref).await {
-        return Ok((model_ref.to_string(), port));
+    // Already loaded and reusable — bypasses LLMMAN_MAX_QUEUE entirely,
+    // same as Ollama's own GetRunner bypassing pendingReqCh for a
+    // reusable runner (server/sched.go): only a request that actually
+    // needs scheduling work (waiting on a concurrent load, or starting
+    // a fresh one) below counts against the cap.
+    if let Some((port, guard)) = check_running(state, model_ref).await {
+        return Ok((model_ref.to_string(), port, guard));
     }
+
+    // See try_admit's doc comment — held for the rest of this function.
+    let _queue_guard = try_admit(state.0.max_queue)?;
 
     let _guard = acquire_load_lock(model_ref).await;
 
     // Someone else may have finished loading this model while we
     // waited for the lock above.
-    if let Some(port) = check_running(state, model_ref).await {
-        return Ok((model_ref.to_string(), port));
+    if let Some((port, guard)) = check_running(state, model_ref).await {
+        return Ok((model_ref.to_string(), port, guard));
     }
 
     // If the model is not in the local store, pull it now.
@@ -2131,8 +2472,8 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
     let model_ref = model_ref.as_str();
 
     // Re-check in case that stored form differs from the key above.
-    if let Some(port) = check_running(state, model_ref).await {
-        return Ok((model_ref.to_string(), port));
+    if let Some((port, guard)) = check_running(state, model_ref).await {
+        return Ok((model_ref.to_string(), port, guard));
     }
 
     let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
@@ -2149,7 +2490,10 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
             })
         })
         .unwrap_or_default();
-    let context_shift = resolve_context_shift(model_ref, state.0.context_shift_override);
+    let context_shift = supports_context_shift(model_ref);
+    // See enforce_max_loaded_models's doc comment — held for the rest
+    // of this function.
+    let _pending_load_guard = enforce_max_loaded_models(state, state.0.max_loaded_models).await?;
     // OOM retry loop — on a local llama-server load that fails with a
     // memory-allocation-looking error, tries progressively more invasive
     // fallbacks before giving up (see each branch's own comment for which
@@ -2167,6 +2511,21 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
     let mut port = find_free_port()?;
     loop {
         eprintln!("[llmman] loading {model_ref} on port {port}");
+        // A `None` ctx_size (a high-VRAM host deferring to the model's
+        // own trained context) has nothing safe to scale — forwarding
+        // --parallel unscaled in that case would silently divide that
+        // trained context across slots instead, exactly what scaling
+        // exists to prevent. Fall back to llama-server's own
+        // single-slot default rather than risk that.
+        let num_parallel = effective_num_parallel(ctx_size, state.0.num_parallel);
+        if state.0.num_parallel.is_some() && num_parallel.is_none() {
+            eprintln!(
+                "[llmman] {model_ref}: no explicit ctx-size to scale, ignoring LLMMAN_NUM_PARALLEL for this load"
+            );
+        }
+        // See backend_ctx_size's doc comment — the value actually
+        // forwarded as --ctx-size, scaled up for num_parallel.
+        let scaled_ctx_size = backend_ctx_size(ctx_size, num_parallel);
         // Only a local llama-server child captures a stderr tail (see
         // spawn_llama_server) — every retry below only fires for that case.
         let mut stderr_tail: Option<OutputTail> = None;
@@ -2179,11 +2538,12 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
                     mmproj.as_deref(),
                     port,
                     state.0.llama_cpp_version.as_deref(),
-                    ctx_size,
+                    scaled_ctx_size,
                     state.0.flash_attention.as_deref(),
                     state.0.kv_cache_type.as_deref(),
                     context_shift,
                     split_mode,
+                    num_parallel,
                 )?,
             ),
             (ModelPath::Gguf(path, mmproj), None) => {
@@ -2193,11 +2553,12 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
                     path,
                     mmproj.as_deref(),
                     port,
-                    ctx_size,
+                    scaled_ctx_size,
                     state.0.flash_attention.as_deref(),
                     state.0.kv_cache_type.as_deref(),
                     context_shift,
                     split_mode,
+                    num_parallel,
                 )
                 .await?;
                 stderr_tail = Some(tail);
@@ -2308,10 +2669,15 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
             last_active_wall: chrono::Utc::now(),
             backend_model_path,
             keep_alive: default_keep_alive(),
-            in_flight: 0,
+            // 1, not 0 — see this function's own doc comment.
+            in_flight: 1,
         },
     );
-    Ok((model_ref.to_string(), port))
+    Ok((
+        model_ref.to_string(),
+        port,
+        ActivityGuard::new(state, model_ref),
+    ))
 }
 
 /// The `"model"` value to actually put in the JSON request body sent to
@@ -2612,9 +2978,10 @@ async fn collect_completion(
     let raw = resp.bytes().await.context("read llama-server response")?;
     eprintln!("[llmman] llama-server raw {} bytes", raw.len());
     if raw.is_empty() {
-        return Err(AppError(anyhow!(
-            "inference backend returned empty response body"
-        )));
+        return Err(AppError(
+            anyhow!("inference backend returned empty response body"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
     }
 
     let text = String::from_utf8_lossy(&raw);
@@ -2744,7 +3111,10 @@ async fn post_chat(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(AppError(anyhow!("inference backend {status}: {body}")));
+        return Err(AppError(
+            anyhow!("inference backend {status}: {body}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
     }
     Ok(resp)
 }
@@ -3318,9 +3688,12 @@ async fn handle_show(
     let model_ref = model_ref.as_str();
     eprintln!("[llmman] /api/show model={model_ref:?}");
     let store = OciStore::open(&state.0.store_path)?;
-    let desc = store
-        .find(model_ref)
-        .map_err(|_| AppError(anyhow!("model not found: {model_ref}")))?;
+    let desc = store.find(model_ref).map_err(|_| {
+        AppError(
+            anyhow!("model not found: {model_ref}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    })?;
     Ok(Json(OllamaShowResponse {
         model_info: serde_json::json!({ "digest": desc.digest, "size": desc.size }),
         details: OllamaModelDetails {
@@ -3578,9 +3951,9 @@ async fn handle_ollama_chat(
         req.model,
         req.messages.len()
     );
-    let (model, port) = ensure_model(&state, &req.model).await?;
+    let (model, port, guard) = ensure_model(&state, &req.model).await?;
     let keep_alive = resolve_keep_alive(&req.keep_alive);
-    let activity = begin_activity(&state, &model, Some(keep_alive)).await;
+    let activity = begin_activity(guard, Some(keep_alive)).await;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     // See backend_wire_model's own doc comment — usually just `model`
     // itself, but a different value for an Engine::Mlx backend. Only
@@ -3671,12 +4044,12 @@ async fn handle_ollama_generate(
         .into_response());
     }
 
-    let (model, port) = ensure_model(&state, &req.model).await?;
+    let (model, port, guard) = ensure_model(&state, &req.model).await?;
     // Empty prompt = load-only request (mirrors ollama server/routes.go:429)
     // — including "preload with a custom keep_alive", so refresh it here
     // even though no generation is happening.
     if req.prompt.is_empty() {
-        refresh_activity(&state, &model, resolve_keep_alive(&req.keep_alive)).await;
+        refresh_activity(guard, resolve_keep_alive(&req.keep_alive)).await;
         return Ok(Json(OllamaGenerateChunk {
             model: req.model,
             created_at: now_rfc3339(),
@@ -3689,7 +4062,7 @@ async fn handle_ollama_generate(
     }
 
     let keep_alive = resolve_keep_alive(&req.keep_alive);
-    let activity = begin_activity(&state, &model, Some(keep_alive)).await;
+    let activity = begin_activity(guard, Some(keep_alive)).await;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     // See backend_wire_model's own doc comment.
     let wire_model = backend_wire_model(&state, &model).await;
@@ -3790,14 +4163,14 @@ async fn resolve_openai_request(
     let mut req: serde_json::Value =
         serde_json::from_slice(&body).context("parse OpenAI request body")?;
     let model = req["model"].as_str().unwrap_or("").to_string();
-    let (model, port) = ensure_model(state, &model).await?;
+    let (model, port, guard) = ensure_model(state, &model).await?;
     // The OpenAI-compatible surface has no `keep_alive` field of its own
     // (real Ollama's doesn't either) — `None` leaves whatever this model
     // already has untouched (its load-time default, or an explicit value
     // pinned via `/api/chat`) rather than overwriting it, e.g. clobbering
     // a `keep_alive: -1` ("never unload") pin with the daemon default the
     // instant one OpenAI-compatible request comes in.
-    let activity = begin_activity(state, &model, None).await;
+    let activity = begin_activity(guard, None).await;
     // See backend_wire_model's own doc comment — usually just `model`
     // itself, but a different value for an Engine::Mlx backend.
     let wire_model = backend_wire_model(state, &model).await;
@@ -4006,10 +4379,10 @@ async fn handle_openai_transcriptions(
         });
         return Ok((StatusCode::BAD_REQUEST, Json(body)).into_response());
     };
-    let (model, port) = ensure_model(&state, &model).await?;
+    let (_, port, guard) = ensure_model(&state, &model).await?;
     // No `keep_alive` field on this API surface either — see
     // resolve_openai_request's own comment on the same choice.
-    let activity = begin_activity(&state, &model, None).await;
+    let activity = begin_activity(guard, None).await;
     let url = format!("http://127.0.0.1:{port}/v1/audio/transcriptions");
     proxy(&state.0.client, &url, &headers, body, activity).await
 }
@@ -4203,11 +4576,11 @@ async fn handle_anthropic_messages(
 ) -> Result<Response, AppError> {
     // Backend needs its canonical name (see ensure_model); the response
     // below still echoes req.model back, unchanged from before.
-    let (canonical_model, port) = ensure_model(&state, &req.model).await?;
+    let (canonical_model, port, guard) = ensure_model(&state, &req.model).await?;
     // The Anthropic Messages API has no `keep_alive` field of its own —
     // `None` leaves it untouched, same as the OpenAI-compatible surface
     // (see resolve_openai_request's own comment on why).
-    let activity = begin_activity(&state, &canonical_model, None).await;
+    let activity = begin_activity(guard, None).await;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
 
     let messages = build_anthropic_messages(&req);
@@ -4275,25 +4648,96 @@ fn opt_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// CORS — mirrors Ollama's gin-contrib/cors setup (AllowWildcard +
+// AllowOrigins). `origin_matches` is this crate's own stand-in for its
+// wildcard matching (tower-http has no glob support built in).
+// ---------------------------------------------------------------------------
+
+/// Default CORS origin patterns, matching Ollama's own hardcoded
+/// localhost/127.0.0.1/0.0.0.0 set (minus its desktop-app-only schemes —
+/// llmman has no desktop app).
+fn default_allowed_origins() -> Vec<String> {
+    let mut origins = Vec::new();
+    for host in ["localhost", "127.0.0.1", "0.0.0.0", "[::1]"] {
+        for scheme in ["http", "https"] {
+            origins.push(format!("{scheme}://{host}"));
+            origins.push(format!("{scheme}://{host}:*"));
+        }
+    }
+    origins
+}
+
+/// `LLMMAN_ORIGINS` (comma-separated, mirrors `OLLAMA_ORIGINS`) plus
+/// [`default_allowed_origins`]'s fixed set, always.
+fn allowed_origins_from_env() -> Vec<String> {
+    let mut origins: Vec<String> = std::env::var("LLMMAN_ORIGINS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    origins.extend(default_allowed_origins());
+    origins
+}
+
+/// A single `*` anywhere in `pattern` matches any substring there (e.g.
+/// `https://*.example.com`, or a bare `*` for "allow everything") —
+/// matches `gin-contrib/cors`'s own `AllowWildcard`, which Ollama's CORS
+/// setup enables. A second `*` never matches (single-wildcard only, same
+/// as that library). No `*` at all requires a byte-for-byte match.
+fn origin_matches(origin: &str, pattern: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) if !suffix.contains('*') => {
+            origin.len() >= prefix.len() + suffix.len()
+                && origin.starts_with(prefix)
+                && origin.ends_with(suffix)
+        }
+        Some(_) => false,
+        None => origin == pattern,
+    }
+}
+
+/// This daemon's CORS layer: any method/header, but `Origin` must match
+/// [`allowed_origins_from_env`].
+fn cors_layer() -> tower_http::cors::CorsLayer {
+    let patterns = allowed_origins_from_env();
+    tower_http::cors::CorsLayer::new()
+        .allow_methods(tower_http::cors::AllowMethods::any())
+        .allow_headers(tower_http::cors::AllowHeaders::any())
+        .allow_origin(tower_http::cors::AllowOrigin::predicate(
+            move |origin, _parts| {
+                origin
+                    .to_str()
+                    .is_ok_and(|origin| patterns.iter().any(|p| origin_matches(origin, p)))
+            },
+        ))
+}
+
+// ---------------------------------------------------------------------------
 // llama-server binary resolution
 // ---------------------------------------------------------------------------
 
-/// Env var names Ollama documents for selecting specific GPU device(s)
-/// within whichever backend is active (see docs/gpu.mdx's "Overrides"
-/// sections: `CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`,
-/// `ROCR_VISIBLE_DEVICES`, `GGML_VK_VISIBLE_DEVICES`). A local
-/// `llama-server` child already inherits these from `llmman serve`'s own
-/// environment with no extra code — they're forwarded explicitly here
-/// anyway so intent doesn't silently depend on `Command`'s default
-/// env-inheritance behavior, and so the exact same list can be reused
-/// as-is by `crate::container::spawn`, whose `docker run`/`podman run`
-/// does *not* inherit the host environment into the container on its own.
+/// GPU device-selection vars Ollama documents. A local `llama-server`
+/// child inherits these for free; forwarded explicitly here so
+/// `crate::container::spawn`'s `docker run`/`podman run` (which does
+/// *not* inherit the host env) can reuse the same list.
 pub const GPU_VISIBLE_DEVICE_VARS: &[&str] = &[
     "CUDA_VISIBLE_DEVICES",
     "HIP_VISIBLE_DEVICES",
     "ROCR_VISIBLE_DEVICES",
     "GGML_VK_VISIBLE_DEVICES",
+    "GPU_DEVICE_ORDINAL",
+    "HSA_OVERRIDE_GFX_VERSION",
 ];
+
+/// llama.cpp's own env-configurable arguments (`common/arg.cpp`'s
+/// `set_env`), forwarded the same way as [`GPU_VISIBLE_DEVICE_VARS`] —
+/// llama-server reads these itself, llmman just makes sure they reach it.
+pub const LLAMA_CPP_ENV_PASSTHROUGH_VARS: &[&str] = &["LLAMA_ARG_FIT", "LLAMA_ARG_FIT_TARGET"];
 
 /// Resolves the `llama-server` binary to run locally (no `--ociman`):
 /// prefers whatever is already on `PATH` untouched, unless
@@ -4417,6 +4861,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let state = AppState(Arc::new(Inner {
         manager: Mutex::new(ModelManager {
             running: HashMap::new(),
+            pending_loads: 0,
         }),
         llama_server_bin: StdMutex::new(llama_server_bin),
         // Canonicalized now, while the file certainly still exists —
@@ -4431,8 +4876,10 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         ctx_size_explicit: ctx_size_explicit.is_some(),
         flash_attention: flash_attention_from_env(),
         kv_cache_type: kv_cache_type_from_env(),
-        context_shift_override: context_shift_override_from_env(),
         split_mode: sched_spread_from_env(),
+        num_parallel: num_parallel_from_env(),
+        max_queue: max_queue_from_env(),
+        max_loaded_models: max_loaded_models_from_env(),
         store_path,
         cache_path,
         client: Client::new(),
@@ -4479,6 +4926,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         )
         // Anthropic API
         .route("/v1/messages", post(handle_anthropic_messages))
+        .layer(cors_layer())
         .with_state(app_state);
 
     let addr = crate::daemon::bind_addr();
@@ -4498,15 +4946,16 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         tokio::spawn(async move {
             match ensure_model(&state_clone, &model).await {
                 // ensure_model's own keep_alive (the daemon default, 5
-                // minutes) would otherwise start counting down the moment
-                // this finishes loading — with no request traffic and no
-                // ActivityGuard to reset it, the idle reaper could unload
-                // a model asked for on the command line before it's ever
-                // actually used, defeating the whole point of pre-loading
-                // it. Pin it ("never unload") instead — a model named
-                // explicitly at startup is meant to stay warm for the
-                // daemon's lifetime, not just its first 5 idle minutes.
-                Ok((canonical, _)) => refresh_activity(&state_clone, &canonical, None).await,
+                // minutes) would otherwise start counting down the
+                // moment this finishes loading, with no request traffic
+                // to reset it — the idle reaper could unload a model
+                // asked for on the command line before it's ever
+                // actually used, defeating the whole point of
+                // pre-loading it. Pin it ("never unload") instead — a
+                // model named explicitly at startup is meant to stay
+                // warm for the daemon's lifetime, not just its first 5
+                // idle minutes.
+                Ok((_, _, guard)) => refresh_activity(guard, None).await,
                 Err(e) => eprintln!("[llmman] pre-load failed: {:#}", e.0),
             }
         });
@@ -4661,6 +5110,39 @@ mod tests {
             Some(Duration::from_secs(600))
         );
         assert_eq!(resolve_keep_alive(&Some(serde_json::json!(-1))), None);
+    }
+
+    #[test]
+    fn parse_load_timeout_accepts_the_same_duration_syntax_as_keep_alive() {
+        assert_eq!(
+            parse_load_timeout("300"),
+            Some(Some(Duration::from_secs(300)))
+        );
+        assert_eq!(
+            parse_load_timeout("10m"),
+            Some(Some(Duration::from_secs(600)))
+        );
+        assert_eq!(parse_load_timeout("garbage"), None);
+    }
+
+    #[test]
+    fn parse_load_timeout_treats_zero_or_negative_as_infinite() {
+        // Unlike keep_alive (where 0 means "unload immediately"),
+        // OLLAMA_LOAD_TIMEOUT documents 0 as meaning "wait forever", same
+        // as any negative value.
+        assert_eq!(parse_load_timeout("0"), Some(None));
+        assert_eq!(parse_load_timeout("-1"), Some(None));
+        assert_eq!(parse_load_timeout("-10m"), Some(None));
+    }
+
+    #[test]
+    fn parse_load_timeout_rejects_a_dash_prefixed_non_duration_instead_of_disabling_forever() {
+        // A bare "starts with '-'" isn't enough — the magnitude must
+        // actually parse as a duration, or this must fall through to
+        // the default (via load_timeout_from_env's own unwrap_or), not
+        // silently disable the timeout forever.
+        assert_eq!(parse_load_timeout("-garbage"), None);
+        assert_eq!(parse_load_timeout("-"), None);
     }
 
     /// Regression test for `handle_ollama_generate`'s unload-sentinel
@@ -5014,6 +5496,7 @@ mod tests {
         AppState(Arc::new(Inner {
             manager: Mutex::new(ModelManager {
                 running: HashMap::new(),
+                pending_loads: 0,
             }),
             llama_server_bin: StdMutex::new(None),
             exe: None,
@@ -5023,8 +5506,14 @@ mod tests {
             ctx_size_explicit: false,
             flash_attention: None,
             kv_cache_type: None,
-            context_shift_override: None,
             split_mode: None,
+            num_parallel: None,
+            // usize::MAX, not 0 — 0 now means "admit almost nothing"
+            // (see try_admit_against's doc comment), and no test here
+            // calls ensure_model (the only caller of try_admit) directly
+            // anyway.
+            max_queue: usize::MAX,
+            max_loaded_models: 0,
             store_path: std::env::temp_dir(),
             cache_path: std::env::temp_dir(),
             client: Client::new(),
@@ -5298,24 +5787,324 @@ mod tests {
         assert!(!evict_other_models(&state, "the-model-being-loaded").await);
     }
 
+    /// Regression test: a cache hit must claim `in_flight`, exactly like
+    /// a fresh load's own insert, so `enforce_max_loaded_models` can
+    /// never see it as idle in the window between `ensure_model`
+    /// returning and the caller's own `begin_activity`/
+    /// `refresh_activity` — see `check_running`'s doc comment.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_running_claims_in_flight_on_a_live_hit() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running
+                .insert("m".into(), running_model_fixture(None, Duration::ZERO, 0));
+        }
+
+        // Held, not dropped immediately — otherwise its own release
+        // could already have run by the next line.
+        let (_, _guard) = check_running(&state, "m").await.unwrap();
+        assert_eq!(
+            state.0.manager.lock().await.running["m"].in_flight,
+            1,
+            "a cache hit must claim in_flight so it can't be evicted before the caller claims it"
+        );
+    }
+
+    /// Regression test: the claim `check_running`/`ensure_model` hands
+    /// back must release itself even if the caller's task is dropped
+    /// before ever reaching `begin_activity`/`refresh_activity` — the
+    /// whole point of returning an [`ActivityGuard`] instead of a plain
+    /// bool/count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unclaimed_activity_guard_still_releases_on_drop() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running
+                .insert("m".into(), running_model_fixture(None, Duration::ZERO, 0));
+        }
+
+        let (_, guard) = check_running(&state, "m").await.unwrap();
+        assert_eq!(state.0.manager.lock().await.running["m"].in_flight, 1);
+
+        drop(guard); // simulates the caller's task being cancelled here
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            state.0.manager.lock().await.running["m"].in_flight,
+            0,
+            "the claim must still be released even if never handed off"
+        );
+    }
+
+    #[test]
+    fn parse_max_queue_defaults_to_ollamas_own_512_on_anything_unparseable() {
+        assert_eq!(parse_max_queue(None), 512);
+        assert_eq!(parse_max_queue(Some("")), 512);
+        assert_eq!(parse_max_queue(Some("garbage")), 512);
+        assert_eq!(parse_max_queue(Some("10")), 10);
+        // Unlike most other LLMMAN_*/parse_* pairs, an explicit "0" is a
+        // real value (disables the bound), not treated as unset.
+        assert_eq!(parse_max_queue(Some("0")), 0);
+    }
+
+    #[test]
+    fn parse_max_loaded_models_defaults_to_unbounded_on_anything_unparseable() {
+        assert_eq!(parse_max_loaded_models(None), 0);
+        assert_eq!(parse_max_loaded_models(Some("")), 0);
+        assert_eq!(parse_max_loaded_models(Some("garbage")), 0);
+        assert_eq!(parse_max_loaded_models(Some("3")), 3);
+    }
+
+    #[test]
+    fn try_admit_rejects_once_the_cap_is_reached_and_releases_on_drop() {
+        // A dedicated counter, not the real PENDING_REQUESTS — isolates
+        // this from other tests running in parallel.
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        let first =
+            try_admit_against(&COUNTER, 1).expect("first admission under the cap must succeed");
+        assert!(
+            try_admit_against(&COUNTER, 1).is_err(),
+            "a second admission at the cap must be rejected"
+        );
+
+        drop(first);
+        assert!(
+            try_admit_against(&COUNTER, 1).is_ok(),
+            "dropping an admitted guard must free its slot for the next caller"
+        );
+    }
+
+    #[test]
+    fn try_admit_with_a_zero_cap_admits_one_at_a_time_not_none_or_unbounded() {
+        // Approximates Ollama's own unbuffered pendingReqCh at
+        // OLLAMA_MAX_QUEUE=0 — neither "reject everything" nor
+        // "unbounded".
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let first = try_admit_against(&COUNTER, 0).expect("one admission must still succeed");
+        assert!(
+            try_admit_against(&COUNTER, 0).is_err(),
+            "a second concurrent admission must still be rejected"
+        );
+        drop(first);
+        assert!(
+            try_admit_against(&COUNTER, 0).is_ok(),
+            "dropping the first must free the slot for the next caller"
+        );
+    }
+
+    #[test]
+    fn default_allowed_origins_covers_every_scheme_and_localhost_spelling() {
+        let origins = default_allowed_origins();
+        for expected in [
+            "http://localhost:*",
+            "https://localhost:*",
+            "http://127.0.0.1:*",
+            "https://127.0.0.1:*",
+            "http://0.0.0.0:*",
+            "https://0.0.0.0:*",
+            "http://[::1]:*",
+            "https://[::1]:*",
+        ] {
+            assert!(
+                origins.iter().any(|o| o == expected),
+                "missing default origin pattern {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_matches_a_trailing_wildcard_port_pattern() {
+        assert!(origin_matches(
+            "http://localhost:3000",
+            "http://localhost:*"
+        ));
+        assert!(origin_matches("http://localhost:1", "http://localhost:*"));
+        assert!(origin_matches("http://localhost:", "http://localhost:*"));
+        assert!(!origin_matches(
+            "http://evil.example:3000",
+            "http://localhost:*"
+        ));
+        assert!(!origin_matches(
+            "http://localhost.evil.example",
+            "http://localhost:*"
+        ));
+    }
+
+    #[test]
+    fn origin_matches_a_wildcard_anywhere_in_the_pattern() {
+        // Subdomain wildcard, mirroring gin-contrib/cors's own
+        // AllowWildcard (not just llmman's default `:*` port entries).
+        assert!(origin_matches(
+            "https://foo.example.com",
+            "https://*.example.com"
+        ));
+        assert!(!origin_matches(
+            "https://example.com",
+            "https://*.example.com"
+        ));
+        // A bare "*" allows every origin.
+        assert!(origin_matches("https://anything.at.all", "*"));
+        // More than one '*' never matches.
+        assert!(!origin_matches("https://example.com", "https://*.*.com"));
+    }
+
+    #[test]
+    fn origin_matches_a_plain_pattern_only_byte_for_byte() {
+        assert!(origin_matches("https://example.com", "https://example.com"));
+        assert!(!origin_matches(
+            "https://example.com:8080",
+            "https://example.com"
+        ));
+        assert!(!origin_matches("http://example.com", "https://example.com"));
+    }
+
+    #[test]
+    fn allowed_origins_from_env_always_includes_the_localhost_defaults() {
+        let origins = allowed_origins_from_env();
+        assert!(origins.iter().any(|o| o == "http://localhost:*"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enforce_max_loaded_models_is_a_no_op_when_unbounded() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "m1".into(),
+                running_model_fixture(None, Duration::from_secs(0), 0),
+            );
+        }
+        assert!(enforce_max_loaded_models(&state, 0).await.is_ok());
+        assert_eq!(state.0.manager.lock().await.running.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enforce_max_loaded_models_evicts_the_least_recently_active_idle_model_first() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "oldest-idle".into(),
+                running_model_fixture(None, Duration::from_secs(300), 0),
+            );
+            mgr.running.insert(
+                "newest-idle".into(),
+                running_model_fixture(None, Duration::from_secs(1), 0),
+            );
+        }
+
+        // Already at the cap (2 running, max_loaded 2) — a caller about
+        // to insert a third must first free exactly one slot.
+        assert!(enforce_max_loaded_models(&state, 2).await.is_ok());
+
+        let mgr = state.0.manager.lock().await;
+        assert_eq!(mgr.running.len(), 1);
+        assert!(
+            !mgr.running.contains_key("oldest-idle"),
+            "the least-recently-active idle model must be evicted first"
+        );
+        assert!(mgr.running.contains_key("newest-idle"));
+    }
+
+    /// Regression test: the freed slot from an eviction must already be
+    /// reserved (`pending_loads`) for the caller that triggered it, in
+    /// the same locked step as the removal — not left open for a
+    /// concurrent caller to steal while `stop_and_wait` is in flight.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enforce_max_loaded_models_reserves_its_own_slot_when_evicting() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "victim".into(),
+                running_model_fixture(None, Duration::from_secs(300), 0),
+            );
+        }
+
+        let guard = enforce_max_loaded_models(&state, 1).await.unwrap();
+        let mgr = state.0.manager.lock().await;
+        assert_eq!(mgr.running.len(), 0, "the sole idle model must be evicted");
+        assert_eq!(
+            mgr.pending_loads, 1,
+            "the freed slot must already be reserved for this caller"
+        );
+        drop(mgr);
+        drop(guard);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enforce_max_loaded_models_rejects_with_503_when_every_loaded_model_is_busy() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "busy-1".into(),
+                running_model_fixture(None, Duration::from_secs(0), 1),
+            );
+        }
+
+        let err = enforce_max_loaded_models(&state, 1)
+            .await
+            .expect_err("every model at/over the cap is busy, so this must reject");
+        assert_eq!(err.1, StatusCode::SERVICE_UNAVAILABLE);
+
+        // Nothing evicted — a busy model must survive.
+        assert_eq!(state.0.manager.lock().await.running.len(), 1);
+    }
+
+    /// Regression test: a second concurrent load of a *different* model
+    /// must not also pass the `max_loaded` check while a first load is
+    /// still pending (not yet in `running`) — see
+    /// `enforce_max_loaded_models`'s doc comment on the reservation this
+    /// closes a race on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enforce_max_loaded_models_reserves_a_pending_slot_for_an_in_flight_load() {
+        let state = test_state();
+        let guard1 = enforce_max_loaded_models(&state, 1).await.unwrap();
+        assert_eq!(state.0.manager.lock().await.pending_loads, 1);
+
+        let state2 = state.clone();
+        let second = tokio::spawn(async move { enforce_max_loaded_models(&state2, 1).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second.is_finished(),
+            "a second load must wait for the first reservation, not double up on it"
+        );
+
+        drop(guard1);
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("second load must proceed once the first reservation is released")
+            .unwrap()
+            .expect("second load must succeed once a slot is actually free");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn begin_activity_marks_in_flight_and_its_drop_releases_it_and_updates_keep_alive() {
         let state = test_state();
         {
             let mut mgr = state.0.manager.lock().await;
+            // in_flight: 1, as ensure_model's own claim (fresh load or
+            // cache hit — either way it always claims one) already left
+            // it before this test's begin_activity call, same as a real
+            // handler would see it.
             mgr.running.insert(
                 "m".into(),
-                running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+                running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 1),
             );
         }
 
-        let guard = begin_activity(&state, "m", Some(Some(Duration::from_secs(42)))).await;
+        let claim = ActivityGuard::new(&state, "m");
+        let guard = begin_activity(claim, Some(Some(Duration::from_secs(42)))).await;
         {
             let mgr = state.0.manager.lock().await;
             let m = &mgr.running["m"];
             assert_eq!(
                 m.in_flight, 1,
-                "begin_activity must mark one in-flight request"
+                "begin_activity must not add a second claim on top of ensure_model's own"
             );
             assert_eq!(m.keep_alive, Some(Duration::from_secs(42)));
         }
@@ -5351,13 +6140,15 @@ mod tests {
         {
             let mut mgr = state.0.manager.lock().await;
             // "Forever" — as if pinned via `/api/chat`'s `keep_alive: -1`.
+            // in_flight: 1, as ensure_model's own prior claim.
             mgr.running.insert(
                 "m".into(),
-                running_model_fixture(None, Duration::from_secs(600), 0),
+                running_model_fixture(None, Duration::from_secs(600), 1),
             );
         }
 
-        let guard = begin_activity(&state, "m", None).await;
+        let claim = ActivityGuard::new(&state, "m");
+        let guard = begin_activity(claim, None).await;
         {
             let mgr = state.0.manager.lock().await;
             let m = &mgr.running["m"];
@@ -5382,27 +6173,54 @@ mod tests {
         );
     }
 
+    /// Regression test: the load-only `/api/generate` path calls
+    /// `refresh_activity` instead of `begin_activity` — it must release
+    /// `ensure_model`'s own provisional claim itself, since no
+    /// `ActivityGuard` will ever do it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_activity_releases_ensure_models_own_claim() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "m".into(),
+                running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 1),
+            );
+        }
+
+        refresh_activity(ActivityGuard::new(&state, "m"), None).await;
+        // The guard's own Drop (releasing the claim) spawns a task —
+        // give it a moment to run, same as every other ActivityGuard
+        // drop test in this file.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            state.0.manager.lock().await.running["m"].in_flight,
+            0,
+            "refresh_activity must release ensure_model's claim, with no guard to do it later"
+        );
+    }
+
     /// Regression test for `serve_async`'s `ServeArgs::model` pre-load:
-    /// `ensure_model` alone leaves a freshly loaded model at the daemon
-    /// default `keep_alive` (5 minutes) with nothing to reset its idle
-    /// clock (no request has been served yet, so no `ActivityGuard`
-    /// exists) — the idle reaper would unload a model asked for on the
-    /// command line before it's ever actually used, defeating the whole
-    /// point of pre-loading it. `refresh_activity(state, model, None)`
-    /// (what the pre-load task now calls right after `ensure_model`
-    /// succeeds) must pin it to "never unload" instead.
+    /// without an explicit pin, a freshly loaded model sits at the
+    /// daemon default `keep_alive` (5 minutes) — the idle reaper would
+    /// unload a model asked for on the command line before it's ever
+    /// actually used, defeating the whole point of pre-loading it.
+    /// `refresh_activity(guard, None)` (what the pre-load task now calls
+    /// right after `ensure_model` succeeds) must pin it to "never
+    /// unload" instead.
     #[tokio::test(flavor = "multi_thread")]
     async fn refresh_activity_with_none_pins_a_model_to_never_unload() {
         let state = test_state();
         {
             let mut mgr = state.0.manager.lock().await;
+            // in_flight: 1, as ensure_model's own prior claim.
             mgr.running.insert(
                 "preloaded".into(),
-                running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+                running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 1),
             );
         }
 
-        refresh_activity(&state, "preloaded", None).await;
+        refresh_activity(ActivityGuard::new(&state, "preloaded"), None).await;
 
         let mgr = state.0.manager.lock().await;
         assert_eq!(
@@ -5476,35 +6294,46 @@ mod tests {
     }
 
     #[test]
-    fn parse_context_shift_is_unset_when_absent_or_empty() {
-        // No explicit override — resolve_context_shift's per-model
-        // default applies instead. See context_shift_override_from_env's
-        // doc comment.
-        assert_eq!(parse_context_shift(None), None);
-        assert_eq!(parse_context_shift(Some("")), None);
-        assert_eq!(parse_context_shift(Some("   ")), None);
-        // An unrecognized-but-non-empty value is still an explicit
-        // override, same as the old bool-returning parser — it just
-        // isn't one of the recognized falsey spellings below.
-        assert_eq!(parse_context_shift(Some("garbage")), Some(true));
+    fn parse_num_parallel_accepts_a_positive_integer() {
+        assert_eq!(parse_num_parallel(Some("4")), Some(4));
+        assert_eq!(parse_num_parallel(Some(" 1 ")), Some(1));
     }
 
     #[test]
-    fn parse_context_shift_recognizes_every_falsey_spelling() {
-        assert_eq!(parse_context_shift(Some("0")), Some(false));
-        assert_eq!(parse_context_shift(Some("false")), Some(false));
-        assert_eq!(parse_context_shift(Some("no")), Some(false));
-        assert_eq!(parse_context_shift(Some("off")), Some(false));
-        // Case-insensitive, whitespace-tolerant.
-        assert_eq!(parse_context_shift(Some(" FALSE \n")), Some(false));
+    fn parse_num_parallel_rejects_zero_and_unparseable_values() {
+        assert_eq!(parse_num_parallel(Some("0")), None);
+        assert_eq!(parse_num_parallel(None), None);
+        assert_eq!(parse_num_parallel(Some("")), None);
+        assert_eq!(parse_num_parallel(Some("-1")), None);
+        assert_eq!(parse_num_parallel(Some("garbage")), None);
     }
 
     #[test]
-    fn parse_context_shift_recognizes_explicit_truthy_spellings_too() {
-        assert_eq!(parse_context_shift(Some("1")), Some(true));
-        assert_eq!(parse_context_shift(Some("true")), Some(true));
-        assert_eq!(parse_context_shift(Some("on")), Some(true));
-        assert_eq!(parse_context_shift(Some("yes")), Some(true));
+    fn backend_ctx_size_scales_by_num_parallel_so_each_slot_keeps_the_full_context() {
+        // llama-server splits one --ctx-size evenly across every
+        // --parallel slot, so this must scale up to compensate —
+        // matching Ollama's own NumCtx * numParallel.
+        assert_eq!(backend_ctx_size(Some(4096), Some(4)), Some(16384));
+        assert_eq!(backend_ctx_size(Some(4096), Some(1)), Some(4096));
+        assert_eq!(backend_ctx_size(Some(4096), None), Some(4096));
+        assert_eq!(backend_ctx_size(None, Some(4)), None);
+        assert_eq!(backend_ctx_size(None, None), None);
+    }
+
+    #[test]
+    fn backend_ctx_size_saturates_instead_of_overflowing() {
+        assert_eq!(backend_ctx_size(Some(u32::MAX), Some(2)), Some(u32::MAX));
+    }
+
+    #[test]
+    fn effective_num_parallel_drops_to_none_without_a_ctx_size_to_scale() {
+        // Nothing to scale --parallel against, so don't forward it at
+        // all rather than let llama-server silently divide the model's
+        // own trained context across slots.
+        assert_eq!(effective_num_parallel(None, Some(4)), None);
+        assert_eq!(effective_num_parallel(Some(4096), Some(4)), Some(4));
+        assert_eq!(effective_num_parallel(Some(4096), None), None);
+        assert_eq!(effective_num_parallel(None, None), None);
     }
 
     #[test]
@@ -5514,17 +6343,6 @@ mod tests {
         assert!(!supports_context_shift("DeepSeek-V2.5:latest")); // case-insensitive
         assert!(supports_context_shift("qwen3.5:latest"));
         assert!(supports_context_shift("gpt-oss:20b"));
-    }
-
-    #[test]
-    fn resolve_context_shift_lets_an_explicit_override_win_over_the_model_default() {
-        // An explicit LLMMAN_CONTEXT_SHIFT always wins, even against a
-        // deepseek model that would otherwise default to disabled.
-        assert!(resolve_context_shift("deepseek-v3:latest", Some(true)));
-        assert!(!resolve_context_shift("qwen3.5:latest", Some(false)));
-        // No override — falls back to the per-model default.
-        assert!(!resolve_context_shift("deepseek-v3:latest", None));
-        assert!(resolve_context_shift("qwen3.5:latest", None));
     }
 
     #[test]

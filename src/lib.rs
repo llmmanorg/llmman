@@ -53,6 +53,39 @@ pub fn default_cache() -> anyhow::Result<PathBuf> {
     Ok(store.parent().unwrap_or(&store).join("cache"))
 }
 
+/// Whether verbose diagnostic logging is enabled, from `LLMMAN_DEBUG`
+/// (mirrors Ollama's `OLLAMA_DEBUG`). llmman has only one verbosity
+/// tier, so any truthy value or non-zero integer enables it (Ollama's
+/// `OLLAMA_DEBUG=2` TRACE spelling also works, just maps to the same
+/// tier).
+pub fn debug_enabled() -> bool {
+    parse_debug_enabled(std::env::var("LLMMAN_DEBUG").ok().as_deref())
+}
+
+fn parse_debug_enabled(value: Option<&str>) -> bool {
+    let v = match value.map(str::trim) {
+        Some(v) if !v.is_empty() => v,
+        _ => return false,
+    };
+    match v.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        other => other.parse::<i64>().map(|n| n != 0).unwrap_or(false),
+    }
+}
+
+/// Prints a `[llmman] [debug] ...` line to stderr, only when
+/// [`debug_enabled`]. A macro (not a plain function) so the `format!`
+/// args aren't even evaluated when debug logging is off.
+#[macro_export]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if $crate::debug_enabled() {
+            eprintln!("[llmman] [debug] {}", format!($($arg)*));
+        }
+    };
+}
+
 /// Split out from [`models_dir_from_env`] for testing without touching
 /// the real environment. Blank values count as unset.
 fn parse_env_path(value: Option<&str>) -> Option<PathBuf> {
@@ -77,5 +110,26 @@ mod tests {
             parse_env_path(Some("  /custom/store  ")),
             Some(PathBuf::from("/custom/store"))
         );
+    }
+
+    #[test]
+    fn parse_debug_enabled_recognizes_boolean_spellings() {
+        assert!(!parse_debug_enabled(None));
+        assert!(!parse_debug_enabled(Some("")));
+        assert!(!parse_debug_enabled(Some("0")));
+        assert!(!parse_debug_enabled(Some("false")));
+        assert!(!parse_debug_enabled(Some("no")));
+        assert!(!parse_debug_enabled(Some("off")));
+        assert!(parse_debug_enabled(Some("1")));
+        assert!(parse_debug_enabled(Some("true")));
+        assert!(parse_debug_enabled(Some("YES")));
+        assert!(parse_debug_enabled(Some("on")));
+    }
+
+    #[test]
+    fn parse_debug_enabled_treats_any_nonzero_integer_as_enabled() {
+        assert!(parse_debug_enabled(Some("2")));
+        assert!(parse_debug_enabled(Some("-1")));
+        assert!(!parse_debug_enabled(Some("not-a-number")));
     }
 }

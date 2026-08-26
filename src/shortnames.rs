@@ -10,7 +10,6 @@
 //!   3. <binary>/../share/llmman/shortnames.conf    install-tree relative path
 //!   4. <binary-dir>/shortnames.conf                development (conf beside binary)
 //!   5. ~/.config/llmman/shortnames.conf            per-user aliases
-//!   6. $LLMMAN_SHORTNAMES_CONF                     env-var override
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -44,13 +43,6 @@ fn config_paths() -> Vec<PathBuf> {
     // ~/.config/llmman/shortnames.conf
     if let Some(cfg) = dirs::config_dir() {
         paths.push(cfg.join("llmman").join("shortnames.conf"));
-    }
-
-    // $LLMMAN_SHORTNAMES_CONF
-    if let Ok(env) = std::env::var("LLMMAN_SHORTNAMES_CONF") {
-        if !env.is_empty() {
-            paths.push(PathBuf::from(env));
-        }
     }
 
     paths
