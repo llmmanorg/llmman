@@ -23,6 +23,15 @@
 //! store) is assumed available and NOT treated as skippable: a pull
 //! failure is a real failure here, not an environment-setup gap.
 //!
+//! [`serve_mlx_safetensors_model`] is the one test in this file that
+//! isn't about a third-party integration at all: it exercises
+//! `llmman serve`'s own `mlx_lm.server` backend for safetensors models
+//! (see `cmd::serve::use_mlx_for_safetensors`) directly via `llmman run`,
+//! against a real (tiny) safetensors model pulled from HuggingFace. Like
+//! every other test here it skips itself — rather than failing — when
+//! its own prerequisite (`mlx_lm.server` on `PATH`, and Apple Silicon
+//! macOS, the only platform that binary even runs on) isn't met.
+//!
 //! `llmman serve` is a process-wide singleton bound to a single loopback
 //! port (127.0.0.1:17434 by default, or wherever `LLMMAN_HOST` points —
 //! see `daemon::server`/`daemon::bind_addr`), so these tests can't
@@ -856,4 +865,104 @@ fn launch_openclaw_with_model() {
 /// tolerated the same way a timeout or a missing "pong" already are.
 fn openclaw_pull_registry_flake(stderr: &str) -> bool {
     stderr.contains("pull failed: copy image") || stderr.contains("FailoverError")
+}
+
+/// A tiny (135M-parameter, 8-bit-quantized) real safetensors model
+/// already published in `mlx-community`'s own MLX-converted form —
+/// small enough to pull quickly in CI, unlike [`MODEL`] (a ~740MB GGUF,
+/// llama-server's own territory, never this file's own concern for the
+/// SafeTensors/mlx path this test exercises instead). Deliberately not
+/// added to [`MODEL`]/[`PROMPT`]'s own constants: those are shared by
+/// every `llmman launch <integration>` test in this file, none of which
+/// have anything to do with safetensors or mlx.
+const MLX_MODEL: &str = "mlx-community/SmolLM2-135M-Instruct-8bit";
+
+/// Exercises `llmman serve`'s `mlx_lm.server` backend
+/// (`cmd::serve::use_mlx_for_safetensors`/`spawn_mlx_server`) end to end:
+/// a real `llmman run` against [`MLX_MODEL`], pulled fresh from
+/// HuggingFace, served locally by a real `mlx_lm.server` process — not a
+/// third-party integration launch like every other test in this file
+/// (there's no "MLX" CLI to launch; this is purely about `llmman serve`'s
+/// own backend selection).
+///
+/// Skips itself (rather than failing) on anything other than Apple
+/// Silicon macOS, or when `mlx_lm.server` isn't on `PATH` — mirrors every
+/// other test in this file's own "prerequisite not installed, not an
+/// llmman bug" convention. CI (see `.github/workflows/ci.yml`'s e2e job)
+/// installs `mlx-lm` before this suite ever runs, on exactly the two
+/// macOS aarch64 matrix legs (`backend: docker` and `backend: podman`)
+/// this is meant to actually exercise — see that job's own comment on
+/// why installation has to happen before, not after, this file's shared
+/// daemon first starts.
+///
+/// Unlike `launch_and_assert`'s small-model sampling-variance tolerance
+/// (this file's other tests, talking to real third-party agentic CLIs
+/// that can spin into a degenerate loop), this only asserts that
+/// `llmman run` itself succeeds — a real non-zero exit here is always a
+/// deterministic llmman bug (a bad spawn, a backend that never became
+/// ready, a wire-model mismatch — see `cmd::serve::backend_wire_model`'s
+/// own doc comment for the specific bug class this exists to catch)
+/// worth failing loudly on immediately, not sampling noise worth
+/// retrying — [`MLX_MODEL`]'s own reply content is never asserted on for
+/// the same reason `warm_model` doesn't either.
+///
+/// Then confirms via `llmman ps` that [`MLX_MODEL`] is actually reported
+/// as running under `mlx (local)` — not silently falling back to `vllm`
+/// (which would also happen to answer this request successfully, since
+/// vllm's own CPU backend can serve any plain safetensors model too, and
+/// so could mask a real `use_mlx_for_safetensors` regression instead of
+/// catching it).
+#[test]
+fn serve_mlx_safetensors_model() {
+    eprintln!("[test] serve_mlx_safetensors_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] serve_mlx_safetensors_model: acquired SERIAL");
+
+    if !(cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")) {
+        eprintln!("skipping: mlx_lm.server only runs on Apple Silicon macOS");
+        return;
+    }
+    if !on_path("mlx_lm.server") {
+        eprintln!("skipping: mlx_lm.server not on PATH — pip install mlx-lm");
+        return;
+    }
+
+    let mut cmd = Command::new(llmman_bin());
+    cmd.arg("run")
+        .arg(MLX_MODEL)
+        .arg("--think")
+        .arg("false")
+        .arg("--num-predict")
+        .arg("64")
+        .arg(PROMPT);
+    let output = spawn_with_timeout(cmd, TIMEOUT, "llmman run (mlx safetensors model)");
+    assert!(
+        output.status.success(),
+        "llmman run {MLX_MODEL} {PROMPT:?} failed (status: {:?})\n\
+         --- stdout ---\n{}\n--- stderr ---\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let ps = Command::new(llmman_bin())
+        .arg("ps")
+        .output()
+        .expect("spawn `llmman ps`");
+    let ps_stdout = String::from_utf8_lossy(&ps.stdout);
+    assert!(
+        ps.status.success(),
+        "llmman ps failed (status: {:?})\n--- stdout ---\n{ps_stdout}\n--- stderr ---\n{}",
+        ps.status,
+        String::from_utf8_lossy(&ps.stderr),
+    );
+    let model_row = ps_stdout
+        .lines()
+        .find(|line| line.contains("SmolLM2-135M-Instruct-8bit"))
+        .unwrap_or_else(|| panic!("{MLX_MODEL} missing from `llmman ps` output:\n{ps_stdout}"));
+    assert!(
+        model_row.contains("mlx (local)"),
+        "{MLX_MODEL} was not served by mlx_lm.server (use_mlx_for_safetensors regression?) \
+         — `llmman ps` row: {model_row:?}"
+    );
 }

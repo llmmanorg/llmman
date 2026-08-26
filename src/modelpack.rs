@@ -3,7 +3,8 @@
 //! equivalent of `huggingface_hub.snapshot_download`.
 //!
 //! Originally private to `cmd::serve` (which uses it to decide whether to
-//! spawn `llama-server` or `vllm` as its backend for a given model), this
+//! spawn `llama-server`, `vllm`, or (Apple Silicon macOS) `mlx_lm.server`
+//! as its backend for a given model), this
 //! module is `pub` so it also backs `cmd::resolve` (`llmman resolve`) — a
 //! standalone, scriptable entry point that other tools (e.g. a vLLM plugin
 //! that wants vLLM itself, not `llmman`, to be the one serving the model)
@@ -28,7 +29,8 @@ pub enum ModelPath {
     /// present, is a companion `--mmproj` projector GGUF (see
     /// [`is_mmproj_layer`]) needed for vision/audio support.
     Gguf(PathBuf, Option<PathBuf>),
-    /// A safetensors directory — serve with vllm.
+    /// A safetensors directory — serve with vllm, or (Apple Silicon
+    /// macOS) `mlx_lm.server` — see `cmd::serve::use_mlx_for_safetensors`.
     SafeTensors(PathBuf),
 }
 
@@ -44,8 +46,9 @@ impl ModelPath {
     }
 
     /// The companion `--mmproj` projector file resolved alongside a
-    /// `Gguf` model, if any — always `None` for `SafeTensors` (vllm has
-    /// no equivalent separate-projector-file convention).
+    /// `Gguf` model, if any — always `None` for `SafeTensors` (neither
+    /// vllm nor mlx_lm.server has an equivalent separate-projector-file
+    /// convention).
     pub fn mmproj(&self) -> Option<&Path> {
         match self {
             ModelPath::Gguf(_, mmproj) => mmproj.as_deref(),
@@ -224,7 +227,7 @@ pub fn resolve_model(
         return Ok(ModelPath::Gguf(primary_path, mmproj_path));
     }
 
-    // ── safetensors → vllm ────────────────────────────────────────────────
+    // ── safetensors → vllm / mlx_lm.server ──────────────────────────────
     if manifest.layers.iter().any(|l| is_safetensors_layer(l)) {
         let model_dir =
             extract_safetensors_dir(&store, store_path, cache_path, &desc.digest, &manifest)?;
@@ -243,7 +246,7 @@ pub fn resolve_model(
     } else {
         anyhow::bail!(
             "no servable model layer in {model_ref} — found {exts:?} files; \
-             llmman serve supports GGUF (llama-server) and safetensors (vllm)"
+             llmman serve supports GGUF (llama-server) and safetensors (vllm/mlx)"
         );
     }
 }
@@ -339,7 +342,7 @@ mod tests {
         );
         assert_eq!(with_mmproj.mmproj(), Some(Path::new("/x/mmproj-f16.gguf")));
 
-        // SafeTensors (vllm) has no equivalent separate-projector-file
+        // SafeTensors (vllm/mlx) has no equivalent separate-projector-file
         // convention.
         assert_eq!(ModelPath::SafeTensors(PathBuf::from("/x")).mmproj(), None);
     }

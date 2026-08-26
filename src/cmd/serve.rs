@@ -192,6 +192,32 @@ fn parse_sched_spread(value: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Which local engine backs a resolved `ModelPath::SafeTensors`
+/// directory: `mlx_lm.server` (see `spawn_mlx_server`) when this host is
+/// Apple Silicon macOS (`crate::hostgpu::detect() == HostGpu::Metal`)
+/// *and* `mlx_lm.server` is actually on `PATH`; `vllm` in every other
+/// case, unchanged from before this engine existed.
+///
+/// Plain `vllm` (no plugin) has no Metal backend of its own at all — its
+/// upstream-published macOS wheel is CPU-only. There *is* a way to make
+/// `vllm serve` itself Metal-accelerated on Apple Silicon —
+/// [vllm-metal](https://github.com/vllm-project/vllm-metal), an
+/// installed-alongside `vllm.platform_plugins` plugin that overrides its
+/// `CpuPlatform` autodetection with a real `MetalPlatform` (itself
+/// implemented on top of MLX — see the `e2e` CI job's own "Install vLLM
+/// (e2e)" step) — but it only supports a narrower set of model
+/// families than `mlx_lm.server` does directly, and pulls in vLLM's own
+/// full dependency footprint for a user who may not want any of the rest
+/// of it. `mlx_lm.server` here is a separate, no-vLLM-at-all option: a
+/// Mac with `mlx-lm` installed gets real Metal acceleration through it
+/// without needing vllm-metal (or vllm) at all; a Mac with neither still
+/// falls back to plain (CPU-only, absent vllm-metal) `vllm` instead of
+/// failing outright.
+fn use_mlx_for_safetensors() -> bool {
+    crate::hostgpu::detect() == crate::hostgpu::HostGpu::Metal
+        && which_binary("mlx_lm.server").is_ok()
+}
+
 /// Explicit `--context-shift`/`--no-context-shift` override from
 /// `LLMMAN_CONTEXT_SHIFT`, or `None` if unset/empty/unparseable — in
 /// which case [`supports_context_shift`]'s per-model default applies
@@ -386,6 +412,14 @@ struct RunningModel {
     /// `ActivityGuard`'s doc comment for why a generation slower than its
     /// own `keep_alive` must not be killed mid-stream.
     in_flight: u32,
+    /// `Some(<absolute model directory path>)` only for `Engine::Mlx`,
+    /// `None` for every other engine — see `backend_wire_model`'s own
+    /// doc comment for what this is actually for (the `"model"` field a
+    /// request must carry to reach *this* model on an `mlx_lm.server`
+    /// backend, since it has no `--served-model-name`-equivalent way to
+    /// register a human-readable alias for it up front the way `vllm`
+    /// does).
+    backend_model_path: Option<String>,
 }
 
 /// Which engine is actually serving requests for a [`RunningModel`] — surfaced
@@ -399,6 +433,7 @@ impl RunningModel {
         match &self.process {
             ModelProcess::Local(Engine::LlamaServer, _, _) => "llama-server (local)".into(),
             ModelProcess::Local(Engine::Vllm, _, _) => "vllm (local)".into(),
+            ModelProcess::Local(Engine::Mlx, _, _) => "mlx (local)".into(),
             ModelProcess::Container(ociman, _) => {
                 format!("llama-server (container/{})", ociman.binary())
             }
@@ -415,17 +450,26 @@ impl RunningModel {
 
 /// Which local engine a [`ModelProcess::Local`] is running — see
 /// [`RunningModel::processor`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Engine {
     LlamaServer,
     Vllm,
+    /// `mlx_lm.server` (the `mlx-lm` PyPI package) — Apple Silicon's own
+    /// Metal-accelerated alternative to `vllm` for a
+    /// [`ModelPath::SafeTensors`] directory, picked instead of it when
+    /// [`use_mlx_for_safetensors`] says so. See [`spawn_mlx_server`]'s
+    /// doc comment for why this engine's requests need a different
+    /// `"model"` field than every other one (handled by
+    /// [`backend_wire_model`]), not anything here.
+    Mlx,
 }
 
-/// A running inference backend: either a local `llama-server`/`vllm`
-/// process (killed via `Child::kill_on_drop`, except `Engine::Vllm` —
-/// see this Drop impl) or an attached `docker run`/`podman run` process,
-/// gracefully stopped via SIGTERM on drop since `kill_on_drop`'s SIGKILL
-/// can't be forwarded to (and so doesn't stop) the container.
+/// A running inference backend: either a local `llama-server`/`vllm`/
+/// `mlx_lm.server` process (killed via `Child::kill_on_drop`, except
+/// `Engine::Vllm` — see this Drop impl) or an attached `docker run`/
+/// `podman run` process, gracefully stopped via SIGTERM on drop since
+/// `kill_on_drop`'s SIGKILL can't be forwarded to (and so doesn't stop)
+/// the container.
 enum ModelProcess {
     // `Option<u32>` is the pid captured right after spawn, not
     // `child.id()` at drop time: `is_alive`'s `try_wait` reaps the child
@@ -463,6 +507,12 @@ impl Drop for ModelProcess {
             }
             #[cfg(not(unix))]
             ModelProcess::Local(Engine::Vllm, _, _) => {}
+            // `mlx_lm.server` runs entirely as one process — a single
+            // background generation thread plus a `ThreadingHTTPServer`,
+            // no forked worker tree of its own the way vllm has above —
+            // so the plain default `kill_on_drop` SIGKILL to just this
+            // one pid is already sufficient; nothing extra to do here.
+            ModelProcess::Local(Engine::Mlx, _, _) => {}
             ModelProcess::Local(Engine::LlamaServer, _, _) => {}
         }
     }
@@ -1650,6 +1700,40 @@ async fn spawn_vllm_server(
         .with_context(|| format!("spawn vllm from {}", vllm.display()))
 }
 
+/// Spawns `mlx_lm.server` (installed on `PATH` by `pip install mlx-lm`
+/// <https://github.com/ml-explore/mlx-lm>) — Apple Silicon's own
+/// Metal-accelerated alternative to `vllm` for a
+/// [`ModelPath::SafeTensors`] directory, picked instead of it by
+/// [`use_mlx_for_safetensors`].
+///
+/// Deliberately does *not* pass `mlx_lm.server`'s own `--model` flag,
+/// even though that's its documented way to preload one: confirmed
+/// against its own `server.py` that doing so loads the model in a
+/// background thread (`ResponseGenerator.__init__`'s
+/// `Thread(target=self._generate)`) with no `try`/`except` anywhere
+/// around that particular load — a bad model directory would silently
+/// kill only that one thread, not this process, while its
+/// `ThreadingHTTPServer` (started right alongside it, not after) keeps
+/// right on reporting `/health` as ready regardless. `wait_for_ready`
+/// would then report this backend ready, and every real request queued
+/// behind that dead thread would hang forever instead of ever seeing an
+/// error.
+///
+/// Loading instead happens on the *first real request* — every caller
+/// sends this model's actual absolute directory path (not its
+/// human-readable reference) as that request's own `"model"` field, via
+/// [`backend_wire_model`] — which goes through `ModelProvider.load`'s
+/// own `try`/`except` in the request-handling path instead, and so does
+/// report a real error back to that request on a bad model directory.
+async fn spawn_mlx_server(port: u16) -> anyhow::Result<tokio::process::Child> {
+    let mlx = which_binary("mlx_lm.server")?;
+    let mut cmd = tokio::process::Command::new(&mlx);
+    cmd.args(["--port", &port.to_string(), "--host", "127.0.0.1"]);
+    cmd.kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("spawn mlx_lm.server from {}", mlx.display()))
+}
+
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -1711,7 +1795,15 @@ async fn wait_for_ready(
         }
         if let Ok(resp) = client.get(&url).send().await {
             // llama-server: 200 + {"status":"ok"}   vllm: 200 + {}
-            // Both return HTTP 200 only when fully ready.
+            // mlx_lm.server: 200 + {"status":"ok"} — but, unlike the other
+            // two, this only means its HTTP listener itself is up, not
+            // that any model has finished loading (mlx_lm.server never
+            // preloads one at all here — see spawn_mlx_server's doc
+            // comment on why). Its own request-handling path still waits
+            // out that load before answering, so this is only ever a
+            // "the process didn't crash outright" check for that engine,
+            // not a full readiness one — an intentional, documented
+            // trade-off, not an oversight.
             if resp.status().is_success() {
                 return Ok(());
             }
@@ -1935,6 +2027,62 @@ async fn evict_other_models(state: &AppState, model_ref: &str) -> bool {
     any
 }
 
+/// If `model_ref` would be served by `Engine::Mlx` were it loaded right
+/// now, returns its canonical name (see `ensure_model`'s own doc
+/// comment on why that can differ from the caller's own input) —
+/// *without* spawning any backend process or loading any weights.
+/// Checks the already-running case first (a cheap map lookup); if it
+/// isn't running, resolves it to a `ModelPath` — extracting/locating
+/// its files on disk if it's already in the local store, but never
+/// spawning a process — and applies the exact same
+/// `ModelPath::SafeTensors` + `use_mlx_for_safetensors()` rule
+/// `ensure_model` itself uses to pick an engine.
+///
+/// Returns `None` — "don't reject early", not "definitely not mlx" —
+/// for a model that isn't in the local store at all yet (nothing to
+/// resolve without also pulling it first, which this deliberately
+/// never does) or that fails to resolve for any other reason:
+/// `ensure_model` is still the right place to actually pull, load, and
+/// (if it turns out to be `Engine::Mlx` after all) reject that one
+/// first real request — this is only a cheap pre-check for the
+/// overwhelmingly common repeat-request case, not a full substitute
+/// for it.
+///
+/// Used only by `proxy_openai_passthrough`'s own `/v1/embeddings`
+/// guard, so an already-pulled (or already-loaded) MLX-served model
+/// doesn't pay for a full `mlx_lm.server` spawn and weights load on
+/// every single embeddings request that could never succeed there
+/// anyway — only ever the very first one, against a model that isn't
+/// locally resolvable at all yet.
+async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<String> {
+    let model_ref = crate::shortnames::resolve_ollama_api(model_ref);
+    let model_ref = crate::storage::default_tag(&model_ref);
+    let model_ref = canonical_ref(&state.0.store_path, &model_ref);
+
+    {
+        let mgr = state.0.manager.lock().await;
+        if let Some(running) = mgr.running.get(&model_ref) {
+            return matches!(running.process, ModelProcess::Local(Engine::Mlx, _, _))
+                .then(|| model_ref.clone());
+        }
+    }
+
+    if !use_mlx_for_safetensors() {
+        return None;
+    }
+    let store_path = state.0.store_path.clone();
+    let cache_path = state.0.cache_path.clone();
+    let lookup_ref = model_ref.clone();
+    let is_safetensors = tokio::task::spawn_blocking(move || {
+        resolve_model(&store_path, &cache_path, &lookup_ref)
+            .map(|p| matches!(p, ModelPath::SafeTensors(_)))
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+    is_safetensors.then_some(model_ref)
+}
+
 /// Ensures `model_ref` is loaded and returns `(canonical_ref, port)`. The
 /// canonical name is what it's actually registered under with its backend
 /// (`--served-model-name`), which can differ from a tagless `model_ref`
@@ -2055,6 +2203,11 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
                 stderr_tail = Some(tail);
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }
+            (ModelPath::SafeTensors(_dir), _) if use_mlx_for_safetensors() => {
+                let child = spawn_mlx_server(port).await?;
+                let pid = child.id();
+                ModelProcess::Local(Engine::Mlx, child, pid)
+            }
             (ModelPath::SafeTensors(dir), _) => {
                 let child = spawn_vllm_server(dir, port, model_ref).await?;
                 let pid = child.id();
@@ -2133,6 +2286,16 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
     }
     eprintln!("[llmman] {model_ref} ready on port {port}");
 
+    // See RunningModel::backend_model_path's own doc comment — only
+    // meaningful for Engine::Mlx, which is the only engine
+    // spawn_mlx_server deliberately doesn't preload via `--model` for
+    // (see its own doc comment), so every request must instead carry
+    // this exact directory as its own "model" field.
+    let backend_model_path = match &process {
+        ModelProcess::Local(Engine::Mlx, _, _) => model_path.path().to_str().map(|s| s.to_string()),
+        _ => None,
+    };
+
     state.0.manager.lock().await.running.insert(
         model_ref.to_string(),
         RunningModel {
@@ -2143,11 +2306,40 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
             started_at: now_rfc3339(),
             last_active: Instant::now(),
             last_active_wall: chrono::Utc::now(),
+            backend_model_path,
             keep_alive: default_keep_alive(),
             in_flight: 0,
         },
     );
     Ok((model_ref.to_string(), port))
+}
+
+/// The `"model"` value to actually put in the JSON request body sent to
+/// `canonical_model`'s backend process — `canonical_model` itself
+/// (`ensure_model`'s return value, already the exact name every other
+/// engine needs — see its own doc comment) for everything except a
+/// running `Engine::Mlx` backend, for which it's that model's real
+/// on-disk directory path instead (`RunningModel::backend_model_path` —
+/// see `spawn_mlx_server`'s doc comment for why `mlx_lm.server` needs
+/// that rather than a human-readable name at all).
+///
+/// Every caller must apply this only to the request forwarded to the
+/// backend — client-facing response bodies (an Ollama chunk's `model`
+/// field, an Anthropic message's `model` field, ...) must keep echoing
+/// back `canonical_model` or the client's own original input unchanged;
+/// a client asking for "gemma4:latest" should never see
+/// "/Users/.../cache/.../abcd1234" reflected back at it just because
+/// that happens to be how this one engine addresses it internally.
+async fn backend_wire_model(state: &AppState, canonical_model: &str) -> String {
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .get(canonical_model)
+        .and_then(|r| r.backend_model_path.clone())
+        .unwrap_or_else(|| canonical_model.to_string())
 }
 
 /// Returns the local llama-server binary to spawn: the one resolved at
@@ -2220,6 +2412,177 @@ async fn proxy(
     let mut builder = Response::builder().status(status.as_u16());
     for (k, v) in &resp_headers {
         builder = builder.header(k, v);
+    }
+    Ok(builder.body(Body::from_stream(stream)).unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Proxy helpers – like `proxy` above, but for a request whose backend
+// needed a *different* "model" name than the client itself asked for
+// (see `backend_wire_model`'s own doc comment — only ever true for an
+// `Engine::Mlx` backend, addressed by its real on-disk directory path
+// rather than a human-readable name). `mlx_lm.server` echoes whatever
+// "model" value it received straight back into every response it sends
+// — the one non-streamed JSON body for `stream: false`, and *every*
+// individual `data: {...}` SSE chunk for `stream: true` — so a plain
+// byte-for-byte relay like `proxy` would leak that internal directory
+// path back to the client instead of the name it actually asked for.
+// These two rewrite just that one field back to the canonical name
+// before any of it reaches the client; every other field, and (for the
+// streaming variant) the SSE framing itself, passes through unchanged.
+// ---------------------------------------------------------------------------
+
+/// Sets `value["model"]` to `canonical_model` if that key is present at
+/// all — shared by both helpers below so a response shape that happens
+/// not to carry one (an error body, a future backend response this
+/// doesn't recognize) is left alone rather than gaining a field it
+/// never had.
+fn set_response_model(value: &mut serde_json::Value, canonical_model: &str) {
+    if value.get("model").is_some() {
+        value["model"] = serde_json::Value::String(canonical_model.to_string());
+    }
+}
+
+/// [`proxy_rewriting_model`]'s actual rewrite, split out as a pure
+/// `bytes -> bytes` function so it's directly unit-testable without any
+/// networking at all. Parses `raw` as JSON, rewrites its `"model"` field
+/// (see [`set_response_model`]), and re-serializes — or returns `raw`
+/// completely unchanged if it isn't valid JSON at all (an error body's
+/// own shape, or a future backend response this doesn't recognize)
+/// rather than mangling or dropping it.
+fn rewrite_json_response_model(raw: &Bytes, canonical_model: &str) -> Bytes {
+    match serde_json::from_slice::<serde_json::Value>(raw) {
+        Ok(mut value) => {
+            set_response_model(&mut value, canonical_model);
+            serde_json::to_vec(&value)
+                .map(Bytes::from)
+                .unwrap_or_else(|_| raw.clone())
+        }
+        Err(_) => raw.clone(),
+    }
+}
+
+/// [`stream_rewriting_model`]'s actual per-line rewrite, split out as a
+/// pure `&str -> String` function so it's directly unit-testable without
+/// any networking at all. `line` is one already-decoded logical line
+/// from [`bytes_to_lines`] (its own line ending already stripped, not
+/// yet restored here — the caller does that once, uniformly, since
+/// every branch below needs it regardless of which one fires): a
+/// `data: {...}` line whose payload parses as JSON gets its `"model"`
+/// field rewritten (see [`set_response_model`]); `data: [DONE]`, a
+/// blank SSE event-separator line, or a `data: ` line whose payload
+/// *doesn't* parse as JSON all pass through byte-for-byte unchanged.
+fn rewrite_sse_line_model(line: &str, canonical_model: &str) -> String {
+    match line.strip_prefix("data: ") {
+        Some(payload) if payload != "[DONE]" => match serde_json::from_str(payload) {
+            Ok(mut value) => {
+                set_response_model(&mut value, canonical_model);
+                format!(
+                    "data: {}",
+                    serde_json::to_string(&value).unwrap_or_else(|_| payload.to_string())
+                )
+            }
+            Err(_) => line.to_string(),
+        },
+        _ => line.to_string(),
+    }
+}
+
+/// The non-streaming (`stream: false`, or no `stream` concept at all —
+/// embeddings, the Responses API's token-counting endpoint) case:
+/// buffers the whole response body (unlike `proxy`, which never does)
+/// so its `"model"` field can be parsed, rewritten, and re-serialized
+/// before forwarding it on. Every route that can reach this returns one
+/// complete JSON object either way (never anything token-streamed a
+/// client would notice the added latency of buffering first), so this
+/// costs nothing a real client could observe.
+///
+/// `Content-Length`, if the backend sent one, is dropped rather than
+/// forwarded: the rewritten body is a different size than the original
+/// one that header described, and hyper/axum fill in the correct value
+/// for a fixed (`Body::from(Bytes)`, not streamed) body on their own
+/// when none is set explicitly.
+async fn proxy_rewriting_model(
+    client: &Client,
+    url: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    activity: ActivityGuard,
+    canonical_model: &str,
+) -> Result<Response, AppError> {
+    let mut req = client.post(url).body(body);
+    if let Some(ct) = headers.get("content-type") {
+        req = req.header("content-type", ct);
+    }
+    let resp = req.send().await.context("proxy request to llama-server")?;
+    let status = reqwest::StatusCode::from(resp.status());
+    let resp_headers = resp.headers().clone();
+    let raw = resp
+        .bytes()
+        .await
+        .context("read inference backend response")?;
+    // The whole body is already collected by this point, so there's no
+    // partial relay left for keeping this alive any longer to protect —
+    // see `proxy`'s own comment on why it instead holds this open across
+    // its whole (streamed) relay.
+    drop(activity);
+
+    let rewritten = rewrite_json_response_model(&raw, canonical_model);
+
+    let mut builder = Response::builder().status(status.as_u16());
+    for (k, v) in &resp_headers {
+        if k == reqwest::header::CONTENT_LENGTH {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+    Ok(builder.body(Body::from(rewritten)).unwrap())
+}
+
+/// The streaming (`stream: true`) case: like `stream_ollama`/
+/// `stream_anthropic`, uses `bytes_to_lines` so a `data: {...}` SSE line
+/// split across two TCP reads is never parsed as JSON prematurely — but
+/// unlike those two (which convert into a completely different wire
+/// format, ndjson/Anthropic SSE, and so don't need to preserve the
+/// original SSE framing at all), this must reproduce the exact original
+/// OpenAI SSE shape byte-for-byte except for the one field being
+/// rewritten: every blank line (an SSE event separator) and the
+/// trailing `data: [DONE]` sentinel pass through completely unchanged;
+/// only a `data: {...}` line whose payload actually parses as a JSON
+/// object carrying a `model` field gets rewritten.
+async fn stream_rewriting_model(
+    client: &Client,
+    url: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    activity: ActivityGuard,
+    canonical_model: String,
+) -> Result<Response, AppError> {
+    let mut req = client.post(url).body(body);
+    if let Some(ct) = headers.get("content-type") {
+        req = req.header("content-type", ct);
+    }
+    let resp = req.send().await.context("proxy request to llama-server")?;
+    let status = reqwest::StatusCode::from(resp.status());
+    // Only content-type is meaningful to forward for a stream the
+    // caller is about to reconstruct line by line — content-length
+    // (absent anyway for a real chunked/streamed response) would be
+    // stale the same way proxy_rewriting_model's is, if present.
+    let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE).cloned();
+
+    let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
+        // See `proxy`'s own comment on this same pattern.
+        let _activity = &activity;
+        // bytes_to_lines strips the original line ending; restored here,
+        // uniformly, regardless of which of rewrite_sse_line_model's own
+        // branches actually fired.
+        let out = rewrite_sse_line_model(&line, &canonical_model) + "\n";
+        Ok::<_, std::convert::Infallible>(Bytes::from(out))
+    });
+
+    let mut builder = Response::builder().status(status.as_u16());
+    if let Some(ct) = content_type {
+        builder = builder.header(reqwest::header::CONTENT_TYPE, ct);
     }
     Ok(builder.body(Body::from_stream(stream)).unwrap())
 }
@@ -3219,8 +3582,13 @@ async fn handle_ollama_chat(
     let keep_alive = resolve_keep_alive(&req.keep_alive);
     let activity = begin_activity(&state, &model, Some(keep_alive)).await;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    // See backend_wire_model's own doc comment — usually just `model`
+    // itself, but a different value for an Engine::Mlx backend. Only
+    // this one outgoing request field, never the response chunk's own
+    // `model` field below (which must keep echoing back `model` as-is).
+    let wire_model = backend_wire_model(&state, &model).await;
     let oai = OAIChatRequest {
-        model: model.clone(),
+        model: wire_model,
         messages: req.messages.iter().map(ollama_message_to_oai).collect(),
         stream: true,
         temperature: opt_f64(&req.options, "temperature"),
@@ -3323,8 +3691,10 @@ async fn handle_ollama_generate(
     let keep_alive = resolve_keep_alive(&req.keep_alive);
     let activity = begin_activity(&state, &model, Some(keep_alive)).await;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    // See backend_wire_model's own doc comment.
+    let wire_model = backend_wire_model(&state, &model).await;
     let oai = OAIChatRequest {
-        model: model.clone(),
+        model: wire_model,
         messages: vec![OAIMessage::text("user", req.prompt.clone())],
         stream: true,
         temperature: opt_f64(&req.options, "temperature"),
@@ -3404,10 +3774,19 @@ fn apply_default_repeat_penalty(req: &mut serde_json::Value) {
 /// `proxy_openai_passthrough` below each finish shaping the parsed body
 /// their own way (the former also defaults `repeat_penalty`, the latter
 /// doesn't) before actually proxying it through.
+///
+/// The returned `Option<String>` is `Some(canonical_model)` only when
+/// the backend actually needed a different wire name than the one the
+/// client asked for (see `backend_wire_model`'s own doc comment — only
+/// ever true for an `Engine::Mlx` backend) — the signal
+/// `proxy_openai_generation`/`proxy_openai_passthrough` need to decide
+/// whether the *response* also needs its own `"model"` field rewritten
+/// back before reaching the client, via `proxy_rewriting_model`/
+/// `stream_rewriting_model` instead of the plain `proxy`.
 async fn resolve_openai_request(
     state: &AppState,
     body: Bytes,
-) -> Result<(serde_json::Value, u16, ActivityGuard), AppError> {
+) -> Result<(serde_json::Value, u16, ActivityGuard, Option<String>), AppError> {
     let mut req: serde_json::Value =
         serde_json::from_slice(&body).context("parse OpenAI request body")?;
     let model = req["model"].as_str().unwrap_or("").to_string();
@@ -3419,8 +3798,12 @@ async fn resolve_openai_request(
     // a `keep_alive: -1` ("never unload") pin with the daemon default the
     // instant one OpenAI-compatible request comes in.
     let activity = begin_activity(state, &model, None).await;
-    req["model"] = serde_json::Value::String(model);
-    Ok((req, port, activity))
+    // See backend_wire_model's own doc comment — usually just `model`
+    // itself, but a different value for an Engine::Mlx backend.
+    let wire_model = backend_wire_model(state, &model).await;
+    let response_model_override = (wire_model != model).then_some(model);
+    req["model"] = serde_json::Value::String(wire_model);
+    Ok((req, port, activity, response_model_override))
 }
 
 /// OpenAI-passthrough for the endpoints that actually generate tokens —
@@ -3431,34 +3814,118 @@ async fn resolve_openai_request(
 /// *which function* it calls (this one, or `proxy_openai_passthrough`
 /// below for the two non-generation routes), not an easily-mis-set
 /// argument at the call site.
+///
+/// Picks which of the three proxy helpers actually relays the response
+/// based on `resolve_openai_request`'s `response_model_override`: plain
+/// `proxy` (untouched byte relay) when it's `None` — every engine
+/// except `Engine::Mlx`, unchanged from before that engine existed —
+/// otherwise `stream_rewriting_model`/`proxy_rewriting_model` depending
+/// on whether this request itself asked for a streamed response, both
+/// of which rewrite the response's own `"model"` field back to the
+/// canonical name before it reaches the client (see either's own doc
+/// comment for why that's needed at all).
 async fn proxy_openai_generation(
     state: &AppState,
     headers: &HeaderMap,
     body: Bytes,
     llama_path: &str,
 ) -> Result<Response, AppError> {
-    let (mut req, port, activity) = resolve_openai_request(state, body).await?;
+    let (mut req, port, activity, response_model_override) =
+        resolve_openai_request(state, body).await?;
     apply_default_repeat_penalty(&mut req);
+    let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
     let url = format!("http://127.0.0.1:{port}{llama_path}");
-    proxy(&state.0.client, &url, headers, body, activity).await
+    match response_model_override {
+        Some(canonical) if streaming => {
+            stream_rewriting_model(&state.0.client, &url, headers, body, activity, canonical).await
+        }
+        Some(canonical) => {
+            proxy_rewriting_model(&state.0.client, &url, headers, body, activity, &canonical).await
+        }
+        None => proxy(&state.0.client, &url, headers, body, activity).await,
+    }
 }
 
 /// OpenAI-passthrough for the routes that don't generate anything a
 /// repeat penalty could apply to — embeddings, and the Responses
 /// token-counting endpoint. Same model-loading/canonicalization as
 /// `proxy_openai_generation` (see `resolve_openai_request`), minus the
-/// `repeat_penalty` default.
+/// `repeat_penalty` default. Neither route has a `stream` concept of
+/// its own, so unlike that function this only ever needs `proxy` or
+/// `proxy_rewriting_model` — never the streaming variant.
+///
+/// `/v1/embeddings` specifically gets two more checks around that:
+/// `Engine::Mlx` is never started with `mlx_lm.server`'s own
+/// `--embedding-model` flag (`spawn_mlx_server` has no way to know which
+/// model a caller would even want for that), so its conditional
+/// `/v1/embeddings` route is never registered there at all — forwarding
+/// anyway would just surface its own bare, unexplained 404, so this
+/// fails fast with [`mlx_embeddings_unsupported_response`] instead,
+/// twice over:
+///
+///   1. Before `resolve_openai_request` (and so `ensure_model`) ever
+///      runs, via [`would_use_mlx`]'s own cheap, spawn-free check —
+///      covering the overwhelmingly common case of a model that's
+///      already resolvable locally, so a repeated embeddings request
+///      against it never pays for spawning `mlx_lm.server` and loading
+///      however many GB of weights for a request that could never
+///      succeed there anyway.
+///   2. After, via `response_model_override` — the fallback for the one
+///      case (1) can't cheaply rule out ahead of time: a model that
+///      wasn't in the local store at all yet, so `ensure_model` above
+///      just pulled and loaded it for the first (and, thanks to (1),
+///      only ever) time, and it turned out to be `Engine::Mlx` after
+///      all.
 async fn proxy_openai_passthrough(
     state: &AppState,
     headers: &HeaderMap,
     body: Bytes,
     llama_path: &str,
 ) -> Result<Response, AppError> {
-    let (req, port, activity) = resolve_openai_request(state, body).await?;
+    if llama_path == "/v1/embeddings" {
+        if let Ok(peek) = serde_json::from_slice::<serde_json::Value>(&body) {
+            if let Some(model_ref) = peek["model"].as_str() {
+                if let Some(canonical) = would_use_mlx(state, model_ref).await {
+                    return Ok(mlx_embeddings_unsupported_response(&canonical));
+                }
+            }
+        }
+    }
+    let (req, port, activity, response_model_override) =
+        resolve_openai_request(state, body).await?;
+    if llama_path == "/v1/embeddings" {
+        if let Some(canonical) = &response_model_override {
+            drop(activity);
+            return Ok(mlx_embeddings_unsupported_response(canonical));
+        }
+    }
     let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
     let url = format!("http://127.0.0.1:{port}{llama_path}");
-    proxy(&state.0.client, &url, headers, body, activity).await
+    match response_model_override {
+        Some(canonical) => {
+            proxy_rewriting_model(&state.0.client, &url, headers, body, activity, &canonical).await
+        }
+        None => proxy(&state.0.client, &url, headers, body, activity).await,
+    }
+}
+
+/// The clear, specific error [`proxy_openai_passthrough`] returns
+/// instead of forwarding a `/v1/embeddings` request on to an
+/// `Engine::Mlx` backend — see that function's own doc comment on why
+/// that request could never succeed there anyway.
+fn mlx_embeddings_unsupported_response(canonical_model: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": format!(
+                "{canonical_model} is served by mlx_lm.server, which llmman never starts with \
+                 --embedding-model — /v1/embeddings isn't supported for it; use a GGUF or \
+                 vllm-served model for embeddings instead"
+            ),
+            "type": "invalid_request_error",
+        }
+    });
+    (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()
 }
 
 async fn handle_openai_chat(
@@ -3745,8 +4212,12 @@ async fn handle_anthropic_messages(
 
     let messages = build_anthropic_messages(&req);
 
+    // See backend_wire_model's own doc comment — usually just
+    // canonical_model itself, but a different value for an Engine::Mlx
+    // backend.
+    let wire_model = backend_wire_model(&state, &canonical_model).await;
     let mut oai = OAIChatRequest {
-        model: canonical_model,
+        model: wire_model,
         messages,
         stream: req.stream,
         temperature: req.temperature,
@@ -4546,10 +5017,20 @@ mod tests {
     /// Windows (which this project does target — see the `#[cfg(windows)]`
     /// branches elsewhere in this module), so it's spawned differently per
     /// platform rather than assuming a Unix-only test environment.
+    ///
+    /// Its own process group (matching `spawn_vllm_server`'s own real
+    /// spawn — see its doc comment), not just the bare default: a
+    /// fixture backing an `Engine::Vllm` `RunningModel` hits
+    /// `ModelProcess::Drop`'s process-group-SIGKILL arm, which needs
+    /// this to actually *be* one, or that kill fails and prints a
+    /// spurious "SIGKILL to vllm process group ... failed" warning on
+    /// every test run that uses one — confirmed live via CodeRabbit
+    /// review on this repo's own git history.
     #[cfg(unix)]
     fn spawn_placeholder_process() -> tokio::process::Child {
         tokio::process::Command::new("sleep")
             .arg("60")
+            .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .expect("spawn placeholder `sleep` process")
@@ -4577,9 +5058,129 @@ mod tests {
             started_at: now_rfc3339(),
             last_active: Instant::now() - idle_for,
             last_active_wall: chrono::Utc::now(),
+            backend_model_path: None,
             keep_alive,
             in_flight,
         }
+    }
+
+    /// Like `running_model_fixture`, but with a caller-chosen `Engine`
+    /// and `backend_model_path` — used only by `backend_wire_model`'s
+    /// own tests below, which need to distinguish an `Engine::Mlx`
+    /// backend from every other one.
+    fn running_model_fixture_with_engine(
+        engine: Engine,
+        backend_model_path: Option<&str>,
+    ) -> RunningModel {
+        RunningModel {
+            process: ModelProcess::Local(engine, spawn_placeholder_process(), None),
+            port: 0,
+            digest: String::new(),
+            size: 0,
+            started_at: now_rfc3339(),
+            last_active: Instant::now(),
+            last_active_wall: chrono::Utc::now(),
+            backend_model_path: backend_model_path.map(|s| s.to_string()),
+            keep_alive: None,
+            in_flight: 0,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_wire_model_is_the_canonical_name_for_every_engine_except_mlx() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "llama-model".into(),
+                running_model_fixture_with_engine(Engine::LlamaServer, None),
+            );
+            mgr.running.insert(
+                "vllm-model".into(),
+                running_model_fixture_with_engine(Engine::Vllm, None),
+            );
+            mgr.running.insert(
+                "mlx-model".into(),
+                running_model_fixture_with_engine(Engine::Mlx, Some("/cache/mlx-model/abcd")),
+            );
+        }
+
+        assert_eq!(
+            backend_wire_model(&state, "llama-model").await,
+            "llama-model"
+        );
+        assert_eq!(backend_wire_model(&state, "vllm-model").await, "vllm-model");
+        assert_eq!(
+            backend_wire_model(&state, "mlx-model").await,
+            "/cache/mlx-model/abcd",
+            "an Engine::Mlx backend must be addressed by its real directory path, not its human-readable name"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_wire_model_falls_back_to_the_canonical_name_when_not_running() {
+        let state = test_state();
+        assert_eq!(
+            backend_wire_model(&state, "not-running").await,
+            "not-running"
+        );
+    }
+
+    /// Regression test for the CodeRabbit nitpick this PR addresses:
+    /// `proxy_openai_passthrough`'s `/v1/embeddings` guard must be able
+    /// to answer "would this already-running model be served by
+    /// Engine::Mlx" from a plain map lookup — no backend spawn, no
+    /// model load — for the common case of a repeated embeddings
+    /// request against a model that's already loaded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn would_use_mlx_finds_an_already_running_mlx_model_without_touching_disk_or_a_process() {
+        let state = test_state();
+        // A reference already in canonical form (host + owner/repo +
+        // explicit tag) so shortnames::resolve_ollama_api/default_tag
+        // and canonical_ref (which no-ops against this test's empty
+        // store — see its own doc comment) all leave it unchanged,
+        // matching the same key this inserts into `mgr.running` under.
+        let model_ref = "hf.co/mlx-community/foo:latest";
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                model_ref.to_string(),
+                running_model_fixture_with_engine(Engine::Mlx, Some("/cache/foo/abcd")),
+            );
+        }
+        assert_eq!(
+            would_use_mlx(&state, model_ref).await,
+            Some(model_ref.to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn would_use_mlx_is_none_for_an_already_running_non_mlx_model() {
+        let state = test_state();
+        let model_ref = "hf.co/mlx-community/foo:latest";
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                model_ref.to_string(),
+                running_model_fixture_with_engine(Engine::LlamaServer, None),
+            );
+        }
+        assert_eq!(would_use_mlx(&state, model_ref).await, None);
+    }
+
+    /// On any host `use_mlx_for_safetensors` itself doesn't consider
+    /// Apple-Silicon-macOS-with-`mlx_lm.server`-on-`PATH` (this test
+    /// suite's own CI hosts included), `would_use_mlx` must say `None`
+    /// for a model that isn't running yet at all — regardless of
+    /// whatever is or isn't actually in the local store for it —
+    /// without needing to fake either check to prove it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn would_use_mlx_is_none_when_not_running_and_this_host_never_uses_mlx() {
+        let state = test_state();
+        assert_eq!(
+            would_use_mlx(&state, "hf.co/mlx-community/not-loaded-yet:latest").await,
+            None
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5175,6 +5776,103 @@ mod tests {
         // Malformed JSON and an empty choices array are skipped, not fatal.
         assert_eq!(oai_chunk_to_content("not json"), None);
         assert_eq!(oai_chunk_to_content(r#"{"choices":[]}"#), None);
+    }
+
+    /// Regression test guarding against exactly the leak CodeRabbit
+    /// flagged on this PR: an `Engine::Mlx` backend is addressed by its
+    /// real on-disk directory path (see `backend_wire_model`), and
+    /// `mlx_lm.server` echoes whatever `"model"` value it received
+    /// straight back into its own response — so a plain byte-for-byte
+    /// relay would leak that internal path back to the client instead of
+    /// the name it actually asked for. `set_response_model` is the one
+    /// place both `rewrite_json_response_model` and
+    /// `rewrite_sse_line_model` below delegate the actual field
+    /// substitution to.
+    #[test]
+    fn set_response_model_overwrites_an_existing_model_field_and_leaves_a_missing_one_alone() {
+        let mut with_model = serde_json::json!({"model": "/abs/path/to/model", "id": "x"});
+        set_response_model(&mut with_model, "gemma4:latest");
+        assert_eq!(
+            with_model,
+            serde_json::json!({"model": "gemma4:latest", "id": "x"})
+        );
+
+        let mut without_model = serde_json::json!({"id": "x"});
+        set_response_model(&mut without_model, "gemma4:latest");
+        assert_eq!(without_model, serde_json::json!({"id": "x"}));
+    }
+
+    #[test]
+    fn rewrite_json_response_model_rewrites_a_json_body_and_leaves_every_other_field_alone() {
+        let raw = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "id": "chatcmpl-1",
+                "model": "/home/user/.local/share/llmman/cache/abcd/model-dir",
+                "choices": [{"message": {"content": "hi"}}]
+            }))
+            .unwrap(),
+        );
+        let rewritten = rewrite_json_response_model(&raw, "gemma4:latest");
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(value["model"], "gemma4:latest");
+        assert_eq!(value["id"], "chatcmpl-1");
+        assert_eq!(value["choices"][0]["message"]["content"], "hi");
+    }
+
+    #[test]
+    fn rewrite_json_response_model_passes_non_json_bodies_through_unchanged() {
+        // An error body, or any other shape this doesn't recognize —
+        // must never be mangled or dropped just because it isn't JSON.
+        let raw = Bytes::from_static(b"not json at all");
+        assert_eq!(rewrite_json_response_model(&raw, "gemma4:latest"), raw);
+    }
+
+    #[test]
+    fn rewrite_sse_line_model_rewrites_only_the_model_field_of_a_data_line() {
+        let line = r#"data: {"id":"1","model":"/abs/path","choices":[{"delta":{"content":"h"}}]}"#;
+        let rewritten = rewrite_sse_line_model(line, "gemma4:latest");
+        let payload = rewritten.strip_prefix("data: ").expect("data: prefix");
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(value["model"], "gemma4:latest");
+        assert_eq!(value["id"], "1");
+        assert_eq!(value["choices"][0]["delta"]["content"], "h");
+    }
+
+    #[test]
+    fn rewrite_sse_line_model_leaves_the_done_sentinel_and_blank_separators_untouched() {
+        assert_eq!(
+            rewrite_sse_line_model("data: [DONE]", "gemma4:latest"),
+            "data: [DONE]"
+        );
+        assert_eq!(rewrite_sse_line_model("", "gemma4:latest"), "");
+    }
+
+    #[test]
+    fn rewrite_sse_line_model_passes_a_non_json_data_line_through_unchanged() {
+        assert_eq!(
+            rewrite_sse_line_model("data: not json", "gemma4:latest"),
+            "data: not json"
+        );
+    }
+
+    /// Regression test for the other CodeRabbit finding this PR
+    /// addresses: `/v1/embeddings` against an `Engine::Mlx` backend must
+    /// fail fast with a clear reason (not a bare, unexplained 404 from
+    /// forwarding to `mlx_lm.server`, which never gets a
+    /// `--embedding-model` from `spawn_mlx_server` — see
+    /// `proxy_openai_passthrough`'s own doc comment).
+    #[tokio::test]
+    async fn mlx_embeddings_unsupported_response_explains_why_and_names_the_model() {
+        let resp = mlx_embeddings_unsupported_response("gemma4:latest");
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("gemma4:latest"));
+        assert!(message.contains("mlx_lm.server"));
+        assert!(message.contains("/v1/embeddings"));
     }
 
     #[test]

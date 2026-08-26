@@ -306,9 +306,23 @@ jobs:
   # macOS aarch64, both `matrix.backend` entries) against this job's own
   # installed `llmman` binary and a real `vllm serve` — CPU-only on
   # Linux, Metal-GPU-backed (via vllm-metal) on macOS.
+  #
+  # On the two macOS aarch64 legs (`matrix.backend` docker and podman —
+  # see this job's own matrix below; "backend" there is the OCI-transport
+  # Cargo feature `llmman` itself was built with, unrelated to how a
+  # model gets served) `tests/launch_e2e.rs`'s own
+  # `serve_mlx_safetensors_model` test additionally pulls and serves a
+  # real safetensors model via `llmman serve`'s new, separate
+  # `mlx_lm.server` backend (see cmd::serve::use_mlx_for_safetensors) —
+  # not vllm-metal above, a different plugin (Metal GPU support bolted
+  # onto `vllm serve` itself) this job's own vllm-plugin steps already
+  # cover independently — the only two matrix entries where "Install
+  # mlx-lm (macOS arm64, e2e)" below actually installs it; every other
+  # entry's copy of that same test skips itself instead (mlx-lm has no
+  # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/opencode/codex/hermes/openclaw, vllm-plugin) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/opencode/codex/hermes/openclaw, vllm-plugin, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the two
@@ -334,7 +348,14 @@ jobs:
     # own per-step budgets below: up to 60 min for "Install vLLM (e2e)"
     # (wheel downloads, but a slow/retried one on a bad connection) plus
     # up to 30 min for "pytest -m e2e (vllm-plugin)".
-    timeout-minutes: 270
+    #
+    # +10 more (280 total) for `serve_mlx_safetensors_model`'s own single
+    # TIMEOUT budget (10 min, same 600s as warm_model's) — it doesn't go
+    # through launch_and_assert's retry loop at all (a real failure there
+    # is always a deterministic llmman bug worth failing loudly on, not
+    # small-model sampling variance), so unlike the 5 launch tests above
+    # it never multiplies by MAX_ATTEMPTS.
+    timeout-minutes: 280
     strategy:
       fail-fast: false
       matrix:
@@ -815,6 +836,46 @@ jobs:
       - name: Force CPU-only llama-server (macOS only)
         if: matrix.target == 'aarch64-apple-darwin'
         run: echo "LLAMA_ARG_N_GPU_LAYERS=0" >> "$GITHUB_ENV"
+
+      # ── mlx-lm (macOS arm64 only) ─────────────────────────────────────────
+      # Apple Silicon's own Metal-accelerated backend for safetensors
+      # models (see cmd::serve::use_mlx_for_safetensors) — installed, and
+      # its `mlx_lm.server` console script put on PATH, *before* "cargo
+      # test --test launch_e2e" below spawns this job's one shared
+      # `llmman serve` daemon (see tests/launch_e2e.rs's own module doc
+      # comment on why every test in that file shares one daemon): PATH is
+      # fixed at that daemon's own spawn time, like every other part of a
+      # child process's inherited environment, so installing this any
+      # later would leave the already-running daemon unable to find
+      # `mlx_lm.server` for the rest of this job — installing it here,
+      # before that daemon ever starts, is the only ordering that works.
+      # A separate venv from vllm-plugin's own (set up further below, for
+      # both Linux and macOS) rather than reusing it: that one doesn't
+      # exist yet at this point in the job, and giving mlx-lm its own
+      # keeps this step's ordering constraint independent of that one's.
+      #
+      # `serve_mlx_safetensors_model` (tests/launch_e2e.rs) is the only
+      # test that actually needs this — every other one in that file
+      # serves qwen3.5:0.8b (a GGUF model, llama-server's own territory,
+      # never mlx's) — and, like every other prerequisite in that file,
+      # skips itself (rather than failing) when `mlx_lm.server` isn't on
+      # PATH, so this step is deliberately scoped to macOS arm64 only:
+      # mlx-lm has no non-Apple-Silicon build to even attempt installing
+      # elsewhere.
+      - name: Set up Python (mlx e2e)
+        if: matrix.target == 'aarch64-apple-darwin'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install mlx-lm (macOS arm64, e2e)
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/mlx-lm-venv"
+          "$RUNNER_TEMP/mlx-lm-venv/bin/pip" install mlx-lm
+          echo "$RUNNER_TEMP/mlx-lm-venv/bin" >> "$GITHUB_PATH"
 
       # --target: for the same reason as the Build llmman step above —
       # and RUSTFLAGS needs repeating here too, not just there: this step

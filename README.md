@@ -59,7 +59,7 @@ Any source `llmman pull` understands (an OCI registry, `hf://`, `ms://`, ...) ca
 
 ### Serve
 
-Start the inference server. Uses `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp) if it's already on `PATH`; otherwise `llmman` downloads and caches a prebuilt release matching your OS/arch/GPU automatically (see `--llama-cpp-version` to pin a specific release).
+Start the inference server. GGUF models are served by `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp), used from `PATH` if it's already there; otherwise `llmman` downloads and caches a prebuilt release matching your OS/arch/GPU automatically (see `--llama-cpp-version` to pin a specific release). Safetensors models are served by [`vllm`](https://github.com/vllm-project/vllm) (plain `vllm` is CPU-only on macOS, unless you separately install [vllm-metal](https://github.com/vllm-project/vllm-metal) for Metal GPU support) — or, on Apple Silicon macOS, by [`mlx-lm`](https://github.com/ml-explore/mlx-lm)'s `mlx_lm.server` instead when it's on `PATH`: Metal-accelerated, with no vLLM dependency at all, and it supports more model families than vllm-metal does.
 
 ```
 llmman serve
@@ -129,6 +129,15 @@ models. The [`vllm-llmman`](https://pypi.org/project/vllm-llmman/) plugin
 is the inverse: install it alongside `vllm` and `vllm serve
 oci://<reference>` pulls a CNCF ModelPack image directly, instead of a
 HuggingFace repo.
+
+### MLX (Apple Silicon)
+
+On Apple Silicon macOS, `llmman serve` uses
+[`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) instead of `vllm`
+for safetensors models whenever it's on `PATH` — Metal-accelerated, with
+no vLLM dependency at all (unlike getting the same acceleration out of
+`vllm serve` itself via [vllm-metal](https://github.com/vllm-project/vllm-metal)).
+Falls back to `vllm` otherwise. Doesn't support `/v1/embeddings`.
 
 ## Store location
 
