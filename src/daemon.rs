@@ -472,8 +472,12 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
 #[cfg(unix)]
 fn signal_group(pid: u32, force: bool) {
     let signal = if force { "-KILL" } else { "-TERM" };
+    // Stdio nulled: an already-empty group makes kill print "No such
+    // process", which would land in front of the real startup error.
     let _ = Command::new("kill")
         .args([signal, &format!("-{pid}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 }
 
@@ -485,7 +489,13 @@ fn signal_group(pid: u32, force: bool) {
     if force {
         args.push("/F".to_string());
     }
-    let _ = Command::new("taskkill").args(&args).status();
+    // Stdio nulled like the Unix branch: taskkill reports a missing PID
+    // loudly, which would land in front of the real startup error.
+    let _ = Command::new("taskkill")
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Bails with the daemon's exit status (and its log tail) if the freshly
@@ -501,6 +511,13 @@ fn bail_if_exited(
     let Some(status) = child.try_wait().context("wait on llmman serve")? else {
         return Ok(());
     };
+    // An exited child is not always a failed startup: two concurrent
+    // clients can both spawn a daemon, and the loser exits with "address
+    // in use" while the winner serves. If something is listening now, the
+    // start succeeded, whoever's daemon it is.
+    if server_alive() {
+        return Ok(());
+    }
     // The daemon may have spawned a llama-server before dying, and that
     // child shares the daemon's process group (see detach), so signal the
     // group rather than orphan a loaded model. The leader itself is dead
@@ -1089,7 +1106,9 @@ mod tests {
         let tail = log_tail(Some(&path));
         std::fs::remove_file(&path).unwrap();
         assert!(tail.contains("last lines of"), "got: {tail}");
-        assert!(!tail.contains("one"), "got: {tail}");
-        assert!(tail.contains("two\nthree\nfour\nfive\nsix"), "got: {tail}");
+        // Only the part after the header line is the log excerpt; the
+        // header contains the temp path, which may itself contain "one".
+        let excerpt = tail.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+        assert_eq!(excerpt, "two\nthree\nfour\nfive\nsix", "got: {tail}");
     }
 }
