@@ -854,6 +854,104 @@ fn launch_openclaw_with_model() {
     );
 }
 
+/// Verifies `daemon::ensure_server`'s fast-fail path end to end: when the
+/// auto-spawned `llmman serve` dies during startup, the client command
+/// must report the daemon's exit within seconds (via the poll loop's
+/// try_wait) instead of polling a dead port for the full 60s, and its
+/// error must carry the exit status plus the daemon log's tail.
+///
+/// The daemon is made to die instantly and deterministically, with no
+/// network and no interference with any real daemon on the machine:
+///
+///   - `LLMMAN_HOST` points at a loopback port nothing listens on, so
+///     the client never reuses (or stops) the developer's real daemon;
+///   - a fake `llama-server` sits first on `PATH`, so serve's
+///     `resolve_llama_server` returns immediately without a download
+///     (it is found but never executed: serve dies before launching it);
+///   - `LLMMAN_MODELS` points at `<tmp>/store` while `<tmp>/cache`
+///     already exists as a regular FILE, so `serve_async`'s
+///     `create_dir_all(cache)` fails right after resolving llama-server,
+///     before the listener ever binds. `<tmp>/serve.log` itself stays
+///     writable, so the failure reaches the log and the client's error
+///     can quote its tail.
+///
+/// Unlike the launch tests above, this needs neither `SERIAL` (its
+/// daemon slot is its own unused port), `warm_model`, nor any binary on
+/// the real `PATH`.
+#[test]
+fn ensure_server_fails_fast_when_daemon_dies_at_startup() {
+    let dir = fresh_home("dead-daemon");
+    let bin_dir = dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = bin_dir.join("llama-server");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write fake llama-server");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake llama-server");
+    }
+    // find_on_path probes only `{name}.exe` on Windows, so the fake must
+    // be an `.exe`; any content works because it is found, never executed.
+    #[cfg(windows)]
+    std::fs::write(bin_dir.join("llama-server.exe"), "not a real executable")
+        .expect("write fake llama-server");
+
+    std::fs::write(dir.join("cache"), "a file where serve expects a directory")
+        .expect("write cache blocker file");
+
+    // Bound once to reserve a definitely-free port number, then dropped:
+    // the port must NOT stay listening, or ensure_server would take a
+    // successful connect as "a daemon is already running" and never spawn
+    // the one under test.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind probe listener")
+        .local_addr()
+        .expect("probe listener addr")
+        .port();
+
+    let path = std::env::join_paths(std::iter::once(bin_dir).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("join PATH");
+
+    let mut cmd = Command::new(llmman_bin());
+    cmd.arg("pull").arg(MODEL);
+    cmd.env("LLMMAN_HOST", format!("127.0.0.1:{port}"))
+        .env("LLMMAN_MODELS", dir.join("store"))
+        .env("PATH", path);
+
+    let start = Instant::now();
+    // 45s: comfortably above the few seconds a fast-fail takes, but below
+    // ensure_server's own 60s poll, so a regression to the old
+    // wait-out-the-timeout behavior fails here as a timeout rather than
+    // passing slowly.
+    let output = spawn_with_timeout(
+        cmd,
+        Duration::from_secs(45),
+        "`llmman pull` against a daemon that dies at startup",
+    );
+    let elapsed = start.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "pull against a dead daemon unexpectedly succeeded\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stderr.contains("exited during startup"),
+        "expected the daemon's startup exit to be reported\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stderr.contains("last lines of"),
+        "expected the error to quote the daemon log's tail\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "fast-fail took {elapsed:?}; it should report within seconds, \
+         not wait out ensure_server's 60s poll"
+    );
+}
+
 /// True for the one openclaw-specific failure shape confirmed live in
 /// CI that isn't an llmman bug: its own onboarding independently
 /// re-verifies whatever model it's given against a real public Docker
