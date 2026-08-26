@@ -122,9 +122,8 @@ fn resolve_release(client: &reqwest::blocking::Client, version: Option<&str>) ->
     let content = fetch_text(client, &pointer.browser_download_url).with_context(|| {
         format!("download {NIGHTLY_POINTER} from pointer release {pointer_tag}")
     })?;
-    let tag = parse_pointer_tag(&content).ok_or_else(|| {
-        anyhow!("pointer release {pointer_tag}'s {NIGHTLY_POINTER} is empty")
-    })?;
+    let tag = parse_pointer_tag(&content)
+        .ok_or_else(|| anyhow!("pointer release {pointer_tag}'s {NIGHTLY_POINTER} is empty"))?;
     let dereferenced = fetch_release(client, Some(tag)).with_context(|| {
         format!("pointer release {pointer_tag} names tag {tag}, but fetching that release failed")
     })?;
@@ -771,7 +770,10 @@ mod tests {
                 browser_download_url: String::new(),
             }],
         };
-        assert_eq!(pointer_asset(&binary_release).map(|a| a.name.as_str()), None);
+        assert_eq!(
+            pointer_asset(&binary_release).map(|a| a.name.as_str()),
+            None
+        );
 
         // A release carrying binaries alongside a pointer file is a binary
         // release, not a pointer release (see pointer_asset's doc comment).
