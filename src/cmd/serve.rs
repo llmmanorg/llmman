@@ -1083,7 +1083,7 @@ fn image_data_uri(base64_bytes: &str) -> String {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 struct OAIChatRequest {
     model: String,
     messages: Vec<OAIMessage>,
@@ -6985,10 +6985,6 @@ mod tests {
         assert_eq!(ext.flush(), "");
     }
 
-    /// Ported from ollama's api/client_test.go (TestClientStream): SSE
-    /// lines split across arbitrary TCP chunk boundaries must be
-    /// reassembled, CRLF line endings trimmed, and a trailing
-    /// unterminated line flushed when the stream ends.
     /// A multi-byte character split across chunk boundaries must survive.
     /// Decoding each chunk on its own turned the split halves into U+FFFD.
     #[test]
@@ -7006,6 +7002,10 @@ mod tests {
         assert_eq!(lines, vec![line.to_string()]);
     }
 
+    /// Ported from ollama's api/client_test.go (TestClientStream): SSE
+    /// lines split across arbitrary TCP chunk boundaries must be
+    /// reassembled, CRLF line endings trimmed, and a trailing
+    /// unterminated line flushed when the stream ends.
     #[test]
     fn bytes_to_lines_ported_ollama_client_stream_chunking() {
         let chunks: Vec<reqwest::Result<Bytes>> = vec![
@@ -7370,5 +7370,89 @@ mod tests {
             multipart_text_field(&plain_body, &HeaderMap::new(), "model").await,
             None
         );
+    }
+
+    // -- stream_ollama over a mock SSE backend --------------------------------
+
+    const MOCK_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\", world\"},\"finish_reason\":\"stop\"}]}\n",
+        "data: [DONE]\n",
+    );
+
+    /// Runs one request through `stream_ollama` against a real HTTP backend
+    /// serving `MOCK_SSE`, returning its content type and body. The fold
+    /// tests alone would still pass if the branch, its content type, or a
+    /// handler's flag forwarding regressed.
+    async fn run_stream_ollama(streaming: bool) -> (String, String) {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { ([("content-type", "text/event-stream")], MOCK_SSE) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let resp = stream_ollama(
+            streaming,
+            Client::new(),
+            format!("http://{addr}/v1/chat/completions"),
+            OAIChatRequest {
+                messages: vec![OAIMessage::text("user", "hi".to_string())],
+                stream: true,
+                ..Default::default()
+            },
+            ActivityGuard::new(&test_state(), "m"),
+            |content, thinking, tool_calls, done| OllamaChatChunk {
+                model: "m".into(),
+                created_at: now_rfc3339(),
+                message: OllamaMessage {
+                    role: "assistant".into(),
+                    content,
+                    thinking,
+                    tool_calls,
+                    ..Default::default()
+                },
+                done,
+                done_reason: done.then(|| "stop".to_string()),
+            },
+        )
+        .await
+        .expect("mock backend answers");
+
+        let ct = resp.headers()["content-type"].to_str().unwrap().to_string();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (ct, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn stream_ollama_false_returns_one_json_object() {
+        let (content_type, body) = run_stream_ollama(false).await;
+        assert_eq!(content_type, "application/json");
+        let one: serde_json::Value =
+            serde_json::from_str(&body).expect("the whole body is one JSON object");
+        assert_eq!(one["message"]["content"], "Hello, world");
+        assert_eq!(one["done"], true);
+        assert_eq!(one["done_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn stream_ollama_true_returns_ndjson_chunks() {
+        let (content_type, body) = run_stream_ollama(true).await;
+        assert_eq!(content_type, "application/x-ndjson");
+        let chunks: Vec<serde_json::Value> = body
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("each line is its own object"))
+            .collect();
+        assert!(chunks.len() > 1, "got {} chunks", chunks.len());
+        let joined: String = chunks
+            .iter()
+            .map(|c| c["message"]["content"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(joined, "Hello, world");
+        assert_eq!(chunks.last().unwrap()["done"], true);
     }
 }
