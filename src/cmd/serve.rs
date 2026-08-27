@@ -2954,61 +2954,6 @@ async fn stream_rewriting_model(
 }
 
 // ---------------------------------------------------------------------------
-// collect_completion — like ollama's Completion() but in Rust.
-//
-// Sends a streaming request to llama-server's /v1/chat/completions
-// (stream:true, same as ollama always uses), collects every byte until EOF,
-// then parses all SSE lines in one pass.  This avoids both the non-streaming
-// timeout problem (server must generate everything before sending a byte) and
-// the async-streaming fragmentation problem (partial SSE lines across chunks).
-// ---------------------------------------------------------------------------
-
-async fn collect_completion(
-    _shared_client: &Client,
-    url: &str,
-    mut oai: OAIChatRequest,
-) -> Result<String, AppError> {
-    // Use a fresh client per request.  The shared client's connection pool is
-    // polluted by the many health-check GETs in wait_for_ready; reusing those
-    // connections for the completion POST can silently produce an empty body
-    // when llama-server has already closed the idle connection on its end.
-    let client = reqwest::Client::new();
-
-    let resp = post_chat(&client, url, &mut oai).await?;
-    let raw = resp.bytes().await.context("read llama-server response")?;
-    eprintln!("[llmman] llama-server raw {} bytes", raw.len());
-    if raw.is_empty() {
-        return Err(AppError(
-            anyhow!("inference backend returned empty response body"),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ));
-    }
-
-    let text = String::from_utf8_lossy(&raw);
-    let mut content = String::new();
-    for line in text.lines() {
-        let Some(payload) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        match oai_chunk_to_content(payload) {
-            Some((tok, _thinking, true)) => {
-                content.push_str(&tok);
-                break;
-            }
-            Some((tok, _thinking, false)) => content.push_str(&tok),
-            None => {}
-        }
-    }
-
-    if content.is_empty() {
-        // Log the raw response for diagnosis so the user can see what came back
-        let preview: String = text.chars().take(400).collect();
-        eprintln!("[llmman] WARNING: empty content extracted. Raw preview:\n{preview}");
-    }
-    Ok(content)
-}
-
-// ---------------------------------------------------------------------------
 // SSE line buffering
 //
 // reqwest::bytes_stream() delivers raw TCP chunks; a single `data: {json}\n`
@@ -3276,11 +3221,86 @@ fn non_empty_thinking(thinking: String, tool: String) -> Option<String> {
     (!combined.is_empty()).then_some(combined)
 }
 
+/// One decoded SSE line: content, thinking, tool calls, done.
+type OllamaDelta = (String, Option<String>, Option<Vec<OllamaToolCall>>, bool);
+
+/// Response-spanning decode state, shared by both paths below so each
+/// reads a response identically.
+struct OllamaLineDecoder {
+    tool_calls_acc: std::cell::RefCell<std::collections::BTreeMap<usize, ToolCallAccumulator>>,
+    content_extractor: std::cell::RefCell<RawContentExtractor>,
+}
+
+impl OllamaLineDecoder {
+    fn new() -> Self {
+        Self {
+            tool_calls_acc: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            content_extractor: std::cell::RefCell::new(RawContentExtractor::new()),
+        }
+    }
+
+    /// `None` for a line that isn't a recognized SSE payload.
+    fn decode(&self, line: &str) -> Option<OllamaDelta> {
+        let payload = line.strip_prefix("data: ")?;
+        accumulate_tool_call_deltas(payload, &self.tool_calls_acc);
+        let (content, thinking, done) = oai_chunk_to_content(payload)?;
+        let (mut content, thinking) = self
+            .content_extractor
+            .borrow_mut()
+            .process(content, thinking);
+        if done {
+            // Idempotent even across the two `done` chunks
+            // real Ollama's stream can produce (see below):
+            // `flush` drains via `mem::take`, so the second call
+            // just returns an already-empty string.
+            content.push_str(&self.content_extractor.borrow_mut().flush());
+        }
+        // llama-server's SSE stream signals "done" twice — once on
+        // the chunk carrying a real finish_reason, then again on
+        // the trailing literal "[DONE]" line — so `done` here can
+        // be true more than once per response. Draining (not just
+        // reading) the accumulator on the first occurrence means
+        // finalize_tool_calls sees an empty map and returns `None`
+        // on any later one, so a client can't be handed (and
+        // potentially act on) the same tool call twice.
+        let tool_calls = done.then(|| {
+            let drained = std::mem::take(&mut *self.tool_calls_acc.borrow_mut());
+            finalize_tool_calls(&drained)
+        });
+        Some((content, thinking, tool_calls.flatten(), done))
+    }
+}
+
+/// Folds a whole response's lines into the values one non-streaming reply
+/// carries. Separate from the handler so it can be tested offline.
+fn fold_ollama_lines<I: IntoIterator<Item = String>>(
+    lines: I,
+) -> (String, Option<String>, Option<Vec<OllamaToolCall>>) {
+    let decoder = OllamaLineDecoder::new();
+    let (mut content, mut thinking, mut tool_calls) = (String::new(), None, None);
+    for line in lines {
+        let Some((c, t, tc, _)) = decoder.decode(&line) else {
+            continue;
+        };
+        content.push_str(&c);
+        if let Some(t) = t {
+            thinking.get_or_insert_with(String::new).push_str(&t);
+        }
+        // Only the first `done` yields tool calls, so a later `None` never
+        // overwrites them.
+        if tc.is_some() {
+            tool_calls = tc;
+        }
+    }
+    (content, thinking, tool_calls)
+}
+
 /// `build_chunk`'s `tool_calls` parameter is only ever `Some` on the final
 /// (`done`) chunk of an `/api/chat` response that made one or more tool
 /// calls — `/api/generate` (no tool-calling support in real Ollama
 /// either) always gets `None` here and ignores it.
 async fn stream_ollama<T: Serialize + Send + 'static>(
+    streaming: bool,
     client: Client,
     url: String,
     mut oai_req: OAIChatRequest,
@@ -3291,41 +3311,28 @@ async fn stream_ollama<T: Serialize + Send + 'static>(
 ) -> Result<Response, AppError> {
     let resp = post_chat(&client, &url, &mut oai_req).await?;
 
-    let tool_calls_acc = std::cell::RefCell::new(std::collections::BTreeMap::new());
-    let content_extractor = std::cell::RefCell::new(RawContentExtractor::new());
+    // `stream: false` answers with the one JSON object Ollama returns.
+    // llama-server is still asked to stream either way: a non-streaming
+    // upstream sends nothing until generation ends, risking a read timeout.
+    if !streaming {
+        let _activity = activity;
+        let mut lines = Box::pin(bytes_to_lines(resp.bytes_stream()));
+        let mut collected = Vec::new();
+        while let Some(line) = lines.next().await {
+            collected.push(line);
+        }
+        let (content, thinking, tool_calls) = fold_ollama_lines(collected);
+        return Ok(Json(build_chunk(content, thinking, tool_calls, true)).into_response());
+    }
+
+    let decoder = OllamaLineDecoder::new();
     let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
         // Moved into this closure purely to keep it alive — see
         // ActivityGuard's doc comment — until the stream itself is
         // dropped, not referenced otherwise.
         let _activity = &activity;
-        let out = line
-            .strip_prefix("data: ")
-            .and_then(|payload| {
-                accumulate_tool_call_deltas(payload, &tool_calls_acc);
-                let (content, thinking, done) = oai_chunk_to_content(payload)?;
-                let (mut content, thinking) =
-                    content_extractor.borrow_mut().process(content, thinking);
-                if done {
-                    // Idempotent even across the two `done` chunks
-                    // real Ollama's stream can produce (see below):
-                    // `flush` drains via `mem::take`, so the second call
-                    // just returns an already-empty string.
-                    content.push_str(&content_extractor.borrow_mut().flush());
-                }
-                // llama-server's SSE stream signals "done" twice — once on
-                // the chunk carrying a real finish_reason, then again on
-                // the trailing literal "[DONE]" line — so `done` here can
-                // be true more than once per response. Draining (not just
-                // reading) the accumulator on the first occurrence means
-                // finalize_tool_calls sees an empty map and returns `None`
-                // on any later one, so a client can't be handed (and
-                // potentially act on) the same tool call twice.
-                let tool_calls = done.then(|| {
-                    let drained = std::mem::take(&mut *tool_calls_acc.borrow_mut());
-                    finalize_tool_calls(&drained)
-                });
-                Some((content, thinking, tool_calls.flatten(), done))
-            })
+        let out = decoder
+            .decode(&line)
             .map(|(content, thinking, tool_calls, done)| {
                 let chunk = build_chunk(content, thinking, tool_calls, done);
                 serde_json::to_string(&chunk).unwrap_or_default() + "\n"
@@ -3976,6 +3983,7 @@ async fn handle_ollama_chat(
         response_format: format_to_response_format(&req.format),
     };
     stream_ollama(
+        req.stream,
         state.0.client.clone(),
         url,
         oai,
@@ -4082,6 +4090,7 @@ async fn handle_ollama_generate(
         response_format: format_to_response_format(&req.format),
     };
     stream_ollama(
+        req.stream,
         state.0.client.clone(),
         url,
         oai,
@@ -6568,6 +6577,53 @@ mod tests {
     /// tests: each SSE payload either yields (content, thinking, done) or
     /// is skipped entirely (None) when malformed — a bad chunk must never
     /// abort the whole stream.
+    /// Content and thinking each concatenate in order; non-SSE lines and
+    /// the trailing `[DONE]` add nothing.
+    #[test]
+    fn fold_ollama_lines_concatenates_deltas() {
+        let lines = [
+            "",
+            r#"data: {"choices":[{"delta":{"reasoning_content":"let me "},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"reasoning_content":"think"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#,
+            ": keep-alive",
+            r#"data: {"choices":[{"delta":{"content":", world"},"finish_reason":"stop"}]}"#,
+            "data: [DONE]",
+        ]
+        .map(String::from);
+        let (content, thinking, tool_calls) = fold_ollama_lines(lines);
+        assert_eq!(content, "Hello, world");
+        assert_eq!(thinking.as_deref(), Some("let me think"));
+        assert_eq!(tool_calls, None);
+    }
+
+    /// llama-server signals done twice and the decoder drains on the first,
+    /// so folding the last `done` line's value would lose the tool calls.
+    #[test]
+    fn fold_ollama_lines_keeps_tool_calls_across_a_second_done_line() {
+        let lines = [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"get_weather","arguments":"{\"city\":"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Ankara\"}"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"content":""},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ]
+        .map(String::from);
+        let calls = fold_ollama_lines(lines)
+            .2
+            .expect("survive the trailing [DONE]");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments["city"], "Ankara");
+    }
+
+    /// A response with no output folds to empty values.
+    #[test]
+    fn fold_ollama_lines_handles_an_empty_response() {
+        let lines = [r#"data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}"#]
+            .map(String::from);
+        assert_eq!(fold_ollama_lines(lines), (String::new(), None, None));
+    }
+
     #[test]
     fn oai_chunk_to_content_ported_ollama_stream_decoding_cases() {
         // Plain content token, stream not finished.
