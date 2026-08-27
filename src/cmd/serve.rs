@@ -6989,6 +6989,23 @@ mod tests {
     /// lines split across arbitrary TCP chunk boundaries must be
     /// reassembled, CRLF line endings trimmed, and a trailing
     /// unterminated line flushed when the stream ends.
+    /// A multi-byte character split across chunk boundaries must survive.
+    /// Decoding each chunk on its own turned the split halves into U+FFFD.
+    #[test]
+    fn bytes_to_lines_preserves_utf8_split_across_chunks() {
+        let line = "data: g\u{fc}nayd\u{131}n \u{1f600}";
+        // One byte per chunk: every multi-byte character is split.
+        let raw = format!("{line}\n");
+        let chunks: Vec<reqwest::Result<Bytes>> = raw
+            .as_bytes()
+            .iter()
+            .map(|b| Ok(Bytes::copy_from_slice(&[*b])))
+            .collect();
+        let stream = bytes_to_lines(futures::stream::iter(chunks));
+        let lines: Vec<String> = futures::executor::block_on(StreamExt::collect::<Vec<_>>(stream));
+        assert_eq!(lines, vec![line.to_string()]);
+    }
+
     #[test]
     fn bytes_to_lines_ported_ollama_client_stream_chunking() {
         let chunks: Vec<reqwest::Result<Bytes>> = vec![
