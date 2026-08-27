@@ -229,8 +229,7 @@ pub fn resolve_model(
 
     // ── safetensors → vllm / mlx_lm.server ──────────────────────────────
     if manifest.layers.iter().any(|l| is_safetensors_layer(l)) {
-        let model_dir =
-            extract_safetensors_dir(&store, store_path, cache_path, &desc.digest, &manifest)?;
+        let model_dir = extract_safetensors_dir(store_path, cache_path, &desc.digest, &manifest)?;
         return Ok(ModelPath::SafeTensors(model_dir));
     }
 
@@ -254,7 +253,6 @@ pub fn resolve_model(
 /// Extract CNCF-format safetensors layers to a cache directory and return the
 /// model directory (parent of `config.json`).
 fn extract_safetensors_dir(
-    store: &OciStore,
     store_path: &Path,
     cache_path: &Path,
     manifest_digest: &str,
