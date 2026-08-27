@@ -2966,21 +2966,24 @@ fn bytes_to_lines(
     stream: impl futures::Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
 ) -> impl futures::Stream<Item = String> + Send + 'static {
     futures::stream::unfold(
-        (stream.boxed(), String::new()),
+        (stream.boxed(), Vec::<u8>::new()),
         |(mut stream, mut buf)| async move {
             loop {
-                if let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].trim_end_matches('\r').to_string();
+                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let line = String::from_utf8_lossy(&buf[..pos])
+                        .trim_end_matches('\r')
+                        .to_string();
                     buf.drain(..=pos);
                     return Some((line, (stream, buf)));
                 }
                 match futures::StreamExt::next(&mut stream).await {
-                    Some(Ok(chunk)) => buf.push_str(&String::from_utf8_lossy(&chunk)),
+                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
                     Some(Err(_)) | None => {
                         if buf.is_empty() {
                             return None;
                         }
-                        let line = std::mem::take(&mut buf);
+                        let line = String::from_utf8_lossy(&buf).into_owned();
+                        buf.clear();
                         return Some((line, (stream, buf)));
                     }
                 }
