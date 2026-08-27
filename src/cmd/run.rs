@@ -736,8 +736,8 @@ mod unix_readline {
             raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG | libc::IEXTEN);
             raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
             raw.c_cflag |= libc::CS8;
-            raw.c_cc[libc::VMIN as usize] = 1;
-            raw.c_cc[libc::VTIME as usize] = 0;
+            raw.c_cc[libc::VMIN] = 1;
+            raw.c_cc[libc::VTIME] = 0;
             raw
         }
 
