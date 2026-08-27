@@ -167,8 +167,8 @@ jobs:
           if-no-files-found: error
 
   # --------------------------------------------------------------------------
-  # Unit tests: every #[cfg(test)] module under src/ (`cargo test --bin`,
-  # since this crate has no lib target — see Cargo.toml). These are pure-
+  # Unit tests: every #[cfg(test)] module under src/, which live in the
+  # lib target and the llmman-bench binary. These are pure-
   # Rust logic tests with no OS-specific behavior, but the crate itself
   # still links the Go shim via CGO, so a target-specific toolchain issue
   # (the exact kind the `build`/`e2e` jobs' own git history is full of —
@@ -288,8 +288,8 @@ jobs:
       # comment on cargo test compiling its own separate test binary,
       # which links against the same Go-shim-produced llmman_shim.lib the
       # main binary does and hit the exact same lld-link requirement.
-      - name: cargo test --bin llmman
-        run: cargo test --release --target ${{ matrix.target }} --bin llmman
+      - name: cargo test --lib --bins
+        run: cargo test --release --target ${{ matrix.target }} --lib --bins
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 

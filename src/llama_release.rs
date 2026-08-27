@@ -459,7 +459,12 @@ impl DownloadMarker {
     /// download from a crashed one whose Drop never ran.
     fn touch(&self) {
         if let Some(path) = &self.0 {
+            // Windows keeps the old mtime when a write is zero bytes,
+            // so set it explicitly.
             let _ = std::fs::write(path, b"");
+            if let Ok(file) = std::fs::File::options().write(true).open(path) {
+                let _ = file.set_modified(std::time::SystemTime::now());
+            }
         }
     }
 }
