@@ -43,11 +43,10 @@ pub fn run(args: &ListArgs) -> anyhow::Result<()> {
         .max(4);
 
     println!(
-        "{:<name_w$}    {:<16}    {:<10}    {}",
+        "{:<name_w$}    {:<16}    {:<10}    MODIFIED",
         "NAME",
         "ID",
         "SIZE",
-        "MODIFIED",
         name_w = name_w,
     );
 
