@@ -231,7 +231,7 @@ fn asset_query() -> AssetQuery {
 
     #[cfg(target_os = "linux")]
     {
-        return match crate::hostgpu::detect() {
+        match crate::hostgpu::detect() {
             HostGpu::Vulkan => AssetQuery {
                 must_contain: format!("-bin-ubuntu-vulkan-{arch}.tar.gz"),
                 companion_must_contain: None,
@@ -261,7 +261,7 @@ fn asset_query() -> AssetQuery {
                 companion_must_contain: None,
                 label: "cpu".into(),
             },
-        };
+        }
     }
 
     #[cfg(target_os = "windows")]
