@@ -228,7 +228,7 @@ pub fn resolve_model(
     }
 
     // ── safetensors → vllm / mlx_lm.server ──────────────────────────────
-    if manifest.layers.iter().any(|l| is_safetensors_layer(l)) {
+    if manifest.layers.iter().any(is_safetensors_layer) {
         let model_dir =
             extract_safetensors_dir(&store, store_path, cache_path, &desc.digest, &manifest)?;
         return Ok(ModelPath::SafeTensors(model_dir));
