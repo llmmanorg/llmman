@@ -22,6 +22,11 @@ pub struct BuildArgs {
 }
 
 pub fn run(args: &BuildArgs) -> anyhow::Result<()> {
+    // The build tag is a user-chosen label stored verbatim, not resolved, so
+    // this is its only validation gate. Check it before touching the store so
+    // a bad tag never creates the store tree.
+    crate::shortnames::validate_reference(&args.tag)?;
+
     let store_root = crate::default_store()?;
     let store = OciStore::open(&store_root)?;
 
@@ -44,4 +49,26 @@ pub fn run(args: &BuildArgs) -> anyhow::Result<()> {
     let desc = store.build(&context_dir, &args.tag, &labels)?;
     println!("Built {} ({})", args.tag, desc.digest);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_rejects_an_invalid_tag_before_building() {
+        // Validation runs before default_store()/OciStore::open() and before
+        // the context dir is read, so a bad tag errors without touching the
+        // filesystem or env.
+        let args = BuildArgs {
+            tag: "hf.co//foo".into(),
+            context_dir: std::path::PathBuf::from("/nonexistent"),
+            label: Vec::new(),
+        };
+        let err = run(&args).expect_err("invalid tag must error");
+        assert!(
+            err.to_string().contains("invalid model reference"),
+            "expected a validation error, got: {err}"
+        );
+    }
 }

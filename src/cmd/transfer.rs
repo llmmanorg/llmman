@@ -47,8 +47,8 @@ pub struct TransferArgs {
 /// daemon (like `pull`/`push`): a transfer never touches the daemon's
 /// persistent store, so there's no shared state to coordinate.
 pub fn run(args: &TransferArgs) -> anyhow::Result<()> {
-    let source = crate::shortnames::resolve(&args.source);
-    let destination = crate::shortnames::resolve(&args.destination);
+    let source = crate::shortnames::resolve(&args.source)?;
+    let destination = crate::shortnames::resolve(&args.destination)?;
 
     let rt = tokio::runtime::Runtime::new().context("start tokio runtime")?;
     let changed = rt.block_on(async {

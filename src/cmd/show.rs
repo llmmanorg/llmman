@@ -43,9 +43,11 @@ pub struct ShowArgs {
 }
 
 pub fn run(args: &ShowArgs) -> anyhow::Result<()> {
+    // Resolve/validate before opening the store so a bad ref never creates
+    // the store tree, matching cp.rs/build.rs.
+    let reference = crate::shortnames::resolve_ollama_api(&args.model)?;
     let store_path = crate::default_store()?;
     let store = OciStore::open(&store_path)?;
-    let reference = crate::shortnames::resolve_ollama_api(&args.model);
     let desc = store.find(&reference)?;
     let manifest = store.read_manifest(&desc.digest)?;
 

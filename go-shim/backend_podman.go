@@ -370,6 +370,13 @@ func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, d
 	copyImageMu.Lock()
 	defer copyImageMu.Unlock()
 
+	// copy.Image fetches the manifest and every blob inside this one
+	// retryStream, so the manifest phase is not separately bounded to a
+	// single attempt the way the Rust HF metadata GET is (hf::client::once). A
+	// typo'd but syntactically valid OCI registry host can still run the
+	// full retry budget on its manifest lookup here: a known residual, left
+	// as a follow-up. Malformed refs never reach this path: validate_reference
+	// (Rust, Layer B) rejects them up front.
 	var manifestData []byte
 	err := retryStream(ctx, progressKey, isHTTP4xx, func() error {
 		data, err := copyImageAttempt(ctx, pctx, dst, src, present, pastTense, opts, changed, progressKey)

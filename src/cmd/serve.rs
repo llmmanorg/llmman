@@ -1308,6 +1308,17 @@ impl AppError {
     fn status(status: StatusCode, message: impl Into<String>) -> Self {
         Self(anyhow!(message.into()), status)
     }
+
+    /// Wraps a rejected model reference as a 400: the reference is client
+    /// input, so the client error is built right where the reference is
+    /// rejected, via `.map_err(AppError::bad_request)` at each resolve
+    /// site. A constructor rather than a `From<InvalidReference>` impl
+    /// because the blanket `From` above already covers every
+    /// `Into<anyhow::Error>` type (it would produce a 500 through `?`),
+    /// and a specific impl would overlap with it.
+    fn bad_request(e: crate::shortnames::InvalidReference) -> Self {
+        Self(e.into(), StatusCode::BAD_REQUEST)
+    }
 }
 
 impl IntoResponse for AppError {
@@ -2173,10 +2184,13 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
 /// `docker.io/ai/m:latest`. `remove` missed, and the reply still said
 /// `"unload"`, leaving the caller believing a model it can still see in
 /// `llmman ps` had been evicted.
-fn unload_key(state: &AppState, model: &str) -> String {
-    let resolved = crate::shortnames::resolve_ollama_api(model);
+fn unload_key(
+    state: &AppState,
+    model: &str,
+) -> Result<String, crate::shortnames::InvalidReference> {
+    let resolved = crate::shortnames::resolve_ollama_api(model)?;
     let tagged = crate::storage::default_tag(&resolved);
-    canonical_ref(&state.0.store_path, &tagged)
+    Ok(canonical_ref(&state.0.store_path, &tagged))
 }
 
 /// Is `model_ref` already running and alive? See `ModelProcess::is_alive`.
@@ -2428,7 +2442,9 @@ fn try_admit(max_queue: usize) -> Result<QueueGuard, AppError> {
 /// anyway — only ever the very first one, against a model that isn't
 /// locally resolvable at all yet.
 async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<String> {
-    let model_ref = crate::shortnames::resolve_ollama_api(model_ref);
+    // An invalid reference is never locally resolvable, so treat it like any
+    // other unresolvable case: return None and let ensure_model reject it.
+    let model_ref = crate::shortnames::resolve_ollama_api(model_ref).ok()?;
     let model_ref = crate::storage::default_tag(&model_ref);
     let model_ref = canonical_ref(&state.0.store_path, &model_ref);
 
@@ -2749,7 +2765,8 @@ async fn ensure_model(
         ));
     }
 
-    let model_ref = crate::shortnames::resolve_ollama_api(model_ref);
+    let model_ref =
+        crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
     // Default the tag before the lock below: otherwise two concurrent
     // first-pulls of e.g. "gemma4" and "gemma4:latest" take different
     // locks and both spawn a process for the same model.
@@ -4124,7 +4141,8 @@ async fn handle_show(
     // Resolve the same way handle_pull stored it — otherwise a bare name
     // (e.g. "gemma4", pulled and stored as "docker.io/ai/gemma4") would
     // never be found by show/delete even though it's in the local store.
-    let model_ref = crate::shortnames::resolve_ollama_api(model_ref);
+    let model_ref =
+        crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
     let model_ref = model_ref.as_str();
     eprintln!("[llmman] /api/show model={model_ref:?}");
     let store = OciStore::open(&state.0.store_path)?;
@@ -4181,7 +4199,13 @@ async fn handle_pull(
         let body = serde_json::json!({"error": "model is required"});
         return (StatusCode::BAD_REQUEST, Json(body)).into_response();
     }
-    let model = crate::shortnames::resolve_ollama_api(model_ref);
+    let model = match crate::shortnames::resolve_ollama_api(model_ref) {
+        Ok(m) => m,
+        Err(e) => {
+            let body = serde_json::json!({"error": e.to_string()});
+            return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+        }
+    };
     eprintln!("[llmman] /api/pull model={model:?}");
     let store_path = state.0.store_path.clone();
 
@@ -4245,7 +4269,13 @@ async fn handle_push(
         let body = serde_json::json!({"error": "model is required"});
         return (StatusCode::BAD_REQUEST, Json(body)).into_response();
     }
-    let model = crate::shortnames::resolve_ollama_api(model_ref);
+    let model = match crate::shortnames::resolve_ollama_api(model_ref) {
+        Ok(m) => m,
+        Err(e) => {
+            let body = serde_json::json!({"error": e.to_string()});
+            return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+        }
+    };
     eprintln!("[llmman] /api/push model={model:?}");
     let store_path = state.0.store_path.clone();
 
@@ -4374,7 +4404,8 @@ async fn handle_delete(
         .filter(|s| !s.is_empty())
         .unwrap_or(&req.model);
     // See handle_show: resolve the same way handle_pull stored it.
-    let model_ref = crate::shortnames::resolve_ollama_api(model_ref);
+    let model_ref =
+        crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
     let store = OciStore::open(&state.0.store_path)?;
     store.remove(&model_ref)?;
     Ok(StatusCode::OK)
@@ -4421,7 +4452,7 @@ async fn handle_ollama_chat(
     // empty message, and a `keep_alive: 0` never unloads anything.
     if req.messages.is_empty() {
         if is_explicit_unload(&req.keep_alive) {
-            let canonical = unload_key(&state, &req.model);
+            let canonical = unload_key(&state, &req.model).map_err(AppError::bad_request)?;
             let _guard = acquire_load_lock(&canonical).await;
             state.0.manager.lock().await.running.remove(&canonical);
             return Ok(Json(empty_chat_chunk(req.model, "unload")).into_response());
@@ -4509,7 +4540,7 @@ async fn handle_ollama_generate(
     // `LLMMAN_KEEP_ALIVE=0` turned a plain preload into an eviction.
     let is_unload = req.prompt.is_empty() && is_explicit_unload(&req.keep_alive);
     if is_unload {
-        let canonical = unload_key(&state, &req.model);
+        let canonical = unload_key(&state, &req.model).map_err(AppError::bad_request)?;
         // Wait for an in-flight load of this model to publish itself first,
         // so it can't race ahead of this remove.
         let _guard = acquire_load_lock(&canonical).await;
@@ -5567,24 +5598,28 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .as_deref()
         .filter(|m| !crate::providers::is_remote_ref(m))
     {
-        let model = crate::shortnames::resolve_ollama_api(model);
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            match ensure_model(&state_clone, &model, None).await {
-                // ensure_model's own keep_alive (the daemon default, 5
-                // minutes) would otherwise start counting down the
-                // moment this finishes loading, with no request traffic
-                // to reset it — the idle reaper could unload a model
-                // asked for on the command line before it's ever
-                // actually used, defeating the whole point of
-                // pre-loading it. Pin it ("never unload") instead — a
-                // model named explicitly at startup is meant to stay
-                // warm for the daemon's lifetime, not just its first 5
-                // idle minutes.
-                Ok((_, _, guard)) => refresh_activity(guard, None).await,
-                Err(e) => eprintln!("[llmman] pre-load failed: {:#}", e.0),
+        match crate::shortnames::resolve_ollama_api(model) {
+            Ok(model) => {
+                let state_clone = state.clone();
+                tokio::spawn(async move {
+                    match ensure_model(&state_clone, &model, None).await {
+                        // ensure_model's own keep_alive (the daemon default, 5
+                        // minutes) would otherwise start counting down the
+                        // moment this finishes loading, with no request traffic
+                        // to reset it — the idle reaper could unload a model
+                        // asked for on the command line before it's ever
+                        // actually used, defeating the whole point of
+                        // pre-loading it. Pin it ("never unload") instead — a
+                        // model named explicitly at startup is meant to stay
+                        // warm for the daemon's lifetime, not just its first 5
+                        // idle minutes.
+                        Ok((_, _, guard)) => refresh_activity(guard, None).await,
+                        Err(e) => eprintln!("[llmman] pre-load failed: {:#}", e.0),
+                    }
+                });
             }
-        });
+            Err(e) => eprintln!("[llmman] pre-load failed: {e}"),
+        }
     }
 
     axum::serve(listener, app)
@@ -8319,12 +8354,12 @@ mod tests {
     /// (see `ensure_model`'s `default_tag` call).
     #[test]
     fn ensure_model_key_pipeline_converges_aliases_before_the_lock() {
-        let tagless = crate::storage::default_tag(&crate::shortnames::resolve_ollama_api(
-            "regression-test-model",
-        ));
-        let tagged = crate::storage::default_tag(&crate::shortnames::resolve_ollama_api(
-            "regression-test-model:latest",
-        ));
+        let tagless = crate::storage::default_tag(
+            &crate::shortnames::resolve_ollama_api("regression-test-model").unwrap(),
+        );
+        let tagged = crate::storage::default_tag(
+            &crate::shortnames::resolve_ollama_api("regression-test-model:latest").unwrap(),
+        );
         assert_eq!(
             tagless, tagged,
             "tagless and :latest aliases must resolve to one key"
@@ -8340,6 +8375,59 @@ mod tests {
         drop(a);
         drop(b);
         release_load_lock(&tagless);
+    }
+
+    /// An invalid client ref is rejected at the top of `ensure_model`, before
+    /// any resolve/pull/network work runs. The reference error is built as a
+    /// 400 right at the resolve site (`AppError::bad_request`), so it must
+    /// survive `into_response` unchanged.
+    #[tokio::test]
+    async fn ensure_model_rejects_an_invalid_ref_with_400() {
+        let state = test_state();
+        let err = ensure_model(&state, "hf.co/../x", None)
+            .await
+            .err()
+            .expect("invalid ref must be rejected");
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// /api/push validates the client ref before resolving it: an invalid
+    /// ref returns a 400, matching /api/pull's early rejection.
+    #[tokio::test]
+    async fn handle_push_rejects_an_invalid_ref_with_400() {
+        let state = test_state();
+        let req = OllamaPushRequest {
+            model: "hf.co/../x".to_string(),
+            name: String::new(),
+        };
+        let resp = handle_push(State(state), Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// /api/delete resolves (and so validates) the client ref before it ever
+    /// opens the store: an invalid ref returns a 400 and touches nothing.
+    #[tokio::test]
+    async fn handle_delete_rejects_an_invalid_ref_with_400() {
+        let state = test_state();
+        let req = OllamaDeleteRequest {
+            model: "hf.co//foo".to_string(),
+            name: None,
+        };
+        let resp = handle_delete(State(state), Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// /api/show resolves (and so validates) the client ref before it ever
+    /// opens the store: an invalid ref returns a 400 and touches nothing.
+    #[tokio::test]
+    async fn handle_show_rejects_an_invalid_ref_with_400() {
+        let state = test_state();
+        let req = OllamaShowRequest {
+            model: "hf:///foo".to_string(),
+            name: None,
+        };
+        let resp = handle_show(State(state), Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// Regression: a call site that drops its guard but not its own `Arc`

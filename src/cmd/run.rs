@@ -106,7 +106,7 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
     // longer "bare" by the time ensure_model resolves it server-side (it
     // already has a "/" and a "."), so the docker.io/ai/ default never
     // fires and this silently falls back to hf.co/<name> instead.
-    let model = crate::shortnames::resolve_ollama_api(&args.model);
+    let model = crate::shortnames::resolve_ollama_api(&args.model)?;
     let prompt = args.prompt.join(" ");
 
     // Starts `llmman serve` detached, left running indefinitely, if one

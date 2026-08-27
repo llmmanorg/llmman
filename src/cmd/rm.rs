@@ -10,18 +10,36 @@ pub struct RmArgs {
 }
 
 pub fn run(args: &RmArgs) -> anyhow::Result<()> {
+    let mut any_err = false;
+
+    // Resolve (and validate) every reference before opening the store, so an
+    // invalid ref never creates the store tree.
+    // resolve_ollama_api, not resolve: a bare name pulled via the Ollama API
+    // (POST /api/pull, /api/chat, ...) is stored under docker.io/ai/<name>,
+    // not hf.co/<name>, so it must resolve the same way here or `llmman rm
+    // <bare-name>` looks for the wrong entry.
+    let mut refs = Vec::new();
+    for raw in &args.references {
+        match crate::shortnames::resolve_ollama_api(raw) {
+            Ok(r) => refs.push(r),
+            Err(e) => {
+                eprintln!("Error removing {raw}: {e}");
+                any_err = true;
+            }
+        }
+    }
+
+    // Nothing valid to remove: don't open (and thereby create) the store.
+    if refs.is_empty() {
+        anyhow::bail!("one or more removals failed");
+    }
+
     let store_root = crate::default_store()?;
     let store = OciStore::open(&store_root)?;
 
-    let mut any_err = false;
     let mut any_removed = false;
-    for raw in &args.references {
-        // resolve_ollama_api, not resolve: a bare name pulled via the
-        // Ollama API (POST /api/pull, /api/chat, ...) is stored under
-        // docker.io/ai/<name>, not hf.co/<name> — must resolve the same
-        // way here or `llmman rm <bare-name>` looks for the wrong entry.
-        let reference = crate::shortnames::resolve_ollama_api(raw);
-        match store.remove(&reference) {
+    for reference in &refs {
+        match store.remove(reference) {
             Ok(()) => {
                 println!("Removed {}", reference);
                 any_removed = true;

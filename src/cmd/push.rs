@@ -16,6 +16,10 @@ pub struct PushArgs {
 /// No store override of its own: set `LLMMAN_MODELS` before starting
 /// `llmman serve` to change the daemon's store for every client.
 pub fn run(args: &PushArgs) -> anyhow::Result<()> {
+    // Fast-fail before starting the daemon (which would create the store
+    // tree), mirroring pull.rs: push sends the raw ref to the daemon
+    // without resolving it locally, so this is its client-side gate.
+    crate::shortnames::validate_reference(&args.reference)?;
     crate::daemon::ensure_server("")?;
     crate::daemon::stream_progress("/api/push", &args.reference)?;
     println!("Pushed {}", args.reference);

@@ -32,7 +32,7 @@ pub fn run(args: &StopArgs) -> anyhow::Result<()> {
         anyhow::bail!("llmman serve is not running (nothing is loaded) — nothing to stop");
     }
 
-    let reference = crate::shortnames::resolve_ollama_api(&args.model);
+    let reference = crate::shortnames::resolve_ollama_api(&args.model)?;
 
     // The unload endpoint itself always reports success even when
     // nothing by that name was running (canonical_ref falls back

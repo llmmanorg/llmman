@@ -22,14 +22,15 @@ pub struct HfFile {
     pub kind: String, // "file" or "directory"
 }
 
-/// Issues an authenticated GET and decodes JSON, retrying transient
-/// failures with the shared backoff budget — mirrors `hfGet`.
+/// Issues an authenticated GET and decodes JSON in a single attempt. This
+/// is a cheap metadata request, so a bad or nonexistent host must fail
+/// fast rather than run the retry backoff.
 async fn get_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
     token: Option<&str>,
 ) -> Result<T> {
-    let body = super::client::retry(&format!("GET {url}"), || async {
+    let body = super::client::once(&format!("GET {url}"), || async {
         let mut req = client.get(url);
         if let Some(t) = token {
             req = req.bearer_auth(t);

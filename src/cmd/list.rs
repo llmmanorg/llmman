@@ -21,7 +21,11 @@ pub fn run(args: &ListArgs) -> anyhow::Result<()> {
     let mut images = store.list()?;
 
     if let Some(filter) = &args.reference {
-        images.retain(|i| matches_filter(&i.reference, filter));
+        // Resolve once up front so an invalid filter surfaces its
+        // validation error instead of silently matching nothing and
+        // printing an empty table.
+        let filter = crate::shortnames::resolve_ollama_api(filter)?;
+        images.retain(|i| matches_filter(&i.reference, &filter));
     }
 
     if images.is_empty() {
@@ -78,22 +82,21 @@ fn split_repo_tag(reference: &str) -> (&str, Option<&str>) {
 }
 
 /// Returns true if a stored image `reference` should be included given a
-/// user-supplied `filter`.
-///
-/// `filter` is first run through `shortnames::resolve_ollama_api` — the
-/// same resolution `rm`/`tag` apply to references they look up in the
-/// local store — so a bare owner/repo filter like `unsloth/Qwen3.5-0.8B`
-/// matches a stored `hf.co/unsloth/Qwen3.5-0.8B:latest` (registries default
-/// to `hf.co/`, exactly as they do when the model was pulled). The
-/// resolved filter then matches either the full stored reference verbatim,
-/// or — if the filter carried no explicit tag — just its repository part.
-fn matches_filter(reference: &str, filter: &str) -> bool {
-    let resolved = crate::shortnames::resolve_ollama_api(filter);
-    if reference == resolved {
+/// `resolved_filter` already run through `shortnames::resolve_ollama_api`
+/// by `run`: the same resolution `rm`/`tag` apply to references they look
+/// up in the local store, so a bare owner/repo filter like
+/// `unsloth/Qwen3.5-0.8B` matches a stored `hf.co/unsloth/Qwen3.5-0.8B:latest`
+/// (registries default to `hf.co/`, exactly as they do when the model was
+/// pulled). Resolution happens once in `run`, not here per image, so an
+/// invalid filter is a reported error rather than a silently empty table.
+/// The resolved filter matches either the full stored reference verbatim,
+/// or (when the filter carried no explicit tag) just its repository part.
+fn matches_filter(reference: &str, resolved_filter: &str) -> bool {
+    if reference == resolved_filter {
         return true;
     }
     let (ref_repo, _) = split_repo_tag(reference);
-    let (filter_repo, filter_tag) = split_repo_tag(&resolved);
+    let (filter_repo, filter_tag) = split_repo_tag(resolved_filter);
     filter_tag.is_none() && ref_repo == filter_repo
 }
 
@@ -145,6 +148,14 @@ fn render_format(template: &str, img: &ImageSummary) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    /// Mirrors `run`'s pipeline for a raw user filter: resolve once, then
+    /// match. Tests below feed raw filters, so they exercise the same
+    /// resolution `run` applies before calling `matches_filter`.
+    fn matches(reference: &str, filter: &str) -> bool {
+        let resolved = crate::shortnames::resolve_ollama_api(filter).unwrap();
+        matches_filter(reference, &resolved)
+    }
+
     fn sample() -> ImageSummary {
         ImageSummary {
             reference: "unsloth/Qwen3.5-0.8B:latest".into(),
@@ -178,15 +189,15 @@ mod tests {
     #[test]
     fn matches_filter_matches_repo_without_tag() {
         // Both sides already fully-qualified: exact-match path.
-        assert!(matches_filter(
+        assert!(matches(
             "hf.co/unsloth/Qwen3.5-0.8B:latest",
             "hf.co/unsloth/Qwen3.5-0.8B"
         ));
-        assert!(matches_filter(
+        assert!(matches(
             "hf.co/unsloth/Qwen3.5-0.8B:latest",
             "hf.co/unsloth/Qwen3.5-0.8B:latest"
         ));
-        assert!(!matches_filter(
+        assert!(!matches(
             "hf.co/unsloth/Qwen3.5-0.8B:latest",
             "hf.co/other/model"
         ));
@@ -198,23 +209,23 @@ mod tests {
         // HuggingFace) is stored under an `hf.co/`-prefixed reference; the
         // same bare owner/repo filter must resolve the same way `rm`/`tag`
         // do, or `llmman list <owner>/<repo>` never matches anything.
-        assert!(matches_filter(
+        assert!(matches(
             "hf.co/unsloth/Qwen3.5-0.8B:latest",
             "unsloth/Qwen3.5-0.8B"
         ));
         // Must not accidentally match a same-prefix but distinct repo.
-        assert!(!matches_filter(
+        assert!(!matches(
             "hf.co/unsloth/Qwen3.5-0.8B-GGUF:latest",
             "unsloth/Qwen3.5-0.8B"
         ));
         // An explicit tag on the filter requires an exact match, no
         // repo-only fallback.
-        assert!(!matches_filter(
+        assert!(!matches(
             "hf.co/unsloth/Qwen3.5-0.8B:latest",
             "unsloth/Qwen3.5-0.8B:q4"
         ));
         // Already-qualified filters still work as before.
-        assert!(matches_filter(
+        assert!(matches(
             "hf.co/unsloth/Qwen3.5-0.8B:latest",
             "hf.co/unsloth/Qwen3.5-0.8B"
         ));
@@ -224,7 +235,7 @@ mod tests {
     fn matches_filter_resolves_bare_names_to_docker_ai_default() {
         // Bare (slash-less) names go through resolve_ollama_api's
         // docker.io/ai/ default, same as `rm`/`tag`.
-        assert!(matches_filter("docker.io/ai/gemma4:latest", "gemma4"));
+        assert!(matches("docker.io/ai/gemma4:latest", "gemma4"));
     }
 
     #[test]

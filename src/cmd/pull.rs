@@ -16,6 +16,7 @@ pub struct PullArgs {
 /// No store override of its own: set `LLMMAN_MODELS` before starting
 /// `llmman serve` to change the daemon's store for every client.
 pub fn run(args: &PullArgs) -> anyhow::Result<()> {
+    crate::shortnames::validate_reference(&args.reference)?;
     crate::daemon::ensure_server("")?;
     crate::daemon::stream_progress("/api/pull", &args.reference)?;
     println!("Pulled {}", args.reference);

@@ -20,7 +20,7 @@ const RETRY_BASE: Duration = Duration::from_secs(1);
 /// No bytes at all for this long aborts the current attempt.
 const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A non-2xx HTTP response, carrying enough structure for [`retry`] to
+/// A non-2xx HTTP response, carrying enough structure for a retry loop to
 /// react to more than just "was this permanent": a server-supplied
 /// `Retry-After` (RFC 9110 §10.2.3), mirroring `huggingface_hub`'s own
 /// handling of it on a 429.
@@ -49,7 +49,7 @@ impl HttpStatusError {
     }
 }
 
-/// How long [`retry`] will ever honor a server-supplied `Retry-After`
+/// How long a retry loop will ever honor a server-supplied `Retry-After`
 /// for. `huggingface_hub` trusts it completely; an unbounded wait here
 /// could eat a whole CI job's time budget on one file, so this caps it
 /// well short of that instead.
@@ -116,46 +116,21 @@ fn rand_unit() -> f64 {
     (nanos % 1_000_000) as f64 / 1_000_000.0
 }
 
-/// Calls `attempt` up to [`MAX_ATTEMPTS`] times with exponential backoff
-/// — or the previous attempt's `Retry-After`, if it had one — stopping
-/// immediately once the most recent error is [`is_permanent`]. Every
-/// attempt restarts its work entirely from scratch (mirrors
-/// `retryStream`'s own doc comment: there's no partial state to resume
-/// into on this side of a registry push either way).
-pub async fn retry<T, F, Fut>(label: &str, mut attempt: F) -> Result<T>
+/// Runs `attempt` exactly once, with no retry loop or backoff. The cheap
+/// metadata requests (the model-info GET and the HEAD size/etag probes)
+/// use this so a bad or nonexistent host fails immediately rather than
+/// running a full backoff budget. The HF client attaches its bearer token
+/// up front (no 401 auth handshake to retry), and the per-request timeout
+/// reqwest already applies still bounds a slow-but-resolvable host. A 4xx
+/// surfaces as-is.
+pub async fn once<T, F, Fut>(label: &str, attempt: F) -> Result<T>
 where
-    F: FnMut() -> Fut,
+    F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    let mut last_err: Option<anyhow::Error> = None;
-    for i in 0..MAX_ATTEMPTS {
-        if i > 0 {
-            let delay = last_err
-                .as_ref()
-                .and_then(retry_after_of)
-                .unwrap_or_else(|| retry_delay(i));
-            eprintln!(
-                "\n[llmman] retrying {label} (attempt {}/{MAX_ATTEMPTS}, wait {delay:?})",
-                i + 1
-            );
-            tokio::time::sleep(delay).await;
-        }
-        match attempt().await {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                let permanent = is_permanent(&e);
-                eprintln!("[llmman] {label} error: {e:#}");
-                last_err = Some(e);
-                if permanent {
-                    break;
-                }
-            }
-        }
-    }
-    Err(anyhow!(
-        "{label} failed after {MAX_ATTEMPTS} attempts: {:#}",
-        last_err.expect("loop always runs at least once")
-    ))
+    attempt().await.inspect_err(|e| {
+        eprintln!("[llmman] {label} error: {e:#}");
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -310,70 +285,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_stops_immediately_on_permanent_error() {
+    async fn once_runs_the_attempt_a_single_time_on_failure() {
         let attempts = AtomicU32::new(0);
-        let result: Result<()> = retry("test", || {
+        let result: Result<()> = once("test", || {
             attempts.fetch_add(1, Ordering::SeqCst);
-            async {
-                Err(anyhow::Error::new(HttpStatusError::new(
-                    "GET x",
-                    404,
-                    &HeaderMap::new(),
-                )))
-            }
+            async { Err(anyhow!("boom")) }
         })
         .await;
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn retry_succeeds_after_transient_failures() {
-        let attempts = AtomicU32::new(0);
-        let result = retry("test", || {
-            let n = attempts.fetch_add(1, Ordering::SeqCst);
-            async move {
-                if n < 2 {
-                    Err(anyhow!("transient"))
-                } else {
-                    Ok(42)
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(result, 42);
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test]
-    async fn retry_honors_retry_after_over_exponential_backoff() {
-        let attempts = AtomicU32::new(0);
-        let start = Instant::now();
-        retry::<(), _, _>("test", || {
-            let n = attempts.fetch_add(1, Ordering::SeqCst);
-            async move {
-                if n == 0 {
-                    Err(anyhow::Error::new(HttpStatusError {
-                        prefix: "GET x".to_string(),
-                        status: 429,
-                        retry_after: Some(Duration::from_millis(100)),
-                    }))
-                } else {
-                    Ok(())
-                }
-            }
-        })
-        .await
-        .unwrap();
-        // Default exponential backoff for the first retry is ~0.75-1.25s;
-        // a Retry-After of 100ms is a clearly distinguishable, much
-        // shorter wait if actually honored.
-        assert!(
-            start.elapsed() < Duration::from_millis(500),
-            "elapsed={:?}",
-            start.elapsed()
-        );
     }
 
     #[tokio::test]

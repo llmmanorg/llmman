@@ -75,11 +75,13 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         // talks to serve's Ollama/OpenAI/Anthropic-compat surfaces, all of
         // which resolve model names the same way (see ensure_model in
         // cmd::serve), so a bare name here must match what the daemon
-        // resolves it to at request time.
+        // resolves it to at request time. Fallible: it validates the raw
+        // reference first (see shortnames::validate_reference).
         None => (
             args.model
                 .as_deref()
                 .map(crate::shortnames::resolve_ollama_api)
+                .transpose()?
                 .unwrap_or_default(),
             providers::PLACEHOLDER_API_KEY.to_string(),
         ),
@@ -1034,7 +1036,7 @@ mod tests {
     #[test]
     fn local_models_are_unaffected_by_the_remote_prefix() {
         for local in ["qwen3.5:0.8b", "hf.co/unsloth/Qwen3.5-0.8B-GGUF"] {
-            let resolved = crate::shortnames::resolve_ollama_api(local);
+            let resolved = crate::shortnames::resolve_ollama_api(local).unwrap();
             assert!(
                 !providers::is_remote_ref(&resolved),
                 "{local} resolved to a provider-routed reference: {resolved}"

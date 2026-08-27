@@ -251,7 +251,9 @@ mod docker {
         let url = format!("{endpoint}{owner}/{repo}/resolve/{commit}/{}", file.path);
         let label = format!("Transferring {}", basename(&file.path));
 
-        let meta = super::super::client::retry(&format!("HEAD {}", file.path), || {
+        // Single attempt: this is a cheap metadata probe, so a bad or
+        // nonexistent host must fail fast rather than run the retry backoff.
+        let meta = super::super::client::once(&format!("HEAD {}", file.path), || {
             download::head_metadata(head_client, url.clone(), token)
         })
         .await
@@ -431,15 +433,14 @@ mod docker {
         .await
     }
 
-    /// Retries `attempt` (the whole open-a-fresh-stream-and-push cycle)
-    /// up to `client::MAX_ATTEMPTS` times, honoring `Retry-After`/
-    /// exponential backoff between tries — mirrors `client::retry`, but
-    /// as its own copy rather than a call to it: `client::retry`'s
-    /// `FnMut() -> Fut` bound doesn't accommodate a closure that also
-    /// needs the attempt number (to seed the exponential backoff — see
-    /// `download::should_retry`), and threading that through would need
-    /// the exact borrow-capturing shape that function's own doc comment
-    /// already explains doesn't work here.
+    /// The push-side retry loop: retries `attempt` (the whole
+    /// open-a-fresh-stream-and-push cycle) up to `client::MAX_ATTEMPTS`
+    /// times, honoring `Retry-After`/exponential backoff between tries.
+    /// It is its own loop rather than a shared helper because `attempt`
+    /// needs the attempt number to seed the backoff (see
+    /// `download::should_retry`); the metadata path's `client::once` runs
+    /// a single attempt and the blob-download loop lives in `download.rs`,
+    /// so there is no shared retry helper to call here.
     async fn retry_push<F, Fut>(label: &str, mut attempt: F) -> Result<bool>
     where
         F: FnMut(u32) -> Fut,

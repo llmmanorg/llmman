@@ -170,7 +170,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
 
     let mut results = Vec::with_capacity(args.model.len());
     for raw_model in &args.model {
-        let model = shortnames::resolve_ollama_api(raw_model);
+        let model = shortnames::resolve_ollama_api(raw_model)?;
         // Fail fast on a bad/unresolvable reference rather than only
         // discovering it partway through warmup below.
         daemon::ensure_model_pulled(&model)?;

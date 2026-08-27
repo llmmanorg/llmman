@@ -64,7 +64,7 @@ struct ResolveOutput<'a> {
 }
 
 pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
-    let reference = crate::shortnames::resolve_ollama_api(&args.reference);
+    let reference = crate::shortnames::resolve_ollama_api(&args.reference)?;
 
     let store_path = crate::default_store()?;
     let cache_path = args
