@@ -1147,12 +1147,31 @@ jobs:
             echo "tag_name=b$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Build release notes
+        id: notes
+        shell: bash
+        env:
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          printf '%s\n' "$HEAD_COMMIT_MESSAGE" \
+            | sed -E '/^[[:space:]]*(signed-off-by|co-authored-by):/Id' \
+            | cat -s \
+            | awk '
+                { line[NR] = $0 }
+                END {
+                  last = NR
+                  while (last > 0 && line[last] ~ /^[[:space:]]*-*[[:space:]]*$/) last--
+                  for (i = 1; i <= last; i++) print line[i]
+                }
+              ' > release-notes.md
+          cat release-notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.tag.outputs.tag_name }}
           name: ${{ steps.tag.outputs.tag_name }}
-          body: ${{ github.event.head_commit.message }}
+          body_path: release-notes.md
           target_commitish: ${{ github.sha }}
           prerelease: false
           files: dist/llmman-*
