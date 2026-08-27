@@ -3274,28 +3274,44 @@ impl OllamaLineDecoder {
     }
 }
 
-/// Folds a whole response's lines into the values one non-streaming reply
-/// carries. Separate from the handler so it can be tested offline.
-fn fold_ollama_lines<I: IntoIterator<Item = String>>(
-    lines: I,
-) -> (String, Option<String>, Option<Vec<OllamaToolCall>>) {
-    let decoder = OllamaLineDecoder::new();
-    let (mut content, mut thinking, mut tool_calls) = (String::new(), None, None);
-    for line in lines {
-        let Some((c, t, tc, _)) = decoder.decode(&line) else {
-            continue;
-        };
-        content.push_str(&c);
-        if let Some(t) = t {
-            thinking.get_or_insert_with(String::new).push_str(&t);
+/// A whole response accumulated into the one reply a non-streaming
+/// request gets. `done` stays false when the backend never sent a
+/// terminal chunk, which means the reply is truncated.
+#[derive(Default)]
+struct OllamaFold {
+    content: String,
+    thinking: Option<String>,
+    tool_calls: Option<Vec<OllamaToolCall>>,
+    done: bool,
+}
+
+impl OllamaFold {
+    fn push(&mut self, (content, thinking, tool_calls, done): OllamaDelta) {
+        self.content.push_str(&content);
+        if let Some(t) = thinking {
+            self.thinking.get_or_insert_with(String::new).push_str(&t);
         }
         // Only the first `done` yields tool calls, so a later `None` never
         // overwrites them.
-        if tc.is_some() {
-            tool_calls = tc;
+        if tool_calls.is_some() {
+            self.tool_calls = tool_calls;
+        }
+        self.done |= done;
+    }
+}
+
+/// Folds lines through a fresh decoder. Used by the tests; the handler
+/// pushes as each line arrives instead of buffering them all.
+#[cfg(test)]
+fn fold_ollama_lines<I: IntoIterator<Item = String>>(lines: I) -> OllamaFold {
+    let decoder = OllamaLineDecoder::new();
+    let mut fold = OllamaFold::default();
+    for line in lines {
+        if let Some(delta) = decoder.decode(&line) {
+            fold.push(delta);
         }
     }
-    (content, thinking, tool_calls)
+    fold
 }
 
 /// `build_chunk`'s `tool_calls` parameter is only ever `Some` on the final
@@ -3319,13 +3335,32 @@ async fn stream_ollama<T: Serialize + Send + 'static>(
     // upstream sends nothing until generation ends, risking a read timeout.
     if !streaming {
         let _activity = activity;
+        let decoder = OllamaLineDecoder::new();
+        let mut fold = OllamaFold::default();
         let mut lines = Box::pin(bytes_to_lines(resp.bytes_stream()));
-        let mut collected = Vec::new();
         while let Some(line) = lines.next().await {
-            collected.push(line);
+            if let Some(delta) = decoder.decode(&line) {
+                fold.push(delta);
+            }
         }
-        let (content, thinking, tool_calls) = fold_ollama_lines(collected);
-        return Ok(Json(build_chunk(content, thinking, tool_calls, true)).into_response());
+        // bytes_to_lines reports a mid-response read failure as a clean end
+        // of stream, so a missing terminal chunk is the only evidence the
+        // backend died. Without this the caller gets 200 and `done: true`
+        // over silently truncated text; the streaming path at least ends
+        // without ever sending a `done` chunk.
+        if !fold.done {
+            return Err(AppError(
+                anyhow!("inference backend closed the connection before finishing"),
+                StatusCode::BAD_GATEWAY,
+            ));
+        }
+        return Ok(Json(build_chunk(
+            fold.content,
+            fold.thinking,
+            fold.tool_calls,
+            true,
+        ))
+        .into_response());
     }
 
     let decoder = OllamaLineDecoder::new();
@@ -6594,10 +6629,11 @@ mod tests {
             "data: [DONE]",
         ]
         .map(String::from);
-        let (content, thinking, tool_calls) = fold_ollama_lines(lines);
-        assert_eq!(content, "Hello, world");
-        assert_eq!(thinking.as_deref(), Some("let me think"));
-        assert_eq!(tool_calls, None);
+        let fold = fold_ollama_lines(lines);
+        assert_eq!(fold.content, "Hello, world");
+        assert_eq!(fold.thinking.as_deref(), Some("let me think"));
+        assert_eq!(fold.tool_calls, None);
+        assert!(fold.done);
     }
 
     /// llama-server signals done twice and the decoder drains on the first,
@@ -6612,7 +6648,7 @@ mod tests {
         ]
         .map(String::from);
         let calls = fold_ollama_lines(lines)
-            .2
+            .tool_calls
             .expect("survive the trailing [DONE]");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
@@ -6624,7 +6660,21 @@ mod tests {
     fn fold_ollama_lines_handles_an_empty_response() {
         let lines = [r#"data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}"#]
             .map(String::from);
-        assert_eq!(fold_ollama_lines(lines), (String::new(), None, None));
+        let fold = fold_ollama_lines(lines);
+        assert!(fold.content.is_empty() && fold.thinking.is_none() && fold.tool_calls.is_none());
+        assert!(fold.done);
+    }
+
+    /// A backend that dies mid-response leaves no terminal chunk, which is
+    /// the only signal the reply is truncated.
+    #[test]
+    fn fold_ollama_lines_reports_a_missing_terminal_chunk() {
+        let lines =
+            [r#"data: {"choices":[{"delta":{"content":"half a sen"},"finish_reason":null}]}"#]
+                .map(String::from);
+        let fold = fold_ollama_lines(lines);
+        assert_eq!(fold.content, "half a sen");
+        assert!(!fold.done, "no terminal chunk means the reply is truncated");
     }
 
     #[test]
