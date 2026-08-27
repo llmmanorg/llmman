@@ -3,7 +3,6 @@
 //! Mirrors `ollama launch`: sets integration-specific environment variables
 //! pointing at the local inference server, then exec's the integration binary.
 
-use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::Command;
 
