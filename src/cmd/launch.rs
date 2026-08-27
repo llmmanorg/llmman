@@ -45,7 +45,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     let model = args
         .model
         .as_deref()
-        .map(|m| crate::shortnames::resolve_ollama_api(m))
+        .map(crate::shortnames::resolve_ollama_api)
         .unwrap_or_default();
 
     // Ensure serve is running (start it in background if needed), preloading

@@ -818,7 +818,7 @@ mod tests {
         // context; a 1GiB LLMMAN_GPU_OVERHEAD knocks it back under the
         // 47GiB threshold into the capped 32768 tier.
         let vram = 47 * GIB;
-        let overhead = 1 * GIB;
+        let overhead = GIB;
         assert_eq!(default_ctx_size_for(vram), None);
         assert_eq!(
             default_ctx_size_for(vram.saturating_sub(overhead)),

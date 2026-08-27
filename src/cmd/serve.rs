@@ -2764,7 +2764,7 @@ async fn proxy(
         req = req.header("content-type", ct);
     }
     let resp = req.send().await.context("proxy request to llama-server")?;
-    let status = reqwest::StatusCode::from(resp.status());
+    let status = resp.status();
     let resp_headers = resp.headers().clone();
 
     // Moved into the stream below (see ActivityGuard's doc comment) so it
@@ -2881,7 +2881,7 @@ async fn proxy_rewriting_model(
         req = req.header("content-type", ct);
     }
     let resp = req.send().await.context("proxy request to llama-server")?;
-    let status = reqwest::StatusCode::from(resp.status());
+    let status = resp.status();
     let resp_headers = resp.headers().clone();
     let raw = resp
         .bytes()
@@ -2929,7 +2929,7 @@ async fn stream_rewriting_model(
         req = req.header("content-type", ct);
     }
     let resp = req.send().await.context("proxy request to llama-server")?;
-    let status = reqwest::StatusCode::from(resp.status());
+    let status = resp.status();
     // Only content-type is meaningful to forward for a stream the
     // caller is about to reconstruct line by line — content-length
     // (absent anyway for a real chunked/streamed response) would be
