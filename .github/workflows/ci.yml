@@ -499,28 +499,70 @@ jobs:
         with:
           node-version: "22"
 
-      # Each install is tolerated independently (`|| ...`, not `&&`-chained)
-      # rather than failing the whole step — and so the whole job — the
-      # moment one of these three isn't installable on a given OS: a
-      # missing CLI just makes tests/launch_e2e.rs's own on_path check skip
-      # that one integration's test instead, exactly as it already does
-      # for a developer machine that simply doesn't have e.g. `codex`
-      # installed. `shell: bash` (not the Windows default of `pwsh`) is
-      # needed on every OS-agnostic step from here on for consistent `||`/
-      # multi-line syntax; ubuntu/macOS already default to bash.
+      # `shell: bash` (not the Windows default of `pwsh`) for consistent
+      # multi-line/array syntax; ubuntu/macOS already default to bash.
+      #
+      # Unlike hermes/mlx_lm.server (legitimately missing on some
+      # platforms), these four are plain npm packages expected to work
+      # everywhere — so install_cli fails the job, rather than letting
+      # tests/launch_e2e.rs's on_path check silently skip, when one never
+      # becomes a working binary.
+      #
+      # install_cli also verifies with `<bin> --version`, not just a
+      # bare `npm install -g`: CI 33006723521 saw `npm install -g
+      # @openai/codex` exit 0 while the `codex` it produced failed every
+      # invocation with "Missing optional dependency
+      # @openai/codex-darwin-arm64" — optionalDependencies working as
+      # designed (npm tolerates one failed platform-tarball fetch, here
+      # a registry blip, instead of failing the install), just not
+      # detectable by a mere on_path/PATH check. Retrying rides that out.
       - name: Install integration CLIs (claude, opencode, codex, openclaw)
         shell: bash
         run: |
-          npm install -g @anthropic-ai/claude-code || echo "::warning::claude-code install failed on ${{ runner.os }}"
-          npm install -g opencode-ai || echo "::warning::opencode-ai install failed on ${{ runner.os }}"
-          npm install -g @openai/codex || echo "::warning::codex install failed on ${{ runner.os }}"
+          failed_clis=()
+
+          install_cli() {
+            local install_spec="$1" pkg_name="$2" bin="$3"
+            local max_attempts=6
+            for attempt in $(seq 1 "$max_attempts"); do
+              if [ "$attempt" -gt 1 ]; then
+                # Clear npm's cache so a corrupted/incomplete cached
+                # response from the last attempt can't repeat itself.
+                npm cache clean --force >/dev/null 2>&1 || true
+              fi
+              local next="retrying"
+              [ "$attempt" -eq "$max_attempts" ] && next="giving up"
+              if ! npm install -g "$install_spec"; then
+                echo "::warning::$pkg_name install failed on ${{ runner.os }} (attempt $attempt/$max_attempts); $next"
+              elif version_output=$("$bin" --version 2>&1); then
+                return 0
+              else
+                echo "::warning::$pkg_name installed but \"$bin --version\" failed on ${{ runner.os }} (attempt $attempt/$max_attempts); $next — output: $version_output"
+              fi
+              # Exponential backoff: 1s, 2s, 4s, 8s, 16s.
+              if [ "$attempt" -lt "$max_attempts" ]; then
+                sleep "$((2 ** (attempt - 1)))"
+              fi
+            done
+            echo "::error::$pkg_name never produced a working \"$bin\" on ${{ runner.os }} after $max_attempts attempts"
+            failed_clis+=("$pkg_name")
+          }
+
+          install_cli "@anthropic-ai/claude-code" "@anthropic-ai/claude-code" "claude"
+          install_cli "opencode-ai" "opencode-ai" "opencode"
+          install_cli "@openai/codex" "@openai/codex" "codex"
           # Pinned (not @latest): tests/launch_e2e.rs's own openclaw
           # invocation was verified against this exact release — its
           # docs describe CLI commands/flags this build doesn't actually
           # have (see launch_and_assert_tolerating's own doc comment),
           # so an unpinned upgrade could silently break the same way
           # again with no warning here.
-          npm install -g openclaw@2026.7.1-2 || echo "::warning::openclaw install failed on ${{ runner.os }}"
+          install_cli "openclaw@2026.7.1-2" "openclaw" "openclaw"
+
+          if [ "${#failed_clis[@]}" -gt 0 ]; then
+            echo "::error::the following integration CLIs never became installable on ${{ runner.os }} after retries: ${failed_clis[*]}"
+            exit 1
+          fi
 
       # hermes has no npm package (install.sh/install.ps1 only, like
       # llmman's own install scripts) — --skip-setup skips its
