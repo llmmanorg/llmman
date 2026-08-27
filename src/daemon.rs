@@ -265,18 +265,17 @@ fn wait_for_port_free() -> bool {
 
 #[cfg(unix)]
 fn kill_daemon(identity: &DaemonIdentity, force: bool) {
-    let signal = if force { "-KILL" } else { "-TERM" };
+    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
     match identity.pid {
-        // Negative pid = the whole process group (the daemon is its own
-        // group leader), falling back to just the pid if that fails.
+        // The daemon's whole process group, falling back to the bare pid
+        // — which /api/version just proved alive — if it leads no group.
         Some(pid) => {
-            let group = Command::new("kill")
-                .args([signal, &format!("-{pid}")])
-                .status();
-            if !group.map(|s| s.success()).unwrap_or(false) {
-                let _ = Command::new("kill")
-                    .args([signal, &pid.to_string()])
-                    .status();
+            if !kill_group(pid, signal) {
+                // Same pid guard as kill_group.
+                if let Some(pid) = i32::try_from(pid).ok().filter(|pid| *pid > 1) {
+                    // SAFETY: see kill_group.
+                    unsafe { libc::kill(pid, signal) };
+                }
             }
         }
         // A daemon too old to report its pid: match on the command line
@@ -284,7 +283,7 @@ fn kill_daemon(identity: &DaemonIdentity, force: bool) {
         // invocation shares.
         None => {
             let _ = Command::new("pkill")
-                .args([signal, "-f", "llmman serve"])
+                .args([if force { "-KILL" } else { "-TERM" }, "-f", "llmman serve"])
                 .status();
         }
     }
@@ -474,25 +473,34 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     )
 }
 
-/// Best-effort signal to the daemon's whole process group (the daemon is
-/// its own group leader, see detach), with no plain-pid fallback: unlike
-/// kill_daemon's stale-daemon path, callers here may hold an
-/// already-reaped pid, and a single-pid signal to a freed pid is the one
-/// form that could hit an innocent reused process. Failures are ignored;
-/// an already-empty group is the common case.
+/// Signals the process group led by `pid`; true if the group existed.
+///
+/// kill(2), not kill(1): procps-ng's kill(1) reads only the first digit
+/// of a negative pid after a `-SIG` flag, so `kill -TERM -12345` issues
+/// `kill(-1, SIGTERM)` — every process the user owns. It also exits 0
+/// for a group that doesn't exist, defeating stop_group's escalation
+/// check.
+#[cfg(unix)]
+fn kill_group(pid: u32, signal: libc::c_int) -> bool {
+    // Never a daemon pid, and catastrophic: kill(0) hits the caller's own
+    // group, kill(-1) every process the user owns. Past pid_t names no
+    // group.
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 1 {
+        return false;
+    }
+    // SAFETY: kill(2) has no memory-safety preconditions.
+    unsafe { libc::kill(-pid, signal) == 0 }
+}
+
+/// Best-effort signal to the daemon's whole process group (it is its own
+/// group leader, see detach), with no bare-pid fallback: callers here may
+/// hold a reaped pid, and signalling that could hit a reused process.
 #[cfg(unix)]
 fn signal_group(pid: u32, force: bool) -> bool {
-    let signal = if force { "-KILL" } else { "-TERM" };
-    // Stdio nulled: an already-empty group makes kill print "No such
-    // process", which would land in front of the real startup error.
-    // kill's exit status reports whether the signal found anyone, which
-    // is what lets stop_group skip a pointless escalation.
-    Command::new("kill")
-        .args([signal, &format!("-{pid}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    kill_group(pid, if force { libc::SIGKILL } else { libc::SIGTERM })
 }
 
 /// Windows equivalent: taskkill's /T already targets the whole process
@@ -1146,5 +1154,78 @@ mod tests {
         // header contains the temp path, which may itself contain "one".
         let excerpt = tail.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
         assert_eq!(excerpt, "two\nthree\nfour\nfive\nsix", "got: {tail}");
+    }
+
+    /// A group signal must never degrade into `kill(0, sig)` or
+    /// `kill(-1, sig)`. Signal 0 is a no-op probe, so a regression fails
+    /// the assertion rather than the machine.
+    #[cfg(unix)]
+    #[test]
+    fn kill_group_refuses_pids_that_would_signal_everything() {
+        assert!(!kill_group(0, 0), "pid 0 = the caller's own process group");
+        assert!(!kill_group(1, 0), "pid 1 = every process the user owns");
+        // Too large for pid_t, so it can't name a group either.
+        assert!(!kill_group(u32::MAX, 0));
+    }
+
+    /// An empty group must report false, so stop_group skips its grace
+    /// and escalation on a childless fast-fail; kill(1) exits 0 here.
+    /// `child` inherits this process's group rather than leading one, and
+    /// a live pid is never reused, so group `child.id()` is empty.
+    #[cfg(unix)]
+    #[test]
+    fn kill_group_reports_missing_group_as_nothing_signalled() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn child");
+        let signalled = kill_group(child.id(), 0);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!signalled, "an empty group reported as signalled");
+    }
+
+    /// The signal reaches its own group and nothing else. `control` stays
+    /// in the harness's group, so the user-wide `kill(-1, ...)` this used
+    /// to issue would take it — and this test binary — down too.
+    #[cfg(unix)]
+    #[test]
+    fn kill_group_kills_only_its_own_group() {
+        use std::os::unix::process::CommandExt;
+
+        let mut target = Command::new("sleep");
+        target.arg("30").process_group(0); // its own leader: pgid == pid
+        let mut target = target.spawn().expect("spawn target");
+
+        let mut control = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn control");
+
+        assert!(
+            kill_group(target.id(), libc::SIGKILL),
+            "a live group should report as signalled"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match target.try_wait().expect("poll target") {
+                Some(_) => break,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = target.kill();
+                    let _ = control.kill();
+                    panic!("target process group survived SIGKILL");
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+
+        let survived = control.try_wait().expect("poll control").is_none();
+        let _ = control.kill();
+        let _ = control.wait();
+        assert!(
+            survived,
+            "a process outside the targeted group was signalled too"
+        );
     }
 }
