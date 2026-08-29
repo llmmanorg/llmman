@@ -5729,10 +5729,14 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
 
     // See threads_from_env_or_cgroup's doc comment. Resolved once here
     // rather than per load, and logged so a surprising thread count is
-    // explainable from the startup output.
+    // explainable from the startup output. Only the local spawn path
+    // consumes the derived value, so don't log it under --ociman (the
+    // container arm deliberately ignores it).
     let threads = threads_from_env_or_cgroup();
     if let Some(n) = threads {
-        eprintln!("[llmman] cgroup CPU quota found: llama-server gets --threads {n}");
+        if _args.ociman.is_none() {
+            eprintln!("[llmman] cgroup CPU quota found: llama-server gets --threads {n}");
+        }
     } else if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         eprintln!("[llmman] LLAMA_ARG_THREADS set: leaving llama-server thread count to it");
     }
