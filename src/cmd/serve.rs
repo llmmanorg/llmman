@@ -3104,6 +3104,11 @@ async fn ensure_model(
         // spawn_llama_server) — every retry below only fires for that case.
         let mut stderr_tail: Option<OutputTail> = None;
         process = match (&model_path, state.0.ociman) {
+            // No derived --threads (state.0.threads) here, deliberately:
+            // it comes from *this daemon's* cgroup, which says nothing
+            // about the limits of the fresh container llama-server runs
+            // in. An explicit LLAMA_ARG_THREADS still reaches it via
+            // LLAMA_CPP_ENV_PASSTHROUGH_VARS in container::spawn.
             (ModelPath::Gguf(path, mmproj), Some(ociman)) => ModelProcess::Container(
                 ociman,
                 crate::container::spawn(
