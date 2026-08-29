@@ -241,10 +241,12 @@ fn parse_num_parallel(value: Option<&str>) -> Option<u32> {
 
 /// `--threads <n>` for every local `llama-server` spawn, derived from the
 /// container's CPU quota. Docker's `--cpus` sets a CFS bandwidth quota
-/// (cgroup `cpu.max`), not CPU affinity, so llama-server's own thread
-/// autodetection (`available_parallelism`, which reads the affinity mask)
-/// reports every host core and the resulting threads fight over the
-/// quota. `LLAMA_ARG_THREADS` set in the environment wins: llama-server
+/// (cgroup `cpu.max`), not CPU affinity, and llama-server's own thread
+/// autodetection is `cpu_get_num_math()`: physical cores counted from
+/// /sys thread_siblings, falling back to `hardware_concurrency()`.
+/// Neither consults the CFS quota, so autodetection reports every host
+/// core and the resulting threads fight over the quota.
+/// `LLAMA_ARG_THREADS` set in the environment wins: llama-server
 /// reads it itself via plain env inheritance, so `None` here keeps that
 /// explicit choice untouched. Any missing/unreadable cgroup file, and
 /// any inconsistency between /proc/self/cgroup and the mounted
