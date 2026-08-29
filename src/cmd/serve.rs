@@ -5600,7 +5600,8 @@ pub const GPU_VISIBLE_DEVICE_VARS: &[&str] = &[
 /// llama.cpp's own env-configurable arguments (`common/arg.cpp`'s
 /// `set_env`), forwarded the same way as [`GPU_VISIBLE_DEVICE_VARS`] —
 /// llama-server reads these itself, llmman just makes sure they reach it.
-pub const LLAMA_CPP_ENV_PASSTHROUGH_VARS: &[&str] = &["LLAMA_ARG_FIT", "LLAMA_ARG_FIT_TARGET"];
+pub const LLAMA_CPP_ENV_PASSTHROUGH_VARS: &[&str] =
+    &["LLAMA_ARG_FIT", "LLAMA_ARG_FIT_TARGET", "LLAMA_ARG_THREADS"];
 
 /// Resolves the `llama-server` binary to run locally (no `--ociman`):
 /// prefers whatever is already on `PATH` untouched, unless
