@@ -259,10 +259,45 @@ fn threads_from_env_or_cgroup() -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
         let available = std::thread::available_parallelism().ok()?.get() as u32;
-        threads_from_cgroup_fs(available)
+        // Cap at physical cores, the same scope llama-server's own
+        // cpu_get_num_math() default targets: on an SMT host a quota of
+        // e.g. 16 CPUs still shouldn't oversubscribe 8 physical cores.
+        let cap = physical_core_count_fs(available).unwrap_or(available);
+        threads_from_cgroup_fs(cap)
     }
     #[cfg(not(target_os = "linux"))]
     None
+}
+
+/// Physical core count from /sys/devices/system/cpu/cpu*/topology,
+/// `None` when that topology is unreadable (callers fall back to
+/// logical-CPU parallelism). Probes one cpu directory per logical CPU;
+/// the pure counting lives in [`count_physical_cores`].
+#[cfg(target_os = "linux")]
+fn physical_core_count_fs(logical_cpus: u32) -> Option<u32> {
+    let sibling_lists: Vec<String> = (0..logical_cpus)
+        .filter_map(|i| {
+            std::fs::read_to_string(format!(
+                "/sys/devices/system/cpu/cpu{i}/topology/thread_siblings_list"
+            ))
+            .ok()
+        })
+        .collect();
+    count_physical_cores(sibling_lists.iter().map(String::as_str))
+}
+
+/// Distinct physical cores among per-CPU `thread_siblings_list`
+/// contents: SMT siblings of one core all report the same list, so the
+/// number of distinct values is the core count (the same counting
+/// llama.cpp's `cpu_get_num_physical_cores` does). `None` when nothing
+/// was readable.
+fn count_physical_cores<'a>(sibling_lists: impl IntoIterator<Item = &'a str>) -> Option<u32> {
+    let cores: std::collections::HashSet<&str> = sibling_lists
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    u32::try_from(cores.len()).ok().filter(|&n| n > 0)
 }
 
 /// The filesystem half of [`threads_from_env_or_cgroup`]: resolves this
@@ -273,7 +308,7 @@ fn threads_from_env_or_cgroup() -> Option<u32> {
 /// quota binds every descendant too. All parsing lives in the pure
 /// functions below; this wrapper only reads files.
 #[cfg(target_os = "linux")]
-fn threads_from_cgroup_fs(available: u32) -> Option<u32> {
+fn threads_from_cgroup_fs(cap: u32) -> Option<u32> {
     let proc_cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let proc_mounts = std::fs::read_to_string("/proc/mounts").ok()?;
     // cgroup v2 first; on a hybrid host the v2 hierarchy exists but
@@ -294,7 +329,7 @@ fn threads_from_cgroup_fs(available: u32) -> Option<u32> {
             .iter()
             .filter_map(|dir| std::fs::read_to_string(dir.join("cpu.max")).ok())
             .collect();
-        if let Some(n) = strictest_threads_v2(contents.iter().map(String::as_str), available) {
+        if let Some(n) = strictest_threads_v2(contents.iter().map(String::as_str), cap) {
             return Some(n);
         }
     }
@@ -316,10 +351,7 @@ fn threads_from_cgroup_fs(available: u32) -> Option<u32> {
             ))
         })
         .collect();
-    strictest_threads_v1(
-        pairs.iter().map(|(q, p)| (q.as_str(), p.as_str())),
-        available,
-    )
+    strictest_threads_v1(pairs.iter().map(|(q, p)| (q.as_str(), p.as_str())), cap)
 }
 
 /// This process's cgroup v2 path from /proc/self/cgroup content: the
@@ -398,13 +430,10 @@ fn cgroup_node_chain(mount: &str, relpath: &str) -> Option<Vec<std::path::PathBu
 /// contents. The kernel enforces every level, so the tightest quota
 /// wins regardless of where in the chain it sits; `None` when no level
 /// has a finite quota.
-fn strictest_threads_v2<'a>(
-    cpu_maxes: impl IntoIterator<Item = &'a str>,
-    available: u32,
-) -> Option<u32> {
+fn strictest_threads_v2<'a>(cpu_maxes: impl IntoIterator<Item = &'a str>, cap: u32) -> Option<u32> {
     cpu_maxes
         .into_iter()
-        .filter_map(|cpu_max| effective_threads_from_cgroup(cpu_max, available))
+        .filter_map(|cpu_max| effective_threads_from_cgroup(cpu_max, cap))
         .min()
 }
 
@@ -412,11 +441,11 @@ fn strictest_threads_v2<'a>(
 /// (`cpu.cfs_quota_us`, `cpu.cfs_period_us`) content pairs.
 fn strictest_threads_v1<'a>(
     pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
-    available: u32,
+    cap: u32,
 ) -> Option<u32> {
     pairs
         .into_iter()
-        .filter_map(|(quota, period)| effective_threads_from_cgroup_v1(quota, period, available))
+        .filter_map(|(quota, period)| effective_threads_from_cgroup_v1(quota, period, cap))
         .min()
 }
 
@@ -425,9 +454,9 @@ fn strictest_threads_v1<'a>(
 /// `cpu.max`: `"<quota> <period>"` in microseconds, or `"max <period>"`
 /// for unlimited (`None`, autodetection is already right). A fractional
 /// quota floors, with a floor of 1 (a 0.5-CPU container still needs one
-/// thread), capped at `available` (the affinity mask can be narrower
-/// than the quota).
-fn effective_threads_from_cgroup(cpu_max: &str, available: u32) -> Option<u32> {
+/// thread), capped at `cap` (physical cores, or logical CPUs when the
+/// topology is unreadable; see [`threads_from_env_or_cgroup`]).
+fn effective_threads_from_cgroup(cpu_max: &str, cap: u32) -> Option<u32> {
     let mut fields = cpu_max.split_whitespace();
     let quota = fields.next()?;
     let period = fields.next()?;
@@ -438,32 +467,29 @@ fn effective_threads_from_cgroup(cpu_max: &str, available: u32) -> Option<u32> {
     if quota == "max" {
         return None;
     }
-    quota_threads(quota.parse().ok()?, period.parse().ok()?, available)
+    quota_threads(quota.parse().ok()?, period.parse().ok()?, cap)
 }
 
 /// The cgroup v1 equivalent of [`effective_threads_from_cgroup`], from
 /// the contents of `cpu.cfs_quota_us` and `cpu.cfs_period_us`. A quota
 /// of `-1` means unlimited.
-fn effective_threads_from_cgroup_v1(quota: &str, period: &str, available: u32) -> Option<u32> {
+fn effective_threads_from_cgroup_v1(quota: &str, period: &str, cap: u32) -> Option<u32> {
     let quota: i64 = quota.trim().parse().ok()?;
     let period: i64 = period.trim().parse().ok()?;
     if quota < 0 {
         return None;
     }
-    quota_threads(
-        u64::try_from(quota).ok()?,
-        u64::try_from(period).ok()?,
-        available,
-    )
+    quota_threads(u64::try_from(quota).ok()?, u64::try_from(period).ok()?, cap)
 }
 
-/// `floor(quota / period)` with a floor of 1, capped at `available`;
-/// `None` for zero fields (nothing meaningful to compute).
-fn quota_threads(quota: u64, period: u64, available: u32) -> Option<u32> {
+/// `floor(quota / period)` with a floor of 1, capped at `cap` (injected
+/// by the caller; see [`threads_from_env_or_cgroup`] for where it comes
+/// from); `None` for zero fields (nothing meaningful to compute).
+fn quota_threads(quota: u64, period: u64, cap: u32) -> Option<u32> {
     if quota == 0 || period == 0 {
         return None;
     }
-    let n = (quota / period).max(1).min(u64::from(available));
+    let n = (quota / period).max(1).min(u64::from(cap));
     Some(n as u32)
 }
 
@@ -7644,7 +7670,8 @@ mod tests {
             // Fractional quotas floor, but never below 1.
             ("50000 100000", 32, Some(1)),
             ("150000 100000", 32, Some(1)),
-            // Capped at available (affinity mask narrower than the quota).
+            // Capped at the injected cap (physical cores, or logical
+            // CPUs when the topology is unreadable).
             ("800000 100000", 4, Some(4)),
             ("200000 100000\n", 32, Some(2)),
         ];
@@ -7827,6 +7854,22 @@ cgroup /sys/fs/cgroup/cpu,cpuacct cgroup rw,nosuid,cpu,cpuacct 0 0
             Some(2)
         );
         assert_eq!(strictest_threads_v1([("-1", "100000")], 32), None);
+    }
+
+    #[test]
+    fn count_physical_cores_dedups_smt_siblings() {
+        // Two SMT threads per core report the same siblings list.
+        assert_eq!(
+            count_physical_cores([
+                "0,4\n", "1,5\n", "2,6\n", "3,7\n", "0,4\n", "1,5\n", "2,6\n", "3,7\n"
+            ]),
+            Some(4)
+        );
+        // No SMT: one entry per core.
+        assert_eq!(count_physical_cores(["0\n", "1\n"]), Some(2));
+        // Unreadable/empty topology: None, so callers fall back.
+        assert_eq!(count_physical_cores([]), None);
+        assert_eq!(count_physical_cores(["", "\n"]), None);
     }
 
     #[test]
