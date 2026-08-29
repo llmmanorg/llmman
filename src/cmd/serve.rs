@@ -272,14 +272,19 @@ fn threads_from_env_or_cgroup() -> Option<u32> {
     None
 }
 
-/// Physical core count from /sys/devices/system/cpu/cpu*/topology,
-/// `None` when that topology is unreadable (callers fall back to
-/// logical-CPU parallelism). The probed IDs come from
-/// /sys/devices/system/cpu/present, never from a CPU *count*: counts
-/// capped by quota or affinity are not IDs, and on hosts with adjacent
-/// SMT sibling numbering probing cpu0..count would see one core twice
-/// instead of two cores. The pure parsing and counting live in
-/// [`cpu_id_list`] and [`count_physical_cores`].
+/// Physical core count from /sys/devices/system/cpu/cpu*/topology. The
+/// probed IDs come from /sys/devices/system/cpu/present, never from a
+/// CPU *count*: counts capped by quota or affinity are not IDs, and on
+/// hosts with adjacent SMT sibling numbering probing cpu0..count would
+/// see one core twice instead of two cores. Skipping per-CPU entries
+/// whose topology is unreadable is deliberate, not a fallback trigger:
+/// `present` keeps offline CPUs listed while the kernel unregisters
+/// their topology directory, and an offline core contributes no
+/// execution capacity, so counting only the readable ones beats
+/// returning `None` and having the caller fall back to
+/// `available_parallelism` (the SMT thread count). Only when *no*
+/// entry is readable does this return `None`. The pure parsing and
+/// counting live in [`cpu_id_list`] and [`count_physical_cores`].
 #[cfg(target_os = "linux")]
 fn physical_core_count_fs() -> Option<u32> {
     let present = std::fs::read_to_string("/sys/devices/system/cpu/present").ok()?;
