@@ -518,6 +518,11 @@ struct Inner {
     split_mode: Option<&'static str>,
     // See num_parallel_from_env's doc comment.
     num_parallel: Option<u32>,
+    // See threads_from_env_or_cgroup's doc comment. Resolved once at
+    // startup (this daemon's cgroup doesn't change per load) and passed
+    // to every *local* spawn_llama_server call from ensure_model's OOM
+    // retry loop.
+    threads: Option<u32>,
     // See max_queue_from_env's doc comment; enforced by try_admit.
     max_queue: usize,
     // See max_loaded_models_from_env's doc comment.
@@ -2938,7 +2943,7 @@ async fn ensure_model(
                     path,
                     mmproj.as_deref(),
                     llama_opts,
-                    threads_from_env_or_cgroup(),
+                    state.0.threads,
                 )
                 .await?;
                 stderr_tail = Some(tail);
@@ -5538,6 +5543,16 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             .context("hostgpu probe task panicked")?,
     };
 
+    // See threads_from_env_or_cgroup's doc comment. Resolved once here
+    // rather than per load, and logged so a surprising thread count is
+    // explainable from the startup output.
+    let threads = threads_from_env_or_cgroup();
+    if let Some(n) = threads {
+        eprintln!("[llmman] cgroup CPU quota found: llama-server gets --threads {n}");
+    } else if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
+        eprintln!("[llmman] LLAMA_ARG_THREADS set: leaving llama-server thread count to it");
+    }
+
     let state = AppState(Arc::new(Inner {
         manager: Mutex::new(ModelManager {
             running: HashMap::new(),
@@ -5558,6 +5573,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         kv_cache_type: kv_cache_type_from_env(),
         split_mode: sched_spread_from_env(),
         num_parallel: num_parallel_from_env(),
+        threads,
         max_queue: max_queue_from_env(),
         max_loaded_models: max_loaded_models_from_env(),
         store_path,
@@ -6525,6 +6541,7 @@ mod tests {
             kv_cache_type: None,
             split_mode: None,
             num_parallel: None,
+            threads: None,
             // usize::MAX, not 0 — 0 now means "admit almost nothing"
             // (see try_admit_against's doc comment), and no test here
             // calls ensure_model (the only caller of try_admit) directly
