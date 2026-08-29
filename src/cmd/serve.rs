@@ -279,6 +279,10 @@ fn effective_threads_from_cgroup(cpu_max: &str, available: u32) -> Option<u32> {
     let mut fields = cpu_max.split_whitespace();
     let quota = fields.next()?;
     let period = fields.next()?;
+    // cpu.max is a two-value file; anything more is not cpu.max.
+    if fields.next().is_some() {
+        return None;
+    }
     if quota == "max" {
         return None;
     }
@@ -7494,6 +7498,9 @@ mod tests {
             "0 100000",
             "200000 0",
             "-200000 100000",
+            // cpu.max holds exactly two fields; more means not cpu.max.
+            "200000 100000 unexpected",
+            "max 100000 unexpected",
         ] {
             assert_eq!(
                 effective_threads_from_cgroup(cpu_max, 32),
