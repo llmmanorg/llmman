@@ -59,6 +59,7 @@ Environment Variables:
       LLMMAN_TMPDIR                  Staging directory for llama-server release downloads
       LLAMA_ARG_FIT                  Enable llama.cpp automatic fit of unset memory options (default \"on\")
       LLAMA_ARG_FIT_TARGET           Target free VRAM margin per device for llama.cpp fit (MiB)
+      LLAMA_ARG_THREADS              Thread count for llama-server (default: CPU quota when containerized)
 ";
 
 #[derive(Args, Debug)]
