@@ -259,22 +259,30 @@ fn threads_from_env_or_cgroup() -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
         let available = std::thread::available_parallelism().ok()?.get() as u32;
-        // Cap at physical cores, the same scope llama-server's own
-        // cpu_get_num_math() default targets: on an SMT host a quota of
-        // e.g. 16 CPUs still shouldn't oversubscribe 8 physical cores.
-        // `available` stays a bound of its own: it carries the affinity
-        // mask and std's quota detection, which topology knows nothing
-        // about.
-        let cap = physical_core_count_fs().unwrap_or(available).min(available);
+        // Cap at math cores, approximating the scope of llama.cpp's own
+        // common_cpu_get_num_math() default (b10621 common/common.cpp:
+        // hybrid x86 pins P-cores one thread each; POWER uses up to
+        // SMT-2, not mirrored here; everything else physical cores): on
+        // an SMT host a quota of e.g. 16 CPUs still shouldn't
+        // oversubscribe 8 physical cores. `available` stays a bound of
+        // its own: it carries the affinity mask and std's quota
+        // detection, which topology knows nothing about.
+        let cap = math_core_count_fs().unwrap_or(available).min(available);
         threads_from_cgroup_fs(cap)
     }
     #[cfg(not(target_os = "linux"))]
     None
 }
 
-/// Physical core count from /sys/devices/system/cpu/cpu*/topology. The
-/// probed IDs come from /sys/devices/system/cpu/present, never from a
-/// CPU *count*: counts capped by quota or affinity are not IDs, and on
+/// Math-core count from /sys/devices/system/cpu/cpu*/topology,
+/// approximating the core set llama.cpp's `common_cpu_get_num_math()`
+/// targets: on hybrid x86 (kernel 5.16+) the probed IDs are the
+/// performance-core threads from /sys/devices/cpu_core/cpus, so
+/// efficiency cores don't inflate the cap; everywhere else they are
+/// every ID in /sys/devices/system/cpu/present (POWER's up-to-SMT-2
+/// rule is not mirrored). The caller still bounds the result by
+/// `available_parallelism`. The probed IDs never come from a CPU
+/// *count*: counts capped by quota or affinity are not IDs, and on
 /// hosts with adjacent SMT sibling numbering probing cpu0..count would
 /// see one core twice instead of two cores. Skipping per-CPU entries
 /// whose topology is unreadable is deliberate, not a fallback trigger:
@@ -284,11 +292,13 @@ fn threads_from_env_or_cgroup() -> Option<u32> {
 /// returning `None` and having the caller fall back to
 /// `available_parallelism` (the SMT thread count). Only when *no*
 /// entry is readable does this return `None`. The pure parsing and
-/// counting live in [`cpu_id_list`] and [`count_physical_cores`].
+/// counting live in [`math_cpu_ids`], [`cpu_id_list`], and
+/// [`count_physical_cores`].
 #[cfg(target_os = "linux")]
-fn physical_core_count_fs() -> Option<u32> {
-    let present = std::fs::read_to_string("/sys/devices/system/cpu/present").ok()?;
-    let sibling_lists: Vec<String> = cpu_id_list(&present)?
+fn math_core_count_fs() -> Option<u32> {
+    let cpu_core = std::fs::read_to_string("/sys/devices/cpu_core/cpus").ok();
+    let present = std::fs::read_to_string("/sys/devices/system/cpu/present").ok();
+    let sibling_lists: Vec<String> = math_cpu_ids(cpu_core.as_deref(), present.as_deref())?
         .into_iter()
         .filter_map(|i| {
             std::fs::read_to_string(format!(
@@ -298,6 +308,19 @@ fn physical_core_count_fs() -> Option<u32> {
         })
         .collect();
     count_physical_cores(sibling_lists.iter().map(String::as_str))
+}
+
+/// The CPU IDs whose physical cores bound the math-thread count: the
+/// hybrid-x86 performance-core list (/sys/devices/cpu_core/cpus
+/// content) when parseable, otherwise every present CPU. Unparseable
+/// `cpu_core` content falls back rather than failing: absence and
+/// garbage both mean "no trustworthy P-core list", and the
+/// all-physical-core count is the right answer on non-hybrid hardware
+/// either way.
+fn math_cpu_ids(cpu_core: Option<&str>, present: Option<&str>) -> Option<Vec<u32>> {
+    cpu_core
+        .and_then(cpu_id_list)
+        .or_else(|| cpu_id_list(present?))
 }
 
 /// CPU IDs from a kernel CPU list such as /sys/devices/system/cpu/present:
@@ -7992,6 +8015,31 @@ cgroup /sys/fs/cgroup/cpu,cpuacct cgroup rw,nosuid,cpu,cpuacct 0 0
         // Unreadable/empty topology: None, so callers fall back.
         assert_eq!(count_physical_cores([]), None);
         assert_eq!(count_physical_cores(["", "\n"]), None);
+    }
+
+    #[test]
+    fn math_cpu_ids_prefers_the_hybrid_p_core_list() {
+        // (cpu_core content, present content, expected)
+        let cases = [
+            // Hybrid x86: /sys/devices/cpu_core/cpus lists the P-core
+            // threads; E-core IDs in `present` must not be probed.
+            (Some("0-7\n"), Some("0-15\n"), Some((0..=7).collect())),
+            // Non-hybrid (or pre-5.16 kernel): the file is absent.
+            (None, Some("0-15\n"), Some((0..=15).collect())),
+            // Unparseable P-core list falls back to `present`.
+            (Some("garbage\n"), Some("0-3\n"), Some(vec![0, 1, 2, 3])),
+            (Some("\n"), Some("0-3\n"), Some(vec![0, 1, 2, 3])),
+            (None, Some("garbage\n"), None),
+            (None, None, None),
+            (Some("0-7\n"), None, Some((0..=7).collect())),
+        ];
+        for (cpu_core, present, expected) in &cases {
+            assert_eq!(
+                &math_cpu_ids(*cpu_core, *present),
+                expected,
+                "cpu_core={cpu_core:?} present={present:?}"
+            );
+        }
     }
 
     #[test]
