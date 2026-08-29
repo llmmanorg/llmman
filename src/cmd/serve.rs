@@ -262,7 +262,10 @@ fn threads_from_env_or_cgroup() -> Option<u32> {
         // Cap at physical cores, the same scope llama-server's own
         // cpu_get_num_math() default targets: on an SMT host a quota of
         // e.g. 16 CPUs still shouldn't oversubscribe 8 physical cores.
-        let cap = physical_core_count_fs(available).unwrap_or(available);
+        // `available` stays a bound of its own: it carries the affinity
+        // mask and std's quota detection, which topology knows nothing
+        // about.
+        let cap = physical_core_count_fs().unwrap_or(available).min(available);
         threads_from_cgroup_fs(cap)
     }
     #[cfg(not(target_os = "linux"))]
@@ -271,11 +274,17 @@ fn threads_from_env_or_cgroup() -> Option<u32> {
 
 /// Physical core count from /sys/devices/system/cpu/cpu*/topology,
 /// `None` when that topology is unreadable (callers fall back to
-/// logical-CPU parallelism). Probes one cpu directory per logical CPU;
-/// the pure counting lives in [`count_physical_cores`].
+/// logical-CPU parallelism). The probed IDs come from
+/// /sys/devices/system/cpu/present, never from a CPU *count*: counts
+/// capped by quota or affinity are not IDs, and on hosts with adjacent
+/// SMT sibling numbering probing cpu0..count would see one core twice
+/// instead of two cores. The pure parsing and counting live in
+/// [`cpu_id_list`] and [`count_physical_cores`].
 #[cfg(target_os = "linux")]
-fn physical_core_count_fs(logical_cpus: u32) -> Option<u32> {
-    let sibling_lists: Vec<String> = (0..logical_cpus)
+fn physical_core_count_fs() -> Option<u32> {
+    let present = std::fs::read_to_string("/sys/devices/system/cpu/present").ok()?;
+    let sibling_lists: Vec<String> = cpu_id_list(&present)?
+        .into_iter()
         .filter_map(|i| {
             std::fs::read_to_string(format!(
                 "/sys/devices/system/cpu/cpu{i}/topology/thread_siblings_list"
@@ -284,6 +293,26 @@ fn physical_core_count_fs(logical_cpus: u32) -> Option<u32> {
         })
         .collect();
     count_physical_cores(sibling_lists.iter().map(String::as_str))
+}
+
+/// CPU IDs from a kernel CPU list such as /sys/devices/system/cpu/present:
+/// comma-separated single IDs or inclusive ranges (`0-15`, `0,4-7`).
+/// `None` on empty or malformed content.
+fn cpu_id_list(list: &str) -> Option<Vec<u32>> {
+    let mut ids = Vec::new();
+    for part in list.trim().split(',') {
+        match part.split_once('-') {
+            Some((lo, hi)) => {
+                let (lo, hi): (u32, u32) = (lo.trim().parse().ok()?, hi.trim().parse().ok()?);
+                if lo > hi {
+                    return None;
+                }
+                ids.extend(lo..=hi);
+            }
+            None => ids.push(part.trim().parse().ok()?),
+        }
+    }
+    (!ids.is_empty()).then_some(ids)
 }
 
 /// Distinct physical cores among per-CPU `thread_siblings_list`
@@ -7880,6 +7909,16 @@ cgroup /sys/fs/cgroup/cpu,cpuacct cgroup rw,nosuid,cpu,cpuacct 0 0
         // Unreadable/empty topology: None, so callers fall back.
         assert_eq!(count_physical_cores([]), None);
         assert_eq!(count_physical_cores(["", "\n"]), None);
+    }
+
+    #[test]
+    fn cpu_id_list_parses_ids_and_inclusive_ranges() {
+        assert_eq!(cpu_id_list("0-3\n"), Some(vec![0, 1, 2, 3]));
+        assert_eq!(cpu_id_list("0"), Some(vec![0]));
+        assert_eq!(cpu_id_list("0,4-6\n"), Some(vec![0, 4, 5, 6]));
+        for malformed in ["", "\n", "3-1", "0-x", "a", "0,,2"] {
+            assert_eq!(cpu_id_list(malformed), None, "list={malformed:?}");
+        }
     }
 
     #[test]
