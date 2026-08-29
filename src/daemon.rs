@@ -172,6 +172,44 @@ fn host_is_local() -> bool {
     is_local_host(host)
 }
 
+/// Whether the daemon is reachable *only* from this machine — i.e.
+/// whether a request can have come from anyone else.
+///
+/// Deliberately not [`connects_over_loopback`]: a wildcard bind is
+/// reached over loopback from here, but it is also reached by anyone who
+/// can route to this host, and `0.0.0.0` is exactly that. `cmd::serve`
+/// uses this to decide whether to spend the daemon's own credentials for
+/// a caller it cannot authenticate.
+pub fn reachable_only_locally() -> bool {
+    host_reachable_only_locally(&parsed_host().1)
+}
+
+/// [`reachable_only_locally`] for an explicit host, so it is testable
+/// without the process-wide `PARSED_HOST` already being fixed.
+fn host_reachable_only_locally(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether this process reaches the daemon without leaving the machine.
+///
+/// The other side of [`reachable_only_locally`]: a wildcard bind counts,
+/// since `connect_addr` sends us to loopback for it. `cmd::launch` uses
+/// this to decide whether handing an integration a real API key would put
+/// it on the network in cleartext.
+pub fn connects_over_loopback() -> bool {
+    host_connects_over_loopback(&parsed_host().1)
+}
+
+/// [`connects_over_loopback`] for an explicit host. See
+/// [`host_reachable_only_locally`].
+fn host_connects_over_loopback(host: &str) -> bool {
+    is_local_host(connectable_host(host))
+}
+
 /// By value rather than by exact spelling, same as `connectable_host` —
 /// a loopback or unspecified IP (in any form) is local; a bare
 /// "localhost" is too, since it always resolves to one.
@@ -978,6 +1016,31 @@ pub fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two locality questions differ on exactly one host, and it is
+    /// the one that matters: a wildcard bind is reached over loopback
+    /// from here, *and* by anyone who can route to this machine.
+    /// Collapsing them either leaks the daemon's credentials to the
+    /// network or refuses `--provider` on a perfectly local hop.
+    #[test]
+    fn wildcard_binds_are_locally_reachable_but_not_only_locally() {
+        // The host-taking forms the two public predicates delegate to,
+        // since those read a PARSED_HOST fixed once per process.
+        for host in ["127.0.0.1", "::1", "localhost", "LOCALHOST"] {
+            assert!(host_connects_over_loopback(host), "{host}");
+            assert!(host_reachable_only_locally(host), "{host}");
+        }
+        // The one host the two disagree on, and the reason there are two:
+        // we reach it over loopback, but so does the rest of the network.
+        for wildcard in ["0.0.0.0", "::", "0:0:0:0:0:0:0:0"] {
+            assert!(host_connects_over_loopback(wildcard), "{wildcard}");
+            assert!(!host_reachable_only_locally(wildcard), "{wildcard}");
+        }
+        for remote in ["192.168.1.50", "10.0.0.1", "example.com"] {
+            assert!(!host_connects_over_loopback(remote), "{remote}");
+            assert!(!host_reachable_only_locally(remote), "{remote}");
+        }
+    }
 
     /// Unset/blank `LLMMAN_HOST` — the common case — resolves to the
     /// documented default.

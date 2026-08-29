@@ -145,6 +145,61 @@ Run `llmman launch` with no arguments to list the supported integrations (Claude
 
 Short names work wherever a model reference is accepted.
 
+#### Hosted providers
+
+`--provider` points the same integrations at a model llmman doesn't serve
+itself:
+
+```sh
+export OPENROUTER_API_KEY=...
+llmman launch opencode --provider openrouter --model qwen/qwen3-coder
+```
+
+The provider list is fetched at runtime from
+[models.dev](https://models.dev) — the same catalog `opencode` resolves
+its own providers from — so a newly added provider works without an
+llmman release. It's cached for 24 hours, and a stale copy is used if the
+fetch fails, so being offline means an out-of-date list rather than a
+broken command. `llmman launch --list-providers` prints the providers
+llmman can route to, with each one's API-key variable and whether it's
+set.
+
+Requests still go through `llmman serve`; `--provider` changes where the
+daemon forwards them, not who the integration talks to. So one endpoint
+and one place integrations are configured, whether a model is local or
+hosted, and both usable from the same session.
+
+The API key is read from the variable models.dev names for that provider
+and travels per request, never to disk. `hermes` is the exception: llmman
+configures it through a file on disk, so it can't carry a key and
+`llmman serve` needs the variable in its own environment instead. That
+fallback is only used for a daemon bound to loopback, and never for a
+browser request from another site — it bounds the blast radius rather
+than authenticating anyone, so on a shared machine prefer an integration
+that sends its own key. `cline`, `kimi`, `copilot`, `gemini` and `openclaw` can't be
+used with `--provider` at all — the first two pick their own model rather
+than taking llmman's, `copilot` has no way to send a key, `gemini` feeds
+its key to a native Google client llmman can't confirm it has redirected,
+and `openclaw` only takes a model during first-run onboarding.
+
+Being OpenAI-compatible doesn't mean implementing every OpenAI route.
+`codex` uses `/v1/responses`, which `openai`, `groq` and `openrouter`
+answer but `anthropic` and `mistral` don't; models.dev carries no
+capability data to filter on, so llmman turns that provider's bare 404
+into an explanation naming what's missing rather than guessing up front.
+
+`--provider` needs a local `llmman serve`. The daemon talks plain HTTP
+and has no authentication, so llmman will not hand an integration a real
+key to send to a remote `LLMMAN_HOST`, and a daemon bound to anything but
+loopback will not spend its own environment's key on behalf of a caller
+that didn't present one.
+
+Providers llmman cannot reach with a single bearer token over an
+OpenAI-compatible https endpoint are deliberately absent rather than
+half-supported: Amazon Bedrock (SigV4 request signing), Google Vertex
+(GCP service-account credentials), Azure, and the others whose endpoint
+is per-account or whose wire format isn't OpenAI's.
+
 ### Use with vLLM directly
 
 `llmman serve` already spawns `vllm` itself as a backend for safetensors

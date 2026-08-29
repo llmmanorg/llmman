@@ -24,6 +24,7 @@ use tokio::time::{sleep, Duration, Instant};
 
 use crate::default_store;
 use crate::modelpack::{resolve_model, ModelPath};
+use crate::providers::PLACEHOLDER_API_KEY;
 use crate::storage::OciStore;
 use crate::webui;
 
@@ -2403,6 +2404,255 @@ async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<String> {
     is_safetensors.then_some(model_ref)
 }
 
+// ---------------------------------------------------------------------------
+// Request target: a local backend, or a remote provider
+// ---------------------------------------------------------------------------
+
+/// Where a resolved request is actually sent.
+///
+/// Until provider routing existed this was a bare `u16`: every backend
+/// was a `llama-server`/vllm/mlx child on loopback, so a port was the
+/// whole of "where does this go". [`Target::Remote`] is the same idea for
+/// a request that leaves the machine — see [`crate::providers`] for which
+/// providers qualify.
+///
+/// Requests are *routed* through, never redirected away from, this
+/// daemon: a provider-backed integration still talks to `llmman serve`
+/// exactly as a locally-served one does, and every surface, keep-alive
+/// guard and model-name rewrite below behaves the same either way.
+#[derive(Clone, Debug)]
+enum Target {
+    /// A locally spawned backend listening on loopback.
+    Local(u16),
+    /// A remote provider's OpenAI-compatible API.
+    Remote(Arc<RemoteTarget>),
+}
+
+/// Everything needed to forward one request to a remote provider,
+/// resolved once by [`resolve_remote_target`].
+///
+/// `Debug` is hand-written rather than derived so that the key cannot
+/// reach a log line or an `anyhow` context chain by someone later
+/// formatting a `Target`.
+struct RemoteTarget {
+    /// models.dev provider id, for diagnostics.
+    provider: String,
+    /// OpenAI-compatible base URL, without a trailing slash.
+    base_url: String,
+    /// The model id as the *provider* knows it — i.e. the incoming
+    /// reference with its [`crate::providers::REMOTE_PREFIX`] and
+    /// provider segment stripped back off.
+    model: String,
+    /// Bearer token for this request. See [`resolve_remote_target`] for
+    /// where it comes from.
+    api_key: String,
+}
+
+impl std::fmt::Debug for RemoteTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteTarget")
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Target {
+    /// The absolute URL an OpenAI route maps to for this target.
+    ///
+    /// `route` is llmman's own internal path (`/v1/chat/completions`);
+    /// [`crate::providers::rebase_url`] re-bases it onto a remote
+    /// provider's own published version segment, which is not always
+    /// `/v1`.
+    fn url(&self, route: &str) -> String {
+        match self {
+            Self::Local(port) => format!("http://127.0.0.1:{port}{route}"),
+            Self::Remote(remote) => crate::providers::rebase_url(&remote.base_url, route),
+        }
+    }
+
+    /// Attaches this target's credentials to an outgoing request.
+    ///
+    /// A no-op for [`Target::Local`]: a loopback `llama-server` has no
+    /// auth, which is why nothing below ever forwarded the client's own
+    /// `Authorization` header upstream — and must keep not forwarding it,
+    /// so a key meant for one provider can never be relayed to another.
+    fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            Self::Local(_) => req,
+            Self::Remote(remote) => req.bearer_auth(&remote.api_key),
+        }
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote(_))
+    }
+
+    /// Names this target for an error message. "inference backend" is
+    /// what every failure here said before providers existed, and is
+    /// still right for a local one; naming the provider is the whole
+    /// difference between "something failed" and "your OpenRouter key is
+    /// wrong". Never includes the key.
+    fn describe(&self) -> String {
+        match self {
+            Self::Local(_) => "inference backend".to_string(),
+            Self::Remote(remote) => format!("provider {}", remote.provider),
+        }
+    }
+}
+
+/// The one route every typed request in this daemon is sent to: the
+/// Ollama and Anthropic surfaces are both translated into an OpenAI chat
+/// completion first (see `stream_ollama` / `handle_anthropic_messages`),
+/// so `post_chat` never needs any other.
+const CHAT_COMPLETIONS_ROUTE: &str = "/v1/chat/completions";
+
+/// Extracts the caller's own API key from a request, in either spelling
+/// the surfaces below accept: `Authorization: Bearer <key>` (OpenAI) or
+/// `x-api-key: <key>` (Anthropic).
+///
+/// This is what lets provider routing work against a daemon that is
+/// *already running* — the common case, since `daemon::ensure_server`
+/// reuses a live one, and a daemon started before the user had a provider
+/// key exported would otherwise never see one. The key travels per
+/// request, from the integration `llmman launch` configured, and is never
+/// persisted.
+fn client_api_key(headers: Option<&HeaderMap>) -> Option<String> {
+    let headers = headers?;
+    let usable = |k: &str| {
+        let k = k.trim();
+        (!k.is_empty() && k != PLACEHOLDER_API_KEY).then(|| k.to_string())
+    };
+    // The scheme is case-insensitive per RFC 7235, and clients do send
+    // `bearer`. Matching one spelling would silently drop a real key.
+    let bearer = headers
+        .get(reqwest::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            let (scheme, token) = v.trim().split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then_some(token)
+        })
+        .and_then(usable);
+    // Each candidate is filtered before the choice between them, not
+    // after: a client that sends both a placeholder `Authorization` and a
+    // real `x-api-key` still has a real key.
+    bearer.or_else(|| {
+        headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .and_then(usable)
+    })
+}
+
+/// Whether a request was made by a browser on some other site's behalf.
+///
+/// `cors_layer` keeps such a page from *reading* a response, but not from
+/// sending the request: a "simple" POST (`text/plain`, a form encoding)
+/// skips the preflight entirely, and these handlers parse the body
+/// without consulting `Content-Type`. Any page a user visits could
+/// therefore make a loopback daemon spend the provider key in its
+/// environment, and never need to see the reply to have cost them money.
+///
+/// `Sec-Fetch-Site` is what distinguishes them: browsers attach it to
+/// every request, `same-origin`/`none` for llmman's own web UI and the
+/// address bar, `cross-site`/`same-site` for another page's fetch. A CLI
+/// integration sends no such header at all, so this only ever withholds
+/// the daemon's own credentials from a browser acting for someone else —
+/// a caller that presents its own key is unaffected.
+fn is_cross_site(headers: Option<&HeaderMap>) -> bool {
+    headers
+        .and_then(|h| h.get("sec-fetch-site"))
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|site| {
+            let site = site.trim();
+            site.eq_ignore_ascii_case("cross-site") || site.eq_ignore_ascii_case("same-site")
+        })
+}
+
+/// Resolves a [`crate::providers::REMOTE_PREFIX`] reference into a
+/// [`Target::Remote`], or `None` for any ordinary local reference.
+///
+/// The API key is the caller's own (see [`client_api_key`]) when it sent
+/// one, else the provider's variable from this daemon's environment — so
+/// both `llmman launch --provider`, which puts the real key in the
+/// integration's requests, and a daemon started with the key already
+/// exported work.
+async fn resolve_remote_target(
+    model_ref: &str,
+    headers: Option<&HeaderMap>,
+) -> Result<Option<Target>, AppError> {
+    let Some((provider_id, model)) = crate::providers::split_remote_ref(model_ref) else {
+        return Ok(None);
+    };
+    let (provider_id, model) = (provider_id.to_string(), model.to_string());
+
+    // Blocking: the first call fetches models.dev (and caches it); every
+    // later one is a memoized lookup.
+    let catalog = tokio::task::spawn_blocking(crate::providers::catalog)
+        .await
+        .context("provider catalog task panicked")?
+        .map_err(|e| AppError(e, StatusCode::BAD_GATEWAY))?;
+
+    let provider = catalog.get(&provider_id).ok_or_else(|| {
+        AppError(
+            anyhow!(
+                "unknown provider {provider_id:?} — run 'llmman launch --list-providers' \
+                 for the providers llmman can route to"
+            ),
+            StatusCode::BAD_REQUEST,
+        )
+    })?;
+
+    // This router has no authentication, so the daemon's own key is
+    // withheld from the two cases where the caller is plainly not the
+    // operator: a bind the whole network can reach, and a browser acting
+    // for another site. That is a blast-radius bound, not authentication
+    // — on a shared machine any local account can still reach a loopback
+    // daemon, as it can already reach every other thing this daemon does.
+    // Presenting a key per request is what avoids relying on this at all.
+    let own_key = || {
+        (crate::daemon::reachable_only_locally() && !is_cross_site(headers))
+            .then(|| provider.api_key())
+            .flatten()
+    };
+    let api_key = client_api_key(headers).or_else(own_key).ok_or_else(|| {
+        AppError(
+            anyhow!(
+                "no API key for provider {provider_id:?} — send it as an Authorization \
+                 header{}",
+                if is_cross_site(headers) {
+                    ". This request came from another site, so llmman serve's own \
+                     environment is deliberately not used"
+                        .to_string()
+                } else if crate::daemon::reachable_only_locally() {
+                    format!(", or set {} where llmman serve runs", provider.key_env)
+                } else {
+                    ". llmman serve is not bound to loopback, so its own environment is \
+                     deliberately not used"
+                        .to_string()
+                }
+            ),
+            StatusCode::UNAUTHORIZED,
+        )
+    })?;
+
+    let target = RemoteTarget {
+        provider: provider_id,
+        base_url: provider.base_url.clone(),
+        model,
+        api_key,
+    };
+    // No key on this line: it is the one piece of a remote target that
+    // must never reach a log file.
+    eprintln!(
+        "[llmman] routing {} to provider {} ({})",
+        target.model, target.provider, target.base_url
+    );
+    Ok(Some(Target::Remote(Arc::new(target))))
+}
+
 /// Ensures `model_ref` is loaded and returns `(canonical_ref, port,
 /// guard)`. The canonical name is what it's actually registered under
 /// with its backend (`--served-model-name`), which can differ from a
@@ -2420,10 +2670,33 @@ async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<String> {
 /// which take over the claim rather than adding a second one; dropping
 /// it any other way (including the whole task being cancelled) still
 /// releases it correctly.
+///
+/// `headers` are the incoming request's, used only to pick up a caller-
+/// supplied provider API key (see [`resolve_remote_target`]); `None` from
+/// a surface that has none to offer.
 async fn ensure_model(
     state: &AppState,
     model_ref: &str,
-) -> Result<(String, u16, ActivityGuard), AppError> {
+    headers: Option<&HeaderMap>,
+) -> Result<(String, Target, ActivityGuard), AppError> {
+    // Before `resolve_ollama_api`, deliberately: a provider-routed
+    // reference names a model on someone else's servers, so none of the
+    // shortname aliasing, tag defaulting, store lookup, or pull below
+    // applies to it — and `resolve_ollama_api` would rewrite it into a
+    // registry path it is not.
+    //
+    // The guard is a real one even though nothing is running: every
+    // `ActivityGuard` operation looks the model up in `running` and is a
+    // no-op when absent (see its `Drop` impl and `begin_activity`), so a
+    // remote target needs no separate no-op path.
+    if let Some(target) = resolve_remote_target(model_ref, headers).await? {
+        return Ok((
+            model_ref.to_string(),
+            target,
+            ActivityGuard::new(state, model_ref),
+        ));
+    }
+
     let model_ref = crate::shortnames::resolve_ollama_api(model_ref);
     // Default the tag before the lock below: otherwise two concurrent
     // first-pulls of e.g. "gemma4" and "gemma4:latest" take different
@@ -2438,7 +2711,7 @@ async fn ensure_model(
     // needs scheduling work (waiting on a concurrent load, or starting
     // a fresh one) below counts against the cap.
     if let Some((port, guard)) = check_running(state, model_ref).await {
-        return Ok((model_ref.to_string(), port, guard));
+        return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
     // See try_admit's doc comment — held for the rest of this function.
@@ -2449,7 +2722,7 @@ async fn ensure_model(
     // Someone else may have finished loading this model while we
     // waited for the lock above.
     if let Some((port, guard)) = check_running(state, model_ref).await {
-        return Ok((model_ref.to_string(), port, guard));
+        return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
     // If the model is not in the local store, pull it now.
@@ -2473,7 +2746,7 @@ async fn ensure_model(
 
     // Re-check in case that stored form differs from the key above.
     if let Some((port, guard)) = check_running(state, model_ref).await {
-        return Ok((model_ref.to_string(), port, guard));
+        return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
     let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
@@ -2675,7 +2948,7 @@ async fn ensure_model(
     );
     Ok((
         model_ref.to_string(),
-        port,
+        Target::Local(port),
         ActivityGuard::new(state, model_ref),
     ))
 }
@@ -2696,7 +2969,13 @@ async fn ensure_model(
 /// a client asking for "gemma4:latest" should never see
 /// "/Users/.../cache/.../abcd1234" reflected back at it just because
 /// that happens to be how this one engine addresses it internally.
-async fn backend_wire_model(state: &AppState, canonical_model: &str) -> String {
+async fn backend_wire_model(state: &AppState, target: &Target, canonical_model: &str) -> String {
+    // A remote provider knows the model by its own id, not by the
+    // prefixed reference llmman routes on — see `providers::REMOTE_PREFIX`
+    // for why that reference has to be namespaced in the first place.
+    if let Target::Remote(remote) = target {
+        return remote.model.clone();
+    }
     state
         .0
         .manager
@@ -2750,7 +3029,8 @@ async fn local_llama_server_bin(state: &AppState) -> anyhow::Result<PathBuf> {
 
 async fn proxy(
     client: &Client,
-    url: &str,
+    target: &Target,
+    route: &str,
     headers: &HeaderMap,
     body: Bytes,
     activity: ActivityGuard,
@@ -2759,11 +3039,14 @@ async fn proxy(
     // through (reqwest::Body: From<Bytes>) avoids an extra full-size
     // allocation that `body.to_vec()` would add on top of it, which
     // matters most for large multipart audio uploads.
-    let mut req = client.post(url).body(body);
+    let mut req = target.authorize(client.post(target.url(route)).body(body));
     if let Some(ct) = headers.get("content-type") {
         req = req.header("content-type", ct);
     }
-    let resp = req.send().await.context("proxy request to llama-server")?;
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("proxy request to {}", target.describe()))?;
     let status = resp.status();
     let resp_headers = resp.headers().clone();
 
@@ -2870,17 +3153,21 @@ fn rewrite_sse_line_model(line: &str, canonical_model: &str) -> String {
 /// when none is set explicitly.
 async fn proxy_rewriting_model(
     client: &Client,
-    url: &str,
+    target: &Target,
+    route: &str,
     headers: &HeaderMap,
     body: Bytes,
     activity: ActivityGuard,
     canonical_model: &str,
 ) -> Result<Response, AppError> {
-    let mut req = client.post(url).body(body);
+    let mut req = target.authorize(client.post(target.url(route)).body(body));
     if let Some(ct) = headers.get("content-type") {
         req = req.header("content-type", ct);
     }
-    let resp = req.send().await.context("proxy request to llama-server")?;
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("proxy request to {}", target.describe()))?;
     let status = resp.status();
     let resp_headers = resp.headers().clone();
     let raw = resp
@@ -2918,17 +3205,21 @@ async fn proxy_rewriting_model(
 /// object carrying a `model` field gets rewritten.
 async fn stream_rewriting_model(
     client: &Client,
-    url: &str,
+    target: &Target,
+    route: &str,
     headers: &HeaderMap,
     body: Bytes,
     activity: ActivityGuard,
     canonical_model: String,
 ) -> Result<Response, AppError> {
-    let mut req = client.post(url).body(body);
+    let mut req = target.authorize(client.post(target.url(route)).body(body));
     if let Some(ct) = headers.get("content-type") {
         req = req.header("content-type", ct);
     }
-    let resp = req.send().await.context("proxy request to llama-server")?;
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("proxy request to {}", target.describe()))?;
     let status = resp.status();
     // Only content-type is meaningful to forward for a stream the
     // caller is about to reconstruct line by line — content-length
@@ -3036,6 +3327,18 @@ fn apply_default_repeat_penalty_typed(oai_req: &mut OAIChatRequest) {
     }
 }
 
+/// Whether a request bound for `target` may carry `repeat_penalty`.
+///
+/// It is a llama.cpp extension, not an OpenAI field. Sending it to a
+/// local backend is the whole point of [`DEFAULT_REPEAT_PENALTY`];
+/// sending it to a provider is at best ignored and at worst a 400, since
+/// OpenAI rejects unrecognized arguments outright. A caller that asked
+/// for one explicitly is in the same position, so a remote request drops
+/// the field either way.
+fn repeat_penalty_applies(target: &Target) -> bool {
+    !target.is_remote()
+}
+
 /// POSTs oai_req to url and returns the still-streaming response, converting
 /// a non-2xx status into an AppError carrying the backend's error body.
 /// The *only* function that actually sends an `OAIChatRequest` to
@@ -3046,25 +3349,49 @@ fn apply_default_repeat_penalty_typed(oai_req: &mut OAIChatRequest) {
 /// exactly once instead of at every construction site.
 async fn post_chat(
     client: &Client,
-    url: &str,
+    target: &Target,
     oai_req: &mut OAIChatRequest,
 ) -> Result<reqwest::Response, AppError> {
-    apply_default_repeat_penalty_typed(oai_req);
-    let resp = client
-        .post(url)
-        .json(oai_req)
+    if repeat_penalty_applies(target) {
+        apply_default_repeat_penalty_typed(oai_req);
+    } else {
+        oai_req.repeat_penalty = None;
+    }
+    let resp = target
+        .authorize(
+            client
+                .post(target.url(CHAT_COMPLETIONS_ROUTE))
+                .json(oai_req),
+        )
         .send()
         .await
-        .context("send to llama-server")?;
+        .with_context(|| format!("send to {}", target.describe()))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         return Err(AppError(
-            anyhow!("inference backend {status}: {body}"),
-            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow!("{} {status}: {body}", target.describe()),
+            // A provider's own 4xx is the actionable answer — a bad key
+            // has to reach the user as 401, not as llmman's 500. A local
+            // backend keeps the blanket 500 it always returned.
+            remote_status(target, status),
         ));
     }
     Ok(resp)
+}
+
+/// The status llmman reports for an unsuccessful upstream response.
+///
+/// A [`Target::Local`] backend failing is llmman's own problem, so it
+/// stays a 500 as it always has. A provider's 4xx is about the caller's
+/// request or credentials, so it is passed through rather than buried;
+/// anything else from a provider is a bad gateway.
+fn remote_status(target: &Target, upstream: StatusCode) -> StatusCode {
+    match target {
+        Target::Local(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Target::Remote(_) if upstream.is_client_error() => upstream,
+        Target::Remote(_) => StatusCode::BAD_GATEWAY,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3321,14 +3648,14 @@ fn fold_ollama_lines<I: IntoIterator<Item = String>>(lines: I) -> OllamaFold {
 async fn stream_ollama<T: Serialize + Send + 'static>(
     streaming: bool,
     client: Client,
-    url: String,
+    target: Target,
     mut oai_req: OAIChatRequest,
     activity: ActivityGuard,
     build_chunk: impl Fn(String, Option<String>, Option<Vec<OllamaToolCall>>, bool) -> T
         + Send
         + 'static,
 ) -> Result<Response, AppError> {
-    let resp = post_chat(&client, &url, &mut oai_req).await?;
+    let resp = post_chat(&client, &target, &mut oai_req).await?;
 
     // `stream: false` answers with the one JSON object Ollama returns.
     // llama-server is still asked to stream either way: a non-streaming
@@ -3391,12 +3718,12 @@ async fn stream_ollama<T: Serialize + Send + 'static>(
 
 async fn stream_anthropic(
     client: Client,
-    url: String,
+    target: Target,
     mut oai_req: OAIChatRequest,
     model: String,
     activity: ActivityGuard,
 ) -> Result<Response, AppError> {
-    let resp = post_chat(&client, &url, &mut oai_req).await?;
+    let resp = post_chat(&client, &target, &mut oai_req).await?;
 
     let msg_id = gen_id();
     let preamble = {
@@ -3726,6 +4053,27 @@ async fn handle_show(
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or(&req.model);
+    // A provider-routed model is served by someone else and is never in
+    // the local store, so the lookup below would report it missing and
+    // send every caller that treats a 500 here as "needs pulling" — most
+    // of all `daemon::ensure_model_pulled`, which `llmman launch` and
+    // `llmman run` both call before their first request — off to pull a
+    // reference that names no registry. Answer for it directly instead.
+    if crate::providers::is_remote_ref(model_ref) {
+        eprintln!("[llmman] /api/show model={model_ref:?} (provider-routed)");
+        return Ok(Json(OllamaShowResponse {
+            model_info: serde_json::json!({ "digest": "", "size": 0 }),
+            details: OllamaModelDetails {
+                // Not "gguf": there are no local weights here at all, and
+                // claiming a format llmman never inspected would be a
+                // guess about someone else's serving stack.
+                format: String::new(),
+                family: String::new(),
+                parameter_size: String::new(),
+                quantization_level: String::new(),
+            },
+        }));
+    }
     // Resolve the same way handle_pull stored it — otherwise a bare name
     // (e.g. "gemma4", pulled and stored as "docker.io/ai/gemma4") would
     // never be found by show/delete even though it's in the local store.
@@ -3989,6 +4337,7 @@ async fn handle_delete(
 
 async fn handle_ollama_chat(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<OllamaChatRequest>,
 ) -> Result<Response, AppError> {
     eprintln!(
@@ -3996,15 +4345,15 @@ async fn handle_ollama_chat(
         req.model,
         req.messages.len()
     );
-    let (model, port, guard) = ensure_model(&state, &req.model).await?;
+    let (model, target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
     let keep_alive = resolve_keep_alive(&req.keep_alive);
     let activity = begin_activity(guard, Some(keep_alive)).await;
-    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     // See backend_wire_model's own doc comment — usually just `model`
-    // itself, but a different value for an Engine::Mlx backend. Only
-    // this one outgoing request field, never the response chunk's own
-    // `model` field below (which must keep echoing back `model` as-is).
-    let wire_model = backend_wire_model(&state, &model).await;
+    // itself, but a different value for an Engine::Mlx backend or a
+    // remote provider. Only this one outgoing request field, never the
+    // response chunk's own `model` field below (which must keep echoing
+    // back `model` as-is).
+    let wire_model = backend_wire_model(&state, &target, &model).await;
     let oai = OAIChatRequest {
         model: wire_model,
         messages: req.messages.iter().map(ollama_message_to_oai).collect(),
@@ -4023,7 +4372,7 @@ async fn handle_ollama_chat(
     stream_ollama(
         req.stream,
         state.0.client.clone(),
-        url,
+        target,
         oai,
         activity,
         move |content, thinking, tool_calls, done| {
@@ -4057,6 +4406,7 @@ async fn handle_ollama_chat(
 
 async fn handle_ollama_generate(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<OllamaGenerateRequest>,
 ) -> Result<Response, AppError> {
     eprintln!(
@@ -4090,7 +4440,7 @@ async fn handle_ollama_generate(
         .into_response());
     }
 
-    let (model, port, guard) = ensure_model(&state, &req.model).await?;
+    let (model, target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
     // Empty prompt = load-only request (mirrors ollama server/routes.go:429)
     // — including "preload with a custom keep_alive", so refresh it here
     // even though no generation is happening.
@@ -4109,9 +4459,8 @@ async fn handle_ollama_generate(
 
     let keep_alive = resolve_keep_alive(&req.keep_alive);
     let activity = begin_activity(guard, Some(keep_alive)).await;
-    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     // See backend_wire_model's own doc comment.
-    let wire_model = backend_wire_model(&state, &model).await;
+    let wire_model = backend_wire_model(&state, &target, &model).await;
     let oai = OAIChatRequest {
         model: wire_model,
         messages: vec![OAIMessage::text("user", req.prompt.clone())],
@@ -4130,7 +4479,7 @@ async fn handle_ollama_generate(
     stream_ollama(
         req.stream,
         state.0.client.clone(),
-        url,
+        target,
         oai,
         activity,
         move |response, thinking, _tool_calls, done| OllamaGenerateChunk {
@@ -4197,20 +4546,22 @@ fn apply_default_repeat_penalty(req: &mut serde_json::Value) {
 ///
 /// The returned `Option<String>` is `Some(canonical_model)` only when
 /// the backend actually needed a different wire name than the one the
-/// client asked for (see `backend_wire_model`'s own doc comment — only
-/// ever true for an `Engine::Mlx` backend) — the signal
+/// client asked for (see `backend_wire_model`'s own doc comment — an
+/// `Engine::Mlx` backend, or any remote provider, which knows the model
+/// by its own unprefixed id) — the signal
 /// `proxy_openai_generation`/`proxy_openai_passthrough` need to decide
 /// whether the *response* also needs its own `"model"` field rewritten
 /// back before reaching the client, via `proxy_rewriting_model`/
 /// `stream_rewriting_model` instead of the plain `proxy`.
 async fn resolve_openai_request(
     state: &AppState,
+    headers: &HeaderMap,
     body: Bytes,
-) -> Result<(serde_json::Value, u16, ActivityGuard, Option<String>), AppError> {
+) -> Result<(serde_json::Value, Target, ActivityGuard, Option<String>), AppError> {
     let mut req: serde_json::Value =
         serde_json::from_slice(&body).context("parse OpenAI request body")?;
     let model = req["model"].as_str().unwrap_or("").to_string();
-    let (model, port, guard) = ensure_model(state, &model).await?;
+    let (model, target, guard) = ensure_model(state, &model, Some(headers)).await?;
     // The OpenAI-compatible surface has no `keep_alive` field of its own
     // (real Ollama's doesn't either) — `None` leaves whatever this model
     // already has untouched (its load-time default, or an explicit value
@@ -4219,11 +4570,12 @@ async fn resolve_openai_request(
     // instant one OpenAI-compatible request comes in.
     let activity = begin_activity(guard, None).await;
     // See backend_wire_model's own doc comment — usually just `model`
-    // itself, but a different value for an Engine::Mlx backend.
-    let wire_model = backend_wire_model(state, &model).await;
+    // itself, but a different value for an Engine::Mlx backend or a
+    // remote provider.
+    let wire_model = backend_wire_model(state, &target, &model).await;
     let response_model_override = (wire_model != model).then_some(model);
     req["model"] = serde_json::Value::String(wire_model);
-    Ok((req, port, activity, response_model_override))
+    Ok((req, target, activity, response_model_override))
 }
 
 /// OpenAI-passthrough for the endpoints that actually generate tokens —
@@ -4250,21 +4602,60 @@ async fn proxy_openai_generation(
     body: Bytes,
     llama_path: &str,
 ) -> Result<Response, AppError> {
-    let (mut req, port, activity, response_model_override) =
-        resolve_openai_request(state, body).await?;
-    apply_default_repeat_penalty(&mut req);
+    let (mut req, target, activity, response_model_override) =
+        resolve_openai_request(state, headers, body).await?;
+    if is_responses_route(llama_path) && !target.is_remote() {
+        sanitize_responses_request(&mut req);
+    }
+    if repeat_penalty_applies(&target) {
+        apply_default_repeat_penalty(&mut req);
+    } else {
+        // See repeat_penalty_applies: not an OpenAI field, and a strict
+        // provider rejects the whole request over it.
+        if let Some(req) = req.as_object_mut() {
+            req.remove("repeat_penalty");
+        }
+    }
     let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
-    let url = format!("http://127.0.0.1:{port}{llama_path}");
-    match response_model_override {
+    let resp = match response_model_override {
         Some(canonical) if streaming => {
-            stream_rewriting_model(&state.0.client, &url, headers, body, activity, canonical).await
+            stream_rewriting_model(
+                &state.0.client,
+                &target,
+                llama_path,
+                headers,
+                body,
+                activity,
+                canonical,
+            )
+            .await
         }
         Some(canonical) => {
-            proxy_rewriting_model(&state.0.client, &url, headers, body, activity, &canonical).await
+            proxy_rewriting_model(
+                &state.0.client,
+                &target,
+                llama_path,
+                headers,
+                body,
+                activity,
+                &canonical,
+            )
+            .await
         }
-        None => proxy(&state.0.client, &url, headers, body, activity).await,
-    }
+        None => {
+            proxy(
+                &state.0.client,
+                &target,
+                llama_path,
+                headers,
+                body,
+                activity,
+            )
+            .await
+        }
+    }?;
+    Ok(explain_missing_route(&target, llama_path, resp))
 }
 
 /// OpenAI-passthrough for the routes that don't generate anything a
@@ -4303,31 +4694,67 @@ async fn proxy_openai_passthrough(
     body: Bytes,
     llama_path: &str,
 ) -> Result<Response, AppError> {
-    if llama_path == "/v1/embeddings" {
+    let embeddings = llama_path == "/v1/embeddings";
+    if embeddings {
         if let Ok(peek) = serde_json::from_slice::<serde_json::Value>(&body) {
             if let Some(model_ref) = peek["model"].as_str() {
-                if let Some(canonical) = would_use_mlx(state, model_ref).await {
-                    return Ok(mlx_embeddings_unsupported_response(&canonical));
+                // A provider-routed model is never an `Engine::Mlx` one —
+                // it isn't local at all — so skip the whole check rather
+                // than letting `would_use_mlx` do a pointless store lookup
+                // against a reference that was never a store reference.
+                if !crate::providers::is_remote_ref(model_ref) {
+                    if let Some(canonical) = would_use_mlx(state, model_ref).await {
+                        return Ok(mlx_embeddings_unsupported_response(&canonical));
+                    }
                 }
             }
         }
     }
-    let (req, port, activity, response_model_override) =
-        resolve_openai_request(state, body).await?;
-    if llama_path == "/v1/embeddings" {
+    let (mut req, target, activity, response_model_override) =
+        resolve_openai_request(state, headers, body).await?;
+    if is_responses_route(llama_path) && !target.is_remote() {
+        sanitize_responses_request(&mut req);
+    }
+    // `!target.is_remote()`, not just `response_model_override.is_some()`:
+    // a remote target *always* sets that override (it addresses the model
+    // by its own unprefixed id — see `backend_wire_model`), so without
+    // this every provider-routed embeddings request would be rejected as
+    // an MLX one. Only a local backend can actually be `Engine::Mlx`.
+    if embeddings && !target.is_remote() {
         if let Some(canonical) = &response_model_override {
             drop(activity);
             return Ok(mlx_embeddings_unsupported_response(canonical));
         }
     }
     let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
-    let url = format!("http://127.0.0.1:{port}{llama_path}");
-    match response_model_override {
+    let resp = match response_model_override {
         Some(canonical) => {
-            proxy_rewriting_model(&state.0.client, &url, headers, body, activity, &canonical).await
+            proxy_rewriting_model(
+                &state.0.client,
+                &target,
+                llama_path,
+                headers,
+                body,
+                activity,
+                &canonical,
+            )
+            .await
         }
-        None => proxy(&state.0.client, &url, headers, body, activity).await,
-    }
+        None => {
+            proxy(
+                &state.0.client,
+                &target,
+                llama_path,
+                headers,
+                body,
+                activity,
+            )
+            .await
+        }
+    }?;
+    // `/v1/responses/input_tokens` comes through here, and a provider
+    // without the Responses API 404s it just the same.
+    Ok(explain_missing_route(&target, llama_path, resp))
 }
 
 /// The clear, specific error [`proxy_openai_passthrough`] returns
@@ -4426,12 +4853,31 @@ async fn handle_openai_transcriptions(
         });
         return Ok((StatusCode::BAD_REQUEST, Json(body)).into_response());
     };
-    let (_, port, guard) = ensure_model(&state, &model).await?;
+    // Every other surface rewrites `model` to the provider's own id
+    // before forwarding, but this body is multipart, not JSON: the raw
+    // relay below would hand the provider a reference it has never heard
+    // of. Refuse in llmman's own words rather than let that surface as
+    // someone else's "unknown model".
+    if crate::providers::is_remote_ref(&model) {
+        let body = serde_json::json!({
+            "error": "llmman does not route /v1/audio/transcriptions to a provider — \
+                      use a locally served model with audio support"
+        });
+        return Ok((StatusCode::BAD_REQUEST, Json(body)).into_response());
+    }
+    let (_, target, guard) = ensure_model(&state, &model, Some(&headers)).await?;
     // No `keep_alive` field on this API surface either — see
     // resolve_openai_request's own comment on the same choice.
     let activity = begin_activity(guard, None).await;
-    let url = format!("http://127.0.0.1:{port}/v1/audio/transcriptions");
-    proxy(&state.0.client, &url, &headers, body, activity).await
+    proxy(
+        &state.0.client,
+        &target,
+        "/v1/audio/transcriptions",
+        &headers,
+        body,
+        activity,
+    )
+    .await
 }
 
 // -- OpenAI Responses API (/v1/responses) ------------------------------------
@@ -4452,7 +4898,6 @@ async fn handle_openai_responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let body = sanitize_responses_request(body)?;
     proxy_openai_generation(&state, &headers, body, "/v1/responses").await
 }
 
@@ -4463,20 +4908,60 @@ async fn handle_openai_responses_input_tokens(
 ) -> Result<Response, AppError> {
     // A token-counting call, not a generation request — repeat_penalty has
     // nothing to apply to here.
-    let body = sanitize_responses_request(body)?;
     proxy_openai_passthrough(&state, &headers, body, "/v1/responses/input_tokens").await
 }
 
-/// Applies both `/v1/responses` request-shape workarounds below and
-/// re-serializes once, rather than parsing the body twice.
-fn sanitize_responses_request(body: Bytes) -> anyhow::Result<Bytes> {
-    let mut req: serde_json::Value =
-        serde_json::from_slice(&body).context("parse OpenAI request body")?;
-    filter_non_function_tools(&mut req);
-    consolidate_responses_instructions(&mut req);
-    Ok(Bytes::from(
-        serde_json::to_vec(&req).context("re-serialize sanitized request")?,
-    ))
+/// Applies both `/v1/responses` request-shape workarounds below, to a
+/// body already parsed by `resolve_openai_request`.
+///
+/// Local targets only, and applied after the target is known rather than
+/// on the way in: both are workarounds for what *llama-server's*
+/// `/v1/responses` cannot accept. A provider that implements the
+/// Responses API natively accepts the request Codex actually sent, and
+/// forwarding a stripped one would silently cost it `web_search` and
+/// every other non-function tool.
+fn sanitize_responses_request(req: &mut serde_json::Value) {
+    filter_non_function_tools(req);
+    consolidate_responses_instructions(req);
+}
+
+/// The routes [`sanitize_responses_request`] applies to.
+fn is_responses_route(llama_path: &str) -> bool {
+    llama_path.starts_with("/v1/responses")
+}
+
+/// Explains a provider's bare 404 on the Responses API.
+///
+/// Being OpenAI-wire-format does not mean implementing every OpenAI
+/// route. `/v1/responses` is the split that matters, because it is the
+/// only one Codex uses: `openai`, `groq` and `openrouter` answer it,
+/// `anthropic` and `mistral` 404. models.dev carries no capability data
+/// to filter on, and a hardcoded list would be wrong the week a provider
+/// shipped it — so this reports the 404 llmman actually received rather
+/// than predicting it, and says which of the two things is missing.
+fn explain_missing_route(target: &Target, route: &str, resp: Response) -> Response {
+    if resp.status() != StatusCode::NOT_FOUND || !is_responses_route(route) {
+        return resp;
+    }
+    // A 404 on any other route means something else entirely — an
+    // unknown model on `/v1/chat/completions`, most often — and claiming
+    // a missing Responses API for it would be a worse answer than the
+    // provider's own.
+    let Target::Remote(remote) = target else {
+        return resp;
+    };
+    let body = serde_json::json!({
+        "error": {
+            "message": format!(
+                "provider {} has no {route} — it is OpenAI-compatible but does not \
+                 implement the Responses API. Use an integration that speaks chat \
+                 completions, or a provider that does (openai, groq, openrouter).",
+                remote.provider
+            ),
+            "type": "invalid_request_error",
+        }
+    });
+    (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()
 }
 
 /// Strips any entry from the request's top-level `tools` array whose
@@ -4619,23 +5104,23 @@ fn build_anthropic_messages(req: &AnthropicRequest) -> Vec<OAIMessage> {
 
 async fn handle_anthropic_messages(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<AnthropicRequest>,
 ) -> Result<Response, AppError> {
     // Backend needs its canonical name (see ensure_model); the response
     // below still echoes req.model back, unchanged from before.
-    let (canonical_model, port, guard) = ensure_model(&state, &req.model).await?;
+    let (canonical_model, target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
     // The Anthropic Messages API has no `keep_alive` field of its own —
     // `None` leaves it untouched, same as the OpenAI-compatible surface
     // (see resolve_openai_request's own comment on why).
     let activity = begin_activity(guard, None).await;
-    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
 
     let messages = build_anthropic_messages(&req);
 
     // See backend_wire_model's own doc comment — usually just
     // canonical_model itself, but a different value for an Engine::Mlx
-    // backend.
-    let wire_model = backend_wire_model(&state, &canonical_model).await;
+    // backend or a remote provider.
+    let wire_model = backend_wire_model(&state, &target, &canonical_model).await;
     let mut oai = OAIChatRequest {
         model: wire_model,
         messages,
@@ -4656,13 +5141,13 @@ async fn handle_anthropic_messages(
     };
 
     if req.stream {
-        stream_anthropic(state.0.client.clone(), url, oai, req.model, activity).await
+        stream_anthropic(state.0.client.clone(), target, oai, req.model, activity).await
     } else {
         // Goes through post_chat like every other typed request (see its
         // own doc comment) rather than posting directly, so this branch
         // also gets repeat_penalty defaulted instead of needing its own
         // copy of that logic.
-        let resp = post_chat(&state.0.client, &url, &mut oai).await?;
+        let resp = post_chat(&state.0.client, &target, &mut oai).await?;
         let body: serde_json::Value = resp.json().await.context("parse llama-server response")?;
         let content = body["choices"][0]["message"]["content"]
             .as_str()
@@ -4987,11 +5472,20 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
 
     // If a model was given on the command line, start loading it immediately
     // so the first request finds it already warm.
-    if let Some(model) = &_args.model {
+    // A provider-routed model has nothing to pre-load — there is no local
+    // weight to warm, and `resolve_ollama_api` below would rewrite its
+    // reference into a registry path it isn't. `cmd::launch` already
+    // declines to pass one; this is the daemon's own guard for anyone
+    // running `llmman serve <ref>` by hand.
+    if let Some(model) = _args
+        .model
+        .as_deref()
+        .filter(|m| !crate::providers::is_remote_ref(m))
+    {
         let model = crate::shortnames::resolve_ollama_api(model);
         let state_clone = state.clone();
         tokio::spawn(async move {
-            match ensure_model(&state_clone, &model).await {
+            match ensure_model(&state_clone, &model, None).await {
                 // ensure_model's own keep_alive (the daemon default, 5
                 // minutes) would otherwise start counting down the
                 // moment this finishes loading, with no request traffic
@@ -5057,6 +5551,334 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- request targets (local backend vs remote provider) -----------------
+
+    fn remote_target(base_url: &str) -> Target {
+        Target::Remote(Arc::new(RemoteTarget {
+            provider: "mockprov".into(),
+            base_url: base_url.into(),
+            model: "mock-model".into(),
+            api_key: "sk-test".into(),
+        }))
+    }
+
+    /// A local target must keep producing byte-for-byte the same loopback
+    /// URLs the `format!("http://127.0.0.1:{port}{path}")` calls this
+    /// replaced did — every existing route depends on it.
+    #[test]
+    fn a_local_target_addresses_loopback_unchanged() {
+        let target = Target::Local(17434);
+        assert_eq!(
+            target.url("/v1/chat/completions"),
+            "http://127.0.0.1:17434/v1/chat/completions"
+        );
+        assert_eq!(
+            target.url("/v1/audio/transcriptions"),
+            "http://127.0.0.1:17434/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            target.url("/v1/responses/input_tokens"),
+            "http://127.0.0.1:17434/v1/responses/input_tokens"
+        );
+        assert!(!target.is_remote());
+    }
+
+    /// A remote target re-bases llmman's internal `/v1/...` route onto
+    /// whatever version segment the provider published, which is often not
+    /// `/v1` and sometimes absent — getting this wrong yields a doubled
+    /// `/v1/v1/` or a dropped path segment.
+    #[test]
+    fn a_remote_target_rebases_routes_onto_the_provider_url() {
+        assert_eq!(
+            remote_target("https://openrouter.ai/api/v1").url("/v1/chat/completions"),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+        assert_eq!(
+            remote_target("https://generativelanguage.googleapis.com/v1beta/openai")
+                .url("/v1/chat/completions"),
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        );
+        assert_eq!(
+            remote_target("https://api.perplexity.ai").url("/v1/chat/completions"),
+            "https://api.perplexity.ai/chat/completions"
+        );
+        assert!(remote_target("https://example.invalid/v1").is_remote());
+    }
+
+    /// Both spellings the surfaces here accept, so a provider key reaches
+    /// an already-running daemon whichever integration sent it.
+    #[test]
+    fn client_api_key_reads_bearer_and_x_api_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer sk-openai-style".parse().unwrap());
+        assert_eq!(
+            client_api_key(Some(&headers)),
+            Some("sk-openai-style".to_string())
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "sk-anthropic-style".parse().unwrap());
+        assert_eq!(
+            client_api_key(Some(&headers)),
+            Some("sk-anthropic-style".to_string())
+        );
+
+        // Authorization wins when a client sends both.
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer sk-bearer".parse().unwrap());
+        headers.insert("x-api-key", "sk-other".parse().unwrap());
+        assert_eq!(
+            client_api_key(Some(&headers)),
+            Some("sk-bearer".to_string())
+        );
+    }
+
+    /// `cmd::launch` gives locally-served integrations a placeholder key
+    /// because several refuse to start without one. Treating it as a real
+    /// credential would forward a meaningless token to a real provider
+    /// (which rejects it with an opaque 401) instead of falling back to
+    /// the daemon's own configured key.
+    #[test]
+    fn client_api_key_ignores_the_local_placeholder_and_empty_values() {
+        for header in ["Bearer llmman", "Bearer ", "Bearer    ", ""] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", header.parse().unwrap());
+            assert_eq!(
+                client_api_key(Some(&headers)),
+                None,
+                "{header:?} was treated as a credential"
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", PLACEHOLDER_API_KEY.parse().unwrap());
+        assert_eq!(client_api_key(Some(&headers)), None);
+
+        assert_eq!(client_api_key(None), None);
+        assert_eq!(client_api_key(Some(&HeaderMap::new())), None);
+    }
+
+    /// A malformed or non-bearer `Authorization` is not a key — llmman
+    /// must fall through to its own configured one rather than forwarding
+    /// something that was never a bearer token.
+    #[test]
+    fn client_api_key_ignores_non_bearer_authorization() {
+        for header in ["Basic dXNlcjpwYXNz", "sk-no-scheme", "Bearer"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", header.parse().unwrap());
+            assert_eq!(
+                client_api_key(Some(&headers)),
+                None,
+                "{header:?} was treated as a bearer token"
+            );
+        }
+    }
+
+    /// RFC 7235 makes the scheme case-insensitive and clients do send
+    /// `bearer`. Matching one spelling silently drops a real key, and on
+    /// a daemon that won't use its own there is nothing to fall back to.
+    #[test]
+    fn client_api_key_accepts_any_spelling_of_bearer() {
+        for header in ["Bearer sk-real", "bearer sk-real", "BEARER sk-real"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", header.parse().unwrap());
+            assert_eq!(
+                client_api_key(Some(&headers)),
+                Some("sk-real".to_string()),
+                "{header:?}"
+            );
+        }
+    }
+
+    /// Each header is judged on its own: an unusable `Authorization` must
+    /// not shadow a real `x-api-key`, which is exactly what a client that
+    /// hardcodes one and configures the other sends.
+    #[test]
+    fn client_api_key_falls_through_an_unusable_authorization() {
+        for header in ["Bearer llmman", "Bearer ", "Basic dXNlcjpwYXNz"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", header.parse().unwrap());
+            headers.insert("x-api-key", "sk-real".parse().unwrap());
+            assert_eq!(
+                client_api_key(Some(&headers)),
+                Some("sk-real".to_string()),
+                "{header:?} shadowed a real x-api-key"
+            );
+        }
+    }
+
+    /// OpenAI-wire-format does not mean every OpenAI route: `anthropic`
+    /// and `mistral` 404 on `/v1/responses` where `openai`, `groq` and
+    /// `openrouter` answer it. Codex uses only that route, so the bare
+    /// 404 it would otherwise show has to become an explanation.
+    #[tokio::test]
+    async fn a_providers_missing_responses_route_is_explained() {
+        let remote = remote_target("https://example.invalid/v1");
+        let not_found = (StatusCode::NOT_FOUND, "{}").into_response();
+        let explained = explain_missing_route(&remote, "/v1/responses", not_found);
+        assert_eq!(explained.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(explained.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("mockprov"), "{body}");
+        assert!(body.contains("Responses API"), "{body}");
+
+        // The token-counting route is the same story.
+        let counted = explain_missing_route(
+            &remote,
+            "/v1/responses/input_tokens",
+            (StatusCode::NOT_FOUND, "{}").into_response(),
+        );
+        assert_eq!(counted.status(), StatusCode::NOT_IMPLEMENTED);
+
+        // Everything else is relayed untouched. A 404 on another route is
+        // an unknown model, not a missing API, and answering it with the
+        // wrong explanation is worse than passing the provider's own.
+        for (target, route, status) in [
+            (&remote, "/v1/chat/completions", StatusCode::NOT_FOUND),
+            (&remote, "/v1/embeddings", StatusCode::NOT_FOUND),
+            (
+                &Target::Local(17434),
+                "/v1/responses",
+                StatusCode::NOT_FOUND,
+            ),
+            (&remote, "/v1/responses", StatusCode::OK),
+            (&remote, "/v1/responses", StatusCode::UNAUTHORIZED),
+        ] {
+            let resp = explain_missing_route(target, route, (status, "{}").into_response());
+            assert_eq!(resp.status(), status, "{route} {status}");
+        }
+    }
+
+    /// A page the user merely visits can POST here — CORS gates reading
+    /// the reply, not sending a "simple" request, and these handlers
+    /// never check `Content-Type`. It must not be able to spend the key
+    /// in the daemon's environment; not seeing the answer is no comfort
+    /// once the money is gone.
+    #[test]
+    fn only_a_browser_acting_for_another_site_is_refused_the_daemons_key() {
+        for site in ["cross-site", "same-site", "Cross-Site", " cross-site "] {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-site", site.parse().unwrap());
+            assert!(is_cross_site(Some(&headers)), "{site:?}");
+        }
+        // llmman's own web UI, and a typed URL.
+        for site in ["same-origin", "none"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-site", site.parse().unwrap());
+            assert!(!is_cross_site(Some(&headers)), "{site:?}");
+        }
+        // A CLI integration sends no such header, which is the whole
+        // reason this can gate on it without breaking them.
+        assert!(!is_cross_site(Some(&HeaderMap::new())));
+        assert!(!is_cross_site(None));
+    }
+
+    /// The key is the one field of a remote target that must never reach
+    /// a log line, so it cannot be reachable through `Debug` either.
+    #[test]
+    fn a_remote_targets_debug_output_omits_the_key() {
+        let rendered = format!("{:?}", remote_target("https://example.invalid/v1"));
+        assert!(!rendered.contains("sk-test"), "{rendered}");
+        assert!(rendered.contains("mockprov"), "{rendered}");
+    }
+
+    /// `repeat_penalty` is a llama.cpp extension. A local backend wants
+    /// llmman's default; a provider rejects the request over it.
+    #[test]
+    fn repeat_penalty_is_local_only() {
+        assert!(repeat_penalty_applies(&Target::Local(17434)));
+        assert!(!repeat_penalty_applies(&remote_target(
+            "https://example.invalid/v1"
+        )));
+    }
+
+    /// A bad provider key must reach the user as the 401 it is. Burying
+    /// it in llmman's blanket 500 is what makes "check your key" look
+    /// like "llmman is broken" — while a local backend, whose failures
+    /// really are llmman's own, keeps the 500 it always returned.
+    #[test]
+    fn a_providers_own_status_is_not_buried_in_a_500() {
+        let remote = remote_target("https://example.invalid/v1");
+        assert_eq!(
+            remote_status(&remote, StatusCode::UNAUTHORIZED),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            remote_status(&remote, StatusCode::TOO_MANY_REQUESTS),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Not the caller's fault, and not llmman's either.
+        assert_eq!(
+            remote_status(&remote, StatusCode::BAD_GATEWAY),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            remote_status(&remote, StatusCode::INTERNAL_SERVER_ERROR),
+            StatusCode::BAD_GATEWAY
+        );
+
+        let local = Target::Local(17434);
+        for upstream in [StatusCode::UNAUTHORIZED, StatusCode::INTERNAL_SERVER_ERROR] {
+            assert_eq!(
+                remote_status(&local, upstream),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a local backend's status changed"
+            );
+        }
+
+        // And the message says which of the two failed, without the key.
+        assert_eq!(local.describe(), "inference backend");
+        assert_eq!(remote.describe(), "provider mockprov");
+    }
+
+    /// What a provider actually receives, checked against a real HTTP
+    /// server rather than inferred from the pieces: the route re-based
+    /// onto its own base URL, the bearer token, the model under the id it
+    /// knows, and no llama.cpp-only field for it to reject.
+    #[tokio::test]
+    async fn a_remote_request_reaches_the_provider_as_plain_openai() {
+        let seen = Arc::new(tokio::sync::Mutex::new(None));
+        let captured = seen.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|headers: HeaderMap, body: Bytes| async move {
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let auth = headers["authorization"].to_str().unwrap().to_string();
+                *captured.lock().await = Some((auth, body));
+                ([("content-type", "application/json")], "{}")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // `/v1` on the base and `/v1/...` on the route must not double up.
+        let target = remote_target(&format!("http://127.0.0.1:{}/v1", addr.port()));
+        let mut req = OAIChatRequest {
+            model: "mock-model".into(),
+            messages: vec![],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            repeat_penalty: Some(1.1),
+            chat_template_kwargs: None,
+            tools: None,
+            response_format: None,
+        };
+        post_chat(&Client::new(), &target, &mut req).await.unwrap();
+
+        let (auth, body) = seen.lock().await.take().expect("provider was not called");
+        assert_eq!(auth, "Bearer sk-test");
+        assert_eq!(body["model"], "mock-model");
+        assert!(
+            body.get("repeat_penalty").is_none(),
+            "llama.cpp-only field sent to a provider: {body}"
+        );
+    }
 
     // -- keep_alive parsing / resolution (idle-timeout auto-unload) ---------
 
@@ -5662,12 +6484,15 @@ mod tests {
         }
 
         assert_eq!(
-            backend_wire_model(&state, "llama-model").await,
+            backend_wire_model(&state, &Target::Local(0), "llama-model").await,
             "llama-model"
         );
-        assert_eq!(backend_wire_model(&state, "vllm-model").await, "vllm-model");
         assert_eq!(
-            backend_wire_model(&state, "mlx-model").await,
+            backend_wire_model(&state, &Target::Local(0), "vllm-model").await,
+            "vllm-model"
+        );
+        assert_eq!(
+            backend_wire_model(&state, &Target::Local(0), "mlx-model").await,
             "/cache/mlx-model/abcd",
             "an Engine::Mlx backend must be addressed by its real directory path, not its human-readable name"
         );
@@ -5677,8 +6502,22 @@ mod tests {
     async fn backend_wire_model_falls_back_to_the_canonical_name_when_not_running() {
         let state = test_state();
         assert_eq!(
-            backend_wire_model(&state, "not-running").await,
+            backend_wire_model(&state, &Target::Local(0), "not-running").await,
             "not-running"
+        );
+    }
+
+    /// A remote provider knows nothing of `providers::REMOTE_PREFIX` — it
+    /// must receive its own bare model id, with the routing prefix llmman
+    /// added stripped back off, and without consulting `running` at all
+    /// (a provider-routed model is never in it).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_wire_model_strips_the_routing_prefix_for_a_remote_target() {
+        let state = test_state();
+        let target = remote_target("https://example.invalid/v1");
+        assert_eq!(
+            backend_wire_model(&state, &target, "llmman.provider/mockprov/mock-model").await,
+            "mock-model"
         );
     }
 
@@ -7396,7 +8235,7 @@ mod tests {
         let resp = stream_ollama(
             streaming,
             Client::new(),
-            format!("http://{addr}/v1/chat/completions"),
+            Target::Local(addr.port()),
             OAIChatRequest {
                 messages: vec![OAIMessage::text("user", "hi".to_string())],
                 stream: true,

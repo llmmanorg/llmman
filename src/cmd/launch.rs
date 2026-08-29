@@ -2,6 +2,14 @@
 //!
 //! Mirrors `ollama launch`: sets integration-specific environment variables
 //! pointing at the local inference server, then exec's the integration binary.
+//!
+//! `--provider` extends that to models llmman does not serve itself, from
+//! the same models.dev catalog opencode resolves its providers from (see
+//! [`crate::providers`]). It does not change the shape above: the
+//! integration is still pointed at `llmman serve`, which forwards upstream
+//! on its behalf. There is deliberately no path here that hands an
+//! integration a provider's URL directly — one endpoint, one place
+//! integrations are configured, whether or not the weights are local.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -10,6 +18,7 @@ use anyhow::Context;
 use clap::Args;
 
 use crate::daemon;
+use crate::providers::{self, Provider};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -26,31 +35,68 @@ pub struct LaunchArgs {
     #[arg(long, short, value_name = "MODEL")]
     pub model: Option<String>,
 
+    /// Serve --model from this provider (openai, anthropic, openrouter, …)
+    /// instead of locally. Requires --model. See --list-providers.
+    #[arg(long, short = 'p', value_name = "PROVIDER")]
+    pub provider: Option<String>,
+
+    /// List the providers --provider accepts, and exit
+    #[arg(long)]
+    pub list_providers: bool,
+
     /// Extra arguments forwarded to the integration binary (after --)
     #[arg(last = true, value_name = "ARGS")]
     pub extra_args: Vec<String>,
 }
 
 pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
+    if args.list_providers {
+        return print_providers();
+    }
+
+    let provider = args
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+
     let Some(ref name) = args.integration else {
         print_integrations();
         return Ok(());
     };
 
-    // resolve_ollama_api, not resolve: every integration this launches talks
-    // to serve's Ollama/OpenAI/Anthropic-compat surfaces, all of which
-    // resolve model names the same way (see ensure_model in cmd::serve), so
-    // a bare name here must match what the daemon resolves it to at
-    // request time.
-    let model = args
-        .model
-        .as_deref()
-        .map(crate::shortnames::resolve_ollama_api)
-        .unwrap_or_default();
+    let (model, api_key) = match provider {
+        Some(provider) => {
+            check_provider_supported(name)?;
+            let per_request = !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
+            resolve_provider_model(provider, args.model.as_deref(), name, per_request)?
+        }
+        // resolve_ollama_api, not resolve: every integration this launches
+        // talks to serve's Ollama/OpenAI/Anthropic-compat surfaces, all of
+        // which resolve model names the same way (see ensure_model in
+        // cmd::serve), so a bare name here must match what the daemon
+        // resolves it to at request time.
+        None => (
+            args.model
+                .as_deref()
+                .map(crate::shortnames::resolve_ollama_api)
+                .unwrap_or_default(),
+            providers::PLACEHOLDER_API_KEY.to_string(),
+        ),
+    };
 
     // Ensure serve is running (start it in background if needed), preloading
     // the requested model so the integration's first request finds it warm.
-    crate::daemon::ensure_server(&model)?;
+    //
+    // A provider-routed model is never preloaded: there is nothing local to
+    // warm up, and asking the daemon to load one would just fail. The daemon
+    // still has to be running — it is what forwards upstream.
+    let preload = if provider.is_some() {
+        ""
+    } else {
+        model.as_str()
+    };
+    crate::daemon::ensure_server(preload)?;
 
     // serve's preload above is fire-and-forget and only fires on a cold
     // `serve` start (see run() in cmd/serve.rs) — if the daemon was already
@@ -58,12 +104,255 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     // only surface as an opaque failure once the integration made its first
     // request. Mirror `llmman run`'s behavior and pull it here instead,
     // synchronously and with progress, before ever handing off to the
-    // integration.
-    if !model.is_empty() {
-        crate::daemon::ensure_model_pulled(&model)?;
+    // integration. Nothing to pull for a provider-routed model.
+    if !preload.is_empty() {
+        crate::daemon::ensure_model_pulled(preload)?;
     }
 
-    launch(name, &model, &args.extra_args)
+    launch(name, &model, &api_key, &args.extra_args)
+}
+
+// ---------------------------------------------------------------------------
+// Providers
+// ---------------------------------------------------------------------------
+
+/// Integrations `--provider` cannot drive, and why.
+///
+/// `launch_simple` only exports `OLLAMA_HOST`: it never passes a model,
+/// so the integration picks its own and the provider-routed reference
+/// never reaches the daemon. `copilot` takes a model but has no way to
+/// carry a key. Refusing is the same call the catalog filter makes — a
+/// combination llmman cannot actually drive is absent, not offered and
+/// then broken at the first request.
+const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
+    (
+        "cline",
+        "it selects its own model rather than taking one from llmman",
+    ),
+    (
+        "kimi",
+        "it selects its own model rather than taking one from llmman",
+    ),
+    ("copilot", "it has no way to send a provider API key"),
+    ("copilot-cli", "it has no way to send a provider API key"),
+    // Its key variable feeds a native Google client, and llmman has not
+    // verified that GEMINI_BASE_URL still redirects it here. Getting that
+    // wrong sends someone's OpenRouter key to Google, which is a worse
+    // outcome than `--provider gemini` not working — the placeholder this
+    // used to pass was harmless either way, a real key is not.
+    (
+        "gemini",
+        "llmman cannot confirm it would send the key here rather than to Google",
+    ),
+    // launch_openclaw passes --custom-model-id only through onboarding,
+    // which runs once. Every later launch reuses whatever openclaw.json
+    // already names, so the provider reference would never reach the
+    // daemon and the session would quietly run on the old model.
+    (
+        "openclaw",
+        "it only takes a model during first-run onboarding",
+    ),
+];
+
+/// Integrations llmman configures through a file on disk. They take a
+/// model on every launch, so `--provider` works, but they cannot carry
+/// the key: writing a real one into `~/.hermes/config.yaml` would persist
+/// a credential, which this feature promises not to do. They rely on
+/// `llmman serve` having the variable itself — which it only uses for a
+/// daemon nobody else can reach (see `reachable_only_locally`).
+const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes"];
+
+fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
+    let name = integration.to_lowercase();
+    if let Some((_, why)) = PROVIDER_UNSUPPORTED.iter().find(|(id, _)| *id == name) {
+        anyhow::bail!(
+            "--provider does not work with {name}: {why}\n\
+             Run it against a locally served model, or use another integration."
+        );
+    }
+    // The key would go to the integration in cleartext, and from there
+    // over plain http to a daemon somewhere else on the network. llmman
+    // controls neither hop, so it does not start the handoff. A wildcard
+    // bind is fine here — that hop is still loopback.
+    if !crate::daemon::connects_over_loopback() {
+        anyhow::bail!(
+            "--provider needs a local llmman serve: LLMMAN_HOST points at {}, and the \
+             provider key would cross the network in cleartext.\n\
+             Export the key where that daemon runs instead.",
+            crate::daemon::server()
+        );
+    }
+    // These reach the daemon over loopback, so the check above passes,
+    // but they send the placeholder key and the daemon will not fall back
+    // to its own on a bind anyone can reach. Say so here rather than let
+    // it surface as a 401 from inside the integration.
+    if PROVIDER_NEEDS_DAEMON_KEY.contains(&name.as_str())
+        && !crate::daemon::reachable_only_locally()
+    {
+        anyhow::bail!(
+            "--provider does not work with {name} while llmman serve is bound to {}: \
+             {name} is configured through a file, so it cannot send the key per request, \
+             and a daemon reachable from the network will not spend its own.\n\
+             Bind llmman serve to loopback, or use an integration that carries the key.",
+            crate::daemon::bind_addr()
+        );
+    }
+    Ok(())
+}
+
+/// Validates `--provider`/`--model` against the catalog, returning the
+/// reference the daemon routes on (see
+/// [`crate::providers::REMOTE_PREFIX`]) and the key `integration` should
+/// authenticate with.
+///
+/// `key_travels_per_request` is false for the integrations in
+/// [`PROVIDER_NEEDS_DAEMON_KEY`], which get the placeholder because they
+/// cannot carry a real key — so this shell having one is beside the
+/// point, and demanding it would reject a perfectly good daemon that has
+/// it while this shell does not.
+///
+/// Every check here is one the daemon would otherwise make at first
+/// request, by which point the integration has already taken over the
+/// terminal and reports whatever it makes of an HTTP error. Failing in
+/// llmman's own output, before the handoff, is the difference between a
+/// named missing environment variable and an opaque "connection error"
+/// inside someone else's TUI.
+fn resolve_provider_model(
+    provider: &str,
+    model: Option<&str>,
+    integration: &str,
+    key_travels_per_request: bool,
+) -> anyhow::Result<(String, String)> {
+    let catalog = providers::catalog()?;
+    let entry = catalog
+        .get(provider)
+        .ok_or_else(|| unknown_provider_error(provider, &catalog))?;
+
+    let model = model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--provider {provider} also needs --model\n\n{}",
+                example_models(entry)
+            )
+        })?;
+
+    // A warning, not an error: models.dev is a snapshot, and a provider
+    // can serve a model — a brand new release, a fine-tune, a private
+    // deployment — before the catalog lists it. Refusing here would make
+    // llmman the reason a working model can't be used.
+    if !entry.models.iter().any(|m| m == model) {
+        eprintln!(
+            "[llmman] warning: {} does not list model {model:?}\n{}",
+            entry.name,
+            example_models(entry)
+        );
+    }
+
+    // Read here rather than left to the daemon so a missing key names the
+    // variable to set, in llmman's own output. The key travels to the
+    // daemon per request, in the integration's own Authorization header
+    // (see client_api_key in cmd::serve) — never written to disk or
+    // passed on a command line.
+    //
+    // Unless the integration cannot carry one, in which case this shell's
+    // key is not the one that matters and its absence is not an error:
+    // what counts is the daemon's own environment, which llmman cannot
+    // read from here. A warning, because the two are usually the same
+    // shell, and the daemon's 401 already names the variable.
+    let key = match (entry.api_key(), key_travels_per_request) {
+        (Some(key), _) => key,
+        (None, false) => {
+            eprintln!(
+                "[llmman] warning: {} is unset here; {} needs it set where \
+                 llmman serve runs",
+                entry.key_env, integration
+            );
+            providers::PLACEHOLDER_API_KEY.to_string()
+        }
+        (None, true) => anyhow::bail!(
+            "no API key for {} — set {} in your environment",
+            entry.name,
+            entry.key_env
+        ),
+    };
+
+    Ok((providers::format_remote_ref(provider, model), key))
+}
+
+/// A few real model ids for `provider`, to turn "which models?" into
+/// something answerable without leaving the error message.
+fn example_models(provider: &Provider) -> String {
+    if provider.models.is_empty() {
+        return format!("{} lists no models", provider.name);
+    }
+    let shown: Vec<&str> = provider.models.iter().take(5).map(String::as_str).collect();
+    let more = provider.models.len().saturating_sub(shown.len());
+    let suffix = if more > 0 {
+        format!(", … ({more} more)")
+    } else {
+        String::new()
+    };
+    format!(
+        "{} models include: {}{suffix}",
+        provider.name,
+        shown.join(", ")
+    )
+}
+
+/// Suggests near-matches before falling back to `--list-providers`, so a
+/// typo or a half-remembered id ("together" for `togetherai`) is one line
+/// away from the right answer instead of a 170-entry list.
+fn unknown_provider_error(provider: &str, catalog: &providers::Catalog) -> anyhow::Error {
+    let needle = provider.to_lowercase();
+    let close: Vec<&str> = catalog
+        .ids()
+        .filter(|id| id.contains(&needle) || needle.contains(*id))
+        .take(10)
+        .collect();
+    if close.is_empty() {
+        anyhow::anyhow!(
+            "unknown provider {provider:?}\nRun 'llmman launch --list-providers' for the \
+             {} providers llmman can route to.",
+            catalog.len()
+        )
+    } else {
+        anyhow::anyhow!(
+            "unknown provider {provider:?}\nDid you mean: {}?\nRun 'llmman launch \
+             --list-providers' for all {} of them.",
+            close.join(", "),
+            catalog.len()
+        )
+    }
+}
+
+fn print_providers() -> anyhow::Result<()> {
+    let catalog = providers::catalog()?;
+    let width = catalog.ids().map(str::len).max().unwrap_or(0);
+    for provider in catalog.iter() {
+        // The key variable is the one thing a user has to act on, and
+        // whether it is already set is the question they are really
+        // asking, so mark it rather than making them check.
+        let status = if provider.api_key().is_some() {
+            "set"
+        } else {
+            "unset"
+        };
+        println!(
+            "  {:<width$}  {:<28}  {} ({status})",
+            provider.id,
+            provider.name,
+            provider.key_env,
+            width = width
+        );
+    }
+    println!(
+        "\n{} providers, from models.dev — the same catalog opencode uses.",
+        catalog.len()
+    );
+    println!("Usage: llmman launch <integration> --provider <provider> --model <model>");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +441,8 @@ fn print_integrations() {
             );
         }
     }
-    println!("\nUsage: llmman launch <integration> [--model <model>]");
+    println!("\nUsage: llmman launch <integration> [--model <model>] [--provider <provider>]");
+    println!("       llmman launch --list-providers");
 }
 
 /// Extensions to try, in order, when resolving a bare command name on
@@ -193,16 +483,27 @@ fn find_on_path(binary: &str) -> Option<PathBuf> {
 // Launch dispatcher
 // ---------------------------------------------------------------------------
 
-fn launch(name: &str, model: &str, extra_args: &[String]) -> anyhow::Result<()> {
+/// `api_key` is what the integration is told to authenticate with:
+/// [`providers::PLACEHOLDER_API_KEY`] for a locally-served model, or the
+/// real provider key under `--provider`.
+///
+/// Passing the real one is what makes `--provider` work against a daemon
+/// that is *already running* — `ensure_server` reuses one, so a daemon
+/// started before the key was exported would otherwise never see it (see
+/// `client_api_key` in cmd::serve). Only the launchers that pass a key in
+/// the integration's environment can do this; the ones that go through a
+/// config file on disk keep the placeholder rather than persist a
+/// credential, and need the key in the daemon's own environment.
+fn launch(name: &str, model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     match name.to_lowercase().as_str() {
-        "claude" => launch_claude(model, extra_args),
-        "opencode" => launch_opencode(model, extra_args),
-        "codex" => launch_codex(model, extra_args),
+        "claude" => launch_claude(model, api_key, extra_args),
+        "opencode" => launch_opencode(model, api_key, extra_args),
+        "codex" => launch_codex(model, api_key, extra_args),
         "cline" => launch_simple("cline", "cline is not installed: npm install -g cline", model, extra_args),
-        "aider" => launch_aider(model, extra_args),
+        "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
         "kimi" => launch_simple("kimi", "kimi is not installed: https://kimi.ai", model, extra_args),
-        "gemini" => launch_gemini(model, extra_args),
+        "gemini" => launch_gemini(model, api_key, extra_args),
         "hermes" => launch_hermes(model, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
         other => anyhow::bail!(
@@ -218,7 +519,7 @@ fn launch(name: &str, model: &str, extra_args: &[String]) -> anyhow::Result<()> 
 
 /// claude: set ANTHROPIC_BASE_URL and a dummy ANTHROPIC_API_KEY so it talks to
 /// our server's Anthropic-compatible API.
-fn launch_claude(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_on_path("claude").ok_or_else(|| {
         anyhow::anyhow!("claude is not installed — https://code.claude.com/docs/en/quickstart")
     })?;
@@ -235,14 +536,14 @@ fn launch_claude(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
         &args,
         &[
             ("ANTHROPIC_BASE_URL", server.as_str()),
-            ("ANTHROPIC_API_KEY", "llmman"),
+            ("ANTHROPIC_API_KEY", api_key),
         ],
     )
 }
 
 /// opencode: pass a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
 /// /v1 endpoint, matching exactly what ollama launch does.
-fn launch_opencode(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch_opencode(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_on_path("opencode").or_else(|| {
         dirs::home_dir().and_then(|h| {
             let p = h.join(".opencode").join("bin").join("opencode");
@@ -253,12 +554,12 @@ fn launch_opencode(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
         bin.ok_or_else(|| anyhow::anyhow!("opencode is not installed — https://opencode.ai"))?;
 
     let effective_model = if model.is_empty() { "default" } else { model };
-    let config = opencode_config(effective_model);
+    let config = opencode_config(effective_model, api_key);
 
     exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
 }
 
-fn opencode_config(model: &str) -> String {
+fn opencode_config(model: &str, api_key: &str) -> String {
     let base_url = format!("{}/v1", daemon::server());
     serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
@@ -267,7 +568,8 @@ fn opencode_config(model: &str) -> String {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "Ollama",
                 "options": {
-                    "baseURL": base_url
+                    "baseURL": base_url,
+                    "apiKey": api_key
                 },
                 "models": {
                     model: { "name": model }
@@ -281,7 +583,7 @@ fn opencode_config(model: &str) -> String {
 
 /// codex: set OPENAI_API_KEY=llmman and write ~/.codex/config.toml with the
 /// ollama provider pointing at our /v1 endpoint.
-fn launch_codex(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch_codex(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     // Write codex config
     write_codex_config()?;
 
@@ -307,7 +609,7 @@ fn launch_codex(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     args.extend(["--profile".to_string(), "llmman".to_string()]);
     args.extend_from_slice(extra_args);
 
-    exec_with_env(&bin, &args, &[("OPENAI_API_KEY", "llmman")])
+    exec_with_env(&bin, &args, &[("OPENAI_API_KEY", api_key)])
 }
 
 /// Writes codex's `llmman` profile.
@@ -372,7 +674,7 @@ fn strip_legacy_llmman_profile(existing: &str) -> String {
 }
 
 /// aider: set OPENAI_API_KEY and OPENAI_BASE_URL.
-fn launch_aider(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch_aider(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let base_url = format!("{}/v1", daemon::server());
     let mut args: Vec<String> = Vec::new();
     if !model.is_empty() {
@@ -385,7 +687,7 @@ fn launch_aider(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
         &PathBuf::from("aider"),
         &args,
         &[
-            ("OPENAI_API_KEY", "llmman"),
+            ("OPENAI_API_KEY", api_key),
             ("OPENAI_BASE_URL", base_url.as_str()),
         ],
     )
@@ -408,7 +710,7 @@ fn launch_copilot(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 }
 
 /// gemini: set GOOGLE_GENAI_BASE_URL pointing at our Anthropic-compatible endpoint.
-fn launch_gemini(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch_gemini(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_on_path("gemini").ok_or_else(|| {
         anyhow::anyhow!("gemini is not installed — npm install -g @google/gemini-cli")
     })?;
@@ -425,7 +727,7 @@ fn launch_gemini(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
         &args,
         &[
             ("GEMINI_BASE_URL", base_url.as_str()),
-            ("GEMINI_API_KEY", "llmman"),
+            ("GEMINI_API_KEY", api_key),
         ],
     )
 }
@@ -640,6 +942,35 @@ fn exec_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> 
 mod tests {
     use super::*;
 
+    /// Every integration `--provider` refuses must be one `launch`
+    /// actually dispatches, or the refusal is for a name nobody can type
+    /// and the real one is still silently broken.
+    #[test]
+    fn every_provider_unsupported_integration_is_a_real_one() {
+        for (id, why) in PROVIDER_UNSUPPORTED {
+            assert!(
+                INTEGRATIONS.iter().any(|i| i.name == *id) || *id == "copilot-cli",
+                "{id} is not an integration"
+            );
+            assert!(!why.is_empty(), "{id} has no reason");
+            assert!(check_provider_supported(id).is_err(), "{id} was accepted");
+            // Case-insensitively, the way `launch` dispatches.
+            assert!(check_provider_supported(&id.to_uppercase()).is_err());
+        }
+        // Same for the ones that depend on the daemon holding the key:
+        // a name nobody can type protects nobody.
+        for id in PROVIDER_NEEDS_DAEMON_KEY {
+            assert!(
+                INTEGRATIONS.iter().any(|i| i.name == *id),
+                "{id} is not an integration"
+            );
+            assert!(
+                !PROVIDER_UNSUPPORTED.iter().any(|(u, _)| u == id),
+                "{id} is both refused outright and expected to work"
+            );
+        }
+    }
+
     /// Regression test for a real CodeRabbit finding: an unquoted model
     /// value in generated YAML could be misparsed as a non-string
     /// (`null`, `true`, ...) or broken outright by metacharacters.
@@ -652,6 +983,63 @@ mod tests {
             yaml_quote(r#"a "quoted" \ value"#),
             r#""a \"quoted\" \\ value""#
         );
+    }
+
+    fn provider(id: &str, models: &[&str]) -> Provider {
+        Provider {
+            id: id.to_string(),
+            name: format!("{id} Inc"),
+            base_url: "https://example.invalid/v1".to_string(),
+            key_env: "EXAMPLE_API_KEY".to_string(),
+            models: models.iter().map(|m| m.to_string()).collect(),
+        }
+    }
+
+    /// The listing has to stay short enough to read in an error message
+    /// while still saying how much was elided.
+    #[test]
+    fn example_models_lists_a_few_and_counts_the_rest() {
+        let few = provider("groq", &["a", "b"]);
+        assert_eq!(example_models(&few), "groq Inc models include: a, b");
+
+        let many = provider("groq", &["a", "b", "c", "d", "e", "f", "g"]);
+        assert_eq!(
+            example_models(&many),
+            "groq Inc models include: a, b, c, d, e, … (2 more)"
+        );
+
+        let none = provider("groq", &[]);
+        assert_eq!(example_models(&none), "groq Inc lists no models");
+    }
+
+    /// A provider-routed `--model` must come out under
+    /// `providers::REMOTE_PREFIX`, which is the only thing that stops the
+    /// daemon resolving it as a HuggingFace or registry reference — and
+    /// must keep an `<vendor>/<model>` id (openrouter's shape) intact.
+    #[test]
+    fn provider_models_are_encoded_under_the_remote_prefix() {
+        assert_eq!(
+            providers::format_remote_ref("openrouter", "qwen/qwen3-coder"),
+            "llmman.provider/openrouter/qwen/qwen3-coder"
+        );
+        assert_eq!(
+            providers::split_remote_ref(&providers::format_remote_ref("groq", "llama-3.3-70b")),
+            Some(("groq", "llama-3.3-70b"))
+        );
+    }
+
+    /// The default path must be untouched by provider support: no
+    /// `--provider` means the same shortname resolution, and so the same
+    /// daemon behavior, as before it existed.
+    #[test]
+    fn local_models_are_unaffected_by_the_remote_prefix() {
+        for local in ["qwen3.5:0.8b", "hf.co/unsloth/Qwen3.5-0.8B-GGUF"] {
+            let resolved = crate::shortnames::resolve_ollama_api(local);
+            assert!(
+                !providers::is_remote_ref(&resolved),
+                "{local} resolved to a provider-routed reference: {resolved}"
+            );
+        }
     }
 
     /// Regression test for the real openclaw onboarding failure

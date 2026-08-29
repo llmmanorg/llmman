@@ -1,0 +1,1119 @@
+//! The models.dev provider catalog, fetched at runtime rather than baked
+//! into this binary, so a provider models.dev gains tomorrow works
+//! without an llmman release.
+//!
+//! opencode resolves the same catalog the same way, through its own
+//! mirror of it (`packages/core/src/models-dev.ts` GETs
+//! `models.opencode.ai/api.json`, byte-identical to `models.dev`'s own
+//! today). llmman reads the upstream directly: a mirror is one more
+//! thing that can disagree, and llmman has no say in what opencode's
+//! serves.
+//!
+//! Only a *subset* is exposed as [`Provider`]s, because `llmman serve`
+//! reaches an upstream exactly one way: an HTTPS POST of an OpenAI Chat
+//! Completions body with `Authorization: Bearer <key>` (see
+//! `Target::Remote` in `cmd::serve`). An entry is offered only if llmman
+//! can be *sure* it speaks that:
+//!
+//! * its `npm` driver is one of [`OPENAI_COMPATIBLE_NPM`], as opposed to
+//!   `@ai-sdk/anthropic` (Messages wire format),
+//!   `@ai-sdk/amazon-bedrock` (SigV4 signing), `@ai-sdk/google-vertex`
+//!   (GCP credentials), and the rest;
+//! * it has one concrete `https` base URL. models.dev leaves `api` unset
+//!   where the SDK hardcodes the endpoint — recovered from
+//!   [`BUILTIN_ENDPOINTS`] — and templated (`${VAR}`) where it is
+//!   per-account, which llmman has nothing to interpolate from;
+//! * exactly one of its `env` entries is an API key. Multi-variable auth
+//!   (`CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_KEY`, ...) is not "one
+//!   bearer token".
+//!
+//! Everything filtered out is deliberately *absent* rather than
+//! half-supported: a provider llmman offers is one it can actually reach.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
+
+use anyhow::Context;
+use serde::Deserialize;
+
+/// Where the catalog is fetched from.
+const CATALOG_URL: &str = "https://models.dev/api.json";
+
+/// Cache filename under [`crate::default_cache`].
+const CACHE_FILE: &str = "models-dev.json";
+
+/// How long a cached catalog is served without re-fetching. Long,
+/// deliberately: the provider list moves in days, while a fetch on every
+/// `llmman launch` would put a network round-trip in front of an
+/// otherwise instant command.
+const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Bounded so a hung models.dev can't wedge `llmman launch`; a failed
+/// fetch falls back to any cached copy, however stale.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The AI SDK driver packages that speak the OpenAI wire format — the
+/// only ones `Target::Remote`'s "POST an OpenAI body with a bearer token"
+/// can actually drive. See this module's own doc comment.
+const OPENAI_COMPATIBLE_NPM: &[&str] = &[
+    "@ai-sdk/openai-compatible",
+    "@ai-sdk/openai",
+    "@openrouter/ai-sdk-provider",
+];
+
+/// A provider whose endpoint models.dev leaves unset because its AI SDK
+/// package hardcodes it, plus the one `env` entry that is its API key.
+struct Builtin {
+    /// models.dev provider id.
+    id: &'static str,
+    /// Base URL that `/chat/completions` is appended to.
+    base_url: &'static str,
+    /// The API-key variable, picked out of the provider's `env` list.
+    key_env: &'static str,
+}
+
+/// Endpoints for providers models.dev has no `api` for, restricted to
+/// ones with a published, stable OpenAI-compatible endpoint that was
+/// checked by hand to answer `POST /chat/completions` at the URL below.
+///
+/// Not a second registry: an entry here must still be present in the
+/// fetched catalog to be offered, and supplies only the one field
+/// models.dev omits. The rest (`amazon-bedrock`, `azure`,
+/// `google-vertex`, `watsonx`, ...) are left out because their auth is
+/// not a bearer token, their endpoint is per-account, or their wire
+/// format is not OpenAI's. `v0` is left out for a third reason: nothing
+/// answers at its documented `https://api.v0.dev/v1`, so llmman has no
+/// endpoint it can vouch for.
+const BUILTIN_ENDPOINTS: &[Builtin] = &[
+    Builtin {
+        id: "openai",
+        base_url: "https://api.openai.com/v1",
+        key_env: "OPENAI_API_KEY",
+    },
+    // Anthropic publishes an OpenAI-compatible surface on its normal API
+    // host, keyed by the same ANTHROPIC_API_KEY as a bearer token, so it
+    // is reachable without llmman speaking the Messages wire format.
+    Builtin {
+        id: "anthropic",
+        base_url: "https://api.anthropic.com/v1",
+        key_env: "ANTHROPIC_API_KEY",
+    },
+    // Gemini's OpenAI-compatibility endpoint, not the native
+    // generateContent one. GEMINI_API_KEY of the three variables
+    // models.dev lists, matching what the Gemini docs use.
+    Builtin {
+        id: "google",
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        key_env: "GEMINI_API_KEY",
+    },
+    Builtin {
+        id: "groq",
+        base_url: "https://api.groq.com/openai/v1",
+        key_env: "GROQ_API_KEY",
+    },
+    Builtin {
+        id: "mistral",
+        base_url: "https://api.mistral.ai/v1",
+        key_env: "MISTRAL_API_KEY",
+    },
+    Builtin {
+        id: "xai",
+        base_url: "https://api.x.ai/v1",
+        key_env: "XAI_API_KEY",
+    },
+    Builtin {
+        id: "cerebras",
+        base_url: "https://api.cerebras.ai/v1",
+        key_env: "CEREBRAS_API_KEY",
+    },
+    Builtin {
+        id: "togetherai",
+        base_url: "https://api.together.xyz/v1",
+        key_env: "TOGETHER_API_KEY",
+    },
+    Builtin {
+        id: "deepinfra",
+        base_url: "https://api.deepinfra.com/v1/openai",
+        key_env: "DEEPINFRA_API_KEY",
+    },
+    // No `/v1`: Perplexity serves /chat/completions off the bare host.
+    Builtin {
+        id: "perplexity",
+        base_url: "https://api.perplexity.ai",
+        key_env: "PERPLEXITY_API_KEY",
+    },
+    Builtin {
+        id: "cohere",
+        base_url: "https://api.cohere.ai/compatibility/v1",
+        key_env: "COHERE_API_KEY",
+    },
+    Builtin {
+        id: "venice",
+        base_url: "https://api.venice.ai/api/v1",
+        key_env: "VENICE_API_KEY",
+    },
+    Builtin {
+        id: "vercel",
+        base_url: "https://ai-gateway.vercel.sh/v1",
+        key_env: "AI_GATEWAY_API_KEY",
+    },
+];
+
+// ---------------------------------------------------------------------------
+// Remote model references
+// ---------------------------------------------------------------------------
+
+/// Namespace every provider-routed model reference is carried under.
+///
+/// Such a request reaches `llmman serve` through the very same `"model"`
+/// field a local one does — the only field the Ollama, OpenAI, and
+/// Anthropic surfaces have in common, and one the launched integrations
+/// pass through opaquely.
+///
+/// The bare `<provider>/<model>` spelling opencode uses would be
+/// ambiguous here in a way it never is there: llmman also resolves
+/// two-segment names as HuggingFace repositories (see
+/// `shortnames::resolve`), so routing on a bare prefix would silently
+/// capture `google/gemma-3`, `openai/gpt-oss-120b` and every other real
+/// `hf.co/<org>/<repo>` whose org shares a name with a provider. This
+/// prefix cannot collide with one: `shortnames` only treats a first
+/// segment as a registry host when it contains a dot.
+pub const REMOTE_PREFIX: &str = "llmman.provider/";
+
+/// The stand-in `cmd::launch` gives integrations pointed at a
+/// locally-served model, where an API key is meaningless but omitting it
+/// makes several of them refuse to start. It is not a credential, so
+/// `cmd::serve` must never forward it to a real provider.
+pub const PLACEHOLDER_API_KEY: &str = "llmman";
+
+/// Encodes `provider` + `model` into the single reference that travels in
+/// a request's `"model"` field. Inverse of [`split_remote_ref`].
+pub fn format_remote_ref(provider: &str, model: &str) -> String {
+    format!("{REMOTE_PREFIX}{provider}/{model}")
+}
+
+/// Splits a [`REMOTE_PREFIX`]-namespaced reference back into its provider
+/// id and upstream model id, or `None` for any ordinary local reference.
+///
+/// Purely syntactic — it does not consult the catalog, so callers still
+/// have to look the provider id up (and report an unknown one) themselves.
+/// The model id keeps any further slashes: `openrouter`'s ids are
+/// themselves `<vendor>/<model>`.
+pub fn split_remote_ref(reference: &str) -> Option<(&str, &str)> {
+    let rest = reference.strip_prefix(REMOTE_PREFIX)?;
+    let (provider, model) = rest.split_once('/')?;
+    (!provider.is_empty() && !model.is_empty()).then_some((provider, model))
+}
+
+/// Whether `reference` names a provider-routed model rather than a local
+/// one. Cheaper than [`split_remote_ref`] when the parts aren't needed.
+pub fn is_remote_ref(reference: &str) -> bool {
+    split_remote_ref(reference).is_some()
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+/// One reachable provider: everything `llmman serve` needs to forward a
+/// request upstream, and everything `llmman launch` needs to explain how
+/// to authenticate to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Provider {
+    /// models.dev provider id, as passed to `--provider`.
+    pub id: String,
+    /// Human-readable name, for listings and error messages.
+    pub name: String,
+    /// OpenAI-compatible base URL that a route (`/chat/completions`, ...)
+    /// is appended to. Never has a trailing slash.
+    pub base_url: String,
+    /// Environment variable holding this provider's API key.
+    pub key_env: String,
+    /// Model ids this provider serves, sorted. Used to validate `--model`
+    /// and to suggest values; never sent upstream verbatim.
+    pub models: Vec<String>,
+}
+
+impl Provider {
+    /// This provider's API key from the environment, or `None` when
+    /// [`Provider::key_env`] is unset or blank.
+    pub fn api_key(&self) -> Option<String> {
+        std::env::var(&self.key_env)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// Appends an OpenAI route to this provider's base URL. See
+    /// [`rebase_url`].
+    pub fn url(&self, route: &str) -> String {
+        rebase_url(&self.base_url, route)
+    }
+}
+
+/// Re-bases one of llmman's own internal routes (`/v1/chat/completions`)
+/// onto a provider base URL.
+///
+/// The `/v1` is dropped because a models.dev `api` already includes
+/// whatever version segment the provider uses, which is not always `v1`
+/// (`.../v1beta/openai` for Gemini, `.../compatibility/v1` for Cohere,
+/// none at all for Perplexity).
+pub fn rebase_url(base_url: &str, route: &str) -> String {
+    let suffix = route.trim_start_matches('/');
+    let suffix = suffix.strip_prefix("v1/").unwrap_or(suffix);
+    format!("{base_url}/{suffix}")
+}
+
+/// Every provider llmman can route to, keyed by id.
+#[derive(Debug, Default)]
+pub struct Catalog {
+    providers: BTreeMap<String, Provider>,
+}
+
+impl Catalog {
+    /// The provider `id` names, or `None` if models.dev has no such
+    /// provider or llmman cannot reach it (see the module doc comment).
+    pub fn get(&self, id: &str) -> Option<&Provider> {
+        self.providers.get(id)
+    }
+
+    /// Every routable provider, ordered by id.
+    pub fn iter(&self) -> impl Iterator<Item = &Provider> {
+        self.providers.values()
+    }
+
+    /// Every routable provider id, ordered.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.providers.keys().map(String::as_str)
+    }
+
+    pub fn len(&self) -> usize {
+        self.providers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
+    /// Parses a models.dev `api.json` body, keeping only the entries this
+    /// module's doc comment describes as reachable.
+    ///
+    /// Each entry is deserialized on its own, so one upstream record that
+    /// grows an unexpected shape costs that provider rather than the
+    /// whole catalog — and `--provider` keeps working until llmman
+    /// catches up. Split out from the fetch/cache plumbing so the
+    /// filtering rules are unit-testable with no network or disk at all.
+    pub fn from_json(raw: &[u8]) -> anyhow::Result<Self> {
+        let raw: BTreeMap<String, serde_json::Value> =
+            serde_json::from_slice(raw).context("parse models.dev api.json")?;
+        let providers: BTreeMap<_, _> = raw
+            .into_iter()
+            .filter_map(|(id, provider)| {
+                let provider = serde_json::from_value(provider).ok()?;
+                Some((id.clone(), routable(&id, provider)?))
+            })
+            .collect();
+        // An empty result is a failed load, not a catalog with nothing in
+        // it: `{"error":"temporarily unavailable"}` is valid JSON and a
+        // valid map, and every entry drops out of the filter. Treating it
+        // as success would overwrite a good cache with nothing and
+        // memoize it, so `--provider` would stay broken for a day.
+        anyhow::ensure!(
+            !providers.is_empty(),
+            "models.dev returned no provider llmman can route to"
+        );
+        Ok(Self { providers })
+    }
+}
+
+/// A models.dev catalog entry, narrowed to the fields llmman reads.
+///
+/// `models` deserializes its values into [`serde::de::IgnoredAny`]: only
+/// the ids (the map's keys) are wanted, and `api.json` is megabytes of
+/// per-model cost/limit/modality metadata that would otherwise all be
+/// materialized.
+#[derive(Debug, Deserialize)]
+struct RawProvider {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    api: Option<String>,
+    #[serde(default)]
+    npm: Option<String>,
+    #[serde(default)]
+    env: Vec<String>,
+    #[serde(default)]
+    models: BTreeMap<String, serde::de::IgnoredAny>,
+}
+
+/// Providers that pass every rule below but still cannot be driven with
+/// the variable models.dev names, because the real credential is minted
+/// by an OAuth exchange rather than exported by hand.
+///
+/// `github-copilot` is the case: it advertises `@ai-sdk/openai-compatible`
+/// and `GITHUB_TOKEN`, but `api.githubcopilot.com` 401s a `GITHUB_TOKEN`
+/// bearer — opencode has a whole plugin that trades it through
+/// `login/oauth/access_token` first, and adds `X-GitHub-Api-Version` and
+/// friends. Offering it would mean a user exports the documented variable
+/// and gets an unexplained 401.
+const OAUTH_ONLY: &[&str] = &["github-copilot"];
+
+/// Applies this module's reachability rules to one catalog entry,
+/// returning `None` for anything llmman cannot talk to.
+fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
+    if OAUTH_ONLY.contains(&id) {
+        return None;
+    }
+    let builtin = BUILTIN_ENDPOINTS.iter().find(|b| b.id == id);
+
+    // A builtin's whole purpose is to supply an endpoint models.dev has
+    // no `api` for, so it is trusted over a templated, absent or
+    // plaintext one — but never over a concrete https `api`, which is the
+    // newer of the two and the one that tracks a provider moving hosts.
+    //
+    // https only: this URL is where an API key is sent, and the catalog
+    // is fetched at runtime, so an `http://` entry upstream would be
+    // enough to put a user's key on the wire in the clear. Today that
+    // rule drops exactly the loopback entries (`lmstudio`, `lynkr`,
+    // `privatemode-ai`, `atomic-chat`) — not a loss, since `--provider`
+    // is for models llmman does not serve itself, and a local one is
+    // llmman's own job.
+    let base_url = match raw.api.as_deref().map(str::trim) {
+        Some(api) if api.starts_with("https://") && !api.contains("${") => api,
+        _ => builtin?.base_url,
+    };
+
+    // `npm` is the wire-format signal. A builtin has already been vetted
+    // by hand, so it stands in for a driver package this doesn't know:
+    // `anthropic`'s entry names `@ai-sdk/anthropic` even though the
+    // endpoint used here is its OpenAI-compatible one.
+    let openai_compatible = raw
+        .npm
+        .as_deref()
+        .is_some_and(|npm| OPENAI_COMPATIBLE_NPM.contains(&npm));
+    if !openai_compatible && builtin.is_none() {
+        return None;
+    }
+
+    // One bearer token, and llmman must know which variable holds it. A
+    // builtin names it explicitly (`google` lists three aliases); for
+    // everything else a single-entry `env` is the only unambiguous case.
+    let key_env = match builtin {
+        Some(b) => b.key_env.to_string(),
+        None => match raw.env.as_slice() {
+            [only] if !only.trim().is_empty() => only.trim().to_string(),
+            _ => return None,
+        },
+    };
+
+    Some(Provider {
+        id: id.to_string(),
+        name: raw.name,
+        base_url: base_url_of(base_url),
+        key_env,
+        models: raw.models.into_keys().collect(),
+    })
+}
+
+/// Normalizes a models.dev `api` into a base URL that a route can be
+/// appended to.
+///
+/// Some entries give the full chat route rather than the base it hangs
+/// off (`bailing` is `.../v1/chat/completions` today). Appending to that
+/// yields `.../chat/completions/chat/completions`, which fails as a
+/// confusing 404 from the provider rather than anything llmman reports.
+/// Trailing slashes go for the same reason — `url` adds its own.
+fn base_url_of(api: &str) -> String {
+    let api = api.trim_end_matches('/');
+    api.strip_suffix("/chat/completions")
+        .unwrap_or(api)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Fetch + cache
+// ---------------------------------------------------------------------------
+
+/// How long a failed load is remembered before the next call retries.
+/// Short, because `llmman serve` outlives the transient failure that
+/// produced it — but not zero, or every request on a machine that cannot
+/// reach models.dev would pay [`FETCH_TIMEOUT`] again.
+const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// The last [`load`], when it happened, and how long it is good for. The
+/// error is kept as a message rather than an `anyhow::Error`, which is
+/// not cloneable.
+type Cached = (Instant, Duration, Result<Arc<Catalog>, String>);
+static CATALOG: Mutex<Option<Cached>> = Mutex::new(None);
+
+/// The routable provider catalog, fetched from models.dev on first use.
+///
+/// Memoized, but not for the life of the process: `llmman serve` runs for
+/// days, so a success is re-checked after [`CACHE_TTL`] and a failure
+/// after [`RETRY_COOLDOWN`] — otherwise one blip at startup would leave a
+/// daemon with no providers until someone restarted it.
+///
+/// The lock is held across the fetch, so concurrent callers wait for one
+/// load rather than racing several. Blocking: callers on an async runtime
+/// (`cmd::serve`) must go through `spawn_blocking`.
+pub fn catalog() -> anyhow::Result<Arc<Catalog>> {
+    let mut cached = CATALOG.lock().unwrap_or_else(|e| e.into_inner());
+    let live = cached
+        .as_ref()
+        .is_some_and(|(at, good_for, _)| at.elapsed() < *good_for);
+    if !live {
+        // A stale catalog is held only as long as a failure: what
+        // produced it was a failed refresh, whatever it managed to
+        // return. See Loaded.
+        *cached = Some(match load() {
+            Ok(loaded) => (
+                Instant::now(),
+                loaded.good_for(),
+                Ok(Arc::new(loaded.into_catalog())),
+            ),
+            Err(e) => (Instant::now(), RETRY_COOLDOWN, Err(format!("{e:#}"))),
+        });
+    }
+    match &cached.as_ref().expect("just populated").2 {
+        Ok(catalog) => Ok(catalog.clone()),
+        Err(e) => Err(anyhow::anyhow!(e.clone())),
+    }
+}
+
+fn cache_path() -> Option<PathBuf> {
+    crate::default_cache().ok().map(|d| d.join(CACHE_FILE))
+}
+
+/// Whether `path` was written within [`CACHE_TTL`]. An mtime that can't
+/// be read, or is in the future on a machine whose clock moved, counts as
+/// stale: re-fetching is cheap, serving something unbounded is not.
+fn is_fresh(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|m| SystemTime::now().duration_since(m).ok())
+        .is_some_and(|age| age < CACHE_TTL)
+}
+
+/// A loaded catalog, and whether it is the result llmman wanted.
+///
+/// [`Loaded::Stale`] is a success the caller should not settle into: the
+/// refresh behind it failed, so [`catalog`] re-tries it on
+/// [`RETRY_COOLDOWN`] rather than the full [`CACHE_TTL`] it gives a real
+/// one. Without the distinction, going offline once for a second would
+/// pin an out-of-date provider list for a day.
+enum Loaded {
+    Fresh(Catalog),
+    Stale(Catalog),
+}
+
+impl Loaded {
+    /// How long [`catalog`] may serve this without loading again.
+    fn good_for(&self) -> Duration {
+        match self {
+            Self::Fresh(_) => CACHE_TTL,
+            Self::Stale(_) => RETRY_COOLDOWN,
+        }
+    }
+
+    fn into_catalog(self) -> Catalog {
+        match self {
+            Self::Fresh(c) | Self::Stale(c) => c,
+        }
+    }
+}
+
+/// Cache-first catalog load: a fresh cache is used as-is, otherwise
+/// models.dev is fetched and the result cached. If that refresh fails,
+/// falls back to a stale cache — an out-of-date provider list beats no
+/// provider list on a machine that is merely offline.
+fn load() -> anyhow::Result<Loaded> {
+    let path = cache_path();
+
+    if let Some(path) = path.as_deref().filter(|p| is_fresh(p)) {
+        if let Ok(raw) = std::fs::read(path) {
+            if let Ok(catalog) = Catalog::from_json(&raw) {
+                crate::debug_log!("provider catalog: {} cached", path.display());
+                return Ok(Loaded::Fresh(catalog));
+            }
+        }
+    }
+
+    crate::debug_log!("provider catalog: fetching {CATALOG_URL}");
+    // Parse is part of the refresh, not a separate step after it: a 200
+    // carrying a truncated body or a captive portal's HTML is a failed
+    // refresh, and must reach the stale cache below like any other.
+    let refreshed = fetch(CATALOG_URL).and_then(|raw| {
+        let catalog = Catalog::from_json(&raw)?;
+        Ok((catalog, raw))
+    });
+
+    match refreshed {
+        Ok((catalog, raw)) => {
+            // Best-effort: an unwritable cache costs a fetch next time,
+            // nothing more, so it must not fail the load.
+            if let Some(path) = &path {
+                let _ = write_cache(path, &raw);
+            }
+            Ok(Loaded::Fresh(catalog))
+        }
+        Err(err) => {
+            let stale = path
+                .as_deref()
+                .and_then(|p| std::fs::read(p).ok())
+                .and_then(|raw| Catalog::from_json(&raw).ok());
+            match stale {
+                Some(catalog) => {
+                    eprintln!("[llmman] using cached provider list ({err:#})");
+                    Ok(Loaded::Stale(catalog))
+                }
+                None => Err(err.context(format!(
+                    "could not fetch the provider list from {CATALOG_URL}, and no cached \
+                     copy is available"
+                ))),
+            }
+        }
+    }
+}
+
+/// Writes the cache through a temp file and a rename, as opencode does
+/// for its own copy: `llmman launch` and `llmman serve` refresh it
+/// independently and do overlap, and a plain write leaves a window in
+/// which the other reads a half-written file. Rename is atomic, so a
+/// reader sees the old copy or the new one. The temp name carries the pid
+/// so two writers can't share one.
+fn write_cache(path: &std::path::Path, raw: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&tmp, raw)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+fn fetch(url: &str) -> anyhow::Result<Vec<u8>> {
+    let resp = reqwest::blocking::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()
+        .context("build HTTP client")?
+        .get(url)
+        .send()
+        .with_context(|| format!("GET {url}"))?;
+    let status = resp.status();
+    anyhow::ensure!(status.is_success(), "GET {url} returned {status}");
+    Ok(resp.bytes().context("read models.dev response")?.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every builtin must name a plausible HTTPS endpoint and a key
+    /// variable — a typo here would surface only as a confusing runtime
+    /// failure against a real provider.
+    #[test]
+    fn builtin_endpoints_are_well_formed_and_unique() {
+        let mut seen = std::collections::BTreeSet::new();
+        for b in BUILTIN_ENDPOINTS {
+            assert!(seen.insert(b.id), "duplicate builtin {}", b.id);
+            assert!(
+                b.base_url.starts_with("https://"),
+                "{} base_url is not https",
+                b.id
+            );
+            assert!(
+                !b.base_url.ends_with('/'),
+                "{} base_url has a trailing slash",
+                b.id
+            );
+            assert!(!b.key_env.is_empty(), "{} has no key_env", b.id);
+        }
+    }
+
+    #[test]
+    fn format_and_split_remote_ref_round_trip() {
+        let reference = format_remote_ref("openrouter", "qwen/qwen3-coder");
+        assert_eq!(reference, "llmman.provider/openrouter/qwen/qwen3-coder");
+        assert_eq!(
+            split_remote_ref(&reference),
+            Some(("openrouter", "qwen/qwen3-coder"))
+        );
+        assert_eq!(
+            split_remote_ref("llmman.provider/groq/llama-3.3-70b"),
+            Some(("groq", "llama-3.3-70b"))
+        );
+    }
+
+    /// The whole reason [`REMOTE_PREFIX`] exists: a bare `<org>/<repo>`
+    /// is a HuggingFace reference (`shortnames::resolve` turns it into
+    /// `hf.co/<org>/<repo>`), and must never be mistaken for a
+    /// provider-routed one just because the org shares a provider's name.
+    #[test]
+    fn split_remote_ref_ignores_local_and_huggingface_references() {
+        for local in [
+            "google/gemma-3",
+            "openai/gpt-oss-120b",
+            "qwen3.5:0.8b",
+            "docker.io/ai/gemma4",
+            "hf.co/unsloth/Qwen3.5-0.8B-GGUF",
+            "",
+        ] {
+            assert_eq!(split_remote_ref(local), None, "{local} routed as remote");
+            assert!(!is_remote_ref(local));
+        }
+    }
+
+    /// A truncated reference is not a remote one — better to fall through
+    /// to the normal local path (which reports "model not found") than to
+    /// route to an empty provider or an empty model.
+    #[test]
+    fn split_remote_ref_rejects_incomplete_references() {
+        assert_eq!(split_remote_ref("llmman.provider/"), None);
+        assert_eq!(split_remote_ref("llmman.provider/openrouter"), None);
+        assert_eq!(split_remote_ref("llmman.provider/openrouter/"), None);
+        assert_eq!(split_remote_ref("llmman.provider//gpt-5"), None);
+    }
+
+    fn catalog_from(json: &str) -> Catalog {
+        Catalog::from_json(json.as_bytes()).expect("fixture parses")
+    }
+
+    /// The base case: an `@ai-sdk/openai-compatible` provider with one
+    /// concrete URL and one key variable is taken straight from
+    /// models.dev, builtins uninvolved.
+    #[test]
+    fn openai_compatible_providers_come_from_the_catalog() {
+        let catalog = catalog_from(
+            r#"{
+                "openrouter": {
+                    "id": "openrouter",
+                    "name": "OpenRouter",
+                    "api": "https://openrouter.ai/api/v1",
+                    "npm": "@openrouter/ai-sdk-provider",
+                    "env": ["OPENROUTER_API_KEY"],
+                    "models": { "z-model": {}, "a-model": {} }
+                }
+            }"#,
+        );
+        let p = catalog.get("openrouter").expect("openrouter is routable");
+        assert_eq!(p.name, "OpenRouter");
+        assert_eq!(p.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(p.key_env, "OPENROUTER_API_KEY");
+        // Sorted, and only the ids — the per-model metadata is dropped.
+        assert_eq!(p.models, vec!["a-model", "z-model"]);
+    }
+
+    /// models.dev leaves `api` unset for providers whose SDK hardcodes
+    /// the endpoint; those are recovered from `BUILTIN_ENDPOINTS`,
+    /// including `anthropic`, whose `npm` is not OpenAI-compatible but
+    /// whose builtin endpoint is.
+    #[test]
+    fn builtins_supply_endpoints_the_catalog_omits() {
+        let catalog = catalog_from(
+            r#"{
+                "anthropic": {
+                    "id": "anthropic", "name": "Anthropic",
+                    "npm": "@ai-sdk/anthropic", "env": ["ANTHROPIC_API_KEY"],
+                    "models": { "claude-sonnet-4": {} }
+                },
+                "google": {
+                    "id": "google", "name": "Google",
+                    "npm": "@ai-sdk/google",
+                    "env": ["GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY", "GEMINI_API_KEY"],
+                    "models": { "gemini-2.5-pro": {} }
+                }
+            }"#,
+        );
+        let anthropic = catalog.get("anthropic").expect("anthropic is routable");
+        assert_eq!(anthropic.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(anthropic.key_env, "ANTHROPIC_API_KEY");
+
+        // Three candidate variables in the catalog, one unambiguous
+        // choice from the builtin.
+        let google = catalog.get("google").expect("google is routable");
+        assert_eq!(google.key_env, "GEMINI_API_KEY");
+    }
+
+    /// A concrete `api` tracks a provider moving hosts, so it wins over
+    /// the hand-written fallback rather than the other way round.
+    #[test]
+    fn a_concrete_api_overrides_the_builtin_endpoint() {
+        let catalog = catalog_from(
+            r#"{
+                "openai": {
+                    "id": "openai", "name": "OpenAI",
+                    "api": "https://api.openai.example/v2/",
+                    "npm": "@ai-sdk/openai", "env": ["OPENAI_API_KEY"],
+                    "models": { "gpt-5": {} }
+                }
+            }"#,
+        );
+        let p = catalog.get("openai").expect("openai is routable");
+        // Trailing slash normalized away so `url()` can't double it.
+        assert_eq!(p.base_url, "https://api.openai.example/v2");
+    }
+
+    /// Everything llmman cannot reach with a bearer-token OpenAI POST
+    /// must be absent rather than half-supported.
+    #[test]
+    fn unreachable_providers_are_dropped() {
+        let catalog = catalog_from(
+            r#"{
+                "minimax": {
+                    "id": "minimax", "name": "MiniMax",
+                    "api": "https://api.minimax.io/anthropic/v1",
+                    "npm": "@ai-sdk/anthropic", "env": ["MINIMAX_API_KEY"],
+                    "models": { "minimax-m2": {} }
+                },
+                "amazon-bedrock": {
+                    "id": "amazon-bedrock", "name": "Amazon Bedrock",
+                    "npm": "@ai-sdk/amazon-bedrock",
+                    "env": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+                    "models": { "claude": {} }
+                },
+                "snowflake-cortex": {
+                    "id": "snowflake-cortex", "name": "Snowflake Cortex",
+                    "api": "https://${SNOWFLAKE_ACCOUNT}.snowflakecomputing.com/api/v2/cortex/v1",
+                    "npm": "@ai-sdk/openai-compatible",
+                    "env": ["SNOWFLAKE_ACCOUNT", "SNOWFLAKE_CORTEX_PAT"],
+                    "models": { "claude": {} }
+                },
+                "cloudflare-workers-ai": {
+                    "id": "cloudflare-workers-ai", "name": "Cloudflare Workers AI",
+                    "api": "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1",
+                    "npm": "@ai-sdk/openai-compatible",
+                    "env": ["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_KEY"],
+                    "models": { "llama": {} }
+                },
+                "github-copilot": {
+                    "id": "github-copilot", "name": "GitHub Copilot",
+                    "api": "https://api.githubcopilot.com",
+                    "npm": "@ai-sdk/openai-compatible", "env": ["GITHUB_TOKEN"],
+                    "models": { "gpt-5": {} }
+                },
+                "openrouter": {
+                    "id": "openrouter", "name": "OpenRouter",
+                    "api": "https://openrouter.ai/api/v1",
+                    "npm": "@openrouter/ai-sdk-provider", "env": ["OPENROUTER_API_KEY"],
+                    "models": { "gpt-5": {} }
+                }
+            }"#,
+        );
+        // Anthropic wire format, not OpenAI's.
+        assert!(catalog.get("minimax").is_none());
+        // SigV4 signing, and no endpoint at all.
+        assert!(catalog.get("amazon-bedrock").is_none());
+        // Per-account templated endpoint, two-variable auth.
+        assert!(catalog.get("snowflake-cortex").is_none());
+        assert!(catalog.get("cloudflare-workers-ai").is_none());
+        // Advertises a plain bearer variable, but the real credential is
+        // minted by an OAuth exchange. See OAUTH_ONLY.
+        assert!(catalog.get("github-copilot").is_none());
+        // The one entry llmman can actually drive, so the filter is doing
+        // the dropping rather than the catalog being unusable outright.
+        assert_eq!(catalog.len(), 1);
+        assert!(catalog.get("openrouter").is_some());
+    }
+
+    /// A plaintext `api` is where an API key would be sent, so it is no
+    /// more usable than a templated one: a builtin's own https endpoint
+    /// stands in where there is one, and the provider is dropped where
+    /// there isn't. In today's catalog that second case is the loopback
+    /// entries, which `--provider` has no business routing to anyway.
+    #[test]
+    fn plaintext_endpoints_are_never_routed_to() {
+        let catalog = catalog_from(
+            r#"{
+                "openai": {
+                    "id": "openai", "name": "OpenAI",
+                    "api": "http://api.openai.example/v1",
+                    "npm": "@ai-sdk/openai", "env": ["OPENAI_API_KEY"],
+                    "models": { "gpt-5": {} }
+                },
+                "lmstudio": {
+                    "id": "lmstudio", "name": "LM Studio",
+                    "api": "http://127.0.0.1:1234/v1",
+                    "npm": "@ai-sdk/openai-compatible", "env": ["LMSTUDIO_API_KEY"],
+                    "models": { "some-model": {} }
+                }
+            }"#,
+        );
+        assert_eq!(
+            catalog.get("openai").expect("openai is routable").base_url,
+            "https://api.openai.com/v1"
+        );
+        assert!(catalog.get("lmstudio").is_none());
+    }
+
+    /// A real models.dev response, trimmed to the fields llmman reads
+    /// (the per-model metadata is megabytes and none of it is used).
+    /// Hand-written fixtures above pin one rule each; this one is what
+    /// says the rules together produce a usable list from real data.
+    const REAL_CATALOG: &[u8] = include_bytes!("../tests/fixtures/models-dev-providers.json");
+
+    /// The filter has to be selective without being empty: a rule that
+    /// accidentally excluded everything, or admitted a provider llmman
+    /// cannot authenticate to, would pass every fixture above.
+    #[test]
+    fn the_real_catalog_yields_a_usable_provider_list() {
+        let catalog = Catalog::from_json(REAL_CATALOG).expect("real catalog parses");
+        assert!(
+            (150..207).contains(&catalog.len()),
+            "{} of 207 routable — the filter moved a lot",
+            catalog.len()
+        );
+        for p in catalog.iter() {
+            assert!(
+                p.base_url.starts_with("https://"),
+                "{}: {}",
+                p.id,
+                p.base_url
+            );
+            assert!(!p.base_url.ends_with('/'), "{}: {}", p.id, p.base_url);
+            assert!(!p.base_url.contains("${"), "{}: {}", p.id, p.base_url);
+            assert!(!p.key_env.is_empty(), "{} has no key variable", p.id);
+        }
+
+        // The providers someone actually reaches for, at the endpoints
+        // each was verified to answer `POST /chat/completions` on.
+        for (id, base_url) in [
+            ("openai", "https://api.openai.com/v1"),
+            ("anthropic", "https://api.anthropic.com/v1"),
+            (
+                "google",
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+            ),
+            ("groq", "https://api.groq.com/openai/v1"),
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            ("perplexity", "https://api.perplexity.ai"),
+        ] {
+            let p = catalog.get(id).unwrap_or_else(|| panic!("{id} is dropped"));
+            assert_eq!(p.base_url, base_url, "{id}");
+        }
+
+        // And the ones it must not offer, each for a different reason.
+        for id in [
+            "amazon-bedrock", // SigV4 signing
+            "google-vertex",  // GCP service-account credentials
+            "azure",          // per-account endpoint
+            "lmstudio",       // loopback, and llmman's own job anyway
+        ] {
+            assert!(catalog.get(id).is_none(), "{id} is offered");
+        }
+    }
+
+    /// Some entries give the full chat route where a base URL belongs
+    /// (`bailing` does today). Appending to that yields
+    /// `.../chat/completions/chat/completions`, which reaches the user as
+    /// a bare 404 from the provider rather than anything llmman said.
+    #[test]
+    fn a_route_specific_api_is_normalized_back_to_its_base() {
+        let catalog = catalog_from(
+            r#"{
+                "bailing": {
+                    "id": "bailing", "name": "Bailing",
+                    "api": "https://api.tbox.cn/api/llm/v1/chat/completions",
+                    "npm": "@ai-sdk/openai-compatible", "env": ["BAILING_API_KEY"],
+                    "models": { "ling-1t": {} }
+                }
+            }"#,
+        );
+        let p = catalog.get("bailing").expect("bailing is routable");
+        assert_eq!(p.base_url, "https://api.tbox.cn/api/llm/v1");
+        assert_eq!(
+            p.url("/v1/chat/completions"),
+            "https://api.tbox.cn/api/llm/v1/chat/completions"
+        );
+
+        // A trailing slash on the route form too, and a base that merely
+        // ends in something similar must be left alone.
+        assert_eq!(
+            base_url_of("https://x.example/v1/chat/completions/"),
+            "https://x.example/v1"
+        );
+        assert_eq!(
+            base_url_of("https://x.example/completions"),
+            "https://x.example/completions"
+        );
+    }
+
+    /// No provider may produce a doubled route, whatever shape its `api`
+    /// arrives in — the fixture is where such an entry actually shows up.
+    #[test]
+    fn no_real_provider_builds_a_doubled_route() {
+        for p in Catalog::from_json(REAL_CATALOG).unwrap().iter() {
+            let url = p.url("/v1/chat/completions");
+            assert_eq!(
+                url.matches("/chat/completions").count(),
+                1,
+                "{}: {url}",
+                p.id
+            );
+        }
+    }
+
+    /// A body that parses but yields nothing routable is a failed
+    /// refresh, not an empty catalog. `{"error":"..."}` is the shape that
+    /// matters: accepting it would overwrite a good cache with nothing
+    /// and memoize that, breaking `--provider` until the TTL expired.
+    #[test]
+    fn a_body_with_nothing_routable_is_an_error_not_an_empty_catalog() {
+        for body in [
+            r#"{"error":"temporarily unavailable"}"#,
+            r#"{"message":"rate limited","retry_after":30}"#,
+            "{}",
+        ] {
+            assert!(
+                Catalog::from_json(body.as_bytes()).is_err(),
+                "{body} was accepted as a catalog"
+            );
+        }
+    }
+
+    /// A stale catalog is a *failed* refresh that happened to have
+    /// something to fall back on, so it must expire on the retry cooldown
+    /// like any other failure. Holding it for the full TTL is how one
+    /// second offline pins an out-of-date provider list for a day.
+    #[test]
+    fn a_stale_catalog_is_held_no_longer_than_a_failure() {
+        assert_eq!(Loaded::Fresh(Catalog::default()).good_for(), CACHE_TTL);
+        assert_eq!(Loaded::Stale(Catalog::default()).good_for(), RETRY_COOLDOWN);
+        assert!(
+            RETRY_COOLDOWN < CACHE_TTL,
+            "a failed refresh outlives a good one"
+        );
+    }
+
+    /// A builtin only ever supplies the endpoint models.dev omits, so one
+    /// naming a provider that already has a concrete `api` upstream is
+    /// dead weight nobody would notice — the entry is silently unused.
+    #[test]
+    fn every_builtin_is_for_a_provider_the_catalog_leaves_without_an_api() {
+        let raw: BTreeMap<String, serde_json::Value> =
+            serde_json::from_slice(REAL_CATALOG).expect("fixture parses");
+        for b in BUILTIN_ENDPOINTS {
+            let entry = raw
+                .get(b.id)
+                .unwrap_or_else(|| panic!("builtin {} is not in the catalog at all", b.id));
+            let api = entry.get("api").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(
+                !api.starts_with("https://"),
+                "builtin {} is unused: the catalog already gives it {api}",
+                b.id
+            );
+            let env: Vec<&str> = entry["env"]
+                .as_array()
+                .map(|e| e.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            assert!(
+                env.contains(&b.key_env),
+                "builtin {} names {}, which is not one of the catalog's {env:?}",
+                b.id,
+                b.key_env
+            );
+        }
+    }
+
+    /// One upstream entry that grows an unexpected shape must cost that
+    /// provider, not the catalog — `--provider` keeps working on today's
+    /// llmman against tomorrow's api.json.
+    #[test]
+    fn a_malformed_entry_does_not_reject_the_whole_catalog() {
+        let catalog = catalog_from(
+            r#"{
+                "broken": { "id": "broken", "name": ["not", "a", "string"] },
+                "openrouter": {
+                    "id": "openrouter", "name": "OpenRouter",
+                    "api": "https://openrouter.ai/api/v1",
+                    "npm": "@openrouter/ai-sdk-provider",
+                    "env": ["OPENROUTER_API_KEY"],
+                    "models": { "gpt-5": {} }
+                }
+            }"#,
+        );
+        assert!(catalog.get("broken").is_none());
+        assert!(catalog.get("openrouter").is_some());
+    }
+
+    /// An OpenAI-compatible provider is still dropped when llmman can't
+    /// tell which of its variables is the API key.
+    #[test]
+    fn multi_variable_auth_is_dropped_without_a_builtin() {
+        let catalog = catalog_from(
+            r#"{
+                "databricks": {
+                    "id": "databricks", "name": "Databricks",
+                    "api": "https://example.cloud.databricks.com/ai-gateway/mlflow/v1",
+                    "npm": "@ai-sdk/openai-compatible",
+                    "env": ["DATABRICKS_HOST", "DATABRICKS_TOKEN"],
+                    "models": { "dbrx": {} }
+                },
+                "openrouter": {
+                    "id": "openrouter", "name": "OpenRouter",
+                    "api": "https://openrouter.ai/api/v1",
+                    "npm": "@openrouter/ai-sdk-provider", "env": ["OPENROUTER_API_KEY"],
+                    "models": { "gpt-5": {} }
+                }
+            }"#,
+        );
+        assert!(catalog.get("databricks").is_none());
+        assert!(catalog.get("openrouter").is_some());
+    }
+
+    /// `url()` has to append to whatever version segment the provider
+    /// already published, since that is not always `/v1`.
+    #[test]
+    fn url_appends_routes_to_the_published_base() {
+        let p = Provider {
+            id: "groq".into(),
+            name: "Groq".into(),
+            base_url: "https://api.groq.com/openai/v1".into(),
+            key_env: "GROQ_API_KEY".into(),
+            models: vec![],
+        };
+        assert_eq!(
+            p.url("/v1/chat/completions"),
+            "https://api.groq.com/openai/v1/chat/completions"
+        );
+        assert_eq!(
+            p.url("/v1/embeddings"),
+            "https://api.groq.com/openai/v1/embeddings"
+        );
+
+        // A base with a non-`v1` version segment, and one with none at
+        // all, must both come out with exactly one `/chat/completions`.
+        let gemini = Provider {
+            base_url: "https://generativelanguage.googleapis.com/v1beta/openai".into(),
+            ..p.clone()
+        };
+        assert_eq!(
+            gemini.url("/v1/chat/completions"),
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        );
+        let perplexity = Provider {
+            base_url: "https://api.perplexity.ai".into(),
+            ..p
+        };
+        assert_eq!(
+            perplexity.url("/v1/chat/completions"),
+            "https://api.perplexity.ai/chat/completions"
+        );
+    }
+
+    #[test]
+    fn api_key_reads_the_providers_own_variable() {
+        let p = Provider {
+            id: "test".into(),
+            name: "Test".into(),
+            base_url: "https://example.invalid/v1".into(),
+            key_env: "LLMMAN_TEST_PROVIDER_KEY_UNSET".into(),
+            models: vec![],
+        };
+        assert_eq!(p.api_key(), None);
+    }
+}

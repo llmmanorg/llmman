@@ -12,6 +12,7 @@ pub mod hostgpu;
 pub mod llama_release;
 pub mod modelpack;
 pub mod oauth;
+pub mod providers;
 pub mod shortnames;
 pub mod storage;
 pub mod thinking;
