@@ -219,10 +219,9 @@ func pushLazy(
 	// stallWriter) can abort this attempt without needing every caller
 	// to plumb a cancel func down to here itself — canceling it only
 	// ever affects this one push attempt, and it composes fine with a
-	// caller's own cancelable ctx (e.g. streamHFGet's attemptCtx, for its
-	// read side): cancellation flows one way, parent to child, so either
-	// one firing aborts this attempt, and firing this one can't reach
-	// back up to affect the caller's.
+	// caller's own cancelable ctx: cancellation flows one way, parent to
+	// child, so either one firing aborts this attempt, and firing this one
+	// can't reach back up to affect the caller's.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -338,13 +337,13 @@ func pushBytes(ctx context.Context, pusher remotes.Pusher, desc ocispec.Descript
 }
 
 // pushStreamLazy pushes a blob whose digest and size are already known
-// (see hfHeadMetadata) from a source opened lazily by openSource — called,
-// and its resulting reader wrapped in a progress bar via newBar, only if
-// the blob isn't already at the destination (see pushLazy). This is what
-// lets `llmman transfer` stream large HuggingFace files straight through:
-// bytes flow source → destination without ever landing on disk (or
-// getting downloaded at all, if the destination turns out to already have
-// them) in between. Pass a nil newBar for no progress reporting.
+// from a source opened lazily by openSource — called, and its resulting
+// reader wrapped in a progress bar via newBar, only if the blob isn't
+// already at the destination (see pushLazy). This is what lets `llmman
+// transfer` stream a large blob straight through: bytes flow source →
+// destination without ever landing on disk (or getting downloaded at all,
+// if the destination turns out to already have them) in between. Pass a
+// nil newBar for no progress reporting.
 func pushStreamLazy(ctx context.Context, pusher remotes.Pusher, desc ocispec.Descriptor, newBar func() *mpb.Bar, openSource func() (io.ReadCloser, error)) (alreadyExists bool, err error) {
 	return pushLazy(ctx, pusher, desc, func() (io.Reader, *mpb.Bar, func(), error) {
 		rc, err := openSource()
@@ -537,7 +536,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 		return err
 	}
 	if !isOCI {
-		return pullHF(ctx, ref, layoutDir, progressKey)
+		return errHFNotHandledHere(ref)
 	}
 
 	if err := ensureLayout(layoutDir); err != nil {

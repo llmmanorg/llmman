@@ -323,6 +323,87 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
   # --------------------------------------------------------------------------
+  # Lint: static analysis of go-shim/, which until now had none. `test`
+  # above builds and runs the Go code but never checks it beyond what the
+  # compiler requires, and `cargo fmt --check` covers only the Rust half.
+  #
+  # Which linters, and why, lives in go-shim/.golangci.yml — the single
+  # source of truth, so a local `golangci-lint run` reproduces this job.
+  #
+  # Scope: this is the Linux view. Go drops OS-tagged files before
+  # analysis, so push_stream_windows.go (19 lines) is compiled by the
+  # `build` matrix but not linted here; cross-GOOS linting would need a
+  # cross C toolchain, since dropping cgo breaks the typecheck.
+  # --------------------------------------------------------------------------
+  lint:
+    name: Lint (go-shim)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # persist-credentials: false — this job runs `go test` on the PR's own
+      # code, which has no reason to reach GITHUB_TOKEN via .git/config.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: go-shim/go.sum
+
+      # Not golangci-lint's formatter support: this names the files.
+      - name: gofmt --check
+        working-directory: go-shim
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would reformat these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: golangci-lint (docker backend, production code)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.13.2
+          working-directory: go-shim
+          args: --build-tags docker --tests=false --timeout=10m
+
+      # Second pass with tests: catches a helper stranded in a _test.go
+      # file once the test using it is deleted.
+      - name: golangci-lint (docker backend, including tests)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.13.2
+          working-directory: go-shim
+          args: --build-tags docker --timeout=10m
+
+      # The podman-tagged files are invisible to the runs above. -D unused
+      # is deliberate: `unused` sees one build-tag view at a time, so
+      # docker-only helpers in shared files look dead from this side.
+      # Tags mirror build.rs's podman list exactly.
+      - name: golangci-lint (podman backend)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.13.2
+          working-directory: go-shim
+          args: >-
+            --build-tags podman,containers_image_openpgp,exclude_graphdriver_btrfs,exclude_graphdriver_devicemapper
+            -D unused
+            --timeout=10m
+
+      # No CI job ran these before. Both backends: each has test files the
+      # other's tags exclude.
+      - name: go test (docker backend)
+        working-directory: go-shim
+        run: go test -tags docker ./...
+
+      - name: go test (podman backend)
+        working-directory: go-shim
+        run: go test -tags podman,containers_image_openpgp,exclude_graphdriver_btrfs,exclude_graphdriver_devicemapper ./...
+
+  # --------------------------------------------------------------------------
   # E2E: `llmman launch <claude|opencode|codex|hermes|openclaw> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
@@ -1108,16 +1189,16 @@ jobs:
   # --------------------------------------------------------------------------
   release:
     name: Release
-    # All of build/test/e2e must be green before a release is cut — not
-    # just build. (`cargo fmt --check` now runs as part of `test`'s own
+    # All of build/test/lint/e2e must be green before a release is cut —
+    # not just build. (`cargo fmt --check` now runs as part of `test`'s own
     # check-fmt leg — see that job's own comment — so it's covered here
-    # too without a separate `fmt` entry.) e2e itself only runs on the
-    # same two push events this job's own `if:` below fires on (see e2e's
-    # own `if:` comment), so this `needs` entry lines up with both the
-    # main-push and v*-tag release channels without ever blocking on an
-    # e2e run that was never going to happen for some other event (e.g. a
-    # PR).
-    needs: [build, test, e2e]
+    # too without a separate `fmt` entry; `lint` covers the Go half.) e2e
+    # itself only runs on the same two push events this job's own `if:`
+    # below fires on (see e2e's own `if:` comment), so this `needs` entry
+    # lines up with both the main-push and v*-tag release channels without
+    # ever blocking on an e2e run that was never going to happen for some
+    # other event (e.g. a PR).
+    needs: [build, test, lint, e2e]
     runs-on: ubuntu-24.04
     # Two release channels, both attaching one binary per matrix.target
     # (see the build job above — this is where "all the platforms

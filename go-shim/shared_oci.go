@@ -5,17 +5,12 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"math/rand"
-	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -25,17 +20,6 @@ import (
 	"github.com/vbauerster/mpb/v8/decor"
 	"golang.org/x/sync/singleflight"
 )
-
-// tagFromRef extracts the tag portion of a registry reference.
-//
-//	"registry.example.com/repo:tag" → "tag"
-//	"registry.example.com/repo"     → "latest"
-func tagFromRef(ref string) string {
-	if i := strings.LastIndex(ref, ":"); i > strings.LastIndex(ref, "/") {
-		return ref[i+1:]
-	}
-	return "latest"
-}
 
 // blobPath returns the path for a blob in an OCI image layout directory.
 func blobPath(layoutDir string, dgst digest.Digest) string {
@@ -149,12 +133,11 @@ func blobExists(layoutDir string, desc ocispec.Descriptor) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Retry/stall-detection primitives shared by every download/transfer path:
-// hf.go's downloadHFBlob (pull, HF → local disk, resumable via a .part
-// file + Range request) and transfer_docker.go's streamHFFileToRegistry /
-// dockerTransferOCI (transfer, streamed straight into a registry push,
-// NOT resumable — see transfer_docker.go's own comment on why — so these
-// retry a failed blob from scratch instead of resuming it).
+// Retry/stall-detection primitives shared by the remaining download and
+// transfer paths: the uri_sources.go source handlers (ModelScope, NGC, S3,
+// GCS) and transfer_docker.go's dockerTransferOCI (streamed straight into a
+// registry push, NOT resumable — see transfer_docker.go's own comment on
+// why — so it retries a failed blob from scratch instead of resuming it).
 // ---------------------------------------------------------------------------
 
 const (
@@ -179,70 +162,19 @@ func retryDelay(attempt int) time.Duration {
 	return base + offset/2
 }
 
-// speedTracker maintains a rolling window of completed-transfer speeds
-// (bytes/sec) for this process, so an in-progress transfer can notice
-// it's running anomalously slowly compared to every other transfer that
-// has recently finished — catching, e.g., a throttled/degraded path to
-// one CDN edge that a plain stall timeout (no bytes for N seconds) would
-// never notice because bytes are still trickling in, just far slower
-// than they should be. Mirrors Ollama's x/transfer speed-based
-// cancellation (see its transfer.go/download.go speedTracker).
-type speedTracker struct {
-	mu     sync.Mutex
-	speeds []float64 // bytes/sec, oldest first
-}
-
-const (
-	speedWindowSize          = 30              // how many recent transfer speeds to remember
-	minSpeedSamples          = 5               // don't judge speed off fewer than this many prior transfers
-	slowCheckInterval        = 5 * time.Second // let a transfer ramp up before judging its rate
-	slowSpeedRatio           = 0.1             // cancel if sustained rate is <10% of the recent median
-	minSpeedSampleSize int64 = 100 << 10       // 100KB — skip recording/judging tiny transfers
-)
-
-var globalSpeedTracker speedTracker
-
-func (t *speedTracker) record(bps float64) {
-	if bps <= 0 {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.speeds = append(t.speeds, bps)
-	if len(t.speeds) > speedWindowSize {
-		t.speeds = t.speeds[len(t.speeds)-speedWindowSize:]
-	}
-}
-
-func (t *speedTracker) median() (float64, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if len(t.speeds) < minSpeedSamples {
-		return 0, false
-	}
-	sorted := append([]float64(nil), t.speeds...)
-	sort.Float64s(sorted)
-	return sorted[len(sorted)/2], true
-}
-
-// stallReader cancels the context if no bytes arrive within timeout, or
-// if the sustained transfer rate drops far below what every other recent
-// transfer in this process has managed (see speedTracker/globalSpeedTracker
-// above). Mirrors llama.cpp's implicit stall detection via cpp-httplib
-// timeouts, extended with Ollama-style slow-speed detection.
+// stallReader cancels the context if no bytes arrive within timeout.
+// Mirrors llama.cpp's implicit stall detection via cpp-httplib timeouts.
+//
+// Slow-speed detection (cancel when far below the recent median rate) went
+// with the HuggingFace downloader that fed it samples — see src/hf.
 type stallReader struct {
-	r         io.Reader
-	timer     *time.Timer
-	cancel    context.CancelFunc
-	start     time.Time
-	total     int64
-	lastCheck time.Time
-	lastTotal int64
+	r      io.Reader
+	timer  *time.Timer
+	cancel context.CancelFunc
 }
 
 func newStallReader(r io.Reader, timeout time.Duration, cancel context.CancelFunc) *stallReader {
-	now := time.Now()
-	sr := &stallReader{r: r, cancel: cancel, start: now, lastCheck: now}
+	sr := &stallReader{r: r, cancel: cancel}
 	sr.timer = time.AfterFunc(timeout, cancel)
 	return sr
 }
@@ -251,53 +183,11 @@ func (sr *stallReader) Read(p []byte) (int, error) {
 	n, err := sr.r.Read(p)
 	if n > 0 {
 		sr.timer.Reset(dlStallTimeout) // bytes arrived, reset stall clock
-		sr.total += int64(n)
-		sr.checkSpeed()
 	}
 	return n, err
 }
 
-// checkSpeed compares the rate since the last check against the recent
-// median transfer speed every slowCheckInterval, cancelling the same way
-// a stall would if this transfer is running at less than slowSpeedRatio
-// of that median. A transfer too small to be a meaningful sample
-// (minSpeedSampleSize) is never judged or recorded.
-func (sr *stallReader) checkSpeed() {
-	if sr.total < minSpeedSampleSize {
-		return
-	}
-	now := time.Now()
-	elapsed := now.Sub(sr.lastCheck)
-	if elapsed < slowCheckInterval {
-		return
-	}
-	bytesSinceCheck := sr.total - sr.lastTotal
-	sr.lastCheck = now
-	sr.lastTotal = sr.total
-	if median, ok := globalSpeedTracker.median(); ok {
-		rate := float64(bytesSinceCheck) / elapsed.Seconds()
-		if rate < median*slowSpeedRatio {
-			sr.cancel()
-		}
-	}
-}
-
 func (sr *stallReader) stop() { sr.timer.Stop() }
-
-// finalSpeed returns this reader's overall average throughput in
-// bytes/sec, for the caller to feed into globalSpeedTracker once a
-// download completes successfully (see downloadAttempt). Returns 0 for a
-// transfer too small to be a meaningful sample.
-func (sr *stallReader) finalSpeed() float64 {
-	if sr.total < minSpeedSampleSize {
-		return 0
-	}
-	elapsed := time.Since(sr.start).Seconds()
-	if elapsed <= 0 {
-		return 0
-	}
-	return float64(sr.total) / elapsed
-}
 
 // stallReadCloser pairs a stallReader with the underlying response body's
 // Close, so callers can pass it around as a plain io.ReadCloser and have
@@ -325,8 +215,8 @@ func (s *stallReadCloser) Close() error {
 // — observed in practice as a registry PUT that goes quiet mid-upload
 // following a transient error (a 502 from Docker Hub, in the one that
 // prompted this) and then simply never completes or fails on its own.
-// stallReader alone doesn't cover this: it only watches the source (the
-// HuggingFace download) side of that same copy, and a source that's
+// stallReader alone doesn't cover this: it only watches the source side
+// of that same copy, and a source that's
 // still delivering bytes just fine gives it nothing to notice while the
 // destination write those bytes are headed into sits blocked. Nor does a
 // plain http.Client's own Timeout help — the call actually blocked here
@@ -335,130 +225,23 @@ func (s *stallReadCloser) Close() error {
 // trip the http.Client even sees as in progress.
 type stallWriter struct {
 	content.Writer
-	timer     *time.Timer
-	cancel    context.CancelFunc
-	start     time.Time
-	total     int64
-	lastCheck time.Time
-	lastTotal int64
+	timer  *time.Timer
+	cancel context.CancelFunc
 }
 
 func newStallWriter(w content.Writer, timeout time.Duration, cancel context.CancelFunc) *stallWriter {
-	now := time.Now()
-	return &stallWriter{Writer: w, timer: time.AfterFunc(timeout, cancel), cancel: cancel, start: now, lastCheck: now}
+	return &stallWriter{Writer: w, timer: time.AfterFunc(timeout, cancel), cancel: cancel}
 }
 
 func (sw *stallWriter) Write(p []byte) (int, error) {
 	n, err := sw.Writer.Write(p)
 	if n > 0 {
 		sw.timer.Reset(dlStallTimeout) // bytes accepted, reset stall clock
-		sw.total += int64(n)
-		sw.checkSpeed()
 	}
 	return n, err
 }
 
-// checkSpeed mirrors stallReader.checkSpeed for the write side — see its
-// doc comment.
-func (sw *stallWriter) checkSpeed() {
-	if sw.total < minSpeedSampleSize {
-		return
-	}
-	now := time.Now()
-	elapsed := now.Sub(sw.lastCheck)
-	if elapsed < slowCheckInterval {
-		return
-	}
-	bytesSinceCheck := sw.total - sw.lastTotal
-	sw.lastCheck = now
-	sw.lastTotal = sw.total
-	if median, ok := globalSpeedTracker.median(); ok {
-		rate := float64(bytesSinceCheck) / elapsed.Seconds()
-		if rate < median*slowSpeedRatio {
-			sw.cancel()
-		}
-	}
-}
-
 func (sw *stallWriter) stop() { sw.timer.Stop() }
-
-// finalSpeed mirrors stallReader.finalSpeed for the write side.
-func (sw *stallWriter) finalSpeed() float64 {
-	if sw.total < minSpeedSampleSize {
-		return 0
-	}
-	elapsed := time.Since(sw.start).Seconds()
-	if elapsed <= 0 {
-		return 0
-	}
-	return float64(sw.total) / elapsed
-}
-
-// httpStatusError wraps a non-2xx HTTP response so retryStream can react
-// to more than just "was this permanent" (isHTTP4xx's job): specifically,
-// a server-supplied Retry-After (RFC 9110 §10.2.3), mirroring
-// huggingface_hub's own handling of it on a 429 (utils/_http.py
-// _http_backoff_base). Its Error() string preserves the exact
-// "<prefix>: HTTP <code>" shape every existing fmt.Errorf(...) call site
-// already produced, including the substring isHTTP4xx greps for.
-type httpStatusError struct {
-	prefix        string
-	statusCode    int
-	retryAfter    time.Duration // valid only if hasRetryAfter
-	hasRetryAfter bool
-}
-
-func (e *httpStatusError) Error() string {
-	return fmt.Sprintf("%s: HTTP %d", e.prefix, e.statusCode)
-}
-
-// newHTTPStatusError builds an httpStatusError for a non-2xx resp, with
-// prefix reproducing what the call site's own fmt.Errorf used to put
-// before "HTTP %d" (e.g. "GET https://...", "download foo.gguf").
-func newHTTPStatusError(prefix string, resp *http.Response) error {
-	e := &httpStatusError{prefix: prefix, statusCode: resp.StatusCode}
-	e.retryAfter, e.hasRetryAfter = parseRetryAfter(resp.Header)
-	return e
-}
-
-// retryAfterCap bounds how long retryStream will ever honor a
-// server-supplied Retry-After for. huggingface_hub trusts it completely
-// (sleeps exactly that long — see _http_backoff_base); here, an
-// unbounded wait on one blob could eat most of a CI job's own time
-// budget (e.g. llmman-publisher's transfer.yml 360-minute ceiling), so
-// this caps it well short of that instead.
-const retryAfterCap = 5 * time.Minute
-
-// parseRetryAfter parses a Retry-After header's delay-seconds form (e.g.
-// "Retry-After: 30"), reporting ok=false if the header is absent,
-// negative, or malformed. Doesn't parse the HTTP-date form
-// ("Wed, 21 Oct 2015 07:28:00 GMT") — huggingface_hub's own
-// _parse_retry_after doesn't either, and every 429 seen from
-// huggingface.co uses delay-seconds. Caps secs before converting to a
-// Duration so an absurd value (e.g. 1e18) can't overflow int64 nanoseconds.
-func parseRetryAfter(h http.Header) (d time.Duration, ok bool) {
-	secs, err := strconv.Atoi(strings.TrimSpace(h.Get("Retry-After")))
-	if err != nil || secs < 0 {
-		return 0, false
-	}
-	if capSecs := int(retryAfterCap / time.Second); secs > capSecs {
-		secs = capSecs
-	}
-	return time.Duration(secs) * time.Second, true
-}
-
-// retryAfter returns the Retry-After duration attached to err by
-// newHTTPStatusError, or (0, false) if err isn't one of those (including
-// err == nil, on retryStream's very first attempt). A zero-second
-// Retry-After ("retry immediately") is a valid, distinct result — hence
-// the separate ok, rather than overloading 0 to also mean "absent".
-func retryAfter(err error) (time.Duration, bool) {
-	var hse *httpStatusError
-	if !errors.As(err, &hse) || !hse.hasRetryAfter {
-		return 0, false
-	}
-	return hse.retryAfter, true
-}
 
 // isHTTP4xx returns true for permanent HTTP client errors (no point retrying).
 func isHTTP4xx(err error) bool {
@@ -474,25 +257,21 @@ func isHTTP4xx(err error) bool {
 	return false
 }
 
-// retryStream calls attempt up to dlMaxAttempts times with exponential
-// backoff (2s, 4s, ...) between tries — or the previous attempt's
-// Retry-After (capped at retryAfterCap), if it had one — stopping
-// immediately (no further retries) once isPermanent reports the most
-// recent error isn't worth retrying (e.g. a 404 — see isHTTP4xx). Every
-// attempt is expected to restart its work entirely from scratch: unlike
-// downloadHFBlob's local .part-file resume, there's no partial state to
-// pick up from here (see the callers' own comments for why) — this only
-// saves the operator from having to notice a transient failure and
-// manually re-run the whole command, it doesn't avoid re-sending bytes a
-// failed attempt already sent.
+// retryStream calls attempt up to dlMaxAttempts times with jittered
+// exponential backoff (see retryDelay), stopping immediately once
+// isPermanent reports the most recent error isn't worth retrying (e.g. a
+// 404 — see isHTTP4xx). Every attempt restarts its work from scratch:
+// there's no partial state to pick up from here (see the callers' own
+// comments for why).
+//
+// Retry-After honoring lived here only for HuggingFace downloads, which
+// now retry natively in Rust (src/hf/client.rs); the remaining callers are
+// OCI registry copies, which never carried one.
 func retryStream(ctx context.Context, label string, isPermanent func(error) bool, attempt func() error) error {
 	var lastErr error
 	for i := 0; i < dlMaxAttempts; i++ {
 		if i > 0 {
 			delay := retryDelay(i)
-			if ra, ok := retryAfter(lastErr); ok {
-				delay = ra
-			}
 			fmt.Fprintf(os.Stderr, "\n[llmman] retrying %s (attempt %d/%d, wait %v)\n", label, i+1, dlMaxAttempts, delay)
 			select {
 			case <-ctx.Done():
@@ -583,8 +362,8 @@ func addLayerBar(p *mpb.Progress, prefix, onComplete string, size int64, key str
 }
 
 // blobFetchGroup deduplicates concurrent fetch-and-write operations for
-// the same underlying content (an OCI blob digest, or an HF source-file
-// key — see downloadHFBlob) across every in-flight pull in this process.
+// the same underlying content (an OCI blob digest, or a source-file key)
+// across every in-flight pull in this process.
 //
 // This became necessary once pulls of *different* models were allowed to
 // run concurrently (see the Rust daemon's per-model lock registry in

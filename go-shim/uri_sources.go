@@ -41,8 +41,8 @@ import (
 
 // dispatchPull routes a URI-scheme reference to the appropriate source handler.
 // Returns (handled bool, error). When handled=false the caller falls through to
-// the existing OCI / HuggingFace routing. progressKey is always the exact,
-// original ref the daemon's /api/pull handler was given — not any
+// the OCI registry routing. progressKey is always the exact, original ref
+// the daemon's /api/pull handler was given — not any
 // source-specific canonicalized form the handler below might separately
 // compute (e.g. pullModelScope's own storeRef) — since that's the exact
 // string the Rust side polls llmman_progress with (see progress_state.go).
@@ -54,8 +54,7 @@ func dispatchPull(ctx context.Context, ref, layoutDir string) (bool, error) {
 
 	switch {
 	case strings.HasPrefix(ref, "hf://") || strings.HasPrefix(ref, "huggingface://"):
-		hfRef := strings.TrimPrefix(strings.TrimPrefix(ref, "hf://"), "huggingface://")
-		return true, pullHF(ctx, hfRef, layoutDir, progressKey)
+		return true, errHFNotHandledHere(ref)
 
 	case strings.HasPrefix(ref, "ms://") || strings.HasPrefix(ref, "modelscope://"):
 		msRef := strings.TrimPrefix(strings.TrimPrefix(ref, "ms://"), "modelscope://")
@@ -92,7 +91,7 @@ func classifyFile(name string) string {
 	case ".safetensors", ".bin", ".pt", ".pth", ".gguf", ".ggml",
 		".gguf_v2", ".ot", ".engine", ".trt", ".onnx":
 		return "application/vnd.cncf.model.weight.v1.raw"
-	// ".jinja": a standalone chat_template.jinja file, see hf.go.
+	// ".jinja": a standalone chat_template.jinja file.
 	case ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
 		".model", ".tiktoken", ".vocab", ".merges", ".spm", ".jinja":
 		return "application/vnd.cncf.model.weight.config.v1.raw"
@@ -501,7 +500,10 @@ func pullS3(ctx context.Context, s3Ref, layoutDir, progressKey string) error {
 		Prefix: &prefix,
 	})
 
-	type s3Object struct{ key string; size int64 }
+	type s3Object struct {
+		key  string
+		size int64
+	}
 	var objects []s3Object
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
@@ -753,5 +755,3 @@ func pullLocal(localPath, layoutDir string) error {
 	// otherwise.
 	return packFilesAsModelPack(layoutDir, storeRef, filepath.Base(localPath), packFiles, true)
 }
-
-

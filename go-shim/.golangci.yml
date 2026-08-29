@@ -1,0 +1,41 @@
+# Static analysis for go-shim. The CI `lint` job runs exactly these three
+# invocations; running them here reproduces it:
+#
+#   golangci-lint run --build-tags docker --tests=false
+#   golangci-lint run --build-tags docker
+#   golangci-lint run --build-tags podman,containers_image_openpgp,exclude_graphdriver_btrfs,exclude_graphdriver_devicemapper -D unused
+#
+# `unused` is why this exists: Go rejects an unused local but accepts an
+# unused package-level func, so dead code accumulates invisibly — as the
+# HuggingFace fetch path did, staying compiled long after Rust took over
+# every ref that could reach it.
+#
+# --tests=false matters, because a func whose only caller is its own test
+# otherwise counts as used. -D unused on the podman view matters because
+# `unused` sees one build-tag view at a time, so docker-only helpers in
+# shared files look dead from that side; the docker view is authoritative.
+#
+# errcheck is deliberately absent: this package's `defer x.Close()` style
+# produces ~30 intentional findings.
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - unused
+    - govet
+    - staticcheck
+    - ineffassign
+
+  # Scoped rather than disabling SA1019 outright, so a deprecation anywhere
+  # else is still reported. SA1019 is the one check whose result tracks the
+  # staticcheck version rather than this code: silent under golangci-lint
+  # 2.12, flagging containerd's ResolverOptions.Client under 2.13. The fix
+  # (HostOptions.UpdateClient) changes how the registry HTTP client is
+  # built, so it belongs in its own change. Deleting these four lines is the
+  # check that it has been done.
+  exclusions:
+    rules:
+      - path: backend_docker.go
+        linters: [staticcheck]
+        text: "SA1019.*ResolverOptions\\).Client is deprecated"

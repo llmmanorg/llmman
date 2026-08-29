@@ -244,14 +244,8 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	if handled {
 		return err
 	}
-	// HuggingFace and similar hosts cannot be pulled via the OCI registry
-	// protocol (their paths contain uppercase letters which go.podman.io/image
-	// rejects).  Delegate to the shared HF pull path instead.
 	if !isOCI {
-		if err := ensureLayout(layoutDir); err != nil {
-			return fmt.Errorf("init OCI layout: %w", err)
-		}
-		return pullHF(ctx, ref, layoutDir, progressKey)
+		return errHFNotHandledHere(ref)
 	}
 
 	if err := ensureLayout(layoutDir); err != nil {
@@ -351,8 +345,8 @@ var copyImageMu sync.Mutex
 
 // copyImageWithProgress runs copyImageAttempt with retry and stall
 // detection, via the same retryStream helper (shared_oci.go) that already
-// backs hf.go's downloads and transfer_docker.go's streaming pushes — for
-// the one path that had none of it: a real registry pull that simply
+// backs transfer_docker.go's streaming pushes — for the one path that had
+// none of it: a real registry pull that simply
 // stalled mid-blob-download (zero bytes, indefinitely, no error) is
 // exactly what a plain context.Context with no deadline of its own can't
 // recover from, and it's what first surfaced this gap — the new
@@ -411,9 +405,9 @@ func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, d
 // pushed, e.g. to report "already up to date" for a no-op re-transfer.
 //
 // Stall detection: copy.Image is a single opaque call into
-// go.podman.io/image with no per-blob hooks of its own — unlike hf.go's
-// downloadHFBlob (which wraps its own http.Response.Body in a
-// stallReader), the only signal available here is copy.Image's own
+// go.podman.io/image with no per-blob hooks of its own — unlike a plain
+// HTTP download (which can wrap its own response body in a stallReader),
+// the only signal available here is copy.Image's own
 // Progress channel, so a ProgressEventRead/NewArtifact/Done/Skipped
 // callback IS this backend's only "still alive" signal. The watchdog
 // goroutine below cancels a context derived from ctx (independent of

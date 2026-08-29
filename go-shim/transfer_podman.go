@@ -12,13 +12,10 @@
 // see copy/copy.go upstream); there's nothing llmman needs to add on top
 // for that case.
 //
-// go.podman.io/image has no HuggingFace (or ms:///ngc:///s3:///gs:///local
-// path) source transport, though, so those fall back to staging through a
-// throwaway local OCI layout — pull, then push from it, mirroring what
-// `llmman transfer` did before streaming support existed, and what
-// transfer_docker.go's docker/containerd backend still does for those same
-// source kinds (see its own doc comment for why implementing zero-disk
-// streaming for each of them individually isn't worth it yet).
+// go.podman.io/image has no ms:///ngc:///s3:///gs:///local-path source
+// transport, though, so those fall back to staging through a throwaway
+// local OCI layout — pull, then push from it. A HuggingFace source never
+// reaches here: it is handled in Rust (src/hf/transfer.rs).
 package main
 
 import (
@@ -40,6 +37,9 @@ func podmanTransfer(ctx context.Context, source, destination string) (changed bo
 	kind, normalized := classifySource(ctx, source)
 	if kind == sourceOCI {
 		return podmanTransferOCI(ctx, normalized, destination)
+	}
+	if kind == sourceHF {
+		return false, errHFNotHandledHere(normalized)
 	}
 	return transferViaStaging(ctx, source, destination)
 }
