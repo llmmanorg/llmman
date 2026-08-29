@@ -238,6 +238,78 @@ fn parse_num_parallel(value: Option<&str>) -> Option<u32> {
     (n != 0).then_some(n)
 }
 
+/// `--threads <n>` for every local `llama-server` spawn, derived from the
+/// container's CPU quota. Docker's `--cpus` sets a CFS bandwidth quota
+/// (cgroup `cpu.max`), not CPU affinity, so llama-server's own thread
+/// autodetection (`available_parallelism`, which reads the affinity mask)
+/// reports every host core and the resulting threads fight over the
+/// quota. `LLAMA_ARG_THREADS` set in the environment wins: llama-server
+/// reads it itself via plain env inheritance, so `None` here keeps that
+/// explicit choice untouched. Any missing/unreadable cgroup file also
+/// returns `None` (rootless or nested containers without /sys/fs/cgroup
+/// keep current behavior).
+fn threads_from_env_or_cgroup() -> Option<u32> {
+    if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let available = std::thread::available_parallelism().ok()?.get() as u32;
+        // cgroup v2 first; fall back to the v1 cpu controller files.
+        if let Ok(cpu_max) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+            return effective_threads_from_cgroup(&cpu_max, available);
+        }
+        let quota = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").ok()?;
+        let period = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us").ok()?;
+        effective_threads_from_cgroup_v1(&quota, &period, available)
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// [`threads_from_env_or_cgroup`]'s cgroup v2 parsing, split out so it's
+/// testable without a real /sys/fs/cgroup. `cpu_max` is the content of
+/// `cpu.max`: `"<quota> <period>"` in microseconds, or `"max <period>"`
+/// for unlimited (`None`, autodetection is already right). A fractional
+/// quota floors, with a floor of 1 (a 0.5-CPU container still needs one
+/// thread), capped at `available` (the affinity mask can be narrower
+/// than the quota).
+fn effective_threads_from_cgroup(cpu_max: &str, available: u32) -> Option<u32> {
+    let mut fields = cpu_max.split_whitespace();
+    let quota = fields.next()?;
+    let period = fields.next()?;
+    if quota == "max" {
+        return None;
+    }
+    quota_threads(quota.parse().ok()?, period.parse().ok()?, available)
+}
+
+/// The cgroup v1 equivalent of [`effective_threads_from_cgroup`], from
+/// the contents of `cpu.cfs_quota_us` and `cpu.cfs_period_us`. A quota
+/// of `-1` means unlimited.
+fn effective_threads_from_cgroup_v1(quota: &str, period: &str, available: u32) -> Option<u32> {
+    let quota: i64 = quota.trim().parse().ok()?;
+    let period: i64 = period.trim().parse().ok()?;
+    if quota < 0 {
+        return None;
+    }
+    quota_threads(
+        u64::try_from(quota).ok()?,
+        u64::try_from(period).ok()?,
+        available,
+    )
+}
+
+/// `floor(quota / period)` with a floor of 1, capped at `available`;
+/// `None` for zero fields (nothing meaningful to compute).
+fn quota_threads(quota: u64, period: u64, available: u32) -> Option<u32> {
+    if quota == 0 || period == 0 {
+        return None;
+    }
+    let n = (quota / period).max(1).min(u64::from(available));
+    Some(n as u32)
+}
+
 /// The `--ctx-size` value to actually forward to llama-server: `ctx_size`
 /// (the per-request context every other computation — retries, error
 /// messages, `LLMMAN_CONTEXT_LENGTH` itself — is expressed in) times
@@ -1697,6 +1769,11 @@ async fn spawn_llama_server(
     model: &Path,
     mmproj: Option<&Path>,
     opts: crate::container::LlamaOptions<'_>,
+    // Not part of LlamaOptions: that struct is shared with
+    // container::spawn, and the derived thread count must stay off the
+    // container path (the daemon's cgroup says nothing about the child
+    // container's).
+    threads: Option<u32>,
 ) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
     let crate::container::LlamaOptions {
         port,
@@ -1756,6 +1833,11 @@ async fn spawn_llama_server(
     // See num_parallel_from_env's doc comment.
     if let Some(n) = num_parallel {
         cmd.args(["--parallel", &n.to_string()]);
+    }
+    // See threads_from_env_or_cgroup's doc comment; `None` leaves
+    // --threads unset, falling back to llama-server's own autodetection.
+    if let Some(n) = threads {
+        cmd.args(["--threads", &n.to_string()]);
     }
     // See GPU_VISIBLE_DEVICE_VARS's own doc comment — already inherited
     // by default, forwarded explicitly here for clarity.
@@ -2846,8 +2928,14 @@ async fn ensure_model(
             ),
             (ModelPath::Gguf(path, mmproj), None) => {
                 let bin = local_llama_server_bin(state).await?;
-                let (child, tail) =
-                    spawn_llama_server(&bin, path, mmproj.as_deref(), llama_opts).await?;
+                let (child, tail) = spawn_llama_server(
+                    &bin,
+                    path,
+                    mmproj.as_deref(),
+                    llama_opts,
+                    threads_from_env_or_cgroup(),
+                )
+                .await?;
                 stderr_tail = Some(tail);
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }
@@ -7370,6 +7458,74 @@ mod tests {
         assert_eq!(parse_num_parallel(Some("")), None);
         assert_eq!(parse_num_parallel(Some("-1")), None);
         assert_eq!(parse_num_parallel(Some("garbage")), None);
+    }
+
+    #[test]
+    fn effective_threads_from_cgroup_floors_the_quota_over_period_ratio() {
+        // (cpu.max content, available, expected)
+        let cases: &[(&str, u32, Option<u32>)] = &[
+            ("200000 100000", 32, Some(2)),
+            // Unlimited: llama-server's own autodetection is already right.
+            ("max 100000", 32, None),
+            // Fractional quotas floor, but never below 1.
+            ("50000 100000", 32, Some(1)),
+            ("150000 100000", 32, Some(1)),
+            // Capped at available (affinity mask narrower than the quota).
+            ("800000 100000", 4, Some(4)),
+            ("200000 100000\n", 32, Some(2)),
+        ];
+        for &(cpu_max, available, expected) in cases {
+            assert_eq!(
+                effective_threads_from_cgroup(cpu_max, available),
+                expected,
+                "cpu_max={cpu_max:?} available={available}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_threads_from_cgroup_rejects_malformed_and_zero_fields() {
+        for cpu_max in [
+            "",
+            "200000",
+            "garbage 100000",
+            "200000 nope",
+            "0 100000",
+            "200000 0",
+            "-200000 100000",
+        ] {
+            assert_eq!(
+                effective_threads_from_cgroup(cpu_max, 32),
+                None,
+                "cpu_max={cpu_max:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_threads_from_cgroup_v1_matches_v2_and_treats_minus_one_as_unlimited() {
+        // (cfs_quota_us, cfs_period_us, available, expected)
+        let cases: &[(&str, &str, u32, Option<u32>)] = &[
+            ("200000", "100000", 32, Some(2)),
+            // -1 means unlimited in cgroup v1.
+            ("-1", "100000", 32, None),
+            ("50000", "100000", 32, Some(1)),
+            ("150000", "100000", 32, Some(1)),
+            ("800000", "100000", 4, Some(4)),
+            ("0", "100000", 32, None),
+            ("200000", "0", 32, None),
+            ("200000", "-1", 32, None),
+            ("garbage", "100000", 32, None),
+            ("200000", "garbage", 32, None),
+            ("200000\n", "100000\n", 32, Some(2)),
+        ];
+        for &(quota, period, available, expected) in cases {
+            assert_eq!(
+                effective_threads_from_cgroup_v1(quota, period, available),
+                expected,
+                "quota={quota:?} period={period:?} available={available}"
+            );
+        }
     }
 
     #[test]
