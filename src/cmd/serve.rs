@@ -2131,6 +2131,25 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
         .unwrap_or_else(|| model_ref.to_owned())
 }
 
+/// The `mgr.running` key an unload request names, resolved through the
+/// same three steps `ensure_model` uses to build the key it inserts
+/// under: `resolve_ollama_api`, then `default_tag`, then `canonical_ref`.
+///
+/// `default_tag` is the step the unload paths used to skip, on the
+/// assumption that `canonical_ref` would supply the tag from the store
+/// index. It only does so while the model is still *in* the store: once
+/// `find` misses — the model was removed after it was loaded, the index
+/// is unreadable — `canonical_ref` returns the reference untouched, so a
+/// tagless unload looked for `docker.io/ai/m` while the model ran under
+/// `docker.io/ai/m:latest`. `remove` missed, and the reply still said
+/// `"unload"`, leaving the caller believing a model it can still see in
+/// `llmman ps` had been evicted.
+fn unload_key(state: &AppState, model: &str) -> String {
+    let resolved = crate::shortnames::resolve_ollama_api(model);
+    let tagged = crate::storage::default_tag(&resolved);
+    canonical_ref(&state.0.store_path, &tagged)
+}
+
 /// Is `model_ref` already running and alive? See `ModelProcess::is_alive`.
 /// If so, claims it (`in_flight += 1`, under the same lock as the
 /// liveness check) and returns the same [`ActivityGuard`] `ensure_model`
@@ -4378,8 +4397,7 @@ async fn handle_ollama_chat(
     // empty message, and a `keep_alive: 0` never unloads anything.
     if req.messages.is_empty() {
         if resolve_keep_alive(&req.keep_alive) == Some(Duration::ZERO) {
-            let resolved = crate::shortnames::resolve_ollama_api(&req.model);
-            let canonical = canonical_ref(&state.0.store_path, &resolved);
+            let canonical = unload_key(&state, &req.model);
             let _guard = acquire_load_lock(&canonical).await;
             state.0.manager.lock().await.running.remove(&canonical);
             return Ok(Json(empty_chat_chunk(req.model, "unload")).into_response());
@@ -4468,8 +4486,7 @@ async fn handle_ollama_generate(
     let is_unload =
         req.prompt.is_empty() && resolve_keep_alive(&req.keep_alive) == Some(Duration::ZERO);
     if is_unload {
-        let resolved = crate::shortnames::resolve_ollama_api(&req.model);
-        let canonical = canonical_ref(&state.0.store_path, &resolved);
+        let canonical = unload_key(&state, &req.model);
         // Wait for an in-flight load of this model to publish itself first,
         // so it can't race ahead of this remove.
         let _guard = acquire_load_lock(&canonical).await;
@@ -7237,6 +7254,48 @@ mod tests {
                 .running
                 .contains_key("docker.io/ai/m:latest"),
             "keep_alive: 0 with no messages must actually unload the model"
+        );
+    }
+
+    /// `test_state`'s store path is an empty temp dir, so `canonical_ref`
+    /// finds nothing and returns the reference untouched — the same
+    /// position a real daemon is in once the model has been removed from
+    /// the store while still running. `default_tag` has to supply the
+    /// `:latest` on its own, or the remove looks up `docker.io/ai/m` and
+    /// misses the entry entirely while still reporting `"unload"`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tagless_unload_still_finds_a_model_running_under_latest() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "docker.io/ai/m:latest".into(),
+                running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+            );
+        }
+
+        let resp = handle_ollama_chat(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(chat_request(serde_json::json!({
+                "model": "docker.io/ai/m",
+                "messages": [],
+                "keep_alive": 0,
+            }))),
+        )
+        .await
+        .expect("unload must not error");
+
+        assert_eq!(chat_response_json(resp).await["done_reason"], "unload");
+        assert!(
+            !state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .contains_key("docker.io/ai/m:latest"),
+            "a tagless unload must reach the model stored under :latest"
         );
     }
 
