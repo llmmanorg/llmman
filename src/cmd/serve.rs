@@ -1373,6 +1373,19 @@ fn resolve_keep_alive(value: &Option<serde_json::Value>) -> Option<Duration> {
         .unwrap_or_else(default_keep_alive)
 }
 
+/// True only when the request itself spells `keep_alive: 0` — Ollama's
+/// unload sentinel, in any of the zero forms `parse_keep_alive_value`
+/// accepts. Deliberately not [`resolve_keep_alive`], which falls back to
+/// [`default_keep_alive`] when the field is absent: under
+/// `LLMMAN_KEEP_ALIVE=0` that fallback made every message-less preload
+/// resolve to zero and answer `"unload"`, so a caller asking to warm a
+/// model got it evicted instead. An unparseable value stays a non-unload
+/// here for the same reason it stays one in `resolve_keep_alive` — the
+/// daemon default decides how long to keep it, not whether to keep it.
+fn is_explicit_unload(keep_alive: &Option<serde_json::Value>) -> bool {
+    keep_alive.as_ref().and_then(parse_keep_alive_value) == Some(Some(Duration::ZERO))
+}
+
 /// `None` = couldn't parse `v` as a keep_alive value at all (caller falls
 /// back to the daemon default). `Some(None)` = "never unload" (a negative
 /// number). `Some(Some(d))` = "unload after `d` of inactivity".
@@ -4396,7 +4409,7 @@ async fn handle_ollama_chat(
     // generation and `done_reason: "stop"` where ollama answers with an
     // empty message, and a `keep_alive: 0` never unloads anything.
     if req.messages.is_empty() {
-        if resolve_keep_alive(&req.keep_alive) == Some(Duration::ZERO) {
+        if is_explicit_unload(&req.keep_alive) {
             let canonical = unload_key(&state, &req.model);
             let _guard = acquire_load_lock(&canonical).await;
             state.0.manager.lock().await.running.remove(&canonical);
@@ -4479,12 +4492,11 @@ async fn handle_ollama_generate(
     );
 
     // Empty prompt + keep_alive:0 = unload request (ollama server/routes.go:354).
-    // resolve_keep_alive (not a bare `.as_i64() == Some(0)` check) so every
-    // zero form it accepts — the JSON number 0, but also "0"/"0s"/etc as a
-    // string — is treated as the unload sentinel, matching how the very
-    // same value is interpreted everywhere else keep_alive is read.
-    let is_unload =
-        req.prompt.is_empty() && resolve_keep_alive(&req.keep_alive) == Some(Duration::ZERO);
+    // is_explicit_unload, not resolve_keep_alive: it still accepts every
+    // zero form — the JSON number 0, but also "0"/"0s"/etc as a string —
+    // without treating an absent field as one, which under
+    // `LLMMAN_KEEP_ALIVE=0` turned a plain preload into an eviction.
+    let is_unload = req.prompt.is_empty() && is_explicit_unload(&req.keep_alive);
     if is_unload {
         let canonical = unload_key(&state, &req.model);
         // Wait for an in-flight load of this model to publish itself first,
@@ -7296,6 +7308,36 @@ mod tests {
                 .running
                 .contains_key("docker.io/ai/m:latest"),
             "a tagless unload must reach the model stored under :latest"
+        );
+    }
+
+    /// Pins which requests name the unload sentinel: every zero form
+    /// `parse_keep_alive_value` accepts, and nothing else — an absent
+    /// field least of all, since that is what a message-less preload
+    /// sends and what `LLMMAN_KEEP_ALIVE=0` used to turn into an eviction.
+    ///
+    /// This pins the contract, not the regression. The old and new
+    /// predicates differ only in whether they consult
+    /// `default_keep_alive`, which reads a process-wide environment
+    /// variable the `resolve_keep_alive` tests in this module read too;
+    /// telling them apart in-process would mean mutating it underneath
+    /// those tests. The regression itself was reproduced against a real
+    /// daemon started with `LLMMAN_KEEP_ALIVE=0`.
+    #[test]
+    fn only_a_keep_alive_the_request_actually_carries_means_unload() {
+        assert!(
+            !is_explicit_unload(&None),
+            "an absent field is not an unload"
+        );
+        assert!(is_explicit_unload(&Some(serde_json::json!(0))));
+        assert!(is_explicit_unload(&Some(serde_json::json!("0"))));
+        assert!(is_explicit_unload(&Some(serde_json::json!("0s"))));
+        assert!(!is_explicit_unload(&Some(serde_json::json!(300))));
+        assert!(!is_explicit_unload(&Some(serde_json::json!(-1))));
+        assert!(
+            !is_explicit_unload(&Some(serde_json::json!("garbage"))),
+            "an unparseable value leaves the daemon default deciding how long \
+             to keep the model, not whether to keep it"
         );
     }
 
