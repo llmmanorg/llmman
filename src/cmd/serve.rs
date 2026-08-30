@@ -605,15 +605,19 @@ impl Drop for ModelProcess {
 impl ModelProcess {
     /// True if the underlying child process hasn't exited on its own since
     /// this model was marked running. Nothing else ever tells `mgr.running`
-    /// about a process exiting unexpectedly (the only place that removes an
-    /// entry today is the explicit Ollama unload signal in
-    /// `handle_ollama_generate`) — a crash, an OOM kill, or anything else
-    /// that takes `llama-server`/vllm down on its own would otherwise keep
+    /// about a process exiting unexpectedly: every other removal is a
+    /// deliberate one — the Ollama unload signal, in both
+    /// `handle_ollama_generate` and `handle_ollama_chat`; the idle reaper
+    /// (`reap_idle_models_once`); and eviction under
+    /// `LLMMAN_MAX_LOADED_MODELS` (`evict_other_models`) — and none of them
+    /// fires on a crash. So a crash, an OOM kill, or anything else that
+    /// takes `llama-server`/vllm down on its own would otherwise keep
     /// handing out that now-dead port forever, indistinguishable from a
     /// real live one until whichever caller's request to it fails with a
-    /// bare connection error. `try_wait` is non-blocking either way: `Ok(None)`
-    /// (still running) is the overwhelmingly common case this needs to stay
-    /// cheap for.
+    /// bare connection error; `check_running` is what drops the entry, the
+    /// moment this returns false. `try_wait` is non-blocking either way:
+    /// `Ok(None)` (still running) is the overwhelmingly common case this
+    /// needs to stay cheap for.
     fn is_alive(&mut self) -> bool {
         let child = match self {
             ModelProcess::Local(_, child, _) => child,
