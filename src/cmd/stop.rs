@@ -32,7 +32,15 @@ pub fn run(args: &StopArgs) -> anyhow::Result<()> {
         anyhow::bail!("llmman serve is not running (nothing is loaded) — nothing to stop");
     }
 
-    let reference = crate::shortnames::resolve_ollama_api(&args.model);
+    // default_tag as well as resolve_ollama_api: `/api/ps` reports the
+    // key the model is running under, which `ensure_model` always tags,
+    // so comparing a caller's bare `smollm2` or `docker.io/ai/smollm2`
+    // against `docker.io/ai/smollm2:latest` never matched and every
+    // tagless `llmman stop` failed with "couldn't find model to stop"
+    // while the model kept running. Same omission the unload handlers in
+    // cmd::serve had.
+    let reference =
+        crate::storage::default_tag(&crate::shortnames::resolve_ollama_api(&args.model));
 
     // The unload endpoint itself always reports success even when
     // nothing by that name was running (canonical_ref falls back
