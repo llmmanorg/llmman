@@ -1377,9 +1377,10 @@ fn resolve_keep_alive(value: &Option<serde_json::Value>) -> Option<Duration> {
 /// unload sentinel, in any of the zero forms `parse_keep_alive_value`
 /// accepts. Deliberately not [`resolve_keep_alive`], which falls back to
 /// [`default_keep_alive`] when the field is absent: under
-/// `LLMMAN_KEEP_ALIVE=0` that fallback made every message-less preload
-/// resolve to zero and answer `"unload"`, so a caller asking to warm a
-/// model got it evicted instead. An unparseable value stays a non-unload
+/// `LLMMAN_KEEP_ALIVE=0` that fallback made a message-less preload
+/// naming no `keep_alive` of its own resolve to zero and answer
+/// `"unload"`, so a caller asking to warm a model got it evicted
+/// instead. An unparseable value stays a non-unload
 /// here for the same reason it stays one in `resolve_keep_alive` — the
 /// daemon default decides how long to keep it, not whether to keep it.
 fn is_explicit_unload(keep_alive: &Option<serde_json::Value>) -> bool {

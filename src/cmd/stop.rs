@@ -33,12 +33,12 @@ pub fn run(args: &StopArgs) -> anyhow::Result<()> {
     }
 
     // default_tag as well as resolve_ollama_api: `/api/ps` reports the
-    // key the model is running under, which `ensure_model` always tags,
-    // so comparing a caller's bare `smollm2` or `docker.io/ai/smollm2`
-    // against `docker.io/ai/smollm2:latest` never matched and every
-    // tagless `llmman stop` failed with "couldn't find model to stop"
-    // while the model kept running. Same omission the unload handlers in
-    // cmd::serve had.
+    // keys of `mgr.running`, and `ensure_model` tags a reference before
+    // inserting one, so comparing a caller's bare `smollm2` or
+    // `docker.io/ai/smollm2` against the `docker.io/ai/smollm2:latest`
+    // sitting there never matched, and a tagless `llmman stop` failed
+    // with "couldn't find model to stop" while the model kept running.
+    // Same omission the unload handlers in cmd::serve had.
     let reference =
         crate::storage::default_tag(&crate::shortnames::resolve_ollama_api(&args.model));
 
