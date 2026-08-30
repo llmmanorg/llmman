@@ -1,8 +1,8 @@
 //! Resolving a HuggingFace file's metadata (digest/size/Xet hash) ahead
 //! of downloading it, and downloading it — via `hf-xet` when it's
 //! Xet-backed (see `crate::xet_fetch`), a plain ranged HTTP GET
-//! otherwise. Rust port of go-shim/hf.go's `hfHeadMetadata`/
-//! `downloadAttempt`/`downloadHFBlobAttempts`.
+//! otherwise. Originally ported from the Go shim's `hfHeadMetadata`/
+//! `downloadAttempt`/`downloadHFBlobAttempts`, since deleted.
 
 use std::io::Write;
 

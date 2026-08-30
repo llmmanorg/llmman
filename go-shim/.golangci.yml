@@ -8,7 +8,9 @@
 # `unused` is why this exists: Go rejects an unused local but accepts an
 # unused package-level func, so dead code accumulates invisibly — as the
 # HuggingFace fetch path did, staying compiled long after Rust took over
-# every ref that could reach it.
+# every ref that could reach it. It has since earned its keep twice more,
+# catching the ms:///ngc:///s3:///gs:///local-path source handlers and
+# the staging-transfer manifest lookup the same way.
 #
 # --tests=false matters, because a func whose only caller is its own test
 # otherwise counts as used. -D unused on the podman view matters because

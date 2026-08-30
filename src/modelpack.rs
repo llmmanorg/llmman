@@ -275,6 +275,15 @@ fn extract_safetensors_dir(
         let Some(rel_path) = layer_filepath(layer) else {
             continue;
         };
+        // The annotation came from whatever produced the manifest, so it
+        // is not this process's to trust: joining "../../id_rsa" onto
+        // cache_dir would escape it and overwrite an arbitrary file.
+        // `crate::sources` rejects these at pack time; this covers a
+        // layer already in the store, or pulled by any other path.
+        if !crate::sources::is_safe_relative_path(rel_path) {
+            eprintln!("[llmman] skipping layer with unsafe filepath {rel_path:?}");
+            continue;
+        }
         let dest = cache_dir.join(rel_path);
         if dest.exists() {
             continue;

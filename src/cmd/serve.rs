@@ -559,7 +559,14 @@ enum ModelProcess {
     // `child.id()` at drop time: `is_alive`'s `try_wait` reaps the child
     // once it exits, after which `child.id()` returns `None` — losing the
     // only pid needed to SIGKILL an `Engine::Vllm` group in Drop below.
-    Local(Engine, tokio::process::Child, Option<u32>),
+    // Only ever read there, so it is genuinely dead on Windows, which has
+    // no process group to signal; carrying it on every platform beats
+    // cfg-ing the variant's shape at all ten construction/match sites.
+    Local(
+        Engine,
+        tokio::process::Child,
+        #[cfg_attr(not(unix), allow(dead_code))] Option<u32>,
+    ),
     Container(crate::container::ContainerManager, tokio::process::Child),
 }
 
@@ -1452,10 +1459,10 @@ fn parse_keep_alive_str(s: &str) -> Option<Option<Duration>> {
             (num * 3600.0, t)
         } else if let Some(t) = tail.strip_prefix('m') {
             (num * 60.0, t)
-        } else if let Some(t) = tail.strip_prefix('s') {
-            (num, t)
         } else {
-            return None;
+            // "s" is the only suffix left; anything else (or nothing at
+            // all) makes the whole component unparseable.
+            (num, tail.strip_prefix('s')?)
         };
         // A component that individually overflows Duration (e.g. a huge
         // digit string like "999999999999999s"), or that overflows once
@@ -1689,14 +1696,17 @@ async fn spawn_llama_server(
     bin: &Path,
     model: &Path,
     mmproj: Option<&Path>,
-    port: u16,
-    ctx_size: Option<u32>,
-    flash_attention: Option<&str>,
-    kv_cache_type: Option<&str>,
-    context_shift: bool,
-    split_mode: Option<&str>,
-    num_parallel: Option<u32>,
+    opts: crate::container::LlamaOptions<'_>,
 ) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
+    let crate::container::LlamaOptions {
+        port,
+        ctx_size,
+        flash_attention,
+        kv_cache_type,
+        context_shift,
+        split_mode,
+        num_parallel,
+    } = opts;
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args([
         "--model",
@@ -2078,9 +2088,11 @@ async fn acquire_load_lock(model: &str) -> LoadLockGuard {
 /// Must be called from a blocking context (`spawn_blocking`): blocks the
 /// current thread on model's lock, not just this async task.
 ///
-/// A HuggingFace reference now pulls entirely in Rust (`crate::hf::pull`,
-/// see its own doc comment for why) straight into the local OCI layout;
-/// everything else still goes through the Go shim exactly as before.
+/// A HuggingFace reference pulls entirely in Rust (`crate::hf::pull`,
+/// see its own doc comment for why) straight into the local OCI layout,
+/// as do the `ms://`/`ngc://`/`s3://`/`gs://`/local-path sources
+/// (`crate::sources`); only an actual OCI registry still goes through
+/// the Go shim.
 fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<()> {
     let lock = model_lock(model);
     let result = (|| {
@@ -2101,6 +2113,9 @@ fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<
             match crate::hf::classify(model).await {
                 crate::hf::ClassifiedRef::Hf(reference) => {
                     crate::hf::pull::pull(&reference, store_path, model).await
+                }
+                crate::hf::ClassifiedRef::Source(reference) => {
+                    crate::sources::pull(&reference, store_path, model).await
                 }
                 crate::hf::ClassifiedRef::Other(normalized) => {
                     crate::ffi::pull(&normalized, layout_dir)
@@ -2803,6 +2818,18 @@ async fn ensure_model(
         // See backend_ctx_size's doc comment — the value actually
         // forwarded as --ctx-size, scaled up for num_parallel.
         let scaled_ctx_size = backend_ctx_size(ctx_size, num_parallel);
+        // Resolved once here, then forwarded verbatim to whichever of
+        // the two llama-server spawners this load ends up using — see
+        // container::LlamaOptions.
+        let llama_opts = crate::container::LlamaOptions {
+            port,
+            ctx_size: scaled_ctx_size,
+            flash_attention: state.0.flash_attention.as_deref(),
+            kv_cache_type: state.0.kv_cache_type.as_deref(),
+            context_shift,
+            split_mode,
+            num_parallel,
+        };
         // Only a local llama-server child captures a stderr tail (see
         // spawn_llama_server) — every retry below only fires for that case.
         let mut stderr_tail: Option<OutputTail> = None;
@@ -2813,31 +2840,14 @@ async fn ensure_model(
                     ociman,
                     path,
                     mmproj.as_deref(),
-                    port,
                     state.0.llama_cpp_version.as_deref(),
-                    scaled_ctx_size,
-                    state.0.flash_attention.as_deref(),
-                    state.0.kv_cache_type.as_deref(),
-                    context_shift,
-                    split_mode,
-                    num_parallel,
+                    llama_opts,
                 )?,
             ),
             (ModelPath::Gguf(path, mmproj), None) => {
                 let bin = local_llama_server_bin(state).await?;
-                let (child, tail) = spawn_llama_server(
-                    &bin,
-                    path,
-                    mmproj.as_deref(),
-                    port,
-                    scaled_ctx_size,
-                    state.0.flash_attention.as_deref(),
-                    state.0.kv_cache_type.as_deref(),
-                    context_shift,
-                    split_mode,
-                    num_parallel,
-                )
-                .await?;
+                let (child, tail) =
+                    spawn_llama_server(&bin, path, mmproj.as_deref(), llama_opts).await?;
                 stderr_tail = Some(tail);
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }

@@ -24,33 +24,28 @@ pub struct TransferArgs {
 ///
 /// The motivating case is HuggingFace → OCI registry —
 /// `llmman transfer hf.co/owner/model registry.example.com/owner/model` —
-/// but any source the Go shim's pull path understands (an OCI registry,
-/// `hf://`, `ms://`, ...) can be paired with any OCI registry destination.
+/// but any source `llmman pull` understands (an OCI registry, `hf://`,
+/// `ms://`, ...) can be paired with any OCI registry destination.
 ///
-/// Unlike an earlier version of this command, the actual transfer — and the
-/// decision between streaming a blob straight through versus falling back
-/// to a throwaway local staging directory — lives entirely in the Go shim
-/// (`go-shim/transfer_docker.go` / `transfer_podman.go`), exactly the way
-/// `login`/`push`/`pull` already keep their real logic there. See those
-/// files for why: streaming a blob straight from source to destination
-/// only works once its digest is already known — for an OCI registry
-/// source that digest comes straight from the manifest, but for a
-/// HuggingFace source it needs a HEAD request against the file first (to
-/// learn its real content digest the same way, before streaming the GET
-/// response straight into the registry push), which only makes sense to
-/// implement where the registry push itself happens.
+/// Streaming a blob straight from source to destination only works once
+/// its digest is already known. For an OCI registry source that digest
+/// comes straight from the source manifest, so the whole transfer stays
+/// in the Go shim (`go-shim/transfer_docker.go` / `transfer_podman.go`),
+/// where the registry protocol lives. For a HuggingFace source it takes
+/// a HEAD request against each file first, which `crate::hf::transfer`
+/// does natively — `hf-xet`, needed for files too large for a plain HTTP
+/// GET to reliably serve, is Rust-only.
+///
+/// The remaining sources (`ms://`, `ngc://`, `s3://`, `gs://`, a local
+/// path) are generic file stores with no way to learn a file's content
+/// digest ahead of downloading it, so they can't stream at all: they
+/// stage through a throwaway local layout and push that — see
+/// `crate::sources::transfer`.
 ///
 /// This intentionally talks to the Go shim directly (like `login`/`logout`
 /// and `inspect --remote`) rather than through a running `llmman serve`
 /// daemon (like `pull`/`push`): a transfer never touches the daemon's
 /// persistent store, so there's no shared state to coordinate.
-///
-/// A HuggingFace source is now handled entirely in Rust — see
-/// `crate::hf::transfer` — since `hf-xet` (needed for files too large
-/// for a plain HTTP GET to reliably serve) is Rust-only; everything else
-/// (an actual OCI registry, or one of the `ms://`/`ngc://`/`s3://`/
-/// `gs://`/local-path sources) still goes through the Go shim exactly as
-/// before.
 pub fn run(args: &TransferArgs) -> anyhow::Result<()> {
     let source = crate::shortnames::resolve(&args.source);
     let destination = crate::shortnames::resolve(&args.destination);
@@ -60,6 +55,9 @@ pub fn run(args: &TransferArgs) -> anyhow::Result<()> {
         match crate::hf::classify(&source).await {
             ClassifiedRef::Hf(reference) => {
                 crate::hf::transfer::transfer(&reference, &destination).await
+            }
+            ClassifiedRef::Source(reference) => {
+                crate::sources::transfer(&reference, &destination).await
             }
             ClassifiedRef::Other(normalized) => ffi::transfer(&normalized, &destination),
         }

@@ -1,11 +1,14 @@
-//! HuggingFace Hub support: auth, host/ref classification, and (in
+//! HuggingFace Hub support: auth, reference classification, and (in
 //! `api`/`client`/`download`/`oci`/`pull`/`transfer`/`progress`) the
-//! full `pull`/`transfer` fetch path — ported from go-shim/hf.go to run
-//! natively, using `hf-xet` directly for Xet-backed files (see
-//! `crate::xet_fetch`). Only actual OCI-registry-protocol work
-//! (`push`/`inspect`, and `pull`/`transfer` for non-HF sources) still
-//! goes through the Go shim (`crate::ffi`), since that's the only part
-//! that needs containerd's/podman's Go libraries.
+//! full `pull`/`transfer` fetch path, run natively and using `hf-xet`
+//! directly for Xet-backed files (see `crate::xet_fetch`).
+//!
+//! [`classify`] below is where every reference is routed, once: to this
+//! module, to `crate::sources` (`ms://`, `ngc://`, `s3://`, `gs://`, a
+//! local directory), or to the Go shim (`crate::ffi`) — which is now
+//! reached only for actual OCI-registry-protocol work (`push`,
+//! `inspect`, and registry `pull`/`transfer`), the only part that needs
+//! containerd's/podman's Go libraries.
 //!
 //! Auth (this module): token storage/validation matches
 //! `huggingface_hub`'s own on-disk conventions, so a token saved by
@@ -205,11 +208,12 @@ pub fn logout() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Host/ref classification — Rust port of go-shim/hf.go's
-// isKnownOCIHost/isKnownHFHost/isOCIRegistry/isOCIHost, now the decision
-// point for whether `cmd::pull`/`cmd::transfer` handle a bare
-// "host/owner/repo[:tag]" ref natively (HuggingFace-compatible) or fall
-// through to the Go shim's registry client (an actual OCI registry).
+// Host/ref classification — the single decision point for which of
+// llmman's three pull/transfer implementations owns a reference. The Go
+// shim used to re-derive this for itself on the other side of the FFI
+// boundary, at the cost of a second /v2/ probe per pull; go-shim/
+// classify.go is what is left of that, and it now only rejects what
+// should never have reached it.
 // ---------------------------------------------------------------------------
 
 fn is_known_oci_host(host: &str) -> bool {
@@ -284,17 +288,20 @@ pub async fn is_oci_host(host: &str) -> bool {
     is_oci_registry(host).await
 }
 
-/// A reference this process should handle as a HuggingFace(-compatible)
-/// pull/transfer natively, vs. one that must still go through the Go
-/// shim's registry client (an actual OCI registry, or one of the
-/// still-Go-only `ms://`/`ngc://`/`s3://`/`gs://`/local-path sources).
+/// Which of llmman's three pull/transfer implementations owns a given
+/// reference.
 pub enum ClassifiedRef {
     /// A bare "host/owner/repo[:tag]" ref (`hf://`/`huggingface://`
     /// prefix already stripped, if present) whose host is
-    /// HuggingFace-compatible.
+    /// HuggingFace-compatible — handled by [`pull`]/[`transfer`].
     Hf(String),
-    /// Everything else, normalized (`:latest` defaulted in for a bare
-    /// ref with no scheme) exactly as `ffi::pull`/`ffi::transfer` expect it.
+    /// One of the `ms://`/`ngc://`/`s3://`/`gs://`/local-path sources —
+    /// handled by [`crate::sources`], verbatim (none of those reference
+    /// forms is tag-normalized).
+    Source(String),
+    /// An actual OCI Distribution registry, normalized (`:latest`
+    /// defaulted in) exactly as `ffi::pull`/`ffi::transfer` expect it —
+    /// the only kind still handled by the Go shim.
     Other(String),
 }
 
@@ -315,10 +322,15 @@ pub async fn classify(reference: &str) -> ClassifiedRef {
             });
         }
     }
-    // Every other explicit scheme (ms://, ngc://, s3://, gs://) and any
-    // local path (starting with "/") stay on the Go shim's existing
-    // dispatch — deliberately out of scope for this migration (see this
-    // module's own top doc comment).
+    // ms://, ngc://, s3://, gs:// and any local path (starting with
+    // "/") are now native too — see `crate::sources`, which owns
+    // exactly the set `sources::handles` names.
+    if crate::sources::handles(reference) {
+        return ClassifiedRef::Source(reference.to_string());
+    }
+    // Any *other* scheme is left verbatim for the Go shim to fail on
+    // with its own message, rather than being tag-normalized into
+    // something that looks like a registry reference here first.
     if reference.contains("://") || reference.starts_with('/') {
         return ClassifiedRef::Other(reference.to_string());
     }
@@ -355,8 +367,9 @@ pub fn hf_endpoint(host: &str) -> String {
 
 /// The HTTP client used for HuggingFace metadata requests (model info,
 /// file listing, HEAD digest probes) — a short total timeout suffices
-/// since these responses are small.
-fn api_client() -> Result<reqwest::Client> {
+/// since these responses are small. Shared with `crate::sources`, whose
+/// own listing APIs (ModelScope, NGC, GCS) have the same shape.
+pub(crate) fn api_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
@@ -366,8 +379,10 @@ fn api_client() -> Result<reqwest::Client> {
 /// The HTTP client used for actually downloading HuggingFace file
 /// content: no *total* deadline, so a large file can take as long as it
 /// needs, but `read_timeout` still times out an individual read that
-/// stalls, and `connect_timeout` a stalled connection attempt.
-fn download_client() -> Result<reqwest::Client> {
+/// stalls, and `connect_timeout` a stalled connection attempt. Shared
+/// with `crate::sources` — a ModelScope/NGC/GCS weight file needs the
+/// same "no total deadline, but do notice a stalled read" treatment.
+pub(crate) fn download_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .tcp_keepalive(Duration::from_secs(30))
@@ -436,11 +451,11 @@ mod tests {
     async fn classify_strips_hf_scheme_prefixes_and_defaults_the_host() {
         match classify("hf://owner/repo:tag").await {
             ClassifiedRef::Hf(r) => assert_eq!(r, "huggingface.co/owner/repo:tag"),
-            ClassifiedRef::Other(_) => panic!("expected Hf"),
+            _ => panic!("expected Hf"),
         }
         match classify("huggingface://owner/repo").await {
             ClassifiedRef::Hf(r) => assert_eq!(r, "huggingface.co/owner/repo"),
-            ClassifiedRef::Other(_) => panic!("expected Hf"),
+            _ => panic!("expected Hf"),
         }
     }
 
@@ -448,23 +463,35 @@ mod tests {
     async fn classify_leaves_an_explicit_host_after_the_hf_scheme_alone() {
         match classify("hf://modelscope.cn/owner/repo").await {
             ClassifiedRef::Hf(r) => assert_eq!(r, "modelscope.cn/owner/repo"),
-            ClassifiedRef::Other(_) => panic!("expected Hf"),
+            _ => panic!("expected Hf"),
         }
     }
 
     #[tokio::test]
-    async fn classify_leaves_other_schemes_and_local_paths_alone() {
+    async fn classify_routes_every_uri_scheme_source_and_local_path_to_sources() {
         for r in [
             "ms://owner/repo",
+            "modelscope://owner/repo",
             "ngc://org/team/model",
             "s3://bucket/key",
             "gs://bucket/key",
             "/abs/path",
         ] {
             match classify(r).await {
-                ClassifiedRef::Other(got) => assert_eq!(got, r),
-                ClassifiedRef::Hf(_) => panic!("expected Other for {r}"),
+                ClassifiedRef::Source(got) => assert_eq!(got, r),
+                _ => panic!("expected Source for {r}"),
             }
+        }
+    }
+
+    /// A scheme nothing implements must reach the Go shim verbatim, so
+    /// its error names what the user actually typed — not a `:latest`-
+    /// normalized rewrite of it.
+    #[tokio::test]
+    async fn classify_leaves_an_unknown_scheme_alone() {
+        match classify("wat://owner/repo").await {
+            ClassifiedRef::Other(got) => assert_eq!(got, "wat://owner/repo"),
+            _ => panic!("expected Other"),
         }
     }
 
@@ -472,7 +499,7 @@ mod tests {
     async fn classify_treats_a_known_registry_host_as_other() {
         match classify("docker.io/library/alpine").await {
             ClassifiedRef::Other(got) => assert_eq!(got, "docker.io/library/alpine:latest"),
-            ClassifiedRef::Hf(_) => panic!("expected Other"),
+            _ => panic!("expected Other"),
         }
     }
 
@@ -480,7 +507,7 @@ mod tests {
     async fn classify_treats_a_bare_hf_host_as_hf() {
         match classify("huggingface.co/owner/repo").await {
             ClassifiedRef::Hf(got) => assert_eq!(got, "huggingface.co/owner/repo:latest"),
-            ClassifiedRef::Other(_) => panic!("expected Hf"),
+            _ => panic!("expected Hf"),
         }
     }
 

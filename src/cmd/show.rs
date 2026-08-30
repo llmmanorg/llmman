@@ -309,8 +309,8 @@ fn find_license(
 /// it's a single-file tar (as every layer `llmman build` produces is —
 /// see `storage::oci::classify_model_layer`'s own doc comment), or else
 /// treating the whole blob as raw text (as HuggingFace/cloud-source pulls
-/// store un-archived doc/config blobs — see `go-shim/uri_sources.go`'s
-/// `classifyFile`).
+/// store un-archived doc/config blobs — see
+/// [`crate::sources::classify_file`]).
 fn read_layer_text(store: &OciStore, layer: &Descriptor) -> anyhow::Result<String> {
     let blob = store.read_blob(&layer.digest)?;
     if blob.len() >= 512 {

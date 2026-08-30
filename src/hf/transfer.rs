@@ -42,18 +42,21 @@ async fn via_temp_pull(reference: &str, destination: &str) -> Result<bool> {
         std::process::id(),
         rand_suffix()
     ));
-    // pull() stages the manifest under `reference` itself, not
-    // `destination` — doesn't matter which, since `ffi::push`'s own
-    // find_manifest_for_transfer fallback accepts "the store has
-    // exactly one entry" for exactly this kind of single-use directory.
-    let result = super::pull::pull(reference, &tmp, "").await.and_then(|()| {
-        crate::ffi::push(
-            tmp.to_str()
-                .context("temp layout path is not valid UTF-8")?,
-            destination,
-        )
-        .map(|_| true)
-    });
+    // pull() stages the manifest under `reference` itself, but
+    // `ffi::push` resolves what to push by an *exact* ref lookup — so
+    // the staged model has to also be findable under `destination`
+    // before the push can find it at all.
+    let result = super::pull::pull(reference, &tmp, "")
+        .await
+        .and_then(|()| super::oci::alias_manifest_ref(&tmp, reference, destination))
+        .and_then(|()| {
+            crate::ffi::push(
+                tmp.to_str()
+                    .context("temp layout path is not valid UTF-8")?,
+                destination,
+            )
+            .map(|_| true)
+        });
     let _ = std::fs::remove_dir_all(&tmp);
     result
 }
@@ -334,11 +337,11 @@ mod docker {
 
     /// Builds the CNCF model-spec config+manifest referencing `layers`
     /// and pushes both directly, without ever writing them to a local
-    /// layout — mirrors `buildCNCFManifest`, but via a throwaway local
-    /// layout purely to reuse its exact JSON construction (config/
-    /// manifest JSON is at most a few KB, so that local round trip costs
-    /// nothing measurable), then pushing those two blobs via
-    /// [`push_stream`] instead of leaving them on disk.
+    /// layout — the same JSON `oci::build_cncf_manifest` writes, reached
+    /// via a throwaway local layout purely to reuse its exact
+    /// construction (config/manifest JSON is at most a few KB, so that
+    /// local round trip costs nothing measurable), then pushing those two
+    /// blobs via [`push_stream`] instead of leaving them on disk.
     async fn push_cncf_manifest(
         session: &crate::ffi::PushSession,
         meta: &ModelMeta,

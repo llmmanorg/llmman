@@ -133,9 +133,9 @@ func blobExists(layoutDir string, desc ocispec.Descriptor) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Retry/stall-detection primitives shared by the remaining download and
-// transfer paths: the uri_sources.go source handlers (ModelScope, NGC, S3,
-// GCS) and transfer_docker.go's dockerTransferOCI (streamed straight into a
+// Retry/stall-detection primitives for the only download and transfer
+// paths left in this shim: backend_docker.go's pullToLayout, and
+// transfer_docker.go's dockerTransferOCI (streamed straight into a
 // registry push, NOT resumable — see transfer_docker.go's own comment on
 // why — so it retries a failed blob from scratch instead of resuming it).
 // ---------------------------------------------------------------------------

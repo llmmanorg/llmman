@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use flate2::write::GzEncoder;
@@ -11,7 +11,7 @@ use flate2::Compression;
 /// it as an MSVC-format LIB using lib.exe.  This is needed on Windows ARM64
 /// because Go uses GNU 'ar' when it can't identify the C compiler as cl.exe,
 /// but MSVC link.exe only accepts its own LIB format.
-fn repack_as_msvc_lib(lib_path: &PathBuf, out_dir: &PathBuf) {
+fn repack_as_msvc_lib(lib_path: &Path, out_dir: &Path) {
     let extract_dir = out_dir.join("ar_extract");
     let _ = fs::remove_dir_all(&extract_dir);
     if fs::create_dir_all(&extract_dir).is_err() {

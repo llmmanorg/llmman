@@ -200,6 +200,45 @@ pub fn pull_image(ociman: ContainerManager, llama_cpp_version: Option<&str>) -> 
     Ok(())
 }
 
+/// Every `llama-server` knob `cmd::serve` resolves once per load and
+/// forwards identically to both a local child
+/// (`cmd::serve::spawn_llama_server`) and a containerized one ([`spawn`]).
+/// One struct rather than seven repeated positional parameters, so
+/// adding a flag is a single edit that can't reach only one backend.
+#[derive(Debug, Clone, Copy)]
+pub struct LlamaOptions<'a> {
+    /// The loopback port llama-server binds, published out of the
+    /// container as `127.0.0.1:<port>:<port>`.
+    pub port: u16,
+
+    /// `--ctx-size`. `None` leaves it unset, falling back to the model's
+    /// own `n_ctx_train` — see `cmd::serve::context_length_from_env`'s
+    /// doc comment for what this does and doesn't guarantee.
+    pub ctx_size: Option<u32>,
+
+    /// `--flash-attn <mode>`. `None` falls back to llama-server's own
+    /// `auto` — see `cmd::serve::flash_attention_from_env`.
+    pub flash_attention: Option<&'a str>,
+
+    /// `--cache-type-k`/`--cache-type-v <type>` (both set together).
+    /// `None` falls back to llama-server's own `f16` — see
+    /// `cmd::serve::kv_cache_type_from_env`.
+    pub kv_cache_type: Option<&'a str>,
+
+    /// `--context-shift` when true, `--no-context-shift` when false —
+    /// always passed explicitly, never left to the default. See
+    /// `cmd::serve::context_shift_from_env`.
+    pub context_shift: bool,
+
+    /// `--split-mode <mode>`. `None` falls back to llama-server's own
+    /// `layer` — see `cmd::serve::sched_spread_from_env`.
+    pub split_mode: Option<&'a str>,
+
+    /// `--parallel <n>`. `None` falls back to llama-server's own single
+    /// slot — see `cmd::serve::num_parallel_from_env`.
+    pub num_parallel: Option<u32>,
+}
+
 /// Callers must stop this gracefully (SIGTERM, not the default
 /// `Child::kill()`/`kill_on_drop`, which sends SIGKILL) — see
 /// `cmd::serve::ModelProcess`'s Drop impl. SIGKILL cannot be caught or
@@ -209,22 +248,8 @@ pub fn pull_image(ociman: ContainerManager, llama_cpp_version: Option<&str>) -> 
 /// `llama_cpp_version`, when given, pins the image to that release tag
 /// (see [`GpuBackend::image_ref`]) instead of the floating one.
 ///
-/// `ctx_size`, when given, is forwarded as `--ctx-size` to the
-/// containerized `llama-server` — see
-/// `cmd::serve::context_length_from_env`'s doc comment for what this
-/// does and doesn't guarantee.
-///
-/// `flash_attention` and `kv_cache_type`, when given, are forwarded the
-/// same way as `--flash-attn <mode>` and `--cache-type-k`/`--cache-type-v
-/// <type>` respectively — see `cmd::serve::flash_attention_from_env` and
-/// `cmd::serve::kv_cache_type_from_env`'s doc comments.
-///
-/// `context_shift` forwards `--context-shift`/`--no-context-shift`.
-///
-/// `split_mode`, when given, forwards `--split-mode <mode>`.
-///
-/// `num_parallel`, when given, forwards `--parallel <n>` — see
-/// `cmd::serve::num_parallel_from_env`'s doc comment.
+/// `opts` carries every `llama-server` flag this forwards into the
+/// container — see [`LlamaOptions`].
 ///
 /// `mmproj_path`, when given, forwards `--mmproj <path>`, mounted as its
 /// own `/mmproj` read-only volume (it's extracted into a different cache
@@ -233,15 +258,18 @@ pub fn spawn(
     ociman: ContainerManager,
     model_path: &Path,
     mmproj_path: Option<&Path>,
-    port: u16,
     llama_cpp_version: Option<&str>,
-    ctx_size: Option<u32>,
-    flash_attention: Option<&str>,
-    kv_cache_type: Option<&str>,
-    context_shift: bool,
-    split_mode: Option<&str>,
-    num_parallel: Option<u32>,
+    opts: LlamaOptions<'_>,
 ) -> Result<tokio::process::Child> {
+    let LlamaOptions {
+        port,
+        ctx_size,
+        flash_attention,
+        kv_cache_type,
+        context_shift,
+        split_mode,
+        num_parallel,
+    } = opts;
     let backend = detect_backend();
     let image = backend.image_ref(llama_cpp_version);
     eprintln!(

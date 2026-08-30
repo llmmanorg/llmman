@@ -1,12 +1,16 @@
-//! Local OCI layout types and read/write helpers — Rust port of
-//! go-shim/shared_oci.go's blob helpers, manifest_ref.go, and hf.go's
-//! CNCF ModelPack manifest construction (`buildCNCFManifest` etc.).
+//! Local OCI layout types and read/write helpers — a Rust equivalent of
+//! go-shim/shared_oci.go's blob helpers and manifest_ref.go, plus the
+//! CNCF ModelPack manifest construction the Go shim's own (since
+//! deleted) `buildCNCFManifest` used to do.
 //!
-//! Writes the exact same on-disk format Go's `build`/`tag`/`push`/
-//! `list`/`run`/`serve` already read and write (content-addressed
-//! `blobs/<alg>/<hex>`, `manifests/<ref>` pointer files, `oci-layout`) —
-//! a from-scratch equivalent, not a replacement, so a Rust-native HF
-//! pull never needs to call into Go.
+//! Writes the exact same on-disk format Go's `push`/`inspect` and
+//! `crate::storage`'s `build`/`tag`/`list`/`run`/`serve` already read
+//! and write (content-addressed `blobs/<alg>/<hex>`, `manifests/<ref>`
+//! pointer files, `oci-layout`) — a from-scratch equivalent, not a
+//! replacement, so a native pull never needs to call into Go.
+//!
+//! Shared with `crate::sources`, which stores the ModelScope/NGC/S3/GCS/
+//! local-directory sources in exactly this format too.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -81,6 +85,10 @@ pub const MEDIA_TYPE_MODEL_WEIGHT_RAW: &str = "application/vnd.cncf.model.weight
 pub const MEDIA_TYPE_MODEL_WEIGHT_CONFIG_RAW: &str =
     "application/vnd.cncf.model.weight.config.v1.raw";
 pub const MEDIA_TYPE_MODEL_DOC_RAW: &str = "application/vnd.cncf.model.doc.v1.raw";
+/// Inference/handler scripts shipped alongside the weights. Only
+/// `crate::sources` produces these — a HuggingFace repo's `.py` files
+/// aren't among the ones `select_downloadable_hf_files` fetches.
+pub const MEDIA_TYPE_MODEL_CODE_RAW: &str = "application/vnd.cncf.model.code.v1.raw";
 pub const ANNOTATION_FILEPATH: &str = "org.cncf.model.filepath";
 
 #[derive(Serialize, Default)]
@@ -192,6 +200,12 @@ pub fn build_cncf_manifest(
 // writeBlobStream/blobExists.
 // ---------------------------------------------------------------------------
 
+/// Process-wide, so no two temp paths written here can ever collide.
+fn next_counter() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn digest_to_path(layout_dir: &Path, digest: &str) -> Result<PathBuf> {
     let (alg, hex) = digest
         .split_once(':')
@@ -232,9 +246,7 @@ pub fn write_blob(layout_dir: &Path, media_type: &str, data: &[u8]) -> Result<De
     // A counter, not a name derived from the digest: two concurrent
     // writes of byte-identical content (same digest) would otherwise
     // share a tmp path and could truncate each other mid-write.
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!("{}-{unique}.tmp", std::process::id()));
+    let tmp = dir.join(format!("{}-{}.tmp", std::process::id(), next_counter()));
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(data)?;
@@ -246,6 +258,91 @@ pub fn write_blob(layout_dir: &Path, media_type: &str, data: &[u8]) -> Result<De
         size: data.len() as i64,
         ..Default::default()
     })
+}
+
+/// Stores a file already on local disk as a blob, hashing a chunk at a
+/// time rather than reading it whole into memory — the input here is a
+/// multi-gigabyte safetensors shard.
+///
+/// `consume` moves the file in (a temp file this process owns and that
+/// nothing else can be writing). Otherwise it is copied and hashed in
+/// one pass into a temp file, so the bytes stored under the returned
+/// digest are the exact bytes that were hashed even if the caller's own
+/// file changes underneath; either way that file is left untouched.
+///
+/// A file whose digest is already stored costs nothing to re-offer, so
+/// the caller still owns any staging file after this returns.
+pub fn write_blob_from_file(
+    layout_dir: &Path,
+    media_type: &str,
+    path: &Path,
+    consume: bool,
+) -> Result<Descriptor> {
+    let dir = layout_dir.join("blobs").join("sha256");
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!("{}-{}.tmp", std::process::id(), next_counter()));
+    let mut source =
+        std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+
+    // Owning the file means nobody else is writing it, so hashing it
+    // where it lies and then renaming is safe — and free.
+    let (size, staged) = if consume {
+        let size = std::io::copy(&mut source, &mut hasher)
+            .with_context(|| format!("hash {}", path.display()))?;
+        (size, path.to_path_buf())
+    } else {
+        let mut out = std::fs::File::create(&tmp)?;
+        let size = std::io::copy(&mut source, &mut HashingWriter(&mut out, &mut hasher))
+            .with_context(|| format!("copy {} into the blob store", path.display()))?;
+        (size, tmp.clone())
+    };
+    drop(source);
+    let digest = format!("sha256:{:x}", hasher.finalize());
+    let dest = dir.join(digest.trim_start_matches("sha256:"));
+
+    // Content-addressed, so an existing blob of this digest already
+    // holds exactly these bytes. Renaming (never writing to `dest`
+    // directly) is what keeps a concurrent writer of the same digest
+    // from ever seeing a half-written blob at its final path.
+    if !dest.exists() {
+        match std::fs::rename(&staged, &dest) {
+            Ok(()) => {}
+            // A sibling won the race and published the identical blob
+            // first; POSIX overwrites silently, Windows errors.
+            Err(_) if dest.exists() => {}
+            Err(e) => {
+                if !consume {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                return Err(e).with_context(|| format!("publish blob for {}", path.display()));
+            }
+        }
+    }
+    if !consume {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(Descriptor {
+        media_type: media_type.to_string(),
+        digest,
+        size: size as i64,
+        ..Default::default()
+    })
+}
+
+/// Tees writes into a hasher, so a copy hashes exactly the bytes it
+/// stores rather than re-reading the source a second time.
+struct HashingWriter<'a>(&'a mut std::fs::File, &'a mut Sha256);
+
+impl std::io::Write for HashingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.0.write(buf)?;
+        self.1.update(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -315,16 +412,29 @@ pub fn write_manifest_ref(
     std::fs::create_dir_all(dir)?;
     let data = serde_json::to_vec_pretty(&manifest_desc)?;
 
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(
-        "{}.{}-{unique}.tmp",
+        "{}.{}-{}.tmp",
         path.file_name().unwrap().to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        next_counter()
     ));
     std::fs::write(&tmp, &data)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+/// Records `alias` as a second name for whatever `reference` already
+/// points at. Needed when staging a pull into a throwaway layout that is
+/// then pushed under a *different* reference: `llmman_push` resolves the
+/// manifest by an exact ref lookup, so the staged model has to be
+/// findable under the destination's own name.
+pub fn alias_manifest_ref(layout_dir: &Path, reference: &str, alias: &str) -> Result<()> {
+    if alias == reference {
+        return Ok(());
+    }
+    let desc = read_manifest_ref(layout_dir, reference)
+        .with_context(|| format!("read staged manifest for {reference}"))?;
+    write_manifest_ref(layout_dir, alias, desc)
 }
 
 /// Initializes the OCI layout marker files and `manifests/` directory if
@@ -415,6 +525,59 @@ mod tests {
         assert_eq!(desc.size, 11);
         assert!(blob_exists(&dir, &desc));
         assert_eq!(read_blob(&dir, &desc.digest).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn write_blob_from_file_moves_a_file_it_owns_and_copies_one_it_does_not() {
+        let dir = tempfile();
+        let src = dir.join("weights.safetensors");
+        std::fs::write(&src, b"weights").unwrap();
+
+        let copied = write_blob_from_file(&dir, MEDIA_TYPE_MODEL_WEIGHT_RAW, &src, false).unwrap();
+        assert_eq!(copied.size, 7);
+        assert!(
+            src.exists(),
+            "consume=false must leave a user's own file alone"
+        );
+        assert_eq!(read_blob(&dir, &copied.digest).unwrap(), b"weights");
+
+        // Same content, so the blob already exists and nothing is
+        // written — but the caller still owns the staging file.
+        let staged = dir.join("staged.part");
+        std::fs::write(&staged, b"weights").unwrap();
+        let moved = write_blob_from_file(&dir, MEDIA_TYPE_MODEL_WEIGHT_RAW, &staged, true).unwrap();
+        assert_eq!(moved.digest, copied.digest);
+
+        // Distinct content: consume=true really does move it away.
+        let staged2 = dir.join("staged2.part");
+        std::fs::write(&staged2, b"other weights").unwrap();
+        let moved2 =
+            write_blob_from_file(&dir, MEDIA_TYPE_MODEL_WEIGHT_RAW, &staged2, true).unwrap();
+        assert!(!staged2.exists(), "consume=true must move, not copy");
+        assert_eq!(read_blob(&dir, &moved2.digest).unwrap(), b"other weights");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn alias_manifest_ref_makes_a_staged_pull_findable_under_another_name() {
+        let dir = tempfile();
+        ensure_layout(&dir).unwrap();
+        let desc = Descriptor {
+            media_type: MEDIA_TYPE_IMAGE_MANIFEST.to_string(),
+            digest: "sha256:abc".to_string(),
+            size: 3,
+            ..Default::default()
+        };
+        write_manifest_ref(&dir, "s3://bucket/model:latest", desc).unwrap();
+        alias_manifest_ref(&dir, "s3://bucket/model:latest", "ghcr.io/me/model:v1").unwrap();
+        assert_eq!(
+            read_manifest_ref(&dir, "ghcr.io/me/model:v1")
+                .unwrap()
+                .digest,
+            "sha256:abc"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

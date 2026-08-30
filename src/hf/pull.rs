@@ -1,6 +1,7 @@
-//! Top-level HuggingFace pull — the Rust port of go-shim/hf.go's
-//! `pullHF`/`pullHFSafetensors`/`downloadHFBlob`, now writing straight
-//! into the local OCI layout without ever calling into the Go shim.
+//! Top-level HuggingFace pull — originally ported from the Go shim's
+//! `pullHF`/`pullHFSafetensors`/`downloadHFBlob` (since deleted), and
+//! writing straight into the local OCI layout without ever calling into
+//! the Go shim.
 
 use std::collections::BTreeMap;
 use std::io::Write;

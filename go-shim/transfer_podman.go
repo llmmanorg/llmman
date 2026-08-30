@@ -12,10 +12,10 @@
 // see copy/copy.go upstream); there's nothing llmman needs to add on top
 // for that case.
 //
-// go.podman.io/image has no ms:///ngc:///s3:///gs:///local-path source
-// transport, though, so those fall back to staging through a throwaway
-// local OCI layout — pull, then push from it. A HuggingFace source never
-// reaches here: it is handled in Rust (src/hf/transfer.rs).
+// No other source kind reaches this file: a HuggingFace source is
+// handled in Rust (src/hf/transfer.rs), and so are the ms://, ngc://,
+// s3://, gs:// and local-path sources (src/sources) — which is just as
+// well, since go.podman.io/image has no transport for any of them.
 package main
 
 import (
@@ -34,14 +34,11 @@ func podmanTransfer(ctx context.Context, source, destination string) (changed bo
 	// See transfer_docker.go's dockerTransfer for why a tagless
 	// destination must default to :latest explicitly here.
 	destination = normalizeTag(destination)
-	kind, normalized := classifySource(ctx, source)
-	if kind == sourceOCI {
-		return podmanTransferOCI(ctx, normalized, destination)
+	normalized, err := classifySource(source)
+	if err != nil {
+		return false, err
 	}
-	if kind == sourceHF {
-		return false, errHFNotHandledHere(normalized)
-	}
-	return transferViaStaging(ctx, source, destination)
+	return podmanTransferOCI(ctx, normalized, destination)
 }
 
 // podmanTransferOCI streams directly between two registries via

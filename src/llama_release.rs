@@ -31,6 +31,10 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 use crate::fmt::human_size;
+// Only the Linux/Windows arms of `asset_query` below branch on the
+// detected accelerator; macOS publishes exactly one asset per
+// architecture, so this would be an unused import there.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::hostgpu::HostGpu;
 
 const REPO_API: &str = "https://api.github.com/repos/ggml-org/llama.cpp";
@@ -214,7 +218,7 @@ fn asset_query() -> AssetQuery {
 
     #[cfg(target_os = "macos")]
     {
-        return if std::env::consts::ARCH == "aarch64" {
+        if arch == "arm64" {
             AssetQuery {
                 must_contain: "-bin-macos-arm64.tar.gz".into(),
                 companion_must_contain: None,
@@ -226,7 +230,7 @@ fn asset_query() -> AssetQuery {
                 companion_must_contain: None,
                 label: "cpu".into(),
             }
-        };
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -266,7 +270,7 @@ fn asset_query() -> AssetQuery {
 
     #[cfg(target_os = "windows")]
     {
-        return match crate::hostgpu::detect() {
+        match crate::hostgpu::detect() {
             HostGpu::Cuda { major } => {
                 // llama.cpp publishes CUDA 12.4 and 13.3 for x64, and a
                 // 13.4 "preview" build for arm64 (no CUDA 12 on arm64) —
@@ -301,7 +305,7 @@ fn asset_query() -> AssetQuery {
                 companion_must_contain: None,
                 label: "cpu".into(),
             },
-        };
+        }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]

@@ -143,47 +143,13 @@ func writeManifestRef(layoutDir, ref string, manifestDesc ocispec.Descriptor) er
 	return nil
 }
 
-// listManifestRefs walks manifests/ and returns every stored manifest
-// descriptor (each still carrying its own ref name in
-// ocispec.AnnotationRefName). A single unreadable or unparsable entry is
-// skipped rather than failing the whole walk.
-func listManifestRefs(layoutDir string) ([]ocispec.Descriptor, error) {
-	root := filepath.Join(layoutDir, manifestsDirName)
-	var out []ocispec.Descriptor
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			// An unreadable subtree must not hide every other model —
-			// skip it (SkipDir if it's a directory WalkDir already
-			// found, otherwise just this one entry) rather than failing
-			// the whole walk.
-			if d != nil && d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if d.IsDir() || strings.HasSuffix(path, ".tmp") {
-			return nil
-		}
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return nil
-		}
-		var desc ocispec.Descriptor
-		if jsonErr := json.Unmarshal(data, &desc); jsonErr != nil {
-			return nil
-		}
-		out = append(out, desc)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// findManifestForPush resolves ref to a manifest descriptor for a
-// user-initiated llmman_push: an exact match only. A mistyped ref must
-// error, never silently guess at some other locally stored model.
+// findManifestForPush resolves ref to a manifest descriptor for
+// llmman_push: an exact match only. A mistyped ref must error, never
+// silently guess at some other locally stored model — which is also why
+// the staged-transfer callers (crate::sources::transfer, and
+// crate::hf::transfer's podman fallback) record the staged model under
+// the *destination* reference before pushing it, rather than relying on
+// a "the store has exactly one entry" fallback here.
 func findManifestForPush(layoutDir, ref string) (ocispec.Descriptor, error) {
 	desc, err := readManifestRef(layoutDir, ref)
 	if err != nil {
@@ -193,22 +159,6 @@ func findManifestForPush(layoutDir, ref string) (ocispec.Descriptor, error) {
 		return ocispec.Descriptor{}, fmt.Errorf("read manifest for %q: %w", ref, err)
 	}
 	return desc, nil
-}
-
-// findManifestForTransfer is findManifestForPush plus a fallback to "the
-// store has exactly one entry", safe only for llmman_transfer's staging
-// directory (transfer_common.go's transferViaStaging), which pulls
-// exactly one model into a fresh, single-use directory under a possibly
-// different ref than the one it's then pushed under.
-func findManifestForTransfer(layoutDir, ref string) (ocispec.Descriptor, error) {
-	if desc, err := readManifestRef(layoutDir, ref); err == nil {
-		return desc, nil
-	}
-	refs, err := listManifestRefs(layoutDir)
-	if err != nil || len(refs) != 1 {
-		return ocispec.Descriptor{}, fmt.Errorf("no manifest found for %q", ref)
-	}
-	return refs[0], nil
 }
 
 // ensureLayout initialises the OCI layout marker files and manifests/

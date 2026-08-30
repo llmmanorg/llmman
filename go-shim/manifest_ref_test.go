@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -151,21 +150,15 @@ func TestConcurrentWriteManifestRefIsSafeAcrossDistinctRefs(t *testing.T) {
 		t.Error(err)
 	}
 
-	refs, err := listManifestRefs(dir)
-	if err != nil {
-		t.Fatalf("listManifestRefs: %v", err)
-	}
-	if len(refs) != n {
-		t.Fatalf("got %d manifests after %d concurrent writes, want %d (lost a concurrent write)", len(refs), n, n)
-	}
-	seen := make(map[string]bool, n)
-	for _, m := range refs {
-		seen[m.Annotations[ocispec.AnnotationRefName]] = true
-	}
 	for i := 0; i < n; i++ {
 		ref := fmt.Sprintf("docker.io/ai/model-%d:latest", i)
-		if !seen[ref] {
-			t.Errorf("manifest for %s missing from listManifestRefs", ref)
+		desc, err := readManifestRef(dir, ref)
+		if err != nil {
+			t.Errorf("readManifestRef(%s) after %d concurrent writes: %v (lost a concurrent write)", ref, n, err)
+			continue
+		}
+		if want := digest.FromString(ref); desc.Digest != want {
+			t.Errorf("readManifestRef(%s) = %s, want %s", ref, desc.Digest, want)
 		}
 	}
 }
@@ -216,11 +209,13 @@ func TestFindManifestForPushMatchesExactRefFirst(t *testing.T) {
 	}
 }
 
-// TestFindManifestForPushRejectsAMismatchedRef checks the direct,
-// user-facing push path never guesses: a mistyped/mismatched ref must
-// error rather than silently pushing whatever else happens to be the
-// only thing in the store (findManifestForTransfer, not
-// findManifestForPush, is for that — see the next test).
+// TestFindManifestForPushRejectsAMismatchedRef checks the push path
+// never guesses: a mistyped/mismatched ref must error rather than
+// silently pushing whatever else happens to be the only thing in the
+// store. A staged transfer, which legitimately pulls under one ref and
+// pushes under another, records the staged model under the destination
+// ref first (crate::sources::transfer) rather than relying on any
+// fallback here.
 func TestFindManifestForPushRejectsAMismatchedRef(t *testing.T) {
 	dir := t.TempDir()
 	ref := "docker.io/ai/qwen3.5:0.8b"
@@ -254,43 +249,6 @@ func TestFindManifestForPushDistinguishesBrokenFromMissing(t *testing.T) {
 	}
 }
 
-// TestFindManifestForTransferFallsBackToSoleEntry covers llmman
-// transfer's staging fallback (transfer_common.go's transferViaStaging):
-// it pulls under one ref and pushes under a different one, so this must
-// still resolve when the (single-use) staging directory has exactly one
-// (differently-named) entry.
-func TestFindManifestForTransferFallsBackToSoleEntry(t *testing.T) {
-	dir := t.TempDir()
-	ref := "docker.io/ai/qwen3.5:0.8b"
-	desc := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageManifest, Digest: digest.FromString(ref), Size: 42}
-	if err := writeManifestRef(dir, ref, desc); err != nil {
-		t.Fatalf("writeManifestRef: %v", err)
-	}
-
-	got, err := findManifestForTransfer(dir, "ghcr.io/someone/else:v1")
-	if err != nil {
-		t.Fatalf("findManifestForTransfer: %v", err)
-	}
-	if got.Digest != desc.Digest {
-		t.Fatalf("got digest %s, want %s", got.Digest, desc.Digest)
-	}
-}
-
-// TestFindManifestForTransferErrorsWithMultipleUnrelatedEntries checks
-// the sole-entry fallback doesn't guess when there's genuine ambiguity.
-func TestFindManifestForTransferErrorsWithMultipleUnrelatedEntries(t *testing.T) {
-	dir := t.TempDir()
-	for _, ref := range []string{"docker.io/ai/qwen3.5:0.8b", "docker.io/ai/gemma4:latest"} {
-		desc := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageManifest, Digest: digest.FromString(ref), Size: 1}
-		if err := writeManifestRef(dir, ref, desc); err != nil {
-			t.Fatalf("writeManifestRef: %v", err)
-		}
-	}
-	if _, err := findManifestForTransfer(dir, "ghcr.io/someone/else:v1"); err == nil {
-		t.Fatalf("expected an error with two unrelated stored entries and no exact match")
-	}
-}
-
 // TestWriteManifestRefWithAnEmptyTagDoesNotBreakOtherTags is a
 // regression test: writing a ref with an empty tag ("repo:") must not
 // clobber the repo's own directory, or every subsequent tag of that
@@ -308,34 +266,5 @@ func TestWriteManifestRefWithAnEmptyTagDoesNotBreakOtherTags(t *testing.T) {
 	}
 	if got, err := readManifestRef(dir, "docker.io/ai/x:latest"); err != nil || got.Digest != latest.Digest {
 		t.Fatalf("readManifestRef(docker.io/ai/x:latest) = %+v, %v", got, err)
-	}
-}
-
-// TestListManifestRefsSkipsAnUnreadableSubtree is a regression test: one
-// unreadable directory under manifests/ (e.g. permission denied) must not
-// hide every other model.
-func TestListManifestRefsSkipsAnUnreadableSubtree(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("chmod-based permission denial isn't portable to Windows")
-	}
-	dir := t.TempDir()
-	if err := writeManifestRef(dir, "docker.io/ai/ok:latest", ocispec.Descriptor{Digest: digest.FromString("ok")}); err != nil {
-		t.Fatalf("writeManifestRef: %v", err)
-	}
-	blocked := filepath.Join(dir, manifestsDirName, "unreadable")
-	if err := os.MkdirAll(blocked, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(blocked, 0); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chmod(blocked, 0o755) // restore so t.TempDir() cleanup can remove it
-
-	refs, err := listManifestRefs(dir)
-	if err != nil {
-		t.Fatalf("listManifestRefs: %v", err)
-	}
-	if len(refs) != 1 || refs[0].Annotations[ocispec.AnnotationRefName] != "docker.io/ai/ok:latest" {
-		t.Fatalf("listManifestRefs = %+v, want just the readable entry", refs)
 	}
 }

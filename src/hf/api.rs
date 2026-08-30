@@ -1,6 +1,8 @@
-//! HuggingFace Hub API calls and file-selection logic — the Rust port of
-//! go-shim/hf.go's `hfFetchModelInfo`/`hfFetchFiles`/`selectGGUF`/
-//! `selectMMProj`/`selectLicenseFile`/`safetensorsMediaType` and friends.
+//! HuggingFace Hub API calls and file-selection logic. Originally
+//! ported from the Go shim's `hfFetchModelInfo`/`hfFetchFiles`/
+//! `selectGGUF`/`selectMMProj`/`selectLicenseFile`/
+//! `safetensorsMediaType`, since deleted — this is the only
+//! implementation now.
 
 use std::collections::BTreeMap;
 
@@ -300,8 +302,11 @@ pub fn safetensors_media_type(path: &str) -> &'static str {
     }
 }
 
-/// True for files that belong in a local model directory — mirrors
-/// `shouldDownloadSafetensors`.
+/// True for files that belong in a local model directory. Deliberately
+/// safetensors-only: a GGUF repo is selected by `select_gguf` in a
+/// separate pass, so weight formats other than safetensors must not be
+/// swept up here. `crate::sources::should_pack` is the wider equivalent
+/// for sources that have no such second pass.
 fn should_download_safetensors(path: &str) -> bool {
     let base = path.rsplit('/').next().unwrap_or(path).to_lowercase();
     if base.starts_with('.') {

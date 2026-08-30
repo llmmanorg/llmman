@@ -63,10 +63,10 @@ pub struct Manifest {
 }
 
 /// `application/vnd.cncf.model.config.v1+json` — the CNCF Model Format Spec
-/// (<https://github.com/modelpack/model-spec>) config document. Mirrors the
-/// `cncfModelConfig` struct in `go-shim/hf.go`, which builds the same shape
-/// for HuggingFace/cloud-source pulls; this is the equivalent for `llmman
-/// build`'s local-directory packaging path.
+/// (<https://github.com/modelpack/model-spec>) config document. The
+/// deserializing counterpart of what `crate::hf::oci::build_cncf_manifest`
+/// writes for HuggingFace/cloud-source pulls; this is the equivalent for
+/// `llmman build`'s local-directory packaging path.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CncfConfigDescriptor {
@@ -421,7 +421,7 @@ impl OciStore {
     /// (<https://github.com/modelpack/model-spec>) OCI artifact stored in
     /// this layout. Each file becomes one uncompressed tar layer, classified
     /// into the appropriate `application/vnd.cncf.model.*` media type by
-    /// extension (mirroring `classifyFile` in `go-shim/uri_sources.go`, the
+    /// extension (mirroring [`crate::sources::classify_file`], the
     /// equivalent classifier used when pulling from HuggingFace/cloud
     /// sources), with `org.cncf.model.filepath` recording its path.
     /// Returns the manifest descriptor.
@@ -528,10 +528,10 @@ const DOC_TAR_MEDIA_TYPE: &str = "application/vnd.cncf.model.doc.v1.tar";
 const CODE_TAR_MEDIA_TYPE: &str = "application/vnd.cncf.model.code.v1.tar";
 
 /// Maps a file's relative path to the appropriate CNCF model layer media
-/// type by extension, mirroring `classifyFile` in `go-shim/uri_sources.go`
-/// (used for HuggingFace/cloud-source pulls). Uses the `.tar` variants
-/// because `build()` wraps each file in its own uncompressed tar archive,
-/// rather than the `.raw` variants the Go side uses for un-archived blobs.
+/// type by extension, mirroring [`crate::sources::classify_file`] (used for
+/// HuggingFace/cloud-source pulls). Uses the `.tar` variants because
+/// `build()` wraps each file in its own uncompressed tar archive, rather
+/// than the `.raw` variants a pulled, un-archived blob gets.
 fn classify_model_layer(rel_path: &str) -> &'static str {
     let lower = rel_path.to_lowercase();
     let base = Path::new(&lower)
@@ -546,7 +546,7 @@ fn classify_model_layer(rel_path: &str) -> &'static str {
     match ext {
         "safetensors" | "bin" | "pt" | "pth" | "gguf" | "ggml" | "ot" | "engine" | "trt"
         | "onnx" => WEIGHT_TAR_MEDIA_TYPE,
-        // "jinja": a standalone chat_template.jinja file, see go-shim/hf.go.
+        // "jinja": a standalone chat_template.jinja file.
         "json" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "conf" | "model" | "tiktoken"
         | "vocab" | "merges" | "spm" | "jinja" => WEIGHT_CONFIG_TAR_MEDIA_TYPE,
         "txt" => {

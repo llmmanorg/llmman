@@ -115,17 +115,14 @@ func llmman_push(cLayoutDir, cRef *C.char) *C.char {
 	ref := C.GoString(cRef)
 	progressReset(ref, "retrieving manifest")
 	defer progressDone(ref)
-	if _, err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), ref, findManifestForPush); err != nil {
+	if _, err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), ref); err != nil {
 		return errResp(err)
 	}
 	return okResp("")
 }
 
-// pushToRegistry is llmman_push's implementation, factored out so
-// llmman_transfer's staging-directory fallback (transferViaStaging, in
-// transfer_common.go) can reuse it without going through CGO. find
-// resolves ref to its local manifest — see backend_docker.go's
-// pushToRegistry for what the two possible values do.
+// pushToRegistry is llmman_push's implementation, factored out from the
+// CGO entry point above so it can take and return ordinary Go types.
 //
 // The push source handed to go.podman.io/image is a throwaway OCI layout
 // holding only an index.json naming the one manifest to push — not
@@ -135,8 +132,8 @@ func llmman_push(cLayoutDir, cRef *C.char) *C.char {
 // of. It needs no blob files of its own: sharedBlobDirOpts points the
 // source straight at layoutDir/blobs, so every blob (manifest included)
 // is read from the real store directly.
-func pushToRegistry(ctx context.Context, layoutDir, ref string, find func(string, string) (ocispec.Descriptor, error)) (changed bool, err error) {
-	manifestDesc, err := find(layoutDir, ref)
+func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, err error) {
+	manifestDesc, err := findManifestForPush(layoutDir, ref)
 	if err != nil {
 		return false, err
 	}
@@ -238,14 +235,11 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	// progressKey is the exact ref llmman_pull was originally called with
 	// (see backend_docker.go's pullToLayout for why this must be
-	// captured before classifyPullRef potentially normalizes ref itself).
+	// captured before classifyPullRef normalizes ref itself).
 	progressKey := ref
-	ref, isOCI, handled, err := classifyPullRef(ctx, ref, layoutDir)
-	if handled {
+	ref, err := classifyPullRef(ref)
+	if err != nil {
 		return err
-	}
-	if !isOCI {
-		return errHFNotHandledHere(ref)
 	}
 
 	if err := ensureLayout(layoutDir); err != nil {

@@ -101,8 +101,8 @@ fn has_host(reference: &str) -> bool {
 ///
 /// URI scheme handling (processed before alias lookup):
 ///   hf:// huggingface://  → strip scheme, continue as bare owner/repo
-///   ms:// modelscope://   → normalise to ms:// (Go shim routes to ModelScope)
-///   ngc:// s3:// gs://    → pass through verbatim (Go shim handles natively)
+///   ms:// modelscope://   → normalise to ms:// (crate::sources routes to ModelScope)
+///   ngc:// s3:// gs://    → pass through verbatim (crate::sources handles natively)
 ///   /absolute/path        → pass through verbatim (local directory import)
 ///
 /// Resolution order for everything else:
@@ -111,8 +111,9 @@ fn has_host(reference: &str) -> bool {
 ///   3. No host            → prepend `hf.co/`
 pub fn resolve(reference: &str) -> String {
     // ── URI schemes that bypass alias lookup and hf.co defaulting ─────────
-    // Local absolute paths and object-store URIs are forwarded as-is to the
-    // Go shim which dispatches them to the appropriate source handler.
+    // Local absolute paths and object-store URIs are forwarded as-is to
+    // crate::sources, which dispatches them to the appropriate source
+    // handler.
     for passthrough in &["ngc://", "s3://", "gs://"] {
         if reference.starts_with(passthrough) {
             return reference.to_owned();
@@ -131,7 +132,7 @@ pub fn resolve(reference: &str) -> String {
     {
         r
     }
-    // ms:// and modelscope:// are normalised to ms:// so the Go shim can
+    // ms:// and modelscope:// are normalised to ms:// so crate::sources can
     // detect the scheme and route to the ModelScope download path.
     else if let Some(r) = reference.strip_prefix("modelscope://") {
         return format!("ms://{r}");

@@ -4,9 +4,9 @@
 //! (`file_download.py`: "Install `hf_xet` ... for xet-powered
 //! downloads."), requiring this protocol instead.
 //!
-//! The Go shim's plain-HTTP path (`go-shim/hf.go`/`transfer_docker.go`)
-//! has no such limit and, now that it always sends a `Range` header,
-//! works in practice past that threshold too — but it leans on a
+//! This crate's own plain-HTTP path (`crate::hf::download::fetch_once`)
+//! has no such limit and, since it always sends a `Range` header, works
+//! in practice past that threshold too — but it leans on a
 //! CloudFront/S3-fronted CAS bridge `huggingface_hub` doesn't trust at
 //! that scale, with none of this protocol's real advantages: no
 //! chunk-level dedup or resume.

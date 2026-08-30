@@ -389,10 +389,10 @@ fn run_interactive_unix(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
     let mut paste_sb = String::new();
 
     loop {
-        let prompt = if multiline.is_some() {
+        // ". " is ollama's AltPrompt: shown both inside a """ block
+        // and while a bracketed paste is still accumulating.
+        let prompt = if multiline.is_some() || !paste_sb.is_empty() {
             ". "
-        } else if !paste_sb.is_empty() {
-            ". " // AltPrompt shown while pasting, mirrors ollama
         } else {
             "> "
         };

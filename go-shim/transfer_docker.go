@@ -12,15 +12,13 @@
 // manifest already gives every blob's digest/size, so it's a straight
 // Fetcher → Pusher stream per blob.
 //
-// A HuggingFace source never reaches this file: it is handled in Rust
-// (src/hf/transfer.rs).
-//
-// Anything else `llmman pull` understands (ms://, ngc://, s3://, gs://, a
-// local path) falls back to transferViaStaging: pull into a throwaway
-// local OCI layout, then push from it, exactly like `llmman transfer` did
-// before this file existed. Reimplementing zero-disk streaming for every
-// one of those source kinds isn't worth it yet — none of them are the
-// large-model-file case this exists for.
+// No other source kind reaches this file. A HuggingFace source is
+// handled in Rust (src/hf/transfer.rs), and so are the ms://, ngc://,
+// s3://, gs:// and local-path sources (src/sources), which stage
+// through a throwaway local layout and then push it with llmman_push —
+// none of them can stream, since none exposes a file's content digest
+// ahead of downloading it, and none is the large-model-file case this
+// file exists for.
 package main
 
 import (
@@ -52,15 +50,11 @@ func dockerTransfer(ctx context.Context, source, destination string) (changed bo
 	// is ever created, silently, so a plain `docker pull owner/repo`
 	// afterwards would find nothing.
 	destination = normalizeTag(destination)
-	kind, normalized := classifySource(ctx, source)
-	switch kind {
-	case sourceOCI:
-		return dockerTransferOCI(ctx, normalized, destination)
-	case sourceHF:
-		return false, errHFNotHandledHere(normalized)
-	default:
-		return transferViaStaging(ctx, source, destination)
+	normalized, err := classifySource(source)
+	if err != nil {
+		return false, err
 	}
+	return dockerTransferOCI(ctx, normalized, destination)
 }
 
 // ---------------------------------------------------------------------------

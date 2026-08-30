@@ -49,6 +49,20 @@ multer     = "3"
 # despite being on crates.io.
 hf-xet = "=1.6.0"
 
+# `s3://` source support (src/sources/s3.rs) — the official SDK rather
+# than a hand-rolled SigV4 signer so the whole credential chain (env
+# vars, ~/.aws/{config,credentials} profiles, SSO, assume-role, IMDS/ECS
+# container roles) keeps working exactly as it did when this source was
+# implemented against aws-sdk-go-v2 in the Go shim. Both crates version
+# their own API independently of the "1" umbrella, hence two entries.
+#
+# Non-default features throughout: the defaults still pull the legacy
+# hyper-0.14/rustls-0.21 HTTP client alongside the hyper-1.x/rustls-0.23
+# one `reqwest` already brings in — `default-https-client` selects the
+# latter alone, so there is exactly one TLS stack in the binary.
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+
 [features]
 default = ["docker"]
 docker = []

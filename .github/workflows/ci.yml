@@ -210,6 +210,14 @@ jobs:
   # formatting is platform-independent, so it only runs once, on the
   # Linux x86_64 leg (matrix.check-fmt below), instead of duplicating the
   # same check across all five targets.
+  #
+  # `cargo clippy` is the opposite case and runs on all five: clippy only
+  # sees the `#[cfg]` arms selected for the target it runs against, and
+  # this crate's platform-gated code is substantial (hostgpu/vendor.rs's
+  # CUDA/HIP/Vulkan FFI, ffi.rs's windows-msvc Go-runtime bootstrap,
+  # container::stop). Linting Linux alone is how ~22 dead-code warnings
+  # accumulated on macOS unseen. `--release` shares dependency artefacts
+  # with the `cargo test --release` step below.
   # --------------------------------------------------------------------------
   test:
     name: Unit tests (${{ matrix.target }})
@@ -278,7 +286,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.target }}
-          components: ${{ matrix.check-fmt && 'rustfmt' || '' }}
+          components: clippy${{ matrix.check-fmt && ', rustfmt' || '' }}
 
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
@@ -309,6 +317,16 @@ jobs:
       - name: cargo fmt --check
         if: matrix.check-fmt
         run: cargo fmt --all -- --check
+
+      # -D warnings: the tree is clippy-clean as of this step being added,
+      # so anything new is a regression, not a wart to triage.
+      # --all-targets covers tests/ too. Default (docker) feature only:
+      # `podman` gates a handful of `ffi` items, not whole subsystems, and
+      # building its Go archive too would roughly double this job.
+      - name: cargo clippy
+        run: cargo clippy --release --target ${{ matrix.target }} --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
       # --target: matches the build job's own invocation (every one of
       # these is a native build, but explicit --target keeps the output
