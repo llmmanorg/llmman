@@ -8,10 +8,6 @@ pub mod fmt;
 pub mod gguf;
 pub mod harmony;
 pub mod hf;
-// /sys CPU topology only exists on Linux; on other targets the module
-// would be all dead code under CI's clippy -D warnings.
-#[cfg(target_os = "linux")]
-pub mod hostcpu;
 pub mod hostgpu;
 pub mod llama_release;
 pub mod modelpack;

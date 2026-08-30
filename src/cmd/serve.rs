@@ -59,7 +59,7 @@ Environment Variables:
       LLMMAN_TMPDIR                  Staging directory for llama-server release downloads
       LLAMA_ARG_FIT                  Enable llama.cpp automatic fit of unset memory options (default \"on\")
       LLAMA_ARG_FIT_TARGET           Target free VRAM margin per device for llama.cpp fit (MiB)
-      LLAMA_ARG_THREADS              Thread count for llama-server (default: math cores bounded by affinity and CPU quota)
+      LLAMA_ARG_THREADS              Thread count for llama-server (default: llama-server autodetection, overridden by a binding CPU quota/affinity limit)
 ";
 
 #[derive(Args, Debug)]
@@ -239,20 +239,22 @@ fn parse_num_parallel(value: Option<&str>) -> Option<u32> {
     (n != 0).then_some(n)
 }
 
-/// `--threads <n>` for every local `llama-server` spawn.
-/// `std::thread::available_parallelism` already carries both bounds
-/// that matter: the CPU affinity mask and the cgroup CPU quota (std
-/// walks /proc/self/cgroup and the ancestor chain itself, v1 and v2),
-/// so no cgroup parsing happens here. Std's walk assumes the standard
-/// /sys/fs/cgroup v2 mount and skips unreadable or malformed levels,
-/// so the quota bound is best-effort; a miss falls back to
-/// min(math cores, affinity), the pre-feature behavior. This function only picks the
-/// math-core count within those bounds: llama-server's own thread
-/// autodetection (`cpu_get_num_math()`) counts every host core without
-/// consulting the quota, so the derived value is passed explicitly.
-/// `LLAMA_ARG_THREADS` set in the environment wins: llama-server
-/// reads it itself via plain env inheritance, so `None` here keeps that
-/// explicit choice untouched.
+/// `--threads <n>` for local `llama-server` spawns, `Some` only when a
+/// CPU limit binds. llama-server's own autodetection
+/// (`cpu_get_num_math()`) already picks the physical/math cores, so an
+/// unconstrained host passes nothing and leaves that choice alone. The
+/// derived value only corrects the case autodetection cannot see: a
+/// cgroup CPU quota, or a narrowed affinity mask, both carried by
+/// `std::thread::available_parallelism` (std walks /proc/self/cgroup
+/// and the ancestor chain itself, v1 and v2). A limit binds when
+/// `available_parallelism` is below the online CPU count; then that
+/// smaller value is passed. Accepted tradeoff: a quota between the
+/// physical-core and SMT-thread counts (e.g. --cpus=12 on an
+/// 8-core/16-thread host) passes 12 where autodetection would pick 8.
+/// Any read or parse failure returns `None`: fail closed to
+/// autodetection. `LLAMA_ARG_THREADS` set in the environment wins:
+/// llama-server reads it itself via plain env inheritance, so `None`
+/// here keeps that explicit choice untouched.
 fn threads_from_env_or_host() -> Option<u32> {
     if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         return None;
@@ -260,14 +262,44 @@ fn threads_from_env_or_host() -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
         let allowed = std::thread::available_parallelism().ok()?.get() as u32;
-        Some(
-            crate::hostcpu::math_core_count()
-                .unwrap_or(allowed)
-                .min(allowed),
-        )
+        let online = online_cpu_count()?;
+        (allowed < online).then_some(allowed)
     }
     #[cfg(not(target_os = "linux"))]
     None
+}
+
+/// Online CPUs from /sys/devices/system/cpu/online, the baseline
+/// `available_parallelism` is compared against to decide whether a
+/// quota or affinity limit binds. `None` when the file is unreadable
+/// or malformed.
+#[cfg(target_os = "linux")]
+fn online_cpu_count() -> Option<u32> {
+    cpu_list_count(&std::fs::read_to_string("/sys/devices/system/cpu/online").ok()?)
+}
+
+/// CPU count from a kernel CPU list such as /sys/devices/system/cpu/online:
+/// comma-separated single IDs or inclusive ranges (`0-15`, `0,4-7`).
+/// `None` on empty or malformed content.
+#[cfg(target_os = "linux")]
+fn cpu_list_count(list: &str) -> Option<u32> {
+    let mut count: u32 = 0;
+    for part in list.trim().split(',') {
+        match part.split_once('-') {
+            Some((lo, hi)) => {
+                let (lo, hi): (u32, u32) = (lo.trim().parse().ok()?, hi.trim().parse().ok()?);
+                if lo > hi {
+                    return None;
+                }
+                count = count.checked_add(hi.checked_sub(lo)?.checked_add(1)?)?;
+            }
+            None => {
+                let _: u32 = part.trim().parse().ok()?;
+                count = count.checked_add(1)?;
+            }
+        }
+    }
+    (count > 0).then_some(count)
 }
 
 /// The `--ctx-size` value to actually forward to llama-server: `ctx_size`
@@ -5500,7 +5532,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let threads = threads_from_env_or_host();
     if let Some(n) = threads {
         if _args.ociman.is_none() {
-            eprintln!("[llmman] llama-server gets --threads {n} (math cores within affinity and CPU quota)");
+            eprintln!("[llmman] llama-server gets --threads {n} (CPU quota/affinity limit below the online CPU count)");
         }
     } else if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         eprintln!("[llmman] LLAMA_ARG_THREADS set: leaving llama-server thread count to it");
@@ -7433,6 +7465,32 @@ mod tests {
         assert_eq!(parse_num_parallel(Some("")), None);
         assert_eq!(parse_num_parallel(Some("-1")), None);
         assert_eq!(parse_num_parallel(Some("garbage")), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_list_count_counts_ids_and_inclusive_ranges() {
+        // (kernel CPU list, expected count)
+        let cases = [
+            ("0-15\n", Some(16)),
+            ("0", Some(1)),
+            ("0,4-7\n", Some(5)),
+            ("0-3,8-11\n", Some(8)),
+            // Malformed or empty content fails closed: the caller then
+            // passes no --threads and llama-server autodetects.
+            ("", None),
+            ("\n", None),
+            ("3-1", None),
+            ("0-x", None),
+            ("a", None),
+            ("0,,2", None),
+            // Range length would overflow u32; no kernel emits this.
+            ("0-4294967295", None),
+            ("0-4294967295,4", None),
+        ];
+        for (list, expected) in &cases {
+            assert_eq!(&cpu_list_count(list), expected, "list={list:?}");
+        }
     }
 
     #[test]

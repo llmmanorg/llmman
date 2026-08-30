@@ -238,8 +238,8 @@ pub struct LlamaOptions<'a> {
     /// slot — see `cmd::serve::num_parallel_from_env`.
     pub num_parallel: Option<u32>,
 
-    /// `--threads <n>`, the daemon's math cores bounded by affinity and
-    /// CPU quota; see `cmd::serve::threads_from_env_or_host`.
+    /// `--threads <n>`, set only when a CPU limit (cgroup quota or
+    /// affinity) binds; see `cmd::serve::threads_from_env_or_host`.
     /// Deliberately ignored by [`spawn`]: the daemon's cgroup says
     /// nothing about the limits of the fresh container llama-server
     /// runs in. An explicit LLAMA_ARG_THREADS still reaches the
