@@ -59,7 +59,7 @@ Environment Variables:
       LLMMAN_TMPDIR                  Staging directory for llama-server release downloads
       LLAMA_ARG_FIT                  Enable llama.cpp automatic fit of unset memory options (default \"on\")
       LLAMA_ARG_FIT_TARGET           Target free VRAM margin per device for llama.cpp fit (MiB)
-      LLAMA_ARG_THREADS              Thread count for llama-server (default: CPU quota when containerized)
+      LLAMA_ARG_THREADS              Thread count for llama-server (default: math cores bounded by affinity and CPU quota)
 ";
 
 #[derive(Args, Debug)]
@@ -239,36 +239,28 @@ fn parse_num_parallel(value: Option<&str>) -> Option<u32> {
     (n != 0).then_some(n)
 }
 
-/// `--threads <n>` for every local `llama-server` spawn, derived from the
-/// container's CPU quota. Docker's `--cpus` sets a CFS bandwidth quota
-/// (cgroup `cpu.max`), not CPU affinity, and llama-server's own thread
-/// autodetection is `cpu_get_num_math()`: physical cores counted from
-/// /sys thread_siblings, falling back to `hardware_concurrency()`.
-/// Neither consults the CFS quota, so autodetection reports every host
-/// core and the resulting threads fight over the quota.
+/// `--threads <n>` for every local `llama-server` spawn.
+/// `std::thread::available_parallelism` already carries both bounds
+/// that matter: the CPU affinity mask and the cgroup CPU quota (std
+/// walks /proc/self/cgroup and the ancestor chain itself, v1 and v2),
+/// so no cgroup parsing happens here. Std's walk assumes the standard
+/// /sys/fs/cgroup v2 mount and skips unreadable or malformed levels,
+/// so the quota bound is best-effort; a miss falls back to
+/// min(math cores, affinity), the pre-feature behavior. This function only picks the
+/// math-core count within those bounds: llama-server's own thread
+/// autodetection (`cpu_get_num_math()`) counts every host core without
+/// consulting the quota, so the derived value is passed explicitly.
 /// `LLAMA_ARG_THREADS` set in the environment wins: llama-server
 /// reads it itself via plain env inheritance, so `None` here keeps that
-/// explicit choice untouched. Any missing/unreadable cgroup file, and
-/// any inconsistency between /proc/self/cgroup and the mounted
-/// hierarchy, also returns `None` (rootless or nested containers
-/// without a readable cgroupfs keep current behavior).
-fn threads_from_env_or_cgroup() -> Option<u32> {
+/// explicit choice untouched.
+fn threads_from_env_or_host() -> Option<u32> {
     if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         return None;
     }
     #[cfg(target_os = "linux")]
     {
-        let available = std::thread::available_parallelism().ok()?.get() as u32;
-        // Cap at math cores, approximating the scope of llama.cpp's own
-        // common_cpu_get_num_math() default (b10621 common/common.cpp:
-        // hybrid x86 pins P-cores one thread each; POWER uses up to
-        // SMT-2, not mirrored here; everything else physical cores): on
-        // an SMT host a quota of e.g. 16 CPUs still shouldn't
-        // oversubscribe 8 physical cores. `available` stays a bound of
-        // its own: it carries the affinity mask and std's quota
-        // detection, which topology knows nothing about.
-        let cap = math_core_count_fs().unwrap_or(available).min(available);
-        threads_from_cgroup_fs(cap)
+        let allowed = std::thread::available_parallelism().ok()?.get() as u32;
+        Some(math_core_count_fs().unwrap_or(allowed).min(allowed))
     }
     #[cfg(not(target_os = "linux"))]
     None
@@ -355,257 +347,6 @@ fn count_physical_cores<'a>(sibling_lists: impl IntoIterator<Item = &'a str>) ->
         .filter(|s| !s.is_empty())
         .collect();
     u32::try_from(cores.len()).ok().filter(|&n| n > 0)
-}
-
-/// The filesystem half of [`threads_from_env_or_cgroup`]: resolves this
-/// process's own cgroup node (not the mount root: a daemon in e.g. a
-/// systemd slice or a Docker container lives in a child cgroup whose
-/// limit the root's files never show) and takes the strictest finite
-/// CPU limit from that node up to the mount root, since an ancestor's
-/// quota binds every descendant too. All parsing lives in the pure
-/// functions below; this wrapper only reads files.
-#[cfg(target_os = "linux")]
-fn threads_from_cgroup_fs(cap: u32) -> Option<u32> {
-    let proc_cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let proc_mounts = std::fs::read_to_string("/proc/mounts").ok()?;
-    // cgroup v2 first; on a hybrid host the v2 hierarchy exists but
-    // carries no cpu controller (no cpu.max files anywhere), which
-    // falls through to the v1 lookup below.
-    if let (Some(rel), Some(mount)) = (
-        cgroup_v2_relpath(&proc_cgroup),
-        cgroup2_mountpoint(&proc_mounts),
-    ) {
-        let chain = cgroup_node_chain(mount, rel)?;
-        // The reported node must actually exist under the mount; a
-        // container that sees the host's /proc/self/cgroup path but a
-        // namespaced mount fails closed here.
-        if !chain.first()?.is_dir() {
-            return None;
-        }
-        let contents: Vec<String> = chain
-            .iter()
-            .filter_map(|dir| std::fs::read_to_string(dir.join("cpu.max")).ok())
-            .collect();
-        if let Some(n) = strictest_threads_v2(contents.iter().map(String::as_str), cap) {
-            return Some(n);
-        }
-    }
-    // cgroup v1: the cpu controller has its own hierarchy (possibly
-    // co-mounted with cpuacct), matched via the controller lists on
-    // both sides rather than an assumed mount path.
-    let rel = cgroup_v1_cpu_relpath(&proc_cgroup)?;
-    let mount = cgroup_v1_cpu_mountpoint(&proc_mounts)?;
-    let chain = cgroup_node_chain(mount, rel)?;
-    if !chain.first()?.is_dir() {
-        return None;
-    }
-    let pairs: Vec<(String, String)> = chain
-        .iter()
-        .filter_map(|dir| {
-            Some((
-                std::fs::read_to_string(dir.join("cpu.cfs_quota_us")).ok()?,
-                std::fs::read_to_string(dir.join("cpu.cfs_period_us")).ok()?,
-            ))
-        })
-        .collect();
-    strictest_threads_v1(pairs.iter().map(|(q, p)| (q.as_str(), p.as_str())), cap)
-}
-
-/// This process's cgroup v2 path from /proc/self/cgroup content: the
-/// `0::<path>` line (hierarchy 0 with an empty controller list is v2 by
-/// definition). `None` on a pure-v1 host.
-fn cgroup_v2_relpath(proc_cgroup: &str) -> Option<&str> {
-    proc_cgroup.lines().find_map(|line| {
-        let mut fields = line.splitn(3, ':');
-        (fields.next()? == "0" && fields.next()?.is_empty()).then(|| fields.next())?
-    })
-}
-
-/// This process's cgroup v1 path in the cpu controller's hierarchy: the
-/// /proc/self/cgroup line whose controller list contains `cpu`. Exact
-/// match per comma-separated entry, so `cpu,cpuacct` and `cpuacct,cpu`
-/// both hit while `cpuset` does not.
-fn cgroup_v1_cpu_relpath(proc_cgroup: &str) -> Option<&str> {
-    proc_cgroup.lines().find_map(|line| {
-        let mut fields = line.splitn(3, ':');
-        fields.next()?;
-        let controllers = fields.next()?;
-        controllers
-            .split(',')
-            .any(|c| c == "cpu")
-            .then(|| fields.next())?
-    })
-}
-
-/// The cgroup2 filesystem's mountpoint from /proc/mounts content
-/// (fields: device, mountpoint, fstype, options, ...).
-fn cgroup2_mountpoint(proc_mounts: &str) -> Option<&str> {
-    proc_mounts.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        fields.next()?;
-        let mountpoint = fields.next()?;
-        (fields.next()? == "cgroup2").then_some(mountpoint)
-    })
-}
-
-/// The mountpoint of the v1 hierarchy carrying the cpu controller: a
-/// `cgroup`-fstype mount whose options list the `cpu` controller (the
-/// kernel echoes enabled controllers into the superblock options, so a
-/// `cpu,cpuacct` co-mount shows both, in either order).
-fn cgroup_v1_cpu_mountpoint(proc_mounts: &str) -> Option<&str> {
-    proc_mounts.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        fields.next()?;
-        let mountpoint = fields.next()?;
-        if fields.next()? != "cgroup" {
-            return None;
-        }
-        let options = fields.next()?;
-        options.split(',').any(|o| o == "cpu").then_some(mountpoint)
-    })
-}
-
-/// The directories whose CPU-limit files bind this process: its own
-/// cgroup node first, then every ancestor up to the mount root
-/// inclusive. `None` on any inconsistency: a relative path, or one
-/// with `.`/`..`/empty components (a namespaced process below its
-/// namespace root reports `/../...`, which must not escape the mount).
-fn cgroup_node_chain(mount: &str, relpath: &str) -> Option<Vec<std::path::PathBuf>> {
-    let relpath = relpath.strip_prefix('/')?;
-    let mut chain = vec![std::path::PathBuf::from(mount)];
-    for component in relpath.split('/').filter(|c| !c.is_empty()) {
-        if component == "." || component == ".." {
-            return None;
-        }
-        chain.push(chain.last()?.join(component));
-    }
-    chain.reverse();
-    Some(chain)
-}
-
-/// One cgroup level's CPU limit as parsed from its limit file(s).
-/// `Unlimited` and `Malformed` must stay distinct: an unlimited level
-/// is simply non-binding, while a malformed one means the hierarchy
-/// isn't what this code understands and the whole chain must fail
-/// closed rather than report a limit computed from the levels that did
-/// parse.
-#[derive(Debug, PartialEq, Eq)]
-enum CgroupCpuLimit {
-    /// A finite quota, already converted to a thread count.
-    Threads(u32),
-    Unlimited,
-    Malformed,
-}
-
-/// The strictest (minimum) thread count across a chain of `cpu.max`
-/// contents. The kernel enforces every level, so the tightest quota
-/// wins regardless of where in the chain it sits. `None` when no level
-/// has a finite quota, or when any level is malformed (see
-/// [`CgroupCpuLimit`]). Missing files never reach here: the fs caller
-/// skips them, since e.g. the v2 root has no `cpu.max` at all.
-fn strictest_threads_v2<'a>(cpu_maxes: impl IntoIterator<Item = &'a str>, cap: u32) -> Option<u32> {
-    strictest_threads(
-        cpu_maxes
-            .into_iter()
-            .map(|cpu_max| cpu_limit_from_cpu_max(cpu_max, cap)),
-    )
-}
-
-/// The cgroup v1 equivalent of [`strictest_threads_v2`], over
-/// (`cpu.cfs_quota_us`, `cpu.cfs_period_us`) content pairs.
-fn strictest_threads_v1<'a>(
-    pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
-    cap: u32,
-) -> Option<u32> {
-    strictest_threads(
-        pairs
-            .into_iter()
-            .map(|(quota, period)| cpu_limit_from_cfs_files(quota, period, cap)),
-    )
-}
-
-/// The minimum finite limit; `None` when there is none, or when any
-/// level is malformed.
-fn strictest_threads(limits: impl IntoIterator<Item = CgroupCpuLimit>) -> Option<u32> {
-    let mut min = None;
-    for limit in limits {
-        match limit {
-            CgroupCpuLimit::Threads(n) => min = Some(min.map_or(n, |m: u32| m.min(n))),
-            CgroupCpuLimit::Unlimited => {}
-            CgroupCpuLimit::Malformed => return None,
-        }
-    }
-    min
-}
-
-/// [`threads_from_env_or_cgroup`]'s cgroup v2 parsing, split out so it's
-/// testable without a real /sys/fs/cgroup. `cpu_max` is the content of
-/// `cpu.max`: `"<quota> <period>"` in microseconds, or `"max <period>"`
-/// for unlimited (autodetection is already right). A fractional quota
-/// floors, with a floor of 1 (a 0.5-CPU container still needs one
-/// thread), capped at `cap` (physical cores, or logical CPUs when the
-/// topology is unreadable; see [`threads_from_env_or_cgroup`]).
-fn cpu_limit_from_cpu_max(cpu_max: &str, cap: u32) -> CgroupCpuLimit {
-    let mut fields = cpu_max.split_whitespace();
-    let (Some(quota), Some(period)) = (fields.next(), fields.next()) else {
-        return CgroupCpuLimit::Malformed;
-    };
-    // cpu.max is a two-value file; anything more is not cpu.max.
-    if fields.next().is_some() {
-        return CgroupCpuLimit::Malformed;
-    }
-    // Validate the period even for "max": an unparseable or zero period
-    // (which the kernel never writes; see `quota_threads`) means this is
-    // not a cpu.max we understand, and the whole chain must fail closed.
-    let Ok(period) = period.parse::<u64>() else {
-        return CgroupCpuLimit::Malformed;
-    };
-    if period == 0 {
-        return CgroupCpuLimit::Malformed;
-    }
-    if quota == "max" {
-        return CgroupCpuLimit::Unlimited;
-    }
-    match quota.parse() {
-        Ok(quota) => quota_threads(quota, period, cap),
-        Err(_) => CgroupCpuLimit::Malformed,
-    }
-}
-
-/// The cgroup v1 equivalent of [`cpu_limit_from_cpu_max`], from the
-/// contents of `cpu.cfs_quota_us` and `cpu.cfs_period_us`. A quota of
-/// exactly `-1` means unlimited; the kernel writes no other negative
-/// value, so anything else negative is `Malformed`, and the period must
-/// parse as positive even for the unlimited case (same rule as the v2
-/// `"max <period>"` form).
-fn cpu_limit_from_cfs_files(quota: &str, period: &str, cap: u32) -> CgroupCpuLimit {
-    let (Ok(quota), Ok(period)) = (quota.trim().parse::<i64>(), period.trim().parse::<i64>())
-    else {
-        return CgroupCpuLimit::Malformed;
-    };
-    if period <= 0 {
-        return CgroupCpuLimit::Malformed;
-    }
-    match quota {
-        -1 => CgroupCpuLimit::Unlimited,
-        q if q < 0 => CgroupCpuLimit::Malformed,
-        q => match u64::try_from(q) {
-            Ok(quota) => quota_threads(quota, period as u64, cap),
-            Err(_) => CgroupCpuLimit::Malformed,
-        },
-    }
-}
-
-/// `floor(quota / period)` with a floor of 1, capped at `cap` (injected
-/// by the caller; see [`threads_from_env_or_cgroup`] for where it comes
-/// from). Zero fields are `Malformed`: the kernel never writes them,
-/// so nothing meaningful can be computed.
-fn quota_threads(quota: u64, period: u64, cap: u32) -> CgroupCpuLimit {
-    if quota == 0 || period == 0 {
-        return CgroupCpuLimit::Malformed;
-    }
-    let n = (quota / period).max(1).min(u64::from(cap));
-    CgroupCpuLimit::Threads(n as u32)
 }
 
 /// The `--ctx-size` value to actually forward to llama-server: `ctx_size`
@@ -811,7 +552,7 @@ struct Inner {
     split_mode: Option<&'static str>,
     // See num_parallel_from_env's doc comment.
     num_parallel: Option<u32>,
-    // See threads_from_env_or_cgroup's doc comment. Resolved once at
+    // See threads_from_env_or_host's doc comment. Resolved once at
     // startup (this daemon's cgroup doesn't change per load) and passed
     // to every *local* spawn_llama_server call from ensure_model's OOM
     // retry loop.
@@ -2137,7 +1878,7 @@ async fn spawn_llama_server(
     if let Some(n) = num_parallel {
         cmd.args(["--parallel", &n.to_string()]);
     }
-    // See threads_from_env_or_cgroup's doc comment; `None` leaves
+    // See threads_from_env_or_host's doc comment; `None` leaves
     // --threads unset, falling back to llama-server's own autodetection.
     if let Some(n) = threads {
         cmd.args(["--threads", &n.to_string()]);
@@ -5842,15 +5583,15 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             .context("hostgpu probe task panicked")?,
     };
 
-    // See threads_from_env_or_cgroup's doc comment. Resolved once here
+    // See threads_from_env_or_host's doc comment. Resolved once here
     // rather than per load, and logged so a surprising thread count is
     // explainable from the startup output. Only the local spawn path
     // consumes the derived value, so don't log it under --ociman (the
     // container arm deliberately ignores it).
-    let threads = threads_from_env_or_cgroup();
+    let threads = threads_from_env_or_host();
     if let Some(n) = threads {
         if _args.ociman.is_none() {
-            eprintln!("[llmman] cgroup CPU quota found: llama-server gets --threads {n}");
+            eprintln!("[llmman] llama-server gets --threads {n} (math cores within affinity and CPU quota)");
         }
     } else if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         eprintln!("[llmman] LLAMA_ARG_THREADS set: leaving llama-server thread count to it");
@@ -7783,222 +7524,6 @@ mod tests {
         assert_eq!(parse_num_parallel(Some("")), None);
         assert_eq!(parse_num_parallel(Some("-1")), None);
         assert_eq!(parse_num_parallel(Some("garbage")), None);
-    }
-
-    #[test]
-    fn cpu_limit_from_cpu_max_floors_the_quota_over_period_ratio() {
-        use CgroupCpuLimit::{Threads, Unlimited};
-        // (cpu.max content, available, expected)
-        let cases: &[(&str, u32, CgroupCpuLimit)] = &[
-            ("200000 100000", 32, Threads(2)),
-            // Unlimited: llama-server's own autodetection is already right.
-            ("max 100000", 32, Unlimited),
-            // Fractional quotas floor, but never below 1.
-            ("50000 100000", 32, Threads(1)),
-            ("150000 100000", 32, Threads(1)),
-            // Capped at the injected cap (physical cores, or logical
-            // CPUs when the topology is unreadable).
-            ("800000 100000", 4, Threads(4)),
-            ("200000 100000\n", 32, Threads(2)),
-        ];
-        for (cpu_max, available, expected) in cases {
-            assert_eq!(
-                &cpu_limit_from_cpu_max(cpu_max, *available),
-                expected,
-                "cpu_max={cpu_max:?} available={available}"
-            );
-        }
-    }
-
-    #[test]
-    fn cpu_limit_from_cpu_max_rejects_malformed_and_zero_fields() {
-        for cpu_max in [
-            "",
-            "200000",
-            "garbage 100000",
-            "200000 nope",
-            "0 100000",
-            "200000 0",
-            "-200000 100000",
-            // cpu.max holds exactly two fields; more means not cpu.max.
-            "200000 100000 unexpected",
-            "max 100000 unexpected",
-            // "max" does not bypass period validation.
-            "max nope",
-            "max 0",
-        ] {
-            assert_eq!(
-                cpu_limit_from_cpu_max(cpu_max, 32),
-                CgroupCpuLimit::Malformed,
-                "cpu_max={cpu_max:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn cpu_limit_from_cfs_files_matches_v2_and_treats_minus_one_as_unlimited() {
-        use CgroupCpuLimit::{Malformed, Threads, Unlimited};
-        // (cfs_quota_us, cfs_period_us, available, expected)
-        let cases: &[(&str, &str, u32, CgroupCpuLimit)] = &[
-            ("200000", "100000", 32, Threads(2)),
-            // -1 means unlimited in cgroup v1.
-            ("-1", "100000", 32, Unlimited),
-            ("50000", "100000", 32, Threads(1)),
-            ("150000", "100000", 32, Threads(1)),
-            ("800000", "100000", 4, Threads(4)),
-            ("0", "100000", 32, Malformed),
-            ("200000", "0", 32, Malformed),
-            ("200000", "-1", 32, Malformed),
-            // Only exactly -1 is unlimited, and even then the period
-            // must be a positive number (the v2 "max <period>" rule).
-            ("-2", "100000", 32, Malformed),
-            ("-1", "0", 32, Malformed),
-            ("-1", "garbage", 32, Malformed),
-            ("garbage", "100000", 32, Malformed),
-            ("200000", "garbage", 32, Malformed),
-            ("200000\n", "100000\n", 32, Threads(2)),
-        ];
-        for (quota, period, available, expected) in cases {
-            assert_eq!(
-                &cpu_limit_from_cfs_files(quota, period, *available),
-                expected,
-                "quota={quota:?} period={period:?} available={available}"
-            );
-        }
-    }
-
-    #[test]
-    fn cgroup_v2_relpath_picks_the_hierarchy_zero_line() {
-        // (/proc/self/cgroup content, expected)
-        let cases: &[(&str, Option<&str>)] = &[
-            (
-                "0::/user.slice/user-1000.slice\n",
-                Some("/user.slice/user-1000.slice"),
-            ),
-            // Root cgroup.
-            ("0::/\n", Some("/")),
-            // Hybrid host: v1 lines coexist with the v2 line.
-            (
-                "3:cpu,cpuacct:/docker/abc\n0::/system.slice/llmman.service\n",
-                Some("/system.slice/llmman.service"),
-            ),
-            // Pure v1 host: no hierarchy-0 line.
-            ("3:cpu,cpuacct:/docker/abc\n2:memory:/docker/abc\n", None),
-            // A v1 line with hierarchy id 0 does not exist, but a named
-            // hierarchy's controller field is non-empty and must not match.
-            ("0:name=weird:/x\n", None),
-            ("", None),
-        ];
-        for &(content, expected) in cases {
-            assert_eq!(cgroup_v2_relpath(content), expected, "content={content:?}");
-        }
-    }
-
-    #[test]
-    fn cgroup_v1_cpu_relpath_matches_the_cpu_controller_in_either_comount_order() {
-        let cases: &[(&str, Option<&str>)] = &[
-            ("3:cpu,cpuacct:/docker/abc\n", Some("/docker/abc")),
-            ("3:cpuacct,cpu:/docker/abc\n", Some("/docker/abc")),
-            ("4:cpu:/\n", Some("/")),
-            // cpuset is a different controller.
-            ("5:cpuset:/docker/abc\n", None),
-            ("0::/system.slice\n", None),
-            ("", None),
-        ];
-        for &(content, expected) in cases {
-            assert_eq!(
-                cgroup_v1_cpu_relpath(content),
-                expected,
-                "content={content:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn cgroup_mountpoints_come_from_fstype_and_superblock_options() {
-        let mounts = "\
-proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
-cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime 0 0
-cgroup /sys/fs/cgroup/cpuset cgroup rw,nosuid,cpuset 0 0
-cgroup /sys/fs/cgroup/cpu,cpuacct cgroup rw,nosuid,cpu,cpuacct 0 0
-";
-        assert_eq!(cgroup2_mountpoint(mounts), Some("/sys/fs/cgroup"));
-        // The cpu controller's mount, not the cpuset one above it.
-        assert_eq!(
-            cgroup_v1_cpu_mountpoint(mounts),
-            Some("/sys/fs/cgroup/cpu,cpuacct")
-        );
-
-        let comount_reversed = "cgroup /sys/fs/cgroup/cpu cgroup rw,cpuacct,cpu 0 0\n";
-        assert_eq!(
-            cgroup_v1_cpu_mountpoint(comount_reversed),
-            Some("/sys/fs/cgroup/cpu")
-        );
-
-        let v1_only = "cgroup /sys/fs/cgroup/memory cgroup rw,memory 0 0\n";
-        assert_eq!(cgroup2_mountpoint(v1_only), None);
-        assert_eq!(cgroup_v1_cpu_mountpoint(v1_only), None);
-    }
-
-    #[test]
-    fn cgroup_node_chain_walks_from_the_node_to_the_mount_root() {
-        assert_eq!(
-            cgroup_node_chain("/sys/fs/cgroup", "/a/b"),
-            Some(vec![
-                std::path::PathBuf::from("/sys/fs/cgroup/a/b"),
-                std::path::PathBuf::from("/sys/fs/cgroup/a"),
-                std::path::PathBuf::from("/sys/fs/cgroup"),
-            ])
-        );
-        // The root cgroup: just the mount itself.
-        assert_eq!(
-            cgroup_node_chain("/sys/fs/cgroup", "/"),
-            Some(vec![std::path::PathBuf::from("/sys/fs/cgroup")])
-        );
-        // Fail closed on paths that are relative or could escape the
-        // mount (a process below its cgroup namespace root reports
-        // `/../...`).
-        assert_eq!(cgroup_node_chain("/sys/fs/cgroup", "a/b"), None);
-        assert_eq!(cgroup_node_chain("/sys/fs/cgroup", "/../escape"), None);
-        assert_eq!(cgroup_node_chain("/sys/fs/cgroup", "/a/../b"), None);
-        assert_eq!(cgroup_node_chain("/sys/fs/cgroup", "/./a"), None);
-        assert_eq!(cgroup_node_chain("/sys/fs/cgroup", ""), None);
-    }
-
-    #[test]
-    fn strictest_threads_takes_the_minimum_across_the_ancestor_chain() {
-        // An unlimited level mid-chain is non-binding, not disqualifying:
-        // an ancestor's quota binds descendants too, and the tightest
-        // finite one wins.
-        assert_eq!(
-            strictest_threads_v2(["400000 100000", "max 100000", "200000 100000"], 32),
-            Some(2)
-        );
-        // Leaf stricter than its ancestors.
-        assert_eq!(
-            strictest_threads_v2(["100000 100000", "800000 100000"], 32),
-            Some(1)
-        );
-        // No finite quota anywhere.
-        assert_eq!(strictest_threads_v2(["max 100000", "max 100000"], 32), None);
-        assert_eq!(strictest_threads_v2([], 32), None);
-        // One malformed level poisons the whole chain, even alongside a
-        // finite one: unlimited and malformed must not be conflated, or
-        // the finite level's count would win by default.
-        assert_eq!(strictest_threads_v2(["garbage", "400000 100000"], 32), None);
-
-        assert_eq!(
-            strictest_threads_v1(
-                [("400000", "100000"), ("-1", "100000"), ("200000", "100000")],
-                32
-            ),
-            Some(2)
-        );
-        assert_eq!(strictest_threads_v1([("-1", "100000")], 32), None);
-        assert_eq!(
-            strictest_threads_v1([("garbage", "100000"), ("400000", "100000")], 32),
-            None
-        );
     }
 
     #[test]
