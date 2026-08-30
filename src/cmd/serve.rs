@@ -4339,14 +4339,10 @@ async fn handle_delete(
 
 // -- Ollama /api/chat ---------------------------------------------------------
 
-/// The terminal-only `/api/chat` body ollama answers a message-less request
-/// with: an empty assistant message, `done: true`, and `done_reason` naming
-/// which short-circuit produced it. Verified against ollama 0.32.6, which
-/// replies to both `{"messages":[]}` and `{"messages":[],"keep_alive":0}`
-/// with exactly `{"model":…,"created_at":…,"message":{"role":"assistant",
-/// "content":""},"done":true,"done_reason":"load"|"unload"}` — the
-/// `OllamaMessage` defaults below skip `thinking`/`images`/`tool_calls`/
-/// `tool_name` on the wire, so this serializes to the same two-key message.
+/// The body ollama answers a message-less `/api/chat` with. `Default` for
+/// the rest of `OllamaMessage`, not explicit `None`s: every other field is
+/// `skip_serializing_if`, so this reaches the wire as the bare
+/// `{"role":"assistant","content":""}` ollama 0.32.6 sends.
 fn empty_chat_chunk(model: String, done_reason: &str) -> OllamaChatChunk {
     OllamaChatChunk {
         model,
@@ -4380,12 +4376,6 @@ async fn handle_ollama_chat(
     // backend to continue from nothing: the caller gets a real, arbitrary
     // generation and `done_reason: "stop"` where ollama answers with an
     // empty message, and a `keep_alive: 0` never unloads anything.
-    //
-    // Each step below deliberately mirrors its counterpart there rather
-    // than restating why — see `handle_ollama_generate` for the
-    // `resolve_keep_alive`-not-`as_i64` reasoning, why the load lock is
-    // taken before the remove, and why a preload refreshes activity even
-    // though it generates nothing.
     if req.messages.is_empty() {
         if resolve_keep_alive(&req.keep_alive) == Some(Duration::ZERO) {
             let resolved = crate::shortnames::resolve_ollama_api(&req.model);
@@ -7172,9 +7162,9 @@ mod tests {
 
     // -- /api/chat's message-less load/unload idiom ---------------------------
 
-    /// Deserialized rather than struct-literal: `stream` defaults to `true`
-    /// through serde (`bool_true`), and both branches under test have to
-    /// answer with a single JSON object even then — exactly as ollama does.
+    /// Deserialized, not struct-literal, so `stream` picks up its serde
+    /// default of `true` — both branches must answer with a single JSON
+    /// object even then.
     fn chat_request(body: serde_json::Value) -> OllamaChatRequest {
         serde_json::from_value(body).expect("valid OllamaChatRequest")
     }
