@@ -1734,11 +1734,6 @@ async fn spawn_llama_server(
     model: &Path,
     mmproj: Option<&Path>,
     opts: crate::container::LlamaOptions<'_>,
-    // Not part of LlamaOptions: that struct is shared with
-    // container::spawn, and the derived thread count must stay off the
-    // container path (the daemon's cgroup says nothing about the child
-    // container's).
-    threads: Option<u32>,
 ) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
     let crate::container::LlamaOptions {
         port,
@@ -1748,6 +1743,7 @@ async fn spawn_llama_server(
         context_shift,
         split_mode,
         num_parallel,
+        threads,
     } = opts;
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args([
@@ -2876,16 +2872,14 @@ async fn ensure_model(
             context_shift,
             split_mode,
             num_parallel,
+            threads: state.0.threads,
         };
         // Only a local llama-server child captures a stderr tail (see
         // spawn_llama_server) — every retry below only fires for that case.
         let mut stderr_tail: Option<OutputTail> = None;
         process = match (&model_path, state.0.ociman) {
-            // No derived --threads (state.0.threads) here, deliberately:
-            // it comes from *this daemon's* cgroup, which says nothing
-            // about the limits of the fresh container llama-server runs
-            // in. An explicit LLAMA_ARG_THREADS still reaches it via
-            // LLAMA_CPP_ENV_PASSTHROUGH_VARS in container::spawn.
+            // container::spawn ignores llama_opts.threads; see that
+            // field's doc comment.
             (ModelPath::Gguf(path, mmproj), Some(ociman)) => ModelProcess::Container(
                 ociman,
                 crate::container::spawn(
@@ -2899,8 +2893,7 @@ async fn ensure_model(
             (ModelPath::Gguf(path, mmproj), None) => {
                 let bin = local_llama_server_bin(state).await?;
                 let (child, tail) =
-                    spawn_llama_server(&bin, path, mmproj.as_deref(), llama_opts, state.0.threads)
-                        .await?;
+                    spawn_llama_server(&bin, path, mmproj.as_deref(), llama_opts).await?;
                 stderr_tail = Some(tail);
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }

@@ -237,6 +237,14 @@ pub struct LlamaOptions<'a> {
     /// `--parallel <n>`. `None` falls back to llama-server's own single
     /// slot — see `cmd::serve::num_parallel_from_env`.
     pub num_parallel: Option<u32>,
+
+    /// `--threads <n>`, the daemon's math cores bounded by affinity and
+    /// CPU quota; see `cmd::serve::threads_from_env_or_host`.
+    /// Deliberately ignored by [`spawn`]: the daemon's cgroup says
+    /// nothing about the limits of the fresh container llama-server
+    /// runs in. An explicit LLAMA_ARG_THREADS still reaches the
+    /// container via LLAMA_CPP_ENV_PASSTHROUGH_VARS.
+    pub threads: Option<u32>,
 }
 
 /// Callers must stop this gracefully (SIGTERM, not the default
@@ -269,6 +277,9 @@ pub fn spawn(
         context_shift,
         split_mode,
         num_parallel,
+        // See the field's doc comment: the derived value describes the
+        // daemon's cgroup, not the container's.
+        threads: _,
     } = opts;
     let backend = detect_backend();
     let image = backend.image_ref(llama_cpp_version);
