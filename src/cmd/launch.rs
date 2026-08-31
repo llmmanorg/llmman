@@ -284,7 +284,6 @@ struct Integration {
     name: &'static str,
     description: &'static str,
     binary: &'static str,
-    install_hint: &'static str,
 }
 
 const INTEGRATIONS: &[Integration] = &[
@@ -292,61 +291,51 @@ const INTEGRATIONS: &[Integration] = &[
         name: "claude",
         description: "Claude Code",
         binary: "claude",
-        install_hint: "https://code.claude.com/docs/en/quickstart",
     },
     Integration {
         name: "opencode",
         description: "OpenCode",
         binary: "opencode",
-        install_hint: "https://opencode.ai",
     },
     Integration {
         name: "codex",
         description: "OpenAI Codex CLI",
         binary: "codex",
-        install_hint: "npm install -g @openai/codex",
     },
     Integration {
         name: "cline",
         description: "Cline",
         binary: "cline",
-        install_hint: "npm install -g cline",
     },
     Integration {
         name: "aider",
         description: "Aider AI pair programmer",
         binary: "aider",
-        install_hint: "pip install aider-install && aider-install",
     },
     Integration {
         name: "copilot",
         description: "GitHub Copilot CLI",
         binary: "gh",
-        install_hint: "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli",
     },
     Integration {
         name: "kimi",
         description: "Kimi Code CLI",
         binary: "kimi",
-        install_hint: "https://kimi.ai",
     },
     Integration {
         name: "gemini",
         description: "Gemini CLI",
         binary: "gemini",
-        install_hint: "npm install -g @google/gemini-cli",
     },
     Integration {
         name: "hermes",
         description: "Hermes Agent",
         binary: "hermes",
-        install_hint: "https://hermes-agent.nousresearch.com/install.sh",
     },
     Integration {
         name: "openclaw",
         description: "OpenClaw",
         binary: "openclaw",
-        install_hint: "npm install -g openclaw",
     },
 ];
 
@@ -356,10 +345,7 @@ fn print_integrations() {
         if find_on_path(i.binary).is_some() {
             println!("  {:<12} {}", i.name, i.description);
         } else {
-            println!(
-                "  {:<12} {} (not installed — {})",
-                i.name, i.description, i.install_hint
-            );
+            println!("  {:<12} {} (not installed)", i.name, i.description);
         }
     }
     println!("\nUsage: llmman launch <integration> [--model <model>] [--provider <provider>]");
@@ -420,10 +406,10 @@ fn launch(name: &str, model: &str, api_key: &str, extra_args: &[String]) -> anyh
         "claude" => launch_claude(model, api_key, extra_args),
         "opencode" => launch_opencode(model, api_key, extra_args),
         "codex" => launch_codex(model, api_key, extra_args),
-        "cline" => launch_simple("cline", "cline is not installed: npm install -g cline", model, extra_args),
+        "cline" => launch_simple("cline", model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
-        "kimi" => launch_simple("kimi", "kimi is not installed: https://kimi.ai", model, extra_args),
+        "kimi" => launch_simple("kimi", model, extra_args),
         "gemini" => launch_gemini(model, api_key, extra_args),
         "hermes" => launch_hermes(model, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
@@ -441,9 +427,7 @@ fn launch(name: &str, model: &str, api_key: &str, extra_args: &[String]) -> anyh
 /// claude: set ANTHROPIC_BASE_URL and a dummy ANTHROPIC_API_KEY so it talks to
 /// our server's Anthropic-compatible API.
 fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("claude").ok_or_else(|| {
-        anyhow::anyhow!("claude is not installed — https://code.claude.com/docs/en/quickstart")
-    })?;
+    let bin = find_on_path("claude").ok_or_else(|| anyhow::anyhow!("claude is not installed"))?;
 
     let mut args: Vec<String> = Vec::new();
     if !model.is_empty() {
@@ -471,8 +455,7 @@ fn launch_opencode(model: &str, api_key: &str, extra_args: &[String]) -> anyhow:
             p.exists().then_some(p)
         })
     });
-    let bin =
-        bin.ok_or_else(|| anyhow::anyhow!("opencode is not installed — https://opencode.ai"))?;
+    let bin = bin.ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
 
     let effective_model = if model.is_empty() { "default" } else { model };
     let config = opencode_config(effective_model, api_key);
@@ -519,8 +502,7 @@ fn launch_codex(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Re
     // @openai/codex` installs a "codex.cmd" shim on Windows, not a
     // "codex.exe", every real Windows codex launch failed with "program
     // not found" — a real E2E-verified failure, not a theoretical one.
-    let bin = find_on_path("codex")
-        .ok_or_else(|| anyhow::anyhow!("codex is not installed: npm install -g @openai/codex"))?;
+    let bin = find_on_path("codex").ok_or_else(|| anyhow::anyhow!("codex is not installed"))?;
 
     let mut args: Vec<String> = Vec::new();
     if !model.is_empty() {
@@ -616,9 +598,8 @@ fn launch_aider(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Re
 
 /// copilot: passes COPILOT_PROVIDER_BASE_URL via env.
 fn launch_copilot(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("gh").ok_or_else(|| {
-        anyhow::anyhow!("gh (GitHub CLI) is not installed — https://cli.github.com")
-    })?;
+    let bin =
+        find_on_path("gh").ok_or_else(|| anyhow::anyhow!("gh (GitHub CLI) is not installed"))?;
 
     let base_url = format!("{}/v1", daemon::server());
     let mut args = vec!["copilot".to_string()];
@@ -632,9 +613,7 @@ fn launch_copilot(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 
 /// gemini: set GOOGLE_GENAI_BASE_URL pointing at our Anthropic-compatible endpoint.
 fn launch_gemini(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("gemini").ok_or_else(|| {
-        anyhow::anyhow!("gemini is not installed — npm install -g @google/gemini-cli")
-    })?;
+    let bin = find_on_path("gemini").ok_or_else(|| anyhow::anyhow!("gemini is not installed"))?;
 
     let mut args: Vec<String> = Vec::new();
     if !model.is_empty() {
@@ -654,14 +633,8 @@ fn launch_gemini(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
 }
 
 /// Generic launcher: just set OLLAMA_HOST and run the binary.
-fn launch_simple(
-    binary: &str,
-    install_hint: &str,
-    _model: &str,
-    extra_args: &[String],
-) -> anyhow::Result<()> {
-    let bin = find_on_path(binary)
-        .ok_or_else(|| anyhow::anyhow!("{binary} is not installed — {install_hint}"))?;
+fn launch_simple(binary: &str, _model: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_on_path(binary).ok_or_else(|| anyhow::anyhow!("{binary} is not installed"))?;
     let server = daemon::server();
     exec_with_env(&bin, extra_args, &[("OLLAMA_HOST", server.as_str())])
 }
@@ -671,11 +644,7 @@ fn launch_simple(
 /// desktop-build setup a full wizard would also handle, which llmman's
 /// own launch has no equivalent for.
 fn launch_hermes(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("hermes").ok_or_else(|| {
-        anyhow::anyhow!(
-            "hermes is not installed — https://hermes-agent.nousresearch.com/install.sh"
-        )
-    })?;
+    let bin = find_on_path("hermes").ok_or_else(|| anyhow::anyhow!("hermes is not installed"))?;
     write_hermes_config(if model.is_empty() { "default" } else { model })?;
     exec_with_env(&bin, extra_args, &[])
 }
@@ -799,8 +768,8 @@ fn openclaw_model_id(model: &str) -> &str {
 /// channel-setup lifecycle a full setup wizard also manages is left to
 /// openclaw's own defaults.
 fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("openclaw")
-        .ok_or_else(|| anyhow::anyhow!("openclaw is not installed — npm install -g openclaw"))?;
+    let bin =
+        find_on_path("openclaw").ok_or_else(|| anyhow::anyhow!("openclaw is not installed"))?;
 
     // Matches openclaw.go's own onboarded() check: current config path,
     // or the legacy pre-rename one.
