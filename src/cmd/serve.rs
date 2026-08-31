@@ -682,11 +682,11 @@ impl ModelProcess {
     /// True if the underlying child process hasn't exited on its own since
     /// this model was marked running. Nothing else ever tells `mgr.running`
     /// about a process exiting unexpectedly: every other removal is a
-    /// deliberate one — the Ollama unload signal, in both
-    /// `handle_ollama_generate` and `handle_ollama_chat`; the idle reaper
-    /// (`reap_idle_models_once`); and eviction under
-    /// `LLMMAN_MAX_LOADED_MODELS` (`evict_other_models`) — and none of them
-    /// fires on a crash. So a crash, an OOM kill, or anything else that
+    /// deliberate one — the Ollama unload signal (`unload_model`, which
+    /// both `handle_ollama_generate` and `handle_ollama_chat` route
+    /// through); the idle reaper (`reap_idle_models_once`); and eviction
+    /// under `LLMMAN_MAX_LOADED_MODELS` (`evict_other_models`) — and none
+    /// of them fires on a crash. So a crash, an OOM kill, or anything else that
     /// takes `llama-server`/vllm down on its own would otherwise keep
     /// handing out that now-dead port forever, indistinguishable from a
     /// real live one until whichever caller's request to it fails with a
@@ -2275,6 +2275,44 @@ fn unload_key(
     let resolved = crate::shortnames::resolve_ollama_api(model)?;
     let tagged = crate::storage::default_tag(&resolved);
     Ok(canonical_ref(&state.0.store_path, &tagged))
+}
+
+/// Drops `model` from `running`, or reports a 404 when llmman has no such
+/// model at all.
+///
+/// Ollama answers an unload with a plain success for a model it holds but
+/// has not loaded, and 404s only for one it has never pulled (checked
+/// against ollama 0.32.6). The local store is what separates those two
+/// cases here. A model removed from the store while still loaded stays
+/// unloadable, since the `running` entry is authoritative and is consulted
+/// first.
+async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
+    let canonical = unload_key(state, model).map_err(AppError::bad_request)?;
+    // Wait for an in-flight load of this model to publish itself first, so
+    // it can't race ahead of this remove.
+    let _guard = acquire_load_lock(&canonical).await;
+    if state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .remove(&canonical)
+        .is_some()
+    {
+        return Ok(());
+    }
+    // Nothing was loaded under that key. A provider-routed model never is,
+    // and is absent from the store by definition, so naming one is not the
+    // 404 case.
+    if crate::providers::is_remote_ref(model) {
+        return Ok(());
+    }
+    let store = OciStore::open(&state.0.store_path)?;
+    store
+        .find(&canonical)
+        .map_err(|_| AppError(anyhow!("model '{model}' not found"), StatusCode::NOT_FOUND))?;
+    Ok(())
 }
 
 /// Is `model_ref` already running and alive? See `ModelProcess::is_alive`.
@@ -4678,9 +4716,7 @@ async fn handle_ollama_chat(
     // empty message, and a `keep_alive: 0` never unloads anything.
     if req.messages.is_empty() {
         if is_explicit_unload(&req.keep_alive) {
-            let canonical = unload_key(&state, &req.model).map_err(AppError::bad_request)?;
-            let _guard = acquire_load_lock(&canonical).await;
-            state.0.manager.lock().await.running.remove(&canonical);
+            unload_model(&state, &req.model).await?;
             return Ok(Json(empty_chat_chunk(req.model, "unload")).into_response());
         }
 
@@ -4766,11 +4802,7 @@ async fn handle_ollama_generate(
     // `LLMMAN_KEEP_ALIVE=0` turned a plain preload into an eviction.
     let is_unload = req.prompt.is_empty() && is_explicit_unload(&req.keep_alive);
     if is_unload {
-        let canonical = unload_key(&state, &req.model).map_err(AppError::bad_request)?;
-        // Wait for an in-flight load of this model to publish itself first,
-        // so it can't race ahead of this remove.
-        let _guard = acquire_load_lock(&canonical).await;
-        state.0.manager.lock().await.running.remove(&canonical);
+        unload_model(&state, &req.model).await?;
         return Ok(Json(OllamaGenerateChunk {
             model: req.model,
             created_at: now_rfc3339(),
@@ -7672,6 +7704,62 @@ mod tests {
                 .running
                 .contains_key("docker.io/ai/m:latest"),
             "a tagless unload must reach the model stored under :latest"
+        );
+    }
+
+    /// The store, not `running`, separates a model llmman has no record of
+    /// from one it holds but has not loaded: ollama 404s the first and
+    /// plainly succeeds the second, and `llmman stop` renders only that
+    /// 404 as an error of its own. `test_state`'s store is an empty temp
+    /// directory, so nothing resolves in it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unloading_a_model_llmman_does_not_have_is_a_404() {
+        let state = test_state();
+        let err = unload_model(&state, "docker.io/ai/nothing-here")
+            .await
+            .expect_err("an unknown model must not report a successful unload");
+        assert_eq!(err.1, StatusCode::NOT_FOUND);
+    }
+
+    /// The 404 above is keyed on a model being absent from `running` and
+    /// from the store, and a provider-routed one is served elsewhere, so
+    /// it is in neither. Naming it in an unload still has to succeed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unloading_a_provider_routed_model_is_not_a_404() {
+        let state = test_state();
+        unload_model(&state, "llmman.provider/openrouter/qwen/qwen3-coder")
+            .await
+            .expect("a provider-routed unload must succeed");
+    }
+
+    /// A model removed from the store while it is still loaded has to stay
+    /// unloadable — `running` is consulted before the store for exactly
+    /// this case, or the 404 above would strand a live `llama-server` with
+    /// no way to stop it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_model_gone_from_the_store_but_still_loaded_unloads_without_a_404() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "docker.io/ai/orphan:latest".into(),
+                running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+            );
+        }
+
+        unload_model(&state, "docker.io/ai/orphan")
+            .await
+            .expect("a loaded model must unload even with nothing in the store");
+
+        assert!(
+            !state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .contains_key("docker.io/ai/orphan:latest"),
+            "the running entry must be gone"
         );
     }
 
