@@ -993,18 +993,27 @@ pub fn ensure_model_pulled(reference: &str) -> anyhow::Result<()> {
 /// reads this exact shape as an immediate-unload request, mirroring real
 /// Ollama's own `ollama stop` (`cmd/cmd.go`'s `loadOrUnloadModel`). Used
 /// by `llmman stop`.
-pub fn unload(reference: &str) -> anyhow::Result<()> {
+///
+/// `Ok(false)` reports the daemon's 404, i.e. it holds no model by that
+/// name — the one outcome `llmman stop` renders as its own error rather
+/// than a transport failure. `Ok(true)` covers both a model that was
+/// loaded and one that simply was not, which the unload does not
+/// distinguish, matching ollama.
+pub fn unload(reference: &str) -> anyhow::Result<bool> {
     let resp = reqwest::blocking::Client::new()
         .post(format!("{}/api/generate", server()))
         .json(&serde_json::json!({"model": reference, "keep_alive": 0}))
         .send()
         .with_context(|| format!("request /api/generate (unload) for {reference}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
         anyhow::bail!("stop {reference}: server returned {status}: {body}");
     }
-    Ok(())
+    Ok(true)
 }
 
 /// A plain `GET {server()}{path}` returning the parsed JSON body — for
