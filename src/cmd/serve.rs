@@ -2263,6 +2263,15 @@ fn unload_key(
     state: &AppState,
     model: &str,
 ) -> Result<String, crate::shortnames::InvalidReference> {
+    // `ensure_model` hands a provider-routed reference straight back before
+    // reaching any of the steps below, for the reason its own comment
+    // gives: none of the aliasing, tag defaulting or store lookup applies
+    // to a model on someone else's servers. The key an unload resolves has
+    // to be built the same way, so it skips them too. Nothing observable
+    // depends on it today, since a remote target never enters `running`.
+    if crate::providers::is_remote_ref(model) {
+        return Ok(model.to_string());
+    }
     let resolved = crate::shortnames::resolve_ollama_api(model)?;
     let tagged = crate::storage::default_tag(&resolved);
     Ok(canonical_ref(&state.0.store_path, &tagged))
