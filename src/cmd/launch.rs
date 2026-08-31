@@ -626,9 +626,8 @@ fn write_droid_config(model: &str) -> anyhow::Result<String> {
 }
 
 /// Adds or replaces llmman's one owned entry and returns Droid's positional
-/// custom-model ID. An explicit marker (`apiKey: "llmman"` plus the ID prefix)
-/// distinguishes this entry from the user's own models without persisting a
-/// real provider credential.
+/// custom-model ID. A dedicated boolean marker distinguishes this entry from
+/// similarly named user models without persisting a real provider credential.
 fn update_droid_settings(
     existing: &str,
     model: &str,
@@ -649,11 +648,13 @@ fn update_droid_settings(
             return false;
         };
         entry
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|id| id.starts_with("custom:llmman-"))
-            || (entry.get("displayName").and_then(serde_json::Value::as_str) == Some("llmman")
-                && entry.get("apiKey").and_then(serde_json::Value::as_str) == Some("llmman"))
+            .get("llmmanManaged")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && entry
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.starts_with("custom:llmman-"))
     });
     let index = owned.unwrap_or(models.len());
     let custom_model_id = format!("custom:llmman-{index}");
@@ -669,6 +670,7 @@ fn update_droid_settings(
     entry.insert("maxOutputTokens".into(), 64_000.into());
     entry.insert("id".into(), custom_model_id.clone().into());
     entry.insert("index".into(), index.into());
+    entry.insert("llmmanManaged".into(), true.into());
 
     if let Some(i) = owned {
         models[i] = serde_json::Value::Object(entry);
@@ -1156,6 +1158,7 @@ mod tests {
         assert_eq!(model["maxOutputTokens"], 64_000);
         assert_eq!(model["id"], id);
         assert_eq!(model["index"], 0);
+        assert_eq!(model["llmmanManaged"], true);
     }
 
     #[test]
@@ -1190,6 +1193,7 @@ mod tests {
                     "apiKey": "llmman",
                     "id": "custom:llmman-1",
                     "index": 1,
+                    "llmmanManaged": true,
                     "futureField": "preserved"
                 }
             ]
@@ -1206,6 +1210,31 @@ mod tests {
         assert_eq!(parsed["customModels"][1]["model"], "new");
         assert_eq!(parsed["customModels"][1]["baseUrl"], "http://new/v1");
         assert_eq!(parsed["customModels"][1]["futureField"], "preserved");
+    }
+
+    #[test]
+    fn droid_settings_do_not_overwrite_a_similarly_named_user_model() {
+        let existing = r#"{
+            "customModels": [{
+                "model": "user-model",
+                "displayName": "llmman",
+                "apiKey": "llmman",
+                "id": "custom:llmman-0",
+                "index": 0
+            }]
+        }"#;
+        let (settings, id) =
+            update_droid_settings(existing, "managed-model", "http://localhost/v1").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
+
+        assert_eq!(id, "custom:llmman-1");
+        assert_eq!(parsed["customModels"][0]["model"], "user-model");
+        assert_eq!(
+            parsed["customModels"][0]["llmmanManaged"],
+            serde_json::Value::Null
+        );
+        assert_eq!(parsed["customModels"][1]["model"], "managed-model");
+        assert_eq!(parsed["customModels"][1]["llmmanManaged"], true);
     }
 
     #[test]
