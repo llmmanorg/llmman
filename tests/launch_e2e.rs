@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `opencode`, `codex`, `hermes`, `openclaw`) — not mocks.
+//! (`claude`, `opencode`, `pi`, `codex`, `hermes`, `openclaw`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -785,6 +785,28 @@ fn launch_opencode_with_model() {
         "opencode",
         &["run", PROMPT, "--print-logs", "--log-level", "DEBUG"],
     );
+}
+
+#[test]
+fn launch_pi_with_model() {
+    eprintln!("[test] launch_pi_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_pi_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("pi") {
+        eprintln!(
+            "skipping: pi not on PATH — npm install -g --ignore-scripts \
+             @earendil-works/pi-coding-agent"
+        );
+        return;
+    }
+
+    // `-p <prompt>`: pi's non-interactive one-shot mode. `run_launch`
+    // supplies a fresh HOME, so this also exercises models.json creation.
+    launch_and_assert("pi", &["-p", PROMPT]);
 }
 
 #[test]

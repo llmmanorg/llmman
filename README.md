@@ -141,7 +141,7 @@ Point an integration at a model in one step. `llmman launch` starts `serve` in t
 llmman launch claude --model gemma4
 ```
 
-Run `llmman launch` with no arguments to list the supported integrations (Claude Code, OpenCode) and whether each is installed. Any extra arguments after `--` are forwarded to the integration's own CLI.
+Run `llmman launch` with no arguments to list the supported integrations (Claude Code, OpenCode, Pi, and others) and whether each is installed. Any extra arguments after `--` are forwarded to the integration's own CLI.
 
 Short names work wherever a model reference is accepted.
 

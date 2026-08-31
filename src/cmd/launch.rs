@@ -382,6 +382,12 @@ const INTEGRATIONS: &[Integration] = &[
         install_hint: "https://opencode.ai",
     },
     Integration {
+        name: "pi",
+        description: "Pi coding agent",
+        binary: "pi",
+        install_hint: "npm install -g --ignore-scripts @earendil-works/pi-coding-agent",
+    },
+    Integration {
         name: "codex",
         description: "OpenAI Codex CLI",
         binary: "codex",
@@ -500,6 +506,7 @@ fn launch(name: &str, model: &str, api_key: &str, extra_args: &[String]) -> anyh
     match name.to_lowercase().as_str() {
         "claude" => launch_claude(model, api_key, extra_args),
         "opencode" => launch_opencode(model, api_key, extra_args),
+        "pi" => launch_pi(model, api_key, extra_args),
         "codex" => launch_codex(model, api_key, extra_args),
         "cline" => launch_simple("cline", "cline is not installed: npm install -g cline", model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
@@ -581,6 +588,84 @@ fn opencode_config(model: &str, api_key: &str) -> String {
         "model": format!("ollama/{model}")
     })
     .to_string()
+}
+
+/// pi: register llmman as an OpenAI-compatible provider in models.json,
+/// then select that provider's model for this launch. The config stores an
+/// environment-variable reference rather than the key itself, so a real
+/// `--provider` credential is passed per request without being persisted.
+fn launch_pi(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_on_path("pi").ok_or_else(|| {
+        anyhow::anyhow!(
+            "pi is not installed — npm install -g --ignore-scripts \
+             @earendil-works/pi-coding-agent"
+        )
+    })?;
+
+    let effective_model = if model.is_empty() { "default" } else { model };
+    write_pi_config(effective_model)?;
+
+    let mut args = vec!["--model".to_string(), format!("llmman/{effective_model}")];
+    args.extend_from_slice(extra_args);
+    exec_with_env(&bin, &args, &[("LLMMAN_PI_API_KEY", api_key)])
+}
+
+/// Matches pi's documented config-directory override before falling back to
+/// its default `~/.pi/agent` directory.
+fn pi_agent_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
+        if !dir.trim().is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    let home = dirs::home_dir().context("no home directory")?;
+    Ok(home.join(".pi").join("agent"))
+}
+
+fn write_pi_config(model: &str) -> anyhow::Result<()> {
+    let config_dir = pi_agent_dir()?;
+    std::fs::create_dir_all(&config_dir)?;
+    let config_path = config_dir.join("models.json");
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(existing) => existing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", config_path.display())),
+    };
+    let contents = pi_config(&existing, model, &daemon::server())?;
+    std::fs::write(config_path, contents)?;
+    Ok(())
+}
+
+/// Adds/replaces only llmman's provider entry, preserving unrelated custom
+/// providers and top-level settings in an existing pi models.json.
+fn pi_config(existing: &str, model: &str, server: &str) -> anyhow::Result<String> {
+    let mut root: serde_json::Value = if existing.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(existing).context("parse pi models.json")?
+    };
+    let root = root
+        .as_object_mut()
+        .context("pi models.json root must be an object")?;
+    let providers = root
+        .entry("providers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("pi models.json providers must be an object")?;
+    providers.insert(
+        "llmman".to_string(),
+        serde_json::json!({
+            "baseUrl": format!("{server}/v1"),
+            "api": "openai-completions",
+            "apiKey": "$LLMMAN_PI_API_KEY",
+            "compat": {
+                "supportsDeveloperRole": false,
+                "supportsReasoningEffort": false
+            },
+            "models": [{ "id": model }]
+        }),
+    );
+    Ok(format!("{}\n", serde_json::to_string_pretty(&root)?))
 }
 
 /// codex: set OPENAI_API_KEY=llmman and write ~/.codex/config.toml with the
@@ -985,6 +1070,46 @@ mod tests {
             yaml_quote(r#"a "quoted" \ value"#),
             r#""a \"quoted\" \\ value""#
         );
+    }
+
+    #[test]
+    fn pi_config_preserves_other_providers_without_persisting_the_key() {
+        let existing = r#"{
+          "custom": true,
+          "providers": {
+            "other": { "baseUrl": "https://example.invalid/v1" },
+            "llmman": { "stale": true }
+          }
+        }"#;
+        let rendered = pi_config(existing, "qwen3.5:0.8b", "http://127.0.0.1:17434")
+            .expect("render pi config");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(parsed["custom"], true);
+        assert_eq!(
+            parsed["providers"]["other"]["baseUrl"],
+            "https://example.invalid/v1"
+        );
+        assert_eq!(
+            parsed["providers"]["llmman"]["baseUrl"],
+            "http://127.0.0.1:17434/v1"
+        );
+        assert_eq!(
+            parsed["providers"]["llmman"]["models"][0]["id"],
+            "qwen3.5:0.8b"
+        );
+        assert_eq!(
+            parsed["providers"]["llmman"]["apiKey"],
+            "$LLMMAN_PI_API_KEY"
+        );
+        assert!(parsed["providers"]["llmman"].get("stale").is_none());
+    }
+
+    #[test]
+    fn pi_config_refuses_malformed_existing_config() {
+        assert!(pi_config("not json", "model", "http://localhost").is_err());
+        assert!(pi_config("[]", "model", "http://localhost").is_err());
+        assert!(pi_config(r#"{"providers": []}"#, "model", "http://localhost").is_err());
     }
 
     fn provider(id: &str, models: &[&str]) -> Provider {

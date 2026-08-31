@@ -422,7 +422,7 @@ jobs:
         run: go test -tags podman,containers_image_openpgp,exclude_graphdriver_btrfs,exclude_graphdriver_devicemapper ./...
 
   # --------------------------------------------------------------------------
-  # E2E: `llmman launch <claude|opencode|codex|hermes|openclaw> --model
+  # E2E: `llmman launch <claude|opencode|pi|codex|hermes|openclaw> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
   # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
@@ -631,7 +631,7 @@ jobs:
       # multi-line/array syntax; ubuntu/macOS already default to bash.
       #
       # Unlike hermes/mlx_lm.server (legitimately missing on some
-      # platforms), these four are plain npm packages expected to work
+      # platforms), these five are plain npm packages expected to work
       # everywhere — so install_cli fails the job, rather than letting
       # tests/launch_e2e.rs's on_path check silently skip, when one never
       # becomes a working binary.
@@ -644,7 +644,7 @@ jobs:
       # designed (npm tolerates one failed platform-tarball fetch, here
       # a registry blip, instead of failing the install), just not
       # detectable by a mere on_path/PATH check. Retrying rides that out.
-      - name: Install integration CLIs (claude, opencode, codex, openclaw)
+      - name: Install integration CLIs (claude, opencode, pi, codex, openclaw)
         shell: bash
         run: |
           failed_clis=()
@@ -678,6 +678,7 @@ jobs:
 
           install_cli "@anthropic-ai/claude-code" "@anthropic-ai/claude-code" "claude"
           install_cli "opencode-ai" "opencode-ai" "opencode"
+          install_cli "@earendil-works/pi-coding-agent" "@earendil-works/pi-coding-agent" "pi"
           install_cli "@openai/codex" "@openai/codex" "codex"
           # Pinned (not @latest): tests/launch_e2e.rs's own openclaw
           # invocation was verified against this exact release — its
