@@ -343,6 +343,43 @@ fn rejoin(parsed: &ParsedRef<'_>) -> String {
     out
 }
 
+/// Fuzz-target entry point (see `fuzz/fuzz_targets/parse_registry_ref.rs`).
+/// Feature-gated so it is absent from every normal build; the `fuzzing`
+/// feature only widens visibility, it does not change parsing behavior.
+/// Panics if `parse_registry_ref` ever accepts a ".." component, an
+/// over-length part, or a part containing a byte outside the allowlist
+/// (`is_part_byte`, plus ':' for host:port and the digest algo separator),
+/// the same invariants `parse_registry_ref_holds_the_part_invariants` pins
+/// as a unit test. Kept here rather than exporting [`ParsedRef`] so the
+/// fuzz crate only calls one function and gets a panic (or not) back.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_check_parse_registry_ref(reference: &str) {
+    let Ok(parsed) = parse_registry_ref(reference) else {
+        return;
+    };
+    let mut parts: Vec<(&str, usize)> = vec![
+        (parsed.model, MAX_PART_LEN),
+        (parsed.tag.unwrap_or("x"), MAX_PART_LEN),
+        (parsed.digest.unwrap_or("x"), MAX_PART_LEN),
+        (parsed.host.unwrap_or("x"), MAX_HOST_LEN),
+    ];
+    for ns in &parsed.namespace {
+        parts.push((ns, MAX_PART_LEN));
+    }
+    for (part, bound) in parts {
+        assert_ne!(part, "..", "{reference:?} parsed with a \"..\" part");
+        assert!(
+            part.len() <= bound,
+            "{reference:?} parsed with an over-length part"
+        );
+        assert!(
+            part.bytes().all(|b| is_part_byte(b) || b == b':'),
+            "{reference:?} parsed a part with a byte outside the allowlist: {part:?}"
+        );
+    }
+}
+
 /// Rejects a raw user-supplied model reference that can never resolve to a
 /// real source, before any resolution or network I/O runs.
 ///

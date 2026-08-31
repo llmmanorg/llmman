@@ -67,6 +67,10 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["default-htt
 default = ["docker"]
 docker = []
 podman = []
+# Exposes a #[doc(hidden)] pub wrapper around private parser internals for
+# the fuzz/ crate to call. Never enabled outside fuzzing: it does not
+# change any parsing behavior, only visibility.
+fuzzing = []
 
 [build-dependencies]
 flate2 = "1"
