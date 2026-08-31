@@ -4406,23 +4406,19 @@ struct OllamaPullRequest {
 async fn handle_pull(
     State(state): State<AppState>,
     Json(req): Json<OllamaPullRequest>,
-) -> impl IntoResponse {
+) -> Result<Response, AppError> {
     let model_ref = if req.model.is_empty() {
         req.name.as_str()
     } else {
         req.model.as_str()
     };
     if model_ref.is_empty() {
-        let body = serde_json::json!({"error": "model is required"});
-        return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            "model is required",
+        ));
     }
-    let model = match crate::shortnames::resolve_ollama_api(model_ref) {
-        Ok(m) => m,
-        Err(e) => {
-            let body = serde_json::json!({"error": e.to_string()});
-            return (StatusCode::BAD_REQUEST, Json(body)).into_response();
-        }
-    };
+    let model = crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
     eprintln!("[llmman] /api/pull model={model:?}");
     let store_path = state.0.store_path.clone();
 
@@ -4431,11 +4427,11 @@ async fn handle_pull(
         .is_ok();
     if already_present {
         let line = serde_json::json!({"status": "success"}).to_string() + "\n";
-        return Response::builder()
+        return Ok(Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/x-ndjson")
             .body(Body::from(line))
-            .unwrap();
+            .unwrap());
     }
 
     // Not in the local store: actually pull it (the previous behavior only
@@ -4453,7 +4449,12 @@ async fn handle_pull(
     let pull_task =
         tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_for_task));
 
-    stream_ffi_progress(model, "pull", "pulling manifest", pull_task)
+    Ok(stream_ffi_progress(
+        model,
+        "pull",
+        "pulling manifest",
+        pull_task,
+    ))
 }
 
 // -- Ollama /api/push ---------------------------------------------------------
@@ -4476,34 +4477,30 @@ struct OllamaPushRequest {
 async fn handle_push(
     State(state): State<AppState>,
     Json(req): Json<OllamaPushRequest>,
-) -> impl IntoResponse {
+) -> Result<Response, AppError> {
     let model_ref = if req.model.is_empty() {
         req.name.as_str()
     } else {
         req.model.as_str()
     };
     if model_ref.is_empty() {
-        let body = serde_json::json!({"error": "model is required"});
-        return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            "model is required",
+        ));
     }
-    let model = match crate::shortnames::resolve_ollama_api(model_ref) {
-        Ok(m) => m,
-        Err(e) => {
-            let body = serde_json::json!({"error": e.to_string()});
-            return (StatusCode::BAD_REQUEST, Json(body)).into_response();
-        }
-    };
+    let model = crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
     eprintln!("[llmman] /api/push model={model:?}");
     let store_path = state.0.store_path.clone();
 
     // Unlike pull, there's nothing sensible to do if the model isn't
-    // already in the local store — push has no "fetch it first" fallback.
+    // already in the local store: push has no "fetch it first" fallback.
     if OciStore::open(&store_path)
         .and_then(|s| s.find(&model))
         .is_err()
     {
         let body = serde_json::json!({"error": format!("model not found: {model}")});
-        return (StatusCode::NOT_FOUND, Json(body)).into_response();
+        return Ok((StatusCode::NOT_FOUND, Json(body)).into_response());
     }
 
     // See MODEL_LOCKS' doc comment: a push shares the same Go-side
@@ -4525,7 +4522,12 @@ async fn handle_push(
         result
     });
 
-    stream_ffi_progress(model, "push", "retrieving manifest", push_task).into_response()
+    Ok(stream_ffi_progress(
+        model,
+        "push",
+        "retrieving manifest",
+        push_task,
+    ))
 }
 
 /// Runs `task` (a blocking FFI call already dispatched via spawn_blocking)
