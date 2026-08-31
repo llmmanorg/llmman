@@ -46,6 +46,12 @@ use crate::daemon;
 pub struct RunArgs {
     #[arg(value_name = "MODEL")]
     pub model: String,
+    /// Chat with MODEL at this hosted provider (openai, anthropic,
+    /// openrouter, …) instead of locally. The request still goes through
+    /// `llmman serve`, which forwards it upstream; MODEL is the
+    /// provider's own model id. See `llmman providers`.
+    #[arg(long, short = 'p', value_name = "PROVIDER")]
+    pub provider: Option<String>,
     /// Forwarded as Ollama's own top-level `think` field on every request
     /// this sends (see cmd::serve's think_to_chat_template_kwargs) —
     /// `--think false` disables a reasoning model's thinking block
@@ -79,35 +85,51 @@ pub struct RunArgs {
 
 /// Per-request knobs threaded through unchanged from `RunArgs`.
 #[derive(Debug, Clone, Copy)]
-struct ChatOptions {
+struct ChatOptions<'a> {
     think: Option<bool>,
     num_predict: Option<u32>,
     /// Inverse of `RunArgs::nowordwrap`, matching ollama's
     /// `runOptions.WordWrap` (defaults `true`).
     word_wrap: bool,
+    /// Provider key to send with every request under `--provider` (see
+    /// `provider_model`), `None` for a local model. Applied as a default
+    /// header, not a body field — see `chat_client`.
+    api_key: Option<&'a str>,
 }
 
-impl Default for ChatOptions {
+impl Default for ChatOptions<'_> {
     fn default() -> Self {
         Self {
             think: None,
             num_predict: None,
             word_wrap: true,
+            api_key: None,
         }
     }
 }
 
 pub fn run(args: &RunArgs) -> anyhow::Result<()> {
+    let provider = crate::providers::provider_flag(args.provider.as_deref())?;
+    let prompt = args.prompt.join(" ");
+
     // resolve_ollama_api, not resolve: `llmman run` is an /api/chat client
     // (see chat_submit/run_interactive_tty below), so a bare name must
     // resolve the same way it would if requested directly over the Ollama
-    // API — otherwise a name resolved here, then handed to ensure_server as
-    // a --model preload and to every /api/chat request this sends, is no
-    // longer "bare" by the time ensure_model resolves it server-side (it
-    // already has a "/" and a "."), so the docker.io/ai/ default never
-    // fires and this silently falls back to hf.co/<name> instead.
-    let model = crate::shortnames::resolve_ollama_api(&args.model)?;
-    let prompt = args.prompt.join(" ");
+    // API — otherwise a name resolved here, then handed to every /api/chat
+    // request this sends, is no longer "bare" by the time ensure_model
+    // resolves it server-side (it already has a "/" and a "."), so the
+    // docker.io/ai/ default never fires and this silently falls back to
+    // hf.co/<name> instead.
+    //
+    // Not applied under `--provider`: that MODEL names a model on someone
+    // else's servers, so no shortname aliasing, tag defaulting, store
+    // lookup or pull applies — the same call ensure_model makes
+    // server-side. Resolved before the daemon starts, so a malformed
+    // local reference still fails without one.
+    let route = match provider {
+        Some(provider) => Route::Provider(provider),
+        None => Route::Local(crate::shortnames::resolve_ollama_api(&args.model)?),
+    };
 
     // Starts `llmman serve` detached, left running indefinitely, if one
     // isn't already reachable — the same shared helper pull/push/launch
@@ -118,17 +140,27 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
     // is a plain `llmman serve` with no model argument, so it's shared
     // cleanly across every future `run`/`pull`/`push`/`launch` in this
     // session rather than looking like it's dedicated to whatever model
-    // happened to start it first. ensure_model_pulled below still makes
-    // sure the model is on disk before the first /api/chat request.
+    // happened to start it first.
+    //
+    // A provider-routed model has nothing to preload or pull, but needs
+    // the daemon sooner still: it owns the catalog `provider_model`
+    // validates against, and it forwards the chat upstream.
     crate::daemon::ensure_server("")?;
 
-    // Fail fast on a bad/unresolvable reference — mirrors ollama's
-    // RunHandler, which resolves (Show, falling back to Pull) the model
-    // before ever showing its interactive prompt. Without this, an error
-    // like an invalid `hf.co/...` reference wouldn't surface until the
-    // first message was submitted to /api/chat, well after the `> `
-    // prompt had already been shown and read from.
-    crate::daemon::ensure_model_pulled(&model)?;
+    let (model, api_key) = match route {
+        Route::Provider(provider) => provider_model(provider, &args.model)?,
+        Route::Local(model) => {
+            // Fail fast on a bad/unresolvable reference — mirrors ollama's
+            // RunHandler, which resolves (Show, falling back to Pull) the
+            // model before ever showing its interactive prompt. Without
+            // this, an error like an invalid `hf.co/...` reference wouldn't
+            // surface until the first message was submitted to /api/chat,
+            // well after the `> ` prompt had already been shown and read
+            // from.
+            crate::daemon::ensure_model_pulled(&model)?;
+            (model, None)
+        }
+    };
 
     // Mirrors ollama's RunHandler: interactive needs *both* ends of the
     // terminal, not just stdin — otherwise a redirected stdout still gets
@@ -138,6 +170,7 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
         think: args.think,
         num_predict: args.num_predict,
         word_wrap: !args.nowordwrap,
+        api_key: api_key.as_deref(),
     };
 
     if interactive {
@@ -156,11 +189,61 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
             // reqwest::blocking, so Ctrl-C can race the response via
             // `tokio::select!` in `chat_submit` — see that fn's doc comment.
             let rt = tokio::runtime::Runtime::new().context("start tokio runtime")?;
-            let client = chat_client()?;
+            let client = chat_client(opts.api_key)?;
             chat_submit(&rt, &client, &model, &mut Vec::new(), p, opts)?;
         }
         Ok(())
     }
+}
+
+/// Where this chat goes: a local reference, already resolved (see `run`),
+/// or a provider id `provider_model` still has to validate.
+enum Route<'a> {
+    Local(String),
+    Provider(&'a str),
+}
+
+/// Validates `--provider`/MODEL against the daemon's catalog, returning
+/// the reference the daemon routes on (see
+/// [`crate::providers::REMOTE_PREFIX`]) and the key to send with each
+/// request, if this shell has one.
+///
+/// Mirrors `cmd::launch`'s `resolve_provider_model` minus the
+/// integrations: the key travels per request in an `Authorization` header
+/// (see `client_api_key` in cmd::serve), never to disk.
+fn provider_model(provider: &str, model: &str) -> anyhow::Result<(String, Option<String>)> {
+    // Same rule as `launch --provider` (see check_provider_supported in
+    // cmd::launch): the daemon has no TLS, so a key sent to one elsewhere
+    // on the network would cross it in cleartext. A wildcard bind is
+    // fine — that hop is still loopback.
+    anyhow::ensure!(
+        crate::daemon::connects_over_loopback(),
+        "--provider needs a local llmman serve: LLMMAN_HOST points at {}, and the provider \
+         key would cross the network in cleartext.\n\
+         Export the key where that daemon runs, and run llmman there.",
+        crate::daemon::server()
+    );
+
+    let entry = daemon::provider(provider)?;
+    let model = model.trim();
+    anyhow::ensure!(
+        !model.is_empty(),
+        "--provider {provider} also needs a model\n\n{}",
+        crate::providers::example_models(&entry.name, &entry.model_ids())
+    );
+
+    entry.warn_unlisted(model);
+
+    // Naming the missing variable beats a 401 mid-conversation — unless
+    // the daemon has the key, in which case it spends its own.
+    let key = entry.api_key();
+    anyhow::ensure!(
+        key.is_some() || entry.daemon_key_usable(),
+        "no API key for {} — set {} in your environment",
+        entry.name,
+        entry.key_env
+    );
+    Ok((crate::providers::format_remote_ref(provider, model), key))
 }
 
 // ---------------------------------------------------------------------------
@@ -178,8 +261,22 @@ struct Msg {
 /// Async, not `reqwest::blocking`, so a chat turn's response can be raced
 /// against `tokio::signal::ctrl_c()` in `chat_submit` — no `.timeout()`
 /// needed either, unlike the blocking client's own 30s default.
-fn chat_client() -> anyhow::Result<Client> {
-    Client::builder().build().context("build http client")
+///
+/// A `--provider` key (see `provider_model`) rides along as a default
+/// `Authorization` header — this client has one destination, and that
+/// header is what `client_api_key` in cmd::serve reads. Sensitive, so a
+/// `Debug`-formatted client or request cannot print it.
+fn chat_client(api_key: Option<&str>) -> anyhow::Result<Client> {
+    let mut builder = Client::builder();
+    if let Some(key) = api_key {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+            .context("provider API key is not a valid HTTP header value")?;
+        value.set_sensitive(true);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+        builder = builder.default_headers(headers);
+    }
+    builder.build().context("build http client")
 }
 
 #[derive(Serialize)]
@@ -358,7 +455,7 @@ impl Drop for SpinnerGuard {
 // Interactive — TTY path
 // ---------------------------------------------------------------------------
 
-fn run_interactive_tty(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
+fn run_interactive_tty(model: &str, opts: ChatOptions<'_>) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         run_interactive_unix(model, opts)
@@ -375,13 +472,13 @@ fn run_interactive_tty(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-fn run_interactive_unix(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
+fn run_interactive_unix(model: &str, opts: ChatOptions<'_>) -> anyhow::Result<()> {
     use unix_readline::Readline;
 
     // One tokio runtime, reused across every turn's `block_on` — see
     // `chat_submit`'s doc comment for why this needs async reqwest.
     let rt = tokio::runtime::Runtime::new().context("start tokio runtime")?;
-    let client = chat_client()?;
+    let client = chat_client(opts.api_key)?;
     let mut messages: Vec<Msg> = Vec::new();
     let mut rl = Readline::new()?;
     let mut multiline: Option<String> = None; // Some while inside """
@@ -497,7 +594,7 @@ fn submit_turn(
     rl: &mut unix_readline::Readline,
     messages: &mut Vec<Msg>,
     content: String,
-    opts: ChatOptions,
+    opts: ChatOptions<'_>,
 ) -> anyhow::Result<()> {
     rl.leave_raw();
     let result = chat_submit(rt, client, model, messages, content, opts);
@@ -520,7 +617,7 @@ fn chat_submit(
     model: &str,
     messages: &mut Vec<Msg>,
     content: String,
-    opts: ChatOptions,
+    opts: ChatOptions<'_>,
 ) -> anyhow::Result<()> {
     rt.block_on(chat_submit_async(client, model, messages, content, opts))
 }
@@ -530,7 +627,7 @@ async fn chat_submit_async(
     model: &str,
     messages: &mut Vec<Msg>,
     content: String,
-    opts: ChatOptions,
+    opts: ChatOptions<'_>,
 ) -> anyhow::Result<()> {
     messages.push(Msg {
         role: "user".into(),
@@ -574,8 +671,11 @@ async fn chat_submit_async(
 
     if !resp.status().is_success() {
         spinner.stop();
-        let e = resp.text().await.unwrap_or_default();
-        anyhow::bail!("{e}");
+        let body = resp.text().await.unwrap_or_default();
+        // The daemon's own message, not the JSON envelope around it: a
+        // provider's 401 naming the key it rejected is the whole of what
+        // is needed here.
+        anyhow::bail!("{}", daemon::api_error(&body).unwrap_or(body));
     }
 
     // Stream NDJSON lines as they arrive, async so each read can be
@@ -937,9 +1037,9 @@ mod unix_readline {
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-fn run_interactive_cooked(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
+fn run_interactive_cooked(model: &str, opts: ChatOptions<'_>) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new().context("start tokio runtime")?;
-    let client = chat_client()?;
+    let client = chat_client(opts.api_key)?;
     let mut messages: Vec<Msg> = Vec::new();
     use std::io::BufRead;
     let stdin = std::io::stdin();

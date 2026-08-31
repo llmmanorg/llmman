@@ -1,3 +1,11 @@
+//! `llmman list` — locally stored images, or (with `--provider`) the
+//! models a hosted provider serves.
+//!
+//! One command for both, because "which models can I run" has one
+//! answer; where the weights sit is a detail of how `llmman serve`
+//! reaches them (see `Target` in cmd::serve). `--provider`'s answer comes
+//! from the daemon's catalog — see cmd::providers for why.
+
 use clap::Args;
 
 use crate::fmt::{human_size, relative_time, short_id};
@@ -13,9 +21,22 @@ pub struct ListArgs {
     /// Available fields: .ID, .Digest, .Name, .Repository, .Tag, .Size, .Modified
     #[arg(long, value_name = "TEMPLATE")]
     pub format: Option<String>,
+    /// List the models this hosted provider serves (openai, anthropic,
+    /// openrouter, …) instead of local images. See `llmman providers`.
+    #[arg(
+        long,
+        short = 'p',
+        value_name = "PROVIDER",
+        conflicts_with_all = ["reference", "format"]
+    )]
+    pub provider: Option<String>,
 }
 
 pub fn run(args: &ListArgs) -> anyhow::Result<()> {
+    if let Some(provider) = crate::providers::provider_flag(args.provider.as_deref())? {
+        return list_provider_models(provider);
+    }
+
     let store_root = crate::default_store()?;
     let store = OciStore::open(&store_root)?;
     let mut images = store.list()?;
@@ -65,6 +86,73 @@ pub fn run(args: &ListArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Prints the models a provider serves and what it charges, from the
+/// daemon's catalog (`GET /llmman/providers/:id`). Nothing is downloaded:
+/// these are ids for `llmman run --provider`. Price replaces
+/// SIZE/MODIFIED, which mean nothing for someone else's weights.
+fn list_provider_models(provider: &str) -> anyhow::Result<()> {
+    crate::daemon::ensure_server("")?;
+    let entry = crate::daemon::provider(provider)?;
+    if entry.models.is_empty() {
+        // As for an empty local store: nothing to tabulate. The provider
+        // exists — an unknown one is an error from the daemon.
+        return Ok(());
+    }
+    let name_w = entry
+        .models
+        .iter()
+        .map(|m| m.id.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    // "IN $/Mtok" is the widest thing in its column, so it sizes itself.
+    println!(
+        "{:<name_w$}    {:<9}    OUT $/Mtok",
+        "NAME",
+        "IN $/Mtok",
+        name_w = name_w
+    );
+    for model in &entry.models {
+        let cost = model.cost;
+        println!(
+            "{:<name_w$}    {:<9}    {}",
+            model.id,
+            price(cost.map(|c| c.input)),
+            price(cost.map(|c| c.output)),
+            name_w = name_w,
+        );
+    }
+    Ok(())
+}
+
+/// Renders one dollars-per-million-tokens figure.
+///
+/// `None` (no published price) is `-`, never `0`: showing a paid model as
+/// free is worse than admitting llmman doesn't know. A genuinely free one
+/// — openrouter has plenty — still prints `0`.
+///
+/// Trailing zeros go because the range spans four orders of magnitude
+/// ($0.0023 and $600 are both real), so any fixed precision either loses
+/// the cheap end or pads the expensive one.
+fn price(value: Option<f64>) -> String {
+    let Some(value) = value else {
+        return "-".to_string();
+    };
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    let rendered = if value >= 1.0 {
+        format!("{value:.2}")
+    } else {
+        format!("{value:.5}")
+    };
+    let trimmed = rendered.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() || trimmed == "0" {
+        return "<0.00001".to_string();
+    }
+    trimmed.to_string()
 }
 
 /// Splits a stored reference into its repository and *explicit* tag,
@@ -262,5 +350,20 @@ mod tests {
     fn render_format_rejects_unknown_field() {
         let img = sample();
         assert!(render_format("{{.Bogus}}", &img).is_err());
+    }
+
+    /// Telling "free", "cheap" and "unpublished" apart is the point.
+    #[test]
+    fn price_distinguishes_free_from_unpublished() {
+        assert_eq!(price(None), "-");
+        assert_eq!(price(Some(0.0)), "0");
+        assert_eq!(price(Some(2.5)), "2.5");
+        assert_eq!(price(Some(10.0)), "10");
+        assert_eq!(price(Some(600.0)), "600");
+        assert_eq!(price(Some(1.234)), "1.23");
+        // The cheap end keeps its digits instead of rounding to free.
+        assert_eq!(price(Some(0.0023)), "0.0023");
+        assert_eq!(price(Some(0.01618)), "0.01618");
+        assert_eq!(price(Some(0.0000001)), "<0.00001");
     }
 }

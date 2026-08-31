@@ -5,6 +5,7 @@ pub mod launch;
 pub mod list;
 pub mod login;
 pub mod logout;
+pub mod providers;
 pub mod ps;
 pub mod pull;
 pub mod push;

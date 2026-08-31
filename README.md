@@ -12,8 +12,9 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 | `launch`  | Launch an integration (Claude Code, OpenCode, …) |
 | `run`     | Run a model interactively or with a one-shot prompt |
 | `pull`    | Pull a model from a registry or HuggingFace |
-| `list`    | List locally stored models |
+| `list`    | List locally stored models, or a hosted provider's (`--provider`) models |
 | `ps`      | List models currently loaded |
+| `providers` | List the hosted providers `--provider` can route to |
 | `stop`    | Stop (unload) a running model |
 | `build`   | Package model files into a local OCI image |
 | `push`    | Push a local image to a registry |
@@ -72,6 +73,18 @@ The server listens on `127.0.0.1:17434` by default, overridable via `LLMMAN_HOST
 | Ollama | `/api/generate`, `/api/chat`, `/api/tags`, `/api/show`, `/api/pull`, `/api/ps`, `/api/delete` |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens` |
 | Anthropic | `/v1/messages` |
+| llmman | `/llmman/providers`, `/llmman/providers/{id}` |
+
+`/llmman/...` is llmman's own API, not a compatibility surface — no
+upstream API has a notion of a [models.dev](https://models.dev) provider
+(see [Hosted providers](#hosted-providers)). `/llmman/providers` lists
+the ones this daemon can route to, each with its API-key variable,
+whether the daemon has that key, and how many models it serves;
+`/llmman/providers/{id}` adds those models and what each costs in US
+dollars per million tokens (absent, not zero, where models.dev publishes
+no price). `llmman providers`, `list --provider`, `run --provider` and
+`launch --provider` are all clients of it, so the catalog is fetched and
+cached in one process: the one that forwards the request upstream.
 
 `/v1/responses` implements the OpenAI Responses API (the dialect [OpenAI
 Codex](https://github.com/openai/codex) requires), including streaming SSE
@@ -147,11 +160,14 @@ Short names work wherever a model reference is accepted.
 
 #### Hosted providers
 
-`--provider` points the same integrations at a model llmman doesn't serve
-itself:
+`--provider` points llmman at a model it doesn't serve itself — from
+`launch`, from `run`, and from `list`:
 
 ```sh
 export OPENROUTER_API_KEY=...
+llmman providers                                    # which providers, and is the key set
+llmman list --provider openrouter                   # its models, and $/Mtok in and out
+llmman run --provider openrouter qwen/qwen3-coder   # chat with one directly
 llmman launch opencode --provider openrouter --model qwen/qwen3-coder
 ```
 
@@ -160,13 +176,16 @@ The provider list is fetched at runtime from
 its own providers from — so a newly added provider works without an
 llmman release. It's cached for 24 hours, and a stale copy is used if the
 fetch fails, so being offline means an out-of-date list rather than a
-broken command. `llmman launch --list-providers` prints the providers
-llmman can route to, with each one's API-key variable and whether it's
-set.
+broken command.
+
+All four commands ask the daemon over [`/llmman/providers`](#serve)
+rather than fetching models.dev themselves, so the cache outlives any
+single command and the key status reported is that of the environment
+whose key actually gets spent.
 
 Requests still go through `llmman serve`; `--provider` changes where the
-daemon forwards them, not who the integration talks to. So one endpoint
-and one place integrations are configured, whether a model is local or
+daemon forwards them, not who the client talks to. So one endpoint and
+one place integrations are configured, whether a model is local or
 hosted, and both usable from the same session.
 
 The API key is read from the variable models.dev names for that provider
@@ -189,10 +208,12 @@ capability data to filter on, so llmman turns that provider's bare 404
 into an explanation naming what's missing rather than guessing up front.
 
 `--provider` needs a local `llmman serve`. The daemon talks plain HTTP
-and has no authentication, so llmman will not hand an integration a real
-key to send to a remote `LLMMAN_HOST`, and a daemon bound to anything but
+and has no authentication, so neither `run` nor `launch` will send a real
+key to a remote `LLMMAN_HOST`, and a daemon bound to anything but
 loopback will not spend its own environment's key on behalf of a caller
-that didn't present one.
+that didn't present one. (`llmman providers` and `llmman list
+--provider` read the catalog only, no key involved, and work against any
+daemon.)
 
 Providers llmman cannot reach with a single bearer token over an
 OpenAI-compatible https endpoint are deliberately absent rather than

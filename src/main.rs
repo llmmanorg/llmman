@@ -44,6 +44,8 @@ enum Commands {
     List(cmd::list::ListArgs),
     /// List models currently loaded by a running `llmman serve`
     Ps(cmd::ps::PsArgs),
+    /// List the hosted providers `--provider` can route to
+    Providers(cmd::providers::ProvidersArgs),
     /// Copy a local image to a new reference
     Cp(cmd::cp::CpArgs),
     /// Remove a local image, freeing its blobs and extracted cache no
@@ -108,6 +110,7 @@ fn main() {
         Commands::Transfer(a) => cmd::transfer::run(a),
         Commands::List(a) => cmd::list::run(a),
         Commands::Ps(a) => cmd::ps::run(a),
+        Commands::Providers(a) => cmd::providers::run(a),
         Commands::Cp(a) => cmd::cp::run(a),
         Commands::Rm(a) => cmd::rm::run(a),
         Commands::Stop(a) => cmd::stop::run(a),

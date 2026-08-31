@@ -220,7 +220,7 @@ pub fn is_remote_ref(reference: &str) -> bool {
 /// One reachable provider: everything `llmman serve` needs to forward a
 /// request upstream, and everything `llmman launch` needs to explain how
 /// to authenticate to it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Provider {
     /// models.dev provider id, as passed to `--provider`.
     pub id: String,
@@ -231,19 +231,35 @@ pub struct Provider {
     pub base_url: String,
     /// Environment variable holding this provider's API key.
     pub key_env: String,
-    /// Model ids this provider serves, sorted. Used to validate `--model`
-    /// and to suggest values; never sent upstream verbatim.
-    pub models: Vec<String>,
+    /// Models this provider serves, sorted by id. Used to validate
+    /// `--model`, to suggest values, and to answer `llmman list
+    /// --provider`; the id is never sent upstream verbatim.
+    pub models: Vec<Model>,
+}
+
+/// One model a provider serves.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Model {
+    /// The model id as the *provider* knows it.
+    pub id: String,
+    /// `None` where models.dev publishes no price, which is not the same
+    /// as free and must not be rendered as one.
+    pub cost: Option<Cost>,
+}
+
+/// US dollars per million tokens — models.dev's own unit, unconverted so
+/// a printed figure matches the provider's pricing page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cost {
+    pub input: f64,
+    pub output: f64,
 }
 
 impl Provider {
     /// This provider's API key from the environment, or `None` when
     /// [`Provider::key_env`] is unset or blank.
     pub fn api_key(&self) -> Option<String> {
-        std::env::var(&self.key_env)
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
+        key_from_env(&self.key_env)
     }
 
     /// Appends an OpenAI route to this provider's base URL. See
@@ -251,6 +267,128 @@ impl Provider {
     pub fn url(&self, route: &str) -> String {
         rebase_url(&self.base_url, route)
     }
+}
+
+/// An API key read out of `var`, or `None` when it is unset or blank.
+///
+/// Free-standing because a `/llmman/providers` client (see
+/// `cmd::providers`) learns only the variable's *name* from the daemon,
+/// never a whole [`Provider`].
+pub fn key_from_env(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// The provider id `--provider` names: `None` when the flag is absent,
+/// an error when it is present but blank.
+///
+/// Blank is not absent. `--provider "$PROVIDER"` with the variable unset
+/// would otherwise silently run, list or launch *locally* — pulling
+/// weights, or reading the local store — when what was asked for was a
+/// hosted model.
+pub fn provider_flag(value: Option<&str>) -> anyhow::Result<Option<&str>> {
+    match value.map(str::trim) {
+        Some("") => anyhow::bail!(
+            "--provider needs a provider id — run 'llmman providers' for the ones llmman \
+             can route to"
+        ),
+        other => Ok(other),
+    }
+}
+
+/// A few real model ids, to make "which models?" answerable without
+/// leaving the error message. Ids, not a [`Provider`]: callers hold a
+/// wire shape from the daemon (see `cmd::providers`).
+pub fn example_models(name: &str, ids: &[&str]) -> String {
+    if ids.is_empty() {
+        return format!("{name} lists no models");
+    }
+    let shown: Vec<&str> = ids.iter().take(5).copied().collect();
+    let more = ids.len().saturating_sub(shown.len());
+    let suffix = if more > 0 {
+        format!(", … ({more} more)")
+    } else {
+        String::new()
+    };
+    format!("{name} models include: {}{suffix}", shown.join(", "))
+}
+
+/// Suggests near-matches before falling back to `llmman providers`, so a
+/// typo is one line from the right answer rather than a 180-entry
+/// listing. Next to the catalog because `llmman serve` owns it, and so is
+/// what reports an unknown id — to `/llmman/providers/:id` callers and to
+/// a request routed at a provider that does not exist alike.
+pub fn unknown_provider_error(provider: &str, catalog: &Catalog) -> anyhow::Error {
+    let close = suggestions(provider, catalog);
+    if close.is_empty() {
+        anyhow::anyhow!(
+            "unknown provider {provider:?}\nRun 'llmman providers' for the {} providers \
+             llmman can route to.",
+            catalog.len()
+        )
+    } else {
+        anyhow::anyhow!(
+            "unknown provider {provider:?}\nDid you mean: {}?\nRun 'llmman providers' for \
+             all {} of them.",
+            close.join(", "),
+            catalog.len()
+        )
+    }
+}
+
+/// Catalog ids closest to `provider`, or nothing when it is too long to
+/// be one: an id can arrive in a request body (see
+/// `resolve_remote_target` in cmd::serve), and both passes below scan the
+/// whole catalog against it — the second at O(needle × id) a candidate.
+/// Neither could match a needle that long anyway, so the guard costs no
+/// suggestion anyone would have wanted.
+fn suggestions<'a>(provider: &str, catalog: &'a Catalog) -> Vec<&'a str> {
+    let needle = provider.to_lowercase();
+    if needle.len() > MAX_SUGGESTION_LEN {
+        return Vec::new();
+    }
+    // A shortened or padded id first ("together" for `togetherai`), then
+    // — no substring match catches a slip like "togethr" — the nearest
+    // ids, allowing about one edit per three characters.
+    let close: Vec<&str> = catalog
+        .ids()
+        .filter(|id| id.contains(&needle) || needle.contains(*id))
+        .take(10)
+        .collect();
+    if !close.is_empty() {
+        return close;
+    }
+    let mut ranked: Vec<(usize, &str)> = catalog
+        .ids()
+        .map(|id| (edit_distance(&needle, id), id))
+        .filter(|(d, id)| d * 3 <= needle.len().max(id.len()))
+        .collect();
+    ranked.sort_unstable();
+    ranked.into_iter().take(5).map(|(_, id)| id).collect()
+}
+
+/// Longest id [`suggestions`] will look for a near-match to. A real one
+/// is ~30 characters; a request body allows megabytes.
+const MAX_SUGGESTION_LEN: usize = 64;
+
+/// Levenshtein distance, two rows at a time. Run over ~180 short ids,
+/// and only once no substring matched.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            cur[j + 1] = (prev[j] + usize::from(ca != *cb))
+                .min(prev[j + 1] + 1)
+                .min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 /// Re-bases one of llmman's own internal routes (`/v1/chat/completions`)
@@ -328,12 +466,9 @@ impl Catalog {
     }
 }
 
-/// A models.dev catalog entry, narrowed to the fields llmman reads.
-///
-/// `models` deserializes its values into [`serde::de::IgnoredAny`]: only
-/// the ids (the map's keys) are wanted, and `api.json` is megabytes of
-/// per-model cost/limit/modality metadata that would otherwise all be
-/// materialized.
+/// A models.dev catalog entry, narrowed to the fields llmman reads —
+/// `api.json` is megabytes of per-model limit/modality metadata nothing
+/// here reads.
 #[derive(Debug, Deserialize)]
 struct RawProvider {
     #[serde(default)]
@@ -345,7 +480,32 @@ struct RawProvider {
     #[serde(default)]
     env: Vec<String>,
     #[serde(default)]
-    models: BTreeMap<String, serde::de::IgnoredAny>,
+    models: BTreeMap<String, RawModel>,
+}
+
+/// A models.dev model entry — the id is the map key, so only the price
+/// is read out of the value.
+#[derive(Debug, Deserialize)]
+struct RawModel {
+    /// Untyped on purpose: a typed `{input, output}` would let an
+    /// upstream `cost` that grew a new shape drop the whole *provider*,
+    /// and a listing column is not worth `--provider x` breaking over.
+    #[serde(default)]
+    cost: Option<serde_json::Value>,
+}
+
+/// A models.dev `cost` object as a [`Cost`], or `None` unless *both*
+/// figures are there and sane — half a price misleads worse than none.
+fn cost_of(raw: &serde_json::Value) -> Option<Cost> {
+    let field = |name: &str| -> Option<f64> {
+        raw.get(name)?
+            .as_f64()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    };
+    Some(Cost {
+        input: field("input")?,
+        output: field("output")?,
+    })
 }
 
 /// Providers that pass every rule below but still cannot be driven with
@@ -413,7 +573,15 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
         name: raw.name,
         base_url: base_url_of(base_url),
         key_env,
-        models: raw.models.into_keys().collect(),
+        // Sorted by id, since `models` came out of a BTreeMap.
+        models: raw
+            .models
+            .into_iter()
+            .map(|(id, model)| Model {
+                id,
+                cost: model.cost.as_ref().and_then(cost_of),
+            })
+            .collect(),
     })
 }
 
@@ -696,7 +864,10 @@ mod tests {
                     "api": "https://openrouter.ai/api/v1",
                     "npm": "@openrouter/ai-sdk-provider",
                     "env": ["OPENROUTER_API_KEY"],
-                    "models": { "z-model": {}, "a-model": {} }
+                    "models": {
+                        "z-model": { "cost": { "input": 2.5, "output": 10 } },
+                        "a-model": {}
+                    }
                 }
             }"#,
         );
@@ -704,8 +875,23 @@ mod tests {
         assert_eq!(p.name, "OpenRouter");
         assert_eq!(p.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(p.key_env, "OPENROUTER_API_KEY");
-        // Sorted, and only the ids — the per-model metadata is dropped.
-        assert_eq!(p.models, vec!["a-model", "z-model"]);
+        // Sorted by id; an unpriced model keeps `None`, not a zero.
+        assert_eq!(
+            p.models,
+            vec![
+                Model {
+                    id: "a-model".into(),
+                    cost: None
+                },
+                Model {
+                    id: "z-model".into(),
+                    cost: Some(Cost {
+                        input: 2.5,
+                        output: 10.0
+                    })
+                },
+            ]
+        );
     }
 
     /// models.dev leaves `api` unset for providers whose SDK hardcodes
@@ -1115,5 +1301,141 @@ mod tests {
             models: vec![],
         };
         assert_eq!(p.api_key(), None);
+    }
+
+    /// The listing has to stay short enough to read in an error message
+    /// while still saying how much was elided.
+    #[test]
+    fn example_models_lists_a_few_and_counts_the_rest() {
+        assert_eq!(
+            example_models("Groq", &["a", "b"]),
+            "Groq models include: a, b"
+        );
+        assert_eq!(
+            example_models("Groq", &["a", "b", "c", "d", "e", "f", "g"]),
+            "Groq models include: a, b, c, d, e, … (2 more)"
+        );
+        assert_eq!(example_models("Groq", &[]), "Groq lists no models");
+    }
+
+    /// An explicitly blank `--provider` asked for a hosted model and gave
+    /// no id; running locally instead would pull weights nobody asked
+    /// for.
+    #[test]
+    fn a_blank_provider_flag_is_an_error_not_an_absent_one() {
+        assert_eq!(provider_flag(None).unwrap(), None);
+        assert_eq!(provider_flag(Some("  openai ")).unwrap(), Some("openai"));
+        assert!(provider_flag(Some("")).is_err());
+        assert!(provider_flag(Some("   ")).is_err());
+    }
+
+    /// A price is carried only when llmman is sure of it; anything else
+    /// is `None`, which `list --provider` prints as unknown, not free.
+    #[test]
+    fn cost_of_takes_both_figures_or_neither() {
+        let cost = |json: &str| cost_of(&serde_json::from_str(json).unwrap());
+        assert_eq!(
+            cost(r#"{"input": 2.5, "output": 10}"#),
+            Some(Cost {
+                input: 2.5,
+                output: 10.0
+            })
+        );
+        // A genuinely free model is a price, not a missing one.
+        assert_eq!(
+            cost(r#"{"input": 0, "output": 0, "cache_read": 1}"#),
+            Some(Cost {
+                input: 0.0,
+                output: 0.0
+            })
+        );
+        // Half a price, no price, and a shape llmman doesn't recognize.
+        assert_eq!(cost(r#"{"input": 2.5}"#), None);
+        assert_eq!(cost(r#"{}"#), None);
+        assert_eq!(cost(r#"{"input": "2.5", "output": "10"}"#), None);
+        assert_eq!(cost(r#"{"input": -1, "output": 10}"#), None);
+        assert_eq!(cost(r#"[]"#), None);
+    }
+
+    /// The reason `cost` is untyped: a shape llmman doesn't know costs
+    /// that model its price, not the provider its routability.
+    #[test]
+    fn an_unrecognized_cost_shape_keeps_the_provider() {
+        let catalog = catalog_from(
+            r#"{
+                "openrouter": {
+                    "id": "openrouter", "name": "OpenRouter",
+                    "api": "https://openrouter.ai/api/v1",
+                    "npm": "@openrouter/ai-sdk-provider", "env": ["OPENROUTER_API_KEY"],
+                    "models": {
+                        "weird": { "cost": "free, actually" },
+                        "fine": { "cost": { "input": 1, "output": 2 } }
+                    }
+                }
+            }"#,
+        );
+        let p = catalog.get("openrouter").expect("openrouter is routable");
+        assert_eq!(p.models.len(), 2);
+        assert_eq!(p.models[0].id, "fine");
+        assert!(p.models[1].cost.is_none());
+    }
+
+    /// A half-remembered or fat-fingered id has to come back with the
+    /// real one, or a 180-entry listing has to be re-read.
+    #[test]
+    fn unknown_provider_error_suggests_near_matches() {
+        let catalog = catalog_from(
+            r#"{
+                "togetherai": {
+                    "id": "togetherai", "name": "Together",
+                    "api": "https://api.together.xyz/v1",
+                    "npm": "@ai-sdk/openai-compatible", "env": ["TOGETHER_API_KEY"],
+                    "models": { "gpt-5": {} }
+                }
+            }"#,
+        );
+        // A shortened id, caught by the substring pass.
+        let short = unknown_provider_error("together", &catalog).to_string();
+        assert!(short.contains("unknown provider \"together\""), "{short}");
+        assert!(short.contains("Did you mean: togetherai?"), "{short}");
+        assert!(short.contains("llmman providers"), "{short}");
+
+        // A dropped character, which only the distance pass catches.
+        let typo = unknown_provider_error("togethr", &catalog).to_string();
+        assert!(typo.contains("Did you mean: togetherai?"), "{typo}");
+
+        // Nothing close: still name the command that lists them all,
+        // without inventing a suggestion.
+        let far = unknown_provider_error("nope", &catalog).to_string();
+        assert!(!far.contains("Did you mean"), "{far}");
+        assert!(far.contains("llmman providers"), "{far}");
+    }
+
+    /// An id from a request body can be megabytes long (see
+    /// `resolve_remote_target` in cmd::serve). Scanning the catalog
+    /// against it — let alone a distance matrix per entry — buys nothing:
+    /// it cannot match either pass.
+    #[test]
+    fn an_absurdly_long_id_is_reported_without_a_suggestion_pass() {
+        let catalog = catalog_from(
+            r#"{
+                "togetherai": {
+                    "id": "togetherai", "name": "Together",
+                    "api": "https://api.together.xyz/v1",
+                    "npm": "@ai-sdk/openai-compatible", "env": ["TOGETHER_API_KEY"],
+                    "models": { "gpt-5": {} }
+                }
+            }"#,
+        );
+        let huge = "z".repeat(4 * 1024 * 1024);
+        let started = Instant::now();
+        let error = unknown_provider_error(&huge, &catalog).to_string();
+        assert!(!error.contains("Did you mean"), "suggested for a 4MB id");
+        assert!(error.contains("llmman providers"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 }

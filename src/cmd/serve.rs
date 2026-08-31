@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context};
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -2714,6 +2714,17 @@ fn is_cross_site(headers: Option<&HeaderMap>) -> bool {
         })
 }
 
+/// The models.dev catalog, as everything in this module reaches it: off
+/// the runtime, since the first call fetches (and caches) it while every
+/// later one is memoized, and a 502 when that fetch fails — the failure
+/// is upstream's, not the caller's.
+async fn provider_catalog() -> Result<Arc<crate::providers::Catalog>, AppError> {
+    tokio::task::spawn_blocking(crate::providers::catalog)
+        .await
+        .context("provider catalog task panicked")?
+        .map_err(|e| AppError(e, StatusCode::BAD_GATEWAY))
+}
+
 /// Resolves a [`crate::providers::REMOTE_PREFIX`] reference into a
 /// [`Target::Remote`], or `None` for any ordinary local reference.
 ///
@@ -2731,19 +2742,11 @@ async fn resolve_remote_target(
     };
     let (provider_id, model) = (provider_id.to_string(), model.to_string());
 
-    // Blocking: the first call fetches models.dev (and caches it); every
-    // later one is a memoized lookup.
-    let catalog = tokio::task::spawn_blocking(crate::providers::catalog)
-        .await
-        .context("provider catalog task panicked")?
-        .map_err(|e| AppError(e, StatusCode::BAD_GATEWAY))?;
+    let catalog = provider_catalog().await?;
 
     let provider = catalog.get(&provider_id).ok_or_else(|| {
         AppError(
-            anyhow!(
-                "unknown provider {provider_id:?} — run 'llmman launch --list-providers' \
-                 for the providers llmman can route to"
-            ),
+            crate::providers::unknown_provider_error(&provider_id, &catalog),
             StatusCode::BAD_REQUEST,
         )
     })?;
@@ -4064,6 +4067,142 @@ async fn handle_props() -> impl IntoResponse {
             }
         }
     }))
+}
+
+// -- llmman's own API --------------------------------------------------------
+//
+// `/llmman` is llmman's own, not a compatibility surface: no upstream API
+// has a notion of a models.dev provider. `llmman providers`, `run
+// --provider`, `list --provider` and `launch --provider` are all clients
+// of the two routes below (see `cmd::providers`, and `crate::daemon` for
+// the wire types), so the catalog lives in one process: the one that
+// needs it to route upstream anyway, and whose key is spent for a request
+// that presents none (see `resolve_remote_target`).
+
+/// One entry in `GET /llmman/providers`.
+///
+/// A count, not the model ids: those are megabytes across the catalog,
+/// and a caller wanting one provider's asks for it (`ProviderResponse`).
+#[derive(Serialize)]
+struct ProviderSummary {
+    id: String,
+    name: String,
+    base_url: String,
+    key_env: String,
+    /// Whether *this daemon's* environment holds `key_env`.
+    key_set: bool,
+    /// Whether it would actually spend it for a request that presents no
+    /// key of its own — `key_set` plus this daemon's own bind check, which
+    /// only it can make (see `resolve_remote_target`). A client asking
+    /// "will my keyless request work" has to read this, not `key_set`:
+    /// its own `LLMMAN_HOST` says nothing about how the daemon is bound.
+    key_usable: bool,
+    models: usize,
+}
+
+impl From<&crate::providers::Provider> for ProviderSummary {
+    fn from(p: &crate::providers::Provider) -> Self {
+        Self {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            base_url: p.base_url.clone(),
+            key_env: p.key_env.clone(),
+            key_set: p.api_key().is_some(),
+            key_usable: daemon_key_usable(p),
+            models: p.models.len(),
+        }
+    }
+}
+
+/// Whether this daemon would spend its own key for a request that
+/// presents none — the same two conditions `resolve_remote_target`
+/// applies, minus the per-request cross-site check no CLI can trip.
+fn daemon_key_usable(provider: &crate::providers::Provider) -> bool {
+    provider.api_key().is_some() && crate::daemon::reachable_only_locally()
+}
+
+/// `GET /llmman/providers`.
+#[derive(Serialize)]
+struct ProvidersResponse {
+    providers: Vec<ProviderSummary>,
+}
+
+/// `GET /llmman/providers/:id` — one provider, with its models.
+#[derive(Serialize)]
+struct ProviderResponse {
+    id: String,
+    name: String,
+    base_url: String,
+    key_env: String,
+    key_set: bool,
+    /// See [`ProviderSummary::key_usable`].
+    key_usable: bool,
+    models: Vec<ProviderModelResponse>,
+}
+
+/// One model in a [`ProviderResponse`].
+#[derive(Serialize)]
+struct ProviderModelResponse {
+    id: String,
+    /// Absent, not zero, where models.dev publishes no price: printing
+    /// "unknown" as "free" lies about someone's bill.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost: Option<ProviderCostResponse>,
+}
+
+/// US dollars per million tokens, models.dev's own unit (see
+/// [`crate::providers::Cost`]).
+#[derive(Serialize)]
+struct ProviderCostResponse {
+    input: f64,
+    output: f64,
+}
+
+impl From<&crate::providers::Provider> for ProviderResponse {
+    fn from(p: &crate::providers::Provider) -> Self {
+        Self {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            base_url: p.base_url.clone(),
+            key_env: p.key_env.clone(),
+            key_set: p.api_key().is_some(),
+            key_usable: daemon_key_usable(p),
+            models: p
+                .models
+                .iter()
+                .map(|m| ProviderModelResponse {
+                    id: m.id.clone(),
+                    cost: m.cost.map(|c| ProviderCostResponse {
+                        input: c.input,
+                        output: c.output,
+                    }),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// `GET /llmman/providers` — every provider `--provider` accepts.
+async fn handle_llmman_providers() -> Result<impl IntoResponse, AppError> {
+    let catalog = provider_catalog().await?;
+    Ok(Json(ProvidersResponse {
+        providers: catalog.iter().map(ProviderSummary::from).collect(),
+    }))
+}
+
+/// `GET /llmman/providers/:id` — one provider, or a 404 naming
+/// near-matches (see [`crate::providers::unknown_provider_error`]).
+async fn handle_llmman_provider(
+    UrlPath(id): UrlPath<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let catalog = provider_catalog().await?;
+    let provider = catalog.get(&id).ok_or_else(|| {
+        AppError(
+            crate::providers::unknown_provider_error(&id, &catalog),
+            StatusCode::NOT_FOUND,
+        )
+    })?;
+    Ok(Json(ProviderResponse::from(provider)))
 }
 
 /// Ollama's GET /api/version, extended with this daemon's own identity —
@@ -5636,6 +5775,9 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .route("/loading.html", get(handle_loading_html))
         // llama.cpp-compatible props endpoint (router mode)
         .route("/props", get(handle_props))
+        // llmman's own API — see handle_llmman_providers
+        .route("/llmman/providers", get(handle_llmman_providers))
+        .route("/llmman/providers/:id", get(handle_llmman_provider))
         // Ollama API
         .route("/api/version", get(handle_version))
         .route("/api/tags", get(handle_tags))
@@ -6571,6 +6713,78 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#
         )
         .is_empty());
+    }
+
+    // -- llmman's own API ----------------------------------------------------
+
+    /// A catalog to serve, without the network. Its key variable is one
+    /// nothing exports, so `key_set` is false even in a shell that has a
+    /// real OpenRouter key.
+    fn fixture_catalog() -> crate::providers::Catalog {
+        crate::providers::Catalog::from_json(
+            br#"{
+                "openrouter": {
+                    "id": "openrouter", "name": "OpenRouter",
+                    "api": "https://openrouter.ai/api/v1",
+                    "npm": "@openrouter/ai-sdk-provider",
+                    "env": ["LLMMAN_TEST_PROVIDER_KEY_UNSET"],
+                    "models": {
+                        "z-model": { "cost": { "input": 2.5, "output": 10 } },
+                        "a-model": {}
+                    }
+                }
+            }"#,
+        )
+        .expect("fixture parses")
+    }
+
+    /// "Which providers are there" gets a count, not every model id.
+    #[test]
+    fn the_provider_listing_reports_model_counts_not_model_ids() {
+        let catalog = fixture_catalog();
+        let summaries: Vec<ProviderSummary> = catalog.iter().map(ProviderSummary::from).collect();
+        let json = serde_json::to_value(&summaries).unwrap();
+        assert_eq!(json[0]["id"], "openrouter");
+        assert_eq!(json[0]["name"], "OpenRouter");
+        assert_eq!(json[0]["key_env"], "LLMMAN_TEST_PROVIDER_KEY_UNSET");
+        assert_eq!(json[0]["models"], 2);
+        assert_eq!(json[0]["key_set"], false);
+        assert_eq!(json[0]["key_usable"], false);
+    }
+
+    /// The per-provider route carries the models themselves, sorted by
+    /// id (`list --provider` prints them straight through) and priced
+    /// where models.dev prices them.
+    #[test]
+    fn a_single_provider_carries_its_models_and_their_prices() {
+        let catalog = fixture_catalog();
+        let provider = catalog.get("openrouter").unwrap();
+        let json = serde_json::to_value(ProviderResponse::from(provider)).unwrap();
+        assert_eq!(json["base_url"], "https://openrouter.ai/api/v1");
+        assert_eq!(
+            json["models"],
+            serde_json::json!([
+                { "id": "a-model" },
+                { "id": "z-model", "cost": { "input": 2.5, "output": 10.0 } },
+            ])
+        );
+    }
+
+    /// `key_set` is the whole of what a client is told about a key.
+    #[test]
+    fn provider_responses_carry_no_api_key() {
+        let catalog = fixture_catalog();
+        let provider = catalog.get("openrouter").unwrap();
+        for json in [
+            serde_json::to_value(ProviderSummary::from(provider)).unwrap(),
+            serde_json::to_value(ProviderResponse::from(provider)).unwrap(),
+        ] {
+            let fields: Vec<&String> = json.as_object().unwrap().keys().collect();
+            assert!(
+                !fields.iter().any(|f| f.contains("api_key")),
+                "{fields:?} carries a key"
+            );
+        }
     }
 
     // -- Idle-timeout auto-unload reaper --------------------------------------

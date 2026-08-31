@@ -3,10 +3,11 @@
 //! by default, overridable via `LLMMAN_HOST`.
 //!
 //! Used by any CLI subcommand that acts as a client of that API rather than
-//! calling the FFI/model-management logic directly — currently `pull`,
-//! `push`, and `launch` — so bare model-name resolution (see
-//! `shortnames::resolve_ollama_api`), the local model store, and any
-//! already-loaded models are always the daemon's, never duplicated
+//! calling the FFI/model-management logic directly — `pull`, `push`,
+//! `run`, `ps`, `stop`, `launch`, and `providers` — so bare model-name
+//! resolution (see `shortnames::resolve_ollama_api`), the local model
+//! store, any already-loaded models, and the provider catalog (see
+//! [`providers`]) are always the daemon's, never duplicated
 //! per-invocation.
 
 use std::io::BufRead;
@@ -1007,18 +1008,177 @@ pub fn unload(reference: &str) -> anyhow::Result<()> {
 }
 
 /// A plain `GET {server()}{path}` returning the parsed JSON body — for
-/// callers (currently just `ps`) that don't need `stream_progress`'s
-/// newline-delimited-JSON streaming, just a single request/response.
+/// callers (`ps`, and the provider helpers below) that don't need
+/// `stream_progress`'s newline-delimited-JSON streaming, just a single
+/// request/response.
 pub fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T> {
     let resp = reqwest::blocking::get(format!("{}{path}", server()))
         .with_context(|| format!("request {path}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
-        anyhow::bail!("{path}: server returned {status}: {body}");
+        // The daemon's errors are `{"error": "<message>"}` (see AppError
+        // in cmd::serve), and that message is written for a person — the
+        // "did you mean" suggestions, say. An envelope and a status code
+        // around it bury the part meant to be read.
+        anyhow::bail!(
+            "{}",
+            api_error(&body).unwrap_or(format!("{path}: server returned {status}: {body}"))
+        );
     }
     resp.json()
         .with_context(|| format!("parse response from {path}"))
+}
+
+/// The `error` message out of an `AppError` response body, or `None` for
+/// a body that isn't one (an empty 404 from axum's router, say). Public
+/// for `cmd::run`, the one client that reads a body itself rather than
+/// through `get_json`.
+pub fn api_error(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("error")?
+        .as_str()
+        .map(str::to_string)
+        .filter(|e| !e.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// Providers — clients of the daemon's own /llmman API
+// ---------------------------------------------------------------------------
+
+/// Wire shape of one entry in `GET /llmman/providers` — see
+/// `ProviderSummary` in `cmd::serve` for the server side these field
+/// names must match.
+#[derive(Debug, Deserialize)]
+pub struct ProviderSummary {
+    pub id: String,
+    pub name: String,
+    pub key_env: String,
+    /// Whether the key is set *where the daemon runs*. This process's own
+    /// environment is [`ProviderSummary::key_here`].
+    pub key_set: bool,
+    /// Whether the daemon would actually spend that key for a request
+    /// presenting none. Only it can tell: that depends on how it is
+    /// bound, which this process's `LLMMAN_HOST` says nothing about.
+    #[serde(default)]
+    pub key_usable: bool,
+    pub models: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProvidersResponse {
+    providers: Vec<ProviderSummary>,
+}
+
+impl ProviderSummary {
+    /// Whether *this* process holds the key — the other way one reaches
+    /// a provider, sent per request (see `client_api_key` in cmd::serve).
+    pub fn key_here(&self) -> bool {
+        crate::providers::key_from_env(&self.key_env).is_some()
+    }
+}
+
+/// Every provider `--provider` accepts, as the running daemon sees them.
+pub fn providers() -> anyhow::Result<Vec<ProviderSummary>> {
+    Ok(get_json::<ProvidersResponse>("/llmman/providers")?.providers)
+}
+
+/// Wire shape of `GET /llmman/providers/:id` — one provider, with the
+/// models it serves. See `ProviderResponse` in `cmd::serve`.
+#[derive(Debug, Deserialize)]
+pub struct ProviderDetail {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub key_env: String,
+    /// See [`ProviderSummary::key_set`].
+    pub key_set: bool,
+    /// See [`ProviderSummary::key_usable`].
+    #[serde(default)]
+    pub key_usable: bool,
+    pub models: Vec<ProviderModel>,
+}
+
+/// One model in a [`ProviderDetail`].
+#[derive(Debug, Deserialize)]
+pub struct ProviderModel {
+    pub id: String,
+    /// `None` where models.dev publishes no price, which is not free.
+    #[serde(default)]
+    pub cost: Option<ModelCost>,
+}
+
+/// US dollars per million tokens (see [`crate::providers::Cost`]).
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct ModelCost {
+    pub input: f64,
+    pub output: f64,
+}
+
+impl ProviderDetail {
+    /// This provider's key from *this* process's environment, to travel
+    /// with each request (see `client_api_key` in cmd::serve). `None` need
+    /// not be fatal — the daemon may hold it ([`ProviderDetail::key_set`]).
+    ///
+    /// The daemon names the variable, so a process squatting the port
+    /// could name an unrelated secret — inside the trust boundary this
+    /// whole module sits in either way: that daemon is handed every
+    /// prompt, and every key, regardless.
+    pub fn api_key(&self) -> Option<String> {
+        crate::providers::key_from_env(&self.key_env)
+    }
+
+    /// Just the ids, for a caller that only needs to name one (see
+    /// `crate::providers::example_models`).
+    pub fn model_ids(&self) -> Vec<&str> {
+        self.models.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    /// Warns when this provider does not list `model` — a warning, since
+    /// models.dev is a snapshot and a provider can serve a model (a new
+    /// release, a fine-tune, a private deployment) before it lists one.
+    pub fn warn_unlisted(&self, model: &str) {
+        if !self.models.iter().any(|m| m.id == model) {
+            eprintln!(
+                "[llmman] warning: {} does not list model {model:?}\n{}",
+                self.name,
+                crate::providers::example_models(&self.name, &self.model_ids())
+            );
+        }
+    }
+
+    /// Whether the *daemon's* own key gets spent for a request that
+    /// presents none — its own answer (see `resolve_remote_target` in
+    /// cmd::serve), not a guess from this process's `LLMMAN_HOST`, which
+    /// describes the host it dials rather than how that daemon is bound.
+    pub fn daemon_key_usable(&self) -> bool {
+        self.key_usable
+    }
+}
+
+/// Looks one provider up in the daemon's catalog. An unknown id comes
+/// back as the daemon's own error, near-matches included (see
+/// `crate::providers::unknown_provider_error`).
+pub fn provider(id: &str) -> anyhow::Result<ProviderDetail> {
+    get_json(&format!("/llmman/providers/{}", encode_path_segment(id)))
+}
+
+/// Percent-encodes everything outside the unreserved set, so a typo'd id
+/// stays one path segment: `a/b` would otherwise miss the daemon's
+/// single-segment route (an empty 404 from axum's router instead of
+/// llmman's "unknown provider"), and `../` would address another.
+fn encode_path_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1048,6 +1208,59 @@ mod tests {
             assert!(!host_connects_over_loopback(remote), "{remote}");
             assert!(!host_reachable_only_locally(remote), "{remote}");
         }
+    }
+
+    /// A typo'd id has to stay one segment, or the daemon's "unknown
+    /// provider" answer never gets printed.
+    #[test]
+    fn encode_path_segment_keeps_a_typo_inside_one_segment() {
+        assert_eq!(encode_path_segment("openrouter"), "openrouter");
+        assert_eq!(
+            encode_path_segment("together-ai_1.0~x"),
+            "together-ai_1.0~x"
+        );
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+        assert_eq!(encode_path_segment("../api/tags"), "..%2Fapi%2Ftags");
+        assert_eq!(encode_path_segment("open ai"), "open%20ai");
+        assert_eq!(encode_path_segment("a?b#c"), "a%3Fb%23c");
+        // Non-ASCII goes out as its UTF-8 bytes, percent-encoded.
+        assert_eq!(encode_path_segment("é"), "%C3%A9");
+    }
+
+    /// Whether the daemon spends its own key is the daemon's answer, not
+    /// a guess from this process's `LLMMAN_HOST`: a daemon bound to
+    /// `0.0.0.0` withholds it while the client dialing loopback would
+    /// conclude the opposite, and only find out at the first request.
+    #[test]
+    fn daemon_key_usable_is_the_daemons_own_answer() {
+        let body = |extra: &str| {
+            serde_json::from_str::<ProviderDetail>(&format!(
+                r#"{{"id":"openai","name":"OpenAI","base_url":"https://api.openai.com/v1",
+                     "key_env":"LLMMAN_TEST_PROVIDER_KEY_UNSET","models":[]{extra}}}"#
+            ))
+            .expect("parses")
+        };
+        assert!(body(r#","key_set":true,"key_usable":true"#).daemon_key_usable());
+        // Has the key, would withhold it — a wildcard-bound daemon.
+        assert!(!body(r#","key_set":true,"key_usable":false"#).daemon_key_usable());
+        // Says nothing at all: assume the conservative answer.
+        assert!(!body(r#","key_set":true"#).daemon_key_usable());
+    }
+
+    /// The daemon's messages are written to be read; the JSON envelope
+    /// around them is not.
+    #[test]
+    fn api_error_unwraps_the_daemons_own_message() {
+        assert_eq!(
+            api_error(r#"{"error":"unknown provider \"togethr\""}"#).as_deref(),
+            Some("unknown provider \"togethr\"")
+        );
+        // Not an AppError body: nothing to unwrap, and the caller falls
+        // back to reporting the status and the raw body.
+        assert_eq!(api_error(""), None);
+        assert_eq!(api_error("Not Found"), None);
+        assert_eq!(api_error(r#"{"error":""}"#), None);
+        assert_eq!(api_error(r#"{"detail":"nope"}"#), None);
     }
 
     /// Unset/blank `LLMMAN_HOST` — the common case — resolves to the
