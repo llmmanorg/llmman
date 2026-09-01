@@ -418,7 +418,7 @@ const MIN_CTX_SIZE_FOR_RETRY: u32 = 16384;
 /// halve). Matches the top VRAM tier's own default (see
 /// `hostgpu::default_ctx_size_for`) rather than starting below
 /// `MIN_CTX_SIZE_FOR_RETRY`.
-const STARTING_CTX_SIZE_FOR_UNBOUNDED_RETRY: u32 = 32768;
+const STARTING_CTX_SIZE_FOR_UNBOUNDED_RETRY: u32 = 65536;
 
 /// Next `--ctx-size` to retry an OOM'd load with, or `None` if shrinking
 /// further wouldn't help (at/under the floor already).
@@ -8123,6 +8123,7 @@ mod tests {
     #[test]
     fn next_ctx_size_after_oom_halves_from_the_vram_tiered_default_down_to_the_floor() {
         // The default_ctx_size_for(<=46GiB) tier — see hostgpu.rs.
+        assert_eq!(next_ctx_size_after_oom(Some(65536)), Some(32768));
         assert_eq!(next_ctx_size_after_oom(Some(32768)), Some(16384));
         // At (or below) the floor, no further shrink is offered.
         assert_eq!(next_ctx_size_after_oom(Some(16384)), None);
@@ -8134,7 +8135,7 @@ mod tests {
         // ctx_size: None means "defer to the model's own trained
         // context" (see hostgpu::default_ctx_size) — nothing to halve,
         // so the first retry pins an explicit starting point instead.
-        assert_eq!(next_ctx_size_after_oom(None), Some(32768));
+        assert_eq!(next_ctx_size_after_oom(None), Some(65536));
     }
 
     #[test]

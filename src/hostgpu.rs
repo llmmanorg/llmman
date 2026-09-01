@@ -131,7 +131,7 @@ fn parse_igpu_enabled(value: Option<&str>) -> bool {
 
 /// VRAM-tiered context-size default (used by `cmd::serve` when
 /// `LLMMAN_CONTEXT_LENGTH` isn't set). Below a 47GiB VRAM threshold,
-/// defaults to 32768 tokens instead of a model's full trained context:
+/// defaults to 65536 tokens instead of a model's full trained context:
 /// llmman forwards requests to llama-server as-is rather than
 /// truncating oversized prompts, and real agentic CLIs routinely send
 /// 7-8k-token prompts before any reply — a smaller floor would be too
@@ -142,7 +142,7 @@ pub fn default_ctx_size_for(vram_bytes: u64) -> Option<u32> {
     if vram_bytes >= 47 * GIB {
         None
     } else {
-        Some(32768)
+        Some(65536)
     }
 }
 
@@ -359,10 +359,10 @@ mod tests {
 
     #[test]
     fn default_ctx_size_for_defers_above_the_top_vram_tier() {
-        assert_eq!(default_ctx_size_for(0), Some(32768));
-        assert_eq!(default_ctx_size_for(8 * GIB), Some(32768));
-        assert_eq!(default_ctx_size_for(23 * GIB), Some(32768));
-        assert_eq!(default_ctx_size_for(46 * GIB), Some(32768));
+        assert_eq!(default_ctx_size_for(0), Some(65536));
+        assert_eq!(default_ctx_size_for(8 * GIB), Some(65536));
+        assert_eq!(default_ctx_size_for(23 * GIB), Some(65536));
+        assert_eq!(default_ctx_size_for(46 * GIB), Some(65536));
         assert_eq!(default_ctx_size_for(47 * GIB), None);
         assert_eq!(default_ctx_size_for(80 * GIB), None);
     }
@@ -410,13 +410,13 @@ mod tests {
     fn default_ctx_size_for_with_overhead_subtracted_can_drop_a_tier() {
         // A host with 47GiB VRAM would defer to the model's own trained
         // context; a 1GiB LLMMAN_GPU_OVERHEAD knocks it back under the
-        // 47GiB threshold into the capped 32768 tier.
+        // 47GiB threshold into the capped 65536 tier.
         let vram = 47 * GIB;
         let overhead = GIB;
         assert_eq!(default_ctx_size_for(vram), None);
         assert_eq!(
             default_ctx_size_for(vram.saturating_sub(overhead)),
-            Some(32768)
+            Some(65536)
         );
     }
 
