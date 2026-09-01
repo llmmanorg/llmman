@@ -9,8 +9,9 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context};
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Path as UrlPath, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -23,6 +24,7 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 
 use crate::default_store;
+use crate::metrics::{self, UnloadReason};
 use crate::modelpack::{resolve_model, ModelPath};
 use crate::providers::PLACEHOLDER_API_KEY;
 use crate::storage::OciStore;
@@ -1729,8 +1731,22 @@ async fn reap_idle_models_once(state: &AppState) {
         })
         .collect();
     for name in expired {
-        eprintln!("[llmman] unloading {name}: idle past its keep_alive deadline");
-        mgr.running.remove(&name);
+        // Report what actually happened, not what woke the reaper.
+        // `check_running` only notices a dead backend when a request
+        // arrives for that model; one that died and was then never asked
+        // for again reaches its keep_alive deadline looking exactly like a
+        // healthy idle model. Calling that idle would leave `Crashed` at
+        // zero on the daemon whose backends are dying, and would put this
+        // log line and its metric at odds about the same unload.
+        if let Some(mut running) = mgr.running.remove(&name) {
+            if running.process.is_alive() {
+                eprintln!("[llmman] unloading {name}: idle past its keep_alive deadline");
+                metrics::record_model_unload(UnloadReason::Idle);
+            } else {
+                eprintln!("[llmman] unloading {name}: its backend had already exited");
+                metrics::record_model_unload(UnloadReason::Crashed);
+            }
+        }
     }
 }
 
@@ -2299,6 +2315,7 @@ async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
         .remove(&canonical)
         .is_some()
     {
+        metrics::record_model_unload(UnloadReason::Requested);
         return Ok(());
     }
     // Nothing was loaded under that key. A provider-routed model never is,
@@ -2332,6 +2349,7 @@ async fn check_running(state: &AppState, model_ref: &str) -> Option<(u16, Activi
             m.port
         );
         mgr.running.remove(model_ref);
+        metrics::record_model_unload(UnloadReason::Crashed);
     }
     None
 }
@@ -2357,6 +2375,7 @@ async fn evict_other_models(state: &AppState, model_ref: &str) -> bool {
     let mut evicted: Vec<(String, RunningModel)> = Vec::with_capacity(other_keys.len());
     for key in other_keys {
         if let Some(running) = mgr.running.remove(&key) {
+            metrics::record_model_unload(UnloadReason::Oom);
             evicted.push((key, running));
         }
     }
@@ -2465,6 +2484,7 @@ async fn enforce_max_loaded_models(
             .running
             .remove(&victim)
             .expect("victim key was just looked up under this same lock");
+        metrics::record_model_unload(UnloadReason::Evicted);
         drop(mgr); // release the lock before the (possibly slow) stop below
         eprintln!(
             "[llmman] evicting {victim} to free a loaded-model slot (LLMMAN_MAX_LOADED_MODELS={max_loaded})"
@@ -3143,6 +3163,7 @@ async fn ensure_model(
             in_flight: 1,
         },
     );
+    metrics::record_model_load();
     Ok((
         model_ref.to_string(),
         Target::Local(port),
@@ -5676,6 +5697,70 @@ fn resolve_llama_server(pinned_version: Option<&str>) -> anyhow::Result<PathBuf>
 }
 
 // ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+/// Records every response this router produces into [`crate::metrics`].
+///
+/// The route label is axum's `MatchedPath` — the route template
+/// (`/llmman/providers/:id`), never the path the client asked for. That
+/// is what bounds the label set to the router below instead of to
+/// traffic. An unmatched request carries no `MatchedPath` and is not
+/// counted: there is no route to attribute it to, and labelling by the
+/// requested path is how a metrics endpoint acquires unbounded
+/// cardinality. A flood of 404s to unknown paths is therefore invisible
+/// here.
+///
+/// The duration ends when the response *headers* are ready. On the
+/// streaming routes (`/api/chat`, `/v1/chat/completions`, ...) that is
+/// time to first byte, not total generation: the body is a stream this
+/// layer has already handed back. Time to first byte is what moves when a
+/// load stalls or the queue backs up, while total generation time mostly
+/// tracks how many tokens were asked for — reporting that as latency
+/// would make every long completion look like a regression.
+///
+/// The scrape route is instrumented like any other, so
+/// `route="/llmman/metrics"` reports what a scrape costs. Exclude that
+/// label when the question is application latency.
+async fn track_metrics(req: Request, next: Next) -> Response {
+    // Cloned, not copied into a `String`: `MatchedPath` is a handle around
+    // an `Arc<str>`, and `record_request` only takes ownership of a route
+    // the first time it sees one. The clone is needed at all because
+    // `next.run` consumes the request.
+    let route = req.extensions().get::<MatchedPath>().cloned();
+    let started = Instant::now();
+    let response = next.run(req).await;
+    if let Some(route) = route {
+        metrics::record_request(
+            route.as_str(),
+            response.status().as_u16(),
+            started.elapsed(),
+        );
+    }
+    response
+}
+
+/// Prometheus scrape target. See `crate::metrics`'s module doc comment
+/// for what this exposes, and for why per-token counters are llama-server's
+/// own `/metrics` to serve rather than llmman's.
+async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let models_loaded = state.0.manager.lock().await.running.len() as u64;
+    let report = metrics::report(metrics::Gauges {
+        version: env!("LLMMAN_VERSION").to_string(),
+        start_time_seconds: metrics::process_start_seconds(),
+        scheduling_requests_in_flight: PENDING_REQUESTS.load(std::sync::atomic::Ordering::SeqCst)
+            as u64,
+        // `.max(1)` rather than the raw setting: see the field's own doc.
+        scheduling_capacity: state.0.max_queue.max(1) as u64,
+        models_loaded,
+    });
+    (
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        metrics::render(&report),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -5823,9 +5908,11 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .route("/loading.html", get(handle_loading_html))
         // llama.cpp-compatible props endpoint (router mode)
         .route("/props", get(handle_props))
-        // llmman's own API — see handle_llmman_providers
+        // llmman's own API — see handle_llmman_providers, and
+        // crate::metrics for the Prometheus scrape target
         .route("/llmman/providers", get(handle_llmman_providers))
         .route("/llmman/providers/:id", get(handle_llmman_provider))
+        .route("/llmman/metrics", get(handle_metrics))
         // Ollama API
         .route("/api/version", get(handle_version))
         .route("/api/tags", get(handle_tags))
@@ -5858,8 +5945,18 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         )
         // Anthropic API
         .route("/v1/messages", post(handle_anthropic_messages))
+        // Innermost of the two, so what it times is the handler rather
+        // than the CORS layer's own header work. CORS therefore answers a
+        // preflight OPTIONS before this layer runs, so preflights are not
+        // counted — they are the browser's negotiation, not a request the
+        // daemon did any work for.
+        .layer(middleware::from_fn(track_metrics))
         .layer(cors_layer())
         .with_state(app_state);
+
+    // Before the listener binds, so uptime counts from the daemon coming
+    // up rather than from whenever something first scraped it.
+    metrics::mark_process_start();
 
     let addr = crate::daemon::bind_addr();
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -9236,5 +9333,161 @@ mod tests {
             .collect();
         assert_eq!(joined, "Hello, world");
         assert_eq!(chunks.last().unwrap()["done"], true);
+    }
+
+    /// Reads one `reason`'s counter out of the process-wide registry.
+    /// Absolute values are shared with every other test in this binary, so
+    /// callers compare deltas rather than totals.
+    fn unload_count(reason: &str) -> u64 {
+        let rendered = metrics::render(&metrics::report(metrics::Gauges {
+            version: "test".into(),
+            start_time_seconds: 0,
+            scheduling_requests_in_flight: 0,
+            scheduling_capacity: 1,
+            models_loaded: 0,
+        }));
+        let needle = format!("llmman_model_unloads_total{{reason=\"{reason}\"}} ");
+        rendered
+            .lines()
+            .find_map(|l| l.strip_prefix(needle.as_str()))
+            .and_then(|v| v.parse().ok())
+            .expect("every reason's counter is always rendered")
+    }
+
+    /// `oom` is the one unload reason that cannot be provoked against a
+    /// real daemon without driving the host to genuine memory exhaustion:
+    /// `looks_like_oom` matches llama-server's own allocation-failure
+    /// text, and `LLMMAN_CONTEXT_LENGTH` is daemon-wide, so any context
+    /// large enough to fail the second load fails the first one too.
+    /// Drive the eviction path directly instead, so the counter is at
+    /// least proven at the site the daemon really calls.
+    #[tokio::test]
+    async fn evicting_for_an_oom_retry_counts_every_model_it_freed() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "loading-now".into(),
+                running_model_fixture(None, Duration::from_secs(0), 0),
+            );
+            mgr.running.insert(
+                "evictable-a".into(),
+                running_model_fixture(None, Duration::from_secs(0), 0),
+            );
+            mgr.running.insert(
+                "evictable-b".into(),
+                running_model_fixture(None, Duration::from_secs(0), 0),
+            );
+            // In flight, so `evict_other_models` must leave it alone — and
+            // must not count an unload it did not perform.
+            mgr.running.insert(
+                "busy".into(),
+                running_model_fixture(None, Duration::from_secs(0), 1),
+            );
+        }
+
+        let _serialised = metrics::GLOBAL_COUNTER_TEST_LOCK.lock().await;
+        let before = unload_count("oom");
+        let evicted = evict_other_models(&state, "loading-now").await;
+        let after = unload_count("oom");
+
+        assert!(evicted, "two idle models were evictable");
+        assert_eq!(
+            after - before,
+            2,
+            "one count per model actually freed, and none for the busy one"
+        );
+
+        let mgr = state.0.manager.lock().await;
+        assert!(mgr.running.contains_key("loading-now"));
+        assert!(mgr.running.contains_key("busy"));
+        assert!(!mgr.running.contains_key("evictable-a"));
+        assert!(!mgr.running.contains_key("evictable-b"));
+    }
+
+    /// A backend that exits on its own and is then never asked for again
+    /// reaches its keep_alive deadline looking exactly like a healthy idle
+    /// model, because `check_running` only inspects a process when a
+    /// request arrives for it. Counting that as `idle` would leave
+    /// `crashed` at zero on the very daemon whose backends are dying.
+    #[tokio::test]
+    async fn the_reaper_labels_an_already_dead_backend_crashed_not_idle() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            let mut dead =
+                running_model_fixture(Some(Duration::from_secs(1)), Duration::from_secs(10), 0);
+            match &mut dead.process {
+                ModelProcess::Local(_, child, _) | ModelProcess::Container(_, child) => {
+                    child.kill().await.expect("kill the placeholder process")
+                }
+            }
+            mgr.running.insert("died-then-expired".into(), dead);
+        }
+
+        let crashed_before = unload_count("crashed");
+        reap_idle_models_once(&state).await;
+
+        assert!(
+            unload_count("crashed") > crashed_before,
+            "a backend already dead when the reaper reached it must count as crashed"
+        );
+        assert!(
+            !state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .contains_key("died-then-expired"),
+            "it must still be unloaded"
+        );
+    }
+
+    /// The `route` label must be the route *template*, never the path the
+    /// client actually asked for: a label taken from the raw URI grows a
+    /// new time series per distinct path, and a scrape — plus whatever
+    /// stores it — grows with it without bound. Checked against a real
+    /// router because what makes it true is axum inserting `MatchedPath`
+    /// before `Router::layer`'s middleware runs, which nothing in this
+    /// file can assert on its own.
+    #[tokio::test]
+    async fn the_metrics_route_label_is_the_template_not_the_request_path() {
+        let app = Router::new()
+            .route(
+                "/test-matched-path/:id",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(middleware::from_fn(track_metrics));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        Client::new()
+            .get(format!(
+                "http://127.0.0.1:{}/test-matched-path/abc123",
+                addr.port()
+            ))
+            .send()
+            .await
+            .expect("request reaches the test router");
+
+        // The process-wide registry, deliberately: this route template is
+        // unique to this test, so a parallel test's samples cannot be
+        // mistaken for it and it needs no isolation of its own.
+        let rendered = metrics::render(&metrics::report(metrics::Gauges {
+            version: "test".into(),
+            start_time_seconds: 0,
+            scheduling_requests_in_flight: 0,
+            scheduling_capacity: 1,
+            models_loaded: 0,
+        }));
+        assert!(
+            rendered.contains(
+                "llmman_http_requests_total{route=\"/test-matched-path/:id\",status=\"204\"} 1\n"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("abc123"), "{rendered}");
     }
 }

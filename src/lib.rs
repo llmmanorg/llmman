@@ -10,6 +10,7 @@ pub mod harmony;
 pub mod hf;
 pub mod hostgpu;
 pub mod llama_release;
+pub mod metrics;
 pub mod modelpack;
 pub mod oauth;
 pub mod providers;

@@ -73,7 +73,7 @@ The server listens on `127.0.0.1:17434` by default, overridable via `LLMMAN_HOST
 | Ollama | `/api/generate`, `/api/chat`, `/api/tags`, `/api/show`, `/api/pull`, `/api/ps`, `/api/delete` |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens` |
 | Anthropic | `/v1/messages` |
-| llmman | `/llmman/providers`, `/llmman/providers/{id}` |
+| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/metrics` |
 
 `/llmman/...` is llmman's own API, not a compatibility surface — no
 upstream API has a notion of a [models.dev](https://models.dev) provider
@@ -85,6 +85,46 @@ dollars per million tokens (absent, not zero, where models.dev publishes
 no price). `llmman providers`, `list --provider`, `run --provider` and
 `launch --provider` are all clients of it, so the catalog is fetched and
 cached in one process: the one that forwards the request upstream.
+
+`/llmman/metrics` is a Prometheus scrape target, in the text exposition
+format, always on. It reports the daemon's start time, requests and their
+duration by matched route, how many models are loaded, how many have been
+loaded and unloaded, and how many requests are doing model-scheduling work
+against the `LLMMAN_MAX_QUEUE` admission limit. Unloads carry a `reason`
+label (`idle`, `requested`, `crashed`, `oom`, `evicted`), which is what
+tells a steady eviction rate from a backend that keeps dying.
+
+Three things it deliberately does not measure. A request for an
+already-loaded model returns before admission control, so it is absent
+from `llmman_scheduling_requests_in_flight` and is not capped by
+`LLMMAN_MAX_QUEUE`. Requests to unknown paths are not counted, since
+labelling by the requested path is how a metrics endpoint acquires
+unbounded cardinality, and neither are CORS preflights, which the CORS
+layer answers before any handler runs. `llmman_models_loaded` is not the
+number `LLMMAN_MAX_LOADED_MODELS` caps either: that limit also counts
+outstanding load reservations, so a daemon can be at its limit while this
+gauge reads below it.
+
+The scrape route is instrumented like any other, so
+`route="/llmman/metrics"` reports what a scrape costs; exclude that label
+when asking about application latency.
+
+The endpoint is not on Prometheus' default path, so a scrape config needs
+one extra line:
+
+```yaml
+scrape_configs:
+  - job_name: llmman
+    metrics_path: /llmman/metrics
+    static_configs:
+      - targets: ["127.0.0.1:17434"]
+```
+
+Per-token counters (prompt and eval totals, KV-cache usage) are
+deliberately absent: llmman does not run inference, `llama-server` does,
+and it already publishes exactly those on its own `/metrics` when started
+with `--metrics`. Scrape the backend for those rather than have llmman
+keep a second copy that drifts.
 
 `/v1/responses` implements the OpenAI Responses API (the dialect [OpenAI
 Codex](https://github.com/openai/codex) requires), including streaming SSE
