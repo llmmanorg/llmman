@@ -224,12 +224,6 @@ that didn't present one. (`llmman providers` and `llmman list
 --provider` read the catalog only, no key involved, and work against any
 daemon.)
 
-Providers llmman cannot reach with a single bearer token over an
-OpenAI-compatible https endpoint are deliberately absent rather than
-half-supported: Amazon Bedrock (SigV4 request signing), Google Vertex
-(GCP service-account credentials), Azure, and the others whose endpoint
-is per-account or whose wire format isn't OpenAI's.
-
 ## Use with vLLM directly
 
 `llmman serve` already spawns `vllm` itself as a backend for safetensors
