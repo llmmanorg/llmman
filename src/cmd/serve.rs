@@ -2246,35 +2246,29 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
         .unwrap_or_else(|| model_ref.to_owned())
 }
 
-/// The `mgr.running` key an unload request names, resolved through the
-/// same three steps `ensure_model` uses to build the key it inserts
-/// under: `resolve_ollama_api`, then `default_tag`, then `canonical_ref`.
+/// The load-lock key for `model`: one string for every spelling of the
+/// same model, independent of what the store holds. `ensure_model` and
+/// `unload_model` both lock on it, so an unload arriving during a first
+/// load waits for that load rather than passing it.
 ///
-/// `default_tag` is the step the unload paths used to skip, on the
-/// assumption that `canonical_ref` would supply the tag from the store
-/// index. It only does so while the model is still *in* the store: once
-/// `find` misses — the model was removed after it was loaded, the index
-/// is unreadable — `canonical_ref` returns the reference untouched, so a
-/// tagless unload looked for `docker.io/ai/m` while the model ran under
-/// `docker.io/ai/m:latest`. `remove` missed, and the reply still said
-/// `"unload"`, leaving the caller believing a model it can still see in
-/// `llmman ps` had been evicted.
-fn unload_key(
-    state: &AppState,
-    model: &str,
-) -> Result<String, crate::shortnames::InvalidReference> {
-    // `ensure_model` hands a provider-routed reference straight back before
-    // reaching any of the steps below, for the reason its own comment
-    // gives: none of the aliasing, tag defaulting or store lookup applies
-    // to a model on someone else's servers. The key an unload resolves has
-    // to be built the same way, so it skips them too. Nothing observable
-    // depends on it today, since a remote target never enters `running`.
+/// Deliberately stops short of `canonical_ref`. That step reads the store,
+/// and the store changes underneath a first load: before the pull it has
+/// nothing and returns the tagged spelling, after it it returns whatever
+/// reference the pull recorded. A lock key that moved with it would let a
+/// caller resolving in that window take a different lock from the loader
+/// still holding the old one. `default_tag` alone is stable, and already
+/// folds the tagless and `:latest` spellings together, which is all the
+/// lock needs.
+///
+/// A provider-routed reference comes back untouched, as `ensure_model`
+/// returns it before any of this applies. Nothing observable depends on
+/// that today, since a remote target never enters `running`.
+fn load_identity(model: &str) -> Result<String, crate::shortnames::InvalidReference> {
     if crate::providers::is_remote_ref(model) {
         return Ok(model.to_string());
     }
     let resolved = crate::shortnames::resolve_ollama_api(model)?;
-    let tagged = crate::storage::default_tag(&resolved);
-    Ok(canonical_ref(&state.0.store_path, &tagged))
+    Ok(crate::storage::default_tag(&resolved))
 }
 
 /// Drops `model` from `running`, or reports a 404 when llmman has no such
@@ -2287,15 +2281,10 @@ fn unload_key(
 /// unloadable, since the `running` entry is authoritative and is consulted
 /// first.
 async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
-    // Lock on the same key `ensure_model` locks on, which it computes
-    // before any pull; then resolve again under the lock, as it does
-    // after its pull. A load in flight can refine the key it finally
-    // inserts under (see its own "re-canonicalise" note), and an unload
-    // that had already fixed its key before waiting on that lock would
-    // remove the stale spelling, miss, find the freshly pulled model in
-    // the store, and answer success while the loader's entry stays.
-    let lock_key = unload_key(state, model).map_err(AppError::bad_request)?;
+    let lock_key = load_identity(model).map_err(AppError::bad_request)?;
     let _guard = acquire_load_lock(&lock_key).await;
+    // Only now, with any load of this model excluded: the running key is
+    // the store's spelling, which a load in flight may just have changed.
     let canonical = if crate::providers::is_remote_ref(model) {
         lock_key
     } else {
@@ -2906,6 +2895,12 @@ async fn ensure_model(
     // first-pulls of e.g. "gemma4" and "gemma4:latest" take different
     // locks and both spawn a process for the same model.
     let model_ref = crate::storage::default_tag(&model_ref);
+    // Kept from before `canonical_ref`, which reads the store: this is
+    // the key the load lock is taken on, and it has to be the same string
+    // for the whole of a load even though the pull below changes what
+    // `canonical_ref` returns. See `load_identity`, which `unload_model`
+    // locks on for the same reason.
+    let load_id = model_ref.clone();
     let model_ref = canonical_ref(&state.0.store_path, &model_ref);
     let model_ref = model_ref.as_str();
 
@@ -2921,7 +2916,7 @@ async fn ensure_model(
     // See try_admit's doc comment — held for the rest of this function.
     let _queue_guard = try_admit(state.0.max_queue)?;
 
-    let _guard = acquire_load_lock(model_ref).await;
+    let _guard = acquire_load_lock(&load_id).await;
 
     // Someone else may have finished loading this model while we
     // waited for the lock above.
@@ -7799,8 +7794,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let state = test_state_at(dir.clone());
 
-        // What ensure_model locks on before its pull, and what unload_key
-        // resolves to against a store that does not yet hold the model.
+        // What ensure_model locks on before its pull, and what load_identity
+        // resolves to whatever the store holds.
         let pre_pull_key = "docker.io/ai/m:latest";
         let loading = acquire_load_lock(pre_pull_key).await;
 
@@ -7840,6 +7835,70 @@ mod tests {
                 .running
                 .contains_key("docker.io/ai/m"),
             "the unload must remove the key the load inserted, not the one it resolved before waiting"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The wider window: the pull has landed but the loader, still holding
+    /// its lock, has not yet inserted into `running`. An unload resolving
+    /// through the store now gets the refined spelling and locks on that
+    /// instead, so nothing makes it wait, and the sibling test's outcome
+    /// follows before the loader's entry even exists. Locking on
+    /// `load_identity`, which does not consult the store, parks it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unload_after_the_pull_but_before_the_insert_still_waits_for_the_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-unload-postpull-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = test_state_at(dir.clone());
+
+        // The pull has already recorded the tagless spelling...
+        let desc = crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:0000".into(),
+            size: 0,
+            annotations: None,
+        };
+        OciStore::open(&dir)
+            .unwrap()
+            .tag(desc, "docker.io/ai/m")
+            .unwrap();
+        // ...and the loader still holds the lock it took before pulling.
+        let loading = acquire_load_lock(&load_identity("docker.io/ai/m").unwrap()).await;
+
+        let unloader = state.clone();
+        let unload = tokio::spawn(async move { unload_model(&unloader, "docker.io/ai/m").await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !unload.is_finished(),
+            "the unload must block on the load in flight, not resolve past it"
+        );
+
+        state.0.manager.lock().await.running.insert(
+            "docker.io/ai/m".into(),
+            running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+        );
+        drop(loading);
+
+        unload
+            .await
+            .unwrap()
+            .expect("the unload must succeed once the load releases");
+        assert!(
+            !state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .contains_key("docker.io/ai/m"),
+            "the entry the load inserted must be gone"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -18,7 +18,7 @@ pub fn run(args: &StopArgs) -> anyhow::Result<()> {
     }
 
     // The reference goes to the daemon as the caller typed it: resolving
-    // it is `unload_key`'s job, and doing it here as well only invites the
+    // it is `unload_model`'s job, and doing it here as well only invites the
     // two spellings to disagree. The daemon's 404 is what distinguishes a
     // model llmman does not have from one it simply has not loaded, so
     // there is no `ps` snapshot to consult first — which also closes the
