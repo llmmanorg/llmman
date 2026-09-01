@@ -877,16 +877,56 @@ fn launch_qwen_with_model() {
     launch_and_assert_tolerating(
         "qwen",
         &[PROMPT, "--safe-mode", "--exclude-tools", "report_findings"],
-        qwen_loop_detection,
+        qwen_runaway_tool_loop,
     );
 }
 
-/// Qwen Code's own loop detector stops a run and exits 1 when a small
-/// model repeats a tool call — a property of MODEL's sampling, not of
-/// llmman, so tolerated the same way a timeout or a missing "pong" already
-/// are (see `openclaw_pull_registry_flake` for the same shape).
-fn qwen_loop_detection(stderr: &str) -> bool {
+/// The two terminal symptoms of one non-llmman-caused failure: MODEL,
+/// a 0.8B quantized model, degenerating into calling Qwen Code's tools
+/// over and over instead of answering PROMPT's one word. Tolerated the
+/// same way a timeout or a missing "pong" already are (see
+/// `openclaw_pull_registry_flake` for the same shape).
+///
+///   - Qwen Code notices first: its own loop detector stops the run and
+///     exits 1 when the model repeats a tool call.
+///   - Otherwise the transcript wins the race, and llama-server rejects
+///     the next request outright: each tool result is appended to the
+///     conversation, and a single result read out of the repository
+///     checkout this suite runs in is easily worth tens of thousands of
+///     tokens. Observed on CI run 33522317129 (macOS, docker), where the
+///     prompt grew 14809 → 35042 tokens across one turn and llama-server
+///     answered 400 "request (35042 tokens) exceeds the available context
+///     size (32768 tokens)". Qwen Code surfaces that verbatim and exits
+///     non-zero.
+///
+/// The second shape is only reachable because Qwen Code has no idea how
+/// much context llmman actually serves: with no `contextWindowSize` for
+/// the provider it assumes its `DEFAULT_TOKEN_LIMIT` of 131072 and so
+/// never auto-compresses below llmman's 32768 (`hostgpu::default_ctx_size`
+/// for any host under 47 GiB of VRAM). Plumbing the real window through to
+/// each integration is issue #363; until then a launch that ends this way
+/// says nothing about whether `llmman launch qwen` itself works, which is
+/// all this test is here to prove.
+fn qwen_runaway_tool_loop(stderr: &str) -> bool {
     stderr.contains("Loop detection halted the run")
+        || stderr.contains("exceeds the available context size")
+}
+
+/// Both shapes `qwen_runaway_tool_loop` tolerates, verbatim from the CI
+/// runs that produced them, plus a real regression that must still fail
+/// the test rather than be absorbed.
+#[test]
+fn qwen_runaway_tool_loop_matches_both_observed_shapes() {
+    assert!(qwen_runaway_tool_loop(
+        "Loop detection halted the run to prevent a repeated tool call.\n"
+    ));
+    assert!(qwen_runaway_tool_loop(
+        "[API Error: 400 request (35042 tokens) exceeds the available \
+         context size (32768 tokens), try increasing it]\n"
+    ));
+    assert!(!qwen_runaway_tool_loop(
+        "[API Error: 500 inference backend unavailable]\n"
+    ));
 }
 
 /// Verifies `daemon::ensure_server`'s fast-fail path end to end: when the
