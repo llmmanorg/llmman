@@ -27,13 +27,18 @@ env:
   # independently.
   LLAMA_CPP_RELEASE: b10293
   # vLLM version the e2e job's "Install vLLM (e2e)" step installs, for
-  # vllm-plugin/tests/test_e2e.py's real `vllm serve` test.
-  VLLM_VERSION: "0.27.1"
+  # vllm-plugin/tests/test_e2e.py's real `vllm serve` test. Moves with
+  # VLLM_METAL_VERSION below: a vllm-metal release names the vLLM
+  # release it was built against in its `.github/vllm-release-tag.commit`.
+  VLLM_VERSION: "0.28.0"
   # vllm-metal (github.com/vllm-project/vllm-metal), macOS's Metal-GPU
-  # vLLM platform below, has no stable release channel — only several-
-  # a-day nightlies — so this pins one verified build instead of
-  # floating on "latest" in a release-gating job. Bump deliberately.
-  VLLM_METAL_VERSION: "0.3.0.dev20260825040033"
+  # vLLM platform below. A stable release, cut from its `releases/vX.Y.Z`
+  # branch and numbered after the vLLM release it pairs with — never a
+  # `.dev` prerelease: those are published on every merge to its main
+  # and each one deletes the previous (vllm-metal#662), so a pinned one
+  # 404s within hours. The 0.3.0.dev20260825040033 pinned here before
+  # went that way and took every macOS e2e run with it. Bump deliberately.
+  VLLM_METAL_VERSION: "0.28.0"
 
 jobs:
   build:
