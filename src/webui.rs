@@ -11,3 +11,13 @@ pub static BUNDLE_CSS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/webui_g
 
 pub static LOADING_HTML: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/webui_gz/loading.html.gz"));
+
+/// llmman live's own page, script and stylesheet — see the
+/// `/llmman/live` handlers in `cmd::serve`. Unlike the bundle above these
+/// three are hand-written source files, not build output, so they are
+/// edited in `webui/` directly.
+pub static LIVE_HTML: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/webui_gz/live.html.gz"));
+
+pub static LIVE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/webui_gz/live.js.gz"));
+
+pub static LIVE_CSS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/webui_gz/live.css.gz"));

@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>llmman live</title>
+    <!--
+      Absolute asset paths, not relative ones: this page answers both
+      /llmman/live and /llmman/live/, and a relative "live.js" would
+      resolve to a different URL under each.
+    -->
+    <link rel="stylesheet" href="/llmman/live/live.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <h1>llmman <span>live</span></h1>
+    </header>
+
+    <main>
+      <section class="stage">
+        <div class="camera">
+          <video id="preview" playsinline muted autoplay></video>
+          <div id="camera-off" class="camera-off">camera off</div>
+          <div id="caption" class="caption" hidden></div>
+        </div>
+
+        <div class="stage-controls">
+          <button id="start" class="primary">Start session</button>
+          <button id="stop" class="ghost" hidden>End session</button>
+          <button id="mic" class="toggle" aria-pressed="true" hidden>
+            Mic on
+          </button>
+          <button id="cam" class="toggle" aria-pressed="true" hidden>
+            Camera on
+          </button>
+        </div>
+
+        <p id="hint" class="hint">
+          Grant microphone and camera access, then just talk. Your browser
+          recognizes the speech, llmman attaches the most recent video frames
+          and streams the reply back — spoken aloud, and interruptible.
+        </p>
+      </section>
+
+      <section class="side">
+        <div class="settings">
+          <label>
+            Model
+            <select id="model"></select>
+          </label>
+          <label>
+            System prompt
+            <!-- Shown rather than applied behind the page's back: a spoken
+                 conversation needs short replies, and the reason it gets
+                 them should be visible and editable. -->
+            <textarea id="system" rows="4" spellcheck="false">
+You are in a live spoken conversation and may be shown frames from the user's camera. Reply in one or two short, natural sentences unless asked for more detail. Never use markdown, lists or emoji: everything you say is read aloud.</textarea
+            >
+          </label>
+          <div class="row">
+            <label class="check">
+              <input id="send-video" type="checkbox" checked />
+              Send video frames
+            </label>
+            <label class="check">
+              <input id="speak" type="checkbox" checked />
+              Speak replies
+            </label>
+          </div>
+          <div class="row">
+            <label class="check">
+              <input id="barge-in" type="checkbox" />
+              Allow interrupting (headphones)
+            </label>
+          </div>
+          <label class="narrow">
+            Frames per turn
+            <input id="frames" type="number" min="0" max="8" value="2" />
+          </label>
+        </div>
+
+        <div id="log" class="log" aria-live="polite"></div>
+
+        <form id="compose" class="compose">
+          <input
+            id="text"
+            type="text"
+            placeholder="…or type instead of talking"
+            autocomplete="off"
+          />
+          <button type="submit">Send</button>
+        </form>
+      </section>
+    </main>
+
+    <script type="module" src="/llmman/live/live.js"></script>
+  </body>
+</html>

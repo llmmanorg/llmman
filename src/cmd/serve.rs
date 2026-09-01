@@ -4257,6 +4257,435 @@ async fn handle_llmman_provider(
     Ok(Json(ProviderResponse::from(provider)))
 }
 
+// -- llmman live (/llmman/live) ----------------------------------------------
+//
+// A hands-free voice-and-camera conversation surface: the browser listens
+// to the microphone and watches the camera, and each time the speaker
+// finishes a sentence it sends what was said plus the most recent frames
+// here; llmman attaches the frames if the chosen model can actually see,
+// and streams the reply back token by token for the page to render and
+// speak.
+//
+// Speech recognition is the browser's own, not a model llmman loads.
+// Every browser that can grant microphone access already ships a
+// recognizer (the Web Speech API — on-device, in recent Chrome), so
+// asking the user to pull a whisper-family model, keep it in the store,
+// hold a second model in memory for every session, and *choose* it from
+// a list they have no basis to choose from would be three costs and a
+// decision in exchange for nothing. It also means the page has the
+// transcript as it is being spoken, which is what makes live captions and
+// interrupting mid-reply possible at all — a server round trip per
+// utterance could only produce text after the fact.
+//
+// So a turn arrives here as text, which is also what makes *any* model a
+// first-class choice: by the time `post_chat` is reached nothing about a
+// turn is model-specific. A small text-only model such as `qwen3.5:0.8b`
+// works exactly as well as a vision one, which only additionally gets to
+// see the camera.
+//
+// Deliberately not a bidirectional socket: with recognition happening in
+// the page, a turn is one short JSON request and one streamed reply. That
+// keeps this on exactly the plumbing every other route here already uses
+// (`ensure_model`, `ActivityGuard`, `post_chat`, `bytes_to_lines`) rather
+// than adding a second connection lifecycle to keep in step with a
+// model's keep-alive, and an upgrade path CORS (see `cors_layer`) does
+// not cover.
+
+/// Frames one turn may carry. The page sends two by default; the cap
+/// exists so a malformed or hostile client cannot make a single turn
+/// expand into a prompt large enough to evict every other loaded model to
+/// fit.
+const MAX_LIVE_FRAMES: usize = 8;
+
+/// A turn is a sentence of text plus a few downscaled JPEG stills,
+/// base64-encoded — a few hundred kilobytes at the page's own settings,
+/// but enough headroom here that raising the frame count or resolution
+/// doesn't turn into a confusing 413. Still far below
+/// `TRANSCRIPTION_BODY_LIMIT_BYTES`, since no audio is ever uploaded.
+const LIVE_TURN_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+
+/// One turn of a live session, as the page sends it.
+///
+/// Every field defaults, so a turn from an older page against a newer
+/// daemon (or the reverse) is a 400 naming what is actually missing
+/// rather than a parse error naming a field the sender never heard of.
+#[derive(Debug, Default, Deserialize, PartialEq)]
+struct LiveTurn {
+    #[serde(default)]
+    model: String,
+    /// The sentence the browser's speech recognizer produced, or what the
+    /// user typed instead.
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    system: Option<String>,
+    #[serde(default)]
+    history: Vec<LiveMessage>,
+    /// Camera stills, base64-encoded, oldest first — the same wire shape
+    /// as Ollama's own `images` (see `OllamaMessage::images`), for the
+    /// same reason: it is the one encoding a JSON body can carry an image
+    /// in.
+    #[serde(default)]
+    frames: Vec<String>,
+}
+
+/// One prior turn, replayed by the page. Text only, and no tool roles:
+/// the page never renders anything else, and a `role: "tool"` message
+/// with no matching call would break a chat template rather than add
+/// context.
+#[derive(Debug, Deserialize, PartialEq)]
+struct LiveMessage {
+    role: String,
+    content: String,
+}
+
+/// One server-sent event on `/llmman/live/turn`.
+///
+/// `Context` always comes first, before any of the model's own output:
+/// the page needs to know whether the frames it just uploaded were
+/// actually used, and only the daemon can answer that, since only it
+/// knows what the resolved backend supports.
+///
+/// There is deliberately no event echoing the user's own turn back — the
+/// page recognized the speech itself and already has the text.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum LiveEvent {
+    /// What llmman did with this turn.
+    Context {
+        model: String,
+        vision: bool,
+        frames: usize,
+    },
+    /// A chunk of the reply.
+    Delta {
+        text: String,
+    },
+    /// A chunk of the model's reasoning. A separate event so the page can
+    /// show it as status without reading it aloud or keeping it in the
+    /// conversation history.
+    Thinking {
+        text: String,
+    },
+    /// A failure that only became apparent after the response headers
+    /// were already on the wire, where a status code is no longer
+    /// available to carry it.
+    Error {
+        message: String,
+    },
+    Done,
+}
+
+/// Whether a backend can accept image content parts, read from the same
+/// llama.cpp `/props` document `query_context_length` uses.
+fn vision_from_props(props: &serde_json::Value) -> bool {
+    props
+        .get("modalities")
+        .and_then(|m| m.get("vision"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether this turn's camera frames should be attached at all.
+///
+/// A local backend is asked: a GGUF loaded without an `--mmproj`
+/// projector cannot see, and handing it images produces a confusing
+/// backend error instead of a reply. Anything unanswerable — a timeout, a
+/// `vllm`/`mlx` backend with no `/props` at all — counts as no vision,
+/// since text still works and images would not.
+///
+/// A provider is assumed to have vision, because it cannot be asked: it
+/// publishes no capability document llmman reads, and a hosted model
+/// picked for a camera-facing session is overwhelmingly likely to be one
+/// that can see. If it isn't, the provider's own 4xx saying so is passed
+/// through by `post_chat` — an actionable answer, unlike silently
+/// dropping the video from every hosted model.
+async fn target_supports_vision(client: &Client, target: &Target) -> bool {
+    let Target::Local(port) = target else {
+        return true;
+    };
+    let Ok(resp) = client
+        .get(format!("http://127.0.0.1:{port}/props"))
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    match resp.json::<serde_json::Value>().await {
+        Ok(props) => vision_from_props(&props),
+        Err(_) => false,
+    }
+}
+
+/// Wraps one captured camera frame as an `image_url` content part value.
+///
+/// Not `image_data_uri`: that one labels everything `image/png` and
+/// relies on llama.cpp sniffing the real format from the bytes, which a
+/// remote provider does not do. The page encodes frames as JPEG and says
+/// so here, so a provider-routed live session works too. A value that
+/// already looks like a data URI is passed through, same as there.
+fn frame_data_uri(frame: &str) -> String {
+    if frame.starts_with("data:") {
+        frame.to_string()
+    } else {
+        format!("data:image/jpeg;base64,{frame}")
+    }
+}
+
+/// Assembles the messages for one live turn.
+///
+/// `history` is replayed as plain text: frames are never re-sent, both
+/// because they are large and because a stale frame is worse than no
+/// frame when the whole point of the current one is to show what the
+/// camera sees *now*. Only the roles the page itself produces survive —
+/// a `role` it never writes came from somewhere else and has no place in
+/// a chat template.
+fn build_live_messages(
+    system: Option<&str>,
+    history: &[LiveMessage],
+    user_text: &str,
+    frames: &[String],
+) -> Vec<OAIMessage> {
+    let mut messages = Vec::with_capacity(history.len() + 2);
+    if let Some(system) = system.filter(|s| !s.trim().is_empty()) {
+        messages.push(OAIMessage::text("system", system));
+    }
+    for message in history {
+        if message.content.is_empty() || !matches!(message.role.as_str(), "user" | "assistant") {
+            continue;
+        }
+        messages.push(OAIMessage::text(&message.role, &message.content));
+    }
+    let content = if frames.is_empty() {
+        serde_json::Value::String(user_text.to_string())
+    } else {
+        // Text first, then oldest frame to newest — the ordering the
+        // OpenAI vision convention llama-server's multimodal templates
+        // follow expects, and the one `ollama_message_to_oai` already
+        // produces for `/api/chat`'s own images.
+        let mut parts = Vec::with_capacity(frames.len() + 1);
+        parts.push(serde_json::json!({ "type": "text", "text": user_text }));
+        for frame in frames {
+            parts.push(serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": frame_data_uri(frame) }
+            }));
+        }
+        serde_json::Value::Array(parts)
+    };
+    messages.push(OAIMessage {
+        role: "user".to_string(),
+        content,
+        tool_calls: None,
+        name: None,
+    });
+    messages
+}
+
+/// One event as a server-sent-event frame.
+///
+/// Every `LiveEvent` serializes to a single line — `serde_json` escapes
+/// any newline inside a string — so one `data:` line per event is always
+/// enough, and the page's reader (see `readEvents` in webui/live.js) can
+/// stay line-oriented.
+fn live_sse_frame(event: &LiveEvent) -> Bytes {
+    let json = serde_json::to_string(event).unwrap_or_else(|_| {
+        r#"{"type":"error","message":"llmman could not serialize this event"}"#.to_string()
+    });
+    Bytes::from(format!("data: {json}\n\n"))
+}
+
+/// The events for one line of the backend's SSE stream, in the order they
+/// should reach the page. Split out from the streaming plumbing below so
+/// the mapping itself is directly testable.
+///
+/// `extractor` carries the `<think>`/harmony tag state across lines for a
+/// backend that emits reasoning as raw text inside `content` instead of a
+/// structured field — the same treatment `/api/chat` gets, so a live
+/// session never reads a model's inner monologue aloud (see
+/// [`RawContentExtractor`]).
+fn live_events_for_line(extractor: &mut RawContentExtractor, line: &str) -> Vec<LiveEvent> {
+    let Some(payload) = line.strip_prefix("data: ") else {
+        return Vec::new();
+    };
+    let Some((content, thinking, done)) = oai_chunk_to_content(payload) else {
+        return Vec::new();
+    };
+    let (mut content, thinking) = extractor.process(content, thinking);
+    if done {
+        content.push_str(&extractor.flush());
+    }
+    let mut events = Vec::new();
+    if let Some(text) = thinking.filter(|t| !t.is_empty()) {
+        events.push(LiveEvent::Thinking { text });
+    }
+    if !content.is_empty() {
+        events.push(LiveEvent::Delta { text: content });
+    }
+    if done {
+        events.push(LiveEvent::Done);
+    }
+    events
+}
+
+fn live_sse_response(
+    stream: impl futures::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static,
+) -> Response {
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        // The page renders and speaks each delta as it lands, so any
+        // proxy between it and the daemon buffering the body would defeat
+        // the whole endpoint.
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// Sends the turn to the model and relays the reply as `LiveEvent`s,
+/// after `preamble` (what llmman did with the turn, which the page needs
+/// before the first token arrives).
+async fn stream_live(
+    client: Client,
+    target: Target,
+    mut oai_req: OAIChatRequest,
+    activity: ActivityGuard,
+    preamble: LiveEvent,
+) -> Result<Response, AppError> {
+    let resp = post_chat(&client, &target, &mut oai_req).await?;
+
+    let head = futures::stream::once(async move { Ok(live_sse_frame(&preamble)) });
+
+    // llama-server signals "done" twice — the chunk carrying a real
+    // finish_reason, then the trailing literal "[DONE]" line — and the
+    // trailer below needs to know whether either was seen at all, so both
+    // it and the mapping share one flag.
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let seen = finished.clone();
+    let mut extractor = RawContentExtractor::new();
+    let body = bytes_to_lines(resp.bytes_stream()).map(move |line| {
+        // Moved into this closure purely to keep it alive — see
+        // ActivityGuard's doc comment — for as long as the reply is still
+        // streaming.
+        let _activity = &activity;
+        let mut out = Vec::new();
+        for event in live_events_for_line(&mut extractor, &line) {
+            if matches!(event, LiveEvent::Done)
+                && seen.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                continue;
+            }
+            out.extend_from_slice(&live_sse_frame(&event));
+        }
+        Ok::<_, std::convert::Infallible>(Bytes::from(out))
+    });
+
+    // `bytes_to_lines` reports a mid-response read failure as a clean end
+    // of stream (see `stream_ollama`'s own note), so a stream that ends
+    // having never signalled "done" is the only evidence the backend
+    // died. Saying so in band beats letting the page read out a truncated
+    // reply as if the model had simply stopped talking; the status line is
+    // long gone by now.
+    let trailer = futures::stream::once(async move {
+        let mut out = Vec::new();
+        if !finished.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            out.extend_from_slice(&live_sse_frame(&LiveEvent::Error {
+                message: "inference backend closed the connection before finishing".to_string(),
+            }));
+            out.extend_from_slice(&live_sse_frame(&LiveEvent::Done));
+        }
+        Ok::<_, std::convert::Infallible>(Bytes::from(out))
+    });
+
+    Ok(live_sse_response(head.chain(body).chain(trailer)))
+}
+
+/// A malformed turn is the request's own fault, so it gets a 400 in
+/// llmman's usual error shape rather than `AppError`'s blanket 500 — the
+/// same split `handle_pull` and `handle_openai_transcriptions` make for
+/// their own missing-field cases.
+fn live_bad_request(message: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": message.into() })),
+    )
+        .into_response()
+}
+
+/// `GET /llmman/live` — the live session page itself.
+async fn handle_live_page() -> impl IntoResponse {
+    gzipped(webui::LIVE_HTML, "text/html; charset=utf-8")
+}
+
+async fn handle_live_js() -> impl IntoResponse {
+    gzipped(webui::LIVE_JS, "application/javascript; charset=utf-8")
+}
+
+async fn handle_live_css() -> impl IntoResponse {
+    gzipped(webui::LIVE_CSS, "text/css; charset=utf-8")
+}
+
+/// `POST /llmman/live/turn` — one spoken (or typed) turn in, one streamed
+/// reply out.
+async fn handle_live_turn(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let turn: LiveTurn = match serde_json::from_slice(&body) {
+        Ok(turn) => turn,
+        Err(e) => {
+            return Ok(live_bad_request(format!(
+                "a live turn is not a JSON object llmman understands: {e}"
+            )))
+        }
+    };
+    if turn.model.trim().is_empty() {
+        return Ok(live_bad_request(
+            "a live turn is missing its required \"model\" field",
+        ));
+    }
+    // The page only sends a turn once its recognizer has produced a whole
+    // sentence, so this is a client bug rather than a cough — a cough
+    // never gets this far, and answering it with a reply to nothing would
+    // be worse than saying so.
+    if turn.text.trim().is_empty() {
+        return Ok(live_bad_request(
+            "a live turn is missing the \"text\" that was said",
+        ));
+    }
+    if turn.frames.len() > MAX_LIVE_FRAMES {
+        return Ok(live_bad_request(format!(
+            "a live turn carries at most {MAX_LIVE_FRAMES} camera frames, not {}",
+            turn.frames.len()
+        )));
+    }
+
+    let (canonical, target, guard) = ensure_model(&state, &turn.model, Some(&headers)).await?;
+    // No `keep_alive` of its own on this surface either — see
+    // `resolve_openai_request`'s comment on the same choice.
+    let activity = begin_activity(guard, None).await;
+
+    let vision = target_supports_vision(&state.0.client, &target).await;
+    let frames: &[String] = if vision { &turn.frames } else { &[] };
+    let oai_req = OAIChatRequest {
+        model: backend_wire_model(&state, &target, &canonical).await,
+        messages: build_live_messages(turn.system.as_deref(), &turn.history, &turn.text, frames),
+        // Always streamed: a live session's whole point is that the reply
+        // starts being read out before it has finished being generated.
+        stream: true,
+        ..Default::default()
+    };
+    let preamble = LiveEvent::Context {
+        model: canonical,
+        vision,
+        frames: frames.len(),
+    };
+    stream_live(state.0.client.clone(), target, oai_req, activity, preamble).await
+}
+
 /// Ollama's GET /api/version, extended with this daemon's own identity —
 /// executable path (canonicalized at startup) and pid — so a client can
 /// tell whether a daemon it found listening still belongs to a live
@@ -5826,6 +6255,18 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         // llmman's own API — see handle_llmman_providers
         .route("/llmman/providers", get(handle_llmman_providers))
         .route("/llmman/providers/:id", get(handle_llmman_provider))
+        // llmman live — see the /llmman/live section's own header comment.
+        // Both spellings of the page's own path are served: the assets and
+        // the turn endpoint are addressed absolutely from live.html, so a
+        // trailing slash changes nothing but the URL a user typed.
+        .route("/llmman/live", get(handle_live_page))
+        .route("/llmman/live/", get(handle_live_page))
+        .route("/llmman/live/live.js", get(handle_live_js))
+        .route("/llmman/live/live.css", get(handle_live_css))
+        .route(
+            "/llmman/live/turn",
+            post(handle_live_turn).layer(DefaultBodyLimit::max(LIVE_TURN_BODY_LIMIT_BYTES)),
+        )
         // Ollama API
         .route("/api/version", get(handle_version))
         .route("/api/tags", get(handle_tags))
@@ -5866,6 +6307,9 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("bind {addr}"))?;
     eprintln!("llmman serve listening on {addr}");
+    // Worth one line: a voice-and-camera session is not something a
+    // client discovers by probing the Ollama or OpenAI surfaces.
+    eprintln!("llmman live at {}/llmman/live", crate::daemon::server());
 
     // Background idle-unload reaper — see reap_idle_models's doc comment.
     tokio::spawn(reap_idle_models(state.clone()));
@@ -9236,5 +9680,540 @@ mod tests {
             .collect();
         assert_eq!(joined, "Hello, world");
         assert_eq!(chunks.last().unwrap()["done"], true);
+    }
+
+    // -- llmman live -------------------------------------------------------
+
+    fn live_turn_body(turn: serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&turn).unwrap())
+    }
+
+    /// Every field defaults, so a page and a daemon of different vintages
+    /// still complete a turn instead of failing over a field one of them
+    /// has never heard of.
+    #[test]
+    fn a_live_turn_parses_with_only_the_fields_a_sender_actually_set() {
+        let turn: LiveTurn =
+            serde_json::from_value(serde_json::json!({ "model": "qwen3.5:0.8b", "text": "hi" }))
+                .expect("parses");
+        assert_eq!(
+            turn,
+            LiveTurn {
+                model: "qwen3.5:0.8b".into(),
+                text: "hi".into(),
+                system: None,
+                history: vec![],
+                frames: vec![],
+            }
+        );
+
+        let turn: LiveTurn = serde_json::from_value(serde_json::json!({
+            "model": "qwen3.5:0.8b",
+            "text": "what is that",
+            "system": "be brief",
+            "history": [{ "role": "user", "content": "hi" }],
+            "frames": ["Zm9v"],
+            "something_new": "ignored",
+        }))
+        .expect("parses");
+        assert_eq!(turn.system.as_deref(), Some("be brief"));
+        assert_eq!(
+            turn.history,
+            vec![LiveMessage {
+                role: "user".into(),
+                content: "hi".into()
+            }]
+        );
+        assert_eq!(turn.frames, vec!["Zm9v".to_string()]);
+    }
+
+    #[test]
+    fn vision_from_props_reads_the_modalities_llama_server_publishes() {
+        assert!(vision_from_props(
+            &serde_json::json!({ "modalities": { "vision": true, "audio": false } })
+        ));
+        assert!(!vision_from_props(
+            &serde_json::json!({ "modalities": { "vision": false } })
+        ));
+        // A backend whose /props says nothing about modalities at all
+        // counts as no vision: text still works, images would not.
+        assert!(!vision_from_props(&serde_json::json!({ "role": "router" })));
+    }
+
+    /// A provider publishes no capability document llmman reads, so it
+    /// cannot be asked — see `target_supports_vision`'s own doc comment
+    /// for why the answer is nonetheless yes.
+    #[tokio::test]
+    async fn target_supports_vision_assumes_a_provider_can_see() {
+        let target = Target::Remote(Arc::new(RemoteTarget {
+            provider: "openrouter".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            model: "some/vision-model".into(),
+            api_key: "k".into(),
+        }));
+        assert!(target_supports_vision(&Client::new(), &target).await);
+    }
+
+    #[tokio::test]
+    async fn target_supports_vision_reads_a_local_backends_own_props() {
+        let app = Router::new().route(
+            "/props",
+            get(|| async { Json(serde_json::json!({ "modalities": { "vision": true } })) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        assert!(target_supports_vision(&Client::new(), &Target::Local(port)).await);
+        // An unreachable backend answers nothing, which is not vision.
+        let dead = Target::Local(find_free_port().unwrap());
+        assert!(!target_supports_vision(&Client::new(), &dead).await);
+    }
+
+    /// A provider does not sniff the real format out of the bytes the way
+    /// llama.cpp does, so the label has to be the truth.
+    #[test]
+    fn frame_data_uri_labels_a_captured_frame_as_the_jpeg_it_is() {
+        assert_eq!(frame_data_uri("Zm9v"), "data:image/jpeg;base64,Zm9v");
+        assert_eq!(
+            frame_data_uri("data:image/webp;base64,Zm9v"),
+            "data:image/webp;base64,Zm9v"
+        );
+    }
+
+    #[test]
+    fn build_live_messages_sends_plain_text_when_no_frames_are_attached() {
+        let messages = build_live_messages(Some("be brief"), &[], "what is that", &[]);
+        assert_eq!(
+            messages,
+            vec![
+                OAIMessage::text("system", "be brief"),
+                OAIMessage::text("user", "what is that"),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_live_messages_puts_frames_after_the_text_oldest_first() {
+        let frames = ["Zm9v".to_string(), "YmFy".to_string()];
+        let messages = build_live_messages(None, &[], "what is that", &frames);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].content,
+            serde_json::json!([
+                { "type": "text", "text": "what is that" },
+                { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,Zm9v" } },
+                { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,YmFy" } },
+            ])
+        );
+    }
+
+    /// History is replayed verbatim for the two roles the page writes, and
+    /// only those: an empty message adds nothing, and a role it never
+    /// writes (a bare `tool` result with no matching call, say) would
+    /// break a chat template rather than add context.
+    #[test]
+    fn build_live_messages_replays_only_the_history_roles_the_page_writes() {
+        let history = [
+            LiveMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            },
+            LiveMessage {
+                role: "assistant".into(),
+                content: "hello".into(),
+            },
+            LiveMessage {
+                role: "tool".into(),
+                content: "{}".into(),
+            },
+            LiveMessage {
+                role: "user".into(),
+                content: String::new(),
+            },
+        ];
+        let messages = build_live_messages(None, &history, "still there?", &[]);
+        assert_eq!(
+            messages,
+            vec![
+                OAIMessage::text("user", "hi"),
+                OAIMessage::text("assistant", "hello"),
+                OAIMessage::text("user", "still there?"),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_live_messages_omits_a_blank_system_prompt_entirely() {
+        let messages = build_live_messages(Some("   "), &[], "hi", &[]);
+        assert_eq!(messages, vec![OAIMessage::text("user", "hi")]);
+    }
+
+    #[test]
+    fn live_sse_frame_is_one_data_line_per_event() {
+        let frame = live_sse_frame(&LiveEvent::Delta {
+            text: "two\nlines".into(),
+        });
+        let frame = String::from_utf8(frame.to_vec()).unwrap();
+        assert_eq!(
+            frame,
+            "data: {\"type\":\"delta\",\"text\":\"two\\nlines\"}\n\n"
+        );
+        assert_eq!(
+            String::from_utf8(live_sse_frame(&LiveEvent::Done).to_vec()).unwrap(),
+            "data: {\"type\":\"done\"}\n\n"
+        );
+    }
+
+    #[test]
+    fn live_events_for_line_maps_a_chunk_to_the_events_the_page_reads() {
+        let mut extractor = RawContentExtractor::new();
+        assert_eq!(
+            live_events_for_line(
+                &mut extractor,
+                r#"data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#
+            ),
+            vec![LiveEvent::Delta {
+                text: "Hello".into()
+            }]
+        );
+        assert_eq!(
+            live_events_for_line(
+                &mut extractor,
+                r#"data: {"choices":[{"delta":{"content":"!"},"finish_reason":"stop"}]}"#
+            ),
+            vec![LiveEvent::Delta { text: "!".into() }, LiveEvent::Done]
+        );
+        assert_eq!(
+            live_events_for_line(&mut extractor, "data: [DONE]"),
+            vec![LiveEvent::Done]
+        );
+        // Neither an SSE comment, a blank separator line, nor a payload
+        // this daemon didn't write is an event.
+        assert!(live_events_for_line(&mut extractor, "").is_empty());
+        assert!(live_events_for_line(&mut extractor, ": keep-alive").is_empty());
+        assert!(live_events_for_line(&mut extractor, "data: not json").is_empty());
+    }
+
+    /// A backend that hands back raw `<think>` tags instead of a
+    /// structured reasoning field must still not have its inner monologue
+    /// read aloud — see `RawContentExtractor`, which this shares with
+    /// `/api/chat`.
+    #[test]
+    fn live_events_for_line_keeps_raw_think_tags_out_of_the_spoken_reply() {
+        let mut extractor = RawContentExtractor::new();
+        let mut thinking = String::new();
+        let mut spoken = String::new();
+        for chunk in [
+            r#"{"choices":[{"delta":{"content":"<think>"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"hmm"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"</think>"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"Hi."},"finish_reason":"stop"}]}"#,
+        ] {
+            for event in live_events_for_line(&mut extractor, &format!("data: {chunk}")) {
+                match event {
+                    LiveEvent::Thinking { text } => thinking.push_str(&text),
+                    LiveEvent::Delta { text } => spoken.push_str(&text),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(spoken, "Hi.");
+        assert_eq!(thinking, "hmm");
+    }
+
+    /// Reads a live response back into the JSON payload of each event, in
+    /// order.
+    async fn live_events_of(resp: Response) -> Vec<serde_json::Value> {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec())
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|p| serde_json::from_str(p).expect("each payload is one JSON object"))
+            .collect()
+    }
+
+    /// Runs one turn through `stream_live` against a real HTTP backend
+    /// serving `sse`.
+    async fn run_stream_live(sse: &'static str) -> Vec<serde_json::Value> {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move { ([("content-type", "text/event-stream")], sse) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let state = test_state();
+        let resp = stream_live(
+            Client::new(),
+            Target::Local(addr.port()),
+            OAIChatRequest {
+                model: "qwen3.5:0.8b".into(),
+                messages: vec![OAIMessage::text("user", "hi")],
+                stream: true,
+                ..Default::default()
+            },
+            ActivityGuard::new(&state, "qwen3.5:0.8b"),
+            LiveEvent::Context {
+                model: "qwen3.5:0.8b".into(),
+                vision: false,
+                frames: 0,
+            },
+        )
+        .await
+        .expect("the mock backend answers 200");
+
+        assert_eq!(
+            resp.headers()["content-type"],
+            "text/event-stream",
+            "the page reads this as SSE"
+        );
+        live_events_of(resp).await
+    }
+
+    /// What llmman did with the turn has to reach the page before the
+    /// first token, since only the daemon knows it.
+    #[tokio::test]
+    async fn stream_live_sends_the_context_then_deltas_then_exactly_one_done() {
+        let events = run_stream_live(MOCK_SSE).await;
+        assert_eq!(events[0]["type"], "context");
+        assert_eq!(events[0]["vision"], false);
+
+        let spoken: String = events
+            .iter()
+            .filter(|e| e["type"] == "delta")
+            .map(|e| e["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(spoken, "Hello, world");
+
+        // llama-server signals done twice — a real finish_reason, then the
+        // trailing "[DONE]" — and the page must not see two ends of one
+        // reply.
+        assert_eq!(events.iter().filter(|e| e["type"] == "done").count(), 1);
+        assert_eq!(events.last().unwrap()["type"], "done");
+        assert!(!events.iter().any(|e| e["type"] == "error"));
+    }
+
+    /// A backend that dies mid-reply looks exactly like a clean end of
+    /// stream to `bytes_to_lines`, and the status line is long gone — so
+    /// the truncation has to be reported in band rather than left looking
+    /// like a model that simply stopped talking.
+    #[tokio::test]
+    async fn stream_live_reports_a_truncated_backend_stream_in_band() {
+        const TRUNCATED: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n";
+        let events = run_stream_live(TRUNCATED).await;
+        assert_eq!(events.iter().filter(|e| e["type"] == "delta").count(), 1);
+        let error = events
+            .iter()
+            .find(|e| e["type"] == "error")
+            .expect("the truncation is reported");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("closed the connection"),
+            "{error}"
+        );
+        assert_eq!(events.last().unwrap()["type"], "done");
+    }
+
+    /// What `ensure_model` will resolve `model_ref` to in a test whose
+    /// store holds nothing — the key a mock backend has to be registered
+    /// under for `check_running` to find it (see `ensure_model`: shortname
+    /// aliasing, then `default_tag`, then a `canonical_ref` that no-ops on
+    /// an empty store).
+    fn live_canonical(model_ref: &str) -> String {
+        crate::storage::default_tag(&crate::shortnames::resolve_ollama_api(model_ref).unwrap())
+    }
+
+    /// Registers `model_ref` as already loaded on `port`, so a live turn
+    /// reaches a mock backend instead of trying to pull anything.
+    async fn register_live_backend(state: &AppState, model_ref: &str, port: u16) {
+        state.0.manager.lock().await.running.insert(
+            live_canonical(model_ref),
+            RunningModel {
+                process: ModelProcess::Local(
+                    Engine::LlamaServer,
+                    spawn_placeholder_process(),
+                    None,
+                ),
+                port,
+                digest: String::new(),
+                size: 0,
+                started_at: now_rfc3339(),
+                last_active: Instant::now(),
+                last_active_wall: chrono::Utc::now(),
+                backend_model_path: None,
+                keep_alive: None,
+                in_flight: 0,
+            },
+        );
+    }
+
+    /// A mock llama-server that reports `vision` on `/props`, answers the
+    /// chat completion with `MOCK_SSE`, and remembers what it was asked.
+    async fn mock_live_backend(
+        vision: bool,
+    ) -> (u16, Arc<tokio::sync::Mutex<Option<serde_json::Value>>>) {
+        let chat = Arc::new(tokio::sync::Mutex::new(None));
+        let chatted = chat.clone();
+        let app = Router::new()
+            .route(
+                "/props",
+                get(move || async move {
+                    Json(serde_json::json!({ "modalities": { "vision": vision } }))
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(move |body: Bytes| async move {
+                    *chatted.lock().await = Some(serde_json::from_slice(&body).unwrap());
+                    ([("content-type", "text/event-stream")], MOCK_SSE)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, chat)
+    }
+
+    /// The whole pipeline against a real HTTP backend: the sentence the
+    /// browser recognized reaches the model, the frames ride along as
+    /// image parts because this backend says it can see, and the reply
+    /// comes back as deltas.
+    #[tokio::test]
+    async fn a_live_turn_shows_the_frames_to_a_model_that_can_see() {
+        let (port, chat) = mock_live_backend(true).await;
+        let state = test_state();
+        register_live_backend(&state, "qwen3.5:0.8b", port).await;
+
+        let resp = handle_live_turn(
+            State(state),
+            HeaderMap::new(),
+            live_turn_body(serde_json::json!({
+                "model": "qwen3.5:0.8b",
+                "text": "what is on the table",
+                "system": "be brief",
+                "frames": ["Zm9v"],
+            })),
+        )
+        .await
+        .expect("the mock backend answers");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let events = live_events_of(resp).await;
+
+        assert_eq!(
+            events[0],
+            serde_json::json!({
+                "type": "context",
+                "model": live_canonical("qwen3.5:0.8b"),
+                "vision": true,
+                "frames": 1,
+            })
+        );
+        let spoken: String = events
+            .iter()
+            .filter(|e| e["type"] == "delta")
+            .map(|e| e["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(spoken, "Hello, world");
+        assert_eq!(events.last().unwrap()["type"], "done");
+
+        let chat = chat.lock().await;
+        let chat = chat.as_ref().expect("the model was prompted");
+        assert_eq!(chat["model"], live_canonical("qwen3.5:0.8b"));
+        assert_eq!(chat["stream"], true);
+        assert_eq!(
+            chat["messages"],
+            serde_json::json!([
+                { "role": "system", "content": "be brief" },
+                { "role": "user", "content": [
+                    { "type": "text", "text": "what is on the table" },
+                    { "type": "image_url",
+                      "image_url": { "url": "data:image/jpeg;base64,Zm9v" } },
+                ] },
+            ])
+        );
+    }
+
+    /// A text-only model — `qwen3.5:0.8b`, say — is a first-class choice,
+    /// not a broken one. Speech recognition happened in the browser, so
+    /// the turn is already text; only the frames are dropped, rather than
+    /// sent to a backend that would fail on them.
+    #[tokio::test]
+    async fn a_live_turn_to_a_model_that_cannot_see_still_works_without_the_frames() {
+        let (port, chat) = mock_live_backend(false).await;
+        let state = test_state();
+        register_live_backend(&state, "qwen3.5:0.8b", port).await;
+
+        let resp = handle_live_turn(
+            State(state),
+            HeaderMap::new(),
+            live_turn_body(serde_json::json!({
+                "model": "qwen3.5:0.8b",
+                "text": "hello there",
+                "frames": ["Zm9v", "YmFy"],
+            })),
+        )
+        .await
+        .expect("a text-only model is not an error");
+        let events = live_events_of(resp).await;
+
+        assert_eq!(events[0]["vision"], false);
+        // Reported, so the page can say why the camera is being ignored.
+        assert_eq!(events[0]["frames"], 0);
+        assert!(events.iter().any(|e| e["type"] == "delta"));
+
+        // Plain text content, not a parts array with an image in it.
+        assert_eq!(
+            chat.lock().await.as_ref().unwrap()["messages"],
+            serde_json::json!([{ "role": "user", "content": "hello there" }])
+        );
+    }
+
+    /// Every way a turn can be malformed is the request's own fault, and
+    /// says which one it was — none of them is llmman failing.
+    #[tokio::test]
+    async fn a_malformed_live_turn_is_a_400_that_names_what_is_wrong() {
+        for (body, expected) in [
+            (Bytes::from_static(b"not json"), "JSON object"),
+            (live_turn_body(serde_json::json!({ "text": "hi" })), "model"),
+            (
+                live_turn_body(serde_json::json!({ "model": "qwen3.5:0.8b" })),
+                "text",
+            ),
+            (
+                live_turn_body(serde_json::json!({
+                    "model": "qwen3.5:0.8b", "text": "  ",
+                })),
+                "text",
+            ),
+            (
+                live_turn_body(serde_json::json!({
+                    "model": "qwen3.5:0.8b",
+                    "text": "hi",
+                    "frames": vec!["Zm9v"; MAX_LIVE_FRAMES + 1],
+                })),
+                "at most",
+            ),
+        ] {
+            let resp = handle_live_turn(State(test_state()), HeaderMap::new(), body)
+                .await
+                .expect("a malformed turn is a 400, not a 500");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let reported = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let reported = String::from_utf8_lossy(&reported);
+            assert!(
+                reported.contains(expected),
+                "{expected:?} not in {reported}"
+            );
+        }
     }
 }

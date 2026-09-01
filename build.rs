@@ -255,7 +255,17 @@ fn main() {
     let webui_out = out_dir.join("webui_gz");
     fs::create_dir_all(&webui_out).expect("create webui_gz dir");
 
-    for name in &["index.html", "bundle.js", "bundle.css", "loading.html"] {
+    for name in &[
+        "index.html",
+        "bundle.js",
+        "bundle.css",
+        "loading.html",
+        // llmman live (webui/live.*) — hand-written source, not part of
+        // the generated bundle above, but embedded the same way.
+        "live.html",
+        "live.js",
+        "live.css",
+    ] {
         let src = webui_src.join(name);
         let dst = webui_out.join(format!("{name}.gz"));
         let data = fs::read(&src).unwrap_or_else(|e| panic!("read webui/{name}: {e}"));

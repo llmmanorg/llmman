@@ -1,0 +1,298 @@
+/* llmman live — hand-written, no build step. See webui/live.js. */
+
+:root {
+  color-scheme: dark;
+  --bg: #0d1117;
+  --panel: #161b22;
+  --panel-2: #1c2430;
+  --line: #2a3341;
+  --text: #e6edf3;
+  --muted: #8b98a5;
+  --accent: #4c8dff;
+  --accent-dim: #1f3a66;
+  --danger: #f2555a;
+  --ok: #3fb950;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    sans-serif;
+  display: flex;
+  flex-direction: column;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.bar h1 {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  margin: 0;
+}
+
+.bar h1 span {
+  color: var(--accent);
+}
+
+main {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(340px, 0.85fr);
+  gap: 16px;
+  padding: 16px 20px 20px;
+}
+
+@media (max-width: 900px) {
+  main {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.stage {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.camera {
+  position: relative;
+  flex: 1;
+  min-height: 220px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #05070a;
+  overflow: hidden;
+}
+
+.camera video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* Mirrored preview only: the frames actually sent to the model are
+     drawn from the unmirrored source. */
+  transform: scaleX(-1);
+}
+
+.camera-off {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 13px;
+  background: #05070a;
+}
+
+.camera-off[hidden] {
+  display: none;
+}
+
+/* Live transcript of what is being said right now — the page's only
+   feedback that the microphone is working, and worth more than a level
+   meter because it shows what was actually understood. */
+.caption {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  padding: 7px 11px;
+  border-radius: 8px;
+  background: #000000a6;
+  backdrop-filter: blur(4px);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.35;
+  max-height: 5.4em;
+  overflow: hidden;
+}
+
+.caption[hidden] {
+  display: none;
+}
+
+.stage-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+button {
+  font: inherit;
+  border-radius: 8px;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: #3a465a;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button[hidden] {
+  display: none;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #06121f;
+  font-weight: 600;
+}
+
+button.toggle[aria-pressed="false"] {
+  color: var(--muted);
+  background: transparent;
+}
+
+.hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.hint.error {
+  color: var(--danger);
+}
+
+.side {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.settings {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.settings label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.settings .row {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.settings .check {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.settings .narrow input {
+  width: 90px;
+}
+
+select,
+input[type="text"],
+input[type="number"],
+textarea {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 9px;
+  resize: vertical;
+}
+
+.log {
+  flex: 1;
+  min-height: 160px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.turn {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.turn b {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.turn p {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.turn.user p {
+  color: #b9c6d3;
+}
+
+.turn.note p,
+.turn.note b {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.turn.failed b,
+.turn.failed p {
+  color: var(--danger);
+}
+
+.compose {
+  display: flex;
+  gap: 8px;
+}
+
+.compose input {
+  flex: 1;
+}

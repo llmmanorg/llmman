@@ -113,7 +113,7 @@ The server listens on `127.0.0.1:17434` by default, overridable via `LLMMAN_HOST
 | Ollama | `/api/generate`, `/api/chat`, `/api/tags`, `/api/show`, `/api/pull`, `/api/ps`, `/api/delete` |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens` |
 | Anthropic | `/v1/messages` |
-| llmman | `/llmman/providers`, `/llmman/providers/{id}` |
+| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/live` |
 
 `/llmman/...` is llmman's own API, not a compatibility surface: no
 upstream API has a notion of a [models.dev](https://models.dev) provider
@@ -131,6 +131,8 @@ Codex](https://github.com/openai/codex) requires), including streaming SSE
 and function-tool-call re-mapping. This is a plain pass-through to
 `llama-server`'s own native `/v1/responses` support, so a recent enough
 `llama-server` build is required for it to work.
+
+`/llmman/live` is described under [llmman live](#llmman-live) below.
 
 Use it as an Ollama-compatible server:
 
@@ -155,6 +157,58 @@ An idle, unused model is automatically unloaded after `keep_alive`
 Daemon-wide settings (bind address, context length, keep-alive, GPU backend
 selection and the rest) are environment variables, set before `llmman serve`
 starts. They're documented in [docs/configuration.md](docs/configuration.md).
+
+## llmman live
+
+A hands-free voice-and-camera conversation with a local model, in the
+browser. Start the server and open it:
+
+```
+llmman serve
+open http://127.0.0.1:17434/llmman/live
+```
+
+Grant microphone and camera access and just talk. Your browser
+recognizes the speech; llmman attaches the most recent frames from your
+camera, streams the reply back token by token and reads it aloud —
+stopping the moment you start talking again.
+
+There is one model to choose, and it is the model you want to talk to.
+Speech-to-text is the browser's own (the [Web Speech
+API](https://developer.mozilla.org/docs/Web/API/Web_Speech_API), which
+recent Chrome runs on-device), so there is no transcription model to
+pull, none held in memory alongside the one you picked, and no second
+dropdown to guess at. llmman asks for on-device recognition wherever the
+browser offers it, so the audio stays on this machine; where it doesn't,
+the browser recognizes speech through its vendor's service.
+
+Any model works. By the time a turn reaches the model it is text, so a
+small text-only model like `qwen3.5:0.8b` is a first-class choice, not a
+degraded one. Camera frames are attached only to a model that reports
+vision support (a GGUF loaded with an `--mmproj` projector), and the page
+says so when they aren't. Models load on demand and unload on the usual
+`keep_alive` timer, like any other request.
+
+Under the hood the page POSTs one JSON request per turn to
+`/llmman/live/turn` — `model`, `text`, `system`, `history` and up to
+eight base64 JPEG `frames` — and reads the reply as server-sent events
+(`context`, `delta`, `thinking`, `error`, `done`). Frames are downscaled
+to a 512 px long edge and captured continuously, so the ones sent are the
+ones from the moment you spoke. Conversation history is replayed as text
+only: a stale frame is worse than no frame when the question is about
+what the camera sees now.
+
+Replies are spoken with the browser's speech synthesis. Without
+headphones the recognizer would hear them and answer itself, so results
+arriving while llmman is speaking are ignored by default; tick **Allow
+interrupting** to talk over it.
+
+Firefox has no speech recognition — there the camera and the text box
+still work.
+
+Browsers only grant microphone and camera access to a secure context, so
+use `http://127.0.0.1:17434` or `http://localhost:17434` rather than a
+LAN address.
 
 ## Launch an integration
 
