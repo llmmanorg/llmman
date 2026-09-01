@@ -572,15 +572,30 @@ fn classify_model_layer(rel_path: &str) -> &'static str {
 
 /// True if the descriptor's ref annotation matches `reference` precisely
 /// — exact match, tag-only match (a bare `reference` against a stored
-/// `"reg/repo:tag"`), or tagless match (`reference` with an implicit
-/// `:latest` appended). The tag-only branch is unambiguous only when
-/// `reference` is a bare tag that's unique across stored tags — two
-/// different repos sharing the same tag (e.g. both `:0.8b`) can still
-/// both match here.
+/// `"reg/repo:tag"`), tagless match (`reference` with an implicit
+/// `:latest` appended), or, for a `reference` carrying `@<digest>`, a
+/// digest match (the branch below says what that compares). The tag-only
+/// branch is unambiguous only when `reference` is a bare tag that's
+/// unique across stored tags — two different repos sharing the same tag
+/// (e.g. both `:0.8b`) can still both match here. A digest match is
+/// ambiguous across the tags of one repository in the same way, and
+/// `matching_index` is what settles that.
 fn ref_matches_precise(desc: &Descriptor, reference: &str) -> bool {
     let Some(stored) = stored_ref_name(desc) else {
         return false;
     };
+
+    // `<name>[:tag]@<digest>` names content, not a tag: it matches the
+    // stored model with that manifest digest under the same repository,
+    // whatever tag it was stored under. Without this a digest reference
+    // for a model already in the store was "not found", and the daemon
+    // pulled the same bytes again under a second reference and started a
+    // second server for them. The hex is compared without regard to case
+    // because `shortnames::validate_reference` accepts either while the
+    // store records lowercase, so an uppercase spelling matched nothing.
+    if let (base, Some(digest)) = split_ref_digest(reference) {
+        return desc.digest.eq_ignore_ascii_case(digest) && repo_name(stored) == repo_name(base);
+    }
 
     if stored == reference || tag_from_ref(stored) == reference {
         return true;
@@ -594,9 +609,60 @@ fn ref_matches_precise(desc: &Descriptor, reference: &str) -> bool {
     false
 }
 
+/// Splits `<name>[:tag]@<digest>` into the part before `@` and the digest.
+/// The `@` has to follow the last `/`, so a host or namespace component
+/// cannot be mistaken for one; a reference without a digest comes back
+/// whole. `shortnames::parse_registry_ref` splits at the first `@`
+/// instead; the two agree on any reference it has accepted, since no
+/// part before the model admits an `@`. This one is also applied to
+/// stored names, which reach `ref_matches_precise` from the annotation
+/// and not through that parser.
+pub fn split_ref_digest(reference: &str) -> (&str, Option<&str>) {
+    let last_slash = reference.rfind('/').map_or(0, |i| i + 1);
+    match reference[last_slash..].find('@') {
+        Some(offset) => {
+            let at = last_slash + offset;
+            (&reference[..at], Some(&reference[at + 1..]))
+        }
+        None => (reference, None),
+    }
+}
+
+/// The repository part of a reference: everything before a tag or digest,
+/// so `docker.io/ai/m:v9`, `docker.io/ai/m` and `docker.io/ai/m@sha256:…`
+/// all give `docker.io/ai/m`. The tag is cut by the rule
+/// `ref_path_segments` lays paths out with, a `:` after the last `/`, so
+/// a host port stays.
+fn repo_name(reference: &str) -> &str {
+    let (base, _) = split_ref_digest(reference);
+    let last_slash = base.rfind('/').map_or(0, |i| i + 1);
+    match base[last_slash..].find(':') {
+        Some(offset) => &base[..last_slash + offset],
+        None => base,
+    }
+}
+
 /// The index of the entry in `manifests` that `find`/`remove` should
 /// treat as matching `reference`, or `None`.
+///
+/// One manifest can sit under several tags, so a digest reference can
+/// match more than one entry. The tag the reference spells (`:latest`
+/// when it spells none) wins: `m:v9@<digest>` with `m:v9` and `m:latest`
+/// both at that digest picks `m:v9`. Between tags it does not spell, the
+/// first in the order `list_refs` walks the tree wins, which is readdir
+/// order and not sorted, so a `remove` by such a reference takes one
+/// entry per call and does not choose which.
 fn matching_index(manifests: &[Descriptor], reference: &str) -> Option<usize> {
+    let (base, digest) = split_ref_digest(reference);
+    if digest.is_some() {
+        let spelled = default_tag(base);
+        let own_tag = manifests.iter().position(|m| {
+            ref_matches_precise(m, reference) && stored_ref_name(m) == Some(spelled.as_str())
+        });
+        if own_tag.is_some() {
+            return own_tag;
+        }
+    }
     manifests
         .iter()
         .position(|m| ref_matches_precise(m, reference))
@@ -789,6 +855,90 @@ mod tests {
         assert!(ref_matches_precise(&d, "docker.io/ai/qwen3.5:0.8b"));
         assert!(!ref_matches_precise(&d, "docker.io/ai/qwen3.5:1.5b"));
         assert!(!ref_matches_precise(&d, "docker.io/ai/other:0.8b"));
+    }
+
+    /// Pins the digest branch of `ref_matches_precise` (see its own
+    /// comment for why it exists): same digest and same repository match
+    /// regardless of tag, and a different digest or repository does not.
+    #[test]
+    fn ref_matches_precise_resolves_a_digest_reference_by_content() {
+        let mut d = desc_with_ref("docker.io/ai/m:v9");
+        d.digest = "sha256:aaaa".into();
+        assert!(ref_matches_precise(&d, "docker.io/ai/m@sha256:aaaa"));
+        assert!(ref_matches_precise(&d, "docker.io/ai/m:latest@sha256:aaaa"));
+        assert!(!ref_matches_precise(&d, "docker.io/ai/m@sha256:bbbb"));
+        assert!(!ref_matches_precise(&d, "docker.io/ai/other@sha256:aaaa"));
+        // A tag beside the digest does not narrow the match: the grammar
+        // in docker/distribution's `reference.go` allows both, and there
+        // the digest is what names content. `matching_index` is where the
+        // tag counts, as a tie-breaker.
+        assert!(ref_matches_precise(&d, "docker.io/ai/m:other@sha256:aaaa"));
+        assert!(ref_matches_precise(&d, "docker.io/ai/m@sha256:AAAA"));
+    }
+
+    /// Two tags at one digest: the spelled tag is chosen, and without one
+    /// the first entry is. See `matching_index`'s doc comment.
+    #[test]
+    fn matching_index_prefers_the_tag_a_digest_reference_spells() {
+        let mut latest = desc_with_ref("docker.io/ai/m:latest");
+        latest.digest = "sha256:aaaa".into();
+        let mut v9 = desc_with_ref("docker.io/ai/m:v9");
+        v9.digest = "sha256:aaaa".into();
+        let manifests = [latest, v9];
+        assert_eq!(
+            matching_index(&manifests, "docker.io/ai/m:v9@sha256:aaaa"),
+            Some(1)
+        );
+        assert_eq!(
+            matching_index(&manifests, "docker.io/ai/m@sha256:aaaa"),
+            Some(0)
+        );
+        assert_eq!(
+            matching_index(&manifests, "docker.io/ai/m:v8@sha256:aaaa"),
+            Some(0)
+        );
+        assert_eq!(
+            matching_index(&manifests, "docker.io/ai/m@sha256:bbbb"),
+            None
+        );
+    }
+
+    #[test]
+    fn split_ref_digest_only_splits_after_the_last_slash() {
+        assert_eq!(
+            split_ref_digest("docker.io/ai/m@sha256:aa"),
+            ("docker.io/ai/m", Some("sha256:aa"))
+        );
+        assert_eq!(
+            split_ref_digest("docker.io/ai/m:v9@sha256:aa"),
+            ("docker.io/ai/m:v9", Some("sha256:aa"))
+        );
+        assert_eq!(
+            split_ref_digest("docker.io/ai/m:v9"),
+            ("docker.io/ai/m:v9", None)
+        );
+        assert_eq!(repo_name("docker.io/ai/m:v9@sha256:aa"), "docker.io/ai/m");
+        assert_eq!(repo_name("localhost:5000/m"), "localhost:5000/m");
+        assert_eq!(repo_name("localhost:5000/m:v1"), "localhost:5000/m");
+    }
+
+    /// Same branch through `find`: stored under a tag, looked up by digest.
+    #[test]
+    fn find_resolves_a_digest_reference_to_the_tagged_entry() {
+        let dir = temp_store_dir("digest-find");
+        let store = OciStore::open(&dir).unwrap();
+        let mut d = desc_with_ref("unused");
+        d.digest = "sha256:cafe".into();
+        store.tag(d, "docker.io/ai/m:latest").unwrap();
+
+        let found = store.find("docker.io/ai/m@sha256:cafe").unwrap();
+        assert_eq!(
+            found.annotations.unwrap()["org.opencontainers.image.ref.name"],
+            "docker.io/ai/m:latest"
+        );
+        assert!(store.find("docker.io/ai/m@sha256:dead").is_err());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
