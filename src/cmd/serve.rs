@@ -2287,10 +2287,20 @@ fn unload_key(
 /// unloadable, since the `running` entry is authoritative and is consulted
 /// first.
 async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
-    let canonical = unload_key(state, model).map_err(AppError::bad_request)?;
-    // Wait for an in-flight load of this model to publish itself first, so
-    // it can't race ahead of this remove.
-    let _guard = acquire_load_lock(&canonical).await;
+    // Lock on the same key `ensure_model` locks on, which it computes
+    // before any pull; then resolve again under the lock, as it does
+    // after its pull. A load in flight can refine the key it finally
+    // inserts under (see its own "re-canonicalise" note), and an unload
+    // that had already fixed its key before waiting on that lock would
+    // remove the stale spelling, miss, find the freshly pulled model in
+    // the store, and answer success while the loader's entry stays.
+    let lock_key = unload_key(state, model).map_err(AppError::bad_request)?;
+    let _guard = acquire_load_lock(&lock_key).await;
+    let canonical = if crate::providers::is_remote_ref(model) {
+        lock_key
+    } else {
+        canonical_ref(&state.0.store_path, &lock_key)
+    };
     if state
         .0
         .manager
@@ -6831,6 +6841,12 @@ mod tests {
     // -- Idle-timeout auto-unload reaper --------------------------------------
 
     fn test_state() -> AppState {
+        test_state_at(std::env::temp_dir())
+    }
+
+    /// `test_state` with a real store directory, for the few tests that
+    /// need `canonical_ref` to actually resolve something.
+    fn test_state_at(store_path: PathBuf) -> AppState {
         AppState(Arc::new(Inner {
             manager: Mutex::new(ModelManager {
                 running: HashMap::new(),
@@ -6853,7 +6869,7 @@ mod tests {
             // anyway.
             max_queue: usize::MAX,
             max_loaded_models: 0,
-            store_path: std::env::temp_dir(),
+            store_path,
             cache_path: std::env::temp_dir(),
             client: Client::new(),
         }))
@@ -7761,6 +7777,71 @@ mod tests {
                 .contains_key("docker.io/ai/orphan:latest"),
             "the running entry must be gone"
         );
+    }
+
+    /// An unload that arrives while a first load of the same model is in
+    /// flight blocks on the load lock. By the time it runs, the pull has
+    /// landed and the loader has inserted under the key `canonical_ref`
+    /// now refines to, which can differ from the key both sides locked
+    /// on. Resolving before the lock and removing that stale spelling
+    /// misses the entry, finds the pulled model in the store, and reports
+    /// success with the model still loaded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unload_waiting_on_a_load_removes_the_key_that_load_inserted() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-unload-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = test_state_at(dir.clone());
+
+        // What ensure_model locks on before its pull, and what unload_key
+        // resolves to against a store that does not yet hold the model.
+        let pre_pull_key = "docker.io/ai/m:latest";
+        let loading = acquire_load_lock(pre_pull_key).await;
+
+        let unloader = state.clone();
+        let unload = tokio::spawn(async move { unload_model(&unloader, "docker.io/ai/m").await });
+        // Let the unload reach the lock and park on it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The pull lands with the tagless spelling as the stored reference,
+        // and the loader inserts under that refined key.
+        let desc = crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:0000".into(),
+            size: 0,
+            annotations: None,
+        };
+        OciStore::open(&dir)
+            .unwrap()
+            .tag(desc, "docker.io/ai/m")
+            .unwrap();
+        state.0.manager.lock().await.running.insert(
+            "docker.io/ai/m".into(),
+            running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+        );
+        drop(loading);
+
+        unload
+            .await
+            .unwrap()
+            .expect("the unload must not error once the load releases the lock");
+        assert!(
+            !state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .contains_key("docker.io/ai/m"),
+            "the unload must remove the key the load inserted, not the one it resolved before waiting"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Pins which requests name the unload sentinel: every zero form
