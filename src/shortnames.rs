@@ -361,6 +361,15 @@ fn rejoin(parsed: &ParsedRef<'_>) -> String {
 ///       malformed input fails by construction rather than by enumerating
 ///       bad shapes.
 pub fn validate_reference(reference: &str) -> Result<(), InvalidReference> {
+    validate_reference_parsed(reference).map(|_| ())
+}
+
+/// The body of [`validate_reference`], additionally returning the
+/// [`ParsedRef`] produced by branch (c) so callers that go on to resolve the
+/// reference (`resolve`, `resolve_ollama_api`) don't have to parse it again.
+/// `None` for the (a) absolute-path and (b) passthrough-scheme branches,
+/// neither of which calls [`parse_registry_ref`].
+fn validate_reference_parsed(reference: &str) -> Result<Option<ParsedRef<'_>>, InvalidReference> {
     let reject = |detail: &str| {
         Err(InvalidReference(format!(
             "invalid model reference {reference:?}: {detail}"
@@ -377,7 +386,7 @@ pub fn validate_reference(reference: &str) -> Result<(), InvalidReference> {
         if reference.chars().any(|c| c.is_ascii_control()) {
             return reject("contains a control character");
         }
-        return Ok(());
+        return Ok(None);
     }
 
     // (b) Object-store passthrough URIs carry an opaque key after the bucket,
@@ -390,23 +399,12 @@ pub fn validate_reference(reference: &str) -> Result<(), InvalidReference> {
             if reference.chars().any(|c| c.is_ascii_control()) {
                 return reject("contains a control character");
             }
-            return Ok(());
+            return Ok(None);
         }
     }
 
     // (c) Registry/HF references: parse-by-construction.
-    parse_registry_ref(reference).map(|_| ())
-}
-
-/// Returns true if `reference` already carries an explicit registry host,
-/// derived from [`parse_registry_ref`]'s decomposition rather than guessed
-/// from the raw string: the parser only assigns a host when there is a "/"
-/// (so a slash-less "qwen3.5:0.8B" is never misread as a host just because
-/// its tag separator is a colon) and the first component is host-shaped
-/// per [`is_host_component`]. An unparsable reference has no host; callers
-/// reach this only with already-validated references.
-fn has_host(reference: &str) -> bool {
-    parse_registry_ref(reference).is_ok_and(|parsed| parsed.host.is_some())
+    parse_registry_ref(reference).map(Some)
 }
 
 /// Resolve `reference` through the short-name alias table, then default the
@@ -423,14 +421,18 @@ fn has_host(reference: &str) -> bool {
 ///   2. Has a registry host → return as-is
 ///   3. No host            → prepend `hf.co/`
 pub fn resolve(reference: &str) -> Result<String, InvalidReference> {
-    validate_reference(reference)?;
-    Ok(resolve_inner(reference))
+    let parsed = validate_reference_parsed(reference)?;
+    Ok(resolve_inner(reference, parsed))
 }
 
 /// The resolution body of [`resolve`] without validation. Callers that have
 /// already validated the reference (or that validate a bare shortcut first,
-/// like [`resolve_ollama_api`]) use this to avoid validating twice.
-fn resolve_inner(reference: &str) -> String {
+/// like [`resolve_ollama_api`]) use this to avoid validating twice. `parsed`
+/// is the [`ParsedRef`] [`validate_reference_parsed`] already produced for
+/// `reference` (registry-grammar branch only; `None` for the passthrough and
+/// absolute-path branches, which return before it would be consulted) so the
+/// host check below doesn't call [`parse_registry_ref`] a second time.
+fn resolve_inner(reference: &str, parsed: Option<ParsedRef<'_>>) -> String {
     // ── URI schemes that bypass alias lookup and hf.co defaulting ─────────
     // Local absolute paths and object-store URIs are forwarded as-is to
     // crate::sources, which dispatches them to the appropriate source
@@ -467,7 +469,7 @@ fn resolve_inner(reference: &str) -> String {
     if let Some(mapped) = aliases().get(reference) {
         return mapped.clone();
     }
-    if has_host(reference) {
+    if parsed.is_some_and(|p| p.host.is_some()) {
         return reference.to_owned();
     }
     format!("hf.co/{reference}")
@@ -508,7 +510,7 @@ fn is_bare(reference: &str) -> bool {
 pub fn resolve_ollama_api(reference: &str) -> Result<String, InvalidReference> {
     // Validate up front: the bare-name branch below returns without calling
     // resolve, so validation cannot be deferred to it.
-    validate_reference(reference)?;
+    let parsed = validate_reference_parsed(reference)?;
     if is_bare(reference) {
         if let Some(mapped) = aliases().get(reference) {
             return Ok(mapped.clone());
@@ -516,7 +518,7 @@ pub fn resolve_ollama_api(reference: &str) -> Result<String, InvalidReference> {
         return Ok(format!("docker.io/ai/{reference}"));
     }
     // Already validated: use the non-validating body so we don't validate twice.
-    Ok(resolve_inner(reference))
+    Ok(resolve_inner(reference, parsed))
 }
 
 #[cfg(test)]
@@ -887,23 +889,34 @@ mod tests {
     #[test]
     fn has_host_requires_a_slash() {
         // No "/" at all: a dotted version number must not be mistaken for
-        // an explicit host, no matter how host-like the dot looks.
-        assert!(!has_host("qwen3.5:0.8B"));
-        assert!(!has_host("qwen3.5"));
+        // an explicit host, no matter how host-like the dot looks. So
+        // resolve() prepends the hf.co default instead of leaving it as-is.
+        assert_eq!(resolve("qwen3.5:0.8B").unwrap(), "hf.co/qwen3.5:0.8B");
+        assert_eq!(resolve("qwen3.5").unwrap(), "hf.co/qwen3.5");
         // With a "/", the first component is genuinely checked for a host.
-        assert!(has_host("hf.co/foo/bar"));
-        assert!(has_host("localhost/foo"));
-        assert!(!has_host("unsloth/Qwen3.5-0.8B-GGUF"));
+        // A host-shaped first component passes through untouched.
+        assert_eq!(resolve("hf.co/foo/bar").unwrap(), "hf.co/foo/bar");
+        assert_eq!(resolve("localhost/foo").unwrap(), "localhost/foo");
+        assert_eq!(
+            resolve("unsloth/Qwen3.5-0.8B-GGUF").unwrap(),
+            "hf.co/unsloth/Qwen3.5-0.8B-GGUF"
+        );
     }
 
     #[test]
-    // Regression: "localhost:PORT/..." (a local test registry) was
-    // mistaken for a host-less reference, since neither the dot check
-    // nor the exact "localhost" match recognized it — "resolve" then
-    // wrongly prepended "hf.co/", producing "hf.co/localhost:PORT/...".
+    // Regression: "localhost:PORT/..." (a local test registry) was mistaken
+    // for a host-less reference, since neither the dot check nor the exact
+    // "localhost" match recognized it. "resolve" then wrongly prepended
+    // "hf.co/", producing "hf.co/localhost:PORT/...".
     fn has_host_recognizes_an_explicit_port() {
-        assert!(has_host("localhost:5000/foo/bar"));
-        assert!(has_host("registry.example.com:5000/foo"));
+        assert_eq!(
+            resolve("localhost:5000/foo/bar").unwrap(),
+            "localhost:5000/foo/bar"
+        );
+        assert_eq!(
+            resolve("registry.example.com:5000/foo").unwrap(),
+            "registry.example.com:5000/foo"
+        );
         assert_eq!(
             resolve("localhost:5000/foo/bar:tag").unwrap(),
             "localhost:5000/foo/bar:tag"
