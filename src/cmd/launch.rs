@@ -337,6 +337,11 @@ const INTEGRATIONS: &[Integration] = &[
         description: "OpenClaw",
         binary: "openclaw",
     },
+    Integration {
+        name: "qwen",
+        description: "Qwen Code",
+        binary: "qwen",
+    },
 ];
 
 fn print_integrations() {
@@ -413,6 +418,7 @@ fn launch(name: &str, model: &str, api_key: &str, extra_args: &[String]) -> anyh
         "gemini" => launch_gemini(model, api_key, extra_args),
         "hermes" => launch_hermes(model, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
+        "qwen" => launch_qwen(model, api_key, extra_args),
         other => anyhow::bail!(
             "unknown integration {:?}\nRun 'llmman launch' without arguments to list supported integrations.",
             other
@@ -802,6 +808,74 @@ fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     exec_with_env(&bin, extra_args, &[])
 }
 
+/// qwen: Qwen Code's OpenAI-compatible mode, pointed at our /v1.
+///
+/// The auth type and model go on the command line, not only in the
+/// environment. Qwen Code resolves both as `argv`, then its own
+/// `~/.qwen/settings.json`, then the `OPENAI_*` variables, and it writes
+/// that file itself whenever a user picks a provider or model with
+/// `/auth` or `/model`. For anyone who has used it before, variables alone
+/// lose: the session went to the cloud provider recorded there, with that
+/// provider's real key, and reported success. Ollama's own
+/// `cmd/launch/qwen.go` prepends the same two flags.
+///
+/// The base URL and key stay in the environment even though Qwen Code
+/// has `--openai-base-url` and `--openai-api-key`: a key on the command
+/// line is visible in `ps` to anyone on the host, and for these two
+/// Qwen Code reads the variables ahead of its settings file, so the flags
+/// buy nothing. The one thing that still precedes them is a
+/// `modelProviders` entry whose id equals the launched model, which the
+/// `docker.io/…` and `hf.co/…` references llmman hands over do not
+/// collide with.
+///
+/// `--model` is required. Qwen Code has no notion of a missing model:
+/// given none it sends its own built-in default (`qwen3.7-max` in
+/// 0.22.3), which the daemon would then try to pull as
+/// `docker.io/ai/qwen3.7-max` and fail on, minutes later, naming a model
+/// the caller did not ask for. Refusing here names the flag instead.
+fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_on_path("qwen").ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
+    if model.is_empty() {
+        anyhow::bail!("qwen needs a model: llmman launch qwen --model <model>");
+    }
+
+    let base_url = format!("{}/v1", daemon::server());
+    exec_with_env(
+        &bin,
+        &qwen_args(model, extra_args),
+        &[
+            ("OPENAI_BASE_URL", base_url.as_str()),
+            ("OPENAI_API_KEY", api_key),
+            ("OPENAI_MODEL", model),
+        ],
+    )
+}
+
+/// `--auth-type openai --model <model>` ahead of the caller's own
+/// arguments, each dropped when the caller already passed it after `--`:
+/// Qwen Code 0.22.3 crashes on either flag repeated (a `toLowerCase`
+/// TypeError) rather than taking the last one, and a caller who spelled
+/// out an auth type meant it. `--authType` is checked too — yargs accepts
+/// a flag's camelCase spelling as well.
+fn qwen_args(model: &str, extra_args: &[String]) -> Vec<String> {
+    let has = |long: &str, short: Option<&str>| {
+        extra_args.iter().any(|a| {
+            a == long
+                || a.starts_with(&format!("{long}="))
+                || short.is_some_and(|s| a == s || a.starts_with(&format!("{s}=")))
+        })
+    };
+    let mut args = Vec::with_capacity(extra_args.len() + 4);
+    if !has("--auth-type", Some("--authType")) {
+        args.extend(["--auth-type".to_string(), "openai".to_string()]);
+    }
+    if !has("--model", Some("-m")) {
+        args.extend(["--model".to_string(), model.to_string()]);
+    }
+    args.extend_from_slice(extra_args);
+    args
+}
+
 // ---------------------------------------------------------------------------
 // Process execution helper
 // ---------------------------------------------------------------------------
@@ -920,6 +994,45 @@ mod tests {
         );
         assert_eq!(openclaw_model_id(""), "default");
         assert_eq!(openclaw_model_id("docker.io/ai/"), "default");
+    }
+
+    /// The two flags `launch_qwen` relies on to beat a persisted
+    /// `~/.qwen/settings.json` (see its doc comment) go first, and each
+    /// yields to the caller's own spelling of it — a repeated `--model`
+    /// crashes Qwen Code.
+    #[test]
+    fn qwen_args_prefix_auth_type_and_model_unless_the_caller_passed_them() {
+        let none: Vec<String> = vec![];
+        assert_eq!(
+            qwen_args("m:latest", &none),
+            ["--auth-type", "openai", "--model", "m:latest"]
+        );
+
+        let user_model = vec![
+            "--model".to_string(),
+            "theirs".to_string(),
+            "-p".to_string(),
+        ];
+        assert_eq!(
+            qwen_args("m:latest", &user_model),
+            ["--auth-type", "openai", "--model", "theirs", "-p"]
+        );
+        let user_short = vec!["-m=theirs".to_string()];
+        assert_eq!(
+            qwen_args("m:latest", &user_short),
+            ["--auth-type", "openai", "-m=theirs"]
+        );
+
+        let user_auth = vec!["--auth-type=qwen-oauth".to_string()];
+        assert_eq!(
+            qwen_args("m:latest", &user_auth),
+            ["--model", "m:latest", "--auth-type=qwen-oauth"]
+        );
+        let user_camel = vec!["--authType".to_string(), "openai".to_string()];
+        assert_eq!(
+            qwen_args("m:latest", &user_camel),
+            ["--model", "m:latest", "--authType", "openai"]
+        );
     }
 
     /// Regression test for the codex config bug described on

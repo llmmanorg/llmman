@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `opencode`, `codex`, `hermes`, `openclaw`) — not mocks.
+//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -852,6 +852,41 @@ fn launch_openclaw_with_model() {
         &["agent", "--local", "--message", PROMPT, "--agent", "main"],
         openclaw_pull_registry_flake,
     );
+}
+
+#[test]
+fn launch_qwen_with_model() {
+    eprintln!("[test] launch_qwen_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_qwen_with_model: acquired SERIAL");
+
+    // No on_path skips: ci.yml's install_cli already fails the job when
+    // qwen did not become a working binary, and a skip here would hide
+    // exactly that (the ask on #332).
+    //
+    // Positional prompt, and first: `-p` is deprecated in 0.22.3, and
+    // `--exclude-tools` is an array option that would swallow a prompt
+    // placed after it. `--safe-mode` trims Qwen Code's eager tool set from
+    // 23 to 10, but its `tool_search` can add the rest back on a later
+    // turn, so `report_findings` is excluded by name as well: that tool's
+    // `summary` field carries `maxLength: 2000`, which llama.cpp's
+    // json-schema-to-grammar renders as `char{0,2000}` and its grammar
+    // parser refuses at exactly that repetition count, for any model whose
+    // template constrains tool calls with a grammar — MODEL's does. The
+    // request then fails with a 400 before generating (issue #352).
+    launch_and_assert_tolerating(
+        "qwen",
+        &[PROMPT, "--safe-mode", "--exclude-tools", "report_findings"],
+        qwen_loop_detection,
+    );
+}
+
+/// Qwen Code's own loop detector stops a run and exits 1 when a small
+/// model repeats a tool call — a property of MODEL's sampling, not of
+/// llmman, so tolerated the same way a timeout or a missing "pong" already
+/// are (see `openclaw_pull_registry_flake` for the same shape).
+fn qwen_loop_detection(stderr: &str) -> bool {
+    stderr.contains("Loop detection halted the run")
 }
 
 /// Verifies `daemon::ensure_server`'s fast-fail path end to end: when the
