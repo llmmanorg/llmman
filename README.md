@@ -7,7 +7,7 @@
 <p align="center"><b>Run any coding agent on any model.</b></p>
 
 <p align="center">
-Claude Code, Codex, OpenCode, Gemini CLI and friends, pointed at a model
+Claude Code, Codex, OpenCode and friends, pointed at a model
 running on your own machine, or at any hosted provider, in one command.
 No subscription, no rewiring, no vendor's idea of which model you should use.
 </p>
@@ -205,11 +205,10 @@ configures it through a file on disk, so it can't carry a key and
 fallback is only used for a daemon bound to loopback, and never for a
 browser request from another site. It bounds the blast radius rather
 than authenticating anyone, so on a shared machine prefer an integration
-that sends its own key. `cline`, `kimi`, `copilot`, `gemini` and `openclaw` can't be
+that sends its own key. `cline`, `kimi`, `copilot` and `openclaw` can't be
 used with `--provider` at all: the first two pick their own model rather
-than taking llmman's, `copilot` has no way to send a key, `gemini` feeds
-its key to a native Google client llmman can't confirm it has redirected,
-and `openclaw` only takes a model during first-run onboarding.
+than taking llmman's, `copilot` has no way to send a key, and `openclaw`
+only takes a model during first-run onboarding.
 
 Being OpenAI-compatible doesn't mean implementing every OpenAI route.
 `codex` uses `/v1/responses`, which `openai`, `groq` and `openrouter`
