@@ -199,9 +199,10 @@ one place integrations are configured, whether a model is local or
 hosted, and both usable from the same session.
 
 The API key is read from the variable models.dev names for that provider
-and travels per request, never to disk. `hermes` is the exception: llmman
-configures it through a file on disk, so it can't carry a key and
-`llmman serve` needs the variable in its own environment instead. That
+and travels per request, never to disk. `hermes` and `talos` are the
+exceptions: llmman configures them through a file on disk, so they can't
+carry a key and `llmman serve` needs the variable in its own environment
+instead. That
 fallback is only used for a daemon bound to loopback, and never for a
 browser request from another site. It bounds the blast radius rather
 than authenticating anyone, so on a shared machine prefer an integration
