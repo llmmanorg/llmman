@@ -2257,8 +2257,19 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
 /// reference the pull recorded. A lock key that moved with it would let a
 /// caller resolving in that window take a different lock from the loader
 /// still holding the old one. `default_tag` alone is stable, and already
-/// folds the tagless and `:latest` spellings together, which is all the
-/// lock needs.
+/// folds the tagless and `:latest` spellings together.
+///
+/// A `@digest` suffix is dropped first, and only from the lock key: the
+/// reference the store is asked about keeps it, so `find` can match it by
+/// content. `default_tag` sees the `:` inside `sha256:…` as a tag and
+/// leaves such a reference alone, so `m@sha256:…` and `m:latest` for one
+/// stored model took two locks and could both load. Which tag a digest
+/// sits under is something only the store knows, so the fold guesses
+/// `:latest`: a digest of a model stored as `m:v9` shares its lock with
+/// `m:latest`, not with `m:v9`. Once through the lock the store resolves
+/// it, so what remains is a first load of `m:v9` and one of its digest
+/// arriving together. The cost the other way is one load waiting behind
+/// another that names different content.
 ///
 /// A provider-routed reference comes back untouched, as `ensure_model`
 /// returns it before any of this applies. Nothing observable depends on
@@ -2268,7 +2279,8 @@ fn load_identity(model: &str) -> Result<String, crate::shortnames::InvalidRefere
         return Ok(model.to_string());
     }
     let resolved = crate::shortnames::resolve_ollama_api(model)?;
-    Ok(crate::storage::default_tag(&resolved))
+    let (without_digest, _) = crate::storage::split_ref_digest(&resolved);
+    Ok(crate::storage::default_tag(without_digest))
 }
 
 /// Drops `model` from `running`, or reports a 404 when llmman has no such
@@ -2285,10 +2297,16 @@ async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
     let _guard = acquire_load_lock(&lock_key).await;
     // Only now, with any load of this model excluded: the running key is
     // the store's spelling, which a load in flight may just have changed.
+    // Resolved from the reference with its `@digest` kept, the two steps
+    // `ensure_model` takes before its own `canonical_ref`, and not from
+    // the lock key: that has folded the digest onto `:latest`, which is
+    // not where the store holds a model tagged otherwise.
     let canonical = if crate::providers::is_remote_ref(model) {
         lock_key
     } else {
-        canonical_ref(&state.0.store_path, &lock_key)
+        let resolved =
+            crate::shortnames::resolve_ollama_api(model).map_err(AppError::bad_request)?;
+        canonical_ref(&state.0.store_path, &crate::storage::default_tag(&resolved))
     };
     if state
         .0
@@ -2889,18 +2907,20 @@ async fn ensure_model(
         ));
     }
 
+    // The key the load lock below is taken on, fixed before `canonical_ref`
+    // reads the store: it has to be the same string for the whole of a
+    // load even though the pull below changes what `canonical_ref`
+    // returns. See `load_identity`, which `unload_model` locks on for the
+    // same reason; the two have to agree, or an unload by one spelling
+    // passes a load by another.
+    let load_id = load_identity(model_ref).map_err(AppError::bad_request)?;
     let model_ref =
         crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
-    // Default the tag before the lock below: otherwise two concurrent
-    // first-pulls of e.g. "gemma4" and "gemma4:latest" take different
-    // locks and both spawn a process for the same model.
+    // Default the tag before the store lookups: otherwise "gemma4" and
+    // "gemma4:latest" reach the store, and the pull, as two spellings. A
+    // `@digest` stays on, unlike in the lock key, so `find` can resolve
+    // it to whatever tag holds that content.
     let model_ref = crate::storage::default_tag(&model_ref);
-    // Kept from before `canonical_ref`, which reads the store: this is
-    // the key the load lock is taken on, and it has to be the same string
-    // for the whole of a load even though the pull below changes what
-    // `canonical_ref` returns. See `load_identity`, which `unload_model`
-    // locks on for the same reason.
-    let load_id = model_ref.clone();
     let model_ref = canonical_ref(&state.0.store_path, &model_ref);
     let model_ref = model_ref.as_str();
 
@@ -7776,6 +7796,64 @@ mod tests {
         );
     }
 
+    /// An unload by digest of a model stored, and loaded, under a tag
+    /// other than `:latest`. The running key comes from the digest
+    /// spelling itself; resolving the lock key instead, which folds the
+    /// digest onto `:latest`, looked for a tag the model is not under and
+    /// reported it missing with the process still up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unload_by_digest_reaches_the_entry_stored_under_another_tag() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-unload-digest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = test_state_at(dir.clone());
+        let desc = crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:a1b2".into(),
+            size: 0,
+            annotations: None,
+        };
+        OciStore::open(&dir)
+            .unwrap()
+            .tag(desc, "docker.io/ai/m-tagged:v9")
+            .unwrap();
+        state.0.manager.lock().await.running.insert(
+            "docker.io/ai/m-tagged:v9".into(),
+            running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+        );
+
+        unload_model(&state, "docker.io/ai/m-tagged@sha256:a1b2")
+            .await
+            .expect("the digest spelling must unload the model loaded under its tag");
+        assert!(
+            !state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .contains_key("docker.io/ai/m-tagged:v9"),
+            "the entry under the tag must be gone"
+        );
+
+        // Stored but no longer loaded is a plain success, as for a tag.
+        unload_model(&state, "docker.io/ai/m-tagged@sha256:a1b2")
+            .await
+            .expect("a stored model must unload without a 404 whether or not it is loaded");
+        // A digest nothing in the store carries is the missing-model case.
+        let err = unload_model(&state, "docker.io/ai/m-tagged@sha256:ffff")
+            .await
+            .expect_err("a digest the store does not hold must be a 404");
+        assert_eq!(err.1, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An unload that arrives while a first load of the same model is in
     /// flight blocks on the load lock. By the time it runs, the pull has
     /// landed and the loader has inserted under the key `canonical_ref`
@@ -7837,6 +7915,83 @@ mod tests {
                 .running
                 .contains_key("docker.io/ai/m"),
             "the unload must remove the key the load inserted, not the one it resolved before waiting"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `m@sha256:…`, `m` and `m:latest` name one stored model and must
+    /// share a load lock; the digest form used to keep its own because
+    /// `default_tag` reads the `:` inside the digest as a tag.
+    #[test]
+    fn load_identity_folds_the_digest_spelling_onto_the_tag_spelling() {
+        let latest = load_identity("docker.io/ai/m:latest").unwrap();
+        assert_eq!(load_identity("docker.io/ai/m").unwrap(), latest);
+        assert_eq!(
+            load_identity("docker.io/ai/m@sha256:0000000000000000").unwrap(),
+            latest
+        );
+        assert_eq!(
+            load_identity("docker.io/ai/m:v9@sha256:0000000000000000").unwrap(),
+            "docker.io/ai/m:v9"
+        );
+    }
+
+    /// The load side of that fold: a load by digest waits on the lock a
+    /// load by tag holds, and once through it takes the process that load
+    /// started rather than starting its own. With `ensure_model` keying
+    /// its lock on the digest spelling, as it did before it went through
+    /// `load_identity`, nothing here would block.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_load_by_digest_waits_on_the_tag_spellings_lock_and_takes_its_process() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-load-digest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = test_state_at(dir.clone());
+        // The pull by tag has landed...
+        let desc = crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:d16e".into(),
+            size: 0,
+            annotations: None,
+        };
+        OciStore::open(&dir)
+            .unwrap()
+            .tag(desc, "docker.io/ai/m-digest:latest")
+            .unwrap();
+        // ...and that load still holds its lock.
+        let loading =
+            acquire_load_lock(&load_identity("docker.io/ai/m-digest:latest").unwrap()).await;
+
+        let loader = state.clone();
+        let load = tokio::spawn(async move {
+            ensure_model(&loader, "docker.io/ai/m-digest@sha256:d16e", None).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !load.is_finished(),
+            "a load by digest must wait on the lock the tag spelling holds"
+        );
+
+        state.0.manager.lock().await.running.insert(
+            "docker.io/ai/m-digest:latest".into(),
+            running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+        );
+        drop(loading);
+
+        let (model_ref, target, _guard) = load
+            .await
+            .unwrap()
+            .expect("the load by digest must succeed once the lock releases");
+        assert_eq!(model_ref, "docker.io/ai/m-digest:latest");
+        assert!(
+            matches!(target, Target::Local(0)),
+            "the process the tag spelling started must be the one handed back"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8929,26 +9084,29 @@ mod tests {
     /// (see `ensure_model`'s `default_tag` call).
     #[test]
     fn ensure_model_key_pipeline_converges_aliases_before_the_lock() {
-        let tagless = crate::storage::default_tag(
-            &crate::shortnames::resolve_ollama_api("regression-test-model").unwrap(),
-        );
-        let tagged = crate::storage::default_tag(
-            &crate::shortnames::resolve_ollama_api("regression-test-model:latest").unwrap(),
-        );
+        let tagless = load_identity("regression-test-model").unwrap();
+        let tagged = load_identity("regression-test-model:latest").unwrap();
+        let digest = load_identity("regression-test-model@sha256:0000").unwrap();
         assert_eq!(
             tagless, tagged,
             "tagless and :latest aliases must resolve to one key"
         );
+        assert_eq!(
+            tagless, digest,
+            "the digest spelling must resolve to the same key"
+        );
 
         let a = load_lock(&tagless);
         let b = load_lock(&tagged);
+        let c = load_lock(&digest);
         assert!(
-            Arc::ptr_eq(&a, &b),
-            "both aliases must take the same load lock"
+            Arc::ptr_eq(&a, &b) && Arc::ptr_eq(&a, &c),
+            "all three aliases must take the same load lock"
         );
 
         drop(a);
         drop(b);
+        drop(c);
         release_load_lock(&tagless);
     }
 
