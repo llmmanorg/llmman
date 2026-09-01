@@ -210,12 +210,6 @@ used with `--provider` at all: the first two pick their own model rather
 than taking llmman's, `copilot` has no way to send a key, and `openclaw`
 only takes a model during first-run onboarding.
 
-Being OpenAI-compatible doesn't mean implementing every OpenAI route.
-`codex` uses `/v1/responses`, which `openai`, `groq` and `openrouter`
-answer but `anthropic` and `mistral` don't; models.dev carries no
-capability data to filter on, so llmman turns that provider's bare 404
-into an explanation naming what's missing rather than guessing up front.
-
 `--provider` needs a local `llmman serve`. The daemon talks plain HTTP
 and has no authentication, so neither `run` nor `launch` will send a real
 key to a remote `LLMMAN_HOST`, and a daemon bound to anything but
