@@ -1066,26 +1066,34 @@ pub fn push(reference: &str) -> anyhow::Result<Option<String>> {
 /// Ollama's own `ollama stop` (`cmd/cmd.go`'s `loadOrUnloadModel`). Used
 /// by `llmman stop`.
 ///
-/// `Ok(false)` reports the daemon's 404, i.e. it holds no model by that
-/// name — the one outcome `llmman stop` renders as its own error rather
-/// than a transport failure. `Ok(true)` covers both a model that was
-/// loaded and one that simply was not, which the unload does not
-/// distinguish, matching ollama.
+/// `Ok(false)` is the daemon's "no such model" answer, which `llmman
+/// stop` renders as its error; `Ok(true)` covers a model loaded or not,
+/// which the unload does not distinguish, matching ollama. Any other
+/// failure is reported with its status and body, a 404 included: a proxy
+/// in front of the daemon answers 404 too, and "couldn't find model"
+/// would be the wrong story for that.
 pub fn unload(reference: &str) -> anyhow::Result<bool> {
     let resp = reqwest::blocking::Client::new()
         .post(format!("{}/api/generate", server()))
         .json(&serde_json::json!({"model": reference, "keep_alive": 0}))
         .send()
         .with_context(|| format!("request /api/generate (unload) for {reference}"))?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(true);
+    }
+    let body = resp.text().unwrap_or_default();
+    if status == reqwest::StatusCode::NOT_FOUND && is_model_not_found_body(&body) {
         return Ok(false);
     }
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().unwrap_or_default();
-        anyhow::bail!("stop {reference}: server returned {status}: {body}");
-    }
-    Ok(true)
+    anyhow::bail!("stop {reference}: server returned {status}: {body}");
+}
+
+/// The ollama-shaped `{"error":"model '…' not found"}` this daemon sends
+/// too (see `unload_model` in cmd::serve), parsed through `api_error` so
+/// an HTML page or a proxy's own JSON does not pass by containing the words.
+pub(crate) fn is_model_not_found_body(body: &str) -> bool {
+    api_error(body).is_some_and(|e| e.starts_with("model '") && e.ends_with("' not found"))
 }
 
 /// A plain `GET {server()}{path}` returning the parsed JSON body — for
@@ -1593,5 +1601,18 @@ mod tests {
             survived,
             "a process outside the targeted group was signalled too"
         );
+    }
+
+    #[test]
+    fn only_the_not_found_error_envelope_means_a_missing_model() {
+        assert!(is_model_not_found_body(
+            r#"{"error":"model 'docker.io/ai/m' not found"}"#
+        ));
+        assert!(!is_model_not_found_body(r#"{"error":"no route"}"#));
+        assert!(!is_model_not_found_body("<html>404 Not Found</html>"));
+        assert!(!is_model_not_found_body(""));
+        assert!(!is_model_not_found_body(
+            r#"{"message":"model 'x' not found"}"#
+        ));
     }
 }
