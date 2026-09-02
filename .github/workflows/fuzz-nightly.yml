@@ -37,7 +37,10 @@ jobs:
       # instrumentation flags are unstable), unlike every other Rust step in
       # ci.yml, which builds and tests entirely on stable.
       - name: Set up Rust (nightly)
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        # Same commit ci.yml pins for its stable installs; the action itself
+        # is toolchain-agnostic, `with: toolchain: nightly` below is what
+        # actually selects nightly here.
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: nightly
 
