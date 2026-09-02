@@ -74,7 +74,7 @@ The server listens on `127.0.0.1:17434` by default, overridable via `LLMMAN_HOST
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens` |
 | Anthropic | `/v1/messages` |
 | llmman | `/llmman/providers`, `/llmman/providers/{id}` |
-| Prometheus | `/metrics` |
+| Prometheus | `/metrics` (off unless `LLMMAN_METRICS=1`) |
 
 `/llmman/...` is llmman's own API, not a compatibility surface — no
 upstream API has a notion of a [models.dev](https://models.dev) provider
@@ -87,28 +87,17 @@ no price). `llmman providers`, `list --provider`, `run --provider` and
 `launch --provider` are all clients of it, so the catalog is fetched and
 cached in one process: the one that forwards the request upstream.
 
-`/metrics` is a Prometheus scrape target, in the text exposition
-format, always on. It reports the daemon's start time, requests and their
-duration by matched route, how many models are loaded, how many have been
-loaded and unloaded, and how many requests are doing model-scheduling work
-against the `LLMMAN_MAX_QUEUE` admission limit. Unloads carry a `reason`
-label (`idle`, `requested`, `crashed`, `oom`, `evicted`), which is what
-tells a steady eviction rate from a backend that keeps dying.
+`/metrics` is a Prometheus scrape target in the text exposition format.
+It is **off by default**; set `LLMMAN_METRICS=1` (or `true`, `yes`, `on`)
+to serve it. Without that the route is absent and answers 404, the same
+as any other path this daemon does not serve. The router has no
+authentication and `LLMMAN_HOST` will bind it to any interface, so an
+upgrade should not start publishing a daemon's version, route mix, model
+names and model churn to whoever can reach the port.
 
-Three things it deliberately does not measure. A request for an
-already-loaded model returns before admission control, so it is absent
-from `llmman_scheduling_requests_in_flight` and is not capped by
-`LLMMAN_MAX_QUEUE`. Requests to unknown paths are not counted, since
-labelling by the requested path is how a metrics endpoint acquires
-unbounded cardinality, and neither are CORS preflights, which the CORS
-layer answers before any handler runs. `llmman_models_loaded` is not the
-number `LLMMAN_MAX_LOADED_MODELS` caps either: that limit also counts
-outstanding load reservations, so a daemon can be at its limit while this
-gauge reads below it.
-
-The scrape route is instrumented like any other, so `route="/metrics"`
-reports what a scrape costs; exclude that label when asking about
-application latency.
+```
+LLMMAN_METRICS=1 llmman serve
+```
 
 It is on Prometheus' default path, so a scrape config needs no
 `metrics_path`:
@@ -119,6 +108,55 @@ scrape_configs:
     static_configs:
       - targets: ["127.0.0.1:17434"]
 ```
+
+Fifteen metric families:
+
+| Metric | Type | Labels | What it tells you |
+|--------|------|--------|-------------------|
+| `llmman_build_info` | gauge | `version` | Which build is running; join against it to break a graph out by version. |
+| `llmman_start_time_seconds` | gauge | — | `time() - llmman_start_time_seconds` is uptime; a step down is a restart. |
+| `llmman_scheduling_requests_in_flight` | gauge | — | Requests doing model-scheduling work right now. |
+| `llmman_scheduling_capacity` | gauge | — | The limit those are counted against, i.e. `LLMMAN_MAX_QUEUE.max(1)`. |
+| `llmman_scheduling_rejections_total` | counter | — | Requests refused with a 503 because that limit was full. |
+| `llmman_models_loaded` | gauge | — | Backends currently running, the set `/api/ps` reports. |
+| `llmman_models_loading` | gauge | — | Loads under way; `loaded + loading` is what `LLMMAN_MAX_LOADED_MODELS` caps. |
+| `llmman_model_up` | gauge | `model`, `engine` | 1 while the backend process is alive, 0 once it has died but llmman has not noticed. |
+| `llmman_model_loads_total` | counter | `model` | Cold starts per model — the churn a too-small `LLMMAN_MAX_LOADED_MODELS` produces. |
+| `llmman_model_load_duration_seconds` | histogram | `model` | How long a cold start takes, from admission to ready. |
+| `llmman_model_load_oom_retries_total` | counter | `model`, `strategy` | Loads that hit an out-of-memory failure and retried: `evict_others`, `split_mode`, `ctx_shrink`. |
+| `llmman_model_unloads_total` | counter | `model`, `reason` | `idle`, `requested`, `crashed`, `oom`, `evicted`. |
+| `llmman_http_requests_total` | counter | `route`, `status` | Request rate and error rate by matched route. |
+| `llmman_http_request_ttfb_seconds` | histogram | `route` | Time to response headers. This is the latency number. |
+| `llmman_http_request_duration_seconds` | histogram | `route` | Time to the last byte of the body. |
+
+The two request histograms are separate on purpose. On a streaming route
+(`/api/chat`, `/v1/chat/completions`) time to the last byte mostly tracks
+how many tokens were asked for, so graphing it as latency makes every long
+completion look like a regression; time to first byte is what moves when a
+load stalls or the queue backs up. Graphing only the first would hide a
+stream that dies after its first byte.
+
+`llmman_model_up` is the one thing no other metric here shows. llmman only
+notices a dead backend when a request arrives for that model, so a backend
+that died and was then never asked for again is still counted by
+`llmman_models_loaded`. A scrape checks liveness directly, so
+`llmman_model_up == 0` is that gap, and
+`sum by (instance) (llmman_models_loaded) - sum by (instance) (llmman_model_up)`
+is how many models are in it.
+
+Three things it deliberately does not measure. A request for an
+already-loaded model returns before admission control, so it is absent
+from `llmman_scheduling_requests_in_flight` and is not capped by
+`LLMMAN_MAX_QUEUE`. Requests to unknown paths are not counted, since
+labelling by the requested path is how a metrics endpoint acquires
+unbounded cardinality, and neither are CORS preflights, which the CORS
+layer answers before any handler runs. Per-model families exist only once
+that model has been seen, since llmman cannot enumerate every model
+reference a user might send.
+
+The scrape route is instrumented like any other, so `route="/metrics"`
+reports what a scrape costs; exclude that label when asking about
+application latency.
 
 It is also the one route outside the CORS layer, so it answers without an
 `Access-Control-Allow-Origin` header. The default origin list allows any
@@ -172,6 +210,7 @@ setting may not behave identically.
 | `LLMMAN_MAX_LOADED_MODELS` | Caps how many models this daemon keeps loaded at once, as one flat daemon-wide total (llmman has no per-model memory estimate to size an automatic per-GPU figure against). Once at the cap, the least-recently-used idle model is evicted to make room; if every loaded model is busy, the request gets a `503` instead. Defaults to `0` (unbounded, today's behavior, unchanged). |
 | `LLMMAN_MAX_QUEUE` | Caps how many requests `llmman serve` admits into scheduling at once; anything beyond that gets an immediate `503` (`server busy, please try again.  maximum pending requests exceeded`, two spaces included). Defaults to `512`. |
 | `LLMMAN_MAX_TRANSFER_STREAMS` | Maximum number of a HuggingFace safetensors repo's files downloaded concurrently during `pull`. Has no effect on GGUF transfers, and is not read by `transfer`'s own `docker`-feature registry-push path, which streams files sequentially. Defaults to `4`. |
+| `LLMMAN_METRICS` | Serves the Prometheus scrape endpoint at `/metrics`. Accepts `1`/`true`/`yes`/`on`. Off by default: the router has no authentication, so an upgrade should not start publishing this daemon's version, route mix, model names and model churn to whoever can reach the port. Unset, the route is absent and answers `404`. |
 | `LLMMAN_MODELS` | Local store directory, overriding the default below. `pull`/`push`/`run`/etc. go through the daemon and always use whichever store it was started with. |
 | `LLMMAN_NUM_PARALLEL` | Number of parallel request slots (`--parallel`) for GGUF models (llama-server only; no vllm/mlx equivalent). `--ctx-size` is scaled up by this value first, so each slot still gets the full configured/default context rather than an even split of it; ignored (with a warning) for a load with no explicit context size to scale. Unset leaves llama-server's own default of 1 untouched. |
 | `LLMMAN_ORIGINS` | A comma-separated list of extra allowed CORS origins for the HTTP API. A trailing `:*` on an entry matches any port on that scheme+host. Always includes every scheme/port on `localhost`/`127.0.0.1`/`0.0.0.0`/`[::1]` regardless of this variable. |
