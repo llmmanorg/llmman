@@ -44,6 +44,14 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    # Every leg finishes in 2-7 min warm, so 60 is pure headroom — it
+    # exists only to bound a wedged runner. CI 33613527281's
+    # ubuntu-24.04-arm leg lost communication with the server mid-build
+    # and, with no timeout here, stalled 46 min before GitHub's own
+    # infrastructure gave up, blocking `release` (which `needs:` this)
+    # the whole time. A timeout can't keep a runner alive, just stop a
+    # dead one from stalling until the 6-hour default.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -1252,6 +1260,10 @@ jobs:
     # other event (e.g. a PR).
     needs: [build, test, lint, e2e]
     runs-on: ubuntu-24.04
+    # Downloads, renames and uploads artefacts in under a minute; 60 is
+    # the same runner-wedge bound as the `build` job above, not an
+    # estimate of this job's own runtime.
+    timeout-minutes: 60
     # Two release channels, both attaching one binary per matrix.target
     # (see the build job above — this is where "all the platforms
     # llama.app does" is actually decided, not here):
