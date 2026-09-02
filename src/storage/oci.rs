@@ -633,7 +633,7 @@ pub fn split_ref_digest(reference: &str) -> (&str, Option<&str>) {
 /// all give `docker.io/ai/m`. The tag is cut by the rule
 /// `ref_path_segments` lays paths out with, a `:` after the last `/`, so
 /// a host port stays.
-fn repo_name(reference: &str) -> &str {
+pub fn repo_name(reference: &str) -> &str {
     let (base, _) = split_ref_digest(reference);
     let last_slash = base.rfind('/').map_or(0, |i| i + 1);
     match base[last_slash..].find(':') {

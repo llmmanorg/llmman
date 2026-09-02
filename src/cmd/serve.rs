@@ -2321,7 +2321,8 @@ fn stored_tag_for_digest(store_path: &std::path::Path, reference: &str) -> Optio
 /// against ollama 0.32.6). The local store is what separates those two
 /// cases here. A model removed from the store while still loaded stays
 /// unloadable, since the `running` entry is authoritative and is consulted
-/// first.
+/// first: by its key, and by the digest it records when the key cannot be
+/// had from the store any more.
 async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
     let lock_key = load_identity(&state.0.store_path, model).map_err(AppError::bad_request)?;
     let _guard = acquire_load_lock(&lock_key).await;
@@ -2354,6 +2355,29 @@ async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
     // 404 case.
     if crate::providers::is_remote_ref(model) {
         return Ok(());
+    }
+    // The store may have lost the tag since the load (`rm` on a loaded
+    // model), in which case `canonical_ref` handed the reference back as
+    // given, digest and all, and the key the model runs under is not to
+    // be had from the store. The digest still names the content, and each
+    // `running` entry records its own, so the one with that digest in the
+    // same repository is it, the spelled tag first when several hold it.
+    if let (base, Some(digest)) = crate::storage::split_ref_digest(&canonical) {
+        let spelled = crate::storage::default_tag(base);
+        let mut mgr = state.0.manager.lock().await;
+        let key = mgr
+            .running
+            .iter()
+            .filter(|(key, m)| {
+                m.digest.eq_ignore_ascii_case(digest)
+                    && crate::storage::repo_name(key) == crate::storage::repo_name(base)
+            })
+            .map(|(key, _)| key.clone())
+            .min_by_key(|key| *key != spelled);
+        if let Some(key) = key {
+            mgr.running.remove(&key);
+            return Ok(());
+        }
     }
     let store = OciStore::open(&state.0.store_path)?;
     store
@@ -7882,6 +7906,54 @@ mod tests {
             .expect_err("a digest the store does not hold must be a 404");
         assert_eq!(err.1, StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The store has lost the entry while the model runs (`rm` on a loaded
+    /// model), so the digest cannot be resolved to the key it runs under;
+    /// the digest each `running` entry records is what finds it, the
+    /// spelled tag first when two entries hold the same content.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unload_by_digest_reaches_a_loaded_model_the_store_has_lost() {
+        let state = test_state();
+        let running = |digest: &str| {
+            let mut m = running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0);
+            m.digest = digest.into();
+            m
+        };
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running
+                .insert("docker.io/ai/m-gone:v8".into(), running("sha256:a1b2"));
+            mgr.running
+                .insert("docker.io/ai/m-gone:v9".into(), running("sha256:a1b2"));
+            mgr.running
+                .insert("docker.io/ai/other:v9".into(), running("sha256:a1b2"));
+        }
+
+        unload_model(&state, "docker.io/ai/m-gone:v9@sha256:A1B2")
+            .await
+            .expect("the digest must reach the model running under its lost tag");
+        let keys = |mgr: &ModelManager| {
+            let mut k: Vec<String> = mgr.running.keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(
+            keys(&*state.0.manager.lock().await),
+            ["docker.io/ai/m-gone:v8", "docker.io/ai/other:v9"],
+            "the spelled tag goes first; the other tag and the other repository stay"
+        );
+        unload_model(&state, "docker.io/ai/m-gone@sha256:a1b2")
+            .await
+            .expect("with no spelled tag, the remaining entry with the digest is it");
+        assert_eq!(
+            keys(&*state.0.manager.lock().await),
+            ["docker.io/ai/other:v9"]
+        );
+        let err = unload_model(&state, "docker.io/ai/m-gone@sha256:a1b2")
+            .await
+            .expect_err("nothing running or stored with it is the 404 case");
+        assert_eq!(err.1, StatusCode::NOT_FOUND);
     }
 
     /// An unload that arrives while a first load of the same model is in
