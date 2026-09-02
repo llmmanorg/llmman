@@ -1364,16 +1364,20 @@ llmman_http_request_duration_seconds_count{route="/llmman/providers/:id"} 1
         let _serialised = GLOBAL_COUNTER_TEST_LOCK.blocking_lock();
         const LOADS: &str = "llmman_model_loads_total{model=\"wrapper-probe\"}";
         const UNLOADS: &str = "llmman_model_unloads_total{model=\"wrapper-probe\",reason=\"oom\"}";
+        const RETRIES: &str =
+            "llmman_model_load_oom_retries_total{model=\"wrapper-probe\",strategy=\"ctx_shrink\"}";
         const REJECTIONS: &str = "llmman_scheduling_rejections_total ";
 
         let before = render(&snapshot());
         record_model_load("wrapper-probe", Duration::from_secs(1));
         record_model_unload("wrapper-probe", UnloadReason::Oom);
+        record_oom_retry("wrapper-probe", OomRetry::CtxShrink);
         record_scheduling_rejection();
         let after = render(&snapshot());
 
         assert_eq!(value_of(&after, LOADS), value_of(&before, LOADS) + 1);
         assert_eq!(value_of(&after, UNLOADS), value_of(&before, UNLOADS) + 1);
+        assert_eq!(value_of(&after, RETRIES), value_of(&before, RETRIES) + 1);
         assert_eq!(
             value_of(&after, REJECTIONS),
             value_of(&before, REJECTIONS) + 1

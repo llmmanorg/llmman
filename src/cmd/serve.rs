@@ -5923,7 +5923,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
 /// [`serve_async`] so `the_scrape_endpoint_is_outside_the_cors_layer` can
 /// assert against the real router instead of a copy of this layering.
 fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
-    Router::new()
+    let app = Router::new()
         // Web UI
         .route("/", get(handle_root))
         .route("/bundle.js", get(handle_bundle_js))
@@ -5965,14 +5965,27 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
             post(handle_openai_responses_input_tokens),
         )
         // Anthropic API
-        .route("/v1/messages", post(handle_anthropic_messages))
-        // Innermost of the two, so what it times is the handler rather
-        // than the CORS layer's own header work. CORS therefore answers a
-        // preflight OPTIONS before this layer runs, so preflights are not
-        // counted — they are the browser's negotiation, not a request the
-        // daemon did any work for.
-        .layer(middleware::from_fn(track_metrics))
-        .layer(cors_layer())
+        .route("/v1/messages", post(handle_anthropic_messages));
+
+    // Applied only when the operator asked for metrics. Nothing can read
+    // the store while the endpoint is absent — enabling it needs a
+    // restart — so instrumenting a disabled daemon would buy a registry
+    // lock and a map write on every request, and a `model` label set that
+    // grows for the life of the process, in exchange for numbers no one
+    // can scrape. Off means off, not hidden.
+    //
+    // Innermost of the two, so what it times is the handler rather than
+    // the CORS layer's own header work. CORS therefore answers a
+    // preflight OPTIONS before this layer runs, so preflights are not
+    // counted — they are the browser's negotiation, not a request the
+    // daemon did any work for.
+    let app = if metrics_enabled {
+        app.layer(middleware::from_fn(track_metrics))
+    } else {
+        app
+    };
+
+    app.layer(cors_layer())
         .merge(metrics_router(metrics_enabled))
         .with_state(app_state)
 }
@@ -7203,9 +7216,9 @@ mod tests {
     }
 
     /// Like `running_model_fixture`, but with a caller-chosen `Engine`
-    /// and `backend_model_path` — used only by `backend_wire_model`'s
-    /// own tests below, which need to distinguish an `Engine::Mlx`
-    /// backend from every other one.
+    /// and `backend_model_path` — used by `backend_wire_model`'s own
+    /// tests below, which need to distinguish an `Engine::Mlx` backend
+    /// from every other one, and by the `engine_label` test.
     fn running_model_fixture_with_engine(
         engine: Engine,
         backend_model_path: Option<&str>,
@@ -7221,6 +7234,27 @@ mod tests {
             backend_model_path: backend_model_path.map(|s| s.to_string()),
             keep_alive: None,
             in_flight: 0,
+        }
+    }
+
+    /// The `engine` label on `llmman_model_up`. One string per engine,
+    /// and the container arm reports the engine it runs rather than the
+    /// runtime that runs it — a dashboard that splits by `engine` should
+    /// not gain a `docker` series when the same llama-server moves into
+    /// a container.
+    // `#[tokio::test]`: the fixture spawns a real placeholder child, and
+    // `tokio::process` needs a reactor on the thread that does it.
+    #[tokio::test]
+    async fn the_engine_label_names_the_engine_not_the_runtime() {
+        for (engine, expected) in [
+            (Engine::LlamaServer, "llama-server"),
+            (Engine::Vllm, "vllm"),
+            (Engine::Mlx, "mlx"),
+        ] {
+            assert_eq!(
+                running_model_fixture_with_engine(engine, None).engine_label(),
+                expected
+            );
         }
     }
 
@@ -9828,6 +9862,29 @@ mod tests {
             .await
             .expect("request reaches the test router");
         assert_eq!(version.status(), StatusCode::OK);
+
+        // Off means off. Enabling the endpoint needs a restart, so a
+        // disabled daemon that still instrumented every request would pay
+        // a registry lock and a map write per request, and grow a `model`
+        // label set for the life of the process, for numbers nothing can
+        // ever read.
+        //
+        // `/loading.html` rather than the route above because the
+        // registry is process-wide and this asserts an absence: no other
+        // test in this binary requests it, so the series exists only if
+        // this disabled router wrote it. A labelled counter has no series
+        // until its first increment, and `track_metrics` records whatever
+        // the status turns out to be, so the assertion does not depend on
+        // the handler succeeding.
+        Client::new()
+            .get(format!("{url}/loading.html"))
+            .send()
+            .await
+            .expect("request reaches the test router");
+        assert!(
+            !rendered_registry().contains("route=\"/loading.html\""),
+            "a router built with metrics disabled must not write to the registry"
+        );
     }
 
     /// Hyper derives `Content-Length` from the body's size hint, and a

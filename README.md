@@ -90,10 +90,12 @@ cached in one process: the one that forwards the request upstream.
 `/metrics` is a Prometheus scrape target in the text exposition format.
 It is **off by default**; set `LLMMAN_METRICS=1` (or `true`, `yes`, `on`)
 to serve it. Without that the route is absent and answers 404, the same
-as any other path this daemon does not serve. The router has no
-authentication and `LLMMAN_HOST` will bind it to any interface, so an
-upgrade should not start publishing a daemon's version, route mix, model
-names and model churn to whoever can reach the port.
+as any other path this daemon does not serve, and nothing is recorded
+either: enabling the endpoint needs a restart, so a disabled daemon that
+kept instrumenting would collect numbers nothing could ever read. The
+router has no authentication and `LLMMAN_HOST` will bind it to any
+interface, so an upgrade should not start publishing a daemon's version,
+route mix, model names and model churn to whoever can reach the port.
 
 ```
 LLMMAN_METRICS=1 llmman serve
