@@ -936,7 +936,8 @@ mod tests {
         assert!(is_bare("gemma4:e4b"));
         assert!(!is_bare("unsloth/gemma4"));
         // Dots alone (no "/") no longer disqualify bareness — see
-        // has_host_requires_a_slash below for the corresponding fix.
+        // resolve_requires_a_slash_to_treat_a_component_as_a_host below for
+        // the corresponding fix.
         assert!(is_bare("qwen3.5"));
         assert!(is_bare("qwen3.5:0.8B"));
         assert!(!is_bare("hf.co/gemma4"));
@@ -1009,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn has_host_requires_a_slash() {
+    fn resolve_requires_a_slash_to_treat_a_component_as_a_host() {
         // No "/" at all: a dotted version number must not be mistaken for
         // an explicit host, no matter how host-like the dot looks. So
         // resolve() prepends the hf.co default instead of leaving it as-is.
@@ -1030,7 +1031,7 @@ mod tests {
     // for a host-less reference, since neither the dot check nor the exact
     // "localhost" match recognized it. "resolve" then wrongly prepended
     // "hf.co/", producing "hf.co/localhost:PORT/...".
-    fn has_host_recognizes_an_explicit_port() {
+    fn resolve_recognizes_an_explicit_port_as_a_host() {
         assert_eq!(
             resolve("localhost:5000/foo/bar").unwrap(),
             "localhost:5000/foo/bar"
