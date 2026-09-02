@@ -4551,8 +4551,10 @@ async fn handle_push(
         .and_then(|s| s.find(&model))
         .is_err()
     {
-        let body = serde_json::json!({"error": format!("model not found: {model}")});
-        return Ok((StatusCode::NOT_FOUND, Json(body)).into_response());
+        return Err(AppError::status(
+            StatusCode::NOT_FOUND,
+            format!("model not found: {model}"),
+        ));
     }
 
     // See MODEL_LOCKS' doc comment: a push shares the same Go-side
