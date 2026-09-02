@@ -2259,28 +2259,58 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
 /// still holding the old one. `default_tag` alone is stable, and already
 /// folds the tagless and `:latest` spellings together.
 ///
-/// A `@digest` suffix is dropped first, and only from the lock key: the
+/// A `@digest` suffix is dropped from the key, and only from the key: the
 /// reference the store is asked about keeps it, so `find` can match it by
 /// content. `default_tag` sees the `:` inside `sha256:…` as a tag and
 /// leaves such a reference alone, so `m@sha256:…` and `m:latest` for one
-/// stored model took two locks and could both load. Which tag a digest
-/// sits under is something only the store knows, so the fold guesses
-/// `:latest`: a digest of a model stored as `m:v9` shares its lock with
-/// `m:latest`, not with `m:v9`. Once through the lock the store resolves
-/// it, so what remains is a first load of `m:v9` and one of its digest
-/// arriving together. The cost the other way is one load waiting behind
-/// another that names different content.
+/// stored model took two locks and could both load. Which tag the content
+/// sits under is the store's to say, so for a digest reference the store
+/// is read once here, before the lock (`stored_tag_for_digest`): content
+/// stored as `m:v9` locks as `m:v9`, alongside a load of that tag, and
+/// content the store lacks, or holds only under a digest-named entry of
+/// its own, folds onto `:latest`. That is the one read of the store this
+/// key allows itself, and a pull by digest does not move it: what such a
+/// pull writes is a digest-named entry, which folds the same way as the
+/// nothing there before. A pull by tag landing the same content while a
+/// load of its digest is in flight does move it, and leaves two loads of
+/// one model, as before this read.
 ///
 /// A provider-routed reference comes back untouched, as `ensure_model`
 /// returns it before any of this applies. Nothing observable depends on
 /// that today, since a remote target never enters `running`.
-fn load_identity(model: &str) -> Result<String, crate::shortnames::InvalidReference> {
+fn load_identity(
+    store_path: &std::path::Path,
+    model: &str,
+) -> Result<String, crate::shortnames::InvalidReference> {
     if crate::providers::is_remote_ref(model) {
         return Ok(model.to_string());
     }
     let resolved = crate::shortnames::resolve_ollama_api(model)?;
-    let (without_digest, _) = crate::storage::split_ref_digest(&resolved);
+    let (without_digest, digest) = crate::storage::split_ref_digest(&resolved);
+    if digest.is_some() {
+        if let Some(tag) = stored_tag_for_digest(store_path, &resolved) {
+            return Ok(tag);
+        }
+    }
     Ok(crate::storage::default_tag(without_digest))
+}
+
+/// The tag the store holds `reference`'s content under, for a reference
+/// carrying a digest: `m:v9` for `m@sha256:…` stored as `m:v9`. `None`
+/// otherwise: no digest, nothing stored, or stored only as the
+/// digest-named entry a pull by digest records. See `load_identity` for
+/// what the distinction is for.
+fn stored_tag_for_digest(store_path: &std::path::Path, reference: &str) -> Option<String> {
+    crate::storage::split_ref_digest(reference).1?;
+    let desc = OciStore::open(store_path).ok()?.find(reference).ok()?;
+    let stored = desc
+        .annotations
+        .as_ref()?
+        .get("org.opencontainers.image.ref.name")?;
+    crate::storage::split_ref_digest(stored)
+        .1
+        .is_none()
+        .then(|| crate::storage::default_tag(stored))
 }
 
 /// Drops `model` from `running`, or reports a 404 when llmman has no such
@@ -2293,7 +2323,7 @@ fn load_identity(model: &str) -> Result<String, crate::shortnames::InvalidRefere
 /// unloadable, since the `running` entry is authoritative and is consulted
 /// first.
 async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
-    let lock_key = load_identity(model).map_err(AppError::bad_request)?;
+    let lock_key = load_identity(&state.0.store_path, model).map_err(AppError::bad_request)?;
     let _guard = acquire_load_lock(&lock_key).await;
     // Only now, with any load of this model excluded: the running key is
     // the store's spelling, which a load in flight may just have changed.
@@ -2913,7 +2943,7 @@ async fn ensure_model(
     // returns. See `load_identity`, which `unload_model` locks on for the
     // same reason; the two have to agree, or an unload by one spelling
     // passes a load by another.
-    let load_id = load_identity(model_ref).map_err(AppError::bad_request)?;
+    let load_id = load_identity(&state.0.store_path, model_ref).map_err(AppError::bad_request)?;
     let model_ref =
         crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
     // Default the tag before the store lookups: otherwise "gemma4" and
@@ -7921,24 +7951,79 @@ mod tests {
 
     /// `m@sha256:…`, `m` and `m:latest` name one stored model and must
     /// share a load lock; the digest form used to keep its own because
-    /// `default_tag` reads the `:` inside the digest as a tag.
+    /// `default_tag` reads the `:` inside the digest as a tag. With the
+    /// store empty the digest folds onto `:latest`.
     #[test]
     fn load_identity_folds_the_digest_spelling_onto_the_tag_spelling() {
-        let latest = load_identity("docker.io/ai/m:latest").unwrap();
-        assert_eq!(load_identity("docker.io/ai/m").unwrap(), latest);
+        let store = std::env::temp_dir();
+        let latest = load_identity(&store, "docker.io/ai/m:latest").unwrap();
+        assert_eq!(load_identity(&store, "docker.io/ai/m").unwrap(), latest);
         assert_eq!(
-            load_identity("docker.io/ai/m@sha256:0000000000000000").unwrap(),
+            load_identity(&store, "docker.io/ai/m@sha256:0000000000000000").unwrap(),
             latest
         );
         assert_eq!(
-            load_identity("docker.io/ai/m:v9@sha256:0000000000000000").unwrap(),
+            load_identity(&store, "docker.io/ai/m:v9@sha256:0000000000000000").unwrap(),
             "docker.io/ai/m:v9"
         );
     }
 
-    /// The load side of that fold: a load by digest waits on the lock a
-    /// load by tag holds, and once through it takes the process that load
-    /// started rather than starting its own. With `ensure_model` keying
+    /// With the content in the store under a tag, a digest locks as that
+    /// tag, whatever tag it spells itself; content the store holds only
+    /// under a digest-named entry, or not at all, still folds.
+    #[test]
+    fn load_identity_takes_the_tag_the_store_holds_a_digest_under() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-identity-store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = OciStore::open(&dir).unwrap();
+        let desc = |digest: &str| crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: digest.into(),
+            size: 0,
+            annotations: None,
+        };
+        store
+            .tag(desc("sha256:aaaa"), "docker.io/ai/m-key:v9")
+            .unwrap();
+        store
+            .tag(desc("sha256:bbbb"), "docker.io/ai/m-key@sha256:bbbb")
+            .unwrap();
+
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key@sha256:aaaa").unwrap(),
+            "docker.io/ai/m-key:v9"
+        );
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key:latest@sha256:aaaa").unwrap(),
+            "docker.io/ai/m-key:v9",
+            "the tag the content is under wins over the one spelled"
+        );
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key@sha256:bbbb").unwrap(),
+            "docker.io/ai/m-key:latest",
+            "a digest-named entry is what a pull by digest writes; it folds"
+        );
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key@sha256:ffff").unwrap(),
+            "docker.io/ai/m-key:latest"
+        );
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key:v9").unwrap(),
+            "docker.io/ai/m-key:v9"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The load side of that key: a load by digest waits on the lock a
+    /// load by tag holds, `:v9` here, not `:latest`, and once through it
+    /// takes the process that load started rather than starting its own.
+    /// With `ensure_model` keying
     /// its lock on the digest spelling, as it did before it went through
     /// `load_identity`, nothing here would block.
     #[tokio::test(flavor = "multi_thread")]
@@ -7962,11 +8047,11 @@ mod tests {
         };
         OciStore::open(&dir)
             .unwrap()
-            .tag(desc, "docker.io/ai/m-digest:latest")
+            .tag(desc, "docker.io/ai/m-digest:v9")
             .unwrap();
         // ...and that load still holds its lock.
         let loading =
-            acquire_load_lock(&load_identity("docker.io/ai/m-digest:latest").unwrap()).await;
+            acquire_load_lock(&load_identity(&dir, "docker.io/ai/m-digest:v9").unwrap()).await;
 
         let loader = state.clone();
         let load = tokio::spawn(async move {
@@ -7979,7 +8064,7 @@ mod tests {
         );
 
         state.0.manager.lock().await.running.insert(
-            "docker.io/ai/m-digest:latest".into(),
+            "docker.io/ai/m-digest:v9".into(),
             running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
         );
         drop(loading);
@@ -7988,7 +8073,7 @@ mod tests {
             .await
             .unwrap()
             .expect("the load by digest must succeed once the lock releases");
-        assert_eq!(model_ref, "docker.io/ai/m-digest:latest");
+        assert_eq!(model_ref, "docker.io/ai/m-digest:v9");
         assert!(
             matches!(target, Target::Local(0)),
             "the process the tag spelling started must be the one handed back"
@@ -8027,7 +8112,7 @@ mod tests {
             .tag(desc, "docker.io/ai/m")
             .unwrap();
         // ...and the loader still holds the lock it took before pulling.
-        let loading = acquire_load_lock(&load_identity("docker.io/ai/m").unwrap()).await;
+        let loading = acquire_load_lock(&load_identity(&dir, "docker.io/ai/m").unwrap()).await;
 
         let unloader = state.clone();
         let unload = tokio::spawn(async move { unload_model(&unloader, "docker.io/ai/m").await });
@@ -9084,9 +9169,10 @@ mod tests {
     /// (see `ensure_model`'s `default_tag` call).
     #[test]
     fn ensure_model_key_pipeline_converges_aliases_before_the_lock() {
-        let tagless = load_identity("regression-test-model").unwrap();
-        let tagged = load_identity("regression-test-model:latest").unwrap();
-        let digest = load_identity("regression-test-model@sha256:0000").unwrap();
+        let store = std::env::temp_dir();
+        let tagless = load_identity(&store, "regression-test-model").unwrap();
+        let tagged = load_identity(&store, "regression-test-model:latest").unwrap();
+        let digest = load_identity(&store, "regression-test-model@sha256:0000").unwrap();
         assert_eq!(
             tagless, tagged,
             "tagless and :latest aliases must resolve to one key"
