@@ -5720,7 +5720,7 @@ fn resolve_llama_server(pinned_version: Option<&str>) -> anyhow::Result<PathBuf>
 /// would make every long completion look like a regression.
 ///
 /// The scrape route is instrumented like any other, so
-/// `route="/llmman/metrics"` reports what a scrape costs. Exclude that
+/// `route="/metrics"` reports what a scrape costs. Exclude that
 /// label when the question is application latency.
 async fn track_metrics(req: Request, next: Next) -> Response {
     // Cloned, not copied into a `String`: `MatchedPath` is a handle around
@@ -5766,6 +5766,75 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
 
 pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     tokio::runtime::Runtime::new()?.block_on(serve_async(args))
+}
+
+/// The daemon's routes and the layers over them, split out of
+/// [`serve_async`] so `the_scrape_endpoint_is_outside_the_cors_layer` can
+/// assert against the real router instead of a copy of this layering.
+fn build_router(app_state: AppState) -> Router {
+    Router::new()
+        // Web UI
+        .route("/", get(handle_root))
+        .route("/bundle.js", get(handle_bundle_js))
+        .route("/bundle.css", get(handle_bundle_css))
+        .route("/loading.html", get(handle_loading_html))
+        // llama.cpp-compatible props endpoint (router mode)
+        .route("/props", get(handle_props))
+        // llmman's own API — see handle_llmman_providers
+        .route("/llmman/providers", get(handle_llmman_providers))
+        .route("/llmman/providers/:id", get(handle_llmman_provider))
+        // Ollama API
+        .route("/api/version", get(handle_version))
+        .route("/api/tags", get(handle_tags))
+        .route("/api/ps", get(handle_ps))
+        .route("/api/show", post(handle_show))
+        .route("/api/pull", post(handle_pull))
+        .route("/api/push", post(handle_push))
+        .route("/api/delete", delete(handle_delete))
+        .route("/api/chat", post(handle_ollama_chat))
+        .route("/api/generate", post(handle_ollama_generate))
+        // OpenAI API
+        .route("/v1/models", get(handle_openai_models))
+        .route("/v1/chat/completions", post(handle_openai_chat))
+        .route("/v1/completions", post(handle_openai_completions))
+        .route("/v1/embeddings", post(handle_openai_embeddings))
+        .route(
+            "/v1/audio/transcriptions",
+            post(handle_openai_transcriptions)
+                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/audio/transcriptions",
+            post(handle_openai_transcriptions)
+                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
+        )
+        .route("/v1/responses", post(handle_openai_responses))
+        .route(
+            "/v1/responses/input_tokens",
+            post(handle_openai_responses_input_tokens),
+        )
+        // Anthropic API
+        .route("/v1/messages", post(handle_anthropic_messages))
+        // Innermost of the two, so what it times is the handler rather
+        // than the CORS layer's own header work. CORS therefore answers a
+        // preflight OPTIONS before this layer runs, so preflights are not
+        // counted — they are the browser's negotiation, not a request the
+        // daemon did any work for.
+        .layer(middleware::from_fn(track_metrics))
+        .layer(cors_layer())
+        // Merged after the CORS layer rather than routed above it, so the
+        // scrape endpoint answers without an Access-Control-Allow-Origin
+        // header. `default_allowed_origins` is appended unconditionally, so
+        // any page on any localhost port is an allowed origin — one could
+        // otherwise read version, route mix and model churn out of every
+        // daemon it can reach. Nothing in a browser scrapes a metrics
+        // endpoint, so it gives up nothing to leave the layer out.
+        .merge(
+            Router::new()
+                .route("/metrics", get(handle_metrics))
+                .layer(middleware::from_fn(track_metrics)),
+        )
+        .with_state(app_state)
 }
 
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
@@ -5899,60 +5968,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         client: Client::new(),
     }));
 
-    let app_state = state.clone();
-    let app = Router::new()
-        // Web UI
-        .route("/", get(handle_root))
-        .route("/bundle.js", get(handle_bundle_js))
-        .route("/bundle.css", get(handle_bundle_css))
-        .route("/loading.html", get(handle_loading_html))
-        // llama.cpp-compatible props endpoint (router mode)
-        .route("/props", get(handle_props))
-        // llmman's own API — see handle_llmman_providers, and
-        // crate::metrics for the Prometheus scrape target
-        .route("/llmman/providers", get(handle_llmman_providers))
-        .route("/llmman/providers/:id", get(handle_llmman_provider))
-        .route("/llmman/metrics", get(handle_metrics))
-        // Ollama API
-        .route("/api/version", get(handle_version))
-        .route("/api/tags", get(handle_tags))
-        .route("/api/ps", get(handle_ps))
-        .route("/api/show", post(handle_show))
-        .route("/api/pull", post(handle_pull))
-        .route("/api/push", post(handle_push))
-        .route("/api/delete", delete(handle_delete))
-        .route("/api/chat", post(handle_ollama_chat))
-        .route("/api/generate", post(handle_ollama_generate))
-        // OpenAI API
-        .route("/v1/models", get(handle_openai_models))
-        .route("/v1/chat/completions", post(handle_openai_chat))
-        .route("/v1/completions", post(handle_openai_completions))
-        .route("/v1/embeddings", post(handle_openai_embeddings))
-        .route(
-            "/v1/audio/transcriptions",
-            post(handle_openai_transcriptions)
-                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/audio/transcriptions",
-            post(handle_openai_transcriptions)
-                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
-        )
-        .route("/v1/responses", post(handle_openai_responses))
-        .route(
-            "/v1/responses/input_tokens",
-            post(handle_openai_responses_input_tokens),
-        )
-        // Anthropic API
-        .route("/v1/messages", post(handle_anthropic_messages))
-        // Innermost of the two, so what it times is the handler rather
-        // than the CORS layer's own header work. CORS therefore answers a
-        // preflight OPTIONS before this layer runs, so preflights are not
-        // counted — they are the browser's negotiation, not a request the
-        // daemon did any work for.
-        .layer(middleware::from_fn(track_metrics))
-        .layer(cors_layer())
-        .with_state(app_state);
+    let app = build_router(state.clone());
 
     // Before the listener binds, so uptime counts from the daemon coming
     // up rather than from whenever something first scraped it.
@@ -7160,6 +7176,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn reap_idle_models_unloads_only_idle_expired_models_not_in_flight_or_forever() {
+        // Holds the counter lock: this unloads through the production
+        // path, so its increment must not land inside another test's
+        // before/after window (see `metrics::GLOBAL_COUNTER_TEST_LOCK`).
+        let _serialised = metrics::GLOBAL_COUNTER_TEST_LOCK.lock().await;
         let state = test_state();
         {
             let mut mgr = state.0.manager.lock().await;
@@ -7204,6 +7224,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn evict_other_models_evicts_everything_except_the_target_and_in_flight_models() {
+        // Holds the counter lock: this unloads through the production
+        // path, so its increment must not land inside another test's
+        // before/after window (see `metrics::GLOBAL_COUNTER_TEST_LOCK`).
+        let _serialised = metrics::GLOBAL_COUNTER_TEST_LOCK.lock().await;
         let state = test_state();
         {
             let mut mgr = state.0.manager.lock().await;
@@ -9412,6 +9436,7 @@ mod tests {
     /// `crashed` at zero on the very daemon whose backends are dying.
     #[tokio::test]
     async fn the_reaper_labels_an_already_dead_backend_crashed_not_idle() {
+        let _serialised = metrics::GLOBAL_COUNTER_TEST_LOCK.lock().await;
         let state = test_state();
         {
             let mut mgr = state.0.manager.lock().await;
@@ -9489,5 +9514,55 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("abc123"), "{rendered}");
+    }
+
+    /// The scrape endpoint answers without an
+    /// `Access-Control-Allow-Origin` header, while every other route
+    /// still carries one. `default_allowed_origins` is appended
+    /// unconditionally, so any page on any localhost port is an allowed
+    /// origin, and one that can reach a daemon could otherwise read its
+    /// version, route mix and model churn straight out of a browser. The
+    /// only thing making that true is that `/metrics` is merged *after*
+    /// `.layer(cors_layer())` in [`build_router`]: an edit moving it up
+    /// among the other routes compiles, passes everything else here, and
+    /// silently puts the header back.
+    #[tokio::test]
+    async fn the_scrape_endpoint_is_outside_the_cors_layer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(test_state());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let get = |path: &'static str| {
+            let url = format!("http://127.0.0.1:{}{path}", addr.port());
+            async move {
+                Client::new()
+                    .get(url)
+                    .header("origin", "http://localhost:3000")
+                    .send()
+                    .await
+                    .expect("request reaches the test router")
+            }
+        };
+
+        // The control: that same origin on an ordinary route *is*
+        // allowed, so a missing header below is the layer being absent
+        // rather than the origin being turned away.
+        let version = get("/api/version").await;
+        assert_eq!(
+            version
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("http://localhost:3000"),
+            "a page served from localhost is meant to be an allowed origin"
+        );
+
+        let scrape = get("/metrics").await;
+        assert_eq!(scrape.status(), StatusCode::OK, "the scrape route answers");
+        assert!(
+            !scrape.headers().contains_key("access-control-allow-origin"),
+            "a browser page can read the scrape endpoint"
+        );
     }
 }

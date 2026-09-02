@@ -1,5 +1,5 @@
 //! Prometheus text-format metrics for `llmman serve` — the data behind
-//! its `GET /llmman/metrics` route (see `cmd::serve::handle_metrics`).
+//! its `GET /metrics` route (see `cmd::serve::handle_metrics`).
 //! Kept in its own module so the exposition format is a pure function
 //! over an owned [`Report`], testable without a running daemon.
 //!
@@ -189,15 +189,18 @@ pub(crate) fn mark_process_start() {
     PROCESS_START_SECONDS.store(secs, Ordering::Relaxed);
 }
 
-/// Serialises the tests that assert an exact delta on [`REGISTRY`].
+/// Serialises every test that touches [`REGISTRY`]'s counters — the ones
+/// that assert a delta, *and* the ones that only write.
 ///
 /// Production paths in `cmd::serve` write these counters too, and the
 /// tests that exercise those paths run in this same binary, in parallel.
 /// A test reading before and after its own write can otherwise see
-/// another one's increment land in between. Any test asserting an exact
-/// global delta holds this first, wherever it lives.
+/// another one's increment land in between. Guarding only the readers
+/// does not close that: an unguarded writer still runs inside a reader's
+/// window, which is the race itself. Both sides hold this, wherever they
+/// live.
 ///
-/// `tokio::sync::Mutex` because `cmd::serve`'s test holds it across an
+/// `tokio::sync::Mutex` because `cmd::serve`'s tests hold it across an
 /// await; a `std` guard there is a clippy error, and rightly so.
 #[cfg(test)]
 pub(crate) static GLOBAL_COUNTER_TEST_LOCK: tokio::sync::Mutex<()> =
@@ -337,6 +340,12 @@ pub(crate) fn report(gauges: Gauges) -> Report {
 /// and reason labels are all closed sets of plain ASCII. Every label is
 /// escaped anyway, so a later metric carrying a free-form value is safe
 /// without anyone remembering to revisit this.
+///
+/// A carriage return is dropped rather than escaped. The format defines
+/// those three sequences and no more, so `\r` fails the parse of the whole
+/// exposition rather than of its own line — `promtool check metrics`
+/// rejects it with "invalid escape sequence '\r'". Left raw it parses, but
+/// puts a bare control character inside a line-oriented format.
 fn escape_label_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for c in value.chars() {
@@ -344,6 +353,7 @@ fn escape_label_value(value: &str) -> String {
             '\\' => escaped.push_str("\\\\"),
             '"' => escaped.push_str("\\\""),
             '\n' => escaped.push_str("\\n"),
+            '\r' => {}
             _ => escaped.push(c),
         }
     }
@@ -527,7 +537,7 @@ mod tests {
     #[test]
     fn rendering_the_same_report_twice_is_byte_identical() {
         let registry = Registry::new();
-        for route in ["/api/chat", "/v1/models", "/api/tags", "/llmman/metrics"] {
+        for route in ["/api/chat", "/v1/models", "/api/tags", "/metrics"] {
             for status in [200u16, 500, 404] {
                 record_request_into(&registry, route, status, Duration::from_millis(7));
             }
@@ -758,6 +768,13 @@ llmman_http_request_duration_seconds_count{route="/llmman/providers/:id"} 1
             .collect()
     }
 
+    /// What [`escape_label_value`] promises to preserve: every character
+    /// except a carriage return, which the exposition format has no way to
+    /// represent.
+    fn representable(value: &str) -> String {
+        value.replace('\r', "")
+    }
+
     /// Reverses [`escape_label_value`], to prove the escaping is lossless.
     /// A value that survives the round trip cannot have introduced
     /// structure of its own into the output.
@@ -784,7 +801,8 @@ llmman_http_request_duration_seconds_count{route="/llmman/providers/:id"} 1
     }
 
     /// Property: no label value, however hostile, can change the *shape*
-    /// of the exposition or fail to survive a round trip.
+    /// of the exposition or fail to survive a round trip — carriage
+    /// returns aside, which come back dropped (see [`representable`]).
     ///
     /// `version` is the one free-form value here: whatever `build.rs`
     /// resolved, including a `git describe` on a tag someone else chose.
@@ -840,7 +858,7 @@ llmman_http_request_duration_seconds_count{route="/llmman/providers/:id"} 1
                 .expect("build_info is always emitted");
             assert_eq!(
                 unescape_label_value(emitted_version),
-                version,
+                representable(&version),
                 "version did not survive the round trip"
             );
 
@@ -851,10 +869,30 @@ llmman_http_request_duration_seconds_count{route="/llmman/providers/:id"} 1
                 .expect("the one recorded route is always emitted");
             assert_eq!(
                 unescape_label_value(emitted_route),
-                route,
+                representable(&route),
                 "route did not survive the round trip"
             );
         }
+    }
+
+    /// The property above would still pass if a carriage return were
+    /// escaped as `\r` instead of dropped, because this module's own
+    /// unescaper would read that back. Prometheus would not: `\r` is not
+    /// one of the format's three escape sequences, so it rejects the whole
+    /// exposition. Pin both halves — no raw control character, and no
+    /// escape the parser will refuse.
+    #[test]
+    fn a_carriage_return_in_a_label_is_dropped_rather_than_escaped() {
+        let escaped = escape_label_value("1.0\r2.0");
+        assert_eq!(escaped, "1.02.0");
+        assert!(
+            !escaped.contains('\r'),
+            "a raw carriage return reached the output"
+        );
+        assert!(
+            !escaped.contains("\\r"),
+            "an escape sequence Prometheus rejects reached the output"
+        );
     }
 
     /// The golden copy fixes this value, so nothing there would notice a

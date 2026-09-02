@@ -73,7 +73,8 @@ The server listens on `127.0.0.1:17434` by default, overridable via `LLMMAN_HOST
 | Ollama | `/api/generate`, `/api/chat`, `/api/tags`, `/api/show`, `/api/pull`, `/api/ps`, `/api/delete` |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens` |
 | Anthropic | `/v1/messages` |
-| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/metrics` |
+| llmman | `/llmman/providers`, `/llmman/providers/{id}` |
+| Prometheus | `/metrics` |
 
 `/llmman/...` is llmman's own API, not a compatibility surface — no
 upstream API has a notion of a [models.dev](https://models.dev) provider
@@ -86,7 +87,7 @@ no price). `llmman providers`, `list --provider`, `run --provider` and
 `launch --provider` are all clients of it, so the catalog is fetched and
 cached in one process: the one that forwards the request upstream.
 
-`/llmman/metrics` is a Prometheus scrape target, in the text exposition
+`/metrics` is a Prometheus scrape target, in the text exposition
 format, always on. It reports the daemon's start time, requests and their
 duration by matched route, how many models are loaded, how many have been
 loaded and unloaded, and how many requests are doing model-scheduling work
@@ -105,20 +106,25 @@ number `LLMMAN_MAX_LOADED_MODELS` caps either: that limit also counts
 outstanding load reservations, so a daemon can be at its limit while this
 gauge reads below it.
 
-The scrape route is instrumented like any other, so
-`route="/llmman/metrics"` reports what a scrape costs; exclude that label
-when asking about application latency.
+The scrape route is instrumented like any other, so `route="/metrics"`
+reports what a scrape costs; exclude that label when asking about
+application latency.
 
-The endpoint is not on Prometheus' default path, so a scrape config needs
-one extra line:
+It is on Prometheus' default path, so a scrape config needs no
+`metrics_path`:
 
 ```yaml
 scrape_configs:
   - job_name: llmman
-    metrics_path: /llmman/metrics
     static_configs:
       - targets: ["127.0.0.1:17434"]
 ```
+
+It is also the one route outside the CORS layer, so it answers without an
+`Access-Control-Allow-Origin` header. The default origin list allows any
+page served from localhost on any port, which would otherwise let one read
+this daemon's version, route mix and model churn out of a browser. Nothing
+in a browser scrapes a metrics endpoint, so that costs nothing.
 
 Per-token counters (prompt and eval totals, KV-cache usage) are
 deliberately absent: llmman does not run inference, `llama-server` does,
