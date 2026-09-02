@@ -891,6 +891,10 @@ fn launch_qwen_with_model() {
     );
 }
 
+// Unix only, like `launch_talos` itself (it bails on Windows): the helpers
+// below ask the OS for a uid, which the Windows test binary must not even
+// have to compile.
+#[cfg(unix)]
 #[test]
 fn launch_talos_with_model() {
     eprintln!("[test] launch_talos_with_model: acquiring SERIAL");
@@ -934,6 +938,7 @@ fn launch_talos_with_model() {
 /// Where `launch_talos` would find Talos: `$TALOS_PREFIX`, else `~/talos`
 /// under the *real* home — checked for the venv interpreter the
 /// installer creates, which is the invocation both use.
+#[cfg(unix)]
 fn talos_prefix() -> Option<PathBuf> {
     let prefix = std::env::var("TALOS_PREFIX")
         .ok()
@@ -952,6 +957,7 @@ fn talos_prefix() -> Option<PathBuf> {
 /// A secrets env file allowing this uid's terminal, next to nothing else
 /// of Talos's — written once per test binary run, mode 600 like Talos
 /// writes its own.
+#[cfg(unix)]
 fn talos_secrets_env(prefix: &Path) -> PathBuf {
     let uid = unsafe { libc::getuid() };
     let path = std::env::temp_dir().join(format!(
@@ -960,7 +966,6 @@ fn talos_secrets_env(prefix: &Path) -> PathBuf {
         uid
     ));
     std::fs::write(&path, format!("TALOS_ALLOWED_PRINCIPALS=cli:{uid}\n")).unwrap();
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
