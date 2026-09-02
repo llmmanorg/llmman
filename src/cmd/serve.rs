@@ -7237,13 +7237,8 @@ mod tests {
         }
     }
 
-    /// The `engine` label on `llmman_model_up`. One string per engine,
-    /// and the container arm reports the engine it runs rather than the
-    /// runtime that runs it — a dashboard that splits by `engine` should
-    /// not gain a `docker` series when the same llama-server moves into
-    /// a container.
-    // `#[tokio::test]`: the fixture spawns a real placeholder child, and
-    // `tokio::process` needs a reactor on the thread that does it.
+    /// The container arm reports the engine it runs, not the runtime that
+    /// runs it. `tokio::test` because the fixture spawns a real child.
     #[tokio::test]
     async fn the_engine_label_names_the_engine_not_the_runtime() {
         for (engine, expected) in [
@@ -7654,10 +7649,8 @@ mod tests {
         assert!(origins.iter().any(|o| o == "http://localhost:*"));
     }
 
-    /// Unbounded evicts nothing, but it still reserves: `pending_loads`
-    /// is what `llmman_models_loading` reports, and unbounded is the
-    /// default, so skipping the reservation here would leave that gauge
-    /// reading zero on almost every daemon.
+    /// Unbounded is the default, so skipping the reservation here would
+    /// leave `llmman_models_loading` reading zero on almost every daemon.
     #[tokio::test(flavor = "multi_thread")]
     async fn enforce_max_loaded_models_evicts_nothing_but_still_reserves_when_unbounded() {
         let state = test_state();
@@ -7680,12 +7673,9 @@ mod tests {
         }
     }
 
-    /// The gap Eric asked to be closed at the root rather than
-    /// documented: `Drop` can only *spawn* the decrement, so between a
-    /// load's `running.insert` and that task running, a finished load is
-    /// in `running` and still reserved — `llmman_models_loading` would
-    /// report it as still loading. `release_into` puts the release in the
-    /// same locked step as the insert.
+    /// `Drop` can only *spawn* the decrement, so a load released that way
+    /// is briefly in `running` and still reserved. `release_into` puts the
+    /// release in the same locked step as the insert.
     #[tokio::test(flavor = "multi_thread")]
     async fn releasing_a_reservation_into_the_lock_leaves_no_double_counted_window() {
         let state = test_state();
@@ -7697,14 +7687,11 @@ mod tests {
             running_model_fixture(None, Duration::from_secs(0), 1),
         );
         guard.release_into(&mut mgr);
-        // Both readings taken under the one lock the insert happened in,
-        // which is the whole point: no scrape can land between them.
         assert_eq!(mgr.running.len(), 1);
         assert_eq!(mgr.pending_loads, 0);
         drop(mgr);
 
-        // And Drop must not release it a second time, which would
-        // underflow the count for every other load in flight.
+        // And Drop must not release it a second time.
         drop(guard);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(state.0.manager.lock().await.pending_loads, 0);
@@ -9613,9 +9600,7 @@ mod tests {
         assert_eq!(chunks.last().unwrap()["done"], true);
     }
 
-    /// Renders the process-wide registry against placeholder gauges, so
-    /// a test can assert against a counter the daemon's own code paths
-    /// wrote.
+    /// The process-wide registry against placeholder gauges.
     fn rendered_registry() -> String {
         metrics::render(&metrics::Snapshot {
             version: "test".into(),
@@ -9628,11 +9613,8 @@ mod tests {
         })
     }
 
-    /// Reads one model's unload counter out of the process-wide
-    /// registry. Absolute values are shared with every other test in this
-    /// binary, so callers compare deltas rather than totals — and a
-    /// labelled counter has no series at all until it is first
-    /// incremented, hence the `unwrap_or(0)`.
+    /// One model's unload counter from the process-wide registry; `0`
+    /// while the series does not exist yet.
     fn unload_count(model: &str, reason: &str) -> u64 {
         let rendered = rendered_registry();
         let needle =
@@ -9644,13 +9626,8 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// `oom` is the one unload reason that cannot be provoked against a
-    /// real daemon without driving the host to genuine memory exhaustion:
-    /// `looks_like_oom` matches llama-server's own allocation-failure
-    /// text, and `LLMMAN_CONTEXT_LENGTH` is daemon-wide, so any context
-    /// large enough to fail the second load fails the first one too.
-    /// Drive the eviction path directly instead, so the counter is at
-    /// least proven at the site the daemon really calls.
+    /// `oom` cannot be provoked against a real daemon without genuine
+    /// memory exhaustion, so the eviction path is driven directly.
     #[tokio::test]
     async fn evicting_for_an_oom_retry_counts_every_model_it_freed() {
         let state = test_state();
@@ -9668,8 +9645,7 @@ mod tests {
                 "evictable-b".into(),
                 running_model_fixture(None, Duration::from_secs(0), 0),
             );
-            // In flight, so `evict_other_models` must leave it alone — and
-            // must not count an unload it did not perform.
+            // In flight, so it must be left alone and not counted.
             mgr.running.insert(
                 "busy".into(),
                 running_model_fixture(None, Duration::from_secs(0), 1),
@@ -9679,9 +9655,7 @@ mod tests {
         let evicted = evict_other_models(&state, "loading-now").await;
 
         assert!(evicted, "two idle models were evictable");
-        // The model names here are unique to this test, so these are
-        // absolute counts and need no serialisation against the other
-        // tests writing the same process-wide registry.
+        // Model names unique to this test, so these are absolute counts.
         assert_eq!(unload_count("evictable-a", "oom"), 1);
         assert_eq!(unload_count("evictable-b", "oom"), 1);
         assert_eq!(
@@ -9697,11 +9671,9 @@ mod tests {
         assert!(!mgr.running.contains_key("evictable-b"));
     }
 
-    /// A backend that exits on its own and is then never asked for again
-    /// reaches its keep_alive deadline looking exactly like a healthy idle
-    /// model, because `check_running` only inspects a process when a
-    /// request arrives for it. Counting that as `idle` would leave
-    /// `crashed` at zero on the very daemon whose backends are dying.
+    /// `check_running` only inspects a process when a request arrives for
+    /// it, so a backend that died and was never asked for again reaches
+    /// its keep_alive deadline looking exactly like a healthy idle model.
     #[tokio::test]
     async fn the_reaper_labels_an_already_dead_backend_crashed_not_idle() {
         let state = test_state();
@@ -9719,8 +9691,6 @@ mod tests {
 
         reap_idle_models_once(&state).await;
 
-        // The model name is unique to this test, so this is an absolute
-        // count rather than a delta against a shared series.
         assert_eq!(
             unload_count("died-then-expired", "crashed"),
             1,
@@ -9743,13 +9713,9 @@ mod tests {
         );
     }
 
-    /// The `route` label must be the route *template*, never the path the
-    /// client actually asked for: a label taken from the raw URI grows a
-    /// new time series per distinct path, and a scrape — plus whatever
-    /// stores it — grows with it without bound. Checked against a real
-    /// router because what makes it true is axum inserting `MatchedPath`
-    /// before `Router::layer`'s middleware runs, which nothing in this
-    /// file can assert on its own.
+    /// A label taken from the raw URI grows a series per distinct path,
+    /// without bound. Against a real router, because what makes this true
+    /// is axum inserting `MatchedPath` before the layer runs.
     #[tokio::test]
     async fn the_metrics_route_label_is_the_template_not_the_request_path() {
         let app = Router::new()
@@ -9771,9 +9737,7 @@ mod tests {
             .await
             .expect("request reaches the test router");
 
-        // The process-wide registry, deliberately: this route template is
-        // unique to this test, so a parallel test's samples cannot be
-        // mistaken for it and it needs no isolation of its own.
+        // Route template unique to this test, so this is an absolute count.
         let rendered = rendered_registry();
         assert!(
             rendered.contains(
@@ -9784,16 +9748,10 @@ mod tests {
         assert!(!rendered.contains("abc123"), "{rendered}");
     }
 
-    /// The scrape endpoint answers without an
-    /// `Access-Control-Allow-Origin` header, while every other route
-    /// still carries one. `default_allowed_origins` is appended
-    /// unconditionally, so any page on any localhost port is an allowed
-    /// origin, and one that can reach a daemon could otherwise read its
-    /// version, route mix and model churn straight out of a browser. The
-    /// only thing making that true is that `/metrics` is merged *after*
-    /// `.layer(cors_layer())` in [`build_router`]: an edit moving it up
-    /// among the other routes compiles, passes everything else here, and
-    /// silently puts the header back.
+    /// Any localhost page is an allowed origin, so one that can reach the
+    /// daemon could otherwise read a scrape out of a browser. What makes
+    /// this true is `/metrics` being merged *after* `.layer(cors_layer())`
+    /// in [`build_router`]; an edit moving it up compiles.
     #[tokio::test]
     async fn the_scrape_endpoint_is_outside_the_cors_layer() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9813,9 +9771,7 @@ mod tests {
             }
         };
 
-        // The control: that same origin on an ordinary route *is*
-        // allowed, so a missing header below is the layer being absent
-        // rather than the origin being turned away.
+        // The control: the same origin on an ordinary route *is* allowed.
         let version = get("/api/version").await;
         assert_eq!(
             version
@@ -9834,12 +9790,8 @@ mod tests {
         );
     }
 
-    /// Off unless the operator asked for it. The router has no
-    /// authentication, `LLMMAN_HOST` will bind it to any interface, and a
-    /// scrape reports version, route mix, model names and model churn —
-    /// none of which should start answering because llmman was upgraded.
     /// A 404 rather than a 403, so a disabled endpoint is indistinguishable
-    /// from a build that never had one.
+    /// from a build that never had one; and nothing is recorded either.
     #[tokio::test]
     async fn the_scrape_endpoint_is_absent_unless_the_operator_enabled_it() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9863,19 +9815,10 @@ mod tests {
             .expect("request reaches the test router");
         assert_eq!(version.status(), StatusCode::OK);
 
-        // Off means off. Enabling the endpoint needs a restart, so a
-        // disabled daemon that still instrumented every request would pay
-        // a registry lock and a map write per request, and grow a `model`
-        // label set for the life of the process, for numbers nothing can
-        // ever read.
-        //
-        // `/loading.html` rather than the route above because the
+        // Off means off — see `build_router`. `/loading.html` because the
         // registry is process-wide and this asserts an absence: no other
-        // test in this binary requests it, so the series exists only if
-        // this disabled router wrote it. A labelled counter has no series
-        // until its first increment, and `track_metrics` records whatever
-        // the status turns out to be, so the assertion does not depend on
-        // the handler succeeding.
+        // test requests it, so the series exists only if this disabled
+        // router wrote it, whatever status the handler returned.
         Client::new()
             .get(format!("{url}/loading.html"))
             .send()
@@ -9888,12 +9831,8 @@ mod tests {
     }
 
     /// Hyper derives `Content-Length` from the body's size hint, and a
-    /// wrapped stream has none. Timing every body the same way would
-    /// therefore turn every JSON reply on the daemon into chunked
-    /// transfer-encoding — measured against a real daemon as
-    /// `content-length: 84` becoming `transfer-encoding: chunked` on
-    /// `/api/version`. The header is not one this middleware sets, so
-    /// nothing but a live response proves it survived.
+    /// wrapped stream has none: wrapping every body made every JSON reply
+    /// chunked. Nothing but a live response proves the header survived.
     #[tokio::test]
     async fn timing_a_response_does_not_cost_it_its_content_length() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9922,18 +9861,15 @@ mod tests {
         }
     }
 
-    /// Total duration is only measurable if the guard reaches the end of
-    /// the *body*, not the end of the handler — see `track_metrics`. A
-    /// wrapper that recorded at header time would make this equal to
-    /// TTFB, which is exactly the conflation this split exists to end.
+    /// A wrapper that recorded at header time would make this equal to
+    /// TTFB, which is the conflation the split exists to end.
     #[tokio::test]
     async fn the_total_duration_clock_stops_at_the_end_of_the_body_not_the_headers() {
         let app = Router::new()
             .route(
                 "/test-slow-body",
                 get(|| async {
-                    // Headers immediately, body 200ms later — a stand-in
-                    // for a streaming completion.
+                    // Headers immediately, body 200ms later.
                     Body::from_stream(futures::stream::once(async {
                         sleep(Duration::from_millis(200)).await;
                         Ok::<_, std::convert::Infallible>(Bytes::from_static(b"done"))
@@ -9955,8 +9891,6 @@ mod tests {
             .expect("the body arrives in full");
         assert_eq!(body, "done");
 
-        // The route template is unique to this test, so these are
-        // absolute counts against the process-wide registry.
         let rendered = rendered_registry();
         // TTFB landed in the fastest bucket; total duration did not.
         assert!(

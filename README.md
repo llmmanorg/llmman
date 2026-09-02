@@ -87,15 +87,10 @@ no price). `llmman providers`, `list --provider`, `run --provider` and
 `launch --provider` are all clients of it, so the catalog is fetched and
 cached in one process: the one that forwards the request upstream.
 
-`/metrics` is a Prometheus scrape target in the text exposition format.
-It is **off by default**; set `LLMMAN_METRICS=1` (or `true`, `yes`, `on`)
-to serve it. Without that the route is absent and answers 404, the same
-as any other path this daemon does not serve, and nothing is recorded
-either: enabling the endpoint needs a restart, so a disabled daemon that
-kept instrumenting would collect numbers nothing could ever read. The
-router has no authentication and `LLMMAN_HOST` will bind it to any
-interface, so an upgrade should not start publishing a daemon's version,
-route mix, model names and model churn to whoever can reach the port.
+`/metrics` is a Prometheus scrape target, off by default: the router has
+no authentication and `LLMMAN_HOST` will bind it to any interface.
+`LLMMAN_METRICS=1` (or `true`, `yes`, `on`) serves it; unset, the route
+is absent, answers 404 and records nothing.
 
 ```
 LLMMAN_METRICS=1 llmman serve
@@ -131,46 +126,16 @@ Fifteen metric families:
 | `llmman_http_request_ttfb_seconds` | histogram | `route` | Time to response headers. This is the latency number. |
 | `llmman_http_request_duration_seconds` | histogram | `route` | Time to the last byte of the body. |
 
-The two request histograms are separate on purpose. On a streaming route
-(`/api/chat`, `/v1/chat/completions`) time to the last byte mostly tracks
-how many tokens were asked for, so graphing it as latency makes every long
-completion look like a regression; time to first byte is what moves when a
-load stalls or the queue backs up. Graphing only the first would hide a
-stream that dies after its first byte.
+On a streaming route, time to the last byte mostly tracks how many tokens
+were asked for. Graph `_ttfb_` as latency; `_duration_` is for a stream
+that dies after its first byte.
 
-`llmman_model_up` is the one thing no other metric here shows. llmman only
-notices a dead backend when a request arrives for that model, so a backend
-that died and was then never asked for again is still counted by
-`llmman_models_loaded`. A scrape checks liveness directly, so
-`llmman_model_up == 0` is that gap, and
+llmman only notices a dead backend when a request arrives for it, so
 `sum by (instance) (llmman_models_loaded) - sum by (instance) (llmman_model_up)`
-is how many models are in it.
+is how many dead backends it has not noticed yet.
 
-Three things it deliberately does not measure. A request for an
-already-loaded model returns before admission control, so it is absent
-from `llmman_scheduling_requests_in_flight` and is not capped by
-`LLMMAN_MAX_QUEUE`. Requests to unknown paths are not counted, since
-labelling by the requested path is how a metrics endpoint acquires
-unbounded cardinality, and neither are CORS preflights, which the CORS
-layer answers before any handler runs. Per-model families exist only once
-that model has been seen, since llmman cannot enumerate every model
-reference a user might send.
-
-The scrape route is instrumented like any other, so `route="/metrics"`
-reports what a scrape costs; exclude that label when asking about
-application latency.
-
-It is also the one route outside the CORS layer, so it answers without an
-`Access-Control-Allow-Origin` header. The default origin list allows any
-page served from localhost on any port, which would otherwise let one read
-this daemon's version, route mix and model churn out of a browser. Nothing
-in a browser scrapes a metrics endpoint, so that costs nothing.
-
-Per-token counters (prompt and eval totals, KV-cache usage) are
-deliberately absent: llmman does not run inference, `llama-server` does,
-and it already publishes exactly those on its own `/metrics` when started
-with `--metrics`. Scrape the backend for those rather than have llmman
-keep a second copy that drifts.
+Per-token counters are deliberately absent: `llama-server` already
+publishes them on its own `/metrics` when started with `--metrics`.
 
 `/v1/responses` implements the OpenAI Responses API (the dialect [OpenAI
 Codex](https://github.com/openai/codex) requires), including streaming SSE

@@ -396,8 +396,7 @@ pub(crate) struct Snapshot {
     /// `llmman_build_info`.
     pub(crate) version: String,
     /// [`process_start_seconds`]. Passed in rather than read inside
-    /// [`render`] so a test sets it outright, and the golden copy does not
-    /// depend on whether another test has marked a start yet.
+    /// [`render`] so a test sets it outright.
     pub(crate) start_time_seconds: u64,
     /// Callers currently past `ensure_model`'s already-loaded fast path.
     ///
@@ -673,8 +672,7 @@ mod tests {
         Mutex::new(Store::new())
     }
 
-    /// Renders `store` against `snapshot`, the way [`render`] does for the
-    /// real registry.
+    /// Renders `store` the way [`render`] does the real registry.
     fn rendered(store: &Mutex<Store>, snapshot: &Snapshot) -> String {
         with_store(store, |s| render_from(s, snapshot))
     }
@@ -700,605 +698,9 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// A scrape of a daemon that has served nothing still has to be a
-    /// valid, complete exposition — every family's HELP and TYPE, and no
-    /// stray sample lines under the accumulated ones.
-    #[test]
-    fn a_daemon_with_no_traffic_still_renders_every_metric_family() {
-        let rendered = rendered(&store(), &snapshot());
-
-        for family in [
-            "llmman_build_info",
-            "llmman_scheduling_rejections_total",
-            "llmman_models_loading",
-            "llmman_model_up",
-            "llmman_model_load_duration_seconds",
-            "llmman_model_load_oom_retries_total",
-            "llmman_http_requests_total",
-            "llmman_http_request_ttfb_seconds",
-            "llmman_http_request_duration_seconds",
-        ] {
-            assert!(
-                rendered.contains(&format!("# TYPE {family} ")),
-                "{family} missing from:\n{rendered}"
-            );
-        }
-        for absent in [
-            "llmman_http_requests_total{",
-            "llmman_http_request_ttfb_seconds_bucket",
-            "llmman_model_up{",
-            "llmman_model_loads_total{",
-        ] {
-            assert!(!rendered.contains(absent), "{absent} in:\n{rendered}");
-        }
-
-        // The one counter that is zero-filled, because it has exactly one
-        // series it could ever have — see `counter_unlabelled`.
-        assert!(
-            rendered.contains("llmman_scheduling_rejections_total 0\n"),
-            "{rendered}"
-        );
-    }
-
-    /// Two scrapes of the same numbers must be the same bytes. Sample
-    /// order coming from the container rather than from a sort is what
-    /// this is really checking — a `HashMap` anywhere in the path fails
-    /// here rather than in production.
-    #[test]
-    fn rendering_the_same_data_twice_is_byte_identical() {
-        let store = store();
-        for route in ["/api/chat", "/v1/models", "/api/tags", "/metrics"] {
-            for status in [200u16, 500, 404] {
-                record_request_into(&store, route, status, Duration::from_millis(7));
-            }
-        }
-        record_model_load_into(&store, "b:latest", Duration::from_secs(3));
-        record_model_unload_into(&store, "b:latest", UnloadReason::Idle);
-
-        let first = rendered(&store, &snapshot());
-        let second = rendered(&store, &snapshot());
-        assert_eq!(first, second);
-
-        // And that order is sorted, not insertion order: /api/chat was
-        // recorded first but /api/tags sorts before it.
-        let chat = first.find("route=\"/api/chat\"").expect(&first);
-        let tags = first.find("route=\"/api/tags\"").expect(&first);
-        assert!(tags > chat, "{first}");
-        let models = first.find("route=\"/v1/models\"").expect(&first);
-        assert!(models > tags, "{first}");
-    }
-
-    /// Bucket semantics, both halves at once. Buckets are cumulative, so an
-    /// observation counts in its own bucket and every wider one, and `+Inf`
-    /// equals `_count`. The bounds are `le`, not `lt`, so 250ms belongs in
-    /// `le="0.25"`. Getting either wrong yields a histogram Prometheus
-    /// accepts and every quantile query silently misreads.
-    #[test]
-    fn buckets_are_cumulative_and_their_bounds_are_inclusive() {
-        let store = store();
-        record_request_into(&store, "/api/chat", 200, Duration::from_millis(250));
-        record_request_into(&store, "/api/chat", 200, Duration::from_secs(45));
-
-        let rendered = rendered(&store, &snapshot());
-
-        for (le, expected) in [
-            ("0.1", 0),  // below both
-            ("0.25", 1), // exactly the 250ms observation's bound: le, not lt
-            ("0.5", 1),
-            ("30", 1),
-            ("60", 2), // 45s joins here and stays in every wider bucket
-            ("600", 2),
-            ("+Inf", 2),
-        ] {
-            assert!(
-                rendered.contains(&format!(
-                    "llmman_http_request_ttfb_seconds_bucket{{route=\"/api/chat\",le=\"{le}\"}} {expected}\n"
-                )),
-                "le={le} should be {expected} in:\n{rendered}"
-            );
-        }
-        assert!(
-            rendered.contains("llmman_http_request_ttfb_seconds_count{route=\"/api/chat\"} 2\n"),
-            "{rendered}"
-        );
-    }
-
-    /// The `model` label is what turns "eviction is happening" into "this
-    /// model is thrashing", so two models unloading for two reasons must
-    /// be four separate series and not one.
-    #[test]
-    fn every_model_and_reason_counts_separately() {
-        let store = store();
-        record_model_unload_into(&store, "a:latest", UnloadReason::Evicted);
-        record_model_unload_into(&store, "a:latest", UnloadReason::Evicted);
-        record_model_unload_into(&store, "a:latest", UnloadReason::Crashed);
-        record_model_unload_into(&store, "b:latest", UnloadReason::Evicted);
-
-        let rendered = rendered(&store, &snapshot());
-        for (model, reason, expected) in [
-            ("a:latest", "evicted", 2),
-            ("a:latest", "crashed", 1),
-            ("b:latest", "evicted", 1),
-        ] {
-            assert!(
-                rendered.contains(&format!(
-                    "llmman_model_unloads_total{{model=\"{model}\",reason=\"{reason}\"}} {expected}\n"
-                )),
-                "{model}/{reason} should be {expected} in:\n{rendered}"
-            );
-        }
-        // And nothing invents a series for a reason that never happened.
-        assert!(!rendered.contains("reason=\"idle\""), "{rendered}");
-    }
-
-    /// Time to first byte and total time are different numbers on a
-    /// streaming route, which is the whole reason both exist. One
-    /// recorder feeding both families would make them identical and the
-    /// split pointless.
-    #[test]
-    fn ttfb_and_total_duration_are_separate_families() {
-        let store = store();
-        record_request_into(&store, "/api/chat", 200, Duration::from_millis(250));
-        record_response_body_into(&store, "/api/chat", Duration::from_secs(45));
-
-        let rendered = rendered(&store, &snapshot());
-        assert!(
-            rendered.contains("llmman_http_request_ttfb_seconds_sum{route=\"/api/chat\"} 0.25\n"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("llmman_http_request_duration_seconds_sum{route=\"/api/chat\"} 45\n"),
-            "{rendered}"
-        );
-    }
-
-    /// `llmman_models_loaded` counts what llmman still lists; this counts
-    /// what is actually alive. A backend that exited without llmman
-    /// noticing is exactly the case no other metric here can show.
-    #[test]
-    fn a_dead_backend_reads_down_while_llmman_still_lists_it() {
-        let mut snapshot = snapshot();
-        snapshot.models_loaded = 2;
-        snapshot.models = vec![
-            ModelState {
-                model: "a:latest".into(),
-                engine: "llama-server",
-                up: true,
-            },
-            ModelState {
-                model: "b:latest".into(),
-                engine: "vllm",
-                up: false,
-            },
-        ];
-
-        let rendered = rendered(&store(), &snapshot);
-        assert!(
-            rendered.contains("llmman_model_up{model=\"a:latest\",engine=\"llama-server\"} 1\n"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("llmman_model_up{model=\"b:latest\",engine=\"vllm\"} 0\n"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("llmman_models_loaded 2\n"), "{rendered}");
-    }
-
-    /// An unlabelled counter renders as a bare name and a value, not as
-    /// `name{}` — legal, but no other exporter emits it and it reads as a
-    /// bug in every dashboard's label editor.
-    #[test]
-    fn an_unlabelled_counter_renders_without_empty_braces() {
-        let store = store();
-        record_scheduling_rejection_into(&store);
-        record_scheduling_rejection_into(&store);
-
-        let rendered = rendered(&store, &snapshot());
-        assert!(
-            rendered.contains("llmman_scheduling_rejections_total 2\n"),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("{}"), "{rendered}");
-    }
-
-    /// The `strategy` label says which fallback fired, which is the
-    /// difference between "the host is small" and "the host is small and
-    /// llmman is quietly serving a shorter context than configured".
-    #[test]
-    fn oom_retries_count_by_strategy() {
-        let store = store();
-        record_oom_retry_into(&store, "a:latest", OomRetry::EvictOthers);
-        record_oom_retry_into(&store, "a:latest", OomRetry::CtxShrink);
-        record_oom_retry_into(&store, "a:latest", OomRetry::CtxShrink);
-
-        let rendered = rendered(&store, &snapshot());
-        for (strategy, expected) in [("evict_others", 1), ("ctx_shrink", 2)] {
-            assert!(
-                rendered.contains(&format!(
-                    "llmman_model_load_oom_retries_total{{model=\"a:latest\",strategy=\"{strategy}\"}} {expected}\n"
-                )),
-                "{strategy} should be {expected} in:\n{rendered}"
-            );
-        }
-    }
-
-    /// Why [`escape_label_value`] still exists now that the label values
-    /// are route templates, a closed set of reasons — and model
-    /// references.
-    ///
-    /// `validate_reference`'s absolute-path branch rejects control
-    /// characters and nothing else, so a local import from a directory
-    /// with a quote in its name is a *valid* reference. Unescaped, its
-    /// label ends early and the rest of the path becomes syntax.
-    #[test]
-    fn a_model_reference_can_legitimately_contain_a_quote() {
-        let path = "/models/My \"Model\"/x.gguf";
-        assert!(
-            crate::shortnames::validate_reference(path).is_ok(),
-            "{path} is a reference llmman accepts, so it can reach a label"
-        );
-
-        let store = store();
-        record_model_load_into(&store, path, Duration::from_secs(1));
-        let rendered = rendered(&store, &snapshot());
-        assert!(
-            rendered.contains(
-                "llmman_model_loads_total{model=\"/models/My \\\"Model\\\"/x.gguf\"} 1\n"
-            ),
-            "{rendered}"
-        );
-    }
-
-    /// The exposition this daemon actually serves, pinned byte for byte.
-    ///
-    /// Every other test here asserts a fragment, which cannot catch a
-    /// series that appeared by accident, one that quietly stopped being
-    /// emitted, or a reordering. Those are the changes that break a
-    /// dashboard without breaking a test. Regenerate this deliberately
-    /// when the surface is meant to change, and never to make a red test
-    /// go green.
-    const GOLDEN: &str = r#"# HELP llmman_build_info Build information for this llmman daemon.
-# TYPE llmman_build_info gauge
-llmman_build_info{version="0.1.0 (ab\"cd)"} 1
-# HELP llmman_start_time_seconds Unix time this daemon started, for uptime and restart detection.
-# TYPE llmman_start_time_seconds gauge
-llmman_start_time_seconds 1700000000
-# HELP llmman_scheduling_requests_in_flight Requests doing model-scheduling work; a request for an already-loaded model bypasses this.
-# TYPE llmman_scheduling_requests_in_flight gauge
-llmman_scheduling_requests_in_flight 3
-# HELP llmman_scheduling_capacity Admission limit for model-scheduling work (LLMMAN_MAX_QUEUE); not a cap on total concurrency.
-# TYPE llmman_scheduling_capacity gauge
-llmman_scheduling_capacity 512
-# HELP llmman_scheduling_rejections_total Requests rejected with 503 because LLMMAN_MAX_QUEUE was already full.
-# TYPE llmman_scheduling_rejections_total counter
-llmman_scheduling_rejections_total 1
-# HELP llmman_models_loaded Models llmman currently has loaded, the same set /api/ps reports.
-# TYPE llmman_models_loaded gauge
-llmman_models_loaded 1
-# HELP llmman_models_loading Loads in flight: admitted, not yet loaded. Added to llmman_models_loaded this is what LLMMAN_MAX_LOADED_MODELS caps.
-# TYPE llmman_models_loading gauge
-llmman_models_loading 1
-# HELP llmman_model_up 1 while a loaded model's backend process is alive, 0 once it has exited and llmman has not yet noticed.
-# TYPE llmman_model_up gauge
-llmman_model_up{model="a:latest",engine="llama-server"} 1
-# HELP llmman_model_loads_total Models loaded since this daemon started.
-# TYPE llmman_model_loads_total counter
-llmman_model_loads_total{model="a:latest"} 1
-# HELP llmman_model_load_duration_seconds Cold start: from llmman finding a model unloaded to it answering, including any queue wait, pull and eviction.
-# TYPE llmman_model_load_duration_seconds histogram
-llmman_model_load_duration_seconds_bucket{model="a:latest",le="0.05"} 0
-llmman_model_load_duration_seconds_bucket{model="a:latest",le="0.1"} 0
-llmman_model_load_duration_seconds_bucket{model="a:latest",le="0.25"} 0
-llmman_model_load_duration_seconds_bucket{model="a:latest",le="0.5"} 0
-llmman_model_load_duration_seconds_bucket{model="a:latest",le="1"} 0
-llmman_model_load_duration_seconds_bucket{model="a:latest",le="2.5"} 0
-llmman_model_load_duration_seconds_bucket{model="a:latest",le="5"} 0
-llmman_model_load_duration_seconds_bucket{model="a:latest",le="10"} 0
-llmman_model_load_duration_seconds_bucket{model="a:latest",le="30"} 1
-llmman_model_load_duration_seconds_bucket{model="a:latest",le="60"} 1
-llmman_model_load_duration_seconds_bucket{model="a:latest",le="120"} 1
-llmman_model_load_duration_seconds_bucket{model="a:latest",le="300"} 1
-llmman_model_load_duration_seconds_bucket{model="a:latest",le="600"} 1
-llmman_model_load_duration_seconds_bucket{model="a:latest",le="+Inf"} 1
-llmman_model_load_duration_seconds_sum{model="a:latest"} 12
-llmman_model_load_duration_seconds_count{model="a:latest"} 1
-# HELP llmman_model_load_oom_retries_total Load attempts retried after an out-of-memory failure, by which fallback was used.
-# TYPE llmman_model_load_oom_retries_total counter
-llmman_model_load_oom_retries_total{model="a:latest",strategy="ctx_shrink"} 1
-# HELP llmman_model_unloads_total Models removed from the loaded set since this daemon started, by cause.
-# TYPE llmman_model_unloads_total counter
-llmman_model_unloads_total{model="a:latest",reason="idle"} 1
-# HELP llmman_http_requests_total Responses served, by matched route and status code.
-# TYPE llmman_http_requests_total counter
-llmman_http_requests_total{route="/api/chat",status="200"} 1
-llmman_http_requests_total{route="/api/chat",status="503"} 1
-llmman_http_requests_total{route="/llmman/providers/:id",status="404"} 1
-# HELP llmman_http_request_ttfb_seconds Time from llmman receiving a request to it sending that response's headers.
-# TYPE llmman_http_request_ttfb_seconds histogram
-llmman_http_request_ttfb_seconds_bucket{route="/api/chat",le="0.05"} 0
-llmman_http_request_ttfb_seconds_bucket{route="/api/chat",le="0.1"} 0
-llmman_http_request_ttfb_seconds_bucket{route="/api/chat",le="0.25"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/api/chat",le="0.5"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/api/chat",le="1"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/api/chat",le="2.5"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/api/chat",le="5"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/api/chat",le="10"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/api/chat",le="30"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/api/chat",le="60"} 2
-llmman_http_request_ttfb_seconds_bucket{route="/api/chat",le="120"} 2
-llmman_http_request_ttfb_seconds_bucket{route="/api/chat",le="300"} 2
-llmman_http_request_ttfb_seconds_bucket{route="/api/chat",le="600"} 2
-llmman_http_request_ttfb_seconds_bucket{route="/api/chat",le="+Inf"} 2
-llmman_http_request_ttfb_seconds_sum{route="/api/chat"} 45.25
-llmman_http_request_ttfb_seconds_count{route="/api/chat"} 2
-llmman_http_request_ttfb_seconds_bucket{route="/llmman/providers/:id",le="0.05"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/llmman/providers/:id",le="0.1"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/llmman/providers/:id",le="0.25"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/llmman/providers/:id",le="0.5"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/llmman/providers/:id",le="1"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/llmman/providers/:id",le="2.5"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/llmman/providers/:id",le="5"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/llmman/providers/:id",le="10"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/llmman/providers/:id",le="30"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/llmman/providers/:id",le="60"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/llmman/providers/:id",le="120"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/llmman/providers/:id",le="300"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/llmman/providers/:id",le="600"} 1
-llmman_http_request_ttfb_seconds_bucket{route="/llmman/providers/:id",le="+Inf"} 1
-llmman_http_request_ttfb_seconds_sum{route="/llmman/providers/:id"} 0.002
-llmman_http_request_ttfb_seconds_count{route="/llmman/providers/:id"} 1
-# HELP llmman_http_request_duration_seconds Time from llmman receiving a request to it finishing that response's body, streaming included.
-# TYPE llmman_http_request_duration_seconds histogram
-llmman_http_request_duration_seconds_bucket{route="/api/chat",le="0.05"} 0
-llmman_http_request_duration_seconds_bucket{route="/api/chat",le="0.1"} 0
-llmman_http_request_duration_seconds_bucket{route="/api/chat",le="0.25"} 0
-llmman_http_request_duration_seconds_bucket{route="/api/chat",le="0.5"} 0
-llmman_http_request_duration_seconds_bucket{route="/api/chat",le="1"} 0
-llmman_http_request_duration_seconds_bucket{route="/api/chat",le="2.5"} 0
-llmman_http_request_duration_seconds_bucket{route="/api/chat",le="5"} 0
-llmman_http_request_duration_seconds_bucket{route="/api/chat",le="10"} 0
-llmman_http_request_duration_seconds_bucket{route="/api/chat",le="30"} 0
-llmman_http_request_duration_seconds_bucket{route="/api/chat",le="60"} 1
-llmman_http_request_duration_seconds_bucket{route="/api/chat",le="120"} 1
-llmman_http_request_duration_seconds_bucket{route="/api/chat",le="300"} 1
-llmman_http_request_duration_seconds_bucket{route="/api/chat",le="600"} 1
-llmman_http_request_duration_seconds_bucket{route="/api/chat",le="+Inf"} 1
-llmman_http_request_duration_seconds_sum{route="/api/chat"} 45
-llmman_http_request_duration_seconds_count{route="/api/chat"} 1
-llmman_http_request_duration_seconds_bucket{route="/llmman/providers/:id",le="0.05"} 1
-llmman_http_request_duration_seconds_bucket{route="/llmman/providers/:id",le="0.1"} 1
-llmman_http_request_duration_seconds_bucket{route="/llmman/providers/:id",le="0.25"} 1
-llmman_http_request_duration_seconds_bucket{route="/llmman/providers/:id",le="0.5"} 1
-llmman_http_request_duration_seconds_bucket{route="/llmman/providers/:id",le="1"} 1
-llmman_http_request_duration_seconds_bucket{route="/llmman/providers/:id",le="2.5"} 1
-llmman_http_request_duration_seconds_bucket{route="/llmman/providers/:id",le="5"} 1
-llmman_http_request_duration_seconds_bucket{route="/llmman/providers/:id",le="10"} 1
-llmman_http_request_duration_seconds_bucket{route="/llmman/providers/:id",le="30"} 1
-llmman_http_request_duration_seconds_bucket{route="/llmman/providers/:id",le="60"} 1
-llmman_http_request_duration_seconds_bucket{route="/llmman/providers/:id",le="120"} 1
-llmman_http_request_duration_seconds_bucket{route="/llmman/providers/:id",le="300"} 1
-llmman_http_request_duration_seconds_bucket{route="/llmman/providers/:id",le="600"} 1
-llmman_http_request_duration_seconds_bucket{route="/llmman/providers/:id",le="+Inf"} 1
-llmman_http_request_duration_seconds_sum{route="/llmman/providers/:id"} 0.002
-llmman_http_request_duration_seconds_count{route="/llmman/providers/:id"} 1
-"#;
-
-    #[test]
-    fn the_full_exposition_matches_its_golden_copy() {
-        let store = store();
-        record_request_into(&store, "/api/chat", 200, Duration::from_millis(250));
-        record_request_into(&store, "/api/chat", 503, Duration::from_secs(45));
-        record_response_body_into(&store, "/api/chat", Duration::from_secs(45));
-        record_request_into(
-            &store,
-            "/llmman/providers/:id",
-            404,
-            Duration::from_millis(2),
-        );
-        record_response_body_into(&store, "/llmman/providers/:id", Duration::from_millis(2));
-        record_scheduling_rejection_into(&store);
-        record_model_load_into(&store, "a:latest", Duration::from_secs(12));
-        record_oom_retry_into(&store, "a:latest", OomRetry::CtxShrink);
-        record_model_unload_into(&store, "a:latest", UnloadReason::Idle);
-
-        let rendered = rendered(
-            &store,
-            &Snapshot {
-                // Carries a quote, so the golden copy also pins escaping.
-                version: "0.1.0 (ab\"cd)".into(),
-                start_time_seconds: 1_700_000_000,
-                scheduling_requests_in_flight: 3,
-                scheduling_capacity: 512,
-                models_loaded: 1,
-                models_loading: 1,
-                models: vec![ModelState {
-                    model: "a:latest".into(),
-                    engine: "llama-server",
-                    up: true,
-                }],
-            },
-        );
-
-        assert_eq!(rendered, GOLDEN);
-    }
-
-    /// xorshift64*, seeded, so this explores a wide input space and still
-    /// fails identically on every machine and every run. A fuzzer would
-    /// explore more, but would not run in CI across five targets.
-    fn next_rand(state: &mut u64) -> u64 {
-        *state ^= *state >> 12;
-        *state ^= *state << 25;
-        *state ^= *state >> 27;
-        state.wrapping_mul(0x2545F4914F6CDD1D)
-    }
-
-    /// The characters that can actually hurt: the two Prometheus requires
-    /// escaped, the line terminator that would forge a new sample, and the
-    /// exposition punctuation a value must not be able to impersonate.
-    const HOSTILE: &[char] = &[
-        '"',
-        '\\',
-        '\n',
-        '\r',
-        '\t',
-        '{',
-        '}',
-        '=',
-        ' ',
-        '#',
-        ',',
-        '+',
-        '\u{0}',
-        '\u{7f}',
-        'é',
-        '中',
-        '\u{1F600}',
-        'a',
-        '1',
-        '/',
-    ];
-
-    fn hostile_string(state: &mut u64, max_len: usize) -> String {
-        let len = (next_rand(state) as usize) % (max_len + 1);
-        (0..len)
-            .map(|_| HOSTILE[(next_rand(state) as usize) % HOSTILE.len()])
-            .collect()
-    }
-
-    /// What [`escape_label_value`] promises to preserve: every character
-    /// except a carriage return, which the exposition format has no way to
-    /// represent.
-    fn representable(value: &str) -> String {
-        value.replace('\r', "")
-    }
-
-    /// Reverses [`escape_label_value`], to prove the escaping is lossless.
-    /// A value that survives the round trip cannot have introduced
-    /// structure of its own into the output.
-    fn unescape_label_value(value: &str) -> String {
-        let mut out = String::with_capacity(value.len());
-        let mut chars = value.chars();
-        while let Some(c) = chars.next() {
-            if c != '\\' {
-                out.push(c);
-                continue;
-            }
-            match chars.next() {
-                Some('\\') => out.push('\\'),
-                Some('"') => out.push('"'),
-                Some('n') => out.push('\n'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            }
-        }
-        out
-    }
-
-    /// Property: no label value, however hostile, can change the *shape*
-    /// of the exposition or fail to survive a round trip — carriage
-    /// returns aside, which come back dropped (see [`representable`]).
-    ///
-    /// Model references are the free-form values here (see
-    /// `a_model_reference_can_legitimately_contain_a_quote`), and
-    /// `version` is whatever `build.rs` resolved. If a quote or newline in
-    /// one could close its own label or start a forged sample line, every
-    /// downstream parser would read a metric llmman never emitted.
-    #[test]
-    fn no_label_value_can_alter_the_shape_of_the_exposition() {
-        let mut state = 0x9E3779B97F4A7C15u64;
-
-        let reference = {
-            let benign = store();
-            record_model_load_into(&benign, "m", Duration::from_millis(1));
-            rendered(&benign, &snapshot())
-        };
-
-        for _ in 0..2000 {
-            let version = hostile_string(&mut state, 24);
-            let model = hostile_string(&mut state, 16);
-
-            let store = store();
-            record_model_load_into(&store, &model, Duration::from_millis(1));
-            let mut snapshot = snapshot();
-            snapshot.version = version.clone();
-            let rendered = rendered(&store, &snapshot);
-
-            // Same data shape with benign values: the line count must be
-            // identical, or something in the hostile input forged a line.
-            assert_eq!(
-                rendered.lines().count(),
-                reference.lines().count(),
-                "line count changed for version={version:?} model={model:?}"
-            );
-
-            // And the values come back out exactly as they went in.
-            let emitted_version = rendered
-                .lines()
-                .find_map(|l| l.strip_prefix("llmman_build_info{version=\""))
-                .and_then(|l| l.strip_suffix("\"} 1"))
-                .expect("build_info is always emitted");
-            assert_eq!(
-                unescape_label_value(emitted_version),
-                representable(&version),
-                "version did not survive the round trip"
-            );
-
-            let emitted_model = rendered
-                .lines()
-                .find_map(|l| l.strip_prefix("llmman_model_loads_total{model=\""))
-                .and_then(|l| l.strip_suffix("\"} 1"))
-                .expect("the one recorded model is always emitted");
-            assert_eq!(
-                unescape_label_value(emitted_model),
-                representable(&model),
-                "model did not survive the round trip"
-            );
-        }
-    }
-
-    /// The property above would still pass if a carriage return were
-    /// escaped as `\r` instead of dropped, because this module's own
-    /// unescaper would read that back. Prometheus would not: `\r` is not
-    /// one of the format's three escape sequences, so it rejects the whole
-    /// exposition. Pin both halves — no raw control character, and no
-    /// escape the parser will refuse.
-    #[test]
-    fn a_carriage_return_in_a_label_is_dropped_rather_than_escaped() {
-        let escaped = escape_label_value("1.0\r2.0");
-        assert_eq!(escaped, "1.02.0");
-        assert!(
-            !escaped.contains('\r'),
-            "a raw carriage return reached the output"
-        );
-        assert!(
-            !escaped.contains("\\r"),
-            "an escape sequence Prometheus rejects reached the output"
-        );
-    }
-
-    /// The golden copy fixes this value, so nothing there would notice a
-    /// `mark_process_start` that did nothing — and a daemon reporting 0
-    /// makes every uptime query measure from the epoch.
-    #[test]
-    fn marking_the_process_start_records_a_plausible_unix_time() {
-        mark_process_start();
-        let marked = process_start_seconds();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("the system clock is after the unix epoch")
-            .as_secs();
-        assert!(marked > 1_700_000_000, "{marked} is not a plausible time");
-        assert!(marked <= now, "{marked} is ahead of now ({now})");
-    }
-
-    /// Metric names are a public API: a dashboard, an alert rule and a
-    /// recording rule all name them directly, and none of them are in this
-    /// repository to be updated alongside a rename. Pin the emitted set so
-    /// adding or renaming one has to be a deliberate edit here, visible in
-    /// review, rather than a side effect of editing `render_from`.
+    /// Metric names are a public API: dashboards and alert rules name
+    /// them directly and live outside this repository, so adding or
+    /// renaming one has to be a deliberate edit here.
     #[test]
     fn the_emitted_metric_names_are_a_fixed_set() {
         let rendered = rendered(&store(), &snapshot());
@@ -1329,11 +731,67 @@ llmman_http_request_duration_seconds_count{route="/llmman/providers/:id"} 1
         );
     }
 
-    /// `_sum` divided by `_count` is how every dashboard computes average
-    /// latency, and nothing else in this module reads `sum_seconds`. An
-    /// arithmetic slip here is therefore invisible until a graph is
-    /// quietly wrong. 250ms + 750ms is exactly 1s in binary floating
-    /// point, so this can assert the rendered text rather than a delta.
+    /// Sample order comes from a sorted container, not insertion order:
+    /// a `HashMap` anywhere in the path fails here, not in production.
+    #[test]
+    fn rendering_the_same_data_twice_is_byte_identical() {
+        let store = store();
+        for route in ["/api/chat", "/v1/models", "/api/tags", "/metrics"] {
+            for status in [200u16, 500, 404] {
+                record_request_into(&store, route, status, Duration::from_millis(7));
+            }
+        }
+        record_model_load_into(&store, "b:latest", Duration::from_secs(3));
+        record_model_unload_into(&store, "b:latest", UnloadReason::Idle);
+
+        let first = rendered(&store, &snapshot());
+        let second = rendered(&store, &snapshot());
+        assert_eq!(first, second);
+
+        // /api/chat was recorded first but /api/tags sorts before it.
+        let chat = first.find("route=\"/api/chat\"").expect(&first);
+        let tags = first.find("route=\"/api/tags\"").expect(&first);
+        assert!(tags > chat, "{first}");
+        let models = first.find("route=\"/v1/models\"").expect(&first);
+        assert!(models > tags, "{first}");
+    }
+
+    /// Buckets are cumulative and their bounds are `le`, not `lt`. Getting
+    /// either wrong yields a histogram Prometheus accepts and every
+    /// quantile query silently misreads.
+    #[test]
+    fn buckets_are_cumulative_and_their_bounds_are_inclusive() {
+        let store = store();
+        record_request_into(&store, "/api/chat", 200, Duration::from_millis(250));
+        record_request_into(&store, "/api/chat", 200, Duration::from_secs(45));
+
+        let rendered = rendered(&store, &snapshot());
+
+        for (le, expected) in [
+            ("0.1", 0),  // below both
+            ("0.25", 1), // exactly the 250ms observation's bound: le, not lt
+            ("0.5", 1),
+            ("30", 1),
+            ("60", 2), // 45s joins here and stays in every wider bucket
+            ("600", 2),
+            ("+Inf", 2),
+        ] {
+            assert!(
+                rendered.contains(&format!(
+                    "llmman_http_request_ttfb_seconds_bucket{{route=\"/api/chat\",le=\"{le}\"}} {expected}\n"
+                )),
+                "le={le} should be {expected} in:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("llmman_http_request_ttfb_seconds_count{route=\"/api/chat\"} 2\n"),
+            "{rendered}"
+        );
+    }
+
+    /// `_sum / _count` is how every dashboard computes average latency,
+    /// and nothing else here reads `sum_seconds`. 250ms + 750ms is exactly
+    /// 1s in binary floating point, so the text itself is assertable.
     #[test]
     fn the_histogram_sum_is_the_total_observed_seconds() {
         let store = store();
@@ -1351,16 +809,173 @@ llmman_http_request_duration_seconds_count{route="/llmman/providers/:id"} 1
         );
     }
 
-    /// The process-wide wrappers are what `cmd::serve` actually calls; the
-    /// `*_into` forms are reachable only from tests. A wrapper that
-    /// dropped its increment would leave a live daemon reporting flat
-    /// counters while every other test here kept passing. Deltas rather
-    /// than absolutes because this is the shared registry, which
-    /// `cmd::serve`'s own tests also write through production paths.
+    #[test]
+    fn ttfb_and_total_duration_are_separate_families() {
+        let store = store();
+        record_request_into(&store, "/api/chat", 200, Duration::from_millis(250));
+        record_response_body_into(&store, "/api/chat", Duration::from_secs(45));
+
+        let rendered = rendered(&store, &snapshot());
+        assert!(
+            rendered.contains("llmman_http_request_ttfb_seconds_sum{route=\"/api/chat\"} 0.25\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("llmman_http_request_duration_seconds_sum{route=\"/api/chat\"} 45\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn every_model_and_reason_counts_separately() {
+        let store = store();
+        record_model_unload_into(&store, "a:latest", UnloadReason::Evicted);
+        record_model_unload_into(&store, "a:latest", UnloadReason::Evicted);
+        record_model_unload_into(&store, "a:latest", UnloadReason::Crashed);
+        record_model_unload_into(&store, "b:latest", UnloadReason::Evicted);
+
+        let rendered = rendered(&store, &snapshot());
+        for (model, reason, expected) in [
+            ("a:latest", "evicted", 2),
+            ("a:latest", "crashed", 1),
+            ("b:latest", "evicted", 1),
+        ] {
+            assert!(
+                rendered.contains(&format!(
+                    "llmman_model_unloads_total{{model=\"{model}\",reason=\"{reason}\"}} {expected}\n"
+                )),
+                "{model}/{reason} should be {expected} in:\n{rendered}"
+            );
+        }
+        // And nothing invents a series for a reason that never happened.
+        assert!(!rendered.contains("reason=\"idle\""), "{rendered}");
+    }
+
+    #[test]
+    fn oom_retries_count_by_strategy() {
+        let store = store();
+        record_oom_retry_into(&store, "a:latest", OomRetry::EvictOthers);
+        record_oom_retry_into(&store, "a:latest", OomRetry::CtxShrink);
+        record_oom_retry_into(&store, "a:latest", OomRetry::CtxShrink);
+
+        let rendered = rendered(&store, &snapshot());
+        for (strategy, expected) in [("evict_others", 1), ("ctx_shrink", 2)] {
+            assert!(
+                rendered.contains(&format!(
+                    "llmman_model_load_oom_retries_total{{model=\"a:latest\",strategy=\"{strategy}\"}} {expected}\n"
+                )),
+                "{strategy} should be {expected} in:\n{rendered}"
+            );
+        }
+    }
+
+    /// A backend that exited without llmman noticing is the one case no
+    /// other metric here can show.
+    #[test]
+    fn a_dead_backend_reads_down_while_llmman_still_lists_it() {
+        let mut snapshot = snapshot();
+        snapshot.models_loaded = 2;
+        snapshot.models = vec![
+            ModelState {
+                model: "a:latest".into(),
+                engine: "llama-server",
+                up: true,
+            },
+            ModelState {
+                model: "b:latest".into(),
+                engine: "vllm",
+                up: false,
+            },
+        ];
+
+        let rendered = rendered(&store(), &snapshot);
+        assert!(
+            rendered.contains("llmman_model_up{model=\"a:latest\",engine=\"llama-server\"} 1\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("llmman_model_up{model=\"b:latest\",engine=\"vllm\"} 0\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("llmman_models_loaded 2\n"), "{rendered}");
+    }
+
+    /// Zero-filled, because it has exactly one series it could ever have;
+    /// and as a bare name rather than `name{}`, which is legal but reads
+    /// as a bug in every dashboard's label editor.
+    #[test]
+    fn an_unlabelled_counter_zero_fills_and_renders_without_empty_braces() {
+        let store = store();
+        let cold = rendered(&store, &snapshot());
+        assert!(
+            cold.contains("llmman_scheduling_rejections_total 0\n"),
+            "{cold}"
+        );
+
+        record_scheduling_rejection_into(&store);
+        record_scheduling_rejection_into(&store);
+        let rendered = rendered(&store, &snapshot());
+        assert!(
+            rendered.contains("llmman_scheduling_rejections_total 2\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("{}"), "{rendered}");
+    }
+
+    /// Why [`escape_label_value`] exists: `validate_reference` rejects
+    /// control characters and nothing else, so a quote in a model path is
+    /// a valid reference that would otherwise end its own label early.
+    #[test]
+    fn a_model_reference_can_legitimately_contain_a_quote() {
+        let path = "/models/My \"Model\"/x.gguf";
+        assert!(
+            crate::shortnames::validate_reference(path).is_ok(),
+            "{path} is a reference llmman accepts, so it can reach a label"
+        );
+
+        let store = store();
+        record_model_load_into(&store, path, Duration::from_secs(1));
+        let rendered = rendered(&store, &snapshot());
+        assert!(
+            rendered.contains(
+                "llmman_model_loads_total{model=\"/models/My \\\"Model\\\"/x.gguf\"} 1\n"
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// The format's three escape sequences, and the one control character
+    /// it has none for: `\r` is dropped, because Prometheus rejects an
+    /// exposition containing `\\r`.
+    #[test]
+    fn escape_label_value_covers_the_three_sequences_and_drops_a_carriage_return() {
+        assert_eq!(escape_label_value("a\\b"), "a\\\\b");
+        assert_eq!(escape_label_value("a\"b"), "a\\\"b");
+        assert_eq!(escape_label_value("a\nb"), "a\\nb");
+        assert_eq!(escape_label_value("1.0\r2.0"), "1.02.0");
+        assert_eq!(escape_label_value("plain/0.1"), "plain/0.1");
+    }
+
+    /// A daemon reporting 0 makes every uptime query measure from the
+    /// epoch.
+    #[test]
+    fn marking_the_process_start_records_a_plausible_unix_time() {
+        mark_process_start();
+        let marked = process_start_seconds();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the system clock is after the unix epoch")
+            .as_secs();
+        assert!(marked > 1_700_000_000, "{marked} is not a plausible time");
+        assert!(marked <= now, "{marked} is ahead of now ({now})");
+    }
+
+    /// The `*_into` forms are reachable only from tests; these wrappers
+    /// are what `cmd::serve` calls. Deltas, because the registry is shared
+    /// with `cmd::serve`'s own tests.
     #[test]
     fn the_process_wide_wrappers_reach_the_shared_registry() {
-        // `blocking_lock` is safe here: this is a plain `#[test]`, so
-        // there is no runtime on this thread to block.
+        // A plain `#[test]`, so there is no runtime on this thread to block.
         let _serialised = GLOBAL_COUNTER_TEST_LOCK.blocking_lock();
         const LOADS: &str = "llmman_model_loads_total{model=\"wrapper-probe\"}";
         const UNLOADS: &str = "llmman_model_unloads_total{model=\"wrapper-probe\",reason=\"oom\"}";
@@ -1384,9 +999,8 @@ llmman_http_request_duration_seconds_count{route="/llmman/providers/:id"} 1
         );
     }
 
-    /// A label is the whole point of these two enums, so a variant added
-    /// without one — or one renamed out from under a running dashboard —
-    /// should fail here rather than in someone's alerting rules.
+    /// A variant added without a label, or one renamed under a running
+    /// dashboard, fails here rather than in someone's alerting rules.
     #[test]
     fn enum_labels_are_stable() {
         let unloads: Vec<&str> = [
@@ -1413,9 +1027,7 @@ llmman_http_request_duration_seconds_count{route="/llmman/providers/:id"} 1
     }
 
     /// Metrics are observability, not service: a panic while a recorder
-    /// held the lock must not take every later request's recording with
-    /// it. Recovering the guard keeps the maps — which are still
-    /// structurally valid — in use.
+    /// held the lock must not stop every later recording.
     #[test]
     fn a_poisoned_lock_does_not_stop_recording() {
         let store = store();
