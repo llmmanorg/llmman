@@ -352,7 +352,7 @@ fn parse_max_queue(value: Option<&str>) -> usize {
 
 /// Whether to serve `GET /metrics` at all, from `LLMMAN_METRICS`. Off
 /// unless the operator asked for it: the router has no authentication,
-/// `LLMMAN_HOST` will bind it to any interface, and a scrape reports
+/// `LLMMAN_HOST` can bind it beyond loopback, and a scrape reports
 /// version, route mix, model names and model churn. None of that should
 /// start answering because llmman was upgraded.
 fn metrics_enabled_from_env() -> bool {

@@ -114,7 +114,7 @@ The server listens on `127.0.0.1:17434` by default, overridable via `LLMMAN_HOST
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens` |
 | Anthropic | `/v1/messages` |
 | llmman | `/llmman/providers`, `/llmman/providers/{id}` |
-| Prometheus | `/metrics` (off unless `LLMMAN_METRICS=1`) |
+| Prometheus | `/metrics` (off unless `LLMMAN_METRICS` is `1`, `true`, `yes` or `on`) |
 
 `/llmman/...` is llmman's own API, not a compatibility surface: no
 upstream API has a notion of a [models.dev](https://models.dev) provider
@@ -128,11 +128,11 @@ no price). `llmman providers`, `list --provider`, `run --provider` and
 cached in one process: the one that forwards the request upstream.
 
 `/metrics` is a Prometheus scrape target, off by default: the router has
-no authentication and `LLMMAN_HOST` will bind it to any interface.
+no authentication, and `LLMMAN_HOST` can bind it beyond loopback.
 `LLMMAN_METRICS=1` (or `true`, `yes`, `on`) serves it; unset, the route
 is absent, answers 404 and records nothing.
 
-```
+```bash
 LLMMAN_METRICS=1 llmman serve
 ```
 
