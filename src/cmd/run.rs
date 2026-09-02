@@ -60,6 +60,15 @@ pub struct RunArgs {
     /// provider's own model id. See `llmman providers`.
     #[arg(long, short = 'p', value_name = "PROVIDER")]
     pub provider: Option<String>,
+    /// Send requests too large for the local MODEL to this provider
+    /// instead (openai, anthropic, openrouter, ...). Needs
+    /// --overflow-model; not combinable with --provider.
+    #[arg(long, value_name = "PROVIDER")]
+    pub overflow_provider: Option<String>,
+    /// The --overflow-provider model that serves requests too large for
+    /// the local MODEL. Everything that fits stays on this machine.
+    #[arg(long, value_name = "MODEL")]
+    pub overflow_model: Option<String>,
     /// Forwarded as Ollama's own top-level `think` field on every request
     /// this sends (see cmd::serve's think_to_chat_template_kwargs) —
     /// `--think false` disables a reasoning model's thinking block
@@ -122,6 +131,11 @@ impl Default for ChatOptions<'_> {
 
 pub fn run(args: &RunArgs) -> anyhow::Result<()> {
     let provider = crate::providers::provider_flag(args.provider.as_deref())?;
+    let overflow = crate::hybrid::overflow_flags(
+        args.overflow_provider.as_deref(),
+        args.overflow_model.as_deref(),
+        provider,
+    )?;
     let prompt = args.prompt.join(" ");
 
     // resolve_ollama_api, not resolve: `llmman run` is an /api/chat client
@@ -175,7 +189,19 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
             // from. The same Show also answers ollama's `opts.MultiModal`.
             let info = crate::daemon::ensure_model_pulled(&model)?;
             let multimodal = info.multimodal();
-            (model, None, multimodal)
+            match overflow {
+                // The hosted half is validated and keyed as a bare
+                // --provider model is, then paired with the local model.
+                Some((provider, hosted)) => {
+                    let (remote, key) = provider_model(provider, hosted)?;
+                    (
+                        crate::hybrid::pair_with_local(&model, &remote)?,
+                        key,
+                        multimodal,
+                    )
+                }
+                None => (model, None, multimodal),
+            }
         }
     };
 

@@ -50,6 +50,57 @@ no authentication, so `run` and `launch` never send a key to a remote
 for a caller that presented none. (`providers` and `list --provider`
 read the catalog only and work against any daemon.)
 
+## Hybrid model pairs
+
+`--overflow-provider` and `--overflow-model` pair the local `--model`
+with a hosted one under a single name, and `llmman serve` picks a side
+per request:
+
+```sh
+llmman launch opencode --model gemma4 --overflow-provider anthropic --overflow-model claude-sonnet-5
+llmman run gemma4 --overflow-provider anthropic --overflow-model claude-sonnet-5
+```
+
+Both halves travel as one reference,
+`llmman.hybrid/gemma4,anthropic/claude-sonnet-5`, in the same `"model"`
+field an ordinary name uses, so a pair works from any client on every
+inference endpoint (`/api/show`, `/api/pull` and the other store
+operations take a plain model name). The local half is resolved and pulled as `--model` always
+is; the hosted half is validated and authenticates exactly as a bare
+`--provider` model does, so the same integration rules apply. The two
+cannot be combined with `--provider`, since the local half has to be
+local.
+
+Which side serves a request:
+
+1. **`x-llmman-route: local` or `cloud`** on the request wins. Any other
+   value, or the header given twice, is a `400`, never a guess; a blank
+   value counts as absent.
+2. **Otherwise, size.** A request larger than the local context can hold
+   goes to the provider. The budget is four bytes per token of the
+   daemon's context size (`LLMMAN_CONTEXT_LENGTH`); `LLMMAN_HYBRID_LOCAL_BYTES`
+   sets it directly, `0` turns the rule off. A request that declares no
+   `Content-Length` stays local.
+3. **Otherwise, local.**
+
+Local is the default because the two mistakes are not equal: a worse
+local answer is recoverable, a request sent to someone else's servers is
+not. Every request logs which way it went and why; the log, not the
+response's `model` field, is the record of the side.
+
+The byte budget is an estimate. If a chat, completion, Responses or
+Messages request it kept local is then refused by the local backend as
+larger than its context, the daemon sends it to the hosted half instead,
+before anything has reached the client. Without that an agent would see the local model's context error,
+compact its history and stay local. A `local` pin is never overridden
+this way, and `LLMMAN_HYBRID_LOCAL_BYTES=0` disables only the size rule,
+not this retry.
+
+`/v1/audio/transcriptions` cannot forward to a provider, so a pair takes
+its local half there whatever the body size. An unload (`keep_alive: 0`)
+or a startup preload of a pair acts on its local half, the only one that
+loads.
+
 ## Integrations
 
 `llmman launch` with no arguments lists these and whether each is

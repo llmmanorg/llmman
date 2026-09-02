@@ -47,6 +47,7 @@ Environment Variables:
       LLMMAN_DEBUG                   Show additional debug information (e.g. LLMMAN_DEBUG=1)
       LLMMAN_HOST                    [host][:port] to bind (default \"127.0.0.1:17434\")
       LLMMAN_CONTEXT_LENGTH          Context size for llama-server/vLLM when set (default 262144 for llama-server)
+      LLMMAN_HYBRID_LOCAL_BYTES      Largest request a hybrid pair serves locally, in bytes (0 disables; default: from the context length)
       LLMMAN_KEEP_ALIVE              The duration that models stay loaded in memory (default \"5m\")
       LLMMAN_MAX_LOADED_MODELS       Maximum number of loaded models (default: unbounded)
       LLMMAN_MAX_TRANSFER_STREAMS    Maximum parallel transfer streams for safetensors model pulls (default 4)
@@ -545,6 +546,9 @@ struct Inner {
     // auto-shrinks the latter (mirrors Ollama's numCtxAuto gate): a
     // user's explicit choice isn't silently overridden.
     ctx_size_explicit: bool,
+    // Largest request a hybrid pair serves locally (see
+    // crate::hybrid::local_budget_bytes). Resolved once at startup.
+    hybrid_local_bytes: Option<u64>,
     // See flash_attention_from_env's doc comment — forwarded verbatim to
     // every spawn_llama_server/container::spawn call, local or
     // containerized.
@@ -2764,15 +2768,26 @@ async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
 
 /// Forwards an Ollama request to a peer as-is, so `keep_alive` and a
 /// load-only request apply where the model runs.
+///
+/// A hybrid pair goes as the half already chosen here (`model`), so the
+/// peer serves it rather than routing the pair again without the pin.
 async fn forward_ollama<T: Serialize>(
     state: &AppState,
     target: &Target,
     route: &str,
     headers: &HeaderMap,
     req: &T,
+    model: &str,
     guard: ActivityGuard,
 ) -> Result<Response, AppError> {
-    let body = Bytes::from(serde_json::to_vec(req).context("re-serialize Ollama request")?);
+    let mut req = serde_json::to_value(req).context("re-serialize Ollama request")?;
+    if req["model"]
+        .as_str()
+        .is_some_and(crate::hybrid::is_hybrid_ref)
+    {
+        req["model"] = serde_json::Value::String(model.to_string());
+    }
+    let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize Ollama request")?);
     let activity = begin_activity(guard, None).await;
     proxy(&state.0.client, target, route, headers, body, activity).await
 }
@@ -3407,6 +3422,178 @@ async fn resolve_remote_target(
     Ok(Some(Target::Remote(Arc::new(target))))
 }
 
+/// Picks which half of a hybrid pair serves this request and returns
+/// that half's own ordinary reference (see [`crate::hybrid`]).
+/// Substitution rather than a third [`Target`] variant, so the rest of
+/// [`ensure_model`] and every proxy past it serve a pair unchanged. Does
+/// no I/O.
+fn resolve_hybrid_side(
+    state: &AppState,
+    pair: &crate::hybrid::Pair<'_>,
+    headers: Option<&HeaderMap>,
+) -> Result<String, AppError> {
+    let pin = request_pin(headers)?;
+    // The declared length is all that is knowable before the body is
+    // parsed. A chunked request declares none and stays local.
+    let request_bytes = headers
+        .and_then(|h| h.get(reqwest::header::CONTENT_LENGTH))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let decision = crate::hybrid::route(pin, request_bytes, state.0.hybrid_local_bytes);
+
+    let why = match decision.reason {
+        crate::hybrid::Reason::Pinned => format!("pinned by {}", crate::hybrid::ROUTE_HEADER),
+        crate::hybrid::Reason::Overflow { bytes, budget } => format!(
+            "{} request exceeds the {} this host serves locally",
+            crate::fmt::human_size(bytes),
+            crate::fmt::human_size(budget)
+        ),
+        crate::hybrid::Reason::LocalFirst => "no reason to leave this machine".to_string(),
+    };
+    // The sides differ in cost and in where the data goes, so every
+    // request says which way it went. `{:?}`, as the request logs do:
+    // both names come straight from the request.
+    eprintln!(
+        "[llmman] hybrid {:?} + {:?} -> {} ({why})",
+        pair.local,
+        pair.remote_ref(),
+        decision.side.as_str()
+    );
+    Ok(pair.side_ref(decision.side))
+}
+
+/// The side a request pinned itself to, if any; a 400 when unreadable.
+/// Raw bytes reach [`crate::hybrid::parse_pin`] so a non-UTF-8 value is
+/// rejected rather than read as absent.
+fn request_pin(headers: Option<&HeaderMap>) -> Result<Option<crate::hybrid::Side>, AppError> {
+    let mut values = headers
+        .map(|h| h.get_all(crate::hybrid::ROUTE_HEADER).iter())
+        .into_iter()
+        .flatten();
+    let value = values.next();
+    // Two values is not a pin, whichever came first.
+    if values.next().is_some() {
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            format!("{} given more than once", crate::hybrid::ROUTE_HEADER),
+        ));
+    }
+    crate::hybrid::parse_pin(value.map(|v| v.as_bytes()))
+        .map_err(|e| AppError(e, StatusCode::BAD_REQUEST))
+}
+
+/// The hosted half a hybrid pair falls back to when its local half
+/// refuses a request as too large: `None` for anything but a pair, and
+/// for a pair pinned local, whose pin is never overridden.
+fn hybrid_fallback(
+    model_ref: &str,
+    headers: Option<&HeaderMap>,
+) -> Result<Option<String>, AppError> {
+    let Some(pair) = crate::hybrid::split_ref(model_ref) else {
+        return Ok(None);
+    };
+    Ok((request_pin(headers)? != Some(crate::hybrid::Side::Local)).then(|| pair.remote_ref()))
+}
+
+/// Serves a generating request through `send` against the target
+/// [`ensure_model`] picks, retrying once on a hybrid pair's hosted half
+/// when the local half refuses the request as over its context. The
+/// byte budget is an estimate; the refusal is exact and arrives before
+/// any output. Without the retry an agent sees the context error,
+/// compacts its history and stays local.
+///
+/// The refusal is [`post_chat`]'s [`ContextOverflow`] or, for a raw
+/// relay, the backend's own 400, read only when a fallback exists so a
+/// plain local model's error passes through untouched.
+async fn send_with_hybrid_fallback<F, Fut>(
+    state: &AppState,
+    model_ref: &str,
+    headers: Option<&HeaderMap>,
+    request_threads: Option<u32>,
+    send: F,
+) -> Result<Response, AppError>
+where
+    F: Fn(String, Target, ActivityGuard) -> Fut,
+    Fut: std::future::Future<Output = Result<Response, AppError>>,
+{
+    let resolve =
+        |m: String| async move { ensure_model(state, &m, headers, request_threads).await };
+    with_hybrid_fallback(model_ref, headers, resolve, send).await
+}
+
+/// [`send_with_hybrid_fallback`] with `ensure_model` abstracted, so the
+/// retry itself is testable.
+async fn with_hybrid_fallback<R, RFut, F, Fut>(
+    model_ref: &str,
+    headers: Option<&HeaderMap>,
+    resolve: R,
+    send: F,
+) -> Result<Response, AppError>
+where
+    R: Fn(String) -> RFut,
+    RFut: std::future::Future<Output = Result<(String, Target, ActivityGuard), AppError>>,
+    F: Fn(String, Target, ActivityGuard) -> Fut,
+    Fut: std::future::Future<Output = Result<Response, AppError>>,
+{
+    let (model, target, guard) = resolve(model_ref.to_string()).await?;
+    let fallback = match target {
+        Target::Local(_) => hybrid_fallback(model_ref, headers)?,
+        _ => None,
+    };
+    let Some(cloud) = fallback else {
+        return send(model, target, guard).await;
+    };
+    let refusal = match send(model, target, guard).await {
+        Ok(resp) => match local_context_overflow(resp).await {
+            Ok(resp) => return Ok(resp),
+            Err(refusal) => refusal,
+        },
+        Err(err) => match err.0.downcast_ref::<ContextOverflow>() {
+            Some(overflow) => overflow.refusal.clone(),
+            None => return Err(err),
+        },
+    };
+    eprintln!("[llmman] hybrid {model_ref:?} -> cloud ({refusal})");
+    let (model, target, guard) = resolve(cloud).await?;
+    send(model, target, guard).await
+}
+
+/// Largest 400 body [`local_context_overflow`] reads to classify it.
+/// llama-server's is one short JSON object.
+const OVERFLOW_BODY_LIMIT: usize = 64 * 1024;
+
+/// Splits a relayed response into the backend's context refusal (`Err`,
+/// with its message) or anything else (`Ok`, the response intact). Only
+/// a 400 is read, up to [`OVERFLOW_BODY_LIMIT`]; whatever was read is
+/// put back in front of the rest when it is some other error.
+async fn local_context_overflow(resp: Response) -> Result<Response, String> {
+    if resp.status() != StatusCode::BAD_REQUEST {
+        return Ok(resp);
+    }
+    let (parts, body) = resp.into_parts();
+    let mut rest = body.into_data_stream();
+    let mut head = Vec::new();
+    while head.len() <= OVERFLOW_BODY_LIMIT {
+        match rest.next().await {
+            Some(Ok(chunk)) => head.extend_from_slice(&chunk),
+            // A read error is the client's to see, as it would have been.
+            Some(Err(_)) | None => break,
+        }
+    }
+    if head.len() <= OVERFLOW_BODY_LIMIT {
+        if let Some(refusal) =
+            context_overflow_message(parts.status, &String::from_utf8_lossy(&head))
+        {
+            return Err(refusal);
+        }
+    }
+    let head = futures::stream::once(futures::future::ready(Ok(Bytes::from(head))));
+    Ok(Response::from_parts(
+        parts,
+        Body::from_stream(head.chain(rest)),
+    ))
+}
+
 /// Ensures `model_ref` is loaded and returns `(canonical_ref, port,
 /// guard)`. The canonical name is what it's actually registered under
 /// with its backend (`--served-model-name`), which can differ from a
@@ -3425,9 +3612,10 @@ async fn resolve_remote_target(
 /// it any other way (including the whole task being cancelled) still
 /// releases it correctly.
 ///
-/// `headers` are the incoming request's, used only to pick up a caller-
-/// supplied provider API key (see [`resolve_remote_target`]); `None` from
-/// a surface that has none to offer.
+/// `headers` are the incoming request's, used to pick up a caller-
+/// supplied provider API key (see [`resolve_remote_target`]) and, for a
+/// hybrid pair, which half to use (see [`resolve_hybrid_side`]); `None`
+/// from a surface that has none to offer, which keeps a pair local.
 ///
 /// `request_threads` is the caller's Ollama `options.num_thread` (see
 /// [`opt_num_thread`]); `None` from every surface without an Ollama
@@ -3451,6 +3639,13 @@ async fn ensure_model(
     headers: Option<&HeaderMap>,
     request_threads: Option<u32>,
 ) -> Result<(String, Target, ActivityGuard), AppError> {
+    // First, so everything below sees one half rather than the pair. A
+    // half is never itself a pair, so this cannot recurse.
+    let hybrid_side = crate::hybrid::split_ref(model_ref)
+        .map(|pair| resolve_hybrid_side(state, &pair, headers))
+        .transpose()?;
+    let model_ref = hybrid_side.as_deref().unwrap_or(model_ref);
+
     // Before `resolve_ollama_api`, deliberately: a provider-routed
     // reference names a model on someone else's servers, so none of the
     // shortname aliasing, tag defaulting, store lookup, or pull below
@@ -4217,15 +4412,61 @@ async fn post_chat(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(AppError(
-            anyhow!("{} {status}: {body}", target.describe()),
-            // A provider's own 4xx is the actionable answer — a bad key
-            // has to reach the user as 401, not as llmman's 500. A local
-            // backend keeps the blanket 500 it always returned.
-            remote_status(target, status),
-        ));
+        let message = format!("{} {status}: {body}", target.describe());
+        // Same message either way; the marker lets a hybrid pair retry
+        // on its hosted half (see send_with_hybrid_fallback).
+        let error = match target {
+            Target::Local(_) => match context_overflow_message(status, &body) {
+                Some(refusal) => anyhow::Error::new(ContextOverflow { message, refusal }),
+                None => anyhow!("{message}"),
+            },
+            _ => anyhow!("{message}"),
+        };
+        // A provider's own 4xx is the actionable answer — a bad key has
+        // to reach the user as 401, not as llmman's 500. A local backend
+        // keeps the blanket 500 it always returned.
+        return Err(AppError(error, remote_status(target, status)));
     }
     Ok(resp)
+}
+
+/// A local backend's refusal of a request as larger than its context,
+/// as [`post_chat`] reports it. Displays as the plain error would.
+#[derive(Debug)]
+struct ContextOverflow {
+    message: String,
+    /// The backend's own wording, for the fallback log line.
+    refusal: String,
+}
+
+impl std::fmt::Display for ContextOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ContextOverflow {}
+
+/// The backend's own message if an unsuccessful response is a prompt
+/// that did not fit its context: llama-server's
+/// `exceed_context_size_error`, or the wording llama-server and vLLM
+/// use for it. `body` may carry a prefix before the JSON, as
+/// [`post_chat`]'s message does.
+fn context_overflow_message(status: StatusCode, body: &str) -> Option<String> {
+    if status != StatusCode::BAD_REQUEST {
+        return None;
+    }
+    let json = &body[body.find('{')?..];
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let error = &value["error"];
+    let message = error["message"]
+        .as_str()
+        .or_else(|| value["message"].as_str())
+        .unwrap_or("");
+    let overflow = error["type"] == "exceed_context_size_error"
+        || message.contains("exceeds the available context size")
+        || message.contains("maximum context length is");
+    overflow.then(|| message.to_string())
 }
 
 /// The status llmman reports for an unsuccessful upstream response.
@@ -5823,27 +6064,41 @@ async fn handle_ollama_chat(
     // generation and `done_reason: "stop"` where ollama answers with an
     // empty message, and a `keep_alive: 0` never unloads anything.
     if req.messages.is_empty() && is_explicit_unload(&req.keep_alive) {
-        unload_everywhere(&state, &req.model, &headers).await?;
+        unload_everywhere(&state, crate::hybrid::local_half(&req.model), &headers).await?;
         return Ok(Json(empty_chat_chunk(req.model, "unload")).into_response());
     }
 
     // The options blob still applies to a load-only request (the
-    // empty-messages branch below): a preload that names num_thread
+    // empty-messages branch inside): a preload that names num_thread
     // should start the process with it, same as a generating request
     // would.
-    let (model, target, guard) = ensure_model(
+    let model_ref = req.model.clone();
+    let request_threads = opt_num_thread(&req.options);
+    send_with_hybrid_fallback(
         &state,
-        &req.model,
+        &model_ref,
         Some(&headers),
-        opt_num_thread(&req.options),
+        request_threads,
+        |model, target, guard| ollama_chat_to(&state, &headers, &req, model, target, guard),
     )
-    .await?;
+    .await
+}
+
+/// [`handle_ollama_chat`] against one resolved target.
+async fn ollama_chat_to(
+    state: &AppState,
+    headers: &HeaderMap,
+    req: &OllamaChatRequest,
+    model: String,
+    target: Target,
+    guard: ActivityGuard,
+) -> Result<Response, AppError> {
     if matches!(target, Target::Peer(_)) {
-        return forward_ollama(&state, &target, "/api/chat", &headers, &req, guard).await;
+        return forward_ollama(state, &target, "/api/chat", headers, req, &model, guard).await;
     }
     if req.messages.is_empty() {
         refresh_activity(guard, resolve_keep_alive(&req.keep_alive)).await;
-        return Ok(Json(empty_chat_chunk(req.model, "load")).into_response());
+        return Ok(Json(empty_chat_chunk(req.model.clone(), "load")).into_response());
     }
 
     let keep_alive = resolve_keep_alive(&req.keep_alive);
@@ -5853,7 +6108,7 @@ async fn handle_ollama_chat(
     // remote provider. Only this one outgoing request field, never the
     // response chunk's own `model` field below (which must keep echoing
     // back `model` as-is).
-    let wire_model = backend_wire_model(&state, &target, &model).await;
+    let wire_model = backend_wire_model(state, &target, &model).await;
     let oai = OAIChatRequest {
         model: wire_model,
         messages: req.messages.iter().map(ollama_message_to_oai).collect(),
@@ -5922,7 +6177,7 @@ async fn handle_ollama_generate(
     // `LLMMAN_KEEP_ALIVE=0` turned a plain preload into an eviction.
     let is_unload = req.prompt.is_empty() && is_explicit_unload(&req.keep_alive);
     if is_unload {
-        unload_everywhere(&state, &req.model, &headers).await?;
+        unload_everywhere(&state, crate::hybrid::local_half(&req.model), &headers).await?;
         return Ok(Json(OllamaGenerateChunk {
             model: req.model,
             created_at: now_rfc3339(),
@@ -5934,15 +6189,29 @@ async fn handle_ollama_generate(
         .into_response());
     }
 
-    let (model, target, guard) = ensure_model(
+    let model_ref = req.model.clone();
+    let request_threads = opt_num_thread(&req.options);
+    send_with_hybrid_fallback(
         &state,
-        &req.model,
+        &model_ref,
         Some(&headers),
-        opt_num_thread(&req.options),
+        request_threads,
+        |model, target, guard| ollama_generate_to(&state, &headers, &req, model, target, guard),
     )
-    .await?;
+    .await
+}
+
+/// [`handle_ollama_generate`] against one resolved target.
+async fn ollama_generate_to(
+    state: &AppState,
+    headers: &HeaderMap,
+    req: &OllamaGenerateRequest,
+    model: String,
+    target: Target,
+    guard: ActivityGuard,
+) -> Result<Response, AppError> {
     if matches!(target, Target::Peer(_)) {
-        return forward_ollama(&state, &target, "/api/generate", &headers, &req, guard).await;
+        return forward_ollama(state, &target, "/api/generate", headers, req, &model, guard).await;
     }
     // Empty prompt = load-only request (mirrors ollama server/routes.go:429)
     // — including "preload with a custom keep_alive", so refresh it here
@@ -5950,7 +6219,7 @@ async fn handle_ollama_generate(
     if req.prompt.is_empty() {
         refresh_activity(guard, resolve_keep_alive(&req.keep_alive)).await;
         return Ok(Json(OllamaGenerateChunk {
-            model: req.model,
+            model: req.model.clone(),
             created_at: now_rfc3339(),
             response: String::new(),
             thinking: None,
@@ -5963,7 +6232,7 @@ async fn handle_ollama_generate(
     let keep_alive = resolve_keep_alive(&req.keep_alive);
     let activity = begin_activity(guard, Some(keep_alive)).await;
     // See backend_wire_model's own doc comment.
-    let wire_model = backend_wire_model(&state, &target, &model).await;
+    let wire_model = backend_wire_model(state, &target, &model).await;
     let oai = OAIChatRequest {
         model: wire_model,
         messages: vec![OAIMessage::text("user", req.prompt.clone())],
@@ -6424,12 +6693,27 @@ async fn resolve_openai_request(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<(serde_json::Value, Target, ActivityGuard, Option<String>), AppError> {
-    let mut req: serde_json::Value =
-        serde_json::from_slice(&body).context("parse OpenAI request body")?;
+    let req = parse_openai_request(&body)?;
     let model = req["model"].as_str().unwrap_or("").to_string();
     // No `request_threads`: the OpenAI-compatible surface has no Ollama
     // options blob, so there is no num_thread to forward.
     let (model, target, guard) = ensure_model(state, &model, Some(headers), None).await?;
+    prepare_openai_request(state, req, model, target, guard).await
+}
+
+fn parse_openai_request(body: &Bytes) -> Result<serde_json::Value, AppError> {
+    Ok(serde_json::from_slice(body).context("parse OpenAI request body")?)
+}
+
+/// [`resolve_openai_request`] after `ensure_model`, for a caller that
+/// ran that itself (see [`send_with_hybrid_fallback`]).
+async fn prepare_openai_request(
+    state: &AppState,
+    mut req: serde_json::Value,
+    model: String,
+    target: Target,
+    guard: ActivityGuard,
+) -> Result<(serde_json::Value, Target, ActivityGuard, Option<String>), AppError> {
     // The OpenAI-compatible surface has no `keep_alive` field of its own
     // (real Ollama's doesn't either) — `None` leaves whatever this model
     // already has untouched (its load-time default, or an explicit value
@@ -6470,8 +6754,40 @@ async fn proxy_openai_generation(
     body: Bytes,
     llama_path: &str,
 ) -> Result<Response, AppError> {
+    let req = parse_openai_request(&body)?;
+    let model_ref = req["model"].as_str().unwrap_or("").to_string();
+    send_with_hybrid_fallback(
+        state,
+        &model_ref,
+        Some(headers),
+        None,
+        |model, target, guard| {
+            proxy_openai_generation_to(
+                state,
+                headers,
+                req.clone(),
+                llama_path,
+                model,
+                target,
+                guard,
+            )
+        },
+    )
+    .await
+}
+
+/// [`proxy_openai_generation`] against one resolved target.
+async fn proxy_openai_generation_to(
+    state: &AppState,
+    headers: &HeaderMap,
+    req: serde_json::Value,
+    llama_path: &str,
+    model: String,
+    target: Target,
+    guard: ActivityGuard,
+) -> Result<Response, AppError> {
     let (mut req, target, activity, response_model_override) =
-        resolve_openai_request(state, headers, body).await?;
+        prepare_openai_request(state, req, model, target, guard).await?;
     if is_responses_route(llama_path) && !target.is_remote() {
         sanitize_responses_request(&mut req);
     }
@@ -6720,6 +7036,25 @@ async fn handle_openai_transcriptions(
             "error": "transcription request is missing a required \"model\" form field"
         });
         return Ok((StatusCode::BAD_REQUEST, Json(body)).into_response());
+    };
+    // A pair takes its local half whatever its size: audio bodies are
+    // past any byte budget, and the check below rules a provider out
+    // anyway. An explicit cloud pin still fails with that same message.
+    let model = match crate::hybrid::split_ref(&model) {
+        Some(pair) => {
+            let side = match request_pin(Some(&headers))? {
+                Some(crate::hybrid::Side::Cloud) => crate::hybrid::Side::Cloud,
+                _ => crate::hybrid::Side::Local,
+            };
+            eprintln!(
+                "[llmman] hybrid {:?} + {:?} -> {} (transcription)",
+                pair.local,
+                pair.remote_ref(),
+                side.as_str()
+            );
+            pair.side_ref(side)
+        }
+        None => model,
     };
     // Every other surface rewrites `model` to the provider's own id
     // before forwarding, but this body is multipart, not JSON: the raw
@@ -6975,23 +7310,39 @@ async fn handle_anthropic_messages(
     headers: HeaderMap,
     Json(req): Json<AnthropicRequest>,
 ) -> Result<Response, AppError> {
-    // Backend needs its canonical name (see ensure_model); the response
-    // below still echoes req.model back, unchanged from before.
     // No `request_threads`: the Anthropic Messages API has no Ollama
     // options blob, so there is no num_thread to forward.
-    let (canonical_model, target, guard) =
-        ensure_model(&state, &req.model, Some(&headers), None).await?;
+    let model_ref = req.model.clone();
+    send_with_hybrid_fallback(
+        &state,
+        &model_ref,
+        Some(&headers),
+        None,
+        |model, target, guard| anthropic_messages_to(&state, &req, model, target, guard),
+    )
+    .await
+}
+
+/// [`handle_anthropic_messages`] against one resolved target. The
+/// response echoes `req.model` back, unchanged from before.
+async fn anthropic_messages_to(
+    state: &AppState,
+    req: &AnthropicRequest,
+    canonical_model: String,
+    target: Target,
+    guard: ActivityGuard,
+) -> Result<Response, AppError> {
     // The Anthropic Messages API has no `keep_alive` field of its own —
     // `None` leaves it untouched, same as the OpenAI-compatible surface
     // (see resolve_openai_request's own comment on why).
     let activity = begin_activity(guard, None).await;
 
-    let messages = build_anthropic_messages(&req);
+    let messages = build_anthropic_messages(req);
 
     // See backend_wire_model's own doc comment — usually just
     // canonical_model itself, but a different value for an Engine::Mlx
     // backend or a remote provider.
-    let wire_model = backend_wire_model(&state, &target, &canonical_model).await;
+    let wire_model = backend_wire_model(state, &target, &canonical_model).await;
     let mut oai = OAIChatRequest {
         model: wire_model,
         messages,
@@ -7012,7 +7363,14 @@ async fn handle_anthropic_messages(
     };
 
     if req.stream {
-        stream_anthropic(state.0.client.clone(), target, oai, req.model, activity).await
+        stream_anthropic(
+            state.0.client.clone(),
+            target,
+            oai,
+            req.model.clone(),
+            activity,
+        )
+        .await
     } else {
         // Goes through post_chat like every other typed request (see its
         // own doc comment) rather than posting directly, so this branch
@@ -7621,6 +7979,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         llama_cpp_version: _args.llama_cpp_version.clone(),
         ctx_size,
         ctx_size_explicit: ctx_size_explicit.is_some(),
+        hybrid_local_bytes: crate::hybrid::local_budget_bytes_from_env(ctx_size),
         flash_attention: flash_attention_from_env(),
         kv_cache_type: kv_cache_type_from_env(),
         split_mode: sched_spread_from_env(),
@@ -7661,10 +8020,12 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // weight to warm, and `resolve_ollama_api` below would rewrite its
     // reference into a registry path it isn't. `cmd::launch` already
     // declines to pass one; this is the daemon's own guard for anyone
-    // running `llmman serve <ref>` by hand.
+    // running `llmman serve <ref>` by hand. A hybrid pair warms its
+    // local half, the only one that loads.
     if let Some(model) = _args
         .model
         .as_deref()
+        .map(crate::hybrid::local_half)
         .filter(|m| !crate::providers::is_remote_ref(m))
     {
         match crate::shortnames::resolve_ollama_api(model) {
@@ -8426,6 +8787,26 @@ mod tests {
         assert!(body.get("think").is_none(), "{body}");
     }
 
+    /// A peer gets the half chosen here, never the pair: it has no pin
+    /// to route on and must not send a `local` request to a provider.
+    #[tokio::test]
+    async fn a_pair_reaches_a_peer_as_its_chosen_half() {
+        let (origin, seen) = mock_peer(node(8 << 30, &["docker.io/ai/m:latest"], &[])).await;
+        let state = state_with_peers(vec![origin], 0);
+        let req: OllamaGenerateRequest = serde_json::from_value(serde_json::json!({
+            "model": "llmman.hybrid/docker.io/ai/m,anthropic/claude-sonnet-5",
+        }))
+        .unwrap();
+        let headers = headers_with(&[("x-llmman-route", "local")]);
+        let resp = handle_ollama_generate(State(state), headers, Json(req))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let calls = seen.lock().await;
+        let body: serde_json::Value = serde_json::from_slice(&calls[0].2).unwrap();
+        assert_eq!(body["model"], "docker.io/ai/m:latest");
+    }
+
     /// `llmman stop` reaches a model wherever the aggregation loaded it.
     #[tokio::test]
     async fn an_unload_is_forwarded_to_every_peer() {
@@ -8450,6 +8831,355 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(seen.lock().await.len(), 1, "forwarded a forwarded unload");
+    }
+
+    // -- hybrid pairs (one reference, a local and a hosted half) -------------
+
+    fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        headers
+    }
+
+    fn pair(reference: &'static str) -> crate::hybrid::Pair<'static> {
+        crate::hybrid::split_ref(reference).expect("test reference must be a pair")
+    }
+
+    const PAIR: &str = "llmman.hybrid/gemma4,anthropic/claude-sonnet-4-5";
+    const HOSTED: &str = "llmman.provider/anthropic/claude-sonnet-4-5";
+
+    /// What comes back is one half's own ordinary reference, with
+    /// nothing left for anything downstream to special-case.
+    #[test]
+    fn a_pair_resolves_to_an_ordinary_reference_for_the_half_it_picks() {
+        let state = test_state();
+        let local = resolve_hybrid_side(&state, &pair(PAIR), Some(&headers_with(&[]))).unwrap();
+        assert_eq!(local, "gemma4");
+
+        let cloud = resolve_hybrid_side(
+            &state,
+            &pair(PAIR),
+            Some(&headers_with(&[("x-llmman-route", "cloud")])),
+        )
+        .unwrap();
+        assert_eq!(cloud, HOSTED);
+        assert!(crate::providers::is_remote_ref(&cloud));
+    }
+
+    /// A surface with no headers to offer keeps a pair local.
+    #[test]
+    fn a_pair_without_headers_stays_local() {
+        let state = test_state();
+        assert_eq!(
+            resolve_hybrid_side(&state, &pair(PAIR), None).unwrap(),
+            "gemma4"
+        );
+    }
+
+    /// The one automatic rule that sends data off the machine, wired to
+    /// a real `Content-Length` and a real budget.
+    #[test]
+    fn a_request_too_large_for_this_host_goes_to_the_hosted_half() {
+        let state = test_state_with_budget(262_144);
+        let fits = headers_with(&[("content-length", "262144")]);
+        assert_eq!(
+            resolve_hybrid_side(&state, &pair(PAIR), Some(&fits)).unwrap(),
+            "gemma4"
+        );
+        let does_not = headers_with(&[("content-length", "262145")]);
+        assert_eq!(
+            resolve_hybrid_side(&state, &pair(PAIR), Some(&does_not)).unwrap(),
+            HOSTED
+        );
+    }
+
+    /// `LLMMAN_HYBRID_LOCAL_BYTES=0`: size alone never routes away.
+    #[test]
+    fn without_a_budget_size_never_routes_a_pair_away() {
+        let state = test_state();
+        let huge = headers_with(&[("content-length", "999999999")]);
+        assert_eq!(
+            resolve_hybrid_side(&state, &pair(PAIR), Some(&huge)).unwrap(),
+            "gemma4"
+        );
+    }
+
+    /// `/v1/audio/transcriptions` relays multipart bytes it cannot
+    /// rewrite, so a pair takes its local half regardless of size there,
+    /// consulting the pin only.
+    #[test]
+    fn a_transcription_pair_takes_its_local_half_whatever_its_size() {
+        let state = test_state_with_budget(1);
+        let huge = headers_with(&[("content-length", "99999999")]);
+        assert_eq!(
+            resolve_hybrid_side(&state, &pair(PAIR), Some(&huge)).unwrap(),
+            HOSTED,
+            "the generic path still routes on size"
+        );
+        assert_eq!(request_pin(Some(&huge)).unwrap(), None);
+        let pinned = headers_with(&[("x-llmman-route", "cloud")]);
+        assert_eq!(
+            request_pin(Some(&pinned)).unwrap(),
+            Some(crate::hybrid::Side::Cloud),
+            "an explicit cloud pin is still refused by that handler"
+        );
+    }
+
+    /// An unreadable pin is a 400, not a guess. See `hybrid::parse_pin`.
+    #[test]
+    fn an_unreadable_route_header_is_rejected_rather_than_guessed() {
+        let state = test_state();
+        let headers = headers_with(&[("x-llmman-route", "on-device")]);
+        let err = resolve_hybrid_side(&state, &pair(PAIR), Some(&headers))
+            .expect_err("an unknown side must not be guessed at");
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An invalid local half is rejected exactly as a bare one is (see
+    /// `ensure_model_rejects_an_invalid_ref_with_400`), which only
+    /// happens if the half was substituted in first.
+    #[tokio::test]
+    async fn ensure_model_validates_the_local_half_of_a_pair() {
+        let state = test_state();
+        let headers = headers_with(&[("x-llmman-route", "local")]);
+        let err = ensure_model(
+            &state,
+            "llmman.hybrid/hf.co/../x,anthropic/claude-sonnet-4-5",
+            Some(&headers),
+            None,
+        )
+        .await
+        .err()
+        .expect("an invalid local half must be rejected");
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The retry that makes a pair useful to an agent: a request the
+    /// byte budget let through but llama-server refused goes to the
+    /// hosted half instead of coming back as an error the client would
+    /// compact its history over.
+    #[test]
+    fn a_local_context_refusal_is_recognised_in_every_shape_it_arrives_in() {
+        let llama = r#"{"error":{"code":400,"message":"request (5213 tokens) exceeds the available context size (2048 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":5213,"n_ctx":2048}}"#;
+        let expected = "request (5213 tokens) exceeds the available context size (2048 tokens), try increasing it";
+        assert_eq!(
+            context_overflow_message(StatusCode::BAD_REQUEST, llama).as_deref(),
+            Some(expected)
+        );
+        // post_chat's message prefixes the body with the target.
+        assert_eq!(
+            context_overflow_message(
+                StatusCode::BAD_REQUEST,
+                &format!("inference backend 400 Bad Request: {llama}")
+            )
+            .as_deref(),
+            Some(expected)
+        );
+        // vLLM's wording, no type field.
+        let vllm = r#"{"object":"error","message":"This model's maximum context length is 2048 tokens. However, you requested 5213 tokens.","type":"BadRequestError","code":400}"#;
+        assert!(context_overflow_message(StatusCode::BAD_REQUEST, vllm).is_some());
+
+        // Anything else is not: another 400, a 500, a non-JSON body.
+        for (status, body) in [
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":{"code":400,"message":"invalid grammar","type":"invalid_request_error"}}"#,
+            ),
+            (StatusCode::INTERNAL_SERVER_ERROR, llama),
+            (StatusCode::BAD_REQUEST, "not json"),
+        ] {
+            assert_eq!(
+                context_overflow_message(status, body),
+                None,
+                "{status} {body}"
+            );
+        }
+    }
+
+    /// Only a pair falls back, and never one the caller pinned local:
+    /// that pin is the promise the data stays on this machine.
+    #[test]
+    fn only_an_unpinned_pair_has_a_hosted_half_to_fall_back_to() {
+        assert_eq!(
+            hybrid_fallback(PAIR, Some(&headers_with(&[]))).unwrap(),
+            Some(HOSTED.to_string())
+        );
+        assert_eq!(
+            hybrid_fallback(PAIR, None).unwrap(),
+            Some(HOSTED.to_string())
+        );
+        assert_eq!(
+            hybrid_fallback(PAIR, Some(&headers_with(&[("x-llmman-route", "local")]))).unwrap(),
+            None
+        );
+        assert_eq!(hybrid_fallback("gemma4", None).unwrap(), None);
+        assert_eq!(hybrid_fallback(HOSTED, None).unwrap(), None);
+    }
+
+    /// Two pins is no pin: the header decides where data goes, so it is
+    /// never resolved by header order.
+    #[test]
+    fn a_repeated_route_header_is_rejected() {
+        let mut headers = headers_with(&[("x-llmman-route", "local")]);
+        headers.append("x-llmman-route", "cloud".parse().unwrap());
+        let err = request_pin(Some(&headers)).expect_err("two pins must not resolve");
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The retry end to end: a local refusal, as an error or a relayed
+    /// 400, sends once more with the hosted target; anything else, or a
+    /// local pin, does not.
+    #[tokio::test]
+    async fn a_local_refusal_is_retried_on_the_hosted_half_unless_pinned() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = test_state();
+        let refusal = r#"{"error":{"code":400,"message":"request (9 tokens) exceeds the available context size (8 tokens), try increasing it","type":"exceed_context_size_error"}}"#;
+        // ensure_model, minus the store: a pair resolves to its local half.
+        let resolve = |m: String| {
+            let state = state.clone();
+            async move {
+                let m = crate::hybrid::local_half(&m).to_string();
+                let target = if crate::providers::is_remote_ref(&m) {
+                    Target::Remote(Arc::new(RemoteTarget {
+                        provider: "anthropic".into(),
+                        base_url: "http://provider".into(),
+                        model: "claude".into(),
+                        api_key: "k".into(),
+                    }))
+                } else {
+                    Target::Local(1)
+                };
+                Ok((m.clone(), target, ActivityGuard::new(&state, &m)))
+            }
+        };
+        // What `send` does on the local target; the hosted one answers 200.
+        enum Local {
+            Error,
+            Relayed,
+            Fine,
+            OtherError,
+        }
+        let run = |local: Local, headers: HeaderMap| async move {
+            let calls = AtomicUsize::new(0);
+            let remote_seen = AtomicUsize::new(0);
+            let (calls, remote_seen, local) = (&calls, &remote_seen, &local);
+            let result = with_hybrid_fallback(PAIR, Some(&headers), resolve, |model, target, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if target.is_remote() {
+                        remote_seen.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(model, HOSTED);
+                        return Ok(StatusCode::OK.into_response());
+                    }
+                    assert_eq!(model, "gemma4");
+                    match local {
+                        Local::Error => Err(AppError(
+                            anyhow::Error::new(ContextOverflow {
+                                message: refusal.into(),
+                                refusal: refusal.into(),
+                            }),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                        )),
+                        Local::Relayed => Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(Body::from(refusal))
+                            .unwrap()),
+                        Local::Fine => Ok(StatusCode::OK.into_response()),
+                        Local::OtherError => Err(AppError::status(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "backend died",
+                        )),
+                    }
+                }
+            })
+            .await;
+            (
+                result.map(|r| r.status()).map_err(|e| e.1),
+                calls.load(Ordering::SeqCst),
+                remote_seen.load(Ordering::SeqCst),
+            )
+        };
+
+        let none = HeaderMap::new();
+        assert_eq!(
+            run(Local::Error, none.clone()).await,
+            (Ok(StatusCode::OK), 2, 1)
+        );
+        assert_eq!(
+            run(Local::Relayed, none.clone()).await,
+            (Ok(StatusCode::OK), 2, 1)
+        );
+        assert_eq!(
+            run(Local::Fine, none.clone()).await,
+            (Ok(StatusCode::OK), 1, 0)
+        );
+        assert_eq!(
+            run(Local::OtherError, none).await,
+            (Err(StatusCode::INTERNAL_SERVER_ERROR), 1, 0)
+        );
+        // Pinned local: the refusal reaches the client, data stays here.
+        let pinned = headers_with(&[("x-llmman-route", "local")]);
+        assert_eq!(
+            run(Local::Error, pinned.clone()).await,
+            (Err(StatusCode::INTERNAL_SERVER_ERROR), 1, 0)
+        );
+        assert_eq!(
+            run(Local::Relayed, pinned).await,
+            (Ok(StatusCode::BAD_REQUEST), 1, 0)
+        );
+    }
+
+    /// A relayed 400 is inspected and either taken as the refusal or
+    /// handed back intact; nothing else is touched.
+    #[tokio::test]
+    async fn a_relayed_response_is_only_intercepted_when_it_is_the_refusal() {
+        let llama = r#"{"error":{"code":400,"message":"request (9 tokens) exceeds the available context size (8 tokens), try increasing it","type":"exceed_context_size_error"}}"#;
+        // No Content-Length: proxy_rewriting_model strips it.
+        let resp = |status: StatusCode, body: &'static str| {
+            Response::builder()
+                .status(status)
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let refusal = local_context_overflow(resp(StatusCode::BAD_REQUEST, llama))
+            .await
+            .expect_err("the refusal must be intercepted");
+        assert!(
+            refusal.contains("exceeds the available context size"),
+            "{refusal}"
+        );
+
+        let other = r#"{"error":{"code":400,"message":"invalid grammar"}}"#;
+        let passed = local_context_overflow(resp(StatusCode::BAD_REQUEST, other))
+            .await
+            .expect("another 400 passes through");
+        assert_eq!(passed.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(passed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, other.as_bytes(), "body reattached intact");
+
+        let ok = local_context_overflow(resp(StatusCode::OK, "data: {}"))
+            .await
+            .expect("a success is never read");
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        // Past the read limit: not classified, and nothing lost.
+        let big: &'static str = String::from_utf8(vec![b'x'; OVERFLOW_BODY_LIMIT + 10])
+            .unwrap()
+            .leak();
+        let passed = local_context_overflow(resp(StatusCode::BAD_REQUEST, big))
+            .await
+            .expect("an oversized 400 passes through");
+        let body = axum::body::to_bytes(passed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), big.len());
     }
 
     // -- keep_alive parsing / resolution (idle-timeout auto-unload) ---------
@@ -9039,6 +9769,13 @@ mod tests {
         AppState(Arc::new(test_inner(store_path)))
     }
 
+    /// `test_state` with a hybrid byte budget (every other test has none).
+    fn test_state_with_budget(hybrid_local_bytes: u64) -> AppState {
+        let mut inner = test_inner(std::env::temp_dir());
+        inner.hybrid_local_bytes = Some(hybrid_local_bytes);
+        AppState(Arc::new(inner))
+    }
+
     /// `test_state_at`'s `Inner`, for tests that set one field differently.
     fn test_inner(store_path: PathBuf) -> Inner {
         Inner {
@@ -9052,6 +9789,7 @@ mod tests {
             llama_cpp_version: None,
             ctx_size: None,
             ctx_size_explicit: false,
+            hybrid_local_bytes: None,
             flash_attention: None,
             kv_cache_type: None,
             split_mode: None,
