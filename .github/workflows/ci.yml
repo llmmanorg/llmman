@@ -744,7 +744,7 @@ jobs:
           set -euo pipefail
           tarball="talos-${TALOS_VERSION}.tar.gz"
           for attempt in 1 2 3; do
-            if curl -fsSL -o "$tarball" "https://talos-agent.ch/dist/${tarball}"; then
+            if curl -fsSL --connect-timeout 20 --max-time 120 -o "$tarball" "https://talos-agent.ch/dist/${tarball}"; then
               break
             fi
             echo "talos download attempt ${attempt} failed"
@@ -757,7 +757,6 @@ jobs:
           tar xzf "$tarball" --strip-components=1 -C "$HOME/talos"
           rm -f "$tarball"
           python3 -m venv "$HOME/talos/.venv"
-          "$HOME/talos/.venv/bin/python" -m pip install --quiet --upgrade pip
           "$HOME/talos/.venv/bin/python" -m pip install --quiet -r "$HOME/talos/requirements.txt"
           # The installer's own first-run file: the template with an empty
           # allowlist, mode 600 — the e2e grants its own terminal separately.
