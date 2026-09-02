@@ -738,8 +738,8 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         env:
-          TALOS_VERSION: 0.17.1-alpha
-          TALOS_SHA256: ac07d1100cf68835a6151134379d36038646c1ab856695082d3cfac8938f6bce
+          TALOS_VERSION: 0.17.2-alpha
+          TALOS_SHA256: 468d45e0bcafe563d1c105a18cc4c9dc7ebd884df59be8cf40b9aa5e5942b4b7
         run: |
           set -euo pipefail
           tarball="talos-${TALOS_VERSION}.tar.gz"
@@ -757,7 +757,7 @@ jobs:
           tar xzf "$tarball" --strip-components=1 -C "$HOME/talos"
           rm -f "$tarball"
           python3 -m venv "$HOME/talos/.venv"
-          "$HOME/talos/.venv/bin/python" -m pip install --quiet -r "$HOME/talos/requirements.txt"
+          "$HOME/talos/.venv/bin/python" -m pip install --quiet --require-hashes -r "$HOME/talos/requirements.lock"
           # The installer's own first-run file: the template with an empty
           # allowlist, mode 600 — the e2e grants its own terminal separately.
           cp "$HOME/talos/.env.example" "$HOME/talos/talos.env"
