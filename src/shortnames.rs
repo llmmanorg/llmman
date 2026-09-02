@@ -343,6 +343,121 @@ fn rejoin(parsed: &ParsedRef<'_>) -> String {
     out
 }
 
+/// Panics unless every field of a successful parse holds its own grammar:
+/// name parts (model, tag, namespace components, host name) against the
+/// per-part byte allowlist, the host port against the 1-5 digit rule, the
+/// digest against the `<algo>:<hex>` shape, and the scheme against
+/// [`REGISTRY_SCHEMES`]. Shared oracle for the fuzz target and the unit
+/// tests below.
+///
+/// Deliberately independent of `check_part` / `check_host` /
+/// `check_digest`: a regression in those functions is exactly what this
+/// oracle must catch, so their rules are restated here byte by byte
+/// (following the deliberate-copy philosophy the rejoin test documents).
+/// Only the two one-line predicates [`is_part_first_byte`] and
+/// [`is_part_byte`] are reused; everything else is inlined.
+#[cfg(any(test, feature = "fuzzing"))]
+fn assert_parsed_ref_grammar(parsed: &ParsedRef<'_>, reference: &str) {
+    // First byte [A-Za-z0-9_], rest [A-Za-z0-9_.-] ('.' only when
+    // allow_dot), non-empty, at most max_len bytes. ':' is outside the
+    // allowlist, so no name part can carry one.
+    let assert_name_part = |kind: &str, part: &str, allow_dot: bool, max_len: usize| {
+        assert_ne!(part, "..", "{reference:?} parsed with a \"..\" {kind}");
+        assert!(!part.is_empty(), "{reference:?} parsed an empty {kind}");
+        assert!(
+            part.len() <= max_len,
+            "{reference:?} parsed an over-length {kind}: {part:?}"
+        );
+        let bytes = part.as_bytes();
+        assert!(
+            is_part_first_byte(bytes[0]),
+            "{reference:?} parsed a {kind} with an invalid first byte: {part:?}"
+        );
+        for &b in &bytes[1..] {
+            assert!(
+                is_part_byte(b) && (allow_dot || b != b'.'),
+                "{reference:?} parsed a {kind} with a byte outside its allowlist: {part:?}"
+            );
+        }
+    };
+
+    if let Some(scheme) = parsed.scheme {
+        assert!(
+            REGISTRY_SCHEMES.contains(&scheme),
+            "{reference:?} parsed with an unknown scheme: {scheme:?}"
+        );
+    }
+    if let Some(host) = parsed.host {
+        assert!(
+            host.len() <= MAX_HOST_LEN,
+            "{reference:?} parsed an over-length host: {host:?}"
+        );
+        // At most one ':', splitting name and port.
+        let (name, port) = match host.split_once(':') {
+            Some((name, port)) => (name, Some(port)),
+            None => (host, None),
+        };
+        assert_name_part("host name", name, true, MAX_HOST_LEN);
+        if let Some(port) = port {
+            assert!(
+                !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit()),
+                "{reference:?} parsed a host port that is not 1-5 digits: {host:?}"
+            );
+        }
+    }
+    for ns in &parsed.namespace {
+        assert_name_part("namespace component", ns, false, MAX_PART_LEN);
+    }
+    assert_name_part("model", parsed.model, true, MAX_PART_LEN);
+    if let Some(tag) = parsed.tag {
+        assert_name_part("tag", tag, true, MAX_PART_LEN);
+    }
+    if let Some(digest) = parsed.digest {
+        assert_ne!(digest, "..", "{reference:?} parsed with a \"..\" digest");
+        assert!(
+            digest.len() <= MAX_PART_LEN,
+            "{reference:?} parsed an over-length digest: {digest:?}"
+        );
+        let Some((algo, hex)) = digest.split_once(':') else {
+            panic!("{reference:?} parsed a digest without an algo separator: {digest:?}");
+        };
+        assert!(
+            !algo.is_empty()
+                && algo
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+            "{reference:?} parsed a digest algorithm that is not [a-z0-9]+: {digest:?}"
+        );
+        // No per-algorithm hex-length rule: the parser accepts short
+        // payloads ("docker.io/ai/gemma4@sha256:abc" is pinned valid), so
+        // asserting sha256=64 / sha512=128 would false-positive on
+        // accepted parses. The hexdigit check still catches e.g.
+        // "sha256:.." ('.' is not a hexdigit).
+        assert!(
+            !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{reference:?} parsed a digest with a non-hex value: {digest:?}"
+        );
+    }
+}
+
+/// Fuzz-target entry point (see `fuzz/fuzz_targets/parse_registry_ref.rs`).
+/// Feature-gated so it is absent from every normal build; the `fuzzing`
+/// feature only widens visibility, it does not change parsing behavior.
+/// Panics whenever a successful parse violates a field's own grammar (see
+/// [`assert_parsed_ref_grammar`]): a ".." or over-length part, a byte
+/// outside a name part's allowlist, a malformed host port, a non-`algo:hex`
+/// digest, or an unknown scheme. The unit tests pin the same oracle against
+/// fixed inputs and the seed corpus. Kept here rather than exporting
+/// [`ParsedRef`] so the fuzz crate only calls one function and gets a panic
+/// (or not) back.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_check_parse_registry_ref(reference: &str) {
+    if let Ok(parsed) = parse_registry_ref(reference) {
+        assert_parsed_ref_grammar(&parsed, reference);
+    }
+}
+
 /// Rejects a raw user-supplied model reference that can never resolve to a
 /// real source, before any resolution or network I/O runs.
 ///
@@ -695,9 +810,10 @@ mod tests {
         }
     }
 
-    /// Fuzz-shaped invariant: no input that parses successfully may contain
-    /// a ".." component or a part over its length bound. Nasty inputs must
-    /// either fail to parse or decompose into parts that hold the invariant.
+    /// Fuzz-shaped invariant: every input that parses successfully must
+    /// decompose into fields that hold their own grammar (the shared
+    /// [`assert_parsed_ref_grammar`] oracle). Nasty inputs must either fail
+    /// to parse or pass the per-field checks.
     #[test]
     fn parse_registry_ref_holds_the_part_invariants() {
         let long = "a".repeat(400);
@@ -729,28 +845,34 @@ mod tests {
             let Ok(parsed) = parse_registry_ref(r) else {
                 continue;
             };
-            let mut parts: Vec<(&str, usize)> = vec![
-                (parsed.model, MAX_PART_LEN),
-                (parsed.tag.unwrap_or("x"), MAX_PART_LEN),
-                (parsed.digest.unwrap_or("x"), MAX_PART_LEN),
-                (parsed.host.unwrap_or("x"), MAX_HOST_LEN),
-            ];
-            for ns in &parsed.namespace {
-                parts.push((ns, MAX_PART_LEN));
-            }
-            for (part, bound) in parts {
-                assert_ne!(part, "..", "{r:?} parsed with a \"..\" part");
-                assert!(part.len() <= bound, "{r:?} parsed with an over-length part");
-                // Every byte of a successfully parsed part must be inside
-                // the allowlist (host additionally allows one ':' for the
-                // port; digest one ':' for the algo separator), so a parser
-                // regression cannot let a space or delimiter through.
-                assert!(
-                    part.bytes().all(|b| is_part_byte(b) || b == b':'),
-                    "{r:?} parsed a part with a byte outside the allowlist: {part:?}"
-                );
+            assert_parsed_ref_grammar(&parsed, r);
+        }
+    }
+
+    /// Sanity-runs the fuzz-harness logic against the checked-in seed
+    /// corpus on every `cargo test`, so a seeded regression (e.g. the
+    /// digest-dotdot seed) fails here even when no fuzzer runs.
+    #[test]
+    fn parse_registry_ref_oracle_holds_on_the_seed_corpus() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/parse_registry_ref");
+        let mut seeds = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("read the seed corpus directory") {
+            let path = entry.expect("read a corpus directory entry").path();
+            let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            seeds += 1;
+            // Mirror the fuzz target byte for byte: skip non-UTF-8 input
+            // (the nul-byte seed is valid UTF-8 and goes through), ignore
+            // parse errors, run the oracle on every successful parse.
+            let Ok(s) = std::str::from_utf8(&data) else {
+                continue;
+            };
+            if let Ok(parsed) = parse_registry_ref(s) {
+                assert_parsed_ref_grammar(&parsed, s);
             }
         }
+        // A wrong path must fail loudly, not pass over zero files.
+        assert!(seeds > 0, "seed corpus at {dir:?} is empty");
     }
 
     #[test]

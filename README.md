@@ -1,8 +1,54 @@
-# llmman
+<p align="center">
+  <img src="https://avatars.githubusercontent.com/u/316802122?s=400&v=4" alt="llmman" width="180">
+</p>
 
-A command-line tool for managing and serving LLM models using OCI registries.
-Models are packaged as standard OCI artifacts and stored in any compatible registry (Docker Hub, GHCR, quay, self-hosted, etc.).
-`llmman serve` exposes Ollama-, OpenAI-, and Anthropic-compatible HTTP APIs.
+<h1 align="center">llmman</h1>
+
+<p align="center"><b>Run any coding agent on any model.</b></p>
+
+<p align="center">
+Claude Code, Codex, OpenCode and friends, pointed at a model
+running on your own machine, or at any hosted provider, in one command.
+No subscription, no rewiring, no vendor's idea of which model you should use.
+</p>
+
+```
+llmman launch claude --model gemma4
+```
+
+That starts a local inference server, downloads a `llama.cpp` build matching your
+GPU, loads the model, and execs Claude Code against it. Every token is generated
+on your machine. No Anthropic API key, no subscription, nothing leaves the box.
+
+<!-- TODO: 20s asciinema/GIF here: launch claude -> boots -> wifi off -> still coding -->
+
+## Install
+
+**Linux, macOS:**
+
+```
+curl -fsSL https://raw.githubusercontent.com/llmmanorg/llmman/main/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```
+irm https://raw.githubusercontent.com/llmmanorg/llmman/main/install.ps1 | iex
+```
+
+## Quick start
+
+Three commands cover most of it:
+
+```sh
+llmman launch claude --model gemma4   # a coding agent on a local model
+llmman run gemma4                     # just chat with a model
+llmman serve                          # an Ollama/OpenAI/Anthropic-compatible endpoint
+```
+
+Run `llmman launch` with no arguments to see the supported agents and whether
+each is installed. Want a hosted model instead of a local one? Every command
+above takes `--provider`; see [Hosted providers](#hosted-providers).
 
 ## Commands
 
@@ -25,21 +71,15 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 | `login`   | Log in to a container registry |
 | `logout`  | Log out from a container registry |
 
-## Install
+See [docs/configuration.md](docs/configuration.md) for environment variables
+and the model store layout.
 
-**Linux, macOS:**
+## Models are OCI artifacts
 
-```
-curl -fsSL https://raw.githubusercontent.com/llmmanorg/llmman/main/install.sh | sh
-```
-
-**Windows (PowerShell):**
-
-```
-irm https://raw.githubusercontent.com/llmmanorg/llmman/main/install.ps1 | iex
-```
-
-## Quick start
+Models are packaged as standard OCI artifacts and stored in any compatible
+registry: Docker Hub, GHCR, quay, self-hosted. There is no curated library and
+no gatekeeper: push a model anywhere you can push a container image, and anyone
+can `llmman run` it straight from there.
 
 ### Pull a model
 
@@ -58,7 +98,7 @@ llmman transfer hf.co/unsloth/Qwen3.5-0.8B-GGUF docker.io/owner/model:latest
 
 Any source `llmman pull` understands (an OCI registry, `hf://`, `ms://`, ...) can be paired with any OCI registry destination.
 
-### Serve
+## Serve
 
 Start the inference server. GGUF models are served by `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp), used from `PATH` if it's already there; otherwise `llmman` downloads and caches a prebuilt release matching your OS/arch/GPU automatically (see `--llama-cpp-version` to pin a specific release). Safetensors models are served by [`vllm`](https://github.com/vllm-project/vllm) (plain `vllm` is CPU-only on macOS, unless you separately install [vllm-metal](https://github.com/vllm-project/vllm-metal) for Metal GPU support), or, on Apple Silicon macOS, by [`mlx-lm`](https://github.com/ml-explore/mlx-lm)'s `mlx_lm.server` instead when it's on `PATH`: Metal-accelerated, with no vLLM dependency at all, and it supports more model families than vllm-metal does.
 
@@ -76,7 +116,7 @@ The server listens on `127.0.0.1:17434` by default, overridable via `LLMMAN_HOST
 | llmman | `/llmman/providers`, `/llmman/providers/{id}` |
 | Prometheus | `/metrics` (off unless `LLMMAN_METRICS=1`) |
 
-`/llmman/...` is llmman's own API, not a compatibility surface — no
+`/llmman/...` is llmman's own API, not a compatibility surface: no
 upstream API has a notion of a [models.dev](https://models.dev) provider
 (see [Hosted providers](#hosted-providers)). `/llmman/providers` lists
 the ones this daemon can route to, each with its API-key variable,
@@ -163,42 +203,11 @@ An idle, unused model is automatically unloaded after `keep_alive`
 `LLMMAN_KEEP_ALIVE`), and `llmman ps`/`/api/ps` reports each model's
 `expires_at`.
 
-Daemon-wide settings, set before `llmman serve` starts. llmman is a very
-different program underneath (no per-GPU memory estimator, no embedded
-inference engine, no cloud/desktop-app features), so an equivalent
-setting may not behave identically.
+Daemon-wide settings (bind address, context length, keep-alive, GPU backend
+selection and the rest) are environment variables, set before `llmman serve`
+starts. They're documented in [docs/configuration.md](docs/configuration.md).
 
-| Variable | Effect |
-|----------|--------|
-| `LLMMAN_DEBUG` | Enables verbose diagnostic logging (a spawned backend's full command line, per-GPU probe detail, etc). Accepts `1`/`true`/`yes`/`on`, or any other non-zero integer. |
-| `LLMMAN_HOST` | `[host][:port]` `llmman serve` binds to. Every `llmman` client in the same environment connects to it too, rewriting a wildcard host to loopback first. Defaults to `127.0.0.1:17434`. |
-| `LLMMAN_CONTEXT_LENGTH` | Context size (`--ctx-size`) for every model this daemon loads. Defaults to a VRAM-tiered value when unset. |
-| `LLMMAN_KEEP_ALIVE` | The daemon-wide default `keep_alive` (how long an idle, unused model stays loaded before being unloaded). Defaults to 5 minutes. Overridden per-request by `/api/chat`/`/api/generate`'s own `keep_alive` field. |
-| `LLMMAN_MAX_LOADED_MODELS` | Caps how many models this daemon keeps loaded at once, as one flat daemon-wide total (llmman has no per-model memory estimate to size an automatic per-GPU figure against). Once at the cap, the least-recently-used idle model is evicted to make room; if every loaded model is busy, the request gets a `503` instead. Defaults to `0` (unbounded, today's behavior, unchanged). |
-| `LLMMAN_MAX_QUEUE` | Caps how many requests `llmman serve` admits into scheduling at once; anything beyond that gets an immediate `503` (`server busy, please try again.  maximum pending requests exceeded`, two spaces included). Defaults to `512`. |
-| `LLMMAN_MAX_TRANSFER_STREAMS` | Maximum number of a HuggingFace safetensors repo's files downloaded concurrently during `pull`. Has no effect on GGUF transfers, and is not read by `transfer`'s own `docker`-feature registry-push path, which streams files sequentially. Defaults to `4`. |
-| `LLMMAN_METRICS` | Serves the Prometheus scrape endpoint at `/metrics`. Accepts `1`/`true`/`yes`/`on`. Off by default: the router has no authentication, so an upgrade should not start publishing this daemon's version, route mix, model names and model churn to whoever can reach the port. Unset, the route is absent and answers `404`. |
-| `LLMMAN_MODELS` | Local store directory, overriding the default below. `pull`/`push`/`run`/etc. go through the daemon and always use whichever store it was started with. |
-| `LLMMAN_NUM_PARALLEL` | Number of parallel request slots (`--parallel`) for GGUF models (llama-server only; no vllm/mlx equivalent). `--ctx-size` is scaled up by this value first, so each slot still gets the full configured/default context rather than an even split of it; ignored (with a warning) for a load with no explicit context size to scale. Unset leaves llama-server's own default of 1 untouched. |
-| `LLMMAN_ORIGINS` | A comma-separated list of extra allowed CORS origins for the HTTP API. A trailing `:*` on an entry matches any port on that scheme+host. Always includes every scheme/port on `localhost`/`127.0.0.1`/`0.0.0.0`/`[::1]` regardless of this variable. |
-| `LLMMAN_SCHED_SPREAD` | Truthy forwards `--split-mode layer` (spread a model across every GPU, already llama-server's own default); falsey forwards `--split-mode none` (restrict to one GPU). |
-| `LLMMAN_FLASH_ATTENTION` | Flash Attention mode (`--flash-attn`): `on`, `off`, or `auto` (llama-server's own default). Also accepts `1`/`0`/`true`/`false`. |
-| `LLMMAN_KV_CACHE_TYPE` | KV-cache quantization (`--cache-type-k`/`--cache-type-v`), e.g. `f16` (default), `q8_0`, `q4_0`. Trades output quality for memory at long context lengths. |
-| `LLMMAN_LLM_LIBRARY` | Forces which GPU backend `llmman serve`/`run` picks (`cpu`, `cuda`/`cuda12`, `cuda13`, `rocm`, `vulkan`, or macOS-only `metal`), bypassing autodetection. Has no effect when a `llama-server` binary is already on `PATH` (its own backend is fixed), or on macOS's local-binary download (one asset per architecture, no separate choice to make). |
-| `LLMMAN_GPU_OVERHEAD` | Bytes of VRAM to hold back from the VRAM-tiered `LLMMAN_CONTEXT_LENGTH` default, leaving headroom for whatever else shares the device. Applied as one combined-total subtraction rather than per-GPU (llmman only ever probes one combined VRAM total). |
-| `LLMMAN_IGPU_ENABLE` | Counts integrated GPUs (Vulkan only) when probing for an accelerator. Defaults to disabled, since an integrated GPU is usually a worse choice than the discrete/CPU fallback it would otherwise be skipped in favor of. |
-| `LLMMAN_LOAD_TIMEOUT` | How long to allow a model load to stall before giving up. Zero or negative means wait forever. Defaults to 10 minutes (`vllm` can take several minutes to load a large safetensors model). |
-| `LLMMAN_TMPDIR` | Staging directory for `llama-server` release downloads, overriding the default `tmp` subdirectory of the install root. |
-| `LLMMAN_NOPRUNE` | When set (to anything other than `0`/`false`/`no`/`off`), skips the garbage-collection sweep that `llmman rm` and `llmman serve` startup otherwise run to delete blobs and extracted-cache entries no longer referenced by any local model. Note this is broader than skipping the daemon-startup catch-all: it also stops `llmman rm` itself from ever freeing disk space, so a removed model's (possibly multi-GB) weights stay on disk until a later sweep runs without this set. Useful for a shared/read-mostly store, or scripts that `rm` in a loop and prune once at the end. |
-| `LLAMA_ARG_FIT` / `LLAMA_ARG_FIT_TARGET` | llama.cpp's own env-configurable `--fit`/`--fit-target` options. Not something llmman parses itself, just forwarded through to every `llama-server` (local or `--ociman` container) it spawns, same as `CUDA_VISIBLE_DEVICES`/etc. below. |
-
-GPU device-selection variables `llmman serve` forwards to every
-`llama-server` it spawns (local or `--ociman` container):
-`CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`,
-`ROCR_VISIBLE_DEVICES`, `GGML_VK_VISIBLE_DEVICES`, `GPU_DEVICE_ORDINAL`,
-`HSA_OVERRIDE_GFX_VERSION`.
-
-### Launch an integration
+## Launch an integration
 
 Point an integration at a model in one step. `llmman launch` starts `serve` in the background if it isn't already running (preloading the requested model), then sets the right environment variables and execs the integration:
 
@@ -210,9 +219,9 @@ Run `llmman launch` with no arguments to list the supported integrations (Claude
 
 Short names work wherever a model reference is accepted.
 
-#### Hosted providers
+### Hosted providers
 
-`--provider` points llmman at a model it doesn't serve itself — from
+`--provider` points llmman at a model it doesn't serve itself, from
 `launch`, from `run`, and from `list`:
 
 ```sh
@@ -224,8 +233,8 @@ llmman launch opencode --provider openrouter --model qwen/qwen3-coder
 ```
 
 The provider list is fetched at runtime from
-[models.dev](https://models.dev) — the same catalog `opencode` resolves
-its own providers from — so a newly added provider works without an
+[models.dev](https://models.dev), the same catalog `opencode` resolves
+its own providers from, so a newly added provider works without an
 llmman release. It's cached for 24 hours, and a stale copy is used if the
 fetch fails, so being offline means an out-of-date list rather than a
 broken command.
@@ -245,19 +254,12 @@ and travels per request, never to disk. `hermes` is the exception: llmman
 configures it through a file on disk, so it can't carry a key and
 `llmman serve` needs the variable in its own environment instead. That
 fallback is only used for a daemon bound to loopback, and never for a
-browser request from another site — it bounds the blast radius rather
+browser request from another site. It bounds the blast radius rather
 than authenticating anyone, so on a shared machine prefer an integration
-that sends its own key. `cline`, `kimi`, `copilot`, `gemini` and `openclaw` can't be
-used with `--provider` at all — the first two pick their own model rather
-than taking llmman's, `copilot` has no way to send a key, `gemini` feeds
-its key to a native Google client llmman can't confirm it has redirected,
-and `openclaw` only takes a model during first-run onboarding.
-
-Being OpenAI-compatible doesn't mean implementing every OpenAI route.
-`codex` uses `/v1/responses`, which `openai`, `groq` and `openrouter`
-answer but `anthropic` and `mistral` don't; models.dev carries no
-capability data to filter on, so llmman turns that provider's bare 404
-into an explanation naming what's missing rather than guessing up front.
+that sends its own key. `cline`, `kimi`, `copilot` and `openclaw` can't be
+used with `--provider` at all: the first two pick their own model rather
+than taking llmman's, `copilot` has no way to send a key, and `openclaw`
+only takes a model during first-run onboarding.
 
 `--provider` needs a local `llmman serve`. The daemon talks plain HTTP
 and has no authentication, so neither `run` nor `launch` will send a real
@@ -267,13 +269,7 @@ that didn't present one. (`llmman providers` and `llmman list
 --provider` read the catalog only, no key involved, and work against any
 daemon.)
 
-Providers llmman cannot reach with a single bearer token over an
-OpenAI-compatible https endpoint are deliberately absent rather than
-half-supported: Amazon Bedrock (SigV4 request signing), Google Vertex
-(GCP service-account credentials), Azure, and the others whose endpoint
-is per-account or whose wire format isn't OpenAI's.
-
-### Use with vLLM directly
+## Use with vLLM directly
 
 `llmman serve` already spawns `vllm` itself as a backend for safetensors
 models. The [`vllm-llmman`](https://pypi.org/project/vllm-llmman/) plugin
@@ -281,7 +277,7 @@ is the inverse: install it alongside `vllm` and `vllm serve
 oci://<reference>` pulls a CNCF ModelPack image directly, instead of a
 HuggingFace repo.
 
-### MLX (Apple Silicon)
+## MLX (Apple Silicon)
 
 On Apple Silicon macOS, `llmman serve` uses
 [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) instead of `vllm`
@@ -289,25 +285,6 @@ for safetensors models whenever it's on `PATH`, Metal-accelerated, with
 no vLLM dependency at all (unlike getting the same acceleration out of
 `vllm serve` itself via [vllm-metal](https://github.com/vllm-project/vllm-metal)).
 Falls back to `vllm` otherwise. Doesn't support `/v1/embeddings`.
-
-## Store location
-
-Default locations:
-
-| OS | Path |
-|----|------|
-| Linux, macOS | `~/.local/share/llmman/store` |
-| Windows | `%LOCALAPPDATA%\llmman\store` |
-
-Set `LLMMAN_MODELS` to change this (matching Ollama's `OLLAMA_MODELS`).
-Commands that read or write the local store directly (`list`, `rm`,
-`build`, `serve`) all honor it. Commands that go through the background
-daemon instead (`pull`, `push`, `run`, `launch`, `ps`) always use whichever
-store the daemon was started with; set `LLMMAN_MODELS` before
-`llmman serve` to change it for all of them. `transfer`, `login`, and
-`logout` never touch a local store at all.
-
-The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), readable by `docker` and `podman`.
 
 ## Transport backends
 

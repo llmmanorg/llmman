@@ -323,6 +323,30 @@ jobs:
         if: matrix.check-fmt
         run: cargo fmt --all -- --check
 
+      # `fuzzing` gates fuzz_check_parse_registry_ref in src/shortnames.rs,
+      # which the fuzz/ crate below calls but nothing else in the tree
+      # references. Without this step, a rename of ParsedRef's fields, or
+      # of MAX_PART_LEN/MAX_HOST_LEN, compiles clean on every other leg
+      # and only breaks the fuzz harness, with no CI signal. This only
+      # compiles the feature; it does not run cargo-fuzz, which needs a
+      # nightly toolchain this job does not install (actual fuzzing runs
+      # on a developer's workstation, not in CI). Runs once, on the
+      # check-fmt leg, same reason as cargo fmt: pure Rust logic, no
+      # OS-specific `#[cfg]`.
+      - name: cargo clippy --features fuzzing
+        if: matrix.check-fmt
+        run: cargo clippy --features fuzzing --lib -- -D warnings
+
+      # fuzz/ is its own crate (cargo-fuzz's own convention), with its own
+      # Cargo.toml, so the workspace-level clippy/test steps above never
+      # touch it. A plain `cargo check` against its manifest catches it
+      # going stale against src/shortnames.rs's public surface, without
+      # needing cargo-fuzz or nightly. Same check-fmt gating as above: no
+      # OS-specific behavior to test per target.
+      - name: cargo check fuzz/
+        if: matrix.check-fmt
+        run: cargo check --manifest-path fuzz/Cargo.toml
+
       # -D warnings: the tree is clippy-clean as of this step being added,
       # so anything new is a regression, not a wart to triage.
       # --all-targets covers tests/ too. Default (docker) feature only:
