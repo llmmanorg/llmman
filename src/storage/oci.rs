@@ -344,7 +344,16 @@ impl OciStore {
             // Present but unparsable is a broken store, not a typo —
             // surface that error rather than falling through to "not
             // found".
-            return self.read_ref(reference);
+            let desc = self.read_ref(reference)?;
+            // A digest reference names content, and the pointer at its
+            // path answers for it only while it holds that content. One
+            // that holds another digest, from a `cp` of an older llmman
+            // to a digest-shaped destination or from a hand edit, is
+            // passed over, and the lookup by content below decides.
+            match split_ref_digest(reference).1 {
+                Some(digest) if !desc.digest.eq_ignore_ascii_case(digest) => {}
+                _ => return Ok(desc),
+            }
         }
         let refs = self.list_refs();
         matching_index(&refs, reference)
@@ -397,8 +406,11 @@ impl OciStore {
     }
 
     /// Remove the same single entry `find` would return for `reference`
-    /// (see `find`'s own doc comment on its fast path and fallback).
-    /// Does not GC blobs.
+    /// (see `find`'s own doc comment on its fast path and fallback), with
+    /// one difference: the pointer at the reference's own path goes
+    /// whatever digest it holds, since a pointer `find` passes over for
+    /// holding other content is exactly what `rm` has to be able to take
+    /// away. Does not GC blobs.
     pub fn remove(&self, reference: &str) -> anyhow::Result<()> {
         if self.remove_ref(reference).is_ok() {
             return Ok(());
@@ -951,6 +963,41 @@ mod tests {
         assert_eq!(repo_name("docker.io/ai/m:v9@sha256:aa"), "docker.io/ai/m");
         assert_eq!(repo_name("localhost:5000/m"), "localhost:5000/m");
         assert_eq!(repo_name("localhost:5000/m:v1"), "localhost:5000/m");
+    }
+
+    /// A pointer at a digest-shaped path that holds another digest is not
+    /// what a lookup by that digest gets; the content decides, and the
+    /// pointer itself can still be removed by name.
+    #[test]
+    fn find_passes_over_a_digest_named_pointer_holding_other_content() {
+        let dir = temp_store_dir("digest-pointer");
+        let store = OciStore::open(&dir).unwrap();
+        let mut lying = desc_with_ref("unused");
+        lying.digest = "sha256:aaaa".into();
+        store.tag(lying, "docker.io/ai/m@sha256:bbbb").unwrap();
+
+        assert!(store.find("docker.io/ai/m@sha256:bbbb").is_err());
+        assert_eq!(
+            store.find("docker.io/ai/m@sha256:aaaa").unwrap().digest,
+            "sha256:aaaa",
+            "by content, the pointer is the entry for the digest it holds"
+        );
+        let mut real = desc_with_ref("unused");
+        real.digest = "sha256:bbbb".into();
+        store.tag(real, "docker.io/ai/m:v9").unwrap();
+        assert_eq!(
+            store
+                .find("docker.io/ai/m@sha256:bbbb")
+                .unwrap()
+                .annotations
+                .unwrap()["org.opencontainers.image.ref.name"],
+            "docker.io/ai/m:v9"
+        );
+        store.remove("docker.io/ai/m@sha256:bbbb").unwrap();
+        assert!(store.find("docker.io/ai/m@sha256:aaaa").is_err());
+        assert!(store.find("docker.io/ai/m:v9").is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Same branch through `find`: stored under a tag, looked up by digest.

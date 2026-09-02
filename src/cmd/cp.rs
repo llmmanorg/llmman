@@ -33,14 +33,41 @@ pub fn run(args: &CpArgs) -> anyhow::Result<()> {
     let store = OciStore::open(&store_root)?;
 
     let desc = store.find(&source)?;
+    // A destination spelled as a digest names content, and the store
+    // answers such a reference by content (see `OciStore::find`): a
+    // pointer there holding some other digest would be passed over by a
+    // lookup for the digest it is named for and answer only for the one
+    // it holds, so it is refused.
+    check_digest_destination(&args.destination, &desc.digest)?;
     store.tag(desc, &args.destination)?;
     println!("copied '{}' to '{}'", args.source, args.destination);
     Ok(())
 }
 
+/// Refuses a `<name>@<digest>` destination whose digest is not `actual`,
+/// the copied descriptor's. A tag, or the matching digest in either
+/// case, passes.
+fn check_digest_destination(destination: &str, actual: &str) -> anyhow::Result<()> {
+    match crate::storage::split_ref_digest(destination).1 {
+        Some(digest) if !digest.eq_ignore_ascii_case(actual) => anyhow::bail!(
+            "destination {destination} names digest {digest}, but the source's is {actual}"
+        ),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A digest-shaped destination has to name the content being copied.
+    #[test]
+    fn a_digest_destination_must_match_the_copied_digest() {
+        assert!(check_digest_destination("docker.io/ai/m:v9", "sha256:aaaa").is_ok());
+        assert!(check_digest_destination("docker.io/ai/m@sha256:aaaa", "sha256:aaaa").is_ok());
+        assert!(check_digest_destination("docker.io/ai/m@sha256:AAAA", "sha256:aaaa").is_ok());
+        assert!(check_digest_destination("docker.io/ai/m@sha256:bbbb", "sha256:aaaa").is_err());
+    }
 
     #[test]
     fn cp_rejects_an_invalid_destination_before_writing() {
