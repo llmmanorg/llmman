@@ -1134,7 +1134,17 @@ fn write_talos_env(path: &std::path::Path, pairs: &[(&str, &str)]) -> anyhow::Re
             anyhow::bail!("{key}: value would not survive a KEY=VALUE line");
         }
     }
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    // Only a file that is not there counts as empty: an unreadable or
+    // non-UTF-8 one must not be quietly replaced by a fresh file that
+    // knows only our two keys — the operator's token and allowlist live
+    // in that file too.
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
     let mut out: Vec<String> = Vec::new();
     let mut written: Vec<&str> = Vec::new();
     for line in existing.lines() {
@@ -1589,6 +1599,14 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
             write_talos_env(&fresh, &[("TALOS_MODEL", "m\nTALOS_ALLOWED_PRINCIPALS=*")]).is_err()
         );
         assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "TALOS_MODEL=m\n");
+
+        // An existing file that cannot be read as text is an error, not an
+        // empty file: rewriting it would drop everything else it holds.
+        let garbled = dir.join("garbled.env");
+        std::fs::write(&garbled, [0xff, 0xfe, b'\n']).unwrap();
+        assert!(write_talos_env(&garbled, &[("TALOS_MODEL", "m")]).is_err());
+        assert_eq!(std::fs::read(&garbled).unwrap(), [0xff, 0xfe, b'\n']);
+        assert!(!dir.join("garbled.env.llmman-tmp").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
