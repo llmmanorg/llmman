@@ -406,23 +406,53 @@ impl OciStore {
     }
 
     /// Remove the same single entry `find` would return for `reference`
-    /// (see `find`'s own doc comment on its fast path and fallback), with
-    /// one difference: the pointer at the reference's own path goes
-    /// whatever digest it holds, since a pointer `find` passes over for
-    /// holding other content is exactly what `rm` has to be able to take
-    /// away. Does not GC blobs.
-    pub fn remove(&self, reference: &str) -> anyhow::Result<()> {
+    /// (see `find`'s own doc comment on its fast path and fallback), and
+    /// say which: the stored reference that went, since for a digest
+    /// that is a tag the caller did not spell. Two differences from
+    /// `find`: the pointer at the reference's own path goes whatever
+    /// digest it holds, since a pointer `find` passes over for holding
+    /// other content is exactly what `rm` has to be able to take away;
+    /// and a digest held by several tags is refused with the tags listed,
+    /// the way `docker rmi` refuses an image several tags point at,
+    /// unless the reference spells one of them (`m:v9@sha256:…`), rather
+    /// than taking whichever the tree is walked to first. A bare
+    /// `m@sha256:…` spells no tag here, even though `find` reads it as
+    /// `:latest` for a lookup: a removal takes the explicit form. Does not
+    /// GC blobs.
+    pub fn remove(&self, reference: &str) -> anyhow::Result<String> {
         if self.remove_ref(reference).is_ok() {
-            return Ok(());
+            return Ok(reference.to_owned());
         }
         let refs = self.list_refs();
+        let (base, digest) = split_ref_digest(reference);
+        if digest.is_some() {
+            // `default_tag` leaves a reference alone only when it already
+            // carries a tag: that is the spelled one.
+            let spelled = (default_tag(base) == base).then_some(base);
+            let held_by: Vec<&str> = refs
+                .iter()
+                .filter(|m| ref_matches_precise(m, reference))
+                .filter_map(stored_ref_name)
+                .collect();
+            if held_by.len() > 1
+                && !held_by
+                    .iter()
+                    .any(|s| spelled.is_some_and(|t| default_tag(s) == t))
+            {
+                return Err(anyhow!(
+                    "{reference} is held by more than one tag: {}; name the tag to remove",
+                    held_by.join(", ")
+                ));
+            }
+        }
         let Some(i) = matching_index(&refs, reference) else {
             return Err(anyhow!("image not found: {}", reference));
         };
         let Some(name) = stored_ref_name(&refs[i]) else {
             return Err(anyhow!("image not found: {}", reference));
         };
-        self.remove_ref(name)
+        self.remove_ref(name)?;
+        Ok(name.to_owned())
     }
 
     // ------------------------------------------------------------------
@@ -605,6 +635,10 @@ fn ref_matches_precise(desc: &Descriptor, reference: &str) -> bool {
     // second server for them. The hex is compared without regard to case
     // because `shortnames::validate_reference` accepts either while the
     // store records lowercase, so an uppercase spelling matched nothing.
+    // Unlike the tag branches below, this one has no tag-only fallback: a
+    // bare `m@sha256:…` against a stored `docker.io/ai/m:v9` misses on the
+    // repository. Latent today, since each caller resolves a reference
+    // through `shortnames::resolve_ollama_api` before it gets here.
     if let (base, Some(digest)) = split_ref_digest(reference) {
         return desc.digest.eq_ignore_ascii_case(digest) && repo_name(stored) == repo_name(base);
     }
@@ -671,9 +705,9 @@ pub fn repo_name(reference: &str) -> &str {
 /// both at that digest picks `m:v9`, and a stored name with no tag
 /// counts as `:latest`, as it does everywhere else in this store.
 /// Between tags it does not spell, the first in the order `list_refs`
-/// walks the tree wins, which is readdir order and not sorted, so a
-/// `remove` by such a reference takes one entry per call and does not
-/// choose which.
+/// walks the tree wins, which is readdir order and not sorted; `remove`
+/// refuses that case rather than take one (see its doc comment), `find`
+/// answers with it.
 fn matching_index(manifests: &[Descriptor], reference: &str) -> Option<usize> {
     let (base, digest) = split_ref_digest(reference);
     if digest.is_some() {
@@ -996,6 +1030,57 @@ mod tests {
         store.remove("docker.io/ai/m@sha256:bbbb").unwrap();
         assert!(store.find("docker.io/ai/m@sha256:aaaa").is_err());
         assert!(store.find("docker.io/ai/m:v9").is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A digest held by several tags: the removal is refused with every
+    /// holder listed, a bare `m@sha256:…` included even with `:latest`
+    /// among them, unless the reference spells one of the tags; then that
+    /// one goes and is named. Nothing goes in readdir order.
+    #[test]
+    fn remove_by_digest_names_what_went_and_refuses_an_ambiguous_one() {
+        let dir = temp_store_dir("digest-remove");
+        let store = OciStore::open(&dir).unwrap();
+        let desc = |digest: &str| {
+            let mut d = desc_with_ref("unused");
+            d.digest = digest.into();
+            d
+        };
+        store.tag(desc("sha256:aaaa"), "docker.io/ai/m:v8").unwrap();
+        store.tag(desc("sha256:aaaa"), "docker.io/ai/m:v9").unwrap();
+        store
+            .tag(desc("sha256:aaaa"), "docker.io/ai/m:latest")
+            .unwrap();
+
+        let err = store.remove("docker.io/ai/m@sha256:aaaa").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            [
+                "docker.io/ai/m:v8",
+                "docker.io/ai/m:v9",
+                "docker.io/ai/m:latest"
+            ]
+            .iter()
+            .all(|t| msg.contains(t)),
+            "{msg}"
+        );
+        assert!(store.find("docker.io/ai/m:latest").is_ok());
+
+        assert_eq!(
+            store.remove("docker.io/ai/m:latest@sha256:aaaa").unwrap(),
+            "docker.io/ai/m:latest"
+        );
+        assert_eq!(
+            store.remove("docker.io/ai/m:v9@sha256:aaaa").unwrap(),
+            "docker.io/ai/m:v9"
+        );
+        assert_eq!(
+            store.remove("docker.io/ai/m@sha256:aaaa").unwrap(),
+            "docker.io/ai/m:v8",
+            "one holder left is not ambiguous, and the name that went is reported"
+        );
+        assert!(store.remove("docker.io/ai/m@sha256:aaaa").is_err());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
