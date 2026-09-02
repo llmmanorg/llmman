@@ -722,18 +722,48 @@ jobs:
         run: |
           & ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -SkipSetup
 
-      # talos has no npm package either (install.sh only, macOS/Linux):
-      # the installer verifies a sha256 and an Ed25519 release signature
-      # before unpacking, runs Talos's own test and adversarial suites,
-      # and puts everything under ~/talos without touching PATH —
-      # tests/launch_e2e.rs's launch_talos_with_model finds it there and
-      # hands the prefix to the launch under test as TALOS_PREFIX. Needs
-      # Python 3.11+, which every non-Windows runner here has.
+      # talos has no npm package either (macOS/Linux only). Its installer
+      # verifies a sha256 and an Ed25519 signature before unpacking, but the
+      # script itself would arrive unpinned — so this does what the installer
+      # does, against a release pinned here: the versioned tarball, checked
+      # against the digest below before anything is unpacked, then a venv
+      # with Talos's requirements under ~/talos (nothing on PATH — that is
+      # where launch_talos looks, and tests/launch_e2e.rs's
+      # launch_talos_with_model hands the prefix on as TALOS_PREFIX).
+      # Bounded retries, then a real failure: a missing Talos would turn
+      # that test into a skip and this job green without it (the ask on
+      # #332, again). Bump version and digest together when moving on.
+      # Needs Python 3.11+, which every non-Windows runner here has.
       - name: Install Talos (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          TALOS_VERSION: 0.17.1-alpha
+          TALOS_SHA256: ac07d1100cf68835a6151134379d36038646c1ab856695082d3cfac8938f6bce
         run: |
-          curl -fsSL https://talos-agent.ch/install.sh | sh || echo "::warning::talos install failed on ${{ runner.os }}"
+          set -euo pipefail
+          tarball="talos-${TALOS_VERSION}.tar.gz"
+          for attempt in 1 2 3; do
+            if curl -fsSL -o "$tarball" "https://talos-agent.ch/dist/${tarball}"; then
+              break
+            fi
+            echo "talos download attempt ${attempt} failed"
+            rm -f "$tarball"
+            [ "$attempt" -lt 3 ] && sleep 10
+          done
+          [ -s "$tarball" ] || { echo "::error::talos ${TALOS_VERSION} never downloaded"; exit 1; }
+          echo "${TALOS_SHA256}  ${tarball}" | shasum -a 256 -c -
+          mkdir -p "$HOME/talos"
+          tar xzf "$tarball" --strip-components=1 -C "$HOME/talos"
+          rm -f "$tarball"
+          python3 -m venv "$HOME/talos/.venv"
+          "$HOME/talos/.venv/bin/python" -m pip install --quiet --upgrade pip
+          "$HOME/talos/.venv/bin/python" -m pip install --quiet -r "$HOME/talos/requirements.txt"
+          # The installer's own first-run file: the template with an empty
+          # allowlist, mode 600 — the e2e grants its own terminal separately.
+          cp "$HOME/talos/.env.example" "$HOME/talos/talos.env"
+          chmod 600 "$HOME/talos/talos.env"
+          (cd "$HOME/talos" && .venv/bin/python -c "import talos; print('talos', talos.__version__)")
 
       # opencode installs its configured provider's npm package (here
       # @ai-sdk/openai-compatible — see launch::opencode_config) on demand
