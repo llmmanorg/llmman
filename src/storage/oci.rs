@@ -618,6 +618,14 @@ fn ref_matches_precise(desc: &Descriptor, reference: &str) -> bool {
 /// stored names, which reach `ref_matches_precise` from the annotation
 /// and not through that parser.
 pub fn split_ref_digest(reference: &str) -> (&str, Option<&str>) {
+    // The same guard as `default_tag`: an absolute path or a URI is
+    // opaque to `shortnames::validate_reference`, so an `@` in its last
+    // component is part of the name, not a digest, and splitting it
+    // would let `s3://bucket/model@sha256:…` resolve to a stored
+    // `s3://bucket/model` of that digest instead of importing the key.
+    if reference.starts_with('/') || reference.contains("://") {
+        return (reference, None);
+    }
     let last_slash = reference.rfind('/').map_or(0, |i| i + 1);
     match reference[last_slash..].find('@') {
         Some(offset) => {
@@ -648,16 +656,19 @@ pub fn repo_name(reference: &str) -> &str {
 /// One manifest can sit under several tags, so a digest reference can
 /// match more than one entry. The tag the reference spells (`:latest`
 /// when it spells none) wins: `m:v9@<digest>` with `m:v9` and `m:latest`
-/// both at that digest picks `m:v9`. Between tags it does not spell, the
-/// first in the order `list_refs` walks the tree wins, which is readdir
-/// order and not sorted, so a `remove` by such a reference takes one
-/// entry per call and does not choose which.
+/// both at that digest picks `m:v9`, and a stored name with no tag
+/// counts as `:latest`, as it does everywhere else in this store.
+/// Between tags it does not spell, the first in the order `list_refs`
+/// walks the tree wins, which is readdir order and not sorted, so a
+/// `remove` by such a reference takes one entry per call and does not
+/// choose which.
 fn matching_index(manifests: &[Descriptor], reference: &str) -> Option<usize> {
     let (base, digest) = split_ref_digest(reference);
     if digest.is_some() {
         let spelled = default_tag(base);
         let own_tag = manifests.iter().position(|m| {
-            ref_matches_precise(m, reference) && stored_ref_name(m) == Some(spelled.as_str())
+            ref_matches_precise(m, reference)
+                && stored_ref_name(m).is_some_and(|stored| default_tag(stored) == spelled)
         });
         if own_tag.is_some() {
             return own_tag;
@@ -901,6 +912,17 @@ mod tests {
             matching_index(&manifests, "docker.io/ai/m@sha256:bbbb"),
             None
         );
+
+        // A tagless stored name is `:latest` here too, ahead of `:v9`
+        // whatever order the tree is walked in.
+        let mut tagless = desc_with_ref("docker.io/ai/m");
+        tagless.digest = "sha256:aaaa".into();
+        let mut v9 = desc_with_ref("docker.io/ai/m:v9");
+        v9.digest = "sha256:aaaa".into();
+        assert_eq!(
+            matching_index(&[v9, tagless], "docker.io/ai/m@sha256:aaaa"),
+            Some(1)
+        );
     }
 
     #[test]
@@ -916,6 +938,15 @@ mod tests {
         assert_eq!(
             split_ref_digest("docker.io/ai/m:v9"),
             ("docker.io/ai/m:v9", None)
+        );
+        // Opaque sources keep their `@`, as `default_tag` keeps their `:`.
+        assert_eq!(
+            split_ref_digest("s3://bucket/model@sha256:aa"),
+            ("s3://bucket/model@sha256:aa", None)
+        );
+        assert_eq!(
+            split_ref_digest("/models/m@sha256:aa"),
+            ("/models/m@sha256:aa", None)
         );
         assert_eq!(repo_name("docker.io/ai/m:v9@sha256:aa"), "docker.io/ai/m");
         assert_eq!(repo_name("localhost:5000/m"), "localhost:5000/m");
