@@ -5,6 +5,7 @@ pub mod container;
 pub mod daemon;
 pub mod ffi;
 pub mod fmt;
+pub mod fsutil;
 pub mod gguf;
 pub mod harmony;
 pub mod hf;

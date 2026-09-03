@@ -747,21 +747,15 @@ fn load() -> anyhow::Result<Loaded> {
     }
 }
 
-/// Writes the cache through a temp file and a rename, as opencode does
+/// Writes the cache atomically (`fsutil::write_atomic`), as opencode does
 /// for its own copy: `llmman launch` and `llmman serve` refresh it
 /// independently and do overlap, and a plain write leaves a window in
-/// which the other reads a half-written file. Rename is atomic, so a
-/// reader sees the old copy or the new one. The temp name carries the pid
-/// so two writers can't share one.
+/// which the other reads a half-written file.
 fn write_cache(path: &std::path::Path, raw: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&tmp, raw)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::fsutil::write_atomic(path, raw)
 }
 
 fn fetch(url: &str) -> anyhow::Result<Vec<u8>> {
