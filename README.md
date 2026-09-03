@@ -12,7 +12,7 @@ running on your own machine, or at any hosted provider, in one command.
 No subscription, no rewiring, no vendor's idea of which model you should use.
 </p>
 
-```
+```sh
 llmman launch claude --model gemma4
 ```
 
@@ -26,13 +26,13 @@ on your machine. No Anthropic API key, no subscription, nothing leaves the box.
 
 **Linux, macOS:**
 
-```
+```sh
 curl -fsSL https://raw.githubusercontent.com/llmmanorg/llmman/main/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
-```
+```powershell
 irm https://raw.githubusercontent.com/llmmanorg/llmman/main/install.ps1 | iex
 ```
 
@@ -211,7 +211,7 @@ starts. They're documented in [docs/configuration.md](docs/configuration.md).
 
 Point an integration at a model in one step. `llmman launch` starts `serve` in the background if it isn't already running (preloading the requested model), then sets the right environment variables and execs the integration:
 
-```
+```sh
 llmman launch claude --model gemma4
 ```
 
