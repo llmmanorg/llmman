@@ -113,7 +113,7 @@ llmman push docker.io/myorg/mymodel:v1 --sign-key signing.key
 llmman verify docker.io/myorg/mymodel:v1 --key signing.pub
 ```
 
-A `verify.conf` trust policy turns that into an automatic check on every
+A `[verify]` trust policy turns that into an automatic check on every
 `pull`, warning or refusing outright per repository. Off by default —
 there is nothing to check against until you have said whom you trust.
 See [docs/verification.md](docs/verification.md).
@@ -261,19 +261,31 @@ broken command.
 
 All four commands ask the daemon over [`/llmman/providers`](#serve)
 rather than fetching models.dev themselves, so the cache outlives any
-single command and the key status reported is that of the environment
-whose key actually gets spent.
+single command and the key status reported is that of the process whose
+key actually gets spent.
 
 Requests still go through `llmman serve`; `--provider` changes where the
 daemon forwards them, not who the client talks to. So one endpoint and
 one place integrations are configured, whether a model is local or
 hosted, and both usable from the same session.
 
-The API key is read from the variable models.dev names for that provider
-and travels per request, never to disk. `hermes` is the exception: llmman
-configures it through a file on disk, so it can't carry a key and
-`llmman serve` needs the variable in its own environment instead. That
-fallback is only used for a daemon bound to loopback, and never for a
+The API key comes from the variable models.dev names for that provider,
+or — when that is unset — from `~/.config/llmman/llmman.conf`, keyed by
+provider id:
+
+```toml
+[providers.openrouter]
+api_key = "sk-or-..."
+```
+
+Either way it travels per request; llmman itself never writes a key
+anywhere. A file carrying one must be `chmod 600` or the keys in it are
+ignored with a warning, and an `export` still overrides it. See
+[docs/configuration.md](docs/configuration.md#provider-api-keys).
+
+`hermes` is the exception: llmman configures it through a file on disk,
+so it can't carry a key and `llmman serve` needs one of its own instead.
+That fallback is only used for a daemon bound to loopback, and never for a
 browser request from another site. It bounds the blast radius rather
 than authenticating anyone, so on a shared machine prefer an integration
 that sends its own key. `cline`, `kimi`, `copilot` and `openclaw` can't be
@@ -284,7 +296,7 @@ only takes a model during first-run onboarding.
 `--provider` needs a local `llmman serve`. The daemon talks plain HTTP
 and has no authentication, so neither `run` nor `launch` will send a real
 key to a remote `LLMMAN_HOST`, and a daemon bound to anything but
-loopback will not spend its own environment's key on behalf of a caller
+loopback will not spend its own key on behalf of a caller
 that didn't present one. (`llmman providers` and `llmman list
 --provider` read the catalog only, no key involved, and work against any
 daemon.)

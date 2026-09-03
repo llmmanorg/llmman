@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 pub mod cmd;
+pub mod config;
 pub mod container;
 pub mod daemon;
 pub mod ffi;

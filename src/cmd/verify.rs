@@ -10,7 +10,7 @@ pub struct VerifyArgs {
     pub reference: String,
 
     /// PEM public key to trust, repeatable. Overrides whatever
-    /// verify.conf would have selected for this reference.
+    /// the `[verify]` policy would have selected for this reference.
     #[arg(long = "key", value_name = "PATH")]
     pub keys: Vec<String>,
 
@@ -33,7 +33,7 @@ pub struct VerifyArgs {
 /// "why did my policy not fire?" and "who actually signed this?" are
 /// answerable without editing config files. Consequently its exit status
 /// reflects the *signature*, not the policy: unverified is a failure
-/// here even where `verify.conf` would only have warned.
+/// here even where the `[verify]` policy would only have warned.
 pub fn run(args: &VerifyArgs) -> anyhow::Result<()> {
     crate::shortnames::validate_reference(&args.reference)?;
     let reference = crate::shortnames::resolve(&args.reference)?;
@@ -56,7 +56,7 @@ pub fn run(args: &VerifyArgs) -> anyhow::Result<()> {
     if keys.is_empty() {
         bail!(
             "no trusted public keys to check {reference} against — pass --key PATH, \
-             or add a [[trust]] rule to verify.conf"
+             or add a [[verify.trust]] rule to llmman.conf"
         );
     }
 

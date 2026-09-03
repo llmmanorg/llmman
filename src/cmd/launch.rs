@@ -252,24 +252,24 @@ fn resolve_provider_model(
             anyhow::ensure!(
                 entry.key_usable,
                 "{integration} is configured through a file, so it cannot send an API key: \
-                 llmman serve needs {} in its own environment, and must be bound to \
-                 loopback to spend it.\n\
-                 Export it where the daemon runs and restart it.",
-                entry.key_env
+                 llmman serve needs a key of its own, and must be bound to loopback to \
+                 spend it.\n\
+                 Where the daemon runs, {}, then restart it.",
+                providers::key_hint(&entry.id, &entry.key_env)
             );
             providers::PLACEHOLDER_API_KEY.to_string()
         }
         (None, true) if entry.daemon_key_usable() => {
             eprintln!(
-                "[llmman] warning: {} is unset here; using the key llmman serve has",
-                entry.key_env
+                "[llmman] warning: no API key for {} here; using the key llmman serve has",
+                entry.name
             );
             providers::PLACEHOLDER_API_KEY.to_string()
         }
         (None, true) => anyhow::bail!(
-            "no API key for {} — set {} in your environment",
+            "no API key for {} — {}",
             entry.name,
-            entry.key_env
+            providers::key_hint(&entry.id, &entry.key_env)
         ),
     };
 
