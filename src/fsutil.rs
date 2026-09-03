@@ -2,17 +2,27 @@
 
 use std::io::Write as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Distinguishes the temp files of concurrent writers in one process; the
+/// pid does the same across processes.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Writes `bytes` to `path` through a temp file beside it and a rename,
-/// so a reader sees the old file or the new one and not a partial one.
+/// so a reader sees the old file or the new one and not a partial one;
+/// the temp name carries the pid and a counter, so no two writers share
+/// one.
 /// A symlink whose target exists is written through to the target, the
 /// old file's permissions go on the temp before it holds anything, and
 /// the temp is synced before the rename.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut tmp = path.clone().into_os_string();
-    tmp.push(format!(".{}.tmp", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+    tmp.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let written = (|| {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -57,6 +67,27 @@ mod tests {
         write_atomic(&path, b"one").unwrap();
         write_atomic(&path, b"two").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writers in one process racing on one file each land whole.
+    #[test]
+    fn write_atomic_concurrent_writers_each_land_a_whole_file() {
+        let dir = temp_dir("race");
+        let path = dir.join("f.json");
+        let threads: Vec<_> = (0..8u8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || write_atomic(&path, &[i; 4096]).unwrap())
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let got = std::fs::read(&path).unwrap();
+        assert_eq!(got.len(), 4096);
+        assert!(got.iter().all(|b| *b == got[0]));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
