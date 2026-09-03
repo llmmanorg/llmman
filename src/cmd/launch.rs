@@ -890,13 +890,8 @@ fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_qwen().ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
     // After the lookup, so nothing is written for an integration that is
-    // not there; `check_model_flag` has made sure there is a model. A
-    // file that cannot be merged into is left alone and the launch goes
-    // on: Qwen Code resets a file it cannot parse to `{}` itself, and
-    // the flags and variables below carry the endpoint regardless.
-    if let Err(e) = write_qwen_settings(model) {
-        eprintln!("[llmman] qwen: settings.json left alone: {e:#}");
-    }
+    // not there; `check_model_flag` has made sure there is a model.
+    write_qwen_settings(model)?;
 
     let base_url = format!("{}/v1", daemon::server());
     exec_with_env(
@@ -1057,9 +1052,13 @@ fn write_qwen_settings(model: &str) -> anyhow::Result<()> {
 }
 
 /// Read as Qwen Code reads it, comments stripped and an empty file as
-/// `{}`; what is still not a JSON object is refused rather than repaired,
-/// since Qwen Code moves a file it cannot parse to `settings.json.corrupted`
-/// and resets it to `{}`. The file as it was before llmman first wrote
+/// `{}`. What is still not a JSON object is left alone, with a line to
+/// say so, and the launch goes on: Qwen Code moves a file it cannot parse
+/// to `settings.json.corrupted` and resets it to `{}`, so no entry in it
+/// survives to outrank the flags and variables `launch_qwen` passes. A
+/// file that parses but cannot be written is an error, since an entry in
+/// it may be exactly what the write was to outrank.
+/// The file as it was before llmman first wrote
 /// it stays as `settings.json.bak`, and a later one carrying comments,
 /// which the rewrite drops, replaces that copy; llmman's own renderings
 /// and Qwen Code's do not.
@@ -1072,20 +1071,17 @@ fn write_qwen_settings_at(dir: &Path, model: &str, base_url: &str) -> anyhow::Re
     };
     let existing = match raw.as_deref().map(str::trim) {
         None | Some("") => serde_json::json!({}),
-        Some(text) => serde_json::from_str::<serde_json::Value>(&strip_json_comments(text))
-            .with_context(|| {
-                format!(
-                    "{} is not valid JSON; fix or move it, then retry",
+        Some(text) => match serde_json::from_str::<serde_json::Value>(&strip_json_comments(text)) {
+            Ok(value) if value.is_object() => value,
+            _ => {
+                eprintln!(
+                    "[llmman] qwen: {} is not a JSON object; leaving it alone",
                     path.display()
-                )
-            })?,
+                );
+                return Ok(());
+            }
+        },
     };
-    if !existing.is_object() {
-        anyhow::bail!(
-            "{} is not a JSON object; fix or move it, then retry",
-            path.display()
-        );
-    }
     let merged = qwen_settings_merged(&existing, model, base_url);
     if merged == existing {
         return Ok(());
@@ -1627,8 +1623,8 @@ mod tests {
     /// one gets the file, a correct file is not touched, a commented one
     /// merges with its text kept as `.bak`, a later rewrite of llmman's
     /// own rendering leaves that `.bak` alone while a hand edit with
-    /// comments refreshes it, an empty file counts as
-    /// `{}`, and what is not JSON is refused with the file left alone.
+    /// comments refreshes it, an empty file counts as `{}`, and what is
+    /// not JSON is left alone without an error.
     #[test]
     fn write_qwen_settings_at_writes_once_keeps_a_bak_and_refuses_non_json() {
         let dir = std::env::temp_dir().join(format!(
@@ -1680,11 +1676,11 @@ mod tests {
         assert_eq!(read()["model"]["name"], "m:latest");
 
         std::fs::write(&path, "{ not json").unwrap();
-        let err = write_qwen_settings_at(&dir, "m:latest", url).unwrap_err();
-        assert!(format!("{err:#}").contains("not valid JSON"), "{err:#}");
+        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
         std::fs::write(&path, "[]").unwrap();
-        assert!(write_qwen_settings_at(&dir, "m:latest", url).is_err());
+        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
