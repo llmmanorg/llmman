@@ -4,7 +4,7 @@
 
 <h1 align="center">llmman</h1>
 
-<p align="center"><b>Run any coding agent on any model.</b></p>
+<p align="center"><b>Run any agent on any model.</b></p>
 
 <p align="center">
 Claude Code, Codex, OpenCode and friends, pointed at a model
@@ -41,7 +41,7 @@ irm https://raw.githubusercontent.com/llmmanorg/llmman/main/install.ps1 | iex
 Three commands cover most of it:
 
 ```sh
-llmman launch claude --model gemma4   # a coding agent on a local model
+llmman launch claude --model gemma4   # an agent on a local model
 llmman run gemma4                     # just chat with a model
 llmman serve                          # an Ollama/OpenAI/Anthropic-compatible endpoint
 ```

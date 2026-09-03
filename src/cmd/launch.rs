@@ -1,4 +1,4 @@
-//! `llmman launch` — launch AI coding-assistant integrations backed by llmman serve.
+//! `llmman launch` — launch AI agent integrations backed by llmman serve.
 //!
 //! Mirrors `ollama launch`: sets integration-specific environment variables
 //! pointing at the local inference server, then exec's the integration binary.

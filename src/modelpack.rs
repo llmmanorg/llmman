@@ -117,7 +117,7 @@ fn is_mmproj_layer(l: &crate::storage::oci::Descriptor) -> bool {
 // a bug to work around. Defeating that safety net via --override-kv
 // produces a real NaN/incoherent-output risk for out-of-distribution
 // RoPE positions that llama-server's own warning exists to prevent, for
-// a use case (fitting a real coding agent's system prompt) that a model
+// a use case (fitting a real agent's system prompt) that a model
 // whose trained context is that tight was never going to serve well
 // regardless — see docker/sandboxes' own llmmanCtxSize doc comment for the
 // model-selection fix that replaced this instead.
