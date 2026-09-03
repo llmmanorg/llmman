@@ -601,7 +601,11 @@ fn run_launch(
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_DATA_HOME", home.join(".local/share"));
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        // Set, not cleared: a `QWEN_HOME` in the developer's shell would
+        // send the settings `launch qwen` writes past this `HOME`, and on
+        // Windows `dirs::home_dir` reads neither `HOME` nor `USERPROFILE`.
+        .env("QWEN_HOME", home.join(".qwen"));
 
     try_spawn_with_timeout(
         cmd,

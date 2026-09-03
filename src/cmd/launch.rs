@@ -11,7 +11,7 @@
 //! integration a provider's URL directly — one endpoint, one place
 //! integrations are configured, whether or not the weights are local.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
@@ -856,30 +856,32 @@ fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     exec_with_env(&bin, extra_args, &[])
 }
 
-/// qwen: Qwen Code's OpenAI-compatible mode, pointed at our /v1.
+/// qwen: Qwen Code's OpenAI-compatible mode, pointed at our /v1 by the
+/// command line, the environment and its settings file together, since
+/// it reads the three in a different order for each value.
 ///
-/// The auth type and model go on the command line, not only in the
-/// environment. Qwen Code resolves both as `argv`, then its own
-/// `~/.qwen/settings.json`, then the `OPENAI_*` variables, and it writes
-/// that file itself whenever a user picks a provider or model with
-/// `/auth` or `/model`. For anyone who has used it before, variables alone
-/// lose: the session went to the cloud provider recorded there, with that
-/// provider's real key, and reported success. Ollama's own
-/// `cmd/launch/qwen.go` prepends the same two flags.
-///
-/// The base URL and key stay in the environment even though Qwen Code
-/// has `--openai-base-url` and `--openai-api-key`: a key on the command
-/// line is visible in `ps` to anyone on the host, and for these two
-/// Qwen Code reads the variables ahead of its settings file, so the flags
-/// buy nothing. The one thing that still precedes them is a
-/// `modelProviders` entry whose id equals the launched model, which the
-/// `docker.io/…` and `hf.co/…` references llmman hands over do not
-/// collide with.
-///
-/// `--model` is required; `check_model_flag` refuses a launch without one
-/// before the daemon starts.
+/// `--auth-type` and `--model` go on the command line: for those it
+/// reads `argv`, then `~/.qwen/settings.json`, then the `OPENAI_*`
+/// variables, and it writes that file itself on `/auth` and `/model`, so
+/// for anyone who has used it before the variables alone lose. For the
+/// base URL a `modelProviders` entry in the settings file whose id is the
+/// model beats both flag and variable (`resolveModelConfig` in its
+/// `packages/core/src/models/modelConfigResolver.ts`), which is what
+/// `write_qwen_settings` is for. The key stays in the environment: on the
+/// command line it shows in `ps`, and the file only names the variable.
+/// Ollama's `cmd/launch/qwen.go` does the same three. `--model` is
+/// required; `check_model_flag` refuses a launch without one before the
+/// daemon starts.
 fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_on_path("qwen").ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
+    // After the lookup, so nothing is written for an integration that is
+    // not there; `check_model_flag` has made sure there is a model. A
+    // file that cannot be merged into is left alone and the launch goes
+    // on: Qwen Code resets a file it cannot parse to `{}` itself, and
+    // the flags and variables below carry the endpoint regardless.
+    if let Err(e) = write_qwen_settings(model) {
+        eprintln!("[llmman] qwen: settings.json left alone: {e:#}");
+    }
 
     let base_url = format!("{}/v1", daemon::server());
     exec_with_env(
@@ -909,6 +911,204 @@ fn qwen_args(model: &str, extra_args: &[String]) -> Vec<String> {
     }
     args.extend_from_slice(extra_args);
     args
+}
+
+/// `$QWEN_HOME` if set, else `~/.qwen`: `Storage.getGlobalQwenDir` in
+/// Qwen Code's `packages/core/src/config/storage.ts`.
+fn qwen_home() -> anyhow::Result<PathBuf> {
+    let home = dirs::home_dir().context("no home directory")?;
+    match std::env::var("QWEN_HOME").ok().filter(|d| !d.is_empty()) {
+        Some(dir) => Ok(expand_tilde(&dir, &home)),
+        None => Ok(home.join(".qwen")),
+    }
+}
+
+/// A leading `~` is `home`, as Qwen Code's `Storage.resolvePath` reads
+/// it; a quoted export leaves it for the program to expand.
+fn expand_tilde(dir: &str, home: &Path) -> PathBuf {
+    match dir.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => {
+            home.join(rest.trim_start_matches(['/', '\\']))
+        }
+        _ => PathBuf::from(dir),
+    }
+}
+
+/// Records llmman as the `openai` provider for `model` in Qwen Code's
+/// `settings.json`, as `write_codex_config` and `write_hermes_config` do
+/// for theirs. See `qwen_settings_merged` for what goes in.
+fn write_qwen_settings(model: &str) -> anyhow::Result<()> {
+    write_qwen_settings_at(&qwen_home()?, model, &format!("{}/v1", daemon::server()))
+}
+
+/// Read as Qwen Code reads it, comments stripped and an empty file as
+/// `{}`; what is still not a JSON object is refused rather than repaired,
+/// since Qwen Code moves a file it cannot parse to `settings.json.corrupted`
+/// and resets it to `{}`. The file as it was before llmman first wrote
+/// it stays as `settings.json.bak`, and a later one carrying comments,
+/// which the rewrite drops, replaces that copy; llmman's own renderings
+/// and Qwen Code's do not.
+fn write_qwen_settings_at(dir: &Path, model: &str, base_url: &str) -> anyhow::Result<()> {
+    let path = dir.join("settings.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => Some(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let existing = match raw.as_deref().map(str::trim) {
+        None | Some("") => serde_json::json!({}),
+        Some(text) => serde_json::from_str::<serde_json::Value>(&strip_json_comments(text))
+            .with_context(|| {
+                format!(
+                    "{} is not valid JSON; fix or move it, then retry",
+                    path.display()
+                )
+            })?,
+    };
+    if !existing.is_object() {
+        anyhow::bail!(
+            "{} is not a JSON object; fix or move it, then retry",
+            path.display()
+        );
+    }
+    let merged = qwen_settings_merged(&existing, model, base_url);
+    if merged == existing {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    if let Some(raw) = &raw {
+        let bak = path.with_extension("json.bak");
+        if !bak.exists() || strip_json_comments(raw) != *raw {
+            std::fs::copy(&path, &bak)
+                .with_context(|| format!("back up {} to {}", path.display(), bak.display()))?;
+        }
+    }
+    let mut out = serde_json::to_string_pretty(&merged)?;
+    out.push('\n');
+    crate::fsutil::write_atomic(&path, out.as_bytes())
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// `//` and `/* */` comments outside strings replaced by spaces, so a
+/// parse error still points at the right place; what `strip-json-comments`
+/// does for Qwen Code before `JSON.parse`.
+fn strip_json_comments(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                out.push(' ');
+                while chars.peek().is_some_and(|&n| n != '\n') {
+                    chars.next();
+                    out.push(' ');
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                out.push_str("  ");
+                let mut prev = ' ';
+                for n in chars.by_ref() {
+                    out.push(if n == '\n' { '\n' } else { ' ' });
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// On the name of every entry `qwen_settings_merged` writes, and what
+/// `qwen_entry_is_ours` recognises one by.
+const QWEN_ENTRY_MARK: &str = " (llmman)";
+
+/// `existing` with llmman's entry merged in; pure, so it is testable on a
+/// literal document. The keys are the ones Qwen Code's own `/auth` and
+/// `/model` write, and ollama's `applyQwenOllamaConfig` in
+/// `cmd/launch/qwen.go`: llmman's entry first in `modelProviders.openai`,
+/// with an earlier one of its own for this daemon replaced, the rest
+/// kept, and a `{ protocol, models }` wrapper an older Qwen Code wrote
+/// unwrapped as its `V5ToV4Migration` does; `security.auth.selectedType`
+/// and `baseUrl`; `model.name` with `model.baseUrl`, which Qwen Code sets
+/// together. No `$version`, which Qwen Code stamps itself, and no key: the
+/// entry names `OPENAI_API_KEY`, which `launch_qwen` exports. A value of
+/// the wrong type on the way down is replaced, as ollama's `qwenMap` does.
+fn qwen_settings_merged(
+    existing: &serde_json::Value,
+    model: &str,
+    base_url: &str,
+) -> serde_json::Value {
+    let mut doc = existing.as_object().cloned().unwrap_or_default();
+    let ours = serde_json::json!({
+        "id": model,
+        "name": format!("{model}{QWEN_ENTRY_MARK}"),
+        "baseUrl": base_url,
+        "envKey": "OPENAI_API_KEY",
+    });
+    let openai = object_under(&mut doc, "modelProviders")
+        .entry("openai")
+        .or_insert_with(|| serde_json::json!([]));
+    let entries = openai
+        .as_array()
+        .or_else(|| openai.get("models").and_then(serde_json::Value::as_array));
+    let kept = entries.map_or_else(Vec::new, |entries| {
+        entries
+            .iter()
+            .filter(|e| !qwen_entry_is_ours(e, base_url))
+            .cloned()
+            .collect()
+    });
+    *openai = serde_json::Value::Array(std::iter::once(ours).chain(kept).collect());
+    let auth = object_under(object_under(&mut doc, "security"), "auth");
+    auth.insert("selectedType".into(), "openai".into());
+    auth.insert("baseUrl".into(), base_url.into());
+    let model_cfg = object_under(&mut doc, "model");
+    model_cfg.insert("name".into(), model.into());
+    model_cfg.insert("baseUrl".into(), base_url.into());
+    serde_json::Value::Object(doc)
+}
+
+/// The object at `key` in `parent`, put there if absent or not an object.
+fn object_under<'a>(
+    parent: &'a mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    let slot = parent.entry(key).or_insert_with(|| serde_json::json!({}));
+    if !slot.is_object() {
+        *slot = serde_json::json!({});
+    }
+    slot.as_object_mut().expect("set to an object just above")
+}
+
+/// An entry llmman wrote: `QWEN_ENTRY_MARK` on its name, at this daemon's
+/// address. The id is the model name and `envKey` is `OPENAI_API_KEY` on
+/// a hand-written entry too, so neither can mark an owner.
+fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
+    let field = |k: &str| entry.get(k).and_then(serde_json::Value::as_str);
+    field("name").is_some_and(|n| n.ends_with(QWEN_ENTRY_MARK))
+        && field("baseUrl")
+            .is_some_and(|u| u.trim_end_matches('/') == base_url.trim_end_matches('/'))
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,6 +1310,220 @@ mod tests {
             qwen_args("m:latest", &user_camel),
             ["--model", "m:latest", "--authType", "openai"]
         );
+    }
+
+    /// A file a Qwen Code user already has: llmman's entry goes first, an
+    /// older one of its own for this daemon goes, and everything else
+    /// stays, a hand-written entry at this daemon's address included.
+    #[test]
+    fn qwen_settings_merge_keeps_what_is_not_llmmans() {
+        let existing = serde_json::json!({
+            "$version": 4,
+            "ui": { "theme": "keep-me" },
+            "modelProviders": {
+                "gemini": [ { "id": "gemini-2.5-pro" } ],
+                "openai": [
+                    { "id": "docker.io/ai/m:latest", "name": "cloud copy",
+                      "baseUrl": "https://cloud.example/v1",
+                      "envKey": "QWEN_CUSTOM_API_KEY_X", "customField": 1 },
+                    { "id": "old:latest", "name": "old:latest (llmman)",
+                      "baseUrl": "http://127.0.0.1:17434/v1/", "envKey": "OPENAI_API_KEY" },
+                    { "id": "other:latest", "name": "other:latest (llmman)",
+                      "baseUrl": "http://10.0.0.2:17434/v1", "envKey": "OPENAI_API_KEY" },
+                    { "id": "local-alias", "name": "my alias for the daemon",
+                      "baseUrl": "http://127.0.0.1:17434/v1", "envKey": "OPENAI_API_KEY",
+                      "generationConfig": { "temperature": 0.2 } }
+                ]
+            },
+            "security": { "auth": { "selectedType": "qwen-oauth", "apiKey": "keep-too" } },
+            "model": { "name": "gemini-2.5-pro", "generationConfig": { "temperature": 0.1 } }
+        });
+        let url = "http://127.0.0.1:17434/v1";
+        let merged = qwen_settings_merged(&existing, "docker.io/ai/m:latest", url);
+        assert_eq!(merged["$version"], 4);
+        assert_eq!(merged["ui"]["theme"], "keep-me");
+        assert_eq!(
+            merged["modelProviders"]["gemini"],
+            existing["modelProviders"]["gemini"]
+        );
+        let before = existing["modelProviders"]["openai"].as_array().unwrap();
+        let openai = merged["modelProviders"]["openai"].as_array().unwrap();
+        assert_eq!(
+            openai[0],
+            serde_json::json!({ "id": "docker.io/ai/m:latest",
+                "name": "docker.io/ai/m:latest (llmman)", "baseUrl": url,
+                "envKey": "OPENAI_API_KEY" })
+        );
+        assert_eq!(
+            openai[1..],
+            [before[0].clone(), before[2].clone(), before[3].clone()]
+        );
+        assert_eq!(merged["security"]["auth"]["selectedType"], "openai");
+        assert_eq!(merged["security"]["auth"]["baseUrl"], url);
+        assert_eq!(merged["security"]["auth"]["apiKey"], "keep-too");
+        assert_eq!(merged["model"]["name"], "docker.io/ai/m:latest");
+        assert_eq!(merged["model"]["baseUrl"], url);
+        assert_eq!(merged["model"]["generationConfig"]["temperature"], 0.1);
+    }
+
+    /// From nothing, and then again: the second merge changes nothing,
+    /// so `write_qwen_settings_at` leaves a correct file alone. No key
+    /// value and no `env` block anywhere in it.
+    #[test]
+    fn qwen_settings_merge_is_complete_from_nothing_and_idempotent() {
+        let url = "http://127.0.0.1:17434/v1";
+        let once = qwen_settings_merged(&serde_json::json!({}), "m:latest", url);
+        assert_eq!(
+            once,
+            serde_json::json!({
+                "modelProviders": { "openai": [ { "id": "m:latest",
+                    "name": "m:latest (llmman)", "baseUrl": url,
+                    "envKey": "OPENAI_API_KEY" } ] },
+                "security": { "auth": { "selectedType": "openai", "baseUrl": url } },
+                "model": { "name": "m:latest", "baseUrl": url }
+            })
+        );
+        assert_eq!(qwen_settings_merged(&once, "m:latest", url), once);
+        let text = once.to_string();
+        assert!(!text.contains("apiKey") && !text.contains("\"env\""));
+        assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"qwen"));
+    }
+
+    /// A wrong-typed value on the path is replaced, a non-object root
+    /// counts as empty, and a `{ protocol, models }` wrapper keeps its
+    /// entries.
+    #[test]
+    fn qwen_settings_merge_replaces_a_wrong_typed_value_on_its_path() {
+        let existing = serde_json::json!({
+            "security": 3, "modelProviders": { "openai": "x" }, "model": []
+        });
+        let merged = qwen_settings_merged(&existing, "m", "http://h/v1");
+        assert_eq!(merged["security"]["auth"]["selectedType"], "openai");
+        assert_eq!(merged["modelProviders"]["openai"][0]["id"], "m");
+        assert_eq!(merged["model"]["name"], "m");
+        let from_null = qwen_settings_merged(&serde_json::json!(null), "m", "http://h/v1");
+        assert_eq!(from_null["model"]["name"], "m");
+
+        let wrapped = serde_json::json!({
+            "$version": 5,
+            "modelProviders": { "openai": { "protocol": "openai", "models": [
+                { "id": "gpt-5", "baseUrl": "https://api.openai.com/v1", "envKey": "MY_KEY" }
+            ] } }
+        });
+        let merged = qwen_settings_merged(&wrapped, "m", "http://h/v1");
+        let openai = merged["modelProviders"]["openai"].as_array().unwrap();
+        assert_eq!(openai.len(), 2);
+        assert_eq!(openai[1]["id"], "gpt-5");
+    }
+
+    /// Ownership is the mark on the name at this daemon's address; a
+    /// trailing slash does not make a second daemon of the same one.
+    #[test]
+    fn qwen_entry_is_ours_needs_the_mark_and_the_address() {
+        let url = "http://127.0.0.1:17434/v1";
+        let ours = serde_json::json!({ "id": "anything", "name": "anything (llmman)",
+            "baseUrl": "http://127.0.0.1:17434/v1/", "envKey": "OPENAI_API_KEY" });
+        assert!(qwen_entry_is_ours(&ours, url));
+        let hand_written = serde_json::json!({ "id": "local-alias", "name": "my alias",
+            "baseUrl": url, "envKey": "OPENAI_API_KEY" });
+        assert!(!qwen_entry_is_ours(&hand_written, url));
+        let elsewhere = serde_json::json!({ "id": "m:latest", "name": "m:latest (llmman)",
+            "baseUrl": "http://10.0.0.2:17434/v1", "envKey": "OPENAI_API_KEY" });
+        assert!(!qwen_entry_is_ours(&elsewhere, url));
+        assert!(!qwen_entry_is_ours(
+            &serde_json::json!("not an object"),
+            url
+        ));
+    }
+
+    /// Comments go, as `strip-json-comments` takes them out for Qwen Code,
+    /// and nothing else moves: not a `//` inside a string, not a column.
+    #[test]
+    fn strip_json_comments_keeps_strings_and_columns() {
+        let raw =
+            "{\n  // note\n  \"url\": \"http://h//v1\", /* block\n  */ \"q\": \"a\\\"//b\"\n}\n";
+        let stripped = strip_json_comments(raw);
+        assert_eq!(stripped.chars().count(), raw.chars().count());
+        assert_eq!(stripped.lines().count(), raw.lines().count());
+        let v: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(v["url"], "http://h//v1");
+        assert_eq!(v["q"], "a\"//b");
+        assert_eq!(strip_json_comments("{\"a\": 1}"), "{\"a\": 1}");
+    }
+
+    /// A leading `~` is the home directory; anything else is as given.
+    #[test]
+    fn expand_tilde_reads_the_forms_qwen_code_reads() {
+        let home = Path::new("/h");
+        assert_eq!(expand_tilde("~/alt", home), PathBuf::from("/h/alt"));
+        assert_eq!(expand_tilde("~", home), PathBuf::from("/h"));
+        assert_eq!(expand_tilde("/abs", home), PathBuf::from("/abs"));
+        assert_eq!(expand_tilde("~user/x", home), PathBuf::from("~user/x"));
+    }
+
+    /// The reading and writing half over a directory of its own: a fresh
+    /// one gets the file, a correct file is not touched, a commented one
+    /// merges with its text kept as `.bak`, a later rewrite of llmman's
+    /// own rendering leaves that `.bak` alone while a hand edit with
+    /// comments refreshes it, an empty file counts as
+    /// `{}`, and what is not JSON is refused with the file left alone.
+    #[test]
+    fn write_qwen_settings_at_writes_once_keeps_a_bak_and_refuses_non_json() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-qwen-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let url = "http://127.0.0.1:17434/v1";
+        let path = dir.join("settings.json");
+        let bak = dir.join("settings.json.bak");
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        };
+
+        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        assert_eq!(read()["model"]["name"], "m:latest");
+        assert!(!bak.exists(), "nothing to back up on a first write");
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            written
+        );
+
+        let commented = "{\n  // mine\n  \"ui\": { \"theme\": \"x\" }\n}\n";
+        std::fs::write(&path, commented).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        assert_eq!(read()["ui"]["theme"], "x");
+        assert_eq!(read()["model"]["name"], "m:latest");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), commented);
+        write_qwen_settings_at(&dir, "other:latest", url).unwrap();
+        assert_eq!(read()["model"]["name"], "other:latest");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            commented,
+            "llmman's own rendering must not replace the user's backup"
+        );
+        let edited = "{\n  // edited by hand\n  \"ui\": { \"theme\": \"y\" }\n}\n";
+        std::fs::write(&path, edited).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), edited);
+
+        std::fs::write(&path, "  \n").unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        assert_eq!(read()["model"]["name"], "m:latest");
+
+        std::fs::write(&path, "{ not json").unwrap();
+        let err = write_qwen_settings_at(&dir, "m:latest", url).unwrap_err();
+        assert!(format!("{err:#}").contains("not valid JSON"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+        std::fs::write(&path, "[]").unwrap();
+        assert!(write_qwen_settings_at(&dir, "m:latest", url).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression test for the codex config bug described on
