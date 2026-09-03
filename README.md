@@ -16,7 +16,7 @@ llmman launch claude --model gemma4
 ```
 
 That starts a local inference server, downloads a `llama.cpp` build matching your
-GPU, loads the model, and execs Claude Code against it.
+GPU, loads the model, and execs an agent against it.
 
 <!-- TODO: 20s asciinema/GIF here: launch claude -> boots -> wifi off -> still coding -->
 
