@@ -2292,7 +2292,7 @@ fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<
         let existing = OciStore::open(store_path).and_then(|s| s.find(model)).ok();
         // In the store is not the same as trusted: it may predate the
         // policy, or have come in under `warn`. Classification first so
-        // a malformed verify.conf can't break a cached non-OCI model no
+        // a malformed llmman.conf can't break a cached non-OCI model no
         // policy could apply to; then an in-memory policy lookup, which
         // returns immediately when nothing is configured.
         if let Some(desc) = existing {
@@ -3153,7 +3153,10 @@ async fn resolve_remote_target(
                      environment is deliberately not used"
                         .to_string()
                 } else if crate::daemon::reachable_only_locally() {
-                    format!(", or set {} where llmman serve runs", provider.key_env)
+                    format!(
+                        ", or give llmman serve a key of its own: {}",
+                        crate::providers::key_hint(&provider.id, &provider.key_env)
+                    )
                 } else {
                     ". llmman serve is not bound to loopback, so its own environment is \
                      deliberately not used"
@@ -6476,7 +6479,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // up rather than from whenever something first scraped it.
     metrics::mark_process_start();
 
-    // Before the listener: a malformed verify.conf or LLMMAN_VERIFY is
+    // Before the listener: a malformed llmman.conf or LLMMAN_VERIFY is
     // fatal, and failing at exec is far better than booting cleanly and
     // then failing every pull with a config error.
     crate::verify::Policy::load().context("signature trust policy")?;

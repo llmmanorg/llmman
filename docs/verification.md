@@ -7,9 +7,10 @@ put them there**.
 
 That gap matters more for llmman than for a registry with a curated
 library, because llmman deliberately has no gatekeeper. A bare
-`llmman pull gemma4` resolves through `shortnames.conf` — five config
-tiers, any of which can repoint it — to some registry you never typed,
-and the GGUF it lands on goes straight into `llama-server`'s parser.
+`llmman pull gemma4` resolves through the `[aliases]` table of
+`llmman.conf` — which either config tier can repoint — to some registry
+you never typed, and the GGUF it lands on goes straight into
+`llama-server`'s parser.
 
 Signatures close that gap, and they do it per-artifact rather than
 per-registry: the check works the same on Docker Hub, GHCR, quay, or your
@@ -67,25 +68,21 @@ full report.
 
 ## Enforcing it on pull
 
-Verification during `pull` is driven by a policy file, `verify.conf`,
-read from the same locations as `shortnames.conf` (later files win):
-
-1. `/usr/share/llmman/verify.conf` — distro / package default
-2. `/etc/llmman/verify.conf` — system-admin policy
-3. `<binary>/../share/llmman/verify.conf` — install-tree relative
-4. `<binary-dir>/verify.conf` — development
-5. `~/.config/llmman/verify.conf` — per-user
+Verification during `pull` is driven by the `[verify]` section of
+`llmman.conf`, read from `/etc/llmman/` then `~/.config/llmman/` (later
+files win — see [configuration.md](configuration.md#llmmanconf)):
 
 ```toml
+[verify]
 # Applies to any reference no rule below matches. Default "off".
 default = "off"
 
-[[trust]]
+[[verify.trust]]
 pattern = "docker.io/myorg/**"
 keys    = ["keys/myorg.pub"]     # relative paths resolve against this file
 mode    = "enforce"
 
-[[trust]]
+[[verify.trust]]
 # Narrower rules written later override broader earlier ones, and
 # *replace* their key set rather than adding to it — so "trust the org
 # key everywhere except here" is expressible.
@@ -93,7 +90,7 @@ pattern = "docker.io/myorg/experimental"
 keys    = ["keys/lab.pub"]
 mode    = "warn"
 
-[[trust]]
+[[verify.trust]]
 pattern = "docker.io/ai/*"
 keys    = ["~/.config/llmman/keys/docker-ai.pub"]
 mode    = "warn"
@@ -105,7 +102,7 @@ mode    = "warn"
 | `warn` | Check, print the outcome, pull anyway. |
 | `enforce` | Refuse to pull unless a trusted key signed that exact manifest. |
 
-A `[[trust]]` rule with no explicit `mode` defaults to `warn`.
+A `[[verify.trust]]` rule with no explicit `mode` defaults to `warn`.
 
 **Patterns** match the *repository* (`host/namespace/name`, no tag), since
 trust is about who publishes a model and tags move. `*` matches within one

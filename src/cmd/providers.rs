@@ -90,15 +90,16 @@ fn matches(provider: &ProviderSummary, needle: Option<&str>) -> bool {
 /// Where a *usable* key is — the one thing to act on before `--provider`
 /// works.
 ///
-/// "shell" is a key only this process has, which travels per request.
-/// "withheld" is one the daemon has but will not spend, because it is
-/// bound where others could reach it (see `resolve_remote_target` in
-/// cmd::serve) — a state of its own, since what needs fixing there is the
-/// bind, not the variable.
+/// "client" is a key only this process has, which travels per request —
+/// from its environment or its own `llmman.conf`, which is why the word
+/// is not "shell". "withheld" is one the daemon has but will not spend,
+/// being bound where others could reach it (see `resolve_remote_target`
+/// in cmd::serve) — a state of its own, since what needs fixing there is
+/// the bind, not the key.
 fn key_status(provider: &ProviderSummary) -> &'static str {
     match (provider.key_usable, provider.key_here(), provider.key_set) {
         (true, _, _) => "set",
-        (false, true, _) => "set (shell)",
+        (false, true, _) => "set (client)",
         (false, false, true) => "set (withheld)",
         (false, false, false) => "unset",
     }

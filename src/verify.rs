@@ -4,13 +4,15 @@
 //! through [`crate::ffi::verify`]); this module decides *when* to invoke
 //! it and *what a negative answer means*, which is a policy question.
 //!
-//! `verify.conf` is read from the same priority-ordered locations as
-//! `shortnames.conf`, merged with later files winning:
+//! Policy comes from the `[verify]` section of `llmman.conf` (see
+//! [`crate::config`] for the locations), merged with later files
+//! winning:
 //!
 //! ```toml
+//! [verify]
 //! default = "off"                  # for references no rule matches
 //!
-//! [[trust]]
+//! [[verify.trust]]
 //! pattern = "docker.io/myorg/**"
 //! keys    = ["keys/myorg.pub"]     # relative to this file's directory
 //! mode    = "enforce"              # off | warn | enforce
@@ -30,7 +32,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context};
-use serde::Deserialize;
+
+use crate::config::VerifyConf;
 
 /// Longest accepted `pattern`. Nothing real comes close; the bound just
 /// keeps a pathological one uninteresting.
@@ -75,25 +78,6 @@ impl std::fmt::Display for Mode {
 // Config
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct Conf {
-    #[serde(default)]
-    default: Option<String>,
-    #[serde(default)]
-    trust: Vec<TrustConf>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TrustConf {
-    pattern: String,
-    #[serde(default)]
-    keys: Vec<String>,
-    #[serde(default)]
-    mode: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 struct Rule {
     pattern: String,
@@ -123,10 +107,10 @@ pub struct Decision {
 }
 
 impl Policy {
-    /// Parse one config file. `dir` is its own directory, which relative
-    /// key paths resolve against, so a policy can ship with its keys.
-    fn parse(text: &str, dir: &Path) -> anyhow::Result<Self> {
-        let conf: Conf = toml::from_str(text).context("parse TOML")?;
+    /// One file's `[verify]` section. `dir` is that file's own
+    /// directory, which relative key paths resolve against, so a policy
+    /// can ship with its keys.
+    fn from_conf(conf: &VerifyConf, dir: &Path) -> anyhow::Result<Self> {
         let default_mode = conf
             .default
             .as_deref()
@@ -134,17 +118,17 @@ impl Policy {
             .transpose()?;
 
         let mut rules = Vec::with_capacity(conf.trust.len());
-        for entry in conf.trust {
+        for entry in &conf.trust {
             validate_pattern(&entry.pattern)?;
             let mode = match entry.mode.as_deref() {
                 Some(s) => Mode::parse(s)
-                    .with_context(|| format!("[[trust]] pattern {:?}", entry.pattern))?,
+                    .with_context(|| format!("[[verify.trust]] pattern {:?}", entry.pattern))?,
                 // Keys but no mode means "check this, tell me, don't
                 // break my build".
                 None => Mode::Warn,
             };
             rules.push(Rule {
-                pattern: entry.pattern,
+                pattern: entry.pattern.clone(),
                 keys: entry
                     .keys
                     .iter()
@@ -158,6 +142,13 @@ impl Policy {
             forced_mode: None,
             rules,
         })
+    }
+
+    /// A `[verify]` section on its own, for tests that care about the
+    /// policy and not the file it came from.
+    #[cfg(test)]
+    fn parse(text: &str, dir: &Path) -> anyhow::Result<Self> {
+        Self::from_conf(&toml::from_str(text).context("parse TOML")?, dir)
     }
 
     /// The mode and trusted keys that apply to `reference`.
@@ -191,10 +182,12 @@ impl Policy {
 
     /// Load and merge every config file present, cached for the process.
     ///
-    /// A file that exists but cannot be read or parsed is fatal, not
-    /// skipped: it could be the one demanding enforcement, and treating
-    /// it like an absent file would silently downgrade to `off`. Only
-    /// "not there" is ignored.
+    /// A file that cannot be read or parsed is fatal here, not skipped:
+    /// it could be the one demanding enforcement, and treating it like
+    /// an absent file would silently downgrade to `off`. This is why
+    /// [`crate::config::files`] reports a parse failure rather than
+    /// deciding what it means — the other two readers of that file can
+    /// carry on without it, and this one cannot.
     pub fn load() -> anyhow::Result<&'static Policy> {
         static CACHE: OnceLock<Result<Policy, String>> = OnceLock::new();
         CACHE
@@ -206,17 +199,9 @@ impl Policy {
 
 fn load_uncached() -> anyhow::Result<Policy> {
     let mut merged = Policy::default();
-    for path in config_paths() {
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                return Err(anyhow!(e)).context(format!("read {}", path.display()));
-            }
-        };
-        let dir = path.parent().unwrap_or(Path::new("."));
-        let policy =
-            Policy::parse(&text, dir).with_context(|| format!("read {}", path.display()))?;
+    for file in crate::config::files().map_err(|e| anyhow!("{e}"))? {
+        let policy = Policy::from_conf(&file.conf.verify, &file.dir)
+            .with_context(|| format!("read {}", file.path.display()))?;
         if let Some(mode) = policy.default_mode {
             merged.default_mode = Some(mode);
         }
@@ -232,19 +217,23 @@ fn load_uncached() -> anyhow::Result<Policy> {
 /// something. Same reasoning as rejecting an unknown `mode`.
 fn validate_pattern(pattern: &str) -> anyhow::Result<()> {
     if pattern.is_empty() {
-        bail!("a [[trust]] entry has an empty `pattern`");
+        bail!("a [[verify.trust]] entry has an empty `pattern`");
     }
     if pattern.len() > MAX_PATTERN_LEN {
-        bail!("[[trust]] pattern is longer than {MAX_PATTERN_LEN} bytes: {pattern:?}");
+        bail!("[[verify.trust]] pattern is longer than {MAX_PATTERN_LEN} bytes: {pattern:?}");
     }
     if pattern.contains('@') {
         bail!(
-            "[[trust]] pattern {pattern:?} contains a digest; patterns match the repository only"
+            "[[verify.trust]] pattern {pattern:?} contains a digest; patterns match the \
+             repository only"
         );
     }
     let last = pattern.rsplit('/').next().unwrap_or(pattern);
     if last.contains(':') {
-        bail!("[[trust]] pattern {pattern:?} contains a tag; patterns match the repository only");
+        bail!(
+            "[[verify.trust]] pattern {pattern:?} contains a tag; patterns match the \
+             repository only"
+        );
     }
     Ok(())
 }
@@ -266,24 +255,6 @@ fn parse_mode_override(raw: Option<&str>) -> anyhow::Result<Option<Mode>> {
         None | Some("") => Ok(None),
         Some(raw) => Mode::parse(raw).map(Some).context("LLMMAN_VERIFY"),
     }
-}
-
-/// The same set and order as `shortnames::config_paths`, different name.
-fn config_paths() -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = vec![
-        PathBuf::from("/usr/share/llmman/verify.conf"),
-        PathBuf::from("/etc/llmman/verify.conf"),
-    ];
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            paths.push(parent.join("../share/llmman/verify.conf"));
-            paths.push(parent.join("verify.conf"));
-        }
-    }
-    if let Some(cfg) = dirs::config_dir() {
-        paths.push(cfg.join("llmman").join("verify.conf"));
-    }
-    paths
 }
 
 /// Expand `~` and make a relative key path absolute against the config
@@ -552,7 +523,7 @@ fn check_with(
         // naming no keys. Nothing to check against.
         let msg = format!(
             "verification is set to {} for {reference}, but no trusted public keys are configured for it \
-             (add a [[trust]] rule with `keys` to verify.conf)",
+             (add a [[verify.trust]] rule with `keys` to llmman.conf)",
             decision.mode
         );
         if decision.mode == Mode::Enforce {
@@ -812,6 +783,46 @@ mod tests {
 
     fn policy(text: &str) -> Policy {
         Policy::parse(text, Path::new("/etc/llmman")).expect("parse policy")
+    }
+
+    /// The other tests hand `Policy` a `[verify]` section on its own.
+    /// This one goes the way the daemon does, through a whole
+    /// `llmman.conf`, so the two cannot drift into a policy that parses
+    /// in tests and is silently absent in production.
+    #[test]
+    fn a_nested_verify_section_of_a_whole_llmman_conf_becomes_a_policy() {
+        let conf = crate::config::parse(
+            r#"
+            [aliases]
+            gemma4 = "docker.io/ai/gemma4"
+
+            [providers.openai]
+            api_key = "sk-x"
+
+            [verify]
+            default = "warn"
+
+            [[verify.trust]]
+            pattern = "docker.io/myorg/**"
+            keys    = ["keys/myorg.pub"]
+            mode    = "enforce"
+            "#,
+        )
+        .expect("valid llmman.conf");
+
+        let policy =
+            Policy::from_conf(&conf.verify, Path::new("/etc/llmman")).expect("valid policy");
+
+        // The rule applies where it matches, keys resolved against the
+        // file's own directory...
+        let decision = policy.decide("docker.io/myorg/model:v1");
+        assert_eq!(decision.mode, Mode::Enforce);
+        assert_eq!(
+            decision.keys,
+            vec![PathBuf::from("/etc/llmman/keys/myorg.pub")]
+        );
+        // ...and `default` covers everything it does not.
+        assert_eq!(policy.decide("docker.io/other/model").mode, Mode::Warn);
     }
 
     #[test]

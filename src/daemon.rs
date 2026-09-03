@@ -1106,8 +1106,8 @@ pub struct ProviderSummary {
     pub id: String,
     pub name: String,
     pub key_env: String,
-    /// Whether the key is set *where the daemon runs*. This process's own
-    /// environment is [`ProviderSummary::key_here`].
+    /// Whether the key is set *where the daemon runs*. What this process
+    /// itself holds is [`ProviderSummary::key_here`].
     pub key_set: bool,
     /// Whether the daemon would actually spend that key for a request
     /// presenting none. Only it can tell: that depends on how it is
@@ -1126,7 +1126,7 @@ impl ProviderSummary {
     /// Whether *this* process holds the key — the other way one reaches
     /// a provider, sent per request (see `client_api_key` in cmd::serve).
     pub fn key_here(&self) -> bool {
-        crate::providers::key_from_env(&self.key_env).is_some()
+        crate::providers::key_for(&self.id, &self.key_env).is_some()
     }
 }
 
@@ -1168,16 +1168,17 @@ pub struct ModelCost {
 }
 
 impl ProviderDetail {
-    /// This provider's key from *this* process's environment, to travel
-    /// with each request (see `client_api_key` in cmd::serve). `None` need
-    /// not be fatal — the daemon may hold it ([`ProviderDetail::key_set`]).
+    /// This provider's key as *this* process resolves it, to travel with
+    /// each request (see `client_api_key` in cmd::serve). `None` need not
+    /// be fatal — the daemon may hold it ([`ProviderDetail::key_set`]).
     ///
     /// The daemon names the variable, so a process squatting the port
     /// could name an unrelated secret — inside the trust boundary this
     /// whole module sits in either way: that daemon is handed every
-    /// prompt, and every key, regardless.
+    /// prompt, and every key, regardless. It does not name the
+    /// `llmman.conf` entry, which is keyed by the provider id.
     pub fn api_key(&self) -> Option<String> {
-        crate::providers::key_from_env(&self.key_env)
+        crate::providers::key_for(&self.id, &self.key_env)
     }
 
     /// Just the ids, for a caller that only needs to name one (see

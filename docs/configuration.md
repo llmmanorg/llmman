@@ -19,18 +19,92 @@ store the daemon was started with; set `LLMMAN_MODELS` before
 
 The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), readable by `docker` and `podman`.
 
-## Signature trust policy
+## llmman.conf
 
-`verify.conf` decides which references must carry a trusted signature
-before `llmman pull` will accept them, and which keys count as trusted.
-It is read from the same five locations as `shortnames.conf`
-(`/usr/share/llmman/`, `/etc/llmman/`, `<binary>/../share/llmman/`,
-`<binary-dir>/`, `~/.config/llmman/`), with later files overriding
-earlier ones. Absent, nothing is verified; present but unreadable or
-malformed is an error rather than a silent downgrade.
+Everything that needs a file rather than an environment variable lives in
+one place: short-name aliases, provider API keys, and the signature trust
+policy.
 
-See [verification.md](verification.md) for the file format, what is
-checked, and the limitations.
+```toml
+# ~/.config/llmman/llmman.conf
+
+[aliases]
+gemma4 = "docker.io/ai/gemma4"
+
+[providers.openrouter]
+api_key = "sk-or-..."
+
+[verify]
+default = "off"
+
+[[verify.trust]]
+pattern = "docker.io/myorg/**"
+keys    = ["keys/myorg.pub"]   # relative to this file's directory
+mode    = "enforce"
+```
+
+Read from two locations, later overriding earlier:
+
+| Path | Purpose |
+|------|---------|
+| `/etc/llmman/llmman.conf` | system-wide, admin-managed |
+| `~/.config/llmman/llmman.conf` | per-user |
+
+The same two paths on every platform, including macOS and Windows, with no
+llmman-specific variable to move them (`~` is `$HOME` as usual): one
+documented answer to "where does this go" beats a per-OS convention.
+
+Unknown sections and keys are rejected rather than ignored: a misspelled
+`[verify]` or `api_kye` that parsed happily would be a policy or a
+credential that silently never takes effect, and the symptom would show up
+somewhere else entirely.
+
+### Provider API keys
+
+`--provider` reaches a hosted model with a key llmman never generates and
+never writes. It takes one from the variable models.dev names for that
+provider, or — when that is unset — from `[providers.<id>]`. Entries are
+keyed by the provider id `llmman providers` prints, not by the variable,
+which is models.dev's naming rather than llmman's.
+
+The environment wins where both have a key, as it does for `aws` and
+`gh`: the file is the standing answer and an `export` is the deliberate,
+this-session-only override. An id that is not a bare TOML key must be
+quoted — `[providers."wafer.ai"]` — since `[providers.wafer.ai]` is two
+nested tables. Setting `api_key = ""` blanks out a key `/etc` supplied.
+
+On Unix a file carrying a key must not be readable by group or other —
+`chmod 600` it — or llmman ignores the keys in it with a warning, the way
+`ssh` refuses a loose private key. Only the keys: a world-readable
+`/etc/llmman/llmman.conf` still supplies its aliases and trust policy,
+which are not secrets. This is unchecked on Windows, which has no mode
+bits.
+
+Which process reads it matters. A key found by `llmman run`/`launch`
+travels per request in an `Authorization` header. A key found by
+`llmman serve` is the fallback for a request that presents none, and is
+only spent for a daemon bound to loopback. `llmman providers` reports
+which of the two has a usable key.
+
+### Short-name aliases
+
+`[aliases]` maps a short name to a full reference, so `llmman pull gemma4`
+resolves to whatever you point it at. Nothing is compiled into the binary.
+
+### Signature trust policy
+
+`[verify]` decides which references must carry a trusted signature before
+`llmman pull` will accept them, and which keys count as trusted. Absent,
+nothing is verified.
+
+A file that is present but unreadable or malformed is a fatal error for
+verification, rather than a silent downgrade to `off` — even though the
+same failure only costs the other two sections their aliases and keys.
+That asymmetry is deliberate: a trust policy llmman cannot read must not
+be mistaken for one that does not exist.
+
+See [verification.md](verification.md) for the format, what is checked,
+and the limitations.
 
 ## Environment variables
 
@@ -60,7 +134,7 @@ setting may not behave identically.
 | `LLMMAN_IGPU_ENABLE` | Counts integrated GPUs (Vulkan only) when probing for an accelerator. Defaults to disabled, since an integrated GPU is usually a worse choice than the discrete/CPU fallback it would otherwise be skipped in favor of. |
 | `LLMMAN_LOAD_TIMEOUT` | How long to allow a model load to stall before giving up. Zero or negative means wait forever. Defaults to 10 minutes (`vllm` can take several minutes to load a large safetensors model). |
 | `LLMMAN_TMPDIR` | Staging directory for `llama-server` release downloads, overriding the default `tmp` subdirectory of the install root. |
-| `LLMMAN_VERIFY` | Overrides the signature-verification mode (`off`, `warn`, or `enforce`) for every reference, ignoring what `verify.conf` selected. Does *not* supply trusted keys — those still come from `verify.conf`, so `enforce` with no configured keys fails every check rather than passing them. Intended for CI, which can demand `enforce` without editing config files. See [verification.md](verification.md). |
+| `LLMMAN_VERIFY` | Overrides the signature-verification mode (`off`, `warn`, or `enforce`) for every reference, ignoring what `[verify]` selected. Does *not* supply trusted keys — those still come from `llmman.conf`, so `enforce` with no configured keys fails every check rather than passing them. Intended for CI, which can demand `enforce` without editing config files. See [verification.md](verification.md). |
 | `LLMMAN_SIGN_PASSWORD` | Passphrase for the `--sign-key` private key used by `push`/`transfer`, when it is an encrypted PEM. Falls back to `COSIGN_PASSWORD`. Read from the client's environment and forwarded to the daemon, since the daemon's own environment is generally not the shell you set it in. |
 | `LLMMAN_NOPRUNE` | When set (to anything other than `0`/`false`/`no`/`off`), skips the garbage-collection sweep that `llmman rm` and `llmman serve` startup otherwise run to delete blobs and extracted-cache entries no longer referenced by any local model. Note this is broader than skipping the daemon-startup catch-all: it also stops `llmman rm` itself from ever freeing disk space, so a removed model's (possibly multi-GB) weights stay on disk until a later sweep runs without this set. Useful for a shared/read-mostly store, or scripts that `rm` in a loop and prune once at the end. |
 | `LLAMA_ARG_FIT` / `LLAMA_ARG_FIT_TARGET` | llama.cpp's own env-configurable `--fit`/`--fit-target` options. Not something llmman parses itself, just forwarded through to every `llama-server` (local or `--ociman` container) it spawns, same as `CUDA_VISIBLE_DEVICES`/etc. below. |

@@ -1,71 +1,28 @@
-//! Short-name alias resolution — loaded from config files at runtime.
+//! Short-name alias resolution — from the `[aliases]` table of
+//! `llmman.conf`, at runtime. Nothing is compiled into the binary.
 //!
-//! Mirrors podman's approach: TOML files are read from a priority-ordered set
-//! of locations; all files are merged with higher-priority entries winning.
-//! Nothing is compiled into the binary.
-//!
-//! Search order (ascending priority — later files override earlier ones):
-//!   1. /usr/share/llmman/shortnames.conf          distro / package default
-//!   2. /etc/llmman/shortnames.conf                 system-admin override
-//!   3. <binary>/../share/llmman/shortnames.conf    install-tree relative path
-//!   4. <binary-dir>/shortnames.conf                development (conf beside binary)
-//!   5. ~/.config/llmman/shortnames.conf            per-user aliases
+//! Mirrors podman's approach: files are merged in priority order, later
+//! entries winning. See [`crate::config`] for the locations.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use serde::Deserialize;
-
-#[derive(Deserialize, Default)]
-struct Conf {
-    #[serde(default)]
-    aliases: HashMap<String, String>,
-}
-
-/// Return all candidate config-file paths in ascending priority order.
-fn config_paths() -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = vec![
-        PathBuf::from("/usr/share/llmman/shortnames.conf"),
-        PathBuf::from("/etc/llmman/shortnames.conf"),
-    ];
-
-    // Paths relative to the running binary.
-    if let Ok(exe) = std::env::current_exe() {
-        // <binary>/../share/llmman/shortnames.conf  (standard install layout)
-        if let Some(parent) = exe.parent() {
-            paths.push(parent.join("../share/llmman/shortnames.conf"));
-            // <binary-dir>/shortnames.conf  (development: cargo run / direct exec)
-            paths.push(parent.join("shortnames.conf"));
-        }
-    }
-
-    // ~/.config/llmman/shortnames.conf
-    if let Some(cfg) = dirs::config_dir() {
-        paths.push(cfg.join("llmman").join("shortnames.conf"));
-    }
-
-    paths
-}
-
-/// Load and merge aliases from all config files.
-/// Higher-priority files (later in the list) override lower-priority ones.
+/// Merge the `[aliases]` table of every `llmman.conf`, later files
+/// winning.
+///
+/// A file that will not parse is reported once by [`crate::config`] and
+/// leaves no aliases, degrading to "unknown reference" rather than
+/// resolving a short name somewhere unintended — an alias pointing at
+/// the wrong registry is how `gemma4` becomes someone else's model.
 fn load_aliases() -> HashMap<String, String> {
     let mut merged: HashMap<String, String> = HashMap::new();
-    for path in config_paths() {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        match toml::from_str::<Conf>(&text) {
-            Ok(conf) => {
-                for (k, v) in conf.aliases {
-                    merged.insert(k, v);
-                }
-            }
-            Err(e) => {
-                eprintln!("[llmman] warning: ignoring {}: {e}", path.display());
-            }
-        }
+    for file in crate::config::files().unwrap_or_default() {
+        merged.extend(
+            file.conf
+                .aliases
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
     }
     merged
 }
