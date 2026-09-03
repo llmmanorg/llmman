@@ -204,11 +204,12 @@ exceptions: llmman configures them through a file on disk, so they can't
 carry a key and `llmman serve` needs the variable in its own environment
 instead. That fallback is only used for a daemon bound to loopback, and
 never for a browser request from another site. It bounds the blast radius
-rather than authenticating anyone, so on a shared machine prefer an integration
-that sends its own key. `cline`, `kimi`, `copilot` and `openclaw` can't be
-used with `--provider` at all: the first two pick their own model rather
-than taking llmman's, `copilot` has no way to send a key, and `openclaw`
-only takes a model during first-run onboarding.
+rather than authenticating anyone, so on a shared machine prefer an
+integration that sends its own key. `cline`, `kimi`, `copilot` and
+`openclaw` can't be used with `--provider` at all: the first two pick
+their own model rather than taking llmman's, `copilot` has no way to
+send a key, and `openclaw` only takes a model during first-run
+onboarding.
 
 `--provider` needs a local `llmman serve`. The daemon talks plain HTTP
 and has no authentication, so neither `run` nor `launch` will send a real

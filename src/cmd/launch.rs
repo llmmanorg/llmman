@@ -149,7 +149,7 @@ const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
 /// Integrations llmman configures through a file on disk. They take a
 /// model on every launch, so `--provider` works, but they cannot carry
 /// the key: writing a real one into `~/.hermes/config.yaml` (or into
-/// Talos's env file, through its `config set`) would persist a
+/// Talos's env file) would persist a
 /// credential, which this feature promises not to do. They rely on
 /// `llmman serve` having the variable itself — which it only uses for a
 /// daemon nobody else can reach (see `reachable_only_locally`).
@@ -923,27 +923,28 @@ fn qwen_args(model: &str, extra_args: &[String]) -> Vec<String> {
 /// daemon's address has to travel alongside it (see `launch_talos`).
 const TALOS_PROVIDER: &str = "ollama";
 /// The two keys `launch_talos` writes, both `SETTING` in Talos's config
-/// schema (talos/schema.py) — the class its `config set` accepts.
+/// schema (talos/schema.py) — the class a script may set.
 const TALOS_PROVIDER_KEY: &str = "TALOS_MODEL_PROVIDER";
 const TALOS_MODEL_KEY: &str = "TALOS_MODEL";
 /// Where Talos reads the local provider's address from. `POLICY` in its
-/// schema (a route to a model), so `config set` refuses it — and it is
+/// schema (a route to a model) — the operator's, not a launcher's — so it is
 /// set in the launched process's environment instead, never on disk.
 const TALOS_BASE_URL_KEY: &str = "TALOS_BASE_URL_OLLAMA";
 
 /// talos: a permission-gated agent (talos-agent.ch) whose kernel rules on
-/// every action before it runs. It keeps its configuration behind a
-/// schema that decides per key what a command may write, so this goes
-/// through `talos config set` — the validated surface Talos offers
-/// scripts, which writes its env file atomically with mode 600 — rather
-/// than rewriting that file from the outside. Two keys, both `SETTING`
-/// there: `TALOS_MODEL_PROVIDER=ollama` (Talos's local provider:
-/// OpenAI-compatible wire, no key) and `TALOS_MODEL=<model>`.
+/// every action before it runs. Its configuration is a flat env file,
+/// and this writes two keys into it the way `write_hermes_config` writes
+/// its YAML — into the file Talos's own `config set` would pick (see
+/// `talos_env_file`), keeping every other line, atomically, mode 600
+/// (see `write_talos_env`). Both keys are `SETTING` in Talos's schema,
+/// i.e. what a script may set: `TALOS_MODEL_PROVIDER=ollama` (Talos's
+/// local provider: OpenAI-compatible wire, no key) and
+/// `TALOS_MODEL=<model>`.
 ///
-/// The daemon's address is the one thing that cannot go that way. Talos's
-/// local provider defaults to Ollama's port, and the per-provider base
-/// URL key is `POLICY` in its schema, which `config set` refuses even
-/// with a confirmation. Talos reads its environment ahead of its env
+/// The daemon's address does not go into the file. Talos's local
+/// provider defaults to Ollama's port, and the per-provider base URL
+/// key is `POLICY` in its schema — the operator's to set, not a
+/// launcher's. Talos reads its environment ahead of its env
 /// file, so `TALOS_BASE_URL_OLLAMA` is set for the process this launches
 /// — per launch, never persisted — the same way the other launchers hand
 /// over their base URLs. Without it Talos would talk to `:11434`, not to
@@ -1169,10 +1170,11 @@ fn write_talos_env(path: &std::path::Path, pairs: &[(&str, &str)]) -> anyhow::Re
     content.push('\n');
 
     let tmp = path.with_file_name(format!(
-        "{}.llmman-tmp",
+        "{}.tmp-{}",
         path.file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("talos.env")
+            .unwrap_or("talos.env"),
+        std::process::id()
     ));
     let _ = std::fs::remove_file(&tmp);
     let mut open = std::fs::OpenOptions::new();
@@ -1587,7 +1589,11 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
-        assert!(!dir.join("talos.env.llmman-tmp").exists());
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp-")));
 
         // No file yet: created, with just ours.
         let fresh = dir.join("fresh.env");
@@ -1606,7 +1612,11 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         std::fs::write(&garbled, [0xff, 0xfe, b'\n']).unwrap();
         assert!(write_talos_env(&garbled, &[("TALOS_MODEL", "m")]).is_err());
         assert_eq!(std::fs::read(&garbled).unwrap(), [0xff, 0xfe, b'\n']);
-        assert!(!dir.join("garbled.env.llmman-tmp").exists());
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp-")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1659,7 +1669,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
     }
 
     /// An exported model setting that disagrees with the launch is
-    /// refused up front (it would outrank the env file `config set`
+    /// refused up front (it would outrank the env file the launcher
     /// writes); one that agrees, or is empty, is not an override.
     #[test]
     fn talos_env_overrides_are_refused_only_when_they_disagree() {
