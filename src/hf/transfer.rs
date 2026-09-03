@@ -15,11 +15,13 @@
 
 use anyhow::{Context, Result};
 
+use crate::ffi::TransferOutcome;
+
 /// Transfers `reference` (already stripped of any `hf://`/
-/// `huggingface://` scheme prefix) directly to `destination`. Returns
-/// whether anything was actually pushed — mirrors `ffi::transfer`'s own
-/// contract.
-pub async fn transfer(reference: &str, destination: &str) -> Result<bool> {
+/// `huggingface://` scheme prefix) directly to `destination`. Reports
+/// what was pushed and the manifest digest that now sits at the
+/// destination — mirrors `ffi::transfer`'s own contract.
+pub async fn transfer(reference: &str, destination: &str) -> Result<TransferOutcome> {
     #[cfg(feature = "docker")]
     {
         docker::transfer(reference, destination).await
@@ -31,12 +33,12 @@ pub async fn transfer(reference: &str, destination: &str) -> Result<bool> {
 }
 
 /// The `podman`-build fallback: pull the whole model into a throwaway
-/// local layout, then push that layout the ordinary way. Always returns
-/// `Ok(true)` on success — `ffi::push` (podman's `copy.Image`) doesn't
+/// local layout, then push that layout the ordinary way. `changed` is
+/// always true on success — `ffi::push` (podman's `copy.Image`) doesn't
 /// report whether the destination actually changed, unlike the docker
 /// path's real per-blob answer.
 #[cfg_attr(feature = "docker", allow(dead_code))]
-async fn via_temp_pull(reference: &str, destination: &str) -> Result<bool> {
+async fn via_temp_pull(reference: &str, destination: &str) -> Result<TransferOutcome> {
     let tmp = std::env::temp_dir().join(format!(
         "llmman-hf-transfer-{}-{}",
         std::process::id(),
@@ -55,8 +57,12 @@ async fn via_temp_pull(reference: &str, destination: &str) -> Result<bool> {
                     .context("temp layout path is not valid UTF-8")?,
                 destination,
             )
-            .map(|_| true)
-        });
+        })
+        // Read back from the staged layout rather than re-resolving the
+        // destination tag: this is the manifest that was just pushed, so
+        // it is what `--sign-key` must sign.
+        .and_then(|()| super::oci::read_manifest_ref(&tmp, destination))
+        .map(|desc| TransferOutcome::new(true, desc.digest));
     let _ = std::fs::remove_dir_all(&tmp);
     result
 }
@@ -82,7 +88,7 @@ mod docker {
     use super::super::progress;
     use crate::xet_fetch::XetFileRef;
 
-    pub async fn transfer(reference: &str, destination: &str) -> Result<bool> {
+    pub async fn transfer(reference: &str, destination: &str) -> Result<super::TransferOutcome> {
         let _guard = progress::DoneGuard(destination);
         let (host, owner, repo, tag) = api::parse_hf_ref(reference)?;
         let endpoint = super::super::hf_endpoint(&host);
@@ -217,7 +223,7 @@ mod docker {
             }
         };
 
-        push_cncf_manifest(
+        let manifest_digest = push_cncf_manifest(
             &session,
             &meta,
             &format!("{owner}/{repo}"),
@@ -226,7 +232,7 @@ mod docker {
             &mut changed,
         )
         .await?;
-        Ok(changed)
+        Ok(super::TransferOutcome::new(changed, manifest_digest))
     }
 
     fn basename(path: &str) -> String {
@@ -344,6 +350,8 @@ mod docker {
     /// construction (config/manifest JSON is at most a few KB, so that
     /// local round trip costs nothing measurable), then pushing those two
     /// blobs via [`push_stream`] instead of leaving them on disk.
+    ///
+    /// Returns the manifest's digest, which is what `--sign-key` signs.
     async fn push_cncf_manifest(
         session: &crate::ffi::PushSession,
         meta: &ModelMeta,
@@ -351,7 +359,7 @@ mod docker {
         filepath_annotation: &str,
         layers: Vec<Descriptor>,
         changed: &mut bool,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let tmp = std::env::temp_dir().join(format!(
             "llmman-hf-transfer-manifest-{}-{}",
             std::process::id(),
@@ -386,7 +394,7 @@ mod docker {
         if *changed {
             eprintln!("Writing manifest to image destination");
         }
-        Ok(())
+        Ok(manifest_desc.digest)
     }
 
     /// Fetches `req` and streams it directly into a fresh push-stream,

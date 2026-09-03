@@ -12,6 +12,14 @@ require (
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 
+	// Signature verification/signing primitives (sigstore.go). Only the
+	// low-level pkg/signature verifier and signer loaders — not cosign
+	// itself, and not the keyless (Fulcio/Rekor) trust roots. Already in
+	// this module's graph as an indirect dependency of go.podman.io/image
+	// before this became a direct one, so promoting it adds nothing to
+	// go.sum.
+	github.com/sigstore/sigstore v1.10.5
+
 	// Progress bars
 	github.com/vbauerster/mpb/v8 v8.12.0
 
@@ -26,7 +34,23 @@ require (
 	golang.org/x/sync v0.20.0
 )
 
-require github.com/sirupsen/logrus v1.9.4
+require (
+	// Test-only: pkg/registry is an in-memory OCI registry, used by
+	// sigstore_registry_test.go to exercise signing and verification
+	// over the real distribution protocol instead of against mocks.
+	// (That test earned its keep immediately, catching both a
+	// signature-dedup bug and a pullToLayout hang on manifests that name
+	// one blob twice.) Go has no test-only require, so it lands here
+	// rather than under `// indirect`, where it already was.
+	github.com/google/go-containerregistry v0.21.1
+	github.com/sirupsen/logrus v1.9.4
+)
+
+// Podman backend only: the registry error codes go.podman.io/image
+// wraps, so isBackendNotFound can tell "manifest unknown" from "I could
+// not find out" by type rather than by message. Already in the graph as
+// an indirect dependency of go.podman.io/image.
+require github.com/docker/distribution v2.8.3+incompatible
 
 require (
 	cyphar.com/go-pathrs v0.2.4 // indirect
@@ -47,7 +71,6 @@ require (
 	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467 // indirect
 	github.com/cyphar/filepath-securejoin v0.6.1 // indirect
 	github.com/distribution/reference v0.6.0 // indirect
-	github.com/docker/distribution v2.8.3+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.9.6 // indirect
 	github.com/docker/go-connections v0.7.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
@@ -56,7 +79,6 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
-	github.com/google/go-containerregistry v0.21.1 // indirect
 	github.com/google/go-intervals v0.0.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/mux v1.8.1 // indirect
@@ -84,7 +106,6 @@ require (
 	github.com/secure-systems-lab/go-securesystemslib v0.11.0 // indirect
 	github.com/sigstore/fulcio v1.8.5 // indirect
 	github.com/sigstore/protobuf-specs v0.5.0 // indirect
-	github.com/sigstore/sigstore v1.10.5 // indirect
 	github.com/smallstep/pkcs7 v0.1.1 // indirect
 	github.com/spf13/cobra v1.10.2 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect

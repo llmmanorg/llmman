@@ -2277,15 +2277,32 @@ async fn acquire_load_lock(model: &str) -> LoadLockGuard {
 /// as do the `ms://`/`ngc://`/`s3://`/`gs://`/local-path sources
 /// (`crate::sources`); only an actual OCI registry still goes through
 /// the Go shim.
-fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<()> {
+///
+/// Signature policy (`crate::verify`) is applied to that last case only.
+/// The other sources have no signature to find — HuggingFace and the
+/// object stores publish nothing in cosign's format — so subjecting them
+/// to the same policy would fail every such pull under `enforce`, which
+/// in practice means the policy gets turned off. `llmman transfer
+/// --sign-key` is the supported way to bring one of those into a
+/// registry as something signed; see `cmd::transfer`.
+fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<Vec<String>> {
     let lock = model_lock(model);
     let result = (|| {
         let _guard = lock.blocking_lock();
-        if OciStore::open(store_path)
-            .and_then(|s| s.find(model))
-            .is_ok()
-        {
-            return Ok(()); // someone else already pulled it while we waited
+        let existing = OciStore::open(store_path).and_then(|s| s.find(model)).ok();
+        // In the store is not the same as trusted: it may predate the
+        // policy, or have come in under `warn`. Classification first so
+        // a malformed verify.conf can't break a cached non-OCI model no
+        // policy could apply to; then an in-memory policy lookup, which
+        // returns immediately when nothing is configured.
+        if let Some(desc) = existing {
+            if !crate::verify::is_registry_reference(model) {
+                return Ok(Vec::new());
+            }
+            if !crate::verify::is_enabled_for(model)? {
+                return Ok(Vec::new());
+            }
+            return verify_stored(store_path, model, &desc.digest);
         }
         let layout_dir = store_path
             .to_str()
@@ -2296,13 +2313,47 @@ fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<
         tokio::runtime::Handle::current().block_on(async {
             match crate::hf::classify(model).await {
                 crate::hf::ClassifiedRef::Hf(reference) => {
-                    crate::hf::pull::pull(&reference, store_path, model).await
+                    // classify routes by a live /v2/ probe, which fails
+                    // *open* into this branch — and this branch applies
+                    // no policy. So a reference the policy covers must
+                    // not be pulled here just because the probe could
+                    // not reach the registry.
+                    if crate::verify::is_registry_reference(model)
+                        && crate::verify::is_enabled_for(model)?
+                    {
+                        return Err(anyhow!(concat!(
+                            "is covered by a signature policy but could not be confirmed ",
+                            "to be an OCI registry (the /v2/ probe failed); refusing to ",
+                            "pull it as a HuggingFace repository unchecked",
+                        ))
+                        .context(model.to_string()));
+                    }
+                    crate::hf::pull::pull(&reference, store_path, model)
+                        .await
+                        .map(|()| Vec::new())
                 }
                 crate::hf::ClassifiedRef::Source(reference) => {
-                    crate::sources::pull(&reference, store_path, model).await
+                    crate::sources::pull(&reference, store_path, model)
+                        .await
+                        .map(|()| Vec::new())
                 }
                 crate::hf::ClassifiedRef::Other(normalized) => {
-                    crate::ffi::pull(&normalized, layout_dir)
+                    // Checked before a single layer is fetched, so a
+                    // model the policy will reject costs one manifest
+                    // lookup instead of a multi-gigabyte download...
+                    let guard = crate::verify::PullGuard::check(&normalized)?;
+                    crate::ffi::pull(&normalized, layout_dir)?;
+                    // ...and confirmed afterwards against what actually
+                    // landed, so a tag repointed mid-pull can't slip
+                    // past the check that just passed.
+                    let stored = OciStore::open(store_path)?.find(&normalized)?;
+                    match guard.confirm(&stored.digest) {
+                        // Relayed to the client rather than logged here:
+                        // this runs in the daemon, whose stderr is a log
+                        // file nobody is watching. See verify::Verdict.
+                        Ok(notices) => Ok(notices),
+                        Err(e) => Err(reject_stored(store_path, &normalized, e)),
+                    }
                 }
             }
         })
@@ -2310,6 +2361,45 @@ fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<
     drop(lock);
     release_model_lock(model);
     result
+}
+
+/// Re-checks an already-stored model against the current policy, using
+/// the digest held rather than re-resolving the tag. Callers must have
+/// established `is_registry_reference` first.
+fn verify_stored(
+    store_path: &std::path::Path,
+    model: &str,
+    digest: &str,
+) -> anyhow::Result<Vec<String>> {
+    debug_assert!(crate::verify::is_registry_reference(model));
+    match crate::verify::check(model, Some(digest)) {
+        Ok(verdict) => Ok(verdict.notices),
+        // Only a verdict *against* this copy removes it. An unreachable
+        // registry is not that: refusing to serve is right, deleting a
+        // model that may well be correctly signed because the network
+        // blinked is not — least of all for an air-gapped deployment,
+        // which is who runs `enforce` in the first place.
+        Err(e) if crate::verify::is_indeterminate(&e) => Err(e),
+        Err(e) => Err(reject_stored(store_path, model, e)),
+    }
+}
+
+/// Drops a reference the policy refused, so a later pull cannot find it
+/// present and hand it out unchecked; blobs are left to the GC sweep. A
+/// failed removal is reported alongside the rejection rather than
+/// swallowed — the store then holds something this daemon won't serve.
+fn reject_stored(
+    store_path: &std::path::Path,
+    reference: &str,
+    cause: anyhow::Error,
+) -> anyhow::Error {
+    match OciStore::open(store_path).and_then(|s| s.remove(reference)) {
+        Ok(_) => cause,
+        Err(e) => cause.context(format!(
+            "could not remove the rejected model {reference} from the store ({e:#}); \
+             it will keep being refused, but `llmman rm {reference}` is needed to clear it"
+        )),
+    }
 }
 
 /// Resolve a user-supplied model ref to the canonical reference stored in
@@ -3156,6 +3246,8 @@ async fn ensure_model(
     // needs scheduling work (waiting on a concurrent load, or starting
     // a fresh one) below counts against the cap.
     if let Some((port, guard)) = check_running(state, model_ref).await {
+        // Already loaded, so no pull and no re-check: a policy tightened
+        // since the load takes effect on the next load, not mid-flight.
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
@@ -3178,18 +3270,29 @@ async fn ensure_model(
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
-    // If the model is not in the local store, pull it now.
-    if crate::storage::OciStore::open(&state.0.store_path)
-        .and_then(|s| s.find(model_ref))
-        .is_err()
+    // Pull if missing — and run pull_serialized even when present, so a
+    // model already on disk is still subject to the signature policy
+    // (it returns immediately when no policy applies). See verify_stored.
     {
-        eprintln!("[llmman] {model_ref} not in store — pulling");
+        let present = crate::storage::OciStore::open(&state.0.store_path)
+            .and_then(|s| s.find(model_ref))
+            .is_ok();
+        if !present {
+            eprintln!("[llmman] {model_ref} not in store — pulling");
+        }
         let store_path = state.0.store_path.clone();
         let model_ref_owned = model_ref.to_owned();
-        tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_ref_owned))
-            .await
-            .context("pull task panicked")?
-            .context("pull failed")?;
+        let notices =
+            tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_ref_owned))
+                .await
+                .context("pull task panicked")?
+                .context("pull failed")?;
+        // No progress stream to relay over on this path — an inference
+        // request triggered it, not `llmman pull` — so the daemon log is
+        // the only place left. Better there than nowhere.
+        for notice in notices {
+            eprintln!("[llmman] {notice}");
+        }
     }
 
     // Re-canonicalise after the pull: default_tag already fixed the lock
@@ -4748,29 +4851,14 @@ async fn handle_pull(
     eprintln!("[llmman] /api/pull model={model:?}");
     let store_path = state.0.store_path.clone();
 
-    let already_present = OciStore::open(&store_path)
-        .and_then(|s| s.find(&model))
-        .is_ok();
-    if already_present {
-        let line = serde_json::json!({"status": "success"}).to_string() + "\n";
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/x-ndjson")
-            .body(Body::from(line))
-            .unwrap());
-    }
-
-    // Not in the local store: actually pull it (the previous behavior only
-    // ever 404'd here, so no real Ollama client's "pull if missing, then
-    // use" flow — e.g. `ollama run <model>` — ever worked against llmman).
-    //
-    // pull_serialized (not a bare crate::ffi::pull call) re-checks presence
-    // after acquiring PULL_LOCK: this request's own `already_present` check
-    // above ran before that wait, so a concurrent pull of the same model
-    // (from another client, or from ensure_model's own fallback below) can
-    // finish while this one was waiting its turn — see PULL_LOCK's doc
-    // comment for why two callers must never invoke the actual FFI pull at
-    // the same time.
+    // Everything, present or not, goes through pull_serialized. It
+    // re-checks presence under the per-model lock (this request's own
+    // check would have raced a concurrent pull anyway), and — the reason
+    // there is no fast-path return here — it applies the signature
+    // policy to a model that is *already* in the store. Being on disk is
+    // not being trusted: it may have been pulled before a policy
+    // existed, or under `warn`. With no policy configured this is an
+    // in-memory lookup and a store hit, as before.
     let model_for_task = model.clone();
     let pull_task =
         tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_for_task));
@@ -4809,6 +4897,24 @@ async fn handle_push(
     } else {
         req.model.as_str()
     };
+    push_impl(state, model_ref, "/api/push").await
+}
+
+/// The push both `/api/push` and `cmd::push` reach.
+///
+/// Deliberately takes no signing key. The daemon binds TCP loopback with
+/// no authentication, and loopback is not user-scoped — so accepting a
+/// caller-supplied key *path* would let any local user have this daemon
+/// read a file only its own user can read, and sign with it using its
+/// registry credentials. TCP carries no peer credentials, so there is no
+/// way to tell that caller apart. Instead the digest that was pushed is
+/// reported back and `cmd::push` signs it itself, which is also what
+/// `cmd::transfer` already does. Nothing the daemon holds is delegable.
+async fn push_impl(
+    state: AppState,
+    model_ref: &str,
+    route: &'static str,
+) -> Result<Response, AppError> {
     if model_ref.is_empty() {
         return Err(AppError::status(
             StatusCode::BAD_REQUEST,
@@ -4816,7 +4922,7 @@ async fn handle_push(
         ));
     }
     let model = crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
-    eprintln!("[llmman] /api/push model={model:?}");
+    eprintln!("[llmman] {route} model={model:?}");
     let store_path = state.0.store_path.clone();
 
     // Unlike pull, there's nothing sensible to do if the model isn't
@@ -4843,7 +4949,13 @@ async fn handle_push(
             let layout_dir = store_path
                 .to_str()
                 .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
-            crate::ffi::push(layout_dir, &model_for_task)
+            crate::ffi::push(layout_dir, &model_for_task)?;
+            // Read inside the lock, so this is the manifest this push
+            // put there and not one a concurrent push retagged.
+            let desc = OciStore::open(&store_path)?.find(&model_for_task)?;
+            Ok(PushOutcome {
+                digest: desc.digest,
+            })
         })();
         drop(lock);
         release_model_lock(&model_for_task);
@@ -4856,6 +4968,34 @@ async fn handle_push(
         "retrieving manifest",
         push_task,
     ))
+}
+
+/// What a completed push reports back, for `cmd::push --sign-key` to
+/// sign. See `push_impl` for why the daemon does not sign it.
+struct PushOutcome {
+    digest: String,
+}
+
+/// Whatever a pull/push task needs to tell the client beyond "success",
+/// as NDJSON objects emitted ahead of the terminal line — a pull's
+/// verification notices, a push's digest. Both go out the one stream, so
+/// `stream_ffi_progress` serves either.
+trait StreamedOutcome {
+    fn into_lines(self) -> Vec<serde_json::Value>;
+}
+
+impl StreamedOutcome for Vec<String> {
+    fn into_lines(self) -> Vec<serde_json::Value> {
+        self.into_iter()
+            .map(|notice| serde_json::json!({"notice": notice}))
+            .collect()
+    }
+}
+
+impl StreamedOutcome for PushOutcome {
+    fn into_lines(self) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({"digest": self.digest})]
+    }
 }
 
 /// Runs `task` (a blocking FFI call already dispatched via spawn_blocking)
@@ -4878,11 +5018,11 @@ async fn handle_push(
 /// inside the daemon, whose stdio is redirected to a log file (see
 /// daemon::ensure_server), so polling and relaying over this NDJSON
 /// stream is the only way those numbers reach `llmman pull`/`llmman push`.
-fn stream_ffi_progress(
+fn stream_ffi_progress<T: StreamedOutcome + Send + 'static>(
     model: String,
     verb: &'static str,
     first_status: &'static str,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<anyhow::Result<T>>,
 ) -> Response {
     let first_line = serde_json::json!({"status": first_status}).to_string() + "\n";
     let stream = futures::stream::once(futures::future::ready(Bytes::from(first_line)))
@@ -4892,12 +5032,27 @@ fn stream_ffi_progress(
                 let mut task = task?;
                 tokio::select! {
                     result = &mut task => {
+                        // Any notices the task produced (see
+                        // verify::Verdict) go out ahead of the terminal
+                        // line, each on its own NDJSON object, so the
+                        // client can print them somewhere a person is
+                        // actually looking — this daemon's own stderr is
+                        // a log file.
+                        let mut out = String::new();
                         let line = match result {
-                            Ok(Ok(())) => serde_json::json!({"status": "success"}).to_string(),
+                            Ok(Ok(outcome)) => {
+                                for field in outcome.into_lines() {
+                                    out.push_str(&field.to_string());
+                                    out.push('\n');
+                                }
+                                serde_json::json!({"status": "success"}).to_string()
+                            }
                             Ok(Err(e)) => serde_json::json!({"error": format!("{e:#}")}).to_string(),
                             Err(e) => serde_json::json!({"error": format!("{verb} task panicked: {e}")}).to_string(),
                         };
-                        Some((Bytes::from(line + "\n"), None))
+                        out.push_str(&line);
+                        out.push('\n');
+                        Some((Bytes::from(out), None))
                     }
                     _ = sleep(Duration::from_millis(200)) => {
                         // A HuggingFace pull tracks its own progress natively
@@ -6320,6 +6475,11 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // Before the listener binds, so uptime counts from the daemon coming
     // up rather than from whenever something first scraped it.
     metrics::mark_process_start();
+
+    // Before the listener: a malformed verify.conf or LLMMAN_VERIFY is
+    // fatal, and failing at exec is far better than booting cleanly and
+    // then failing every pull with a config error.
+    crate::verify::Policy::load().context("signature trust policy")?;
 
     let addr = crate::daemon::bind_addr();
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -9856,6 +10016,41 @@ mod tests {
         };
         let resp = handle_push(State(state), Json(req)).await.into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A push reports the digest it landed on, which is what
+    /// `cmd::push --sign-key` signs — the daemon deliberately does not
+    /// sign, so losing this line would silently disable signing.
+    #[test]
+    fn a_push_outcome_reports_its_digest_on_the_stream() {
+        let lines = PushOutcome {
+            digest: "sha256:abc".into(),
+        }
+        .into_lines();
+        assert_eq!(lines, vec![serde_json::json!({"digest": "sha256:abc"})]);
+    }
+
+    /// A pull's notices go out the same stream, so one helper serves
+    /// both verbs.
+    #[test]
+    fn pull_notices_go_out_as_notice_lines() {
+        let lines = vec!["warning: unsigned".to_string()].into_lines();
+        assert_eq!(
+            lines,
+            vec![serde_json::json!({"notice": "warning: unsigned"})]
+        );
+    }
+
+    /// An Ollama client's push body has no signing fields at all, and
+    /// deserializing one must not require them.
+    #[test]
+    fn an_ollama_push_body_still_deserializes() {
+        let req: OllamaPushRequest =
+            serde_json::from_str(r#"{"model":"docker.io/org/model:v1"}"#).unwrap();
+        assert_eq!(req.model, "docker.io/org/model:v1");
+        // The deprecated `name` spelling real Ollama still accepts.
+        let req: OllamaPushRequest = serde_json::from_str(r#"{"name":"x"}"#).unwrap();
+        assert_eq!(req.name, "x");
     }
 
     /// /api/delete resolves (and so validates) the client ref before it ever

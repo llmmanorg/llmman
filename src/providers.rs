@@ -1427,15 +1427,49 @@ mod tests {
                 }
             }"#,
         );
-        let huge = "z".repeat(4 * 1024 * 1024);
-        let started = Instant::now();
+        // Absurdly long, and *padding a real id* so the assertion below
+        // actually pins the length guard: `needle.contains(id)` would
+        // match without it, so "Did you mean" appearing is exactly the
+        // signal that the search was not skipped. A plain run of "z"
+        // returns no suggestion either way and would pass regardless.
+        //
+        // No wall-clock budget: the previous one measured this test's own
+        // multi-megabyte `{:?}` formatting and `contains` scans on a
+        // shared CI runner more than anything in `suggestions`.
+        let huge = format!("togetherai{}", "z".repeat(64 * 1024));
         let error = unknown_provider_error(&huge, &catalog).to_string();
-        assert!(!error.contains("Did you mean"), "suggested for a 4MB id");
+        assert!(!error.contains("Did you mean"), "suggested for a huge id");
         assert!(error.contains("llmman providers"));
+    }
+
+    /// The exact threshold, pinned deterministically — what the test
+    /// above used to approximate with a timer. `suggestions` short-
+    /// circuits on length because `edit_distance` over every catalog id
+    /// is superlinear in a caller-supplied one.
+    #[test]
+    fn suggestions_are_skipped_just_above_the_length_limit() {
+        let catalog = catalog_from(
+            r#"{
+                "togetherai": {
+                    "id": "togetherai", "name": "Together",
+                    "api": "https://api.together.xyz/v1",
+                    "npm": "@ai-sdk/openai-compatible", "env": ["TOGETHER_API_KEY"],
+                    "models": { "gpt-5": {} }
+                }
+            }"#,
+        );
+        // Both of these contain a real id, so both would be suggested if
+        // the guard were gone; only the length distinguishes them.
+        let pad = |len: usize| format!("togetherai{}", "z".repeat(len - "togetherai".len()));
+
+        assert_eq!(
+            suggestions(&pad(MAX_SUGGESTION_LEN), &catalog),
+            vec!["togetherai"],
+            "an id at exactly the limit was not searched"
+        );
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "took {:?}",
-            started.elapsed()
+            suggestions(&pad(MAX_SUGGESTION_LEN + 1), &catalog).is_empty(),
+            "one byte over the limit was still searched"
         );
     }
 }

@@ -104,7 +104,18 @@ func writeBlobStream(layoutDir, mediaType string, r io.Reader, size int64, dgst 
 		return ocispec.Descriptor{}, err
 	}
 
-	written, err := io.Copy(io.MultiWriter(f, digester.Hash()), r)
+	// Bounded by the descriptor's own declared size, when it has one.
+	// Receiving more than declared is already a hard error below, but
+	// io.Copy alone would write all of it to disk first and only then
+	// notice — so a registry declaring a 300-byte signature payload
+	// could fill the disk before the size check fired. One byte past the
+	// limit is enough to detect and reject it. A zero/unknown size (the
+	// caller has nothing to check against) stays unbounded.
+	src := r
+	if remaining := size - startOffset; size > 0 && remaining >= 0 {
+		src = io.LimitReader(r, remaining+1)
+	}
+	written, err := io.Copy(io.MultiWriter(f, digester.Hash()), src)
 	f.Close()
 	if err != nil {
 		os.Remove(tmp)

@@ -236,7 +236,7 @@ fn is_known_oci_host(host: &str) -> bool {
 /// against ModelScope's HF-compatible API surface when given as a bare
 /// host, no separate implementation needed — only the explicit `ms://`
 /// scheme uses ModelScope's own dedicated (non-HF-compatible) API.
-fn is_known_hf_host(host: &str) -> bool {
+pub(crate) fn is_known_hf_host(host: &str) -> bool {
     matches!(host, "hf.co" | "huggingface.co" | "modelscope.cn")
 }
 

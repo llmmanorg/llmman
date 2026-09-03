@@ -25,6 +25,18 @@ extern "C" {
     fn llmman_inspect(reference: *const c_char) -> *mut c_char;
     fn llmman_transfer(source: *const c_char, destination: *const c_char) -> *mut c_char;
     fn llmman_progress(key: *const c_char) -> *mut c_char;
+    fn llmman_verify(
+        reference: *const c_char,
+        digest: *const c_char,
+        keys_json: *const c_char,
+    ) -> *mut c_char;
+    fn llmman_sign(
+        reference: *const c_char,
+        digest: *const c_char,
+        key_path: *const c_char,
+        password: *const c_char,
+    ) -> *mut c_char;
+    fn llmman_resolve_digest(reference: *const c_char) -> *mut c_char;
 }
 
 // go-shim/push_stream.go is `!podman`-only: containerd's docker.Resolver
@@ -199,23 +211,111 @@ pub fn inspect_remote(reference: &str) -> anyhow::Result<String> {
     consume(unsafe { llmman_inspect(r.as_ptr()) })
 }
 
+/// The result of one completed transfer, whichever of the three
+/// implementations (`ffi::transfer`, `crate::hf::transfer`,
+/// `crate::sources::transfer`) produced it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransferOutcome {
+    /// Whether anything was actually pushed. Everything is
+    /// content-addressed, so re-running a transfer for an unchanged
+    /// source pushes nothing — this lets `cmd::transfer` say so instead
+    /// of always printing "Transferred ...".
+    pub changed: bool,
+    /// The manifest digest now at the destination. `--sign-key` signs
+    /// exactly this rather than re-resolving the tag afterwards, so
+    /// nothing can slip in between the push and the signature.
+    #[serde(default)]
+    pub digest: Option<String>,
+}
+
+impl TransferOutcome {
+    /// For the transfer paths that push a manifest they built or staged
+    /// themselves, and so already know its digest.
+    pub fn new(changed: bool, digest: impl Into<String>) -> Self {
+        Self {
+            changed,
+            digest: Some(digest.into()),
+        }
+    }
+}
+
 /// Transfer an image directly from `source` to `destination` without
 /// going through the local store. See go-shim/transfer_docker.go /
 /// transfer_podman.go for how each backend implements this (streamed
 /// blob-for-blob where possible, falling back to a throwaway local
 /// staging directory only for source kinds that transport has no way to
 /// stream).
-///
-/// Returns whether anything was actually pushed: every real weight file
-/// (and the manifest built from it) is content-addressed by digest, so
-/// re-running a transfer for a source that hasn't changed since the last
-/// one pushes nothing at all — this lets `cmd::transfer` report that
-/// accurately instead of unconditionally printing "Transferred ...".
-pub fn transfer(source: &str, destination: &str) -> anyhow::Result<bool> {
+pub fn transfer(source: &str, destination: &str) -> anyhow::Result<TransferOutcome> {
     let s = cstr(source)?;
     let d = cstr(destination)?;
     let data = consume(unsafe { llmman_transfer(s.as_ptr(), d.as_ptr()) })?;
-    Ok(data == "changed")
+    serde_json::from_str(&data).context("decode transfer outcome")
+}
+
+/// One signature that verified, and the trusted key that accepted it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureMatch {
+    pub key_path: String,
+    /// The `docker-reference` the signer claimed to be signing.
+    pub identity: String,
+}
+
+/// The outcome of checking a manifest's signatures — see
+/// go-shim/sigstore.go's `verifyReport`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyReport {
+    pub reference: String,
+    pub digest: String,
+    pub verified: bool,
+    /// Signature layers present on the registry, whether or not any
+    /// verified — "nobody signed this" and "someone signed this, but not
+    /// with a key you trust" are very different things to report.
+    pub signatures_found: u32,
+    pub matches: Vec<SignatureMatch>,
+    /// Why `verified` is false. Empty when it's true.
+    pub reason: String,
+}
+
+/// Check the signatures published for `reference` against the PEM public
+/// keys at `keys`. `digest` may be `""` to resolve `reference` first.
+///
+/// "Not verified" comes back as `Ok` with `verified` false; `Err` means
+/// no answer could be reached. `crate::verify` decides what each means.
+pub fn verify(reference: &str, digest: &str, keys: &[String]) -> anyhow::Result<VerifyReport> {
+    let r = cstr(reference)?;
+    let d = cstr(digest)?;
+    let k = cstr(&serde_json::to_string(keys).context("encode trusted key list")?)?;
+    let data = consume(unsafe { llmman_verify(r.as_ptr(), d.as_ptr(), k.as_ptr()) })?;
+    serde_json::from_str(&data).context("decode verification report")
+}
+
+/// Sign `reference` at `digest` with the PEM private key at `key_path`
+/// and publish a cosign-format signature beside it in the same
+/// repository. Returns the digest that was signed.
+///
+/// `digest` may be `""` to resolve `reference` remotely first.
+/// `password` is ignored for an unencrypted key.
+pub fn sign(
+    reference: &str,
+    digest: &str,
+    key_path: &str,
+    password: &str,
+) -> anyhow::Result<String> {
+    let r = cstr(reference)?;
+    let d = cstr(digest)?;
+    let k = cstr(key_path)?;
+    let p = cstr(password)?;
+    consume(unsafe { llmman_sign(r.as_ptr(), d.as_ptr(), k.as_ptr(), p.as_ptr()) })
+}
+
+/// The manifest digest the registry currently serves for `reference`,
+/// without fetching any layer. `crate::verify::PullGuard` uses it to
+/// check a signature before starting a multi-gigabyte download.
+pub fn resolved_digest_of(reference: &str) -> anyhow::Result<String> {
+    let r = cstr(reference)?;
+    consume(unsafe { llmman_resolve_digest(r.as_ptr()) })
 }
 
 /// A registry destination resolved once via [`push_session_open`] and
