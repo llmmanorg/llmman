@@ -75,14 +75,17 @@ jobs:
             binary: llmman
 
           # ── Windows x86_64 ────────────────────────────────────────────────
-          # lld-link is used instead of MSVC link.exe: it accepts clang's
-          # .pdata format (fixing LNK1223) and GNU ar archives (fixing LNK4003).
+          # No linker override; build.rs repacks the Go archive and strips
+          # its SEH sections so the default MSVC link.exe works (see it for
+          # the LNK1223/LNK4003 detail). Empty deliberately, not as
+          # belt-and-braces: an override would hide a regression in that
+          # path, and this leg is the only thing exercising it.
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
             go-os: windows
             binary: llmman.exe
             msvc-arch: amd64
-            rustflags: "-C linker=lld-link"
+            rustflags: ""
 
           # ── Windows aarch64 ───────────────────────────────────────────────
           # ARM64 uses the MSVC-native link.exe (put first in PATH by
@@ -260,20 +263,19 @@ jobs:
             go-os: darwin
 
           # ── Windows x86_64 ────────────────────────────────────────────────
-          # lld-link, not MSVC link.exe — see the `build` job's own comment
-          # on why (same CGO-produced-object-format issue, native build or
-          # not).
+          # No linker override; build.rs makes the default MSVC link.exe
+          # work — see the `build` job's own comment.
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
             go-os: windows
             msvc-arch: amd64
-            rustflags: "-C linker=lld-link"
+            rustflags: ""
             timeout: 60
 
           # ── Windows aarch64 ───────────────────────────────────────────────
-          # rustflags empty (MSVC-native link.exe, not lld-link) — see the
-          # `build` job's own comment on why this one architecture is the
-          # opposite of the x86_64 Windows entry just above.
+          # rustflags empty like x86_64, but for a simpler reason: ARM64's
+          # unwind encoding was never the problem, so it links with MSVC
+          # link.exe and build.rs leaves its unwind data intact.
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             go-os: windows
@@ -369,11 +371,10 @@ jobs:
 
       # --target: matches the build job's own invocation (every one of
       # these is a native build, but explicit --target keeps the output
-      # path/build-plan identical to that job's). RUSTFLAGS is needed here
-      # too, not just on a separate build step — see the e2e job's own
-      # comment on cargo test compiling its own separate test binary,
-      # which links against the same Go-shim-produced llmman_shim.lib the
-      # main binary does and hit the exact same lld-link requirement.
+      # path/build-plan identical to that job's). RUSTFLAGS no longer
+      # carries a Windows linker choice: build.rs fixes the archive as it
+      # produces it, so the separate test binary compiled here links the
+      # same way the main binary does with nothing repeated per step.
       - name: cargo test --lib --bins
         run: cargo test --release --target ${{ matrix.target }} --lib --bins
         env:
@@ -586,23 +587,20 @@ jobs:
             feature-flags: "--no-default-features --features podman"
 
           # ── Windows x86_64 (docker backend) ──────────────────────────────
-          # lld-link, not MSVC link.exe — see the `build` job's own comment
-          # on why (same CGO-produced-object-format issue, native build or
-          # not). No podman entry: containers/image has no Windows support
-          # (see the `build` job's own comment on its identical exclusion).
+          # No linker override; build.rs makes the default MSVC link.exe
+          # work — see the `build` job's own comment. No podman entry:
+          # containers/image has no Windows support.
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
             go-os: windows
             llama-asset: win-cpu-x64.zip
             msvc-arch: amd64
-            rustflags: "-C linker=lld-link"
+            rustflags: ""
             backend: docker
             feature-flags: ""
 
           # ── Windows aarch64 (docker backend) ─────────────────────────────
-          # rustflags empty (MSVC-native link.exe, not lld-link) — see the
-          # `build` job's own comment on why this one architecture is the
-          # opposite of the x86_64 Windows entry just above.
+          # rustflags empty; ARM64 keeps its unwind data — see `test`.
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             go-os: windows
@@ -1091,15 +1089,12 @@ jobs:
           "$RUNNER_TEMP/mlx-lm-venv/bin/pip" install mlx-lm
           echo "$RUNNER_TEMP/mlx-lm-venv/bin" >> "$GITHUB_PATH"
 
-      # --target: for the same reason as the Build llmman step above —
-      # and RUSTFLAGS needs repeating here too, not just there: this step
-      # compiles its own separate test binary (tests/launch_e2e.rs), which
-      # links against the exact same Go-shim-produced llmman_shim.lib the
-      # main binary does, and hit that same LNK1223 lld-link exists to
-      # avoid (see the `build` job's own comment) the first several times
-      # this job's Windows entry ran — root-caused to exactly this: the
-      # env was present on the Build llmman step above, but this step
-      # never inherits another step's `env:` block, and never had its own.
+      # --target: for the same reason as the Build llmman step above.
+      # RUSTFLAGS no longer carries a Windows linker choice. This step
+      # compiles its own test binary (tests/launch_e2e.rs) against the same
+      # Go-shim archive, and used to hit LNK1223 whenever the flag was
+      # missing here, since a step never inherits another's `env:`.
+      # build.rs now fixes the archive itself, so that is gone.
       # matrix.feature-flags: same reasoning as the Build llmman step —
       # this test binary must link against the same backend the one built
       # above did, or the two podman entries would silently test a docker-
