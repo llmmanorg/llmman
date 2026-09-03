@@ -1,0 +1,80 @@
+# GENERATED FILE -- DO NOT EDIT.
+#
+# Rendered by packaging/render.sh in github.com/llmmanorg/llmman from
+# packaging/homebrew/llmman.rb.in, and pushed here by that repo's
+# `publish-homebrew` CI job. Every release overwrites this file
+# wholesale, so edit the template upstream instead.
+#
+# This installs the prebuilt release binary rather than building from
+# source. Building from source would mean making Go *and* Rust build
+# dependencies and recompiling the whole tree (plus the CGO shim) on every
+# user's machine, for a binary CI has already built, tested end-to-end and
+# published for these exact three platforms.
+class @CLASS@ < Formula
+  desc "Run any coding agent on any model"
+  homepage "https://github.com/llmmanorg/llmman"
+  version "@VERSION@"
+  license "Apache-2.0"
+
+  # One bare binary per platform, not a tarball — that is the shape
+  # .github/workflows/ci.yml's `release` job publishes (see its "Rename
+  # binaries for release" step). Homebrew cannot infer a version from such
+  # a URL, hence the explicit `version` above.
+  on_macos do
+    # llmman publishes no x86_64-apple-darwin build (see the `build` job's
+    # matrix in .github/workflows/ci.yml — Apple Silicon only). Declaring
+    # the requirement gives Intel users Homebrew's own clear "requires an
+    # arm64 architecture" error instead of a download 404.
+    depends_on arch: :arm64
+
+    url "@BASE_URL@/llmman-aarch64-apple-darwin"
+    sha256 "@SHA_MACOS_ARM64@"
+  end
+
+  on_linux do
+    on_intel do
+      url "@BASE_URL@/llmman-x86_64-unknown-linux-gnu"
+      sha256 "@SHA_LINUX_X86_64@"
+    end
+    on_arm do
+      url "@BASE_URL@/llmman-aarch64-unknown-linux-gnu"
+      sha256 "@SHA_LINUX_AARCH64@"
+    end
+  end
+
+  def install
+    # The staged file keeps its release-asset name (llmman-<triple>), which
+    # differs per platform — matched by glob rather than repeating the
+    # triple a third time. `=> "llmman"` is what puts it on PATH under the
+    # name users actually type.
+    bin.install Dir["llmman-*"].first => "llmman"
+  end
+
+  def caveats
+    <<~EOS
+      llmman downloads a llama.cpp build matching your GPU on first use; no
+      extra setup is needed. To get started:
+
+        llmman launch claude --model gemma4
+
+      Models and cached llama.cpp builds live under ~/.llmman.
+    EOS
+  end
+
+  test do
+    # `llmman --version` prints "llmman <crate version> (<git describe>)"
+    # (see emit_version in build.rs). Asserted against the crate version
+    # rather than this formula's own `version`, because on the dev channel
+    # the latter is a bare build number that the line does not contain:
+    # the `git describe` part is a plain commit hash there, since the
+    # b<N> tag does not yet exist when the binary is built.
+    assert_match "@VERSION_MATCH@", shell_output("#{bin}/llmman --version")
+
+    # A second, real command: `--version` is handled by clap before any of
+    # llmman's own code runs, so on its own it would still pass if the
+    # binary could not reach its storage layer at all. `list` against an
+    # empty store exercises that layer and must exit 0 with no rows --
+    # shell_output itself raises on a non-zero exit.
+    assert_empty shell_output("#{bin}/llmman list").strip
+  end
+end

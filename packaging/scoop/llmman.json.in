@@ -1,0 +1,41 @@
+{
+    "##": [
+        "GENERATED FILE -- DO NOT EDIT.",
+        "",
+        "Rendered by packaging/render.sh in github.com/llmmanorg/llmman from",
+        "packaging/scoop/llmman.json.in, and pushed here by that repo's",
+        "`publish-scoop` CI job. Every release overwrites this file wholesale,",
+        "so edit the template upstream instead.",
+        "",
+        "Scoop rather than Chocolatey (issue #390 asked for whichever works",
+        "better): a plain JSON manifest with first-class 64bit/arm64 keys, no",
+        "human moderation queue between a green build and an installable",
+        "package, and no admin rights required to install.",
+        "",
+        "No checkver/autoupdate block: CI owns this file and rewrites it on",
+        "every release, so a bucket-side version poll would only ever race",
+        "with the push that already updated it."
+    ],
+    "version": "@VERSION@",
+    "description": "Run any coding agent on any model",
+    "homepage": "https://github.com/llmmanorg/llmman",
+    "license": "Apache-2.0",
+    "architecture": {
+        "64bit": {
+            "url": "@BASE_URL@/llmman-x86_64-pc-windows-msvc.exe#/llmman.exe",
+            "hash": "@SHA_WINDOWS_X86_64@"
+        },
+        "arm64": {
+            "url": "@BASE_URL@/llmman-aarch64-pc-windows-msvc.exe#/llmman.exe",
+            "hash": "@SHA_WINDOWS_AARCH64@"
+        }
+    },
+    "bin": "llmman.exe",
+    "notes": [
+        "llmman downloads a llama.cpp build matching your GPU on first use; no extra setup is needed.",
+        "",
+        "To get started:  llmman launch claude --model gemma4",
+        "",
+        "Models and cached llama.cpp builds live under %USERPROFILE%\\.llmman."
+    ]
+}

@@ -36,10 +36,34 @@ curl -fsSL https://raw.githubusercontent.com/llmmanorg/llmman/main/install.sh | 
 irm https://raw.githubusercontent.com/llmmanorg/llmman/main/install.ps1 | iex
 ```
 
-### From source
+### Package managers
 
-`llmman` is published to crates.io, which also covers platforms with no
-prebuilt binary (Intel macOS, for instance):
+If you'd rather have llmman upgraded and removed by something that keeps
+track of it, all three of these are published automatically from the same
+CI run as the binaries above:
+
+**Homebrew** (macOS Apple Silicon, Linux x86_64/aarch64):
+
+```sh
+brew tap llmmanorg/tap
+brew trust llmmanorg/tap
+brew install llmman
+```
+
+The `brew trust` step is required because current Homebrew refuses to load
+formulae from third-party taps until you explicitly trust them; without
+it, `brew install` stops with `Refusing to load formula ... from untrusted
+tap`.
+
+**Scoop** (Windows x86_64/aarch64):
+
+```powershell
+scoop bucket add llmman https://github.com/llmmanorg/scoop-bucket
+scoop install llmman
+```
+
+**Cargo** — builds from source, so it also covers platforms with no
+published binary (Intel macOS, for instance):
 
 ```sh
 cargo install llmman
@@ -47,8 +71,13 @@ cargo install llmman
 
 > `cargo install` needs a **Go 1.25+ toolchain on `PATH`** in addition to
 > Rust: llmman links a Go static archive for its OCI registry transport
-> (see `build.rs` and `go-shim/`). The `curl`/`irm` scripts above ship a
+> (see `build.rs` and `go-shim/`). The other three install methods ship a
 > prebuilt binary and need neither.
+
+The `curl`/`irm` scripts above install the newest commit that passed CI;
+`brew`, `scoop` and `cargo install` follow tagged releases. To track
+individual commits through Homebrew or Scoop instead, install
+`llmman-dev` rather than `llmman`.
 
 ## Quick start
 

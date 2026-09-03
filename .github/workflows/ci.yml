@@ -459,6 +459,189 @@ jobs:
         run: go test -tags podman,containers_image_openpgp,exclude_graphdriver_btrfs,exclude_graphdriver_devicemapper ./...
 
   # --------------------------------------------------------------------------
+  # Packaging: renders the Homebrew formula and Scoop manifest from
+  # packaging/ and checks the *output* parses, on every PR.
+  #
+  # Without this, the only thing that ever exercises those templates is
+  # the publish-homebrew/publish-scoop jobs at the very end of a release —
+  # by which point a one-character typo has already been pushed to
+  # llmmanorg/homebrew-tap, where it doesn't break this repo's CI at all,
+  # it breaks `brew install` for everyone (a formula that raises during
+  # load takes out the whole tap, not just llmman).
+  #
+  # Synthetic checksums, not a real release's: this validates the
+  # rendering and the templates' syntax, which are independent of what
+  # the hashes actually are. render.sh's own placeholder-leak and
+  # hash-shape guards (see that script) are exercised for free.
+  # --------------------------------------------------------------------------
+  packaging:
+    name: Packaging (brew/scoop templates)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: shellcheck packaging/render.sh
+        run: shellcheck packaging/render.sh
+
+      # Both channels: they take different branches through render.sh
+      # (different package name, version derivation and formula class), so
+      # checking one proves nothing about the other.
+      #
+      # The stable tag has to be the *real* crate version rather than a
+      # made-up one: render.sh deliberately refuses a stable tag that
+      # disagrees with Cargo.toml (see its own comment on why), so a
+      # hardcoded "v9.9.9" here would only ever exercise that rejection.
+      - name: Render both channels
+        id: render
+        run: |
+          set -euo pipefail
+          for asset in \
+            llmman-aarch64-apple-darwin \
+            llmman-x86_64-unknown-linux-gnu \
+            llmman-aarch64-unknown-linux-gnu \
+            llmman-x86_64-pc-windows-msvc.exe \
+            llmman-aarch64-pc-windows-msvc.exe; do
+            printf '%s  %s\n' "$(printf '%s' "$asset" | sha256sum | cut -d' ' -f1)" "$asset"
+          done > fake-checksums.txt
+
+          crate_version="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          echo "crate_version=$crate_version" >> "$GITHUB_OUTPUT"
+          echo "Crate version: $crate_version"
+
+          packaging/render.sh --tag "v$crate_version" --checksums fake-checksums.txt --out-dir out-stable
+          packaging/render.sh --tag b99999 --checksums fake-checksums.txt --out-dir out-dev
+
+      # The formula's `test do` block asserts `llmman --version` contains
+      # this string, so if render.sh ever stops sourcing it from
+      # Cargo.toml the formulae still install fine and only fail later,
+      # under `brew test`, on a machine nobody is watching.
+      - name: Check both channels assert the crate version
+        env:
+          CRATE_VERSION: ${{ steps.render.outputs.crate_version }}
+        run: |
+          set -euo pipefail
+          for f in out-stable/Formula/llmman.rb out-dev/Formula/llmman-dev.rb; do
+            grep -q "assert_match \"$CRATE_VERSION\", shell_output" "$f" \
+              || { echo "::error::$f does not assert the crate version $CRATE_VERSION"; exit 1; }
+          done
+          echo "OK: both formulae assert $CRATE_VERSION"
+
+      # ruby -c, not `brew audit`: this catches the failure mode that
+      # actually matters (a formula that cannot be parsed, and so breaks
+      # the entire tap) without making the whole job depend on installing
+      # Homebrew on a Linux runner.
+      - name: Check formulae parse
+        run: |
+          set -euo pipefail
+          for f in out-stable/Formula/*.rb out-dev/Formula/*.rb; do
+            echo "== $f"
+            ruby -c "$f"
+          done
+
+      # Structural, not just well-formed. Scoop's own schema sets
+      # "additionalProperties": false, so a typo'd or invented key makes a
+      # manifest Scoop rejects while `json.tool` still calls it valid
+      # JSON. The key allowlist below is the schema's own top-level
+      # property set (ScoopInstaller/Scoop's schema.json), checked
+      # offline rather than by fetching that schema at CI time so this
+      # job cannot start failing because of someone else's outage.
+      - name: Check manifests
+        run: |
+          set -euo pipefail
+          python3 - out-stable/bucket/*.json out-dev/bucket/*.json <<'PY'
+          import json, sys
+
+          ALLOWED = {
+              "##", "$schema", "_comment", "architecture", "autoupdate", "bin",
+              "checkver", "cookie", "depends", "description", "env_add_path",
+              "env_set", "extract_dir", "extract_to", "hash", "homepage",
+              "innosetup", "installer", "license", "notes", "persist",
+              "post_install", "post_uninstall", "pre_install", "pre_uninstall",
+              "psmodule", "shortcuts", "suggest", "uninstaller", "url", "version",
+          }
+          REQUIRED = {"version", "homepage", "license"}
+          ARCHES = {"64bit", "arm64"}
+
+          failed = False
+          for path in sys.argv[1:]:
+              with open(path) as fh:
+                  m = json.load(fh)
+
+              def bad(msg):
+                  global failed
+                  print(f"::error::{path}: {msg}")
+                  failed = True
+
+              unknown = sorted(set(m) - ALLOWED)
+              if unknown:
+                  bad(f"unknown top-level key(s) {unknown}; Scoop's schema forbids extras")
+              missing = sorted(REQUIRED - set(m))
+              if missing:
+                  bad(f"missing required key(s) {missing}")
+
+              arch = m.get("architecture", {})
+              if set(arch) != ARCHES:
+                  bad(f"architecture keys are {sorted(arch)}, expected {sorted(ARCHES)}")
+              for name, spec in arch.items():
+                  if not spec.get("url"):
+                      bad(f"architecture.{name} has no url")
+                  if len(spec.get("hash", "")) != 64:
+                      bad(f"architecture.{name}.hash is not a 64-char sha256")
+                  # Scoop renames a bare .exe download via this fragment;
+                  # without it the installed file keeps the release asset's
+                  # own llmman-<triple>.exe name and "bin" never resolves.
+                  if not spec.get("url", "").endswith("#/llmman.exe"):
+                      bad(f"architecture.{name}.url lacks the '#/llmman.exe' rename fragment")
+
+              if m.get("bin") != "llmman.exe":
+                  bad(f"bin is {m.get('bin')!r}, expected 'llmman.exe'")
+
+              if not failed:
+                  print(f"OK {path} (version {m['version']})")
+
+          sys.exit(1 if failed else 0)
+          PY
+
+      # Homebrew derives a formula's class name from its filename and
+      # refuses to load the file if they disagree, so the two must be
+      # checked against each other rather than just individually parsing.
+      # Same for the package name render.sh picks per channel.
+      - name: Check filenames, class names and versions
+        run: |
+          set -euo pipefail
+          check() {
+            local rb="$1" want_class="$2" want_version="$3" json="$4"
+            test -f "$rb" || { echo "::error::missing $rb"; exit 1; }
+            grep -q "^class $want_class < Formula$" "$rb" \
+              || { echo "::error::$rb does not declare 'class $want_class'"; exit 1; }
+            grep -q "^  version \"$want_version\"$" "$rb" \
+              || { echo "::error::$rb does not declare version $want_version"; exit 1; }
+            local got
+            got="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['version'])" "$json")"
+            [ "$got" = "$want_version" ] \
+              || { echo "::error::$json has version $got, expected $want_version"; exit 1; }
+          }
+          check out-stable/Formula/llmman.rb  Llmman    "${{ steps.render.outputs.crate_version }}" out-stable/bucket/llmman.json
+          check out-dev/Formula/llmman-dev.rb LlmmanDev 99999 out-dev/bucket/llmman-dev.json
+          echo "OK"
+
+      # A rejected tag must stay rejected: render.sh keying the channel off
+      # the tag prefix is what keeps the stable and dev package versions
+      # from ever being compared against each other, so a tag shape it
+      # does not recognise has to fail loudly rather than default to one.
+      - name: Check an unrecognised tag is rejected
+        run: |
+          if packaging/render.sh --tag 1.2.3 --checksums fake-checksums.txt --out-dir out-bad 2>/dev/null; then
+            echo "::error::render.sh accepted a tag with neither a v nor b prefix"
+            exit 1
+          fi
+          echo "OK: unrecognised tag rejected"
+
+  # --------------------------------------------------------------------------
   # E2E: `llmman launch <claude|opencode|codex|qwen|hermes|openclaw> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
@@ -1258,7 +1441,12 @@ jobs:
     # lines up with both the main-push and v*-tag release channels without
     # ever blocking on an e2e run that was never going to happen for some
     # other event (e.g. a PR).
-    needs: [build, test, lint, e2e]
+    #
+    # `packaging` is in here too: the publish-homebrew/publish-scoop jobs
+    # below run off this job, and a formula/manifest that fails to render
+    # should stop the release rather than be discovered only once it has
+    # been pushed to the tap.
+    needs: [build, test, lint, e2e, packaging]
     runs-on: ubuntu-24.04
     # Downloads, renames and uploads artefacts in under a minute; 60 is
     # the same runner-wedge bound as the `build` job above, not an
@@ -1329,6 +1517,42 @@ jobs:
             echo "tag_name=b$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
           fi
 
+      # SHA256 of every published binary, attached to the release as
+      # checksums.txt. Two consumers:
+      #
+      #   - users, who can verify a `curl`-ed binary by hand;
+      #   - the publish-homebrew/publish-scoop jobs below, whose formula
+      #     and manifest must each embed a hash per asset. They read this
+      #     file (via the artifact uploaded below) rather than hashing the
+      #     binaries themselves, so the hash a user's `brew install`
+      #     enforces provably belongs to the same byte stream that got
+      #     uploaded here — not to a separately-recomputed copy.
+      #
+      # Run from inside dist/ so the names in the file are bare basenames
+      # (what packaging/render.sh's own lookup expects) rather than
+      # "dist/"-prefixed. The llmman-docker-*/ artifact subdirectories the
+      # previous step copied out of are excluded by -maxdepth 1 -type f.
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          find . -maxdepth 1 -type f -name 'llmman-*' -printf '%f\0' \
+            | sort -z \
+            | xargs -0 sha256sum > checksums.txt
+          cat checksums.txt
+
+      # Also an artifact, not just a release asset: the publish jobs below
+      # `needs: [release]` but cannot read the release's own assets
+      # without another authenticated round trip, and an artifact is the
+      # same bytes with none of that.
+      - name: Upload checksums artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-checksums
+          path: dist/checksums.txt
+          if-no-files-found: error
+
       - name: Build release notes
         id: notes
         shell: bash
@@ -1356,7 +1580,9 @@ jobs:
           body_path: release-notes.md
           target_commitish: ${{ github.sha }}
           prerelease: false
-          files: dist/llmman-*
+          files: |
+            dist/llmman-*
+            dist/checksums.txt
 
   # --------------------------------------------------------------------------
   # crates.io (issue #389). Publishes the `llmman` crate.
@@ -1443,3 +1669,216 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked
+
+  # --------------------------------------------------------------------------
+  # Homebrew (issue #385) and Scoop (issue #390).
+  #
+  # Both push a generated formula/manifest into a repo outside this one
+  # (llmmanorg/homebrew-tap, llmmanorg/scoop-bucket), which the workflow's
+  # own GITHUB_TOKEN cannot write to — hence secrets.TAP_GITHUB_TOKEN.
+  #
+  # Both fire on the same two channels the `release` job itself publishes,
+  # and packaging/render.sh turns the tag into the right package name:
+  # a `v*` tag updates `llmman`, a push to main updates `llmman-dev`. See
+  # that script's own header for why these must be two packages and not
+  # one.
+  #
+  # Two jobs rather than one so a failure to reach one of the two
+  # repos does not also withhold an already-rendered, already-correct
+  # update from the other.
+  # --------------------------------------------------------------------------
+  publish-homebrew:
+    name: Publish Homebrew formula
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Serialize every run of this job across the whole repo, so two
+    # commits landing on main close together can't have their tap pushes
+    # interleave. Without this the second run's `git push` is rejected as
+    # a non-fast-forward — recoverable, but it would make the common case
+    # (llmman merges several times an hour) depend on the retry loop
+    # below rather than never racing in the first place.
+    #
+    # cancel-in-progress: false — these must queue, not cancel. Cancelling
+    # the in-flight one would abandon a formula update for a release that
+    # has already been published.
+    concurrency:
+      group: publish-homebrew
+      cancel-in-progress: false
+    steps:
+      # persist-credentials: false — this checkout only supplies
+      # packaging/; the tap checkout below is the one that needs a token,
+      # and leaving this one's in .git/config would put a GITHUB_TOKEN
+      # next to a script this job then runs.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-checksums
+
+      - name: Render formula
+        run: |
+          packaging/render.sh \
+            --tag "${{ needs.release.outputs.tag_name }}" \
+            --checksums checksums.txt \
+            --out-dir rendered
+
+      - name: Check out the tap
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: llmmanorg/homebrew-tap
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: tap
+
+      - name: Commit and push
+        working-directory: tap
+        env:
+          TAG: ${{ needs.release.outputs.tag_name }}
+          SRC: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "llmman-ci"
+          git config user.email "llmman-ci@users.noreply.github.com"
+          # symbolic-ref, not rev-parse --abbrev-ref: the latter prints
+          # the literal string "HEAD" on a detached checkout instead of
+          # failing, which would then be pushed as a branch named HEAD.
+          branch="$(git symbolic-ref --quiet --short HEAD || true)"
+          if [ -z "$branch" ]; then
+            branch="$(git remote show origin | sed -n 's/.*HEAD branch: //p')"
+          fi
+          echo "Target branch: $branch"
+
+          # Re-sync, re-copy and re-commit from scratch on each attempt
+          # rather than rebasing: the file being written is generated
+          # output, so a concurrent update to it is not a conflict to
+          # resolve but simply a base to regenerate on top of. `reset
+          # --hard` is safe for the same reason -- nothing here is
+          # authored in this checkout.
+          #
+          # The `concurrency` group above should already make a second
+          # attempt unnecessary; this exists for transient network/5xx
+          # failures and for the tag-push and main-push runs of the same
+          # commit, which are in different concurrency groups only by
+          # virtue of being the same group name at different times.
+          for attempt in 1 2 3 4 5; do
+            # FETCH_HEAD, not origin/$branch: actions/checkout clones
+            # shallow with a narrow refspec, so a remote-tracking ref for
+            # the branch is not guaranteed to exist here. `git fetch`
+            # always writes FETCH_HEAD.
+            git fetch --quiet origin "$branch"
+            git reset --quiet --hard FETCH_HEAD
+
+            mkdir -p Formula
+            cp ../rendered/Formula/*.rb Formula/
+            git add Formula
+
+            # A re-run for an unchanged release would otherwise fail on
+            # `git commit`'s own "nothing to commit" exit status, turning
+            # a genuine no-op into a red X.
+            if git diff --cached --quiet; then
+              echo "::notice::tap already up to date for $TAG"
+              exit 0
+            fi
+
+            git commit --quiet -m "llmman $TAG" \
+              -m "Generated from llmmanorg/llmman@$SRC by packaging/render.sh."
+
+            if git push --quiet origin "HEAD:$branch"; then
+              echo "Pushed llmman $TAG to the tap"
+              exit 0
+            fi
+            echo "::warning::push to homebrew-tap rejected (attempt $attempt/5); re-syncing"
+            sleep "$((attempt * 3))"
+          done
+          echo "::error::could not push llmman $TAG to homebrew-tap after 5 attempts"
+          exit 1
+
+  publish-scoop:
+    name: Publish Scoop manifest
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # See publish-homebrew's own comment. A separate group from that job:
+    # these two write to different repos and have no reason to block each
+    # other, only their own successive runs.
+    concurrency:
+      group: publish-scoop
+      cancel-in-progress: false
+    steps:
+      # persist-credentials: false — same reasoning as publish-homebrew.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-checksums
+
+      - name: Render manifest
+        run: |
+          packaging/render.sh \
+            --tag "${{ needs.release.outputs.tag_name }}" \
+            --checksums checksums.txt \
+            --out-dir rendered
+
+      - name: Check out the bucket
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: llmmanorg/scoop-bucket
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: bucket-repo
+
+      # Same regenerate-and-retry structure as publish-homebrew's own
+      # push step; see its comments for why this resets rather than
+      # rebases.
+      - name: Commit and push
+        working-directory: bucket-repo
+        env:
+          TAG: ${{ needs.release.outputs.tag_name }}
+          SRC: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "llmman-ci"
+          git config user.email "llmman-ci@users.noreply.github.com"
+          # symbolic-ref, not rev-parse --abbrev-ref: the latter prints
+          # the literal string "HEAD" on a detached checkout instead of
+          # failing, which would then be pushed as a branch named HEAD.
+          branch="$(git symbolic-ref --quiet --short HEAD || true)"
+          if [ -z "$branch" ]; then
+            branch="$(git remote show origin | sed -n 's/.*HEAD branch: //p')"
+          fi
+          echo "Target branch: $branch"
+
+          for attempt in 1 2 3 4 5; do
+            # FETCH_HEAD, not origin/$branch: actions/checkout clones
+            # shallow with a narrow refspec, so a remote-tracking ref for
+            # the branch is not guaranteed to exist here. `git fetch`
+            # always writes FETCH_HEAD.
+            git fetch --quiet origin "$branch"
+            git reset --quiet --hard FETCH_HEAD
+
+            mkdir -p bucket
+            cp ../rendered/bucket/*.json bucket/
+            git add bucket
+
+            if git diff --cached --quiet; then
+              echo "::notice::bucket already up to date for $TAG"
+              exit 0
+            fi
+
+            git commit --quiet -m "llmman $TAG" \
+              -m "Generated from llmmanorg/llmman@$SRC by packaging/render.sh."
+
+            if git push --quiet origin "HEAD:$branch"; then
+              echo "Pushed llmman $TAG to the bucket"
+              exit 0
+            fi
+            echo "::warning::push to scoop-bucket rejected (attempt $attempt/5); re-syncing"
+            sleep "$((attempt * 3))"
+          done
+          echo "::error::could not push llmman $TAG to scoop-bucket after 5 attempts"
+          exit 1
