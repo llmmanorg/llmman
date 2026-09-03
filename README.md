@@ -253,8 +253,7 @@ The API key is read from the variable models.dev names for that provider
 and travels per request, never to disk. `droid` and `hermes` are the
 exceptions: llmman configures them through files on disk, so they can't
 carry a key. `llmman serve` needs the variable in its own environment
-instead. That
-fallback is only used for a daemon bound to loopback, and never for a
+instead. That fallback is only used for a daemon bound to loopback, and never for a
 browser request from another site. It bounds the blast radius rather
 than authenticating anyone, so on a shared machine prefer an integration
 that sends its own key. `cline`, `kimi`, `copilot` and `openclaw` can't be

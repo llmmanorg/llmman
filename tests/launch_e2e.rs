@@ -828,6 +828,36 @@ fn launch_hermes_with_model() {
 }
 
 #[test]
+fn launch_droid_with_model() {
+    let _guard = lock_serial();
+    if !on_path("llama-server") || !on_path("droid") {
+        eprintln!("skipping Droid E2E: requires llama-server and droid on PATH");
+        return;
+    }
+    // No --model override: this verifies the persisted session-default selection.
+    let home = fresh_home("droid");
+    std::fs::create_dir_all(home.join(".factory")).unwrap();
+    std::fs::write(
+        home.join(".factory/settings.json"),
+        r#"{"cloudSessionSync":false}"#,
+    )
+    .unwrap();
+    let output = run_launch(&home, "droid", &["exec", PROMPT])
+        .unwrap_or_else(|_| panic!("Droid launch timed out"));
+    assert!(
+        output.status.success(),
+        "Droid rejected the launch: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_lowercase()
+            .contains("pong"),
+        "Droid did not return the expected model response"
+    );
+}
+
+#[test]
 fn launch_openclaw_with_model() {
     eprintln!("[test] launch_openclaw_with_model: acquiring SERIAL");
     let _guard = lock_serial();

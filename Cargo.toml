@@ -39,6 +39,7 @@ flate2     = "1"
 zip        = { version = "2", default-features = false, features = ["deflate"] }
 libloading = "0.8"
 multer     = "3"
+tempfile   = "3"
 
 # Real Xet-protocol downloads for HuggingFace files too large for the
 # plain-HTTP path to reliably serve — see src/xet_fetch.rs. Its

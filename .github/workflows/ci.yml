@@ -716,6 +716,7 @@ jobs:
           install_cli "@anthropic-ai/claude-code" "@anthropic-ai/claude-code" "claude"
           install_cli "opencode-ai" "opencode-ai" "opencode"
           install_cli "@openai/codex" "@openai/codex" "codex"
+          install_cli "droid@0.208.1" "droid" "droid"
           # Pinned (not @latest): tests/launch_e2e.rs's qwen test relies on
           # this release's tool set under --safe-mode and on the
           # report_findings schema it excludes by name; a newer release can
