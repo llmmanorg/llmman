@@ -9,7 +9,6 @@
 <p align="center">
 Claude Code, Codex, OpenCode and friends, pointed at a model
 running on your own machine, or at any hosted provider, in one command.
-No subscription, no rewiring, no vendor's idea of which model you should use.
 </p>
 
 ```
@@ -17,8 +16,7 @@ llmman launch claude --model gemma4
 ```
 
 That starts a local inference server, downloads a `llama.cpp` build matching your
-GPU, loads the model, and execs Claude Code against it. Every token is generated
-on your machine. No Anthropic API key, no subscription, nothing leaves the box.
+GPU, loads the model, and execs Claude Code against it.
 
 <!-- TODO: 20s asciinema/GIF here: launch claude -> boots -> wifi off -> still coding -->
 
