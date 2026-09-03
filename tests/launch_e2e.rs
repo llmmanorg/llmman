@@ -828,6 +828,17 @@ fn launch_hermes_with_model() {
 }
 
 #[test]
+fn launch_droid_with_model() {
+    let _guard = lock_serial();
+    if !on_path("llama-server") || !on_path("droid") {
+        eprintln!("skipping Droid E2E: requires llama-server and droid on PATH");
+        return;
+    }
+    // No --model override: this verifies the persisted session-default selection.
+    launch_and_assert("droid", &["exec", PROMPT]);
+}
+
+#[test]
 fn launch_openclaw_with_model() {
     eprintln!("[test] launch_openclaw_with_model: acquiring SERIAL");
     let _guard = lock_serial();

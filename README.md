@@ -12,7 +12,7 @@ running on your own machine, or at any hosted provider, in one command.
 No subscription, no rewiring, no vendor's idea of which model you should use.
 </p>
 
-```
+```sh
 llmman launch claude --model gemma4
 ```
 
@@ -26,13 +26,13 @@ on your machine. No Anthropic API key, no subscription, nothing leaves the box.
 
 **Linux, macOS:**
 
-```
+```sh
 curl -fsSL https://raw.githubusercontent.com/llmmanorg/llmman/main/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
-```
+```powershell
 irm https://raw.githubusercontent.com/llmmanorg/llmman/main/install.ps1 | iex
 ```
 
@@ -231,11 +231,11 @@ starts. They're documented in [docs/configuration.md](docs/configuration.md).
 
 Point an integration at a model in one step. `llmman launch` starts `serve` in the background if it isn't already running (preloading the requested model), then sets the right environment variables and execs the integration:
 
-```
+```sh
 llmman launch claude --model gemma4
 ```
 
-Run `llmman launch` with no arguments to list the supported integrations (Claude Code, OpenCode) and whether each is installed. Any extra arguments after `--` are forwarded to the integration's own CLI.
+Run `llmman launch` with no arguments to list the supported integrations (Claude Code, OpenCode, Factory Droid, and others) and whether each is installed. Any extra arguments after `--` are forwarded to the integration's own CLI.
 
 Short names work wherever a model reference is accepted.
 
@@ -270,10 +270,10 @@ one place integrations are configured, whether a model is local or
 hosted, and both usable from the same session.
 
 The API key is read from the variable models.dev names for that provider
-and travels per request, never to disk. `hermes` is the exception: llmman
-configures it through a file on disk, so it can't carry a key and
-`llmman serve` needs the variable in its own environment instead. That
-fallback is only used for a daemon bound to loopback, and never for a
+and travels per request, never to disk. `droid` and `hermes` are the
+exceptions: llmman configures them through files on disk, so they can't
+carry a key. `llmman serve` needs the variable in its own environment
+instead. That fallback is only used for a daemon bound to loopback, and never for a
 browser request from another site. It bounds the blast radius rather
 than authenticating anyone, so on a shared machine prefer an integration
 that sends its own key. `cline`, `kimi`, `copilot` and `openclaw` can't be
@@ -325,4 +325,3 @@ Uses [`github.com/podman-container-tools/container-libs`](https://github.com/pod
 ```
 cargo build --release --no-default-features --features podman
 ```
-

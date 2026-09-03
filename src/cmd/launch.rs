@@ -152,7 +152,7 @@ const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
 /// a credential, which this feature promises not to do. They rely on
 /// `llmman serve` having the variable itself — which it only uses for a
 /// daemon nobody else can reach (see `reachable_only_locally`).
-const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes"];
+const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["droid", "hermes"];
 
 fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
     let name = integration.to_lowercase();
@@ -303,6 +303,11 @@ const INTEGRATIONS: &[Integration] = &[
         binary: "codex",
     },
     Integration {
+        name: "droid",
+        description: "Factory Droid CLI",
+        binary: "droid",
+    },
+    Integration {
         name: "cline",
         description: "Cline",
         binary: "cline",
@@ -411,6 +416,7 @@ fn launch(name: &str, model: &str, api_key: &str, extra_args: &[String]) -> anyh
         "claude" => launch_claude(model, api_key, extra_args),
         "opencode" => launch_opencode(model, api_key, extra_args),
         "codex" => launch_codex(model, api_key, extra_args),
+        "droid" => launch_droid(model, extra_args),
         "cline" => launch_simple("cline", model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
@@ -580,6 +586,201 @@ fn strip_legacy_llmman_profile(existing: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// droid: add one llmman-owned custom model to Factory's shared settings,
+/// then select that exact entry on launch. The placeholder key is deliberate:
+/// local models need no secret, while provider-routed launches require the
+/// loopback daemon to hold the real key (see `PROVIDER_NEEDS_DAEMON_KEY`).
+fn launch_droid(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_on_path("droid").ok_or_else(|| anyhow::anyhow!("droid is not installed"))?;
+    let effective_model = if model.is_empty() { "default" } else { model };
+    write_droid_config(effective_model)?;
+    exec_with_env(&bin, extra_args, &[])
+}
+
+/// Writes the modern Factory settings format documented at
+/// <https://docs.factory.ai/model-independence/byok>. The parsed JSON object is
+/// retained so unrelated user settings and custom models survive unchanged.
+fn write_droid_config(model: &str) -> anyhow::Result<String> {
+    let home = dirs::home_dir().context("no home directory")?;
+    let config_dir = home.join(".factory");
+    std::fs::create_dir_all(&config_dir)?;
+    let config_path = config_dir.join("settings.json");
+
+    // Serialize cooperating llmman launches before reading and replacing settings.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(config_dir.join("settings.llmman.lock"))?;
+    lock.lock()?;
+
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => "{}".to_string(),
+        Err(err) => return Err(err).with_context(|| format!("read {}", config_path.display())),
+    };
+    let base_url = format!("{}/v1", daemon::server());
+    let (contents, custom_model_id) = update_droid_settings_with_capabilities(
+        &existing,
+        model,
+        &base_url,
+        droid_image_support(model),
+    )
+    .with_context(|| format!("parse {}", config_path.display()))?;
+
+    if existing != contents {
+        save_droid_settings(&config_path, &existing, &contents)?;
+    }
+    Ok(custom_model_id)
+}
+
+// Provider metadata currently does not expose modalities. Preserve Droid's
+// default for unknown capabilities instead of declaring such a model text-only.
+fn droid_image_support(model: &str) -> Option<bool> {
+    let reference = crate::shortnames::resolve_ollama_api(model).ok()?;
+    let store_path = crate::default_store().ok()?;
+    let store = crate::storage::OciStore::open(&store_path).ok()?;
+    let desc = store.find(&reference).ok()?;
+    let manifest = store.read_manifest(&desc.digest).ok()?;
+    let raw = crate::hf::oci::read_blob(&store_path, &manifest.config.digest).ok()?;
+    let config: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let inputs = config
+        .pointer("/config/capabilities/inputTypes")?
+        .as_array()?;
+    Some(inputs.iter().any(|input| input.as_str() == Some("image")))
+}
+
+fn save_droid_settings(
+    path: &std::path::Path,
+    expected: &str,
+    contents: &str,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .context("Factory settings have no parent directory")?;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(m) => {
+            anyhow::ensure!(m.is_file(), "Factory settings must be a regular file");
+            Some(m)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    if let Some(m) = &metadata {
+        staged.as_file().set_permissions(m.permissions())?;
+    }
+    staged.write_all(contents.as_bytes())?;
+    staged.as_file().sync_all()?;
+    if metadata.is_some() {
+        anyhow::ensure!(
+            std::fs::read_to_string(path)? == expected,
+            "Factory settings changed concurrently; retry launch"
+        );
+        let mut backup = tempfile::NamedTempFile::new_in(parent)?;
+        backup.write_all(expected.as_bytes())?;
+        backup.as_file().sync_all()?;
+        backup.persist(path.with_extension("json.bak"))?;
+    } else {
+        staged.persist_noclobber(path)?;
+        return Ok(());
+    }
+    staged.persist(path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn update_droid_settings(
+    existing: &str,
+    model: &str,
+    base_url: &str,
+) -> anyhow::Result<(String, String)> {
+    update_droid_settings_with_capabilities(existing, model, base_url, Some(false))
+}
+
+/// Match ownership by Factory-visible fields, not the placeholder key alone.
+fn is_llmman_droid_entry(entry: &serde_json::Map<String, serde_json::Value>) -> bool {
+    entry.get("apiKey").and_then(serde_json::Value::as_str) == Some(providers::PLACEHOLDER_API_KEY)
+        && entry.get("displayName").and_then(serde_json::Value::as_str) == Some("llmman")
+        && entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id.starts_with("custom:llmman-"))
+        && entry
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+}
+
+fn update_droid_settings_with_capabilities(
+    existing: &str,
+    model: &str,
+    base_url: &str,
+    supports_images: Option<bool>,
+) -> anyhow::Result<(String, String)> {
+    let mut settings: serde_json::Value = serde_json::from_str(existing)?;
+    let root = settings
+        .as_object_mut()
+        .context("Factory settings must be a JSON object")?;
+    let models = root
+        .entry("customModels")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("Factory customModels must be a JSON array")?;
+
+    let owned = models
+        .iter()
+        .position(|entry| entry.as_object().is_some_and(is_llmman_droid_entry));
+    let index = owned.unwrap_or(models.len());
+    let custom_model_id = format!("custom:llmman-{index}");
+
+    let mut entry = owned
+        .and_then(|i| models[i].as_object().cloned())
+        .unwrap_or_default();
+    entry.insert("model".into(), model.into());
+    entry.insert("displayName".into(), "llmman".into());
+    entry.insert("baseUrl".into(), base_url.into());
+    entry.insert("apiKey".into(), providers::PLACEHOLDER_API_KEY.into());
+    entry.insert("provider".into(), "generic-chat-completion-api".into());
+    entry.insert("maxOutputTokens".into(), 64_000.into());
+    entry.insert("id".into(), custom_model_id.clone().into());
+    entry.insert("index".into(), index.into());
+    entry.remove("llmmanManaged");
+    if let Some(images) = supports_images {
+        entry.insert("supportsImages".into(), images.into());
+        entry.insert("noImageSupport".into(), (!images).into());
+    } else {
+        entry.remove("supportsImages");
+        entry.remove("noImageSupport");
+    }
+
+    if let Some(i) = owned {
+        models[i] = serde_json::Value::Object(entry);
+    } else {
+        models.push(serde_json::Value::Object(entry));
+    }
+
+    let defaults = root
+        .entry("sessionDefaultSettings")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("Factory sessionDefaultSettings must be a JSON object")?;
+    defaults.insert("model".into(), custom_model_id.clone().into());
+    if !matches!(
+        defaults
+            .get("reasoningEffort")
+            .and_then(serde_json::Value::as_str),
+        Some("none" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "dynamic")
+    ) {
+        defaults.insert("reasoningEffort".into(), "none".into());
+    }
+    let mut rendered = serde_json::to_string_pretty(&settings)?;
+    rendered.push('\n');
+    Ok((rendered, custom_model_id))
 }
 
 /// aider: set OPENAI_API_KEY and OPENAI_BASE_URL.
@@ -1032,6 +1233,198 @@ mod tests {
         assert_eq!(
             qwen_args("m:latest", &user_camel),
             ["--model", "m:latest", "--authType", "openai"]
+        );
+    }
+
+    #[test]
+    fn droid_settings_create_a_selectable_llmman_model() {
+        let (settings, id) = update_droid_settings("{}", "qwen3.5:0.8b", "http://localhost/v1")
+            .expect("valid settings");
+        let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
+        let model = &parsed["customModels"][0];
+
+        assert_eq!(id, "custom:llmman-0");
+        assert_eq!(model["model"], "qwen3.5:0.8b");
+        assert_eq!(model["displayName"], "llmman");
+        assert_eq!(model["baseUrl"], "http://localhost/v1");
+        assert_eq!(model["apiKey"], "llmman");
+        assert_eq!(model["provider"], "generic-chat-completion-api");
+        assert_eq!(model["maxOutputTokens"], 64_000);
+        assert_eq!(model["id"], id);
+        assert_eq!(model["index"], 0);
+        assert!(model.get("llmmanManaged").is_none());
+        assert_eq!(parsed["sessionDefaultSettings"]["model"], id);
+        assert_eq!(parsed["sessionDefaultSettings"]["reasoningEffort"], "none");
+        assert_eq!(model["supportsImages"], false);
+    }
+
+    #[test]
+    fn droid_settings_preserve_unrelated_data_and_append_ours() {
+        let existing = r#"{
+            "theme": "dark",
+            "customModels": [{
+                "model": "other",
+                "displayName": "Other",
+                "customField": {"keep": true}
+            }]
+        }"#;
+        let (settings, id) =
+            update_droid_settings(existing, "model/with:specials", "http://localhost/v1").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
+
+        assert_eq!(parsed["theme"], "dark");
+        assert_eq!(parsed["customModels"][0]["customField"]["keep"], true);
+        assert_eq!(parsed["customModels"][1]["model"], "model/with:specials");
+        assert_eq!(parsed["customModels"][1]["index"], 1);
+        assert_eq!(id, "custom:llmman-1");
+    }
+
+    #[test]
+    fn droid_settings_replace_only_our_entry_and_are_idempotent() {
+        let existing = r#"{
+            "customModels": [
+                {"model": "other", "displayName": "Other"},
+                {
+                    "model": "old",
+                    "displayName": "llmman",
+                    "apiKey": "llmman",
+                    "id": "custom:llmman-1",
+                    "index": 1,
+                    "llmmanManaged": true,
+                    "futureField": "preserved"
+                }
+            ]
+        }"#;
+        let (once, id) = update_droid_settings(existing, "new", "http://new/v1").unwrap();
+        let (twice, second_id) = update_droid_settings(&once, "new", "http://new/v1").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&twice).unwrap();
+
+        assert_eq!(id, "custom:llmman-1");
+        assert_eq!(second_id, id);
+        assert_eq!(once, twice);
+        assert_eq!(parsed["customModels"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["customModels"][0]["model"], "other");
+        assert_eq!(parsed["customModels"][1]["model"], "new");
+        assert_eq!(parsed["customModels"][1]["baseUrl"], "http://new/v1");
+        assert_eq!(parsed["customModels"][1]["futureField"], "preserved");
+    }
+
+    #[test]
+    fn droid_settings_do_not_overwrite_user_model_with_placeholder_key() {
+        let existing = r#"{
+            "customModels": [{
+                "model": "user-model",
+                "displayName": "Personal",
+                "apiKey": "llmman",
+                "id": "custom:user-0",
+                "index": 0
+            }]
+        }"#;
+        let (settings, id) =
+            update_droid_settings(existing, "managed-model", "http://localhost/v1").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
+
+        assert_eq!(id, "custom:llmman-1");
+        assert_eq!(parsed["customModels"][0]["model"], "user-model");
+        assert_eq!(parsed["customModels"][0]["displayName"], "Personal");
+        assert_eq!(parsed["customModels"][1]["model"], "managed-model");
+    }
+
+    #[test]
+    fn droid_settings_do_not_overwrite_a_similarly_named_user_model() {
+        let existing = r#"{
+            "customModels": [{
+                "model": "user-model",
+                "displayName": "llmman",
+                "apiKey": "user-owned-key",
+                "id": "custom:llmman-0",
+                "index": 0
+            }]
+        }"#;
+        let (settings, id) =
+            update_droid_settings(existing, "managed-model", "http://localhost/v1").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
+
+        assert_eq!(id, "custom:llmman-1");
+        assert_eq!(parsed["customModels"][0]["model"], "user-model");
+        assert_eq!(
+            parsed["customModels"][0]["llmmanManaged"],
+            serde_json::Value::Null
+        );
+        assert_eq!(parsed["customModels"][1]["model"], "managed-model");
+        assert!(parsed["customModels"][1].get("llmmanManaged").is_none());
+    }
+
+    #[test]
+    fn droid_settings_reject_corruption_instead_of_overwriting_it() {
+        assert!(update_droid_settings("{broken", "model", "http://localhost/v1").is_err());
+        assert!(update_droid_settings("[]", "model", "http://localhost/v1").is_err());
+        assert!(update_droid_settings(
+            r#"{"customModels":"not-an-array"}"#,
+            "model",
+            "http://localhost/v1"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn droid_settings_preserve_valid_effort_and_set_image_support() {
+        let existing =
+            r#"{"sessionDefaultSettings":{"reasoningEffort":"low","autonomyLevel":"off"}}"#;
+        let (settings, _) = update_droid_settings_with_capabilities(
+            existing,
+            "vision",
+            "http://localhost/v1",
+            Some(true),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&settings).unwrap();
+        assert_eq!(v["customModels"][0]["supportsImages"], true);
+        assert_eq!(v["customModels"][0]["noImageSupport"], false);
+        assert_eq!(v["sessionDefaultSettings"]["reasoningEffort"], "low");
+        assert_eq!(v["sessionDefaultSettings"]["autonomyLevel"], "off");
+    }
+
+    #[test]
+    fn droid_settings_clear_stale_image_flags_when_capability_is_unknown() {
+        let existing = r#"{
+            "customModels": [{
+                "model": "vision",
+                "displayName": "llmman",
+                "baseUrl": "http://old/v1",
+                "apiKey": "llmman",
+                "provider": "generic-chat-completion-api",
+                "id": "custom:llmman-0",
+                "index": 0,
+                "supportsImages": true,
+                "noImageSupport": false
+            }]
+        }"#;
+        let (settings, _) =
+            update_droid_settings_with_capabilities(existing, "unknown", "http://new/v1", None)
+                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&settings).unwrap();
+
+        assert_eq!(v["customModels"][0]["model"], "unknown");
+        assert!(v["customModels"][0].get("supportsImages").is_none());
+        assert!(v["customModels"][0].get("noImageSupport").is_none());
+    }
+
+    #[test]
+    fn droid_settings_backup_and_concurrent_change_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        save_droid_settings(&path, "{}", "{\"theme\":\"dark\"}").unwrap();
+        assert!(!path.with_extension("json.bak").exists());
+        save_droid_settings(&path, "{\"theme\":\"dark\"}", "{\"theme\":\"light\"}").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.bak")).unwrap(),
+            "{\"theme\":\"dark\"}"
+        );
+        assert!(save_droid_settings(&path, "{}", "{}").is_err());
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "{\"theme\":\"light\"}"
         );
     }
 
