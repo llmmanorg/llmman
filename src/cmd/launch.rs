@@ -53,6 +53,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         return Ok(());
     };
 
+    // Before either arm starts the daemon; see `check_model_flag`.
+    check_model_flag(name, args.model.as_deref(), provider, &args.extra_args)?;
+
     let (model, api_key) = match provider {
         Some(provider) => {
             check_provider_supported(name)?;
@@ -102,6 +105,51 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     };
 
     launch(name, &model, &api_key, &args.extra_args)
+}
+
+// ---------------------------------------------------------------------------
+// Pre-flight
+// ---------------------------------------------------------------------------
+
+/// Integrations that cannot be launched without `--model`: Qwen Code has
+/// no notion of a missing model and sends its own built-in default
+/// (`qwen3.7-max` in 0.22.3), which the daemon would then try to pull.
+/// Checked before `ensure_server`, so the refusal costs no daemon start.
+const MODEL_REQUIRED: &[&str] = &["qwen"];
+
+/// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
+/// `--provider` too. A second `--model` after `--` is the caller's to
+/// win (`qwen_args` yields to it), but `run` resolves the top-level one
+/// and, locally, preloads it, so that gets said.
+fn check_model_flag(
+    integration: &str,
+    model: Option<&str>,
+    provider: Option<&str>,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
+    let name = integration.to_lowercase();
+    if !MODEL_REQUIRED.contains(&name.as_str()) {
+        return Ok(());
+    }
+    let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
+        let with_provider = provider.map_or(String::new(), |p| format!(" --provider {p}"));
+        anyhow::bail!("{name} needs a model: llmman launch {name}{with_provider} --model <model>");
+    };
+    if has_flag(extra_args, "--model", Some("-m")) {
+        eprintln!(
+            "[llmman] {name}: the --model after -- wins over --model {model}, the one llmman resolved"
+        );
+    }
+    Ok(())
+}
+
+/// Whether `extra_args` spells `long` or `short`, as a word or `=`-joined.
+fn has_flag(extra_args: &[String], long: &str, short: Option<&str>) -> bool {
+    extra_args.iter().any(|a| {
+        a == long
+            || a.starts_with(&format!("{long}="))
+            || short.is_some_and(|s| a == s || a.starts_with(&format!("{s}=")))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -828,16 +876,10 @@ fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 /// `docker.io/…` and `hf.co/…` references llmman hands over do not
 /// collide with.
 ///
-/// `--model` is required. Qwen Code has no notion of a missing model:
-/// given none it sends its own built-in default (`qwen3.7-max` in
-/// 0.22.3), which the daemon would then try to pull as
-/// `docker.io/ai/qwen3.7-max` and fail on, minutes later, naming a model
-/// the caller did not ask for. Refusing here names the flag instead.
+/// `--model` is required; `check_model_flag` refuses a launch without one
+/// before the daemon starts.
 fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_on_path("qwen").ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
-    if model.is_empty() {
-        anyhow::bail!("qwen needs a model: llmman launch qwen --model <model>");
-    }
 
     let base_url = format!("{}/v1", daemon::server());
     exec_with_env(
@@ -858,18 +900,11 @@ fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Res
 /// out an auth type meant it. `--authType` is checked too — yargs accepts
 /// a flag's camelCase spelling as well.
 fn qwen_args(model: &str, extra_args: &[String]) -> Vec<String> {
-    let has = |long: &str, short: Option<&str>| {
-        extra_args.iter().any(|a| {
-            a == long
-                || a.starts_with(&format!("{long}="))
-                || short.is_some_and(|s| a == s || a.starts_with(&format!("{s}=")))
-        })
-    };
     let mut args = Vec::with_capacity(extra_args.len() + 4);
-    if !has("--auth-type", Some("--authType")) {
+    if !has_flag(extra_args, "--auth-type", Some("--authType")) {
         args.extend(["--auth-type".to_string(), "openai".to_string()]);
     }
-    if !has("--model", Some("-m")) {
+    if !has_flag(extra_args, "--model", Some("-m")) {
         args.extend(["--model".to_string(), model.to_string()]);
     }
     args.extend_from_slice(extra_args);
@@ -994,6 +1029,48 @@ mod tests {
         );
         assert_eq!(openclaw_model_id(""), "default");
         assert_eq!(openclaw_model_id("docker.io/ai/"), "default");
+    }
+
+    /// Every integration `check_model_flag` holds to a model must be one
+    /// `launch` dispatches; it is refused without one, under `--provider`
+    /// too, and a `--model` after `--` is let through.
+    #[test]
+    fn model_required_integrations_are_refused_without_a_model() {
+        let none: Vec<String> = vec![];
+        for id in MODEL_REQUIRED {
+            assert!(
+                INTEGRATIONS.iter().any(|i| i.name == *id),
+                "{id} is not an integration"
+            );
+            assert!(check_model_flag(id, None, None, &none).is_err());
+            assert!(check_model_flag(id, Some(" "), None, &none).is_err());
+            assert!(check_model_flag(&id.to_uppercase(), None, None, &none).is_err());
+            let err = check_model_flag(id, None, Some("openrouter"), &none).unwrap_err();
+            assert!(
+                err.to_string().contains("--provider openrouter --model"),
+                "{err}"
+            );
+            assert!(check_model_flag(id, Some("m"), None, &none).is_ok());
+            let forwarded = vec!["--model".to_string(), "theirs".to_string()];
+            assert!(check_model_flag(id, Some("m"), None, &forwarded).is_ok());
+        }
+        assert!(check_model_flag("claude", None, None, &none).is_ok());
+    }
+
+    /// A word or `=`-joined, and nothing looser: `-sm` is not `-m`.
+    #[test]
+    fn has_flag_takes_the_exact_and_joined_forms_only() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(has_flag(&args(&["--model", "x"]), "--model", Some("-m")));
+        assert!(has_flag(&args(&["--model=x"]), "--model", Some("-m")));
+        assert!(has_flag(&args(&["-m", "x"]), "--model", Some("-m")));
+        assert!(has_flag(&args(&["-m=x"]), "--model", Some("-m")));
+        assert!(!has_flag(&args(&["-sm", "x"]), "--model", Some("-m")));
+        assert!(!has_flag(
+            &args(&["--model-context", "x"]),
+            "--model",
+            Some("-m")
+        ));
     }
 
     /// The two flags `launch_qwen` relies on to beat a persisted
