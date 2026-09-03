@@ -36,6 +36,20 @@ curl -fsSL https://raw.githubusercontent.com/llmmanorg/llmman/main/install.sh | 
 irm https://raw.githubusercontent.com/llmmanorg/llmman/main/install.ps1 | iex
 ```
 
+### From source
+
+`llmman` is published to crates.io, which also covers platforms with no
+prebuilt binary (Intel macOS, for instance):
+
+```sh
+cargo install llmman
+```
+
+> `cargo install` needs a **Go 1.25+ toolchain on `PATH`** in addition to
+> Rust: llmman links a Go static archive for its OCI registry transport
+> (see `build.rs` and `go-shim/`). The `curl`/`irm` scripts above ship a
+> prebuilt binary and need neither.
+
 ## Quick start
 
 Three commands cover most of it:

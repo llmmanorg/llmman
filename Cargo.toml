@@ -4,6 +4,58 @@ version = "0.1.0"
 edition = "2021"
 description = "llmman manages OCI models"
 license = "Apache-2.0"
+repository = "https://github.com/llmmanorg/llmman"
+homepage = "https://github.com/llmmanorg/llmman"
+documentation = "https://docs.rs/llmman"
+readme = "README.md"
+keywords = ["llm", "oci", "inference", "gguf", "ai"]
+categories = ["command-line-utilities", "science"]
+# Not a policy choice — this is the floor the dependency graph already
+# imposes, and is the highest `rust-version` declared by anything in it
+# (the aws-* crates behind the `s3://` source, as of the pinned
+# versions). Declaring it here is what turns "cargo install llmman" on an
+# older toolchain into Cargo's own "requires rustc 1.94.1" message
+# instead of a pile of confusing syntax errors from inside a dependency.
+#
+# CI itself tracks `stable` (see the dtolnay/rust-toolchain steps in
+# .github/workflows/ci.yml), so this exact version is not built there;
+# re-derive it with
+#   cargo metadata --format-version 1 | jq -r '.packages[].rust_version'
+# after a dependency bump rather than assuming it still holds.
+rust-version = "1.94.1"
+
+# What NOT to ship in the .crate. Everything build.rs actually reads must
+# stay: `go-shim/` (the c-archive it compiles and statically links) and
+# `webui/` (gzipped and `include_bytes!`d — see src/webui.rs). What's left
+# is developer/CI-only and is pure dead weight to a `cargo install`:
+#
+#   vllm-plugin/  a separately-published Python package, not Rust
+#   fuzz/         its own cargo-fuzz crate, nightly-only
+#   docs/, .github/, install.sh, install.ps1
+#                 repo-level material with no bearing on building
+#
+# tests/ is deliberately NOT excluded despite launch_e2e.rs being
+# unrunnable from an unpacked .crate (it drives real agent CLIs against a
+# real llama-server). It is 108K, and excluding it makes `cargo package`
+# warn "ignoring test `launch_e2e`" on every run, which reads like a
+# problem and isn't. Suppressing that warning properly would need
+# `autotests = false`, which would in turn stop Cargo discovering the
+# target at all and break the e2e job's own `cargo test --test
+# launch_e2e` invocation.
+#
+# This is deliberately an `exclude` rather than an `include`: an
+# `include` list silently drops any *new* path a future build.rs starts
+# depending on, which would only surface as a broken published crate.
+exclude = [
+	"vllm-plugin/",
+	"fuzz/",
+	"docs/",
+	".github/",
+	".ruff_cache/",
+	"install.sh",
+	"install.ps1",
+	"packaging/",
+]
 
 [lib]
 name = "llmman"

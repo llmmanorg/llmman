@@ -1282,6 +1282,14 @@ jobs:
     permissions:
       contents: write
 
+    # Consumed by the three package-manager publish jobs below
+    # (publish-crate/publish-homebrew/publish-scoop), so the tag is
+    # computed once, here, rather than each of them re-deriving it from
+    # github.ref and `git rev-list` and risking drift from this job's own
+    # "Determine release tag" step.
+    outputs:
+      tag_name: ${{ steps.tag.outputs.tag_name }}
+
     steps:
       # fetch-depth: 0 — the b<N> tag below is the full commit count,
       # which a shallow default clone can't compute. Checkout comes
@@ -1349,3 +1357,89 @@ jobs:
           target_commitish: ${{ github.sha }}
           prerelease: false
           files: dist/llmman-*
+
+  # --------------------------------------------------------------------------
+  # crates.io (issue #389). Publishes the `llmman` crate.
+  #
+  # Stable `v*` tags only, unlike every other job here that also fires on
+  # each push to main: crates.io versions are immutable and permanent (a
+  # bad one can only be yanked, never replaced or deleted), and the
+  # version published comes from Cargo.toml, which does not change
+  # per-commit. Publishing the b<N> channel here would therefore mean
+  # either hundreds of throwaway versions or a hard failure on the second
+  # commit — so the per-commit channel stays with install.sh/install.ps1
+  # and the `llmman-dev` brew/scoop packages below, which are all
+  # overwrite-in-place by design.
+  #
+  # `needs: [release]` rather than repeating release's own
+  # [build, test, lint, e2e]: that job already gates on all four, so this
+  # additionally guarantees the GitHub release itself succeeded before a
+  # permanent, unrevocable crates.io version exists for it.
+  # --------------------------------------------------------------------------
+  publish-crate:
+    name: Publish to crates.io
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # Go, gcc: `cargo publish` runs a full verification build of the
+      # packaged crate by default, and build.rs compiles the go-shim
+      # c-archive via CGO. Same toolchain the `build` job sets up, for the
+      # same reason.
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: go-shim/go.sum
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc
+
+      # The tag is the release's identity but Cargo.toml's `version` is
+      # what actually gets published, and nothing otherwise ties them
+      # together — a `v0.2.0` tag cut without bumping Cargo.toml would
+      # silently publish 0.1.0 again (or fail deep inside `cargo publish`
+      # with an "already uploaded" error that names neither the tag nor
+      # the mismatch). Fail here instead, before anything is uploaded.
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.release.outputs.tag_name }}"
+          manifest="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "${tag#v}" != "$manifest" ]; then
+            echo "::error::tag $tag does not match Cargo.toml version $manifest — bump the version before tagging"
+            exit 1
+          fi
+          echo "OK: $tag matches Cargo.toml version $manifest"
+          echo "CRATE_VERSION=$manifest" >> "$GITHUB_ENV"
+
+      # Makes a re-run of a partially-failed workflow safe. crates.io
+      # rejects a duplicate version outright, which would turn any re-run
+      # (e.g. to retry a failed publish-homebrew below) into a red X on an
+      # already-correctly-published crate.
+      - name: Skip if this version is already on crates.io
+        id: exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          if curl -fsS -H "User-Agent: llmman-ci (github.com/llmmanorg/llmman)" \
+              "https://crates.io/api/v1/crates/llmman/$CRATE_VERSION" >/dev/null 2>&1; then
+            echo "::notice::llmman $CRATE_VERSION is already published; skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: cargo publish
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked

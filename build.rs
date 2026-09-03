@@ -105,6 +105,25 @@ fn git_path(path: &str) -> Option<PathBuf> {
         .map(|s| PathBuf::from(s.trim()))
 }
 
+/// True when running inside docs.rs's builder, which sets `DOCS_RS` for
+/// exactly this purpose.
+///
+/// docs.rs runs `cargo doc` in a network-isolated sandbox with no Go
+/// toolchain, so the `go mod download` / `go build -buildmode=c-archive`
+/// below cannot possibly succeed there — without this the crate's
+/// documentation build fails outright the moment it's published to
+/// crates.io (see the `publish-crate` job in .github/workflows/ci.yml),
+/// leaving a permanently broken docs.rs page for every release.
+///
+/// Skipping the shim is safe *specifically* because rustdoc never links:
+/// it type-checks and documents, so the `#[link(kind = "static")]` items
+/// in src/ffi.rs are resolved as declarations only and the archive they
+/// name is never opened. A real `cargo build` still goes down the normal
+/// path below and still hard-fails if Go is missing.
+fn is_docs_rs() -> bool {
+    env::var_os("DOCS_RS").is_some()
+}
+
 fn main() {
     emit_version();
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -112,6 +131,16 @@ fn main() {
     let shim_dir = manifest_dir.join("go-shim");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+
+    // See is_docs_rs(). The webui gzipping at the bottom of this function
+    // still has to run even here: src/webui.rs `include_bytes!`s its
+    // output, so skipping it would break the very `cargo doc` this is
+    // meant to rescue. Only the Go/CGO half is skipped.
+    if is_docs_rs() {
+        println!("cargo:warning=DOCS_RS set: skipping the Go shim build (rustdoc does not link)");
+        gzip_webui(&manifest_dir, &out_dir);
+        return;
+    }
 
     // Determine backend build tags from Cargo features.
     // For the podman backend we add two extra tags to avoid pulling in C library
@@ -250,7 +279,13 @@ fn main() {
     println!("cargo:rerun-if-changed=go-shim/");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PODMAN");
 
-    // ── Gzip web UI assets for embedding ──────────────────────────────────
+    gzip_webui(&manifest_dir, &out_dir);
+}
+
+/// Gzip the web UI assets into `$OUT_DIR/webui_gz/` for src/webui.rs to
+/// `include_bytes!`. Split out of `main` so the docs.rs early return
+/// above can still produce them — see is_docs_rs().
+fn gzip_webui(manifest_dir: &Path, out_dir: &Path) {
     let webui_src = manifest_dir.join("webui");
     let webui_out = out_dir.join("webui_gz");
     fs::create_dir_all(&webui_out).expect("create webui_gz dir");
