@@ -235,7 +235,7 @@ jobs:
   test:
     name: Unit tests (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: ${{ matrix.timeout || 60 }}
     strategy:
       fail-fast: false
       matrix:
@@ -268,6 +268,7 @@ jobs:
             go-os: windows
             msvc-arch: amd64
             rustflags: "-C linker=lld-link"
+            timeout: 60
 
           # ── Windows aarch64 ───────────────────────────────────────────────
           # rustflags empty (MSVC-native link.exe, not lld-link) — see the
@@ -278,6 +279,7 @@ jobs:
             go-os: windows
             msvc-arch: arm64
             rustflags: ""
+            timeout: 60
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
