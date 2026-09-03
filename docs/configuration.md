@@ -19,6 +19,19 @@ store the daemon was started with; set `LLMMAN_MODELS` before
 
 The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), readable by `docker` and `podman`.
 
+## Signature trust policy
+
+`verify.conf` decides which references must carry a trusted signature
+before `llmman pull` will accept them, and which keys count as trusted.
+It is read from the same five locations as `shortnames.conf`
+(`/usr/share/llmman/`, `/etc/llmman/`, `<binary>/../share/llmman/`,
+`<binary-dir>/`, `~/.config/llmman/`), with later files overriding
+earlier ones. Absent, nothing is verified; present but unreadable or
+malformed is an error rather than a silent downgrade.
+
+See [verification.md](verification.md) for the file format, what is
+checked, and the limitations.
+
 ## Environment variables
 
 Daemon-wide settings, set before `llmman serve` starts. llmman is a very
@@ -47,6 +60,8 @@ setting may not behave identically.
 | `LLMMAN_IGPU_ENABLE` | Counts integrated GPUs (Vulkan only) when probing for an accelerator. Defaults to disabled, since an integrated GPU is usually a worse choice than the discrete/CPU fallback it would otherwise be skipped in favor of. |
 | `LLMMAN_LOAD_TIMEOUT` | How long to allow a model load to stall before giving up. Zero or negative means wait forever. Defaults to 10 minutes (`vllm` can take several minutes to load a large safetensors model). |
 | `LLMMAN_TMPDIR` | Staging directory for `llama-server` release downloads, overriding the default `tmp` subdirectory of the install root. |
+| `LLMMAN_VERIFY` | Overrides the signature-verification mode (`off`, `warn`, or `enforce`) for every reference, ignoring what `verify.conf` selected. Does *not* supply trusted keys — those still come from `verify.conf`, so `enforce` with no configured keys fails every check rather than passing them. Intended for CI, which can demand `enforce` without editing config files. See [verification.md](verification.md). |
+| `LLMMAN_SIGN_PASSWORD` | Passphrase for the `--sign-key` private key used by `push`/`transfer`, when it is an encrypted PEM. Falls back to `COSIGN_PASSWORD`. Read from the client's environment and forwarded to the daemon, since the daemon's own environment is generally not the shell you set it in. |
 | `LLMMAN_NOPRUNE` | When set (to anything other than `0`/`false`/`no`/`off`), skips the garbage-collection sweep that `llmman rm` and `llmman serve` startup otherwise run to delete blobs and extracted-cache entries no longer referenced by any local model. Note this is broader than skipping the daemon-startup catch-all: it also stops `llmman rm` itself from ever freeing disk space, so a removed model's (possibly multi-GB) weights stay on disk until a later sweep runs without this set. Useful for a shared/read-mostly store, or scripts that `rm` in a loop and prune once at the end. |
 | `LLAMA_ARG_FIT` / `LLAMA_ARG_FIT_TARGET` | llama.cpp's own env-configurable `--fit`/`--fit-target` options. Not something llmman parses itself, just forwarded through to every `llama-server` (local or `--ociman` container) it spawns, same as `CUDA_VISIBLE_DEVICES`/etc. below. |
 

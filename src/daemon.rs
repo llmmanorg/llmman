@@ -784,6 +784,16 @@ pub fn disable_std_handle_inheritance() {
 struct ProgressLine {
     status: Option<String>,
     error: Option<String>,
+    /// A message the daemon needs a human to see — today, the outcome of
+    /// a signature check (see `crate::verify::Verdict`). Relayed rather
+    /// than logged because the daemon's stderr is a log file, while this
+    /// process is the one attached to a terminal.
+    #[serde(default)]
+    notice: Option<String>,
+    /// The manifest digest a push landed on, for `--sign-key` to sign
+    /// here rather than in the daemon. See `cmd::serve`'s `push_impl`.
+    #[serde(default)]
+    digest: Option<String>,
     #[serde(default)]
     total: Option<u64>,
     #[serde(default)]
@@ -838,13 +848,21 @@ fn progress_bar_style() -> ProgressStyle {
 /// Returns an error if the stream reports one, or if it ends without ever
 /// reporting "success".
 pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
+    stream_progress_with(path, reference).map(|_| ())
+}
+
+/// [`stream_progress`], returning the manifest digest the stream
+/// reported, when it reported one. `/api/push` does, for `--sign-key`.
+pub fn stream_progress_with(path: &str, reference: &str) -> anyhow::Result<Option<String>> {
+    let body = serde_json::json!({"model": reference});
+
     let client = reqwest::blocking::Client::builder()
         .timeout(None) // model transfers can take much longer than any sane fixed timeout
         .build()
         .context("build http client")?;
     let resp = client
         .post(format!("{}{path}", server()))
-        .json(&serde_json::json!({"model": reference}))
+        .json(&body)
         .send()
         .with_context(|| format!("request {path} for {reference}"))?;
 
@@ -855,6 +873,7 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
     }
 
     let mut saw_success = false;
+    let mut pushed_digest: Option<String> = None;
     let mut last_status = String::new();
     let mut bar: Option<ProgressBar> = None;
     // Set once we've printed the "already have it" shortcut line (see this
@@ -871,6 +890,19 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
         let Ok(msg) = serde_json::from_str::<ProgressLine>(line) else {
             continue; // tolerate stray non-JSON keepalive output
         };
+        if let Some(d) = msg.digest.filter(|d| !d.is_empty()) {
+            pushed_digest = Some(d);
+            continue;
+        }
+        if let Some(notice) = msg.notice.filter(|n| !n.is_empty()) {
+            // suspend(), so the message doesn't land in the middle of a
+            // half-drawn bar and get overwritten by the next frame.
+            match &bar {
+                Some(b) => b.suspend(|| eprintln!("[llmman] {notice}")),
+                None => eprintln!("[llmman] {notice}"),
+            }
+            continue;
+        }
         if let Some(err) = msg.error.filter(|e| !e.is_empty()) {
             if let Some(b) = bar.take() {
                 b.abandon(); // leave whatever was drawn in place instead of clearing it
@@ -955,7 +987,7 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
     if !saw_success {
         anyhow::bail!("{reference}: stream ended without a success status");
     }
-    Ok(())
+    Ok(pushed_digest)
 }
 
 /// POSTs `{"model": reference}` to `/api/show` and reports whether the
@@ -985,6 +1017,16 @@ pub fn ensure_model_pulled(reference: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     stream_progress("/api/pull", reference)
+}
+
+/// Pushes `reference` via the daemon's `/api/push` and returns the
+/// manifest digest it landed on, for `cmd::push --sign-key` to sign.
+///
+/// The daemon is deliberately not asked to sign: see `cmd::serve`'s
+/// `push_impl` for why a caller-supplied key path is not something an
+/// unauthenticated loopback endpoint may accept.
+pub fn push(reference: &str) -> anyhow::Result<Option<String>> {
+    stream_progress_with("/api/push", reference)
 }
 
 /// POSTs the Ollama unload sentinel (`{"model": reference, "keep_alive":

@@ -29,6 +29,7 @@ import (
 	dockercliconfig "github.com/docker/cli/cli/config"
 	"github.com/docker/cli/cli/config/credentials"
 	clitypes "github.com/docker/cli/cli/config/types"
+	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
 	"golang.org/x/sync/errgroup"
@@ -603,8 +604,23 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	sem := make(chan struct{}, maxParallel)
 	g, gctx := errgroup.WithContext(ctx)
 	var barMu sync.Mutex // serialise bar creation so order matches layer order
+	// One fetch per distinct blob, not per layer entry. A manifest may
+	// legally list the same digest more than once — a cosign signature
+	// artifact signed by two keys is exactly that, since the signature
+	// itself lives in each layer's annotations while the payload blob
+	// they describe is identical (see sigstore.go). Without this, two
+	// entries each get their own progress bar but share one
+	// singleflight'd fetch (dedupBlobFetch), and whichever bar's
+	// goroutine loses the race can be left never marked complete — so
+	// prog.Wait() below blocks forever. The blob is content-addressed,
+	// so fetching it once satisfies every entry naming it.
+	fetched := make(map[digest.Digest]bool, len(manifest.Layers))
 	for _, layer := range manifest.Layers {
 		layer := layer // capture
+		if fetched[layer.Digest] {
+			continue
+		}
+		fetched[layer.Digest] = true
 		shortDigest := layer.Digest.Hex()
 		if len(shortDigest) > 12 {
 			shortDigest = shortDigest[:12]
@@ -626,7 +642,17 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 			// blobFetchGroup's own doc comment) that's fetching this
 			// exact same blob digest right now, rather than racing it
 			// to append to the same deterministic .part file.
-			_, err := dedupBlobFetch(layer.Digest.String(), progressKey, layer.Size, func() (ocispec.Descriptor, error) {
+			//
+			// Keyed by layout *and* digest, not digest alone: the
+			// winner writes into its own layoutDir and every loser is
+			// told the blob is on disk. That holds only while both are
+			// pulling into the same directory. Signature verification
+			// pulls into a fresh temp layout per call (sigstore.go), so
+			// two concurrent verifications of one digest would otherwise
+			// leave one of them believing it had a blob it never
+			// received — and reporting a correctly signed model as
+			// unverified.
+			_, err := dedupBlobFetch(layoutDir+"\x00"+layer.Digest.String(), progressKey, layer.Size, func() (ocispec.Descriptor, error) {
 				layerRC, err := fetcher.Fetch(gctx, layer)
 				if err != nil {
 					return ocispec.Descriptor{}, fmt.Errorf("fetch layer %s: %w", layer.Digest, err)
@@ -676,30 +702,66 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	return writeManifestRef(layoutDir, ref, manifestDesc)
 }
 
+// resolveManifestDigest returns the manifest digest the registry
+// currently serves for ref, without fetching the manifest body or any
+// layer. containerd's resolver learns the digest from the registry's
+// Docker-Content-Digest response header on a HEAD, so this is one cheap
+// round trip.
+//
+// The only piece of signature handling that can't be backend-agnostic:
+// signing and verifying are otherwise expressed entirely in terms of
+// pullToLayout/pushToRegistry, which both backends already implement
+// identically, but neither offers a layout-shaped way to ask "what does
+// this tag point at right now" without downloading it. See sigstore.go.
+func resolveManifestDigest(ctx context.Context, ref string) (digest.Digest, error) {
+	_, desc, err := newResolver(ctx).Resolve(ctx, ref)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", ref, err)
+	}
+	return desc.Digest, nil
+}
+
+// fetchManifestRaw returns ref's manifest bytes, without fetching any
+// layer. Signature handling uses it to inspect an artifact's shape
+// before deciding whether to download it — see sigstore.go.
+func fetchManifestRaw(ctx context.Context, ref string) ([]byte, error) {
+	resolver := newResolver(ctx)
+	name, desc, err := resolver.Resolve(ctx, ref)
+	if err != nil {
+		return nil, fmt.Errorf("resolve: %w", err)
+	}
+	fetcher, err := resolver.Fetcher(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("create fetcher: %w", err)
+	}
+	rc, err := fetcher.Fetch(ctx, desc)
+	if err != nil {
+		return nil, fmt.Errorf("fetch manifest: %w", err)
+	}
+	defer rc.Close()
+	// Bounded: a manifest is JSON, and an unbounded ReadAll here would
+	// let a hostile registry stream indefinitely. One byte over the
+	// limit is reported as such rather than truncated, which would
+	// surface as a confusing "unexpected end of JSON input".
+	data, err := io.ReadAll(io.LimitReader(rc, maxManifestBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read manifest: %w", err)
+	}
+	if int64(len(data)) > maxManifestBytes {
+		return nil, fmt.Errorf("manifest is over the %d-byte limit", maxManifestBytes)
+	}
+	return data, nil
+}
+
 // llmman_inspect fetches and returns the raw manifest JSON for a remote reference.
 //
 //export llmman_inspect
 func llmman_inspect(cRef *C.char) *C.char {
 	ref := C.GoString(cRef)
-	ctx := context.Background()
 
-	resolver := newResolver(ctx)
-	name, manifestDesc, err := resolver.Resolve(ctx, ref)
+	data, err := fetchManifestRaw(context.Background(), ref)
 	if err != nil {
-		return errResp(fmt.Errorf("resolve: %w", err))
-	}
-	fetcher, err := resolver.Fetcher(ctx, name)
-	if err != nil {
-		return errResp(fmt.Errorf("create fetcher: %w", err))
-	}
-	rc, err := fetcher.Fetch(ctx, manifestDesc)
-	if err != nil {
-		return errResp(fmt.Errorf("fetch manifest: %w", err))
-	}
-	data, err := io.ReadAll(rc)
-	rc.Close()
-	if err != nil {
-		return errResp(fmt.Errorf("read manifest: %w", err))
+		return errResp(err)
 	}
 
 	// Pretty-print
@@ -718,16 +780,15 @@ func llmman_inspect(cRef *C.char) *C.char {
 //
 //export llmman_transfer
 func llmman_transfer(cSource, cDestination *C.char) *C.char {
-	changed, err := dockerTransfer(context.Background(), C.GoString(cSource), C.GoString(cDestination))
+	changed, pushed, err := dockerTransfer(context.Background(), C.GoString(cSource), C.GoString(cDestination))
 	if err != nil {
 		return errResp(err)
 	}
-	// data carries whether anything was actually pushed, so the Rust CLI
-	// layer (cmd::transfer) can report "already up to date" instead of
-	// "Transferred" when re-running a transfer for content that hasn't
-	// changed since the last one — see transferStatusChanged/Unchanged.
-	if changed {
-		return okResp(transferStatusChanged)
-	}
-	return okResp(transferStatusUnchanged)
+	return okResp(transferResultJSON(changed, pushed))
+}
+
+// isBackendNotFound reports containerd's own typed "not found", which is
+// more reliable than any message match. See sigstore.go's isNotFoundError.
+func isBackendNotFound(err error) bool {
+	return errdefs.IsNotFound(err)
 }

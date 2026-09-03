@@ -68,11 +68,13 @@ above takes `--provider`; see [Hosted providers](#hosted-providers).
 | `cp`      | Copy a local image to a new reference |
 | `rm`      | Remove a local image |
 | `show`    | Show a local model's architecture, parameters, license, and template |
+| `verify`  | Check a registry model's signatures against trusted public keys |
 | `login`   | Log in to a container registry |
 | `logout`  | Log out from a container registry |
 
 See [docs/configuration.md](docs/configuration.md) for environment variables
-and the model store layout.
+and the model store layout, and [docs/verification.md](docs/verification.md)
+for signature verification.
 
 ## Models are OCI artifacts
 
@@ -97,6 +99,24 @@ llmman transfer hf.co/unsloth/Qwen3.5-0.8B-GGUF docker.io/owner/model:latest
 ```
 
 Any source `llmman pull` understands (an OCI registry, `hf://`, `ms://`, ...) can be paired with any OCI registry destination.
+
+### Sign a model, and verify what you pull
+
+No gatekeeper means nothing vouches for a model implicitly, so llmman
+verifies the artifact rather than trusting the hub. Signatures are
+[cosign](https://github.com/sigstore/cosign)-format, so `cosign verify`
+reads what llmman writes and the check works the same on Docker Hub,
+GHCR, quay, or an air-gapped mirror.
+
+```
+llmman push docker.io/myorg/mymodel:v1 --sign-key signing.key
+llmman verify docker.io/myorg/mymodel:v1 --key signing.pub
+```
+
+A `verify.conf` trust policy turns that into an automatic check on every
+`pull`, warning or refusing outright per repository. Off by default —
+there is nothing to check against until you have said whom you trust.
+See [docs/verification.md](docs/verification.md).
 
 ## Serve
 

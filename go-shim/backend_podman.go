@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/docker/distribution/registry/api/errcode"
+	v2 "github.com/docker/distribution/registry/api/v2"
+
+	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
@@ -707,28 +712,53 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 	return manifestData, err
 }
 
+// resolveManifestDigest returns the manifest digest the registry
+// currently serves for ref. See backend_docker.go's counterpart for why
+// this is the one part of signature handling each backend has to
+// implement itself.
+//
+// go.podman.io/image has no digest-only lookup, so unlike containerd's
+// HEAD-and-read-the-header this actually reads the manifest body — a few
+// hundred bytes, and no layer is touched either way.
+func resolveManifestDigest(ctx context.Context, ref string) (digest.Digest, error) {
+	raw, err := fetchManifestRaw(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+	return manifest.Digest(raw)
+}
+
+// fetchManifestRaw returns ref's manifest bytes, without fetching any
+// layer. See backend_docker.go's counterpart.
+func fetchManifestRaw(ctx context.Context, ref string) ([]byte, error) {
+	srcStr := "docker://" + ref
+	srcRef, err := alltransports.ParseImageName(srcStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse ref %q: %w", srcStr, err)
+	}
+	src, err := srcRef.NewImageSource(ctx, &types.SystemContext{})
+	if err != nil {
+		return nil, fmt.Errorf("open image source: %w", err)
+	}
+	defer src.Close()
+	// nil instanceDigest: the top-level manifest.
+	data, _, err := src.GetManifest(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("fetch manifest: %w", err)
+	}
+	if int64(len(data)) > maxManifestBytes {
+		return nil, fmt.Errorf("manifest is %d bytes, over the %d-byte limit", len(data), maxManifestBytes)
+	}
+	return data, nil
+}
+
 // llmman_inspect fetches and returns the raw manifest JSON for a remote reference.
 //
 //export llmman_inspect
 func llmman_inspect(cRef *C.char) *C.char {
-	ref := C.GoString(cRef)
-
-	srcStr := "docker://" + ref
-	srcRef, err := alltransports.ParseImageName(srcStr)
+	manifestData, err := fetchManifestRaw(context.Background(), C.GoString(cRef))
 	if err != nil {
-		return errResp(fmt.Errorf("parse ref %q: %w", srcStr, err))
-	}
-
-	sys := &types.SystemContext{}
-	img, err := srcRef.NewImage(context.Background(), sys)
-	if err != nil {
-		return errResp(fmt.Errorf("open image: %w", err))
-	}
-	defer img.Close()
-
-	manifestData, _, err := img.Manifest(context.Background())
-	if err != nil {
-		return errResp(fmt.Errorf("fetch manifest: %w", err))
+		return errResp(err)
 	}
 
 	var buf bytes.Buffer
@@ -749,13 +779,19 @@ func llmman_inspect(cRef *C.char) *C.char {
 //
 //export llmman_transfer
 func llmman_transfer(cSource, cDestination *C.char) *C.char {
-	changed, err := podmanTransfer(context.Background(), C.GoString(cSource), C.GoString(cDestination))
+	changed, pushed, err := podmanTransfer(context.Background(), C.GoString(cSource), C.GoString(cDestination))
 	if err != nil {
 		return errResp(err)
 	}
-	// See backend_docker.go's llmman_transfer for why data carries this.
-	if changed {
-		return okResp(transferStatusChanged)
-	}
-	return okResp(transferStatusUnchanged)
+	// See transferOutcome (transfer_common.go) for what data carries.
+	return okResp(transferResultJSON(changed, pushed))
+}
+
+// isBackendNotFound reports go.podman.io/image's typed "manifest
+// unknown", which docker_client.go recognizes the same way. See
+// sigstore.go's isNotFoundError for why a typed answer matters.
+func isBackendNotFound(err error) bool {
+	var ec errcode.ErrorCoder
+	return errors.As(err, &ec) &&
+		(ec.ErrorCode() == v2.ErrorCodeManifestUnknown || ec.ErrorCode() == v2.ErrorCodeNameUnknown)
 }

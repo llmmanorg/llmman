@@ -39,6 +39,8 @@ enum Commands {
     Resolve(cmd::resolve::ResolveArgs),
     /// Transfer an image directly from one location to another (e.g. HuggingFace to an OCI registry)
     Transfer(cmd::transfer::TransferArgs),
+    /// Check a registry model's signatures against trusted public keys
+    Verify(cmd::verify::VerifyArgs),
     /// List locally stored images
     #[command(alias = "ls")]
     List(cmd::list::ListArgs),
@@ -108,6 +110,7 @@ fn main() {
         Commands::Pull(a) => cmd::pull::run(a),
         Commands::Resolve(a) => cmd::resolve::run(a),
         Commands::Transfer(a) => cmd::transfer::run(a),
+        Commands::Verify(a) => cmd::verify::run(a),
         Commands::List(a) => cmd::list::run(a),
         Commands::Ps(a) => cmd::ps::run(a),
         Commands::Providers(a) => cmd::providers::run(a),

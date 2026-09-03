@@ -29,6 +29,7 @@ import (
 	"os"
 
 	"github.com/containerd/containerd/v2/core/remotes"
+	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
 )
@@ -40,8 +41,16 @@ import (
 // dockerTransfer returns whether anything was actually pushed to
 // destination — false if the source turned out to already be identical
 // (by digest) to what's already there, e.g. re-running a transfer for a
-// model that hasn't been updated at its source since the last transfer.
-func dockerTransfer(ctx context.Context, source, destination string) (changed bool, err error) {
+// model that hasn't been updated at its source since the last transfer —
+// and the manifest digest that now sits at destination.
+//
+// That digest is returned even when changed is false: `llmman transfer
+// --sign-key` still has to sign an unchanged destination (the content
+// being already present says nothing about whether it has been signed),
+// and re-resolving the tag afterwards instead would leave a window in
+// which it could be repointed at something else between the push and the
+// signature. See cmd::transfer.
+func dockerTransfer(ctx context.Context, source, destination string) (changed bool, pushed digest.Digest, err error) {
 	// A tagless destination (e.g. "docker.io/owner/repo") must default to
 	// :latest here explicitly: unlike a local OCI layout's index.json
 	// (which always has some ref-name annotation to look up),
@@ -52,7 +61,7 @@ func dockerTransfer(ctx context.Context, source, destination string) (changed bo
 	destination = normalizeTag(destination)
 	normalized, err := classifySource(source)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	return dockerTransferOCI(ctx, normalized, destination)
 }
@@ -61,37 +70,42 @@ func dockerTransfer(ctx context.Context, source, destination string) (changed bo
 // OCI registry → OCI registry
 // ---------------------------------------------------------------------------
 
-func dockerTransferOCI(ctx context.Context, source, destination string) (changed bool, err error) {
+func dockerTransferOCI(ctx context.Context, source, destination string) (changed bool, pushed digest.Digest, err error) {
 	resolver := newResolver(ctx)
 	name, manifestDesc, err := resolver.Resolve(ctx, source)
 	if err != nil {
-		return false, fmt.Errorf("resolve %s: %w", source, err)
+		return false, "", fmt.Errorf("resolve %s: %w", source, err)
 	}
 	fetcher, err := resolver.Fetcher(ctx, name)
 	if err != nil {
-		return false, fmt.Errorf("create fetcher: %w", err)
+		return false, "", fmt.Errorf("create fetcher: %w", err)
 	}
 	pusher, err := resolver.Pusher(ctx, destination)
 	if err != nil {
-		return false, fmt.Errorf("create pusher: %w", err)
+		return false, "", fmt.Errorf("create pusher: %w", err)
 	}
 
 	rc, err := fetcher.Fetch(ctx, manifestDesc)
 	if err != nil {
-		return false, fmt.Errorf("fetch manifest: %w", err)
+		return false, "", fmt.Errorf("fetch manifest: %w", err)
 	}
 	manifestData, err := io.ReadAll(rc)
 	rc.Close()
 	if err != nil {
-		return false, fmt.Errorf("read manifest: %w", err)
+		return false, "", fmt.Errorf("read manifest: %w", err)
 	}
+
+	// The destination ends up with the source's manifest bytes verbatim,
+	// so the digest that will be at destination is the one already
+	// resolved from source — no separate re-resolve, and nothing to race.
+	pushed = manifestDesc.Digest
 
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
 		// An image index (manifest list): push it as-is. Per-instance
 		// (multi-arch) selection isn't implemented here.
 		alreadyExists, err := pushBytes(ctx, pusher, manifestDesc, manifestData)
-		return !alreadyExists, err
+		return !alreadyExists, pushed, err
 	}
 
 	// "Transferring blob/config <digest>" progress bars — "Transferring",
@@ -139,11 +153,11 @@ func dockerTransferOCI(ctx context.Context, source, destination string) (changed
 
 	for _, layer := range manifest.Layers {
 		if err := streamOne(layer, "blob"); err != nil {
-			return false, err
+			return false, "", err
 		}
 	}
 	if err := streamOne(manifest.Config, "config"); err != nil {
-		return false, err
+		return false, "", err
 	}
 
 	// Manifest push: no progress bar (a few hundred bytes of JSON) — just
@@ -151,7 +165,7 @@ func dockerTransferOCI(ctx context.Context, source, destination string) (changed
 	// a bar for this step.
 	manifestAlreadyExists, err := pushBytes(ctx, pusher, manifestDesc, manifestData)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	if !manifestAlreadyExists {
 		changed = true
@@ -159,7 +173,7 @@ func dockerTransferOCI(ctx context.Context, source, destination string) (changed
 	if changed {
 		fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
 	}
-	return changed, nil
+	return changed, pushed, nil
 }
 
 // streamBlobFromFetcher streams one blob from an OCI registry fetcher

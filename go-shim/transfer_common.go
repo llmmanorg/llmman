@@ -3,20 +3,46 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 
 	digest "github.com/opencontainers/go-digest"
 )
 
-// transferStatusChanged/transferStatusUnchanged are the `data` values
-// llmman_transfer's response envelope carries back to the Rust CLI layer
-// (see ffi::transfer / cmd::transfer::run) to report whether a transfer
-// actually pushed anything new, or found the destination already up to
-// date with the source and did nothing.
-const (
-	transferStatusChanged   = "changed"
-	transferStatusUnchanged = "unchanged"
-)
+// transferOutcome is the `data` payload of llmman_transfer's response
+// envelope (see ffi::TransferOutcome / cmd::transfer::run).
+//
+// Changed reports whether a transfer actually pushed anything new, or
+// found the destination already up to date with the source and did
+// nothing. Digest is the manifest digest now at the destination, which
+// `--sign-key` signs — carried out of the transfer rather than
+// re-resolved from the destination afterwards, so there is no window in
+// which the tag could move between what was pushed and what gets signed.
+//
+// This used to be a bare "changed"/"unchanged" string; the JSON object
+// is what made room for Digest.
+type transferOutcome struct {
+	Changed bool   `json:"changed"`
+	Digest  string `json:"digest,omitempty"`
+}
+
+// transferResultJSON renders a completed transfer as that payload.
+// Returns a plain string rather than the usual *C.char envelope so this
+// file stays free of cgo and directly unit-testable; each backend's
+// llmman_transfer wraps the result in okResp itself.
+//
+// A zero digest (an empty digest.Digest, which only arises if a backend
+// ever returns success without one) marshals away entirely via omitempty
+// rather than as the string "", so a caller sees "absent", not "empty".
+func transferResultJSON(changed bool, pushed digest.Digest) string {
+	out := transferOutcome{Changed: changed}
+	if pushed != "" {
+		out.Digest = pushed.String()
+	}
+	// Cannot fail: two scalar fields, no cycles, no unsupported types.
+	data, _ := json.Marshal(out)
+	return string(data)
+}
 
 // classifySource normalizes an `llmman transfer` source for the registry
 // client and rejects anything Rust should already have routed elsewhere
