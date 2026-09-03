@@ -395,7 +395,7 @@ const INTEGRATIONS: &[Integration] = &[
 fn print_integrations() {
     println!("Available integrations:\n");
     for i in INTEGRATIONS {
-        if find_on_path(i.binary).is_some() {
+        if find_integration_binary(i).is_some() {
             println!("  {:<12} {}", i.name, i.description);
         } else {
             println!("  {:<12} {} (not installed)", i.name, i.description);
@@ -437,6 +437,17 @@ fn find_on_path(binary: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// The binary `launch` will run for `i`, so the listing does not report
+/// as missing what the launcher would find: `PATH`, then what the
+/// launcher knows.
+fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
+    match i.name {
+        "opencode" => find_opencode(),
+        "qwen" => find_qwen(),
+        _ => find_on_path(i.binary),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -503,18 +514,22 @@ fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
 /// opencode: pass a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
 /// /v1 endpoint, matching exactly what ollama launch does.
 fn launch_opencode(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("opencode").or_else(|| {
-        dirs::home_dir().and_then(|h| {
-            let p = h.join(".opencode").join("bin").join("opencode");
-            p.exists().then_some(p)
-        })
-    });
-    let bin = bin.ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
+    let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
 
     let effective_model = if model.is_empty() { "default" } else { model };
     let config = opencode_config(effective_model, api_key);
 
     exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
+}
+
+/// `PATH`, then opencode's own installer target, `~/.opencode/bin`.
+fn find_opencode() -> Option<PathBuf> {
+    find_on_path("opencode").or_else(|| {
+        dirs::home_dir().and_then(|h| {
+            let p = h.join(".opencode").join("bin").join("opencode");
+            p.exists().then_some(p)
+        })
+    })
 }
 
 fn opencode_config(model: &str, api_key: &str) -> String {
@@ -873,7 +888,7 @@ fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 /// required; `check_model_flag` refuses a launch without one before the
 /// daemon starts.
 fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("qwen").ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
+    let bin = find_qwen().ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
     // After the lookup, so nothing is written for an integration that is
     // not there; `check_model_flag` has made sure there is a model. A
     // file that cannot be merged into is left alone and the launch goes
@@ -911,6 +926,105 @@ fn qwen_args(model: &str, extra_args: &[String]) -> Vec<String> {
     }
     args.extend_from_slice(extra_args);
     args
+}
+
+/// `PATH`, then the installers' own targets; see `qwen_fallback_paths`.
+fn find_qwen() -> Option<PathBuf> {
+    find_on_path("qwen").or_else(|| qwen_fallback_paths().into_iter().find(|p| p.is_file()))
+}
+
+/// Where a Qwen Code install lands that a process without the user's
+/// login shell does not see: the standalone installer's `~/.local/bin`,
+/// the `~/.npm-global` prefix its older npm installer set, nvm's newest
+/// node that has it, Homebrew's prefixes, `/usr/local/bin`, and on
+/// Windows npm's `%APPDATA%\npm` and the standalone installer's
+/// `%LOCALAPPDATA%\qwen-code\bin`. Ollama's `cmd/launch/qwen.go` checks
+/// a similar list. What nvm holds is a `#!/usr/bin/env node` shim whose
+/// `node` is on `PATH` only in an nvm-sourced shell, so a launch from
+/// another shell fails at exec rather than here.
+fn qwen_fallback_paths() -> Vec<PathBuf> {
+    let home = dirs::home_dir();
+    let mut paths = Vec::new();
+    if cfg!(windows) {
+        // Blank counts as unset, or the candidate would be relative.
+        let roaming = std::env::var_os("APPDATA")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join("AppData").join("Roaming")));
+        let local = std::env::var_os("LOCALAPPDATA")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join("AppData").join("Local")));
+        let dirs = [
+            roaming.map(|d| d.join("npm")),
+            local.map(|d| d.join("qwen-code").join("bin")),
+        ];
+        for dir in dirs.into_iter().flatten() {
+            paths.extend(
+                WINDOWS_PATH_EXTS
+                    .iter()
+                    .map(|ext| dir.join(format!("qwen.{ext}"))),
+            );
+        }
+        return paths;
+    }
+    if let Some(h) = &home {
+        paths.push(h.join(".local").join("bin").join("qwen"));
+        paths.push(h.join(".npm-global").join("bin").join("qwen"));
+        paths.extend(nvm_dirs(h).iter().filter_map(|d| nvm_qwen(d)));
+    }
+    if cfg!(target_os = "macos") {
+        paths.push(PathBuf::from("/opt/homebrew/bin/qwen"));
+    } else {
+        paths.push(PathBuf::from("/home/linuxbrew/.linuxbrew/bin/qwen"));
+    }
+    paths.push(PathBuf::from("/usr/local/bin/qwen"));
+    paths
+}
+
+/// `$NVM_DIR`, `$XDG_CONFIG_HOME/nvm`, `~/.config/nvm` and `~/.nvm`: which
+/// one an install took depends on the environment nvm was installed in,
+/// not on this process's, so all are probed.
+fn nvm_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = std::env::var_os("NVM_DIR").filter(|d| !d.is_empty()) {
+        dirs.push(PathBuf::from(dir));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()) {
+        dirs.push(PathBuf::from(xdg).join("nvm"));
+    }
+    dirs.push(home.join(".config").join("nvm"));
+    dirs.push(home.join(".nvm"));
+    dirs
+}
+
+/// The `qwen` under the newest node version nvm holds one for; nvm keeps
+/// one tree per version and picks between them by editing `PATH` in the
+/// shell.
+fn nvm_qwen(nvm_dir: &Path) -> Option<PathBuf> {
+    let node = nvm_dir.join("versions").join("node");
+    let mut versions: Vec<String> = std::fs::read_dir(&node)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    sort_node_versions_newest_first(&mut versions);
+    versions
+        .into_iter()
+        .map(|v| node.join(v).join("bin").join("qwen"))
+        .find(|p| p.is_file())
+}
+
+/// `v22.14.0` before `v22.9.1` before `v9.0.0`; a name that is not a
+/// version sorts last.
+fn sort_node_versions_newest_first(names: &mut [String]) {
+    fn key(name: &str) -> Option<Vec<u64>> {
+        name.strip_prefix('v')?
+            .split('.')
+            .map(|part| part.parse().ok())
+            .collect()
+    }
+    names.sort_by_key(|name| std::cmp::Reverse(key(name)));
 }
 
 /// `$QWEN_HOME` if set, else `~/.qwen`: `Storage.getGlobalQwenDir` in
@@ -1310,6 +1424,53 @@ mod tests {
             qwen_args("m:latest", &user_camel),
             ["--model", "m:latest", "--authType", "openai"]
         );
+    }
+
+    /// Newest node first; the directory order is not by version.
+    #[test]
+    fn node_versions_sort_newest_first_with_other_names_last() {
+        let mut names: Vec<String> = ["v9.0.0", "v20.19.0", ".DS_Store", "v22.14.0", "v22.9.1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        sort_node_versions_newest_first(&mut names);
+        assert_eq!(
+            names,
+            ["v22.14.0", "v22.9.1", "v20.19.0", "v9.0.0", ".DS_Store"]
+        );
+    }
+
+    /// Over nvm's layout, the newest version that has qwen wins.
+    #[test]
+    fn nvm_qwen_picks_the_newest_version_that_has_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-nvm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let node = dir.join("versions").join("node");
+        for v in ["v20.19.0", "v22.14.0", "v22.9.1"] {
+            std::fs::create_dir_all(node.join(v).join("bin")).unwrap();
+        }
+        std::fs::write(node.join("v20.19.0/bin/qwen"), "").unwrap();
+        std::fs::write(node.join("v22.9.1/bin/qwen"), "").unwrap();
+        assert_eq!(nvm_qwen(&dir), Some(node.join("v22.9.1/bin/qwen")));
+        assert_eq!(nvm_qwen(&dir.join("nowhere")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The documented targets are on the list (see `find_qwen`).
+    #[cfg(unix)]
+    #[test]
+    fn qwen_fallback_paths_name_the_documented_targets() {
+        let home = dirs::home_dir().unwrap();
+        let paths = qwen_fallback_paths();
+        assert!(paths.contains(&home.join(".local/bin/qwen")));
+        assert!(paths.contains(&home.join(".npm-global/bin/qwen")));
+        assert!(paths.contains(&PathBuf::from("/usr/local/bin/qwen")));
     }
 
     /// A file a Qwen Code user already has: llmman's entry goes first, an
