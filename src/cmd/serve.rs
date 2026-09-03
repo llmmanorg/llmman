@@ -8981,6 +8981,20 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// /api/push has no "fetch it first" fallback: a valid ref that isn't
+    /// already in the local store returns a 404 through AppError, not a
+    /// hand-built body.
+    #[tokio::test]
+    async fn handle_push_returns_404_for_a_model_not_in_the_store() {
+        let state = test_state();
+        let req = OllamaPushRequest {
+            model: "hf.co/does-not-exist/nowhere".to_string(),
+            name: String::new(),
+        };
+        let resp = handle_push(State(state), Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     /// /api/delete resolves (and so validates) the client ref before it ever
     /// opens the store: an invalid ref returns a 400 and touches nothing.
     #[tokio::test]
