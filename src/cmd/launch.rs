@@ -702,7 +702,20 @@ fn update_droid_settings(
     update_droid_settings_with_capabilities(existing, model, base_url, Some(false))
 }
 
-/// Match ownership by the reserved placeholder key; do not add private schema fields.
+/// Match ownership by Factory-visible fields, not the placeholder key alone.
+fn is_llmman_droid_entry(entry: &serde_json::Map<String, serde_json::Value>) -> bool {
+    entry.get("apiKey").and_then(serde_json::Value::as_str) == Some(providers::PLACEHOLDER_API_KEY)
+        && entry.get("displayName").and_then(serde_json::Value::as_str) == Some("llmman")
+        && entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id.starts_with("custom:llmman-"))
+        && entry
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+}
+
 fn update_droid_settings_with_capabilities(
     existing: &str,
     model: &str,
@@ -719,13 +732,9 @@ fn update_droid_settings_with_capabilities(
         .as_array_mut()
         .context("Factory customModels must be a JSON array")?;
 
-    let owned = models.iter().position(|entry| {
-        let Some(entry) = entry.as_object() else {
-            return false;
-        };
-        entry.get("apiKey").and_then(serde_json::Value::as_str)
-            == Some(providers::PLACEHOLDER_API_KEY)
-    });
+    let owned = models
+        .iter()
+        .position(|entry| entry.as_object().is_some_and(is_llmman_droid_entry));
     let index = owned.unwrap_or(models.len());
     let custom_model_id = format!("custom:llmman-{index}");
 
@@ -744,6 +753,9 @@ fn update_droid_settings_with_capabilities(
     if let Some(images) = supports_images {
         entry.insert("supportsImages".into(), images.into());
         entry.insert("noImageSupport".into(), (!images).into());
+    } else {
+        entry.remove("supportsImages");
+        entry.remove("noImageSupport");
     }
 
     if let Some(i) = owned {
@@ -1298,6 +1310,27 @@ mod tests {
     }
 
     #[test]
+    fn droid_settings_do_not_overwrite_user_model_with_placeholder_key() {
+        let existing = r#"{
+            "customModels": [{
+                "model": "user-model",
+                "displayName": "Personal",
+                "apiKey": "llmman",
+                "id": "custom:user-0",
+                "index": 0
+            }]
+        }"#;
+        let (settings, id) =
+            update_droid_settings(existing, "managed-model", "http://localhost/v1").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
+
+        assert_eq!(id, "custom:llmman-1");
+        assert_eq!(parsed["customModels"][0]["model"], "user-model");
+        assert_eq!(parsed["customModels"][0]["displayName"], "Personal");
+        assert_eq!(parsed["customModels"][1]["model"], "managed-model");
+    }
+
+    #[test]
     fn droid_settings_do_not_overwrite_a_similarly_named_user_model() {
         let existing = r#"{
             "customModels": [{
@@ -1350,6 +1383,31 @@ mod tests {
         assert_eq!(v["customModels"][0]["noImageSupport"], false);
         assert_eq!(v["sessionDefaultSettings"]["reasoningEffort"], "low");
         assert_eq!(v["sessionDefaultSettings"]["autonomyLevel"], "off");
+    }
+
+    #[test]
+    fn droid_settings_clear_stale_image_flags_when_capability_is_unknown() {
+        let existing = r#"{
+            "customModels": [{
+                "model": "vision",
+                "displayName": "llmman",
+                "baseUrl": "http://old/v1",
+                "apiKey": "llmman",
+                "provider": "generic-chat-completion-api",
+                "id": "custom:llmman-0",
+                "index": 0,
+                "supportsImages": true,
+                "noImageSupport": false
+            }]
+        }"#;
+        let (settings, _) =
+            update_droid_settings_with_capabilities(existing, "unknown", "http://new/v1", None)
+                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&settings).unwrap();
+
+        assert_eq!(v["customModels"][0]["model"], "unknown");
+        assert!(v["customModels"][0].get("supportsImages").is_none());
+        assert!(v["customModels"][0].get("noImageSupport").is_none());
     }
 
     #[test]
