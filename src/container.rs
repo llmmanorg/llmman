@@ -238,6 +238,16 @@ pub struct LlamaOptions<'a> {
     /// slot — see `cmd::serve::num_parallel_from_env`.
     pub num_parallel: Option<u32>,
 
+    /// `--embeddings`: an embedding model (see
+    /// `cmd::serve::embedding_model_ctx`) gets 501 on `/v1/embeddings`
+    /// without it.
+    pub embeddings: bool,
+
+    /// `-b`/`-ub`. Set only for an embedding model, to its per-slot
+    /// context (not the `num_parallel`-scaled `ctx_size`): llama-server
+    /// needs a whole input in one ubatch.
+    pub batch_size: Option<u32>,
+
     /// `--threads <n>`, set only when a CPU limit (cgroup quota or
     /// affinity) binds; see `cmd::serve::threads_from_env_or_host`.
     /// Deliberately ignored by [`spawn`]: the daemon's cgroup says
@@ -277,6 +287,8 @@ pub fn spawn(
         context_shift,
         split_mode,
         num_parallel,
+        embeddings,
+        batch_size,
         // See the field's doc comment: the derived value describes the
         // daemon's cgroup, not the container's.
         threads: _,
@@ -386,6 +398,15 @@ pub fn spawn(
     }
     if let Some(n) = num_parallel {
         args.push("--parallel".into());
+        args.push(n.to_string());
+    }
+    if embeddings {
+        args.push("--embeddings".into());
+    }
+    if let Some(n) = batch_size {
+        args.push("-b".into());
+        args.push(n.to_string());
+        args.push("-ub".into());
         args.push(n.to_string());
     }
 

@@ -158,7 +158,7 @@ The server listens on `127.0.0.1:17434` by default, overridable via `LLMMAN_HOST
 
 | API | Endpoints |
 |-----|-----------|
-| Ollama | `/api/generate`, `/api/chat`, `/api/tags`, `/api/show`, `/api/pull`, `/api/ps`, `/api/delete` |
+| Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/pull`, `/api/push`, `/api/copy`, `/api/create`, `/api/blobs/{digest}`, `/api/ps`, `/api/delete`, `/api/version` |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens` |
 | Anthropic | `/v1/messages` |
 | llmman | `/llmman/providers`, `/llmman/providers/{id}` |
@@ -200,6 +200,15 @@ Models are loaded on demand. Each model gets its own `llama-server` subprocess o
 as `message.tool_calls`), `images` (vision, base64, same as Ollama's own
 wire format), and `format` (`"json"` or a JSON Schema object, for
 constrained structured output).
+
+`/api/embed` and `/api/embeddings` work with any embedding model (a GGUF
+with a pooling type, e.g. `embeddinggemma`, `nomic-embed-text`): `llama-server`
+is started with `--embeddings` for it, so `/v1/embeddings` works too.
+
+`/api/create` supports `from` (alias a model) and `files` (GGUFs uploaded via
+`/api/blobs/{digest}`, as `ollama create` does). Modelfile fields such as
+`system` or `quantize` are refused with a 400: the GGUF's own chat template
+applies.
 
 An idle, unused model is automatically unloaded after `keep_alive`
 (default 5 minutes, matching Ollama; set per-request, or daemon-wide via

@@ -21,27 +21,32 @@ pub struct CpArgs {
 /// to match ollama's naming for anyone coming from there, not because the
 /// underlying operation differs at all.
 pub fn run(args: &CpArgs) -> anyhow::Result<()> {
-    // Validate/resolve both refs before touching the store, so a bad ref
-    // never creates the store tree. DESTINATION is stored verbatim, not
-    // resolved/canonicalized, so this is its only client-side validation
-    // gate. resolve_ollama_api for SOURCE, not resolve: it must match how
-    // the model is actually stored, same reasoning as tag.rs/rm.rs.
-    crate::shortnames::validate_reference(&args.destination)?;
+    // Both via resolve_ollama_api, before touching the store: SOURCE to
+    // match how it's stored, DESTINATION to be stored the way run/rm/show
+    // look it up (a bare `mine:v1` becomes `docker.io/ai/mine:v1`).
     let source = crate::shortnames::resolve_ollama_api(&args.source)?;
+    let destination = crate::shortnames::resolve_ollama_api(&args.destination)?;
 
     let store_root = crate::default_store()?;
     let store = OciStore::open(&store_root)?;
+    copy(&store, &source, &destination)?;
+    println!("copied '{}' to '{}'", args.source, args.destination);
+    Ok(())
+}
 
-    let desc = store.find(&source)?;
+/// Points `destination` at the content `source` names (both already
+/// resolved) and returns its digest. Shared by `llmman cp` and `/api/copy`.
+pub fn copy(store: &OciStore, source: &str, destination: &str) -> anyhow::Result<String> {
+    let desc = store.find(source)?;
     // A destination spelled as a digest names content, and the store
     // answers such a reference by content (see `OciStore::find`): a
     // pointer there holding some other digest would be passed over by a
     // lookup for the digest it is named for and answer only for the one
     // it holds, so it is refused.
-    check_digest_destination(&args.destination, &desc.digest)?;
-    store.tag(desc, &args.destination)?;
-    println!("copied '{}' to '{}'", args.source, args.destination);
-    Ok(())
+    check_digest_destination(destination, &desc.digest)?;
+    let digest = desc.digest.clone();
+    store.tag(desc, destination)?;
+    Ok(digest)
 }
 
 /// Refuses a `<name>@<digest>` destination whose digest is not `actual`,

@@ -22,10 +22,9 @@ pub struct BuildArgs {
 }
 
 pub fn run(args: &BuildArgs) -> anyhow::Result<()> {
-    // The build tag is a user-chosen label stored verbatim, not resolved, so
-    // this is its only validation gate. Check it before touching the store so
-    // a bad tag never creates the store tree.
-    crate::shortnames::validate_reference(&args.tag)?;
+    // Resolved the way run/rm/show look it up (see cp.rs), before
+    // touching the store so a bad tag never creates the store tree.
+    let tag = crate::shortnames::resolve_ollama_api(&args.tag)?;
 
     let store_root = crate::default_store()?;
     let store = OciStore::open(&store_root)?;
@@ -46,7 +45,7 @@ pub fn run(args: &BuildArgs) -> anyhow::Result<()> {
         .canonicalize()
         .with_context(|| format!("context dir: {}", args.context_dir.display()))?;
 
-    let desc = store.build(&context_dir, &args.tag, &labels)?;
+    let desc = store.build(&context_dir, &tag, &labels)?;
     println!("Built {} ({})", args.tag, desc.digest);
     Ok(())
 }
