@@ -900,16 +900,38 @@ fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Res
     write_qwen_settings(model)?;
 
     let base_url = format!("{}/v1", daemon::server());
-    exec_with_env(
-        &bin,
-        &qwen_args(model, extra_args),
-        &[
-            ("OPENAI_BASE_URL", base_url.as_str()),
-            ("OPENAI_API_KEY", api_key),
-            (QWEN_ENV_KEY, api_key),
-            ("OPENAI_MODEL", model),
-        ],
-    )
+    let mut env = vec![
+        ("OPENAI_BASE_URL", base_url.as_str()),
+        ("OPENAI_API_KEY", api_key),
+        (QWEN_ENV_KEY, api_key),
+        ("OPENAI_MODEL", model),
+    ];
+    // A shim the fallback found is a `#!/usr/bin/env node` script whose
+    // `node` sits beside it, so its directory goes on the child's `PATH`.
+    let path = path_with_dir_prepended(bin.parent(), &std::env::var_os("PATH").unwrap_or_default())
+        .map(|p| p.to_string_lossy().into_owned());
+    if let Some(path) = &path {
+        env.push(("PATH", path.as_str()));
+    }
+    exec_with_env(&bin, &qwen_args(model, extra_args), &env)
+}
+
+/// `path_var` with `dir` in front, or `None` when it is there already or
+/// there is no `dir`. Empty components go: one is how an unset `PATH`
+/// arrives, and on POSIX it means the working directory.
+fn path_with_dir_prepended(
+    dir: Option<&Path>,
+    path_var: &std::ffi::OsStr,
+) -> Option<std::ffi::OsString> {
+    let dir = dir?;
+    let mut components: Vec<PathBuf> = std::env::split_paths(path_var)
+        .filter(|d| !d.as_os_str().is_empty())
+        .collect();
+    if components.iter().any(|d| d == dir) {
+        return None;
+    }
+    components.insert(0, dir.to_path_buf());
+    std::env::join_paths(components).ok()
 }
 
 /// The value of the last `--model`/`-m` after `--`, as a word or
@@ -963,10 +985,7 @@ fn find_qwen() -> Option<PathBuf> {
 /// what ollama's `cmd/launch/qwen.go` probes, `~/.cargo/bin`, macOS's
 /// `~/Library/Application Support/qwen/bin`, and on Windows npm's global
 /// directory under both `%APPDATA%` and `%LOCALAPPDATA%`,
-/// `%LOCALAPPDATA%\Programs\qwen` and `%APPDATA%\qwen\bin`. What nvm
-/// holds is a `#!/usr/bin/env node` shim whose `node` is on `PATH` only
-/// in an nvm-sourced shell, so a launch from another shell fails at exec
-/// rather than here.
+/// `%LOCALAPPDATA%\Programs\qwen` and `%APPDATA%\qwen\bin`.
 fn qwen_fallback_paths() -> Vec<PathBuf> {
     let home = dirs::home_dir();
     let mut paths = Vec::new();
@@ -1415,6 +1434,51 @@ mod tests {
             assert!(check_model_flag(id, Some("m"), None, &forwarded).is_ok());
         }
         assert!(check_model_flag("claude", None, None, &none).is_ok());
+    }
+
+    /// The found directory goes in front of `PATH` only when it is not
+    /// there, with no empty component either way.
+    #[test]
+    fn path_with_dir_prepended_only_when_it_is_missing() {
+        let path_var =
+            std::env::join_paths([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap();
+        assert_eq!(
+            path_with_dir_prepended(Some(Path::new("/usr/bin")), &path_var),
+            None
+        );
+        assert_eq!(
+            path_with_dir_prepended(Some(Path::new("/opt/nvm/bin")), &path_var),
+            Some(
+                std::env::join_paths([
+                    PathBuf::from("/opt/nvm/bin"),
+                    PathBuf::from("/usr/bin"),
+                    PathBuf::from("/bin"),
+                ])
+                .unwrap()
+            )
+        );
+        assert_eq!(path_with_dir_prepended(None, &path_var), None);
+        assert_eq!(
+            path_with_dir_prepended(Some(Path::new("/opt/nvm/bin")), std::ffi::OsStr::new("")),
+            Some(std::ffi::OsString::from("/opt/nvm/bin"))
+        );
+        let gappy = std::env::join_paths([
+            PathBuf::from("/usr/bin"),
+            PathBuf::from(""),
+            PathBuf::from("/bin"),
+        ])
+        .unwrap();
+        assert_eq!(
+            path_with_dir_prepended(Some(Path::new("/opt/nvm/bin")), &gappy),
+            Some(
+                std::env::join_paths([
+                    PathBuf::from("/opt/nvm/bin"),
+                    PathBuf::from("/usr/bin"),
+                    PathBuf::from("/bin"),
+                ])
+                .unwrap()
+            )
+        );
     }
 
     /// The last forwarded model wins, in either spelling; none is none.
