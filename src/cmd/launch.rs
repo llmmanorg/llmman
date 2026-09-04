@@ -883,8 +883,11 @@ fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 /// model beats both flag and variable (`resolveModelConfig` in its
 /// `packages/core/src/models/modelConfigResolver.ts`), which is what
 /// `write_qwen_settings` is for. The key stays in the environment: on the
-/// command line it shows in `ps`, and the file only names the variable.
-/// Ollama's `cmd/launch/qwen.go` does the same three. `--model` is
+/// command line it shows in `ps`, and the file only names the variable,
+/// `LLMMAN_API_KEY`, exported with the same value as `OPENAI_API_KEY` so
+/// that llmman's entry is told from any other by its key name, the way
+/// ollama's is by `OLLAMA_API_KEY`. Ollama's `cmd/launch/qwen.go` does
+/// the same three. `--model` is
 /// required; `check_model_flag` refuses a launch without one before the
 /// daemon starts.
 fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
@@ -900,6 +903,7 @@ fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Res
         &[
             ("OPENAI_BASE_URL", base_url.as_str()),
             ("OPENAI_API_KEY", api_key),
+            (QWEN_ENV_KEY, api_key),
             ("OPENAI_MODEL", model),
         ],
     )
@@ -1150,9 +1154,9 @@ fn strip_json_comments(raw: &str) -> String {
     out
 }
 
-/// On the name of every entry `qwen_settings_merged` writes, and what
-/// `qwen_entry_is_ours` recognises one by.
-const QWEN_ENTRY_MARK: &str = " (llmman)";
+/// The variable llmman's entry names as its key, and what marks the entry
+/// as llmman's: a user can rename it in `/model`, but not re-key it.
+const QWEN_ENV_KEY: &str = "LLMMAN_API_KEY";
 
 /// `existing` with llmman's entry merged in; pure, so it is testable on a
 /// literal document. The keys are the ones Qwen Code's own `/auth` and
@@ -1163,7 +1167,7 @@ const QWEN_ENTRY_MARK: &str = " (llmman)";
 /// unwrapped as its `V5ToV4Migration` does; `security.auth.selectedType`
 /// and `baseUrl`; `model.name` with `model.baseUrl`, which Qwen Code sets
 /// together. No `$version`, which Qwen Code stamps itself, and no key: the
-/// entry names `OPENAI_API_KEY`, which `launch_qwen` exports. A value of
+/// entry names `QWEN_ENV_KEY`, which `launch_qwen` exports. A value of
 /// the wrong type on the way down is replaced, as ollama's `qwenMap` does.
 fn qwen_settings_merged(
     existing: &serde_json::Value,
@@ -1173,9 +1177,9 @@ fn qwen_settings_merged(
     let mut doc = existing.as_object().cloned().unwrap_or_default();
     let ours = serde_json::json!({
         "id": model,
-        "name": format!("{model}{QWEN_ENTRY_MARK}"),
+        "name": format!("{model} (llmman)"),
         "baseUrl": base_url,
-        "envKey": "OPENAI_API_KEY",
+        "envKey": QWEN_ENV_KEY,
     });
     let openai = object_under(&mut doc, "modelProviders")
         .entry("openai")
@@ -1212,12 +1216,13 @@ fn object_under<'a>(
     slot.as_object_mut().expect("set to an object just above")
 }
 
-/// An entry llmman wrote: `QWEN_ENTRY_MARK` on its name, at this daemon's
-/// address. The id is the model name and `envKey` is `OPENAI_API_KEY` on
-/// a hand-written entry too, so neither can mark an owner.
+/// An entry llmman wrote: `QWEN_ENV_KEY` as its key, at this daemon's
+/// address, the test `qwenIsOllamaProvider` makes in ollama's
+/// `cmd/launch/qwen.go`. The id is the model name and the display name
+/// is the user's to change, so neither marks an owner.
 fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
     let field = |k: &str| entry.get(k).and_then(serde_json::Value::as_str);
-    field("name").is_some_and(|n| n.ends_with(QWEN_ENTRY_MARK))
+    field("envKey") == Some(QWEN_ENV_KEY)
         && field("baseUrl")
             .is_some_and(|u| u.trim_end_matches('/') == base_url.trim_end_matches('/'))
 }
@@ -1484,10 +1489,10 @@ mod tests {
                     { "id": "docker.io/ai/m:latest", "name": "cloud copy",
                       "baseUrl": "https://cloud.example/v1",
                       "envKey": "QWEN_CUSTOM_API_KEY_X", "customField": 1 },
-                    { "id": "old:latest", "name": "old:latest (llmman)",
-                      "baseUrl": "http://127.0.0.1:17434/v1/", "envKey": "OPENAI_API_KEY" },
+                    { "id": "old:latest", "name": "renamed by the user",
+                      "baseUrl": "http://127.0.0.1:17434/v1/", "envKey": "LLMMAN_API_KEY" },
                     { "id": "other:latest", "name": "other:latest (llmman)",
-                      "baseUrl": "http://10.0.0.2:17434/v1", "envKey": "OPENAI_API_KEY" },
+                      "baseUrl": "http://10.0.0.2:17434/v1", "envKey": "LLMMAN_API_KEY" },
                     { "id": "local-alias", "name": "my alias for the daemon",
                       "baseUrl": "http://127.0.0.1:17434/v1", "envKey": "OPENAI_API_KEY",
                       "generationConfig": { "temperature": 0.2 } }
@@ -1510,7 +1515,7 @@ mod tests {
             openai[0],
             serde_json::json!({ "id": "docker.io/ai/m:latest",
                 "name": "docker.io/ai/m:latest (llmman)", "baseUrl": url,
-                "envKey": "OPENAI_API_KEY" })
+                "envKey": "LLMMAN_API_KEY" })
         );
         assert_eq!(
             openai[1..],
@@ -1536,7 +1541,7 @@ mod tests {
             serde_json::json!({
                 "modelProviders": { "openai": [ { "id": "m:latest",
                     "name": "m:latest (llmman)", "baseUrl": url,
-                    "envKey": "OPENAI_API_KEY" } ] },
+                    "envKey": "LLMMAN_API_KEY" } ] },
                 "security": { "auth": { "selectedType": "openai", "baseUrl": url } },
                 "model": { "name": "m:latest", "baseUrl": url }
             })
@@ -1574,19 +1579,20 @@ mod tests {
         assert_eq!(openai[1]["id"], "gpt-5");
     }
 
-    /// Ownership is the mark on the name at this daemon's address; a
-    /// trailing slash does not make a second daemon of the same one.
+    /// Ownership is the key name at this daemon's address, whatever the
+    /// entry was renamed to; a trailing slash does not make a second
+    /// daemon of the same one.
     #[test]
-    fn qwen_entry_is_ours_needs_the_mark_and_the_address() {
+    fn qwen_entry_is_ours_needs_the_key_name_and_the_address() {
         let url = "http://127.0.0.1:17434/v1";
-        let ours = serde_json::json!({ "id": "anything", "name": "anything (llmman)",
-            "baseUrl": "http://127.0.0.1:17434/v1/", "envKey": "OPENAI_API_KEY" });
+        let ours = serde_json::json!({ "id": "anything", "name": "renamed by the user",
+            "baseUrl": "http://127.0.0.1:17434/v1/", "envKey": "LLMMAN_API_KEY" });
         assert!(qwen_entry_is_ours(&ours, url));
-        let hand_written = serde_json::json!({ "id": "local-alias", "name": "my alias",
+        let hand_written = serde_json::json!({ "id": "local-alias", "name": "m (llmman)",
             "baseUrl": url, "envKey": "OPENAI_API_KEY" });
         assert!(!qwen_entry_is_ours(&hand_written, url));
         let elsewhere = serde_json::json!({ "id": "m:latest", "name": "m:latest (llmman)",
-            "baseUrl": "http://10.0.0.2:17434/v1", "envKey": "OPENAI_API_KEY" });
+            "baseUrl": "http://10.0.0.2:17434/v1", "envKey": "LLMMAN_API_KEY" });
         assert!(!qwen_entry_is_ours(&elsewhere, url));
         assert!(!qwen_entry_is_ours(
             &serde_json::json!("not an object"),
