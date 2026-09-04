@@ -106,6 +106,13 @@ pub fn server() -> String {
     format!("http://{}", connect_addr())
 }
 
+/// A peer's `scheme://host:port` origin from a `LLMMAN_HOST`-style spec
+/// (`asahi`, `spark:17434`, `http://10.0.0.5`), port defaulting to ours.
+pub fn peer_url(spec: &str) -> String {
+    let (scheme, host, port) = parse_host(Some(spec));
+    format!("{scheme}://{}", format_host_port(&host, port))
+}
+
 /// The bare `host:port` `llmman serve`'s own listener binds — the raw
 /// configured host, since a wildcard bind (`0.0.0.0`/`::`) is meaningful
 /// here, unlike for `connect_addr`.
@@ -1421,6 +1428,14 @@ mod tests {
             parse_host(Some("example.com:8080/some/path")),
             ("http".to_string(), "example.com".to_string(), 8080)
         );
+    }
+
+    #[test]
+    fn peer_url_spells_a_peer_the_way_llmman_host_is_spelled() {
+        assert_eq!(peer_url("asahi"), "http://asahi:17434");
+        assert_eq!(peer_url("spark:8080"), "http://spark:8080");
+        assert_eq!(peer_url("https://x.example/"), "https://x.example:443");
+        assert_eq!(peer_url("[fe80::1]"), "http://[fe80::1]:17434");
     }
 
     #[test]

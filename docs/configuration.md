@@ -22,8 +22,8 @@ The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/b
 ## llmman.conf
 
 Everything that needs a file rather than an environment variable lives in
-one place: short-name aliases, provider API keys, and the signature trust
-policy.
+one place: short-name aliases, provider API keys, the signature trust
+policy, and the peers of an aggregation.
 
 ```toml
 # ~/.config/llmman/llmman.conf
@@ -41,6 +41,9 @@ default = "off"
 pattern = "docker.io/myorg/**"
 keys    = ["keys/myorg.pub"]   # relative to this file's directory
 mode    = "enforce"
+
+[aggregation]
+peers = "asahi, spark:17434"
 ```
 
 Read from two locations, later overriding earlier:
@@ -156,6 +159,15 @@ be mistaken for one that does not exist.
 See [verification.md](verification.md) for the format, what is checked,
 and the limitations.
 
+### Aggregation peers
+
+`[aggregation]` names the other `llmman serve` daemons this one pools
+hardware with, comma-separated and spelled like `LLMMAN_HOST`
+(`[scheme://]host[:port]`, port defaulting to `17434`). `LLMMAN_PEERS`
+overrides it for one daemon; a user file's value replaces `/etc`'s
+rather than merging with it, and `peers = ""` opts out. See
+[aggregation.md](aggregation.md).
+
 ## Environment variables
 
 Daemon-wide settings, set before `llmman serve` starts. llmman is a very
@@ -175,6 +187,7 @@ setting may not behave identically.
 | `LLMMAN_METRICS` | Serves the Prometheus scrape endpoint at `/metrics`. Accepts `1`/`true`/`yes`/`on`. Off by default: the router has no authentication, so an upgrade should not start publishing this daemon's version, route mix, model names and model churn to whoever can reach the port. Unset, the route is absent and answers `404`. |
 | `LLMMAN_MODELS` | Local store directory, overriding the default above. `pull`/`push`/`run`/etc. go through the daemon and always use whichever store it was started with. |
 | `LLMMAN_NUM_PARALLEL` | Number of parallel request slots (`--parallel`) for GGUF models (llama-server only; no vllm/mlx equivalent). `--ctx-size` is scaled up by this value first, so each slot still gets the full configured/default context rather than an even split of it; ignored (with a warning) for a load with no explicit context size to scale. Unset leaves llama-server's own default of 1 untouched. |
+| `LLMMAN_PEERS` | Comma-separated peer daemons (`[scheme://]host[:port]`) to pool hardware with, overriding `[aggregation]` in `llmman.conf`. Set but empty takes this daemon out of its aggregation. See [aggregation.md](aggregation.md). |
 | `LLMMAN_ORIGINS` | A comma-separated list of extra allowed CORS origins for the HTTP API. A trailing `:*` on an entry matches any port on that scheme+host. Always includes every scheme/port on `localhost`/`127.0.0.1`/`0.0.0.0`/`[::1]` regardless of this variable. |
 | `LLMMAN_SCHED_SPREAD` | Truthy forwards `--split-mode layer` (spread a model across every GPU, already llama-server's own default); falsey forwards `--split-mode none` (restrict to one GPU). |
 | `LLMMAN_FLASH_ATTENTION` | Flash Attention mode (`--flash-attn`): `on`, `off`, or `auto` (llama-server's own default). Also accepts `1`/`0`/`true`/`false`. |

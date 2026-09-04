@@ -146,10 +146,84 @@ pub fn default_ctx_size_for(vram_bytes: u64) -> Option<u32> {
     }
 }
 
-/// [`default_ctx_size_for`] applied to [`detect_with_vram`]'s live probe,
+/// [`default_ctx_size_for`] applied to a [`detect_with_vram`] result,
 /// less [`gpu_overhead_bytes`] (floors at 0, never underflows).
-pub fn default_ctx_size() -> Option<u32> {
-    default_ctx_size_for(detect_with_vram().1.saturating_sub(gpu_overhead_bytes()))
+pub fn default_ctx_size(vram_bytes: u64) -> Option<u32> {
+    default_ctx_size_for(vram_bytes.saturating_sub(gpu_overhead_bytes()))
+}
+
+/// The accelerator's memory, else system RAM, else 0. What
+/// `cmd::serve::aggregation` weighs nodes by.
+pub fn memory_bytes(vram_bytes: u64) -> u64 {
+    if vram_bytes > 0 {
+        return vram_bytes;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| parse_meminfo_total(&s))
+            .unwrap_or(0)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        apple_unified_memory_bytes().unwrap_or(0)
+    }
+    #[cfg(windows)]
+    {
+        windows_memory_bytes().unwrap_or(0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        0
+    }
+}
+
+/// `GlobalMemoryStatusEx().ullTotalPhys`; no `windows` crate here.
+#[cfg(windows)]
+fn windows_memory_bytes() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status.total_phys)
+}
+
+/// `MemTotal:       16384000 kB` -> bytes.
+#[cfg(any(target_os = "linux", test))]
+fn parse_meminfo_total(meminfo: &str) -> Option<u64> {
+    let kib = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(kib * 1024)
 }
 
 /// The hidden re-exec argument `main()` checks for, before anything else,
@@ -365,6 +439,19 @@ mod tests {
         assert_eq!(default_ctx_size_for(46 * GIB), Some(65536));
         assert_eq!(default_ctx_size_for(47 * GIB), None);
         assert_eq!(default_ctx_size_for(80 * GIB), None);
+    }
+
+    #[test]
+    fn parse_meminfo_total_reads_the_kib_line() {
+        let meminfo = "MemTotal:        7864320 kB\nMemFree:         1234 kB\n";
+        assert_eq!(parse_meminfo_total(meminfo), Some(7864320 * 1024));
+        assert_eq!(parse_meminfo_total("MemFree: 1 kB\n"), None);
+        assert_eq!(parse_meminfo_total("MemTotal: lots\n"), None);
+    }
+
+    #[test]
+    fn memory_bytes_prefers_vram() {
+        assert_eq!(memory_bytes(8 * GIB), 8 * GIB);
     }
 
     #[test]
