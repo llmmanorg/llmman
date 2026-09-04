@@ -32,6 +32,8 @@ use crate::providers::PLACEHOLDER_API_KEY;
 use crate::storage::OciStore;
 use crate::webui;
 
+mod aggregation;
+
 // ---------------------------------------------------------------------------
 // CLI args
 // ---------------------------------------------------------------------------
@@ -53,6 +55,7 @@ Environment Variables:
       LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only)
       LLMMAN_NOPRUNE                 Do not prune model blobs on startup
       LLMMAN_ORIGINS                 A comma separated list of allowed CORS origins
+      LLMMAN_PEERS                   A comma separated list of peer daemons ([host][:port]) to pool hardware with (overrides [aggregation] in llmman.conf)
       LLMMAN_SCHED_SPREAD            Always schedule model across all GPUs
       LLMMAN_FLASH_ATTENTION         Enable flash attention
       LLMMAN_KV_CACHE_TYPE           Quantization type for the K/V cache (default: f16)
@@ -540,6 +543,10 @@ struct Inner {
     max_queue: usize,
     // See max_loaded_models_from_env's doc comment.
     max_loaded_models: usize,
+    // Peer origins (`http://host:port`) — see the `aggregation` module.
+    peers: Vec<String>,
+    // See hostgpu::memory_bytes; what `aggregation` weighs this node by.
+    memory: u64,
     store_path: PathBuf,
     cache_path: PathBuf,
     client: Client,
@@ -564,9 +571,8 @@ struct RunningModel {
     /// Full manifest digest (e.g. "sha256:abcd...") from the OCI store,
     /// captured at load time (see resolve_model's caller in ensure_model).
     digest: String,
-    /// GGUF file size in bytes; 0 for a safetensors dir (vllm) — walking a
-    /// multi-file safetensors directory isn't worth the cost just for
-    /// `ps` output today.
+    /// Sum of the model's layer sizes from its store manifest (every
+    /// engine); 0 if that lookup failed.
     size: u64,
     started_at: String,
     /// Monotonic clock reading of this model's last activity (a request
@@ -823,55 +829,58 @@ struct OllamaToolCallFunction {
     arguments: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
+// `Serialize` too: forwarded as-is to an aggregation peer.
+#[derive(Debug, Serialize, Deserialize)]
 struct OllamaChatRequest {
     model: String,
     #[serde(default)]
     messages: Vec<OllamaMessage>,
     #[serde(default = "bool_true")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<serde_json::Value>,
     /// Ollama's own top-level `think` field ("for thinking models, should
     /// the model think before responding? Can be a boolean or a thinking
     /// level"). See `think_to_chat_template_kwargs`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     think: Option<serde_json::Value>,
     /// Tool/function definitions, in the same shape OpenAI's `tools`
     /// field uses (Ollama's own tool schema is already
     /// OpenAI-function-tool compatible) — passed straight through to
     /// llama-server. See `handle_ollama_chat`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tools: Option<serde_json::Value>,
     /// `"json"` for unconstrained-schema JSON mode, or a JSON Schema
     /// object for constrained structured output. See
     /// `format_to_response_format`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     format: Option<serde_json::Value>,
     /// See `OllamaGenerateRequest::keep_alive`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     keep_alive: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OllamaGenerateRequest {
     model: String,
     #[serde(default)]
     prompt: String,
     #[serde(default = "bool_true")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<serde_json::Value>,
     /// keep_alive: 0 with an empty prompt is the Ollama unload signal;
     /// otherwise resolved (see `resolve_keep_alive`) into how long this
     /// model should stay loaded once idle.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     keep_alive: Option<serde_json::Value>,
     /// See `OllamaChatRequest::think`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     think: Option<serde_json::Value>,
     /// See `OllamaChatRequest::format`. `/api/generate` has no `tools`
     /// field in real Ollama either — only `/api/chat` supports tool
     /// calling.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     format: Option<serde_json::Value>,
 }
 
@@ -944,12 +953,13 @@ struct OllamaGenerateChunk {
     done_reason: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+// Also `Deserialize`: a node reads its peers' tags/ps answers back in.
+#[derive(Debug, Serialize, Deserialize)]
 struct OllamaTagsResponse {
     models: Vec<OllamaModelInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OllamaModelInfo {
     name: String,
     model: String,
@@ -959,7 +969,7 @@ struct OllamaModelInfo {
     details: OllamaModelDetails,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OllamaModelDetails {
     format: String,
     family: String,
@@ -967,12 +977,12 @@ struct OllamaModelDetails {
     quantization_level: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OllamaPsResponse {
     models: Vec<OllamaRunningModelInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OllamaRunningModelInfo {
     name: String,
     model: String,
@@ -997,6 +1007,9 @@ struct OllamaRunningModelInfo {
     processor: String,
     context_length: Option<u64>,
     started_at: String,
+    /// The peer this model is loaded on; absent for this node's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2573,6 +2586,35 @@ async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Forwards an Ollama request to a peer as-is, so `keep_alive` and a
+/// load-only request apply where the model runs.
+async fn forward_ollama<T: Serialize>(
+    state: &AppState,
+    target: &Target,
+    route: &str,
+    headers: &HeaderMap,
+    req: &T,
+    guard: ActivityGuard,
+) -> Result<Response, AppError> {
+    let body = Bytes::from(serde_json::to_vec(req).context("re-serialize Ollama request")?);
+    let activity = begin_activity(guard, None).await;
+    proxy(&state.0.client, target, route, headers, body, activity).await
+}
+
+/// [`unload_model`] here and on every peer. A peer that had it makes
+/// the local answer moot, including a 404 for a model never pulled here.
+async fn unload_everywhere(
+    state: &AppState,
+    model: &str,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    let local = unload_model(state, model).await;
+    if aggregation::unload(state, model, headers).await {
+        return Ok(());
+    }
+    local
+}
+
 /// Is `model_ref` already running and alive? See `ModelProcess::is_alive`.
 /// If so, claims it (`in_flight += 1`, under the same lock as the
 /// liveness check) and returns the same [`ActivityGuard`] `ensure_model`
@@ -2928,7 +2970,7 @@ async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Request target: a local backend, or a remote provider
+// Request target: a local backend, a peer daemon, or a remote provider
 // ---------------------------------------------------------------------------
 
 /// Where a resolved request is actually sent.
@@ -2937,7 +2979,7 @@ async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<String> {
 /// was a `llama-server`/vllm/mlx child on loopback, so a port was the
 /// whole of "where does this go". [`Target::Remote`] is the same idea for
 /// a request that leaves the machine — see [`crate::providers`] for which
-/// providers qualify.
+/// providers qualify — and [`Target::Peer`] for another `llmman serve`.
 ///
 /// Requests are *routed* through, never redirected away from, this
 /// daemon: a provider-backed integration still talks to `llmman serve`
@@ -2947,6 +2989,9 @@ async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<String> {
 enum Target {
     /// A locally spawned backend listening on loopback.
     Local(u16),
+    /// Another `llmman serve`, by origin; speaks our dialect, so not
+    /// `is_remote`.
+    Peer(String),
     /// A remote provider's OpenAI-compatible API.
     Remote(Arc<RemoteTarget>),
 }
@@ -2992,11 +3037,13 @@ impl Target {
     fn url(&self, route: &str) -> String {
         match self {
             Self::Local(port) => format!("http://127.0.0.1:{port}{route}"),
+            Self::Peer(origin) => format!("{origin}{route}"),
             Self::Remote(remote) => crate::providers::rebase_url(&remote.base_url, route),
         }
     }
 
-    /// Attaches this target's credentials to an outgoing request.
+    /// Attaches this target's credentials to an outgoing request, or for
+    /// a peer the hop marker.
     ///
     /// A no-op for [`Target::Local`]: a loopback `llama-server` has no
     /// auth, which is why nothing below ever forwarded the client's own
@@ -3005,6 +3052,7 @@ impl Target {
     fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self {
             Self::Local(_) => req,
+            Self::Peer(_) => req.header(aggregation::HOP, "1"),
             Self::Remote(remote) => req.bearer_auth(&remote.api_key),
         }
     }
@@ -3021,6 +3069,7 @@ impl Target {
     fn describe(&self) -> String {
         match self {
             Self::Local(_) => "inference backend".to_string(),
+            Self::Peer(origin) => format!("peer {origin}"),
             Self::Remote(remote) => format!("provider {}", remote.provider),
         }
     }
@@ -3252,6 +3301,16 @@ async fn ensure_model(
         // Already loaded, so no pull and no re-check: a policy tightened
         // since the load takes effect on the next load, not mid-flight.
         return Ok((model_ref.to_string(), Target::Local(port), guard));
+    }
+
+    // Not loaded here: a peer may have it, or more room for it. The
+    // guard is a no-op one, as for a provider.
+    if let Some(peer) = aggregation::route(state, model_ref, headers).await {
+        return Ok((
+            model_ref.to_string(),
+            Target::Peer(peer),
+            ActivityGuard::new(state, model_ref),
+        ));
     }
 
     // The cold-start clock. It starts here rather than at the spawn
@@ -3962,10 +4021,12 @@ async fn post_chat(
 /// A [`Target::Local`] backend failing is llmman's own problem, so it
 /// stays a 500 as it always has. A provider's 4xx is about the caller's
 /// request or credentials, so it is passed through rather than buried;
-/// anything else from a provider is a bad gateway.
+/// anything else from a provider is a bad gateway. A peer already
+/// applied this mapping, so its status stands.
 fn remote_status(target: &Target, upstream: StatusCode) -> StatusCode {
     match target {
         Target::Local(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Target::Peer(_) => upstream,
         Target::Remote(_) if upstream.is_client_error() => upstream,
         Target::Remote(_) => StatusCode::BAD_GATEWAY,
     }
@@ -4650,10 +4711,13 @@ async fn handle_version(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-async fn handle_tags(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+async fn handle_tags(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
     let store = OciStore::open(&state.0.store_path)?;
     let list = store.list()?;
-    let models = list
+    let mut models: Vec<OllamaModelInfo> = list
         .into_iter()
         .map(|img| OllamaModelInfo {
             name: img.reference.clone(),
@@ -4674,6 +4738,16 @@ async fn handle_tags(State(state): State<AppState>) -> Result<impl IntoResponse,
             },
         })
         .collect();
+    // A peer's models are servable from here too, by forwarding.
+    if aggregation::aggregates(&state, &headers) {
+        for (_, peer) in aggregation::poll::<OllamaTagsResponse>(&state, "/api/tags").await {
+            for m in peer.models {
+                if !models.iter().any(|have| have.name == m.name) {
+                    models.push(m);
+                }
+            }
+        }
+    }
     Ok(Json(OllamaTagsResponse { models }))
 }
 
@@ -4691,7 +4765,7 @@ struct PsEntry {
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-async fn handle_ps(State(state): State<AppState>) -> impl IntoResponse {
+async fn handle_ps(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let entries: Vec<PsEntry> = {
         let mgr = state.0.manager.lock().await;
         mgr.running
@@ -4729,7 +4803,17 @@ async fn handle_ps(State(state): State<AppState>) -> impl IntoResponse {
             expires_at: entry
                 .expires_at
                 .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            node: None,
         });
+    }
+    // Loaded on a peer is loaded for this node's callers too.
+    if aggregation::aggregates(&state, &headers) {
+        for (origin, peer) in aggregation::poll::<OllamaPsResponse>(&state, "/api/ps").await {
+            models.extend(peer.models.into_iter().map(|m| OllamaRunningModelInfo {
+                node: Some(origin.clone()),
+                ..m
+            }));
+        }
     }
     Json(OllamaPsResponse { models })
 }
@@ -5155,18 +5239,20 @@ async fn handle_ollama_chat(
     // backend to continue from nothing: the caller gets a real, arbitrary
     // generation and `done_reason: "stop"` where ollama answers with an
     // empty message, and a `keep_alive: 0` never unloads anything.
-    if req.messages.is_empty() {
-        if is_explicit_unload(&req.keep_alive) {
-            unload_model(&state, &req.model).await?;
-            return Ok(Json(empty_chat_chunk(req.model, "unload")).into_response());
-        }
+    if req.messages.is_empty() && is_explicit_unload(&req.keep_alive) {
+        unload_everywhere(&state, &req.model, &headers).await?;
+        return Ok(Json(empty_chat_chunk(req.model, "unload")).into_response());
+    }
 
-        let (_model, _target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
+    let (model, target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
+    if matches!(target, Target::Peer(_)) {
+        return forward_ollama(&state, &target, "/api/chat", &headers, &req, guard).await;
+    }
+    if req.messages.is_empty() {
         refresh_activity(guard, resolve_keep_alive(&req.keep_alive)).await;
         return Ok(Json(empty_chat_chunk(req.model, "load")).into_response());
     }
 
-    let (model, target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
     let keep_alive = resolve_keep_alive(&req.keep_alive);
     let activity = begin_activity(guard, Some(keep_alive)).await;
     // See backend_wire_model's own doc comment — usually just `model`
@@ -5243,7 +5329,7 @@ async fn handle_ollama_generate(
     // `LLMMAN_KEEP_ALIVE=0` turned a plain preload into an eviction.
     let is_unload = req.prompt.is_empty() && is_explicit_unload(&req.keep_alive);
     if is_unload {
-        unload_model(&state, &req.model).await?;
+        unload_everywhere(&state, &req.model, &headers).await?;
         return Ok(Json(OllamaGenerateChunk {
             model: req.model,
             created_at: now_rfc3339(),
@@ -5256,6 +5342,9 @@ async fn handle_ollama_generate(
     }
 
     let (model, target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
+    if matches!(target, Target::Peer(_)) {
+        return forward_ollama(&state, &target, "/api/generate", &headers, &req, guard).await;
+    }
     // Empty prompt = load-only request (mirrors ollama server/routes.go:429)
     // — including "preload with a custom keep_alive", so refresh it here
     // even though no generation is happening.
@@ -5313,24 +5402,40 @@ async fn handle_ollama_generate(
 
 async fn handle_openai_models(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let store = OciStore::open(&state.0.store_path)?;
     let list = store.list()?;
-    let mgr = state.0.manager.lock().await;
-    let data: Vec<serde_json::Value> = list
-        .into_iter()
-        .map(|img| {
-            let loaded = mgr.running.contains_key(&img.reference);
-            serde_json::json!({
-                "id": img.reference,
-                "object": "model",
-                "created": 0,
-                "owned_by": "llmman",
-                // status field consumed by the web UI to track loaded/unloaded state
-                "status": { "value": if loaded { "loaded" } else { "unloaded" } },
+    let mut data: Vec<serde_json::Value> = {
+        let mgr = state.0.manager.lock().await;
+        list.into_iter()
+            .map(|img| {
+                let loaded = mgr.running.contains_key(&img.reference);
+                serde_json::json!({
+                    "id": img.reference,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "llmman",
+                    // status field consumed by the web UI to track loaded/unloaded state
+                    "status": { "value": if loaded { "loaded" } else { "unloaded" } },
+                })
             })
-        })
-        .collect();
+            .collect()
+    };
+    // As `handle_tags`; loaded anywhere counts as loaded.
+    if aggregation::aggregates(&state, &headers) {
+        for (_, peer) in aggregation::poll::<serde_json::Value>(&state, "/v1/models").await {
+            for m in peer["data"].as_array().into_iter().flatten() {
+                match data.iter_mut().find(|have| have["id"] == m["id"]) {
+                    Some(have) if m["status"]["value"] == "loaded" => {
+                        have["status"] = m["status"].clone();
+                    }
+                    Some(_) => {}
+                    None => data.push(m.clone()),
+                }
+            }
+        }
+    }
     Ok(Json(serde_json::json!({ "object": "list", "data": data })))
 }
 
@@ -6262,6 +6367,7 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         // llmman's own API — see handle_llmman_providers
         .route("/llmman/providers", get(handle_llmman_providers))
         .route("/llmman/providers/:id", get(handle_llmman_provider))
+        .route("/llmman/node", get(aggregation::handle_node))
         // Ollama API
         .route("/api/version", get(handle_version))
         .route("/api/tags", get(handle_tags))
@@ -6420,16 +6526,33 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         }
     }
 
-    // See context_length_from_env's doc comment. spawn_blocking: like
-    // resolve_llama_server above, the VRAM probe fallback spawns a
-    // subprocess and must not block this async fn's executor thread.
+    // See the `aggregation` module.
+    let peers: Vec<String> = crate::config::peers()
+        .iter()
+        .map(|p| crate::daemon::peer_url(p))
+        .collect();
+
+    // One accelerator probe serves both the VRAM-tiered context default
+    // and this node's weight in its aggregation; skipped when neither
+    // needs it. spawn_blocking: it spawns a subprocess.
     let ctx_size_explicit = context_length_from_env();
-    let ctx_size = match ctx_size_explicit {
-        Some(n) => Some(n),
-        None => tokio::task::spawn_blocking(crate::hostgpu::default_ctx_size)
+    let vram = if ctx_size_explicit.is_none() || !peers.is_empty() {
+        tokio::task::spawn_blocking(crate::hostgpu::detect_with_vram)
             .await
-            .context("hostgpu probe task panicked")?,
+            .context("hostgpu probe task panicked")?
+            .1
+    } else {
+        0
     };
+    let ctx_size = ctx_size_explicit.or_else(|| crate::hostgpu::default_ctx_size(vram));
+    let memory = crate::hostgpu::memory_bytes(vram);
+    if !peers.is_empty() {
+        eprintln!(
+            "[llmman] aggregation peers: {} (this node: {} of model memory)",
+            peers.join(", "),
+            crate::fmt::human_size(memory)
+        );
+    }
 
     // See threads_from_env_or_host's doc comment. Resolved once here
     // rather than per load, and logged so a surprising thread count is
@@ -6468,6 +6591,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         threads,
         max_queue: max_queue_from_env(),
         max_loaded_models: max_loaded_models_from_env(),
+        peers,
+        memory,
         store_path,
         cache_path,
         client: Client::new(),
@@ -6905,6 +7030,328 @@ mod tests {
             body.get("repeat_penalty").is_none(),
             "llama.cpp-only field sent to a provider: {body}"
         );
+    }
+
+    // -- aggregation (peer daemons) ------------------------------------------
+
+    #[test]
+    fn a_peer_target_is_a_local_backend_in_all_but_address() {
+        let peer = Target::Peer("http://spark:17434".into());
+        assert_eq!(
+            peer.url("/v1/chat/completions"),
+            "http://spark:17434/v1/chat/completions"
+        );
+        assert!(!peer.is_remote(), "a peer accepts llama.cpp extensions");
+        assert!(repeat_penalty_applies(&peer));
+        assert_eq!(peer.describe(), "peer http://spark:17434");
+        for upstream in [
+            StatusCode::NOT_FOUND,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert_eq!(remote_status(&peer, upstream), upstream);
+        }
+    }
+
+    /// `/llmman/node` answers `node`; every other route records its call.
+    async fn mock_peer(
+        node: aggregation::Node,
+    ) -> (
+        String,
+        Arc<tokio::sync::Mutex<Vec<(String, HeaderMap, Bytes)>>>,
+    ) {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let app = Router::new()
+            .route("/llmman/node", get(move || async move { Json(node) }))
+            .fallback(move |req: Request| async move {
+                let (parts, body) = req.into_parts();
+                let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                captured
+                    .lock()
+                    .await
+                    .push((parts.uri.path().to_string(), parts.headers, body));
+                ([("content-type", "application/json")], "{}")
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (origin, seen)
+    }
+
+    /// Store tags `docker.io/ai/m:latest` with no blobs, so a local load
+    /// fails offline instead of pulling.
+    fn state_with_peers(peers: Vec<String>, memory: u64) -> AppState {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-aggregation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let desc = crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:a1b2".into(),
+            size: 0,
+            annotations: None,
+        };
+        OciStore::open(&dir)
+            .unwrap()
+            .tag(desc, "docker.io/ai/m:latest")
+            .unwrap();
+        let mut inner = test_inner(dir);
+        inner.peers = peers;
+        inner.memory = memory;
+        AppState(Arc::new(inner))
+    }
+
+    fn node(memory: u64, loaded: &[&str], stored: &[&str]) -> aggregation::Node {
+        let map = |names: &[&str]| names.iter().map(|n| (n.to_string(), 1 << 30)).collect();
+        aggregation::Node {
+            memory,
+            loaded: map(loaded),
+            stored: map(stored),
+        }
+    }
+
+    /// A peer gets llmman's own dialect, the hop marker, no credential.
+    #[tokio::test]
+    async fn a_peer_request_carries_the_hop_marker_and_nothing_else() {
+        let (origin, seen) = mock_peer(node(0, &[], &[])).await;
+        let mut req = OAIChatRequest {
+            model: "docker.io/ai/m:latest".into(),
+            ..Default::default()
+        };
+        post_chat(&Client::new(), &Target::Peer(origin), &mut req)
+            .await
+            .unwrap();
+
+        let calls = seen.lock().await;
+        let (path, headers, body) = &calls[0];
+        assert_eq!(path, "/v1/chat/completions");
+        assert_eq!(headers[aggregation::HOP], "1");
+        assert!(headers.get("authorization").is_none());
+        let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(body["repeat_penalty"], DEFAULT_REPEAT_PENALTY);
+    }
+
+    /// A model a peer has loaded is served there; a hopped request or a
+    /// pre-load stays put.
+    #[tokio::test]
+    async fn ensure_model_forwards_to_the_peer_that_has_the_model_loaded() {
+        let (origin, _) = mock_peer(node(8 << 30, &["docker.io/ai/m:latest"], &[])).await;
+        let state = state_with_peers(vec![origin.clone()], 0);
+
+        let (name, target, _) = ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(name, "docker.io/ai/m:latest");
+        assert!(
+            matches!(&target, Target::Peer(o) if *o == origin),
+            "{target:?}"
+        );
+
+        // Hopped once: load here (failing on the fixture), never bounce.
+        let mut hopped = HeaderMap::new();
+        hopped.insert(aggregation::HOP, "1".parse().unwrap());
+        let err = ensure_model(&state, "docker.io/ai/m", Some(&hopped))
+            .await
+            .err()
+            .expect("the fixture has no blobs to load");
+        assert!(
+            format!("{:#}", err.0).contains("resolve model"),
+            "{:#}",
+            err.0
+        );
+
+        // A pre-load names a model for *this* node.
+        let err = ensure_model(&state, "docker.io/ai/m", None)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{:#}", err.0).contains("resolve model"),
+            "{:#}",
+            err.0
+        );
+    }
+
+    /// A cold model goes to the roomiest node that has it stored; a dead
+    /// peer is ignored and one that would have to pull loses to this node.
+    #[tokio::test]
+    async fn ensure_model_places_a_cold_model_on_the_roomiest_reachable_node() {
+        let (roomy, _) = mock_peer(node(128 << 30, &[], &["docker.io/ai/m:latest"])).await;
+        let state = state_with_peers(vec![roomy.clone()], 8 << 30);
+        let (_, target, _) = ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&target, Target::Peer(o) if *o == roomy),
+            "{target:?}"
+        );
+
+        // A dead peer, and a listening one that would have to pull.
+        let (bare, _) = mock_peer(node(128 << 30, &[], &[])).await;
+        let dead = "http://127.0.0.1:9".to_string();
+        let state = state_with_peers(vec![dead, bare], 8 << 30);
+        let err = ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()))
+            .await
+            .err()
+            .expect("loads (and fails on the fixture) locally");
+        assert!(
+            format!("{:#}", err.0).contains("resolve model"),
+            "{:#}",
+            err.0
+        );
+    }
+
+    /// Listings cover the peers' models too, unless a peer is asking.
+    #[tokio::test]
+    async fn listings_cover_the_aggregation_except_for_a_peer_asking() {
+        let ps = serde_json::json!({ "models": [{
+            "name": "docker.io/ai/m:latest", "model": "docker.io/ai/m:latest",
+            "expires_at": null, "digest": "sha256:aa", "size": 1, "size_vram": 0,
+            "pid": null, "port": 1, "processor": "GPU", "context_length": null,
+            "started_at": "2026-01-01T00:00:00Z"
+        }]});
+        let tags = serde_json::json!({ "models": [{
+            "name": "docker.io/ai/m:latest", "model": "docker.io/ai/m:latest",
+            "size": 1, "digest": "sha256:aa", "modified_at": "2026-01-01T00:00:00Z",
+            "details": { "format": "gguf", "family": "", "parameter_size": "", "quantization_level": "" }
+        }]});
+        let models = serde_json::json!({ "object": "list", "data": [
+            { "id": "docker.io/ai/m:latest", "object": "model", "created": 0,
+              "owned_by": "llmman", "status": { "value": "loaded" } }
+        ]});
+        let app = Router::new()
+            .route("/api/ps", get(move || async move { Json(ps) }))
+            .route("/api/tags", get(move || async move { Json(tags) }))
+            .route("/v1/models", get(move || async move { Json(models) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-aggregation-listings-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        OciStore::open(&dir).unwrap();
+        let mut inner = test_inner(dir);
+        inner.peers = vec![origin.clone()];
+        let state = AppState(Arc::new(inner));
+
+        async fn body(resp: Response) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        let mut hopped = HeaderMap::new();
+        hopped.insert(aggregation::HOP, "1".parse().unwrap());
+
+        let ps = body(
+            handle_ps(State(state.clone()), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(ps["models"][0]["name"], "docker.io/ai/m:latest");
+        assert_eq!(ps["models"][0]["node"], origin);
+        let own = body(
+            handle_ps(State(state.clone()), hopped.clone())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(own["models"].as_array().unwrap().len(), 0);
+
+        let tags = body(
+            handle_tags(State(state.clone()), HeaderMap::new())
+                .await
+                .unwrap()
+                .into_response(),
+        )
+        .await;
+        assert_eq!(tags["models"][0]["name"], "docker.io/ai/m:latest");
+        assert!(!tags.to_string().contains("\"node\""));
+        let own = body(
+            handle_tags(State(state.clone()), hopped.clone())
+                .await
+                .unwrap()
+                .into_response(),
+        )
+        .await;
+        assert_eq!(own["models"].as_array().unwrap().len(), 0);
+
+        let models = body(
+            handle_openai_models(State(state.clone()), HeaderMap::new())
+                .await
+                .unwrap()
+                .into_response(),
+        )
+        .await;
+        assert_eq!(models["data"][0]["id"], "docker.io/ai/m:latest");
+        assert_eq!(models["data"][0]["status"]["value"], "loaded");
+        let own = body(
+            handle_openai_models(State(state), hopped)
+                .await
+                .unwrap()
+                .into_response(),
+        )
+        .await;
+        assert_eq!(own["data"].as_array().unwrap().len(), 0);
+    }
+
+    /// An Ollama request bound for a peer goes there as-is.
+    #[tokio::test]
+    async fn an_ollama_request_reaches_a_peer_natively() {
+        let (origin, seen) = mock_peer(node(8 << 30, &["docker.io/ai/m:latest"], &[])).await;
+        let state = state_with_peers(vec![origin], 0);
+        let req: OllamaGenerateRequest = serde_json::from_value(
+            serde_json::json!({ "model": "docker.io/ai/m", "keep_alive": "1h" }),
+        )
+        .unwrap();
+        let resp = handle_ollama_generate(State(state), HeaderMap::new(), Json(req))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let calls = seen.lock().await;
+        let (path, headers, body) = &calls[0];
+        assert_eq!(path, "/api/generate");
+        assert_eq!(headers[aggregation::HOP], "1");
+        let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(body["model"], "docker.io/ai/m");
+        assert_eq!(body["keep_alive"], "1h");
+        assert_eq!(body["prompt"], "");
+        assert!(body.get("think").is_none(), "{body}");
+    }
+
+    /// `llmman stop` reaches a model wherever the aggregation loaded it.
+    #[tokio::test]
+    async fn an_unload_is_forwarded_to_every_peer() {
+        let (origin, seen) = mock_peer(node(0, &[], &[])).await;
+        let state = state_with_peers(vec![origin], 0);
+        unload_everywhere(&state, "docker.io/ai/m", &HeaderMap::new())
+            .await
+            .unwrap();
+        let calls = seen.lock().await;
+        let (path, headers, body) = &calls[0];
+        assert_eq!(path, "/api/generate");
+        assert_eq!(headers[aggregation::HOP], "1");
+        let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(body["model"], "docker.io/ai/m");
+        assert_eq!(body["keep_alive"], 0);
+        drop(calls);
+
+        // A peer asking does not fan out again.
+        let mut hopped = HeaderMap::new();
+        hopped.insert(aggregation::HOP, "1".parse().unwrap());
+        unload_everywhere(&state, "docker.io/ai/m", &hopped)
+            .await
+            .unwrap();
+        assert_eq!(seen.lock().await.len(), 1, "forwarded a forwarded unload");
     }
 
     // -- keep_alive parsing / resolution (idle-timeout auto-unload) ---------
@@ -7467,7 +7914,12 @@ mod tests {
     /// `test_state` with a real store directory, for the few tests that
     /// need `canonical_ref` to actually resolve something.
     fn test_state_at(store_path: PathBuf) -> AppState {
-        AppState(Arc::new(Inner {
+        AppState(Arc::new(test_inner(store_path)))
+    }
+
+    /// `test_state_at`'s `Inner`, for tests that set one field differently.
+    fn test_inner(store_path: PathBuf) -> Inner {
+        Inner {
             manager: Mutex::new(ModelManager {
                 running: HashMap::new(),
                 pending_loads: 0,
@@ -7489,10 +7941,12 @@ mod tests {
             // anyway.
             max_queue: usize::MAX,
             max_loaded_models: 0,
+            peers: Vec::new(),
+            memory: 0,
             store_path,
             cache_path: std::env::temp_dir(),
             client: Client::new(),
-        }))
+        }
     }
 
     /// A long-lived, harmless real child process to back a test

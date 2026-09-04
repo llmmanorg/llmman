@@ -460,8 +460,8 @@ mod tests {
         println!("detect_rocm() -> {:?}", detect_rocm());
         println!("detect_vulkan() -> {:?}", detect_vulkan());
         println!(
-            "default_ctx_size() -> {:?}",
-            super::super::default_ctx_size()
+            "detect_with_vram() -> {:?}",
+            super::super::detect_with_vram()
         );
     }
 }

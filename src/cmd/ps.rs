@@ -34,6 +34,9 @@ struct PsModel {
     /// "Forever" in the UNTIL column, same as `ollama ps` does for its own
     /// zero-value sentinel.
     expires_at: Option<String>,
+    /// The peer this model is loaded on; absent for the daemon's own.
+    #[serde(default)]
+    node: Option<String>,
 }
 
 /// `llmman ps` — list models currently loaded by a running `llmman serve`,
@@ -43,7 +46,8 @@ struct PsModel {
 /// cmd::serve::RunningModel::processor's doc comment) — PROCESSOR instead
 /// shows which engine loaded the model. STARTED (how long ago a model
 /// loaded) is also kept alongside UNTIL (when it'll be auto-unloaded),
-/// since `ollama ps` has no equivalent of the former.
+/// since `ollama ps` has no equivalent of the former. A NODE column
+/// appears only when a model is loaded on an aggregation peer.
 ///
 /// Unlike `pull`/`push`/`run`, this does not start `llmman serve` if it
 /// isn't already running — matching `ollama ps`'s own `checkServerHeartbeat`
@@ -105,29 +109,46 @@ pub fn run(args: &PsArgs) -> anyhow::Result<()> {
         .max()
         .unwrap_or(7)
         .max(7);
+    let nodes: Vec<&str> = models
+        .iter()
+        .map(|m| node_label(m.node.as_deref()))
+        .collect();
+    let node_w = models
+        .iter()
+        .any(|m| m.node.is_some())
+        .then(|| nodes.iter().map(|n| n.len()).max().unwrap_or(4).max(4));
+
+    // Its own segment (or nothing), so UNTIL stays last and unpadded.
+    let node_col = |node: &str| {
+        node_w
+            .map(|w| format!("{node:<w$}    "))
+            .unwrap_or_default()
+    };
 
     println!(
-        "{:<name_w$}    {:<12}    {:<10}    {:<proc_w$}    {:<9}    {:<started_w$}    UNTIL",
+        "{:<name_w$}    {:<12}    {:<10}    {:<proc_w$}    {:<9}    {:<started_w$}    {}UNTIL",
         "NAME",
         "ID",
         "SIZE",
         "PROCESSOR",
         "CONTEXT",
         "STARTED",
+        node_col("NODE"),
         name_w = name_w,
         proc_w = proc_w,
         started_w = started_w,
     );
 
-    for (m, (started, until)) in models.iter().zip(rendered.iter()) {
+    for ((m, (started, until)), node) in models.iter().zip(rendered.iter()).zip(nodes) {
         println!(
-            "{:<name_w$}    {:<12}    {:<10}    {:<proc_w$}    {:<9}    {:<started_w$}    {}",
+            "{:<name_w$}    {:<12}    {:<10}    {:<proc_w$}    {:<9}    {:<started_w$}    {}{}",
             m.name,
             short_id(&m.digest),
             human_size(m.size),
             m.processor,
             m.context_length.map(|c| c.to_string()).unwrap_or_default(),
             started,
+            node_col(node),
             until,
             name_w = name_w,
             proc_w = proc_w,
@@ -135,4 +156,24 @@ pub fn run(args: &PsArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// `http://spark:17434` -> `spark:17434`; this daemon's own -> `local`.
+fn node_label(node: Option<&str>) -> &str {
+    let Some(node) = node else {
+        return "local";
+    };
+    node.split_once("://").map_or(node, |(_, rest)| rest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_label_drops_the_scheme_and_names_this_daemon_local() {
+        assert_eq!(node_label(None), "local");
+        assert_eq!(node_label(Some("http://spark:17434")), "spark:17434");
+        assert_eq!(node_label(Some("asahi:17434")), "asahi:17434");
+    }
 }

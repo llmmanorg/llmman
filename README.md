@@ -161,7 +161,7 @@ The server listens on `127.0.0.1:17434` by default, overridable via `LLMMAN_HOST
 | Ollama | `/api/generate`, `/api/chat`, `/api/tags`, `/api/show`, `/api/pull`, `/api/ps`, `/api/delete` |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens` |
 | Anthropic | `/v1/messages` |
-| llmman | `/llmman/providers`, `/llmman/providers/{id}` |
+| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node` |
 | Prometheus | `/metrics` (off unless `LLMMAN_METRICS` is `1`, `true`, `yes` or `on`) |
 
 `/llmman/...` is llmman's own API, not a compatibility surface: no
@@ -209,6 +209,22 @@ An idle, unused model is automatically unloaded after `keep_alive`
 Daemon-wide settings (bind address, context length, keep-alive, GPU backend
 selection and the rest) are environment variables, set before `llmman serve`
 starts. They're documented in [docs/configuration.md](docs/configuration.md).
+
+### Aggregation
+
+Several machines each running `llmman serve` can pool their hardware — a
+group of manatees is an aggregation. Name the others on each node and a
+request to any of them is served by whichever has the model loaded, or
+the most room to load it:
+
+```
+llmman config set aggregation.peers asahi,spark
+LLMMAN_HOST=0.0.0.0 llmman serve
+```
+
+`llmman ps`, `/api/tags` and `/v1/models` then show the whole
+aggregation, and `llmman stop` reaches a model wherever it was loaded.
+See [docs/aggregation.md](docs/aggregation.md).
 
 ## Launch an integration
 

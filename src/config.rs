@@ -23,6 +23,9 @@
 //! pattern = "docker.io/myorg/**"
 //! keys    = ["keys/myorg.pub"]         # relative to this file's directory
 //! mode    = "enforce"
+//!
+//! [aggregation]                        # cmd::serve::aggregation
+//! peers = "asahi,spark:17434"
 //! ```
 //!
 //! Parsing happens once, in [`files`]; what a *failed* parse means is
@@ -58,6 +61,19 @@ pub struct Conf {
     /// Signature trust policy — see [`crate::verify`].
     #[serde(default)]
     pub verify: VerifyConf,
+    /// Peer daemons — see `cmd::serve::aggregation`.
+    #[serde(default)]
+    pub aggregation: AggregationConf,
+}
+
+/// The `[aggregation]` section.
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AggregationConf {
+    /// Comma-separated `[scheme://]host[:port]`, as `LLMMAN_PEERS` — a
+    /// string so `llmman config set aggregation.peers a,b` can write it.
+    #[serde(default)]
+    pub peers: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -298,6 +314,35 @@ fn merge_keys(per_file: Vec<HashMap<String, String>>) -> HashMap<String, String>
     merged
 }
 
+// ---------------------------------------------------------------------------
+// Aggregation peers
+// ---------------------------------------------------------------------------
+
+/// Peer daemons, as written: `LLMMAN_PEERS` when set (even empty), else
+/// the last file that sets `aggregation.peers`. Replaced, not merged —
+/// half of two aggregations is no one's intent — so `peers = ""` opts out.
+pub fn peers() -> Vec<String> {
+    peers_from(
+        std::env::var("LLMMAN_PEERS").ok().as_deref(),
+        files().unwrap_or_default(),
+    )
+}
+
+fn peers_from(env: Option<&str>, files: &[File]) -> Vec<String> {
+    env.or_else(|| {
+        files
+            .iter()
+            .rev()
+            .find_map(|f| f.conf.aggregation.peers.as_deref())
+    })
+    .unwrap_or_default()
+    .split(',')
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(str::to_string)
+    .collect()
+}
+
 /// Refuses a file that group or other can read, the way `ssh` refuses a
 /// loose private key.
 ///
@@ -455,6 +500,38 @@ mod tests {
     #[test]
     fn malformed_toml_is_an_error() {
         assert!(parse("[providers.openai").is_err());
+    }
+
+    // -- aggregation peers ---------------------------------------------------
+
+    fn file(text: &str) -> File {
+        File {
+            path: PathBuf::from("llmman.conf"),
+            dir: PathBuf::from("."),
+            conf: conf(text),
+        }
+    }
+
+    #[test]
+    fn peers_come_from_the_environment_then_the_last_file_that_sets_them() {
+        let system = || file("[aggregation]\npeers = \"a, b\"");
+        let user = file("[aggregation]\npeers = \"c\"");
+        let silent = file("");
+        let opted_out = file("[aggregation]\npeers = \"\"");
+
+        assert_eq!(
+            peers_from(Some(" x , ,y:1 "), &[]),
+            vec!["x".to_string(), "y:1".to_string()]
+        );
+        assert!(peers_from(Some(""), &[system()]).is_empty());
+        assert_eq!(
+            peers_from(None, &[system(), silent]),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(peers_from(None, &[system(), user]), vec!["c".to_string()]);
+        assert!(peers_from(None, &[system(), opted_out]).is_empty());
+        assert!(peers_from(None, &[]).is_empty());
+        assert!(parse("[aggregation]\npeer = \"a\"").is_err());
     }
 
     // -- search paths --------------------------------------------------------
