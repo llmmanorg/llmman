@@ -969,9 +969,14 @@ const TALOS_BASE_URL_KEY: &str = "TALOS_BASE_URL_OLLAMA";
 /// `--model` is required: with none, Talos would start on whatever its
 /// env file or shipped default names, which is not what the caller asked
 /// for. An exported `TALOS_MODEL_PROVIDER`/`TALOS_MODEL` that disagrees
-/// with the launch is refused before anything is written: it outranks
-/// the env file in Talos's own loader, so the launch would otherwise
-/// save and report one model while the process runs another.
+/// with the launch is refused before this function writes anything: it
+/// outranks the env file in Talos's own loader, so the launch would
+/// otherwise save and report one model while the process runs another.
+/// That guarantee is local to this function, not the daemon: `run()`
+/// above already calls `ensure_server`/`ensure_model_pulled` for every
+/// integration before dispatch, so a refusal here can still follow a
+/// daemon start or a model pull — same as it would for any other
+/// integration's own refusal.
 ///
 /// macOS and Linux only — Talos's installer ships no Windows path.
 fn launch_talos(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
@@ -984,13 +989,33 @@ fn launch_talos(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     }
     talos_check_env_overrides(model, |key| std::env::var(key).ok())?;
 
-    let env_file = talos_env_file(talos_prefix().as_deref(), |key| std::env::var(key).ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot tell where talos reads its env file: set TALOS_PREFIX (the install \
-                 directory holding talos.env) or TALOS_SECRETS_ENV"
-            )
-        })?;
+    // Where to guess the env file lives: an explicit TALOS_PREFIX always
+    // wins (the operator's own claim), otherwise only the venv form's own
+    // `cwd` — where `talos_command` actually found Talos, not a guess.
+    // A shim on PATH carries no such location; `talos_env_file` is left
+    // to fall back to TALOS_SECRETS_ENV alone (or refuse) rather than aim
+    // at a `~/talos` that may not be where the shim's Talos lives.
+    let config_prefix = talos_prefix_override().or_else(|| talos.cwd.clone());
+    let secrets_env_absolute = absolute_env_path("TALOS_SECRETS_ENV")?;
+    let env_file = talos_env_file(
+        config_prefix.as_deref(),
+        dirs::home_dir().as_deref(),
+        |key| {
+            if key == "TALOS_SECRETS_ENV" {
+                secrets_env_absolute
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+            } else {
+                std::env::var(key).ok()
+            }
+        },
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot tell where talos reads its env file: set TALOS_PREFIX (the install \
+             directory holding talos.env) or TALOS_SECRETS_ENV"
+        )
+    })?;
     write_talos_env(
         &env_file,
         &[
@@ -1002,12 +1027,40 @@ fn launch_talos(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 
     let base_url = format!("{}/v1", daemon::server());
     let (bin, args) = talos_exec_argv(&talos, extra_args);
-    exec_with_env_in(
-        &bin,
-        &args,
-        &[(TALOS_BASE_URL_KEY, base_url.as_str())],
-        talos.cwd.as_deref(),
-    )
+    let mut extra_env: Vec<(&str, &str)> = vec![(TALOS_BASE_URL_KEY, base_url.as_str())];
+    // Talos's own cwd changes to the prefix for the venv form (see
+    // `TalosCommand`'s doc comment) — a relative TALOS_SECRETS_ENV would
+    // then resolve differently for Talos than it just did for the write
+    // above. Overlaying the absolute value keeps both resolutions the
+    // same file; the shim form's cwd never changes, so this only matters
+    // for the venv form.
+    let secrets_env_owned = if talos.cwd.is_some() {
+        secrets_env_absolute
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+    if let Some(value) = &secrets_env_owned {
+        extra_env.push(("TALOS_SECRETS_ENV", value.as_str()));
+    }
+    exec_with_env_in(&bin, &args, &extra_env, talos.cwd.as_deref())
+}
+
+/// `key`'s value, absolutized — `None` when unset or empty. Lexical only
+/// (no symlink resolution, no existence requirement), the same way
+/// [`talos_prefix_override`] absolutizes `TALOS_PREFIX`.
+fn absolute_env_path(key: &str) -> anyhow::Result<Option<PathBuf>> {
+    let Some(raw) = std::env::var(key)
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+    else {
+        return Ok(None);
+    };
+    std::path::absolute(&raw)
+        .map(Some)
+        .with_context(|| format!("{key}={raw:?} could not be resolved to an absolute path"))
 }
 
 /// How Talos is run: the command line, and the directory it has to be
@@ -1037,16 +1090,33 @@ fn find_talos() -> Option<PathBuf> {
     talos_command().map(|talos| PathBuf::from(&talos.argv[0]))
 }
 
+/// `$TALOS_PREFIX`, absolutized — `None` when unset or empty. Kept apart
+/// from [`talos_prefix`]'s `~/talos` default: an env-file target guessed
+/// from that default would aim at the wrong place for a `talos` shim
+/// installed somewhere else, so [`launch_talos`] only falls back to it
+/// for the venv form, where the prefix is where the venv was actually
+/// found rather than a guess (see its own `config_prefix`).
+///
+/// Absolutized because it is handed to Talos twice over: once here, to
+/// build the env-file path, and once as `current_dir` for the exec'd
+/// process. A relative value would resolve against llmman's cwd for the
+/// first and then AGAIN relative to itself for the second (Talos's own
+/// `current_dir` becoming its own base), doubling the path. Lexical only
+/// (`std::path::absolute`, no symlink resolution, no existence
+/// requirement) — the directory need not exist yet when this runs.
+fn talos_prefix_override() -> Option<PathBuf> {
+    let raw = std::env::var("TALOS_PREFIX")
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())?;
+    Some(std::path::absolute(&raw).unwrap_or_else(|_| PathBuf::from(raw)))
+}
+
 /// Talos's install directory: `$TALOS_PREFIX`, else `~/talos`, where the
 /// installer puts everything. `None` only when neither can be resolved —
 /// a shim on `PATH` needs no prefix, so this is asked for after that.
 fn talos_prefix() -> Option<PathBuf> {
-    std::env::var("TALOS_PREFIX")
-        .ok()
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join("talos")))
+    talos_prefix_override().or_else(|| dirs::home_dir().map(|h| h.join("talos")))
 }
 
 /// [`talos_command`] with its two inputs explicit, so it can be tested
@@ -1079,7 +1149,10 @@ fn talos_command_in(
 
 /// Refuses a launch that an exported `TALOS_MODEL_PROVIDER`/`TALOS_MODEL`
 /// would silently override (see `launch_talos`). An empty variable is no
-/// override — Talos's own loader treats it as unset.
+/// override — Talos's own loader treats it as unset (Python's `or`, which
+/// is falsy only for the literal empty string). NOT trimmed to match: a
+/// whitespace-only value is truthy there too, so Talos would use it as
+/// the value verbatim — the mismatch this function exists to catch.
 fn talos_check_env_overrides(
     model: &str,
     get: impl Fn(&str) -> Option<String>,
@@ -1089,7 +1162,6 @@ fn talos_check_env_overrides(
         (TALOS_MODEL_KEY, model),
     ] {
         if let Some(value) = get(key) {
-            let value = value.trim();
             if !value.is_empty() && value != want {
                 anyhow::bail!(
                     "{key} is set to {value:?} in your environment and overrides Talos's env file\n\
@@ -1103,20 +1175,23 @@ fn talos_check_env_overrides(
 
 /// The file `launch_talos` writes the model into — the same one Talos's
 /// own `config set` picks without `--file`: the secrets env file when it
-/// exists (`$TALOS_SECRETS_ENV`, else `~/.secrets/talos-telegram.env`),
-/// otherwise `talos.env` in the install prefix. Talos reads the process
+/// exists (`$TALOS_SECRETS_ENV`, else `~/.secrets/talos-telegram.env` —
+/// `home` is injected rather than read here, so a test can supply a fake
+/// one instead of the machine's real home directory), otherwise
+/// `talos.env` in the install prefix. Talos reads the process
 /// environment first, then the secrets file, then the prefix file, so
 /// writing the one `config set` would write keeps the launch's choice
 /// where Talos will see it.
 fn talos_env_file(
     prefix: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
     getenv: impl Fn(&str) -> Option<String>,
 ) -> Option<PathBuf> {
     let secrets = getenv("TALOS_SECRETS_ENV")
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".secrets").join("talos-telegram.env")));
+        .or_else(|| home.map(|h| h.join(".secrets").join("talos-telegram.env")));
     if let Some(secrets) = secrets.filter(|p| p.is_file()) {
         return Some(secrets);
     }
@@ -1128,13 +1203,19 @@ fn talos_env_file(
 /// line of each key is replaced and its duplicates dropped, missing keys
 /// are appended; the result lands atomically through a temp file created
 /// with mode 600 (Talos treats the file as holding secrets). A value that
-/// would break the line format is refused rather than written.
+/// would break the line format is refused rather than written. Values are
+/// stripped before writing — Talos's own `config set` returns `value.strip()`
+/// (see its `_one_line` validator) and its file-loader strips every value it
+/// reads back, so writing the untrimmed form would silently diverge from
+/// what Talos itself would have stored for the same input.
 fn write_talos_env(path: &std::path::Path, pairs: &[(&str, &str)]) -> anyhow::Result<()> {
     for (key, value) in pairs {
-        if value.contains(['\n', '\r']) || key.contains(['=', '\n', '\r']) {
+        if value.contains(['\n', '\r', '\0']) || key.contains(['=', '\n', '\r', '\0']) {
             anyhow::bail!("{key}: value would not survive a KEY=VALUE line");
         }
     }
+    let pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.trim())).collect();
+    let pairs = pairs.as_slice();
     // Only a file that is not there counts as empty: an unreadable or
     // non-UTF-8 one must not be quietly replaced by a fresh file that
     // knows only our two keys — the operator's token and allowlist live
@@ -1543,18 +1624,49 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         let prefix = dir.join("prefix");
         std::fs::create_dir_all(&prefix).unwrap();
         let secrets = dir.join("secrets.env");
+        // A fake, guaranteed-nonexistent home — never the machine's real
+        // one, or this test would pass or fail depending on whether the
+        // developer running it happens to have Talos configured (see
+        // `talos_env_file_falls_back_to_home_only_when_named_secrets_is_absent`
+        // for the case this stands in for).
+        let fake_home = dir.join("no-such-home");
         let getenv = |key: &str| {
             (key == "TALOS_SECRETS_ENV").then(|| secrets.to_string_lossy().into_owned())
         };
         // Named but absent: Talos would not read it either.
         assert_eq!(
-            talos_env_file(Some(&prefix), getenv),
+            talos_env_file(Some(&prefix), Some(&fake_home), getenv),
             Some(prefix.join("talos.env"))
         );
         std::fs::write(&secrets, "").unwrap();
-        assert_eq!(talos_env_file(Some(&prefix), getenv), Some(secrets.clone()));
-        assert_eq!(talos_env_file(None, getenv), Some(secrets.clone()));
-        assert_eq!(talos_env_file(None, |_| None), None);
+        assert_eq!(
+            talos_env_file(Some(&prefix), Some(&fake_home), getenv),
+            Some(secrets.clone())
+        );
+        assert_eq!(
+            talos_env_file(None, Some(&fake_home), getenv),
+            Some(secrets.clone())
+        );
+        assert_eq!(talos_env_file(None, Some(&fake_home), |_| None), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `home` is used only when `TALOS_SECRETS_ENV` is unset — the exact
+    /// case a hardcoded `dirs::home_dir()` inside `talos_env_file` itself
+    /// could not be tested hermetically (it would read whatever secrets
+    /// file the machine running the test happens to have).
+    #[test]
+    fn talos_env_file_falls_back_to_home_only_when_named_secrets_is_absent() {
+        let dir = scratch_dir("talos-env-file-home");
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".secrets")).unwrap();
+        let home_secrets = home.join(".secrets").join("talos-telegram.env");
+        assert_eq!(talos_env_file(None, Some(&home), |_| None), None);
+        std::fs::write(&home_secrets, "").unwrap();
+        assert_eq!(
+            talos_env_file(None, Some(&home), |_| None),
+            Some(home_secrets)
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1617,6 +1729,23 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
             .file_name()
             .to_string_lossy()
             .contains(".tmp-")));
+
+        // A NUL byte is rejected exactly like a newline — Talos's own
+        // `_one_line` validator refuses it too.
+        let clean = dir.join("clean.env");
+        assert!(write_talos_env(&clean, &[("TALOS_MODEL", "m\0")]).is_err());
+        assert!(!clean.exists());
+
+        // Written stripped, matching Talos's own `config set` (which
+        // returns `value.strip()`) and its file-loader (which strips
+        // every value it reads back) — an untrimmed write here would
+        // silently diverge from what Talos itself would have stored.
+        let padded = dir.join("padded.env");
+        write_talos_env(&padded, &[("TALOS_MODEL", "  qwen3.5  ")]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&padded).unwrap(),
+            "TALOS_MODEL=qwen3.5\n"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1683,7 +1812,10 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         };
         assert!(talos_check_env_overrides("m:latest", env(&[])).is_ok());
         assert!(talos_check_env_overrides("m:latest", env(&[("TALOS_MODEL", "")])).is_ok());
-        assert!(talos_check_env_overrides("m:latest", env(&[("TALOS_MODEL", "  ")])).is_ok());
+        // Whitespace-only is NOT treated as unset: Talos's own `or` sees a
+        // truthy string and would use it verbatim, so this has to refuse
+        // exactly like any other disagreeing value.
+        assert!(talos_check_env_overrides("m:latest", env(&[("TALOS_MODEL", "  ")])).is_err());
         assert!(talos_check_env_overrides(
             "m:latest",
             env(&[
