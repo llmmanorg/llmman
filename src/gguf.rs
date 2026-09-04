@@ -394,50 +394,68 @@ fn ggml_type_name(ty: u32) -> &'static str {
     }
 }
 
+/// Test fixture (also for `cmd::serve`): a minimal GGUF with
+/// `general.architecture = "llama"`, `llama.context_length = 4096`, any
+/// extra `UINT32` keys, and one 2-D Q4_K tensor. The caller removes it.
+#[cfg(test)]
+pub(crate) fn write_test_gguf_with(extra_u32: &[(&str, u32)]) -> std::path::PathBuf {
+    use std::io::Write;
+
+    fn write_string(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"GGUF");
+    buf.extend_from_slice(&3u32.to_le_bytes()); // version
+    buf.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
+    buf.extend_from_slice(&(2 + extra_u32.len() as u64).to_le_bytes()); // metadata_kv_count
+
+    // general.architecture = "llama"
+    write_string(&mut buf, "general.architecture");
+    buf.extend_from_slice(&8u32.to_le_bytes()); // STRING
+    write_string(&mut buf, "llama");
+
+    // llama.context_length = 4096 (u32)
+    write_string(&mut buf, "llama.context_length");
+    buf.extend_from_slice(&4u32.to_le_bytes()); // UINT32
+    buf.extend_from_slice(&4096u32.to_le_bytes());
+
+    for (key, value) in extra_u32 {
+        write_string(&mut buf, key);
+        buf.extend_from_slice(&4u32.to_le_bytes()); // UINT32
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    // one tensor: "blk.0.weight", 2 dims [4, 8], type Q4_K (12)
+    write_string(&mut buf, "blk.0.weight");
+    buf.extend_from_slice(&2u32.to_le_bytes()); // n_dims
+    buf.extend_from_slice(&4u64.to_le_bytes());
+    buf.extend_from_slice(&8u64.to_le_bytes());
+    buf.extend_from_slice(&12u32.to_le_bytes()); // ggml_type = Q4_K
+    buf.extend_from_slice(&0u64.to_le_bytes()); // offset
+
+    let path = std::env::temp_dir().join(format!(
+        "llmman-gguf-test-{}-{}.gguf",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut f = File::create(&path).unwrap();
+    f.write_all(&buf).unwrap();
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
 
-    /// Builds a minimal-but-valid GGUF file in memory: one string
-    /// metadata key, one u32 metadata key, and one 2-D tensor, then
-    /// writes it to a temp file and reads it back through [`read_info`].
     fn write_test_gguf() -> std::path::PathBuf {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"GGUF");
-        buf.extend_from_slice(&3u32.to_le_bytes()); // version
-        buf.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
-        buf.extend_from_slice(&2u64.to_le_bytes()); // metadata_kv_count
-
-        // general.architecture = "llama"
-        write_string(&mut buf, "general.architecture");
-        buf.extend_from_slice(&8u32.to_le_bytes()); // STRING
-        write_string(&mut buf, "llama");
-
-        // llama.context_length = 4096 (u32)
-        write_string(&mut buf, "llama.context_length");
-        buf.extend_from_slice(&4u32.to_le_bytes()); // UINT32
-        buf.extend_from_slice(&4096u32.to_le_bytes());
-
-        // one tensor: "blk.0.weight", 2 dims [4, 8], type Q4_K (12)
-        write_string(&mut buf, "blk.0.weight");
-        buf.extend_from_slice(&2u32.to_le_bytes()); // n_dims
-        buf.extend_from_slice(&4u64.to_le_bytes());
-        buf.extend_from_slice(&8u64.to_le_bytes());
-        buf.extend_from_slice(&12u32.to_le_bytes()); // ggml_type = Q4_K
-        buf.extend_from_slice(&0u64.to_le_bytes()); // offset
-
-        let path = std::env::temp_dir().join(format!(
-            "llmman-gguf-test-{}-{}.gguf",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut f = File::create(&path).unwrap();
-        f.write_all(&buf).unwrap();
-        path
+        write_test_gguf_with(&[])
     }
 
     fn write_string(buf: &mut Vec<u8>, s: &str) {

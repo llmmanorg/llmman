@@ -427,6 +427,21 @@ fn supports_context_shift(model_ref: &str) -> bool {
     !model_ref.to_ascii_lowercase().contains("deepseek")
 }
 
+/// `Some(trained context)` if the GGUF is an embedding model — one with
+/// an `{arch}.pooling_type` key, ollama's own test (`llm/llama_server.go`)
+/// — else `None`. An unreadable header counts as a generation model, so
+/// it fails at load with llama-server's diagnosis rather than here.
+fn embedding_model_ctx(path: &Path) -> Option<Option<u32>> {
+    let info = crate::gguf::read_info(path).ok()?;
+    let arch = info.architecture()?;
+    info.u64(&format!("{arch}.pooling_type"))?;
+    Some(
+        info.context_length()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Out-of-memory auto-shrink retry (ensure_model) — mirrors Ollama's
 // reduceAutoNumCtxForLoadOOM: a chosen --ctx-size can still be too big
@@ -1015,6 +1030,102 @@ struct OllamaShowResponse {
 struct OllamaDeleteRequest {
     model: String,
     name: Option<String>,
+}
+
+/// `POST /api/copy` — ollama's `api.CopyRequest`.
+#[derive(Debug, Deserialize)]
+struct OllamaCopyRequest {
+    source: String,
+    destination: String,
+}
+
+/// `POST /api/create` — the subset of ollama's `api.CreateRequest` this
+/// daemon honours; see [`handle_create`].
+#[derive(Debug, Deserialize)]
+struct OllamaCreateRequest {
+    #[serde(default)]
+    model: String,
+    /// Deprecated spelling of `model`.
+    #[serde(default)]
+    name: String,
+    /// An existing model to alias.
+    #[serde(default)]
+    from: Option<String>,
+    /// `{"<filename>": "sha256:<digest>"}` of blobs uploaded via
+    /// `/api/blobs/<digest>`.
+    #[serde(default)]
+    files: Option<HashMap<String, String>>,
+    #[serde(default = "bool_true")]
+    stream: bool,
+    /// Every other (Modelfile) field, kept so `handle_create` can refuse
+    /// them by name rather than silently drop them.
+    #[serde(flatten)]
+    unsupported: HashMap<String, serde_json::Value>,
+}
+
+/// `POST /api/embed` — ollama's `api.EmbedRequest`.
+#[derive(Debug, Deserialize)]
+struct OllamaEmbedRequest {
+    model: String,
+    /// A string or an array of strings.
+    #[serde(default)]
+    input: serde_json::Value,
+    /// Defaults to true, as on ollama; `false` makes an over-long input a 400.
+    #[serde(default)]
+    truncate: Option<bool>,
+    /// Cut each vector to this many values and re-normalise.
+    #[serde(default)]
+    dimensions: Option<usize>,
+    /// See `OllamaGenerateRequest::keep_alive`.
+    #[serde(default)]
+    keep_alive: Option<serde_json::Value>,
+}
+
+/// ollama's `api.EmbedResponse`.
+#[derive(Debug, Serialize)]
+struct OllamaEmbedResponse {
+    model: String,
+    embeddings: Vec<Vec<f32>>,
+    total_duration: u64,
+    load_duration: u64,
+    prompt_eval_count: u64,
+}
+
+/// `POST /api/embeddings` — ollama's legacy single-prompt `api.EmbeddingRequest`.
+#[derive(Debug, Deserialize)]
+struct OllamaEmbeddingsRequest {
+    model: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    keep_alive: Option<serde_json::Value>,
+}
+
+/// ollama's `api.EmbeddingResponse` — `float64`s there, hence `f64`.
+#[derive(Debug, Serialize)]
+struct OllamaEmbeddingsResponse {
+    embedding: Vec<f64>,
+}
+
+/// The parts of a backend's OpenAI `/v1/embeddings` response read here.
+#[derive(Debug, Deserialize)]
+struct OAIEmbeddingsResponse {
+    data: Vec<OAIEmbeddingsDatum>,
+    #[serde(default)]
+    usage: OAIEmbeddingsUsage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAIEmbeddingsDatum {
+    #[serde(default)]
+    index: usize,
+    embedding: Vec<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OAIEmbeddingsUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1855,6 +1966,8 @@ async fn spawn_llama_server(
         context_shift,
         split_mode,
         num_parallel,
+        embeddings,
+        batch_size,
         threads,
     } = opts;
     let mut cmd = tokio::process::Command::new(bin);
@@ -1911,6 +2024,14 @@ async fn spawn_llama_server(
     // --threads unset, falling back to llama-server's own autodetection.
     if let Some(n) = threads {
         cmd.args(["--threads", &n.to_string()]);
+    }
+    // See LlamaOptions::embeddings and ::batch_size.
+    if embeddings {
+        cmd.arg("--embeddings");
+    }
+    if let Some(n) = batch_size {
+        let n = n.to_string();
+        cmd.args(["-b", &n, "-ub", &n]);
     }
     // See GPU_VISIBLE_DEVICE_VARS's own doc comment — already inherited
     // by default, forwarded explicitly here for clarity.
@@ -3332,6 +3453,14 @@ async fn ensure_model(
     let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
         .with_context(|| format!("resolve model {model_ref}"))?;
     let context_shift = supports_context_shift(model_ref);
+    // See embedding_model_ctx: `Some` marks an embedding model, and its
+    // trained context caps --ctx-size below — a chat-sized default (see
+    // hostgpu::default_ctx_size_for) is meaningless for a model with
+    // learned absolute positions, and would size the batch to match.
+    let embedding_ctx = match &model_path {
+        ModelPath::Gguf(path, _) => embedding_model_ctx(path),
+        _ => None,
+    };
     // See enforce_max_loaded_models's doc comment — held for the rest
     // of this function.
     let mut pending_load_guard =
@@ -3344,7 +3473,18 @@ async fn ensure_model(
     // attempt, not just the first — otherwise a retry's replacement
     // process could try to bind the same port the previous (failed,
     // possibly not-yet-fully-exited) one was still holding.
-    let mut ctx_size = state.0.ctx_size;
+    // 0 means "trained context" (see context_length_from_env), which is
+    // exactly `trained` here rather than a zero batch.
+    let mut ctx_size = match embedding_ctx {
+        Some(Some(trained)) => Some(
+            state
+                .0
+                .ctx_size
+                .filter(|n| *n > 0)
+                .map_or(trained, |n| n.min(trained)),
+        ),
+        _ => state.0.ctx_size,
+    };
     let mut split_mode = state.0.split_mode;
     let mut shrink_attempts = 0u32;
     let mut evicted_others = false;
@@ -3379,6 +3519,9 @@ async fn ensure_model(
             context_shift,
             split_mode,
             num_parallel,
+            embeddings: embedding_ctx.is_some(),
+            // `.filter`: a 0 here is "trained context", not a batch size.
+            batch_size: embedding_ctx.and(ctx_size).filter(|n| *n > 0),
             threads: state.0.threads,
         };
         // Only a local llama-server child captures a stderr tail (see
@@ -5116,6 +5259,346 @@ async fn handle_delete(
     Ok(StatusCode::OK)
 }
 
+// -- Ollama /api/copy ---------------------------------------------------------
+
+/// Mirrors `ollama.CopyHandler`: `llmman cp` over the wire, with
+/// ollama's 404 for a missing source.
+async fn handle_copy(
+    State(state): State<AppState>,
+    Json(req): Json<OllamaCopyRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if req.source.is_empty() || req.destination.is_empty() {
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            "source and destination are required",
+        ));
+    }
+    // Both resolved the way handle_pull stores a model, so a bare
+    // `mine:tag` destination is found by the /api/chat that follows.
+    let source =
+        crate::shortnames::resolve_ollama_api(&req.source).map_err(AppError::bad_request)?;
+    let destination =
+        crate::shortnames::resolve_ollama_api(&req.destination).map_err(AppError::bad_request)?;
+    eprintln!("[llmman] /api/copy {source:?} -> {destination:?}");
+    let store = OciStore::open(&state.0.store_path)?;
+    if store.find(&source).is_err() {
+        return Err(AppError::status(
+            StatusCode::NOT_FOUND,
+            format!("model '{}' not found", req.source),
+        ));
+    }
+    let digest = crate::cmd::cp::copy(&store, &source, &destination)?;
+    evict_if_retagged(&state, &destination, &digest).await;
+    Ok(StatusCode::OK)
+}
+
+/// Drops a loaded model whose tag `/api/copy` or `/api/create` just
+/// pointed at other content, so the next request loads that content.
+/// Keys are compared tag-defaulted, since a runner may be keyed `m:latest`
+/// for a tag written as `m`. In-flight requests on the old content are
+/// cut, as an explicit `keep_alive: 0` unload cuts them.
+async fn evict_if_retagged(state: &AppState, reference: &str, digest: &str) {
+    let want = crate::storage::default_tag(reference);
+    let mut mgr = state.0.manager.lock().await;
+    let stale: Vec<String> = mgr
+        .running
+        .iter()
+        .filter(|(k, m)| m.digest != digest && crate::storage::default_tag(k) == want)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in stale {
+        mgr.running.remove(&key);
+        metrics::record_model_unload(&key, UnloadReason::Requested);
+    }
+}
+
+// -- Ollama /api/blobs, /api/create --------------------------------------------
+//
+// Ollama's import flow: `POST /api/blobs/sha256:<digest>` uploads each raw
+// file (after a `HEAD` to skip ones already present), then `POST
+// /api/create` names them under `files`. Uploads land in a staging
+// directory; `create` packages them with `OciStore::build`, the same path
+// as `llmman build`, so the result is an ordinary store image.
+
+/// Where uploads wait for a `create`. Kept afterwards, so one upload can
+/// back several creates; `storage::gc::prune_cache` sweeps the directory
+/// at the next startup once it has been idle for its grace period.
+fn blob_staging_dir(state: &AppState) -> PathBuf {
+    state.0.cache_path.join("blobs")
+}
+
+/// Per-process counter making concurrent requests' temp paths distinct
+/// (see `OciStore::write_ref`).
+static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn staging_temp_name(prefix: &str) -> String {
+    let n = STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{prefix}-{}-{n}", std::process::id())
+}
+
+/// The staging path for `digest`, or a 400 if it isn't `sha256:<64 hex>`
+/// — which is also what keeps the path inside the staging directory.
+fn staged_blob_path(state: &AppState, digest: &str) -> Result<PathBuf, AppError> {
+    let hex = digest.strip_prefix("sha256:").unwrap_or_default();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            format!("invalid digest {digest:?}: expected sha256:<64 hex digits>"),
+        ));
+    }
+    Ok(blob_staging_dir(state).join(hex.to_ascii_lowercase()))
+}
+
+/// `HEAD /api/blobs/:digest` — mirrors `ollama.HeadBlobHandler`.
+async fn handle_blob_head(
+    State(state): State<AppState>,
+    UrlPath(digest): UrlPath<String>,
+) -> Result<StatusCode, AppError> {
+    let path = staged_blob_path(&state, &digest)?;
+    Ok(if path.is_file() {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    })
+}
+
+/// `POST /api/blobs/:digest` — streams the body to staging, kept only if
+/// it hashes to `digest`. Mirrors `ollama.CreateBlobHandler`.
+async fn handle_blob_upload(
+    State(state): State<AppState>,
+    UrlPath(digest): UrlPath<String>,
+    body: Body,
+) -> Result<StatusCode, AppError> {
+    use sha2::Digest as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let dest = staged_blob_path(&state, &digest)?;
+    if dest.is_file() {
+        return Ok(StatusCode::OK);
+    }
+    let dir = blob_staging_dir(&state);
+    tokio::fs::create_dir_all(&dir).await?;
+    let tmp = dir.join(staging_temp_name("tmp"));
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    let mut hasher = sha2::Sha256::new();
+    let mut stream = body.into_data_stream();
+    let written = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("read upload body")?;
+            hasher.update(&chunk);
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        anyhow::Ok(())
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e.into());
+    }
+    let actual = format!("sha256:{}", hex::encode(hasher.finalize()));
+    if !actual.eq_ignore_ascii_case(&digest) {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            format!("digest mismatch, expected {digest:?}, got {actual:?}"),
+        ));
+    }
+    tokio::fs::rename(&tmp, &dest).await?;
+    eprintln!("[llmman] /api/blobs stored {digest} ({})", dest.display());
+    Ok(StatusCode::CREATED)
+}
+
+/// The two halves of `ollama.CreateHandler` an OCI artifact can express:
+/// `from` (alias an existing model) and `files` (package uploaded blobs
+/// via `OciStore::build`). Modelfile fields — `system`, `template`,
+/// `parameters`, `quantize`, ... — have no counterpart here (the GGUF's
+/// own chat template applies), so each is refused with a 400 naming it
+/// rather than dropped: a caller that set a system prompt must not hear
+/// "success". Answers like ollama: `{"status": ...}` lines ending in
+/// `success`, or one object for `stream: false`.
+async fn handle_create(
+    State(state): State<AppState>,
+    Json(req): Json<OllamaCreateRequest>,
+) -> Result<Response, AppError> {
+    let model = if req.model.is_empty() {
+        req.name.as_str()
+    } else {
+        req.model.as_str()
+    };
+    if model.is_empty() {
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            "model is required",
+        ));
+    }
+    let refused: Vec<&str> = req
+        .unsupported
+        .iter()
+        .filter(|(_, v)| !is_empty_json(v))
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if !refused.is_empty() {
+        let mut refused = refused;
+        refused.sort_unstable();
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "/api/create: {} not supported by llmman — models are plain OCI artifacts \
+                 whose GGUF carries its own chat template; only `from` (alias an existing \
+                 model) and `files` (package uploaded blobs) are honoured",
+                refused.join(", ")
+            ),
+        ));
+    }
+    // Resolved like handle_copy's destination. A `@digest` spelling names
+    // content, which a created model doesn't have yet (see cp.rs).
+    let model = &crate::shortnames::resolve_ollama_api(model).map_err(AppError::bad_request)?;
+    if crate::storage::split_ref_digest(model).1.is_some() {
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            "/api/create: the model name can't be a digest reference",
+        ));
+    }
+    let files = req.files.unwrap_or_default();
+    let from = req.from.filter(|f| !f.is_empty());
+    let statuses: Vec<String> = match (from, files.is_empty()) {
+        (Some(_), false) => {
+            return Err(AppError::status(
+                StatusCode::BAD_REQUEST,
+                "/api/create: `from` and `files` are mutually exclusive here",
+            ))
+        }
+        (None, true) => {
+            return Err(AppError::status(
+                StatusCode::BAD_REQUEST,
+                "/api/create: one of `from` or `files` is required",
+            ))
+        }
+        (Some(from), true) => {
+            let source =
+                crate::shortnames::resolve_ollama_api(&from).map_err(AppError::bad_request)?;
+            eprintln!("[llmman] /api/create {model:?} from {source:?}");
+            let store = OciStore::open(&state.0.store_path)?;
+            if store.find(&source).is_err() {
+                return Err(AppError::status(
+                    StatusCode::NOT_FOUND,
+                    format!("model '{from}' not found"),
+                ));
+            }
+            let digest = crate::cmd::cp::copy(&store, &source, model)?;
+            evict_if_retagged(&state, model, &digest).await;
+            vec![format!("using existing layer {source}")]
+        }
+        (None, false) => {
+            eprintln!(
+                "[llmman] /api/create {model:?} from {} uploaded file(s)",
+                files.len()
+            );
+            let staged = files
+                .iter()
+                .map(|(name, digest)| Ok((name.clone(), staged_file(&state, name, digest)?)))
+                .collect::<Result<Vec<_>, AppError>>()?;
+            let store_path = state.0.store_path.clone();
+            let staging = blob_staging_dir(&state);
+            let model_owned = model.to_string();
+            let (digest, statuses) = tokio::task::spawn_blocking(move || {
+                create_from_staged_blobs(&store_path, &staging, &model_owned, &staged)
+            })
+            .await
+            .context("create task panicked")??;
+            evict_if_retagged(&state, model, &digest).await;
+            statuses
+        }
+    };
+    let mut lines: Vec<serde_json::Value> = statuses
+        .into_iter()
+        .map(|s| serde_json::json!({"status": s}))
+        .collect();
+    lines.push(serde_json::json!({"status": "success"}));
+    Ok(if req.stream {
+        let body: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+        ([("content-type", "application/x-ndjson")], body).into_response()
+    } else {
+        Json(lines.pop().unwrap_or_default()).into_response()
+    })
+}
+
+/// The placeholders a client sends for a Modelfile field it isn't using.
+fn is_empty_json(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.is_empty(),
+        serde_json::Value::Object(m) => m.is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        _ => false,
+    }
+}
+
+/// One `files` entry, checked: a bare file name (`../` would escape the
+/// build directory), a well-formed digest, and an upload that has landed.
+fn staged_file(state: &AppState, name: &str, digest: &str) -> Result<PathBuf, AppError> {
+    let bare = Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == name);
+    if !bare {
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            format!("files: {name:?} must be a bare file name"),
+        ));
+    }
+    let src = staged_blob_path(state, digest)?;
+    if !src.is_file() {
+        return Err(AppError::status(
+            StatusCode::NOT_FOUND,
+            format!("files: {digest} for {name:?} was never uploaded to /api/blobs"),
+        ));
+    }
+    Ok(src)
+}
+
+/// Hard-links (or copies) the staged uploads into a directory under the
+/// caller's file names — `build` classifies layers by extension, so
+/// `model.gguf` is what makes a servable model — and runs `OciStore::build`
+/// on it as `llmman build <dir>` would.
+fn create_from_staged_blobs(
+    store_path: &Path,
+    staging: &Path,
+    model: &str,
+    files: &[(String, PathBuf)],
+) -> anyhow::Result<(String, Vec<String>)> {
+    // `create_dir`, not `create_dir_all`: a leftover directory from a
+    // crashed daemon with a reused pid must not feed stale files to build.
+    let tmp = (0..3)
+        .map(|_| staging.join(staging_temp_name("create")))
+        .find_map(|dir| std::fs::create_dir(&dir).ok().map(|()| dir))
+        .ok_or_else(|| {
+            anyhow!(
+                "couldn't create a fresh build directory under {}",
+                staging.display()
+            )
+        })?;
+    let result = (|| {
+        let mut statuses = Vec::new();
+        for (name, src) in files {
+            let dst = tmp.join(name);
+            if std::fs::hard_link(src, &dst).is_err() {
+                std::fs::copy(src, &dst)
+                    .with_context(|| format!("stage {name} from {}", src.display()))?;
+            }
+            let digest = src.file_name().unwrap_or_default().to_string_lossy();
+            statuses.push(format!("using sha256:{digest} as {name}"));
+        }
+        let store = OciStore::open(store_path)?;
+        let desc = store.build(&tmp, model, &HashMap::new())?;
+        statuses.push(format!("writing manifest {}", desc.digest));
+        Ok((desc.digest, statuses))
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
 // -- Ollama /api/chat ---------------------------------------------------------
 
 /// The body ollama answers a message-less `/api/chat` with. `Default` for
@@ -5307,6 +5790,351 @@ async fn handle_ollama_generate(
         },
     )
     .await
+}
+
+// -- Ollama /api/embed, /api/embeddings ---------------------------------------
+//
+// Both ride on the backend's `/v1/embeddings`, as /api/chat rides on
+// /v1/chat/completions. llama-server is started with `--embeddings` for a
+// pooling model (see `embedding_model_ctx`), so that route is live.
+
+/// A string or an array of strings, as ollama accepts; an empty string or
+/// `null` is the load-only request.
+fn embed_inputs(input: &serde_json::Value) -> Result<Vec<String>, AppError> {
+    let invalid = || AppError::status(StatusCode::BAD_REQUEST, "invalid input type");
+    match input {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::String(s) if s.is_empty() => Ok(Vec::new()),
+        serde_json::Value::String(s) => Ok(vec![s.clone()]),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|v| v.as_str().map(str::to_owned).ok_or_else(invalid))
+            .collect(),
+        _ => Err(invalid()),
+    }
+}
+
+/// Shared by both routes: load the model, refuse an `Engine::Mlx`
+/// backend, embed each input. Returns vectors in input order, total
+/// prompt tokens, and the load time.
+async fn embed_via_backend(
+    state: &AppState,
+    headers: &HeaderMap,
+    model_ref: &str,
+    inputs: &[String],
+    truncate: bool,
+    keep_alive: &Option<serde_json::Value>,
+) -> Result<(Vec<Vec<f32>>, u64, Duration), AppError> {
+    let mlx_unsupported = |model: &str| {
+        AppError::status(
+            StatusCode::NOT_IMPLEMENTED,
+            format!(
+                "{model} is served by mlx_lm.server, which llmman never starts with \
+                 --embedding-model; use a GGUF or vllm-served model for embeddings"
+            ),
+        )
+    };
+    // Before ensure_model, as proxy_openai_passthrough does, so a known
+    // MLX model isn't loaded for a request that can't succeed.
+    if !crate::providers::is_remote_ref(model_ref) {
+        if let Some(canonical) = would_use_mlx(state, model_ref).await {
+            return Err(mlx_unsupported(&canonical));
+        }
+    }
+    let started = Instant::now();
+    let (model, target, guard) = ensure_model(state, model_ref, Some(headers)).await?;
+    let loaded = started.elapsed();
+    if !target.is_remote() && would_use_mlx(state, &model).await.is_some() {
+        return Err(mlx_unsupported(&model));
+    }
+    let keep_alive = resolve_keep_alive(keep_alive);
+    if inputs.is_empty() {
+        refresh_activity(guard, keep_alive).await;
+        return Ok((Vec::new(), 0, loaded));
+    }
+    let _activity = begin_activity(guard, Some(keep_alive)).await;
+    let wire_model = backend_wire_model(state, &target, &model).await;
+
+    // One call per input (llama-server fails a whole batch if any member
+    // overflows, and the retry needs to know which), a few at a time.
+    use futures::TryStreamExt as _;
+    let calls: Vec<_> = inputs
+        .iter()
+        .map(|text| embed_one(state, &target, &wire_model, text, truncate))
+        .collect();
+    let results: Vec<(Vec<f32>, u64)> = futures::stream::iter(calls)
+        .buffered(EMBED_CONCURRENCY)
+        .try_collect()
+        .await?;
+    let total_tokens = results.iter().map(|(_, n)| n).sum();
+    let embeddings = results
+        .into_iter()
+        .map(|(mut v, _)| {
+            // Ollama normalises every result regardless of backend.
+            normalize_in_place(&mut v)?;
+            Ok(v)
+        })
+        .collect::<Result<_, AppError>>()?;
+    Ok((embeddings, total_tokens, loaded))
+}
+
+/// How many of one `/api/embed` request's inputs are in flight at once.
+const EMBED_CONCURRENCY: usize = 8;
+
+/// One `/v1/embeddings` round trip with ollama's truncation on top:
+/// llama-server refuses an input longer than its batch (sized to the
+/// context) rather than cutting it, so on that failure the text is cut
+/// to the context via `/tokenize` + `/detokenize` and sent once more.
+/// Only on failure, unlike ollama, so a normal input pays no extra trips.
+async fn embed_one(
+    state: &AppState,
+    target: &Target,
+    wire_model: &str,
+    text: &str,
+    truncate: bool,
+) -> Result<(Vec<f32>, u64), AppError> {
+    match post_embeddings(&state.0.client, target, wire_model, text).await {
+        Ok(ok) => Ok(ok),
+        Err((status, body)) if truncate && !target.is_remote() && status.is_server_error() => {
+            let Target::Local(port) = target else {
+                unreachable!("guarded by !is_remote")
+            };
+            let limit = query_context_length(&state.0.client, *port)
+                .await
+                .ok_or_else(|| anyhow!("{} {status}: {body}", target.describe()))?;
+            // Room for the model's own BOS/EOS (ollama's `adjustTokenLimit`).
+            let limit = usize::try_from(limit)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(2);
+            let truncated = truncate_to_tokens(&state.0.client, *port, text, limit).await?;
+            if truncated.len() >= text.len() {
+                return Err(AppError(
+                    anyhow!("{} {status}: {body}", target.describe()),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ));
+            }
+            post_embeddings(&state.0.client, target, wire_model, &truncated)
+                .await
+                .map_err(|(status, body)| {
+                    AppError(
+                        anyhow!("{} {status}: {body}", target.describe()),
+                        remote_status(target, status),
+                    )
+                })
+        }
+        // Ollama's 400 for `truncate: false`; llama-server reports the
+        // overflow as a 500.
+        Err((status, body))
+            if !truncate
+                && !target.is_remote()
+                && status.is_server_error()
+                && body.contains("too large") =>
+        {
+            Err(AppError(
+                anyhow!("the input length exceeds the context length: {body}"),
+                StatusCode::BAD_REQUEST,
+            ))
+        }
+        Err((status, body)) => Err(AppError(
+            anyhow!("{} {status}: {body}", target.describe()),
+            remote_status(target, status),
+        )),
+    }
+}
+
+/// `POST /v1/embeddings` for one input; the error carries the upstream
+/// status and body so `embed_one` can recognise an overflow.
+async fn post_embeddings(
+    client: &Client,
+    target: &Target,
+    wire_model: &str,
+    text: &str,
+) -> Result<(Vec<f32>, u64), (StatusCode, String)> {
+    let resp = target
+        .authorize(
+            client
+                .post(target.url("/v1/embeddings"))
+                .timeout(EMBEDDINGS_TIMEOUT)
+                .json(&serde_json::json!({ "model": wire_model, "input": text })),
+        )
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("send to {}: {e}", target.describe()),
+            )
+        })?;
+    let status = resp.status();
+    let body = resp.bytes().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err((status, String::from_utf8_lossy(&body).into_owned()));
+    }
+    let mut parsed: OAIEmbeddingsResponse = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "{} returned an unexpected embeddings body: {e}",
+                target.describe()
+            ),
+        )
+    })?;
+    parsed.data.sort_by_key(|d| d.index);
+    let vector = parsed
+        .data
+        .into_iter()
+        .next()
+        .map(|d| d.embedding)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("{} returned no embedding", target.describe()),
+            )
+        })?;
+    Ok((vector, parsed.usage.prompt_tokens))
+}
+
+/// Bounds the two token-conversion calls in `truncate_to_tokens`: both
+/// are cheap and local, so a stall is a wedged backend.
+const TOKENIZE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounds one `/v1/embeddings` call; generous, since a context-length
+/// input on CPU is legitimately slow.
+const EMBEDDINGS_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// `text` cut to its first `limit` tokens via the backend's own
+/// `/tokenize` and `/detokenize`, so the cut lands on model boundaries.
+async fn truncate_to_tokens(
+    client: &Client,
+    port: u16,
+    text: &str,
+    limit: usize,
+) -> anyhow::Result<String> {
+    #[derive(Deserialize)]
+    struct Tokens {
+        tokens: Vec<i64>,
+    }
+    #[derive(Deserialize)]
+    struct Content {
+        content: String,
+    }
+    let base = format!("http://127.0.0.1:{port}");
+    let Tokens { mut tokens } = client
+        .post(format!("{base}/tokenize"))
+        .timeout(TOKENIZE_TIMEOUT)
+        .json(&serde_json::json!({ "content": text }))
+        .send()
+        .await
+        .context("tokenize for truncation")?
+        .error_for_status()?
+        .json()
+        .await?;
+    if limit == 0 {
+        anyhow::bail!("input after truncation exceeds maximum context length");
+    }
+    if tokens.len() <= limit {
+        return Ok(text.to_string());
+    }
+    tokens.truncate(limit);
+    let Content { content } = client
+        .post(format!("{base}/detokenize"))
+        .timeout(TOKENIZE_TIMEOUT)
+        .json(&serde_json::json!({ "tokens": tokens }))
+        .send()
+        .await
+        .context("detokenize for truncation")?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(content)
+}
+
+/// Unit-length in place (a prefix of a unit vector isn't one); a zero
+/// vector is left alone, a non-finite one is an error, as on ollama.
+fn normalize_in_place(v: &mut [f32]) -> Result<(), AppError> {
+    if v.iter().any(|x| !x.is_finite()) {
+        return Err(AppError::status(
+            StatusCode::BAD_GATEWAY,
+            "embedding contains NaN or Inf values",
+        ));
+    }
+    // f64: the sum can't overflow, and any nonzero f32 vector has a
+    // positive norm.
+    let norm = v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x = (f64::from(*x) / norm) as f32;
+        }
+    }
+    Ok(())
+}
+
+/// Mirrors `ollama.EmbedHandler`; durations are nanoseconds, as there.
+async fn handle_embed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<OllamaEmbedRequest>,
+) -> Result<Response, AppError> {
+    let started = Instant::now();
+    let inputs = embed_inputs(&req.input)?;
+    eprintln!(
+        "[llmman] /api/embed model={:?} inputs={}",
+        req.model,
+        inputs.len()
+    );
+    let (mut embeddings, tokens, loaded) = embed_via_backend(
+        &state,
+        &headers,
+        &req.model,
+        &inputs,
+        req.truncate != Some(false),
+        &req.keep_alive,
+    )
+    .await?;
+    if let Some(dims) = req.dimensions.filter(|d| *d > 0) {
+        for v in &mut embeddings {
+            if dims < v.len() {
+                v.truncate(dims);
+                normalize_in_place(v)?;
+            }
+        }
+    }
+    Ok(Json(OllamaEmbedResponse {
+        model: req.model,
+        embeddings,
+        total_duration: started.elapsed().as_nanos() as u64,
+        load_duration: loaded.as_nanos() as u64,
+        prompt_eval_count: tokens,
+    })
+    .into_response())
+}
+
+/// Mirrors `ollama.EmbeddingsHandler`: one prompt, one `float64` vector.
+async fn handle_embeddings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<OllamaEmbeddingsRequest>,
+) -> Result<Response, AppError> {
+    eprintln!(
+        "[llmman] /api/embeddings model={:?} prompt_len={}",
+        req.model,
+        req.prompt.len()
+    );
+    let inputs = if req.prompt.is_empty() {
+        Vec::new()
+    } else {
+        vec![req.prompt.clone()]
+    };
+    let (embeddings, _tokens, _loaded) =
+        embed_via_backend(&state, &headers, &req.model, &inputs, true, &req.keep_alive).await?;
+    let embedding = embeddings
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .into_iter()
+        .map(f64::from)
+        .collect();
+    Ok(Json(OllamaEmbeddingsResponse { embedding }).into_response())
 }
 
 // -- OpenAI pass-through handlers --------------------------------------------
@@ -6188,6 +7016,60 @@ async fn track_metrics(req: Request, next: Next) -> Response {
     Response::from_parts(parts, body)
 }
 
+/// Lets the Ollama routes take a JSON body under any `Content-Type`, as
+/// ollama does (gin's `ShouldBindJSON` ignores the header): `curl -d`
+/// sends a form type, a browser `fetch` sends `text/plain`, some SDKs
+/// send none, and axum's `Json` 415s all of them. Rewriting the header
+/// before extraction closes that; a non-JSON body still gets the 400.
+///
+/// A non-JSON POST carrying an `Origin` that `cors_layer` wouldn't allow
+/// is a browser's "simple" request that skipped preflight; it is refused
+/// outright, since `/api/blobs` reads a raw body and `/api/pull` or
+/// `/api/create` would otherwise be drivable from any page.
+async fn accept_any_content_type(mut req: Request, next: Next) -> Response {
+    let is_json = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(is_json_content_type);
+    if !is_json {
+        if foreign_origin(req.headers()) {
+            let body = serde_json::json!({ "error": "cross-site request refused" });
+            return (StatusCode::FORBIDDEN, Json(body)).into_response();
+        }
+        req.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+    }
+    next.run(req).await
+}
+
+/// Whether the request carries an `Origin` that `cors_layer` wouldn't
+/// allow. No `Origin` (a CLI, an SDK) is not foreign.
+fn foreign_origin(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|origin| {
+            !allowed_origins_from_env()
+                .iter()
+                .any(|pattern| origin_matches(origin, pattern))
+        })
+}
+
+/// `application/json` or `application/*+json`, parameters and case aside.
+fn is_json_content_type(value: &str) -> bool {
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || (essence.starts_with("application/") && essence.ends_with("+json"))
+}
+
 /// Stops [`track_metrics`]'s second clock when a response body ends —
 /// see that function's own doc comment. Drop rather than the end of the
 /// stream, so a client that disconnects mid-completion is recorded too.
@@ -6263,15 +7145,7 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .route("/llmman/providers", get(handle_llmman_providers))
         .route("/llmman/providers/:id", get(handle_llmman_provider))
         // Ollama API
-        .route("/api/version", get(handle_version))
-        .route("/api/tags", get(handle_tags))
-        .route("/api/ps", get(handle_ps))
-        .route("/api/show", post(handle_show))
-        .route("/api/pull", post(handle_pull))
-        .route("/api/push", post(handle_push))
-        .route("/api/delete", delete(handle_delete))
-        .route("/api/chat", post(handle_ollama_chat))
-        .route("/api/generate", post(handle_ollama_generate))
+        .merge(ollama_router())
         // OpenAI API
         .route("/v1/models", get(handle_openai_models))
         .route("/v1/chat/completions", post(handle_openai_chat))
@@ -6316,6 +7190,32 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
     app.layer(cors_layer())
         .merge(metrics_router(metrics_enabled))
         .with_state(app_state)
+}
+
+/// The Ollama-compatible surface; its own router so
+/// [`accept_any_content_type`] applies to exactly these routes.
+fn ollama_router() -> Router<AppState> {
+    Router::new()
+        .route("/api/version", get(handle_version))
+        .route("/api/tags", get(handle_tags))
+        .route("/api/ps", get(handle_ps))
+        .route("/api/show", post(handle_show))
+        .route("/api/pull", post(handle_pull))
+        .route("/api/push", post(handle_push))
+        .route("/api/delete", delete(handle_delete))
+        .route("/api/copy", post(handle_copy))
+        .route("/api/create", post(handle_create))
+        .route(
+            "/api/blobs/:digest",
+            axum::routing::head(handle_blob_head)
+                .post(handle_blob_upload)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route("/api/chat", post(handle_ollama_chat))
+        .route("/api/generate", post(handle_ollama_generate))
+        .route("/api/embed", post(handle_embed))
+        .route("/api/embeddings", post(handle_embeddings))
+        .layer(middleware::from_fn(accept_any_content_type))
 }
 
 /// `GET /metrics`, or nothing at all when `LLMMAN_METRICS` is unset —
@@ -9133,6 +10033,206 @@ mod tests {
         assert_eq!(effective_num_parallel(Some(4096), Some(4)), Some(4));
         assert_eq!(effective_num_parallel(Some(4096), None), None);
         assert_eq!(effective_num_parallel(None, None), None);
+    }
+
+    /// The GGUF test (ollama's own): a `{arch}.pooling_type` key marks an
+    /// embedding model, and its trained context comes along with it.
+    #[test]
+    fn embedding_model_ctx_keys_off_pooling_type_and_reports_the_trained_context() {
+        let chat = crate::gguf::write_test_gguf_with(&[]);
+        let embed = crate::gguf::write_test_gguf_with(&[("llama.pooling_type", 1)]);
+        let chat_ctx = embedding_model_ctx(&chat);
+        let embed_ctx = embedding_model_ctx(&embed);
+        std::fs::remove_file(&chat).ok();
+        std::fs::remove_file(&embed).ok();
+        assert_eq!(chat_ctx, None);
+        assert_eq!(embed_ctx, Some(Some(4096)));
+        // Unreadable: a generation model, not an error — see the doc comment.
+        assert_eq!(embedding_model_ctx(Path::new("/nonexistent.gguf")), None);
+    }
+
+    /// `/api/embed` takes a string or an array of strings, and nothing
+    /// else; an empty string and `null` both mean "no inputs".
+    #[test]
+    fn embed_inputs_accepts_a_string_or_string_array_only() {
+        assert_eq!(embed_inputs(&serde_json::json!("hi")).unwrap(), vec!["hi"]);
+        assert_eq!(
+            embed_inputs(&serde_json::json!(["a", "b"])).unwrap(),
+            vec!["a", "b"]
+        );
+        assert!(embed_inputs(&serde_json::Value::Null).unwrap().is_empty());
+        assert!(embed_inputs(&serde_json::json!("")).unwrap().is_empty());
+        for bad in [
+            serde_json::json!(1),
+            serde_json::json!(["a", 1]),
+            serde_json::json!({}),
+        ] {
+            let err = embed_inputs(&bad).unwrap_err();
+            assert_eq!(err.1, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn normalize_in_place_yields_a_unit_vector_and_rejects_non_finite() {
+        let mut v = vec![3.0f32, 4.0];
+        normalize_in_place(&mut v).unwrap();
+        assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
+        let mut zero = vec![0.0f32, 0.0];
+        normalize_in_place(&mut zero).unwrap();
+        assert_eq!(zero, vec![0.0, 0.0]);
+        assert!(normalize_in_place(&mut [1.0, f32::NAN]).is_err());
+        assert!(normalize_in_place(&mut [f32::INFINITY]).is_err());
+        let mut huge = vec![f32::MAX, f32::MAX];
+        normalize_in_place(&mut huge).unwrap();
+        assert!((huge[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        let mut tiny = vec![1e-20f32, 0.0];
+        normalize_in_place(&mut tiny).unwrap();
+        assert_eq!(tiny, vec![1.0, 0.0]);
+    }
+
+    /// Only a JSON content type is left alone by `accept_any_content_type`.
+    #[test]
+    fn is_json_content_type_matches_json_and_json_suffixed_types_only() {
+        assert!(is_json_content_type("application/json"));
+        assert!(is_json_content_type("Application/JSON; charset=utf-8"));
+        assert!(is_json_content_type("application/vnd.api+json"));
+        assert!(!is_json_content_type("text/plain;charset=UTF-8"));
+        assert!(!is_json_content_type("application/x-www-form-urlencoded"));
+        assert!(!is_json_content_type(""));
+    }
+
+    /// Ollama's `/api/*` routes accept a JSON body under any (or no)
+    /// `Content-Type` — except with an `Origin` CORS wouldn't allow, which
+    /// is refused.
+    #[tokio::test]
+    async fn ollama_routes_accept_json_without_a_json_content_type() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(test_state(), false);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://127.0.0.1:{}/api/show", addr.port());
+        let post = |content_type: Option<&str>, origin: Option<&str>| {
+            let mut req = Client::new()
+                .post(&url)
+                .body(r#"{"model":"hf:///bad ref"}"#);
+            if let Some(ct) = content_type {
+                req = req.header("content-type", ct);
+            }
+            if let Some(origin) = origin {
+                req = req.header("origin", origin);
+            }
+            req.send()
+        };
+        for content_type in [None, Some("text/plain;charset=UTF-8")] {
+            let resp = post(content_type, None).await.unwrap();
+            // Past the extractor: the handler's own 400, not a 415.
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{content_type:?}");
+        }
+        // A page on an allowed origin (localhost, any port) is fine.
+        let resp = post(Some("text/plain"), Some("http://localhost:3000"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = post(Some("text/plain"), Some("https://evil.example"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = post(None, Some("https://evil.example")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// `/api/create` refuses the Modelfile fields it can't honour, by
+    /// name, rather than dropping them — and doesn't refuse the empty
+    /// placeholders clients send for fields they aren't using.
+    #[tokio::test]
+    async fn create_refuses_unsupported_modelfile_fields_by_name() {
+        let state = test_state();
+        let req: OllamaCreateRequest = serde_json::from_value(serde_json::json!({
+            "model": "mine", "from": "gemma4",
+            "system": "be terse", "quantize": "q4_K_M", "template": "", "adapters": null
+        }))
+        .unwrap();
+        let resp = handle_create(State(state), Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        // Sorted, and only the two non-empty ones: "" and null are the
+        // placeholders a client sends for fields it isn't using.
+        assert!(
+            body.contains("/api/create: quantize, system not supported"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_needs_exactly_one_of_from_or_files() {
+        let state = test_state();
+        for body in [
+            serde_json::json!({"model": "mine"}),
+            serde_json::json!({"model": format!("mine@sha256:{}", "a".repeat(64)), "from": "a"}),
+            serde_json::json!({"model": "mine", "from": "a", "files": {"m.gguf": "sha256:00"}}),
+        ] {
+            let req: OllamaCreateRequest = serde_json::from_value(body).unwrap();
+            let resp = handle_create(State(state.clone()), Json(req))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    /// A loaded model whose tag now points at other content is dropped,
+    /// whichever way the tag is spelled; one serving the same content stays.
+    #[tokio::test]
+    async fn evict_if_retagged_drops_only_a_runner_serving_stale_content() {
+        let state = test_state();
+        let key = "hf.co/o/m:latest";
+        let mut fixture = running_model_fixture(None, Duration::ZERO, 0);
+        fixture.digest = "sha256:old".into();
+        state
+            .0
+            .manager
+            .lock()
+            .await
+            .running
+            .insert(key.into(), fixture);
+        evict_if_retagged(&state, key, "sha256:old").await;
+        assert!(state.0.manager.lock().await.running.contains_key(key));
+        evict_if_retagged(&state, "hf.co/o/m", "sha256:new").await;
+        assert!(!state.0.manager.lock().await.running.contains_key(key));
+    }
+
+    /// `files` keys name a file inside the build directory; anything else
+    /// is refused before a link is made.
+    #[test]
+    fn staged_file_refuses_a_name_that_is_not_a_bare_file_name() {
+        let state = test_state();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        for name in ["../escape.gguf", "sub/dir.gguf", ".", ""] {
+            let err = staged_file(&state, name, &digest).unwrap_err();
+            assert_eq!(err.1, StatusCode::BAD_REQUEST, "{name:?}");
+        }
+    }
+
+    /// A malformed digest is a 400, which also keeps a crafted path
+    /// segment out of the filesystem.
+    #[test]
+    fn staged_blob_path_requires_a_well_formed_sha256_digest() {
+        let state = test_state();
+        let ok = staged_blob_path(&state, &format!("sha256:{}", "a".repeat(64))).unwrap();
+        assert_eq!(ok, state.0.cache_path.join("blobs").join("a".repeat(64)));
+        for bad in [
+            "sha256:abc",
+            "md5:0000",
+            &format!("sha256:{}", "g".repeat(64)),
+            "../x",
+        ] {
+            assert_eq!(
+                staged_blob_path(&state, bad).unwrap_err().1,
+                StatusCode::BAD_REQUEST
+            );
+        }
     }
 
     #[test]
