@@ -889,9 +889,12 @@ fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 /// ollama's is by `OLLAMA_API_KEY`. Ollama's `cmd/launch/qwen.go` does
 /// the same three. `--model` is
 /// required; `check_model_flag` refuses a launch without one before the
-/// daemon starts.
+/// daemon starts. A `--model` after `--` is the one Qwen Code will use
+/// (`qwen_args` yields to it), so the settings and `OPENAI_MODEL` follow
+/// it; `run` has resolved and preloaded the top-level one regardless.
 fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_qwen().ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
+    let model = forwarded_model(extra_args).unwrap_or(model);
     // After the lookup, so nothing is written for an integration that is
     // not there; `check_model_flag` has made sure there is a model.
     write_qwen_settings(model)?;
@@ -907,6 +910,24 @@ fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Res
             ("OPENAI_MODEL", model),
         ],
     )
+}
+
+/// The value of the last `--model`/`-m` after `--`, as a word or
+/// `=`-joined, the forms `has_flag` takes; yargs keeps the last too.
+fn forwarded_model(extra_args: &[String]) -> Option<&str> {
+    let mut found = None;
+    let mut args = extra_args.iter().map(String::as_str);
+    while let Some(a) = args.next() {
+        match a {
+            "--model" | "-m" => found = args.next().or(found),
+            _ => {
+                if let Some(v) = a.strip_prefix("--model=").or_else(|| a.strip_prefix("-m=")) {
+                    found = Some(v);
+                }
+            }
+        }
+    }
+    found.filter(|v| !v.is_empty())
 }
 
 /// `--auth-type openai --model <model>` ahead of the caller's own
@@ -1394,6 +1415,18 @@ mod tests {
             assert!(check_model_flag(id, Some("m"), None, &forwarded).is_ok());
         }
         assert!(check_model_flag("claude", None, None, &none).is_ok());
+    }
+
+    /// The last forwarded model wins, in either spelling; none is none.
+    #[test]
+    fn forwarded_model_takes_the_last_spelling() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(forwarded_model(&args(&["--model", "b"])), Some("b"));
+        assert_eq!(forwarded_model(&args(&["-m=b", "--model", "c"])), Some("c"));
+        assert_eq!(forwarded_model(&args(&["--model=b", "-m", "c"])), Some("c"));
+        assert_eq!(forwarded_model(&args(&["-p", "x"])), None);
+        assert_eq!(forwarded_model(&args(&["--model"])), None);
+        assert_eq!(forwarded_model(&args(&["--model="])), None);
     }
 
     /// A word or `=`-joined, and nothing looser: `-sm` is not `-m`.
