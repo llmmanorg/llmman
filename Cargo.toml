@@ -30,6 +30,10 @@ tower-http = { version = "0.6", features = ["cors"] }
 libc       = "0.2"
 tokio-util = { version = "0.7", features = ["io"] }
 toml       = { version = "0.8", default-features = false, features = ["parse"] }
+# `llmman config set` edits a file people also hand-edit, so comments and
+# layout have to survive a one-key write; serializing a `Conf` back out
+# would drop both. Already compiled as `toml`'s own parser.
+toml_edit  = "0.22"
 tokio      = { version = "1", features = ["full"] }
 reqwest    = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls", "http2", "charset"] }
 futures    = "0.3"

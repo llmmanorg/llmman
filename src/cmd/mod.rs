@@ -1,4 +1,5 @@
 pub mod build;
+pub mod config;
 pub mod cp;
 pub mod gpu_discover;
 pub mod launch;

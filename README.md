@@ -98,10 +98,11 @@ above takes `--provider`; see [Hosted providers](#hosted-providers).
 | `verify`  | Check a registry model's signatures against trusted public keys |
 | `login`   | Log in to a container registry |
 | `logout`  | Log out from a container registry |
+| `config`  | Read and write `llmman.conf` settings |
 
-See [docs/configuration.md](docs/configuration.md) for environment variables
-and the model store layout, and [docs/verification.md](docs/verification.md)
-for signature verification.
+See [docs/configuration.md](docs/configuration.md) for `llmman config`,
+environment variables and the model store layout, and
+[docs/verification.md](docs/verification.md) for signature verification.
 
 ## Models are OCI artifacts
 

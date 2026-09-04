@@ -48,6 +48,8 @@ enum Commands {
     Ps(cmd::ps::PsArgs),
     /// List the hosted providers `--provider` can route to
     Providers(cmd::providers::ProvidersArgs),
+    /// Read and write llmman.conf settings
+    Config(cmd::config::ConfigArgs),
     /// Copy a local image to a new reference
     Cp(cmd::cp::CpArgs),
     /// Remove a local image, freeing its blobs and extracted cache no
@@ -114,6 +116,7 @@ fn main() {
         Commands::List(a) => cmd::list::run(a),
         Commands::Ps(a) => cmd::ps::run(a),
         Commands::Providers(a) => cmd::providers::run(a),
+        Commands::Config(a) => cmd::config::run(a),
         Commands::Cp(a) => cmd::cp::run(a),
         Commands::Rm(a) => cmd::rm::run(a),
         Commands::Stop(a) => cmd::stop::run(a),
