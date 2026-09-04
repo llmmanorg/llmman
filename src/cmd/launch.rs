@@ -1164,9 +1164,10 @@ const QWEN_ENV_KEY: &str = "LLMMAN_API_KEY";
 /// `cmd/launch/qwen.go`: llmman's entry first in `modelProviders.openai`,
 /// with an earlier one of its own for this daemon replaced, the rest
 /// kept, and a `{ protocol, models }` wrapper an older Qwen Code wrote
-/// unwrapped as its `V5ToV4Migration` does; `security.auth.selectedType`
-/// and `baseUrl`; `model.name` with `model.baseUrl`, which Qwen Code sets
-/// together. No `$version`, which Qwen Code stamps itself, and no key: the
+/// unwrapped as its `V5ToV4Migration` does, `$version` set to 4 with it;
+/// `security.auth.selectedType` and `baseUrl`; `model.name` with
+/// `model.baseUrl`, which Qwen Code sets together. Otherwise no
+/// `$version`, which Qwen Code stamps itself, and no key: the
 /// entry names `QWEN_ENV_KEY`, which `launch_qwen` exports. A value of
 /// the wrong type on the way down is replaced, as ollama's `qwenMap` does.
 fn qwen_settings_merged(
@@ -1184,6 +1185,7 @@ fn qwen_settings_merged(
     let openai = object_under(&mut doc, "modelProviders")
         .entry("openai")
         .or_insert_with(|| serde_json::json!([]));
+    let unwrapped = openai.get("models").is_some_and(|m| m.is_array());
     let entries = openai
         .as_array()
         .or_else(|| openai.get("models").and_then(serde_json::Value::as_array));
@@ -1195,6 +1197,9 @@ fn qwen_settings_merged(
             .collect()
     });
     *openai = serde_json::Value::Array(std::iter::once(ours).chain(kept).collect());
+    if unwrapped {
+        doc.insert("$version".into(), 4.into());
+    }
     let auth = object_under(object_under(&mut doc, "security"), "auth");
     auth.insert("selectedType".into(), "openai".into());
     auth.insert("baseUrl".into(), base_url.into());
@@ -1577,6 +1582,7 @@ mod tests {
         let openai = merged["modelProviders"]["openai"].as_array().unwrap();
         assert_eq!(openai.len(), 2);
         assert_eq!(openai[1]["id"], "gpt-5");
+        assert_eq!(merged["$version"], 4, "the version follows the shape");
     }
 
     /// Ownership is the key name at this daemon's address, whatever the
