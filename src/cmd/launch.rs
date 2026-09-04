@@ -1085,7 +1085,8 @@ fn sort_node_versions_newest_first(names: &mut [String]) {
 }
 
 /// `$QWEN_HOME` if set, else `~/.qwen`: `Storage.getGlobalQwenDir` in
-/// Qwen Code's `packages/core/src/config/storage.ts`.
+/// Qwen Code's `packages/core/src/config/storage.ts`. Qwen Code can also
+/// take it from `~/.qwen/.env`; that is left to the user's shell.
 fn qwen_home() -> anyhow::Result<PathBuf> {
     let home = || dirs::home_dir().context("no home directory");
     match std::env::var("QWEN_HOME").ok().filter(|d| !d.is_empty()) {
