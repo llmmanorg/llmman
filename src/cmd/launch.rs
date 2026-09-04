@@ -933,14 +933,19 @@ fn find_qwen() -> Option<PathBuf> {
 }
 
 /// Where a Qwen Code install lands that a process without the user's
-/// login shell does not see: the standalone installer's `~/.local/bin`,
-/// the `~/.npm-global` prefix its older npm installer set, nvm's newest
-/// node that has it, Homebrew's prefixes, `/usr/local/bin`, and on
-/// Windows npm's `%APPDATA%\npm` and the standalone installer's
-/// `%LOCALAPPDATA%\qwen-code\bin`. Ollama's `cmd/launch/qwen.go` checks
-/// a similar list. What nvm holds is a `#!/usr/bin/env node` shim whose
-/// `node` is on `PATH` only in an nvm-sourced shell, so a launch from
-/// another shell fails at exec rather than here.
+/// login shell does not see: the standalone installer's `~/.local/bin`
+/// and, on Windows, its `%LOCALAPPDATA%\qwen-code\bin`
+/// (`Get-QwenInstallBinDir` in Qwen Code's
+/// `scripts/installation/install-qwen-standalone.ps1`); the
+/// `~/.npm-global` prefix its older npm installer set; nvm's newest node
+/// that has it; Homebrew's prefixes and `/usr/local/bin`; and the rest of
+/// what ollama's `cmd/launch/qwen.go` probes, `~/.cargo/bin`, macOS's
+/// `~/Library/Application Support/qwen/bin`, and on Windows npm's global
+/// directory under both `%APPDATA%` and `%LOCALAPPDATA%`,
+/// `%LOCALAPPDATA%\Programs\qwen` and `%APPDATA%\qwen\bin`. What nvm
+/// holds is a `#!/usr/bin/env node` shim whose `node` is on `PATH` only
+/// in an nvm-sourced shell, so a launch from another shell fails at exec
+/// rather than here.
 fn qwen_fallback_paths() -> Vec<PathBuf> {
     let home = dirs::home_dir();
     let mut paths = Vec::new();
@@ -955,8 +960,11 @@ fn qwen_fallback_paths() -> Vec<PathBuf> {
             .map(PathBuf::from)
             .or_else(|| home.as_ref().map(|h| h.join("AppData").join("Local")));
         let dirs = [
-            roaming.map(|d| d.join("npm")),
-            local.map(|d| d.join("qwen-code").join("bin")),
+            roaming.as_ref().map(|d| d.join("npm")),
+            local.as_ref().map(|d| d.join("npm")),
+            local.as_ref().map(|d| d.join("qwen-code").join("bin")),
+            local.as_ref().map(|d| d.join("Programs").join("qwen")),
+            roaming.as_ref().map(|d| d.join("qwen").join("bin")),
         ];
         for dir in dirs.into_iter().flatten() {
             paths.extend(
@@ -970,6 +978,16 @@ fn qwen_fallback_paths() -> Vec<PathBuf> {
     if let Some(h) = &home {
         paths.push(h.join(".local").join("bin").join("qwen"));
         paths.push(h.join(".npm-global").join("bin").join("qwen"));
+        paths.push(h.join(".cargo").join("bin").join("qwen"));
+        if cfg!(target_os = "macos") {
+            paths.push(
+                h.join("Library")
+                    .join("Application Support")
+                    .join("qwen")
+                    .join("bin")
+                    .join("qwen"),
+            );
+        }
         paths.extend(nvm_dirs(h).iter().filter_map(|d| nvm_qwen(d)));
     }
     if cfg!(target_os = "macos") {
@@ -1477,6 +1495,7 @@ mod tests {
         let paths = qwen_fallback_paths();
         assert!(paths.contains(&home.join(".local/bin/qwen")));
         assert!(paths.contains(&home.join(".npm-global/bin/qwen")));
+        assert!(paths.contains(&home.join(".cargo/bin/qwen")));
         assert!(paths.contains(&PathBuf::from("/usr/local/bin/qwen")));
     }
 
