@@ -139,7 +139,7 @@ pub struct File {
 /// `<binary-dir>/` tiers earlier versions searched: nothing ever shipped
 /// a file to them, and they are package-managed and world-readable,
 /// which `llmman.conf` cannot be.
-fn search_paths() -> Vec<PathBuf> {
+pub fn search_paths() -> Vec<PathBuf> {
     let mut paths = vec![system_dir().join(FILE)];
     paths.extend(user_dir().map(|d| d.join(FILE)));
     paths
@@ -169,9 +169,16 @@ fn user_dir() -> Option<PathBuf> {
 }
 
 /// Where a user's own config belongs, for a message that has to name
-/// it. `None` only when there is no home directory.
-fn user_path() -> Option<PathBuf> {
+/// it or a [`crate::cmd::config`] that has to write it. `None` only when
+/// there is no home directory.
+pub fn user_path() -> Option<PathBuf> {
     user_dir().map(|d| d.join(FILE))
+}
+
+/// Where the system-wide config belongs. Always known, unlike
+/// [`user_path`]: it does not depend on there being a home directory.
+pub fn system_path() -> PathBuf {
+    system_dir().join(FILE)
 }
 
 /// [`user_path`] for printing, falling back to the bare file name.
@@ -298,7 +305,7 @@ fn merge_keys(per_file: Vec<HashMap<String, String>>) -> HashMap<String, String>
 /// legitimately world-readable for the aliases and trust policy it also
 /// carries, so a loose file still supplies everything but the key.
 #[cfg(unix)]
-fn owner_readable_only(path: &Path) -> Result<(), String> {
+pub(crate) fn owner_readable_only(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
     let mode = std::fs::metadata(path)
@@ -320,7 +327,7 @@ fn owner_readable_only(path: &Path) -> Result<(), String> {
 /// owner-only under the user's profile, but a file with a widened ACL,
 /// or one under the system directory, is accepted as-is.
 #[cfg(not(unix))]
-fn owner_readable_only(_path: &Path) -> Result<(), String> {
+pub(crate) fn owner_readable_only(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 

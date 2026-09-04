@@ -59,6 +59,56 @@ Unknown sections and keys are rejected rather than ignored: a misspelled
 credential that silently never takes effect, and the symptom would show up
 somewhere else entirely.
 
+### llmman config
+
+`llmman config` edits that file the way `git config` edits `.gitconfig`,
+so nothing above has to be typed into an editor:
+
+```console
+$ llmman config set aliases.gemma4 docker.io/ai/gemma4
+$ llmman config set providers.openrouter.api_key sk-or-...
+$ llmman config get aliases.gemma4
+docker.io/ai/gemma4
+$ llmman config list
+aliases.gemma4=docker.io/ai/gemma4
+providers.openrouter.api_key=<redacted>
+$ llmman config unset providers.openrouter.api_key
+```
+
+| Command | Effect |
+|---------|--------|
+| `llmman config list` | Print every key that is set, one `key=value` per line. `--show-origin` prefixes each with the file it came from. |
+| `llmman config get <key>` | Print one value, or exit non-zero if it is not set. |
+| `llmman config set <key> <value>` | Set one key. |
+| `llmman config unset <key>` | Remove one key, or exit non-zero if it was not set. |
+| `llmman config edit` | Open the file in `$VISUAL`/`$EDITOR`, then check that it still parses. |
+
+A key is a TOML dotted key, so an id that is not a bare key is quoted
+exactly as it is in the file: `llmman config get
+'providers."wafer.ai".api_key'`. Array entries are addressed by index for
+reading — `verify.trust[0].pattern` — but not for writing; use
+`llmman config edit` for a trust policy. Values are always written as
+strings, which is every field the format has.
+
+`list` and `get` read both locations, later overriding earlier, so what
+`get` prints is what llmman would actually use. Array indices are the
+exception: trust rules are appended across files rather than overridden,
+so `verify.trust[0]` names one entry per file and `--show-origin` is what
+tells them apart. `set`, `unset` and `edit`
+write the per-user file; pass `--system` for `/etc/llmman/llmman.conf`
+(which generally needs root) or `--file <path>` for any other one.
+
+Two things it does that an editor cannot. Every write is checked against
+the format before the file is replaced, so `api_kye` is an error on the
+spot rather than a key that silently never takes effect, and the file on
+disk is left as it was. And a file that ends up holding an `api_key` is
+made owner-only, since llmman would otherwise ignore the key that was
+just set (see below); one holding no key keeps the mode it had. Comments
+and layout survive a write.
+
+`list` prints `<redacted>` for an `api_key`, since it is the command whose
+output ends up in a bug report. `get` prints it in full.
+
 ### Provider API keys
 
 `--provider` reaches a hosted model with a key llmman never generates and
