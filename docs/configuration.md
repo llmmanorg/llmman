@@ -117,7 +117,7 @@ setting may not behave identically.
 |----------|--------|
 | `LLMMAN_DEBUG` | Enables verbose diagnostic logging (a spawned backend's full command line, per-GPU probe detail, etc). Accepts `1`/`true`/`yes`/`on`, or any other non-zero integer. |
 | `LLMMAN_HOST` | `[host][:port]` `llmman serve` binds to. Every `llmman` client in the same environment connects to it too, rewriting a wildcard host to loopback first. Defaults to `127.0.0.1:17434`. |
-| `LLMMAN_CONTEXT_LENGTH` | Context size for model loads. When set, llmman passes it to llama-server as `--ctx-size` and passes positive values to vLLM as `--max-model-len`. llama-server caps oversized values to the model's trained context; vLLM rejects oversized values. When unset or invalid, llama-server may use llmman’s VRAM-tiered default, while vLLM keeps its model-derived default. On high-VRAM hosts, llmman’s VRAM-tiered default may also defer to the backend default. `mlx_lm.server` has no equivalent setting. |
+| `LLMMAN_CONTEXT_LENGTH` | Context size for llama-server/vLLM when set. Defaults and backend-specific forwarding are below. |
 | `LLMMAN_KEEP_ALIVE` | The daemon-wide default `keep_alive` (how long an idle, unused model stays loaded before being unloaded). Defaults to 5 minutes. Overridden per-request by `/api/chat`/`/api/generate`'s own `keep_alive` field. |
 | `LLMMAN_MAX_LOADED_MODELS` | Caps how many models this daemon keeps loaded at once, as one flat daemon-wide total (llmman has no per-model memory estimate to size an automatic per-GPU figure against). Once at the cap, the least-recently-used idle model is evicted to make room; if every loaded model is busy, the request gets a `503` instead. Defaults to `0` (unbounded, today's behavior, unchanged). |
 | `LLMMAN_MAX_QUEUE` | Caps how many requests `llmman serve` admits into scheduling at once; anything beyond that gets an immediate `503` (`server busy, please try again.  maximum pending requests exceeded`, two spaces included). Defaults to `512`. |
@@ -138,6 +138,14 @@ setting may not behave identically.
 | `LLMMAN_SIGN_PASSWORD` | Passphrase for the `--sign-key` private key used by `push`/`transfer`, when it is an encrypted PEM. Falls back to `COSIGN_PASSWORD`. Read from the client's environment and forwarded to the daemon, since the daemon's own environment is generally not the shell you set it in. |
 | `LLMMAN_NOPRUNE` | When set (to anything other than `0`/`false`/`no`/`off`), skips the garbage-collection sweep that `llmman rm` and `llmman serve` startup otherwise run to delete blobs and extracted-cache entries no longer referenced by any local model. Note this is broader than skipping the daemon-startup catch-all: it also stops `llmman rm` itself from ever freeing disk space, so a removed model's (possibly multi-GB) weights stay on disk until a later sweep runs without this set. Useful for a shared/read-mostly store, or scripts that `rm` in a loop and prune once at the end. |
 | `LLAMA_ARG_FIT` / `LLAMA_ARG_FIT_TARGET` | llama.cpp's own env-configurable `--fit`/`--fit-target` options. Not something llmman parses itself, just forwarded through to every `llama-server` (local or `--ociman` container) it spawns, same as `CUDA_VISIBLE_DEVICES`/etc. below. |
+
+### Context length by backend
+
+| Backend | When `LLMMAN_CONTEXT_LENGTH` is set | When unset or invalid |
+|---------|-------------------------------------|-----------------------|
+| `llama-server` | Passed as `--ctx-size`; oversized values may be capped to the model's trained context. | Uses llmman's VRAM-tiered default, which may defer to the backend default on high-VRAM hosts. |
+| `vLLM` | Positive values are passed as `--max-model-len`; oversized values are rejected by vLLM. `0` is not forwarded. | Uses vLLM's model-derived default. |
+| `mlx_lm.server` | Not currently forwarded. | Uses `mlx_lm.server` defaults. |
 
 GPU device-selection variables `llmman serve` forwards to every
 `llama-server` it spawns (local or `--ociman` container):
