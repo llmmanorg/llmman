@@ -110,7 +110,7 @@ installed:
 |------|-------------|--------------|
 | `claude` | Claude Code | yes |
 | `opencode` | OpenCode | yes |
-| `codex` | OpenAI Codex CLI | yes |
+| `codex` | OpenAI Codex CLI | yes (below) |
 | `aider` | Aider | yes |
 | `qwen` | Qwen Code | yes |
 | `hermes` | Hermes Agent | yes, but the daemon holds the key (below) |
@@ -126,3 +126,10 @@ Any extra arguments after `--` are forwarded to the integration's own CLI.
 per request; `llmman serve` needs one of its own, spent only for a
 loopback daemon and never for a cross-site browser request. On a shared
 machine prefer an integration that sends its own key.
+
+`codex` speaks only OpenAI's Responses API, which most providers lack
+(`anthropic` 404s it, `opencode` 500s it for non-OpenAI models). The
+daemon tries the provider first and, on a 404/405/501 or 5xx, translates
+the request to a chat completion and the reply back, tool calls included.
+Providers that have the API (`openai`, `groq`, `openrouter`) are used
+natively; any other 4xx is relayed as-is.

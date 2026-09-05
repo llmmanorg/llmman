@@ -648,13 +648,31 @@ fn write_codex_config() -> anyhow::Result<()> {
     }
 
     let profile_path = config_dir.join("llmman.config.toml");
-    let contents = format!("openai_base_url = \"{}/v1\"\n", daemon::server());
+    let contents = codex_profile(&daemon::server());
     // Avoid rewriting (and bumping the mtime of) a file that's already
     // correct.
     if std::fs::read_to_string(&profile_path).ok().as_deref() != Some(contents.as_str()) {
         std::fs::write(&profile_path, contents)?;
     }
     Ok(())
+}
+
+/// The contents of `~/.codex/llmman.config.toml`: a provider of llmman's
+/// own rather than `openai_base_url` on codex's built-in one, which codex
+/// treats as WebSocket-capable and so opened every session with five
+/// failed `ws://` attempts (~6s of "Reconnecting...") before HTTP.
+fn codex_profile(server: &str) -> String {
+    format!(
+        "# Written by `llmman launch codex`; edits are overwritten.\n\
+         model_provider = \"llmman\"\n\
+         \n\
+         [model_providers.llmman]\n\
+         name = \"llmman\"\n\
+         base_url = \"{server}/v1\"\n\
+         env_key = \"OPENAI_API_KEY\"\n\
+         wire_api = \"responses\"\n\
+         supports_websockets = false\n"
+    )
 }
 
 /// Removes a `[profiles.llmman]` table (and everything up to the next
@@ -1887,6 +1905,26 @@ model = \"gpt-5\"
     fn strip_legacy_llmman_profile_handles_the_table_at_end_of_file() {
         let existing = "[profiles.llmman]\nopenai_base_url = \"http://127.0.0.1:17434/v1\"\n";
         assert_eq!(strip_legacy_llmman_profile(existing), "");
+    }
+
+    #[test]
+    fn codex_profile_is_a_websocket_free_provider_at_the_daemon() {
+        let profile: toml::Value = codex_profile("http://127.0.0.1:17434")
+            .parse()
+            .expect("valid TOML");
+        assert_eq!(profile["model_provider"].as_str(), Some("llmman"));
+        let provider = &profile["model_providers"]["llmman"];
+        assert_eq!(
+            provider["base_url"].as_str(),
+            Some("http://127.0.0.1:17434/v1")
+        );
+        assert_eq!(provider["env_key"].as_str(), Some("OPENAI_API_KEY"));
+        assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+        assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
+        assert!(
+            profile.get("openai_base_url").is_none(),
+            "the built-in openai provider is not the one in use"
+        );
     }
 
     /// Regression test for `write_hermes_config` preserving unrelated

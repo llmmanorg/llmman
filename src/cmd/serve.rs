@@ -33,6 +33,7 @@ use crate::storage::OciStore;
 use crate::webui;
 
 mod aggregation;
+mod responses;
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -4090,6 +4091,12 @@ async fn proxy(
         .send()
         .await
         .with_context(|| format!("proxy request to {}", target.describe()))?;
+    Ok(relay(resp, activity))
+}
+
+/// The relay half of [`proxy`], split out so `remote_responses` can
+/// inspect the status before deciding to relay.
+fn relay(resp: reqwest::Response, activity: ActivityGuard) -> Response {
     let status = resp.status();
     let resp_headers = resp.headers().clone();
 
@@ -4105,7 +4112,7 @@ async fn proxy(
     for (k, v) in &resp_headers {
         builder = builder.header(k, v);
     }
-    Ok(builder.body(Body::from_stream(stream)).unwrap())
+    builder.body(Body::from_stream(stream)).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -4132,6 +4139,12 @@ async fn proxy(
 fn set_response_model(value: &mut serde_json::Value, canonical_model: &str) {
     if value.get("model").is_some() {
         value["model"] = serde_json::Value::String(canonical_model.to_string());
+    }
+    // A Responses API event nests it: `response.created`'s `response`.
+    if let Some(response) = value.get_mut("response") {
+        if response.get("model").is_some() {
+            response["model"] = serde_json::Value::String(canonical_model.to_string());
+        }
     }
 }
 
@@ -4211,6 +4224,15 @@ async fn proxy_rewriting_model(
         .send()
         .await
         .with_context(|| format!("proxy request to {}", target.describe()))?;
+    relay_rewriting_model(resp, activity, canonical_model).await
+}
+
+/// The relay half of [`proxy_rewriting_model`]; see [`relay`].
+async fn relay_rewriting_model(
+    resp: reqwest::Response,
+    activity: ActivityGuard,
+    canonical_model: &str,
+) -> Result<Response, AppError> {
     let status = resp.status();
     let resp_headers = resp.headers().clone();
     let raw = resp
@@ -4263,6 +4285,19 @@ async fn stream_rewriting_model(
         .send()
         .await
         .with_context(|| format!("proxy request to {}", target.describe()))?;
+    Ok(relay_stream_rewriting_model(
+        resp,
+        activity,
+        canonical_model,
+    ))
+}
+
+/// The relay half of [`stream_rewriting_model`]; see [`relay`].
+fn relay_stream_rewriting_model(
+    resp: reqwest::Response,
+    activity: ActivityGuard,
+    canonical_model: String,
+) -> Response {
     let status = resp.status();
     // Only content-type is meaningful to forward for a stream the
     // caller is about to reconstruct line by line — content-length
@@ -4284,7 +4319,7 @@ async fn stream_rewriting_model(
     if let Some(ct) = content_type {
         builder = builder.header(reqwest::header::CONTENT_TYPE, ct);
     }
-    Ok(builder.body(Body::from_stream(stream)).unwrap())
+    builder.body(Body::from_stream(stream)).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -6788,6 +6823,16 @@ async fn proxy_openai_generation_to(
 ) -> Result<Response, AppError> {
     let (mut req, target, activity, response_model_override) =
         prepare_openai_request(state, req, model, target, guard).await?;
+    if llama_path == RESPONSES_ROUTE && target.is_remote() {
+        // See repeat_penalty_applies: a strict provider 400s on it.
+        if let Some(req) = req.as_object_mut() {
+            req.remove("repeat_penalty");
+        }
+        // A remote target always has an override (see backend_wire_model).
+        let canonical = response_model_override
+            .unwrap_or_else(|| req["model"].as_str().unwrap_or_default().to_string());
+        return remote_responses(&state.0.client, &target, headers, req, activity, canonical).await;
+    }
     if is_responses_route(llama_path) && !target.is_remote() {
         sanitize_responses_request(&mut req);
     }
@@ -7093,15 +7138,125 @@ async fn handle_openai_transcriptions(
 // response.output_text.delta -> ... -> response.completed, no `[DONE]`) and
 // re-mapping of tool_calls into function_call output items. Re-implementing
 // that translation here would just duplicate — and risk drifting out of
-// sync with — llama.cpp's own logic, so this is a plain pass-through
-// exactly like the other /v1/* routes above, apart from
-// filter_non_function_tools (see its own doc comment) below.
+// sync with — llama.cpp's own logic, so for a local backend this is a plain
+// pass-through exactly like the other /v1/* routes above, apart from
+// filter_non_function_tools (see its own doc comment) below. A remote
+// provider without /v1/responses gets the `responses` submodule's own
+// translation instead (see `remote_responses`).
 async fn handle_openai_responses(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    proxy_openai_generation(&state, &headers, body, "/v1/responses").await
+    proxy_openai_generation(&state, &headers, body, RESPONSES_ROUTE).await
+}
+
+/// The generating Responses route, the one Codex talks to.
+const RESPONSES_ROUTE: &str = "/v1/responses";
+
+/// `/v1/responses` for a remote provider: natively when the provider has
+/// it, as a translated chat completion when it doesn't.
+///
+/// The provider is asked first rather than consulted in a list (models.dev
+/// has no capability data, and a list would go stale). A success is
+/// relayed; a status [`responses::falls_back`] recognises as the route
+/// being missing or broken (anthropic 404s, opencode 500s for non-OpenAI
+/// models) is retried as a chat completion; any other failure is the
+/// provider's own answer about the caller's key or request, relayed
+/// untouched. The retry happens before any body has been relayed.
+async fn remote_responses(
+    client: &Client,
+    target: &Target,
+    headers: &HeaderMap,
+    req: serde_json::Value,
+    activity: ActivityGuard,
+    canonical_model: String,
+) -> Result<Response, AppError> {
+    let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
+    let mut native = target.authorize(client.post(target.url(RESPONSES_ROUTE)).body(body));
+    if let Some(ct) = headers.get("content-type") {
+        native = native.header("content-type", ct);
+    }
+    let resp = native
+        .send()
+        .await
+        .with_context(|| format!("proxy request to {}", target.describe()))?;
+    let status = resp.status();
+    if status.is_success() {
+        return if streaming {
+            Ok(relay_stream_rewriting_model(
+                resp,
+                activity,
+                canonical_model,
+            ))
+        } else {
+            relay_rewriting_model(resp, activity, &canonical_model).await
+        };
+    }
+    if !responses::falls_back(status) {
+        return Ok(relay(resp, activity));
+    }
+    eprintln!(
+        "[llmman] {} answered {RESPONSES_ROUTE} with {status}; retrying as a chat completion",
+        target.describe()
+    );
+
+    let chat_req = responses::from_responses_request(&req)
+        .map_err(|e| AppError(e, StatusCode::BAD_REQUEST))?;
+    let resp = target
+        .authorize(
+            client
+                .post(target.url(CHAT_COMPLETIONS_ROUTE))
+                .json(&chat_req),
+        )
+        .send()
+        .await
+        .with_context(|| format!("send to {}", target.describe()))?;
+    let status = resp.status();
+    if status.is_client_error() {
+        // The provider's own error object, intact for a client that reads it.
+        return Ok(relay(resp, activity));
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError(
+            anyhow!("{} {status}: {body}", target.describe()),
+            remote_status(target, status),
+        ));
+    }
+
+    let mut converter = responses::StreamConverter::new(&canonical_model, &req);
+    if !streaming {
+        let lines: Vec<String> = bytes_to_lines(resp.bytes_stream()).collect().await;
+        drop(activity);
+        let response = converter.fold(lines);
+        let status = if converter.failed() {
+            StatusCode::BAD_GATEWAY
+        } else {
+            StatusCode::OK
+        };
+        return Ok((status, Json(response)).into_response());
+    }
+
+    // A trailing `None` lets the converter close a stream the provider
+    // ended without `[DONE]`.
+    let sse_stream = bytes_to_lines(resp.bytes_stream())
+        .map(Some)
+        .chain(futures::stream::once(futures::future::ready(None)))
+        .map(move |line| {
+            let _activity = &activity;
+            let out = match line {
+                Some(line) => converter.line(&line),
+                None => converter.finish(),
+            };
+            Ok::<_, std::convert::Infallible>(Bytes::from(out))
+        });
+    Ok(Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(sse_stream))
+        .unwrap())
 }
 
 async fn handle_openai_responses_input_tokens(
@@ -7136,12 +7291,12 @@ fn is_responses_route(llama_path: &str) -> bool {
 /// Explains a provider's bare 404 on the Responses API.
 ///
 /// Being OpenAI-wire-format does not mean implementing every OpenAI
-/// route. `/v1/responses` is the split that matters, because it is the
-/// only one Codex uses: `openai`, `groq` and `openrouter` answer it,
-/// `anthropic` and `mistral` 404. models.dev carries no capability data
-/// to filter on, and a hardcoded list would be wrong the week a provider
-/// shipped it — so this reports the 404 llmman actually received rather
-/// than predicting it, and says which of the two things is missing.
+/// route: `openai`, `groq` and `openrouter` answer `/v1/responses*`,
+/// `anthropic` and `mistral` 404. Generation is bridged by
+/// [`remote_responses`], so this only fires for
+/// `/v1/responses/input_tokens`, which has no chat-completions
+/// equivalent. It reports the 404 actually received rather than
+/// predicting one from a list that would go stale.
 fn explain_missing_route(target: &Target, route: &str, resp: Response) -> Response {
     if resp.status() != StatusCode::NOT_FOUND || !is_responses_route(route) {
         return resp;
@@ -7157,8 +7312,8 @@ fn explain_missing_route(target: &Target, route: &str, resp: Response) -> Respon
         "error": {
             "message": format!(
                 "provider {} has no {route} — it is OpenAI-compatible but does not \
-                 implement the Responses API. Use an integration that speaks chat \
-                 completions, or a provider that does (openai, groq, openrouter).",
+                 implement the Responses API's token counting. Generation on \
+                 /v1/responses is bridged; this route cannot be.",
                 remote.provider
             ),
             "type": "invalid_request_error",
@@ -8359,6 +8514,109 @@ mod tests {
         ] {
             let resp = explain_missing_route(target, route, (status, "{}").into_response());
             assert_eq!(resp.status(), status, "{route} {status}");
+        }
+    }
+
+    /// A fake provider for `remote_responses`: `/v1/responses` answers
+    /// with `native`, `/v1/chat/completions` streams one "OK" reply.
+    async fn fake_provider(native: StatusCode) -> String {
+        use axum::routing::post;
+        let app = Router::new()
+            .route(
+                "/v1/responses",
+                post(move || async move {
+                    (
+                        native,
+                        [("x-provider", "native")],
+                        r#"{"error":{"message":"native"}}"#,
+                    )
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    (
+                        [("content-type", "text/event-stream")],
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n\
+                         data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                         data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n\
+                         data: [DONE]\n\n",
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/v1")
+    }
+
+    async fn call_remote_responses(
+        base_url: &str,
+        stream: bool,
+    ) -> (StatusCode, HeaderMap, String) {
+        let state = test_state();
+        let req = serde_json::json!({ "model": "mock-model", "input": "hi", "stream": stream });
+        let resp = remote_responses(
+            &state.0.client,
+            &remote_target(base_url),
+            &HeaderMap::new(),
+            req,
+            ActivityGuard::new(&state, "m"),
+            "llmman.provider/mockprov/mock-model".to_string(),
+        )
+        .await
+        .unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The provider's own answer on `/v1/responses` decides: a missing or
+    /// broken route falls back to a chat completion translated both ways,
+    /// anything else is relayed as it came.
+    #[tokio::test]
+    async fn remote_responses_falls_back_only_on_a_missing_or_broken_route() {
+        for native in [StatusCode::NOT_FOUND, StatusCode::INTERNAL_SERVER_ERROR] {
+            let base = fake_provider(native).await;
+            let (status, headers, body) = call_remote_responses(&base, true).await;
+            assert_eq!(status, StatusCode::OK, "{native}");
+            assert_eq!(headers["content-type"], "text/event-stream");
+            assert!(body.contains("event: response.created"), "{body}");
+            assert!(body.contains("\"delta\":\"OK\""), "{body}");
+            assert!(body.contains("event: response.completed"), "{body}");
+            assert!(
+                body.contains("\"model\":\"llmman.provider/mockprov/mock-model\""),
+                "{body}"
+            );
+
+            let (status, headers, body) = call_remote_responses(&base, false).await;
+            assert_eq!(status, StatusCode::OK, "{native}");
+            assert_eq!(headers["content-type"], "application/json");
+            let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(response["status"], "completed");
+            assert_eq!(response["output"][0]["content"][0]["text"], "OK");
+            assert_eq!(response["usage"]["total_tokens"], 4);
+        }
+
+        for native in [
+            StatusCode::OK,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            let base = fake_provider(native).await;
+            let (status, headers, body) = call_remote_responses(&base, true).await;
+            assert_eq!(status, native);
+            assert!(body.contains("\"native\""), "{native}: {body}");
+            // A failure is relayed whole; a success is re-streamed line by
+            // line with only its content-type.
+            assert_eq!(
+                headers.contains_key("x-provider"),
+                !native.is_success(),
+                "{native}"
+            );
         }
     }
 
@@ -12058,6 +12316,12 @@ mod tests {
         let mut without_model = serde_json::json!({"id": "x"});
         set_response_model(&mut without_model, "gemma4:latest");
         assert_eq!(without_model, serde_json::json!({"id": "x"}));
+
+        // A Responses event carries it nested.
+        let mut event =
+            serde_json::json!({"type": "response.created", "response": {"model": "wire"}});
+        set_response_model(&mut event, "canonical");
+        assert_eq!(event["response"]["model"], "canonical");
     }
 
     #[test]
