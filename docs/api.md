@@ -1,0 +1,94 @@
+# HTTP API
+
+`llmman serve` listens on `127.0.0.1:17434` by default (`LLMMAN_HOST`
+changes it; see [configuration.md](configuration.md)) and speaks the
+Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
+
+| API | Endpoints |
+|-----|-----------|
+| Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/pull`, `/api/push`, `/api/copy`, `/api/create`, `/api/blobs/{digest}`, `/api/ps`, `/api/delete`, `/api/version` |
+| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`) |
+| Anthropic | `/v1/messages` |
+| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node` |
+| llama.cpp | `/props`, and the llama.cpp web UI at `/` |
+| Prometheus | `/metrics` (off unless `LLMMAN_METRICS` is `1`, `true`, `yes` or `on`) |
+
+Use it as a drop-in Ollama server:
+
+```
+OLLAMA_HOST=127.0.0.1:17434 ollama run unsloth/Qwen3.5-0.8B-GGUF
+```
+
+Or with any Ollama, OpenAI or Anthropic client. `http://127.0.0.1:17434/`
+in a browser is llama.cpp's web UI.
+
+## Model lifecycle
+
+Models load on demand, each in its own backend subprocess
+(`llama-server`, `vllm` or `mlx_lm.server`; see [backends.md](backends.md))
+on a random loopback port, reused by later requests.
+
+An idle model unloads after `keep_alive` (default 5 minutes, as in
+Ollama; per-request, or daemon-wide via `LLMMAN_KEEP_ALIVE`);
+`llmman ps`/`/api/ps` report each model's `expires_at`.
+`LLMMAN_MAX_LOADED_MODELS` caps how many stay loaded, evicting the
+least-recently-used idle one. `llmman stop <model>` (or `keep_alive: 0`
+on `/api/generate`) unloads immediately.
+
+## Ollama API notes
+
+`/api/chat` supports Ollama's `tools` (function calling, streamed back as
+`message.tool_calls`), `images` (vision, base64, same as Ollama's own wire
+format), and `format` (`"json"` or a JSON Schema object, for constrained
+structured output).
+
+`/api/embed` and `/api/embeddings` work with any GGUF embedding model
+(one with a pooling type, e.g. `embeddinggemma`, `nomic-embed-text`):
+`llama-server` is started with `--embeddings` for it, so `/v1/embeddings`
+works too.
+
+`/api/create` supports `from` (alias a model) and `files` (GGUFs uploaded
+via `/api/blobs/{digest}`, as `ollama create` does). Modelfile fields such
+as `system` or `quantize` are refused with a 400: the GGUF's own chat
+template applies.
+
+## OpenAI API notes
+
+`/v1/responses` implements the OpenAI Responses API (the dialect
+[OpenAI Codex](https://github.com/openai/codex) requires), including
+streaming SSE and function-tool-call re-mapping. This is a plain
+pass-through to `llama-server`'s own native `/v1/responses` support, so a
+recent enough `llama-server` build is required for it to work.
+
+`/v1/audio/transcriptions` is likewise a pass-through. The model needs
+audio support (an `--mmproj` projector, supplied when the model image
+carries one). Bodies up to 200 MiB are accepted.
+
+## llmman's own API
+
+`/llmman/...` is llmman's own API, not a compatibility surface: no
+upstream API has a notion of a [models.dev](https://models.dev) provider
+(see [providers.md](providers.md)). `/llmman/providers` lists the ones
+this daemon can route to, each with its API-key variable, whether the
+daemon has that key, and how many models it serves;
+`/llmman/providers/{id}` adds those models and what each costs in US
+dollars per million tokens (absent, not zero, where models.dev publishes
+no price). `llmman providers`, `list --provider`, `run --provider` and
+`launch --provider` are all clients of it, so the catalog is fetched and
+cached in one process: the one that forwards the request upstream.
+
+`/llmman/node` reports this node's memory and loaded/stored models; it
+is what aggregation peers ask each other. See [aggregation.md](aggregation.md).
+
+## Metrics
+
+`/metrics` is a Prometheus scrape target, off by default because the
+router has no authentication. `LLMMAN_METRICS=1 llmman serve` turns it
+on; the fifteen metric families and how to read them are in
+[metrics.md](metrics.md).
+
+## CORS
+
+Browser clients on `localhost`, `127.0.0.1`, `0.0.0.0` and `[::1]` (any
+scheme, any port) are always allowed. `LLMMAN_ORIGINS` adds more; see
+[configuration.md](configuration.md#environment-variables).

@@ -39,6 +39,10 @@ GPU, loads the model, and execs an agent against it.
   moves a model from HuggingFace straight into your own registry, optionally
   signed, without landing on a laptop first.
   That is the shape air-gapped and compliance-bound environments need.
+- **Pool your machines.** Several `llmman serve` daemons form an
+  [aggregation](#aggregation): name the others, and a request to any of
+  them runs on whichever node has the model loaded or the most room for
+  it. A laptop, a workstation and a Spark look like one endpoint.
 
 | | llmman | Ollama |
 |---|---|---|
@@ -48,6 +52,7 @@ GPU, loads the model, and execs an agent against it.
 | Hosted models | Any provider via `--provider` | Ollama Cloud |
 | Registry-to-registry transfer | `llmman transfer hf.co/... docker.io/...` in one step, no local copy | Pull, write a `Modelfile`, `create`, push to ollama.com |
 | Signing and verification | cosign-format signatures; `verify` command and per-repo pull-time trust policy | None |
+| Multiple machines | Aggregation: daemons pool hardware, any node answers for all | One host per endpoint |
 
 ## Install
 
@@ -85,7 +90,7 @@ above takes `--provider`; see [Hosted providers](#hosted-providers).
 | `launch`  | Launch an integration (Claude Code, OpenCode, …) |
 | `run`     | Run a model interactively or with a one-shot prompt |
 | `pull`    | Pull a model from a registry or HuggingFace |
-| `list`    | List locally stored models, or a hosted provider's (`--provider`) models |
+| `list` (`ls`) | List locally stored models, or a hosted provider's (`--provider`) models |
 | `ps`      | List models currently loaded |
 | `providers` | List the hosted providers `--provider` can route to |
 | `stop`    | Stop (unload) a running model |
@@ -96,13 +101,9 @@ above takes `--provider`; see [Hosted providers](#hosted-providers).
 | `rm`      | Remove a local image |
 | `show`    | Show a local model's architecture, parameters, license, and template |
 | `verify`  | Check a registry model's signatures against trusted public keys |
-| `login`   | Log in to a container registry |
-| `logout`  | Log out from a container registry |
-| `config`  | Read and write `llmman.conf` settings |
-
-See [docs/configuration.md](docs/configuration.md) for `llmman config`,
-environment variables and the model store layout, and
-[docs/verification.md](docs/verification.md) for signature verification.
+| `login`   | Log in to a container registry or HuggingFace |
+| `logout`  | Log out from a container registry or HuggingFace |
+| `config`  | Read and write `llmman.conf` settings (aliases, API keys, trust policy, aggregation peers) |
 
 ## Models are OCI artifacts
 
@@ -148,76 +149,38 @@ See [docs/verification.md](docs/verification.md).
 
 ## Serve
 
-Start the inference server. GGUF models are served by `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp), used from `PATH` if it's already there; otherwise `llmman` downloads and caches a prebuilt release matching your OS/arch/GPU automatically (see `--llama-cpp-version` to pin a specific release). Safetensors models are served by [`vllm`](https://github.com/vllm-project/vllm) (plain `vllm` is CPU-only on macOS, unless you separately install [vllm-metal](https://github.com/vllm-project/vllm-metal) for Metal GPU support), or, on Apple Silicon macOS, by [`mlx-lm`](https://github.com/ml-explore/mlx-lm)'s `mlx_lm.server` instead when it's on `PATH`: Metal-accelerated, with no vLLM dependency at all, and it supports more model families than vllm-metal does.
-
 ```
 llmman serve
 ```
 
-The server listens on `127.0.0.1:17434` by default, overridable via `LLMMAN_HOST`, and exposes:
+One endpoint on `127.0.0.1:17434` that speaks Ollama, OpenAI and Anthropic:
 
 | API | Endpoints |
 |-----|-----------|
-| Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/pull`, `/api/push`, `/api/copy`, `/api/create`, `/api/blobs/{digest}`, `/api/ps`, `/api/delete`, `/api/version` |
-| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens` |
+| Ollama | `/api/chat`, `/api/generate`, `/api/embed`, `/api/tags`, `/api/ps`, `/api/pull`, `/api/push`, `/api/create`, ... |
+| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/audio/transcriptions` |
 | Anthropic | `/v1/messages` |
-| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node` |
-| Prometheus | `/metrics` (off unless `LLMMAN_METRICS` is `1`, `true`, `yes` or `on`) |
 
-`/llmman/...` is llmman's own API, not a compatibility surface: no
-upstream API has a notion of a [models.dev](https://models.dev) provider
-(see [Hosted providers](#hosted-providers)). `/llmman/providers` lists
-the ones this daemon can route to, each with its API-key variable,
-whether the daemon has that key, and how many models it serves;
-`/llmman/providers/{id}` adds those models and what each costs in US
-dollars per million tokens (absent, not zero, where models.dev publishes
-no price). `llmman providers`, `list --provider`, `run --provider` and
-`launch --provider` are all clients of it, so the catalog is fetched and
-cached in one process: the one that forwards the request upstream.
-
-`/metrics` is a Prometheus scrape target, off by default because the
-router has no authentication. `LLMMAN_METRICS=1 llmman serve` turns it
-on; the fifteen metric families and how to read them are in
-[docs/metrics.md](docs/metrics.md).
-
-`/v1/responses` implements the OpenAI Responses API (the dialect [OpenAI
-Codex](https://github.com/openai/codex) requires), including streaming SSE
-and function-tool-call re-mapping. This is a plain pass-through to
-`llama-server`'s own native `/v1/responses` support, so a recent enough
-`llama-server` build is required for it to work.
-
-Use it as an Ollama-compatible server:
+So any existing client works unchanged:
 
 ```
 OLLAMA_HOST=127.0.0.1:17434 ollama run unsloth/Qwen3.5-0.8B-GGUF
 ```
 
-Or with any Ollama, Anthropic or OpenAI-compatible client.
+Models load on demand, each in its own backend process, and unload after
+five idle minutes (`keep_alive`, as in Ollama). GGUF is served by upstream
+[`llama.cpp`](https://github.com/ggml-org/llama.cpp), downloaded to match
+your GPU if no `llama-server` is on `PATH`; safetensors by
+[`vllm`](https://github.com/vllm-project/vllm), or by
+[`mlx-lm`](https://github.com/ml-explore/mlx-lm) on Apple Silicon. Tool
+calling, vision, structured output, embeddings (GGUF) and the Responses
+API (what Codex speaks) all work; there is a web UI at `/` and an
+optional Prometheus `/metrics`.
 
-Models are loaded on demand. Each model gets its own `llama-server` subprocess on a random loopback port; subsequent requests reuse the running process.
-
-`/api/chat` also supports Ollama's `tools` (function calling, streamed back
-as `message.tool_calls`), `images` (vision, base64, same as Ollama's own
-wire format), and `format` (`"json"` or a JSON Schema object, for
-constrained structured output).
-
-`/api/embed` and `/api/embeddings` work with any embedding model (a GGUF
-with a pooling type, e.g. `embeddinggemma`, `nomic-embed-text`): `llama-server`
-is started with `--embeddings` for it, so `/v1/embeddings` works too.
-
-`/api/create` supports `from` (alias a model) and `files` (GGUFs uploaded via
-`/api/blobs/{digest}`, as `ollama create` does). Modelfile fields such as
-`system` or `quantize` are refused with a 400: the GGUF's own chat template
-applies.
-
-An idle, unused model is automatically unloaded after `keep_alive`
-(default 5 minutes, matching Ollama; set per-request, or daemon-wide via
-`LLMMAN_KEEP_ALIVE`), and `llmman ps`/`/api/ps` reports each model's
-`expires_at`.
-
-Daemon-wide settings (bind address, context length, keep-alive, GPU backend
-selection and the rest) are environment variables, set before `llmman serve`
-starts. They're documented in [docs/configuration.md](docs/configuration.md).
+The full endpoint list and per-API notes are in [docs/api.md](docs/api.md);
+backend selection in [docs/backends.md](docs/backends.md); bind address,
+context length, keep-alive and the other daemon settings in
+[docs/configuration.md](docs/configuration.md).
 
 ### Aggregation
 
@@ -233,19 +196,25 @@ LLMMAN_HOST=0.0.0.0 llmman serve
 
 `llmman ps`, `/api/tags` and `/v1/models` then show the whole
 aggregation, and `llmman stop` reaches a model wherever it was loaded.
-See [docs/aggregation.md](docs/aggregation.md).
+Nothing is elected and nothing is shared: every node is a whole llmman
+that knows the others' addresses. See [docs/aggregation.md](docs/aggregation.md).
 
 ## Launch an integration
 
-Point an integration at a model in one step. `llmman launch` starts `serve` in the background if it isn't already running (preloading the requested model), then sets the right environment variables and execs the integration:
+Point an integration at a model in one step. `llmman launch` starts `serve`
+in the background if it isn't already running (preloading a local
+model), then sets the right environment variables and execs the
+integration:
 
 ```
 llmman launch claude --model gemma4
 ```
 
-Run `llmman launch` with no arguments to list the supported integrations (Claude Code, OpenCode, Codex, etc.) and whether each is installed. Any extra arguments after `--` are forwarded to the integration's own CLI.
-
-Short names work wherever a model reference is accepted.
+Run `llmman launch` with no arguments to list the supported integrations
+(Claude Code, OpenCode, Codex, Aider, Qwen Code, Gemini CLI, ...) and
+whether each is installed. Any extra arguments after `--` are forwarded to
+the integration's own CLI. Short names work wherever a model reference is
+accepted.
 
 ### Hosted providers
 
@@ -260,89 +229,25 @@ llmman run --provider openrouter qwen/qwen3-coder   # chat with one directly
 llmman launch opencode --provider openrouter --model qwen/qwen3-coder
 ```
 
-The provider list is fetched at runtime from
-[models.dev](https://models.dev), the same catalog `opencode` resolves
-its own providers from, so a newly added provider works without an
-llmman release. It's cached for 24 hours, and a stale copy is used if the
-fetch fails, so being offline means an out-of-date list rather than a
-broken command.
+The provider list comes from [models.dev](https://models.dev), the same
+catalog `opencode` uses, so a new provider works without an llmman
+release. Requests still go through `llmman serve`; `--provider` changes
+where the daemon forwards them, not who the client talks to, so a local
+and a hosted model are one endpoint and one integration config. The key
+travels per request; it is never written into an integration's config.
 
-All four commands ask the daemon over [`/llmman/providers`](#serve)
-rather than fetching models.dev themselves, so the cache outlives any
-single command and the key status reported is that of the process whose
-key actually gets spent.
+Which integrations support `--provider`, where the key comes from, and
+why it is only ever sent to a loopback daemon are in
+[docs/providers.md](docs/providers.md).
 
-Requests still go through `llmman serve`; `--provider` changes where the
-daemon forwards them, not who the client talks to. So one endpoint and
-one place integrations are configured, whether a model is local or
-hosted, and both usable from the same session.
+## Documentation
 
-The API key comes from the variable models.dev names for that provider,
-or — when that is unset — from `~/.config/llmman/llmman.conf`, keyed by
-provider id:
-
-```toml
-[providers.openrouter]
-api_key = "sk-or-..."
-```
-
-Either way it travels per request; llmman itself never writes a key
-anywhere. A file carrying one must be `chmod 600` or the keys in it are
-ignored with a warning, and an `export` still overrides it. See
-[docs/configuration.md](docs/configuration.md#provider-api-keys).
-
-`hermes` is the exception: llmman configures it through a file on disk,
-so it can't carry a key and `llmman serve` needs one of its own instead.
-That fallback is only used for a daemon bound to loopback, and never for a
-browser request from another site. It bounds the blast radius rather
-than authenticating anyone, so on a shared machine prefer an integration
-that sends its own key. `cline`, `kimi`, `copilot` and `openclaw` can't be
-used with `--provider` at all: the first two pick their own model rather
-than taking llmman's, `copilot` has no way to send a key, and `openclaw`
-only takes a model during first-run onboarding.
-
-`--provider` needs a local `llmman serve`. The daemon talks plain HTTP
-and has no authentication, so neither `run` nor `launch` will send a real
-key to a remote `LLMMAN_HOST`, and a daemon bound to anything but
-loopback will not spend its own key on behalf of a caller
-that didn't present one. (`llmman providers` and `llmman list
---provider` read the catalog only, no key involved, and work against any
-daemon.)
-
-## Use with vLLM directly
-
-`llmman serve` already spawns `vllm` itself as a backend for safetensors
-models. The [`vllm-llmman`](https://pypi.org/project/vllm-llmman/) plugin
-is the inverse: install it alongside `vllm` and `vllm serve
-oci://<reference>` pulls a CNCF ModelPack image directly, instead of a
-HuggingFace repo.
-
-## MLX (Apple Silicon)
-
-On Apple Silicon macOS, `llmman serve` uses
-[`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) instead of `vllm`
-for safetensors models whenever it's on `PATH`, Metal-accelerated, with
-no vLLM dependency at all (unlike getting the same acceleration out of
-`vllm serve` itself via [vllm-metal](https://github.com/vllm-project/vllm-metal)).
-Falls back to `vllm` otherwise. Doesn't support `/v1/embeddings`.
-
-## Transport backends
-
-The registry transport is a compiled-in Go shim. Two backends are available via Cargo feature flags.
-
-### Docker (default)
-
-Uses [`github.com/containerd/containerd`](https://github.com/containerd/containerd), the same OCI resolver used by Docker.
-
-```
-cargo build --release
-```
-
-### Podman
-
-Uses [`github.com/podman-container-tools/container-libs`](https://github.com/podman-container-tools/container-libs), the same library Podman uses internally.
-
-```
-cargo build --release --no-default-features --features podman
-```
-
+| | |
+|---|---|
+| [docs/api.md](docs/api.md) | Every HTTP endpoint, and per-API notes |
+| [docs/aggregation.md](docs/aggregation.md) | Pooling several machines into one endpoint |
+| [docs/backends.md](docs/backends.md) | llama.cpp, vLLM, MLX, containers, and building from source |
+| [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, environment variables, store layout |
+| [docs/providers.md](docs/providers.md) | Hosted providers, API keys, and which integrations can use them |
+| [docs/verification.md](docs/verification.md) | Signing models and pull-time trust policy |
+| [docs/metrics.md](docs/metrics.md) | The Prometheus `/metrics` families |

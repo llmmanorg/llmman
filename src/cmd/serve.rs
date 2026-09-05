@@ -51,11 +51,12 @@ Environment Variables:
       LLMMAN_MAX_LOADED_MODELS       Maximum number of loaded models (default: unbounded)
       LLMMAN_MAX_TRANSFER_STREAMS    Maximum parallel transfer streams for safetensors model pulls (default 4)
       LLMMAN_MAX_QUEUE               Maximum number of queued requests (default 512)
+      LLMMAN_METRICS                 Serve a Prometheus scrape endpoint at /metrics (default: off)
       LLMMAN_MODELS                  The path to the models directory
       LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only)
       LLMMAN_NOPRUNE                 Do not prune model blobs on startup
       LLMMAN_ORIGINS                 A comma separated list of allowed CORS origins
-      LLMMAN_PEERS                   A comma separated list of peer daemons ([host][:port]) to pool hardware with (overrides [aggregation] in llmman.conf)
+      LLMMAN_PEERS                   A comma separated list of peer daemons ([scheme://]host[:port]) to pool hardware with (overrides [aggregation] in llmman.conf)
       LLMMAN_SCHED_SPREAD            Always schedule model across all GPUs
       LLMMAN_FLASH_ATTENTION         Enable flash attention
       LLMMAN_KV_CACHE_TYPE           Quantization type for the K/V cache (default: f16)

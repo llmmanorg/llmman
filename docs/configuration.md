@@ -10,11 +10,11 @@ Default locations:
 | Windows | `%LOCALAPPDATA%\llmman\store` |
 
 Set `LLMMAN_MODELS` to change this (matching Ollama's `OLLAMA_MODELS`).
-Commands that read or write the local store directly (`list`, `rm`,
-`build`, `serve`) all honor it. Commands that go through the background
-daemon instead (`pull`, `push`, `run`, `launch`, `ps`) always use whichever
-store the daemon was started with; set `LLMMAN_MODELS` before
-`llmman serve` to change it for all of them. `transfer`, `login`, and
+Commands that read or write the local store directly (`list`, `rm`, `cp`,
+`show`, `build`, `serve`) all honor it. Commands that go through the
+background daemon instead (`pull`, `push`, `run`, `launch`, `ps`, `stop`)
+always use whichever store the daemon was started with; set `LLMMAN_MODELS`
+before `llmman serve` to change it for all of them. `transfer`, `login`, and
 `logout` never touch a local store at all.
 
 The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), readable by `docker` and `podman`.
@@ -100,6 +100,7 @@ so `verify.trust[0]` names one entry per file and `--show-origin` is what
 tells them apart. `set`, `unset` and `edit`
 write the per-user file; pass `--system` for `/etc/llmman/llmman.conf`
 (which generally needs root) or `--file <path>` for any other one.
+`--user` restricts `list` and `get` to the per-user file alone.
 
 Two things it does that an editor cannot. Every write is checked against
 the format before the file is replaced, so `api_kye` is an error on the
@@ -114,8 +115,8 @@ output ends up in a bug report. `get` prints it in full.
 
 ### Provider API keys
 
-`--provider` reaches a hosted model with a key llmman never generates and
-never writes. It takes one from the variable models.dev names for that
+`--provider` reaches a hosted model with a key llmman never generates
+and never writes into an integration's config. It takes one from the variable models.dev names for that
 provider, or — when that is unset — from `[providers.<id>]`. Entries are
 keyed by the provider id `llmman providers` prints, not by the variable,
 which is models.dev's naming rather than llmman's.
@@ -163,7 +164,8 @@ and the limitations.
 
 `[aggregation]` names the other `llmman serve` daemons this one pools
 hardware with, comma-separated and spelled like `LLMMAN_HOST`
-(`[scheme://]host[:port]`, port defaulting to `17434`). `LLMMAN_PEERS`
+(`[scheme://]host[:port]`, port defaulting to `17434`, or 80/443 with an
+explicit scheme). `LLMMAN_PEERS`
 overrides it for one daemon; a user file's value replaces `/etc`'s
 rather than merging with it, and `peers = ""` opts out. See
 [aggregation.md](aggregation.md).
@@ -188,19 +190,19 @@ setting may not behave identically.
 | `LLMMAN_MODELS` | Local store directory, overriding the default above. `pull`/`push`/`run`/etc. go through the daemon and always use whichever store it was started with. |
 | `LLMMAN_NUM_PARALLEL` | Number of parallel request slots (`--parallel`) for GGUF models (llama-server only; no vllm/mlx equivalent). `--ctx-size` is scaled up by this value first, so each slot still gets the full configured/default context rather than an even split of it; ignored (with a warning) for a load with no explicit context size to scale. Unset leaves llama-server's own default of 1 untouched. |
 | `LLMMAN_PEERS` | Comma-separated peer daemons (`[scheme://]host[:port]`) to pool hardware with, overriding `[aggregation]` in `llmman.conf`. Set but empty takes this daemon out of its aggregation. See [aggregation.md](aggregation.md). |
-| `LLMMAN_ORIGINS` | A comma-separated list of extra allowed CORS origins for the HTTP API. A trailing `:*` on an entry matches any port on that scheme+host. Always includes every scheme/port on `localhost`/`127.0.0.1`/`0.0.0.0`/`[::1]` regardless of this variable. |
+| `LLMMAN_ORIGINS` | A comma-separated list of extra allowed CORS origins for the HTTP API. A single `*` anywhere in an entry matches any substring (`http://host:*` for any port, `https://*.example.com` for any subdomain, a bare `*` for everything), same as Ollama. Always includes every scheme/port on `localhost`/`127.0.0.1`/`0.0.0.0`/`[::1]` regardless of this variable. |
 | `LLMMAN_SCHED_SPREAD` | Truthy forwards `--split-mode layer` (spread a model across every GPU, already llama-server's own default); falsey forwards `--split-mode none` (restrict to one GPU). |
 | `LLMMAN_FLASH_ATTENTION` | Flash Attention mode (`--flash-attn`): `on`, `off`, or `auto` (llama-server's own default). Also accepts `1`/`0`/`true`/`false`. |
 | `LLMMAN_KV_CACHE_TYPE` | KV-cache quantization (`--cache-type-k`/`--cache-type-v`), e.g. `f16` (default), `q8_0`, `q4_0`. Trades output quality for memory at long context lengths. |
-| `LLMMAN_LLM_LIBRARY` | Forces which GPU backend `llmman serve`/`run` picks (`cpu`, `cuda`/`cuda12`, `cuda13`, `rocm`, `vulkan`, or macOS-only `metal`), bypassing autodetection. Has no effect when a `llama-server` binary is already on `PATH` (its own backend is fixed), or on macOS's local-binary download (one asset per architecture, no separate choice to make). |
+| `LLMMAN_LLM_LIBRARY` | Forces which GPU backend `llmman serve`/`run` picks (`cpu`, `cuda`/`cuda12`/`cuda_v12`, `cuda13`/`cuda_v13`, `rocm`, `vulkan`, or macOS-only `metal`), bypassing autodetection. Has no effect when a `llama-server` binary is already on `PATH` (its own backend is fixed), or on macOS's local-binary download (one asset per architecture, no separate choice to make). |
 | `LLMMAN_GPU_OVERHEAD` | Bytes of VRAM to hold back from the VRAM-tiered `LLMMAN_CONTEXT_LENGTH` default, leaving headroom for whatever else shares the device. Applied as one combined-total subtraction rather than per-GPU (llmman only ever probes one combined VRAM total). |
 | `LLMMAN_IGPU_ENABLE` | Counts integrated GPUs (Vulkan only) when probing for an accelerator. Defaults to disabled, since an integrated GPU is usually a worse choice than the discrete/CPU fallback it would otherwise be skipped in favor of. |
 | `LLMMAN_LOAD_TIMEOUT` | How long to allow a model load to stall before giving up. Zero or negative means wait forever. Defaults to 10 minutes (`vllm` can take several minutes to load a large safetensors model). |
 | `LLMMAN_TMPDIR` | Staging directory for `llama-server` release downloads, overriding the default `tmp` subdirectory of the install root. |
 | `LLMMAN_VERIFY` | Overrides the signature-verification mode (`off`, `warn`, or `enforce`) for every reference, ignoring what `[verify]` selected. Does *not* supply trusted keys — those still come from `llmman.conf`, so `enforce` with no configured keys fails every check rather than passing them. Intended for CI, which can demand `enforce` without editing config files. See [verification.md](verification.md). |
-| `LLMMAN_SIGN_PASSWORD` | Passphrase for the `--sign-key` private key used by `push`/`transfer`, when it is an encrypted PEM. Falls back to `COSIGN_PASSWORD`. Read from the client's environment and forwarded to the daemon, since the daemon's own environment is generally not the shell you set it in. |
+| `LLMMAN_SIGN_PASSWORD` | Passphrase for the `--sign-key` private key used by `push`/`transfer`, when it is an encrypted PEM. Falls back to `COSIGN_PASSWORD`. Read by the CLI process, which does the signing itself; neither key nor passphrase reaches the daemon. |
 | `LLMMAN_NOPRUNE` | When set (to anything other than `0`/`false`/`no`/`off`), skips the garbage-collection sweep that `llmman rm` and `llmman serve` startup otherwise run to delete blobs and extracted-cache entries no longer referenced by any local model. Note this is broader than skipping the daemon-startup catch-all: it also stops `llmman rm` itself from ever freeing disk space, so a removed model's (possibly multi-GB) weights stay on disk until a later sweep runs without this set. Useful for a shared/read-mostly store, or scripts that `rm` in a loop and prune once at the end. |
-| `LLAMA_ARG_FIT` / `LLAMA_ARG_FIT_TARGET` | llama.cpp's own env-configurable `--fit`/`--fit-target` options. Not something llmman parses itself, just forwarded through to every `llama-server` (local or `--ociman` container) it spawns, same as `CUDA_VISIBLE_DEVICES`/etc. below. |
+| `LLAMA_ARG_FIT` / `LLAMA_ARG_FIT_TARGET` / `LLAMA_ARG_THREADS` | llama.cpp's own env-configurable `--fit`/`--fit-target`/`--threads` options. Not something llmman parses itself, just forwarded through to every `llama-server` (local or `--ociman` container) it spawns, same as `CUDA_VISIBLE_DEVICES`/etc. below. |
 
 ### Context length by backend
 
