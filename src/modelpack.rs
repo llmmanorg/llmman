@@ -355,13 +355,14 @@ mod tests {
     }
 
     fn descriptor(digest: &str, filepath: &str) -> crate::storage::oci::Descriptor {
-        let mut ann = std::collections::HashMap::new();
+        let mut ann = std::collections::BTreeMap::new();
         ann.insert("org.cncf.model.filepath".to_string(), filepath.to_string());
         crate::storage::oci::Descriptor {
             media_type: "application/vnd.cncf.model.weight.v1.tar".into(),
             digest: digest.to_string(),
             size: 123,
             annotations: Some(ann),
+            ..Default::default()
         }
     }
 

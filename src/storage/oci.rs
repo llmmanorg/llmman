@@ -22,6 +22,7 @@
 //!                          manifest's own raw JSON bytes
 //! ```
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -37,62 +38,103 @@ static WRITE_REF_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Minimal OCI spec types (no external crate needed)
+//
+// The single shared definition of the OCI image-spec shapes this
+// codebase reads and writes — `crate::hf::oci` re-exports these rather
+// than keeping its own copy, so the pull path and the local store path
+// can never drift apart.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Matches `ocispec.Descriptor`'s JSON shape exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Descriptor {
+    #[serde(rename = "mediaType")]
     pub media_type: String,
     pub digest: String,
-    pub size: u64,
+    pub size: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<std::collections::HashMap<String, String>>,
+    pub urls: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<BTreeMap<String, String>>,
+    #[serde(
+        rename = "artifactType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub artifact_type: Option<String>,
 }
 
+impl Descriptor {
+    pub fn annotation(&self, key: &str) -> Option<&str> {
+        self.annotations.as_ref()?.get(key).map(String::as_str)
+    }
+}
+
+/// Matches `ocispec.Manifest`'s JSON shape exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Manifest {
-    pub schema_version: u32,
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: i32,
+    #[serde(rename = "mediaType")]
     pub media_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "artifactType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub artifact_type: Option<String>,
     pub config: Descriptor,
     pub layers: Vec<Descriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<std::collections::HashMap<String, String>>,
+    pub annotations: Option<BTreeMap<String, String>>,
 }
 
 /// `application/vnd.cncf.model.config.v1+json` — the CNCF Model Format Spec
-/// (<https://github.com/modelpack/model-spec>) config document. The
-/// deserializing counterpart of what `crate::hf::oci::build_cncf_manifest`
-/// writes for HuggingFace/cloud-source pulls; this is the equivalent for
-/// `llmman build`'s local-directory packaging path.
+/// (<https://github.com/modelpack/model-spec>) config document. Written by
+/// both `crate::hf::oci::build_cncf_manifest` (HuggingFace/cloud-source
+/// pulls) and `OciStore::build`'s local-directory packaging path.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
 pub struct CncfConfigDescriptor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub licenses: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct CncfConfigConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub format: Option<String>,
+pub struct CncfCapabilities {
+    #[serde(rename = "inputTypes", default, skip_serializing_if = "Vec::is_empty")]
+    pub input_types: Vec<String>,
+    #[serde(rename = "outputTypes", default, skip_serializing_if = "Vec::is_empty")]
+    pub output_types: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CncfConfigConfig {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<CncfCapabilities>,
+}
+
+fn is_default_cncf_config(c: &CncfConfigConfig) -> bool {
+    c.format.is_empty() && c.capabilities.is_none()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CncfModelFs {
     #[serde(rename = "type")]
     pub fs_type: String,
     pub diff_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CncfModelConfig {
+    #[serde(default)]
     pub descriptor: CncfConfigDescriptor,
+    #[serde(default, skip_serializing_if = "is_default_cncf_config")]
     pub config: CncfConfigConfig,
+    #[serde(default)]
     pub modelfs: CncfModelFs,
 }
 
@@ -245,8 +287,8 @@ impl OciStore {
         Ok(Descriptor {
             media_type: media_type.into(),
             digest,
-            size: data.len() as u64,
-            annotations: None,
+            size: data.len() as i64,
+            ..Default::default()
         })
     }
 
@@ -291,8 +333,8 @@ impl OciStore {
         Ok(Descriptor {
             media_type: media_type.into(),
             digest,
-            size,
-            annotations: None,
+            size: size as i64,
+            ..Default::default()
         })
     }
 
@@ -369,8 +411,8 @@ impl OciStore {
     /// error over what's only ever used for display.
     pub fn total_size(&self, desc: &Descriptor) -> u64 {
         self.read_manifest(&desc.digest)
-            .map(|manifest| manifest.layers.iter().map(|l| l.size).sum())
-            .unwrap_or(desc.size)
+            .map(|manifest| manifest.layers.iter().map(|l| l.size).sum::<i64>() as u64)
+            .unwrap_or(desc.size as u64)
     }
 
     // ------------------------------------------------------------------
@@ -506,7 +548,7 @@ impl OciStore {
             let tar_data = make_single_file_tar(entry.path(), &rel)?;
             let mut desc = self.write_blob(media_type, &tar_data)?;
             desc.annotations = Some({
-                let mut m = std::collections::HashMap::new();
+                let mut m = BTreeMap::new();
                 m.insert("org.cncf.model.filepath".into(), rel.clone());
                 m.insert("org.opencontainers.image.title".into(), rel);
                 m
@@ -524,9 +566,11 @@ impl OciStore {
         let cncf_config = CncfModelConfig {
             descriptor: CncfConfigDescriptor {
                 created_at: Some(chrono::Utc::now().to_rfc3339()),
+                ..Default::default()
             },
             config: CncfConfigConfig {
-                format: format.map(str::to_string),
+                format: format.unwrap_or_default().to_string(),
+                ..Default::default()
             },
             modelfs: CncfModelFs {
                 fs_type: "layers".into(),
@@ -542,7 +586,7 @@ impl OciStore {
         let manifest_annotations = if labels.is_empty() {
             None
         } else {
-            Some(labels.clone())
+            Some(labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
         };
 
         // Manifest
@@ -746,7 +790,7 @@ fn stored_ref_name(desc: &Descriptor) -> Option<&str> {
 /// empty, "." or ".." segment (e.g. an empty tag from "repo:") becomes
 /// "__" instead, since any of those would otherwise produce a malformed
 /// or unintended path — see `sanitize_ref_segment`.
-fn ref_path_segments(reference: &str) -> Vec<String> {
+pub(crate) fn ref_path_segments(reference: &str) -> Vec<String> {
     let tagged = default_tag(reference);
     let (name, tag): (&str, &str) = match tagged.rfind(':') {
         Some(pos) if pos > tagged.rfind('/').unwrap_or(0) => (&tagged[..pos], &tagged[pos + 1..]),
@@ -766,7 +810,7 @@ fn ref_path_segments(reference: &str) -> Vec<String> {
 /// `://`) becomes `_`, and a segment that's exactly `..` is neutralized,
 /// so no reference can ever escape the `manifests/` tree it's rooted
 /// under.
-fn sanitize_ref_segment(s: &str) -> String {
+pub(crate) fn sanitize_ref_segment(s: &str) -> String {
     if s.is_empty() || s == "." || s == ".." {
         return "__".to_string();
     }
@@ -891,7 +935,7 @@ mod tests {
     use super::*;
 
     fn desc_with_ref(ref_name: &str) -> Descriptor {
-        let mut ann = std::collections::HashMap::new();
+        let mut ann = BTreeMap::new();
         ann.insert(
             "org.opencontainers.image.ref.name".to_string(),
             ref_name.to_string(),
@@ -901,6 +945,7 @@ mod tests {
             digest: "sha256:deadbeef".into(),
             size: 123,
             annotations: Some(ann),
+            ..Default::default()
         }
     }
 
@@ -1149,6 +1194,7 @@ mod tests {
             digest: "sha256:deadbeef".into(),
             size: 123,
             annotations: None,
+            ..Default::default()
         };
         assert!(!ref_matches_precise(&d, "docker.io/ai/qwen3.5:0.8b"));
     }

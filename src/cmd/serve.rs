@@ -8147,6 +8147,7 @@ mod tests {
             digest: "sha256:a1b2".into(),
             size: 0,
             annotations: None,
+            ..Default::default()
         };
         OciStore::open(&dir)
             .unwrap()
@@ -10000,6 +10001,7 @@ mod tests {
             digest: "sha256:a1b2".into(),
             size: 0,
             annotations: None,
+            ..Default::default()
         };
         OciStore::open(&dir)
             .unwrap()
@@ -10105,6 +10107,7 @@ mod tests {
             digest: digest.into(),
             size: 0,
             annotations: None,
+            ..Default::default()
         };
         let store = OciStore::open(&dir).unwrap();
         store
@@ -10181,6 +10184,7 @@ mod tests {
             digest: "sha256:0000".into(),
             size: 0,
             annotations: None,
+            ..Default::default()
         };
         OciStore::open(&dir)
             .unwrap()
@@ -10247,6 +10251,7 @@ mod tests {
             digest: digest.into(),
             size: 0,
             annotations: None,
+            ..Default::default()
         };
         store
             .tag(desc("sha256:aaaa"), "docker.io/ai/m-key:v9")
@@ -10304,6 +10309,7 @@ mod tests {
             digest: "sha256:d16e".into(),
             size: 0,
             annotations: None,
+            ..Default::default()
         };
         OciStore::open(&dir)
             .unwrap()
@@ -10366,6 +10372,7 @@ mod tests {
             digest: "sha256:0000".into(),
             size: 0,
             annotations: None,
+            ..Default::default()
         };
         OciStore::open(&dir)
             .unwrap()

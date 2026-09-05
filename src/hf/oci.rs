@@ -1,4 +1,4 @@
-//! Local OCI layout types and read/write helpers — a Rust equivalent of
+//! Local OCI layout read/write helpers — a Rust equivalent of
 //! go-shim/shared_oci.go's blob helpers and manifest_ref.go, plus the
 //! CNCF ModelPack manifest construction the Go shim's own (since
 //! deleted) `buildCNCFManifest` used to do.
@@ -9,6 +9,11 @@
 //! pointer files, `oci-layout`) — a from-scratch equivalent, not a
 //! replacement, so a native pull never needs to call into Go.
 //!
+//! The OCI image-spec types themselves (`Descriptor`, `Manifest`, and the
+//! CNCF model-spec config document) are defined once in
+//! `crate::storage::oci` and re-exported here, so the pull path and the
+//! local store path share one definition.
+//!
 //! Shared with `crate::sources`, which stores the ModelScope/NGC/S3/GCS/
 //! local-directory sources in exactly this format too.
 
@@ -17,66 +22,26 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-// ---------------------------------------------------------------------------
-// OCI image-spec types — just enough of the public spec to round-trip
-// what this codebase actually produces/reads (mirrors
-// opencontainers/image-spec's Go structs field-for-field).
-// ---------------------------------------------------------------------------
+use crate::storage::oci::{
+    ref_path_segments, CncfCapabilities, CncfConfigConfig, CncfConfigDescriptor, CncfModelConfig,
+    CncfModelFs,
+};
 
 pub const MEDIA_TYPE_IMAGE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 pub const ANNOTATION_REF_NAME: &str = "org.opencontainers.image.ref.name";
 pub const ANNOTATION_TITLE: &str = "org.opencontainers.image.title";
 
-/// Matches `ocispec.Descriptor`'s JSON shape exactly.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Descriptor {
-    #[serde(rename = "mediaType")]
-    pub media_type: String,
-    pub digest: String,
-    pub size: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub urls: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<BTreeMap<String, String>>,
-    #[serde(
-        rename = "artifactType",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub artifact_type: Option<String>,
-}
-
-impl Descriptor {
-    pub fn annotation(&self, key: &str) -> Option<&str> {
-        self.annotations.as_ref()?.get(key).map(String::as_str)
-    }
-}
-
-/// Matches `ocispec.Manifest`'s JSON shape exactly.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Manifest {
-    #[serde(rename = "schemaVersion")]
-    pub schema_version: i32,
-    #[serde(rename = "mediaType")]
-    pub media_type: String,
-    #[serde(
-        rename = "artifactType",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub artifact_type: Option<String>,
-    pub config: Descriptor,
-    pub layers: Vec<Descriptor>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<BTreeMap<String, String>>,
-}
+/// The single shared OCI image-spec types, defined in
+/// `crate::storage::oci` — re-exported so `crate::hf` and
+/// `crate::sources` keep their existing import paths.
+pub use crate::storage::oci::{Descriptor, Manifest};
 
 // ---------------------------------------------------------------------------
-// CNCF ModelPack config (github.com/modelpack/model-spec) — just the
-// fields buildCNCFManifest actually populates.
+// CNCF ModelPack config (github.com/modelpack/model-spec) — built on the
+// shared `Cncf*` types in `crate::storage::oci`, which `OciStore::build`
+// serializes with too.
 // ---------------------------------------------------------------------------
 
 pub const ARTIFACT_TYPE_MODEL_MANIFEST: &str = "application/vnd.cncf.model.manifest.v1+json";
@@ -90,49 +55,6 @@ pub const MEDIA_TYPE_MODEL_DOC_RAW: &str = "application/vnd.cncf.model.doc.v1.ra
 /// aren't among the ones `select_downloadable_hf_files` fetches.
 pub const MEDIA_TYPE_MODEL_CODE_RAW: &str = "application/vnd.cncf.model.code.v1.raw";
 pub const ANNOTATION_FILEPATH: &str = "org.cncf.model.filepath";
-
-#[derive(Serialize, Default)]
-struct ModelDescriptor {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    licenses: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct ModelFS {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(rename = "diffIds")]
-    diff_ids: Vec<String>,
-}
-
-#[derive(Serialize, Default)]
-struct ModelCapabilities {
-    #[serde(rename = "inputTypes", default, skip_serializing_if = "Vec::is_empty")]
-    input_types: Vec<&'static str>,
-    #[serde(rename = "outputTypes", default, skip_serializing_if = "Vec::is_empty")]
-    output_types: Vec<&'static str>,
-}
-
-#[derive(Serialize, Default)]
-struct ModelConfig {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    format: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    capabilities: Option<ModelCapabilities>,
-}
-
-#[derive(Serialize)]
-struct Model {
-    #[serde(rename = "descriptor")]
-    descriptor: ModelDescriptor,
-    modelfs: ModelFS,
-    #[serde(default, skip_serializing_if = "is_default_config")]
-    config: ModelConfig,
-}
-
-fn is_default_config(c: &ModelConfig) -> bool {
-    c.format.is_empty() && c.capabilities.is_none()
-}
 
 /// Mirrors `modelMeta` in hf.go: the optional-but-valuable metadata
 /// `build_cncf_manifest` populates beyond the bare config.format+modelfs.
@@ -155,20 +77,21 @@ pub fn build_cncf_manifest(
     filepath_annotation: &str,
     layers: Vec<Descriptor>,
 ) -> Result<Descriptor> {
-    let model = Model {
-        descriptor: ModelDescriptor {
+    let model = CncfModelConfig {
+        descriptor: CncfConfigDescriptor {
+            created_at: None,
             licenses: meta.licenses.clone(),
         },
-        modelfs: ModelFS {
-            kind: "layers".to_string(),
-            diff_ids: layers.iter().map(|l| l.digest.clone()).collect(),
-        },
-        config: ModelConfig {
+        config: CncfConfigConfig {
             format: meta.format.clone(),
-            capabilities: meta.vision.then(|| ModelCapabilities {
-                input_types: vec!["text", "image"],
-                output_types: vec!["text"],
+            capabilities: meta.vision.then(|| CncfCapabilities {
+                input_types: vec!["text".to_string(), "image".to_string()],
+                output_types: vec!["text".to_string()],
             }),
+        },
+        modelfs: CncfModelFs {
+            fs_type: "layers".to_string(),
+            diff_ids: layers.iter().map(|l| l.digest.clone()).collect(),
         },
     };
     let cfg_data = serde_json::to_vec(&model).context("marshal CNCF model config")?;
@@ -351,38 +274,10 @@ impl std::io::Write for HashingWriter<'_> {
 
 const MANIFESTS_DIR_NAME: &str = "manifests";
 
-fn sanitize_ref_segment(s: &str) -> String {
-    if s.is_empty() || s == "." || s == ".." {
-        return "__".to_string();
-    }
-    s.replace([':', '\\'], "_")
-}
-
-/// Splits `reference` into the path segments used to lay it out under
-/// `manifests/` — mirrors `refPathSegments`. A `:` only starts a tag if
-/// it comes after the last `/` (so a registry port, e.g.
-/// "host:5000/owner/repo", isn't mistaken for one); otherwise the tag
-/// defaults to "latest".
-fn ref_path_segments(reference: &str) -> Vec<String> {
-    let last_colon = reference.rfind(':').map(|i| i as isize).unwrap_or(-1);
-    let last_slash = reference.rfind('/').map(|i| i as isize).unwrap_or(-1);
-    let (name, tag) = if last_colon > last_slash {
-        (
-            &reference[..last_colon as usize],
-            &reference[last_colon as usize + 1..],
-        )
-    } else {
-        (reference, "latest")
-    };
-    let mut segs: Vec<String> = name
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(sanitize_ref_segment)
-        .collect();
-    segs.push(sanitize_ref_segment(tag));
-    segs
-}
-
+/// The `manifests/` path for `reference` — the segment layout comes from
+/// `crate::storage::oci::ref_path_segments`, the one shared with the local
+/// store, so a reference always lands at the same file whichever path
+/// wrote it.
 fn manifest_ref_path(layout_dir: &Path, reference: &str) -> PathBuf {
     let mut p = layout_dir.join(MANIFESTS_DIR_NAME);
     for seg in ref_path_segments(reference) {
