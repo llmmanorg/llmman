@@ -182,6 +182,67 @@ fn extract_gguf_layer(
     Err(anyhow!("no .gguf in tar layer {}", layer.digest))
 }
 
+/// Ollama's `model.Capability` values reported in `/api/show`'s
+/// `capabilities` array (`ollama run` reads them to set `opts.MultiModal`).
+pub const CAPABILITY_COMPLETION: &str = "completion";
+pub const CAPABILITY_VISION: &str = "vision";
+
+/// The part of ollama's `Model.Capabilities()` (server/images.go) a
+/// manifest alone can answer, without extracting or opening a GGUF:
+/// `"completion"` always, plus `"vision"` when a companion mmproj layer
+/// is present (`projectorCapabilities`) or the CNCF config's
+/// `config.capabilities.inputTypes` lists `"image"` (`configCapabilities`).
+pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) -> Vec<String> {
+    let mut caps = vec![CAPABILITY_COMPLETION.to_string()];
+
+    let has_mmproj = gguf_layers(manifest).is_some_and(|(_, mmproj)| mmproj.is_some());
+
+    // Shape written by crate::hf::oci::build_cncf_manifest.
+    let config_says_image = store
+        .read_blob(&manifest.config.digest)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| {
+            v.get("config")?
+                .get("capabilities")?
+                .get("inputTypes")?
+                .as_array()
+                .map(|a| a.iter().any(|t| t.as_str() == Some("image")))
+        })
+        .unwrap_or(false);
+
+    if has_mmproj || config_says_image {
+        caps.push(CAPABILITY_VISION.to_string());
+    }
+    caps
+}
+
+/// The manifest's primary GGUF layer and its companion mmproj layer, if
+/// any. Prefers a non-mmproj-named layer as primary so an mmproj file
+/// that sorts first isn't taken for the model; falls back to the first
+/// layer if every one looks like mmproj.
+fn gguf_layers(
+    manifest: &crate::storage::oci::Manifest,
+) -> Option<(
+    &crate::storage::oci::Descriptor,
+    Option<&crate::storage::oci::Descriptor>,
+)> {
+    let layers: Vec<&crate::storage::oci::Descriptor> = manifest
+        .layers
+        .iter()
+        .filter(|l| is_gguf_layer(l))
+        .collect();
+    let primary = *layers
+        .iter()
+        .find(|l| !is_mmproj_layer(l))
+        .or(layers.first())?;
+    let mmproj = layers
+        .iter()
+        .copied()
+        .find(|l| is_mmproj_layer(l) && l.digest != primary.digest);
+    Some((primary, mmproj))
+}
+
 /// Resolve `model_ref` (already present in the `OciStore` at `store_path`)
 /// to either a `.gguf` file or an extracted safetensors directory, caching
 /// any extraction under `cache_path`.
@@ -197,25 +258,7 @@ pub fn resolve_model(
     let manifest = store.read_manifest(&desc.digest)?;
 
     // ── GGUF → llama-server ────────────────────────────────────────────────
-    let gguf_layers: Vec<&crate::storage::oci::Descriptor> = manifest
-        .layers
-        .iter()
-        .filter(|l| is_gguf_layer(l))
-        .collect();
-    if !gguf_layers.is_empty() {
-        // Prefer a non-mmproj-named layer as the primary model, so an
-        // mmproj file that happens to sort first (e.g. "mmproj-F16.gguf"
-        // before "model-Q4_K_M.gguf") isn't picked as the model itself.
-        // Falls back to the first layer if every one looks like mmproj.
-        let primary = *gguf_layers
-            .iter()
-            .find(|l| !is_mmproj_layer(l))
-            .unwrap_or(&gguf_layers[0]);
-        let mmproj = gguf_layers
-            .iter()
-            .copied()
-            .find(|l| is_mmproj_layer(l) && l.digest != primary.digest);
-
+    if let Some((primary, mmproj)) = gguf_layers(&manifest) {
         let primary_path = extract_gguf_layer(&store, store_path, cache_path, primary)?;
         let mmproj_path = mmproj
             .map(|l| extract_gguf_layer(&store, store_path, cache_path, l))
@@ -376,6 +419,89 @@ mod tests {
             "sha256:c",
             "model.Q4_K_M.gguf"
         )));
+    }
+
+    fn manifest_with(
+        layers: Vec<crate::storage::oci::Descriptor>,
+    ) -> (OciStore, crate::storage::oci::Manifest) {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-modelpack-caps-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = OciStore::open(&dir).unwrap();
+        let config = store
+            .write_blob("application/vnd.cncf.model.config.v1+json", b"{}")
+            .unwrap();
+        let manifest = crate::storage::oci::Manifest {
+            schema_version: 2,
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            artifact_type: None,
+            config,
+            layers,
+            annotations: None,
+        };
+        (store, manifest)
+    }
+
+    #[test]
+    fn capabilities_is_completion_only_without_a_projector() {
+        let (store, m) = manifest_with(vec![descriptor("sha256:a", "model.Q4_K_M.gguf")]);
+        assert_eq!(capabilities(&store, &m), vec!["completion"]);
+    }
+
+    #[test]
+    fn capabilities_adds_vision_when_a_companion_mmproj_layer_is_present() {
+        // Mirrors ollama's projectorCapabilities: any projector ⇒ vision.
+        let (store, m) = manifest_with(vec![
+            descriptor("sha256:a", "mmproj-F16.gguf"),
+            descriptor("sha256:b", "model.Q4_K_M.gguf"),
+        ]);
+        assert_eq!(capabilities(&store, &m), vec!["completion", "vision"]);
+    }
+
+    #[test]
+    fn capabilities_a_lone_mmproj_named_gguf_is_the_model_not_a_projector() {
+        let (store, m) = manifest_with(vec![descriptor("sha256:a", "mmproj-only.gguf")]);
+        assert_eq!(capabilities(&store, &m), vec!["completion"]);
+    }
+
+    #[test]
+    fn capabilities_two_mmproj_named_ggufs_load_with_a_projector_so_report_vision() {
+        // resolve_model's fallback: first is primary, second is its mmproj.
+        let (store, m) = manifest_with(vec![
+            descriptor("sha256:a", "mmproj-model.gguf"),
+            descriptor("sha256:b", "mmproj-F16.gguf"),
+        ]);
+        assert_eq!(capabilities(&store, &m), vec!["completion", "vision"]);
+    }
+
+    #[test]
+    fn capabilities_honours_cncf_config_input_types_image() {
+        // The exact shape hf::oci::build_cncf_manifest writes.
+        let (store, mut m) = manifest_with(vec![descriptor("sha256:a", "model.gguf")]);
+        m.config = store
+            .write_blob(
+                "application/vnd.cncf.model.config.v1+json",
+                br#"{"descriptor":{},"modelfs":{"type":"layers","diffIds":[]},"config":{"format":"gguf","capabilities":{"inputTypes":["text","image"],"outputTypes":["text"]}}}"#,
+            )
+            .unwrap();
+        assert_eq!(capabilities(&store, &m), vec!["completion", "vision"]);
+    }
+
+    #[test]
+    fn capabilities_ignores_input_types_at_the_document_root() {
+        let (store, mut m) = manifest_with(vec![descriptor("sha256:a", "model.gguf")]);
+        m.config = store
+            .write_blob(
+                "application/vnd.cncf.model.config.v1+json",
+                br#"{"capabilities":{"inputTypes":["text","image"]}}"#,
+            )
+            .unwrap();
+        assert_eq!(capabilities(&store, &m), vec!["completion"]);
     }
 
     #[test]
