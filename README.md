@@ -22,11 +22,6 @@ GPU, loads the model, and execs an agent against it.
   <img src="https://github.com/llmmanorg/llmman/releases/download/docs-assets/launch.gif" alt="llmman launch claude --model qwen3.8, answering from a local model" width="900">
 </p>
 
-<p align="center">
-<sub>A real session, played back at 1.95×. <a href="docs/launch.cast">docs/launch.cast</a> is
-the unedited recording, and <a href="docs/record-launch.py">docs/record-launch.py</a> reproduces it.</sub>
-</p>
-
 Models are OCI images, so moving one takes no tooling you don't already have:
 
 ```
