@@ -32,11 +32,12 @@ $ LLMMAN_HOST=0.0.0.0 llmman serve
 ```toml
 # ~/.config/llmman/llmman.conf
 [aggregation]
-peers = "asahi, spark:17434, http://10.0.0.5"
+peers = "asahi, spark:17434, 10.0.0.5"
 ```
 
 Each entry is spelled like `LLMMAN_HOST` — `[scheme://]host[:port]`, the
-port defaulting to `17434`. `LLMMAN_PEERS=asahi,spark` overrides the
+port defaulting to `17434` (or 80/443 when an explicit `http://`/`https://`
+scheme is given). `LLMMAN_PEERS=asahi,spark` overrides the
 file for one daemon, and `LLMMAN_PEERS=` (empty) takes it out of the
 aggregation without editing anything.
 
@@ -73,13 +74,14 @@ an ordinary request: its own queue, keep-alive and eviction apply. A
 node that receives a hopped request never forwards it again, so two
 nodes that name each other never bounce one between them.
 
-Memory is what `llmman gpu-discover` reports as VRAM, or system RAM for
-a node with no accelerator (which is what a CPU-only `llama-server`
-fills). Apple Silicon is unified, so it is system RAM there too.
+Memory is the VRAM llmman's GPU probe finds, or system RAM for a node
+with no accelerator (which is what a CPU-only `llama-server` fills).
+Apple Silicon is unified, so it is system RAM there too. Unknown memory
+reports `0`: assumed to fit anything, ranked last on room.
 
-A peer that does not answer within a few seconds is simply not part of
-the aggregation for that decision. Nothing is remembered between
-requests: bring a node up or down and the next request sees it.
+A peer that does not answer within 3 seconds is simply not part of the
+aggregation for that decision. Nothing is remembered between requests:
+bring a node up or down and the next request sees it.
 
 `llmman serve <model>` pre-loads on the node it was run on, always.
 
@@ -91,9 +93,9 @@ is loaded elsewhere:
 
 ```console
 $ llmman ps
-NAME                        ID              SIZE        PROCESSOR    CONTEXT      STARTED          NODE           UNTIL
-docker.io/ai/gemma4:latest  sha256:3f2a…    8.1 GB      GPU          65536        2 minutes ago    spark:17434    4 minutes from now
-docker.io/ai/qwen3.5:0.8b   sha256:9c01…    0.7 GB      GPU          65536        1 minute ago     local          4 minutes from now
+NAME                        ID              SIZE        PROCESSOR               CONTEXT      STARTED          NODE           UNTIL
+docker.io/ai/gemma4:latest  sha256:3f2a…    8.1 GB      llama-server (local)    65536        2 minutes ago    spark:17434    4 minutes from now
+docker.io/ai/qwen3.5:0.8b   sha256:9c01…    0.7 GB      llama-server (local)    65536        1 minute ago     local          4 minutes from now
 ```
 
 `llmman stop <model>` unloads it wherever the aggregation put it.

@@ -63,7 +63,7 @@ main() {
 	(Darwin)
 		[ "$ARCH" = "aarch64" ] || die \
 			"Intel (x86_64) macOS is not supported by llmman's published builds — only" \
-			"Apple Silicon (arm64) is. Build from source instead: see README.md."
+			"Apple Silicon (arm64) is. Build from source instead: see docs/backends.md."
 		TARGET="aarch64-apple-darwin"
 		;;
 	(*) die "OS not supported: $(uname -s). On Windows, use install.ps1 instead." ;;
