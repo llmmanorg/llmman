@@ -46,7 +46,7 @@ const SERVE_ENV_HELP: &str = "\
 Environment Variables:
       LLMMAN_DEBUG                   Show additional debug information (e.g. LLMMAN_DEBUG=1)
       LLMMAN_HOST                    [host][:port] to bind (default \"127.0.0.1:17434\")
-      LLMMAN_CONTEXT_LENGTH          Context size for llama-server/vLLM when set (defaults are backend-specific)
+      LLMMAN_CONTEXT_LENGTH          Context size for llama-server/vLLM when set (default 262144 for llama-server)
       LLMMAN_KEEP_ALIVE              The duration that models stay loaded in memory (default \"5m\")
       LLMMAN_MAX_LOADED_MODELS       Maximum number of loaded models (default: unbounded)
       LLMMAN_MAX_TRANSFER_STREAMS    Maximum parallel transfer streams for safetensors model pulls (default 4)
@@ -61,7 +61,6 @@ Environment Variables:
       LLMMAN_FLASH_ATTENTION         Enable flash attention
       LLMMAN_KV_CACHE_TYPE           Quantization type for the K/V cache (default: f16)
       LLMMAN_LLM_LIBRARY             Set backend (cpu/cuda/cuda13/rocm/vulkan/metal) to bypass GPU autodetection
-      LLMMAN_GPU_OVERHEAD            Reserve a portion of VRAM (bytes)
       LLMMAN_IGPU_ENABLE             Enable integrated GPUs
       LLMMAN_LOAD_TIMEOUT            How long to allow model loads to stall before giving up (default \"10m\")
       LLMMAN_TMPDIR                  Staging directory for llama-server release downloads
@@ -137,16 +136,12 @@ pub struct ServeArgs {
 
 /// Context tokens requested for every backend this daemon spawns — read
 /// from `LLMMAN_CONTEXT_LENGTH` (an env var, not a `llmman serve` flag).
-/// For llama-server, this is a ceiling, not a guarantee: llama-server
-/// caps it back down to a model's own trained context (`n_ctx_train`)
-/// when that's smaller, with a warning, since serving positions past a
-/// model's trained length risks incoherent/NaN output.
+/// Forwarded to llama-server as-is for generation models (0 meaning
+/// "trained context"); embedding models are always capped to their
+/// trained context. See [`initial_ctx_size`]. Not forwarded to vLLM
+/// when 0.
 ///
-/// Unset or unparseable, this falls back to
-/// [`crate::hostgpu::default_ctx_size`]: a VRAM-tiered value (see that
-/// function's doc comment). A value of 0 is preserved for llama-server,
-/// where it means "use the model's trained context", but is not
-/// forwarded to vLLM.
+/// Unset or unparseable, this falls back to [`DEFAULT_CTX_SIZE`].
 fn context_length_from_env() -> Option<u32> {
     parse_context_length(std::env::var("LLMMAN_CONTEXT_LENGTH").ok().as_deref())
 }
@@ -156,6 +151,12 @@ fn context_length_from_env() -> Option<u32> {
 fn parse_context_length(value: Option<&str>) -> Option<u32> {
     value?.trim().parse().ok()
 }
+
+/// `--ctx-size` when `LLMMAN_CONTEXT_LENGTH` is unset: 256k regardless
+/// of VRAM, capped per model to its trained context (see
+/// [`initial_ctx_size`]). A load that then OOMs is retried halved (see
+/// [`next_ctx_size_after_oom`]) instead of guessing from memory up front.
+pub const DEFAULT_CTX_SIZE: u32 = 262144;
 
 /// Flash Attention mode requested for every `llama-server` this daemon
 /// spawns — read from `LLMMAN_FLASH_ATTENTION` (an env var, not a
@@ -431,18 +432,44 @@ fn supports_context_shift(model_ref: &str) -> bool {
     !model_ref.to_ascii_lowercase().contains("deepseek")
 }
 
+/// A GGUF's `{arch}.context_length` (`n_ctx_train`), if present and
+/// non-zero.
+fn gguf_trained_ctx(info: &crate::gguf::Info) -> Option<u32> {
+    info.context_length()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
+}
+
 /// `Some(trained context)` if the GGUF is an embedding model — one with
 /// an `{arch}.pooling_type` key, ollama's own test (`llm/llama_server.go`)
-/// — else `None`. An unreadable header counts as a generation model, so
-/// it fails at load with llama-server's diagnosis rather than here.
-fn embedding_model_ctx(path: &Path) -> Option<Option<u32>> {
-    let info = crate::gguf::read_info(path).ok()?;
+/// — else `None`.
+fn embedding_model_ctx(info: &crate::gguf::Info) -> Option<Option<u32>> {
     let arch = info.architecture()?;
     info.u64(&format!("{arch}.pooling_type"))?;
+    Some(gguf_trained_ctx(info))
+}
+
+/// The `--ctx-size` a load starts from: `configured` capped to `trained`
+/// unless it's an `explicit` user value for a non-`embedding` model.
+/// llama-server allocates the KV cache at `--ctx-size` and only caps
+/// per-slot use to `n_ctx_train`, so an unclamped [`DEFAULT_CTX_SIZE`]
+/// would reserve 256k of KV for a 32k model. 0/`None` mean `trained`.
+fn initial_ctx_size(
+    configured: Option<u32>,
+    explicit: bool,
+    trained: Option<u32>,
+    embedding: bool,
+) -> Option<u32> {
+    let Some(trained) = trained else {
+        return configured;
+    };
+    if explicit && !embedding {
+        return configured;
+    }
     Some(
-        info.context_length()
-            .and_then(|n| u32::try_from(n).ok())
-            .filter(|n| *n > 0),
+        configured
+            .filter(|n| *n > 0)
+            .map_or(trained, |n| n.min(trained)),
     )
 }
 
@@ -453,17 +480,15 @@ fn embedding_model_ctx(path: &Path) -> Option<Option<u32>> {
 // failing the load outright.
 // ---------------------------------------------------------------------------
 
-/// Max halving retries for an OOM-looking local llama-server load.
+/// Max halving retries for an OOM-looking llama-server load.
 const MAX_CTX_SHRINK_ATTEMPTS: u32 = 4;
 
 /// Floor below which a still-failing load is a hard failure, not
 /// something to keep shrinking.
 const MIN_CTX_SIZE_FOR_RETRY: u32 = 16384;
 
-/// First retry value when `ctx_size` started as `None` (no number to
-/// halve). Matches the top VRAM tier's own default (see
-/// `hostgpu::default_ctx_size_for`) rather than starting below
-/// `MIN_CTX_SIZE_FOR_RETRY`.
+/// First retry value when `ctx_size` is `None` (nothing to halve). Kept
+/// well above `MIN_CTX_SIZE_FOR_RETRY` so there's still room to shrink.
 const STARTING_CTX_SIZE_FOR_UNBOUNDED_RETRY: u32 = 65536;
 
 /// Next `--ctx-size` to retry an OOM'd load with, or `None` if shrinking
@@ -529,10 +554,9 @@ struct Inner {
     // backends that expose a context-size flag.
     ctx_size: Option<u32>,
     // True if `ctx_size` came from an explicit LLMMAN_CONTEXT_LENGTH
-    // rather than hostgpu's VRAM-tiered auto default — see
-    // ensure_model's OOM retry loop, which only auto-shrinks the latter
-    // (mirrors Ollama's own numCtxAuto gate on reduceAutoNumCtxForLoadOOM:
-    // a user's explicit choice shouldn't be silently overridden).
+    // rather than DEFAULT_CTX_SIZE. ensure_model only clamps and
+    // auto-shrinks the latter (mirrors Ollama's numCtxAuto gate): a
+    // user's explicit choice isn't silently overridden.
     ctx_size_explicit: bool,
     // See flash_attention_from_env's doc comment — forwarded verbatim to
     // every spawn_llama_server/container::spawn call, local or
@@ -2073,7 +2097,13 @@ async fn spawn_llama_server(
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawn llama-server from {}", bin.display()))?;
+    let tail = tail_child_output(&mut child);
+    Ok((child, tail))
+}
 
+/// Takes `child`'s piped stdout/stderr and relays both through
+/// [`spawn_tail_relay`], returning the shared tail.
+fn tail_child_output(child: &mut tokio::process::Child) -> OutputTail {
     let tail: OutputTail = Arc::new(StdMutex::new(VecDeque::with_capacity(TAIL_LINES)));
     if let Some(stdout) = child.stdout.take() {
         spawn_tail_relay(stdout, tail.clone(), false);
@@ -2081,7 +2111,7 @@ async fn spawn_llama_server(
     if let Some(stderr) = child.stderr.take() {
         spawn_tail_relay(stderr, tail.clone(), true);
     }
-    Ok((child, tail))
+    tail
 }
 
 /// vLLM should only override its model-derived default for explicit
@@ -2233,8 +2263,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Polls `process`'s `/health` endpoint until ready, bailing out early
 /// if `process` itself exits first (so a crash-on-startup doesn't hang
-/// the caller for the whole deadline). `stderr_tail`, when given (local
-/// llama-server only), includes the crash reason in the error.
+/// the caller for the whole deadline). `stderr_tail`, when given
+/// (llama-server only), includes the crash reason in the error.
 async fn wait_for_ready(
     client: &Client,
     port: u16,
@@ -3544,19 +3574,21 @@ async fn ensure_model(
     let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
         .with_context(|| format!("resolve model {model_ref}"))?;
     let context_shift = supports_context_shift(model_ref);
-    // See embedding_model_ctx: `Some` marks an embedding model, and its
-    // trained context caps --ctx-size below — a chat-sized default (see
-    // hostgpu::default_ctx_size_for) is meaningless for a model with
-    // learned absolute positions, and would size the batch to match.
-    let embedding_ctx = match &model_path {
-        ModelPath::Gguf(path, _) => embedding_model_ctx(path),
+    // One header read feeds both initial_ctx_size and embedding_model_ctx;
+    // unreadable means "generation model, unknown trained context" and
+    // llama-server reports the real problem.
+    let gguf_info = match &model_path {
+        ModelPath::Gguf(path, _) => crate::gguf::read_info(path).ok(),
         _ => None,
     };
+    let trained_ctx = gguf_info.as_ref().and_then(gguf_trained_ctx);
+    // `Some` marks an embedding model; see embedding_model_ctx.
+    let embedding_ctx = gguf_info.as_ref().and_then(embedding_model_ctx);
     // See enforce_max_loaded_models's doc comment — held for the rest
     // of this function.
     let mut pending_load_guard =
         enforce_max_loaded_models(state, state.0.max_loaded_models).await?;
-    // OOM retry loop — on a local llama-server load that fails with a
+    // OOM retry loop — on a llama-server load that fails with a
     // memory-allocation-looking error, tries progressively more invasive
     // fallbacks before giving up (see each branch's own comment for which
     // Ollama behavior it mirrors). Never mutates state.0.ctx_size, so a
@@ -3564,18 +3596,12 @@ async fn ensure_model(
     // attempt, not just the first — otherwise a retry's replacement
     // process could try to bind the same port the previous (failed,
     // possibly not-yet-fully-exited) one was still holding.
-    // 0 means "trained context" (see context_length_from_env), which is
-    // exactly `trained` here rather than a zero batch.
-    let mut ctx_size = match embedding_ctx {
-        Some(Some(trained)) => Some(
-            state
-                .0
-                .ctx_size
-                .filter(|n| *n > 0)
-                .map_or(trained, |n| n.min(trained)),
-        ),
-        _ => state.0.ctx_size,
-    };
+    let mut ctx_size = initial_ctx_size(
+        state.0.ctx_size,
+        state.0.ctx_size_explicit,
+        trained_ctx,
+        embedding_ctx.is_some(),
+    );
     let mut split_mode = state.0.split_mode;
     let mut shrink_attempts = 0u32;
     let mut evicted_others = false;
@@ -3584,12 +3610,10 @@ async fn ensure_model(
     let mut port = find_free_port()?;
     loop {
         eprintln!("[llmman] loading {model_ref} on port {port}");
-        // A `None` ctx_size (a high-VRAM host deferring to the model's
-        // own trained context) has nothing safe to scale — forwarding
-        // --parallel unscaled in that case would silently divide that
-        // trained context across slots instead, exactly what scaling
-        // exists to prevent. Fall back to llama-server's own
-        // single-slot default rather than risk that.
+        // A `None` ctx_size has nothing to scale — an unscaled --parallel
+        // would silently divide the trained context across slots, exactly
+        // what scaling exists to prevent. Fall back to llama-server's own
+        // single-slot default instead.
         let num_parallel = effective_num_parallel(ctx_size, state.0.num_parallel);
         if state.0.num_parallel.is_some() && num_parallel.is_none() {
             eprintln!(
@@ -3617,22 +3641,23 @@ async fn ensure_model(
             // full precedence chain this `.or` implements.
             threads: request_threads.or(state.0.threads),
         };
-        // Only a local llama-server child captures a stderr tail (see
-        // spawn_llama_server) — every retry below only fires for that case.
+        // Only llama-server children (local or containerized) capture a
+        // stderr tail — every OOM retry below only fires for those.
         let mut stderr_tail: Option<OutputTail> = None;
         process = match (&model_path, state.0.ociman) {
             // container::spawn ignores llama_opts.threads; see that
             // field's doc comment.
-            (ModelPath::Gguf(path, mmproj), Some(ociman)) => ModelProcess::Container(
-                ociman,
-                crate::container::spawn(
+            (ModelPath::Gguf(path, mmproj), Some(ociman)) => {
+                let mut child = crate::container::spawn(
                     ociman,
                     path,
                     mmproj.as_deref(),
                     state.0.llama_cpp_version.as_deref(),
                     llama_opts,
-                )?,
-            ),
+                )?;
+                stderr_tail = Some(tail_child_output(&mut child));
+                ModelProcess::Container(ociman, child)
+            }
             (ModelPath::Gguf(path, mmproj), None) => {
                 let bin = local_llama_server_bin(state).await?;
                 let (child, tail) =
@@ -3656,7 +3681,7 @@ async fn ensure_model(
         match wait_for_ready(&state.0.client, port, &mut process, stderr_tail.as_ref()).await {
             Ok(()) => break,
             Err(e) => {
-                let looks_oom = stderr_tail.is_some() // local llama-server only
+                let looks_oom = stderr_tail.is_some() // llama-server only
                     && looks_like_oom(&e.to_string());
                 if !looks_oom {
                     return Err(e.into());
@@ -7524,11 +7549,10 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .map(|p| crate::daemon::peer_url(p))
         .collect();
 
-    // One accelerator probe serves both the VRAM-tiered context default
-    // and this node's weight in its aggregation; skipped when neither
-    // needs it. spawn_blocking: it spawns a subprocess.
+    // The accelerator probe only weighs this node in aggregation, so
+    // it's skipped without peers. spawn_blocking: it spawns a subprocess.
     let ctx_size_explicit = context_length_from_env();
-    let vram = if ctx_size_explicit.is_none() || !peers.is_empty() {
+    let vram = if !peers.is_empty() {
         tokio::task::spawn_blocking(crate::hostgpu::detect_with_vram)
             .await
             .context("hostgpu probe task panicked")?
@@ -7536,7 +7560,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     } else {
         0
     };
-    let ctx_size = ctx_size_explicit.or_else(|| crate::hostgpu::default_ctx_size(vram));
+    let ctx_size = ctx_size_explicit.or(Some(DEFAULT_CTX_SIZE));
     let memory = crate::hostgpu::memory_bytes(vram);
     if !peers.is_empty() {
         eprintln!(
@@ -10643,19 +10667,56 @@ mod tests {
     }
 
     /// The GGUF test (ollama's own): a `{arch}.pooling_type` key marks an
-    /// embedding model, and its trained context comes along with it.
+    /// embedding model; both kinds report their trained context.
     #[test]
     fn embedding_model_ctx_keys_off_pooling_type_and_reports_the_trained_context() {
         let chat = crate::gguf::write_test_gguf_with(&[]);
         let embed = crate::gguf::write_test_gguf_with(&[("llama.pooling_type", 1)]);
-        let chat_ctx = embedding_model_ctx(&chat);
-        let embed_ctx = embedding_model_ctx(&embed);
+        let chat_info = crate::gguf::read_info(&chat).unwrap();
+        let embed_info = crate::gguf::read_info(&embed).unwrap();
         std::fs::remove_file(&chat).ok();
         std::fs::remove_file(&embed).ok();
-        assert_eq!(chat_ctx, None);
-        assert_eq!(embed_ctx, Some(Some(4096)));
-        // Unreadable: a generation model, not an error — see the doc comment.
-        assert_eq!(embedding_model_ctx(Path::new("/nonexistent.gguf")), None);
+        assert_eq!(embedding_model_ctx(&chat_info), None);
+        assert_eq!(embedding_model_ctx(&embed_info), Some(Some(4096)));
+        assert_eq!(gguf_trained_ctx(&chat_info), Some(4096));
+        assert_eq!(gguf_trained_ctx(&embed_info), Some(4096));
+    }
+
+    #[test]
+    fn initial_ctx_size_caps_the_auto_default_at_the_trained_context() {
+        let auto = Some(DEFAULT_CTX_SIZE);
+        // Smaller trained context wins; larger leaves the default alone.
+        assert_eq!(
+            initial_ctx_size(auto, false, Some(32768), false),
+            Some(32768)
+        );
+        assert_eq!(initial_ctx_size(auto, false, Some(1 << 20), false), auto);
+        // No readable header: nothing to clamp against.
+        assert_eq!(initial_ctx_size(auto, false, None, false), auto);
+    }
+
+    #[test]
+    fn initial_ctx_size_forwards_an_explicit_value_unless_embedding() {
+        // A user's LLMMAN_CONTEXT_LENGTH is theirs to get wrong; 0 stays 0.
+        assert_eq!(
+            initial_ctx_size(Some(65536), true, Some(4096), false),
+            Some(65536)
+        );
+        assert_eq!(initial_ctx_size(Some(0), true, Some(4096), false), Some(0));
+        // Embedding models are capped regardless, and 0/None mean trained.
+        assert_eq!(
+            initial_ctx_size(Some(65536), true, Some(4096), true),
+            Some(4096)
+        );
+        assert_eq!(
+            initial_ctx_size(Some(2048), true, Some(4096), true),
+            Some(2048)
+        );
+        assert_eq!(
+            initial_ctx_size(Some(0), false, Some(4096), true),
+            Some(4096)
+        );
+        assert_eq!(initial_ctx_size(None, false, Some(4096), true), Some(4096));
     }
 
     /// `/api/embed` takes a string or an array of strings, and nothing
@@ -10852,8 +10913,12 @@ mod tests {
     }
 
     #[test]
-    fn next_ctx_size_after_oom_halves_from_the_vram_tiered_default_down_to_the_floor() {
-        // The default_ctx_size_for(<=46GiB) tier — see hostgpu.rs.
+    fn next_ctx_size_after_oom_halves_from_the_default_down_to_the_floor() {
+        assert_eq!(
+            next_ctx_size_after_oom(Some(DEFAULT_CTX_SIZE)),
+            Some(131072)
+        );
+        assert_eq!(next_ctx_size_after_oom(Some(131072)), Some(65536));
         assert_eq!(next_ctx_size_after_oom(Some(65536)), Some(32768));
         assert_eq!(next_ctx_size_after_oom(Some(32768)), Some(16384));
         // At (or below) the floor, no further shrink is offered.
@@ -10862,10 +10927,23 @@ mod tests {
     }
 
     #[test]
+    fn default_ctx_size_reaches_the_floor_within_the_shrink_budget() {
+        // 262144 -> 131072 -> 65536 -> 32768 -> 16384: exactly
+        // MAX_CTX_SHRINK_ATTEMPTS halvings, so the floor is reachable.
+        let mut ctx = Some(DEFAULT_CTX_SIZE);
+        let mut attempts = 0;
+        while let Some(next) = next_ctx_size_after_oom(ctx) {
+            ctx = Some(next);
+            attempts += 1;
+        }
+        assert_eq!(ctx, Some(MIN_CTX_SIZE_FOR_RETRY));
+        assert!(attempts <= MAX_CTX_SHRINK_ATTEMPTS);
+    }
+
+    #[test]
     fn next_ctx_size_after_oom_starts_an_unbounded_ctx_size_at_an_explicit_ceiling() {
-        // ctx_size: None means "defer to the model's own trained
-        // context" (see hostgpu::default_ctx_size) — nothing to halve,
-        // so the first retry pins an explicit starting point instead.
+        // ctx_size: None has nothing to halve, so the first retry pins
+        // an explicit starting point instead.
         assert_eq!(next_ctx_size_after_oom(None), Some(65536));
     }
 

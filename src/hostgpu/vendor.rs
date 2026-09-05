@@ -96,8 +96,8 @@ fn cuda_major_from_driver_version(driver_version: i32) -> u32 {
 /// `Some((kind, total_vram_bytes))` if at least one CUDA device is
 /// present. Sums every visible device's memory (via
 /// `cuDeviceTotalMem_v2`), not just device 0's, so a multi-GPU host's
-/// combined VRAM sizes `--ctx-size` correctly (see
-/// `default_ctx_size_for`) — matching `detect_vulkan_inner`'s existing
+/// combined VRAM weighs it correctly in aggregation (see
+/// `hostgpu::memory_bytes`) — matching `detect_vulkan_inner`'s existing
 /// multi-device summation below.
 pub(super) fn detect_cuda() -> Option<(HostGpu, u64)> {
     let lib = open_cuda_lib()?;
