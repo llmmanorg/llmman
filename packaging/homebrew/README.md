@@ -1,6 +1,6 @@
 # llmmanorg/homebrew-tap
 
-Homebrew tap for [llmman](https://github.com/llmmanorg/llmman) — run any
+Homebrew tap for [llmman](https://github.com/llmmanorg/llmman): run any
 agent on any model, models stored as OCI images.
 
 ## Install
@@ -20,7 +20,7 @@ Supported platforms (the platforms llmman publishes builds for):
 | Linux | `x86_64` |
 | Linux | `aarch64` |
 
-Intel macOS is not supported — llmman publishes no `x86_64-apple-darwin`
+Intel macOS is not supported; llmman publishes no `x86_64-apple-darwin`
 build. `cargo install llmman` builds from source there (needs Rust and Go).
 
 ## Versions
@@ -35,5 +35,5 @@ is no separate stable channel.
 `Formula/llmman.rb` is rendered by
 [`packaging/render.sh`](https://github.com/llmmanorg/llmman/blob/main/packaging/render.sh)
 in the main repo and pushed here by its CI on every release. **Edits made
-directly in this repo are overwritten by the next release** — change
+directly in this repo are overwritten by the next release**; change
 `packaging/homebrew/llmman.rb.in` upstream instead.

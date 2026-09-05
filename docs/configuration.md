@@ -89,7 +89,7 @@ $ llmman config unset providers.openrouter.api_key
 A key is a TOML dotted key, so an id that is not a bare key is quoted
 exactly as it is in the file: `llmman config get
 'providers."wafer.ai".api_key'`. Array entries are addressed by index for
-reading — `verify.trust[0].pattern` — but not for writing; use
+reading (`verify.trust[0].pattern`) but not for writing; use
 `llmman config edit` for a trust policy. Values are always written as
 strings, which is every field the format has.
 
@@ -117,18 +117,18 @@ output ends up in a bug report. `get` prints it in full.
 
 `--provider` reaches a hosted model with a key llmman never generates
 and never writes into an integration's config. It takes one from the variable models.dev names for that
-provider, or — when that is unset — from `[providers.<id>]`. Entries are
+provider, or, when that is unset, from `[providers.<id>]`. Entries are
 keyed by the provider id `llmman providers` prints, not by the variable,
 which is models.dev's naming rather than llmman's.
 
 The environment wins where both have a key, as it does for `aws` and
 `gh`: the file is the standing answer and an `export` is the deliberate,
 this-session-only override. An id that is not a bare TOML key must be
-quoted — `[providers."wafer.ai"]` — since `[providers.wafer.ai]` is two
+quoted, as `[providers."wafer.ai"]`, since `[providers.wafer.ai]` is two
 nested tables. Setting `api_key = ""` blanks out a key `/etc` supplied.
 
-On Unix a file carrying a key must not be readable by group or other —
-`chmod 600` it — or llmman ignores the keys in it with a warning, the way
+On Unix a file carrying a key must not be readable by group or other
+(`chmod 600` it), or llmman ignores the keys in it with a warning, the way
 `ssh` refuses a loose private key. Only the keys: a world-readable
 `/etc/llmman/llmman.conf` still supplies its aliases and trust policy,
 which are not secrets. This is unchecked on Windows, which has no mode
@@ -152,7 +152,7 @@ resolves to whatever you point it at. Nothing is compiled into the binary.
 nothing is verified.
 
 A file that is present but unreadable or malformed is a fatal error for
-verification, rather than a silent downgrade to `off` — even though the
+verification, rather than a silent downgrade to `off`, even though the
 same failure only costs the other two sections their aliases and keys.
 That asymmetry is deliberate: a trust policy llmman cannot read must not
 be mistaken for one that does not exist.
@@ -199,7 +199,7 @@ setting may not behave identically.
 | `LLMMAN_IGPU_ENABLE` | Counts integrated GPUs (Vulkan only) when probing for an accelerator. Defaults to disabled, since an integrated GPU is usually a worse choice than the discrete/CPU fallback it would otherwise be skipped in favor of. |
 | `LLMMAN_LOAD_TIMEOUT` | How long to allow a model load to stall before giving up. Zero or negative means wait forever. Defaults to 10 minutes (`vllm` can take several minutes to load a large safetensors model). |
 | `LLMMAN_TMPDIR` | Staging directory for `llama-server` release downloads, overriding the default `tmp` subdirectory of the install root. |
-| `LLMMAN_VERIFY` | Overrides the signature-verification mode (`off`, `warn`, or `enforce`) for every reference, ignoring what `[verify]` selected. Does *not* supply trusted keys — those still come from `llmman.conf`, so `enforce` with no configured keys fails every check rather than passing them. Intended for CI, which can demand `enforce` without editing config files. See [verification.md](verification.md). |
+| `LLMMAN_VERIFY` | Overrides the signature-verification mode (`off`, `warn`, or `enforce`) for every reference, ignoring what `[verify]` selected. Does *not* supply trusted keys; those still come from `llmman.conf`, so `enforce` with no configured keys fails every check rather than passing them. Intended for CI, which can demand `enforce` without editing config files. See [verification.md](verification.md). |
 | `LLMMAN_SIGN_PASSWORD` | Passphrase for the `--sign-key` private key used by `push`/`transfer`, when it is an encrypted PEM. Falls back to `COSIGN_PASSWORD`. Read by the CLI process, which does the signing itself; neither key nor passphrase reaches the daemon. |
 | `LLMMAN_NOPRUNE` | When set (to anything other than `0`/`false`/`no`/`off`), skips the garbage-collection sweep that `llmman rm` and `llmman serve` startup otherwise run to delete blobs and extracted-cache entries no longer referenced by any local model. Note this is broader than skipping the daemon-startup catch-all: it also stops `llmman rm` itself from ever freeing disk space, so a removed model's (possibly multi-GB) weights stay on disk until a later sweep runs without this set. Useful for a shared/read-mostly store, or scripts that `rm` in a loop and prune once at the end. |
 | `LLAMA_ARG_FIT` / `LLAMA_ARG_FIT_TARGET` / `LLAMA_ARG_THREADS` | llama.cpp's own env-configurable `--fit`/`--fit-target`/`--threads` options. Not something llmman parses itself, just forwarded through to every `llama-server` (local or `--ociman` container) it spawns, same as `CUDA_VISIBLE_DEVICES`/etc. below. |

@@ -28,7 +28,7 @@ one command and the key status reported is the daemon's.
 ## API keys
 
 The API key comes from the variable models.dev names for that provider,
-or — when that is unset — from `~/.config/llmman/llmman.conf`, keyed by
+or, when that is unset, from `~/.config/llmman/llmman.conf`, keyed by
 provider id:
 
 ```toml
