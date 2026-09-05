@@ -17,7 +17,7 @@ vllm serve oci://ghcr.io/org/model:tag
 - The `llmman` binary on `PATH` (or point `LLMMAN_BIN` at it):
 
   ```
-  curl -fsSL https://raw.githubusercontent.com/llmmanorg/llmman/main/install.sh | sh
+  curl -fsSL https://llmmanorg.github.io/install.sh | sh
   ```
 
 ## How it works

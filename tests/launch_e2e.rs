@@ -144,7 +144,8 @@ static WARM: Once = Once::new();
 ///
 /// CI (see `.github/workflows/ci.yml`'s e2e job) installs the exact
 /// binary `cargo build` just produced via the real `install.sh`/
-/// `install.ps1` scripts before running this suite, then points
+/// `install.ps1` scripts (fetched from https://llmmanorg.github.io/)
+/// before running this suite, then points
 /// `LLMMAN_E2E_BIN` at the resulting installed copy (`~/.local/bin/llmman`
 /// on Unix, `%LOCALAPPDATA%\Microsoft\WindowsApps\llmman.exe` on Windows)
 /// — so what's actually under test is the same installed artifact a real
