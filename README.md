@@ -12,13 +12,29 @@ running on your own machine, or at any hosted provider, in one command.
 </p>
 
 ```
-llmman launch claude --model gemma4
+llmman launch claude --model qwen3.8
 ```
 
 That starts a local inference server, downloads a `llama.cpp` build matching your
 GPU, loads the model, and execs an agent against it.
 
-<!-- TODO: 20s asciinema/GIF here: launch claude -> boots -> wifi off -> still coding -->
+<p align="center">
+  <img src="https://github.com/llmmanorg/llmman/releases/download/docs-assets/launch.gif" alt="llmman launch claude --model qwen3.8, answering from a local model" width="900">
+</p>
+
+<p align="center">
+<sub>A real session, played back at 1.95×. <a href="docs/launch.cast">docs/launch.cast</a> is
+the unedited recording, and <a href="docs/record-launch.py">docs/record-launch.py</a> reproduces it.</sub>
+</p>
+
+Models are OCI images, so moving one takes no tooling you don't already have:
+
+```
+llmman transfer hf.co/unsloth/Qwen3.5-0.8B-GGUF docker.io/owner/model:latest
+```
+
+That copies from Hugging Face into your own registry directly, without a copy
+landing in your local store.
 
 ## Why llmman?
 
@@ -35,9 +51,8 @@ GPU, loads the model, and execs an agent against it.
   unmodified GGUF and safetensors files. No fork to wait on, no import step,
   no private blob format: the store is a standard OCI Image Layout that all
   can read.
-- **One-step transfer.** `llmman transfer hf.co/org/model docker.io/you/model`
-  moves a model from HuggingFace straight into your own registry, optionally
-  signed, without landing on a laptop first.
+- **One-step transfer.** Any source `pull` understands paired with any OCI
+  registry destination, optionally signed, without a copy in your local store.
   That is the shape air-gapped and compliance-bound environments need.
 - **Pool your machines.** Several `llmman serve` daemons form an
   [aggregation](#aggregation): name the others, and a request to any of
@@ -50,7 +65,7 @@ GPU, loads the model, and execs an agent against it.
 | Model format on disk | Unmodified GGUF / safetensors in a standard OCI Image Layout | GGUF and safetensors imported via `Modelfile` into Ollama's blob layout |
 | Inference engine | Upstream `llama.cpp` release, or your own `llama-server`; `vllm`; `mlx-lm` | Bundled `llama.cpp`/ggml fork plus Ollama's own engine |
 | Hosted models | Any provider via `--provider` | Ollama Cloud |
-| Registry-to-registry transfer | `llmman transfer hf.co/... docker.io/...` in one step, no local copy | Pull, write a `Modelfile`, `create`, push to ollama.com |
+| Registry-to-registry transfer | `llmman transfer hf.co/... docker.io/...` in one step, nothing added to your local store | Pull, write a `Modelfile`, `create`, push to ollama.com |
 | Signing and verification | cosign-format signatures; `verify` command and per-repo pull-time trust policy | None |
 | Multiple machines | Aggregation: daemons pool hardware, any node answers for all | One host per endpoint |
 
@@ -73,8 +88,8 @@ irm https://raw.githubusercontent.com/llmmanorg/llmman/main/install.ps1 | iex
 Three commands cover most of it:
 
 ```sh
-llmman launch claude --model gemma4   # an agent on a local model
-llmman run gemma4                     # just chat with a model
+llmman launch claude --model qwen3.8  # an agent on a local model
+llmman run qwen3.8                    # just chat with a model
 llmman serve                          # an Ollama/OpenAI/Anthropic-compatible endpoint
 ```
 
@@ -115,13 +130,13 @@ can `llmman run` it straight from there.
 ### Pull a model
 
 ```
-llmman pull gemma4
+llmman pull qwen3.8
 ```
 
 ### Transfer a model between locations
 
-Transfer an image directly from a source to a destination without storing
-it locally first, e.g. HuggingFace straight to an OCI registry:
+Transfer an image directly from a source to a destination without adding it
+to your local store, e.g. HuggingFace straight to an OCI registry:
 
 ```
 llmman transfer hf.co/unsloth/Qwen3.5-0.8B-GGUF docker.io/owner/model:latest
@@ -207,7 +222,7 @@ model), then sets the right environment variables and execs the
 integration:
 
 ```
-llmman launch claude --model gemma4
+llmman launch claude --model qwen3.8
 ```
 
 Run `llmman launch` with no arguments to list the supported integrations
