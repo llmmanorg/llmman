@@ -501,6 +501,27 @@ fn looks_like_oom(detail: &str) -> bool {
     .any(|needle| d.contains(needle))
 }
 
+/// True if `detail` (a failed load's stderr tail, or an error message)
+/// says llama-server loaded the primary GGUF fine but then bailed on the
+/// companion `--mmproj` projector — typically because the installed
+/// llama-server predates that model family's projector type (e.g. a
+/// Homebrew b9430 rejecting Gemma 4's `gemma4uv` with "unknown projector
+/// type"). The text model itself is perfectly usable in that case, so the
+/// load is retried without `--mmproj` (see `ensure_model`) rather than
+/// failing outright. Matched against llama.cpp's own mtmd/clip log
+/// phrasings, deliberately specific for the same reason as
+/// [`looks_like_oom`].
+fn looks_like_mmproj_failure(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    [
+        "unknown projector type",
+        "failed to load multimodal model",
+        "failed to load clip model",
+    ]
+    .iter()
+    .any(|needle| d.contains(needle))
+}
+
 // ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
@@ -3580,6 +3601,10 @@ async fn ensure_model(
     let mut shrink_attempts = 0u32;
     let mut evicted_others = false;
     let mut split_mode_relaxed = false;
+    // Set once the companion --mmproj has been dropped after a failed
+    // load — see looks_like_mmproj_failure. Only ever flips false->true,
+    // so a projector that fails for some other reason can't loop.
+    let mut mmproj_dropped = false;
     let mut process;
     let mut port = find_free_port()?;
     loop {
@@ -3635,8 +3660,12 @@ async fn ensure_model(
             ),
             (ModelPath::Gguf(path, mmproj), None) => {
                 let bin = local_llama_server_bin(state).await?;
-                let (child, tail) =
-                    spawn_llama_server(&bin, path, mmproj.as_deref(), llama_opts).await?;
+                let mmproj = if mmproj_dropped {
+                    None
+                } else {
+                    mmproj.as_deref()
+                };
+                let (child, tail) = spawn_llama_server(&bin, path, mmproj, llama_opts).await?;
                 stderr_tail = Some(tail);
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }
@@ -3656,8 +3685,32 @@ async fn ensure_model(
         match wait_for_ready(&state.0.client, port, &mut process, stderr_tail.as_ref()).await {
             Ok(()) => break,
             Err(e) => {
-                let looks_oom = stderr_tail.is_some() // local llama-server only
-                    && looks_like_oom(&e.to_string());
+                // Local llama-server only (the only spawner with a stderr
+                // tail to classify) — see stderr_tail above.
+                let detail = e.to_string();
+                let has_mmproj = matches!(&model_path, ModelPath::Gguf(_, Some(_)));
+
+                // The primary GGUF loaded but the companion projector
+                // didn't (see looks_like_mmproj_failure) — retry
+                // text-only rather than fail a model whose text side
+                // works fine. Checked before OOM: a projector-load error
+                // isn't a memory problem, and an OOM retry couldn't fix it.
+                if stderr_tail.is_some()
+                    && has_mmproj
+                    && !mmproj_dropped
+                    && looks_like_mmproj_failure(&detail)
+                {
+                    process.stop_and_wait().await;
+                    mmproj_dropped = true;
+                    eprintln!(
+                        "[llmman] {model_ref} failed to load on port {port} because its multimodal projector (mmproj) was rejected — this usually means the installed llama-server is too old for this model family. Retrying text-only (no image/audio input): {:#}",
+                        e
+                    );
+                    port = find_free_port()?;
+                    continue;
+                }
+
+                let looks_oom = stderr_tail.is_some() && looks_like_oom(&detail);
                 if !looks_oom {
                     return Err(e.into());
                 }
@@ -10890,6 +10943,43 @@ mod tests {
             "error: unknown argument: --not-a-real-flag",
         ] {
             assert!(!looks_like_oom(msg), "unexpected OOM match for {msg:?}");
+        }
+    }
+
+    #[test]
+    fn looks_like_mmproj_failure_matches_mtmd_clip_load_errors() {
+        for msg in [
+            // Verbatim from a Homebrew llama-server b9430 loading Gemma 4.
+            "clip_init: failed to load model '/x/mmproj-F16.gguf': load_hparams: unknown projector type: gemma4uv",
+            "mtmd_init_from_file: error: Failed to load CLIP model from /x/mmproj-F16.gguf",
+            "srv    load_model: failed to load multimodal model, '/x/mmproj-F16.gguf'",
+            // As surfaced through wait_for_ready's joined stderr tail.
+            "inference server on port 1 exited before becoming ready: load_model: loading model '/x/m.gguf' | E clip_init: unknown projector type: gemma4uv | exiting due to model loading error",
+        ] {
+            assert!(
+                looks_like_mmproj_failure(msg),
+                "expected mmproj-failure match for {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_mmproj_failure_does_not_flag_unrelated_or_oom_failures() {
+        for msg in [
+            "error while loading shared libraries: libcuda.so.1: cannot open shared object file",
+            "error loading model: unknown architecture 'not-a-real-arch'",
+            "ggml_backend_alloc_ctx_tensors_from_buft: failed to allocate CUDA0 buffer of size 123",
+            "CUDA error: out of memory",
+            "srv    load_model: loading model '/x/mmproj-F16.gguf'",
+        ] {
+            assert!(
+                !looks_like_mmproj_failure(msg),
+                "unexpected mmproj-failure match for {msg:?}"
+            );
+            assert!(
+                !looks_like_oom(msg) || !looks_like_mmproj_failure(msg),
+                "an OOM must never also classify as an mmproj failure: {msg:?}"
+            );
         }
     }
 
