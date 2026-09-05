@@ -16,7 +16,7 @@ pub mod metrics;
 pub mod modelpack;
 pub mod oauth;
 pub mod providers;
-pub mod shortnames;
+pub mod utils;
 pub mod sources;
 pub mod storage;
 pub mod thinking;
