@@ -601,7 +601,11 @@ fn run_launch(
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_DATA_HOME", home.join(".local/share"));
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        // Set, not cleared: a `QWEN_HOME` in the developer's shell would
+        // send the settings `launch qwen` writes past this `HOME`, and on
+        // Windows `dirs::home_dir` reads neither `HOME` nor `USERPROFILE`.
+        .env("QWEN_HOME", home.join(".qwen"));
 
     try_spawn_with_timeout(
         cmd,
@@ -915,40 +919,7 @@ fn qwen_loop_detection(stderr: &str) -> bool {
 /// the real `PATH`.
 #[test]
 fn ensure_server_fails_fast_when_daemon_dies_at_startup() {
-    let dir = fresh_home("dead-daemon");
-    let bin_dir = dir.join("bin");
-    std::fs::create_dir_all(&bin_dir).expect("create fake bin dir");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let fake = bin_dir.join("llama-server");
-        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write fake llama-server");
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod fake llama-server");
-    }
-    // find_on_path probes only `{name}.exe` on Windows, so the fake must
-    // be an `.exe`; any content works because it is found, never executed.
-    #[cfg(windows)]
-    std::fs::write(bin_dir.join("llama-server.exe"), "not a real executable")
-        .expect("write fake llama-server");
-
-    std::fs::write(dir.join("cache"), "a file where serve expects a directory")
-        .expect("write cache blocker file");
-
-    // Bound once to reserve a definitely-free port number, then dropped:
-    // the port must NOT stay listening, or ensure_server would take a
-    // successful connect as "a daemon is already running" and never spawn
-    // the one under test.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind probe listener")
-        .local_addr()
-        .expect("probe listener addr")
-        .port();
-
-    let path = std::env::join_paths(std::iter::once(bin_dir).chain(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )))
-    .expect("join PATH");
+    let (dir, port, path) = dead_daemon_setup("dead-daemon");
 
     let mut cmd = Command::new(llmman_bin());
     cmd.arg("pull").arg(MODEL);
@@ -985,6 +956,83 @@ fn ensure_server_fails_fast_when_daemon_dies_at_startup() {
         "fast-fail took {elapsed:?}; it should report within seconds, \
          not wait out ensure_server's 60s poll"
     );
+}
+
+/// `llmman launch qwen` with no `--model` is refused on the flag before
+/// any daemon work: under the dead-daemon setup a build that checked
+/// after `ensure_server` would report the daemon's startup exit instead.
+#[test]
+fn launch_qwen_without_a_model_is_refused_before_the_daemon() {
+    let (dir, port, path) = dead_daemon_setup("qwen-no-model");
+
+    let mut cmd = Command::new(llmman_bin());
+    cmd.arg("launch").arg("qwen");
+    cmd.env("HOME", &dir)
+        .env("USERPROFILE", &dir)
+        .env("QWEN_HOME", dir.join(".qwen"))
+        .env("LLMMAN_HOST", format!("127.0.0.1:{port}"))
+        .env("LLMMAN_MODELS", dir.join("store"))
+        .env("PATH", path);
+
+    let start = Instant::now();
+    let output = spawn_with_timeout(
+        cmd,
+        Duration::from_secs(45),
+        "`llmman launch qwen` with no --model",
+    );
+    let elapsed = start.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "launch without a model succeeded\n{stderr}"
+    );
+    assert!(stderr.contains("qwen needs a model"), "{stderr}");
+    assert!(
+        !stderr.contains("exited during startup"),
+        "the daemon was started first\n{stderr}"
+    );
+    assert!(elapsed < Duration::from_secs(5), "refusal took {elapsed:?}");
+}
+
+/// A fresh `HOME` in which any daemon `llmman` spawns dies at startup, a
+/// port nothing answers on for `LLMMAN_HOST`, and the `PATH` that makes
+/// it so; see `ensure_server_fails_fast_when_daemon_dies_at_startup`.
+fn dead_daemon_setup(label: &str) -> (PathBuf, u16, std::ffi::OsString) {
+    let dir = fresh_home(label);
+    let bin_dir = dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = bin_dir.join("llama-server");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write fake llama-server");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake llama-server");
+    }
+    // find_on_path probes `.exe`, `.cmd` and `.bat` on Windows; `.exe` is
+    // the natural fake, and any content works: it is found, not executed.
+    #[cfg(windows)]
+    std::fs::write(bin_dir.join("llama-server.exe"), "not a real executable")
+        .expect("write fake llama-server");
+
+    std::fs::write(dir.join("cache"), "a file where serve expects a directory")
+        .expect("write cache blocker file");
+
+    // Bound once to reserve a definitely-free port number, then dropped:
+    // the port must NOT stay listening, or ensure_server would take a
+    // successful connect as "a daemon is already running" and never spawn
+    // the one under test.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind probe listener")
+        .local_addr()
+        .expect("probe listener addr")
+        .port();
+
+    let path = std::env::join_paths(std::iter::once(bin_dir).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("join PATH");
+    (dir, port, path)
 }
 
 /// True for the one openclaw-specific failure shape confirmed live in
