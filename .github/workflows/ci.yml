@@ -551,7 +551,7 @@ jobs:
         run: go test -tags "$PODMAN_TAGS" ./...
 
   # --------------------------------------------------------------------------
-  # E2E: `llmman launch <claude|opencode|codex|qwen|hermes|openclaw|dsh> --model
+  # E2E: `llmman launch <claude|agy|opencode|codex|qwen|hermes|openclaw|dsh> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
   # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
@@ -582,7 +582,7 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/opencode/codex/qwen/hermes/openclaw/dsh, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/agy/opencode/codex/qwen/hermes/openclaw/dsh, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
@@ -858,6 +858,14 @@ jobs:
         continue-on-error: true
         run: |
           & ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -SkipSetup
+
+      # AGY is an optional native CLI. The pinned official release and its
+      # per-platform SHA-256 checksums live in mise.toml/mise.lock; Renovate
+      # should update those files together.
+      - name: Install AGY with mise
+        uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+        with:
+          github_token: ${{ github.token }}
 
       # opencode installs its configured provider's npm package (here
       # @ai-sdk/openai-compatible — see launch::opencode_config) on demand

@@ -278,13 +278,18 @@ integration:
 
 ```
 llmman launch claude --model qwen3.8
+llmman launch agy --model qwen3.8 -- -p "Explain this repository"
 ```
 
 Run `llmman launch` with no arguments to list the supported integrations
-(Claude Code, OpenCode, Codex, Aider, Qwen Code, Gemini CLI, ...) and
+(Claude Code, OpenCode, Codex, Aider, Qwen Code, Gemini CLI, AGY, ...) and
 whether each is installed. Any extra arguments after `--` are forwarded to
 the integration's own CLI. Short names work wherever a model reference is
 accepted.
+
+AGY requires version 1.1.13 or newer for Gemini API-key and custom-endpoint
+support. llmman writes Gemini mode to its own stable settings directory at
+`~/.gemini/llmman/`; your AGY settings stay untouched.
 
 ### Hosted providers
 
