@@ -151,16 +151,28 @@ fn warn_missing_msvc_tools(target_arch: &str) {
 /// Every nightly/CI build shares the same Cargo.toml version, so without
 /// the commit suffix two different builds are indistinguishable to
 /// `llmman --version` and the daemon's /api/version.
+///
+/// `LLMMAN_GIT_DESCRIBE`, if set, replaces the `git describe` output. CI
+/// sets it to the bare commit hash after `packaging/version.sh --apply`
+/// edits Cargo.toml/Cargo.lock, which would otherwise make every release
+/// binary report `-dirty`.
 fn emit_version() {
     let pkg = env::var("CARGO_PKG_VERSION").unwrap_or_default();
-    let describe = Command::new("git")
-        .args(["describe", "--always", "--dirty"])
-        .output()
+    println!("cargo:rerun-if-env-changed=LLMMAN_GIT_DESCRIBE");
+    let describe = env::var("LLMMAN_GIT_DESCRIBE")
         .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            Command::new("git")
+                .args(["describe", "--always", "--dirty"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
     let version = match describe {
         Some(desc) => format!("{pkg} ({desc})"),
         None => pkg,
@@ -194,6 +206,15 @@ fn git_path(path: &str) -> Option<PathBuf> {
         .map(|s| PathBuf::from(s.trim()))
 }
 
+/// docs.rs sets `DOCS_RS`. Its sandbox has no Go and no network, so the Go
+/// shim cannot be built there; skipping it is safe because rustdoc never
+/// links, so the `rustc-link-lib=static=` directive is never acted on. A
+/// real `cargo build` still hard-fails without Go.
+fn is_docs_rs() -> bool {
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
+    env::var_os("DOCS_RS").is_some()
+}
+
 fn main() {
     emit_version();
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -201,6 +222,14 @@ fn main() {
     let shim_dir = manifest_dir.join("go-shim");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+
+    // src/webui.rs include_bytes!s the gzipped webui, so that part still
+    // runs; only the Go half is skipped.
+    if is_docs_rs() {
+        println!("cargo:warning=DOCS_RS set: skipping the Go shim build (rustdoc does not link)");
+        gzip_webui(&manifest_dir, &out_dir);
+        return;
+    }
 
     // Determine backend build tags from Cargo features.
     // For the podman backend we add two extra tags to avoid pulling in C library
@@ -341,7 +370,12 @@ fn main() {
     println!("cargo:rerun-if-changed=go-shim/");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PODMAN");
 
-    // ── Gzip web UI assets for embedding ──────────────────────────────────
+    gzip_webui(&manifest_dir, &out_dir);
+}
+
+/// Gzip the web UI assets into `$OUT_DIR/webui_gz/` for src/webui.rs to
+/// `include_bytes!`. Separate so the docs.rs early return can still run it.
+fn gzip_webui(manifest_dir: &Path, out_dir: &Path) {
     let webui_src = manifest_dir.join("webui");
     let webui_out = out_dir.join("webui_gz");
     fs::create_dir_all(&webui_out).expect("create webui_gz dir");

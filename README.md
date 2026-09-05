@@ -78,6 +78,30 @@ curl -fsSL https://raw.githubusercontent.com/llmmanorg/llmman/main/install.sh | 
 irm https://raw.githubusercontent.com/llmmanorg/llmman/main/install.ps1 | iex
 ```
 
+**Homebrew** (macOS Apple Silicon, Linux x86_64/aarch64):
+
+```sh
+brew install llmmanorg/tap/llmman
+```
+
+**winget** (Windows x86_64/aarch64):
+
+```powershell
+winget install llmmanorg.llmman
+```
+
+**Cargo:**
+
+```sh
+cargo binstall llmman   # prebuilt binary, any of the platforms above
+cargo install llmman    # build from source; needs Go 1.25+ (and LLVM on Windows) as well as Rust
+```
+
+Every commit that passes CI on `main` is a release, versioned
+`MAJOR.MINOR.<commit count>` (e.g. `0.1.324`) and published to all of the
+above from the same CI run (winget lags a little: each version is a pull
+request to microsoft/winget-pkgs that their bots validate first).
+
 ## Quick start
 
 Three commands cover most of it:
