@@ -238,13 +238,27 @@ integration:
 
 ```
 llmman launch claude --model qwen3.8
+llmman launch agy --model qwen3.8 -- -p "Explain this repository"
 ```
 
 Run `llmman launch` with no arguments to list the supported integrations
-(Claude Code, OpenCode, Codex, Aider, Qwen Code, Gemini CLI, ...) and
+(Claude Code, OpenCode, Codex, Aider, Qwen Code, Gemini CLI, AGY, ...) and
 whether each is installed. Any extra arguments after `--` are forwarded to
 the integration's own CLI. Short names work wherever a model reference is
 accepted.
+
+AGY requires version 1.1.13 or newer for Gemini API-key and custom-endpoint
+support. llmman copies your settings into a unique per-session directory under
+`~/.config/llmman/agy/` and selects Gemini mode there. The directory, including
+session state AGY writes there, is deleted when AGY exits; your original settings
+stay untouched.
+
+llmman also does a best-effort cleanup of stale session directories on startup, so old
+leftovers are pruned after a normal next launch. This isolation is intentionally at the
+directory level: AGY treats the whole `--gemini_dir` as its mutable data root, so a
+force-kill or power loss can still leave that session directory behind. The user’s real
+AGY settings file is never modified, but AGY itself does not provide crash-safe cleanup
+after an abrupt process death.
 
 ### Hosted providers
 

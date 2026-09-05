@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context};
+use base64::Engine as _;
 // `HttpBody` is axum's re-export of the `http_body::Body` trait, in
 // scope only for `size_hint` in `track_metrics`.
 use axum::body::{Body, Bytes, HttpBody as _};
-use axum::extract::{DefaultBodyLimit, MatchedPath, Path as UrlPath, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Path as UrlPath, Query, Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -1212,6 +1213,328 @@ struct OAIEmbeddingsUsage {
 }
 
 // ---------------------------------------------------------------------------
+// Gemini API types (AGY integration)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct GeminiRequest {
+    #[serde(default)]
+    contents: Vec<GeminiContent>,
+    #[serde(default, rename = "systemInstruction")]
+    system_instruction: Option<GeminiContent>,
+    #[serde(default, rename = "generationConfig")]
+    generation_config: Option<serde_json::Value>,
+    #[serde(default)]
+    tools: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiContent {
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    parts: Vec<serde_json::Value>,
+}
+
+/// Converts Gemini content parts into the OpenAI-compatible content shape.
+fn gemini_content(parts: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+    let mut content = Vec::new();
+    for part in parts {
+        if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+            content.push(serde_json::json!({"type": "text", "text": text}));
+            continue;
+        }
+        let Some(data) = part.get("inlineData") else {
+            continue;
+        };
+        let mime_type = data
+            .get("mimeType")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "Gemini inlineData requires mimeType".to_string())?;
+        if !matches!(
+            mime_type,
+            "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+        ) {
+            return Err(format!(
+                "unsupported Gemini inlineData MIME type: {mime_type}"
+            ));
+        }
+        let bytes = data
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "Gemini inlineData requires base64 data".to_string())?;
+        base64::engine::general_purpose::STANDARD
+            .decode(bytes)
+            .map_err(|_| "Gemini inlineData must be valid base64".to_string())?;
+        content.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {"url": format!("data:{mime_type};base64,{bytes}")}
+        }));
+    }
+    match content.len() {
+        0 => Ok(serde_json::Value::String(String::new())),
+        1 if content[0]["type"] == "text" => Ok(serde_json::Value::String(
+            content[0]["text"].as_str().unwrap_or_default().to_string(),
+        )),
+        _ => Ok(serde_json::Value::Array(content)),
+    }
+}
+
+/// Converts a complete Gemini conversation, including function calls, to chat messages.
+fn gemini_messages(req: &GeminiRequest) -> Result<Vec<OAIMessage>, String> {
+    let mut messages = Vec::new();
+    if let Some(system) = &req.system_instruction {
+        let content = gemini_content(&system.parts)?;
+        if content != serde_json::Value::String(String::new()) {
+            messages.push(OAIMessage {
+                role: "system".into(),
+                content,
+                tool_calls: None,
+                name: None,
+                tool_call_id: None,
+            });
+        }
+    }
+    for content in &req.contents {
+        let role = if content.role == "model" {
+            "assistant"
+        } else {
+            "user"
+        };
+        let message_content = gemini_content(&content.parts)?;
+        let mut call_occurrences = HashMap::new();
+        let calls: Vec<OAIToolCall> = content
+            .parts
+            .iter()
+            .filter_map(|part| part.get("functionCall"))
+            .filter_map(|call| {
+                let name = call.get("name")?.as_str()?.to_string();
+                let occurrence = call_occurrences.entry(name.clone()).or_insert(0usize);
+                let id = call
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("call_{name}_{}", *occurrence));
+                *occurrence += 1;
+                Some(OAIToolCall {
+                    id,
+                    type_: "function",
+                    function: OAIToolCallFunction {
+                        name,
+                        arguments: call
+                            .get("args")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}))
+                            .to_string(),
+                    },
+                })
+            })
+            .collect();
+        if message_content != serde_json::Value::String(String::new()) || !calls.is_empty() {
+            messages.push(OAIMessage {
+                role: role.to_string(),
+                content: message_content,
+                tool_calls: (!calls.is_empty()).then_some(calls),
+                name: None,
+                tool_call_id: None,
+            });
+        }
+        let mut response_occurrences = HashMap::new();
+        for response in content
+            .parts
+            .iter()
+            .filter_map(|part| part.get("functionResponse"))
+        {
+            let Some(name) = response.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let occurrence = response_occurrences.entry(name).or_insert(0usize);
+            let tool_call_id = response
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("call_{name}_{}", *occurrence));
+            messages.push(OAIMessage {
+                role: "tool".into(),
+                content: serde_json::Value::String(
+                    response
+                        .get("response")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)
+                        .to_string(),
+                ),
+                tool_calls: None,
+                name: Some(name.to_string()),
+                tool_call_id: Some(tool_call_id),
+            });
+            *occurrence += 1;
+        }
+    }
+    Ok(messages)
+}
+
+/// Converts Gemini function declarations to OpenAI-compatible tool declarations.
+fn gemini_tools(tools: &Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let declarations = tools
+        .as_ref()?
+        .as_array()?
+        .iter()
+        .flat_map(|tool| {
+            tool.get("functionDeclarations")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|decl| {
+            let name = decl.get("name")?.clone();
+            let description = decl.get("description").cloned();
+            let parameters = decl
+                .get("parametersJsonSchema")
+                .or_else(|| decl.get("parameters"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"type":"object"}));
+            let mut function = serde_json::Map::new();
+            function.insert("name".to_string(), name);
+            if let Some(description) = description {
+                function.insert("description".to_string(), description);
+            }
+            function.insert("parameters".to_string(), parameters);
+            Some(serde_json::json!({
+                "type": "function",
+                "function": function,
+            }))
+        })
+        .collect::<Vec<_>>();
+    (!declarations.is_empty()).then_some(serde_json::Value::Array(declarations))
+}
+
+/// Gemini's JSON MIME mode has the same backend representation as OpenAI's
+/// JSON mode. When the caller also supplies a Gemini response schema, retain
+/// it as a constrained JSON schema instead of silently weakening the request.
+fn gemini_response_format(generation: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let generation = generation?;
+    if generation
+        .get("responseMimeType")
+        .and_then(serde_json::Value::as_str)
+        != Some("application/json")
+    {
+        return None;
+    }
+    generation
+        .get("responseJsonSchema")
+        .or_else(|| generation.get("responseSchema"))
+        .filter(|schema| schema.is_object())
+        .map(|schema| {
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "response", "schema": schema, "strict": true}
+            })
+        })
+        .or_else(|| Some(serde_json::json!({"type": "json_object"})))
+}
+
+/// Maps backend completion reasons to Gemini's finish-reason vocabulary.
+fn gemini_finish_reason(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("length") | Some("max_tokens") => "MAX_TOKENS",
+        Some("content_filter") => "SAFETY",
+        _ => "STOP",
+    }
+}
+
+/// Rewrites one OpenAI SSE payload into a Gemini SSE payload.
+fn gemini_sse_line(
+    payload: &str,
+    calls: &std::cell::RefCell<std::collections::BTreeMap<usize, ToolCallAccumulator>>,
+    finished: &std::cell::Cell<bool>,
+) -> String {
+    accumulate_tool_call_deltas(payload, calls);
+    let usage = gemini_usage_metadata(payload);
+    let Some((content, thinking, done)) = oai_chunk_to_content(payload) else {
+        return usage
+            .map(|usage| format!("data: {}\n\n", serde_json::json!({"usageMetadata": usage})))
+            .unwrap_or_default();
+    };
+    let finish_reason = serde_json::from_str::<OAIChunk>(payload)
+        .ok()
+        .and_then(|chunk| chunk.choices.into_iter().next())
+        .and_then(|choice| choice.finish_reason)
+        .map(|reason| gemini_finish_reason(Some(&reason)))
+        .unwrap_or("STOP");
+
+    if done.is_some() && !finished.replace(true) {
+        let tool_parts = calls
+            .borrow()
+            .iter()
+            .map(|(index, call)| {
+                let id = if !call.id.is_empty() {
+                    call.id.clone()
+                } else {
+                    format!("call_{}_{}", call.name, index)
+                };
+                serde_json::json!({
+                    "functionCall": {
+                        "id": id,
+                        "name": call.name,
+                        "args": serde_json::from_str::<serde_json::Value>(&call.arguments)
+                            .unwrap_or_else(|_| serde_json::json!({}))
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut parts = Vec::new();
+        if let Some(thinking) = thinking.filter(|thinking| !thinking.is_empty()) {
+            parts.push(serde_json::json!({"text": thinking, "thought": true}));
+        }
+        if !content.is_empty() {
+            parts.push(serde_json::json!({"text": content}));
+        }
+        parts.extend(tool_parts);
+        let chunk = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": parts},
+                "finishReason": finish_reason,
+            }]
+        });
+        format!("data: {chunk}\n\n")
+    } else if !content.is_empty()
+        || thinking
+            .as_deref()
+            .is_some_and(|thinking| !thinking.is_empty())
+    {
+        let mut parts = Vec::new();
+        if let Some(thinking) = thinking.filter(|thinking| !thinking.is_empty()) {
+            parts.push(serde_json::json!({"text": thinking, "thought": true}));
+        }
+        if !content.is_empty() {
+            parts.push(serde_json::json!({"text": content}));
+        }
+        let chunk = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": parts}
+            }]
+        });
+        format!("data: {chunk}\n\n")
+    } else {
+        String::new()
+    }
+}
+
+/// Extracts OpenAI token usage into Gemini's usage metadata field names.
+fn gemini_usage_metadata(payload: &str) -> Option<serde_json::Value> {
+    let usage = serde_json::from_str::<OAIChunk>(payload).ok()?.usage?;
+    Some(serde_json::json!({
+        "promptTokenCount": usage.prompt_tokens,
+        "candidatesTokenCount": usage.completion_tokens,
+        "totalTokenCount": if usage.total_tokens == 0 {
+            usage.prompt_tokens + usage.completion_tokens
+        } else {
+            usage.total_tokens
+        },
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Anthropic API types
 // ---------------------------------------------------------------------------
 
@@ -1526,6 +1849,8 @@ struct OAIUsage {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
     #[serde(default)]
     prompt_tokens_details: OAIPromptTokensDetails,
 }
@@ -3424,7 +3749,7 @@ const CHAT_COMPLETIONS_ROUTE: &str = "/v1/chat/completions";
 
 /// Extracts the caller's own API key from a request, in either spelling
 /// the surfaces below accept: `Authorization: Bearer <key>` (OpenAI) or
-/// `x-api-key: <key>` (Anthropic).
+/// `x-api-key: <key>` (Anthropic), or `x-goog-api-key: <key>` (Gemini).
 ///
 /// This is what lets provider routing work against a daemon that is
 /// *already running* — the common case, since `daemon::ensure_server`
@@ -3451,12 +3776,19 @@ fn client_api_key(headers: Option<&HeaderMap>) -> Option<String> {
     // Each candidate is filtered before the choice between them, not
     // after: a client that sends both a placeholder `Authorization` and a
     // real `x-api-key` still has a real key.
-    bearer.or_else(|| {
-        headers
-            .get("x-api-key")
-            .and_then(|v| v.to_str().ok())
-            .and_then(usable)
-    })
+    bearer
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .and_then(usable)
+        })
+        .or_else(|| {
+            headers
+                .get("x-goog-api-key")
+                .and_then(|v| v.to_str().ok())
+                .and_then(usable)
+        })
 }
 
 /// Whether a request was made by a browser on some other site's behalf.
@@ -8351,6 +8683,261 @@ async fn relay_anthropic_messages(
     relay_rewriting_model(resp, activity, &client_model).await
 }
 
+// -- Gemini /v1beta/models/<model>:streamGenerateContent -------------------
+
+/// Extracts a Gemini model name from a streaming method path.
+fn gemini_stream_model(path: &str) -> Option<&str> {
+    path.strip_suffix(":streamGenerateContent")
+        .filter(|model| !model.is_empty())
+}
+
+/// Extracts a Gemini model name when `path` names the requested method.
+fn gemini_model_for<'a>(path: &'a str, method: &str) -> Option<&'a str> {
+    path.strip_suffix(&format!(":{method}"))
+        .filter(|model| !model.is_empty())
+}
+
+#[derive(Debug, Default, Deserialize)]
+/// Query parameters accepted by Gemini's REST surface.
+struct GeminiQuery {
+    key: Option<String>,
+}
+
+/// Gemini's REST API accepts its API key in either `x-goog-api-key` or a
+/// `key` query parameter. Normalise the latter at the boundary so the shared
+/// provider-routing code only needs to inspect headers. An explicit header
+/// wins, matching the API's usual precedence.
+fn gemini_query_key(headers: &mut HeaderMap, query: GeminiQuery) -> Result<(), AppError> {
+    if headers.contains_key("x-goog-api-key") {
+        return Ok(());
+    }
+    let Some(key) = query.key else {
+        return Ok(());
+    };
+    let value = HeaderValue::from_str(&key)
+        .map_err(|_| AppError::status(StatusCode::BAD_REQUEST, "invalid Gemini API key"))?;
+    headers.insert("x-goog-api-key", value);
+    Ok(())
+}
+
+/// Gemini's public `streamGenerateContent` endpoint. The model named in the
+/// API path is the model llmman serves, so any Gemini-compatible client can
+/// use the daemon directly as its API root.
+async fn handle_gemini(
+    State(state): State<AppState>,
+    UrlPath(model_and_method): UrlPath<String>,
+    Query(query): Query<GeminiQuery>,
+    mut headers: HeaderMap,
+    Json(req): Json<GeminiRequest>,
+) -> Result<Response, AppError> {
+    gemini_query_key(&mut headers, query)?;
+    if let Some(model) = gemini_stream_model(&model_and_method) {
+        return handle_gemini_request(state, model, headers, req).await;
+    }
+    if let Some(model) = gemini_model_for(&model_and_method, "generateContent") {
+        return handle_gemini_generate(state, model, headers, req, false).await;
+    }
+    if let Some(model) = gemini_model_for(&model_and_method, "countTokens") {
+        return handle_gemini_generate(state, model, headers, req, true).await;
+    }
+    Err(AppError::status(
+        StatusCode::NOT_FOUND,
+        "Gemini endpoint supports streamGenerateContent, generateContent, and countTokens only",
+    ))
+}
+
+// -- Gemini /gemini/<model>/v1beta/models/... ------------------------------
+
+/// AGY appends its own model name to `GOOGLE_GEMINI_BASE_URL`, including
+/// separate hard-coded models for title/planning work. The first path segment
+/// instead carries the model selected by `llmman launch agy`, encoded so OCI
+/// references containing `/` remain one safe URL segment. Every AGY request in
+/// the session is intentionally pinned to that model.
+async fn handle_pinned_gemini(
+    State(state): State<AppState>,
+    UrlPath((encoded_model, gemini_path)): UrlPath<(String, String)>,
+    Query(query): Query<GeminiQuery>,
+    mut headers: HeaderMap,
+    Json(req): Json<GeminiRequest>,
+) -> Result<Response, AppError> {
+    gemini_query_key(&mut headers, query)?;
+    let model_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded_model)
+        .map_err(|_| AppError::status(StatusCode::BAD_REQUEST, "invalid AGY model route"))?;
+    let selected_model = String::from_utf8(model_bytes)
+        .map_err(|_| AppError::status(StatusCode::BAD_REQUEST, "invalid AGY model route"))?;
+
+    if gemini_stream_model(&gemini_path).is_some() {
+        return handle_gemini_request(state, &selected_model, headers, req).await;
+    }
+    if gemini_model_for(&gemini_path, "generateContent").is_some() {
+        return handle_gemini_generate(state, &selected_model, headers, req, false).await;
+    }
+    if gemini_model_for(&gemini_path, "countTokens").is_some() {
+        return handle_gemini_generate(state, &selected_model, headers, req, true).await;
+    }
+    Err(AppError::status(
+        StatusCode::NOT_FOUND,
+        "pinned Gemini endpoint supports streamGenerateContent, generateContent, and countTokens only",
+    ))
+}
+
+async fn handle_gemini_request(
+    state: AppState,
+    selected_model: &str,
+    headers: HeaderMap,
+    req: GeminiRequest,
+) -> Result<Response, AppError> {
+    let (canonical_model, target, guard) =
+        ensure_model(&state, selected_model, Some(&headers), None).await?;
+    let activity = begin_activity(guard, None).await;
+    let wire_model = backend_wire_model(&state, &target, &canonical_model).await;
+    let mut oai = gemini_oai_request(wire_model, &req, true, None)?;
+    let resp = post_chat(&state.0.client, &target, &mut oai).await?;
+
+    let calls = std::cell::RefCell::new(std::collections::BTreeMap::new());
+    let finished = std::cell::Cell::new(false);
+    let stream = bytes_to_lines(resp).map(move |line| {
+        let _activity = &activity;
+        let Some(payload) = line.strip_prefix("data: ") else {
+            return Ok::<_, std::convert::Infallible>(Bytes::new());
+        };
+        Ok(Bytes::from(gemini_sse_line(payload, &calls, &finished)))
+    });
+
+    Ok(Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap())
+}
+
+/// Builds the backend chat request for one Gemini request.
+fn gemini_oai_request(
+    model: String,
+    req: &GeminiRequest,
+    stream: bool,
+    max_tokens: Option<u32>,
+) -> Result<OAIChatRequest, AppError> {
+    let generation = req.generation_config.as_ref();
+    Ok(OAIChatRequest {
+        model,
+        messages: gemini_messages(req)
+            .map_err(|error| AppError::status(StatusCode::BAD_REQUEST, error))?,
+        stream,
+        temperature: generation
+            .and_then(|v| v.get("temperature"))
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32),
+        top_p: generation
+            .and_then(|v| v.get("topP"))
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32),
+        // countTokens deliberately overrides this with zero: the backend
+        // should account for the prompt without producing a completion.
+        max_tokens: max_tokens.or_else(|| {
+            generation
+                .and_then(|v| v.get("maxOutputTokens"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+        }),
+        repeat_penalty: None,
+        chat_template_kwargs: None,
+        tools: gemini_tools(&req.tools),
+        response_format: gemini_response_format(generation),
+        seed: None,
+        stop: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        top_k: None,
+        min_p: None,
+        stream_options: stream.then(|| serde_json::json!({"include_usage": true})),
+    })
+}
+
+async fn handle_gemini_generate(
+    state: AppState,
+    selected_model: &str,
+    headers: HeaderMap,
+    req: GeminiRequest,
+    count_tokens: bool,
+) -> Result<Response, AppError> {
+    let (canonical_model, target, guard) =
+        ensure_model(&state, selected_model, Some(&headers), None).await?;
+    let activity = begin_activity(guard, None).await;
+    let wire_model = backend_wire_model(&state, &target, &canonical_model).await;
+    let mut oai = gemini_oai_request(wire_model, &req, false, count_tokens.then_some(0))?;
+    let raw = collect_body(post_chat(&state.0.client, &target, &mut oai).await?).await;
+    drop(activity);
+    let response: serde_json::Value = serde_json::from_slice(&raw).map_err(|error| {
+        AppError::status(
+            StatusCode::BAD_GATEWAY,
+            format!("parse backend response: {error}"),
+        )
+    })?;
+    let response = gemini_generate_response(&response, count_tokens)
+        .map_err(|error| AppError::status(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(response).into_response())
+}
+
+/// Converts one non-streaming backend completion into Gemini's response shape.
+fn gemini_generate_response(
+    response: &serde_json::Value,
+    count_tokens: bool,
+) -> Result<serde_json::Value, String> {
+    let usage = response.get("usage").cloned().unwrap_or_default();
+    if count_tokens {
+        return Ok(serde_json::json!({
+            "totalTokens": usage.get("prompt_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0)
+        }));
+    }
+    let choice = response
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| choices.first())
+        .ok_or_else(|| "backend response had no choices".to_string())?;
+    let text = choice
+        .pointer("/message/content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let mut parts = (!text.is_empty())
+        .then(|| serde_json::json!({"text": text}))
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Some(calls) = choice
+        .pointer("/message/tool_calls")
+        .and_then(serde_json::Value::as_array)
+    {
+        for call in calls {
+            let Some(name) = call
+                .pointer("/function/name")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let args = call
+                .pointer("/function/arguments")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            parts.push(serde_json::json!({"functionCall": {"name": name, "args": args}}));
+        }
+    }
+    let finish_reason = gemini_finish_reason(
+        choice
+            .get("finish_reason")
+            .and_then(serde_json::Value::as_str),
+    );
+    Ok(serde_json::json!({
+        "candidates": [{"content": {"role": "model", "parts": parts}, "finishReason": finish_reason}],
+        "usageMetadata": {
+            "promptTokenCount": usage.get("prompt_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            "candidatesTokenCount": usage.get("completion_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            "totalTokenCount": usage.get("total_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0)
+        }
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Option extractors from Ollama options blob
 // ---------------------------------------------------------------------------
@@ -8723,6 +9310,11 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
             "/v1/responses/input_tokens",
             post(handle_openai_responses_input_tokens),
         )
+        // Native Gemini compatibility. The public route accepts a model in
+        // Gemini's normal API path; the AGY route pins AGY's auxiliary calls
+        // to the model chosen by `llmman launch agy`.
+        .route("/v1beta/models/:model", post(handle_gemini))
+        .route("/gemini/:model/*gemini_path", post(handle_pinned_gemini))
         // Anthropic API
         .route("/v1/messages", post(handle_anthropic_messages));
 
@@ -9056,6 +9648,399 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_request_translates_system_text_history_and_tools() {
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({
+            "systemInstruction": {"role":"user", "parts":[{"text":"Be concise"}]},
+            "contents": [
+                {"role":"user", "parts":[{"text":"inspect"}]},
+                {"role":"model", "parts":[{"functionCall":{"name":"view_file","args":{"path":"a.rs"}}}]},
+                {"role":"user", "parts":[{"functionResponse":{"name":"view_file","response":{"text":"ok"}}}]}
+            ],
+            "tools": [{"functionDeclarations":[{
+                "name":"view_file", "description":"read a file",
+                "parametersJsonSchema":{"type":"object","properties":{"path":{"type":"string"}}}
+            }]}]
+        })).unwrap();
+        let messages = gemini_messages(&req).unwrap();
+        assert_eq!(messages[0], OAIMessage::text("system", "Be concise"));
+        assert_eq!(messages[1], OAIMessage::text("user", "inspect"));
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(
+            messages[2].tool_calls.as_ref().unwrap()[0].function.name,
+            "view_file"
+        );
+        assert_eq!(messages[3].role, "tool");
+        assert_eq!(
+            messages[3].tool_call_id.as_deref(),
+            Some("call_view_file_0")
+        );
+
+        let tools = gemini_tools(&req.tools).unwrap();
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "view_file");
+        assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn gemini_stream_route_uses_the_model_from_the_native_api_path() {
+        assert_eq!(
+            gemini_stream_model("qwen3.5:streamGenerateContent"),
+            Some("qwen3.5")
+        );
+        assert_eq!(gemini_stream_model("qwen3.5:generateContent"), None);
+        assert_eq!(gemini_stream_model(":streamGenerateContent"), None);
+        assert_eq!(
+            gemini_model_for("qwen3.5:generateContent", "generateContent"),
+            Some("qwen3.5")
+        );
+        assert_eq!(
+            gemini_model_for("qwen3.5:countTokens", "countTokens"),
+            Some("qwen3.5")
+        );
+        // The same suffix parsing is used after AGY's selected model has
+        // replaced the client-supplied model segment in its pinned route.
+        assert_eq!(
+            gemini_model_for("agy-title-model:generateContent", "generateContent"),
+            Some("agy-title-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_gemini_route_rejects_unknown_methods_and_invalid_models() {
+        let body = serde_json::json!({"contents": []});
+        let encoded_model = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("model");
+        let err = handle_pinned_gemini(
+            State(test_state()),
+            UrlPath((encoded_model, "v1beta/models/client:unknownMethod".into())),
+            Query(GeminiQuery::default()),
+            HeaderMap::new(),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.1, StatusCode::NOT_FOUND);
+
+        let err = handle_pinned_gemini(
+            State(test_state()),
+            UrlPath((
+                "not*base64".into(),
+                "v1beta/models/client:generateContent".into(),
+            )),
+            Query(GeminiQuery::default()),
+            HeaderMap::new(),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.1, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn gemini_inline_image_becomes_an_openai_image_url_part() {
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({
+            "contents": [{"parts": [
+                {"text": "What is this?"},
+                {"inlineData": {"mimeType": "image/png", "data": "Zm9v"}}
+            ]}]
+        }))
+        .unwrap();
+
+        let messages = gemini_messages(&req).unwrap();
+        assert_eq!(messages[0].content[0]["type"], "text");
+        assert_eq!(messages[0].content[1]["type"], "image_url");
+        assert_eq!(
+            messages[0].content[1]["image_url"]["url"],
+            "data:image/png;base64,Zm9v"
+        );
+    }
+
+    #[test]
+    fn gemini_rejects_unsupported_inline_data() {
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({
+            "contents": [{"parts": [
+                {"inlineData": {"mimeType": "application/pdf", "data": "Zm9v"}}
+            ]}]
+        }))
+        .unwrap();
+
+        assert!(gemini_messages(&req)
+            .unwrap_err()
+            .contains("unsupported Gemini inlineData MIME type"));
+    }
+
+    #[test]
+    fn client_api_key_reads_gemini_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-goog-api-key", "provider-secret".parse().unwrap());
+        assert_eq!(
+            client_api_key(Some(&headers)).as_deref(),
+            Some("provider-secret")
+        );
+        headers.insert("x-goog-api-key", PLACEHOLDER_API_KEY.parse().unwrap());
+        assert_eq!(client_api_key(Some(&headers)), None);
+    }
+
+    #[test]
+    fn gemini_query_key_is_normalized_without_overriding_a_header() {
+        let mut headers = HeaderMap::new();
+        gemini_query_key(
+            &mut headers,
+            GeminiQuery {
+                key: Some("query-secret".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            client_api_key(Some(&headers)).as_deref(),
+            Some("query-secret")
+        );
+
+        headers.insert("x-goog-api-key", "header-secret".parse().unwrap());
+        gemini_query_key(
+            &mut headers,
+            GeminiQuery {
+                key: Some("another-query-secret".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            client_api_key(Some(&headers)).as_deref(),
+            Some("header-secret")
+        );
+    }
+
+    #[test]
+    fn openai_stream_is_converted_to_gemini_sse() {
+        let calls = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        let finished = std::cell::Cell::new(false);
+        let text = gemini_sse_line(
+            r#"{"choices":[{"delta":{"content":"pong"},"finish_reason":null}]}"#,
+            &calls,
+            &finished,
+        );
+        assert!(text.starts_with("data: "));
+        assert!(text.contains(r#""text":"pong""#));
+        let done = gemini_sse_line("[DONE]", &calls, &finished);
+        assert!(done.contains(r#""finishReason":"STOP""#));
+        assert!(gemini_sse_line("[DONE]", &calls, &finished).is_empty());
+    }
+
+    #[test]
+    fn fragmented_openai_tool_call_becomes_one_gemini_function_call() {
+        let calls = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        let finished = std::cell::Cell::new(false);
+        let first = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_backend_7","function":{"name":"view_file","arguments":"{\"path\":"}}]},"finish_reason":null}]}"#;
+        let second = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+        assert!(gemini_sse_line(first, &calls, &finished).is_empty());
+        let done = gemini_sse_line(second, &calls, &finished);
+        assert!(done.contains(r#""name":"view_file""#));
+        assert!(done.contains(r#""id":"call_backend_7""#));
+        assert!(done.contains(r#""args":{"path":"a.rs"}"#));
+    }
+
+    #[test]
+    fn gemini_function_calls_preserve_incoming_ids() {
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({
+            "contents": [{
+                "role": "model",
+                "parts": [
+                    {"functionCall": {"id": "call_view_file_7", "name": "view_file", "args": {"path": "a.rs"}}}
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let messages = gemini_messages(&req).unwrap();
+        assert_eq!(
+            messages[0].tool_calls.as_ref().unwrap()[0].id,
+            "call_view_file_7"
+        );
+    }
+
+    #[test]
+    fn gemini_function_responses_keep_their_call_index() {
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({
+            "contents": [{
+                "role": "model",
+                "parts": [
+                    {"functionCall": {"name": "view_file", "args": {"path": "a.rs"}}},
+                    {"functionCall": {"name": "view_file", "args": {"path": "b.rs"}}},
+                    {"functionResponse": {"id": "call_view_file_1", "name": "view_file", "response": {"text": "done"}}}
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let messages = gemini_messages(&req).unwrap();
+        let tool = messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool.len(), 2);
+        assert_eq!(tool[0].id, "call_view_file_0");
+        assert_eq!(tool[1].id, "call_view_file_1");
+        assert_eq!(
+            messages[1].tool_call_id.as_deref(),
+            Some("call_view_file_1")
+        );
+    }
+
+    #[test]
+    fn gemini_tool_ids_count_each_tool_name_independently() {
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({
+            "contents": [
+                {
+                    "role": "model",
+                    "parts": [
+                        {"functionCall": {"name": "read", "args": {}}},
+                        {"functionCall": {"name": "write", "args": {}}},
+                        {"functionCall": {"name": "read", "args": {}}}
+                    ]
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        {"functionResponse": {"name": "read", "response": {}}},
+                        {"functionResponse": {"name": "write", "response": {}}},
+                        {"functionResponse": {"name": "read", "response": {}}}
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let messages = gemini_messages(&req).unwrap();
+        let calls = messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0].id, "call_read_0");
+        assert_eq!(calls[1].id, "call_write_0");
+        assert_eq!(calls[2].id, "call_read_1");
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_read_0"));
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_write_0"));
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_read_1"));
+    }
+
+    #[test]
+    fn gemini_sse_line_maps_length_to_max_tokens_and_keeps_terminal_text() {
+        let calls = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        let finished = std::cell::Cell::new(false);
+        let out = gemini_sse_line(
+            r#"{"choices":[{"delta":{"content":"tail"},"finish_reason":"length"}]}"#,
+            &calls,
+            &finished,
+        );
+        assert!(out.contains(r#""text":"tail""#));
+        assert!(out.contains(r#""finishReason":"MAX_TOKENS""#));
+    }
+
+    #[test]
+    fn gemini_finish_reason_maps_content_filter_to_safety() {
+        assert_eq!(gemini_finish_reason(Some("content_filter")), "SAFETY");
+    }
+
+    #[test]
+    fn gemini_sse_line_keeps_reasoning_as_a_thought_part() {
+        let calls = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        let finished = std::cell::Cell::new(false);
+        let out = gemini_sse_line(
+            r#"{"choices":[{"delta":{"reasoning_content":"considering options"},"finish_reason":null}]}"#,
+            &calls,
+            &finished,
+        );
+
+        assert!(out.contains(r#""text":"considering options""#));
+        assert!(out.contains(r#""thought":true"#));
+    }
+
+    #[test]
+    fn gemini_sse_line_forwards_usage_only_events() {
+        let calls = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        let finished = std::cell::Cell::new(false);
+        let out = gemini_sse_line(
+            r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+            &calls,
+            &finished,
+        );
+
+        assert!(out.contains(r#""promptTokenCount":3"#));
+        assert!(out.contains(r#""candidatesTokenCount":2"#));
+        assert!(out.contains(r#""totalTokenCount":5"#));
+    }
+
+    #[test]
+    fn gemini_tools_omit_missing_descriptions() {
+        let tools = Some(serde_json::json!([
+            {"functionDeclarations": [{"name": "read_file", "parameters": {"type": "object"}}]}
+        ]));
+        let converted = gemini_tools(&tools).unwrap();
+        assert_eq!(converted[0]["function"].get("description"), None);
+    }
+
+    #[test]
+    fn gemini_non_stream_response_keeps_tool_calls_and_usage() {
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {"content": null, "tool_calls": [{
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
+                }]},
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        });
+
+        let converted = gemini_generate_response(&response, false).unwrap();
+        assert_eq!(
+            converted["candidates"][0]["content"]["parts"][0]["functionCall"]["name"],
+            "read_file"
+        );
+        assert_eq!(
+            converted["candidates"][0]["content"]["parts"][0]["functionCall"]["args"]["path"],
+            "a.rs"
+        );
+        assert_eq!(converted["usageMetadata"]["totalTokenCount"], 5);
+    }
+
+    #[test]
+    fn gemini_generation_config_limits_output_unless_counting_tokens() {
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({
+            "contents": [{"parts": [{"text": "hello"}]}],
+            "generationConfig": {"maxOutputTokens": 42}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            gemini_oai_request("model".into(), &req, false, None)
+                .unwrap()
+                .max_tokens,
+            Some(42)
+        );
+        assert_eq!(
+            gemini_oai_request("model".into(), &req, false, Some(0))
+                .unwrap()
+                .max_tokens,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn gemini_generation_config_maps_json_mime_type_and_schema() {
+        let json = serde_json::json!({"responseMimeType": "application/json"});
+        assert_eq!(
+            gemini_response_format(Some(&json)),
+            Some(serde_json::json!({"type": "json_object"}))
+        );
+
+        let schema = serde_json::json!({
+            "responseMimeType": "application/json",
+            "responseJsonSchema": {"type": "object", "properties": {"answer": {"type": "string"}}}
+        });
+        assert_eq!(
+            gemini_response_format(Some(&schema)),
+            Some(serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "response", "schema": schema["responseJsonSchema"], "strict": true}
+            }))
+        );
+        assert_eq!(gemini_response_format(None), None);
+    }
 
     // -- pull/push progress relay -------------------------------------------
 
@@ -11149,9 +12134,9 @@ mod tests {
         acc.insert(
             0,
             ToolCallAccumulator {
+                id: String::new(),
                 name: "f".into(),
                 arguments: "not json".into(),
-                ..Default::default()
             },
         );
         let calls = finalize_tool_calls(&acc).unwrap();
