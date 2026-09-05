@@ -1813,9 +1813,13 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile wingetcreate.exe
           $got = (Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash
           if ($got -ne $env:WINGETCREATE_SHA256) { throw "wingetcreate.exe sha256 $got != $env:WINGETCREATE_SHA256" }
-          # `version` is a subcommand; `--version` prints help and exits 1.
-          .\wingetcreate.exe version
-          if ($LASTEXITCODE -ne 0) { throw "wingetcreate version failed with exit code $LASTEXITCODE" }
+          # Smoke test. `info` is the only real "print the version" command:
+          # `version` and `help` are listed in the help text by
+          # CommandLineParser but are not registered verbs, so they (like
+          # `--version`) print help and exit 1. `info` also skips the GitHub
+          # client, so it needs no token or network.
+          .\wingetcreate.exe info
+          if ($LASTEXITCODE -ne 0) { throw "wingetcreate info failed with exit code $LASTEXITCODE" }
 
       # WINGET_CREATE_GITHUB_TOKEN is wingetcreate's env var for CI
       # (https://aka.ms/winget-create-token); --token may be logged.
