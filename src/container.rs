@@ -248,12 +248,18 @@ pub struct LlamaOptions<'a> {
     /// needs a whole input in one ubatch.
     pub batch_size: Option<u32>,
 
-    /// `--threads <n>`, set only when a CPU limit (cgroup quota or
-    /// affinity) binds; see `cmd::serve::threads_from_env_or_host`.
-    /// Deliberately ignored by [`spawn`]: the daemon's cgroup says
-    /// nothing about the limits of the fresh container llama-server
-    /// runs in. An explicit LLAMA_ARG_THREADS still reaches the
-    /// container via LLAMA_CPP_ENV_PASSTHROUGH_VARS.
+    /// `--threads <n>`: a request's Ollama `options.num_thread` when
+    /// set, else the derived host-limit value, which is `Some` only
+    /// when a CPU limit (cgroup quota or affinity) binds; see
+    /// `cmd::serve::ensure_model`'s `request_threads` parameter and
+    /// `cmd::serve::threads_from_env_or_host`. Deliberately ignored by
+    /// [`spawn`], whichever source it came from: the derived value
+    /// describes the daemon's cgroup, which says nothing about the
+    /// limits of the fresh container llama-server runs in, and a
+    /// request's num_thread counts host cores the container may not
+    /// have either, so both stay local-spawn-only until container CPU
+    /// limits are plumbed deliberately. An explicit LLAMA_ARG_THREADS
+    /// still reaches the container via LLAMA_CPP_ENV_PASSTHROUGH_VARS.
     pub threads: Option<u32>,
 }
 
@@ -289,8 +295,8 @@ pub fn spawn(
         num_parallel,
         embeddings,
         batch_size,
-        // See the field's doc comment: the derived value describes the
-        // daemon's cgroup, not the container's.
+        // See the field's doc comment: neither the derived value nor a
+        // request's num_thread describes the container's own CPU limits.
         threads: _,
     } = opts;
     let backend = detect_backend();

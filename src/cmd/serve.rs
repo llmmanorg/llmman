@@ -3373,10 +3373,28 @@ async fn resolve_remote_target(
 /// `headers` are the incoming request's, used only to pick up a caller-
 /// supplied provider API key (see [`resolve_remote_target`]); `None` from
 /// a surface that has none to offer.
+///
+/// `request_threads` is the caller's Ollama `options.num_thread` (see
+/// [`opt_num_thread`]); `None` from every surface without an Ollama
+/// options blob (OpenAI-compat, Anthropic, embeddings, preload).
+/// Precedence for the thread count a local llama-server ends up with:
+/// request option > `LLAMA_ARG_THREADS` > the derived `state.threads`
+/// (see [`threads_from_env_or_host`]) > llama-server's own
+/// autodetection. The request option is forwarded as `--threads`, and
+/// llama.cpp applies env before CLI, so that flag wins over
+/// `LLAMA_ARG_THREADS`; when the option is absent, `state.threads` is
+/// already `None` whenever `LLAMA_ARG_THREADS` is set, so no
+/// `--threads` is emitted and the env choice stands untouched. Like a
+/// per-request ctx change, the option only takes effect on a fresh
+/// load: the `check_running` short-circuits below reuse an
+/// already-running instance as-is, never reloading it for a different
+/// thread count. Under `--ociman` it is ignored along with the derived
+/// value; see `container::LlamaOptions::threads` for why.
 async fn ensure_model(
     state: &AppState,
     model_ref: &str,
     headers: Option<&HeaderMap>,
+    request_threads: Option<u32>,
 ) -> Result<(String, Target, ActivityGuard), AppError> {
     // Before `resolve_ollama_api`, deliberately: a provider-routed
     // reference names a model on someone else's servers, so none of the
@@ -3581,7 +3599,9 @@ async fn ensure_model(
             embeddings: embedding_ctx.is_some(),
             // `.filter`: a 0 here is "trained context", not a batch size.
             batch_size: embedding_ctx.and(ctx_size).filter(|n| *n > 0),
-            threads: state.0.threads,
+            // See ensure_model's `request_threads` doc comment for the
+            // full precedence chain this `.or` implements.
+            threads: request_threads.or(state.0.threads),
         };
         // Only a local llama-server child captures a stderr tail (see
         // spawn_llama_server) — every retry below only fires for that case.
@@ -5727,7 +5747,17 @@ async fn handle_ollama_chat(
         return Ok(Json(empty_chat_chunk(req.model, "unload")).into_response());
     }
 
-    let (model, target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
+    // The options blob still applies to a load-only request (the
+    // empty-messages branch below): a preload that names num_thread
+    // should start the process with it, same as a generating request
+    // would.
+    let (model, target, guard) = ensure_model(
+        &state,
+        &req.model,
+        Some(&headers),
+        opt_num_thread(&req.options),
+    )
+    .await?;
     if matches!(target, Target::Peer(_)) {
         return forward_ollama(&state, &target, "/api/chat", &headers, &req, guard).await;
     }
@@ -5824,7 +5854,13 @@ async fn handle_ollama_generate(
         .into_response());
     }
 
-    let (model, target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
+    let (model, target, guard) = ensure_model(
+        &state,
+        &req.model,
+        Some(&headers),
+        opt_num_thread(&req.options),
+    )
+    .await?;
     if matches!(target, Target::Peer(_)) {
         return forward_ollama(&state, &target, "/api/generate", &headers, &req, guard).await;
     }
@@ -5931,7 +5967,9 @@ async fn embed_via_backend(
         }
     }
     let started = Instant::now();
-    let (model, target, guard) = ensure_model(state, model_ref, Some(headers)).await?;
+    // No `request_threads`: OllamaEmbedRequest carries no `options`
+    // blob here, so there is no num_thread to forward.
+    let (model, target, guard) = ensure_model(state, model_ref, Some(headers), None).await?;
     let loaded = started.elapsed();
     if !target.is_remote() && would_use_mlx(state, &model).await.is_some() {
         return Err(mlx_unsupported(&model));
@@ -6309,7 +6347,9 @@ async fn resolve_openai_request(
     let mut req: serde_json::Value =
         serde_json::from_slice(&body).context("parse OpenAI request body")?;
     let model = req["model"].as_str().unwrap_or("").to_string();
-    let (model, target, guard) = ensure_model(state, &model, Some(headers)).await?;
+    // No `request_threads`: the OpenAI-compatible surface has no Ollama
+    // options blob, so there is no num_thread to forward.
+    let (model, target, guard) = ensure_model(state, &model, Some(headers), None).await?;
     // The OpenAI-compatible surface has no `keep_alive` field of its own
     // (real Ollama's doesn't either) — `None` leaves whatever this model
     // already has untouched (its load-time default, or an explicit value
@@ -6613,7 +6653,7 @@ async fn handle_openai_transcriptions(
         });
         return Ok((StatusCode::BAD_REQUEST, Json(body)).into_response());
     }
-    let (_, target, guard) = ensure_model(&state, &model, Some(&headers)).await?;
+    let (_, target, guard) = ensure_model(&state, &model, Some(&headers), None).await?;
     // No `keep_alive` field on this API surface either — see
     // resolve_openai_request's own comment on the same choice.
     let activity = begin_activity(guard, None).await;
@@ -6857,7 +6897,10 @@ async fn handle_anthropic_messages(
 ) -> Result<Response, AppError> {
     // Backend needs its canonical name (see ensure_model); the response
     // below still echoes req.model back, unchanged from before.
-    let (canonical_model, target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
+    // No `request_threads`: the Anthropic Messages API has no Ollama
+    // options blob, so there is no num_thread to forward.
+    let (canonical_model, target, guard) =
+        ensure_model(&state, &req.model, Some(&headers), None).await?;
     // The Anthropic Messages API has no `keep_alive` field of its own —
     // `None` leaves it untouched, same as the OpenAI-compatible surface
     // (see resolve_openai_request's own comment on why).
@@ -6925,6 +6968,21 @@ fn opt_f64(opts: &Option<serde_json::Value>, key: &str) -> Option<f32> {
 
 fn opt_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32> {
     opts.as_ref()?.get(key)?.as_u64().map(|n| n as u32)
+}
+
+/// `num_thread` from the Ollama options blob: the per-request
+/// `--threads <n>` for a fresh local llama-server load (see
+/// `ensure_model`'s `request_threads` parameter for the full precedence
+/// chain and the reuse/container caveats). Zero, negative, fractional,
+/// or above-u32 numbers are dropped, falling back down that chain, the
+/// same way `parse_num_parallel` rejects zero for `--parallel`. Unlike
+/// that env-string parser this value arrives as a JSON number (Ollama's
+/// `num_thread` is an int field), so `as_u64` does the type filtering;
+/// not built on [`opt_u32`], whose `as u32` truncation is harmless for
+/// `num_predict` but would turn e.g. 2^32+1 into `--threads 1` here.
+fn opt_num_thread(opts: &Option<serde_json::Value>) -> Option<u32> {
+    let n = opts.as_ref()?.get("num_thread")?.as_u64()?;
+    u32::try_from(n).ok().filter(|&n| n != 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -7534,7 +7592,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             Ok(model) => {
                 let state_clone = state.clone();
                 tokio::spawn(async move {
-                    match ensure_model(&state_clone, &model, None).await {
+                    match ensure_model(&state_clone, &model, None, None).await {
                         // ensure_model's own keep_alive (the daemon default, 5
                         // minutes) would otherwise start counting down the
                         // moment this finishes loading, with no request traffic
@@ -8043,9 +8101,10 @@ mod tests {
         let (origin, _) = mock_peer(node(8 << 30, &["docker.io/ai/m:latest"], &[])).await;
         let state = state_with_peers(vec![origin.clone()], 0);
 
-        let (name, target, _) = ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()))
-            .await
-            .unwrap();
+        let (name, target, _) =
+            ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()), None)
+                .await
+                .unwrap();
         assert_eq!(name, "docker.io/ai/m:latest");
         assert!(
             matches!(&target, Target::Peer(o) if *o == origin),
@@ -8055,7 +8114,7 @@ mod tests {
         // Hopped once: load here (failing on the fixture), never bounce.
         let mut hopped = HeaderMap::new();
         hopped.insert(aggregation::HOP, "1".parse().unwrap());
-        let err = ensure_model(&state, "docker.io/ai/m", Some(&hopped))
+        let err = ensure_model(&state, "docker.io/ai/m", Some(&hopped), None)
             .await
             .err()
             .expect("the fixture has no blobs to load");
@@ -8066,7 +8125,7 @@ mod tests {
         );
 
         // A pre-load names a model for *this* node.
-        let err = ensure_model(&state, "docker.io/ai/m", None)
+        let err = ensure_model(&state, "docker.io/ai/m", None, None)
             .await
             .err()
             .unwrap();
@@ -8083,7 +8142,7 @@ mod tests {
     async fn ensure_model_places_a_cold_model_on_the_roomiest_reachable_node() {
         let (roomy, _) = mock_peer(node(128 << 30, &[], &["docker.io/ai/m:latest"])).await;
         let state = state_with_peers(vec![roomy.clone()], 8 << 30);
-        let (_, target, _) = ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()))
+        let (_, target, _) = ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()), None)
             .await
             .unwrap();
         assert!(
@@ -8095,7 +8154,7 @@ mod tests {
         let (bare, _) = mock_peer(node(128 << 30, &[], &[])).await;
         let dead = "http://127.0.0.1:9".to_string();
         let state = state_with_peers(vec![dead, bare], 8 << 30);
-        let err = ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()))
+        let err = ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()), None)
             .await
             .err()
             .expect("loads (and fails on the fixture) locally");
@@ -9972,7 +10031,7 @@ mod tests {
                 .insert("docker.io/ai/m-df@sha256:df01".into(), running);
         }
 
-        let (key, target, guard) = ensure_model(&state, "docker.io/ai/m-df", None)
+        let (key, target, guard) = ensure_model(&state, "docker.io/ai/m-df", None, None)
             .await
             .expect("the tag must find the running content rather than load again");
         assert_eq!(key, "docker.io/ai/m-df@sha256:df01");
@@ -10162,7 +10221,7 @@ mod tests {
 
         let loader = state.clone();
         let load = tokio::spawn(async move {
-            ensure_model(&loader, "docker.io/ai/m-digest@sha256:d16e", None).await
+            ensure_model(&loader, "docker.io/ai/m-digest@sha256:d16e", None, None).await
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
@@ -11439,6 +11498,43 @@ mod tests {
     }
 
     #[test]
+    fn opt_num_thread_accepts_a_positive_integer() {
+        assert_eq!(
+            opt_num_thread(&Some(serde_json::json!({"num_thread": 4}))),
+            Some(4)
+        );
+        assert_eq!(
+            opt_num_thread(&Some(serde_json::json!({"num_thread": 1}))),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn opt_num_thread_rejects_zero_negative_and_non_integer_values() {
+        // (num_thread value in the options blob, why it must be dropped)
+        let cases = [
+            (
+                serde_json::json!(0),
+                "zero: llama-server rejects --threads 0",
+            ),
+            (serde_json::json!(-1), "negative"),
+            (serde_json::json!(2.5), "fractional"),
+            (serde_json::json!("4"), "string, not a JSON number"),
+            (
+                serde_json::json!(u64::from(u32::MAX) + 1),
+                "above u32: must not truncate to --threads 0",
+            ),
+        ];
+        for (value, why) in cases {
+            let opts = Some(serde_json::json!({ "num_thread": value }));
+            assert_eq!(opt_num_thread(&opts), None, "{why}");
+        }
+        // Missing key, and no options blob at all.
+        assert_eq!(opt_num_thread(&Some(serde_json::json!({}))), None);
+        assert_eq!(opt_num_thread(&None), None);
+    }
+
+    #[test]
     fn keyed_lock_is_per_key_and_release_only_drops_unreferenced_entries() {
         let registry: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> =
             StdMutex::new(HashMap::new());
@@ -11541,7 +11637,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_model_rejects_an_invalid_ref_with_400() {
         let state = test_state();
-        let err = ensure_model(&state, "hf.co/../x", None)
+        let err = ensure_model(&state, "hf.co/../x", None, None)
             .await
             .err()
             .expect("invalid ref must be rejected");
