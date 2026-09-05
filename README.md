@@ -69,13 +69,32 @@ landing in your local store.
 **Linux, macOS:**
 
 ```
-curl -fsSL https://raw.githubusercontent.com/llmmanorg/llmman/main/install.sh | sh
+curl -fsSL https://llmmanorg.github.io/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```
-irm https://raw.githubusercontent.com/llmmanorg/llmman/main/install.ps1 | iex
+irm https://llmmanorg.github.io/install.ps1 | iex
+```
+
+**Homebrew:**
+
+```sh
+brew install llmmanorg/tap/llmman
+```
+
+**winget:**
+
+```powershell
+winget install llmmanorg.llmman
+```
+
+**Cargo:**
+
+```sh
+cargo binstall llmman   # prebuilt binary
+cargo install llmman    # build from source; needs Go 1.25+ (and LLVM on Windows) as well as Rust
 ```
 
 ## Quick start
