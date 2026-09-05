@@ -300,8 +300,13 @@ pub enum ClassifiedRef {
     /// forms is tag-normalized).
     Source(String),
     /// An actual OCI Distribution registry, normalized (`:latest`
-    /// defaulted in) exactly as `ffi::pull`/`ffi::transfer` expect it —
-    /// the only kind still handled by the Go shim.
+    /// defaulted in) — the only kind still handled by the Go shim,
+    /// which takes either spelling since it applies the same rule.
+    ///
+    /// Not a progress key: the shim tracks byte progress under the
+    /// literal string it is handed, so a caller that also polls
+    /// `ffi::progress` must pass `ffi::pull` the reference it polls
+    /// with. See `cmd::serve`'s `ffi_pull_ref`.
     Other(String),
 }
 

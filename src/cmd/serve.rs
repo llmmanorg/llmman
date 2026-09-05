@@ -2396,6 +2396,19 @@ async fn acquire_load_lock(model: &str) -> LoadLockGuard {
     }
 }
 
+/// The reference an OCI-registry pull hands `ffi::pull`: the string
+/// `stream_ffi_progress` polls progress under, never the `:latest`-
+/// defaulted `classified`. The shim keys byte progress on what it is
+/// given and defaults the tag itself, so `classified` files the counts
+/// where nothing reads them — which cost every tagless pull its bar.
+fn ffi_pull_ref<'a>(progress_key: &'a str, classified: &str) -> &'a str {
+    debug_assert!(
+        classified == progress_key || classified.strip_prefix(progress_key) == Some(":latest"),
+        "classify should differ from the progress key only by a defaulted tag",
+    );
+    progress_key
+}
+
 /// Pulls `model` into `layout_dir` if (still, after acquiring model's own
 /// lock) missing from the local store — shared by `ensure_model`'s
 /// fallback and `handle_pull` so both funnel through the same
@@ -2476,7 +2489,7 @@ fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<
                     // model the policy will reject costs one manifest
                     // lookup instead of a multi-gigabyte download...
                     let guard = crate::verify::PullGuard::check(&normalized)?;
-                    crate::ffi::pull(&normalized, layout_dir)?;
+                    crate::ffi::pull(ffi_pull_ref(model, &normalized), layout_dir)?;
                     // ...and confirmed afterwards against what actually
                     // landed, so a tag repointed mid-pull can't slip
                     // past the check that just passed.
@@ -5248,6 +5261,34 @@ impl StreamedOutcome for PushOutcome {
     }
 }
 
+/// One poll's worth of NDJSON, or `None` to send nothing. `saw_bytes`
+/// latches once real counts arrive: an empty snapshot after that means
+/// the transfer ended while the task finishes up, and heartbeating
+/// there printed a stray line under the finished bar.
+fn progress_line(
+    verb: &str,
+    model: &str,
+    snap: (String, i64, i64),
+    saw_bytes: &mut bool,
+) -> Option<serde_json::Value> {
+    let (status, total, completed) = snap;
+    if total > 0 {
+        *saw_bytes = true;
+        return Some(serde_json::json!({
+            "status": if status.is_empty() { format!("{verb}ing {model}") } else { status },
+            "total": total,
+            "completed": completed.clamp(0, total),
+        }));
+    }
+    if !status.is_empty() {
+        return Some(serde_json::json!({"status": status}));
+    }
+    if *saw_bytes {
+        return None;
+    }
+    Some(serde_json::json!({"status": format!("{verb}ing {model}")}))
+}
+
 /// Runs `task` (a blocking FFI call already dispatched via spawn_blocking)
 /// to completion, streaming an immediate `first_status` line, then polling
 /// `ffi::progress(&model)` every 200ms (matching the Go shim's own mpb
@@ -5276,7 +5317,8 @@ fn stream_ffi_progress<T: StreamedOutcome + Send + 'static>(
 ) -> Response {
     let first_line = serde_json::json!({"status": first_status}).to_string() + "\n";
     let stream = futures::stream::once(futures::future::ready(Bytes::from(first_line)))
-        .chain(futures::stream::unfold(Some(task), move |task| {
+        .chain(futures::stream::unfold((Some(task), false), move |state| {
+            let (task, mut saw_bytes) = state;
             let model = model.clone();
             async move {
                 let mut task = task?;
@@ -5302,7 +5344,7 @@ fn stream_ffi_progress<T: StreamedOutcome + Send + 'static>(
                         };
                         out.push_str(&line);
                         out.push('\n');
-                        Some((Bytes::from(out), None))
+                        Some((Bytes::from(out), (None, saw_bytes)))
                     }
                     _ = sleep(Duration::from_millis(200)) => {
                         // A HuggingFace pull tracks its own progress natively
@@ -5321,18 +5363,9 @@ fn stream_ffi_progress<T: StreamedOutcome + Send + 'static>(
                         } else {
                             (String::new(), 0, 0)
                         };
-                        let line = if total > 0 {
-                            serde_json::json!({
-                                "status": if status.is_empty() { format!("{verb}ing {model}") } else { status },
-                                "total": total.max(0),
-                                "completed": completed.clamp(0, total),
-                            })
-                        } else if !status.is_empty() {
-                            serde_json::json!({"status": status})
-                        } else {
-                            serde_json::json!({"status": format!("{verb}ing {model}")})
-                        };
-                        Some((Bytes::from(line.to_string() + "\n"), Some(task)))
+                        let line = progress_line(verb, &model, (status, total, completed), &mut saw_bytes);
+                        let out = line.map(|l| l.to_string() + "\n").unwrap_or_default();
+                        Some((Bytes::from(out), (Some(task), saw_bytes)))
                     }
                 }
             }
@@ -7661,6 +7694,66 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- pull/push progress relay -------------------------------------------
+
+    /// Regression test for tagless pulls losing their bar: the shim
+    /// must get the reference the daemon polls under, not the
+    /// tag-normalized one.
+    #[test]
+    fn ffi_pull_ref_is_the_polled_key_not_the_tag_normalized_ref() {
+        assert_eq!(
+            ffi_pull_ref("docker.io/ai/qwen3.8", "docker.io/ai/qwen3.8:latest"),
+            "docker.io/ai/qwen3.8"
+        );
+        // An already-tagged reference classifies to itself.
+        assert_eq!(
+            ffi_pull_ref("docker.io/ai/qwen3.8:0.8b", "docker.io/ai/qwen3.8:0.8b"),
+            "docker.io/ai/qwen3.8:0.8b"
+        );
+    }
+
+    /// The heartbeat must not come back once the bar is running: the
+    /// shim drops its entry when the transfer ends, while the task still
+    /// has its signature check to do, and a heartbeat there printed a
+    /// stray line under the finished bar.
+    #[test]
+    fn progress_line_stops_heartbeating_once_byte_counts_have_been_seen() {
+        let mut saw_bytes = false;
+        // Nothing known yet: the heartbeat is all there is to send.
+        assert_eq!(
+            progress_line("pull", "m", (String::new(), 0, 0), &mut saw_bytes),
+            Some(serde_json::json!({"status": "pulling m"}))
+        );
+        assert!(!saw_bytes);
+        // Real counts latch the flag and drive the bar.
+        assert_eq!(
+            progress_line("pull", "m", ("pulling".into(), 100, 40), &mut saw_bytes),
+            Some(serde_json::json!({"status": "pulling", "total": 100, "completed": 40}))
+        );
+        assert!(saw_bytes);
+        // Entry dropped, task still finishing: say nothing.
+        assert_eq!(
+            progress_line("pull", "m", (String::new(), 0, 0), &mut saw_bytes),
+            None
+        );
+    }
+
+    /// A status-only snapshot still reports; a blank status names the
+    /// model, and `completed` never exceeds `total`.
+    #[test]
+    fn progress_line_reports_status_only_snapshots_and_clamps_completed() {
+        let mut saw_bytes = false;
+        assert_eq!(
+            progress_line("pull", "m", ("verifying".into(), 0, 0), &mut saw_bytes),
+            Some(serde_json::json!({"status": "verifying"}))
+        );
+        assert!(!saw_bytes);
+        assert_eq!(
+            progress_line("push", "m", (String::new(), 100, 999), &mut saw_bytes),
+            Some(serde_json::json!({"status": "pushing m", "total": 100, "completed": 100}))
+        );
+    }
 
     // -- request targets (local backend vs remote provider) -----------------
 
