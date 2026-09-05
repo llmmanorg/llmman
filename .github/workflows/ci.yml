@@ -1,9 +1,10 @@
 name: CI
 
+# No `tags:` trigger: every commit on main is a release, and the `release`
+# job creates the v<version> tag itself (see packaging/version.sh).
 on:
   push:
     branches: ["main"]
-    tags: ["v*"]
   pull_request:
     branches: ["main"]
 
@@ -102,7 +103,23 @@ jobs:
             rustflags: ""
 
     steps:
+      # fetch-depth: 0 — packaging/version.sh needs the full commit count.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Writes MAJOR.MINOR.<commit count> into Cargo.toml/Cargo.lock before
+      # compiling, so `llmman --version`, the release tag, the crate and
+      # the brew/winget packages all carry the same version. Runs on PRs
+      # too, so a broken script fails before it can ship. That edit would
+      # make build.rs's `git describe --dirty` report -dirty, so the commit
+      # hash is passed explicitly instead.
+      - name: Set release version
+        shell: bash
+        run: |
+          packaging/version.sh --apply
+          echo "LLMMAN_GIT_DESCRIBE=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       # ── Go toolchain ──────────────────────────────────────────────────────
       - name: Set up Go
@@ -117,6 +134,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # The version step changes Cargo.lock every commit, so rust-cache
+      # never gets an exact key hit; its prefix fallback still restores
+      # all dependency artefacts.
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
@@ -462,6 +482,175 @@ jobs:
         run: go test -tags podman,containers_image_openpgp,exclude_graphdriver_btrfs,exclude_graphdriver_devicemapper ./...
 
   # --------------------------------------------------------------------------
+  # Packaging: runs packaging/version.sh and packaging/render.sh on every PR
+  # and checks their output (Homebrew formula, winget manifests, the crate),
+  # so a broken template fails here rather than after it has been pushed to
+  # the tap or opened against winget-pkgs. `release` gates on this.
+  # --------------------------------------------------------------------------
+  packaging:
+    name: Packaging (version, brew/winget templates, crate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: shellcheck
+        run: shellcheck packaging/version.sh packaging/render.sh
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      # MAJOR.MINOR from Cargo.toml (PATCH must stay 0), PATCH = commit
+      # count; --apply must leave Cargo.toml and Cargo.lock agreeing.
+      - name: version.sh
+        id: version
+        run: |
+          set -euo pipefail
+          base="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{gsub(/^[^"]*"|".*$/,""); print; exit}' Cargo.toml)"
+          count="$(git rev-list --count HEAD)"
+          want="${base%.*}.$count"
+          got="$(packaging/version.sh)"
+          [ "$got" = "$want" ] || { echo "::error::version.sh printed $got, expected $want"; exit 1; }
+          [ "${base##*.}" = "0" ] || { echo "::error::Cargo.toml PATCH is ${base##*.}, must stay 0 (CI owns it)"; exit 1; }
+
+          packaging/version.sh --apply >/dev/null
+          applied="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          [ "$applied" = "$want" ] || { echo "::error::--apply left Cargo.toml at $applied, expected $want"; exit 1; }
+          cargo metadata --locked --format-version 1 >/dev/null
+          echo "version=$want" >> "$GITHUB_OUTPUT"
+          echo "OK: version $want applied to Cargo.toml and Cargo.lock"
+
+      # Synthetic checksums: this checks rendering, not hashes. Everything
+      # goes to $RUNNER_TEMP so `cargo package` below sees a clean tree.
+      - name: Render formula and manifests
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          for asset in \
+            llmman-aarch64-apple-darwin \
+            llmman-x86_64-unknown-linux-gnu \
+            llmman-aarch64-unknown-linux-gnu \
+            llmman-x86_64-pc-windows-msvc.exe \
+            llmman-aarch64-pc-windows-msvc.exe; do
+            printf '%s  %s\n' "$(printf '%s' "$asset" | sha256sum | cut -d' ' -f1)" "$asset"
+          done > "$RUNNER_TEMP/fake-checksums.txt"
+          packaging/render.sh --version "$VERSION" --checksums "$RUNNER_TEMP/fake-checksums.txt" --out-dir "$RUNNER_TEMP/out"
+
+          # A missing platform or a malformed version must be rejected.
+          grep -v aarch64-unknown-linux-gnu "$RUNNER_TEMP/fake-checksums.txt" > "$RUNNER_TEMP/short.txt"
+          if packaging/render.sh --version "$VERSION" --checksums "$RUNNER_TEMP/short.txt" --out-dir "$RUNNER_TEMP/out-bad" 2>/dev/null; then
+            echo "::error::render.sh accepted a checksums file with no Linux aarch64 entry"; exit 1
+          fi
+          for bad in "v$VERSION" "$VERSION-rc1" "0.1" ""; do
+            if packaging/render.sh --version "$bad" --checksums "$RUNNER_TEMP/fake-checksums.txt" --out-dir "$RUNNER_TEMP/out-bad" 2>/dev/null; then
+              echo "::error::render.sh accepted version \"$bad\""; exit 1
+            fi
+          done
+          echo "OK"
+
+      # ruby -c catches the failure that breaks the whole tap (a formula
+      # that does not parse). Homebrew also requires class == filename.
+      - name: Check Homebrew formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          f="$RUNNER_TEMP/out/Formula/llmman.rb"
+          ruby -c "$f"
+          grep -q '^class Llmman < Formula$' "$f" || { echo "::error::$f does not declare 'class Llmman'"; exit 1; }
+          grep -q "^  version \"$VERSION\"$" "$f" || { echo "::error::$f does not declare version $VERSION"; exit 1; }
+          for asset in llmman-aarch64-apple-darwin llmman-x86_64-unknown-linux-gnu llmman-aarch64-unknown-linux-gnu; do
+            grep -q "releases/download/v$VERSION/$asset\"" "$f" || { echo "::error::$f has no url for $asset"; exit 1; }
+          done
+          [ "$(grep -c '^ *sha256 "[0-9a-f]\{64\}"$' "$f")" -eq 3 ] || { echo "::error::$f does not have exactly 3 sha256 lines"; exit 1; }
+          if grep -q '^ *url ".*x86_64-apple-darwin' "$f"; then
+            echo "::error::$f has a url for x86_64-apple-darwin, which llmman does not publish"; exit 1
+          fi
+          test -f "$RUNNER_TEMP/out/README.md"
+          echo "OK: $f"
+
+      # Against the real 1.12.0 manifest schemas. The timestamp override
+      # keeps ReleaseDate a string, as winget's YAML parser does.
+      - name: Check winget manifests
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet pyyaml jsonschema
+          dir="$RUNNER_TEMP/out/manifests/l/llmmanorg/llmman/$VERSION"
+          for t in version installer defaultLocale; do
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/schema-$t.json" \
+              "https://raw.githubusercontent.com/microsoft/winget-cli/master/schemas/JSON/manifests/v1.12.0/manifest.$t.1.12.0.json"
+          done
+          "$RUNNER_TEMP/venv/bin/python" - "$dir" "$VERSION" "$RUNNER_TEMP" <<'PY'
+          import json, sys, yaml, jsonschema
+          d, version, tmp = sys.argv[1], sys.argv[2], sys.argv[3]
+          class L(yaml.SafeLoader): pass
+          L.add_constructor('tag:yaml.org,2002:timestamp', lambda l, n: l.construct_scalar(n))
+          files = {
+              "version": "llmmanorg.llmman.yaml",
+              "installer": "llmmanorg.llmman.installer.yaml",
+              "defaultLocale": "llmmanorg.llmman.locale.en-US.yaml",
+          }
+          docs = {}
+          for t, name in files.items():
+              with open(f"{d}/{name}") as fh:
+                  doc = yaml.load(fh, Loader=L)
+              jsonschema.validate(doc, json.load(open(f"{tmp}/schema-{t}.json")), format_checker=jsonschema.FormatChecker())
+              assert doc["PackageIdentifier"] == "llmmanorg.llmman", name
+              assert doc["PackageVersion"] == version, (name, doc["PackageVersion"])
+              docs[t] = doc
+              print(f"OK {name}: valid against manifest.{t}.1.12.0")
+          inst = docs["installer"]
+          assert inst["InstallerType"] == "portable", inst["InstallerType"]
+          assert inst.get("Commands") == ["llmman"], inst.get("Commands")  # names the PATH symlink
+          arches = {i["Architecture"]: i for i in inst["Installers"]}
+          assert set(arches) == {"x64", "arm64"}, sorted(arches)
+          for arch, triple in (("x64", "x86_64-pc-windows-msvc"), ("arm64", "aarch64-pc-windows-msvc")):
+              i = arches[arch]
+              assert i["InstallerUrl"] == f"https://github.com/llmmanorg/llmman/releases/download/v{version}/llmman-{triple}.exe", i["InstallerUrl"]
+              assert len(i["InstallerSha256"]) == 64 and i["InstallerSha256"] == i["InstallerSha256"].upper(), i["InstallerSha256"]
+              deps = [d["PackageIdentifier"] for d in i["Dependencies"]["PackageDependencies"]]
+              assert deps == [f"Microsoft.VCRedist.2015+.{arch}"], (arch, deps)  # binaries import VCRUNTIME140.dll
+          loc = docs["defaultLocale"]
+          for key in ("Publisher", "PackageName", "License", "LicenseUrl", "ShortDescription", "Description", "Moniker", "ReleaseNotesUrl"):
+              assert loc.get(key), f"locale manifest lacks {key}"
+          print(f"OK: x64 and arm64 portable installers for v{version}")
+          PY
+
+      # `build`/`test` already compile this source on all five targets; this
+      # checks the .crate carries what build.rs reads (go-shim/, webui/),
+      # drops the dev-only paths, and fits crates.io's 10 MiB limit.
+      # publish-crate does the verification build.
+      - name: Check crate contents
+        run: |
+          set -euo pipefail
+          files="$RUNNER_TEMP/files.txt"
+          cargo package --no-verify --allow-dirty --list > "$files"
+          for must in build.rs Cargo.toml Cargo.lock LICENSE README.md go-shim/go.mod go-shim/go.sum go-shim/shim.go \
+                      go-shim/backend_docker.go go-shim/backend_podman.go \
+                      webui/index.html webui/bundle.js webui/bundle.css webui/loading.html \
+                      src/main.rs src/lib.rs src/webui.rs src/ffi.rs; do
+            grep -qx "$must" "$files" || { echo "::error::$must is missing from the .crate"; exit 1; }
+          done
+          for never in '^packaging/' '^vllm-plugin/' '^docs/' '^\.github/' '^install\.sh$' '^install\.ps1$' '^fuzz/' '^go-shim/go-shim$'; do
+            if grep -q "$never" "$files"; then
+              echo "::error::.crate contains files matching $never:"; grep "$never" "$files"; exit 1
+            fi
+          done
+          cargo package --no-verify --allow-dirty
+          crate="$(ls target/package/llmman-*.crate)"
+          size="$(stat -c %s "$crate")"
+          echo "$crate: $size bytes"
+          [ "$size" -lt $((10 * 1024 * 1024)) ] || { echo "::error::$crate is over crates.io's 10 MiB limit"; exit 1; }
+          echo "OK: crate contents ($(wc -l < "$files") files)"
+
+  # --------------------------------------------------------------------------
   # E2E: `llmman launch <claude|opencode|codex|qwen|hermes|openclaw> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
@@ -493,13 +682,11 @@ jobs:
     name: E2E (launch claude/opencode/codex/qwen/hermes/openclaw, vllm-plugin, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
-    # they're skipped on pull_request entirely and only run on the two
-    # push events that can actually lead to a release: a push to main
-    # itself (the per-commit b<N> release channel) and a v* tag push (the
-    # versioned release channel) — see the `release` job's own `needs`,
-    # which now includes this job for exactly that reason, and its own
-    # identical two-channel `if:` condition below.
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    # they're skipped on pull_request entirely and only run on the one
+    # push event that leads to a release: a push to main — see the
+    # `release` job's own `needs`, which includes this job for exactly
+    # that reason, and its own identical `if:` condition below.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     # 6 tests run serialized (--test-threads=1 + lock_serial()), so the
     # worst case sums all 6's own retry budgets: MAX_ATTEMPTS * TIMEOUT
     # (3 * 600s = 30 min) each — a timeout itself never retries (see
@@ -1241,52 +1428,46 @@ jobs:
           fi
 
   # --------------------------------------------------------------------------
-  # Release: a GitHub Release per commit on main (llama.cpp-style b<N>
-  # tags) plus proper versioned releases on v* tag pushes
+  # Release: a GitHub Release per commit on main, tagged v<version> where
+  # version = packaging/version.sh's MAJOR.MINOR.<commit count>. The build
+  # job compiled with that version in Cargo.toml, so the binaries report
+  # it. Non-prerelease, so install.sh's /releases/latest/ tracks main and
+  # older builds stay downloadable by tag. The publish-* jobs hang off this
+  # one: nothing reaches a package manager until the release its download
+  # URLs point at exists.
   # --------------------------------------------------------------------------
   release:
     name: Release
-    # All of build/test/lint/e2e must be green before a release is cut —
-    # not just build. (`cargo fmt --check` now runs as part of `test`'s own
-    # check-fmt leg — see that job's own comment — so it's covered here
-    # too without a separate `fmt` entry; `lint` covers the Go half.) e2e
-    # itself only runs on the same two push events this job's own `if:`
-    # below fires on (see e2e's own `if:` comment), so this `needs` entry
-    # lines up with both the main-push and v*-tag release channels without
-    # ever blocking on an e2e run that was never going to happen for some
-    # other event (e.g. a PR).
-    needs: [build, test, lint, e2e]
+    # Everything must be green first. e2e only runs on the same push event
+    # this job fires on, so this never waits on a run that will not happen.
+    needs: [build, test, lint, e2e, packaging]
     runs-on: ubuntu-24.04
-    # Downloads, renames and uploads artefacts in under a minute; 60 is
-    # the same runner-wedge bound as the `build` job above, not an
-    # estimate of this job's own runtime.
     timeout-minutes: 60
-    # Two release channels, both attaching one binary per matrix.target
-    # (see the build job above — this is where "all the platforms
-    # llama.app does" is actually decided, not here):
-    #   - a real v* tag push  -> a proper versioned release, tag as-is.
-    #   - any other push to main -> one release *per commit*, tagged
-    #     b<N> where N is `git rev-list --count HEAD` — exactly
-    #     llama.cpp's scheme (see its .github/actions/get-tag-name).
-    #     Each is a regular (non-prerelease) release, so `curl
-    #     install.sh | sh` (which defaults to /releases/latest/download/,
-    #     see install.sh/install.ps1) always resolves to the newest
-    #     commit's binaries, and older builds stay downloadable forever
-    #     by tag instead of being overwritten.
-    # PRs never reach this job at all (github.event_name == 'pull_request'
-    # is excluded by construction: neither condition below matches it).
-    if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:
       contents: write
 
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+
     steps:
-      # fetch-depth: 0 — the b<N> tag below is the full commit count,
-      # which a shallow default clone can't compute. Checkout comes
-      # before download-artifact: it cleans the workspace, so the other
-      # order would delete dist/ again.
+      # fetch-depth: 0 for the commit count. Checkout before
+      # download-artifact, since it cleans the workspace.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine version and tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(packaging/version.sh)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag_name=v$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing llmman $version as tag v$version"
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -1308,15 +1489,54 @@ jobs:
             fi
           done
 
-      - name: Determine release tag
-        id: tag
+      # All five assets, by name, before anything is published, and the
+      # one binary this runner can execute must report this version.
+      - name: Verify release assets
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          for asset in \
+            llmman-x86_64-unknown-linux-gnu \
+            llmman-aarch64-unknown-linux-gnu \
+            llmman-aarch64-apple-darwin \
+            llmman-x86_64-pc-windows-msvc.exe \
+            llmman-aarch64-pc-windows-msvc.exe; do
+            [ -s "$asset" ] || { echo "::error::release asset $asset is missing or empty"; exit 1; }
+          done
+          chmod +x llmman-x86_64-unknown-linux-gnu
+          out="$(./llmman-x86_64-unknown-linux-gnu --version)"
+          echo "$out"
+          case "$out" in
+          "llmman $VERSION ("*")") ;;
+          *) echo "::error::binary reports \"$out\", expected \"llmman $VERSION (<commit>)\""; exit 1 ;;
+          esac
+          case "$out" in
+          *-dirty*) echo "::error::release binary reports a dirty tree: $out"; exit 1 ;;
+          esac
+
+      # checksums.txt: a release asset for users, and (as an artifact) the
+      # hashes publish-homebrew/publish-winget embed, so what brew/winget
+      # enforce is the hash of the bytes uploaded here. Run from dist/ so
+      # names are bare basenames, which render.sh expects.
+      - name: Generate checksums
         shell: bash
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "tag_name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag_name=b$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          cd dist
+          find . -maxdepth 1 -type f -name 'llmman-*' -printf '%f\0' \
+            | sort -z \
+            | xargs -0 sha256sum > checksums.txt
+          cat checksums.txt
+
+      - name: Upload checksums artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-checksums
+          path: dist/checksums.txt
+          if-no-files-found: error
 
       - name: Build release notes
         id: notes
@@ -1340,9 +1560,268 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag_name }}
-          name: ${{ steps.tag.outputs.tag_name }}
+          tag_name: ${{ steps.version.outputs.tag_name }}
+          name: ${{ steps.version.outputs.tag_name }}
           body_path: release-notes.md
           target_commitish: ${{ github.sha }}
           prerelease: false
-          files: dist/llmman-*
+          files: |
+            dist/llmman-*
+            dist/checksums.txt
+
+  # --------------------------------------------------------------------------
+  # crates.io: the `llmman` crate at the same version, on every commit to
+  # main. Versions are immutable there, which is fine: the commit count
+  # never repeats. `cargo install llmman` builds from source (needs Go);
+  # `cargo binstall llmman` fetches the release binary via Cargo.toml's
+  # [package.metadata.binstall], whose v{ version } URL is this tag.
+  # Needs secret CARGO_REGISTRY_TOKEN (publish-new + publish-update).
+  # --------------------------------------------------------------------------
+  publish-crate:
+    name: Publish to crates.io
+    needs: [release]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set release version
+        shell: bash
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          got="$(packaging/version.sh --apply)"
+          [ "$got" = "$VERSION" ] || { echo "::error::version.sh gave $got here but $VERSION in the release job"; exit 1; }
+
+      # `cargo publish` verifies by building the packaged crate, which
+      # compiles the Go shim via CGO -- the only thing that proves the
+      # .crate (with Cargo.toml's `exclude` applied) still builds.
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: go-shim/go.sum
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Install build dependencies
+        run: sudo apt-get install -y gcc
+
+      # Re-runs must not fail on crates.io's duplicate-version error. Only
+      # an explicit 404 means "not published"; anything else (rate limit,
+      # outage) fails here rather than guessing.
+      - name: Skip if this version is already on crates.io
+        id: exists
+        shell: bash
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 \
+            -H "User-Agent: llmman-ci (github.com/llmmanorg/llmman)" \
+            "https://crates.io/api/v1/crates/llmman/$VERSION")"
+          case "$code" in
+          200) echo "::notice::llmman $VERSION is already published; skipping"; echo "skip=true" >> "$GITHUB_OUTPUT" ;;
+          404) echo "skip=false" >> "$GITHUB_OUTPUT" ;;
+          *) echo "::error::crates.io returned HTTP $code for llmman $VERSION"; exit 1 ;;
+          esac
+
+      # --allow-dirty: the version edit above is uncommitted by design.
+      - name: cargo publish
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked --allow-dirty
+
+  # --------------------------------------------------------------------------
+  # Homebrew (#385): macOS arm64, Linux x86_64/aarch64. Pushes the rendered
+  # Formula/llmman.rb to llmmanorg/homebrew-tap, which needs
+  # secrets.TAP_GITHUB_TOKEN (contents:write there). Users run
+  # `brew install llmmanorg/tap/llmman`.
+  # --------------------------------------------------------------------------
+  publish-homebrew:
+    name: Publish Homebrew formula
+    needs: [release]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Queue, never cancel: two close merges must not interleave their tap
+    # pushes, and cancelling would drop an already-released version.
+    concurrency:
+      group: publish-homebrew
+      cancel-in-progress: false
+    steps:
+      # persist-credentials: false -- only the tap checkout needs a token.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-checksums
+
+      - name: Render formula
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          packaging/render.sh \
+            --version "$VERSION" \
+            --checksums checksums.txt \
+            --out-dir rendered
+
+      - name: Check out the tap
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: llmmanorg/homebrew-tap
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: tap
+
+      - name: Commit and push
+        working-directory: tap
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          TAG: ${{ needs.release.outputs.tag_name }}
+          SRC: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "llmman-ci"
+          git config user.email "llmman-ci@users.noreply.github.com"
+          # symbolic-ref: rev-parse --abbrev-ref prints "HEAD" when detached.
+          branch="$(git symbolic-ref --quiet --short HEAD || true)"
+          if [ -z "$branch" ]; then
+            branch="$(git remote show origin | sed -n 's/.*HEAD branch: //p')"
+          fi
+          echo "Target branch: $branch"
+
+          # The formula is generated output, so on a rejected push just
+          # re-sync and regenerate on top rather than rebase.
+          for attempt in 1 2 3 4 5; do
+            git fetch --quiet origin "$branch"
+            git reset --quiet --hard FETCH_HEAD
+
+            # Never move the tap backwards: two main pushes can finish out
+            # of order, and a downgrade would hit every `brew upgrade`.
+            if [ -f Formula/llmman.rb ]; then
+              have="$(sed -n 's/^  version "\(.*\)"$/\1/p' Formula/llmman.rb | head -n1)"
+              if [ -n "$have" ] && [ "$have" != "$VERSION" ] \
+                 && [ "$(printf '%s\n%s\n' "$have" "$VERSION" | sort -V | tail -n1)" = "$have" ]; then
+                echo "::notice::tap already has llmman $have, newer than $VERSION; leaving it"
+                exit 0
+              fi
+            fi
+
+            mkdir -p Formula
+            cp ../rendered/Formula/llmman.rb Formula/llmman.rb
+            cp ../rendered/README.md README.md
+            git add Formula README.md
+
+            if git diff --cached --quiet; then
+              echo "::notice::tap already up to date for $TAG"
+              exit 0
+            fi
+
+            git commit --quiet -m "llmman $VERSION" \
+              -m "Generated from llmmanorg/llmman@$SRC by packaging/render.sh."
+
+            if git push --quiet origin "HEAD:$branch"; then
+              echo "Pushed llmman $VERSION to the tap"
+              exit 0
+            fi
+            echo "::warning::push to homebrew-tap rejected (attempt $attempt/5); re-syncing"
+            sleep "$((attempt * 3))"
+          done
+          echo "::error::could not push llmman $VERSION to homebrew-tap after 5 attempts"
+          exit 1
+
+  # --------------------------------------------------------------------------
+  # winget (#390): Windows x64/arm64. Every version is a PR against
+  # microsoft/winget-pkgs, opened with Microsoft's wingetcreate (Windows
+  # only) using secrets.WINGET_GITHUB_TOKEN, a PAT for an account that can
+  # fork winget-pkgs. Their bot validates, a moderator merges. Users run
+  # `winget install llmmanorg.llmman`.
+  # --------------------------------------------------------------------------
+  publish-winget:
+    name: Publish winget manifest
+    needs: [release]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: windows-2025
+    timeout-minutes: 20
+    concurrency:
+      group: publish-winget
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-checksums
+
+      - name: Render manifests
+        shell: bash
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          packaging/render.sh \
+            --version "$VERSION" \
+            --checksums checksums.txt \
+            --out-dir rendered
+
+      # Re-runs must not open a duplicate PR moderators have to close:
+      # skip if the version is already merged or already has an open PR.
+      - name: Skip if this version is already in winget-pkgs
+        id: exists
+        shell: bash
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/microsoft/winget-pkgs/contents/manifests/l/llmmanorg/llmman/$VERSION" >/dev/null 2>&1; then
+            echo "::notice::winget-pkgs already has llmman $VERSION; skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          open="$(gh api "search/issues?q=repo:microsoft/winget-pkgs+is:pr+is:open+in:title+%22llmmanorg.llmman+version+$VERSION%22" --jq .total_count)"
+          if [ "$open" != "0" ]; then
+            echo "::notice::an open winget-pkgs PR for llmman $VERSION already exists; skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      # Pinned release + checksum, not aka.ms/wingetcreate/latest: this
+      # binary runs with a PAT in its environment.
+      - name: Install wingetcreate
+        if: steps.exists.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          WINGETCREATE_VERSION: v1.12.13.0
+          WINGETCREATE_SHA256: 24042BD37915805615E6CF969AC57C6439124C3FE85823327F5F3FB24BD9FFEA
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = "https://github.com/microsoft/winget-create/releases/download/$env:WINGETCREATE_VERSION/wingetcreate.exe"
+          Invoke-WebRequest -Uri $url -OutFile wingetcreate.exe
+          $got = (Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash
+          if ($got -ne $env:WINGETCREATE_SHA256) { throw "wingetcreate.exe sha256 $got != $env:WINGETCREATE_SHA256" }
+          .\wingetcreate.exe --version
+
+      # WINGET_CREATE_GITHUB_TOKEN is wingetcreate's env var for CI
+      # (https://aka.ms/winget-create-token); --token may be logged.
+      - name: Submit to microsoft/winget-pkgs
+        if: steps.exists.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = "rendered/manifests/l/llmmanorg/llmman/$env:VERSION"
+          Get-ChildItem $dir
+          .\wingetcreate.exe submit $dir
+          if ($LASTEXITCODE -ne 0) { throw "wingetcreate submit failed with exit code $LASTEXITCODE" }
