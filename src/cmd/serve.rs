@@ -1049,6 +1049,9 @@ struct OllamaShowRequest {
 struct OllamaShowResponse {
     model_info: serde_json::Value,
     details: OllamaModelDetails,
+    /// Ollama's `api.ShowResponse.Capabilities`; see
+    /// `crate::modelpack::capabilities`.
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1289,10 +1292,19 @@ fn ollama_message_to_oai(m: &OllamaMessage) -> OAIMessage {
                 parts.push(serde_json::json!({ "type": "text", "text": m.content }));
             }
             for image in images {
-                parts.push(serde_json::json!({
-                    "type": "image_url",
-                    "image_url": { "url": image_data_uri(image) }
-                }));
+                // Ollama's `images` also carries audio; llama-server
+                // wants that as `input_audio`, not `image_url`.
+                if is_wav_base64(image) {
+                    parts.push(serde_json::json!({
+                        "type": "input_audio",
+                        "input_audio": { "data": image, "format": "wav" }
+                    }));
+                } else {
+                    parts.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": { "url": image_data_uri(image) }
+                    }));
+                }
             }
             serde_json::Value::Array(parts)
         }
@@ -1339,6 +1351,18 @@ fn image_data_uri(base64_bytes: &str) -> String {
     } else {
         format!("data:image/png;base64,{base64_bytes}")
     }
+}
+
+/// True if bare base64 decodes to a RIFF/WAVE header (16 chars = 12 bytes).
+fn is_wav_base64(base64_bytes: &str) -> bool {
+    use base64::Engine as _;
+    let Some(head) = base64_bytes.get(..16) else {
+        return false;
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(head)
+        .map(|b| b.starts_with(b"RIFF") && b[8..].starts_with(b"WAVE"))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -5040,7 +5064,7 @@ async fn handle_show(
         .unwrap_or(&req.model);
     // A provider-routed model is served by someone else and is never in
     // the local store, so the lookup below would report it missing and
-    // send every caller that treats a 500 here as "needs pulling" — most
+    // send every caller that treats a 404 here as "needs pulling" — most
     // of all `daemon::ensure_model_pulled`, which `llmman launch` and
     // `llmman run` both call before their first request — off to pull a
     // reference that names no registry. Answer for it directly instead.
@@ -5057,6 +5081,8 @@ async fn handle_show(
                 parameter_size: String::new(),
                 quantization_level: String::new(),
             },
+            // Nothing local to inspect.
+            capabilities: Vec::new(),
         }));
     }
     // Resolve the same way handle_pull stored it — otherwise a bare name
@@ -5067,12 +5093,20 @@ async fn handle_show(
     let model_ref = model_ref.as_str();
     eprintln!("[llmman] /api/show model={model_ref:?}");
     let store = OciStore::open(&state.0.store_path)?;
-    let desc = store.find(model_ref).map_err(|_| {
-        AppError(
-            anyhow!("model not found: {model_ref}"),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        )
+    // 404 like ollama (`showOrPullModel` pulls only on not-found); a
+    // broken store entry stays a 500.
+    let desc = store.find(model_ref).map_err(|e| {
+        if e.downcast_ref::<crate::storage::oci::NotFound>().is_some() {
+            AppError::status(
+                StatusCode::NOT_FOUND,
+                format!("model not found: {model_ref}"),
+            )
+        } else {
+            AppError::from(e)
+        }
     })?;
+    let manifest = store.read_manifest(&desc.digest)?;
+    let capabilities = crate::modelpack::capabilities(&store, &manifest);
     Ok(Json(OllamaShowResponse {
         model_info: serde_json::json!({ "digest": desc.digest, "size": desc.size }),
         details: OllamaModelDetails {
@@ -5081,6 +5115,7 @@ async fn handle_show(
             parameter_size: String::new(),
             quantization_level: String::new(),
         },
+        capabilities,
     }))
 }
 
@@ -8795,6 +8830,30 @@ mod tests {
     }
 
     #[test]
+    fn ollama_message_to_oai_sends_wav_as_input_audio() {
+        use base64::Engine as _;
+        let mut wav = b"RIFF\x58\x02\x00\x00WAVEfmt ".to_vec();
+        wav.resize(64, 0);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
+        let m = OllamaMessage {
+            role: "user".into(),
+            content: "transcribe".into(),
+            images: Some(vec![b64.clone()]),
+            ..Default::default()
+        };
+        let oai = ollama_message_to_oai(&m);
+        assert_eq!(
+            oai.content,
+            serde_json::json!([
+                { "type": "text", "text": "transcribe" },
+                { "type": "input_audio", "input_audio": { "data": b64, "format": "wav" } }
+            ])
+        );
+        assert!(!is_wav_base64("Zm9v"));
+        assert!(!is_wav_base64("data:image/png;base64,Zm9v"));
+    }
+
+    #[test]
     fn image_data_uri_wraps_bare_base64_and_passes_through_existing_data_uris() {
         assert_eq!(image_data_uri("Zm9v"), "data:image/png;base64,Zm9v");
         assert_eq!(
@@ -11878,6 +11937,17 @@ mod tests {
         };
         let resp = handle_show(State(state), Json(req)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn handle_show_answers_404_for_a_model_not_in_the_store() {
+        let state = test_state();
+        let req = OllamaShowRequest {
+            model: "docker.io/ai/nothing-here".to_string(),
+            name: None,
+        };
+        let resp = handle_show(State(state), Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// Regression: a call site that drops its guard but not its own `Arc`

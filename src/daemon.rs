@@ -997,33 +997,56 @@ pub fn stream_progress_with(path: &str, reference: &str) -> anyhow::Result<Optio
     Ok(pushed_digest)
 }
 
-/// POSTs `{"model": reference}` to `/api/show` and reports whether the
-/// daemon's local store already has it — a read-only existence check with
-/// no download/pull side effects.
-fn model_exists(reference: &str) -> anyhow::Result<bool> {
+/// The part of Ollama's `api.ShowResponse` that `llmman run` reads.
+#[derive(Debug, Default, Deserialize)]
+pub struct ShowResponse {
+    /// `"completion"`, `"vision"`, … — see `crate::modelpack::capabilities`.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+impl ShowResponse {
+    /// Ollama's `RunHandler`: `opts.MultiModal` = vision or audio.
+    pub fn multimodal(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c == crate::modelpack::CAPABILITY_VISION || c == "audio")
+    }
+}
+
+/// Ollama's `client.Show`: a read-only `/api/show` lookup. `Ok(None)` is
+/// a 404 only; any other failure is an error, as in `showOrPullModel`.
+pub fn show(reference: &str) -> anyhow::Result<Option<ShowResponse>> {
     let resp = reqwest::blocking::Client::new()
         .post(format!("{}/api/show", server()))
         .json(&serde_json::json!({"model": reference}))
         .send()
         .with_context(|| format!("request /api/show for {reference}"))?;
-    Ok(resp.status().is_success())
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!("{}", api_error(&body).unwrap_or(body));
+    }
+    // An older daemon omits `capabilities`; serde(default) handles it.
+    let body = resp
+        .json::<ShowResponse>()
+        .with_context(|| format!("decode /api/show for {reference}"))?;
+    Ok(Some(body))
 }
 
-/// Ensures `reference` is present in the daemon's local store, pulling it
-/// (and streaming progress the same way `llmman pull` does) if it isn't.
+/// Ensures `reference` is in the daemon's local store, pulling it (with
+/// `llmman pull`'s progress) if not, and returns its `/api/show` info.
 ///
-/// Mirrors ollama's `RunHandler`, which calls `client.Show` before ever
-/// entering the interactive/one-shot prompt loop and only falls back to
-/// `PullHandler` on a miss — so a bad reference (typo'd tag, malformed
-/// `hf.co/...` name, etc.) is reported and aborts the command immediately,
-/// instead of only surfacing once the first message is submitted to
-/// `/api/chat` (by which point the interactive `> ` prompt has already
-/// been shown and read from).
-pub fn ensure_model_pulled(reference: &str) -> anyhow::Result<()> {
-    if model_exists(reference).unwrap_or(false) {
-        return Ok(());
+/// Mirrors ollama's `showOrPullModel`: Show, Pull on a 404, Show again —
+/// so a bad reference fails before the prompt loop.
+pub fn ensure_model_pulled(reference: &str) -> anyhow::Result<ShowResponse> {
+    if let Some(info) = show(reference)? {
+        return Ok(info);
     }
-    stream_progress("/api/pull", reference)
+    stream_progress("/api/pull", reference)?;
+    show(reference)?.ok_or_else(|| anyhow::anyhow!("{reference}: not found after pull"))
 }
 
 /// Pushes `reference` via the daemon's `/api/push` and returns the

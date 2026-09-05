@@ -40,6 +40,9 @@ serde_json = "1"
 sha2       = "0.10"
 hex        = "0.4"
 base64     = "0.22"
+# `llmman run`'s image-path detection is a verbatim port of ollama's
+# extractFileNames regex (cmd/interactive.go) — see cmd::run.
+regex      = "1"
 anyhow     = "1"
 walkdir    = "2"
 chrono     = { version = "0.4", features = ["serde"] }
