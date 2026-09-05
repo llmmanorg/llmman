@@ -1,10 +1,8 @@
 [package]
 name = "llmman"
-# MAJOR.MINOR only. The PATCH digit here is a placeholder: CI replaces it
-# with the commit count (packaging/version.sh --apply) before building and
-# publishing, so every commit on main ships as e.g. 0.1.324 to GitHub
-# Releases, crates.io, Homebrew and winget alike. Bump MAJOR or MINOR here
-# to start a new series; never touch PATCH (leave it 0).
+# MAJOR.MINOR only: CI replaces PATCH with the commit count before building
+# and publishing (packaging/version.sh), so every commit on main ships as
+# e.g. 0.1.324. Bump MAJOR or MINOR here to start a new series; leave PATCH 0.
 version = "0.1.0"
 edition = "2021"
 description = "Run any agent on any model, models stored as OCI images"
@@ -16,28 +14,15 @@ readme = "README.md"
 keywords = ["llm", "oci", "inference", "gguf", "ai"]
 categories = ["command-line-utilities", "science"]
 
-# What NOT to ship in the .crate. Everything build.rs actually reads must
-# stay: `go-shim/` (the c-archive it compiles and statically links) and
-# `webui/` (gzipped and `include_bytes!`d -- see src/webui.rs). What's left
-# is developer/CI-only and pure dead weight to a `cargo install`:
-#
-#   vllm-plugin/  a separately-published Python package, not Rust
-#   packaging/    Homebrew/winget templates and the CI version script
-#   docs/, .github/, install.sh, install.ps1
-#                 repo-level material with no bearing on building
-#
-# (fuzz/ is its own crate and Cargo already leaves nested packages out.)
-#
-# Deliberately an `exclude` rather than an `include`: an `include` list
-# silently drops any *new* path a future build.rs starts depending on,
-# which would only surface as a broken published crate.
+# Not shipped in the .crate. build.rs needs go-shim/ (the CGO archive) and
+# webui/ (embedded via include_bytes!); the rest is dev/CI-only. An
+# `exclude`, not an `include`, so a new build.rs input is never dropped
+# silently. (fuzz/ is its own crate; Cargo already leaves it out.)
 exclude = [
 	"vllm-plugin/",
 	"packaging/",
 	"docs/",
 	".github/",
-	"install.sh",
-	"install.ps1",
 ]
 
 [lib]

@@ -69,22 +69,22 @@ landing in your local store.
 **Linux, macOS:**
 
 ```
-curl -fsSL https://raw.githubusercontent.com/llmmanorg/llmman/main/install.sh | sh
+curl -fsSL https://llmmanorg.github.io/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```
-irm https://raw.githubusercontent.com/llmmanorg/llmman/main/install.ps1 | iex
+irm https://llmmanorg.github.io/install.ps1 | iex
 ```
 
-**Homebrew** (macOS Apple Silicon, Linux x86_64/aarch64):
+**Homebrew:**
 
 ```sh
 brew install llmmanorg/tap/llmman
 ```
 
-**winget** (Windows x86_64/aarch64):
+**winget:**
 
 ```powershell
 winget install llmmanorg.llmman
@@ -93,14 +93,9 @@ winget install llmmanorg.llmman
 **Cargo:**
 
 ```sh
-cargo binstall llmman   # prebuilt binary, any of the platforms above
+cargo binstall llmman   # prebuilt binary
 cargo install llmman    # build from source; needs Go 1.25+ (and LLVM on Windows) as well as Rust
 ```
-
-Every commit that passes CI on `main` is a release, versioned
-`MAJOR.MINOR.<commit count>` (e.g. `0.1.324`) and published to all of the
-above from the same CI run (winget lags a little: each version is a pull
-request to microsoft/winget-pkgs that their bots validate first).
 
 ## Quick start
 

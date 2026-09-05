@@ -638,7 +638,7 @@ jobs:
                       src/main.rs src/lib.rs src/webui.rs src/ffi.rs; do
             grep -qx "$must" "$files" || { echo "::error::$must is missing from the .crate"; exit 1; }
           done
-          for never in '^packaging/' '^vllm-plugin/' '^docs/' '^\.github/' '^install\.sh$' '^install\.ps1$' '^fuzz/' '^go-shim/go-shim$'; do
+          for never in '^packaging/' '^vllm-plugin/' '^docs/' '^\.github/' '^fuzz/' '^go-shim/go-shim$'; do
             if grep -q "$never" "$files"; then
               echo "::error::.crate contains files matching $never:"; grep "$never" "$files"; exit 1
             fi
@@ -1086,7 +1086,9 @@ jobs:
 
       # ── Install llmman via the real install script ───────────────────────
       # Runs the actual install.sh (Unix) / install.ps1 (Windows) a real
-      # user's `curl ... | sh` / `irm ... | iex` runs, pointed (via
+      # user's `curl ... | sh` / `irm ... | iex` runs — fetched from
+      # https://llmmanorg.github.io/, their only home (repo
+      # llmmanorg/llmmanorg.github.io, static/) — pointed (via
       # LLMMAN_BASE_URL — an env override added to both scripts
       # specifically for this) at a throwaway local HTTP server serving
       # *this job's own* just-built binary from the step above, instead of
@@ -1173,6 +1175,7 @@ jobs:
 
           export LLMMAN_BASE_URL="http://127.0.0.1:8791"
           if [ "${{ runner.os }}" = "Windows" ]; then
+            curl -fsSL --retry 3 -o install.ps1 https://llmmanorg.github.io/install.ps1
             pwsh -NoProfile -File install.ps1
             # cygpath -w, not a bare "$LOCALAPPDATA/..." concatenation:
             # this exact value is about to cross into $GITHUB_ENV for the
@@ -1183,6 +1186,7 @@ jobs:
             # forward slashes.
             install_bin=$(cygpath -w "$LOCALAPPDATA/Microsoft/WindowsApps/llmman.exe")
           else
+            curl -fsSL --retry 3 -o install.sh https://llmmanorg.github.io/install.sh
             sh install.sh
             install_bin="$HOME/.local/bin/llmman"
             # install.sh itself only prints instructions to add this to
@@ -1431,7 +1435,7 @@ jobs:
   # Release: a GitHub Release per commit on main, tagged v<version> where
   # version = packaging/version.sh's MAJOR.MINOR.<commit count>. The build
   # job compiled with that version in Cargo.toml, so the binaries report
-  # it. Non-prerelease, so install.sh's /releases/latest/ tracks main and
+  # it. Non-prerelease, so the install scripts' /releases/latest/ tracks main and
   # older builds stay downloadable by tag. The publish-* jobs hang off this
   # one: nothing reaches a package manager until the release its download
   # URLs point at exists.
