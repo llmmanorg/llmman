@@ -8,7 +8,7 @@ use llmman::{cmd, daemon, ffi, hostgpu};
 #[derive(Parser, Debug)]
 #[command(
     name = "llmman",
-    about = "LLM model image manager",
+    about = "Run any agent on any model, models stored as OCI images",
     version = env!("LLMMAN_VERSION"),
     propagate_version = true
 )]
@@ -39,6 +39,8 @@ enum Commands {
     Resolve(cmd::resolve::ResolveArgs),
     /// Transfer an image directly from one location to another (e.g. HuggingFace to an OCI registry)
     Transfer(cmd::transfer::TransferArgs),
+    /// Check a registry model's signatures against trusted public keys
+    Verify(cmd::verify::VerifyArgs),
     /// List locally stored images
     #[command(alias = "ls")]
     List(cmd::list::ListArgs),
@@ -46,6 +48,8 @@ enum Commands {
     Ps(cmd::ps::PsArgs),
     /// List the hosted providers `--provider` can route to
     Providers(cmd::providers::ProvidersArgs),
+    /// Read and write llmman.conf settings
+    Config(cmd::config::ConfigArgs),
     /// Copy a local image to a new reference
     Cp(cmd::cp::CpArgs),
     /// Remove a local image, freeing its blobs and extracted cache no
@@ -108,9 +112,11 @@ fn main() {
         Commands::Pull(a) => cmd::pull::run(a),
         Commands::Resolve(a) => cmd::resolve::run(a),
         Commands::Transfer(a) => cmd::transfer::run(a),
+        Commands::Verify(a) => cmd::verify::run(a),
         Commands::List(a) => cmd::list::run(a),
         Commands::Ps(a) => cmd::ps::run(a),
         Commands::Providers(a) => cmd::providers::run(a),
+        Commands::Config(a) => cmd::config::run(a),
         Commands::Cp(a) => cmd::cp::run(a),
         Commands::Rm(a) => cmd::rm::run(a),
         Commands::Stop(a) => cmd::stop::run(a),

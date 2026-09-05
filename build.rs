@@ -7,11 +7,64 @@ use std::process::Command;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
+/// Strip Go's SEH unwind sections from `go.o`, so MSVC `link.exe` accepts
+/// the archive instead of failing with "LNK1223: ... invalid .pdata
+/// contributions".
+///
+/// `go.o` comes from the Go linker, not the clang wrapper below, so no
+/// compiler flag can affect it. `lld-link` tolerates it -- which is what CI
+/// used until now -- but that is not available to `cargo install llmman`:
+/// Cargo reads no config from a downloaded package and a build script
+/// cannot set `-C linker`. The archive is the only lever left.
+///
+/// Cost: Windows can no longer unwind through Go frames, losing Go stack
+/// fidelity in debuggers and crash dumps. Nothing llmman needs -- Go's
+/// panic/recover uses its own stack maps, faults go to the runtime's
+/// vectored handler, and no C++ exception crosses Go. x86_64 only; aarch64
+/// links with this data intact, so it keeps it.
+fn strip_go_unwind_sections(objs: &[PathBuf]) {
+    let mut found = false;
+    for obj in objs {
+        if obj.file_name().and_then(|s| s.to_str()) != Some("go.o") {
+            continue;
+        }
+        found = true;
+        // .xdata too: .pdata entries point into it, so it would otherwise
+        // just be unreferenced bytes.
+        let ok = Command::new("llvm-objcopy")
+            .args(["--remove-section=.pdata", "--remove-section=.xdata"])
+            .arg(obj)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            println!("cargo:warning=Stripped SEH unwind sections from go.o");
+        } else {
+            println!(
+                "cargo:warning=llvm-objcopy failed on go.o; the link will fail with \
+                 LNK1223. Install LLVM, or use RUSTFLAGS=\"-C linker=lld-link\"."
+            );
+        }
+    }
+    // Guards against a future Go release naming this object something else,
+    // which would otherwise silently stop stripping and resurface as a bare
+    // LNK1223.
+    if !found {
+        println!(
+            "cargo:warning=no go.o in the Go archive, so nothing was stripped; \
+             expect LNK1223 unless linking with lld-link."
+        );
+    }
+}
+
 /// Extract every object from a (possibly GNU ar) static archive and repack
-/// it as an MSVC-format LIB using lib.exe.  This is needed on Windows ARM64
-/// because Go uses GNU 'ar' when it can't identify the C compiler as cl.exe,
-/// but MSVC link.exe only accepts its own LIB format.
-fn repack_as_msvc_lib(lib_path: &Path, out_dir: &Path) {
+/// it as an MSVC-format LIB using lib.exe. Go uses GNU 'ar' when it can't
+/// identify the C compiler as cl.exe, and MSVC link.exe rejects that format
+/// with LNK4003.
+///
+/// `strip_unwind` also drops Go's SEH sections -- see
+/// strip_go_unwind_sections.
+fn repack_as_msvc_lib(lib_path: &Path, out_dir: &Path, strip_unwind: bool) {
     let extract_dir = out_dir.join("ar_extract");
     let _ = fs::remove_dir_all(&extract_dir);
     if fs::create_dir_all(&extract_dir).is_err() {
@@ -38,7 +91,11 @@ fn repack_as_msvc_lib(lib_path: &Path, out_dir: &Path) {
         return;
     }
 
-    // lib.exe is the ARM64-native MSVC archiver; it infers machine type from objects
+    if strip_unwind {
+        strip_go_unwind_sections(&objs);
+    }
+
+    // lib.exe is the MSVC archiver; it infers machine type from objects
     let tmp = out_dir.join("_shim_repack.lib");
     let mut cmd = Command::new("lib.exe");
     cmd.arg("/nologo").arg(format!("/out:{}", tmp.display()));
@@ -50,11 +107,43 @@ fn repack_as_msvc_lib(lib_path: &Path, out_dir: &Path) {
 
     if cmd.status().map(|s| s.success()).unwrap_or(false) {
         let _ = fs::rename(&tmp, lib_path);
-        println!("cargo:warning=Repacked Go archive as MSVC LIB (ARM64)");
+        println!("cargo:warning=Repacked Go archive as MSVC LIB");
     } else {
         eprintln!("cargo:warning=lib.exe repack failed; keeping original archive");
     }
     let _ = fs::remove_dir_all(&extract_dir);
+}
+
+/// True if `tool` is on `PATH`. `--version`, not a bare spawn: a stale PATH
+/// entry can leave a name resolvable but not executable.
+fn on_path(tool: &str) -> bool {
+    Command::new(tool)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Name missing Windows prerequisites up front, rather than letting them
+/// surface minutes later as a cgo compiler error or a bare LNK1223. Both
+/// ship with LLVM, already required here, so this adds no dependency:
+/// `clang` backs the CC wrapper below, `llvm-objcopy` does the strip.
+fn warn_missing_msvc_tools(target_arch: &str) {
+    if !on_path("clang") {
+        println!(
+            "cargo:warning=clang was not found on PATH. Building llmman for \
+             *-pc-windows-msvc needs it as cgo's C compiler; install LLVM \
+             (https://releases.llvm.org) or `winget install LLVM.LLVM`."
+        );
+    }
+
+    if target_arch == "x86_64" && !on_path("llvm-objcopy") {
+        println!(
+            "cargo:warning=llvm-objcopy was not found on PATH. It is needed to strip \
+             Go's SEH unwind sections for x86_64-pc-windows-msvc, without which \
+             linking fails with LNK1223; it ships with LLVM."
+        );
+    }
 }
 
 /// Emits `LLMMAN_VERSION`: the Cargo package version plus, when built from
@@ -171,6 +260,7 @@ fn main() {
     // command itself; this is unconditional and cannot be filtered out.
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+        warn_missing_msvc_tools(&arch);
         let msvc_triple = match arch.as_str() {
             "x86_64" => "x86_64-pc-windows-msvc",
             "aarch64" => "aarch64-pc-windows-msvc",
@@ -203,20 +293,21 @@ fn main() {
         panic!("Go shim build failed for tags={}", go_tags);
     }
 
-    // On Windows MSVC + aarch64: Go doesn't recognise our clang wrapper as
-    // MSVC (it checks the binary name for "cl.exe"), so it archives the CGO
-    // objects with GNU 'ar' instead of MSVC 'lib.exe'.  GNU ar archives are
-    // rejected by MSVC link.exe with LNK4003.
+    // Go archives the CGO objects with GNU 'ar' on every *-pc-windows-msvc
+    // target (it identifies MSVC by looking for "cl.exe" in the compiler
+    // name, which our clang wrapper is not), and MSVC link.exe rejects that
+    // with LNK4003. Extract with llvm-ar, which reads both formats, and
+    // repack with lib.exe; it infers machine type from the objects.
     //
-    // Fix: extract every object from the archive with llvm-ar (which reads
-    // both GNU ar and MSVC LIB), then repack with the ARM64-native lib.exe
-    // to produce a proper MSVC LIB.  lib.exe infers the machine type from
-    // the objects so this is safe even when run unconditionally.
+    // Previously aarch64-only, because x86_64 got lld-link via RUSTFLAGS in
+    // CI and lld-link accepts GNU ar archives. Now that x86_64 links with
+    // the default toolchain it needs the MSVC-format archive too, plus the
+    // strip -- see strip_go_unwind_sections.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
         && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
-        && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64")
     {
-        repack_as_msvc_lib(&lib_path, &out_dir);
+        let strip_unwind = env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64");
+        repack_as_msvc_lib(&lib_path, &out_dir, strip_unwind);
     }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());

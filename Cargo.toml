@@ -2,7 +2,7 @@
 name = "llmman"
 version = "0.1.0"
 edition = "2021"
-description = "llmman manages OCI models"
+description = "Run any agent on any model, models stored as OCI images"
 license = "Apache-2.0"
 
 [lib]
@@ -30,6 +30,10 @@ tower-http = { version = "0.6", features = ["cors"] }
 libc       = "0.2"
 tokio-util = { version = "0.7", features = ["io"] }
 toml       = { version = "0.8", default-features = false, features = ["parse"] }
+# `llmman config set` edits a file people also hand-edit, so comments and
+# layout have to survive a one-key write; serializing a `Conf` back out
+# would drop both. Already compiled as `toml`'s own parser.
+toml_edit  = "0.22"
 tokio      = { version = "1", features = ["full"] }
 reqwest    = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls", "http2", "charset"] }
 futures    = "0.3"
@@ -67,6 +71,23 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["default-htt
 default = ["docker"]
 docker = []
 podman = []
+# Exposes a #[doc(hidden)] pub wrapper around private parser internals for
+# the fuzz/ crate to call. Never enabled outside fuzzing: it does not
+# change any parsing behavior, only visibility.
+fuzzing = []
 
 [build-dependencies]
 flate2 = "1"
+
+# `cargo binstall llmman` fetches the prebuilt release binary instead of
+# compiling, so it needs neither a Rust nor a Go toolchain.
+#
+# `pkg-fmt = "bin"` because the assets are bare binaries, not archives (see
+# the `release` job's "Rename binaries for release" step). Their names
+# already match binstall's default `{ name }-{ target }{ binary-ext }`
+# layout, so nothing about how releases are published had to change. The URL
+# is spelled out rather than using `{ repo }` so it does not depend on the
+# `repository` field staying put.
+[package.metadata.binstall]
+pkg-url = "https://github.com/llmmanorg/llmman/releases/download/v{ version }/llmman-{ target }{ binary-ext }"
+pkg-fmt = "bin"

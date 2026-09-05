@@ -234,14 +234,14 @@ fn provider_model(provider: &str, model: &str) -> anyhow::Result<(String, Option
 
     entry.warn_unlisted(model);
 
-    // Naming the missing variable beats a 401 mid-conversation — unless
-    // the daemon has the key, in which case it spends its own.
+    // Naming where the missing key goes beats a 401 mid-conversation —
+    // unless the daemon has the key, in which case it spends its own.
     let key = entry.api_key();
     anyhow::ensure!(
         key.is_some() || entry.daemon_key_usable(),
-        "no API key for {} — set {} in your environment",
+        "no API key for {} — {}",
         entry.name,
-        entry.key_env
+        crate::providers::key_hint(&entry.id, &entry.key_env)
     );
     Ok((crate::providers::format_remote_ref(provider, model), key))
 }

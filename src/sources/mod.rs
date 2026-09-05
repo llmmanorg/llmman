@@ -76,9 +76,9 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
 /// file's content digest up front, which no generic file store offers —
 /// so this stages through disk, as `transferViaStaging` did.
 ///
-/// Always `Ok(true)` on success, like `crate::hf::transfer`'s podman
-/// fallback: `ffi::push` doesn't report whether anything changed.
-pub async fn transfer(reference: &str, destination: &str) -> Result<bool> {
+/// `changed` is always true on success, like `crate::hf::transfer`'s
+/// podman fallback: `ffi::push` doesn't report whether anything changed.
+pub async fn transfer(reference: &str, destination: &str) -> Result<crate::ffi::TransferOutcome> {
     let tmp = std::env::temp_dir().join(format!(
         "llmman-source-transfer-{}-{}",
         std::process::id(),
@@ -86,7 +86,7 @@ pub async fn transfer(reference: &str, destination: &str) -> Result<bool> {
     ));
     // store_as: `llmman_push` resolves what to push by an *exact* ref
     // lookup, so a manifest filed under "s3://bucket/x" would not be
-    // found when pushing to "ghcr.io/me/x:v1".
+    // found when pushing to "docker.io/me/x:v1".
     let result = pull_into(
         reference,
         &Target {
@@ -103,7 +103,11 @@ pub async fn transfer(reference: &str, destination: &str) -> Result<bool> {
             destination,
         )
     })
-    .map(|()| true);
+    // Read the digest back out of the staging layout rather than
+    // re-resolving the destination tag afterwards: this is the manifest
+    // that was just pushed, so it is what `--sign-key` must sign.
+    .and_then(|()| crate::hf::oci::read_manifest_ref(&tmp, destination))
+    .map(|desc| crate::ffi::TransferOutcome::new(true, desc.digest));
     let _ = std::fs::remove_dir_all(&tmp);
     result
 }

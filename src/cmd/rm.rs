@@ -40,8 +40,10 @@ pub fn run(args: &RmArgs) -> anyhow::Result<()> {
     let mut any_removed = false;
     for reference in &refs {
         match store.remove(reference) {
-            Ok(()) => {
-                println!("Removed {}", reference);
+            // The stored reference, not the one given: for a digest that
+            // is the tag it was held under.
+            Ok(removed) => {
+                println!("Removed {}", removed);
                 any_removed = true;
             }
             Err(e) => {

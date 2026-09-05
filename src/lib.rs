@@ -1,15 +1,18 @@
 #![recursion_limit = "256"]
 
 pub mod cmd;
+pub mod config;
 pub mod container;
 pub mod daemon;
 pub mod ffi;
 pub mod fmt;
+pub mod fsutil;
 pub mod gguf;
 pub mod harmony;
 pub mod hf;
 pub mod hostgpu;
 pub mod llama_release;
+pub mod metrics;
 pub mod modelpack;
 pub mod oauth;
 pub mod providers;
@@ -17,6 +20,7 @@ pub mod shortnames;
 pub mod sources;
 pub mod storage;
 pub mod thinking;
+pub mod verify;
 pub mod webui;
 pub mod xet_fetch;
 

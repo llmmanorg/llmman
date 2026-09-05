@@ -8,9 +8,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context};
-use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
+// `HttpBody` is axum's re-export of the `http_body::Body` trait, in
+// scope only for `size_hint` in `track_metrics`.
+use axum::body::{Body, Bytes, HttpBody as _};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Path as UrlPath, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -23,10 +26,13 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 
 use crate::default_store;
+use crate::metrics::{self, UnloadReason};
 use crate::modelpack::{resolve_model, ModelPath};
 use crate::providers::PLACEHOLDER_API_KEY;
 use crate::storage::OciStore;
 use crate::webui;
+
+mod aggregation;
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -40,15 +46,17 @@ const SERVE_ENV_HELP: &str = "\
 Environment Variables:
       LLMMAN_DEBUG                   Show additional debug information (e.g. LLMMAN_DEBUG=1)
       LLMMAN_HOST                    [host][:port] to bind (default \"127.0.0.1:17434\")
-      LLMMAN_CONTEXT_LENGTH          Context length to use unless otherwise specified (default: VRAM-tiered)
+      LLMMAN_CONTEXT_LENGTH          Context size for llama-server/vLLM when set (defaults are backend-specific)
       LLMMAN_KEEP_ALIVE              The duration that models stay loaded in memory (default \"5m\")
       LLMMAN_MAX_LOADED_MODELS       Maximum number of loaded models (default: unbounded)
       LLMMAN_MAX_TRANSFER_STREAMS    Maximum parallel transfer streams for safetensors model pulls (default 4)
       LLMMAN_MAX_QUEUE               Maximum number of queued requests (default 512)
+      LLMMAN_METRICS                 Serve a Prometheus scrape endpoint at /metrics (default: off)
       LLMMAN_MODELS                  The path to the models directory
       LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only)
       LLMMAN_NOPRUNE                 Do not prune model blobs on startup
       LLMMAN_ORIGINS                 A comma separated list of allowed CORS origins
+      LLMMAN_PEERS                   A comma separated list of peer daemons ([scheme://]host[:port]) to pool hardware with (overrides [aggregation] in llmman.conf)
       LLMMAN_SCHED_SPREAD            Always schedule model across all GPUs
       LLMMAN_FLASH_ATTENTION         Enable flash attention
       LLMMAN_KV_CACHE_TYPE           Quantization type for the K/V cache (default: f16)
@@ -127,16 +135,18 @@ pub struct ServeArgs {
     pub pull_bin: bool,
 }
 
-/// Context tokens requested for every `llama-server` this daemon spawns —
-/// read from `LLMMAN_CONTEXT_LENGTH` (an env var, not a `llmman serve`
-/// flag). A ceiling, not a guarantee: llama-server caps it back down to
-/// a model's own trained context (`n_ctx_train`) when that's smaller,
-/// with a warning, since serving positions past a model's trained
-/// length risks incoherent/NaN output.
+/// Context tokens requested for every backend this daemon spawns — read
+/// from `LLMMAN_CONTEXT_LENGTH` (an env var, not a `llmman serve` flag).
+/// For llama-server, this is a ceiling, not a guarantee: llama-server
+/// caps it back down to a model's own trained context (`n_ctx_train`)
+/// when that's smaller, with a warning, since serving positions past a
+/// model's trained length risks incoherent/NaN output.
 ///
 /// Unset or unparseable, this falls back to
 /// [`crate::hostgpu::default_ctx_size`]: a VRAM-tiered value (see that
-/// function's doc comment).
+/// function's doc comment). A value of 0 is preserved for llama-server,
+/// where it means "use the model's trained context", but is not
+/// forwarded to vLLM.
 fn context_length_from_env() -> Option<u32> {
     parse_context_length(std::env::var("LLMMAN_CONTEXT_LENGTH").ok().as_deref())
 }
@@ -346,6 +356,27 @@ fn parse_max_queue(value: Option<&str>) -> usize {
     }
 }
 
+/// Whether to serve `GET /metrics` at all, from `LLMMAN_METRICS`. Off
+/// unless the operator asked for it: the router has no authentication,
+/// `LLMMAN_HOST` can bind it beyond loopback, and a scrape reports
+/// version, route mix, model names and model churn. None of that should
+/// start answering because llmman was upgraded.
+fn metrics_enabled_from_env() -> bool {
+    parse_metrics_enabled(std::env::var("LLMMAN_METRICS").ok().as_deref())
+}
+
+/// [`metrics_enabled_from_env`]'s parsing, split out so it's testable
+/// without mutating the real process environment. `1` is what the README
+/// documents; the rest of the truthy set is here because every other
+/// boolean env var in this file accepts it, and a `LLMMAN_METRICS=true`
+/// that silently did nothing would be worse than the extra branch.
+fn parse_metrics_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 /// Maximum number of models [`ensure_model`] keeps loaded at once, from
 /// `LLMMAN_MAX_LOADED_MODELS` (mirrors Ollama's `OLLAMA_MAX_LOADED_MODELS`,
 /// but as one flat daemon-wide total, not per-GPU — llmman has no
@@ -398,6 +429,21 @@ fn use_mlx_for_safetensors() -> bool {
 /// instead.
 fn supports_context_shift(model_ref: &str) -> bool {
     !model_ref.to_ascii_lowercase().contains("deepseek")
+}
+
+/// `Some(trained context)` if the GGUF is an embedding model — one with
+/// an `{arch}.pooling_type` key, ollama's own test (`llm/llama_server.go`)
+/// — else `None`. An unreadable header counts as a generation model, so
+/// it fails at load with llama-server's diagnosis rather than here.
+fn embedding_model_ctx(path: &Path) -> Option<Option<u32>> {
+    let info = crate::gguf::read_info(path).ok()?;
+    let arch = info.architecture()?;
+    info.u64(&format!("{arch}.pooling_type"))?;
+    Some(
+        info.context_length()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -479,9 +525,8 @@ struct Inner {
     exe: Option<PathBuf>,
     ociman: Option<crate::container::ContainerManager>,
     llama_cpp_version: Option<String>,
-    // See context_length_from_env's doc comment — forwarded verbatim to
-    // every spawn_llama_server/container::spawn call, local or
-    // containerized.
+    // See context_length_from_env's doc comment — forwarded to
+    // backends that expose a context-size flag.
     ctx_size: Option<u32>,
     // True if `ctx_size` came from an explicit LLMMAN_CONTEXT_LENGTH
     // rather than hostgpu's VRAM-tiered auto default — see
@@ -514,6 +559,10 @@ struct Inner {
     max_queue: usize,
     // See max_loaded_models_from_env's doc comment.
     max_loaded_models: usize,
+    // Peer origins (`http://host:port`) — see the `aggregation` module.
+    peers: Vec<String>,
+    // See hostgpu::memory_bytes; what `aggregation` weighs this node by.
+    memory: u64,
     store_path: PathBuf,
     cache_path: PathBuf,
     client: Client,
@@ -538,9 +587,8 @@ struct RunningModel {
     /// Full manifest digest (e.g. "sha256:abcd...") from the OCI store,
     /// captured at load time (see resolve_model's caller in ensure_model).
     digest: String,
-    /// GGUF file size in bytes; 0 for a safetensors dir (vllm) — walking a
-    /// multi-file safetensors directory isn't worth the cost just for
-    /// `ps` output today.
+    /// Sum of the model's layer sizes from its store manifest (every
+    /// engine); 0 if that lookup failed.
     size: u64,
     started_at: String,
     /// Monotonic clock reading of this model's last activity (a request
@@ -597,6 +645,20 @@ impl RunningModel {
         match &self.process {
             ModelProcess::Local(_, child, _) => child.id(),
             ModelProcess::Container(_, child) => child.id(),
+        }
+    }
+
+    /// The `engine` label on `llmman_model_up`. Deliberately not
+    /// [`RunningModel::processor`]: that is prose for `/api/ps`, and its
+    /// container form carries the runtime binary, which would put
+    /// `docker` and `podman` in a label for the same engine. A container
+    /// runs llama-server (see `container::spawn`), so it reports as one.
+    fn engine_label(&self) -> &'static str {
+        match &self.process {
+            ModelProcess::Local(Engine::LlamaServer, _, _) => "llama-server",
+            ModelProcess::Local(Engine::Vllm, _, _) => "vllm",
+            ModelProcess::Local(Engine::Mlx, _, _) => "mlx",
+            ModelProcess::Container(_, _) => "llama-server",
         }
     }
 }
@@ -690,8 +752,9 @@ impl ModelProcess {
     /// takes `llama-server`/vllm down on its own would otherwise keep
     /// handing out that now-dead port forever, indistinguishable from a
     /// real live one until whichever caller's request to it fails with a
-    /// bare connection error; `check_running` is what drops the entry, the
-    /// moment this returns false. `try_wait` is non-blocking either way:
+    /// bare connection error; `check_running` and `check_running_by_digest`
+    /// are what drop the entry, the moment this returns false. `try_wait`
+    /// is non-blocking either way:
     /// `Ok(None)` (still running) is the overwhelmingly common case this
     /// needs to stay cheap for.
     fn is_alive(&mut self) -> bool {
@@ -782,55 +845,58 @@ struct OllamaToolCallFunction {
     arguments: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
+// `Serialize` too: forwarded as-is to an aggregation peer.
+#[derive(Debug, Serialize, Deserialize)]
 struct OllamaChatRequest {
     model: String,
     #[serde(default)]
     messages: Vec<OllamaMessage>,
     #[serde(default = "bool_true")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<serde_json::Value>,
     /// Ollama's own top-level `think` field ("for thinking models, should
     /// the model think before responding? Can be a boolean or a thinking
     /// level"). See `think_to_chat_template_kwargs`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     think: Option<serde_json::Value>,
     /// Tool/function definitions, in the same shape OpenAI's `tools`
     /// field uses (Ollama's own tool schema is already
     /// OpenAI-function-tool compatible) — passed straight through to
     /// llama-server. See `handle_ollama_chat`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tools: Option<serde_json::Value>,
     /// `"json"` for unconstrained-schema JSON mode, or a JSON Schema
     /// object for constrained structured output. See
     /// `format_to_response_format`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     format: Option<serde_json::Value>,
     /// See `OllamaGenerateRequest::keep_alive`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     keep_alive: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OllamaGenerateRequest {
     model: String,
     #[serde(default)]
     prompt: String,
     #[serde(default = "bool_true")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<serde_json::Value>,
     /// keep_alive: 0 with an empty prompt is the Ollama unload signal;
     /// otherwise resolved (see `resolve_keep_alive`) into how long this
     /// model should stay loaded once idle.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     keep_alive: Option<serde_json::Value>,
     /// See `OllamaChatRequest::think`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     think: Option<serde_json::Value>,
     /// See `OllamaChatRequest::format`. `/api/generate` has no `tools`
     /// field in real Ollama either — only `/api/chat` supports tool
     /// calling.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     format: Option<serde_json::Value>,
 }
 
@@ -903,12 +969,13 @@ struct OllamaGenerateChunk {
     done_reason: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+// Also `Deserialize`: a node reads its peers' tags/ps answers back in.
+#[derive(Debug, Serialize, Deserialize)]
 struct OllamaTagsResponse {
     models: Vec<OllamaModelInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OllamaModelInfo {
     name: String,
     model: String,
@@ -918,7 +985,7 @@ struct OllamaModelInfo {
     details: OllamaModelDetails,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OllamaModelDetails {
     format: String,
     family: String,
@@ -926,12 +993,12 @@ struct OllamaModelDetails {
     quantization_level: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OllamaPsResponse {
     models: Vec<OllamaRunningModelInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OllamaRunningModelInfo {
     name: String,
     model: String,
@@ -956,6 +1023,9 @@ struct OllamaRunningModelInfo {
     processor: String,
     context_length: Option<u64>,
     started_at: String,
+    /// The peer this model is loaded on; absent for this node's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -974,6 +1044,102 @@ struct OllamaShowResponse {
 struct OllamaDeleteRequest {
     model: String,
     name: Option<String>,
+}
+
+/// `POST /api/copy` — ollama's `api.CopyRequest`.
+#[derive(Debug, Deserialize)]
+struct OllamaCopyRequest {
+    source: String,
+    destination: String,
+}
+
+/// `POST /api/create` — the subset of ollama's `api.CreateRequest` this
+/// daemon honours; see [`handle_create`].
+#[derive(Debug, Deserialize)]
+struct OllamaCreateRequest {
+    #[serde(default)]
+    model: String,
+    /// Deprecated spelling of `model`.
+    #[serde(default)]
+    name: String,
+    /// An existing model to alias.
+    #[serde(default)]
+    from: Option<String>,
+    /// `{"<filename>": "sha256:<digest>"}` of blobs uploaded via
+    /// `/api/blobs/<digest>`.
+    #[serde(default)]
+    files: Option<HashMap<String, String>>,
+    #[serde(default = "bool_true")]
+    stream: bool,
+    /// Every other (Modelfile) field, kept so `handle_create` can refuse
+    /// them by name rather than silently drop them.
+    #[serde(flatten)]
+    unsupported: HashMap<String, serde_json::Value>,
+}
+
+/// `POST /api/embed` — ollama's `api.EmbedRequest`.
+#[derive(Debug, Deserialize)]
+struct OllamaEmbedRequest {
+    model: String,
+    /// A string or an array of strings.
+    #[serde(default)]
+    input: serde_json::Value,
+    /// Defaults to true, as on ollama; `false` makes an over-long input a 400.
+    #[serde(default)]
+    truncate: Option<bool>,
+    /// Cut each vector to this many values and re-normalise.
+    #[serde(default)]
+    dimensions: Option<usize>,
+    /// See `OllamaGenerateRequest::keep_alive`.
+    #[serde(default)]
+    keep_alive: Option<serde_json::Value>,
+}
+
+/// ollama's `api.EmbedResponse`.
+#[derive(Debug, Serialize)]
+struct OllamaEmbedResponse {
+    model: String,
+    embeddings: Vec<Vec<f32>>,
+    total_duration: u64,
+    load_duration: u64,
+    prompt_eval_count: u64,
+}
+
+/// `POST /api/embeddings` — ollama's legacy single-prompt `api.EmbeddingRequest`.
+#[derive(Debug, Deserialize)]
+struct OllamaEmbeddingsRequest {
+    model: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    keep_alive: Option<serde_json::Value>,
+}
+
+/// ollama's `api.EmbeddingResponse` — `float64`s there, hence `f64`.
+#[derive(Debug, Serialize)]
+struct OllamaEmbeddingsResponse {
+    embedding: Vec<f64>,
+}
+
+/// The parts of a backend's OpenAI `/v1/embeddings` response read here.
+#[derive(Debug, Deserialize)]
+struct OAIEmbeddingsResponse {
+    data: Vec<OAIEmbeddingsDatum>,
+    #[serde(default)]
+    usage: OAIEmbeddingsUsage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAIEmbeddingsDatum {
+    #[serde(default)]
+    index: usize,
+    embedding: Vec<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OAIEmbeddingsUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1729,8 +1895,22 @@ async fn reap_idle_models_once(state: &AppState) {
         })
         .collect();
     for name in expired {
-        eprintln!("[llmman] unloading {name}: idle past its keep_alive deadline");
-        mgr.running.remove(&name);
+        // Report what actually happened, not what woke the reaper.
+        // `check_running` only notices a dead backend when a request
+        // arrives for that model; one that died and was then never asked
+        // for again reaches its keep_alive deadline looking exactly like a
+        // healthy idle model. Calling that idle would leave `Crashed` at
+        // zero on the daemon whose backends are dying, and would put this
+        // log line and its metric at odds about the same unload.
+        if let Some(mut running) = mgr.running.remove(&name) {
+            if running.process.is_alive() {
+                eprintln!("[llmman] unloading {name}: idle past its keep_alive deadline");
+                metrics::record_model_unload(&name, UnloadReason::Idle);
+            } else {
+                eprintln!("[llmman] unloading {name}: its backend had already exited");
+                metrics::record_model_unload(&name, UnloadReason::Crashed);
+            }
+        }
     }
 }
 
@@ -1800,6 +1980,8 @@ async fn spawn_llama_server(
         context_shift,
         split_mode,
         num_parallel,
+        embeddings,
+        batch_size,
         threads,
     } = opts;
     let mut cmd = tokio::process::Command::new(bin);
@@ -1857,6 +2039,14 @@ async fn spawn_llama_server(
     if let Some(n) = threads {
         cmd.args(["--threads", &n.to_string()]);
     }
+    // See LlamaOptions::embeddings and ::batch_size.
+    if embeddings {
+        cmd.arg("--embeddings");
+    }
+    if let Some(n) = batch_size {
+        let n = n.to_string();
+        cmd.args(["-b", &n, "-ub", &n]);
+    }
     // See GPU_VISIBLE_DEVICE_VARS's own doc comment — already inherited
     // by default, forwarded explicitly here for clarity.
     for var in GPU_VISIBLE_DEVICE_VARS {
@@ -1894,25 +2084,54 @@ async fn spawn_llama_server(
     Ok((child, tail))
 }
 
+/// vLLM should only override its model-derived default for explicit
+/// positive user input. This deliberately skips backend_ctx_size's
+/// num_parallel scaling because vLLM's limit is per request, not split
+/// across llama-server-style request slots.
+fn vllm_max_model_len(ctx_size: Option<u32>, ctx_size_explicit: bool) -> Option<u32> {
+    ctx_size.filter(|n| ctx_size_explicit && *n > 0)
+}
+
+/// argv after the `vllm` binary, kept separate so context forwarding is testable.
+fn vllm_serve_args(
+    model_dir: &str,
+    port: u16,
+    model_name: &str,
+    max_model_len: Option<u32>,
+) -> Vec<String> {
+    let mut args = vec![
+        "serve".into(),
+        model_dir.into(),
+        "--port".into(),
+        port.to_string(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        // Register the model under the same name used in API requests so
+        // {"model": "<ref>"} is accepted by vllm's OpenAI-compatible API.
+        "--served-model-name".into(),
+        model_name.into(),
+    ];
+    if let Some(n) = max_model_len {
+        args.push("--max-model-len".into());
+        args.push(n.to_string());
+    }
+    args
+}
+
 async fn spawn_vllm_server(
     model_dir: &Path,
     port: u16,
     model_name: &str,
+    max_model_len: Option<u32>,
 ) -> anyhow::Result<tokio::process::Child> {
     let vllm = which_binary("vllm")?;
     let mut cmd = tokio::process::Command::new(&vllm);
-    cmd.args([
-        "serve",
+    cmd.args(vllm_serve_args(
         model_dir.to_str().context("non-UTF-8 model path")?,
-        "--port",
-        &port.to_string(),
-        "--host",
-        "127.0.0.1",
-        // Register the model under the same name used in API requests so
-        // {"model": "<ref>"} is accepted by vllm's OpenAI-compatible API.
-        "--served-model-name",
+        port,
         model_name,
-    ]);
+        max_model_len,
+    ));
     // Own process group so ModelProcess's Drop impl can kill vllm's whole
     // worker tree, not just this one pid, without also killing ourselves.
     #[cfg(unix)]
@@ -2178,6 +2397,19 @@ async fn acquire_load_lock(model: &str) -> LoadLockGuard {
     }
 }
 
+/// The reference an OCI-registry pull hands `ffi::pull`: the string
+/// `stream_ffi_progress` polls progress under, never the `:latest`-
+/// defaulted `classified`. The shim keys byte progress on what it is
+/// given and defaults the tag itself, so `classified` files the counts
+/// where nothing reads them — which cost every tagless pull its bar.
+fn ffi_pull_ref<'a>(progress_key: &'a str, classified: &str) -> &'a str {
+    debug_assert!(
+        classified == progress_key || classified.strip_prefix(progress_key) == Some(":latest"),
+        "classify should differ from the progress key only by a defaulted tag",
+    );
+    progress_key
+}
+
 /// Pulls `model` into `layout_dir` if (still, after acquiring model's own
 /// lock) missing from the local store — shared by `ensure_model`'s
 /// fallback and `handle_pull` so both funnel through the same
@@ -2193,15 +2425,32 @@ async fn acquire_load_lock(model: &str) -> LoadLockGuard {
 /// as do the `ms://`/`ngc://`/`s3://`/`gs://`/local-path sources
 /// (`crate::sources`); only an actual OCI registry still goes through
 /// the Go shim.
-fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<()> {
+///
+/// Signature policy (`crate::verify`) is applied to that last case only.
+/// The other sources have no signature to find — HuggingFace and the
+/// object stores publish nothing in cosign's format — so subjecting them
+/// to the same policy would fail every such pull under `enforce`, which
+/// in practice means the policy gets turned off. `llmman transfer
+/// --sign-key` is the supported way to bring one of those into a
+/// registry as something signed; see `cmd::transfer`.
+fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<Vec<String>> {
     let lock = model_lock(model);
     let result = (|| {
         let _guard = lock.blocking_lock();
-        if OciStore::open(store_path)
-            .and_then(|s| s.find(model))
-            .is_ok()
-        {
-            return Ok(()); // someone else already pulled it while we waited
+        let existing = OciStore::open(store_path).and_then(|s| s.find(model)).ok();
+        // In the store is not the same as trusted: it may predate the
+        // policy, or have come in under `warn`. Classification first so
+        // a malformed llmman.conf can't break a cached non-OCI model no
+        // policy could apply to; then an in-memory policy lookup, which
+        // returns immediately when nothing is configured.
+        if let Some(desc) = existing {
+            if !crate::verify::is_registry_reference(model) {
+                return Ok(Vec::new());
+            }
+            if !crate::verify::is_enabled_for(model)? {
+                return Ok(Vec::new());
+            }
+            return verify_stored(store_path, model, &desc.digest);
         }
         let layout_dir = store_path
             .to_str()
@@ -2212,13 +2461,47 @@ fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<
         tokio::runtime::Handle::current().block_on(async {
             match crate::hf::classify(model).await {
                 crate::hf::ClassifiedRef::Hf(reference) => {
-                    crate::hf::pull::pull(&reference, store_path, model).await
+                    // classify routes by a live /v2/ probe, which fails
+                    // *open* into this branch — and this branch applies
+                    // no policy. So a reference the policy covers must
+                    // not be pulled here just because the probe could
+                    // not reach the registry.
+                    if crate::verify::is_registry_reference(model)
+                        && crate::verify::is_enabled_for(model)?
+                    {
+                        return Err(anyhow!(concat!(
+                            "is covered by a signature policy but could not be confirmed ",
+                            "to be an OCI registry (the /v2/ probe failed); refusing to ",
+                            "pull it as a HuggingFace repository unchecked",
+                        ))
+                        .context(model.to_string()));
+                    }
+                    crate::hf::pull::pull(&reference, store_path, model)
+                        .await
+                        .map(|()| Vec::new())
                 }
                 crate::hf::ClassifiedRef::Source(reference) => {
-                    crate::sources::pull(&reference, store_path, model).await
+                    crate::sources::pull(&reference, store_path, model)
+                        .await
+                        .map(|()| Vec::new())
                 }
                 crate::hf::ClassifiedRef::Other(normalized) => {
-                    crate::ffi::pull(&normalized, layout_dir)
+                    // Checked before a single layer is fetched, so a
+                    // model the policy will reject costs one manifest
+                    // lookup instead of a multi-gigabyte download...
+                    let guard = crate::verify::PullGuard::check(&normalized)?;
+                    crate::ffi::pull(ffi_pull_ref(model, &normalized), layout_dir)?;
+                    // ...and confirmed afterwards against what actually
+                    // landed, so a tag repointed mid-pull can't slip
+                    // past the check that just passed.
+                    let stored = OciStore::open(store_path)?.find(&normalized)?;
+                    match guard.confirm(&stored.digest) {
+                        // Relayed to the client rather than logged here:
+                        // this runs in the daemon, whose stderr is a log
+                        // file nobody is watching. See verify::Verdict.
+                        Ok(notices) => Ok(notices),
+                        Err(e) => Err(reject_stored(store_path, &normalized, e)),
+                    }
                 }
             }
         })
@@ -2226,6 +2509,45 @@ fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<
     drop(lock);
     release_model_lock(model);
     result
+}
+
+/// Re-checks an already-stored model against the current policy, using
+/// the digest held rather than re-resolving the tag. Callers must have
+/// established `is_registry_reference` first.
+fn verify_stored(
+    store_path: &std::path::Path,
+    model: &str,
+    digest: &str,
+) -> anyhow::Result<Vec<String>> {
+    debug_assert!(crate::verify::is_registry_reference(model));
+    match crate::verify::check(model, Some(digest)) {
+        Ok(verdict) => Ok(verdict.notices),
+        // Only a verdict *against* this copy removes it. An unreachable
+        // registry is not that: refusing to serve is right, deleting a
+        // model that may well be correctly signed because the network
+        // blinked is not — least of all for an air-gapped deployment,
+        // which is who runs `enforce` in the first place.
+        Err(e) if crate::verify::is_indeterminate(&e) => Err(e),
+        Err(e) => Err(reject_stored(store_path, model, e)),
+    }
+}
+
+/// Drops a reference the policy refused, so a later pull cannot find it
+/// present and hand it out unchecked; blobs are left to the GC sweep. A
+/// failed removal is reported alongside the rejection rather than
+/// swallowed — the store then holds something this daemon won't serve.
+fn reject_stored(
+    store_path: &std::path::Path,
+    reference: &str,
+    cause: anyhow::Error,
+) -> anyhow::Error {
+    match OciStore::open(store_path).and_then(|s| s.remove(reference)) {
+        Ok(_) => cause,
+        Err(e) => cause.context(format!(
+            "could not remove the rejected model {reference} from the store ({e:#}); \
+             it will keep being refused, but `llmman rm {reference}` is needed to clear it"
+        )),
+    }
 }
 
 /// Resolve a user-supplied model ref to the canonical reference stored in
@@ -2257,18 +2579,61 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
 /// reference the pull recorded. A lock key that moved with it would let a
 /// caller resolving in that window take a different lock from the loader
 /// still holding the old one. `default_tag` alone is stable, and already
-/// folds the tagless and `:latest` spellings together, which is all the
-/// lock needs.
+/// folds the tagless and `:latest` spellings together.
+///
+/// A `@digest` suffix is dropped from the key, and only from the key: the
+/// reference the store is asked about keeps it, so `find` can match it by
+/// content. `default_tag` sees the `:` inside `sha256:…` as a tag and
+/// leaves such a reference alone, so `m@sha256:…` and `m:latest` for one
+/// stored model took two locks and could both load. Which tag the content
+/// sits under is the store's to say, so for a digest reference the store
+/// is read once here, before the lock (`stored_tag_for_digest`): content
+/// stored as `m:v9` locks as `m:v9`, alongside a load of that tag, and
+/// content the store lacks, or holds only under a digest-named entry of
+/// its own, folds onto `:latest`. That is the one read of the store this
+/// key allows itself, and a pull by digest does not move it: what such a
+/// pull writes is a digest-named entry, which folds the same way as the
+/// nothing there before. A pull by tag landing the same content while a
+/// load of its digest is in flight does move it; the load that then
+/// takes the other lock pulls the same bytes again and, on finding the
+/// process the first started (`check_running_by_digest`), uses that.
 ///
 /// A provider-routed reference comes back untouched, as `ensure_model`
 /// returns it before any of this applies. Nothing observable depends on
 /// that today, since a remote target never enters `running`.
-fn load_identity(model: &str) -> Result<String, crate::shortnames::InvalidReference> {
+fn load_identity(
+    store_path: &std::path::Path,
+    model: &str,
+) -> Result<String, crate::shortnames::InvalidReference> {
     if crate::providers::is_remote_ref(model) {
         return Ok(model.to_string());
     }
     let resolved = crate::shortnames::resolve_ollama_api(model)?;
-    Ok(crate::storage::default_tag(&resolved))
+    let (without_digest, digest) = crate::storage::split_ref_digest(&resolved);
+    if digest.is_some() {
+        if let Some(tag) = stored_tag_for_digest(store_path, &resolved) {
+            return Ok(tag);
+        }
+    }
+    Ok(crate::storage::default_tag(without_digest))
+}
+
+/// The tag the store holds `reference`'s content under, for a reference
+/// carrying a digest: `m:v9` for `m@sha256:…` stored as `m:v9`. `None`
+/// otherwise: no digest, nothing stored, or stored only as the
+/// digest-named entry a pull by digest records. See `load_identity` for
+/// what the distinction is for.
+fn stored_tag_for_digest(store_path: &std::path::Path, reference: &str) -> Option<String> {
+    crate::storage::split_ref_digest(reference).1?;
+    let desc = OciStore::open(store_path).ok()?.find(reference).ok()?;
+    let stored = desc
+        .annotations
+        .as_ref()?
+        .get("org.opencontainers.image.ref.name")?;
+    crate::storage::split_ref_digest(stored)
+        .1
+        .is_none()
+        .then(|| crate::storage::default_tag(stored))
 }
 
 /// Drops `model` from `running`, or reports a 404 when llmman has no such
@@ -2279,16 +2644,23 @@ fn load_identity(model: &str) -> Result<String, crate::shortnames::InvalidRefere
 /// against ollama 0.32.6). The local store is what separates those two
 /// cases here. A model removed from the store while still loaded stays
 /// unloadable, since the `running` entry is authoritative and is consulted
-/// first.
+/// first: by its key, and by the digest it records when the key cannot be
+/// had from the store any more.
 async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
-    let lock_key = load_identity(model).map_err(AppError::bad_request)?;
+    let lock_key = load_identity(&state.0.store_path, model).map_err(AppError::bad_request)?;
     let _guard = acquire_load_lock(&lock_key).await;
     // Only now, with any load of this model excluded: the running key is
     // the store's spelling, which a load in flight may just have changed.
+    // Resolved from the reference with its `@digest` kept, the two steps
+    // `ensure_model` takes before its own `canonical_ref`, and not from
+    // the lock key: that has folded the digest onto `:latest`, which is
+    // not where the store holds a model tagged otherwise.
     let canonical = if crate::providers::is_remote_ref(model) {
         lock_key
     } else {
-        canonical_ref(&state.0.store_path, &lock_key)
+        let resolved =
+            crate::shortnames::resolve_ollama_api(model).map_err(AppError::bad_request)?;
+        canonical_ref(&state.0.store_path, &crate::storage::default_tag(&resolved))
     };
     if state
         .0
@@ -2299,6 +2671,7 @@ async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
         .remove(&canonical)
         .is_some()
     {
+        metrics::record_model_unload(&canonical, UnloadReason::Requested);
         return Ok(());
     }
     // Nothing was loaded under that key. A provider-routed model never is,
@@ -2307,11 +2680,74 @@ async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
     if crate::providers::is_remote_ref(model) {
         return Ok(());
     }
-    let store = OciStore::open(&state.0.store_path)?;
-    store
-        .find(&canonical)
-        .map_err(|_| AppError(anyhow!("model '{model}' not found"), StatusCode::NOT_FOUND))?;
+    // The key may not be the one the content runs under. The store may
+    // have lost the tag since the load (`rm` on a loaded model), so that
+    // `canonical_ref` handed the reference back as given, digest and all;
+    // or the content may run under the digest-named key a load by digest
+    // registered (see `check_running_by_digest`) while this spelling is
+    // the tag. Either way the digest names the content, from the
+    // reference itself or from the store's entry for it, and each
+    // `running` entry records its own, so the one with that digest in
+    // the same repository is it, the spelled tag first when several hold
+    // it.
+    let stored = OciStore::open(&state.0.store_path)?.find(&canonical).ok();
+    let (base, digest) = crate::storage::split_ref_digest(&canonical);
+    let digest = digest
+        .map(str::to_owned)
+        .or_else(|| stored.as_ref().map(|d| d.digest.clone()));
+    if let Some(digest) = digest {
+        let spelled = crate::storage::default_tag(base);
+        let mut mgr = state.0.manager.lock().await;
+        let key = mgr
+            .running
+            .iter()
+            .filter(|(key, m)| {
+                m.digest.eq_ignore_ascii_case(&digest)
+                    && crate::storage::repo_name(key) == crate::storage::repo_name(base)
+            })
+            .map(|(key, _)| key.clone())
+            .min_by_key(|key| *key != spelled);
+        if let Some(key) = key {
+            mgr.running.remove(&key);
+            return Ok(());
+        }
+    }
+    if stored.is_none() {
+        return Err(AppError(
+            anyhow!("model '{model}' not found"),
+            StatusCode::NOT_FOUND,
+        ));
+    }
     Ok(())
+}
+
+/// Forwards an Ollama request to a peer as-is, so `keep_alive` and a
+/// load-only request apply where the model runs.
+async fn forward_ollama<T: Serialize>(
+    state: &AppState,
+    target: &Target,
+    route: &str,
+    headers: &HeaderMap,
+    req: &T,
+    guard: ActivityGuard,
+) -> Result<Response, AppError> {
+    let body = Bytes::from(serde_json::to_vec(req).context("re-serialize Ollama request")?);
+    let activity = begin_activity(guard, None).await;
+    proxy(&state.0.client, target, route, headers, body, activity).await
+}
+
+/// [`unload_model`] here and on every peer. A peer that had it makes
+/// the local answer moot, including a 404 for a model never pulled here.
+async fn unload_everywhere(
+    state: &AppState,
+    model: &str,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    let local = unload_model(state, model).await;
+    if aggregation::unload(state, model, headers).await {
+        return Ok(());
+    }
+    local
 }
 
 /// Is `model_ref` already running and alive? See `ModelProcess::is_alive`.
@@ -2332,8 +2768,50 @@ async fn check_running(state: &AppState, model_ref: &str) -> Option<(u16, Activi
             m.port
         );
         mgr.running.remove(model_ref);
+        metrics::record_model_unload(model_ref, UnloadReason::Crashed);
     }
     None
+}
+
+/// `check_running` by content rather than by key: the entry in
+/// `model_ref`'s repository whose manifest digest is `digest`, claimed
+/// the same way, with its own key returned so the caller answers under
+/// the name the process is registered by.
+///
+/// The order this is for: from an empty store, a load by digest takes
+/// the shared lock first (see `load_identity`), pulls, and registers
+/// under the digest-named reference that pull records; the load by tag
+/// waiting on the lock then wakes with its own key, finds nothing under
+/// it, pulls the same manifest again under the tag, and without this
+/// would start a second server for content already served. The other
+/// order, tag first, is what `load_identity` settles by reading the
+/// store before the lock.
+async fn check_running_by_digest(
+    state: &AppState,
+    model_ref: &str,
+    digest: &str,
+) -> Option<(String, u16, ActivityGuard)> {
+    let repo = crate::storage::repo_name(model_ref);
+    let mut mgr = state.0.manager.lock().await;
+    let key = mgr
+        .running
+        .iter()
+        .find(|(key, m)| {
+            crate::storage::repo_name(key) == repo && m.digest.eq_ignore_ascii_case(digest)
+        })
+        .map(|(key, _)| key.clone())?;
+    let m = mgr.running.get_mut(&key)?;
+    if !m.process.is_alive() {
+        eprintln!(
+            "[llmman] {key} was marked running on port {} but its process has exited — reloading",
+            m.port
+        );
+        mgr.running.remove(&key);
+        return None;
+    }
+    m.in_flight += 1;
+    let port = m.port;
+    Some((key.clone(), port, ActivityGuard::new(state, &key)))
 }
 
 /// Evicts every currently-running model other than `model_ref` that
@@ -2357,6 +2835,7 @@ async fn evict_other_models(state: &AppState, model_ref: &str) -> bool {
     let mut evicted: Vec<(String, RunningModel)> = Vec::with_capacity(other_keys.len());
     for key in other_keys {
         if let Some(running) = mgr.running.remove(&key) {
+            metrics::record_model_unload(&key, UnloadReason::Oom);
             evicted.push((key, running));
         }
     }
@@ -2372,9 +2851,28 @@ async fn evict_other_models(state: &AppState, model_ref: &str) -> bool {
 /// Releases a `pending_loads` reservation on drop — see
 /// [`enforce_max_loaded_models`]. Mirrors [`ActivityGuard`]'s
 /// Drop-can't-be-async workaround.
+///
+/// Prefer [`PendingLoadGuard::release_into`] on the path that succeeds.
+/// Drop can only spawn the decrement, so between a load's
+/// `running.insert` and that task running, the model is in `running`
+/// *and* still reserved — a window `llmman_models_loading` would report
+/// as a load still in progress. Releasing under the same lock as the
+/// insert closes it; Drop stays as the release for every path that never
+/// inserts.
 struct PendingLoadGuard {
     state: AppState,
     armed: bool,
+}
+
+impl PendingLoadGuard {
+    /// Releases the reservation immediately, under a lock the caller
+    /// already holds, and disarms so `Drop` doesn't release it twice.
+    fn release_into(&mut self, mgr: &mut ModelManager) {
+        if !std::mem::take(&mut self.armed) {
+            return;
+        }
+        mgr.pending_loads = mgr.pending_loads.saturating_sub(1);
+    }
 }
 
 impl std::fmt::Debug for PendingLoadGuard {
@@ -2419,9 +2917,14 @@ async fn enforce_max_loaded_models(
     max_loaded: usize,
 ) -> Result<PendingLoadGuard, AppError> {
     if max_loaded == 0 {
+        // Nothing to enforce, but the reservation is still taken: it is
+        // what `llmman_models_loading` counts, and unbounded is the
+        // default, so an unarmed guard here would leave that gauge
+        // reading zero on almost every daemon.
+        state.0.manager.lock().await.pending_loads += 1;
         return Ok(PendingLoadGuard {
             state: state.clone(),
-            armed: false,
+            armed: true,
         });
     }
     loop {
@@ -2465,6 +2968,7 @@ async fn enforce_max_loaded_models(
             .running
             .remove(&victim)
             .expect("victim key was just looked up under this same lock");
+        metrics::record_model_unload(&victim, UnloadReason::Evicted);
         drop(mgr); // release the lock before the (possibly slow) stop below
         eprintln!(
             "[llmman] evicting {victim} to free a loaded-model slot (LLMMAN_MAX_LOADED_MODELS={max_loaded})"
@@ -2532,7 +3036,14 @@ fn try_admit_against(
 }
 
 fn try_admit(max_queue: usize) -> Result<QueueGuard, AppError> {
-    try_admit_against(&PENDING_REQUESTS, max_queue)
+    // Counted here rather than in `try_admit_against`, which the tests
+    // drive against a counter of their own — a rejection there is a test
+    // fixture, not a saturated daemon.
+    let admitted = try_admit_against(&PENDING_REQUESTS, max_queue);
+    if admitted.is_err() {
+        metrics::record_scheduling_rejection();
+    }
+    admitted
 }
 
 /// If `model_ref` would be served by `Engine::Mlx` were it loaded right
@@ -2594,7 +3105,7 @@ async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Request target: a local backend, or a remote provider
+// Request target: a local backend, a peer daemon, or a remote provider
 // ---------------------------------------------------------------------------
 
 /// Where a resolved request is actually sent.
@@ -2603,7 +3114,7 @@ async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<String> {
 /// was a `llama-server`/vllm/mlx child on loopback, so a port was the
 /// whole of "where does this go". [`Target::Remote`] is the same idea for
 /// a request that leaves the machine — see [`crate::providers`] for which
-/// providers qualify.
+/// providers qualify — and [`Target::Peer`] for another `llmman serve`.
 ///
 /// Requests are *routed* through, never redirected away from, this
 /// daemon: a provider-backed integration still talks to `llmman serve`
@@ -2613,6 +3124,9 @@ async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<String> {
 enum Target {
     /// A locally spawned backend listening on loopback.
     Local(u16),
+    /// Another `llmman serve`, by origin; speaks our dialect, so not
+    /// `is_remote`.
+    Peer(String),
     /// A remote provider's OpenAI-compatible API.
     Remote(Arc<RemoteTarget>),
 }
@@ -2658,11 +3172,13 @@ impl Target {
     fn url(&self, route: &str) -> String {
         match self {
             Self::Local(port) => format!("http://127.0.0.1:{port}{route}"),
+            Self::Peer(origin) => format!("{origin}{route}"),
             Self::Remote(remote) => crate::providers::rebase_url(&remote.base_url, route),
         }
     }
 
-    /// Attaches this target's credentials to an outgoing request.
+    /// Attaches this target's credentials to an outgoing request, or for
+    /// a peer the hop marker.
     ///
     /// A no-op for [`Target::Local`]: a loopback `llama-server` has no
     /// auth, which is why nothing below ever forwarded the client's own
@@ -2671,6 +3187,7 @@ impl Target {
     fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self {
             Self::Local(_) => req,
+            Self::Peer(_) => req.header(aggregation::HOP, "1"),
             Self::Remote(remote) => req.bearer_auth(&remote.api_key),
         }
     }
@@ -2687,6 +3204,7 @@ impl Target {
     fn describe(&self) -> String {
         match self {
             Self::Local(_) => "inference backend".to_string(),
+            Self::Peer(origin) => format!("peer {origin}"),
             Self::Remote(remote) => format!("provider {}", remote.provider),
         }
     }
@@ -2819,7 +3337,10 @@ async fn resolve_remote_target(
                      environment is deliberately not used"
                         .to_string()
                 } else if crate::daemon::reachable_only_locally() {
-                    format!(", or set {} where llmman serve runs", provider.key_env)
+                    format!(
+                        ", or give llmman serve a key of its own: {}",
+                        crate::providers::key_hint(&provider.id, &provider.key_env)
+                    )
                 } else {
                     ". llmman serve is not bound to loopback, so its own environment is \
                      deliberately not used"
@@ -2866,10 +3387,28 @@ async fn resolve_remote_target(
 /// `headers` are the incoming request's, used only to pick up a caller-
 /// supplied provider API key (see [`resolve_remote_target`]); `None` from
 /// a surface that has none to offer.
+///
+/// `request_threads` is the caller's Ollama `options.num_thread` (see
+/// [`opt_num_thread`]); `None` from every surface without an Ollama
+/// options blob (OpenAI-compat, Anthropic, embeddings, preload).
+/// Precedence for the thread count a local llama-server ends up with:
+/// request option > `LLAMA_ARG_THREADS` > the derived `state.threads`
+/// (see [`threads_from_env_or_host`]) > llama-server's own
+/// autodetection. The request option is forwarded as `--threads`, and
+/// llama.cpp applies env before CLI, so that flag wins over
+/// `LLAMA_ARG_THREADS`; when the option is absent, `state.threads` is
+/// already `None` whenever `LLAMA_ARG_THREADS` is set, so no
+/// `--threads` is emitted and the env choice stands untouched. Like a
+/// per-request ctx change, the option only takes effect on a fresh
+/// load: the `check_running` short-circuits below reuse an
+/// already-running instance as-is, never reloading it for a different
+/// thread count. Under `--ociman` it is ignored along with the derived
+/// value; see `container::LlamaOptions::threads` for why.
 async fn ensure_model(
     state: &AppState,
     model_ref: &str,
     headers: Option<&HeaderMap>,
+    request_threads: Option<u32>,
 ) -> Result<(String, Target, ActivityGuard), AppError> {
     // Before `resolve_ollama_api`, deliberately: a provider-routed
     // reference names a model on someone else's servers, so none of the
@@ -2889,18 +3428,20 @@ async fn ensure_model(
         ));
     }
 
+    // The key the load lock below is taken on, fixed before `canonical_ref`
+    // reads the store: it has to be the same string for the whole of a
+    // load even though the pull below changes what `canonical_ref`
+    // returns. See `load_identity`, which `unload_model` locks on for the
+    // same reason; the two have to agree, or an unload by one spelling
+    // passes a load by another.
+    let load_id = load_identity(&state.0.store_path, model_ref).map_err(AppError::bad_request)?;
     let model_ref =
         crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
-    // Default the tag before the lock below: otherwise two concurrent
-    // first-pulls of e.g. "gemma4" and "gemma4:latest" take different
-    // locks and both spawn a process for the same model.
+    // Default the tag before the store lookups: otherwise "gemma4" and
+    // "gemma4:latest" reach the store, and the pull, as two spellings. A
+    // `@digest` stays on, unlike in the lock key, so `find` can resolve
+    // it to whatever tag holds that content.
     let model_ref = crate::storage::default_tag(&model_ref);
-    // Kept from before `canonical_ref`, which reads the store: this is
-    // the key the load lock is taken on, and it has to be the same string
-    // for the whole of a load even though the pull below changes what
-    // `canonical_ref` returns. See `load_identity`, which `unload_model`
-    // locks on for the same reason.
-    let load_id = model_ref.clone();
     let model_ref = canonical_ref(&state.0.store_path, &model_ref);
     let model_ref = model_ref.as_str();
 
@@ -2910,8 +3451,28 @@ async fn ensure_model(
     // needs scheduling work (waiting on a concurrent load, or starting
     // a fresh one) below counts against the cap.
     if let Some((port, guard)) = check_running(state, model_ref).await {
+        // Already loaded, so no pull and no re-check: a policy tightened
+        // since the load takes effect on the next load, not mid-flight.
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
+
+    // Not loaded here: a peer may have it, or more room for it. The
+    // guard is a no-op one, as for a provider.
+    if let Some(peer) = aggregation::route(state, model_ref, headers).await {
+        return Ok((
+            model_ref.to_string(),
+            Target::Peer(peer),
+            ActivityGuard::new(state, model_ref),
+        ));
+    }
+
+    // The cold-start clock. It starts here rather than at the spawn
+    // because everything from here on is time the caller waits for a
+    // model it hasn't got: admission, the load lock, the pull, an
+    // eviction, the spawn and `wait_for_ready`. Only the path that
+    // reaches the `running.insert` below records, so this pairs exactly
+    // with `llmman_model_loads_total`.
+    let load_started = Instant::now();
 
     // See try_admit's doc comment — held for the rest of this function.
     let _queue_guard = try_admit(state.0.max_queue)?;
@@ -2924,18 +3485,29 @@ async fn ensure_model(
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
-    // If the model is not in the local store, pull it now.
-    if crate::storage::OciStore::open(&state.0.store_path)
-        .and_then(|s| s.find(model_ref))
-        .is_err()
+    // Pull if missing — and run pull_serialized even when present, so a
+    // model already on disk is still subject to the signature policy
+    // (it returns immediately when no policy applies). See verify_stored.
     {
-        eprintln!("[llmman] {model_ref} not in store — pulling");
+        let present = crate::storage::OciStore::open(&state.0.store_path)
+            .and_then(|s| s.find(model_ref))
+            .is_ok();
+        if !present {
+            eprintln!("[llmman] {model_ref} not in store — pulling");
+        }
         let store_path = state.0.store_path.clone();
         let model_ref_owned = model_ref.to_owned();
-        tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_ref_owned))
-            .await
-            .context("pull task panicked")?
-            .context("pull failed")?;
+        let notices =
+            tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_ref_owned))
+                .await
+                .context("pull task panicked")?
+                .context("pull failed")?;
+        // No progress stream to relay over on this path — an inference
+        // request triggered it, not `llmman pull` — so the daemon log is
+        // the only place left. Better there than nowhere.
+        for notice in notices {
+            eprintln!("[llmman] {notice}");
+        }
     }
 
     // Re-canonicalise after the pull: default_tag already fixed the lock
@@ -2948,12 +3520,11 @@ async fn ensure_model(
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
-    let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
-        .with_context(|| format!("resolve model {model_ref}"))?;
-    // Best-effort — used only to populate `llmman ps`'s ID/SIZE columns;
-    // resolve_model above already established the model exists, so a
-    // failure here (e.g. a race with a concurrent `rm`) just means those
-    // columns show as empty/zero rather than failing the whole request.
+    // Best-effort — used to populate `llmman ps`'s ID/SIZE columns and
+    // for the check right below; `resolve_model` after them establishes
+    // the model exists, so a failure here (e.g. a race with a concurrent
+    // `rm`) just means those columns show as empty/zero rather than
+    // failing the whole request.
     let (digest, size) = OciStore::open(&state.0.store_path)
         .and_then(|s| {
             s.find(model_ref).map(|d| {
@@ -2962,10 +3533,29 @@ async fn ensure_model(
             })
         })
         .unwrap_or_default();
+    // The content may be running already under a key this spelling does
+    // not resolve to; see `check_running_by_digest`'s doc comment for the
+    // order that produces one.
+    if !digest.is_empty() {
+        if let Some((key, port, guard)) = check_running_by_digest(state, model_ref, &digest).await {
+            return Ok((key, Target::Local(port), guard));
+        }
+    }
+    let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
+        .with_context(|| format!("resolve model {model_ref}"))?;
     let context_shift = supports_context_shift(model_ref);
+    // See embedding_model_ctx: `Some` marks an embedding model, and its
+    // trained context caps --ctx-size below — a chat-sized default (see
+    // hostgpu::default_ctx_size_for) is meaningless for a model with
+    // learned absolute positions, and would size the batch to match.
+    let embedding_ctx = match &model_path {
+        ModelPath::Gguf(path, _) => embedding_model_ctx(path),
+        _ => None,
+    };
     // See enforce_max_loaded_models's doc comment — held for the rest
     // of this function.
-    let _pending_load_guard = enforce_max_loaded_models(state, state.0.max_loaded_models).await?;
+    let mut pending_load_guard =
+        enforce_max_loaded_models(state, state.0.max_loaded_models).await?;
     // OOM retry loop — on a local llama-server load that fails with a
     // memory-allocation-looking error, tries progressively more invasive
     // fallbacks before giving up (see each branch's own comment for which
@@ -2974,7 +3564,18 @@ async fn ensure_model(
     // attempt, not just the first — otherwise a retry's replacement
     // process could try to bind the same port the previous (failed,
     // possibly not-yet-fully-exited) one was still holding.
-    let mut ctx_size = state.0.ctx_size;
+    // 0 means "trained context" (see context_length_from_env), which is
+    // exactly `trained` here rather than a zero batch.
+    let mut ctx_size = match embedding_ctx {
+        Some(Some(trained)) => Some(
+            state
+                .0
+                .ctx_size
+                .filter(|n| *n > 0)
+                .map_or(trained, |n| n.min(trained)),
+        ),
+        _ => state.0.ctx_size,
+    };
     let mut split_mode = state.0.split_mode;
     let mut shrink_attempts = 0u32;
     let mut evicted_others = false;
@@ -3009,7 +3610,12 @@ async fn ensure_model(
             context_shift,
             split_mode,
             num_parallel,
-            threads: state.0.threads,
+            embeddings: embedding_ctx.is_some(),
+            // `.filter`: a 0 here is "trained context", not a batch size.
+            batch_size: embedding_ctx.and(ctx_size).filter(|n| *n > 0),
+            // See ensure_model's `request_threads` doc comment for the
+            // full precedence chain this `.or` implements.
+            threads: request_threads.or(state.0.threads),
         };
         // Only a local llama-server child captures a stderr tail (see
         // spawn_llama_server) — every retry below only fires for that case.
@@ -3040,7 +3646,8 @@ async fn ensure_model(
                 ModelProcess::Local(Engine::Mlx, child, pid)
             }
             (ModelPath::SafeTensors(dir), _) => {
-                let child = spawn_vllm_server(dir, port, model_ref).await?;
+                let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
+                let child = spawn_vllm_server(dir, port, model_ref, max_model_len).await?;
                 let pid = child.id();
                 ModelProcess::Local(Engine::Vllm, child, pid)
             }
@@ -3064,6 +3671,7 @@ async fn ensure_model(
                 if !evicted_others {
                     evicted_others = true;
                     if evict_other_models(state, model_ref).await {
+                        metrics::record_oom_retry(model_ref, metrics::OomRetry::EvictOthers);
                         eprintln!(
                             "[llmman] {model_ref} failed to load on port {port}, which looks like an out-of-memory error — evicted other loaded models and retrying: {:#}",
                             e
@@ -3081,6 +3689,7 @@ async fn ensure_model(
                 if !split_mode_relaxed && split_mode == Some("none") {
                     split_mode_relaxed = true;
                     split_mode = Some("layer");
+                    metrics::record_oom_retry(model_ref, metrics::OomRetry::SplitMode);
                     eprintln!(
                         "[llmman] {model_ref} failed to load on port {port} with --split-mode none, which looks like an out-of-memory error — retrying with --split-mode layer (spread across every GPU) instead of failing outright: {:#}",
                         e
@@ -3111,6 +3720,7 @@ async fn ensure_model(
                 );
                 ctx_size = Some(next);
                 shrink_attempts += 1;
+                metrics::record_oom_retry(model_ref, metrics::OomRetry::CtxShrink);
                 port = find_free_port()?;
             }
         }
@@ -3127,7 +3737,8 @@ async fn ensure_model(
         _ => None,
     };
 
-    state.0.manager.lock().await.running.insert(
+    let mut mgr = state.0.manager.lock().await;
+    mgr.running.insert(
         model_ref.to_string(),
         RunningModel {
             process,
@@ -3143,6 +3754,11 @@ async fn ensure_model(
             in_flight: 1,
         },
     );
+    // Same locked step as the insert, so this load is never both in
+    // `running` and still reserved — see `PendingLoadGuard::release_into`.
+    pending_load_guard.release_into(&mut mgr);
+    drop(mgr);
+    metrics::record_model_load(model_ref, load_started.elapsed());
     Ok((
         model_ref.to_string(),
         Target::Local(port),
@@ -3582,10 +4198,12 @@ async fn post_chat(
 /// A [`Target::Local`] backend failing is llmman's own problem, so it
 /// stays a 500 as it always has. A provider's 4xx is about the caller's
 /// request or credentials, so it is passed through rather than buried;
-/// anything else from a provider is a bad gateway.
+/// anything else from a provider is a bad gateway. A peer already
+/// applied this mapping, so its status stands.
 fn remote_status(target: &Target, upstream: StatusCode) -> StatusCode {
     match target {
         Target::Local(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Target::Peer(_) => upstream,
         Target::Remote(_) if upstream.is_client_error() => upstream,
         Target::Remote(_) => StatusCode::BAD_GATEWAY,
     }
@@ -4270,10 +4888,13 @@ async fn handle_version(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-async fn handle_tags(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+async fn handle_tags(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
     let store = OciStore::open(&state.0.store_path)?;
     let list = store.list()?;
-    let models = list
+    let mut models: Vec<OllamaModelInfo> = list
         .into_iter()
         .map(|img| OllamaModelInfo {
             name: img.reference.clone(),
@@ -4294,6 +4915,16 @@ async fn handle_tags(State(state): State<AppState>) -> Result<impl IntoResponse,
             },
         })
         .collect();
+    // A peer's models are servable from here too, by forwarding.
+    if aggregation::aggregates(&state, &headers) {
+        for (_, peer) in aggregation::poll::<OllamaTagsResponse>(&state, "/api/tags").await {
+            for m in peer.models {
+                if !models.iter().any(|have| have.name == m.name) {
+                    models.push(m);
+                }
+            }
+        }
+    }
     Ok(Json(OllamaTagsResponse { models }))
 }
 
@@ -4311,7 +4942,7 @@ struct PsEntry {
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-async fn handle_ps(State(state): State<AppState>) -> impl IntoResponse {
+async fn handle_ps(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let entries: Vec<PsEntry> = {
         let mgr = state.0.manager.lock().await;
         mgr.running
@@ -4349,7 +4980,17 @@ async fn handle_ps(State(state): State<AppState>) -> impl IntoResponse {
             expires_at: entry
                 .expires_at
                 .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            node: None,
         });
+    }
+    // Loaded on a peer is loaded for this node's callers too.
+    if aggregation::aggregates(&state, &headers) {
+        for (origin, peer) in aggregation::poll::<OllamaPsResponse>(&state, "/api/ps").await {
+            models.extend(peer.models.into_iter().map(|m| OllamaRunningModelInfo {
+                node: Some(origin.clone()),
+                ..m
+            }));
+        }
     }
     Json(OllamaPsResponse { models })
 }
@@ -4474,29 +5115,14 @@ async fn handle_pull(
     eprintln!("[llmman] /api/pull model={model:?}");
     let store_path = state.0.store_path.clone();
 
-    let already_present = OciStore::open(&store_path)
-        .and_then(|s| s.find(&model))
-        .is_ok();
-    if already_present {
-        let line = serde_json::json!({"status": "success"}).to_string() + "\n";
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/x-ndjson")
-            .body(Body::from(line))
-            .unwrap());
-    }
-
-    // Not in the local store: actually pull it (the previous behavior only
-    // ever 404'd here, so no real Ollama client's "pull if missing, then
-    // use" flow — e.g. `ollama run <model>` — ever worked against llmman).
-    //
-    // pull_serialized (not a bare crate::ffi::pull call) re-checks presence
-    // after acquiring PULL_LOCK: this request's own `already_present` check
-    // above ran before that wait, so a concurrent pull of the same model
-    // (from another client, or from ensure_model's own fallback below) can
-    // finish while this one was waiting its turn — see PULL_LOCK's doc
-    // comment for why two callers must never invoke the actual FFI pull at
-    // the same time.
+    // Everything, present or not, goes through pull_serialized. It
+    // re-checks presence under the per-model lock (this request's own
+    // check would have raced a concurrent pull anyway), and — the reason
+    // there is no fast-path return here — it applies the signature
+    // policy to a model that is *already* in the store. Being on disk is
+    // not being trusted: it may have been pulled before a policy
+    // existed, or under `warn`. With no policy configured this is an
+    // in-memory lookup and a store hit, as before.
     let model_for_task = model.clone();
     let pull_task =
         tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_for_task));
@@ -4535,6 +5161,24 @@ async fn handle_push(
     } else {
         req.model.as_str()
     };
+    push_impl(state, model_ref, "/api/push").await
+}
+
+/// The push both `/api/push` and `cmd::push` reach.
+///
+/// Deliberately takes no signing key. The daemon binds TCP loopback with
+/// no authentication, and loopback is not user-scoped — so accepting a
+/// caller-supplied key *path* would let any local user have this daemon
+/// read a file only its own user can read, and sign with it using its
+/// registry credentials. TCP carries no peer credentials, so there is no
+/// way to tell that caller apart. Instead the digest that was pushed is
+/// reported back and `cmd::push` signs it itself, which is also what
+/// `cmd::transfer` already does. Nothing the daemon holds is delegable.
+async fn push_impl(
+    state: AppState,
+    model_ref: &str,
+    route: &'static str,
+) -> Result<Response, AppError> {
     if model_ref.is_empty() {
         return Err(AppError::status(
             StatusCode::BAD_REQUEST,
@@ -4542,7 +5186,7 @@ async fn handle_push(
         ));
     }
     let model = crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
-    eprintln!("[llmman] /api/push model={model:?}");
+    eprintln!("[llmman] {route} model={model:?}");
     let store_path = state.0.store_path.clone();
 
     // Unlike pull, there's nothing sensible to do if the model isn't
@@ -4551,8 +5195,10 @@ async fn handle_push(
         .and_then(|s| s.find(&model))
         .is_err()
     {
-        let body = serde_json::json!({"error": format!("model not found: {model}")});
-        return Ok((StatusCode::NOT_FOUND, Json(body)).into_response());
+        return Err(AppError::status(
+            StatusCode::NOT_FOUND,
+            format!("model not found: {model}"),
+        ));
     }
 
     // See MODEL_LOCKS' doc comment: a push shares the same Go-side
@@ -4567,7 +5213,13 @@ async fn handle_push(
             let layout_dir = store_path
                 .to_str()
                 .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
-            crate::ffi::push(layout_dir, &model_for_task)
+            crate::ffi::push(layout_dir, &model_for_task)?;
+            // Read inside the lock, so this is the manifest this push
+            // put there and not one a concurrent push retagged.
+            let desc = OciStore::open(&store_path)?.find(&model_for_task)?;
+            Ok(PushOutcome {
+                digest: desc.digest,
+            })
         })();
         drop(lock);
         release_model_lock(&model_for_task);
@@ -4580,6 +5232,62 @@ async fn handle_push(
         "retrieving manifest",
         push_task,
     ))
+}
+
+/// What a completed push reports back, for `cmd::push --sign-key` to
+/// sign. See `push_impl` for why the daemon does not sign it.
+struct PushOutcome {
+    digest: String,
+}
+
+/// Whatever a pull/push task needs to tell the client beyond "success",
+/// as NDJSON objects emitted ahead of the terminal line — a pull's
+/// verification notices, a push's digest. Both go out the one stream, so
+/// `stream_ffi_progress` serves either.
+trait StreamedOutcome {
+    fn into_lines(self) -> Vec<serde_json::Value>;
+}
+
+impl StreamedOutcome for Vec<String> {
+    fn into_lines(self) -> Vec<serde_json::Value> {
+        self.into_iter()
+            .map(|notice| serde_json::json!({"notice": notice}))
+            .collect()
+    }
+}
+
+impl StreamedOutcome for PushOutcome {
+    fn into_lines(self) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({"digest": self.digest})]
+    }
+}
+
+/// One poll's worth of NDJSON, or `None` to send nothing. `saw_bytes`
+/// latches once real counts arrive: an empty snapshot after that means
+/// the transfer ended while the task finishes up, and heartbeating
+/// there printed a stray line under the finished bar.
+fn progress_line(
+    verb: &str,
+    model: &str,
+    snap: (String, i64, i64),
+    saw_bytes: &mut bool,
+) -> Option<serde_json::Value> {
+    let (status, total, completed) = snap;
+    if total > 0 {
+        *saw_bytes = true;
+        return Some(serde_json::json!({
+            "status": if status.is_empty() { format!("{verb}ing {model}") } else { status },
+            "total": total,
+            "completed": completed.clamp(0, total),
+        }));
+    }
+    if !status.is_empty() {
+        return Some(serde_json::json!({"status": status}));
+    }
+    if *saw_bytes {
+        return None;
+    }
+    Some(serde_json::json!({"status": format!("{verb}ing {model}")}))
 }
 
 /// Runs `task` (a blocking FFI call already dispatched via spawn_blocking)
@@ -4602,26 +5310,42 @@ async fn handle_push(
 /// inside the daemon, whose stdio is redirected to a log file (see
 /// daemon::ensure_server), so polling and relaying over this NDJSON
 /// stream is the only way those numbers reach `llmman pull`/`llmman push`.
-fn stream_ffi_progress(
+fn stream_ffi_progress<T: StreamedOutcome + Send + 'static>(
     model: String,
     verb: &'static str,
     first_status: &'static str,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<anyhow::Result<T>>,
 ) -> Response {
     let first_line = serde_json::json!({"status": first_status}).to_string() + "\n";
     let stream = futures::stream::once(futures::future::ready(Bytes::from(first_line)))
-        .chain(futures::stream::unfold(Some(task), move |task| {
+        .chain(futures::stream::unfold((Some(task), false), move |state| {
+            let (task, mut saw_bytes) = state;
             let model = model.clone();
             async move {
                 let mut task = task?;
                 tokio::select! {
                     result = &mut task => {
+                        // Any notices the task produced (see
+                        // verify::Verdict) go out ahead of the terminal
+                        // line, each on its own NDJSON object, so the
+                        // client can print them somewhere a person is
+                        // actually looking — this daemon's own stderr is
+                        // a log file.
+                        let mut out = String::new();
                         let line = match result {
-                            Ok(Ok(())) => serde_json::json!({"status": "success"}).to_string(),
+                            Ok(Ok(outcome)) => {
+                                for field in outcome.into_lines() {
+                                    out.push_str(&field.to_string());
+                                    out.push('\n');
+                                }
+                                serde_json::json!({"status": "success"}).to_string()
+                            }
                             Ok(Err(e)) => serde_json::json!({"error": format!("{e:#}")}).to_string(),
                             Err(e) => serde_json::json!({"error": format!("{verb} task panicked: {e}")}).to_string(),
                         };
-                        Some((Bytes::from(line + "\n"), None))
+                        out.push_str(&line);
+                        out.push('\n');
+                        Some((Bytes::from(out), (None, saw_bytes)))
                     }
                     _ = sleep(Duration::from_millis(200)) => {
                         // A HuggingFace pull tracks its own progress natively
@@ -4640,18 +5364,9 @@ fn stream_ffi_progress(
                         } else {
                             (String::new(), 0, 0)
                         };
-                        let line = if total > 0 {
-                            serde_json::json!({
-                                "status": if status.is_empty() { format!("{verb}ing {model}") } else { status },
-                                "total": total.max(0),
-                                "completed": completed.clamp(0, total),
-                            })
-                        } else if !status.is_empty() {
-                            serde_json::json!({"status": status})
-                        } else {
-                            serde_json::json!({"status": format!("{verb}ing {model}")})
-                        };
-                        Some((Bytes::from(line.to_string() + "\n"), Some(task)))
+                        let line = progress_line(verb, &model, (status, total, completed), &mut saw_bytes);
+                        let out = line.map(|l| l.to_string() + "\n").unwrap_or_default();
+                        Some((Bytes::from(out), (Some(task), saw_bytes)))
                     }
                 }
             }
@@ -4680,6 +5395,346 @@ async fn handle_delete(
     let store = OciStore::open(&state.0.store_path)?;
     store.remove(&model_ref)?;
     Ok(StatusCode::OK)
+}
+
+// -- Ollama /api/copy ---------------------------------------------------------
+
+/// Mirrors `ollama.CopyHandler`: `llmman cp` over the wire, with
+/// ollama's 404 for a missing source.
+async fn handle_copy(
+    State(state): State<AppState>,
+    Json(req): Json<OllamaCopyRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if req.source.is_empty() || req.destination.is_empty() {
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            "source and destination are required",
+        ));
+    }
+    // Both resolved the way handle_pull stores a model, so a bare
+    // `mine:tag` destination is found by the /api/chat that follows.
+    let source =
+        crate::shortnames::resolve_ollama_api(&req.source).map_err(AppError::bad_request)?;
+    let destination =
+        crate::shortnames::resolve_ollama_api(&req.destination).map_err(AppError::bad_request)?;
+    eprintln!("[llmman] /api/copy {source:?} -> {destination:?}");
+    let store = OciStore::open(&state.0.store_path)?;
+    if store.find(&source).is_err() {
+        return Err(AppError::status(
+            StatusCode::NOT_FOUND,
+            format!("model '{}' not found", req.source),
+        ));
+    }
+    let digest = crate::cmd::cp::copy(&store, &source, &destination)?;
+    evict_if_retagged(&state, &destination, &digest).await;
+    Ok(StatusCode::OK)
+}
+
+/// Drops a loaded model whose tag `/api/copy` or `/api/create` just
+/// pointed at other content, so the next request loads that content.
+/// Keys are compared tag-defaulted, since a runner may be keyed `m:latest`
+/// for a tag written as `m`. In-flight requests on the old content are
+/// cut, as an explicit `keep_alive: 0` unload cuts them.
+async fn evict_if_retagged(state: &AppState, reference: &str, digest: &str) {
+    let want = crate::storage::default_tag(reference);
+    let mut mgr = state.0.manager.lock().await;
+    let stale: Vec<String> = mgr
+        .running
+        .iter()
+        .filter(|(k, m)| m.digest != digest && crate::storage::default_tag(k) == want)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in stale {
+        mgr.running.remove(&key);
+        metrics::record_model_unload(&key, UnloadReason::Requested);
+    }
+}
+
+// -- Ollama /api/blobs, /api/create --------------------------------------------
+//
+// Ollama's import flow: `POST /api/blobs/sha256:<digest>` uploads each raw
+// file (after a `HEAD` to skip ones already present), then `POST
+// /api/create` names them under `files`. Uploads land in a staging
+// directory; `create` packages them with `OciStore::build`, the same path
+// as `llmman build`, so the result is an ordinary store image.
+
+/// Where uploads wait for a `create`. Kept afterwards, so one upload can
+/// back several creates; `storage::gc::prune_cache` sweeps the directory
+/// at the next startup once it has been idle for its grace period.
+fn blob_staging_dir(state: &AppState) -> PathBuf {
+    state.0.cache_path.join("blobs")
+}
+
+/// Per-process counter making concurrent requests' temp paths distinct
+/// (see `OciStore::write_ref`).
+static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn staging_temp_name(prefix: &str) -> String {
+    let n = STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{prefix}-{}-{n}", std::process::id())
+}
+
+/// The staging path for `digest`, or a 400 if it isn't `sha256:<64 hex>`
+/// — which is also what keeps the path inside the staging directory.
+fn staged_blob_path(state: &AppState, digest: &str) -> Result<PathBuf, AppError> {
+    let hex = digest.strip_prefix("sha256:").unwrap_or_default();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            format!("invalid digest {digest:?}: expected sha256:<64 hex digits>"),
+        ));
+    }
+    Ok(blob_staging_dir(state).join(hex.to_ascii_lowercase()))
+}
+
+/// `HEAD /api/blobs/:digest` — mirrors `ollama.HeadBlobHandler`.
+async fn handle_blob_head(
+    State(state): State<AppState>,
+    UrlPath(digest): UrlPath<String>,
+) -> Result<StatusCode, AppError> {
+    let path = staged_blob_path(&state, &digest)?;
+    Ok(if path.is_file() {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    })
+}
+
+/// `POST /api/blobs/:digest` — streams the body to staging, kept only if
+/// it hashes to `digest`. Mirrors `ollama.CreateBlobHandler`.
+async fn handle_blob_upload(
+    State(state): State<AppState>,
+    UrlPath(digest): UrlPath<String>,
+    body: Body,
+) -> Result<StatusCode, AppError> {
+    use sha2::Digest as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let dest = staged_blob_path(&state, &digest)?;
+    if dest.is_file() {
+        return Ok(StatusCode::OK);
+    }
+    let dir = blob_staging_dir(&state);
+    tokio::fs::create_dir_all(&dir).await?;
+    let tmp = dir.join(staging_temp_name("tmp"));
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    let mut hasher = sha2::Sha256::new();
+    let mut stream = body.into_data_stream();
+    let written = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("read upload body")?;
+            hasher.update(&chunk);
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        anyhow::Ok(())
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e.into());
+    }
+    let actual = format!("sha256:{}", hex::encode(hasher.finalize()));
+    if !actual.eq_ignore_ascii_case(&digest) {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            format!("digest mismatch, expected {digest:?}, got {actual:?}"),
+        ));
+    }
+    tokio::fs::rename(&tmp, &dest).await?;
+    eprintln!("[llmman] /api/blobs stored {digest} ({})", dest.display());
+    Ok(StatusCode::CREATED)
+}
+
+/// The two halves of `ollama.CreateHandler` an OCI artifact can express:
+/// `from` (alias an existing model) and `files` (package uploaded blobs
+/// via `OciStore::build`). Modelfile fields — `system`, `template`,
+/// `parameters`, `quantize`, ... — have no counterpart here (the GGUF's
+/// own chat template applies), so each is refused with a 400 naming it
+/// rather than dropped: a caller that set a system prompt must not hear
+/// "success". Answers like ollama: `{"status": ...}` lines ending in
+/// `success`, or one object for `stream: false`.
+async fn handle_create(
+    State(state): State<AppState>,
+    Json(req): Json<OllamaCreateRequest>,
+) -> Result<Response, AppError> {
+    let model = if req.model.is_empty() {
+        req.name.as_str()
+    } else {
+        req.model.as_str()
+    };
+    if model.is_empty() {
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            "model is required",
+        ));
+    }
+    let refused: Vec<&str> = req
+        .unsupported
+        .iter()
+        .filter(|(_, v)| !is_empty_json(v))
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if !refused.is_empty() {
+        let mut refused = refused;
+        refused.sort_unstable();
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "/api/create: {} not supported by llmman — models are plain OCI artifacts \
+                 whose GGUF carries its own chat template; only `from` (alias an existing \
+                 model) and `files` (package uploaded blobs) are honoured",
+                refused.join(", ")
+            ),
+        ));
+    }
+    // Resolved like handle_copy's destination. A `@digest` spelling names
+    // content, which a created model doesn't have yet (see cp.rs).
+    let model = &crate::shortnames::resolve_ollama_api(model).map_err(AppError::bad_request)?;
+    if crate::storage::split_ref_digest(model).1.is_some() {
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            "/api/create: the model name can't be a digest reference",
+        ));
+    }
+    let files = req.files.unwrap_or_default();
+    let from = req.from.filter(|f| !f.is_empty());
+    let statuses: Vec<String> = match (from, files.is_empty()) {
+        (Some(_), false) => {
+            return Err(AppError::status(
+                StatusCode::BAD_REQUEST,
+                "/api/create: `from` and `files` are mutually exclusive here",
+            ))
+        }
+        (None, true) => {
+            return Err(AppError::status(
+                StatusCode::BAD_REQUEST,
+                "/api/create: one of `from` or `files` is required",
+            ))
+        }
+        (Some(from), true) => {
+            let source =
+                crate::shortnames::resolve_ollama_api(&from).map_err(AppError::bad_request)?;
+            eprintln!("[llmman] /api/create {model:?} from {source:?}");
+            let store = OciStore::open(&state.0.store_path)?;
+            if store.find(&source).is_err() {
+                return Err(AppError::status(
+                    StatusCode::NOT_FOUND,
+                    format!("model '{from}' not found"),
+                ));
+            }
+            let digest = crate::cmd::cp::copy(&store, &source, model)?;
+            evict_if_retagged(&state, model, &digest).await;
+            vec![format!("using existing layer {source}")]
+        }
+        (None, false) => {
+            eprintln!(
+                "[llmman] /api/create {model:?} from {} uploaded file(s)",
+                files.len()
+            );
+            let staged = files
+                .iter()
+                .map(|(name, digest)| Ok((name.clone(), staged_file(&state, name, digest)?)))
+                .collect::<Result<Vec<_>, AppError>>()?;
+            let store_path = state.0.store_path.clone();
+            let staging = blob_staging_dir(&state);
+            let model_owned = model.to_string();
+            let (digest, statuses) = tokio::task::spawn_blocking(move || {
+                create_from_staged_blobs(&store_path, &staging, &model_owned, &staged)
+            })
+            .await
+            .context("create task panicked")??;
+            evict_if_retagged(&state, model, &digest).await;
+            statuses
+        }
+    };
+    let mut lines: Vec<serde_json::Value> = statuses
+        .into_iter()
+        .map(|s| serde_json::json!({"status": s}))
+        .collect();
+    lines.push(serde_json::json!({"status": "success"}));
+    Ok(if req.stream {
+        let body: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+        ([("content-type", "application/x-ndjson")], body).into_response()
+    } else {
+        Json(lines.pop().unwrap_or_default()).into_response()
+    })
+}
+
+/// The placeholders a client sends for a Modelfile field it isn't using.
+fn is_empty_json(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.is_empty(),
+        serde_json::Value::Object(m) => m.is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        _ => false,
+    }
+}
+
+/// One `files` entry, checked: a bare file name (`../` would escape the
+/// build directory), a well-formed digest, and an upload that has landed.
+fn staged_file(state: &AppState, name: &str, digest: &str) -> Result<PathBuf, AppError> {
+    let bare = Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == name);
+    if !bare {
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            format!("files: {name:?} must be a bare file name"),
+        ));
+    }
+    let src = staged_blob_path(state, digest)?;
+    if !src.is_file() {
+        return Err(AppError::status(
+            StatusCode::NOT_FOUND,
+            format!("files: {digest} for {name:?} was never uploaded to /api/blobs"),
+        ));
+    }
+    Ok(src)
+}
+
+/// Hard-links (or copies) the staged uploads into a directory under the
+/// caller's file names — `build` classifies layers by extension, so
+/// `model.gguf` is what makes a servable model — and runs `OciStore::build`
+/// on it as `llmman build <dir>` would.
+fn create_from_staged_blobs(
+    store_path: &Path,
+    staging: &Path,
+    model: &str,
+    files: &[(String, PathBuf)],
+) -> anyhow::Result<(String, Vec<String>)> {
+    // `create_dir`, not `create_dir_all`: a leftover directory from a
+    // crashed daemon with a reused pid must not feed stale files to build.
+    let tmp = (0..3)
+        .map(|_| staging.join(staging_temp_name("create")))
+        .find_map(|dir| std::fs::create_dir(&dir).ok().map(|()| dir))
+        .ok_or_else(|| {
+            anyhow!(
+                "couldn't create a fresh build directory under {}",
+                staging.display()
+            )
+        })?;
+    let result = (|| {
+        let mut statuses = Vec::new();
+        for (name, src) in files {
+            let dst = tmp.join(name);
+            if std::fs::hard_link(src, &dst).is_err() {
+                std::fs::copy(src, &dst)
+                    .with_context(|| format!("stage {name} from {}", src.display()))?;
+            }
+            let digest = src.file_name().unwrap_or_default().to_string_lossy();
+            statuses.push(format!("using sha256:{digest} as {name}"));
+        }
+        let store = OciStore::open(store_path)?;
+        let desc = store.build(&tmp, model, &HashMap::new())?;
+        statuses.push(format!("writing manifest {}", desc.digest));
+        Ok((desc.digest, statuses))
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
 }
 
 // -- Ollama /api/chat ---------------------------------------------------------
@@ -4721,18 +5776,30 @@ async fn handle_ollama_chat(
     // backend to continue from nothing: the caller gets a real, arbitrary
     // generation and `done_reason: "stop"` where ollama answers with an
     // empty message, and a `keep_alive: 0` never unloads anything.
-    if req.messages.is_empty() {
-        if is_explicit_unload(&req.keep_alive) {
-            unload_model(&state, &req.model).await?;
-            return Ok(Json(empty_chat_chunk(req.model, "unload")).into_response());
-        }
+    if req.messages.is_empty() && is_explicit_unload(&req.keep_alive) {
+        unload_everywhere(&state, &req.model, &headers).await?;
+        return Ok(Json(empty_chat_chunk(req.model, "unload")).into_response());
+    }
 
-        let (_model, _target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
+    // The options blob still applies to a load-only request (the
+    // empty-messages branch below): a preload that names num_thread
+    // should start the process with it, same as a generating request
+    // would.
+    let (model, target, guard) = ensure_model(
+        &state,
+        &req.model,
+        Some(&headers),
+        opt_num_thread(&req.options),
+    )
+    .await?;
+    if matches!(target, Target::Peer(_)) {
+        return forward_ollama(&state, &target, "/api/chat", &headers, &req, guard).await;
+    }
+    if req.messages.is_empty() {
         refresh_activity(guard, resolve_keep_alive(&req.keep_alive)).await;
         return Ok(Json(empty_chat_chunk(req.model, "load")).into_response());
     }
 
-    let (model, target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
     let keep_alive = resolve_keep_alive(&req.keep_alive);
     let activity = begin_activity(guard, Some(keep_alive)).await;
     // See backend_wire_model's own doc comment — usually just `model`
@@ -4809,7 +5876,7 @@ async fn handle_ollama_generate(
     // `LLMMAN_KEEP_ALIVE=0` turned a plain preload into an eviction.
     let is_unload = req.prompt.is_empty() && is_explicit_unload(&req.keep_alive);
     if is_unload {
-        unload_model(&state, &req.model).await?;
+        unload_everywhere(&state, &req.model, &headers).await?;
         return Ok(Json(OllamaGenerateChunk {
             model: req.model,
             created_at: now_rfc3339(),
@@ -4821,7 +5888,16 @@ async fn handle_ollama_generate(
         .into_response());
     }
 
-    let (model, target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
+    let (model, target, guard) = ensure_model(
+        &state,
+        &req.model,
+        Some(&headers),
+        opt_num_thread(&req.options),
+    )
+    .await?;
+    if matches!(target, Target::Peer(_)) {
+        return forward_ollama(&state, &target, "/api/generate", &headers, &req, guard).await;
+    }
     // Empty prompt = load-only request (mirrors ollama server/routes.go:429)
     // — including "preload with a custom keep_alive", so refresh it here
     // even though no generation is happening.
@@ -4875,28 +5951,391 @@ async fn handle_ollama_generate(
     .await
 }
 
+// -- Ollama /api/embed, /api/embeddings ---------------------------------------
+//
+// Both ride on the backend's `/v1/embeddings`, as /api/chat rides on
+// /v1/chat/completions. llama-server is started with `--embeddings` for a
+// pooling model (see `embedding_model_ctx`), so that route is live.
+
+/// A string or an array of strings, as ollama accepts; an empty string or
+/// `null` is the load-only request.
+fn embed_inputs(input: &serde_json::Value) -> Result<Vec<String>, AppError> {
+    let invalid = || AppError::status(StatusCode::BAD_REQUEST, "invalid input type");
+    match input {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::String(s) if s.is_empty() => Ok(Vec::new()),
+        serde_json::Value::String(s) => Ok(vec![s.clone()]),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|v| v.as_str().map(str::to_owned).ok_or_else(invalid))
+            .collect(),
+        _ => Err(invalid()),
+    }
+}
+
+/// Shared by both routes: load the model, refuse an `Engine::Mlx`
+/// backend, embed each input. Returns vectors in input order, total
+/// prompt tokens, and the load time.
+async fn embed_via_backend(
+    state: &AppState,
+    headers: &HeaderMap,
+    model_ref: &str,
+    inputs: &[String],
+    truncate: bool,
+    keep_alive: &Option<serde_json::Value>,
+) -> Result<(Vec<Vec<f32>>, u64, Duration), AppError> {
+    let mlx_unsupported = |model: &str| {
+        AppError::status(
+            StatusCode::NOT_IMPLEMENTED,
+            format!(
+                "{model} is served by mlx_lm.server, which llmman never starts with \
+                 --embedding-model; use a GGUF or vllm-served model for embeddings"
+            ),
+        )
+    };
+    // Before ensure_model, as proxy_openai_passthrough does, so a known
+    // MLX model isn't loaded for a request that can't succeed.
+    if !crate::providers::is_remote_ref(model_ref) {
+        if let Some(canonical) = would_use_mlx(state, model_ref).await {
+            return Err(mlx_unsupported(&canonical));
+        }
+    }
+    let started = Instant::now();
+    // No `request_threads`: OllamaEmbedRequest carries no `options`
+    // blob here, so there is no num_thread to forward.
+    let (model, target, guard) = ensure_model(state, model_ref, Some(headers), None).await?;
+    let loaded = started.elapsed();
+    if !target.is_remote() && would_use_mlx(state, &model).await.is_some() {
+        return Err(mlx_unsupported(&model));
+    }
+    let keep_alive = resolve_keep_alive(keep_alive);
+    if inputs.is_empty() {
+        refresh_activity(guard, keep_alive).await;
+        return Ok((Vec::new(), 0, loaded));
+    }
+    let _activity = begin_activity(guard, Some(keep_alive)).await;
+    let wire_model = backend_wire_model(state, &target, &model).await;
+
+    // One call per input (llama-server fails a whole batch if any member
+    // overflows, and the retry needs to know which), a few at a time.
+    use futures::TryStreamExt as _;
+    let calls: Vec<_> = inputs
+        .iter()
+        .map(|text| embed_one(state, &target, &wire_model, text, truncate))
+        .collect();
+    let results: Vec<(Vec<f32>, u64)> = futures::stream::iter(calls)
+        .buffered(EMBED_CONCURRENCY)
+        .try_collect()
+        .await?;
+    let total_tokens = results.iter().map(|(_, n)| n).sum();
+    let embeddings = results
+        .into_iter()
+        .map(|(mut v, _)| {
+            // Ollama normalises every result regardless of backend.
+            normalize_in_place(&mut v)?;
+            Ok(v)
+        })
+        .collect::<Result<_, AppError>>()?;
+    Ok((embeddings, total_tokens, loaded))
+}
+
+/// How many of one `/api/embed` request's inputs are in flight at once.
+const EMBED_CONCURRENCY: usize = 8;
+
+/// One `/v1/embeddings` round trip with ollama's truncation on top:
+/// llama-server refuses an input longer than its batch (sized to the
+/// context) rather than cutting it, so on that failure the text is cut
+/// to the context via `/tokenize` + `/detokenize` and sent once more.
+/// Only on failure, unlike ollama, so a normal input pays no extra trips.
+async fn embed_one(
+    state: &AppState,
+    target: &Target,
+    wire_model: &str,
+    text: &str,
+    truncate: bool,
+) -> Result<(Vec<f32>, u64), AppError> {
+    match post_embeddings(&state.0.client, target, wire_model, text).await {
+        Ok(ok) => Ok(ok),
+        Err((status, body)) if truncate && !target.is_remote() && status.is_server_error() => {
+            let Target::Local(port) = target else {
+                unreachable!("guarded by !is_remote")
+            };
+            let limit = query_context_length(&state.0.client, *port)
+                .await
+                .ok_or_else(|| anyhow!("{} {status}: {body}", target.describe()))?;
+            // Room for the model's own BOS/EOS (ollama's `adjustTokenLimit`).
+            let limit = usize::try_from(limit)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(2);
+            let truncated = truncate_to_tokens(&state.0.client, *port, text, limit).await?;
+            if truncated.len() >= text.len() {
+                return Err(AppError(
+                    anyhow!("{} {status}: {body}", target.describe()),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ));
+            }
+            post_embeddings(&state.0.client, target, wire_model, &truncated)
+                .await
+                .map_err(|(status, body)| {
+                    AppError(
+                        anyhow!("{} {status}: {body}", target.describe()),
+                        remote_status(target, status),
+                    )
+                })
+        }
+        // Ollama's 400 for `truncate: false`; llama-server reports the
+        // overflow as a 500.
+        Err((status, body))
+            if !truncate
+                && !target.is_remote()
+                && status.is_server_error()
+                && body.contains("too large") =>
+        {
+            Err(AppError(
+                anyhow!("the input length exceeds the context length: {body}"),
+                StatusCode::BAD_REQUEST,
+            ))
+        }
+        Err((status, body)) => Err(AppError(
+            anyhow!("{} {status}: {body}", target.describe()),
+            remote_status(target, status),
+        )),
+    }
+}
+
+/// `POST /v1/embeddings` for one input; the error carries the upstream
+/// status and body so `embed_one` can recognise an overflow.
+async fn post_embeddings(
+    client: &Client,
+    target: &Target,
+    wire_model: &str,
+    text: &str,
+) -> Result<(Vec<f32>, u64), (StatusCode, String)> {
+    let resp = target
+        .authorize(
+            client
+                .post(target.url("/v1/embeddings"))
+                .timeout(EMBEDDINGS_TIMEOUT)
+                .json(&serde_json::json!({ "model": wire_model, "input": text })),
+        )
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("send to {}: {e}", target.describe()),
+            )
+        })?;
+    let status = resp.status();
+    let body = resp.bytes().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err((status, String::from_utf8_lossy(&body).into_owned()));
+    }
+    let mut parsed: OAIEmbeddingsResponse = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "{} returned an unexpected embeddings body: {e}",
+                target.describe()
+            ),
+        )
+    })?;
+    parsed.data.sort_by_key(|d| d.index);
+    let vector = parsed
+        .data
+        .into_iter()
+        .next()
+        .map(|d| d.embedding)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("{} returned no embedding", target.describe()),
+            )
+        })?;
+    Ok((vector, parsed.usage.prompt_tokens))
+}
+
+/// Bounds the two token-conversion calls in `truncate_to_tokens`: both
+/// are cheap and local, so a stall is a wedged backend.
+const TOKENIZE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounds one `/v1/embeddings` call; generous, since a context-length
+/// input on CPU is legitimately slow.
+const EMBEDDINGS_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// `text` cut to its first `limit` tokens via the backend's own
+/// `/tokenize` and `/detokenize`, so the cut lands on model boundaries.
+async fn truncate_to_tokens(
+    client: &Client,
+    port: u16,
+    text: &str,
+    limit: usize,
+) -> anyhow::Result<String> {
+    #[derive(Deserialize)]
+    struct Tokens {
+        tokens: Vec<i64>,
+    }
+    #[derive(Deserialize)]
+    struct Content {
+        content: String,
+    }
+    let base = format!("http://127.0.0.1:{port}");
+    let Tokens { mut tokens } = client
+        .post(format!("{base}/tokenize"))
+        .timeout(TOKENIZE_TIMEOUT)
+        .json(&serde_json::json!({ "content": text }))
+        .send()
+        .await
+        .context("tokenize for truncation")?
+        .error_for_status()?
+        .json()
+        .await?;
+    if limit == 0 {
+        anyhow::bail!("input after truncation exceeds maximum context length");
+    }
+    if tokens.len() <= limit {
+        return Ok(text.to_string());
+    }
+    tokens.truncate(limit);
+    let Content { content } = client
+        .post(format!("{base}/detokenize"))
+        .timeout(TOKENIZE_TIMEOUT)
+        .json(&serde_json::json!({ "tokens": tokens }))
+        .send()
+        .await
+        .context("detokenize for truncation")?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(content)
+}
+
+/// Unit-length in place (a prefix of a unit vector isn't one); a zero
+/// vector is left alone, a non-finite one is an error, as on ollama.
+fn normalize_in_place(v: &mut [f32]) -> Result<(), AppError> {
+    if v.iter().any(|x| !x.is_finite()) {
+        return Err(AppError::status(
+            StatusCode::BAD_GATEWAY,
+            "embedding contains NaN or Inf values",
+        ));
+    }
+    // f64: the sum can't overflow, and any nonzero f32 vector has a
+    // positive norm.
+    let norm = v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x = (f64::from(*x) / norm) as f32;
+        }
+    }
+    Ok(())
+}
+
+/// Mirrors `ollama.EmbedHandler`; durations are nanoseconds, as there.
+async fn handle_embed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<OllamaEmbedRequest>,
+) -> Result<Response, AppError> {
+    let started = Instant::now();
+    let inputs = embed_inputs(&req.input)?;
+    eprintln!(
+        "[llmman] /api/embed model={:?} inputs={}",
+        req.model,
+        inputs.len()
+    );
+    let (mut embeddings, tokens, loaded) = embed_via_backend(
+        &state,
+        &headers,
+        &req.model,
+        &inputs,
+        req.truncate != Some(false),
+        &req.keep_alive,
+    )
+    .await?;
+    if let Some(dims) = req.dimensions.filter(|d| *d > 0) {
+        for v in &mut embeddings {
+            if dims < v.len() {
+                v.truncate(dims);
+                normalize_in_place(v)?;
+            }
+        }
+    }
+    Ok(Json(OllamaEmbedResponse {
+        model: req.model,
+        embeddings,
+        total_duration: started.elapsed().as_nanos() as u64,
+        load_duration: loaded.as_nanos() as u64,
+        prompt_eval_count: tokens,
+    })
+    .into_response())
+}
+
+/// Mirrors `ollama.EmbeddingsHandler`: one prompt, one `float64` vector.
+async fn handle_embeddings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<OllamaEmbeddingsRequest>,
+) -> Result<Response, AppError> {
+    eprintln!(
+        "[llmman] /api/embeddings model={:?} prompt_len={}",
+        req.model,
+        req.prompt.len()
+    );
+    let inputs = if req.prompt.is_empty() {
+        Vec::new()
+    } else {
+        vec![req.prompt.clone()]
+    };
+    let (embeddings, _tokens, _loaded) =
+        embed_via_backend(&state, &headers, &req.model, &inputs, true, &req.keep_alive).await?;
+    let embedding = embeddings
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .into_iter()
+        .map(f64::from)
+        .collect();
+    Ok(Json(OllamaEmbeddingsResponse { embedding }).into_response())
+}
+
 // -- OpenAI pass-through handlers --------------------------------------------
 
 async fn handle_openai_models(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let store = OciStore::open(&state.0.store_path)?;
     let list = store.list()?;
-    let mgr = state.0.manager.lock().await;
-    let data: Vec<serde_json::Value> = list
-        .into_iter()
-        .map(|img| {
-            let loaded = mgr.running.contains_key(&img.reference);
-            serde_json::json!({
-                "id": img.reference,
-                "object": "model",
-                "created": 0,
-                "owned_by": "llmman",
-                // status field consumed by the web UI to track loaded/unloaded state
-                "status": { "value": if loaded { "loaded" } else { "unloaded" } },
+    let mut data: Vec<serde_json::Value> = {
+        let mgr = state.0.manager.lock().await;
+        list.into_iter()
+            .map(|img| {
+                let loaded = mgr.running.contains_key(&img.reference);
+                serde_json::json!({
+                    "id": img.reference,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "llmman",
+                    // status field consumed by the web UI to track loaded/unloaded state
+                    "status": { "value": if loaded { "loaded" } else { "unloaded" } },
+                })
             })
-        })
-        .collect();
+            .collect()
+    };
+    // As `handle_tags`; loaded anywhere counts as loaded.
+    if aggregation::aggregates(&state, &headers) {
+        for (_, peer) in aggregation::poll::<serde_json::Value>(&state, "/v1/models").await {
+            for m in peer["data"].as_array().into_iter().flatten() {
+                match data.iter_mut().find(|have| have["id"] == m["id"]) {
+                    Some(have) if m["status"]["value"] == "loaded" => {
+                        have["status"] = m["status"].clone();
+                    }
+                    Some(_) => {}
+                    None => data.push(m.clone()),
+                }
+            }
+        }
+    }
     Ok(Json(serde_json::json!({ "object": "list", "data": data })))
 }
 
@@ -4942,7 +6381,9 @@ async fn resolve_openai_request(
     let mut req: serde_json::Value =
         serde_json::from_slice(&body).context("parse OpenAI request body")?;
     let model = req["model"].as_str().unwrap_or("").to_string();
-    let (model, target, guard) = ensure_model(state, &model, Some(headers)).await?;
+    // No `request_threads`: the OpenAI-compatible surface has no Ollama
+    // options blob, so there is no num_thread to forward.
+    let (model, target, guard) = ensure_model(state, &model, Some(headers), None).await?;
     // The OpenAI-compatible surface has no `keep_alive` field of its own
     // (real Ollama's doesn't either) — `None` leaves whatever this model
     // already has untouched (its load-time default, or an explicit value
@@ -5246,7 +6687,7 @@ async fn handle_openai_transcriptions(
         });
         return Ok((StatusCode::BAD_REQUEST, Json(body)).into_response());
     }
-    let (_, target, guard) = ensure_model(&state, &model, Some(&headers)).await?;
+    let (_, target, guard) = ensure_model(&state, &model, Some(&headers), None).await?;
     // No `keep_alive` field on this API surface either — see
     // resolve_openai_request's own comment on the same choice.
     let activity = begin_activity(guard, None).await;
@@ -5490,7 +6931,10 @@ async fn handle_anthropic_messages(
 ) -> Result<Response, AppError> {
     // Backend needs its canonical name (see ensure_model); the response
     // below still echoes req.model back, unchanged from before.
-    let (canonical_model, target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
+    // No `request_threads`: the Anthropic Messages API has no Ollama
+    // options blob, so there is no num_thread to forward.
+    let (canonical_model, target, guard) =
+        ensure_model(&state, &req.model, Some(&headers), None).await?;
     // The Anthropic Messages API has no `keep_alive` field of its own —
     // `None` leaves it untouched, same as the OpenAI-compatible surface
     // (see resolve_openai_request's own comment on why).
@@ -5558,6 +7002,21 @@ fn opt_f64(opts: &Option<serde_json::Value>, key: &str) -> Option<f32> {
 
 fn opt_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32> {
     opts.as_ref()?.get(key)?.as_u64().map(|n| n as u32)
+}
+
+/// `num_thread` from the Ollama options blob: the per-request
+/// `--threads <n>` for a fresh local llama-server load (see
+/// `ensure_model`'s `request_threads` parameter for the full precedence
+/// chain and the reuse/container caveats). Zero, negative, fractional,
+/// or above-u32 numbers are dropped, falling back down that chain, the
+/// same way `parse_num_parallel` rejects zero for `--parallel`. Unlike
+/// that env-string parser this value arrives as a JSON number (Ollama's
+/// `num_thread` is an int field), so `as_u64` does the type filtering;
+/// not built on [`opt_u32`], whose `as u32` truncation is harmless for
+/// `num_predict` but would turn e.g. 2^32+1 into `--threads 1` here.
+fn opt_num_thread(opts: &Option<serde_json::Value>) -> Option<u32> {
+    let n = opts.as_ref()?.get("num_thread")?.as_u64()?;
+    u32::try_from(n).ok().filter(|&n| n != 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -5676,11 +7135,309 @@ fn resolve_llama_server(pinned_version: Option<&str>) -> anyhow::Result<PathBuf>
 }
 
 // ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+/// Records every response this router produces into [`crate::metrics`].
+///
+/// The route label is axum's `MatchedPath` — the route template
+/// (`/llmman/providers/:id`), never the path the client asked for. That
+/// is what bounds the label set to the router below instead of to
+/// traffic. An unmatched request carries no `MatchedPath` and is not
+/// counted: there is no route to attribute it to, and labelling by the
+/// requested path is how a metrics endpoint acquires unbounded
+/// cardinality. A flood of 404s to unknown paths is therefore invisible
+/// here.
+///
+/// Two clocks, because on the streaming routes (`/api/chat`,
+/// `/v1/chat/completions`, ...) they measure different things and only
+/// one of them is latency. `llmman_http_request_ttfb_seconds` stops when
+/// the response *headers* are ready — that is what moves when a load
+/// stalls or the queue backs up. `llmman_http_request_duration_seconds`
+/// stops when the body ends, which mostly tracks how many tokens were
+/// asked for; graphing that as latency would make every long completion
+/// look like a regression, and graphing only TTFB would hide a stream
+/// that stalls after its first byte.
+///
+/// The body outlives this function, so the second clock is stopped by a
+/// guard moved into the stream — the same idiom `proxy` already uses to
+/// hold an `ActivityGuard` until a completion finishes. A client that
+/// disconnects early drops the stream, so that records too: the request
+/// did end. Only a body of unknown length is wrapped that way; see the
+/// comment on the size-hint branch for what wrapping the rest would cost.
+///
+/// The scrape route is instrumented like any other, so
+/// `route="/metrics"` reports what a scrape costs. Exclude that
+/// label when the question is application latency.
+async fn track_metrics(req: Request, next: Next) -> Response {
+    // Cloned, not copied into a `String`: `MatchedPath` is a handle around
+    // an `Arc<str>`, and `record_request` only takes ownership of a route
+    // the first time it sees one. The clone is needed at all because
+    // `next.run` consumes the request.
+    let route = req.extensions().get::<MatchedPath>().cloned();
+    let started = Instant::now();
+    let response = next.run(req).await;
+    let Some(route) = route else {
+        return response;
+    };
+    metrics::record_request(
+        route.as_str(),
+        response.status().as_u16(),
+        started.elapsed(),
+    );
+
+    let (parts, body) = response.into_parts();
+    if body.size_hint().exact().is_some() {
+        // A body already in memory when the headers go out has no
+        // generation left to time, so the second clock would read the
+        // same as the first — and wrapping it would cost the response
+        // its `Content-Length`, which hyper derives from the size hint a
+        // wrapped stream no longer has. Every JSON reply on the daemon
+        // would become chunked to measure nothing. The bodies with no
+        // exact size are the streaming ones, already chunked either way.
+        metrics::record_response_body(route.as_str(), started.elapsed());
+        return Response::from_parts(parts, body);
+    }
+
+    let timer = ResponseBodyTimer {
+        route: route.as_str().to_string(),
+        started,
+    };
+    let body = Body::from_stream(body.into_data_stream().map(move |chunk| {
+        // Borrowed, not used: this is what moves `timer` into the stream
+        // so it drops with the body rather than at the end of this
+        // function. Same trick as `proxy`'s `ActivityGuard`.
+        let _timer = &timer;
+        chunk
+    }));
+    Response::from_parts(parts, body)
+}
+
+/// Lets the Ollama routes take a JSON body under any `Content-Type`, as
+/// ollama does (gin's `ShouldBindJSON` ignores the header): `curl -d`
+/// sends a form type, a browser `fetch` sends `text/plain`, some SDKs
+/// send none, and axum's `Json` 415s all of them. Rewriting the header
+/// before extraction closes that; a non-JSON body still gets the 400.
+///
+/// A non-JSON POST carrying an `Origin` that `cors_layer` wouldn't allow
+/// is a browser's "simple" request that skipped preflight; it is refused
+/// outright, since `/api/blobs` reads a raw body and `/api/pull` or
+/// `/api/create` would otherwise be drivable from any page.
+async fn accept_any_content_type(mut req: Request, next: Next) -> Response {
+    let is_json = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(is_json_content_type);
+    if !is_json {
+        if foreign_origin(req.headers()) {
+            let body = serde_json::json!({ "error": "cross-site request refused" });
+            return (StatusCode::FORBIDDEN, Json(body)).into_response();
+        }
+        req.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+    }
+    next.run(req).await
+}
+
+/// Whether the request carries an `Origin` that `cors_layer` wouldn't
+/// allow. No `Origin` (a CLI, an SDK) is not foreign.
+fn foreign_origin(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|origin| {
+            !allowed_origins_from_env()
+                .iter()
+                .any(|pattern| origin_matches(origin, pattern))
+        })
+}
+
+/// `application/json` or `application/*+json`, parameters and case aside.
+fn is_json_content_type(value: &str) -> bool {
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || (essence.starts_with("application/") && essence.ends_with("+json"))
+}
+
+/// Stops [`track_metrics`]'s second clock when a response body ends —
+/// see that function's own doc comment. Drop rather than the end of the
+/// stream, so a client that disconnects mid-completion is recorded too.
+struct ResponseBodyTimer {
+    route: String,
+    started: Instant,
+}
+
+impl Drop for ResponseBodyTimer {
+    fn drop(&mut self) {
+        metrics::record_response_body(&self.route, self.started.elapsed());
+    }
+}
+
+/// Prometheus scrape target. See `crate::metrics`'s module doc comment
+/// for what this exposes, and for why per-token counters are llama-server's
+/// own `/metrics` to serve rather than llmman's.
+async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let (models_loaded, models_loading, models) = {
+        let mut mgr = state.0.manager.lock().await;
+        let models = mgr
+            .running
+            .iter_mut()
+            .map(|(model, m)| metrics::ModelState {
+                model: model.clone(),
+                engine: m.engine_label(),
+                // The one thing no other metric here can show: llmman
+                // only notices a dead backend when a request arrives for
+                // that model, so `models_loaded` counts it until then.
+                up: m.process.is_alive(),
+            })
+            .collect();
+        (mgr.running.len() as u64, mgr.pending_loads as u64, models)
+    };
+    let snapshot = metrics::Snapshot {
+        version: env!("LLMMAN_VERSION").to_string(),
+        start_time_seconds: metrics::process_start_seconds(),
+        scheduling_requests_in_flight: PENDING_REQUESTS.load(std::sync::atomic::Ordering::SeqCst)
+            as u64,
+        // `.max(1)` rather than the raw setting: see the field's own doc.
+        scheduling_capacity: state.0.max_queue.max(1) as u64,
+        models_loaded,
+        models_loading,
+        models,
+    };
+    (
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        metrics::render(&snapshot),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     tokio::runtime::Runtime::new()?.block_on(serve_async(args))
+}
+
+/// The daemon's routes and the layers over them, split out of
+/// [`serve_async`] so `the_scrape_endpoint_is_outside_the_cors_layer` can
+/// assert against the real router instead of a copy of this layering.
+fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
+    let app = Router::new()
+        // Web UI
+        .route("/", get(handle_root))
+        .route("/bundle.js", get(handle_bundle_js))
+        .route("/bundle.css", get(handle_bundle_css))
+        .route("/loading.html", get(handle_loading_html))
+        // llama.cpp-compatible props endpoint (router mode)
+        .route("/props", get(handle_props))
+        // llmman's own API — see handle_llmman_providers
+        .route("/llmman/providers", get(handle_llmman_providers))
+        .route("/llmman/providers/:id", get(handle_llmman_provider))
+        .route("/llmman/node", get(aggregation::handle_node))
+        // Ollama API
+        .merge(ollama_router())
+        // OpenAI API
+        .route("/v1/models", get(handle_openai_models))
+        .route("/v1/chat/completions", post(handle_openai_chat))
+        .route("/v1/completions", post(handle_openai_completions))
+        .route("/v1/embeddings", post(handle_openai_embeddings))
+        .route(
+            "/v1/audio/transcriptions",
+            post(handle_openai_transcriptions)
+                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/audio/transcriptions",
+            post(handle_openai_transcriptions)
+                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
+        )
+        .route("/v1/responses", post(handle_openai_responses))
+        .route(
+            "/v1/responses/input_tokens",
+            post(handle_openai_responses_input_tokens),
+        )
+        // Anthropic API
+        .route("/v1/messages", post(handle_anthropic_messages));
+
+    // Applied only when the operator asked for metrics. Nothing can read
+    // the store while the endpoint is absent — enabling it needs a
+    // restart — so instrumenting a disabled daemon would buy a registry
+    // lock and a map write on every request, and a `model` label set that
+    // grows for the life of the process, in exchange for numbers no one
+    // can scrape. Off means off, not hidden.
+    //
+    // Innermost of the two, so what it times is the handler rather than
+    // the CORS layer's own header work. CORS therefore answers a
+    // preflight OPTIONS before this layer runs, so preflights are not
+    // counted — they are the browser's negotiation, not a request the
+    // daemon did any work for.
+    let app = if metrics_enabled {
+        app.layer(middleware::from_fn(track_metrics))
+    } else {
+        app
+    };
+
+    app.layer(cors_layer())
+        .merge(metrics_router(metrics_enabled))
+        .with_state(app_state)
+}
+
+/// The Ollama-compatible surface; its own router so
+/// [`accept_any_content_type`] applies to exactly these routes.
+fn ollama_router() -> Router<AppState> {
+    Router::new()
+        .route("/api/version", get(handle_version))
+        .route("/api/tags", get(handle_tags))
+        .route("/api/ps", get(handle_ps))
+        .route("/api/show", post(handle_show))
+        .route("/api/pull", post(handle_pull))
+        .route("/api/push", post(handle_push))
+        .route("/api/delete", delete(handle_delete))
+        .route("/api/copy", post(handle_copy))
+        .route("/api/create", post(handle_create))
+        .route(
+            "/api/blobs/:digest",
+            axum::routing::head(handle_blob_head)
+                .post(handle_blob_upload)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route("/api/chat", post(handle_ollama_chat))
+        .route("/api/generate", post(handle_ollama_generate))
+        .route("/api/embed", post(handle_embed))
+        .route("/api/embeddings", post(handle_embeddings))
+        .layer(middleware::from_fn(accept_any_content_type))
+}
+
+/// `GET /metrics`, or nothing at all when `LLMMAN_METRICS` is unset —
+/// see [`metrics_enabled_from_env`]. Absent means a 404, the same answer
+/// as any other path this daemon does not serve, so a disabled endpoint
+/// is not distinguishable from a build without one.
+///
+/// Merged into [`build_router`] after `.layer(cors_layer())` rather than
+/// routed above it, so the scrape endpoint answers without an
+/// Access-Control-Allow-Origin header. `default_allowed_origins` is
+/// appended unconditionally, so any page on any localhost port is an
+/// allowed origin — one could otherwise read version, route mix, model
+/// names and model churn out of every daemon it can reach. Nothing in a
+/// browser scrapes a metrics endpoint, so it gives up nothing to leave
+/// the layer out. Taking the parameter rather than reading the
+/// environment here is what lets both answers be tested against a real
+/// router.
+fn metrics_router(enabled: bool) -> Router<AppState> {
+    if !enabled {
+        return Router::new();
+    }
+    Router::new()
+        .route("/metrics", get(handle_metrics))
+        .layer(middleware::from_fn(track_metrics))
 }
 
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
@@ -5761,16 +7518,33 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         }
     }
 
-    // See context_length_from_env's doc comment. spawn_blocking: like
-    // resolve_llama_server above, the VRAM probe fallback spawns a
-    // subprocess and must not block this async fn's executor thread.
+    // See the `aggregation` module.
+    let peers: Vec<String> = crate::config::peers()
+        .iter()
+        .map(|p| crate::daemon::peer_url(p))
+        .collect();
+
+    // One accelerator probe serves both the VRAM-tiered context default
+    // and this node's weight in its aggregation; skipped when neither
+    // needs it. spawn_blocking: it spawns a subprocess.
     let ctx_size_explicit = context_length_from_env();
-    let ctx_size = match ctx_size_explicit {
-        Some(n) => Some(n),
-        None => tokio::task::spawn_blocking(crate::hostgpu::default_ctx_size)
+    let vram = if ctx_size_explicit.is_none() || !peers.is_empty() {
+        tokio::task::spawn_blocking(crate::hostgpu::detect_with_vram)
             .await
-            .context("hostgpu probe task panicked")?,
+            .context("hostgpu probe task panicked")?
+            .1
+    } else {
+        0
     };
+    let ctx_size = ctx_size_explicit.or_else(|| crate::hostgpu::default_ctx_size(vram));
+    let memory = crate::hostgpu::memory_bytes(vram);
+    if !peers.is_empty() {
+        eprintln!(
+            "[llmman] aggregation peers: {} (this node: {} of model memory)",
+            peers.join(", "),
+            crate::fmt::human_size(memory)
+        );
+    }
 
     // See threads_from_env_or_host's doc comment. Resolved once here
     // rather than per load, and logged so a surprising thread count is
@@ -5809,57 +7583,23 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         threads,
         max_queue: max_queue_from_env(),
         max_loaded_models: max_loaded_models_from_env(),
+        peers,
+        memory,
         store_path,
         cache_path,
         client: Client::new(),
     }));
 
-    let app_state = state.clone();
-    let app = Router::new()
-        // Web UI
-        .route("/", get(handle_root))
-        .route("/bundle.js", get(handle_bundle_js))
-        .route("/bundle.css", get(handle_bundle_css))
-        .route("/loading.html", get(handle_loading_html))
-        // llama.cpp-compatible props endpoint (router mode)
-        .route("/props", get(handle_props))
-        // llmman's own API — see handle_llmman_providers
-        .route("/llmman/providers", get(handle_llmman_providers))
-        .route("/llmman/providers/:id", get(handle_llmman_provider))
-        // Ollama API
-        .route("/api/version", get(handle_version))
-        .route("/api/tags", get(handle_tags))
-        .route("/api/ps", get(handle_ps))
-        .route("/api/show", post(handle_show))
-        .route("/api/pull", post(handle_pull))
-        .route("/api/push", post(handle_push))
-        .route("/api/delete", delete(handle_delete))
-        .route("/api/chat", post(handle_ollama_chat))
-        .route("/api/generate", post(handle_ollama_generate))
-        // OpenAI API
-        .route("/v1/models", get(handle_openai_models))
-        .route("/v1/chat/completions", post(handle_openai_chat))
-        .route("/v1/completions", post(handle_openai_completions))
-        .route("/v1/embeddings", post(handle_openai_embeddings))
-        .route(
-            "/v1/audio/transcriptions",
-            post(handle_openai_transcriptions)
-                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/audio/transcriptions",
-            post(handle_openai_transcriptions)
-                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
-        )
-        .route("/v1/responses", post(handle_openai_responses))
-        .route(
-            "/v1/responses/input_tokens",
-            post(handle_openai_responses_input_tokens),
-        )
-        // Anthropic API
-        .route("/v1/messages", post(handle_anthropic_messages))
-        .layer(cors_layer())
-        .with_state(app_state);
+    let app = build_router(state.clone(), metrics_enabled_from_env());
+
+    // Before the listener binds, so uptime counts from the daemon coming
+    // up rather than from whenever something first scraped it.
+    metrics::mark_process_start();
+
+    // Before the listener: a malformed llmman.conf or LLMMAN_VERIFY is
+    // fatal, and failing at exec is far better than booting cleanly and
+    // then failing every pull with a config error.
+    crate::verify::Policy::load().context("signature trust policy")?;
 
     let addr = crate::daemon::bind_addr();
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -5886,7 +7626,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             Ok(model) => {
                 let state_clone = state.clone();
                 tokio::spawn(async move {
-                    match ensure_model(&state_clone, &model, None).await {
+                    match ensure_model(&state_clone, &model, None, None).await {
                         // ensure_model's own keep_alive (the daemon default, 5
                         // minutes) would otherwise start counting down the
                         // moment this finishes loading, with no request traffic
@@ -5955,6 +7695,66 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- pull/push progress relay -------------------------------------------
+
+    /// Regression test for tagless pulls losing their bar: the shim
+    /// must get the reference the daemon polls under, not the
+    /// tag-normalized one.
+    #[test]
+    fn ffi_pull_ref_is_the_polled_key_not_the_tag_normalized_ref() {
+        assert_eq!(
+            ffi_pull_ref("docker.io/ai/qwen3.8", "docker.io/ai/qwen3.8:latest"),
+            "docker.io/ai/qwen3.8"
+        );
+        // An already-tagged reference classifies to itself.
+        assert_eq!(
+            ffi_pull_ref("docker.io/ai/qwen3.8:0.8b", "docker.io/ai/qwen3.8:0.8b"),
+            "docker.io/ai/qwen3.8:0.8b"
+        );
+    }
+
+    /// The heartbeat must not come back once the bar is running: the
+    /// shim drops its entry when the transfer ends, while the task still
+    /// has its signature check to do, and a heartbeat there printed a
+    /// stray line under the finished bar.
+    #[test]
+    fn progress_line_stops_heartbeating_once_byte_counts_have_been_seen() {
+        let mut saw_bytes = false;
+        // Nothing known yet: the heartbeat is all there is to send.
+        assert_eq!(
+            progress_line("pull", "m", (String::new(), 0, 0), &mut saw_bytes),
+            Some(serde_json::json!({"status": "pulling m"}))
+        );
+        assert!(!saw_bytes);
+        // Real counts latch the flag and drive the bar.
+        assert_eq!(
+            progress_line("pull", "m", ("pulling".into(), 100, 40), &mut saw_bytes),
+            Some(serde_json::json!({"status": "pulling", "total": 100, "completed": 40}))
+        );
+        assert!(saw_bytes);
+        // Entry dropped, task still finishing: say nothing.
+        assert_eq!(
+            progress_line("pull", "m", (String::new(), 0, 0), &mut saw_bytes),
+            None
+        );
+    }
+
+    /// A status-only snapshot still reports; a blank status names the
+    /// model, and `completed` never exceeds `total`.
+    #[test]
+    fn progress_line_reports_status_only_snapshots_and_clamps_completed() {
+        let mut saw_bytes = false;
+        assert_eq!(
+            progress_line("pull", "m", ("verifying".into(), 0, 0), &mut saw_bytes),
+            Some(serde_json::json!({"status": "verifying"}))
+        );
+        assert!(!saw_bytes);
+        assert_eq!(
+            progress_line("push", "m", (String::new(), 100, 999), &mut saw_bytes),
+            Some(serde_json::json!({"status": "pushing m", "total": 100, "completed": 100}))
+        );
+    }
 
     // -- request targets (local backend vs remote provider) -----------------
 
@@ -6282,6 +8082,329 @@ mod tests {
             body.get("repeat_penalty").is_none(),
             "llama.cpp-only field sent to a provider: {body}"
         );
+    }
+
+    // -- aggregation (peer daemons) ------------------------------------------
+
+    #[test]
+    fn a_peer_target_is_a_local_backend_in_all_but_address() {
+        let peer = Target::Peer("http://spark:17434".into());
+        assert_eq!(
+            peer.url("/v1/chat/completions"),
+            "http://spark:17434/v1/chat/completions"
+        );
+        assert!(!peer.is_remote(), "a peer accepts llama.cpp extensions");
+        assert!(repeat_penalty_applies(&peer));
+        assert_eq!(peer.describe(), "peer http://spark:17434");
+        for upstream in [
+            StatusCode::NOT_FOUND,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert_eq!(remote_status(&peer, upstream), upstream);
+        }
+    }
+
+    /// `/llmman/node` answers `node`; every other route records its call.
+    async fn mock_peer(
+        node: aggregation::Node,
+    ) -> (
+        String,
+        Arc<tokio::sync::Mutex<Vec<(String, HeaderMap, Bytes)>>>,
+    ) {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let app = Router::new()
+            .route("/llmman/node", get(move || async move { Json(node) }))
+            .fallback(move |req: Request| async move {
+                let (parts, body) = req.into_parts();
+                let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                captured
+                    .lock()
+                    .await
+                    .push((parts.uri.path().to_string(), parts.headers, body));
+                ([("content-type", "application/json")], "{}")
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (origin, seen)
+    }
+
+    /// Store tags `docker.io/ai/m:latest` with no blobs, so a local load
+    /// fails offline instead of pulling.
+    fn state_with_peers(peers: Vec<String>, memory: u64) -> AppState {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-aggregation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let desc = crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:a1b2".into(),
+            size: 0,
+            annotations: None,
+        };
+        OciStore::open(&dir)
+            .unwrap()
+            .tag(desc, "docker.io/ai/m:latest")
+            .unwrap();
+        let mut inner = test_inner(dir);
+        inner.peers = peers;
+        inner.memory = memory;
+        AppState(Arc::new(inner))
+    }
+
+    fn node(memory: u64, loaded: &[&str], stored: &[&str]) -> aggregation::Node {
+        let map = |names: &[&str]| names.iter().map(|n| (n.to_string(), 1 << 30)).collect();
+        aggregation::Node {
+            memory,
+            loaded: map(loaded),
+            stored: map(stored),
+        }
+    }
+
+    /// A peer gets llmman's own dialect, the hop marker, no credential.
+    #[tokio::test]
+    async fn a_peer_request_carries_the_hop_marker_and_nothing_else() {
+        let (origin, seen) = mock_peer(node(0, &[], &[])).await;
+        let mut req = OAIChatRequest {
+            model: "docker.io/ai/m:latest".into(),
+            ..Default::default()
+        };
+        post_chat(&Client::new(), &Target::Peer(origin), &mut req)
+            .await
+            .unwrap();
+
+        let calls = seen.lock().await;
+        let (path, headers, body) = &calls[0];
+        assert_eq!(path, "/v1/chat/completions");
+        assert_eq!(headers[aggregation::HOP], "1");
+        assert!(headers.get("authorization").is_none());
+        let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(body["repeat_penalty"], DEFAULT_REPEAT_PENALTY);
+    }
+
+    /// A model a peer has loaded is served there; a hopped request or a
+    /// pre-load stays put.
+    #[tokio::test]
+    async fn ensure_model_forwards_to_the_peer_that_has_the_model_loaded() {
+        let (origin, _) = mock_peer(node(8 << 30, &["docker.io/ai/m:latest"], &[])).await;
+        let state = state_with_peers(vec![origin.clone()], 0);
+
+        let (name, target, _) =
+            ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()), None)
+                .await
+                .unwrap();
+        assert_eq!(name, "docker.io/ai/m:latest");
+        assert!(
+            matches!(&target, Target::Peer(o) if *o == origin),
+            "{target:?}"
+        );
+
+        // Hopped once: load here (failing on the fixture), never bounce.
+        let mut hopped = HeaderMap::new();
+        hopped.insert(aggregation::HOP, "1".parse().unwrap());
+        let err = ensure_model(&state, "docker.io/ai/m", Some(&hopped), None)
+            .await
+            .err()
+            .expect("the fixture has no blobs to load");
+        assert!(
+            format!("{:#}", err.0).contains("resolve model"),
+            "{:#}",
+            err.0
+        );
+
+        // A pre-load names a model for *this* node.
+        let err = ensure_model(&state, "docker.io/ai/m", None, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{:#}", err.0).contains("resolve model"),
+            "{:#}",
+            err.0
+        );
+    }
+
+    /// A cold model goes to the roomiest node that has it stored; a dead
+    /// peer is ignored and one that would have to pull loses to this node.
+    #[tokio::test]
+    async fn ensure_model_places_a_cold_model_on_the_roomiest_reachable_node() {
+        let (roomy, _) = mock_peer(node(128 << 30, &[], &["docker.io/ai/m:latest"])).await;
+        let state = state_with_peers(vec![roomy.clone()], 8 << 30);
+        let (_, target, _) = ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()), None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&target, Target::Peer(o) if *o == roomy),
+            "{target:?}"
+        );
+
+        // A dead peer, and a listening one that would have to pull.
+        let (bare, _) = mock_peer(node(128 << 30, &[], &[])).await;
+        let dead = "http://127.0.0.1:9".to_string();
+        let state = state_with_peers(vec![dead, bare], 8 << 30);
+        let err = ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()), None)
+            .await
+            .err()
+            .expect("loads (and fails on the fixture) locally");
+        assert!(
+            format!("{:#}", err.0).contains("resolve model"),
+            "{:#}",
+            err.0
+        );
+    }
+
+    /// Listings cover the peers' models too, unless a peer is asking.
+    #[tokio::test]
+    async fn listings_cover_the_aggregation_except_for_a_peer_asking() {
+        let ps = serde_json::json!({ "models": [{
+            "name": "docker.io/ai/m:latest", "model": "docker.io/ai/m:latest",
+            "expires_at": null, "digest": "sha256:aa", "size": 1, "size_vram": 0,
+            "pid": null, "port": 1, "processor": "GPU", "context_length": null,
+            "started_at": "2026-01-01T00:00:00Z"
+        }]});
+        let tags = serde_json::json!({ "models": [{
+            "name": "docker.io/ai/m:latest", "model": "docker.io/ai/m:latest",
+            "size": 1, "digest": "sha256:aa", "modified_at": "2026-01-01T00:00:00Z",
+            "details": { "format": "gguf", "family": "", "parameter_size": "", "quantization_level": "" }
+        }]});
+        let models = serde_json::json!({ "object": "list", "data": [
+            { "id": "docker.io/ai/m:latest", "object": "model", "created": 0,
+              "owned_by": "llmman", "status": { "value": "loaded" } }
+        ]});
+        let app = Router::new()
+            .route("/api/ps", get(move || async move { Json(ps) }))
+            .route("/api/tags", get(move || async move { Json(tags) }))
+            .route("/v1/models", get(move || async move { Json(models) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-aggregation-listings-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        OciStore::open(&dir).unwrap();
+        let mut inner = test_inner(dir);
+        inner.peers = vec![origin.clone()];
+        let state = AppState(Arc::new(inner));
+
+        async fn body(resp: Response) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        let mut hopped = HeaderMap::new();
+        hopped.insert(aggregation::HOP, "1".parse().unwrap());
+
+        let ps = body(
+            handle_ps(State(state.clone()), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(ps["models"][0]["name"], "docker.io/ai/m:latest");
+        assert_eq!(ps["models"][0]["node"], origin);
+        let own = body(
+            handle_ps(State(state.clone()), hopped.clone())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(own["models"].as_array().unwrap().len(), 0);
+
+        let tags = body(
+            handle_tags(State(state.clone()), HeaderMap::new())
+                .await
+                .unwrap()
+                .into_response(),
+        )
+        .await;
+        assert_eq!(tags["models"][0]["name"], "docker.io/ai/m:latest");
+        assert!(!tags.to_string().contains("\"node\""));
+        let own = body(
+            handle_tags(State(state.clone()), hopped.clone())
+                .await
+                .unwrap()
+                .into_response(),
+        )
+        .await;
+        assert_eq!(own["models"].as_array().unwrap().len(), 0);
+
+        let models = body(
+            handle_openai_models(State(state.clone()), HeaderMap::new())
+                .await
+                .unwrap()
+                .into_response(),
+        )
+        .await;
+        assert_eq!(models["data"][0]["id"], "docker.io/ai/m:latest");
+        assert_eq!(models["data"][0]["status"]["value"], "loaded");
+        let own = body(
+            handle_openai_models(State(state), hopped)
+                .await
+                .unwrap()
+                .into_response(),
+        )
+        .await;
+        assert_eq!(own["data"].as_array().unwrap().len(), 0);
+    }
+
+    /// An Ollama request bound for a peer goes there as-is.
+    #[tokio::test]
+    async fn an_ollama_request_reaches_a_peer_natively() {
+        let (origin, seen) = mock_peer(node(8 << 30, &["docker.io/ai/m:latest"], &[])).await;
+        let state = state_with_peers(vec![origin], 0);
+        let req: OllamaGenerateRequest = serde_json::from_value(
+            serde_json::json!({ "model": "docker.io/ai/m", "keep_alive": "1h" }),
+        )
+        .unwrap();
+        let resp = handle_ollama_generate(State(state), HeaderMap::new(), Json(req))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let calls = seen.lock().await;
+        let (path, headers, body) = &calls[0];
+        assert_eq!(path, "/api/generate");
+        assert_eq!(headers[aggregation::HOP], "1");
+        let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(body["model"], "docker.io/ai/m");
+        assert_eq!(body["keep_alive"], "1h");
+        assert_eq!(body["prompt"], "");
+        assert!(body.get("think").is_none(), "{body}");
+    }
+
+    /// `llmman stop` reaches a model wherever the aggregation loaded it.
+    #[tokio::test]
+    async fn an_unload_is_forwarded_to_every_peer() {
+        let (origin, seen) = mock_peer(node(0, &[], &[])).await;
+        let state = state_with_peers(vec![origin], 0);
+        unload_everywhere(&state, "docker.io/ai/m", &HeaderMap::new())
+            .await
+            .unwrap();
+        let calls = seen.lock().await;
+        let (path, headers, body) = &calls[0];
+        assert_eq!(path, "/api/generate");
+        assert_eq!(headers[aggregation::HOP], "1");
+        let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(body["model"], "docker.io/ai/m");
+        assert_eq!(body["keep_alive"], 0);
+        drop(calls);
+
+        // A peer asking does not fan out again.
+        let mut hopped = HeaderMap::new();
+        hopped.insert(aggregation::HOP, "1".parse().unwrap());
+        unload_everywhere(&state, "docker.io/ai/m", &hopped)
+            .await
+            .unwrap();
+        assert_eq!(seen.lock().await.len(), 1, "forwarded a forwarded unload");
     }
 
     // -- keep_alive parsing / resolution (idle-timeout auto-unload) ---------
@@ -6844,7 +8967,12 @@ mod tests {
     /// `test_state` with a real store directory, for the few tests that
     /// need `canonical_ref` to actually resolve something.
     fn test_state_at(store_path: PathBuf) -> AppState {
-        AppState(Arc::new(Inner {
+        AppState(Arc::new(test_inner(store_path)))
+    }
+
+    /// `test_state_at`'s `Inner`, for tests that set one field differently.
+    fn test_inner(store_path: PathBuf) -> Inner {
+        Inner {
             manager: Mutex::new(ModelManager {
                 running: HashMap::new(),
                 pending_loads: 0,
@@ -6866,10 +8994,12 @@ mod tests {
             // anyway.
             max_queue: usize::MAX,
             max_loaded_models: 0,
+            peers: Vec::new(),
+            memory: 0,
             store_path,
             cache_path: std::env::temp_dir(),
             client: Client::new(),
-        }))
+        }
     }
 
     /// A long-lived, harmless real child process to back a test
@@ -6926,9 +9056,9 @@ mod tests {
     }
 
     /// Like `running_model_fixture`, but with a caller-chosen `Engine`
-    /// and `backend_model_path` — used only by `backend_wire_model`'s
-    /// own tests below, which need to distinguish an `Engine::Mlx`
-    /// backend from every other one.
+    /// and `backend_model_path` — used by `backend_wire_model`'s own
+    /// tests below, which need to distinguish an `Engine::Mlx` backend
+    /// from every other one, and by the `engine_label` test.
     fn running_model_fixture_with_engine(
         engine: Engine,
         backend_model_path: Option<&str>,
@@ -6944,6 +9074,22 @@ mod tests {
             backend_model_path: backend_model_path.map(|s| s.to_string()),
             keep_alive: None,
             in_flight: 0,
+        }
+    }
+
+    /// The container arm reports the engine it runs, not the runtime that
+    /// runs it. `tokio::test` because the fixture spawns a real child.
+    #[tokio::test]
+    async fn the_engine_label_names_the_engine_not_the_runtime() {
+        for (engine, expected) in [
+            (Engine::LlamaServer, "llama-server"),
+            (Engine::Vllm, "vllm"),
+            (Engine::Mlx, "mlx"),
+        ] {
+            assert_eq!(
+                running_model_fixture_with_engine(engine, None).engine_label(),
+                expected
+            );
         }
     }
 
@@ -7063,6 +9209,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn reap_idle_models_unloads_only_idle_expired_models_not_in_flight_or_forever() {
+        // Holds the counter lock: this unloads through the production
+        // path, so its increment must not land inside another test's
+        // before/after window (see `metrics::GLOBAL_COUNTER_TEST_LOCK`).
+        let _serialised = metrics::GLOBAL_COUNTER_TEST_LOCK.lock().await;
         let state = test_state();
         {
             let mut mgr = state.0.manager.lock().await;
@@ -7107,6 +9257,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn evict_other_models_evicts_everything_except_the_target_and_in_flight_models() {
+        // Holds the counter lock: this unloads through the production
+        // path, so its increment must not land inside another test's
+        // before/after window (see `metrics::GLOBAL_COUNTER_TEST_LOCK`).
+        let _serialised = metrics::GLOBAL_COUNTER_TEST_LOCK.lock().await;
         let state = test_state();
         {
             let mut mgr = state.0.manager.lock().await;
@@ -7335,8 +9489,10 @@ mod tests {
         assert!(origins.iter().any(|o| o == "http://localhost:*"));
     }
 
+    /// Unbounded is the default, so skipping the reservation here would
+    /// leave `llmman_models_loading` reading zero on almost every daemon.
     #[tokio::test(flavor = "multi_thread")]
-    async fn enforce_max_loaded_models_is_a_no_op_when_unbounded() {
+    async fn enforce_max_loaded_models_evicts_nothing_but_still_reserves_when_unbounded() {
         let state = test_state();
         {
             let mut mgr = state.0.manager.lock().await;
@@ -7345,8 +9501,54 @@ mod tests {
                 running_model_fixture(None, Duration::from_secs(0), 0),
             );
         }
-        assert!(enforce_max_loaded_models(&state, 0).await.is_ok());
-        assert_eq!(state.0.manager.lock().await.running.len(), 1);
+        let mut guard = enforce_max_loaded_models(&state, 0)
+            .await
+            .expect("unbounded admits every load");
+        {
+            let mut mgr = state.0.manager.lock().await;
+            assert_eq!(mgr.running.len(), 1, "nothing was evicted");
+            assert_eq!(mgr.pending_loads, 1, "the load is still counted as loading");
+            guard.release_into(&mut mgr);
+            assert_eq!(mgr.pending_loads, 0);
+        }
+    }
+
+    /// `Drop` can only *spawn* the decrement, so a load released that way
+    /// is briefly in `running` and still reserved. `release_into` puts the
+    /// release in the same locked step as the insert.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn releasing_a_reservation_into_the_lock_leaves_no_double_counted_window() {
+        let state = test_state();
+        let mut guard = enforce_max_loaded_models(&state, 0).await.unwrap();
+
+        let mut mgr = state.0.manager.lock().await;
+        mgr.running.insert(
+            "just-loaded".into(),
+            running_model_fixture(None, Duration::from_secs(0), 1),
+        );
+        guard.release_into(&mut mgr);
+        assert_eq!(mgr.running.len(), 1);
+        assert_eq!(mgr.pending_loads, 0);
+        drop(mgr);
+
+        // And Drop must not release it a second time.
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(state.0.manager.lock().await.pending_loads, 0);
+    }
+
+    #[test]
+    fn parse_metrics_enabled_accepts_the_truthy_spellings_and_nothing_else() {
+        for on in ["1", "true", "TRUE", "yes", "on", " 1 "] {
+            assert!(parse_metrics_enabled(Some(on)), "{on:?} should enable");
+        }
+        for off in ["0", "false", "no", "off", "", "  ", "2", "enabled"] {
+            assert!(!parse_metrics_enabled(Some(off)), "{off:?} should not");
+        }
+        assert!(
+            !parse_metrics_enabled(None),
+            "unset is the default, and the default is off"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7776,6 +9978,172 @@ mod tests {
         );
     }
 
+    /// An unload by digest of a model stored, and loaded, under a tag
+    /// other than `:latest`. The running key comes from the digest
+    /// spelling itself; resolving the lock key instead, which folds the
+    /// digest onto `:latest`, looked for a tag the model is not under and
+    /// reported it missing with the process still up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unload_by_digest_reaches_the_entry_stored_under_another_tag() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-unload-digest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = test_state_at(dir.clone());
+        let desc = crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:a1b2".into(),
+            size: 0,
+            annotations: None,
+        };
+        OciStore::open(&dir)
+            .unwrap()
+            .tag(desc, "docker.io/ai/m-tagged:v9")
+            .unwrap();
+        state.0.manager.lock().await.running.insert(
+            "docker.io/ai/m-tagged:v9".into(),
+            running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+        );
+
+        unload_model(&state, "docker.io/ai/m-tagged@sha256:a1b2")
+            .await
+            .expect("the digest spelling must unload the model loaded under its tag");
+        assert!(
+            !state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .contains_key("docker.io/ai/m-tagged:v9"),
+            "the entry under the tag must be gone"
+        );
+
+        // Stored but no longer loaded is a plain success, as for a tag.
+        unload_model(&state, "docker.io/ai/m-tagged@sha256:a1b2")
+            .await
+            .expect("a stored model must unload without a 404 whether or not it is loaded");
+        // A digest nothing in the store carries is the missing-model case.
+        let err = unload_model(&state, "docker.io/ai/m-tagged@sha256:ffff")
+            .await
+            .expect_err("a digest the store does not hold must be a 404");
+        assert_eq!(err.1, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The store has lost the entry while the model runs (`rm` on a loaded
+    /// model), so the digest cannot be resolved to the key it runs under;
+    /// the digest each `running` entry records is what finds it, the
+    /// spelled tag first when two entries hold the same content.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unload_by_digest_reaches_a_loaded_model_the_store_has_lost() {
+        let state = test_state();
+        let running = |digest: &str| {
+            let mut m = running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0);
+            m.digest = digest.into();
+            m
+        };
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running
+                .insert("docker.io/ai/m-gone:v8".into(), running("sha256:a1b2"));
+            mgr.running
+                .insert("docker.io/ai/m-gone:v9".into(), running("sha256:a1b2"));
+            mgr.running
+                .insert("docker.io/ai/other:v9".into(), running("sha256:a1b2"));
+        }
+
+        unload_model(&state, "docker.io/ai/m-gone:v9@sha256:A1B2")
+            .await
+            .expect("the digest must reach the model running under its lost tag");
+        let keys = |mgr: &ModelManager| {
+            let mut k: Vec<String> = mgr.running.keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(
+            keys(&*state.0.manager.lock().await),
+            ["docker.io/ai/m-gone:v8", "docker.io/ai/other:v9"],
+            "the spelled tag goes first; the other tag and the other repository stay"
+        );
+        unload_model(&state, "docker.io/ai/m-gone@sha256:a1b2")
+            .await
+            .expect("with no spelled tag, the remaining entry with the digest is it");
+        assert_eq!(
+            keys(&*state.0.manager.lock().await),
+            ["docker.io/ai/other:v9"]
+        );
+        let err = unload_model(&state, "docker.io/ai/m-gone@sha256:a1b2")
+            .await
+            .expect_err("nothing running or stored with it is the 404 case");
+        assert_eq!(err.1, StatusCode::NOT_FOUND);
+    }
+
+    /// Digest first: the load by digest registered the process under the
+    /// digest-named key its pull recorded, and the tag's own pull has
+    /// landed since. A load and an unload by the tag must both reach that
+    /// process, by content, rather than start or strand a second one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tag_reaches_the_process_a_load_by_digest_registered() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-digest-first-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = test_state_at(dir.clone());
+        let desc = |digest: &str| crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: digest.into(),
+            size: 0,
+            annotations: None,
+        };
+        let store = OciStore::open(&dir).unwrap();
+        store
+            .tag(desc("sha256:df01"), "docker.io/ai/m-df@sha256:df01")
+            .unwrap();
+        store
+            .tag(desc("sha256:df01"), "docker.io/ai/m-df:latest")
+            .unwrap();
+        {
+            let mut running = running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0);
+            running.digest = "sha256:df01".into();
+            state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .insert("docker.io/ai/m-df@sha256:df01".into(), running);
+        }
+
+        let (key, target, guard) = ensure_model(&state, "docker.io/ai/m-df", None, None)
+            .await
+            .expect("the tag must find the running content rather than load again");
+        assert_eq!(key, "docker.io/ai/m-df@sha256:df01");
+        assert!(matches!(target, Target::Local(0)));
+        drop(guard);
+
+        unload_model(&state, "docker.io/ai/m-df:latest")
+            .await
+            .expect("the tag must unload the process running under the digest key");
+        assert!(
+            state.0.manager.lock().await.running.is_empty(),
+            "the digest-keyed entry must be gone"
+        );
+        // Stored and not running: a plain success, as for any tag.
+        unload_model(&state, "docker.io/ai/m-df").await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An unload that arrives while a first load of the same model is in
     /// flight blocks on the load lock. By the time it runs, the pull has
     /// landed and the loader has inserted under the key `canonical_ref`
@@ -7841,6 +10209,138 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `m@sha256:…`, `m` and `m:latest` name one stored model and must
+    /// share a load lock; the digest form used to keep its own because
+    /// `default_tag` reads the `:` inside the digest as a tag. With the
+    /// store empty the digest folds onto `:latest`.
+    #[test]
+    fn load_identity_folds_the_digest_spelling_onto_the_tag_spelling() {
+        let store = std::env::temp_dir();
+        let latest = load_identity(&store, "docker.io/ai/m:latest").unwrap();
+        assert_eq!(load_identity(&store, "docker.io/ai/m").unwrap(), latest);
+        assert_eq!(
+            load_identity(&store, "docker.io/ai/m@sha256:0000000000000000").unwrap(),
+            latest
+        );
+        assert_eq!(
+            load_identity(&store, "docker.io/ai/m:v9@sha256:0000000000000000").unwrap(),
+            "docker.io/ai/m:v9"
+        );
+    }
+
+    /// With the content in the store under a tag, a digest locks as that
+    /// tag, whatever tag it spells itself; content the store holds only
+    /// under a digest-named entry, or not at all, still folds.
+    #[test]
+    fn load_identity_takes_the_tag_the_store_holds_a_digest_under() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-identity-store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = OciStore::open(&dir).unwrap();
+        let desc = |digest: &str| crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: digest.into(),
+            size: 0,
+            annotations: None,
+        };
+        store
+            .tag(desc("sha256:aaaa"), "docker.io/ai/m-key:v9")
+            .unwrap();
+        store
+            .tag(desc("sha256:bbbb"), "docker.io/ai/m-key@sha256:bbbb")
+            .unwrap();
+
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key@sha256:aaaa").unwrap(),
+            "docker.io/ai/m-key:v9"
+        );
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key:latest@sha256:aaaa").unwrap(),
+            "docker.io/ai/m-key:v9",
+            "the tag the content is under wins over the one spelled"
+        );
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key@sha256:bbbb").unwrap(),
+            "docker.io/ai/m-key:latest",
+            "a digest-named entry is what a pull by digest writes; it folds"
+        );
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key@sha256:ffff").unwrap(),
+            "docker.io/ai/m-key:latest"
+        );
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key:v9").unwrap(),
+            "docker.io/ai/m-key:v9"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The load side of that key: a load by digest waits on the lock a
+    /// load by tag holds, `:v9` here, not `:latest`, and once through it
+    /// takes the process that load started rather than starting its own.
+    /// With `ensure_model` keying
+    /// its lock on the digest spelling, as it did before it went through
+    /// `load_identity`, nothing here would block.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_load_by_digest_waits_on_the_tag_spellings_lock_and_takes_its_process() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-load-digest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = test_state_at(dir.clone());
+        // The pull by tag has landed...
+        let desc = crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:d16e".into(),
+            size: 0,
+            annotations: None,
+        };
+        OciStore::open(&dir)
+            .unwrap()
+            .tag(desc, "docker.io/ai/m-digest:v9")
+            .unwrap();
+        // ...and that load still holds its lock.
+        let loading =
+            acquire_load_lock(&load_identity(&dir, "docker.io/ai/m-digest:v9").unwrap()).await;
+
+        let loader = state.clone();
+        let load = tokio::spawn(async move {
+            ensure_model(&loader, "docker.io/ai/m-digest@sha256:d16e", None, None).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !load.is_finished(),
+            "a load by digest must wait on the lock the tag spelling holds"
+        );
+
+        state.0.manager.lock().await.running.insert(
+            "docker.io/ai/m-digest:v9".into(),
+            running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+        );
+        drop(loading);
+
+        let (model_ref, target, _guard) = load
+            .await
+            .unwrap()
+            .expect("the load by digest must succeed once the lock releases");
+        assert_eq!(model_ref, "docker.io/ai/m-digest:v9");
+        assert!(
+            matches!(target, Target::Local(0)),
+            "the process the tag spelling started must be the one handed back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The wider window: the pull has landed but the loader, still holding
     /// its lock, has not yet inserted into `running`. An unload resolving
     /// through the store now gets the refined spelling and locks on that
@@ -7872,7 +10372,7 @@ mod tests {
             .tag(desc, "docker.io/ai/m")
             .unwrap();
         // ...and the loader still holds the lock it took before pulling.
-        let loading = acquire_load_lock(&load_identity("docker.io/ai/m").unwrap()).await;
+        let loading = acquire_load_lock(&load_identity(&dir, "docker.io/ai/m").unwrap()).await;
 
         let unloader = state.clone();
         let unload = tokio::spawn(async move { unload_model(&unloader, "docker.io/ai/m").await });
@@ -7982,6 +10482,7 @@ mod tests {
     fn parse_context_length_accepts_a_plain_number_and_rejects_everything_else() {
         assert_eq!(parse_context_length(Some("32768")), Some(32768));
         assert_eq!(parse_context_length(Some(" 32768 \n")), Some(32768));
+        assert_eq!(parse_context_length(Some("0")), Some(0));
         assert_eq!(parse_context_length(None), None);
         assert_eq!(parse_context_length(Some("")), None);
         assert_eq!(parse_context_length(Some("not-a-number")), None);
@@ -8084,6 +10585,36 @@ mod tests {
     }
 
     #[test]
+    fn vllm_max_model_len_uses_only_explicit_ctx_size() {
+        assert_eq!(vllm_max_model_len(Some(4096), true), Some(4096));
+        assert_eq!(vllm_max_model_len(Some(0), true), None);
+        assert_eq!(vllm_max_model_len(Some(65536), false), None);
+        assert_eq!(vllm_max_model_len(None, true), None);
+        assert_eq!(vllm_max_model_len(None, false), None);
+    }
+
+    #[test]
+    fn vllm_serve_args_handles_max_model_len() {
+        for (max_model_len, expected) in [
+            (Some(256), Some("256")),
+            (Some(1024), Some("1024")),
+            (Some(4096), Some("4096")),
+            (None, None),
+        ] {
+            let args = vllm_serve_args("/models/qwen", 8000, "qwen3.5:0.8b", max_model_len);
+            let pos = args.iter().position(|arg| arg == "--max-model-len");
+
+            match expected {
+                Some(value) => {
+                    let i = pos.expect("--max-model-len should be present");
+                    assert_eq!(args.get(i + 1).map(String::as_str), Some(value));
+                }
+                None => assert!(pos.is_none()),
+            }
+        }
+    }
+
+    #[test]
     fn backend_ctx_size_scales_by_num_parallel_so_each_slot_keeps_the_full_context() {
         // llama-server splits one --ctx-size evenly across every
         // --parallel slot, so this must scale up to compensate —
@@ -8109,6 +10640,206 @@ mod tests {
         assert_eq!(effective_num_parallel(Some(4096), Some(4)), Some(4));
         assert_eq!(effective_num_parallel(Some(4096), None), None);
         assert_eq!(effective_num_parallel(None, None), None);
+    }
+
+    /// The GGUF test (ollama's own): a `{arch}.pooling_type` key marks an
+    /// embedding model, and its trained context comes along with it.
+    #[test]
+    fn embedding_model_ctx_keys_off_pooling_type_and_reports_the_trained_context() {
+        let chat = crate::gguf::write_test_gguf_with(&[]);
+        let embed = crate::gguf::write_test_gguf_with(&[("llama.pooling_type", 1)]);
+        let chat_ctx = embedding_model_ctx(&chat);
+        let embed_ctx = embedding_model_ctx(&embed);
+        std::fs::remove_file(&chat).ok();
+        std::fs::remove_file(&embed).ok();
+        assert_eq!(chat_ctx, None);
+        assert_eq!(embed_ctx, Some(Some(4096)));
+        // Unreadable: a generation model, not an error — see the doc comment.
+        assert_eq!(embedding_model_ctx(Path::new("/nonexistent.gguf")), None);
+    }
+
+    /// `/api/embed` takes a string or an array of strings, and nothing
+    /// else; an empty string and `null` both mean "no inputs".
+    #[test]
+    fn embed_inputs_accepts_a_string_or_string_array_only() {
+        assert_eq!(embed_inputs(&serde_json::json!("hi")).unwrap(), vec!["hi"]);
+        assert_eq!(
+            embed_inputs(&serde_json::json!(["a", "b"])).unwrap(),
+            vec!["a", "b"]
+        );
+        assert!(embed_inputs(&serde_json::Value::Null).unwrap().is_empty());
+        assert!(embed_inputs(&serde_json::json!("")).unwrap().is_empty());
+        for bad in [
+            serde_json::json!(1),
+            serde_json::json!(["a", 1]),
+            serde_json::json!({}),
+        ] {
+            let err = embed_inputs(&bad).unwrap_err();
+            assert_eq!(err.1, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn normalize_in_place_yields_a_unit_vector_and_rejects_non_finite() {
+        let mut v = vec![3.0f32, 4.0];
+        normalize_in_place(&mut v).unwrap();
+        assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
+        let mut zero = vec![0.0f32, 0.0];
+        normalize_in_place(&mut zero).unwrap();
+        assert_eq!(zero, vec![0.0, 0.0]);
+        assert!(normalize_in_place(&mut [1.0, f32::NAN]).is_err());
+        assert!(normalize_in_place(&mut [f32::INFINITY]).is_err());
+        let mut huge = vec![f32::MAX, f32::MAX];
+        normalize_in_place(&mut huge).unwrap();
+        assert!((huge[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        let mut tiny = vec![1e-20f32, 0.0];
+        normalize_in_place(&mut tiny).unwrap();
+        assert_eq!(tiny, vec![1.0, 0.0]);
+    }
+
+    /// Only a JSON content type is left alone by `accept_any_content_type`.
+    #[test]
+    fn is_json_content_type_matches_json_and_json_suffixed_types_only() {
+        assert!(is_json_content_type("application/json"));
+        assert!(is_json_content_type("Application/JSON; charset=utf-8"));
+        assert!(is_json_content_type("application/vnd.api+json"));
+        assert!(!is_json_content_type("text/plain;charset=UTF-8"));
+        assert!(!is_json_content_type("application/x-www-form-urlencoded"));
+        assert!(!is_json_content_type(""));
+    }
+
+    /// Ollama's `/api/*` routes accept a JSON body under any (or no)
+    /// `Content-Type` — except with an `Origin` CORS wouldn't allow, which
+    /// is refused.
+    #[tokio::test]
+    async fn ollama_routes_accept_json_without_a_json_content_type() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(test_state(), false);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://127.0.0.1:{}/api/show", addr.port());
+        let post = |content_type: Option<&str>, origin: Option<&str>| {
+            let mut req = Client::new()
+                .post(&url)
+                .body(r#"{"model":"hf:///bad ref"}"#);
+            if let Some(ct) = content_type {
+                req = req.header("content-type", ct);
+            }
+            if let Some(origin) = origin {
+                req = req.header("origin", origin);
+            }
+            req.send()
+        };
+        for content_type in [None, Some("text/plain;charset=UTF-8")] {
+            let resp = post(content_type, None).await.unwrap();
+            // Past the extractor: the handler's own 400, not a 415.
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{content_type:?}");
+        }
+        // A page on an allowed origin (localhost, any port) is fine.
+        let resp = post(Some("text/plain"), Some("http://localhost:3000"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = post(Some("text/plain"), Some("https://evil.example"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = post(None, Some("https://evil.example")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// `/api/create` refuses the Modelfile fields it can't honour, by
+    /// name, rather than dropping them — and doesn't refuse the empty
+    /// placeholders clients send for fields they aren't using.
+    #[tokio::test]
+    async fn create_refuses_unsupported_modelfile_fields_by_name() {
+        let state = test_state();
+        let req: OllamaCreateRequest = serde_json::from_value(serde_json::json!({
+            "model": "mine", "from": "gemma4",
+            "system": "be terse", "quantize": "q4_K_M", "template": "", "adapters": null
+        }))
+        .unwrap();
+        let resp = handle_create(State(state), Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        // Sorted, and only the two non-empty ones: "" and null are the
+        // placeholders a client sends for fields it isn't using.
+        assert!(
+            body.contains("/api/create: quantize, system not supported"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_needs_exactly_one_of_from_or_files() {
+        let state = test_state();
+        for body in [
+            serde_json::json!({"model": "mine"}),
+            serde_json::json!({"model": format!("mine@sha256:{}", "a".repeat(64)), "from": "a"}),
+            serde_json::json!({"model": "mine", "from": "a", "files": {"m.gguf": "sha256:00"}}),
+        ] {
+            let req: OllamaCreateRequest = serde_json::from_value(body).unwrap();
+            let resp = handle_create(State(state.clone()), Json(req))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    /// A loaded model whose tag now points at other content is dropped,
+    /// whichever way the tag is spelled; one serving the same content stays.
+    #[tokio::test]
+    async fn evict_if_retagged_drops_only_a_runner_serving_stale_content() {
+        let state = test_state();
+        let key = "hf.co/o/m:latest";
+        let mut fixture = running_model_fixture(None, Duration::ZERO, 0);
+        fixture.digest = "sha256:old".into();
+        state
+            .0
+            .manager
+            .lock()
+            .await
+            .running
+            .insert(key.into(), fixture);
+        evict_if_retagged(&state, key, "sha256:old").await;
+        assert!(state.0.manager.lock().await.running.contains_key(key));
+        evict_if_retagged(&state, "hf.co/o/m", "sha256:new").await;
+        assert!(!state.0.manager.lock().await.running.contains_key(key));
+    }
+
+    /// `files` keys name a file inside the build directory; anything else
+    /// is refused before a link is made.
+    #[test]
+    fn staged_file_refuses_a_name_that_is_not_a_bare_file_name() {
+        let state = test_state();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        for name in ["../escape.gguf", "sub/dir.gguf", ".", ""] {
+            let err = staged_file(&state, name, &digest).unwrap_err();
+            assert_eq!(err.1, StatusCode::BAD_REQUEST, "{name:?}");
+        }
+    }
+
+    /// A malformed digest is a 400, which also keeps a crafted path
+    /// segment out of the filesystem.
+    #[test]
+    fn staged_blob_path_requires_a_well_formed_sha256_digest() {
+        let state = test_state();
+        let ok = staged_blob_path(&state, &format!("sha256:{}", "a".repeat(64))).unwrap();
+        assert_eq!(ok, state.0.cache_path.join("blobs").join("a".repeat(64)));
+        for bad in [
+            "sha256:abc",
+            "md5:0000",
+            &format!("sha256:{}", "g".repeat(64)),
+            "../x",
+        ] {
+            assert_eq!(
+                staged_blob_path(&state, bad).unwrap_err().1,
+                StatusCode::BAD_REQUEST
+            );
+        }
     }
 
     #[test]
@@ -8861,6 +11592,43 @@ mod tests {
     }
 
     #[test]
+    fn opt_num_thread_accepts_a_positive_integer() {
+        assert_eq!(
+            opt_num_thread(&Some(serde_json::json!({"num_thread": 4}))),
+            Some(4)
+        );
+        assert_eq!(
+            opt_num_thread(&Some(serde_json::json!({"num_thread": 1}))),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn opt_num_thread_rejects_zero_negative_and_non_integer_values() {
+        // (num_thread value in the options blob, why it must be dropped)
+        let cases = [
+            (
+                serde_json::json!(0),
+                "zero: llama-server rejects --threads 0",
+            ),
+            (serde_json::json!(-1), "negative"),
+            (serde_json::json!(2.5), "fractional"),
+            (serde_json::json!("4"), "string, not a JSON number"),
+            (
+                serde_json::json!(u64::from(u32::MAX) + 1),
+                "above u32: must not truncate to --threads 0",
+            ),
+        ];
+        for (value, why) in cases {
+            let opts = Some(serde_json::json!({ "num_thread": value }));
+            assert_eq!(opt_num_thread(&opts), None, "{why}");
+        }
+        // Missing key, and no options blob at all.
+        assert_eq!(opt_num_thread(&Some(serde_json::json!({}))), None);
+        assert_eq!(opt_num_thread(&None), None);
+    }
+
+    #[test]
     fn keyed_lock_is_per_key_and_release_only_drops_unreferenced_entries() {
         let registry: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> =
             StdMutex::new(HashMap::new());
@@ -8929,26 +11697,30 @@ mod tests {
     /// (see `ensure_model`'s `default_tag` call).
     #[test]
     fn ensure_model_key_pipeline_converges_aliases_before_the_lock() {
-        let tagless = crate::storage::default_tag(
-            &crate::shortnames::resolve_ollama_api("regression-test-model").unwrap(),
-        );
-        let tagged = crate::storage::default_tag(
-            &crate::shortnames::resolve_ollama_api("regression-test-model:latest").unwrap(),
-        );
+        let store = std::env::temp_dir();
+        let tagless = load_identity(&store, "regression-test-model").unwrap();
+        let tagged = load_identity(&store, "regression-test-model:latest").unwrap();
+        let digest = load_identity(&store, "regression-test-model@sha256:0000").unwrap();
         assert_eq!(
             tagless, tagged,
             "tagless and :latest aliases must resolve to one key"
         );
+        assert_eq!(
+            tagless, digest,
+            "the digest spelling must resolve to the same key"
+        );
 
         let a = load_lock(&tagless);
         let b = load_lock(&tagged);
+        let c = load_lock(&digest);
         assert!(
-            Arc::ptr_eq(&a, &b),
-            "both aliases must take the same load lock"
+            Arc::ptr_eq(&a, &b) && Arc::ptr_eq(&a, &c),
+            "all three aliases must take the same load lock"
         );
 
         drop(a);
         drop(b);
+        drop(c);
         release_load_lock(&tagless);
     }
 
@@ -8959,7 +11731,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_model_rejects_an_invalid_ref_with_400() {
         let state = test_state();
-        let err = ensure_model(&state, "hf.co/../x", None)
+        let err = ensure_model(&state, "hf.co/../x", None, None)
             .await
             .err()
             .expect("invalid ref must be rejected");
@@ -8977,6 +11749,55 @@ mod tests {
         };
         let resp = handle_push(State(state), Json(req)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// /api/push has no "fetch it first" fallback: a valid ref that isn't
+    /// already in the local store returns a 404 through AppError, not a
+    /// hand-built body.
+    #[tokio::test]
+    async fn handle_push_returns_404_for_a_model_not_in_the_store() {
+        let state = test_state();
+        let req = OllamaPushRequest {
+            model: "hf.co/does-not-exist/nowhere".to_string(),
+            name: String::new(),
+        };
+        let resp = handle_push(State(state), Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A push reports the digest it landed on, which is what
+    /// `cmd::push --sign-key` signs — the daemon deliberately does not
+    /// sign, so losing this line would silently disable signing.
+    #[test]
+    fn a_push_outcome_reports_its_digest_on_the_stream() {
+        let lines = PushOutcome {
+            digest: "sha256:abc".into(),
+        }
+        .into_lines();
+        assert_eq!(lines, vec![serde_json::json!({"digest": "sha256:abc"})]);
+    }
+
+    /// A pull's notices go out the same stream, so one helper serves
+    /// both verbs.
+    #[test]
+    fn pull_notices_go_out_as_notice_lines() {
+        let lines = vec!["warning: unsigned".to_string()].into_lines();
+        assert_eq!(
+            lines,
+            vec![serde_json::json!({"notice": "warning: unsigned"})]
+        );
+    }
+
+    /// An Ollama client's push body has no signing fields at all, and
+    /// deserializing one must not require them.
+    #[test]
+    fn an_ollama_push_body_still_deserializes() {
+        let req: OllamaPushRequest =
+            serde_json::from_str(r#"{"model":"docker.io/org/model:v1"}"#).unwrap();
+        assert_eq!(req.model, "docker.io/org/model:v1");
+        // The deprecated `name` spelling real Ollama still accepts.
+        let req: OllamaPushRequest = serde_json::from_str(r#"{"name":"x"}"#).unwrap();
+        assert_eq!(req.name, "x");
     }
 
     /// /api/delete resolves (and so validates) the client ref before it ever
@@ -9236,5 +12057,318 @@ mod tests {
             .collect();
         assert_eq!(joined, "Hello, world");
         assert_eq!(chunks.last().unwrap()["done"], true);
+    }
+
+    /// The process-wide registry against placeholder gauges.
+    fn rendered_registry() -> String {
+        metrics::render(&metrics::Snapshot {
+            version: "test".into(),
+            start_time_seconds: 0,
+            scheduling_requests_in_flight: 0,
+            scheduling_capacity: 1,
+            models_loaded: 0,
+            models_loading: 0,
+            models: Vec::new(),
+        })
+    }
+
+    /// One model's unload counter from the process-wide registry; `0`
+    /// while the series does not exist yet.
+    fn unload_count(model: &str, reason: &str) -> u64 {
+        let rendered = rendered_registry();
+        let needle =
+            format!("llmman_model_unloads_total{{model=\"{model}\",reason=\"{reason}\"}} ");
+        rendered
+            .lines()
+            .find_map(|l| l.strip_prefix(needle.as_str()))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// `oom` cannot be provoked against a real daemon without genuine
+    /// memory exhaustion, so the eviction path is driven directly.
+    #[tokio::test]
+    async fn evicting_for_an_oom_retry_counts_every_model_it_freed() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "loading-now".into(),
+                running_model_fixture(None, Duration::from_secs(0), 0),
+            );
+            mgr.running.insert(
+                "evictable-a".into(),
+                running_model_fixture(None, Duration::from_secs(0), 0),
+            );
+            mgr.running.insert(
+                "evictable-b".into(),
+                running_model_fixture(None, Duration::from_secs(0), 0),
+            );
+            // In flight, so it must be left alone and not counted.
+            mgr.running.insert(
+                "busy".into(),
+                running_model_fixture(None, Duration::from_secs(0), 1),
+            );
+        }
+
+        let evicted = evict_other_models(&state, "loading-now").await;
+
+        assert!(evicted, "two idle models were evictable");
+        // Model names unique to this test, so these are absolute counts.
+        assert_eq!(unload_count("evictable-a", "oom"), 1);
+        assert_eq!(unload_count("evictable-b", "oom"), 1);
+        assert_eq!(
+            unload_count("busy", "oom"),
+            0,
+            "the in-flight model was left alone, so it must not be counted"
+        );
+
+        let mgr = state.0.manager.lock().await;
+        assert!(mgr.running.contains_key("loading-now"));
+        assert!(mgr.running.contains_key("busy"));
+        assert!(!mgr.running.contains_key("evictable-a"));
+        assert!(!mgr.running.contains_key("evictable-b"));
+    }
+
+    /// `check_running` only inspects a process when a request arrives for
+    /// it, so a backend that died and was never asked for again reaches
+    /// its keep_alive deadline looking exactly like a healthy idle model.
+    #[tokio::test]
+    async fn the_reaper_labels_an_already_dead_backend_crashed_not_idle() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            let mut dead =
+                running_model_fixture(Some(Duration::from_secs(1)), Duration::from_secs(10), 0);
+            match &mut dead.process {
+                ModelProcess::Local(_, child, _) | ModelProcess::Container(_, child) => {
+                    child.kill().await.expect("kill the placeholder process")
+                }
+            }
+            mgr.running.insert("died-then-expired".into(), dead);
+        }
+
+        reap_idle_models_once(&state).await;
+
+        assert_eq!(
+            unload_count("died-then-expired", "crashed"),
+            1,
+            "a backend already dead when the reaper reached it must count as crashed"
+        );
+        assert_eq!(
+            unload_count("died-then-expired", "idle"),
+            0,
+            "and must not also be counted idle"
+        );
+        assert!(
+            !state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .contains_key("died-then-expired"),
+            "it must still be unloaded"
+        );
+    }
+
+    /// A label taken from the raw URI grows a series per distinct path,
+    /// without bound. Against a real router, because what makes this true
+    /// is axum inserting `MatchedPath` before the layer runs.
+    #[tokio::test]
+    async fn the_metrics_route_label_is_the_template_not_the_request_path() {
+        let app = Router::new()
+            .route(
+                "/test-matched-path/:id",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(middleware::from_fn(track_metrics));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        Client::new()
+            .get(format!(
+                "http://127.0.0.1:{}/test-matched-path/abc123",
+                addr.port()
+            ))
+            .send()
+            .await
+            .expect("request reaches the test router");
+
+        // Route template unique to this test, so this is an absolute count.
+        let rendered = rendered_registry();
+        assert!(
+            rendered.contains(
+                "llmman_http_requests_total{route=\"/test-matched-path/:id\",status=\"204\"} 1\n"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("abc123"), "{rendered}");
+    }
+
+    /// Any localhost page is an allowed origin, so one that can reach the
+    /// daemon could otherwise read a scrape out of a browser. What makes
+    /// this true is `/metrics` being merged *after* `.layer(cors_layer())`
+    /// in [`build_router`]; an edit moving it up compiles.
+    #[tokio::test]
+    async fn the_scrape_endpoint_is_outside_the_cors_layer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(test_state(), true);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let get = |path: &'static str| {
+            let url = format!("http://127.0.0.1:{}{path}", addr.port());
+            async move {
+                Client::new()
+                    .get(url)
+                    .header("origin", "http://localhost:3000")
+                    .send()
+                    .await
+                    .expect("request reaches the test router")
+            }
+        };
+
+        // The control: the same origin on an ordinary route *is* allowed.
+        let version = get("/api/version").await;
+        assert_eq!(
+            version
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("http://localhost:3000"),
+            "a page served from localhost is meant to be an allowed origin"
+        );
+
+        let scrape = get("/metrics").await;
+        assert_eq!(scrape.status(), StatusCode::OK, "the scrape route answers");
+        assert!(
+            !scrape.headers().contains_key("access-control-allow-origin"),
+            "a browser page can read the scrape endpoint"
+        );
+    }
+
+    /// A 404 rather than a 403, so a disabled endpoint is indistinguishable
+    /// from a build that never had one; and nothing is recorded either.
+    #[tokio::test]
+    async fn the_scrape_endpoint_is_absent_unless_the_operator_enabled_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(test_state(), false);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let url = format!("http://127.0.0.1:{}", addr.port());
+        let scrape = Client::new()
+            .get(format!("{url}/metrics"))
+            .send()
+            .await
+            .expect("request reaches the test router");
+        assert_eq!(scrape.status(), StatusCode::NOT_FOUND);
+
+        // The control: the rest of the daemon is unaffected.
+        let version = Client::new()
+            .get(format!("{url}/api/version"))
+            .send()
+            .await
+            .expect("request reaches the test router");
+        assert_eq!(version.status(), StatusCode::OK);
+
+        // Off means off — see `build_router`. `/loading.html` because the
+        // registry is process-wide and this asserts an absence: no other
+        // test requests it, so the series exists only if this disabled
+        // router wrote it, whatever status the handler returned.
+        Client::new()
+            .get(format!("{url}/loading.html"))
+            .send()
+            .await
+            .expect("request reaches the test router");
+        assert!(
+            !rendered_registry().contains("route=\"/loading.html\""),
+            "a router built with metrics disabled must not write to the registry"
+        );
+    }
+
+    /// Hyper derives `Content-Length` from the body's size hint, and a
+    /// wrapped stream has none: wrapping every body made every JSON reply
+    /// chunked. Nothing but a live response proves the header survived.
+    #[tokio::test]
+    async fn timing_a_response_does_not_cost_it_its_content_length() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(test_state(), true);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let url = format!("http://127.0.0.1:{}", addr.port());
+        for route in ["/api/version", "/metrics"] {
+            let response = Client::new()
+                .get(format!("{url}{route}"))
+                .send()
+                .await
+                .expect("request reaches the test router");
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            assert!(
+                response.headers().contains_key("content-length"),
+                "{route} lost its content-length: {:?}",
+                response.headers()
+            );
+            assert!(
+                !response.headers().contains_key("transfer-encoding"),
+                "{route} was made chunked: {:?}",
+                response.headers()
+            );
+        }
+    }
+
+    /// A wrapper that recorded at header time would make this equal to
+    /// TTFB, which is the conflation the split exists to end.
+    #[tokio::test]
+    async fn the_total_duration_clock_stops_at_the_end_of_the_body_not_the_headers() {
+        let app = Router::new()
+            .route(
+                "/test-slow-body",
+                get(|| async {
+                    // Headers immediately, body 200ms later.
+                    Body::from_stream(futures::stream::once(async {
+                        sleep(Duration::from_millis(200)).await;
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(b"done"))
+                    }))
+                }),
+            )
+            .layer(middleware::from_fn(track_metrics));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let body = Client::new()
+            .get(format!("http://127.0.0.1:{}/test-slow-body", addr.port()))
+            .send()
+            .await
+            .expect("request reaches the test router")
+            .text()
+            .await
+            .expect("the body arrives in full");
+        assert_eq!(body, "done");
+
+        let rendered = rendered_registry();
+        // TTFB landed in the fastest bucket; total duration did not.
+        assert!(
+            rendered.contains(
+                "llmman_http_request_ttfb_seconds_bucket{route=\"/test-slow-body\",le=\"0.05\"} 1\n"
+            ),
+            "headers were ready immediately:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "llmman_http_request_duration_seconds_bucket{route=\"/test-slow-body\",le=\"0.05\"} 0\n"
+            ),
+            "the body took 200ms, so total duration cannot be under 50ms:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "llmman_http_request_duration_seconds_count{route=\"/test-slow-body\"} 1\n"
+            ),
+            "the body ended, so it was recorded exactly once:\n{rendered}"
+        );
     }
 }

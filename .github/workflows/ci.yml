@@ -44,6 +44,14 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    # Every leg finishes in 2-7 min warm, so 60 is pure headroom — it
+    # exists only to bound a wedged runner. CI 33613527281's
+    # ubuntu-24.04-arm leg lost communication with the server mid-build
+    # and, with no timeout here, stalled 46 min before GitHub's own
+    # infrastructure gave up, blocking `release` (which `needs:` this)
+    # the whole time. A timeout can't keep a runner alive, just stop a
+    # dead one from stalling until the 6-hour default.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -67,14 +75,17 @@ jobs:
             binary: llmman
 
           # ── Windows x86_64 ────────────────────────────────────────────────
-          # lld-link is used instead of MSVC link.exe: it accepts clang's
-          # .pdata format (fixing LNK1223) and GNU ar archives (fixing LNK4003).
+          # No linker override; build.rs repacks the Go archive and strips
+          # its SEH sections so the default MSVC link.exe works (see it for
+          # the LNK1223/LNK4003 detail). Empty deliberately, not as
+          # belt-and-braces: an override would hide a regression in that
+          # path, and this leg is the only thing exercising it.
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
             go-os: windows
             binary: llmman.exe
             msvc-arch: amd64
-            rustflags: "-C linker=lld-link"
+            rustflags: ""
 
           # ── Windows aarch64 ───────────────────────────────────────────────
           # ARM64 uses the MSVC-native link.exe (put first in PATH by
@@ -227,7 +238,7 @@ jobs:
   test:
     name: Unit tests (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: ${{ matrix.timeout || 60 }}
     strategy:
       fail-fast: false
       matrix:
@@ -252,24 +263,25 @@ jobs:
             go-os: darwin
 
           # ── Windows x86_64 ────────────────────────────────────────────────
-          # lld-link, not MSVC link.exe — see the `build` job's own comment
-          # on why (same CGO-produced-object-format issue, native build or
-          # not).
+          # No linker override; build.rs makes the default MSVC link.exe
+          # work — see the `build` job's own comment.
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
             go-os: windows
             msvc-arch: amd64
-            rustflags: "-C linker=lld-link"
+            rustflags: ""
+            timeout: 60
 
           # ── Windows aarch64 ───────────────────────────────────────────────
-          # rustflags empty (MSVC-native link.exe, not lld-link) — see the
-          # `build` job's own comment on why this one architecture is the
-          # opposite of the x86_64 Windows entry just above.
+          # rustflags empty like x86_64, but for a simpler reason: ARM64's
+          # unwind encoding was never the problem, so it links with MSVC
+          # link.exe and build.rs leaves its unwind data intact.
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             go-os: windows
             msvc-arch: arm64
             rustflags: ""
+            timeout: 60
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -323,6 +335,30 @@ jobs:
         if: matrix.check-fmt
         run: cargo fmt --all -- --check
 
+      # `fuzzing` gates fuzz_check_parse_registry_ref in src/shortnames.rs,
+      # which the fuzz/ crate below calls but nothing else in the tree
+      # references. Without this step, a rename of ParsedRef's fields, or
+      # of MAX_PART_LEN/MAX_HOST_LEN, compiles clean on every other leg
+      # and only breaks the fuzz harness, with no CI signal. This only
+      # compiles the feature; it does not run cargo-fuzz, which needs a
+      # nightly toolchain this job does not install (actual fuzzing runs
+      # on a developer's workstation, not in CI). Runs once, on the
+      # check-fmt leg, same reason as cargo fmt: pure Rust logic, no
+      # OS-specific `#[cfg]`.
+      - name: cargo clippy --features fuzzing
+        if: matrix.check-fmt
+        run: cargo clippy --features fuzzing --lib -- -D warnings
+
+      # fuzz/ is its own crate (cargo-fuzz's own convention), with its own
+      # Cargo.toml, so the workspace-level clippy/test steps above never
+      # touch it. A plain `cargo check` against its manifest catches it
+      # going stale against src/shortnames.rs's public surface, without
+      # needing cargo-fuzz or nightly. Same check-fmt gating as above: no
+      # OS-specific behavior to test per target.
+      - name: cargo check fuzz/
+        if: matrix.check-fmt
+        run: cargo check --manifest-path fuzz/Cargo.toml
+
       # -D warnings: the tree is clippy-clean as of this step being added,
       # so anything new is a regression, not a wart to triage.
       # --all-targets covers tests/ too. Default (docker) feature only:
@@ -335,11 +371,10 @@ jobs:
 
       # --target: matches the build job's own invocation (every one of
       # these is a native build, but explicit --target keeps the output
-      # path/build-plan identical to that job's). RUSTFLAGS is needed here
-      # too, not just on a separate build step — see the e2e job's own
-      # comment on cargo test compiling its own separate test binary,
-      # which links against the same Go-shim-produced llmman_shim.lib the
-      # main binary does and hit the exact same lld-link requirement.
+      # path/build-plan identical to that job's). RUSTFLAGS no longer
+      # carries a Windows linker choice: build.rs fixes the archive as it
+      # produces it, so the separate test binary compiled here links the
+      # same way the main binary does with nothing repeated per step.
       - name: cargo test --lib --bins
         run: cargo test --release --target ${{ matrix.target }} --lib --bins
         env:
@@ -552,23 +587,20 @@ jobs:
             feature-flags: "--no-default-features --features podman"
 
           # ── Windows x86_64 (docker backend) ──────────────────────────────
-          # lld-link, not MSVC link.exe — see the `build` job's own comment
-          # on why (same CGO-produced-object-format issue, native build or
-          # not). No podman entry: containers/image has no Windows support
-          # (see the `build` job's own comment on its identical exclusion).
+          # No linker override; build.rs makes the default MSVC link.exe
+          # work — see the `build` job's own comment. No podman entry:
+          # containers/image has no Windows support.
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
             go-os: windows
             llama-asset: win-cpu-x64.zip
             msvc-arch: amd64
-            rustflags: "-C linker=lld-link"
+            rustflags: ""
             backend: docker
             feature-flags: ""
 
           # ── Windows aarch64 (docker backend) ─────────────────────────────
-          # rustflags empty (MSVC-native link.exe, not lld-link) — see the
-          # `build` job's own comment on why this one architecture is the
-          # opposite of the x86_64 Windows entry just above.
+          # rustflags empty; ARM64 keeps its unwind data — see `test`.
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             go-os: windows
@@ -738,8 +770,8 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         env:
-          TALOS_VERSION: 0.17.2-alpha
-          TALOS_SHA256: 468d45e0bcafe563d1c105a18cc4c9dc7ebd884df59be8cf40b9aa5e5942b4b7
+          TALOS_VERSION: 0.18.0-alpha
+          TALOS_SHA256: 05b4e3345a0027474b7c479a62fdb16681a9ca0f9f277f1b5c872eb45cee9d33
         run: |
           set -euo pipefail
           tarball="talos-${TALOS_VERSION}.tar.gz"
@@ -1099,15 +1131,12 @@ jobs:
           "$RUNNER_TEMP/mlx-lm-venv/bin/pip" install mlx-lm
           echo "$RUNNER_TEMP/mlx-lm-venv/bin" >> "$GITHUB_PATH"
 
-      # --target: for the same reason as the Build llmman step above —
-      # and RUSTFLAGS needs repeating here too, not just there: this step
-      # compiles its own separate test binary (tests/launch_e2e.rs), which
-      # links against the exact same Go-shim-produced llmman_shim.lib the
-      # main binary does, and hit that same LNK1223 lld-link exists to
-      # avoid (see the `build` job's own comment) the first several times
-      # this job's Windows entry ran — root-caused to exactly this: the
-      # env was present on the Build llmman step above, but this step
-      # never inherits another step's `env:` block, and never had its own.
+      # --target: for the same reason as the Build llmman step above.
+      # RUSTFLAGS no longer carries a Windows linker choice. This step
+      # compiles its own test binary (tests/launch_e2e.rs) against the same
+      # Go-shim archive, and used to hit LNK1223 whenever the flag was
+      # missing here, since a step never inherits another's `env:`.
+      # build.rs now fixes the archive itself, so that is gone.
       # matrix.feature-flags: same reasoning as the Build llmman step —
       # this test binary must link against the same backend the one built
       # above did, or the two podman entries would silently test a docker-
@@ -1270,6 +1299,10 @@ jobs:
     # other event (e.g. a PR).
     needs: [build, test, lint, e2e]
     runs-on: ubuntu-24.04
+    # Downloads, renames and uploads artefacts in under a minute; 60 is
+    # the same runner-wedge bound as the `build` job above, not an
+    # estimate of this job's own runtime.
+    timeout-minutes: 60
     # Two release channels, both attaching one binary per matrix.target
     # (see the build job above — this is where "all the platforms
     # llama.app does" is actually decided, not here):

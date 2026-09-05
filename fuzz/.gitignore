@@ -1,0 +1,7 @@
+target
+artifacts
+coverage
+# Ignore corpus entries discovered by fuzzing runs everywhere, but keep the
+# hand-curated seed corpus (corpus/parse_registry_ref/*) trackable.
+corpus/*
+!corpus/parse_registry_ref/

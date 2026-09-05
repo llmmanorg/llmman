@@ -256,10 +256,10 @@ pub struct Cost {
 }
 
 impl Provider {
-    /// This provider's API key from the environment, or `None` when
-    /// [`Provider::key_env`] is unset or blank.
+    /// This provider's API key, or `None` when neither the environment
+    /// nor `llmman.conf` has one. See [`key_for`].
     pub fn api_key(&self) -> Option<String> {
-        key_from_env(&self.key_env)
+        key_for(&self.id, &self.key_env)
     }
 
     /// Appends an OpenAI route to this provider's base URL. See
@@ -269,16 +269,66 @@ impl Provider {
     }
 }
 
-/// An API key read out of `var`, or `None` when it is unset or blank.
+/// The API key for provider `id`: `var` from the environment, else the
+/// `[providers.<id>]` entry in `llmman.conf` (see [`crate::config`]).
+/// `None` when neither has one.
 ///
-/// Free-standing because a `/llmman/providers` client (see
-/// `cmd::providers`) learns only the variable's *name* from the daemon,
-/// never a whole [`Provider`].
-pub fn key_from_env(var: &str) -> Option<String> {
+/// The environment wins, as it does for `aws` and `gh`: the file is the
+/// standing answer, an `export` the deliberate this-session-only
+/// override. The reverse would make `OPENAI_API_KEY=... llmman run`
+/// silently spend the wrong key.
+///
+/// Free-standing because a `/llmman/providers` client learns only the id
+/// and the variable's *name* from the daemon, never a [`Provider`].
+pub fn key_for(id: &str, var: &str) -> Option<String> {
+    resolve_key(key_from_env(var), crate::config::provider_api_key(id))
+}
+
+/// Split out so the precedence is testable without touching the process
+/// environment or the filesystem.
+fn resolve_key(from_env: Option<String>, from_conf: Option<&str>) -> Option<String> {
+    from_env.or_else(|| {
+        from_conf
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+    })
+}
+
+/// An API key read out of `var`, or `None` when it is unset or blank.
+fn key_from_env(var: &str) -> Option<String> {
     std::env::var(var)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// Both places llmman looks, named, for an error that fires because it
+/// found neither. One string so every such message agrees: a user told
+/// only about the variable would never learn the file exists.
+pub fn key_hint(id: &str, var: &str) -> String {
+    format!(
+        "set {var} in the environment, or add a [providers.{}] api_key to {}",
+        toml_key(id),
+        crate::config::user_path_display()
+    )
+}
+
+/// `id` as a TOML key, quoted when it is not a bare one.
+///
+/// models.dev has ids with a dot in them (`wafer.ai`), and
+/// `[providers.wafer.ai]` is two nested tables, not the key `wafer.ai` —
+/// so an unquoted hint tells the user to write something that silently
+/// does not configure the provider they asked about.
+fn toml_key(id: &str) -> String {
+    let bare = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if bare {
+        id.to_string()
+    } else {
+        format!("{id:?}")
+    }
 }
 
 /// The provider id `--provider` names: `None` when the flag is absent,
@@ -747,21 +797,15 @@ fn load() -> anyhow::Result<Loaded> {
     }
 }
 
-/// Writes the cache through a temp file and a rename, as opencode does
+/// Writes the cache atomically (`fsutil::write_atomic`), as opencode does
 /// for its own copy: `llmman launch` and `llmman serve` refresh it
 /// independently and do overlap, and a plain write leaves a window in
-/// which the other reads a half-written file. Rename is atomic, so a
-/// reader sees the old copy or the new one. The temp name carries the pid
-/// so two writers can't share one.
+/// which the other reads a half-written file.
 fn write_cache(path: &std::path::Path, raw: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&tmp, raw)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::fsutil::write_atomic(path, raw)
 }
 
 fn fetch(url: &str) -> anyhow::Result<Vec<u8>> {
@@ -1303,6 +1347,60 @@ mod tests {
         assert_eq!(p.api_key(), None);
     }
 
+    /// An `export` overrides the standing answer in `llmman.conf`. The
+    /// other way round would quietly spend the wrong key.
+    #[test]
+    fn the_environment_beats_the_config_file() {
+        assert_eq!(
+            resolve_key(Some("from-env".into()), Some("from-conf")),
+            Some("from-env".to_string())
+        );
+        assert_eq!(
+            resolve_key(None, Some("from-conf")),
+            Some("from-conf".to_string())
+        );
+        assert_eq!(
+            resolve_key(Some("from-env".into()), None),
+            Some("from-env".to_string())
+        );
+        assert_eq!(resolve_key(None, None), None);
+    }
+
+    /// What is only whitespace is no key — as in the environment.
+    #[test]
+    fn a_config_file_key_is_trimmed_and_a_blank_one_ignored() {
+        assert_eq!(
+            resolve_key(None, Some("  padded  ")),
+            Some("padded".to_string())
+        );
+        assert_eq!(resolve_key(None, Some("   ")), None);
+        assert_eq!(resolve_key(None, Some("")), None);
+    }
+
+    /// Both places, in one message.
+    #[test]
+    fn key_hint_names_the_variable_and_the_config_file() {
+        let hint = key_hint("openrouter", "OPENROUTER_API_KEY");
+        assert!(hint.contains("OPENROUTER_API_KEY"), "{hint}");
+        assert!(hint.contains("[providers.openrouter]"), "{hint}");
+        assert!(hint.contains("llmman.conf"), "{hint}");
+    }
+
+    /// models.dev ships `wafer.ai`, and `[providers.wafer.ai]` is two
+    /// nested tables rather than that key — a hint saying so would not
+    /// configure the provider it names.
+    #[test]
+    fn key_hint_quotes_a_provider_id_that_is_not_a_bare_toml_key() {
+        assert!(
+            key_hint("wafer.ai", "WAFER_API_KEY").contains(r#"[providers."wafer.ai"]"#),
+            "{}",
+            key_hint("wafer.ai", "WAFER_API_KEY")
+        );
+        assert_eq!(toml_key("openrouter"), "openrouter");
+        assert_eq!(toml_key("z-ai"), "z-ai");
+        assert_eq!(toml_key("wafer.ai"), r#""wafer.ai""#);
+    }
+
     /// The listing has to stay short enough to read in an error message
     /// while still saying how much was elided.
     #[test]
@@ -1427,15 +1525,49 @@ mod tests {
                 }
             }"#,
         );
-        let huge = "z".repeat(4 * 1024 * 1024);
-        let started = Instant::now();
+        // Absurdly long, and *padding a real id* so the assertion below
+        // actually pins the length guard: `needle.contains(id)` would
+        // match without it, so "Did you mean" appearing is exactly the
+        // signal that the search was not skipped. A plain run of "z"
+        // returns no suggestion either way and would pass regardless.
+        //
+        // No wall-clock budget: the previous one measured this test's own
+        // multi-megabyte `{:?}` formatting and `contains` scans on a
+        // shared CI runner more than anything in `suggestions`.
+        let huge = format!("togetherai{}", "z".repeat(64 * 1024));
         let error = unknown_provider_error(&huge, &catalog).to_string();
-        assert!(!error.contains("Did you mean"), "suggested for a 4MB id");
+        assert!(!error.contains("Did you mean"), "suggested for a huge id");
         assert!(error.contains("llmman providers"));
+    }
+
+    /// The exact threshold, pinned deterministically — what the test
+    /// above used to approximate with a timer. `suggestions` short-
+    /// circuits on length because `edit_distance` over every catalog id
+    /// is superlinear in a caller-supplied one.
+    #[test]
+    fn suggestions_are_skipped_just_above_the_length_limit() {
+        let catalog = catalog_from(
+            r#"{
+                "togetherai": {
+                    "id": "togetherai", "name": "Together",
+                    "api": "https://api.together.xyz/v1",
+                    "npm": "@ai-sdk/openai-compatible", "env": ["TOGETHER_API_KEY"],
+                    "models": { "gpt-5": {} }
+                }
+            }"#,
+        );
+        // Both of these contain a real id, so both would be suggested if
+        // the guard were gone; only the length distinguishes them.
+        let pad = |len: usize| format!("togetherai{}", "z".repeat(len - "togetherai".len()));
+
+        assert_eq!(
+            suggestions(&pad(MAX_SUGGESTION_LEN), &catalog),
+            vec!["togetherai"],
+            "an id at exactly the limit was not searched"
+        );
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "took {:?}",
-            started.elapsed()
+            suggestions(&pad(MAX_SUGGESTION_LEN + 1), &catalog).is_empty(),
+            "one byte over the limit was still searched"
         );
     }
 }

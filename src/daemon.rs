@@ -106,6 +106,13 @@ pub fn server() -> String {
     format!("http://{}", connect_addr())
 }
 
+/// A peer's `scheme://host:port` origin from a `LLMMAN_HOST`-style spec
+/// (`asahi`, `spark:17434`, `http://10.0.0.5`), port defaulting to ours.
+pub fn peer_url(spec: &str) -> String {
+    let (scheme, host, port) = parse_host(Some(spec));
+    format!("{scheme}://{}", format_host_port(&host, port))
+}
+
 /// The bare `host:port` `llmman serve`'s own listener binds — the raw
 /// configured host, since a wildcard bind (`0.0.0.0`/`::`) is meaningful
 /// here, unlike for `connect_addr`.
@@ -784,6 +791,16 @@ pub fn disable_std_handle_inheritance() {
 struct ProgressLine {
     status: Option<String>,
     error: Option<String>,
+    /// A message the daemon needs a human to see — today, the outcome of
+    /// a signature check (see `crate::verify::Verdict`). Relayed rather
+    /// than logged because the daemon's stderr is a log file, while this
+    /// process is the one attached to a terminal.
+    #[serde(default)]
+    notice: Option<String>,
+    /// The manifest digest a push landed on, for `--sign-key` to sign
+    /// here rather than in the daemon. See `cmd::serve`'s `push_impl`.
+    #[serde(default)]
+    digest: Option<String>,
     #[serde(default)]
     total: Option<u64>,
     #[serde(default)]
@@ -838,13 +855,21 @@ fn progress_bar_style() -> ProgressStyle {
 /// Returns an error if the stream reports one, or if it ends without ever
 /// reporting "success".
 pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
+    stream_progress_with(path, reference).map(|_| ())
+}
+
+/// [`stream_progress`], returning the manifest digest the stream
+/// reported, when it reported one. `/api/push` does, for `--sign-key`.
+pub fn stream_progress_with(path: &str, reference: &str) -> anyhow::Result<Option<String>> {
+    let body = serde_json::json!({"model": reference});
+
     let client = reqwest::blocking::Client::builder()
         .timeout(None) // model transfers can take much longer than any sane fixed timeout
         .build()
         .context("build http client")?;
     let resp = client
         .post(format!("{}{path}", server()))
-        .json(&serde_json::json!({"model": reference}))
+        .json(&body)
         .send()
         .with_context(|| format!("request {path} for {reference}"))?;
 
@@ -855,6 +880,7 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
     }
 
     let mut saw_success = false;
+    let mut pushed_digest: Option<String> = None;
     let mut last_status = String::new();
     let mut bar: Option<ProgressBar> = None;
     // Set once we've printed the "already have it" shortcut line (see this
@@ -871,6 +897,19 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
         let Ok(msg) = serde_json::from_str::<ProgressLine>(line) else {
             continue; // tolerate stray non-JSON keepalive output
         };
+        if let Some(d) = msg.digest.filter(|d| !d.is_empty()) {
+            pushed_digest = Some(d);
+            continue;
+        }
+        if let Some(notice) = msg.notice.filter(|n| !n.is_empty()) {
+            // suspend(), so the message doesn't land in the middle of a
+            // half-drawn bar and get overwritten by the next frame.
+            match &bar {
+                Some(b) => b.suspend(|| eprintln!("[llmman] {notice}")),
+                None => eprintln!("[llmman] {notice}"),
+            }
+            continue;
+        }
         if let Some(err) = msg.error.filter(|e| !e.is_empty()) {
             if let Some(b) = bar.take() {
                 b.abandon(); // leave whatever was drawn in place instead of clearing it
@@ -955,7 +994,7 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
     if !saw_success {
         anyhow::bail!("{reference}: stream ended without a success status");
     }
-    Ok(())
+    Ok(pushed_digest)
 }
 
 /// POSTs `{"model": reference}` to `/api/show` and reports whether the
@@ -985,6 +1024,16 @@ pub fn ensure_model_pulled(reference: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     stream_progress("/api/pull", reference)
+}
+
+/// Pushes `reference` via the daemon's `/api/push` and returns the
+/// manifest digest it landed on, for `cmd::push --sign-key` to sign.
+///
+/// The daemon is deliberately not asked to sign: see `cmd::serve`'s
+/// `push_impl` for why a caller-supplied key path is not something an
+/// unauthenticated loopback endpoint may accept.
+pub fn push(reference: &str) -> anyhow::Result<Option<String>> {
+    stream_progress_with("/api/push", reference)
 }
 
 /// POSTs the Ollama unload sentinel (`{"model": reference, "keep_alive":
@@ -1064,8 +1113,8 @@ pub struct ProviderSummary {
     pub id: String,
     pub name: String,
     pub key_env: String,
-    /// Whether the key is set *where the daemon runs*. This process's own
-    /// environment is [`ProviderSummary::key_here`].
+    /// Whether the key is set *where the daemon runs*. What this process
+    /// itself holds is [`ProviderSummary::key_here`].
     pub key_set: bool,
     /// Whether the daemon would actually spend that key for a request
     /// presenting none. Only it can tell: that depends on how it is
@@ -1084,7 +1133,7 @@ impl ProviderSummary {
     /// Whether *this* process holds the key — the other way one reaches
     /// a provider, sent per request (see `client_api_key` in cmd::serve).
     pub fn key_here(&self) -> bool {
-        crate::providers::key_from_env(&self.key_env).is_some()
+        crate::providers::key_for(&self.id, &self.key_env).is_some()
     }
 }
 
@@ -1126,16 +1175,17 @@ pub struct ModelCost {
 }
 
 impl ProviderDetail {
-    /// This provider's key from *this* process's environment, to travel
-    /// with each request (see `client_api_key` in cmd::serve). `None` need
-    /// not be fatal — the daemon may hold it ([`ProviderDetail::key_set`]).
+    /// This provider's key as *this* process resolves it, to travel with
+    /// each request (see `client_api_key` in cmd::serve). `None` need not
+    /// be fatal — the daemon may hold it ([`ProviderDetail::key_set`]).
     ///
     /// The daemon names the variable, so a process squatting the port
     /// could name an unrelated secret — inside the trust boundary this
     /// whole module sits in either way: that daemon is handed every
-    /// prompt, and every key, regardless.
+    /// prompt, and every key, regardless. It does not name the
+    /// `llmman.conf` entry, which is keyed by the provider id.
     pub fn api_key(&self) -> Option<String> {
-        crate::providers::key_from_env(&self.key_env)
+        crate::providers::key_for(&self.id, &self.key_env)
     }
 
     /// Just the ids, for a caller that only needs to name one (see
@@ -1378,6 +1428,14 @@ mod tests {
             parse_host(Some("example.com:8080/some/path")),
             ("http".to_string(), "example.com".to_string(), 8080)
         );
+    }
+
+    #[test]
+    fn peer_url_spells_a_peer_the_way_llmman_host_is_spelled() {
+        assert_eq!(peer_url("asahi"), "http://asahi:17434");
+        assert_eq!(peer_url("spark:8080"), "http://spark:8080");
+        assert_eq!(peer_url("https://x.example/"), "https://x.example:443");
+        assert_eq!(peer_url("[fe80::1]"), "http://[fe80::1]:17434");
     }
 
     #[test]
