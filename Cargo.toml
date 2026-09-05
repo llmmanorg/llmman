@@ -2,7 +2,7 @@
 name = "llmman"
 version = "0.1.0"
 edition = "2021"
-description = "llmman manages OCI models"
+description = "Run any agent on any model, models stored as OCI images"
 license = "Apache-2.0"
 
 [lib]

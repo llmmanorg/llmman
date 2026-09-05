@@ -8,7 +8,7 @@ use llmman::{cmd, daemon, ffi, hostgpu};
 #[derive(Parser, Debug)]
 #[command(
     name = "llmman",
-    about = "LLM model image manager",
+    about = "Run any agent on any model, models stored as OCI images",
     version = env!("LLMMAN_VERSION"),
     propagate_version = true
 )]
