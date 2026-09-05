@@ -921,6 +921,16 @@ fn launch_talos_with_model() {
     // secrets env file of its own, which Talos reads on top of its env
     // file — so the launcher under test stays exactly what a user runs.
     let secrets = talos_secrets_env(&prefix);
+    // The launcher refuses when an exported TALOS_MODEL/_PROVIDER
+    // disagrees with what it is about to launch (see
+    // talos_check_env_overrides) — inherited from the test runner's own
+    // shell, that would fail every attempt for anyone who happens to
+    // have Talos configured for something else. Overlaid with the exact
+    // values `launch_talos` will use: the fixed provider, and the model
+    // reference through the same resolver `run()` calls, so this can
+    // never quietly drift from what the launch actually compares against.
+    let resolved_model =
+        llmman::shortnames::resolve_ollama_api(MODEL).expect("MODEL is a valid reference");
     // `ask`: Talos's one-turn command, answer on stdout — `chat` counts
     // a terminal as attended only when stdin and stdout both are one,
     // and there is no terminal here.
@@ -930,6 +940,8 @@ fn launch_talos_with_model() {
         &[
             ("TALOS_PREFIX", prefix.to_string_lossy().into_owned()),
             ("TALOS_SECRETS_ENV", secrets.to_string_lossy().into_owned()),
+            ("TALOS_MODEL_PROVIDER", "ollama".to_string()),
+            ("TALOS_MODEL", resolved_model),
         ],
         |_stderr| false,
     );
