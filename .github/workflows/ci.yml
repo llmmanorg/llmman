@@ -1813,7 +1813,9 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile wingetcreate.exe
           $got = (Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash
           if ($got -ne $env:WINGETCREATE_SHA256) { throw "wingetcreate.exe sha256 $got != $env:WINGETCREATE_SHA256" }
-          .\wingetcreate.exe --version
+          # `version` is a subcommand; `--version` prints help and exits 1.
+          .\wingetcreate.exe version
+          if ($LASTEXITCODE -ne 0) { throw "wingetcreate version failed with exit code $LASTEXITCODE" }
 
       # WINGET_CREATE_GITHUB_TOKEN is wingetcreate's env var for CI
       # (https://aka.ms/winget-create-token); --token may be logged.
