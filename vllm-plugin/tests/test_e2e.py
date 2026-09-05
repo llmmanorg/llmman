@@ -300,9 +300,12 @@ def test_vllm_serve_resolves_and_serves_a_real_oci_reference(tmp_path):
         env.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.8")
     else:
         cmd += ["--dtype", "bfloat16", "--enforce-eager"]
-        # Bounds vLLM CPU's own KV-cache arena, well under its default
-        # sizing heuristic, to avoid OOM on a shared/constrained CI runner.
-        env.setdefault("VLLM_CPU_KVCACHE_SPACE", "4")
+        # vLLM CPU's KV-cache arena, in GiB. A demand, not a cap: the CPU
+        # worker refuses to start unless this much is free right then (a
+        # real aarch64 CI run failed at 4 with only 3.3 GiB left). Unset,
+        # vLLM 0.28 demands 0.9 of total RAM instead. 1 GiB still fits
+        # dozens of --max-model-len 1024 sequences of a 0.8B model.
+        env.setdefault("VLLM_CPU_KVCACHE_SPACE", "1")
 
     log_file = open(log_path, "wb")
     try:
