@@ -39,22 +39,41 @@ static WRITE_REF_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Minimal OCI spec types (no external crate needed)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Descriptor {
+    #[serde(rename = "mediaType")]
     pub media_type: String,
     pub digest: String,
-    pub size: u64,
+    pub size: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urls: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<std::collections::HashMap<String, String>>,
+    #[serde(
+        rename = "artifactType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub artifact_type: Option<String>,
+}
+
+impl Descriptor {
+    pub fn annotation(&self, key: &str) -> Option<&str> {
+        self.annotations.as_ref()?.get(key).map(String::as_str)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Manifest {
-    pub schema_version: u32,
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: i32,
+    #[serde(rename = "mediaType")]
     pub media_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "artifactType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub artifact_type: Option<String>,
     pub config: Descriptor,
     pub layers: Vec<Descriptor>,
@@ -77,8 +96,8 @@ pub struct CncfConfigDescriptor {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CncfConfigConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub format: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,7 +264,9 @@ impl OciStore {
         Ok(Descriptor {
             media_type: media_type.into(),
             digest,
-            size: data.len() as u64,
+            size: data.len() as i64,
+            urls: None,
+            artifact_type: None,
             annotations: None,
         })
     }
@@ -291,7 +312,9 @@ impl OciStore {
         Ok(Descriptor {
             media_type: media_type.into(),
             digest,
-            size,
+            size: size as i64,
+            urls: None,
+            artifact_type: None,
             annotations: None,
         })
     }
@@ -369,8 +392,8 @@ impl OciStore {
     /// error over what's only ever used for display.
     pub fn total_size(&self, desc: &Descriptor) -> u64 {
         self.read_manifest(&desc.digest)
-            .map(|manifest| manifest.layers.iter().map(|l| l.size).sum())
-            .unwrap_or(desc.size)
+            .map(|manifest| manifest.layers.iter().map(|l| l.size).sum::<i64>() as u64)
+            .unwrap_or(desc.size as u64)
     }
 
     // ------------------------------------------------------------------
