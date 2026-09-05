@@ -28,14 +28,14 @@ Fifteen metric families:
 | Metric | Type | Labels | What it tells you |
 |--------|------|--------|-------------------|
 | `llmman_build_info` | gauge | `version` | Which build is running; join against it to break a graph out by version. |
-| `llmman_start_time_seconds` | gauge | — | `time() - llmman_start_time_seconds` is uptime; a step down is a restart. |
-| `llmman_scheduling_requests_in_flight` | gauge | — | Requests doing model-scheduling work right now. |
-| `llmman_scheduling_capacity` | gauge | — | The limit those are counted against, i.e. `LLMMAN_MAX_QUEUE.max(1)`. |
-| `llmman_scheduling_rejections_total` | counter | — | Requests refused with a 503 because that limit was full. |
-| `llmman_models_loaded` | gauge | — | Backends currently running, the set `/api/ps` reports. |
-| `llmman_models_loading` | gauge | — | Loads under way; `loaded + loading` is what `LLMMAN_MAX_LOADED_MODELS` caps. |
+| `llmman_start_time_seconds` | gauge | (none) | `time() - llmman_start_time_seconds` is uptime; a step down is a restart. |
+| `llmman_scheduling_requests_in_flight` | gauge | (none) | Requests doing model-scheduling work right now. |
+| `llmman_scheduling_capacity` | gauge | (none) | The limit those are counted against, i.e. `LLMMAN_MAX_QUEUE.max(1)`. |
+| `llmman_scheduling_rejections_total` | counter | (none) | Requests refused with a 503 because that limit was full. |
+| `llmman_models_loaded` | gauge | (none) | Backends currently running, the set `/api/ps` reports. |
+| `llmman_models_loading` | gauge | (none) | Loads under way; `loaded + loading` is what `LLMMAN_MAX_LOADED_MODELS` caps. |
 | `llmman_model_up` | gauge | `model`, `engine` | 1 while the backend process is alive, 0 once it has died but llmman has not noticed. |
-| `llmman_model_loads_total` | counter | `model` | Cold starts per model — the churn a too-small `LLMMAN_MAX_LOADED_MODELS` produces. |
+| `llmman_model_loads_total` | counter | `model` | Cold starts per model, i.e. the churn a too-small `LLMMAN_MAX_LOADED_MODELS` produces. |
 | `llmman_model_load_duration_seconds` | histogram | `model` | How long a cold start takes, from admission to ready. |
 | `llmman_model_load_oom_retries_total` | counter | `model`, `strategy` | Loads that hit an out-of-memory failure and retried: `evict_others`, `split_mode`, `ctx_shrink`. |
 | `llmman_model_unloads_total` | counter | `model`, `reason` | `idle`, `requested`, `crashed`, `oom`, `evicted`. |

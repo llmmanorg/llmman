@@ -35,7 +35,7 @@ $ LLMMAN_HOST=0.0.0.0 llmman serve
 peers = "asahi, spark:17434, 10.0.0.5"
 ```
 
-Each entry is spelled like `LLMMAN_HOST` — `[scheme://]host[:port]`, the
+Each entry is spelled like `LLMMAN_HOST`: `[scheme://]host[:port]`, the
 port defaulting to `17434` (or 80/443 when an explicit `http://`/`https://`
 scheme is given). `LLMMAN_PEERS=asahi,spark` overrides the
 file for one daemon, and `LLMMAN_PEERS=` (empty) takes it out of the
@@ -51,15 +51,15 @@ the laptop then offloads to it, and the workstation serves as it always
 did.
 
 `llmman serve` has no authentication and no TLS. An aggregation is for a
-network you already trust — the same caveat as any non-loopback
+network you already trust, the same caveat as any non-loopback
 `LLMMAN_HOST`. A daemon bound off loopback does not spend its own
 provider API keys; see [configuration.md](configuration.md).
 
 ## What each node does
 
 For a request naming a model this node does not have loaded, it asks
-every peer `GET /llmman/node` — what it has loaded, what it has stored,
-how much memory it has — and picks:
+every peer `GET /llmman/node` (what it has loaded, what it has stored,
+how much memory it has) and picks:
 
 1. A node that already has the model **loaded**. Never a second copy.
 2. Otherwise, of the nodes the model **fits** on (free memory, estimated
@@ -68,8 +68,8 @@ how much memory it has — and picks:
 3. Otherwise the node with the **most room**. Ties go to this node.
 
 If that is this node, it loads the model as it always did. If it is a
-peer, the request is forwarded there — the same bytes, the same
-streaming, with an `x-llmman-hop: 1` header — and the peer treats it as
+peer, the request is forwarded there (the same bytes, the same
+streaming, with an `x-llmman-hop: 1` header) and the peer treats it as
 an ordinary request: its own queue, keep-alive and eviction apply. A
 node that receives a hopped request never forwards it again, so two
 nodes that name each other never bounce one between them.
@@ -114,7 +114,7 @@ too:
 ## What it is not
 
 This routes whole requests to whole models. It does not split one model
-across machines — for a model too large for any single node, run
+across machines; for a model too large for any single node, run
 llama.cpp's `rpc-server` on the others and point one `llama-server` at
 them with `--rpc`; that is a different tool for a different problem.
 Nor is it prefill/decode disaggregation or KV-cache-aware routing in

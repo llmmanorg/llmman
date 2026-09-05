@@ -172,7 +172,7 @@ llmman verify docker.io/myorg/mymodel:v1 --key signing.pub
 ```
 
 A `[verify]` trust policy turns that into an automatic check on every
-`pull`, warning or refusing outright per repository. Off by default —
+`pull`, warning or refusing outright per repository. Off by default:
 there is nothing to check against until you have said whom you trust.
 See [docs/verification.md](docs/verification.md).
 
@@ -213,7 +213,7 @@ context length, keep-alive and the other daemon settings in
 
 ### Aggregation
 
-Several machines each running `llmman serve` can pool their hardware — a
+Several machines each running `llmman serve` can pool their hardware; a
 group of manatees is an aggregation. Name the others on each node and a
 request to any of them is served by whichever has the model loaded, or
 the most room to load it:

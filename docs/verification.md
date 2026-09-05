@@ -8,7 +8,7 @@ put them there**.
 That gap matters more for llmman than for a registry with a curated
 library, because llmman deliberately has no gatekeeper. A bare
 `llmman pull gemma4` resolves through the `[aliases]` table of
-`llmman.conf` — which either config tier can repoint — to some registry
+`llmman.conf` (which either config tier can repoint) to some registry
 you never typed, and the GGUF it lands on goes straight into
 `llama-server`'s parser.
 
@@ -27,7 +27,7 @@ manifest, with one layer per signature:
 |---|---|
 | layer media type | `application/vnd.dev.cosign.simplesigning.v1+json` |
 | layer blob | the signed payload naming the manifest digest and repository |
-| layer annotation | `dev.cosignproject.cosign/signature` — base64 of the raw signature |
+| layer annotation | `dev.cosignproject.cosign/signature`, base64 of the raw signature |
 
 Nothing about this is llmman-specific: `cosign verify --key` reads what
 `llmman push --sign-key` writes. There is a test for exactly that claim
@@ -36,7 +36,7 @@ rather than against our own reading of its documentation.
 
 ## Quick start
 
-Generate a key pair. Any standard PEM works — this is plain PKCS#8, which
+Generate a key pair. Any standard PEM works: this is plain PKCS#8, which
 is what `openssl` produces:
 
 ```console
@@ -51,7 +51,7 @@ $ llmman push docker.io/myorg/mymodel:v1 --sign-key signing.key
 $ llmman transfer hf.co/owner/model docker.io/myorg/mymodel:v1 --sign-key signing.key
 ```
 
-Check by hand at any time — no daemon, no local copy required:
+Check by hand at any time, with no daemon and no local copy required:
 
 ```console
 $ llmman verify docker.io/myorg/mymodel:v1 --key signing.pub
@@ -70,7 +70,7 @@ full report.
 
 Verification during `pull` is driven by the `[verify]` section of
 `llmman.conf`, read from `/etc/llmman/` then `~/.config/llmman/` (later
-files win — see [configuration.md](configuration.md#llmmanconf)):
+files win; see [configuration.md](configuration.md#llmmanconf)):
 
 ```toml
 [verify]
@@ -84,7 +84,7 @@ mode    = "enforce"
 
 [[verify.trust]]
 # Narrower rules written later override broader earlier ones, and
-# *replace* their key set rather than adding to it — so "trust the org
+# *replace* their key set rather than adding to it, so "trust the org
 # key everywhere except here" is expressible.
 pattern = "docker.io/myorg/experimental"
 keys    = ["keys/lab.pub"]
@@ -110,7 +110,7 @@ path segment; `**` crosses them. So `docker.io/myorg/*` covers
 `docker.io/myorg/model` but not `docker.io/myorg/team/model`, and
 `docker.io/myorg/**` covers both.
 
-`LLMMAN_VERIFY=off|warn|enforce` overrides the mode — but not the keys —
+`LLMMAN_VERIFY=off|warn|enforce` overrides the mode (but not the keys)
 for every reference, which is the useful knob in CI: a pipeline can demand
 `enforce` without editing the image's config files.
 
@@ -118,7 +118,7 @@ for every reference, which is the useful knob in CI: a pipeline can demand
 
 A default of `warn` sounds safer and is worse. With no configured trust
 roots there is nothing any model could be checked against, so every pull
-would print an unsigned-model warning you can do nothing about — a
+would print an unsigned-model warning you can do nothing about, a
 reliable way to teach people to ignore the one warning that eventually
 matters. A trust policy only means anything once you have said whom you
 trust, so that is what turns it on.
@@ -134,7 +134,7 @@ For each published signature, all four of these must hold:
 
 Check 3 is not decoration. A signature is bound to a digest, not to a
 location, so an attacker who wants their repository to look endorsed can
-copy a legitimately signed model *and* its signature into it — the
+copy a legitimately signed model *and* its signature into it; the
 cryptography still checks out. Comparing the claimed identity is what
 pins a signature to where it was meant to live.
 
@@ -146,12 +146,12 @@ makes that safe.
 
 | Operation | Behaviour |
 |---|---|
-| `pull` from an OCI registry | Policy applied. Checked *before* any layer is fetched, so a rejected model costs one manifest lookup instead of a multi-gigabyte download, then re-confirmed against the digest actually stored — a tag repointed mid-pull cannot slip past the check that just passed. Under `enforce`, a failure removes the reference again. |
+| `pull` from an OCI registry | Policy applied. Checked *before* any layer is fetched, so a rejected model costs one manifest lookup instead of a multi-gigabyte download, then re-confirmed against the digest actually stored; a tag repointed mid-pull cannot slip past the check that just passed. Under `enforce`, a failure removes the reference again. |
 | A model already in the store | Re-checked against the digest held locally, on every `pull` and on the auto-pull an inference request triggers. Being on disk is not the same as being trusted: it may have arrived before the policy existed, or under `warn`. Costs nothing when no policy applies. |
 | `pull` from HuggingFace, `ms://`, `ngc://`, `s3://`, `gs://`, a local path | Not checked. There is no signature to find, and failing every such pull under `enforce` would only get the policy switched off. Use `llmman transfer --sign-key` to bring one of these into a registry as something you vouch for. |
 | `transfer` from an OCI registry | Source checked under the same policy as `pull`: re-publishing an unverified model under your own name is how a supply-chain problem propagates, and a transfer that skipped the check would launder one past a policy `pull` enforces. |
 | `push --sign-key` / `transfer --sign-key` | Signs the digest that was actually pushed, never one re-resolved from the destination tag afterwards. |
-| `verify` | Always checks and always reports, whatever the policy says — it is the diagnostic, so its exit status reflects the signature, not the policy. |
+| `verify` | Always checks and always reports, whatever the policy says: it is the diagnostic, so its exit status reflects the signature, not the policy. |
 
 Signing twice with different keys **appends**, so key rotation works:
 publish under the new key while the old one is still trusted, then
@@ -164,8 +164,8 @@ These are real and worth stating plainly.
 
 - **Keyless signing (Fulcio / Rekor) is not supported.** llmman does
   key-based verification only. Keyless brings a much larger dependency
-  and trust-root surface, and an air-gapped deployment — llmman's stated
-  audience — cannot use it anyway. The on-registry format leaves room for
+  and trust-root surface, and an air-gapped deployment (llmman's stated
+  audience) cannot use it anyway. The on-registry format leaves room for
   it: a keyless signature is the same layer shape with two extra
   annotations.
 
@@ -190,8 +190,8 @@ These are real and worth stating plainly.
 - **A mirrored or relocated repository cannot verify.** The claimed-identity
   check compares repositories, so a model re-hosted at
   `mirror.corp/original/name` will not match a signature naming
-  `original/name`. That is the check working as intended — it is what stops
-  a signature being copied into someone else's repository — but it means a
+  `original/name`. That is the check working as intended (it is what stops
+  a signature being copied into someone else's repository), but it means a
   pull-through mirror needs its own signatures today. A per-rule identity
   override would close this and is not implemented.
 
@@ -199,5 +199,5 @@ These are real and worth stating plainly.
   --sign-key` has the daemon report which digest it pushed and then signs
   that itself, so no key path or passphrase ever crosses the socket. The
   daemon binds unauthenticated TCP loopback, which is not user-scoped and
-  carries no peer credentials — accepting a key path there would let any
+  carries no peer credentials; accepting a key path there would let any
   local user have it read a file only its own user can read.
