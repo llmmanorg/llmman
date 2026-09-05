@@ -423,11 +423,8 @@ fn use_mlx_for_safetensors() -> bool {
 /// Whether `model_ref` gets `--context-shift`. Enabled except for
 /// DeepSeek-family ("deepseek2" architecture) models, mirroring Ollama's
 /// own `supportsContextShift` (`server/sched.go`) — their MLA-compressed
-/// KV cache can't be shifted the way llama-server expects. Ollama
-/// detects that from parsed GGUF metadata; llmman deliberately doesn't
-/// parse GGUF metadata at all (see modelpack.rs's removed
-/// gguf_architecture note), so this is a coarser name-based heuristic
-/// instead.
+/// KV cache can't be shifted the way llama-server expects. Ollama reads
+/// the GGUF architecture; this is a coarser name-based heuristic.
 fn supports_context_shift(model_ref: &str) -> bool {
     !model_ref.to_ascii_lowercase().contains("deepseek")
 }
@@ -487,23 +484,13 @@ const MAX_CTX_SHRINK_ATTEMPTS: u32 = 4;
 /// something to keep shrinking.
 const MIN_CTX_SIZE_FOR_RETRY: u32 = 16384;
 
-/// First retry value when `ctx_size` is `None` (nothing to halve). Kept
-/// well above `MIN_CTX_SIZE_FOR_RETRY` so there's still room to shrink.
-const STARTING_CTX_SIZE_FOR_UNBOUNDED_RETRY: u32 = 65536;
-
 /// Next `--ctx-size` to retry an OOM'd load with, or `None` if shrinking
 /// further wouldn't help (at/under the floor already).
-fn next_ctx_size_after_oom(current: Option<u32>) -> Option<u32> {
-    match current {
-        None => Some(STARTING_CTX_SIZE_FOR_UNBOUNDED_RETRY),
-        Some(n) => {
-            let next = (n / 2).max(MIN_CTX_SIZE_FOR_RETRY);
-            // `next < n`, not just `!=`: below the floor, halving+max
-            // would otherwise suggest a *larger* ctx-size, backwards
-            // after an OOM.
-            (next < n).then_some(next)
-        }
-    }
+fn next_ctx_size_after_oom(current: u32) -> Option<u32> {
+    let next = (current / 2).max(MIN_CTX_SIZE_FOR_RETRY);
+    // `next < current`, not `!=`: below the floor, halving+max would
+    // otherwise suggest a *larger* ctx-size after an OOM.
+    (next < current).then_some(next)
 }
 
 /// True if `detail` (a failed load's stderr tail, or an error message)
@@ -3603,6 +3590,15 @@ async fn ensure_model(
         embedding_ctx.is_some(),
     );
     let mut split_mode = state.0.split_mode;
+    // A `None` ctx_size has nothing to scale — an unscaled --parallel
+    // would divide the trained context across slots. Decided once so the
+    // retries below can't start multiplying by it partway through.
+    let num_parallel = effective_num_parallel(ctx_size, state.0.num_parallel);
+    if state.0.num_parallel.is_some() && num_parallel.is_none() {
+        eprintln!(
+            "[llmman] {model_ref}: no explicit ctx-size to scale, ignoring LLMMAN_NUM_PARALLEL for this load"
+        );
+    }
     let mut shrink_attempts = 0u32;
     let mut evicted_others = false;
     let mut split_mode_relaxed = false;
@@ -3610,16 +3606,6 @@ async fn ensure_model(
     let mut port = find_free_port()?;
     loop {
         eprintln!("[llmman] loading {model_ref} on port {port}");
-        // A `None` ctx_size has nothing to scale — an unscaled --parallel
-        // would silently divide the trained context across slots, exactly
-        // what scaling exists to prevent. Fall back to llama-server's own
-        // single-slot default instead.
-        let num_parallel = effective_num_parallel(ctx_size, state.0.num_parallel);
-        if state.0.num_parallel.is_some() && num_parallel.is_none() {
-            eprintln!(
-                "[llmman] {model_ref}: no explicit ctx-size to scale, ignoring LLMMAN_NUM_PARALLEL for this load"
-            );
-        }
         // See backend_ctx_size's doc comment — the value actually
         // forwarded as --ctx-size, scaled up for num_parallel.
         let scaled_ctx_size = backend_ctx_size(ctx_size, num_parallel);
@@ -3731,7 +3717,7 @@ async fn ensure_model(
                 let can_shrink =
                     !state.0.ctx_size_explicit && shrink_attempts < MAX_CTX_SHRINK_ATTEMPTS;
                 let Some(next) = can_shrink
-                    .then(|| next_ctx_size_after_oom(ctx_size))
+                    .then(|| ctx_size.and_then(next_ctx_size_after_oom))
                     .flatten()
                 else {
                     return Err(e.into());
@@ -10914,37 +10900,27 @@ mod tests {
 
     #[test]
     fn next_ctx_size_after_oom_halves_from_the_default_down_to_the_floor() {
-        assert_eq!(
-            next_ctx_size_after_oom(Some(DEFAULT_CTX_SIZE)),
-            Some(131072)
-        );
-        assert_eq!(next_ctx_size_after_oom(Some(131072)), Some(65536));
-        assert_eq!(next_ctx_size_after_oom(Some(65536)), Some(32768));
-        assert_eq!(next_ctx_size_after_oom(Some(32768)), Some(16384));
+        assert_eq!(next_ctx_size_after_oom(DEFAULT_CTX_SIZE), Some(131072));
+        assert_eq!(next_ctx_size_after_oom(131072), Some(65536));
+        assert_eq!(next_ctx_size_after_oom(65536), Some(32768));
+        assert_eq!(next_ctx_size_after_oom(32768), Some(16384));
         // At (or below) the floor, no further shrink is offered.
-        assert_eq!(next_ctx_size_after_oom(Some(16384)), None);
-        assert_eq!(next_ctx_size_after_oom(Some(8192)), None);
+        assert_eq!(next_ctx_size_after_oom(16384), None);
+        assert_eq!(next_ctx_size_after_oom(8192), None);
     }
 
     #[test]
     fn default_ctx_size_reaches_the_floor_within_the_shrink_budget() {
         // 262144 -> 131072 -> 65536 -> 32768 -> 16384: exactly
         // MAX_CTX_SHRINK_ATTEMPTS halvings, so the floor is reachable.
-        let mut ctx = Some(DEFAULT_CTX_SIZE);
+        let mut ctx = DEFAULT_CTX_SIZE;
         let mut attempts = 0;
         while let Some(next) = next_ctx_size_after_oom(ctx) {
-            ctx = Some(next);
+            ctx = next;
             attempts += 1;
         }
-        assert_eq!(ctx, Some(MIN_CTX_SIZE_FOR_RETRY));
+        assert_eq!(ctx, MIN_CTX_SIZE_FOR_RETRY);
         assert!(attempts <= MAX_CTX_SHRINK_ATTEMPTS);
-    }
-
-    #[test]
-    fn next_ctx_size_after_oom_starts_an_unbounded_ctx_size_at_an_explicit_ceiling() {
-        // ctx_size: None has nothing to halve, so the first retry pins
-        // an explicit starting point instead.
-        assert_eq!(next_ctx_size_after_oom(None), Some(65536));
     }
 
     #[test]
