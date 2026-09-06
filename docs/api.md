@@ -60,7 +60,9 @@ streaming SSE and function-tool-call re-mapping. For a local model this
 is a plain pass-through to `llama-server`'s own native `/v1/responses`
 support, so a recent enough `llama-server` build is required for it to
 work. For a [provider](providers.md) without the route, the daemon
-translates to and from `/v1/chat/completions` itself.
+translates to and from `/v1/chat/completions` itself, and for a provider
+that speaks the Anthropic Messages API from there to `/v1/messages` (see
+[wire formats](providers.md#wire-formats)).
 
 `/v1/audio/transcriptions` is likewise a pass-through. The model needs
 audio support (an `--mmproj` projector, supplied when the model image

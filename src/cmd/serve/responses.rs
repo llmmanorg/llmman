@@ -3,8 +3,10 @@
 //! Codex speaks only `/v1/responses` (`wire_api = "responses"` is the only
 //! value it accepts). llama-server, `openai`, `groq` and `openrouter`
 //! implement it; most OpenAI-compatible providers stop at
-//! `/v1/chat/completions` — `anthropic` 404s the route, `opencode` 500s it
-//! for every non-OpenAI model — so the daemon bridges the two.
+//! `/v1/chat/completions` (`mistral` 404s the route, `opencode` 500s it
+//! for every non-OpenAI model), so the daemon bridges the two. An
+//! Anthropic-wire provider has no Responses route and is bridged without
+//! being asked (see the `anthropic` sibling module).
 //!
 //! A port of Ollama's `openai/responses.go` (`FromResponsesRequest`,
 //! `ResponsesStreamConverter`), speaking chat completions to a provider

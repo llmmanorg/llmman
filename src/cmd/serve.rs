@@ -28,11 +28,12 @@ use tokio::time::{sleep, Duration, Instant};
 use crate::default_store;
 use crate::metrics::{self, UnloadReason};
 use crate::modelpack::{resolve_model, ModelPath};
-use crate::providers::PLACEHOLDER_API_KEY;
+use crate::providers::{Wire, PLACEHOLDER_API_KEY};
 use crate::storage::OciStore;
 use crate::webui;
 
 mod aggregation;
+mod anthropic;
 mod responses;
 
 // ---------------------------------------------------------------------------
@@ -3184,7 +3185,7 @@ enum Target {
     /// Another `llmman serve`, by origin; speaks our dialect, so not
     /// `is_remote`.
     Peer(String),
-    /// A remote provider's OpenAI-compatible API.
+    /// A remote provider's API, in whichever [`Wire`] it speaks.
     Remote(Arc<RemoteTarget>),
 }
 
@@ -3197,14 +3198,20 @@ enum Target {
 struct RemoteTarget {
     /// models.dev provider id, for diagnostics.
     provider: String,
-    /// OpenAI-compatible base URL, without a trailing slash.
+    /// Base URL the wire's route is appended to, without a trailing slash.
     base_url: String,
+    /// What is spoken at `base_url`: route, credential header, and
+    /// whether a chat completion is translated (see `anthropic`).
+    wire: Wire,
     /// The model id as the *provider* knows it — i.e. the incoming
     /// reference with its [`crate::providers::REMOTE_PREFIX`] and
     /// provider segment stripped back off.
     model: String,
-    /// Bearer token for this request. See [`resolve_remote_target`] for
-    /// where it comes from.
+    /// The catalog's output ceiling, for a wire that requires
+    /// `max_tokens` (see [`anthropic::DEFAULT_MAX_TOKENS`]).
+    max_output: Option<u32>,
+    /// API key for this request. See [`resolve_remote_target`] for where
+    /// it comes from.
     api_key: String,
 }
 
@@ -3213,6 +3220,7 @@ impl std::fmt::Debug for RemoteTarget {
         f.debug_struct("RemoteTarget")
             .field("provider", &self.provider)
             .field("base_url", &self.base_url)
+            .field("wire", &self.wire)
             .field("model", &self.model)
             .field("api_key", &"<redacted>")
             .finish()
@@ -3235,7 +3243,8 @@ impl Target {
     }
 
     /// Attaches this target's credentials to an outgoing request, or for
-    /// a peer the hop marker.
+    /// a peer the hop marker: `Authorization: Bearer` for OpenAI,
+    /// `x-api-key` plus the API version for Anthropic.
     ///
     /// A no-op for [`Target::Local`]: a loopback `llama-server` has no
     /// auth, which is why nothing below ever forwarded the client's own
@@ -3245,12 +3254,31 @@ impl Target {
         match self {
             Self::Local(_) => req,
             Self::Peer(_) => req.header(aggregation::HOP, "1"),
-            Self::Remote(remote) => req.bearer_auth(&remote.api_key),
+            Self::Remote(remote) => match remote.wire {
+                Wire::OpenAi => req.bearer_auth(&remote.api_key),
+                Wire::Anthropic => req
+                    .header("x-api-key", &remote.api_key)
+                    .header("anthropic-version", anthropic::VERSION),
+            },
         }
     }
 
     fn is_remote(&self) -> bool {
         matches!(self, Self::Remote(_))
+    }
+
+    /// The wire a remote target speaks; `None` for a local backend or a
+    /// peer, which speak llmman's own OpenAI dialect.
+    fn wire(&self) -> Option<Wire> {
+        match self {
+            Self::Remote(remote) => Some(remote.wire),
+            _ => None,
+        }
+    }
+
+    /// Whether a chat completion here is translated to the Messages API.
+    fn is_anthropic(&self) -> bool {
+        self.wire() == Some(Wire::Anthropic)
     }
 
     /// Names this target for an error message. "inference backend" is
@@ -3270,7 +3298,9 @@ impl Target {
 /// The one route every typed request in this daemon is sent to: the
 /// Ollama and Anthropic surfaces are both translated into an OpenAI chat
 /// completion first (see `stream_ollama` / `handle_anthropic_messages`),
-/// so `post_chat` never needs any other.
+/// so `post_chat` never needs any other. A [`Wire::Anthropic`] target
+/// gets that completion translated once more in [`send_chat_completion`],
+/// the only place the wire is consulted for generation.
 const CHAT_COMPLETIONS_ROUTE: &str = "/v1/chat/completions";
 
 /// Extracts the caller's own API key from a request, in either spelling
@@ -3411,14 +3441,23 @@ async fn resolve_remote_target(
     let target = RemoteTarget {
         provider: provider_id,
         base_url: provider.base_url.clone(),
+        wire: provider.wire,
+        max_output: provider
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.max_output),
         model,
         api_key,
     };
     // No key on this line: it is the one piece of a remote target that
     // must never reach a log file.
     eprintln!(
-        "[llmman] routing {} to provider {} ({})",
-        target.model, target.provider, target.base_url
+        "[llmman] routing {} to provider {} ({}, {} wire)",
+        target.model,
+        target.provider,
+        target.base_url,
+        target.wire.as_str()
     );
     Ok(Some(Target::Remote(Arc::new(target))))
 }
@@ -4141,9 +4180,12 @@ fn set_response_model(value: &mut serde_json::Value, canonical_model: &str) {
         value["model"] = serde_json::Value::String(canonical_model.to_string());
     }
     // A Responses API event nests it: `response.created`'s `response`.
-    if let Some(response) = value.get_mut("response") {
-        if response.get("model").is_some() {
-            response["model"] = serde_json::Value::String(canonical_model.to_string());
+    // So does a Messages API stream: `message_start`'s `message`.
+    for key in ["response", "message"] {
+        if let Some(nested) = value.get_mut(key) {
+            if nested.get("model").is_some() {
+                nested["model"] = serde_json::Value::String(canonical_model.to_string());
+            }
         }
     }
 }
@@ -4299,11 +4341,12 @@ fn relay_stream_rewriting_model(
     canonical_model: String,
 ) -> Response {
     let status = resp.status();
-    // Only content-type is meaningful to forward for a stream the
-    // caller is about to reconstruct line by line — content-length
-    // (absent anyway for a real chunked/streamed response) would be
-    // stale the same way proxy_rewriting_model's is, if present.
-    let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE).cloned();
+    // Every header but the ones describing a body about to be rewritten
+    // line by line: a provider's `request-id`, rate limits and
+    // `Retry-After` matter to the client.
+    let mut resp_headers = resp.headers().clone();
+    resp_headers.remove(reqwest::header::CONTENT_LENGTH);
+    resp_headers.remove(reqwest::header::TRANSFER_ENCODING);
 
     let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
         // See `proxy`'s own comment on this same pattern.
@@ -4316,8 +4359,8 @@ fn relay_stream_rewriting_model(
     });
 
     let mut builder = Response::builder().status(status.as_u16());
-    if let Some(ct) = content_type {
-        builder = builder.header(reqwest::header::CONTENT_TYPE, ct);
+    for (k, v) in &resp_headers {
+        builder = builder.header(k, v);
     }
     builder.body(Body::from_stream(stream)).unwrap()
 }
@@ -4417,8 +4460,183 @@ fn repeat_penalty_applies(target: &Target) -> bool {
     !target.is_remote()
 }
 
-/// POSTs oai_req to url and returns the still-streaming response, converting
-/// a non-2xx status into an AppError carrying the backend's error body.
+/// A chat completion's body from any target: OpenAI-shaped bytes,
+/// whatever the provider spoke.
+type ChatBody = futures::stream::BoxStream<'static, reqwest::Result<Bytes>>;
+
+/// A chat completion's answer from upstream, before anything reads it.
+/// Always OpenAI-shaped: a [`Wire::Anthropic`] reply has already been
+/// translated (see [`send_chat_completion`]), so every consumer reads
+/// one dialect.
+struct ChatUpstream {
+    status: StatusCode,
+    /// The provider's response headers (`request-id`, rate limits,
+    /// `Retry-After`), minus any describing a body since replaced.
+    headers: HeaderMap,
+    body: ChatBody,
+}
+
+impl ChatUpstream {
+    /// Wraps a provider's answer unchanged.
+    fn relay(resp: reqwest::Response) -> Self {
+        Self {
+            status: resp.status(),
+            headers: resp.headers().clone(),
+            body: resp.bytes_stream().boxed(),
+        }
+    }
+
+    /// The provider's headers with a translated body of `content_type`
+    /// in place of the one they described.
+    fn translated(resp: &reqwest::Response, content_type: &'static str) -> HeaderMap {
+        let mut headers = resp.headers().clone();
+        headers.remove(reqwest::header::CONTENT_LENGTH);
+        headers.remove(reqwest::header::TRANSFER_ENCODING);
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static(content_type),
+        );
+        headers
+    }
+
+    /// Reads the whole body; a read error ends it early.
+    async fn text(self) -> String {
+        String::from_utf8_lossy(&collect_body(self.body).await).into_owned()
+    }
+}
+
+/// Everything a body stream yields until it ends or fails.
+async fn collect_body(mut body: ChatBody) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(Ok(chunk)) = body.next().await {
+        out.extend_from_slice(&chunk);
+    }
+    out
+}
+
+/// POSTs one OpenAI chat-completion request to `target` in the wire it
+/// speaks and returns the answer OpenAI-shaped.
+///
+/// An OpenAI target, local backend or peer gets `req` as-is on
+/// [`CHAT_COMPLETIONS_ROUTE`]. An Anthropic target gets it translated by
+/// [`anthropic::from_chat_request`] onto [`anthropic::MESSAGES_ROUTE`]
+/// and the reply translated back by [`anthropic::StreamConverter`]:
+/// streamed when the caller streams, folded into one object otherwise.
+/// `response_model` is the name that translation echoes back.
+///
+/// A non-2xx is returned as-is so a caller can relay the provider's own
+/// error. Only a request the Messages API cannot carry fails here (400).
+async fn send_chat_completion<T: Serialize + ?Sized>(
+    client: &Client,
+    target: &Target,
+    req: &T,
+    response_model: &str,
+) -> Result<ChatUpstream, AppError> {
+    if !target.is_anthropic() {
+        let resp = target
+            .authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)).json(req))
+            .send()
+            .await
+            .with_context(|| format!("send to {}", target.describe()))?;
+        return Ok(ChatUpstream::relay(resp));
+    }
+
+    let req = serde_json::to_value(req).context("serialize chat request")?;
+    let streaming = req
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let default_max_tokens = match target {
+        Target::Remote(remote) => remote.max_output,
+        _ => None,
+    }
+    .unwrap_or(anthropic::DEFAULT_MAX_TOKENS);
+    let messages_req = anthropic::from_chat_request(&req, default_max_tokens)
+        .map_err(|e| AppError(e, StatusCode::BAD_REQUEST))?;
+    let mut upstream = target.authorize(client.post(target.url(anthropic::MESSAGES_ROUTE)));
+    if anthropic::thinks(&messages_req) {
+        upstream = upstream.header("anthropic-beta", anthropic::INTERLEAVED_THINKING_BETA);
+    }
+    let resp = upstream
+        .json(&messages_req)
+        .send()
+        .await
+        .with_context(|| format!("send to {}", target.describe()))?;
+    if !resp.status().is_success() {
+        return Ok(ChatUpstream::relay(resp));
+    }
+
+    let mut converter =
+        anthropic::StreamConverter::new(response_model).json_tool(anthropic::json_tool_name(&req));
+    if !streaming {
+        let headers = ChatUpstream::translated(&resp, "application/json");
+        let lines: Vec<String> = bytes_to_lines(resp.bytes_stream()).collect().await;
+        for line in &lines {
+            converter.line(line);
+        }
+        converter.finish();
+        // A 200 whose stream errored or ended early is a gateway failure,
+        // not a truncated success.
+        let (status, body) = match converter.error() {
+            Some(error) => (
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({ "error": error }),
+            ),
+            None if !converter.finished() => (
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({ "error": {
+                    "message": format!("{} closed the stream before finishing", target.describe()),
+                    "type": "server_error",
+                } }),
+            ),
+            None => (StatusCode::OK, converter.completion()),
+        };
+        let body = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
+        return Ok(ChatUpstream {
+            status,
+            headers,
+            body: futures::stream::once(futures::future::ready(Ok(body))).boxed(),
+        });
+    }
+
+    // A trailing `None` lets the converter close a stream the provider
+    // ended without `message_stop`.
+    let headers = ChatUpstream::translated(&resp, "text/event-stream");
+    let body = bytes_to_lines(resp.bytes_stream())
+        .map(Some)
+        .chain(futures::stream::once(futures::future::ready(None)))
+        .map(move |line| {
+            let out = match line {
+                Some(line) => converter.line(&line),
+                None => converter.finish(),
+            };
+            Ok(Bytes::from(out))
+        })
+        .boxed();
+    Ok(ChatUpstream {
+        status: StatusCode::OK,
+        headers,
+        body,
+    })
+}
+
+/// [`relay`] for a [`ChatUpstream`]: `activity` lives until the whole
+/// body has been relayed (see `ActivityGuard`).
+fn relay_chat_upstream(upstream: ChatUpstream, activity: ActivityGuard) -> Response {
+    let stream = upstream.body.map(move |item| {
+        let _activity = &activity;
+        item.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    });
+    let mut builder = Response::builder().status(upstream.status.as_u16());
+    for (k, v) in &upstream.headers {
+        builder = builder.header(k, v);
+    }
+    builder.body(Body::from_stream(stream)).unwrap()
+}
+
+/// POSTs oai_req to url and returns the still-streaming, OpenAI-shaped
+/// body, converting a non-2xx status into an AppError carrying the
+/// backend's error body.
 /// The *only* function that actually sends an `OAIChatRequest` to
 /// llama-server — every caller (`collect_completion`, `stream_ollama`,
 /// `stream_anthropic`, and `handle_anthropic_messages`'s non-streaming
@@ -4429,24 +4647,17 @@ async fn post_chat(
     client: &Client,
     target: &Target,
     oai_req: &mut OAIChatRequest,
-) -> Result<reqwest::Response, AppError> {
+) -> Result<ChatBody, AppError> {
     if repeat_penalty_applies(target) {
         apply_default_repeat_penalty_typed(oai_req);
     } else {
         oai_req.repeat_penalty = None;
     }
-    let resp = target
-        .authorize(
-            client
-                .post(target.url(CHAT_COMPLETIONS_ROUTE))
-                .json(oai_req),
-        )
-        .send()
-        .await
-        .with_context(|| format!("send to {}", target.describe()))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+    // Typed callers build their own chunks and never read the model.
+    let upstream = send_chat_completion(client, target, &*oai_req, &oai_req.model).await?;
+    if !upstream.status.is_success() {
+        let status = upstream.status;
+        let body = upstream.text().await;
         let message = format!("{} {status}: {body}", target.describe());
         // Same message either way; the marker lets a hybrid pair retry
         // on its hosted half (see send_with_hybrid_fallback).
@@ -4462,7 +4673,7 @@ async fn post_chat(
         // keeps the blanket 500 it always returned.
         return Err(AppError(error, remote_status(target, status)));
     }
-    Ok(resp)
+    Ok(upstream.body)
 }
 
 /// A local backend's refusal of a request as larger than its context,
@@ -4790,7 +5001,7 @@ async fn stream_ollama<T: Serialize + Send + 'static>(
         let _activity = activity;
         let decoder = OllamaLineDecoder::new();
         let mut fold = OllamaFold::default();
-        let mut lines = Box::pin(bytes_to_lines(resp.bytes_stream()));
+        let mut lines = Box::pin(bytes_to_lines(resp));
         while let Some(line) = lines.next().await {
             if let Some(delta) = decoder.decode(&line) {
                 fold.push(delta);
@@ -4817,7 +5028,7 @@ async fn stream_ollama<T: Serialize + Send + 'static>(
     }
 
     let decoder = OllamaLineDecoder::new();
-    let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
+    let stream = bytes_to_lines(resp).map(move |line| {
         // Moved into this closure purely to keep it alive — see
         // ActivityGuard's doc comment — until the stream itself is
         // dropped, not referenced otherwise.
@@ -4880,7 +5091,7 @@ async fn stream_anthropic(
             Bytes::from(preamble),
         )));
 
-    let sse_stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
+    let sse_stream = bytes_to_lines(resp).map(move |line| {
         let out = if let Some(payload) = line.strip_prefix("data: ") {
             if payload == "[DONE]" {
                 let msg_delta = serde_json::json!({
@@ -5070,6 +5281,9 @@ struct ProviderSummary {
     name: String,
     base_url: String,
     key_env: String,
+    /// What is spoken at `base_url`: `openai` or `anthropic` (see
+    /// [`crate::providers::Wire`]).
+    wire: &'static str,
     /// Whether *this daemon's* environment holds `key_env`.
     key_set: bool,
     /// Whether it would actually spend it for a request that presents no
@@ -5088,6 +5302,7 @@ impl From<&crate::providers::Provider> for ProviderSummary {
             name: p.name.clone(),
             base_url: p.base_url.clone(),
             key_env: p.key_env.clone(),
+            wire: p.wire.as_str(),
             key_set: p.api_key().is_some(),
             key_usable: daemon_key_usable(p),
             models: p.models.len(),
@@ -5115,6 +5330,8 @@ struct ProviderResponse {
     name: String,
     base_url: String,
     key_env: String,
+    /// See [`ProviderSummary::wire`].
+    wire: &'static str,
     key_set: bool,
     /// See [`ProviderSummary::key_usable`].
     key_usable: bool,
@@ -5146,6 +5363,7 @@ impl From<&crate::providers::Provider> for ProviderResponse {
             name: p.name.clone(),
             base_url: p.base_url.clone(),
             key_env: p.key_env.clone(),
+            wire: p.wire.as_str(),
             key_set: p.api_key().is_some(),
             key_usable: daemon_key_usable(p),
             models: p
@@ -6358,6 +6576,9 @@ async fn embed_via_backend(
     if !target.is_remote() && would_use_mlx(state, &model).await.is_some() {
         return Err(mlx_unsupported(&model));
     }
+    if let Some(refusal) = wire_refusal(&target, "/v1/embeddings") {
+        return Err(AppError::status(StatusCode::NOT_IMPLEMENTED, refusal));
+    }
     let keep_alive = resolve_keep_alive(keep_alive);
     if inputs.is_empty() {
         refresh_activity(guard, keep_alive).await;
@@ -6823,6 +7044,10 @@ async fn proxy_openai_generation_to(
 ) -> Result<Response, AppError> {
     let (mut req, target, activity, response_model_override) =
         prepare_openai_request(state, req, model, target, guard).await?;
+    if let Some(refusal) = unsupported_on_wire(&target, llama_path) {
+        drop(activity);
+        return Ok(refusal);
+    }
     if llama_path == RESPONSES_ROUTE && target.is_remote() {
         // See repeat_penalty_applies: a strict provider 400s on it.
         if let Some(req) = req.as_object_mut() {
@@ -6832,6 +7057,16 @@ async fn proxy_openai_generation_to(
         let canonical = response_model_override
             .unwrap_or_else(|| req["model"].as_str().unwrap_or_default().to_string());
         return remote_responses(&state.0.client, &target, headers, req, activity, canonical).await;
+    }
+    if llama_path == CHAT_COMPLETIONS_ROUTE && target.is_anthropic() {
+        if let Some(req) = req.as_object_mut() {
+            req.remove("repeat_penalty");
+        }
+        let canonical = response_model_override
+            .unwrap_or_else(|| req["model"].as_str().unwrap_or_default().to_string());
+        // The translated reply already names the canonical model.
+        let upstream = send_chat_completion(&state.0.client, &target, &req, &canonical).await?;
+        return Ok(relay_chat_upstream(upstream, activity));
     }
     if is_responses_route(llama_path) && !target.is_remote() {
         sanitize_responses_request(&mut req);
@@ -6941,6 +7176,10 @@ async fn proxy_openai_passthrough(
     }
     let (mut req, target, activity, response_model_override) =
         resolve_openai_request(state, headers, body).await?;
+    if let Some(refusal) = unsupported_on_wire(&target, llama_path) {
+        drop(activity);
+        return Ok(refusal);
+    }
     if is_responses_route(llama_path) && !target.is_remote() {
         sanitize_responses_request(&mut req);
     }
@@ -7173,53 +7412,49 @@ async fn remote_responses(
     canonical_model: String,
 ) -> Result<Response, AppError> {
     let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
-    let mut native = target.authorize(client.post(target.url(RESPONSES_ROUTE)).body(body));
-    if let Some(ct) = headers.get("content-type") {
-        native = native.header("content-type", ct);
+    // The Messages API has no Responses route; skip the 404 round trip.
+    if !target.is_anthropic() {
+        let body =
+            Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
+        let mut native = target.authorize(client.post(target.url(RESPONSES_ROUTE)).body(body));
+        if let Some(ct) = headers.get("content-type") {
+            native = native.header("content-type", ct);
+        }
+        let resp = native
+            .send()
+            .await
+            .with_context(|| format!("proxy request to {}", target.describe()))?;
+        let status = resp.status();
+        if status.is_success() {
+            return if streaming {
+                Ok(relay_stream_rewriting_model(
+                    resp,
+                    activity,
+                    canonical_model,
+                ))
+            } else {
+                relay_rewriting_model(resp, activity, &canonical_model).await
+            };
+        }
+        if !responses::falls_back(status) {
+            return Ok(relay(resp, activity));
+        }
+        eprintln!(
+            "[llmman] {} answered {RESPONSES_ROUTE} with {status}; retrying as a chat completion",
+            target.describe()
+        );
     }
-    let resp = native
-        .send()
-        .await
-        .with_context(|| format!("proxy request to {}", target.describe()))?;
-    let status = resp.status();
-    if status.is_success() {
-        return if streaming {
-            Ok(relay_stream_rewriting_model(
-                resp,
-                activity,
-                canonical_model,
-            ))
-        } else {
-            relay_rewriting_model(resp, activity, &canonical_model).await
-        };
-    }
-    if !responses::falls_back(status) {
-        return Ok(relay(resp, activity));
-    }
-    eprintln!(
-        "[llmman] {} answered {RESPONSES_ROUTE} with {status}; retrying as a chat completion",
-        target.describe()
-    );
 
     let chat_req = responses::from_responses_request(&req)
         .map_err(|e| AppError(e, StatusCode::BAD_REQUEST))?;
-    let resp = target
-        .authorize(
-            client
-                .post(target.url(CHAT_COMPLETIONS_ROUTE))
-                .json(&chat_req),
-        )
-        .send()
-        .await
-        .with_context(|| format!("send to {}", target.describe()))?;
-    let status = resp.status();
+    let upstream = send_chat_completion(client, target, &chat_req, &canonical_model).await?;
+    let status = upstream.status;
     if status.is_client_error() {
         // The provider's own error object, intact for a client that reads it.
-        return Ok(relay(resp, activity));
+        return Ok(relay_chat_upstream(upstream, activity));
     }
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = upstream.text().await;
         return Err(AppError(
             anyhow!("{} {status}: {body}", target.describe()),
             remote_status(target, status),
@@ -7228,7 +7463,7 @@ async fn remote_responses(
 
     let mut converter = responses::StreamConverter::new(&canonical_model, &req);
     if !streaming {
-        let lines: Vec<String> = bytes_to_lines(resp.bytes_stream()).collect().await;
+        let lines: Vec<String> = bytes_to_lines(upstream.body).collect().await;
         drop(activity);
         let response = converter.fold(lines);
         let status = if converter.failed() {
@@ -7241,7 +7476,7 @@ async fn remote_responses(
 
     // A trailing `None` lets the converter close a stream the provider
     // ended without `[DONE]`.
-    let sse_stream = bytes_to_lines(resp.bytes_stream())
+    let sse_stream = bytes_to_lines(upstream.body)
         .map(Some)
         .chain(futures::stream::once(futures::future::ready(None)))
         .map(move |line| {
@@ -7288,15 +7523,41 @@ fn is_responses_route(llama_path: &str) -> bool {
     llama_path.starts_with("/v1/responses")
 }
 
+/// Routes the Messages API has no equivalent of (legacy completions,
+/// embeddings, Responses token counting), refused with a 501 instead of
+/// a round trip that could only 404.
+fn unsupported_on_wire(target: &Target, route: &str) -> Option<Response> {
+    let message = wire_refusal(target, route)?;
+    let body = serde_json::json!({
+        "error": { "message": message, "type": "invalid_request_error" }
+    });
+    Some((StatusCode::NOT_IMPLEMENTED, Json(body)).into_response())
+}
+
+/// The message behind [`unsupported_on_wire`], for the Ollama embedding
+/// routes.
+fn wire_refusal(target: &Target, route: &str) -> Option<String> {
+    let Target::Remote(remote) = target else {
+        return None;
+    };
+    if remote.wire != Wire::Anthropic || matches!(route, CHAT_COMPLETIONS_ROUTE | RESPONSES_ROUTE) {
+        return None;
+    }
+    Some(format!(
+        "provider {} speaks the Anthropic Messages API, which has no equivalent of {route}; \
+         only chat completions, /v1/responses and /v1/messages reach it",
+        remote.provider
+    ))
+}
+
 /// Explains a provider's bare 404 on the Responses API.
 ///
 /// Being OpenAI-wire-format does not mean implementing every OpenAI
 /// route: `openai`, `groq` and `openrouter` answer `/v1/responses*`,
-/// `anthropic` and `mistral` 404. Generation is bridged by
-/// [`remote_responses`], so this only fires for
-/// `/v1/responses/input_tokens`, which has no chat-completions
-/// equivalent. It reports the 404 actually received rather than
-/// predicting one from a list that would go stale.
+/// `mistral` 404s. Generation is bridged by [`remote_responses`], so
+/// this only fires for `/v1/responses/input_tokens`, which has no
+/// chat-completions equivalent. It reports the 404 actually received
+/// rather than predicting one from a list that would go stale.
 fn explain_missing_route(target: &Target, route: &str, resp: Response) -> Response {
     if resp.status() != StatusCode::NOT_FOUND || !is_responses_route(route) {
         return resp;
@@ -7460,29 +7721,40 @@ fn build_anthropic_messages(req: &AnthropicRequest) -> Vec<OAIMessage> {
     messages
 }
 
+/// The Anthropic Messages surface. The body is kept raw until the target
+/// is known: a [`Wire::Anthropic`] provider gets it relayed as sent (see
+/// [`relay_anthropic_messages`]); anything else gets the
+/// [`AnthropicRequest`] subset translated into a chat completion.
 async fn handle_anthropic_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<AnthropicRequest>,
+    body: Bytes,
 ) -> Result<Response, AppError> {
+    let raw: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        AppError(
+            anyhow!("parse Anthropic request: {e}"),
+            StatusCode::BAD_REQUEST,
+        )
+    })?;
+    let model_ref = raw["model"].as_str().unwrap_or("").to_string();
     // No `request_threads`: the Anthropic Messages API has no Ollama
     // options blob, so there is no num_thread to forward.
-    let model_ref = req.model.clone();
     send_with_hybrid_fallback(
         &state,
         &model_ref,
         Some(&headers),
         None,
-        |model, target, guard| anthropic_messages_to(&state, &req, model, target, guard),
+        |model, target, guard| anthropic_messages_to(&state, &headers, &raw, model, target, guard),
     )
     .await
 }
 
 /// [`handle_anthropic_messages`] against one resolved target. The
-/// response echoes `req.model` back, unchanged from before.
+/// response echoes the client's own `model` back, unchanged from before.
 async fn anthropic_messages_to(
     state: &AppState,
-    req: &AnthropicRequest,
+    headers: &HeaderMap,
+    raw: &serde_json::Value,
     canonical_model: String,
     target: Target,
     guard: ActivityGuard,
@@ -7492,12 +7764,32 @@ async fn anthropic_messages_to(
     // (see resolve_openai_request's own comment on why).
     let activity = begin_activity(guard, None).await;
 
-    let messages = build_anthropic_messages(req);
-
     // See backend_wire_model's own doc comment — usually just
     // canonical_model itself, but a different value for an Engine::Mlx
     // backend or a remote provider.
     let wire_model = backend_wire_model(state, &target, &canonical_model).await;
+
+    if target.is_anthropic() {
+        return relay_anthropic_messages(
+            &state.0.client,
+            &target,
+            headers,
+            raw,
+            &wire_model,
+            activity,
+        )
+        .await;
+    }
+
+    let req: AnthropicRequest = serde_json::from_value(raw.clone()).map_err(|e| {
+        AppError(
+            anyhow!("parse Anthropic request: {e}"),
+            StatusCode::BAD_REQUEST,
+        )
+    })?;
+    let req = &req;
+    let messages = build_anthropic_messages(req);
+
     let mut oai = OAIChatRequest {
         model: wire_model,
         messages,
@@ -7532,7 +7824,8 @@ async fn anthropic_messages_to(
         // also gets repeat_penalty defaulted instead of needing its own
         // copy of that logic.
         let resp = post_chat(&state.0.client, &target, &mut oai).await?;
-        let body: serde_json::Value = resp.json().await.context("parse llama-server response")?;
+        let body: serde_json::Value = serde_json::from_slice(&collect_body(resp).await)
+            .context("parse llama-server response")?;
         let content = body["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("")
@@ -7549,6 +7842,49 @@ async fn anthropic_messages_to(
         }))
         .into_response())
     }
+}
+
+/// Headers a `/v1/messages` caller sets for the provider: opt-in
+/// features and the API version it wrote against. Its credential is not
+/// among them (see `Target::authorize`).
+const ANTHROPIC_PASSTHROUGH_HEADERS: [&str; 2] = ["anthropic-beta", "anthropic-version"];
+
+/// `/v1/messages` to a provider that speaks it: relayed as sent, with
+/// only `model` rewritten out and back. Claude Code's cache breakpoints,
+/// thinking, betas and tools, which the typed [`AnthropicRequest`]
+/// translation drops for llama-server, reach a provider intact.
+async fn relay_anthropic_messages(
+    client: &Client,
+    target: &Target,
+    headers: &HeaderMap,
+    raw: &serde_json::Value,
+    wire_model: &str,
+    activity: ActivityGuard,
+) -> Result<Response, AppError> {
+    let client_model = raw["model"].as_str().unwrap_or_default().to_string();
+    let streaming = raw["stream"].as_bool().unwrap_or(false);
+    let mut body = raw.clone();
+    body["model"] = serde_json::Value::String(wire_model.to_string());
+
+    // `headers()` replaces the `authorize` default; `header()` would
+    // append a second `anthropic-version`.
+    let mut passthrough = HeaderMap::new();
+    for name in ANTHROPIC_PASSTHROUGH_HEADERS {
+        if let Some(value) = headers.get(name) {
+            passthrough.insert(name, value.clone());
+        }
+    }
+    let resp = target
+        .authorize(client.post(target.url(anthropic::MESSAGES_ROUTE)))
+        .headers(passthrough)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("proxy request to {}", target.describe()))?;
+    if streaming {
+        return Ok(relay_stream_rewriting_model(resp, activity, client_model));
+    }
+    relay_rewriting_model(resp, activity, &client_model).await
 }
 
 // ---------------------------------------------------------------------------
@@ -8320,10 +8656,16 @@ mod tests {
     // -- request targets (local backend vs remote provider) -----------------
 
     fn remote_target(base_url: &str) -> Target {
+        remote_target_on(base_url, Wire::OpenAi)
+    }
+
+    fn remote_target_on(base_url: &str, wire: Wire) -> Target {
         Target::Remote(Arc::new(RemoteTarget {
             provider: "mockprov".into(),
             base_url: base_url.into(),
+            wire,
             model: "mock-model".into(),
+            max_output: None,
             api_key: "sk-test".into(),
         }))
     }
@@ -8610,13 +8952,9 @@ mod tests {
             let (status, headers, body) = call_remote_responses(&base, true).await;
             assert_eq!(status, native);
             assert!(body.contains("\"native\""), "{native}: {body}");
-            // A failure is relayed whole; a success is re-streamed line by
-            // line with only its content-type.
-            assert_eq!(
-                headers.contains_key("x-provider"),
-                !native.is_success(),
-                "{native}"
-            );
+            // Relayed whole or re-streamed line by line, the provider's
+            // own headers reach the client either way.
+            assert!(headers.contains_key("x-provider"), "{native}");
         }
     }
 
@@ -8737,7 +9075,7 @@ mod tests {
             tools: None,
             response_format: None,
         };
-        post_chat(&Client::new(), &target, &mut req).await.unwrap();
+        let _body = post_chat(&Client::new(), &target, &mut req).await.unwrap();
 
         let (auth, body) = seen.lock().await.take().expect("provider was not called");
         assert_eq!(auth, "Bearer sk-test");
@@ -8746,6 +9084,235 @@ mod tests {
             body.get("repeat_penalty").is_none(),
             "llama.cpp-only field sent to a provider: {body}"
         );
+    }
+
+    /// A mock Messages API: records requests, answers `/v1/messages` with
+    /// `reply`, 404s everything else.
+    async fn mock_anthropic(
+        reply: &'static str,
+    ) -> (
+        String,
+        Arc<tokio::sync::Mutex<Vec<(String, HeaderMap, serde_json::Value)>>>,
+    ) {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(move |headers: HeaderMap, body: Bytes| async move {
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    captured
+                        .lock()
+                        .await
+                        .push(("/v1/messages".to_string(), headers, body));
+                    (
+                        [
+                            ("content-type", "text/event-stream"),
+                            ("request-id", "req_mock"),
+                        ],
+                        reply,
+                    )
+                }),
+            )
+            .fallback(|req: Request| async move {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("no such route: {}", req.uri().path()),
+                )
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!(
+            "http://127.0.0.1:{}/v1",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, seen)
+    }
+
+    const MOCK_MESSAGES_STREAM: &str = "event: message_start\n\
+        data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n\
+        event: content_block_start\n\
+        data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+        event: content_block_delta\n\
+        data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi there\"}}\n\n\
+        event: message_delta\n\
+        data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n\
+        event: message_stop\n\
+        data: {\"type\":\"message_stop\"}\n\n";
+
+    /// An Anthropic-wire provider gets `/v1/messages`, `x-api-key`, the
+    /// version header and a Messages body; what comes back is the
+    /// chat-completion SSE every consumer here reads.
+    #[tokio::test]
+    async fn a_typed_request_to_an_anthropic_provider_speaks_messages() {
+        let (base, seen) = mock_anthropic(MOCK_MESSAGES_STREAM).await;
+        let target = remote_target_on(&base, Wire::Anthropic);
+        let mut req = OAIChatRequest {
+            model: "mock-model".into(),
+            messages: vec![
+                OAIMessage::text("system", "be brief"),
+                OAIMessage::text("user", "hello"),
+            ],
+            stream: true,
+            repeat_penalty: Some(1.1),
+            ..Default::default()
+        };
+        let body = post_chat(&Client::new(), &target, &mut req).await.unwrap();
+        let lines: Vec<String> = bytes_to_lines(body).collect().await;
+
+        let calls = seen.lock().await;
+        let (path, headers, sent) = &calls[0];
+        assert_eq!(path, "/v1/messages");
+        assert_eq!(headers["x-api-key"], "sk-test");
+        assert_eq!(headers["anthropic-version"], anthropic::VERSION);
+        assert!(
+            headers.get("authorization").is_none(),
+            "bearer sent to Anthropic"
+        );
+        assert_eq!(sent["model"], "mock-model");
+        assert_eq!(sent["system"][0]["text"], "be brief");
+        assert_eq!(sent["messages"][0]["role"], "user");
+        assert_eq!(sent["messages"][0]["content"][0]["text"], "hello");
+        // Prompt caching on by default; no thinking, so no beta header.
+        assert_eq!(sent["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(headers.get("anthropic-beta").is_none());
+        assert_eq!(sent["max_tokens"], anthropic::DEFAULT_MAX_TOKENS);
+        assert_eq!(sent["stream"], true);
+        assert!(sent.get("repeat_penalty").is_none(), "{sent}");
+
+        // Decoded exactly as a llama-server stream would be.
+        let fold = fold_ollama_lines(lines);
+        assert_eq!(fold.content, "hi there");
+        assert!(fold.done);
+    }
+
+    /// A `stream: false` caller gets one object, folded from the stream
+    /// the provider was asked for regardless.
+    #[tokio::test]
+    async fn a_non_streaming_request_to_an_anthropic_provider_is_folded() {
+        let (base, seen) = mock_anthropic(MOCK_MESSAGES_STREAM).await;
+        let target = remote_target_on(&base, Wire::Anthropic);
+        let req = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": false
+        });
+        let upstream = send_chat_completion(
+            &Client::new(),
+            &target,
+            &req,
+            "llmman.provider/mockprov/mock-model",
+        )
+        .await
+        .unwrap();
+        assert_eq!(upstream.status, StatusCode::OK);
+        assert_eq!(upstream.headers["content-type"], "application/json");
+        assert!(upstream.headers.get("content-length").is_none());
+        // The provider's own headers survive translation.
+        assert_eq!(upstream.headers["request-id"], "req_mock");
+        let body: serde_json::Value = serde_json::from_str(&upstream.text().await).unwrap();
+        assert_eq!(body["object"], "chat.completion");
+        assert_eq!(body["model"], "llmman.provider/mockprov/mock-model");
+        assert_eq!(body["choices"][0]["message"]["content"], "hi there");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["usage"]["total_tokens"], 5);
+        assert_eq!(seen.lock().await[0].2["stream"], true);
+    }
+
+    /// `/v1/messages` is relayed whole, `model` rewritten, the client's
+    /// `anthropic-beta` forwarded and its credential not.
+    #[tokio::test]
+    async fn an_inbound_messages_request_is_relayed_to_an_anthropic_provider_intact() {
+        let (base, seen) = mock_anthropic(MOCK_MESSAGES_STREAM).await;
+        let target = remote_target_on(&base, Wire::Anthropic);
+        let state = test_state();
+        let raw = serde_json::json!({
+            "model": "llmman.provider/mockprov/mock-model",
+            "max_tokens": 32,
+            "stream": true,
+            "system": [{ "type": "text", "text": "sys", "cache_control": { "type": "ephemeral" } }],
+            "messages": [{ "role": "user", "content": "hi" }],
+            "thinking": { "type": "enabled", "budget_tokens": 1024 },
+            "tools": [{ "name": "f", "input_schema": { "type": "object" } }]
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            "interleaved-thinking-2025-05-14".parse().unwrap(),
+        );
+        headers.insert("anthropic-version", "2024-01-01".parse().unwrap());
+        headers.insert("x-api-key", "the-clients-own-key".parse().unwrap());
+        let activity = begin_activity(ActivityGuard::new(&state, "m"), None).await;
+        let resp = relay_anthropic_messages(
+            &Client::new(),
+            &target,
+            &headers,
+            &raw,
+            "mock-model",
+            activity,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["request-id"], "req_mock");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        // The provider's `model` echo is rewritten back to the client's.
+        assert!(
+            body.contains("\"model\":\"llmman.provider/mockprov/mock-model\""),
+            "{body}"
+        );
+        assert!(!body.contains("claude-x"), "{body}");
+
+        let calls = seen.lock().await;
+        let (_, sent_headers, sent) = &calls[0];
+        assert_eq!(
+            sent_headers["anthropic-beta"],
+            "interleaved-thinking-2025-05-14"
+        );
+        // The client's version replaces the default: one value only.
+        let versions: Vec<_> = sent_headers.get_all("anthropic-version").iter().collect();
+        assert_eq!(versions, ["2024-01-01"]);
+        // The target's key, never the client's header relayed as-is.
+        assert_eq!(sent_headers["x-api-key"], "sk-test");
+        let mut expected = raw.clone();
+        expected["model"] = serde_json::json!("mock-model");
+        assert_eq!(*sent, expected);
+    }
+
+    /// Routes without a Messages equivalent are refused before any
+    /// request leaves; the two that reach it, and other targets, are not.
+    #[test]
+    fn routes_without_a_messages_equivalent_are_refused_up_front() {
+        let anthropic = remote_target_on("https://api.anthropic.com/v1", Wire::Anthropic);
+        for route in [
+            "/v1/completions",
+            "/v1/embeddings",
+            "/v1/responses/input_tokens",
+        ] {
+            let refusal = unsupported_on_wire(&anthropic, route)
+                .unwrap_or_else(|| panic!("{route} was not refused"));
+            assert_eq!(refusal.status(), StatusCode::NOT_IMPLEMENTED);
+        }
+        for route in [CHAT_COMPLETIONS_ROUTE, RESPONSES_ROUTE] {
+            assert!(unsupported_on_wire(&anthropic, route).is_none(), "{route}");
+        }
+        let openai = remote_target("https://api.openai.com/v1");
+        assert!(unsupported_on_wire(&openai, "/v1/embeddings").is_none());
+        assert!(unsupported_on_wire(&Target::Local(1), "/v1/embeddings").is_none());
+    }
+
+    /// `message_start` nests the model one level down.
+    #[test]
+    fn set_response_model_reaches_a_messages_stream_event() {
+        let mut event = serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-x" }
+        });
+        set_response_model(&mut event, "mine");
+        assert_eq!(event["message"]["model"], "mine");
     }
 
     // -- aggregation (peer daemons) ------------------------------------------
@@ -8839,7 +9406,7 @@ mod tests {
             model: "docker.io/ai/m:latest".into(),
             ..Default::default()
         };
-        post_chat(&Client::new(), &Target::Peer(origin), &mut req)
+        let _body = post_chat(&Client::new(), &Target::Peer(origin), &mut req)
             .await
             .unwrap();
 
@@ -9304,9 +9871,11 @@ mod tests {
                 let m = crate::hybrid::local_half(&m).to_string();
                 let target = if crate::providers::is_remote_ref(&m) {
                     Target::Remote(Arc::new(RemoteTarget {
-                        provider: "anthropic".into(),
+                        provider: "mockprov".into(),
                         base_url: "http://provider".into(),
+                        wire: Wire::OpenAi,
                         model: "claude".into(),
+                        max_output: None,
                         api_key: "k".into(),
                     }))
                 } else {
