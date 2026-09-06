@@ -10,22 +10,24 @@
 //! serves.
 //!
 //! Only a *subset* is exposed as [`Provider`]s, because `llmman serve`
-//! reaches an upstream exactly one way: an HTTPS POST of an OpenAI Chat
-//! Completions body with `Authorization: Bearer <key>` (see
-//! `Target::Remote` in `cmd::serve`). An entry is offered only if llmman
-//! can be *sure* it speaks that:
+//! reaches an upstream exactly two ways, one per [`Wire`]: an HTTPS POST
+//! of an OpenAI Chat Completions body with `Authorization: Bearer <key>`,
+//! or an HTTPS POST of an Anthropic Messages body with `x-api-key: <key>`
+//! (see `Target::Remote` in `cmd::serve`). An entry is offered only if
+//! llmman can be *sure* it speaks one of those:
 //!
-//! * its `npm` driver is one of [`OPENAI_COMPATIBLE_NPM`], as opposed to
-//!   `@ai-sdk/anthropic` (Messages wire format),
-//!   `@ai-sdk/amazon-bedrock` (SigV4 signing), `@ai-sdk/google-vertex`
-//!   (GCP credentials), and the rest;
+//! * its `npm` driver is one of [`OPENAI_COMPATIBLE_NPM`], or it is a
+//!   [`BUILTIN_ENDPOINTS`] entry vetted by hand (the one way onto the
+//!   Anthropic wire, since `@ai-sdk/anthropic` names a body format, not
+//!   an auth scheme), as opposed to `@ai-sdk/amazon-bedrock` (SigV4
+//!   signing), `@ai-sdk/google-vertex` (GCP credentials), and the rest;
 //! * it has one concrete `https` base URL. models.dev leaves `api` unset
 //!   where the SDK hardcodes the endpoint — recovered from
 //!   [`BUILTIN_ENDPOINTS`] — and templated (`${VAR}`) where it is
 //!   per-account, which llmman has nothing to interpolate from;
 //! * exactly one of its `env` entries is an API key. Multi-variable auth
 //!   (`CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_KEY`, ...) is not "one
-//!   bearer token".
+//!   API key".
 //!
 //! Everything filtered out is deliberately *absent* rather than
 //! half-supported: a provider llmman offers is one it can actually reach.
@@ -54,36 +56,58 @@ const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// fetch falls back to any cached copy, however stale.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The AI SDK driver packages that speak the OpenAI wire format — the
-/// only ones `Target::Remote`'s "POST an OpenAI body with a bearer token"
-/// can actually drive. See this module's own doc comment.
+/// The AI SDK driver packages that speak the OpenAI wire format, which
+/// [`Wire::OpenAi`] drives. See this module's own doc comment.
 const OPENAI_COMPATIBLE_NPM: &[&str] = &[
     "@ai-sdk/openai-compatible",
     "@ai-sdk/openai",
     "@openrouter/ai-sdk-provider",
 ];
 
+/// The wire format `llmman serve` speaks to a provider: the route, the
+/// credential header, and whether a request is translated on the way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wire {
+    /// OpenAI Chat Completions, `Authorization: Bearer <key>`.
+    OpenAi,
+    /// Anthropic Messages, `x-api-key: <key>` + `anthropic-version`.
+    Anthropic,
+}
+
+impl Wire {
+    /// The lowercase name the daemon's own API reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Wire::OpenAi => "openai",
+            Wire::Anthropic => "anthropic",
+        }
+    }
+}
+
 /// A provider whose endpoint models.dev leaves unset because its AI SDK
 /// package hardcodes it, plus the one `env` entry that is its API key.
 struct Builtin {
     /// models.dev provider id.
     id: &'static str,
-    /// Base URL that `/chat/completions` is appended to.
+    /// Base URL that the wire's route (`/chat/completions`, `/messages`)
+    /// is appended to.
     base_url: &'static str,
     /// The API-key variable, picked out of the provider's `env` list.
     key_env: &'static str,
+    /// What is spoken at `base_url`.
+    wire: Wire,
 }
 
 /// Endpoints for providers models.dev has no `api` for, restricted to
-/// ones with a published, stable OpenAI-compatible endpoint that was
-/// checked by hand to answer `POST /chat/completions` at the URL below.
+/// ones with a published, stable endpoint that was checked by hand to
+/// answer its wire's route at the URL below.
 ///
 /// Not a second registry: an entry here must still be present in the
 /// fetched catalog to be offered, and supplies only the one field
 /// models.dev omits. The rest (`amazon-bedrock`, `azure`,
 /// `google-vertex`, `watsonx`, ...) are left out because their auth is
-/// not a bearer token, their endpoint is per-account, or their wire
-/// format is not OpenAI's. `v0` is left out for a third reason: nothing
+/// not an API key, their endpoint is per-account, or their wire format
+/// is neither of [`Wire`]'s. `v0` is left out for a third reason: nothing
 /// answers at its documented `https://api.v0.dev/v1`, so llmman has no
 /// endpoint it can vouch for.
 const BUILTIN_ENDPOINTS: &[Builtin] = &[
@@ -91,14 +115,15 @@ const BUILTIN_ENDPOINTS: &[Builtin] = &[
         id: "openai",
         base_url: "https://api.openai.com/v1",
         key_env: "OPENAI_API_KEY",
+        wire: Wire::OpenAi,
     },
-    // Anthropic publishes an OpenAI-compatible surface on its normal API
-    // host, keyed by the same ANTHROPIC_API_KEY as a bearer token, so it
-    // is reachable without llmman speaking the Messages wire format.
+    // Its own Messages API, never the OpenAI-compatibility shim, which
+    // has no thinking, cache control or beta headers.
     Builtin {
         id: "anthropic",
         base_url: "https://api.anthropic.com/v1",
         key_env: "ANTHROPIC_API_KEY",
+        wire: Wire::Anthropic,
     },
     // Gemini's OpenAI-compatibility endpoint, not the native
     // generateContent one. GEMINI_API_KEY of the three variables
@@ -107,57 +132,68 @@ const BUILTIN_ENDPOINTS: &[Builtin] = &[
         id: "google",
         base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         key_env: "GEMINI_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "groq",
         base_url: "https://api.groq.com/openai/v1",
         key_env: "GROQ_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "mistral",
         base_url: "https://api.mistral.ai/v1",
         key_env: "MISTRAL_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "xai",
         base_url: "https://api.x.ai/v1",
         key_env: "XAI_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "cerebras",
         base_url: "https://api.cerebras.ai/v1",
         key_env: "CEREBRAS_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "togetherai",
         base_url: "https://api.together.xyz/v1",
         key_env: "TOGETHER_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "deepinfra",
         base_url: "https://api.deepinfra.com/v1/openai",
         key_env: "DEEPINFRA_API_KEY",
+        wire: Wire::OpenAi,
     },
     // No `/v1`: Perplexity serves /chat/completions off the bare host.
     Builtin {
         id: "perplexity",
         base_url: "https://api.perplexity.ai",
         key_env: "PERPLEXITY_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "cohere",
         base_url: "https://api.cohere.ai/compatibility/v1",
         key_env: "COHERE_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "venice",
         base_url: "https://api.venice.ai/api/v1",
         key_env: "VENICE_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "vercel",
         base_url: "https://ai-gateway.vercel.sh/v1",
         key_env: "AI_GATEWAY_API_KEY",
+        wire: Wire::OpenAi,
     },
 ];
 
@@ -226,11 +262,13 @@ pub struct Provider {
     pub id: String,
     /// Human-readable name, for listings and error messages.
     pub name: String,
-    /// OpenAI-compatible base URL that a route (`/chat/completions`, ...)
-    /// is appended to. Never has a trailing slash.
+    /// Base URL that the wire's route (`/chat/completions`, `/messages`,
+    /// ...) is appended to. Never has a trailing slash.
     pub base_url: String,
     /// Environment variable holding this provider's API key.
     pub key_env: String,
+    /// What is spoken at `base_url`.
+    pub wire: Wire,
     /// Models this provider serves, sorted by id. Used to validate
     /// `--model`, to suggest values, and to answer `llmman list
     /// --provider`; the id is never sent upstream verbatim.
@@ -245,6 +283,9 @@ pub struct Model {
     /// `None` where models.dev publishes no price, which is not the same
     /// as free and must not be rendered as one.
     pub cost: Option<Cost>,
+    /// models.dev's `limit.output`, the default `max_tokens` for a wire
+    /// that requires one. `None` where the catalog has none.
+    pub max_output: Option<u32>,
 }
 
 /// US dollars per million tokens — models.dev's own unit, unconverted so
@@ -534,7 +575,7 @@ struct RawProvider {
 }
 
 /// A models.dev model entry — the id is the map key, so only the price
-/// is read out of the value.
+/// and the output ceiling are read out of the value.
 #[derive(Debug, Deserialize)]
 struct RawModel {
     /// Untyped on purpose: a typed `{input, output}` would let an
@@ -542,6 +583,16 @@ struct RawModel {
     /// and a listing column is not worth `--provider x` breaking over.
     #[serde(default)]
     cost: Option<serde_json::Value>,
+    /// Untyped for the same reason; only `output` is read.
+    #[serde(default)]
+    limit: Option<serde_json::Value>,
+}
+
+/// A models.dev `limit.output` as a token count, or `None` unless it is
+/// a positive whole number that fits.
+fn max_output_of(raw: &serde_json::Value) -> Option<u32> {
+    let n = raw.get("output")?.as_u64()?;
+    u32::try_from(n).ok().filter(|&n| n > 0)
 }
 
 /// A models.dev `cost` object as a [`Cost`], or `None` unless *both*
@@ -596,18 +647,16 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
     };
 
     // `npm` is the wire-format signal. A builtin has already been vetted
-    // by hand, so it stands in for a driver package this doesn't know:
-    // `anthropic`'s entry names `@ai-sdk/anthropic` even though the
-    // endpoint used here is its OpenAI-compatible one.
-    let openai_compatible = raw
-        .npm
-        .as_deref()
-        .is_some_and(|npm| OPENAI_COMPATIBLE_NPM.contains(&npm));
-    if !openai_compatible && builtin.is_none() {
-        return None;
-    }
+    // by hand, so its own `wire` stands in for a driver package this
+    // doesn't know (`google`'s entry names `@ai-sdk/google` even though
+    // the endpoint used here is its OpenAI-compatible one).
+    let wire = match (builtin, raw.npm.as_deref()) {
+        (Some(b), _) => b.wire,
+        (None, Some(npm)) if OPENAI_COMPATIBLE_NPM.contains(&npm) => Wire::OpenAi,
+        _ => return None,
+    };
 
-    // One bearer token, and llmman must know which variable holds it. A
+    // One API key, and llmman must know which variable holds it. A
     // builtin names it explicitly (`google` lists three aliases); for
     // everything else a single-entry `env` is the only unambiguous case.
     let key_env = match builtin {
@@ -623,6 +672,7 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
         name: raw.name,
         base_url: base_url_of(base_url),
         key_env,
+        wire,
         // Sorted by id, since `models` came out of a BTreeMap.
         models: raw
             .models
@@ -630,6 +680,7 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
             .map(|(id, model)| Model {
                 id,
                 cost: model.cost.as_ref().and_then(cost_of),
+                max_output: model.limit.as_ref().and_then(max_output_of),
             })
             .collect(),
     })
@@ -638,14 +689,15 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
 /// Normalizes a models.dev `api` into a base URL that a route can be
 /// appended to.
 ///
-/// Some entries give the full chat route rather than the base it hangs
-/// off (`bailing` is `.../v1/chat/completions` today). Appending to that
+/// Some entries give the full route rather than the base it hangs off
+/// (`bailing` is `.../v1/chat/completions` today). Appending to that
 /// yields `.../chat/completions/chat/completions`, which fails as a
 /// confusing 404 from the provider rather than anything llmman reports.
 /// Trailing slashes go for the same reason — `url` adds its own.
 fn base_url_of(api: &str) -> String {
     let api = api.trim_end_matches('/');
     api.strip_suffix("/chat/completions")
+        .or_else(|| api.strip_suffix("/messages"))
         .unwrap_or(api)
         .trim_end_matches('/')
         .to_string()
@@ -909,7 +961,7 @@ mod tests {
                     "npm": "@openrouter/ai-sdk-provider",
                     "env": ["OPENROUTER_API_KEY"],
                     "models": {
-                        "z-model": { "cost": { "input": 2.5, "output": 10 } },
+                        "z-model": { "cost": { "input": 2.5, "output": 10 }, "limit": { "context": 200000, "output": 32000 } },
                         "a-model": {}
                     }
                 }
@@ -919,29 +971,31 @@ mod tests {
         assert_eq!(p.name, "OpenRouter");
         assert_eq!(p.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(p.key_env, "OPENROUTER_API_KEY");
+        assert_eq!(p.wire, Wire::OpenAi);
         // Sorted by id; an unpriced model keeps `None`, not a zero.
         assert_eq!(
             p.models,
             vec![
                 Model {
                     id: "a-model".into(),
-                    cost: None
+                    cost: None,
+                    max_output: None,
                 },
                 Model {
                     id: "z-model".into(),
                     cost: Some(Cost {
                         input: 2.5,
                         output: 10.0
-                    })
+                    }),
+                    max_output: Some(32000),
                 },
             ]
         );
     }
 
     /// models.dev leaves `api` unset for providers whose SDK hardcodes
-    /// the endpoint; those are recovered from `BUILTIN_ENDPOINTS`,
-    /// including `anthropic`, whose `npm` is not OpenAI-compatible but
-    /// whose builtin endpoint is.
+    /// the endpoint; those are recovered from `BUILTIN_ENDPOINTS`, each
+    /// with the wire format its builtin was vetted for.
     #[test]
     fn builtins_supply_endpoints_the_catalog_omits() {
         let catalog = catalog_from(
@@ -962,11 +1016,24 @@ mod tests {
         let anthropic = catalog.get("anthropic").expect("anthropic is routable");
         assert_eq!(anthropic.base_url, "https://api.anthropic.com/v1");
         assert_eq!(anthropic.key_env, "ANTHROPIC_API_KEY");
+        // Its own Messages API, never the OpenAI-compatibility shim.
+        assert_eq!(anthropic.wire, Wire::Anthropic);
 
         // Three candidate variables in the catalog, one unambiguous
         // choice from the builtin.
         let google = catalog.get("google").expect("google is routable");
         assert_eq!(google.key_env, "GEMINI_API_KEY");
+        assert_eq!(google.wire, Wire::OpenAi);
+    }
+
+    /// A full `/messages` route is trimmed to its base like
+    /// `/chat/completions` is.
+    #[test]
+    fn a_messages_route_is_trimmed_to_its_base() {
+        assert_eq!(
+            base_url_of("https://api.anthropic.com/v1/messages/"),
+            "https://api.anthropic.com/v1"
+        );
     }
 
     /// A concrete `api` tracks a provider moving hosts, so it wins over
@@ -988,8 +1055,8 @@ mod tests {
         assert_eq!(p.base_url, "https://api.openai.example/v2");
     }
 
-    /// Everything llmman cannot reach with a bearer-token OpenAI POST
-    /// must be absent rather than half-supported.
+    /// Everything llmman cannot reach with an API-key POST in one of its
+    /// two wire formats must be absent rather than half-supported.
     #[test]
     fn unreachable_providers_are_dropped() {
         let catalog = catalog_from(
@@ -1034,7 +1101,8 @@ mod tests {
                 }
             }"#,
         );
-        // Anthropic wire format, not OpenAI's.
+        // The Messages body format, but no vetted auth scheme: only the
+        // `anthropic` builtin rides that wire.
         assert!(catalog.get("minimax").is_none());
         // SigV4 signing, and no endpoint at all.
         assert!(catalog.get("amazon-bedrock").is_none());
@@ -1304,6 +1372,7 @@ mod tests {
             name: "Groq".into(),
             base_url: "https://api.groq.com/openai/v1".into(),
             key_env: "GROQ_API_KEY".into(),
+            wire: Wire::OpenAi,
             models: vec![],
         };
         assert_eq!(
@@ -1342,6 +1411,7 @@ mod tests {
             name: "Test".into(),
             base_url: "https://example.invalid/v1".into(),
             key_env: "LLMMAN_TEST_PROVIDER_KEY_UNSET".into(),
+            wire: Wire::OpenAi,
             models: vec![],
         };
         assert_eq!(p.api_key(), None);
