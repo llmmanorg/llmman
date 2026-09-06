@@ -193,44 +193,12 @@ fn dir_size(dir: &Path) -> u64 {
 /// rather prune once at the end themselves. Read fresh at each call site,
 /// like every other `LLMMAN_*` var.
 pub fn noprune_from_env() -> bool {
-    parse_noprune(std::env::var("LLMMAN_NOPRUNE").ok().as_deref())
-}
-
-/// Split out from [`noprune_from_env`] for testing without touching the
-/// real environment. Unset, blank, or an explicit falsy value
-/// (`0`/`false`/`no`/`off`, case-insensitive) all mean "don't skip".
-fn parse_noprune(value: Option<&str>) -> bool {
-    let Some(v) = value else { return false };
-    let v = v.trim();
-    if v.is_empty() {
-        return false;
-    }
-    !matches!(
-        v.to_ascii_lowercase().as_str(),
-        "0" | "false" | "no" | "off"
-    )
+    crate::env_flag_set("LLMMAN_NOPRUNE")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_noprune_is_false_when_unset_blank_or_explicitly_falsy() {
-        assert!(!parse_noprune(None));
-        assert!(!parse_noprune(Some("")));
-        assert!(!parse_noprune(Some("   ")));
-        for falsy in ["0", "false", "no", "off", "FALSE", "Off", "  no  "] {
-            assert!(!parse_noprune(Some(falsy)), "{falsy:?} should be falsy");
-        }
-    }
-
-    #[test]
-    fn parse_noprune_is_true_for_any_other_value() {
-        for truthy in ["1", "true", "yes", "on", "anything"] {
-            assert!(parse_noprune(Some(truthy)), "{truthy:?} should be truthy");
-        }
-    }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(

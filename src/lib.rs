@@ -16,6 +16,7 @@ pub mod llama_release;
 pub mod metrics;
 pub mod modelpack;
 pub mod oauth;
+pub mod promptlog;
 pub mod providers;
 pub mod shortnames;
 pub mod sources;
@@ -100,6 +101,24 @@ fn parse_env_path(value: Option<&str>) -> Option<PathBuf> {
     (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
 }
 
+/// Whether an opt-out variable (`LLMMAN_NOPRUNE`, `LLMMAN_NOHISTORY`) is
+/// set: anything but unset, blank, or `0`/`false`/`no`/`off`.
+pub fn env_flag_set(name: &str) -> bool {
+    parse_env_flag(std::env::var(name).ok().as_deref())
+}
+
+fn parse_env_flag(value: Option<&str>) -> bool {
+    let Some(v) = value else { return false };
+    let v = v.trim();
+    if v.is_empty() {
+        return false;
+    }
+    !matches!(
+        v.to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +157,22 @@ mod tests {
         assert!(parse_debug_enabled(Some("2")));
         assert!(parse_debug_enabled(Some("-1")));
         assert!(!parse_debug_enabled(Some("not-a-number")));
+    }
+
+    #[test]
+    fn parse_env_flag_is_false_when_unset_blank_or_explicitly_falsy() {
+        assert!(!parse_env_flag(None));
+        assert!(!parse_env_flag(Some("")));
+        assert!(!parse_env_flag(Some("   ")));
+        for falsy in ["0", "false", "no", "off", "FALSE", "Off", "  no  "] {
+            assert!(!parse_env_flag(Some(falsy)), "{falsy:?} should be falsy");
+        }
+    }
+
+    #[test]
+    fn parse_env_flag_is_true_for_any_other_value() {
+        for truthy in ["1", "true", "yes", "on", "anything"] {
+            assert!(parse_env_flag(Some(truthy)), "{truthy:?} should be truthy");
+        }
     }
 }

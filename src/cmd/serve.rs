@@ -11,7 +11,7 @@ use anyhow::{anyhow, Context};
 // `HttpBody` is axum's re-export of the `http_body::Body` trait, in
 // scope only for `size_hint` in `track_metrics`.
 use axum::body::{Body, Bytes, HttpBody as _};
-use axum::extract::{DefaultBodyLimit, MatchedPath, Path as UrlPath, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, MatchedPath, Path as UrlPath, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -57,6 +57,7 @@ Environment Variables:
       LLMMAN_METRICS                 Serve a Prometheus scrape endpoint at /metrics (default: off)
       LLMMAN_MODELS                  The path to the models directory
       LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only)
+      LLMMAN_NOHISTORY               Do not record prompts for `llmman log`
       LLMMAN_NOPRUNE                 Do not prune model blobs on startup
       LLMMAN_ORIGINS                 A comma separated list of allowed CORS origins
       LLMMAN_PEERS                   A comma separated list of peer daemons ([scheme://]host[:port]) to pool hardware with (overrides [aggregation] in llmman.conf)
@@ -582,6 +583,8 @@ struct Inner {
     memory: u64,
     store_path: PathBuf,
     cache_path: PathBuf,
+    // `record_prompt`'s file; None under LLMMAN_NOHISTORY (and in tests).
+    prompt_log: Option<PathBuf>,
     client: Client,
 }
 
@@ -8572,6 +8575,45 @@ async fn track_metrics(req: Request, next: Next) -> Response {
     Response::from_parts(parts, body)
 }
 
+/// Appends each generation request's prompt to the log `llmman log`
+/// reads (`crate::promptlog`). The body goes through the same `Bytes`
+/// extractor the handlers use, so the size limit and its 413 are
+/// unchanged; the handler then reads it back from memory.
+async fn record_prompt(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let Some(log) = state.0.prompt_log.as_deref() else {
+        return next.run(req).await;
+    };
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .filter(|r| crate::promptlog::is_generation_route(r));
+    // Not a prompt: another method (a 405 ahead), or on the Ollama routes
+    // the forged cross-site request that `accept_any_content_type`, which
+    // runs after this layer, refuses.
+    let Some(route) = route.filter(|r| {
+        req.method() == axum::http::Method::POST
+            && !(r.starts_with("/api/") && forged_cross_site(req.headers()))
+    }) else {
+        return next.run(req).await;
+    };
+    let (parts, body) = req.into_parts();
+    let body = match Bytes::from_request(Request::from_parts(parts.clone(), body), &()).await {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let client = parts
+        .headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    if let Some(entry) = crate::promptlog::entry(&route, &body, client, now_rfc3339()) {
+        if let Err(e) = crate::promptlog::append(log, &entry) {
+            eprintln!("[llmman] warning: prompt log {}: {e}", log.display());
+        }
+    }
+    next.run(Request::from_parts(parts, Body::from(body))).await
+}
+
 /// Lets the Ollama routes take a JSON body under any `Content-Type`, as
 /// ollama does (gin's `ShouldBindJSON` ignores the header): `curl -d`
 /// sends a form type, a browser `fetch` sends `text/plain`, some SDKs
@@ -8583,12 +8625,7 @@ async fn track_metrics(req: Request, next: Next) -> Response {
 /// outright, since `/api/blobs` reads a raw body and `/api/pull` or
 /// `/api/create` would otherwise be drivable from any page.
 async fn accept_any_content_type(mut req: Request, next: Next) -> Response {
-    let is_json = req
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(is_json_content_type);
-    if !is_json {
+    if !has_json_content_type(req.headers()) {
         if foreign_origin(req.headers()) {
             let body = serde_json::json!({ "error": "cross-site request refused" });
             return (StatusCode::FORBIDDEN, Json(body)).into_response();
@@ -8599,6 +8636,19 @@ async fn accept_any_content_type(mut req: Request, next: Next) -> Response {
         );
     }
     next.run(req).await
+}
+
+fn has_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(is_json_content_type)
+}
+
+/// A browser "simple" request from a page `cors_layer` wouldn't allow —
+/// what `accept_any_content_type` refuses.
+fn forged_cross_site(headers: &HeaderMap) -> bool {
+    !has_json_content_type(headers) && foreign_origin(headers)
 }
 
 /// Whether the request carries an `Origin` that `cors_layer` wouldn't
@@ -8738,6 +8788,13 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
     // preflight OPTIONS before this layer runs, so preflights are not
     // counted — they are the browser's negotiation, not a request the
     // daemon did any work for.
+    // Innermost, so `track_metrics` times its body read as the handler's
+    // and CORS answers preflights before it.
+    let app = app.layer(middleware::from_fn_with_state(
+        app_state.clone(),
+        record_prompt,
+    ));
+
     let app = if metrics_enabled {
         app.layer(middleware::from_fn(track_metrics))
     } else {
@@ -8946,6 +9003,9 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         memory,
         store_path,
         cache_path,
+        prompt_log: crate::promptlog::enabled_from_env()
+            .then(crate::promptlog::path)
+            .transpose()?,
         client: Client::new(),
     }));
 
@@ -11287,6 +11347,7 @@ mod tests {
             memory: 0,
             store_path,
             cache_path: std::env::temp_dir(),
+            prompt_log: None,
             client: Client::new(),
         }
     }
@@ -14803,5 +14864,133 @@ mod tests {
             ),
             "the body ended, so it was recorded exactly once:\n{rendered}"
         );
+    }
+
+    /// Only generation routes are logged, and the handler still gets the
+    /// whole body — an echo handler proves it without a model to load.
+    #[tokio::test]
+    async fn record_prompt_logs_generation_requests_and_hands_the_body_on() {
+        let log =
+            std::env::temp_dir().join(format!("llmman-record-prompt-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        let mut inner = test_inner(std::env::temp_dir());
+        inner.prompt_log = Some(log.clone());
+        let state = AppState(Arc::new(inner));
+
+        let echo = || post(|body: Bytes| async move { body });
+        let app = Router::new()
+            .route("/api/chat", echo())
+            .route("/api/embed", echo())
+            .route("/v1/chat/completions", echo())
+            .layer(middleware::from_fn_with_state(state.clone(), record_prompt))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let send = |route: &str, body: &'static str, headers: &'static [(&str, &str)]| {
+            let url = format!("http://127.0.0.1:{}{route}", addr.port());
+            async move {
+                let mut map = reqwest::header::HeaderMap::new();
+                for (k, v) in [
+                    ("user-agent", "test-agent/1"),
+                    ("content-type", "application/json"),
+                ]
+                .iter()
+                .chain(headers)
+                {
+                    map.insert(*k, v.parse().unwrap());
+                }
+                Client::new()
+                    .post(url)
+                    .headers(map)
+                    .body(body)
+                    .send()
+                    .await
+                    .expect("request reaches the test router")
+                    .text()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let chat = r#"{"model":"m","messages":[{"role":"user","content":"hello there"}]}"#;
+        assert_eq!(
+            send("/api/chat", chat, &[]).await,
+            chat,
+            "the handler got the body"
+        );
+        // Not prompts: another route, a load/unload request, a browser's
+        // forged cross-site request, a method the route doesn't take.
+        send("/api/embed", r#"{"model":"m","input":"vector me"}"#, &[]).await;
+        send("/api/chat", r#"{"model":"m","messages":[]}"#, &[]).await;
+        send(
+            "/api/chat",
+            chat,
+            &[
+                ("content-type", "text/plain"),
+                ("origin", "https://evil.example"),
+            ],
+        )
+        .await;
+        Client::new()
+            .get(format!("http://127.0.0.1:{}/api/chat", addr.port()))
+            .body(chat)
+            .send()
+            .await
+            .expect("request reaches the test router");
+        // But the OpenAI routes serve that same request, so it is a prompt.
+        send(
+            "/v1/chat/completions",
+            chat,
+            &[
+                ("content-type", "text/plain"),
+                ("origin", "https://evil.example"),
+            ],
+        )
+        .await;
+
+        let entries = crate::promptlog::read(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        let routes: Vec<&str> = entries.iter().map(|e| e.route.as_str()).collect();
+        assert_eq!(routes, ["/api/chat", "/v1/chat/completions"], "{entries:?}");
+        assert_eq!(entries[0].model, "m");
+        assert_eq!(entries[0].prompt, "hello there");
+        assert_eq!(entries[0].client.as_deref(), Some("test-agent/1"));
+    }
+
+    /// An over-limit body is refused as the extractor would refuse it.
+    /// The limit is lowered to 64 bytes rather than exceeding the 2 MB
+    /// default: a 413 sent while the client still has megabytes to send
+    /// is a client-side ConnectionAborted on Windows.
+    #[tokio::test]
+    async fn record_prompt_keeps_the_body_limit() {
+        let mut inner = test_inner(std::env::temp_dir());
+        inner.prompt_log = Some(std::env::temp_dir().join("llmman-unwritten.jsonl"));
+        let state = AppState(Arc::new(inner));
+        let app = Router::new()
+            .route("/api/chat", post(|body: Bytes| async move { body }))
+            .layer(middleware::from_fn_with_state(state.clone(), record_prompt))
+            .layer(DefaultBodyLimit::max(64))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let send = |len: usize| {
+            let url = format!("http://127.0.0.1:{}/api/chat", addr.port());
+            async move {
+                Client::new()
+                    .post(url)
+                    .body(vec![b' '; len])
+                    .send()
+                    .await
+                    .expect("request reaches the test router")
+                    .status()
+            }
+        };
+        assert_eq!(send(256).await, StatusCode::PAYLOAD_TOO_LARGE);
+        // The control: under the limit, the body reaches the handler.
+        assert_eq!(send(32).await, StatusCode::OK);
     }
 }
