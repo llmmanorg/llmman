@@ -260,6 +260,31 @@ pub struct LlamaOptions<'a> {
     /// limits are plumbed deliberately. An explicit LLAMA_ARG_THREADS
     /// still reaches the container via LLAMA_CPP_ENV_PASSTHROUGH_VARS.
     pub threads: Option<u32>,
+
+    /// `--metrics`, passed when true. Gated by the same `LLMMAN_METRICS`
+    /// flag as llmman's own `/metrics` (see
+    /// `cmd::serve::metrics_enabled_from_env`) rather than a second knob:
+    /// off means the backend's per-token counters (`llamacpp:*` on its
+    /// own loopback port) are exposed exactly when llmman's own daemon-
+    /// level counters are, and not otherwise. `false` leaves it unset,
+    /// falling back to llama-server's own default (disabled) — see
+    /// `metrics.rs`'s module doc comment for why those counters live on
+    /// the backend's endpoint rather than being re-derived here.
+    ///
+    /// llama-server's own disabled-endpoint answer is `501` (body:
+    /// `"This server does not support metrics endpoint. Start it with
+    /// --metrics"`), *not* the `404` llmman's own `/metrics` gives when
+    /// `LLMMAN_METRICS` is unset — confirmed directly against a bare
+    /// `llama-server`, no llmman daemon involved. A genuinely unknown
+    /// route on the same server gets `404` instead, so this isn't a
+    /// llmman bug to fix, just a different upstream convention worth
+    /// knowing before writing a Prometheus scrape/alert rule against the
+    /// backend's own target. Pinned by
+    /// `backend_metrics_follows_llmman_metrics` in `tests/launch_e2e.rs`,
+    /// against a backend llmman itself spawned — a future llama.cpp
+    /// release that changes this fails that test loudly instead of
+    /// silently breaking whatever alert rule assumed `404`.
+    pub metrics: bool,
 }
 
 /// Callers must stop this gracefully (SIGTERM, not the default
@@ -284,6 +309,33 @@ pub fn spawn(
     llama_cpp_version: Option<&str>,
     opts: LlamaOptions<'_>,
 ) -> Result<tokio::process::Child> {
+    let args = spawn_args(ociman, model_path, mmproj_path, llama_cpp_version, opts)?;
+    crate::debug_log!("spawning {} {}", ociman.binary(), args.join(" "));
+    // Piped, not inherited, so cmd::serve can tail the container's
+    // startup output (an OOM abort, a missing library, ...) exactly as it
+    // does a local llama-server's. With `-t` the CLI merges the
+    // container's stdout+stderr onto its own stdout, CRLF-terminated.
+    tokio::process::Command::new(ociman.binary())
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn {} {}", ociman.binary(), args.join(" ")))
+}
+
+/// Builds the exact `docker run`/`podman run` argument vector [`spawn`]
+/// executes. Split out from `spawn` so every flag forwarded into the
+/// container is assertable without a container runtime, an image pull, or
+/// a real model file — `spawn` itself can only be exercised end to end.
+/// See `spawn`'s own doc comment for what each argument means and why.
+pub(crate) fn spawn_args(
+    ociman: ContainerManager,
+    model_path: &Path,
+    mmproj_path: Option<&Path>,
+    llama_cpp_version: Option<&str>,
+    opts: LlamaOptions<'_>,
+) -> Result<Vec<String>> {
     let LlamaOptions {
         port,
         ctx_size,
@@ -297,6 +349,7 @@ pub fn spawn(
         // See the field's doc comment: neither the derived value nor a
         // request's num_thread describes the container's own CPU limits.
         threads: _,
+        metrics,
     } = opts;
     let backend = detect_backend();
     let image = backend.image_ref(llama_cpp_version);
@@ -414,19 +467,21 @@ pub fn spawn(
         args.push("-ub".into());
         args.push(n.to_string());
     }
+    // See LlamaOptions::metrics's doc comment. No env_remove needed here
+    // unlike the local spawn_llama_server path: `docker run`/`podman run`
+    // doesn't inherit the host's environment on its own (see the comment
+    // above on GPU_VISIBLE_DEVICE_VARS/LLAMA_CPP_ENV_PASSTHROUGH_VARS,
+    // both explicitly forwarded via -e for exactly that reason), and
+    // LLAMA_ARG_ENDPOINT_METRICS is in neither passthrough list, so a
+    // host-side value can't reach the container's llama-server this way
+    // — asserted by cmd::serve's own
+    // endpoint_metrics_env_is_removed_and_never_passed_through, which
+    // covers both spawn paths because both read those same two lists.
+    if metrics {
+        args.push("--metrics".into());
+    }
 
-    crate::debug_log!("spawning {} {}", ociman.binary(), args.join(" "));
-    // Piped, not inherited, so cmd::serve can tail the container's
-    // startup output (an OOM abort, a missing library, ...) exactly as it
-    // does a local llama-server's. With `-t` the CLI merges the
-    // container's stdout+stderr onto its own stdout, CRLF-terminated.
-    tokio::process::Command::new(ociman.binary())
-        .args(&args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawn {} {}", ociman.binary(), args.join(" ")))
+    Ok(args)
 }
 
 /// Gracefully stops a container started by [`spawn`] by sending SIGTERM to
@@ -462,6 +517,74 @@ pub fn stop(_pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `spawn_args` case below re-runs GPU detection, which on
+    /// Linux and Windows re-execs the current binary as a probe
+    /// subprocess (see `hostgpu::PROBE_SUBPROCESS_ARG`). Under `cargo
+    /// test` that binary is the test harness, which treats the probe
+    /// argument as a name filter, matches nothing, and prints no probe
+    /// output — so detection falls back to `HostGpu::None` and these
+    /// assertions see the CPU image on every platform. That is only
+    /// incidental here: none of them assert on the image.
+    fn test_opts(metrics: bool) -> LlamaOptions<'static> {
+        LlamaOptions {
+            port: 18080,
+            ctx_size: None,
+            flash_attention: None,
+            kv_cache_type: None,
+            context_shift: false,
+            split_mode: None,
+            num_parallel: None,
+            embeddings: false,
+            batch_size: None,
+            threads: None,
+            metrics,
+        }
+    }
+
+    /// The argv [`spawn`] would run for a plain GGUF model with no
+    /// mmproj and no pinned llama.cpp version, with only `metrics`
+    /// varying between calls.
+    fn container_args(metrics: bool) -> Vec<String> {
+        spawn_args(
+            ContainerManager::Docker,
+            Path::new("/store/blobs/qwen3.5-0.8b.gguf"),
+            None,
+            None,
+            test_opts(metrics),
+        )
+        .expect("spawn_args")
+    }
+
+    #[test]
+    fn container_forwards_metrics_flag_when_enabled() {
+        assert!(
+            container_args(true).iter().any(|a| a == "--metrics"),
+            "container spawn dropped --metrics with LlamaOptions::metrics set"
+        );
+    }
+
+    #[test]
+    fn container_omits_metrics_flag_when_disabled() {
+        assert!(
+            !container_args(false).iter().any(|a| a == "--metrics"),
+            "container spawn passed --metrics with LlamaOptions::metrics unset — the backend \
+             would expose /metrics with LLMMAN_METRICS off, breaking the guarantee \
+             cmd::serve's own metrics endpoint makes"
+        );
+    }
+
+    /// `--metrics` is the *only* difference between the two, appended at
+    /// the end: a future edit that makes the flag also change a mount, a
+    /// port publish, or an `-e` passthrough fails here rather than
+    /// silently changing what the container runs.
+    #[test]
+    fn metrics_flag_is_the_only_difference_in_container_args() {
+        let mut enabled = container_args(true);
+        let disabled = container_args(false);
+        assert_eq!(enabled.pop().as_deref(), Some("--metrics"));
+        assert_eq!(enabled, disabled);
+    }
 
     #[test]
     fn cuda_major_12_picks_cuda12_image() {
