@@ -992,7 +992,12 @@ fn launch_qwen_without_a_model_is_refused_before_the_daemon() {
         !stderr.contains("exited during startup"),
         "the daemon was started first\n{stderr}"
     );
-    assert!(elapsed < Duration::from_secs(5), "refusal took {elapsed:?}");
+    // 30s, like the dead-daemon test: the refusal takes milliseconds, but
+    // a runner busy with the model tests beside it does not.
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "refusal took {elapsed:?}"
+    );
 }
 
 /// A fresh `HOME` in which any daemon `llmman` spawns dies at startup, a
