@@ -929,25 +929,15 @@ fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 
 /// qwen: Qwen Code's OpenAI-compatible mode, pointed at our /v1 by the
 /// command line, the environment and its settings file together, since
-/// it reads the three in a different order for each value.
-///
-/// `--auth-type` and `--model` go on the command line: for those it
-/// reads `argv`, then `~/.qwen/settings.json`, then the `OPENAI_*`
-/// variables, and it writes that file itself on `/auth` and `/model`, so
-/// for anyone who has used it before the variables alone lose. For the
-/// base URL a `modelProviders` entry in the settings file whose id is the
-/// model beats both flag and variable (`resolveModelConfig` in its
-/// `packages/core/src/models/modelConfigResolver.ts`), which is what
-/// `write_qwen_settings` is for. The key stays in the environment: on the
-/// command line it shows in `ps`, and the file only names the variable,
-/// `LLMMAN_API_KEY`, exported with the same value as `OPENAI_API_KEY` so
-/// that llmman's entry is told from any other by its key name, the way
-/// ollama's is by `OLLAMA_API_KEY`. Ollama's `cmd/launch/qwen.go` does
-/// the same three. `--model` is
-/// required; `check_model_flag` refuses a launch without one before the
-/// daemon starts. A `--model` after `--` is the one Qwen Code will use
-/// (`qwen_args` yields to it), so the settings and `OPENAI_MODEL` follow
-/// it; `run` has resolved and preloaded the top-level one regardless.
+/// Qwen Code reads the three in a different order for each value:
+/// `--auth-type` and `--model` win on the command line, the base URL is
+/// won by a `modelProviders` entry for the model (`resolveModelConfig` in
+/// its `packages/core/src/models/modelConfigResolver.ts`), which is what
+/// `write_qwen_settings` is for, and the key stays in the environment,
+/// named in that entry as `LLMMAN_API_KEY` so llmman's entry is told from
+/// any other. Ollama's `cmd/launch/qwen.go` does the same three. A
+/// `--model` after `--` is the one Qwen Code uses, so the settings and
+/// `OPENAI_MODEL` follow it.
 fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_qwen().ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
     let model = forwarded_model(extra_args).unwrap_or(model);
@@ -1136,16 +1126,11 @@ fn write_qwen_settings(model: &str) -> anyhow::Result<()> {
 }
 
 /// Read as Qwen Code reads it, comments stripped and an empty file as
-/// `{}`. What is still not a JSON object is left alone, with a line to
-/// say so, and the launch goes on: Qwen Code moves a file it cannot parse
-/// to `settings.json.corrupted` and resets it to `{}`, so no entry in it
-/// survives to outrank the flags and variables `launch_qwen` passes. A
-/// file that parses but cannot be written is an error, since an entry in
-/// it may be exactly what the write was to outrank.
-/// The file as it was before llmman first wrote
-/// it stays as `settings.json.bak`, and a later one carrying comments,
-/// which the rewrite drops, replaces that copy; llmman's own renderings
-/// and Qwen Code's do not.
+/// `{}`. A file that is not a JSON object is left alone with a line
+/// printed, since Qwen Code resets such a file to `{}` itself; one that
+/// parses but cannot be written is an error, since an entry in it may be
+/// the one this write was to outrank. The user's own file, and any later
+/// one carrying comments, is kept as `settings.json.bak`.
 fn write_qwen_settings_at(dir: &Path, model: &str, base_url: &str) -> anyhow::Result<()> {
     let path = dir.join("settings.json");
     let raw = match std::fs::read_to_string(&path) {
@@ -1238,18 +1223,12 @@ fn strip_json_comments(raw: &str) -> String {
 /// as llmman's: a user can rename it in `/model`, but not re-key it.
 const QWEN_ENV_KEY: &str = "LLMMAN_API_KEY";
 
-/// `existing` with llmman's entry merged in; pure, so it is testable on a
-/// literal document. The keys are the ones Qwen Code's own `/auth` and
-/// `/model` write, and ollama's `applyQwenOllamaConfig` in
-/// `cmd/launch/qwen.go`: llmman's entry first in `modelProviders.openai`,
-/// with an earlier one of its own for this daemon replaced, the rest
-/// kept, and a `{ protocol, models }` wrapper an older Qwen Code wrote
-/// unwrapped as its `V5ToV4Migration` does, `$version` set to 4 with it;
-/// `security.auth.selectedType` and `baseUrl`; `model.name` with
-/// `model.baseUrl`, which Qwen Code sets together. Otherwise no
-/// `$version`, which Qwen Code stamps itself, and no key: the
-/// entry names `QWEN_ENV_KEY`, which `launch_qwen` exports. A value of
-/// the wrong type on the way down is replaced, as ollama's `qwenMap` does.
+/// `existing` with llmman's entry merged in, pure so a test can hand it
+/// a literal. The keys follow Qwen Code's own `/auth` and `/model` and
+/// ollama's `applyQwenOllamaConfig` in `cmd/launch/qwen.go`: the entry
+/// first in `modelProviders.openai`, an earlier one of llmman's replaced,
+/// the rest kept and a `{ protocol, models }` wrapper unwrapped with
+/// `$version` set to 4; `security.auth`; `model.name` and `model.baseUrl`.
 fn qwen_settings_merged(
     existing: &serde_json::Value,
     model: &str,
