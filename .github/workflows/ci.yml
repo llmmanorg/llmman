@@ -960,24 +960,24 @@ jobs:
       # itself not being installed (see the step above) — `command -v`
       # guards against that rather than failing here instead.
       #
-      # `--kill-after=10`: confirmed live on a real x86_64-windows-2025 run
-      # that plain `timeout 45` (SIGTERM only) can leave this hanging far
-      # past its own 45s cap — the whole job ran to its 45-*minute*
-      # timeout-minutes instead and got force-cancelled. A Node process
-      # deep in this ai-sdk runtime's own indefinite connection-retry loop
-      # doesn't reliably act on SIGTERM promptly (a known Node.js/libuv
-      # quirk: a blocking native socket call in flight isn't necessarily
-      # interrupted by a signal the event loop hasn't gotten back to yet),
-      # so nothing here otherwise ever escalates to a harder kill.
-      # `--kill-after` sends SIGKILL 10s after the initial SIGTERM if the
-      # process is still alive, guaranteeing this step can't hang
-      # regardless of whether opencode's own process tree responds to
-      # SIGTERM at all.
+      # `--kill-after=10` escalates to SIGKILL, since a process deep in
+      # that retry loop doesn't reliably act on SIGTERM. Not enough on
+      # Windows: `opencode` on PATH there is npm's sh shim, which runs the
+      # real opencode.exe as a child (Git Bash can't exec a native binary
+      # in place), and `timeout` kills only the shim. The orphaned
+      # opencode.exe keeps this step's stdout open, so the step never ends
+      # — a real x86_64-windows-2025 run sat here 45 min until the runner
+      # itself died ("lost communication with the server"). So it is
+      # killed by name too, and `timeout-minutes` is the backstop
+      # (`continue-on-error`: the backstop firing is not a failed job).
       - name: Warm up opencode's on-demand provider install
         shell: bash
+        timeout-minutes: 10
+        continue-on-error: true
         run: |
           export OPENCODE_CONFIG_CONTENT='{"$schema":"https://opencode.ai/config.json","provider":{"ollama":{"npm":"@ai-sdk/openai-compatible","name":"Ollama","options":{"baseURL":"http://127.0.0.1:1/v1"},"models":{"warmup":{"name":"warmup"}}}},"model":"ollama/warmup"}'
           command -v opencode >/dev/null && timeout --kill-after=10 45 opencode run "hi" --print-logs --log-level DEBUG || true
+          [ "$RUNNER_OS" = Windows ] && taskkill //F //T //IM opencode.exe || true
 
       # ── llama-server (the inference backend `llmman serve` shells out to) ──
       # A prebuilt release straight from upstream llama.cpp, pinned so CI
