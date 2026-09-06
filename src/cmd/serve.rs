@@ -838,26 +838,30 @@ struct OllamaMessage {
     /// so multi-turn tool-calling history round-trips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OllamaToolCall>>,
-    /// Ollama's tool-result message (`role: "tool"`) carries the name of
-    /// the tool it's a result for, but — unlike OpenAI's `tool_call_id` —
-    /// no id linking it back to a specific call. See
-    /// `ollama_message_to_oai`'s doc comment for the limitation that
-    /// implies.
+    /// On a `role: "tool"` message, the name of the tool the result is
+    /// for, and the id of the call (`api.Message.ToolCallID`). Older
+    /// clients send only the name; see `ollama_message_to_oai`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
 }
 
 /// Ollama's tool-call shape (`api.ToolCall` in ollama/api/types.go):
-/// `{"function": {"name": ..., "arguments": {...}}}` — unlike OpenAI's
-/// `arguments` (a JSON-encoded *string*), Ollama's is already a decoded
-/// JSON object, and there is no top-level `id`/`type`.
+/// `{"id": ..., "function": {"index": 0, "name": ..., "arguments": {...}}}`.
+/// Unlike OpenAI's, `arguments` is a decoded JSON object and there is no
+/// `type`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 struct OllamaToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     function: OllamaToolCallFunction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 struct OllamaToolCallFunction {
+    #[serde(default)]
+    index: usize,
     name: String,
     arguments: serde_json::Value,
 }
@@ -915,6 +919,25 @@ struct OllamaGenerateRequest {
     /// calling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     format: Option<serde_json::Value>,
+    /// A system prompt for this request; see `OllamaMessage::images` for
+    /// `images`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<String>>,
+    /// Ollama renders these itself (fill-in-the-middle, a custom template,
+    /// no template at all); llmman has no template of its own to render
+    /// with, so a request that sets one is refused rather than served
+    /// wrongly. `context` is deprecated in Ollama and ignored, as its
+    /// warning says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    suffix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    template: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    raw: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context: Option<serde_json::Value>,
 }
 
 /// Maps Ollama's `format` request field to the OpenAI-style
@@ -972,6 +995,8 @@ struct OllamaChatChunk {
     done: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     done_reason: Option<String>,
+    #[serde(flatten)]
+    metrics: OllamaMetrics,
 }
 
 #[derive(Debug, Serialize)]
@@ -984,6 +1009,30 @@ struct OllamaGenerateChunk {
     done: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     done_reason: Option<String>,
+    #[serde(flatten)]
+    metrics: OllamaMetrics,
+}
+
+/// Ollama's `api.Metrics`, on the `done` chunk only: durations in
+/// nanoseconds, counts in tokens. Counts come from the backend's `usage`
+/// (or llama-server's `timings`); durations from llama-server's
+/// `timings` where it sends them, else from llmman's own clock.
+#[derive(Debug, Serialize, Default, Clone, PartialEq)]
+struct OllamaMetrics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_duration: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    load_duration: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_eval_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_eval_cached_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_eval_duration: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eval_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eval_duration: Option<u64>,
 }
 
 // Also `Deserialize`: a node reads its peers' tags/ps answers back in.
@@ -1233,13 +1282,12 @@ struct OAIMessage {
     content: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OAIToolCall>>,
-    /// Only meaningful on a `role: "tool"` message: which tool this is a
-    /// result for. Ollama's own wire format has no `tool_call_id`
-    /// equivalent (see `OllamaMessage::tool_name`'s doc comment) — set
-    /// from that field on a best-effort basis so name-matching chat
-    /// templates still work, even though a strict id-matching one won't.
+    /// On a `role: "tool"` message, which tool the result is for and
+    /// which call; Ollama's `tool_name` and `tool_call_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
 }
 
 impl OAIMessage {
@@ -1250,8 +1298,7 @@ impl OAIMessage {
         Self {
             role: role.into(),
             content: serde_json::Value::String(content.into()),
-            tool_calls: None,
-            name: None,
+            ..Default::default()
         }
     }
 }
@@ -1286,10 +1333,9 @@ struct OAIToolCallFunction {
 /// - `tool_calls`: carried onto an assistant message so multi-turn
 ///   tool-calling history round-trips; Ollama's `arguments` (already a
 ///   decoded JSON value) is re-encoded to the JSON *string* OpenAI's
-///   schema requires.
-/// - `tool_name` on a `role: "tool"` message: mapped to `name`, the
-///   closest OpenAI equivalent llama-server's chat templates read Ollama's
-///   `tool_call_id` are not surfaced to `/api/chat` callers).
+///   schema requires, and a call without an id gets one.
+/// - `tool_name`/`tool_call_id` on a `role: "tool"` message: mapped to
+///   `name`/`tool_call_id`.
 fn ollama_message_to_oai(m: &OllamaMessage) -> OAIMessage {
     let content = match &m.images {
         Some(images) if !images.is_empty() => {
@@ -1326,7 +1372,11 @@ fn ollama_message_to_oai(m: &OllamaMessage) -> OAIMessage {
                 // coarse clock could return the same reading twice) — the
                 // index makes each id unique within this message even
                 // then.
-                id: format!("{}_{i}", gen_id()),
+                id: c
+                    .id
+                    .clone()
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| format!("call_{}_{i}", gen_id())),
                 type_: "function",
                 function: OAIToolCallFunction {
                     name: c.function.name.clone(),
@@ -1340,6 +1390,7 @@ fn ollama_message_to_oai(m: &OllamaMessage) -> OAIMessage {
         content,
         tool_calls,
         name: m.tool_name.clone(),
+        tool_call_id: m.tool_call_id.clone(),
     }
 }
 
@@ -1403,6 +1454,25 @@ struct OAIChatRequest {
     /// See `format_to_response_format`.
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<serde_json::Value>,
+    /// The rest of Ollama's `options` with an OpenAI or llama-server
+    /// spelling. `top_k` and `min_p` are llama.cpp extensions, dropped
+    /// for a provider like `repeat_penalty` (see `strip_llama_fields`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_p: Option<f32>,
+    /// Always `{"include_usage": true}` for a typed request: the counts
+    /// on Ollama's `done` chunk come from the usage chunk it buys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<serde_json::Value>,
 }
 
 /// Ollama's actual default for `repeat_penalty`: `DefaultOptions()` in
@@ -1439,7 +1509,45 @@ const DEFAULT_REPEAT_PENALTY: f32 = 1.0;
 
 #[derive(Debug, Deserialize)]
 struct OAIChunk {
+    #[serde(default)]
     choices: Vec<OAIChunkChoice>,
+    /// The trailing usage chunk (`stream_options.include_usage`), or
+    /// llama-server's final chunk, which carries both.
+    #[serde(default)]
+    usage: Option<OAIUsage>,
+    /// llama-server's own timings on its final chunk.
+    #[serde(default)]
+    timings: Option<LlamaTimings>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+struct OAIUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: OAIPromptTokensDetails,
+}
+
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+struct OAIPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+struct LlamaTimings {
+    #[serde(default)]
+    prompt_n: u64,
+    #[serde(default)]
+    prompt_ms: f64,
+    #[serde(default)]
+    cache_n: Option<u64>,
+    #[serde(default)]
+    predicted_n: u64,
+    #[serde(default)]
+    predicted_ms: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1462,16 +1570,14 @@ struct OAIChunkDelta {
 }
 
 /// One fragment of one streamed tool call. Mirrors OpenAI's streaming
-/// shape: `function.name` normally arrives whole in the first delta for a
-/// given `index`, while `function.arguments` arrives incrementally as a
-/// partial JSON string across many deltas — see `ToolCallAccumulator`.
-/// (OpenAI's streaming shape also carries a top-level `id` on that first
-/// delta; deliberately not deserialized here — [`OllamaToolCall`], the
-/// only shape it ever needs to flow into, has no `id` field to carry it
-/// to.)
+/// shape: `id` and `function.name` normally arrive whole in the first
+/// delta for a given `index`, while `function.arguments` arrives
+/// incrementally as a partial JSON string; see `ToolCallAccumulator`.
 #[derive(Debug, Deserialize, Default)]
 struct OAIToolCallDelta {
     index: usize,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     function: Option<OAIToolCallFunctionDelta>,
 }
@@ -1491,6 +1597,7 @@ struct OAIToolCallFunctionDelta {
 /// `done` chunk arrives.
 #[derive(Default, Clone)]
 struct ToolCallAccumulator {
+    id: String,
     name: String,
     arguments: String,
 }
@@ -1524,6 +1631,11 @@ fn accumulate_tool_call_deltas(
     let mut acc = acc.borrow_mut();
     for delta in deltas {
         let entry = acc.entry(delta.index).or_default();
+        if let Some(id) = delta.id.filter(|id| !id.is_empty()) {
+            if entry.id.is_empty() {
+                entry.id = id;
+            }
+        }
         if let Some(f) = delta.function {
             if let Some(name) = f.name {
                 entry.name.push_str(&name);
@@ -1551,9 +1663,16 @@ fn finalize_tool_calls(
         return None;
     }
     Some(
-        acc.values()
-            .map(|c| OllamaToolCall {
+        acc.iter()
+            .map(|(index, c)| OllamaToolCall {
+                // Ollama mints `call_<8 chars>` for a backend that sent none.
+                id: Some(if c.id.is_empty() {
+                    format!("call_{}_{index}", gen_id())
+                } else {
+                    c.id.clone()
+                }),
                 function: OllamaToolCallFunction {
+                    index: *index,
                     name: c.name.clone(),
                     arguments: serde_json::from_str(&c.arguments)
                         .unwrap_or_else(|_| serde_json::json!({})),
@@ -4408,10 +4527,12 @@ fn bytes_to_lines(
 // Shared SSE-chunk helper
 // ---------------------------------------------------------------------------
 
-/// Returns (content, thinking, done).
-fn oai_chunk_to_content(payload: &str) -> Option<(String, Option<String>, bool)> {
+/// Returns (content, thinking, finish_reason). `[DONE]` is a finish
+/// with no reason; a chunk without choices (the trailing usage chunk)
+/// is `None`.
+fn oai_chunk_to_content(payload: &str) -> Option<(String, Option<String>, Option<String>)> {
     if payload == "[DONE]" {
-        return Some((String::new(), None, true));
+        return Some((String::new(), None, Some(String::new())));
     }
     let chunk = serde_json::from_str::<OAIChunk>(payload).ok()?;
     let choice = chunk.choices.first()?;
@@ -4423,12 +4544,11 @@ fn oai_chunk_to_content(payload: &str) -> Option<(String, Option<String>, bool)>
         .clone()
         .or_else(|| choice.delta.thinking.clone())
         .filter(|s| !s.is_empty());
-    let done = choice
+    let finish = choice
         .finish_reason
-        .as_deref()
-        .map(|r| !r.is_empty() && r != "null")
-        .unwrap_or(false);
-    Some((content, thinking, done))
+        .clone()
+        .filter(|r| !r.is_empty() && r != "null");
+    Some((content, thinking, finish))
 }
 
 // ---------------------------------------------------------------------------
@@ -4458,6 +4578,142 @@ fn apply_default_repeat_penalty_typed(oai_req: &mut OAIChatRequest) {
 /// the field either way.
 fn repeat_penalty_applies(target: &Target) -> bool {
     !target.is_remote()
+}
+
+/// llama-server's own request fields, which a provider has no notion of
+/// and a strict one (OpenAI, Mistral, Groq) rejects the whole request
+/// over. `top_k` and `min_p` are here too: common on local backends,
+/// absent from the OpenAI schema.
+const LLAMA_FIELDS: &[&str] = &[
+    "repeat_penalty",
+    "chat_template_kwargs",
+    "top_k",
+    "min_p",
+    "typical_p",
+    "n_probs",
+    "cache_prompt",
+    "samplers",
+    "id_slot",
+    "n_keep",
+    "n_indent",
+    "dynatemp_range",
+    "dynatemp_exponent",
+    "mirostat",
+    "mirostat_tau",
+    "mirostat_eta",
+    "dry_multiplier",
+    "dry_base",
+    "dry_allowed_length",
+    "dry_penalty_last_n",
+    "dry_sequence_breakers",
+    "xtc_probability",
+    "xtc_threshold",
+    "top_n_sigma",
+    "penalty_last_n",
+    "repeat_last_n",
+    "n_predict",
+    "grammar",
+    "grammar_lazy",
+    "grammar_triggers",
+    "preserved_tokens",
+    "json_schema",
+    "reasoning_format",
+    "reasoning_budget",
+    "thinking_forced_open",
+    "return_progress",
+    "return_tokens",
+    "timings_per_token",
+    "post_sampling_probs",
+    "response_fields",
+    "min_keep",
+    "t_max_predict_ms",
+    "t_max_prompt_ms",
+    "ignore_eos",
+    "lora",
+];
+
+/// Removes [`LLAMA_FIELDS`] from a request bound for a provider.
+fn strip_llama_fields(req: &mut serde_json::Value) {
+    if let Some(o) = req.as_object_mut() {
+        for field in LLAMA_FIELDS {
+            o.remove(*field);
+        }
+    }
+}
+
+/// Makes a chat completion acceptable to the provider it is bound for.
+///
+/// Ollama's `think` travels as llama-server's `chat_template_kwargs`;
+/// a provider reads `reasoning_effort` instead. An explicit level maps
+/// to it for every wire; a bare `true`/`false` only for the Anthropic
+/// wire, which has a budget to turn on or off, since an OpenAI provider
+/// 400s `reasoning_effort` on a model that does not reason. OpenAI's
+/// reasoning models then take `max_completion_tokens`, not `max_tokens`,
+/// and reject sampling overrides (litellm's o-series and gpt-5 rules).
+fn provider_compat(remote: &RemoteTarget, req: &mut serde_json::Value) {
+    let Some(o) = req.as_object_mut() else {
+        return;
+    };
+    if let Some(kwargs) = o.remove("chat_template_kwargs") {
+        let level = kwargs.get("reasoning_effort").and_then(|v| v.as_str());
+        let enabled = kwargs.get("enable_thinking").and_then(|v| v.as_bool());
+        let effort = match (level, enabled, remote.wire) {
+            (Some(level), _, _) => Some(level.to_string()),
+            (None, Some(true), Wire::Anthropic) => Some("medium".to_string()),
+            (None, Some(false), Wire::Anthropic) => Some("none".to_string()),
+            _ => None,
+        };
+        if let Some(effort) = effort {
+            o.entry("reasoning_effort")
+                .or_insert(serde_json::Value::String(effort));
+        }
+    }
+    for field in LLAMA_FIELDS {
+        o.remove(*field);
+    }
+    // Cohere's compatibility API rejects `stream_options`.
+    if remote.provider == "cohere" {
+        o.remove("stream_options");
+    }
+    if remote.provider != "openai" {
+        return;
+    }
+    if !openai_reasoning_model(&remote.model) {
+        o.remove("reasoning_effort");
+        return;
+    }
+    if let Some(max) = o.remove("max_tokens") {
+        o.entry("max_completion_tokens").or_insert(max);
+    }
+    if o.get("temperature").and_then(|t| t.as_f64()) != Some(1.0) {
+        o.remove("temperature");
+    }
+    for field in [
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "logprobs",
+        "top_logprobs",
+    ] {
+        o.remove(field);
+    }
+    if remote.model.contains("gpt-5") || remote.model.contains("gpt-6") {
+        for field in ["stop", "logit_bias", "modalities", "prediction", "audio"] {
+            o.remove(field);
+        }
+    }
+}
+
+/// OpenAI's reasoning models, as litellm tells them apart: `o<digit>...`
+/// and the `gpt-5`/`gpt-6` families, bar `gpt-5-chat`.
+fn openai_reasoning_model(model: &str) -> bool {
+    let name = model.rsplit('/').next().unwrap_or(model);
+    let o_series = name
+        .strip_prefix('o')
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| c.is_ascii_digit());
+    let gpt = (name.contains("gpt-5") || name.contains("gpt-6")) && !name.starts_with("gpt-5-chat");
+    o_series || gpt
 }
 
 /// A chat completion's body from any target: OpenAI-shaped bytes,
@@ -4532,16 +4788,26 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
     req: &T,
     response_model: &str,
 ) -> Result<ChatUpstream, AppError> {
-    if !target.is_anthropic() {
+    let Target::Remote(remote) = target else {
         let resp = target
             .authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)).json(req))
             .send()
             .await
             .with_context(|| format!("send to {}", target.describe()))?;
         return Ok(ChatUpstream::relay(resp));
+    };
+
+    let mut req = serde_json::to_value(req).context("serialize chat request")?;
+    provider_compat(remote, &mut req);
+    if remote.wire == Wire::OpenAi {
+        let resp = target
+            .authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)).json(&req))
+            .send()
+            .await
+            .with_context(|| format!("send to {}", target.describe()))?;
+        return Ok(ChatUpstream::relay(resp));
     }
 
-    let req = serde_json::to_value(req).context("serialize chat request")?;
     let streaming = req
         .get("stream")
         .and_then(serde_json::Value::as_bool)
@@ -4888,53 +5154,165 @@ fn non_empty_thinking(thinking: String, tool: String) -> Option<String> {
     (!combined.is_empty()).then_some(combined)
 }
 
-/// One decoded SSE line: content, thinking, tool calls, done.
-type OllamaDelta = (String, Option<String>, Option<Vec<OllamaToolCall>>, bool);
+/// One decoded SSE line as an Ollama chunk's worth of change. `done` is
+/// set exactly once per response, on the chunk that also carries the
+/// tool calls, `done_reason` and metrics.
+#[derive(Default, Debug)]
+struct OllamaDelta {
+    content: String,
+    thinking: Option<String>,
+    tool_calls: Option<Vec<OllamaToolCall>>,
+    done: bool,
+    done_reason: Option<String>,
+    metrics: OllamaMetrics,
+}
 
 /// Response-spanning decode state, shared by both paths below so each
 /// reads a response identically.
+///
+/// An OpenAI stream ends with a `finish_reason` chunk, then (with
+/// `include_usage`) a choiceless `usage` chunk, then `[DONE]`; llama-server
+/// puts `usage` and `timings` on the finish chunk itself. Ollama sends one
+/// `done` chunk carrying everything, so the finish is held until `[DONE]`
+/// (or the end of the stream, via [`OllamaLineDecoder::finish`]).
 struct OllamaLineDecoder {
     tool_calls_acc: std::cell::RefCell<std::collections::BTreeMap<usize, ToolCallAccumulator>>,
     content_extractor: std::cell::RefCell<RawContentExtractor>,
+    finish_reason: std::cell::RefCell<Option<String>>,
+    usage: std::cell::Cell<Option<OAIUsage>>,
+    timings: std::cell::Cell<Option<LlamaTimings>>,
+    done_sent: std::cell::Cell<bool>,
+    /// When the request arrived and how long loading the model took, for
+    /// `total_duration` and `load_duration`.
+    started: Instant,
+    load_duration: Duration,
 }
 
 impl OllamaLineDecoder {
-    fn new() -> Self {
+    fn new(started: Instant, load_duration: Duration) -> Self {
         Self {
             tool_calls_acc: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             content_extractor: std::cell::RefCell::new(RawContentExtractor::new()),
+            finish_reason: std::cell::RefCell::new(None),
+            usage: std::cell::Cell::new(None),
+            timings: std::cell::Cell::new(None),
+            done_sent: std::cell::Cell::new(false),
+            started,
+            load_duration,
         }
     }
 
-    /// `None` for a line that isn't a recognized SSE payload.
+    /// `None` for a line that isn't a recognized SSE payload, or one
+    /// with nothing to relay yet (the usage chunk).
     fn decode(&self, line: &str) -> Option<OllamaDelta> {
         let payload = line.strip_prefix("data: ")?;
         accumulate_tool_call_deltas(payload, &self.tool_calls_acc);
-        let (content, thinking, done) = oai_chunk_to_content(payload)?;
-        let (mut content, thinking) = self
+        if let Ok(chunk) = serde_json::from_str::<OAIChunk>(payload) {
+            if let Some(usage) = chunk.usage {
+                self.usage.set(Some(usage));
+            }
+            if let Some(timings) = chunk.timings {
+                self.timings.set(Some(timings));
+            }
+        }
+        let (content, thinking, finish) = oai_chunk_to_content(payload)?;
+        let (content, thinking) = self
             .content_extractor
             .borrow_mut()
             .process(content, thinking);
-        if done {
-            // Idempotent even across the two `done` chunks
-            // real Ollama's stream can produce (see below):
-            // `flush` drains via `mem::take`, so the second call
-            // just returns an already-empty string.
-            content.push_str(&self.content_extractor.borrow_mut().flush());
+        match finish {
+            // `[DONE]` after a finish chunk: everything is in; this is the
+            // one done chunk. Without one it is a truncated stream (see
+            // `finish`).
+            Some(reason) if reason.is_empty() => {
+                if self.finish_reason.borrow().is_none() {
+                    return Some(OllamaDelta {
+                        content,
+                        thinking,
+                        ..Default::default()
+                    });
+                }
+                Some(self.done_delta(content, thinking))
+            }
+            Some(reason) => {
+                *self.finish_reason.borrow_mut() = Some(reason);
+                Some(OllamaDelta {
+                    content,
+                    thinking,
+                    ..Default::default()
+                })
+            }
+            None => Some(OllamaDelta {
+                content,
+                thinking,
+                ..Default::default()
+            }),
         }
-        // llama-server's SSE stream signals "done" twice — once on
-        // the chunk carrying a real finish_reason, then again on
-        // the trailing literal "[DONE]" line — so `done` here can
-        // be true more than once per response. Draining (not just
-        // reading) the accumulator on the first occurrence means
-        // finalize_tool_calls sees an empty map and returns `None`
-        // on any later one, so a client can't be handed (and
-        // potentially act on) the same tool call twice.
-        let tool_calls = done.then(|| {
-            let drained = std::mem::take(&mut *self.tool_calls_acc.borrow_mut());
-            finalize_tool_calls(&drained)
-        });
-        Some((content, thinking, tool_calls.flatten(), done))
+    }
+
+    /// The end of the stream without `[DONE]`: the done chunk if a
+    /// finish reason was seen, else nothing, since partial output is not
+    /// completion. Idempotent, like `[DONE]` after `[DONE]`.
+    fn finish(&self) -> Option<OllamaDelta> {
+        if self.finish_reason.borrow().is_none() {
+            return None;
+        }
+        (!self.done_sent.get()).then(|| self.done_delta(String::new(), None))
+    }
+
+    fn done_delta(&self, mut content: String, thinking: Option<String>) -> OllamaDelta {
+        if self.done_sent.replace(true) {
+            return OllamaDelta {
+                content,
+                thinking,
+                ..Default::default()
+            };
+        }
+        content.push_str(&self.content_extractor.borrow_mut().flush());
+        let drained = std::mem::take(&mut *self.tool_calls_acc.borrow_mut());
+        let reason = self.finish_reason.borrow().clone().unwrap_or_default();
+        OllamaDelta {
+            content,
+            thinking,
+            tool_calls: finalize_tool_calls(&drained),
+            done: true,
+            done_reason: Some(ollama_done_reason(&reason)),
+            metrics: self.metrics(),
+        }
+    }
+
+    fn metrics(&self) -> OllamaMetrics {
+        let ns = |ms: f64| (ms * 1_000_000.0) as u64;
+        let usage = self.usage.get();
+        let timings = self.timings.get();
+        let total = self.started.elapsed();
+        OllamaMetrics {
+            total_duration: Some(total.as_nanos() as u64),
+            load_duration: Some(self.load_duration.as_nanos() as u64),
+            prompt_eval_count: timings
+                .map(|t| t.prompt_n)
+                .or(usage.map(|u| u.prompt_tokens)),
+            prompt_eval_cached_count: timings
+                .and_then(|t| t.cache_n)
+                .or(usage.and_then(|u| u.prompt_tokens_details.cached_tokens)),
+            prompt_eval_duration: timings.map(|t| ns(t.prompt_ms)),
+            eval_count: timings
+                .map(|t| t.predicted_n)
+                .or(usage.map(|u| u.completion_tokens)),
+            // Only the backend can time generation apart from prompt
+            // evaluation; a guess would misreport tokens per second.
+            eval_duration: timings.map(|t| ns(t.predicted_ms)),
+        }
+    }
+}
+
+/// Ollama's `done_reason` for a chat completion's `finish_reason`. Ollama
+/// reports a tool-calling turn as `stop` (its `openai` layer is what
+/// relabels that `tool_calls`), and knows only `stop` and `length`.
+fn ollama_done_reason(finish_reason: &str) -> String {
+    match finish_reason {
+        "length" => "length".to_string(),
+        _ => "stop".to_string(),
     }
 }
 
@@ -4947,20 +5325,34 @@ struct OllamaFold {
     thinking: Option<String>,
     tool_calls: Option<Vec<OllamaToolCall>>,
     done: bool,
+    done_reason: Option<String>,
+    metrics: OllamaMetrics,
 }
 
 impl OllamaFold {
-    fn push(&mut self, (content, thinking, tool_calls, done): OllamaDelta) {
-        self.content.push_str(&content);
-        if let Some(t) = thinking {
+    fn push(&mut self, delta: OllamaDelta) {
+        self.content.push_str(&delta.content);
+        if let Some(t) = delta.thinking {
             self.thinking.get_or_insert_with(String::new).push_str(&t);
         }
-        // Only the first `done` yields tool calls, so a later `None` never
-        // overwrites them.
-        if tool_calls.is_some() {
-            self.tool_calls = tool_calls;
+        if delta.done {
+            self.tool_calls = delta.tool_calls;
+            self.done = true;
+            self.done_reason = delta.done_reason;
+            self.metrics = delta.metrics;
         }
-        self.done |= done;
+    }
+
+    /// The done chunk this fold stands for.
+    fn into_delta(self) -> OllamaDelta {
+        OllamaDelta {
+            content: self.content,
+            thinking: self.thinking,
+            tool_calls: self.tool_calls,
+            done: true,
+            done_reason: self.done_reason,
+            metrics: self.metrics,
+        }
     }
 }
 
@@ -4968,30 +5360,35 @@ impl OllamaFold {
 /// pushes as each line arrives instead of buffering them all.
 #[cfg(test)]
 fn fold_ollama_lines<I: IntoIterator<Item = String>>(lines: I) -> OllamaFold {
-    let decoder = OllamaLineDecoder::new();
+    let decoder = OllamaLineDecoder::new(Instant::now(), Duration::ZERO);
     let mut fold = OllamaFold::default();
     for line in lines {
         if let Some(delta) = decoder.decode(&line) {
             fold.push(delta);
         }
     }
+    if let Some(delta) = decoder.finish() {
+        fold.push(delta);
+    }
     fold
 }
 
-/// `build_chunk`'s `tool_calls` parameter is only ever `Some` on the final
-/// (`done`) chunk of an `/api/chat` response that made one or more tool
-/// calls — `/api/generate` (no tool-calling support in real Ollama
-/// either) always gets `None` here and ignores it.
+/// Streams (or folds) a chat completion as Ollama chunks built by
+/// `build_chunk`. `started` is when the request arrived and
+/// `load_duration` how long its model took to load, for the metrics on
+/// the done chunk.
+#[allow(clippy::too_many_arguments)]
 async fn stream_ollama<T: Serialize + Send + 'static>(
     streaming: bool,
     client: Client,
     target: Target,
     mut oai_req: OAIChatRequest,
     activity: ActivityGuard,
-    build_chunk: impl Fn(String, Option<String>, Option<Vec<OllamaToolCall>>, bool) -> T
-        + Send
-        + 'static,
+    started: Instant,
+    load_duration: Duration,
+    build_chunk: impl Fn(OllamaDelta) -> T + Send + 'static,
 ) -> Result<Response, AppError> {
+    oai_req.stream_options = Some(serde_json::json!({ "include_usage": true }));
     let resp = post_chat(&client, &target, &mut oai_req).await?;
 
     // `stream: false` answers with the one JSON object Ollama returns.
@@ -4999,13 +5396,16 @@ async fn stream_ollama<T: Serialize + Send + 'static>(
     // upstream sends nothing until generation ends, risking a read timeout.
     if !streaming {
         let _activity = activity;
-        let decoder = OllamaLineDecoder::new();
+        let decoder = OllamaLineDecoder::new(started, load_duration);
         let mut fold = OllamaFold::default();
         let mut lines = Box::pin(bytes_to_lines(resp));
         while let Some(line) = lines.next().await {
             if let Some(delta) = decoder.decode(&line) {
                 fold.push(delta);
             }
+        }
+        if let Some(delta) = decoder.finish() {
+            fold.push(delta);
         }
         // bytes_to_lines reports a mid-response read failure as a clean end
         // of stream, so a missing terminal chunk is the only evidence the
@@ -5018,30 +5418,27 @@ async fn stream_ollama<T: Serialize + Send + 'static>(
                 StatusCode::BAD_GATEWAY,
             ));
         }
-        return Ok(Json(build_chunk(
-            fold.content,
-            fold.thinking,
-            fold.tool_calls,
-            true,
-        ))
-        .into_response());
+        return Ok(Json(build_chunk(fold.into_delta())).into_response());
     }
 
-    let decoder = OllamaLineDecoder::new();
-    let stream = bytes_to_lines(resp).map(move |line| {
-        // Moved into this closure purely to keep it alive — see
-        // ActivityGuard's doc comment — until the stream itself is
-        // dropped, not referenced otherwise.
-        let _activity = &activity;
-        let out = decoder
-            .decode(&line)
-            .map(|(content, thinking, tool_calls, done)| {
-                let chunk = build_chunk(content, thinking, tool_calls, done);
-                serde_json::to_string(&chunk).unwrap_or_default() + "\n"
-            })
-            .unwrap_or_default();
-        Ok::<_, std::convert::Infallible>(Bytes::from(out))
-    });
+    let decoder = OllamaLineDecoder::new(started, load_duration);
+    // A trailing `None` closes a stream the backend ended without `[DONE]`.
+    let stream = bytes_to_lines(resp)
+        .map(Some)
+        .chain(futures::stream::once(futures::future::ready(None)))
+        .map(move |line| {
+            // Moved into this closure purely to keep it alive until the
+            // stream is dropped (see ActivityGuard), not referenced.
+            let _activity = &activity;
+            let delta = match line {
+                Some(line) => decoder.decode(&line),
+                None => decoder.finish(),
+            };
+            let out = delta
+                .map(|delta| serde_json::to_string(&build_chunk(delta)).unwrap_or_default() + "\n")
+                .unwrap_or_default();
+            Ok::<_, std::convert::Infallible>(Bytes::from(out))
+        });
 
     Ok(Response::builder()
         .header("content-type", "application/x-ndjson")
@@ -6293,6 +6690,7 @@ fn empty_chat_chunk(model: String, done_reason: &str) -> OllamaChatChunk {
         },
         done: true,
         done_reason: Some(done_reason.into()),
+        metrics: OllamaMetrics::default(),
     }
 }
 
@@ -6327,17 +6725,22 @@ async fn handle_ollama_chat(
     // would.
     let model_ref = req.model.clone();
     let request_threads = opt_num_thread(&req.options);
+    let started = Instant::now();
     send_with_hybrid_fallback(
         &state,
         &model_ref,
         Some(&headers),
         request_threads,
-        |model, target, guard| ollama_chat_to(&state, &headers, &req, model, target, guard),
+        |model, target, guard| {
+            ollama_chat_to(&state, &headers, &req, model, target, guard, started)
+        },
     )
     .await
 }
 
-/// [`handle_ollama_chat`] against one resolved target.
+/// [`handle_ollama_chat`] against one resolved target. `started` is when
+/// the request arrived; the time to here is its `load_duration`.
+#[allow(clippy::too_many_arguments)]
 async fn ollama_chat_to(
     state: &AppState,
     headers: &HeaderMap,
@@ -6345,7 +6748,15 @@ async fn ollama_chat_to(
     model: String,
     target: Target,
     guard: ActivityGuard,
+    started: Instant,
 ) -> Result<Response, AppError> {
+    // A provider loads nothing; and the hosted half of a hybrid retry
+    // must not be charged the failed local attempt.
+    let load_duration = if target.is_remote() {
+        Duration::ZERO
+    } else {
+        started.elapsed()
+    };
     if matches!(target, Target::Peer(_)) {
         return forward_ollama(state, &target, "/api/chat", headers, req, &model, guard).await;
     }
@@ -6366,16 +6777,10 @@ async fn ollama_chat_to(
         model: wire_model,
         messages: req.messages.iter().map(ollama_message_to_oai).collect(),
         stream: true,
-        temperature: opt_f64(&req.options, "temperature"),
-        top_p: opt_f64(&req.options, "top_p"),
-        max_tokens: opt_u32(&req.options, "num_predict"),
-        // No `.or(Some(DEFAULT_REPEAT_PENALTY))` here — post_chat (the
-        // only place this request actually reaches llama-server) resolves
-        // that default itself now. See apply_default_repeat_penalty_typed.
-        repeat_penalty: opt_f64(&req.options, "repeat_penalty"),
         chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
         tools: req.tools.clone(),
         response_format: format_to_response_format(&req.format),
+        ..options_to_oai(&req.options)
     };
     stream_ollama(
         req.stream,
@@ -6383,31 +6788,59 @@ async fn ollama_chat_to(
         target,
         oai,
         activity,
-        move |content, thinking, tool_calls, done| {
-            let done_reason = done.then(|| {
-                if tool_calls.is_some() {
-                    "tool_calls".to_string()
-                } else {
-                    "stop".to_string()
-                }
-            });
-            OllamaChatChunk {
-                model: model.clone(),
-                created_at: now_rfc3339(),
-                message: OllamaMessage {
-                    role: "assistant".into(),
-                    content,
-                    thinking,
-                    tool_calls,
-                    images: None,
-                    tool_name: None,
-                },
-                done,
-                done_reason,
-            }
+        started,
+        load_duration,
+        move |delta| OllamaChatChunk {
+            model: model.clone(),
+            created_at: now_rfc3339(),
+            message: OllamaMessage {
+                role: "assistant".into(),
+                content: delta.content,
+                thinking: delta.thinking,
+                tool_calls: delta.tool_calls,
+                ..Default::default()
+            },
+            done: delta.done,
+            done_reason: delta.done_reason,
+            metrics: delta.metrics,
         },
     )
     .await
+}
+
+/// Ollama's `options` under their OpenAI (or llama-server) names. The
+/// sampling knobs Ollama documents that have no equivalent on a chat
+/// completion (`num_ctx`, `num_keep`, `repeat_last_n`, `typical_p`,
+/// `mirostat*`) are left out; `num_ctx` is `LLMMAN_CONTEXT_LENGTH`.
+fn options_to_oai(options: &Option<serde_json::Value>) -> OAIChatRequest {
+    OAIChatRequest {
+        temperature: opt_f64(options, "temperature"),
+        top_p: opt_f64(options, "top_p"),
+        // `-1` (no limit) and `-2` (fill the context) both mean "no cap".
+        max_tokens: opt_u32(options, "num_predict"),
+        // Defaulted by post_chat; see apply_default_repeat_penalty_typed.
+        repeat_penalty: opt_f64(options, "repeat_penalty"),
+        seed: options.as_ref().and_then(|o| o.get("seed")?.as_u64()),
+        stop: opt_stop(options),
+        presence_penalty: opt_f64(options, "presence_penalty"),
+        frequency_penalty: opt_f64(options, "frequency_penalty"),
+        top_k: opt_u32(options, "top_k"),
+        min_p: opt_f64(options, "min_p"),
+        ..Default::default()
+    }
+}
+
+/// Ollama's `stop`: a string or an array of strings.
+fn opt_stop(options: &Option<serde_json::Value>) -> Option<Vec<String>> {
+    match options.as_ref()?.get("stop")? {
+        serde_json::Value::String(s) => Some(vec![s.clone()]),
+        serde_json::Value::Array(a) => Some(
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 // -- Ollama /api/generate -----------------------------------------------------
@@ -6438,23 +6871,47 @@ async fn handle_ollama_generate(
             thinking: None,
             done: true,
             done_reason: Some("unload".into()),
+            metrics: OllamaMetrics::default(),
         })
         .into_response());
     }
 
+    // Ollama renders these itself; llmman leaves templating to the
+    // backend and has nothing to render them with (see the fields' doc).
+    let unsupported = if req.raw {
+        Some("raw")
+    } else if req.suffix.as_deref().is_some_and(|s| !s.is_empty()) {
+        Some("suffix")
+    } else if req.template.as_deref().is_some_and(|t| !t.is_empty()) {
+        Some("template")
+    } else {
+        None
+    };
+    if let Some(field) = unsupported {
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            format!("llmman does not support the {field:?} field of /api/generate"),
+        ));
+    }
+
     let model_ref = req.model.clone();
     let request_threads = opt_num_thread(&req.options);
+    let started = Instant::now();
     send_with_hybrid_fallback(
         &state,
         &model_ref,
         Some(&headers),
         request_threads,
-        |model, target, guard| ollama_generate_to(&state, &headers, &req, model, target, guard),
+        |model, target, guard| {
+            ollama_generate_to(&state, &headers, &req, model, target, guard, started)
+        },
     )
     .await
 }
 
-/// [`handle_ollama_generate`] against one resolved target.
+/// [`handle_ollama_generate`] against one resolved target; see
+/// [`ollama_chat_to`] for `started`.
+#[allow(clippy::too_many_arguments)]
 async fn ollama_generate_to(
     state: &AppState,
     headers: &HeaderMap,
@@ -6462,7 +6919,14 @@ async fn ollama_generate_to(
     model: String,
     target: Target,
     guard: ActivityGuard,
+    started: Instant,
 ) -> Result<Response, AppError> {
+    // See ollama_chat_to.
+    let load_duration = if target.is_remote() {
+        Duration::ZERO
+    } else {
+        started.elapsed()
+    };
     if matches!(target, Target::Peer(_)) {
         return forward_ollama(state, &target, "/api/generate", headers, req, &model, guard).await;
     }
@@ -6478,6 +6942,7 @@ async fn ollama_generate_to(
             thinking: None,
             done: true,
             done_reason: Some("load".into()),
+            metrics: OllamaMetrics::default(),
         })
         .into_response());
     }
@@ -6486,20 +6951,30 @@ async fn ollama_generate_to(
     let activity = begin_activity(guard, Some(keep_alive)).await;
     // See backend_wire_model's own doc comment.
     let wire_model = backend_wire_model(state, &target, &model).await;
+    // The prompt is one user turn, with the request's images on it, under
+    // its system prompt when given.
+    let user = OllamaMessage {
+        role: "user".into(),
+        content: req.prompt.clone(),
+        images: req.images.clone(),
+        ..Default::default()
+    };
+    let messages = req
+        .system
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| OAIMessage::text("system", s))
+        .into_iter()
+        .chain(std::iter::once(ollama_message_to_oai(&user)))
+        .collect();
     let oai = OAIChatRequest {
         model: wire_model,
-        messages: vec![OAIMessage::text("user", req.prompt.clone())],
+        messages,
         stream: true,
-        temperature: opt_f64(&req.options, "temperature"),
-        top_p: opt_f64(&req.options, "top_p"),
-        max_tokens: opt_u32(&req.options, "num_predict"),
-        // No `.or(Some(DEFAULT_REPEAT_PENALTY))` here — post_chat (the
-        // only place this request actually reaches llama-server) resolves
-        // that default itself now. See apply_default_repeat_penalty_typed.
-        repeat_penalty: opt_f64(&req.options, "repeat_penalty"),
         chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
         tools: None,
         response_format: format_to_response_format(&req.format),
+        ..options_to_oai(&req.options)
     };
     stream_ollama(
         req.stream,
@@ -6507,13 +6982,16 @@ async fn ollama_generate_to(
         target,
         oai,
         activity,
-        move |response, thinking, _tool_calls, done| OllamaGenerateChunk {
+        started,
+        load_duration,
+        move |delta| OllamaGenerateChunk {
             model: model.clone(),
             created_at: now_rfc3339(),
-            response,
-            thinking,
-            done,
-            done_reason: done.then_some("stop".into()),
+            response: delta.content,
+            thinking: delta.thinking,
+            done: delta.done,
+            done_reason: delta.done_reason,
+            metrics: delta.metrics,
         },
     )
     .await
@@ -7049,19 +7527,13 @@ async fn proxy_openai_generation_to(
         return Ok(refusal);
     }
     if llama_path == RESPONSES_ROUTE && target.is_remote() {
-        // See repeat_penalty_applies: a strict provider 400s on it.
-        if let Some(req) = req.as_object_mut() {
-            req.remove("repeat_penalty");
-        }
+        strip_llama_fields(&mut req);
         // A remote target always has an override (see backend_wire_model).
         let canonical = response_model_override
             .unwrap_or_else(|| req["model"].as_str().unwrap_or_default().to_string());
         return remote_responses(&state.0.client, &target, headers, req, activity, canonical).await;
     }
     if llama_path == CHAT_COMPLETIONS_ROUTE && target.is_anthropic() {
-        if let Some(req) = req.as_object_mut() {
-            req.remove("repeat_penalty");
-        }
         let canonical = response_model_override
             .unwrap_or_else(|| req["model"].as_str().unwrap_or_default().to_string());
         // The translated reply already names the canonical model.
@@ -7071,14 +7543,12 @@ async fn proxy_openai_generation_to(
     if is_responses_route(llama_path) && !target.is_remote() {
         sanitize_responses_request(&mut req);
     }
-    if repeat_penalty_applies(&target) {
-        apply_default_repeat_penalty(&mut req);
-    } else {
-        // See repeat_penalty_applies: not an OpenAI field, and a strict
-        // provider rejects the whole request over it.
-        if let Some(req) = req.as_object_mut() {
-            req.remove("repeat_penalty");
+    match &target {
+        Target::Remote(remote) if llama_path == CHAT_COMPLETIONS_ROUTE => {
+            provider_compat(remote, &mut req)
         }
+        Target::Remote(_) => strip_llama_fields(&mut req),
+        _ => apply_default_repeat_penalty(&mut req),
     }
     let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
@@ -7797,16 +8267,10 @@ async fn anthropic_messages_to(
         temperature: req.temperature,
         top_p: req.top_p,
         max_tokens: req.max_tokens,
-        // The Anthropic Messages API has no repeat_penalty concept of its
-        // own to read an override from, so this is always `None` here —
-        // post_chat (the only place this request actually reaches
-        // llama-server) resolves DEFAULT_REPEAT_PENALTY itself. See
-        // apply_default_repeat_penalty_typed.
-        repeat_penalty: None,
-        // Nor a `think` override — see think_to_chat_template_kwargs.
-        chat_template_kwargs: None,
-        tools: None,
-        response_format: None,
+        // No repeat_penalty concept to read an override from: post_chat
+        // resolves DEFAULT_REPEAT_PENALTY itself (see
+        // apply_default_repeat_penalty_typed). Nor a `think` override.
+        ..Default::default()
     };
 
     if req.stream {
@@ -9065,25 +9529,26 @@ mod tests {
         let target = remote_target(&format!("http://127.0.0.1:{}/v1", addr.port()));
         let mut req = OAIChatRequest {
             model: "mock-model".into(),
-            messages: vec![],
             stream: false,
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
             repeat_penalty: Some(1.1),
-            chat_template_kwargs: None,
-            tools: None,
-            response_format: None,
+            top_k: Some(40),
+            min_p: Some(0.05),
+            chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": true })),
+            ..Default::default()
         };
         let _body = post_chat(&Client::new(), &target, &mut req).await.unwrap();
 
         let (auth, body) = seen.lock().await.take().expect("provider was not called");
         assert_eq!(auth, "Bearer sk-test");
         assert_eq!(body["model"], "mock-model");
-        assert!(
-            body.get("repeat_penalty").is_none(),
-            "llama.cpp-only field sent to a provider: {body}"
-        );
+        for field in ["repeat_penalty", "top_k", "min_p", "chat_template_kwargs"] {
+            assert!(
+                body.get(field).is_none(),
+                "llama.cpp-only field {field} sent to a provider: {body}"
+            );
+        }
+        // A bare `think: true` says nothing to an OpenAI provider.
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
     }
 
     /// A mock Messages API: records requests, answers `/v1/messages` with
@@ -9313,6 +9778,97 @@ mod tests {
         });
         set_response_model(&mut event, "mine");
         assert_eq!(event["message"]["model"], "mine");
+    }
+
+    fn remote(provider: &str, model: &str, wire: Wire) -> RemoteTarget {
+        RemoteTarget {
+            provider: provider.into(),
+            base_url: "https://example.invalid/v1".into(),
+            wire,
+            model: model.into(),
+            max_output: None,
+            api_key: "k".into(),
+        }
+    }
+
+    /// Ollama's `think` reaches a provider as `reasoning_effort`: any
+    /// explicit level everywhere; a bare `true`/`false` only on the
+    /// Anthropic wire, where it is a budget rather than a 400.
+    #[test]
+    fn provider_compat_translates_think_per_wire() {
+        let with = |remote: &RemoteTarget, kwargs: serde_json::Value| {
+            let mut req = serde_json::json!({ "model": "m", "chat_template_kwargs": kwargs });
+            provider_compat(remote, &mut req);
+            assert!(req.get("chat_template_kwargs").is_none());
+            req.get("reasoning_effort").cloned()
+        };
+        let openrouter = remote("openrouter", "some/model", Wire::OpenAi);
+        let anthropic = remote("anthropic", "claude", Wire::Anthropic);
+        let level = serde_json::json!({ "enable_thinking": true, "reasoning_effort": "high" });
+        assert_eq!(with(&openrouter, level.clone()), Some("high".into()));
+        assert_eq!(with(&anthropic, level), Some("high".into()));
+        let on = serde_json::json!({ "enable_thinking": true });
+        assert_eq!(with(&openrouter, on.clone()), None);
+        assert_eq!(with(&anthropic, on), Some("medium".into()));
+        let off = serde_json::json!({ "enable_thinking": false });
+        assert_eq!(with(&anthropic, off), Some("none".into()));
+    }
+
+    /// OpenAI's reasoning models take `max_completion_tokens` and reject
+    /// sampling overrides; its other models reject `reasoning_effort`.
+    /// Other providers are left alone beyond the llama.cpp fields.
+    #[test]
+    fn provider_compat_applies_openais_reasoning_model_rules() {
+        let mut req = serde_json::json!({
+            "model": "o3", "max_tokens": 100, "temperature": 0.2, "top_p": 0.9,
+            "presence_penalty": 0.1, "stop": ["x"], "reasoning_effort": "high",
+            "n_probs": 5, "cache_prompt": true, "json_schema": {}, "repeat_last_n": 64,
+            "n_predict": 8, "grammar_lazy": true, "grammar_triggers": [], "preserved_tokens": []
+        });
+        provider_compat(&remote("openai", "o3", Wire::OpenAi), &mut req);
+        assert_eq!(
+            req,
+            serde_json::json!({
+                "model": "o3", "max_completion_tokens": 100, "stop": ["x"], "reasoning_effort": "high"
+            })
+        );
+
+        let mut gpt5 = serde_json::json!({ "model": "gpt-5", "temperature": 1, "stop": ["x"], "logit_bias": {}, "max_completion_tokens": 7, "max_tokens": 9 });
+        provider_compat(&remote("openai", "gpt-5", Wire::OpenAi), &mut gpt5);
+        assert_eq!(
+            gpt5,
+            serde_json::json!({ "model": "gpt-5", "temperature": 1, "max_completion_tokens": 7 })
+        );
+
+        let mut plain = serde_json::json!({ "model": "gpt-4o", "temperature": 0.2, "reasoning_effort": "high", "max_tokens": 5 });
+        provider_compat(&remote("openai", "gpt-4o", Wire::OpenAi), &mut plain);
+        assert_eq!(
+            plain,
+            serde_json::json!({ "model": "gpt-4o", "temperature": 0.2, "max_tokens": 5 })
+        );
+
+        let mut other = serde_json::json!({ "model": "o3-mini", "temperature": 0.2, "max_tokens": 5, "top_k": 3, "stream_options": { "include_usage": true } });
+        provider_compat(&remote("groq", "o3-mini", Wire::OpenAi), &mut other);
+        assert_eq!(
+            other,
+            serde_json::json!({ "model": "o3-mini", "temperature": 0.2, "max_tokens": 5, "stream_options": { "include_usage": true } })
+        );
+        let mut cohere =
+            serde_json::json!({ "model": "c", "stream_options": { "include_usage": true } });
+        provider_compat(&remote("cohere", "c", Wire::OpenAi), &mut cohere);
+        assert_eq!(cohere, serde_json::json!({ "model": "c" }));
+
+        for (model, reasoning) in [
+            ("o1", true),
+            ("o4-mini", true),
+            ("openai/o3", true),
+            ("gpt-5-mini", true),
+            ("gpt-5-chat-latest", false),
+            ("gpt-4o", false),
+            ("omni", false),
+        ] {
+            assert_eq!(openai_reasoning_model(model), reasoning, "{model}");
+        }
     }
 
     // -- aggregation (peer daemons) ------------------------------------------
@@ -10236,15 +10792,9 @@ mod tests {
     fn oai_chat_request_with_repeat_penalty(repeat_penalty: Option<f32>) -> OAIChatRequest {
         OAIChatRequest {
             model: "qwen3.5:0.8b".into(),
-            messages: vec![],
             stream: true,
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
             repeat_penalty,
-            chat_template_kwargs: None,
-            tools: None,
-            response_format: None,
+            ..Default::default()
         }
     }
 
@@ -10319,7 +10869,9 @@ mod tests {
         let m = OllamaMessage {
             role: "assistant".into(),
             tool_calls: Some(vec![OllamaToolCall {
+                id: None,
                 function: OllamaToolCallFunction {
+                    index: 0,
                     name: "get_weather".into(),
                     arguments: serde_json::json!({ "city": "nyc" }),
                 },
@@ -10351,13 +10903,17 @@ mod tests {
             role: "assistant".into(),
             tool_calls: Some(vec![
                 OllamaToolCall {
+                    id: None,
                     function: OllamaToolCallFunction {
+                        index: 0,
                         name: "get_weather".into(),
                         arguments: serde_json::json!({ "city": "nyc" }),
                     },
                 },
                 OllamaToolCall {
+                    id: None,
                     function: OllamaToolCallFunction {
+                        index: 0,
                         name: "get_weather".into(),
                         arguments: serde_json::json!({ "city": "sf" }),
                     },
@@ -10380,10 +10936,108 @@ mod tests {
             role: "tool".into(),
             content: "72F and sunny".into(),
             tool_name: Some("get_weather".into()),
+            tool_call_id: Some("call_abc".into()),
             ..Default::default()
         };
         let oai = ollama_message_to_oai(&m);
         assert_eq!(oai.name.as_deref(), Some("get_weather"));
+        assert_eq!(oai.tool_call_id.as_deref(), Some("call_abc"));
+    }
+
+    /// A call's own id (`api.ToolCall.ID`) is kept, so a strict template
+    /// can match its result; one without gets a `call_` id.
+    #[test]
+    fn ollama_message_to_oai_keeps_a_tool_calls_own_id() {
+        let m = OllamaMessage {
+            role: "assistant".into(),
+            tool_calls: Some(vec![
+                OllamaToolCall {
+                    id: Some("call_given".into()),
+                    ..Default::default()
+                },
+                OllamaToolCall::default(),
+                OllamaToolCall {
+                    id: Some(String::new()),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let calls = ollama_message_to_oai(&m).tool_calls.unwrap();
+        assert_eq!(calls[0].id, "call_given");
+        assert!(calls[1].id.starts_with("call_"), "{}", calls[1].id);
+        assert!(calls[2].id.starts_with("call_"), "{}", calls[2].id);
+    }
+
+    /// Every Ollama option with a chat-completion spelling is mapped;
+    /// `num_predict: -1` (no limit) is no cap, and `stop` takes both forms.
+    #[test]
+    fn options_to_oai_maps_the_documented_sampling_options() {
+        let oai = options_to_oai(&Some(serde_json::json!({
+            "temperature": 0.5, "top_p": 0.9, "top_k": 40, "min_p": 0.05,
+            "seed": 42, "num_predict": -1, "repeat_penalty": 1.1,
+            "presence_penalty": 0.1, "frequency_penalty": 0.2,
+            "stop": ["a", "b"], "num_ctx": 8192
+        })));
+        assert_eq!(oai.temperature, Some(0.5));
+        assert_eq!(oai.top_k, Some(40));
+        assert_eq!(oai.min_p, Some(0.05));
+        assert_eq!(oai.seed, Some(42));
+        assert_eq!(oai.max_tokens, None);
+        assert_eq!(oai.presence_penalty, Some(0.1));
+        assert_eq!(oai.frequency_penalty, Some(0.2));
+        assert_eq!(
+            oai.stop.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
+        let one = options_to_oai(&Some(
+            serde_json::json!({ "stop": "END", "num_predict": 8 }),
+        ));
+        assert_eq!(one.stop.as_deref(), Some(&["END".to_string()][..]));
+        assert_eq!(one.max_tokens, Some(8));
+        assert_eq!(options_to_oai(&None).seed, None);
+    }
+
+    /// `/api/generate` fields Ollama renders itself are refused, not
+    /// silently dropped; `system` and `images` are honoured.
+    #[tokio::test]
+    async fn generate_refuses_what_it_cannot_render() {
+        for (field, value) in [
+            ("raw", serde_json::json!(true)),
+            ("suffix", serde_json::json!("}")),
+            ("template", serde_json::json!("{{ .Prompt }}")),
+        ] {
+            let mut body = serde_json::json!({ "model": "docker.io/ai/m", "prompt": "x" });
+            body[field] = value;
+            let req: OllamaGenerateRequest = serde_json::from_value(body).unwrap();
+            let err = handle_ollama_generate(State(test_state()), HeaderMap::new(), Json(req))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{field} accepted"));
+            assert_eq!(err.1, StatusCode::BAD_REQUEST, "{field}");
+            assert!(err.0.to_string().contains(field), "{field}: {}", err.0);
+        }
+        // `raw: false` and an empty suffix are the defaults, not a request.
+        let req: OllamaGenerateRequest = serde_json::from_value(
+            serde_json::json!({ "model": "docker.io/ai/m", "prompt": "", "raw": false, "suffix": "" }),
+        )
+        .unwrap();
+        assert!(!req.raw);
+    }
+
+    /// The system prompt and images of a generate request become the
+    /// system turn and the user turn's image parts.
+    #[test]
+    fn generate_system_and_images_become_messages() {
+        let user = OllamaMessage {
+            role: "user".into(),
+            content: "what is this".into(),
+            images: Some(vec!["AAAA".into()]),
+            ..Default::default()
+        };
+        let oai = ollama_message_to_oai(&user);
+        assert_eq!(oai.content[0]["text"], "what is this");
+        assert_eq!(oai.content[1]["type"], "image_url");
     }
 
     #[test]
@@ -10497,6 +11151,7 @@ mod tests {
             ToolCallAccumulator {
                 name: "f".into(),
                 arguments: "not json".into(),
+                ..Default::default()
             },
         );
         let calls = finalize_tool_calls(&acc).unwrap();
@@ -12786,23 +13441,79 @@ mod tests {
         assert!(fold.done);
     }
 
-    /// llama-server signals done twice and the decoder drains on the first,
-    /// so folding the last `done` line's value would lose the tool calls.
+    /// The finish chunk, a trailing usage chunk and `[DONE]` fold into one
+    /// done chunk: tool calls with the backend's id and Ollama's index,
+    /// `done_reason: stop` for a tool-calling turn (as Ollama reports it),
+    /// and the usage as `prompt_eval_count`/`eval_count`.
     #[test]
     fn fold_ollama_lines_keeps_tool_calls_across_a_second_done_line() {
         let lines = [
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"get_weather","arguments":"{\"city\":"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"name":"get_weather","arguments":"{\"city\":"}}]},"finish_reason":null}]}"#,
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Ankara\"}"}}]},"finish_reason":null}]}"#,
             r#"data: {"choices":[{"delta":{"content":""},"finish_reason":"tool_calls"}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":7}}"#,
             "data: [DONE]",
         ]
         .map(String::from);
-        let calls = fold_ollama_lines(lines)
-            .tool_calls
-            .expect("survive the trailing [DONE]");
+        let fold = fold_ollama_lines(lines);
+        let calls = fold.tool_calls.expect("survive the trailing [DONE]");
         assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id.as_deref(), Some("call_abc"));
+        assert_eq!(calls[0].function.index, 0);
         assert_eq!(calls[0].function.name, "get_weather");
         assert_eq!(calls[0].function.arguments["city"], "Ankara");
+        assert_eq!(fold.done_reason.as_deref(), Some("stop"));
+        assert_eq!(fold.metrics.prompt_eval_count, Some(12));
+        assert_eq!(fold.metrics.eval_count, Some(7));
+        assert!(fold.metrics.total_duration.is_some());
+    }
+
+    /// The done chunk is sent once, at `[DONE]`, never at the finish
+    /// chunk too; a stream that ends without `[DONE]` is closed by
+    /// `finish` when a finish reason was seen. `length` survives, and
+    /// llama-server's `timings` supply the counts and durations.
+    #[test]
+    fn the_decoder_emits_one_done_chunk() {
+        let decoder = OllamaLineDecoder::new(Instant::now(), Duration::from_millis(5));
+        assert!(
+            !decoder
+                .decode(r#"data: {"choices":[{"delta":{"content":"a"},"finish_reason":null}]}"#)
+                .unwrap()
+                .done
+        );
+        let finish = decoder
+            .decode(
+                r#"data: {"choices":[{"delta":{"content":"b"},"finish_reason":"length"}],"timings":{"prompt_n":3,"prompt_ms":10.0,"cache_n":1,"predicted_n":2,"predicted_ms":20.0}}"#,
+            )
+            .unwrap();
+        assert_eq!(finish.content, "b");
+        assert!(!finish.done, "the finish chunk is not the done chunk");
+        let done = decoder.decode("data: [DONE]").unwrap();
+        assert!(done.done);
+        assert_eq!(done.done_reason.as_deref(), Some("length"));
+        assert_eq!(done.metrics.prompt_eval_count, Some(3));
+        assert_eq!(done.metrics.prompt_eval_cached_count, Some(1));
+        assert_eq!(done.metrics.eval_count, Some(2));
+        assert_eq!(done.metrics.prompt_eval_duration, Some(10_000_000));
+        assert_eq!(done.metrics.eval_duration, Some(20_000_000));
+        assert_eq!(done.metrics.load_duration, Some(5_000_000));
+        assert!(!decoder.decode("data: [DONE]").unwrap().done);
+        assert!(decoder.finish().is_none());
+
+        let without_done = OllamaLineDecoder::new(Instant::now(), Duration::ZERO);
+        without_done
+            .decode(r#"data: {"choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]}"#);
+        let closed = without_done
+            .finish()
+            .expect("a seen finish closes the stream");
+        assert!(closed.done);
+        assert_eq!(closed.done_reason.as_deref(), Some("stop"));
+        assert!(without_done.finish().is_none());
+
+        // `[DONE]` with no finish chunk is truncation, not completion.
+        let cut = OllamaLineDecoder::new(Instant::now(), Duration::ZERO);
+        assert!(!cut.decode("data: [DONE]").unwrap().done);
+        assert!(cut.finish().is_none());
     }
 
     /// A response with no output folds to empty values.
@@ -12834,19 +13545,19 @@ mod tests {
             oai_chunk_to_content(
                 r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#
             ),
-            Some(("hi".into(), None, false))
+            Some(("hi".into(), None, None))
         );
-        // finish_reason "stop" marks the stream done.
+        // A finish_reason is carried through.
         assert_eq!(
             oai_chunk_to_content(
                 r#"{"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}"#
             ),
-            Some((String::new(), None, true))
+            Some((String::new(), None, Some("stop".into())))
         );
-        // The [DONE] sentinel also marks the stream done.
+        // The [DONE] sentinel is a finish with no reason.
         assert_eq!(
             oai_chunk_to_content("[DONE]"),
-            Some((String::new(), None, true))
+            Some((String::new(), None, Some(String::new())))
         );
         // llama-server's two reasoning field spellings both surface as
         // thinking: "reasoning_content" (Homebrew builds) and "thinking"
@@ -12855,20 +13566,20 @@ mod tests {
             oai_chunk_to_content(
                 r#"{"choices":[{"delta":{"reasoning_content":"hmm"},"finish_reason":null}]}"#
             ),
-            Some((String::new(), Some("hmm".into()), false))
+            Some((String::new(), Some("hmm".into()), None))
         );
         assert_eq!(
             oai_chunk_to_content(
                 r#"{"choices":[{"delta":{"thinking":"hmm"},"finish_reason":null}]}"#
             ),
-            Some((String::new(), Some("hmm".into()), false))
+            Some((String::new(), Some("hmm".into()), None))
         );
         // An empty reasoning string is filtered out rather than surfaced.
         assert_eq!(
             oai_chunk_to_content(
                 r#"{"choices":[{"delta":{"content":"x","reasoning_content":""},"finish_reason":null}]}"#
             ),
-            Some(("x".into(), None, false))
+            Some(("x".into(), None, None))
         );
         // Malformed JSON and an empty choices array are skipped, not fatal.
         assert_eq!(oai_chunk_to_content("not json"), None);
@@ -13687,6 +14398,7 @@ mod tests {
     const MOCK_SSE: &str = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n",
         "data: {\"choices\":[{\"delta\":{\"content\":\", world\"},\"finish_reason\":\"stop\"}]}\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":3}}\n",
         "data: [DONE]\n",
     );
 
@@ -13713,18 +14425,21 @@ mod tests {
                 ..Default::default()
             },
             ActivityGuard::new(&test_state(), "m"),
-            |content, thinking, tool_calls, done| OllamaChatChunk {
+            Instant::now(),
+            Duration::from_millis(1),
+            |delta| OllamaChatChunk {
                 model: "m".into(),
                 created_at: now_rfc3339(),
                 message: OllamaMessage {
                     role: "assistant".into(),
-                    content,
-                    thinking,
-                    tool_calls,
+                    content: delta.content,
+                    thinking: delta.thinking,
+                    tool_calls: delta.tool_calls,
                     ..Default::default()
                 },
-                done,
-                done_reason: done.then(|| "stop".to_string()),
+                done: delta.done,
+                done_reason: delta.done_reason,
+                metrics: delta.metrics,
             },
         )
         .await
@@ -13746,6 +14461,13 @@ mod tests {
         assert_eq!(one["message"]["content"], "Hello, world");
         assert_eq!(one["done"], true);
         assert_eq!(one["done_reason"], "stop");
+        // Ollama's metrics, from the usage chunk and llmman's clock.
+        assert_eq!(one["prompt_eval_count"], 4);
+        assert_eq!(one["eval_count"], 3);
+        assert_eq!(one["load_duration"], 1_000_000);
+        assert!(one["total_duration"].is_u64());
+        // No llama-server timings in the mock: no guessed eval_duration.
+        assert!(one.get("eval_duration").is_none());
     }
 
     #[tokio::test]
@@ -13763,7 +14485,11 @@ mod tests {
             .map(|c| c["message"]["content"].as_str().unwrap_or_default())
             .collect();
         assert_eq!(joined, "Hello, world");
-        assert_eq!(chunks.last().unwrap()["done"], true);
+        // Exactly one done chunk, and only it carries the metrics.
+        let done: Vec<_> = chunks.iter().filter(|c| c["done"] == true).collect();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0]["eval_count"], 3);
+        assert!(chunks[0].get("eval_count").is_none());
     }
 
     /// The process-wide registry against placeholder gauges.

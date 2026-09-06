@@ -53,6 +53,12 @@ pub(super) fn falls_back(status: StatusCode) -> bool {
 /// can report token counts; a `stream: false` caller folds the stream.
 /// Errors on `input_file`, as Ollama does.
 pub(super) fn from_responses_request(req: &Value) -> anyhow::Result<Value> {
+    // Nothing is stored here to resolve it against; silently ignoring it
+    // would answer with the history missing.
+    anyhow::ensure!(
+        req.get("previous_response_id").is_none_or(Value::is_null),
+        "previous_response_id is not supported: this server stores no responses; send the full input"
+    );
     let available_tools = req
         .get("tools")
         .and_then(Value::as_array)
@@ -106,10 +112,15 @@ pub(super) fn from_responses_request(req: &Value) -> anyhow::Result<Value> {
         ("temperature", "temperature"),
         ("top_p", "top_p"),
         ("max_output_tokens", "max_tokens"),
+        ("user", "user"),
+        ("safety_identifier", "safety_identifier"),
     ] {
         if let Some(v) = req.get(from).filter(|v| !v.is_null()) {
             chat[to] = v.clone();
         }
+    }
+    if let Some(v) = req.pointer("/text/verbosity").filter(|v| v.is_string()) {
+        chat["verbosity"] = v.clone();
     }
 
     // Ollama's `think` level; chat completions calls it `reasoning_effort`.
@@ -400,6 +411,11 @@ fn convert_responses_content(content: &Value) -> anyhow::Result<Value> {
                 let text = block.get("text").and_then(Value::as_str).unwrap_or("");
                 parts.push(json!({ "type": "text", "text": text }));
             }
+            // A replayed refusal is what the assistant said.
+            Some("refusal") => {
+                let text = block.get("refusal").and_then(Value::as_str).unwrap_or("");
+                parts.push(json!({ "type": "text", "text": text }));
+            }
             Some("input_image") => {
                 // A `file_id` image has no URL to send; skipped, as Ollama skips it.
                 if let Some(url) = block
@@ -444,6 +460,13 @@ fn content_text(content: &Value) -> String {
 // ResponsesStreamConverter)
 // ---------------------------------------------------------------------------
 
+/// A message content part's kind.
+#[derive(Clone, Copy, PartialEq)]
+enum PartKind {
+    Text,
+    Refusal,
+}
+
 /// One tool call, assembled from streamed argument fragments.
 #[derive(Default)]
 struct ToolCall {
@@ -470,7 +493,10 @@ pub(super) struct StreamConverter {
     first_write: bool,
     output_index: usize,
     content_started: bool,
-    accumulated_text: String,
+    /// The message's content parts in order, text or refusal, each with
+    /// what has streamed into it so far. OpenAI sends one or the other;
+    /// a backend sending both gets both, at their own indices.
+    parts: Vec<(PartKind, String)>,
     sequence_number: u64,
     accumulated_thinking: String,
     reasoning_item_id: String,
@@ -513,7 +539,7 @@ impl StreamConverter {
             first_write: true,
             output_index: 0,
             content_started: false,
-            accumulated_text: String::new(),
+            parts: Vec::new(),
             sequence_number: 0,
             accumulated_thinking: String::new(),
             reasoning_item_id: String::new(),
@@ -538,7 +564,12 @@ impl StreamConverter {
         let payload = payload.trim();
         let mut out = self.first_write();
         if payload == "[DONE]" {
-            out.push_str(&self.process_completion());
+            // Not proof of completion on its own, any more than EOF is.
+            if self.saw_finish {
+                out.push_str(&self.process_completion());
+            } else {
+                out.push_str(&self.response_failed("upstream stream ended before completion"));
+            }
             return out;
         }
         let Ok(chunk) = serde_json::from_str::<Value>(payload) else {
@@ -612,6 +643,13 @@ impl StreamConverter {
         {
             out.push_str(&self.process_text_content(content));
         }
+        if let Some(refusal) = delta
+            .get("refusal")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            out.push_str(&self.process_refusal(refusal));
+        }
 
         if choice
             .get("finish_reason")
@@ -660,20 +698,14 @@ impl StreamConverter {
 
     /// The `response` object as it stands once the stream is over.
     fn final_response(&self) -> Value {
-        let mut response = if self.error.is_some() {
-            let mut r = self.build_response_object(
-                "failed",
-                self.completed_items.clone(),
-                self.usage.clone(),
-            );
-            r["error"] = self.error.clone().unwrap_or(Value::Null);
-            r
-        } else {
-            self.build_response_object(
-                "completed",
-                self.completed_items.clone(),
-                self.usage.clone(),
-            )
+        let items = self.completed_items.clone();
+        let mut response = match &self.error {
+            Some(error) => {
+                let mut r = self.build_response_object("failed", items, self.usage.clone());
+                r["error"] = error.clone();
+                r
+            }
+            None => self.build_response_object("completed", items, self.usage.clone()),
         };
         response["completed_at"] = Value::from(now_unix());
         response
@@ -758,11 +790,13 @@ impl StreamConverter {
             "usage": usage,
             "max_output_tokens": req.get("max_output_tokens").cloned().unwrap_or(Value::Null),
             "max_tool_calls": Value::Null,
+            // Never stored here, whatever was asked.
             "store": false,
             "background": req.get("background").and_then(Value::as_bool).unwrap_or(false),
             "service_tier": "default",
-            "metadata": {},
-            "safety_identifier": Value::Null,
+            "metadata": req.get("metadata").cloned().filter(|m| m.is_object()).unwrap_or_else(|| json!({})),
+            "user": req.get("user").cloned().unwrap_or(Value::Null),
+            "safety_identifier": req.get("safety_identifier").cloned().unwrap_or(Value::Null),
             "prompt_cache_key": Value::Null,
         })
     }
@@ -825,6 +859,17 @@ impl StreamConverter {
 
     /// Ollama's `processTextContent`.
     fn process_text_content(&mut self, content: &str) -> String {
+        self.process_part(PartKind::Text, content)
+    }
+
+    /// A refusal streams like text, as a `refusal` part.
+    fn process_refusal(&mut self, refusal: &str) -> String {
+        self.process_part(PartKind::Refusal, refusal)
+    }
+
+    /// Appends `delta` to the message's current part of `kind`, opening
+    /// the message and a new part as needed.
+    fn process_part(&mut self, kind: PartKind, delta: &str) -> String {
         let mut out = self.finish_reasoning();
         if !self.content_started {
             self.content_started = true;
@@ -841,59 +886,75 @@ impl StreamConverter {
                     },
                 }),
             ));
+        }
+        if self.parts.last().is_none_or(|(k, _)| *k != kind) {
+            self.parts.push((kind, String::new()));
+            let index = self.parts.len() - 1;
             out.push_str(&self.new_event(
                 "response.content_part.added",
                 json!({
                     "item_id": self.item_id,
                     "output_index": self.output_index,
-                    "content_index": 0,
-                    "part": { "type": "output_text", "text": "", "annotations": [], "logprobs": [] },
+                    "content_index": index,
+                    "part": part_json(kind, ""),
                 }),
             ));
         }
-        self.accumulated_text.push_str(content);
-        out.push_str(&self.new_event(
-            "response.output_text.delta",
-            json!({
-                "item_id": self.item_id,
-                "output_index": self.output_index,
-                "content_index": 0,
-                "delta": content,
-                "logprobs": [],
-            }),
-        ));
+        let index = self.parts.len() - 1;
+        self.parts[index].1.push_str(delta);
+        let (event, mut data) = match kind {
+            PartKind::Text => ("response.output_text.delta", json!({ "logprobs": [] })),
+            PartKind::Refusal => ("response.refusal.delta", json!({})),
+        };
+        data["item_id"] = json!(self.item_id);
+        data["output_index"] = json!(self.output_index);
+        data["content_index"] = json!(index);
+        data["delta"] = json!(delta);
+        out.push_str(&self.new_event(event, data));
         out
     }
 
-    /// Ollama's `FinishMessageItem`.
+    /// Ollama's `FinishMessageItem`, closing every part in order.
     fn finish_message_item(&mut self) -> String {
         if !self.content_started {
             return String::new();
         }
         self.content_started = false;
-        let text = std::mem::take(&mut self.accumulated_text);
+        let parts = std::mem::take(&mut self.parts);
         let item_id = self.item_id.clone();
         let output_index = self.output_index;
-        let part =
-            json!({ "type": "output_text", "text": text, "annotations": [], "logprobs": [] });
+        let content: Vec<Value> = parts
+            .iter()
+            .map(|(kind, text)| part_json(*kind, text))
+            .collect();
         let item = json!({
             "id": item_id,
             "type": "message",
             "status": "completed",
             "role": "assistant",
-            "content": [part.clone()],
+            "content": content,
         });
         self.completed_items.push(item.clone());
         self.output_index += 1;
 
-        let mut out = self.new_event(
-            "response.output_text.done",
-            json!({ "item_id": item_id, "output_index": output_index, "content_index": 0, "text": text, "logprobs": [] }),
-        );
-        out.push_str(&self.new_event(
-            "response.content_part.done",
-            json!({ "item_id": item_id, "output_index": output_index, "content_index": 0, "part": part }),
-        ));
+        let mut out = String::new();
+        for (index, (kind, text)) in parts.iter().enumerate() {
+            let (event, mut data) = match kind {
+                PartKind::Text => (
+                    "response.output_text.done",
+                    json!({ "text": text, "logprobs": [] }),
+                ),
+                PartKind::Refusal => ("response.refusal.done", json!({ "refusal": text })),
+            };
+            data["item_id"] = json!(item_id);
+            data["output_index"] = json!(output_index);
+            data["content_index"] = json!(index);
+            out.push_str(&self.new_event(event, data));
+            out.push_str(&self.new_event(
+                "response.content_part.done",
+                json!({ "item_id": item_id, "output_index": output_index, "content_index": index, "part": part_json(*kind, text) }),
+            ));
+        }
         out.push_str(&self.new_event(
             "response.output_item.done",
             json!({ "output_index": output_index, "item": item }),
@@ -990,6 +1051,16 @@ impl StreamConverter {
         data["sequence_number"] = Value::from(self.sequence_number);
         self.sequence_number += 1;
         format!("event: {kind}\ndata: {data}\n\n")
+    }
+}
+
+/// A message content part of `kind` holding `text`.
+fn part_json(kind: PartKind, text: &str) -> Value {
+    match kind {
+        PartKind::Text => {
+            json!({ "type": "output_text", "text": text, "annotations": [], "logprobs": [] })
+        }
+        PartKind::Refusal => json!({ "type": "refusal", "refusal": text }),
     }
 }
 
@@ -1715,6 +1786,105 @@ mod tests {
             assert_eq!(output[0]["type"], "reasoning");
             assert_eq!(output[1]["type"], "message");
         }
+    }
+
+    /// `previous_response_id` cannot be honoured without a store and is
+    /// refused rather than answered with the history missing.
+    #[test]
+    fn a_previous_response_id_is_refused() {
+        let err =
+            from_responses_request(&json!({ "input": "hi", "previous_response_id": "resp_1" }))
+                .unwrap_err();
+        assert!(err.to_string().contains("previous_response_id"), "{err}");
+        assert!(
+            from_responses_request(&json!({ "input": "hi", "previous_response_id": null })).is_ok()
+        );
+    }
+
+    /// Fields with a chat-completion spelling are forwarded, and a
+    /// replayed refusal is what the assistant said.
+    #[test]
+    fn user_verbosity_and_refusals_are_forwarded() {
+        let chat = from_responses_request(&json!({
+            "input": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": [{ "type": "refusal", "refusal": "I cannot." }] }
+            ],
+            "user": "u1", "text": { "verbosity": "low" }
+        }))
+        .unwrap();
+        assert_eq!(chat["user"], "u1");
+        assert_eq!(chat["verbosity"], "low");
+        assert_eq!(chat["messages"][1]["content"], "I cannot.");
+        let both = from_responses_request(
+            &json!({ "input": "hi", "user": "u1", "safety_identifier": "s1" }),
+        )
+        .unwrap();
+        assert_eq!(both["user"], "u1");
+        assert_eq!(both["safety_identifier"], "s1");
+    }
+
+    /// Text and a refusal in one message are two parts at their own
+    /// indices, both kept.
+    #[test]
+    fn mixed_text_and_refusal_are_separate_parts() {
+        let lines = [
+            r#"data: {"choices":[{"index":0,"delta":{"content":"Some"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"refusal":"No."},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"content":" more"},"finish_reason":"stop"}]}"#,
+            "data: [DONE]",
+        ];
+        let (_, events) = run(json!({}), &lines);
+        let deltas: Vec<(String, u64)> = events
+            .iter()
+            .filter(|e| {
+                e["type"]
+                    .as_str()
+                    .is_some_and(|t| t.ends_with(".delta") && !t.contains("reasoning"))
+            })
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap().to_string(),
+                    e["content_index"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            deltas,
+            [
+                ("response.output_text.delta".to_string(), 0),
+                ("response.refusal.delta".to_string(), 1),
+                ("response.output_text.delta".to_string(), 2),
+            ]
+        );
+        let content = &events.last().unwrap()["response"]["output"][0]["content"];
+        assert_eq!(content[0]["text"], "Some");
+        assert_eq!(content[1]["refusal"], "No.");
+        assert_eq!(content[2]["text"], " more");
+    }
+
+    /// A refusal streams as a `refusal` part with its own events, and the
+    /// request's `metadata` and `user` come back on the response object.
+    #[test]
+    fn a_refusal_is_a_refusal_part() {
+        let lines = [
+            r#"data: {"choices":[{"index":0,"delta":{"refusal":"I can"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"refusal":"not."},"finish_reason":"stop"}]}"#,
+            "data: [DONE]",
+        ];
+        let (_, events) = run(json!({ "metadata": { "k": "v" }, "user": "u1" }), &lines);
+        let kinds: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert!(kinds.contains(&"response.refusal.delta"), "{kinds:?}");
+        assert!(kinds.contains(&"response.refusal.done"), "{kinds:?}");
+        assert!(!kinds.contains(&"response.output_text.delta"), "{kinds:?}");
+        let last = events.last().unwrap();
+        assert_eq!(
+            last["response"]["output"][0]["content"][0],
+            json!({ "type": "refusal", "refusal": "I cannot." })
+        );
+        assert_eq!(last["response"]["metadata"], json!({ "k": "v" }));
+        assert_eq!(last["response"]["user"], "u1");
+        assert_eq!(last["response"]["store"], false);
     }
 
     /// Ollama reports a truncated reply as `completed` with the text it
