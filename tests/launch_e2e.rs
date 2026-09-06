@@ -32,6 +32,14 @@
 //! its own prerequisite (`mlx_lm.server` on `PATH`, and Apple Silicon
 //! macOS, the only platform that binary even runs on) isn't met.
 //!
+//! [`backend_metrics_follows_llmman_metrics`] is the other non-integration
+//! test here: it proves `LLMMAN_METRICS` reaches the backend
+//! `llama-server` llmman spawns (see `container::LlamaOptions::metrics`).
+//! Unlike everything else in this file it starts daemons of its own
+//! rather than using the shared one, because that flag is read once at
+//! daemon startup and both of its states have to be exercised — see the
+//! test's own doc comment.
+//!
 //! `llmman serve` is a process-wide singleton bound to a single loopback
 //! port (127.0.0.1:17434 by default, or wherever `LLMMAN_HOST` points —
 //! see `daemon::server`/`daemon::bind_addr`), so these tests can't
@@ -1052,6 +1060,564 @@ fn dead_daemon_setup(label: &str) -> (PathBuf, u16, std::ffi::OsString) {
 /// tolerated the same way a timeout or a missing "pong" already are.
 fn openclaw_pull_registry_flake(stderr: &str) -> bool {
     stderr.contains("pull failed: copy image") || stderr.contains("FailoverError")
+}
+
+/// How long [`backend_metrics_follows_llmman_metrics`] waits for a
+/// freshly spawned `llmman serve` to answer `/api/version`. Enforced as
+/// one overall deadline rather than a fixed iteration count times a
+/// per-request timeout: a daemon that accepts the connection and then
+/// hangs must not be able to stretch this into a multiple of itself.
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Per-request timeout while polling for readiness. Deliberately much
+/// shorter than [`DAEMON_READY_TIMEOUT`] so a single wedged request
+/// costs one poll interval, not the whole budget — the loop's own
+/// deadline is what bounds the wait.
+const READY_POLL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Timeout for the individual assertions against a daemon already known
+/// to be up. Generous, since the backend it proxies to is a real
+/// llama-server, but finite: a hung response has to fail this one
+/// request rather than block the job until the workflow's own
+/// `timeout-minutes` kills it (see `kill_process_tree`'s doc comment for
+/// the same failure shape this file was already bitten by once).
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on one `llmman stop`, which is a single HTTP round trip plus the
+/// backend's own teardown. Deliberately not [`TIMEOUT`]: that budget
+/// exists to cover a cold ~740MB model pull, and spending it on three
+/// unloads as well would put this one test's worst case at 52 minutes,
+/// past the headroom the e2e job's own `timeout-minutes` accounting
+/// leaves (see that comment in `.github/workflows/ci.yml`).
+const UNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// An `llmman serve` daemon this file started itself on its own port,
+/// separate from the one shared, implicitly-started daemon every other
+/// test here talks to (see the module doc comment). Needed because
+/// `LLMMAN_METRICS` is read once at daemon startup — proving both its
+/// states means two daemons, and neither can be the shared one, whose
+/// environment belongs to whoever started it.
+struct IsolatedDaemon {
+    port: u16,
+    /// Killed as a process *tree* on drop, not just as one process: the
+    /// daemon spawns a real llama-server child of its own, which would
+    /// otherwise survive this struct and keep both the model's memory
+    /// and its port. Drop (rather than a kill at the end of the test)
+    /// covers the panic-unwind path an `assert!` below takes.
+    child: std::process::Child,
+    stdout: Arc<Mutex<VecDeque<u8>>>,
+    stderr: Arc<Mutex<VecDeque<u8>>>,
+}
+
+impl Drop for IsolatedDaemon {
+    fn drop(&mut self) {
+        kill_process_tree(&mut self.child);
+    }
+}
+
+impl IsolatedDaemon {
+    /// This daemon's own HTTP root, which is never the shared daemon's.
+    fn base(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Fails if this daemon has exited, *before* anything reads a result
+    /// that assumes it is still the process answering.
+    ///
+    /// Every client command below goes through `daemon::ensure_server`,
+    /// which silently starts a replacement daemon on `LLMMAN_HOST` when
+    /// nothing is listening there. That replacement would inherit this
+    /// test process's own environment rather than the one this struct
+    /// was started with, so a crash between startup and the assertions
+    /// would otherwise turn into a result about the wrong daemon's
+    /// configuration — a false pass in the enabled phase, and in the
+    /// disabled phase a silent loss of the `LLAMA_ARG_ENDPOINT_METRICS`
+    /// setup that phase exists to test.
+    fn assert_alive(&mut self, phase: &str) {
+        match self.child.try_wait() {
+            Ok(None) => {}
+            other => panic!(
+                "the isolated daemon for the {phase} phase exited before its assertions \
+                 ({other:?}) — anything reached on port {} after this is a replacement \
+                 daemon started by ensure_server with this test's environment, not the one \
+                 under test\n{}",
+                self.port,
+                self.logs(),
+            ),
+        }
+    }
+
+    /// Both captured streams, for an assertion message. Kept off the
+    /// happy path: a passing run never renders these.
+    fn logs(&self) -> String {
+        format!(
+            "--- daemon stdout ---\n{}\n--- daemon stderr ---\n{}",
+            tail_str(&self.stdout.lock().unwrap(), 4096),
+            tail_str(&self.stderr.lock().unwrap(), 4096),
+        )
+    }
+}
+
+/// How many ports [`start_isolated_daemon`] will try before giving up.
+/// The port it hands the daemon comes from a probe listener that must be
+/// dropped before the daemon can bind it, so another process on the same
+/// machine can take it in between: on a CI runner this file shares the
+/// ephemeral range with everything else the job is running, and `SERIAL`
+/// only orders the tests in this file. Retrying a fresh port turns that
+/// race into a slower start instead of an intermittent failure.
+const DAEMON_START_ATTEMPTS: u32 = 3;
+
+/// What one [`start_one_isolated_daemon`] attempt produced. The two
+/// failures are kept apart because only one of them is worth retrying: a
+/// lost port race makes the daemon exit almost immediately, where a
+/// daemon that bound its port and then never answered is a real fault
+/// that a different port would not fix.
+enum DaemonStart {
+    Ready(IsolatedDaemon),
+    Exited(IsolatedDaemon),
+    NeverAnswered(IsolatedDaemon),
+}
+
+/// Starts an isolated `llmman serve` with `LLMMAN_METRICS` set to
+/// `metrics` (or unset when `None`), and `LLAMA_ARG_ENDPOINT_METRICS` set
+/// to `endpoint_metrics` (or unset when `None`) — see
+/// `container::LlamaOptions::metrics` for why that second variable is a
+/// distinct input and not the same knob spelled differently.
+///
+/// Returns once the daemon answers `/api/version`, retrying a fresh port
+/// up to [`DAEMON_START_ATTEMPTS`] times if it exits during startup, or
+/// panics with the last attempt's streams attached.
+///
+/// Only a fast exit is retried, so the wall-clock budget is unchanged:
+/// at most one attempt can spend the full [`DAEMON_READY_TIMEOUT`].
+fn start_isolated_daemon(metrics: Option<&str>, endpoint_metrics: Option<&str>) -> IsolatedDaemon {
+    let mut last_exited = None;
+    for attempt in 1..=DAEMON_START_ATTEMPTS {
+        match start_one_isolated_daemon(metrics, endpoint_metrics) {
+            DaemonStart::Ready(daemon) => return daemon,
+            DaemonStart::NeverAnswered(daemon) => panic!(
+                "isolated llmman serve bound port {} and never answered /api/version within \
+                 {DAEMON_READY_TIMEOUT:?}; a different port wouldn't fix that, so this isn't \
+                 retried\n{}",
+                daemon.port,
+                daemon.logs(),
+            ),
+            DaemonStart::Exited(daemon) => {
+                eprintln!(
+                    "[test] isolated daemon on port {} exited during startup \
+                     (attempt {attempt}/{DAEMON_START_ATTEMPTS}), retrying on a fresh port",
+                    daemon.port,
+                );
+                last_exited = Some(daemon);
+            }
+        }
+    }
+    let daemon = last_exited.expect("at least one attempt ran");
+    panic!(
+        "isolated llmman serve exited during startup on all {DAEMON_START_ATTEMPTS} ports tried, \
+         the last being {}. More than one lost port race in a row is unlikely, so read the \
+         streams below for the real reason (a bad store path, a missing llama-server) rather \
+         than assuming a busy port\n{}",
+        daemon.port,
+        daemon.logs(),
+    )
+}
+
+/// One [`start_isolated_daemon`] attempt on one freshly allocated port.
+fn start_one_isolated_daemon(metrics: Option<&str>, endpoint_metrics: Option<&str>) -> DaemonStart {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind probe listener")
+        .local_addr()
+        .expect("probe listener addr")
+        .port();
+
+    let mut cmd = Command::new(llmman_bin());
+    cmd.arg("serve");
+    // Every child below (this daemon, and the `llmman run`/`llmman stop`
+    // clients that must reach *it* rather than the shared daemon) agrees
+    // on one host. Without this the clients auto-start their own daemon
+    // on the default port with none of this configuration, silently
+    // testing nothing.
+    cmd.env("LLMMAN_HOST", format!("127.0.0.1:{port}"));
+    match metrics {
+        Some(v) => cmd.env("LLMMAN_METRICS", v),
+        None => cmd.env_remove("LLMMAN_METRICS"),
+    };
+    match endpoint_metrics {
+        Some(v) => cmd.env("LLAMA_ARG_ENDPOINT_METRICS", v),
+        None => cmd.env_remove("LLAMA_ARG_ENDPOINT_METRICS"),
+    };
+    // Own process group, so the Drop above can take out the whole tree
+    // (daemon plus its llama-server child) with one signal — same
+    // reasoning as `try_spawn_with_timeout`'s, see `kill_process_tree`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    // Piped, not null: a daemon that fails to start (port taken, a
+    // missing llama-server, a bad store path) explains itself on these
+    // streams, and the readiness assertion below is the only place that
+    // explanation can surface.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn llmman serve");
+    let stdout = Arc::new(Mutex::new(VecDeque::new()));
+    let stderr = Arc::new(Mutex::new(VecDeque::new()));
+    spawn_reader(
+        child.stdout.take().expect("child stdout"),
+        Arc::clone(&stdout),
+    );
+    spawn_reader(
+        child.stderr.take().expect("child stderr"),
+        Arc::clone(&stderr),
+    );
+    let mut daemon = IsolatedDaemon {
+        port,
+        child,
+        stdout,
+        stderr,
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(READY_POLL_TIMEOUT)
+        .build()
+        .expect("build readiness client");
+    let base = daemon.base();
+    let deadline = Instant::now() + DAEMON_READY_TIMEOUT;
+    let mut ready = false;
+    let mut exited = None;
+    while Instant::now() < deadline {
+        if client
+            .get(format!("{base}/api/version"))
+            .send()
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            ready = true;
+            break;
+        }
+        // A daemon that can't bind its port, or that fails on its store
+        // path, is gone within milliseconds. Without this the loop polls
+        // a closed port for the whole deadline before reporting a
+        // failure it already had the answer to.
+        if let Ok(Some(status)) = daemon.child.try_wait() {
+            exited = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if ready {
+        return DaemonStart::Ready(daemon);
+    }
+    // One last look before classifying: the daemon can still have exited
+    // during the final sleep, and calling a dead process "never answered"
+    // would both skip the retry it deserves and point whoever reads the
+    // panic at the wrong cause.
+    if exited.is_none() {
+        exited = daemon.child.try_wait().ok().flatten();
+    }
+    match exited {
+        Some(_) => DaemonStart::Exited(daemon),
+        None => DaemonStart::NeverAnswered(daemon),
+    }
+}
+
+/// Unloads [`MODEL`] from the daemon on `port`, or from the shared one
+/// when `None`.
+///
+/// Best-effort in every direction, so neither of its failure modes may
+/// fail the test. A daemon that isn't running, or has nothing loaded,
+/// exits non-zero, which the discarded `Output` covers; one that accepts
+/// the connection and then wedges hits [`UNLOAD_TIMEOUT`] and is printed
+/// rather than panicked on. Nothing here is load-bearing: the shared
+/// unload only keeps a second copy of the weights out of memory, and an
+/// isolated daemon's own unload is redundant with the process-tree kill
+/// its `Drop` already does.
+fn unload_model(port: Option<u16>) {
+    let mut cmd = Command::new(llmman_bin());
+    cmd.args(["stop", MODEL]);
+    let target = match port {
+        Some(port) => {
+            cmd.env("LLMMAN_HOST", format!("127.0.0.1:{port}"));
+            format!("port {port}")
+        }
+        None => "the shared daemon".to_string(),
+    };
+    if let Err(timed_out) =
+        try_spawn_with_timeout(cmd, UNLOAD_TIMEOUT, &format!("llmman stop ({target})"))
+    {
+        eprintln!(
+            "[test] ignoring best-effort unload on {target}: {}",
+            timed_out.message
+        );
+    }
+}
+
+/// Whether the shared daemon currently has [`MODEL`] loaded. `false`
+/// when no shared daemon is running, which is the same state this test
+/// would leave behind, so no restore is owed in that case either.
+///
+/// Bounded, and `false` on timeout, for the same reason [`unload_model`]
+/// is: this talks to a daemon the test neither started nor controls, and
+/// `llmman ps` reaches it through `daemon::get_json`, which uses
+/// `reqwest::blocking::get` with no timeout of its own. A reachable but
+/// wedged daemon would otherwise block here until the workflow's own
+/// `timeout-minutes` killed the whole job. `false` is also the right
+/// answer in that case: the unload below is bounded too, so a wedged
+/// daemon keeps whatever it had and there is nothing to put back.
+fn shared_daemon_has_model() -> bool {
+    let mut cmd = Command::new(llmman_bin());
+    cmd.arg("ps");
+    let Ok(output) = try_spawn_with_timeout(cmd, UNLOAD_TIMEOUT, "llmman ps (shared daemon)")
+    else {
+        eprintln!("[test] shared `llmman ps` timed out; assuming nothing to restore");
+        return false;
+    };
+    output.status.success() && String::from_utf8_lossy(&output.stdout).contains("qwen3.5")
+}
+
+/// Reloads [`MODEL`] into the shared daemon on drop when this test found
+/// it loaded and unloaded it — see the call site for why leaving it cold
+/// would slow whichever `launch_*` test runs next.
+///
+/// A `Drop` guard rather than a line at the end of the test, so an
+/// `assert!` panicking part-way through still restores what it took.
+/// Best-effort like the unload itself: a failed restore costs a later
+/// test its warm start, which must not be reported as this test failing.
+struct RestoreSharedModel(bool);
+
+impl Drop for RestoreSharedModel {
+    fn drop(&mut self) {
+        if !self.0 {
+            return;
+        }
+        let mut cmd = Command::new(llmman_bin());
+        cmd.args([
+            "run",
+            MODEL,
+            "--think",
+            "false",
+            "--num-predict",
+            "1",
+            PROMPT,
+        ]);
+        if let Err(timed_out) =
+            try_spawn_with_timeout(cmd, TIMEOUT, "llmman run (restore shared warm-up)")
+        {
+            eprintln!(
+                "[test] shared daemon left cold, the next launch_* test pays its own warm-up: {}",
+                timed_out.message
+            );
+        }
+    }
+}
+
+/// Runs one `llmman` subcommand against `daemon` rather than the shared
+/// one, returning its output. Panics at [`TIMEOUT`], which has to cover a
+/// cold pull of the model the same way `warm_model`'s does, since a load
+/// that never finishes leaves nothing for this test to assert against.
+fn run_against(daemon: &IsolatedDaemon, args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(llmman_bin());
+    cmd.args(args)
+        .env("LLMMAN_HOST", format!("127.0.0.1:{}", daemon.port));
+    spawn_with_timeout(cmd, TIMEOUT, &format!("llmman {}", args.join(" ")))
+}
+
+/// The port `daemon` reports for its currently-loaded [`MODEL`] backend,
+/// read from `/api/ps` (whose `port` field is one of llmman's own
+/// additions to the Ollama `/api/ps` shape — see
+/// `cmd::serve::OllamaRunningModelInfo`). This is the only way to reach
+/// the backend directly: llmman assigns it a fresh port per load.
+fn backend_port(daemon: &IsolatedDaemon, client: &reqwest::blocking::Client) -> u16 {
+    let base = daemon.base();
+    let body = client
+        .get(format!("{base}/api/ps"))
+        .send()
+        .expect("GET /api/ps")
+        .text()
+        .expect("read /api/ps body");
+    let ps: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("/api/ps returned non-JSON ({e}): {body}"));
+    let models = ps["models"]
+        .as_array()
+        .unwrap_or_else(|| panic!("/api/ps has no models array: {body}"));
+    let entry = models
+        .iter()
+        .find(|m| m["name"].as_str().is_some_and(|n| n.contains("qwen3.5")))
+        .unwrap_or_else(|| {
+            panic!(
+                "{MODEL} is not loaded according to /api/ps: {body}\n{}",
+                daemon.logs()
+            )
+        });
+    entry["port"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or_else(|| panic!("/api/ps entry has no usable port: {entry}"))
+}
+
+/// Proves `LLMMAN_METRICS` reaches the *backend* llama-server llmman
+/// spawns, through the real daemon and the real spawn path — not just
+/// that the Rust compiles.
+///
+/// Both directions matter and neither is redundant:
+///
+///   - On, the backend answers `/metrics` with 200 and llama.cpp's own
+///     `llamacpp:`-prefixed exposition. Fails if `Inner::metrics_enabled`
+///     stops being forwarded into `LlamaOptions`, or if
+///     `spawn_llama_server` stops pushing `--metrics`.
+///   - Off, it answers 501 — llama-server's own signal for a
+///     registered-but-disabled endpoint, *not* the 404 llmman's own
+///     `/metrics` uses for the same state (see
+///     `container::LlamaOptions::metrics`), and not the 404 a genuinely
+///     unknown route gets. Pinned here so a future llama.cpp release
+///     changing it fails loudly rather than silently breaking whatever
+///     alert rule an operator wrote against it.
+///
+/// The off case deliberately runs with `LLAMA_ARG_ENDPOINT_METRICS=1` in
+/// the daemon's own environment: llama-server reads that variable as the
+/// same switch as `--metrics`, and a local spawn inherits the daemon's
+/// environment, so without `spawn_llama_server`'s `env_remove` this
+/// assertion sees 200 and fails. That is the regression it guards.
+///
+/// The container spawn path (`--ociman`) is covered separately and
+/// without Docker or Podman, by `container::spawn_args`'s own unit tests.
+#[test]
+fn backend_metrics_follows_llmman_metrics() {
+    eprintln!("[test] backend_metrics_follows_llmman_metrics: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] backend_metrics_follows_llmman_metrics: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+
+    // Deliberately does NOT call warm_model(): that loads MODEL into the
+    // *shared* daemon and leaves it resident for its whole keep-alive,
+    // which this test's own two loads would then sit on top of. Unloading
+    // the shared copy first keeps exactly one copy of the weights
+    // resident at any point here, so a runner sized for one model still
+    // passes. See unload_model for why nothing about this step can fail
+    // the test.
+    //
+    // Whether it *was* resident is recorded, because `warm_model` is
+    // guarded by a `Once`: if a launch_* test has already run, its later
+    // calls are no-ops, so leaving the shared daemon cold would hand the
+    // next third-party client exactly the uncached first request that
+    // warm-up exists to prevent. Test order is not guaranteed, so this
+    // restores what it found rather than assuming it ran first.
+    let shared_was_loaded = shared_daemon_has_model();
+    unload_model(None);
+    let _restore = RestoreSharedModel(shared_was_loaded);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .expect("build reqwest client");
+
+    // ── on ──────────────────────────────────────────────────────────
+    {
+        let mut daemon = start_isolated_daemon(Some("1"), None);
+        let run = run_against(
+            &daemon,
+            &[
+                "run",
+                MODEL,
+                "--think",
+                "false",
+                "--num-predict",
+                "1",
+                PROMPT,
+            ],
+        );
+        assert!(
+            run.status.success(),
+            "llmman run {MODEL} (metrics on) failed (status: {:?})\n--- stdout ---\n{}\n\
+             --- stderr ---\n{}\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+            daemon.logs(),
+        );
+
+        daemon.assert_alive("enabled");
+        let port = backend_port(&daemon, &client);
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/metrics"))
+            .send()
+            .expect("GET backend /metrics (metrics on)");
+        let status = resp.status().as_u16();
+        let body = resp.text().unwrap_or_default();
+        assert_eq!(
+            status,
+            200,
+            "backend /metrics on port {port} answered {status}, not 200, with LLMMAN_METRICS=1 \
+             — --metrics did not reach the llama-server llmman spawned\n--- body ---\n{body}\n{}",
+            daemon.logs(),
+        );
+        assert!(
+            body.contains("llamacpp:"),
+            "backend /metrics answered 200 but without llama.cpp's own llamacpp:-prefixed \
+             exposition — got: {body}"
+        );
+
+        // Unload before the next phase's daemon loads its own copy.
+        unload_model(Some(daemon.port));
+    }
+
+    // ── off, against a daemon environment that would re-enable it ────
+    {
+        let mut daemon = start_isolated_daemon(None, Some("1"));
+        let run = run_against(
+            &daemon,
+            &[
+                "run",
+                MODEL,
+                "--think",
+                "false",
+                "--num-predict",
+                "1",
+                PROMPT,
+            ],
+        );
+        assert!(
+            run.status.success(),
+            "llmman run {MODEL} (metrics off) failed (status: {:?})\n--- stdout ---\n{}\n\
+             --- stderr ---\n{}\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+            daemon.logs(),
+        );
+
+        daemon.assert_alive("disabled");
+        let port = backend_port(&daemon, &client);
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/metrics"))
+            .send()
+            .expect("GET backend /metrics (metrics off)");
+        let status = resp.status().as_u16();
+        let body = resp.text().unwrap_or_default();
+        assert_eq!(
+            status,
+            501,
+            "backend /metrics on port {port} answered {status}, not 501, with LLMMAN_METRICS \
+             unset and LLAMA_ARG_ENDPOINT_METRICS=1 set — a 200 here means the inherited \
+             environment re-enabled the endpoint (spawn_llama_server's env_remove), and any \
+             other status means llama-server's own disabled-endpoint answer changed: update \
+             LlamaOptions::metrics's doc comment (src/container.rs) and \
+             docs/configuration.md's LLMMAN_METRICS row\n--- body ---\n{body}\n{}",
+            daemon.logs(),
+        );
+        assert!(
+            body.contains("--metrics"),
+            "expected llama-server's disabled-metrics body to mention --metrics, got: {body}"
+        );
+
+        unload_model(Some(daemon.port));
+    }
 }
 
 /// A tiny (135M-parameter, 8-bit-quantized) real safetensors model

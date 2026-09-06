@@ -710,7 +710,18 @@ jobs:
     # is always a deterministic llmman bug worth failing loudly on, not
     # small-model sampling variance), so unlike the 6 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
-    timeout-minutes: 310
+    #
+    # +40 more (350 total) for `backend_metrics_follows_llmman_metrics`
+    # (tests/launch_e2e.rs), the one test here that starts daemons of its
+    # own rather than sharing this job's. Its worst case is ~36 min:
+    # three `llmman run` calls at that same TIMEOUT (10 min each, and any
+    # of them can pay a cold pull), being one load per metrics state plus
+    # one to put the shared daemon back the way it was found, then three
+    # 60s best-effort unloads, two 60s waits for a daemon to answer
+    # /api/version, and four 10s HTTP assertions. Like the mlx test it has
+    # no retry loop, so nothing here multiplies by MAX_ATTEMPTS either;
+    # the extra 4 min is the same kind of headroom the 210 above carries.
+    timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
