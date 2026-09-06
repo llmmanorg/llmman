@@ -173,7 +173,13 @@ fn check_digest(digest: &str) -> Result<(), String> {
 /// "localhost:5000"; a real repository name never contains a colon itself,
 /// matching docker/distribution's own reference grammar) or equals
 /// "localhost" outright.
-fn is_host_component(first: &str) -> bool {
+///
+/// Shared with [`crate::verify::canonical_repository`], which applies the
+/// identical rule to tell a registry host from a namespace component; kept
+/// in one place so the two cannot drift (case-sensitivity of the
+/// "localhost" match, in particular, used to differ between the two
+/// copies).
+pub(crate) fn is_host_component(first: &str) -> bool {
     first.contains('.') || first.contains(':') || first.eq_ignore_ascii_case("localhost")
 }
 

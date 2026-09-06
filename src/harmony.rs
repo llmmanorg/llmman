@@ -143,7 +143,7 @@ impl HarmonyParser {
                     events.push(HarmonyEvent::MessageEnd);
                     (events, true)
                 } else {
-                    let overlap_len = overlap(&self.acc, &self.message_end_tag);
+                    let overlap_len = crate::strutil::overlap(&self.acc, &self.message_end_tag);
                     if overlap_len > 0 {
                         let split = self.acc.len() - overlap_len;
                         let content = self.acc[..split].to_string();
@@ -216,17 +216,6 @@ fn parse_header(raw: &str) -> HarmonyHeader {
     }
 
     header
-}
-
-/// Longest overlap between a suffix of `s` and a prefix of `delim`.
-fn overlap(s: &str, delim: &str) -> usize {
-    let max = delim.len().min(s.len());
-    for i in (1..=max).rev() {
-        if s.ends_with(&delim[..i]) {
-            return i;
-        }
-    }
-    0
 }
 
 // ---------------------------------------------------------------------------

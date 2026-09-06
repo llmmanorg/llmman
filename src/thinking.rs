@@ -127,7 +127,7 @@ impl Parser {
                     };
                     (thinking, remaining, false)
                 } else {
-                    let overlap_len = overlap(&acc, &self.closing_tag);
+                    let overlap_len = crate::strutil::overlap(&acc, &self.closing_tag);
                     if overlap_len > 0 {
                         let split = acc.len() - overlap_len;
                         let thinking = acc[..split].to_string();
@@ -168,17 +168,6 @@ fn strip_all_leading_occurrences<'a>(trimmed: &'a str, tag: &str) -> Option<&'a 
         return None;
     }
     trimmed.strip_prefix(tag)
-}
-
-/// Longest overlap between a suffix of `s` and a prefix of `delim`.
-fn overlap(s: &str, delim: &str) -> usize {
-    let max = delim.len().min(s.len());
-    for i in (1..=max).rev() {
-        if s.ends_with(&delim[..i]) {
-            return i;
-        }
-    }
-    0
 }
 
 #[cfg(test)]
@@ -301,12 +290,5 @@ mod tests {
             p.add_content("  more content"),
             ("".into(), "more content".into())
         );
-    }
-
-    #[test]
-    fn overlap_finds_longest_suffix_prefix_match() {
-        assert_eq!(overlap("abc</thi", "</think>"), 5);
-        assert_eq!(overlap("abcdef", "</think>"), 0);
-        assert_eq!(overlap("", "</think>"), 0);
     }
 }

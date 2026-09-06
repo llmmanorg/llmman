@@ -262,6 +262,19 @@ pub struct LlamaOptions<'a> {
     pub threads: Option<u32>,
 }
 
+/// Appends `-e VAR=val` to `args` for every name in `vars` that is set in
+/// this process's environment, so `docker run`/`podman run` (which does
+/// not inherit the host environment on its own) forwards it into the
+/// container. Silently skips a name that isn't set.
+fn forward_env_vars(args: &mut Vec<String>, vars: &[&str]) {
+    for var in vars {
+        if let Ok(val) = std::env::var(var) {
+            args.push("-e".into());
+            args.push(format!("{var}={val}"));
+        }
+    }
+}
+
 /// Callers must stop this gracefully (SIGTERM, not the default
 /// `Child::kill()`/`kill_on_drop`, which sends SIGKILL) — see
 /// `cmd::serve::ModelProcess`'s Drop impl. SIGKILL cannot be caught or
@@ -347,21 +360,10 @@ pub fn spawn(
     // own — forward the same GPU device-selection vars Ollama documents
     // (see cmd::serve::GPU_VISIBLE_DEVICE_VARS) so `GGML_VK_VISIBLE_DEVICES=1`
     // etc. set on the host actually reaches llama-server inside the
-    // container too.
-    for var in crate::cmd::serve::GPU_VISIBLE_DEVICE_VARS {
-        if let Ok(val) = std::env::var(var) {
-            args.push("-e".into());
-            args.push(format!("{var}={val}"));
-        }
-    }
-    // Same as above, for llama.cpp's own env-configurable arguments —
-    // see LLAMA_CPP_ENV_PASSTHROUGH_VARS's doc comment.
-    for var in crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS {
-        if let Ok(val) = std::env::var(var) {
-            args.push("-e".into());
-            args.push(format!("{var}={val}"));
-        }
-    }
+    // container too, plus llama.cpp's own env-configurable arguments (see
+    // LLAMA_CPP_ENV_PASSTHROUGH_VARS's doc comment).
+    forward_env_vars(&mut args, crate::cmd::serve::GPU_VISIBLE_DEVICE_VARS);
+    forward_env_vars(&mut args, crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS);
     args.push(image);
     args.extend([
         "-m".into(),

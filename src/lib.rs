@@ -20,6 +20,7 @@ pub mod providers;
 pub mod shortnames;
 pub mod sources;
 pub mod storage;
+pub mod strutil;
 pub mod thinking;
 pub mod verify;
 pub mod webui;

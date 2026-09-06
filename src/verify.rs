@@ -329,9 +329,9 @@ fn canonical_repository(repo: &str) -> String {
         Some((first, rest)) => (first, Some(rest)),
         None => (repo, None),
     };
-    // Docker's own rule for telling a registry host from a namespace.
-    let has_host = first.contains('.') || first.contains(':') || first == "localhost";
-    if !has_host {
+    // Docker's own rule for telling a registry host from a namespace,
+    // shared with `shortnames::is_host_component` so the two cannot drift.
+    if !crate::shortnames::is_host_component(first) {
         return match rest {
             Some(rest) => format!("docker.io/{first}/{rest}"),
             None => format!("docker.io/library/{first}"),
