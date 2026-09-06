@@ -38,9 +38,19 @@ on `/api/generate`) unloads immediately.
 ## Ollama API notes
 
 `/api/chat` supports Ollama's `tools` (function calling, streamed back as
-`message.tool_calls`), `images` (vision, base64, same as Ollama's own wire
-format), and `format` (`"json"` or a JSON Schema object, for constrained
-structured output).
+`message.tool_calls` with their `id`, and matched to `tool_call_id` on
+the way back in), `images` (vision, base64, same as Ollama's own wire
+format), `think`, and `format` (`"json"` or a JSON Schema object, for
+constrained structured output). `/api/generate` takes `system` and
+`images` too; `raw`, `suffix` and `template` are refused with a 400,
+since llmman leaves templating to the backend.
+
+Of `options`, `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stop`,
+`num_predict`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`
+and `num_thread` apply; `num_ctx` is `LLMMAN_CONTEXT_LENGTH`. The `done`
+chunk carries Ollama's counts and durations (`prompt_eval_count`,
+`eval_count`, `total_duration`, ...) and `done_reason` is `stop` or
+`length` as in Ollama, which reports a tool-calling turn as `stop`.
 
 `/api/embed` and `/api/embeddings` work with any GGUF embedding model
 (one with a pooling type, e.g. `embeddinggemma`, `nomic-embed-text`):
@@ -63,6 +73,13 @@ work. For a [provider](providers.md) without the route, the daemon
 translates to and from `/v1/chat/completions` itself, and for a provider
 that speaks the Anthropic Messages API from there to `/v1/messages` (see
 [wire formats](providers.md#wire-formats)).
+
+A request bound for a provider loses llama-server's own fields
+(`repeat_penalty`, `top_k`, `min_p`, `chat_template_kwargs`, ...), which
+a strict provider would reject the whole request over; OpenAI's reasoning
+models get `max_completion_tokens` and lose the sampling overrides they
+refuse. `previous_response_id` is refused when `/v1/responses` has to be
+bridged through chat completions: nothing is stored to resolve it against.
 
 `/v1/audio/transcriptions` is likewise a pass-through. The model needs
 audio support (an `--mmproj` projector, supplied when the model image

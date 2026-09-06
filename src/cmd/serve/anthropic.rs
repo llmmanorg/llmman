@@ -140,10 +140,11 @@ pub(super) fn from_chat_request(req: &Value, default_max_tokens: u32) -> anyhow:
     if !stops.is_empty() {
         out["stop_sequences"] = json!(stops);
     }
-    if let Some(user) = req
-        .get("user")
-        .and_then(Value::as_str)
-        .filter(|u| !u.is_empty())
+    // Either OpenAI spelling of the caller's end user.
+    if let Some(user) = ["user", "safety_identifier"]
+        .into_iter()
+        .filter_map(|k| req.get(k).and_then(Value::as_str))
+        .find(|u| !u.is_empty())
     {
         out["metadata"] = json!({ "user_id": user });
     }
@@ -409,21 +410,7 @@ fn sanitize_id(id: &str) -> String {
 /// The budget a `reasoning_effort` asks for, clamped to leave room for
 /// the answer; `None` when not requested or `max_tokens` is too small.
 fn thinking_budget(req: &Value, max_tokens: u32) -> Option<u32> {
-    // `/api/chat` carries Ollama's `think` as `chat_template_kwargs`.
-    let kwargs = req.get("chat_template_kwargs");
-    let effort = match req.get("reasoning_effort").and_then(Value::as_str) {
-        Some(effort) => effort,
-        None => match kwargs
-            .and_then(|k| k.get("enable_thinking"))
-            .and_then(Value::as_bool)?
-        {
-            false => return None,
-            true => kwargs
-                .and_then(|k| k.get("reasoning_effort"))
-                .and_then(Value::as_str)
-                .unwrap_or("medium"),
-        },
-    };
+    let effort = req.get("reasoning_effort").and_then(Value::as_str)?;
     if effort == "none" {
         return None;
     }
@@ -1396,31 +1383,6 @@ mod tests {
         assert!(out.get("thinking").is_none());
     }
 
-    /// Ollama's `think`, arriving as `chat_template_kwargs`: `false` is
-    /// off, `true` is a medium budget, a level is that level.
-    #[test]
-    fn ollama_think_becomes_a_thinking_budget() {
-        let with = |kwargs: Value| {
-            convert(json!({
-                "messages": [{ "role": "user", "content": "hi" }],
-                "max_tokens": 64000,
-                "chat_template_kwargs": kwargs
-            }))
-        };
-        assert!(with(json!({ "enable_thinking": false }))
-            .get("thinking")
-            .is_none());
-        assert_eq!(
-            with(json!({ "enable_thinking": true }))["thinking"]["budget_tokens"],
-            8192
-        );
-        assert_eq!(
-            with(json!({ "enable_thinking": true, "reasoning_effort": "max" }))["thinking"]
-                ["budget_tokens"],
-            32000
-        );
-    }
-
     /// An `/api/chat` tool result has a `name` and no id; it answers the
     /// first still-open call of that name, or the first call at all.
     #[test]
@@ -1563,6 +1525,11 @@ mod tests {
         assert_eq!(out["top_p"], 0.9);
         assert_eq!(out["stop_sequences"], json!(["END"]));
         assert_eq!(out["metadata"], json!({ "user_id": "u1" }));
+        let fallback = convert(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "user": "", "safety_identifier": "s1"
+        }));
+        assert_eq!(fallback["metadata"], json!({ "user_id": "s1" }));
         // No Messages equivalent: dropped rather than sent to be 400'd.
         assert!(out.get("frequency_penalty").is_none());
     }
