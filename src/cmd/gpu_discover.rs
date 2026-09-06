@@ -29,11 +29,5 @@ pub fn run(_args: &GpuDiscoverArgs) -> anyhow::Result<()> {
     } else {
         println!("vram: unknown");
     }
-    match crate::hostgpu::default_ctx_size_for(vram) {
-        Some(n) => println!("default context length override: {n}"),
-        None => println!(
-            "default context length override: none (uses each model's own trained context)"
-        ),
-    }
     Ok(())
 }

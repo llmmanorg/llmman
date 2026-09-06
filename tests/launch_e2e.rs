@@ -909,12 +909,9 @@ fn launch_talos_with_model() {
         eprintln!("skipping: llama-server not on PATH (required to serve any model)");
         return;
     }
-    // Talos is never on PATH: its installer puts everything under
-    // ~/talos (or $TALOS_PREFIX) and deliberately adds nothing there, so
-    // `launch_talos` runs the venv interpreter under that prefix. This
-    // looks for it the same way — and since every launch here gets a
-    // fresh HOME (see run_launch), the real prefix is handed over as
-    // TALOS_PREFIX rather than rediscovered under the empty one.
+    // Resolve the real installation before run_launch supplies a fresh HOME.
+    // The official wrapper may be on PATH, while CI also supports the venv
+    // layout; either way this stable prefix must survive that HOME change.
     let Some(prefix) = talos_prefix() else {
         eprintln!("skipping: talos not installed — https://talos-agent.ch/install.sh");
         return;
@@ -926,16 +923,9 @@ fn launch_talos_with_model() {
     // secrets env file of its own, which Talos reads on top of its env
     // file — so the launcher under test stays exactly what a user runs.
     let secrets = talos_secrets_env(&prefix);
-    // The launcher refuses when an exported TALOS_MODEL/_PROVIDER
-    // disagrees with what it is about to launch (see
-    // talos_check_env_overrides) — inherited from the test runner's own
-    // shell, that would fail every attempt for anyone who happens to
-    // have Talos configured for something else. Overlaid with the exact
-    // values `launch_talos` will use: the fixed provider, and the model
-    // reference through the same resolver `run()` calls, so this can
-    // never quietly drift from what the launch actually compares against.
-    let resolved_model =
-        llmman::shortnames::resolve_ollama_api(MODEL).expect("MODEL is a valid reference");
+    // Empty overrides neutralize the runner's private configuration while
+    // forcing Talos to read the provider/model and allowlist from the file.
+    // Supplying the expected model here would mask a broken file handoff.
     // `ask`: Talos's one-turn command, answer on stdout — `chat` counts
     // a terminal as attended only when stdin and stdout both are one,
     // and there is no terminal here.
@@ -945,11 +935,26 @@ fn launch_talos_with_model() {
         &[
             ("TALOS_PREFIX", prefix.to_string_lossy().into_owned()),
             ("TALOS_SECRETS_ENV", secrets.to_string_lossy().into_owned()),
-            ("TALOS_MODEL_PROVIDER", "ollama".to_string()),
-            ("TALOS_MODEL", resolved_model),
+            ("TALOS_MODEL_PROVIDER", String::new()),
+            ("TALOS_MODEL", String::new()),
+            ("TALOS_ALLOWED_PRINCIPALS", String::new()),
         ],
         |_stderr| false,
     );
+    let written = std::fs::read_to_string(&secrets).unwrap();
+    let model = llmman::shortnames::resolve_ollama_api(MODEL).unwrap();
+    let uid = unsafe { libc::getuid() };
+    for expected in [
+        "TALOS_MODEL_PROVIDER=ollama".to_string(),
+        format!("TALOS_MODEL={model}"),
+        format!("TALOS_ALLOWED_PRINCIPALS=cli:{uid}"),
+    ] {
+        assert!(
+            written.lines().any(|line| line == expected),
+            "missing {expected}"
+        );
+    }
+    std::fs::remove_file(secrets).unwrap();
 }
 
 /// Where `launch_talos` would find Talos: `$TALOS_PREFIX`, else `~/talos`
@@ -1101,7 +1106,12 @@ fn launch_qwen_without_a_model_is_refused_before_the_daemon() {
         !stderr.contains("exited during startup"),
         "the daemon was started first\n{stderr}"
     );
-    assert!(elapsed < Duration::from_secs(5), "refusal took {elapsed:?}");
+    // 30s, like the dead-daemon test: the refusal takes milliseconds, but
+    // a runner busy with the model tests beside it does not.
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "refusal took {elapsed:?}"
+    );
 }
 
 /// A fresh `HOME` in which any daemon `llmman` spawns dies at startup, a

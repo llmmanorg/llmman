@@ -95,23 +95,6 @@ fn parse_llm_library(value: Option<&str>) -> Option<HostGpu> {
     }
 }
 
-const GIB: u64 = 1024 * 1024 * 1024;
-
-/// Bytes of VRAM to hold back from [`default_ctx_size`]'s tiering, from
-/// `LLMMAN_GPU_OVERHEAD` (mirrors Ollama's `OLLAMA_GPU_OVERHEAD`).
-/// Subtracted once from the combined total, not per GPU — llmman only
-/// probes one combined VRAM figure. Unset/blank/unparseable is `0`.
-pub fn gpu_overhead_bytes() -> u64 {
-    parse_gpu_overhead(std::env::var("LLMMAN_GPU_OVERHEAD").ok().as_deref())
-}
-
-fn parse_gpu_overhead(value: Option<&str>) -> u64 {
-    value
-        .map(str::trim)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
-}
-
 /// Whether integrated GPUs count during Vulkan probing, from
 /// `LLMMAN_IGPU_ENABLE` (mirrors Ollama's `OLLAMA_IGPU_ENABLE`).
 /// Defaults to disabled, same as Ollama — an integrated GPU is usually a
@@ -127,29 +110,6 @@ fn parse_igpu_enabled(value: Option<&str>) -> bool {
         }
         _ => false,
     }
-}
-
-/// VRAM-tiered context-size default (used by `cmd::serve` when
-/// `LLMMAN_CONTEXT_LENGTH` isn't set). Below a 47GiB VRAM threshold,
-/// defaults to 65536 tokens instead of a model's full trained context:
-/// llmman forwards requests to llama-server as-is rather than
-/// truncating oversized prompts, and real agentic CLIs routinely send
-/// 7-8k-token prompts before any reply — a smaller floor would be too
-/// tight for that without truncation. `None` defers to a model's own
-/// trained context rather than hardcoding a fixed ceiling for
-/// well-resourced hosts.
-pub fn default_ctx_size_for(vram_bytes: u64) -> Option<u32> {
-    if vram_bytes >= 47 * GIB {
-        None
-    } else {
-        Some(65536)
-    }
-}
-
-/// [`default_ctx_size_for`] applied to a [`detect_with_vram`] result,
-/// less [`gpu_overhead_bytes`] (floors at 0, never underflows).
-pub fn default_ctx_size(vram_bytes: u64) -> Option<u32> {
-    default_ctx_size_for(vram_bytes.saturating_sub(gpu_overhead_bytes()))
 }
 
 /// The accelerator's memory, else system RAM, else 0. What
@@ -362,9 +322,10 @@ fn detect_macos() -> HostGpu {
 }
 
 /// Kind + total VRAM bytes (0 if none/unknown) for the best accelerator
-/// on this host — used by [`crate::hostgpu::default_ctx_size`]. A
-/// separate probe from [`detect`] (which only needs kind) rather than a
-/// shared cache, since this only runs once at `llmman serve` startup.
+/// on this host — what `cmd::serve::aggregation` weighs this node by
+/// (via [`memory_bytes`]). A separate probe from [`detect`] (which only
+/// needs kind) rather than a shared cache, since this only runs once at
+/// `llmman serve` startup.
 pub fn detect_with_vram() -> (HostGpu, u64) {
     #[cfg(target_os = "macos")]
     {
@@ -431,15 +392,7 @@ use vendor::{detect_cuda, detect_rocm, detect_vulkan};
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_ctx_size_for_defers_above_the_top_vram_tier() {
-        assert_eq!(default_ctx_size_for(0), Some(65536));
-        assert_eq!(default_ctx_size_for(8 * GIB), Some(65536));
-        assert_eq!(default_ctx_size_for(23 * GIB), Some(65536));
-        assert_eq!(default_ctx_size_for(46 * GIB), Some(65536));
-        assert_eq!(default_ctx_size_for(47 * GIB), None);
-        assert_eq!(default_ctx_size_for(80 * GIB), None);
-    }
+    const GIB: u64 = 1024 * 1024 * 1024;
 
     #[test]
     fn parse_meminfo_total_reads_the_kib_line() {
@@ -482,29 +435,6 @@ mod tests {
         assert_eq!(parse_llm_library(Some("")), None);
         assert_eq!(parse_llm_library(Some("   ")), None);
         assert_eq!(parse_llm_library(Some("intel-arc")), None);
-    }
-
-    #[test]
-    fn parse_gpu_overhead_defaults_to_zero_on_anything_unparseable() {
-        assert_eq!(parse_gpu_overhead(None), 0);
-        assert_eq!(parse_gpu_overhead(Some("")), 0);
-        assert_eq!(parse_gpu_overhead(Some("not-a-number")), 0);
-        assert_eq!(parse_gpu_overhead(Some("1073741824")), 1073741824);
-        assert_eq!(parse_gpu_overhead(Some(" 512 ")), 512);
-    }
-
-    #[test]
-    fn default_ctx_size_for_with_overhead_subtracted_can_drop_a_tier() {
-        // A host with 47GiB VRAM would defer to the model's own trained
-        // context; a 1GiB LLMMAN_GPU_OVERHEAD knocks it back under the
-        // 47GiB threshold into the capped 65536 tier.
-        let vram = 47 * GIB;
-        let overhead = GIB;
-        assert_eq!(default_ctx_size_for(vram), None);
-        assert_eq!(
-            default_ctx_size_for(vram.saturating_sub(overhead)),
-            Some(65536)
-        );
     }
 
     #[test]

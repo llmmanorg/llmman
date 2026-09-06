@@ -1348,6 +1348,50 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
+      # The step above leaves its shared `llmman serve` daemon (see
+      # tests/launch_e2e.rs) running with qwen3.5:0.8b resident at the
+      # 256k default --ctx-size — several GiB nothing below needs (`llmman
+      # resolve` never talks to the daemon). On a real aarch64 run that
+      # left `vllm serve` only 3.3 of 15.6 GiB, under the KV arena it
+      # demands up front (see test_e2e.py's VLLM_CPU_KVCACHE_SPACE).
+      #
+      # Signals the daemon's process group, which its llama-server shares,
+      # the same way daemon::kill_daemon does: pid from /api/version,
+      # `pkill -f` fallback. Never fails the job: a daemon that never
+      # started (every launch_e2e test skipped) is fine here.
+      - name: Stop the launch_e2e daemon (free RAM for vllm-plugin e2e)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -uo pipefail
+          host="${LLMMAN_HOST:-127.0.0.1:17434}"
+          pid=$(curl -fsS --max-time 5 "http://$host/api/version" 2>/dev/null \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin).get("pid") or "")' 2>/dev/null) || pid=""
+          # Only signal a pid that is numeric and still an llmman process.
+          case "$pid" in ''|*[!0-9]*) pid="" ;; esac
+          if [ -n "$pid" ] && ! ps -o command= -p "$pid" 2>/dev/null | grep -q 'llmman'; then
+            echo "pid $pid from /api/version is not an llmman process; ignoring"
+            pid=""
+          fi
+          if [ -n "$pid" ]; then
+            echo "stopping llmman serve (pid $pid) and its process group"
+            kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+          else
+            echo "no llmman serve daemon at $host; falling back to pkill"
+            pkill -TERM -f 'llmman serve' 2>/dev/null || true
+          fi
+          # A SIGTERM'd process still holds its memory until it has exited.
+          for _ in $(seq 1 30); do
+            pgrep -f 'llmman serve|llama-server' >/dev/null 2>&1 || break
+            sleep 1
+          done
+          if pgrep -f 'llmman serve|llama-server' >/dev/null 2>&1; then
+            echo "::warning::llmman serve/llama-server still alive 30s after SIGTERM; sending SIGKILL"
+            pkill -KILL -f 'llmman serve|llama-server' 2>/dev/null || true
+            sleep 2
+          fi
+          if [ "${{ runner.os }}" = "Linux" ]; then free -m; else vm_stat; fi
+
       # ── vllm-plugin e2e (Linux + macOS) ──────────────────────────────────
       # `vllm-plugin/tests/test_e2e.py` against this job's own installed
       # `llmman` binary and a real `vllm serve` — CPU-only on Linux,
@@ -1855,7 +1899,13 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile wingetcreate.exe
           $got = (Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash
           if ($got -ne $env:WINGETCREATE_SHA256) { throw "wingetcreate.exe sha256 $got != $env:WINGETCREATE_SHA256" }
-          .\wingetcreate.exe --version
+          # Smoke test. `info` is the only real "print the version" command:
+          # `version` and `help` are listed in the help text by
+          # CommandLineParser but are not registered verbs, so they (like
+          # `--version`) print help and exit 1. `info` also skips the GitHub
+          # client, so it needs no token or network.
+          .\wingetcreate.exe info
+          if ($LASTEXITCODE -ne 0) { throw "wingetcreate info failed with exit code $LASTEXITCODE" }
 
       # WINGET_CREATE_GITHUB_TOKEN is wingetcreate's env var for CI
       # (https://aka.ms/winget-create-token); --token may be logged.

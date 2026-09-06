@@ -11,6 +11,7 @@ pub mod gguf;
 pub mod harmony;
 pub mod hf;
 pub mod hostgpu;
+pub mod hybrid;
 pub mod llama_release;
 pub mod metrics;
 pub mod modelpack;

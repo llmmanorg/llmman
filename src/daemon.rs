@@ -997,33 +997,56 @@ pub fn stream_progress_with(path: &str, reference: &str) -> anyhow::Result<Optio
     Ok(pushed_digest)
 }
 
-/// POSTs `{"model": reference}` to `/api/show` and reports whether the
-/// daemon's local store already has it — a read-only existence check with
-/// no download/pull side effects.
-fn model_exists(reference: &str) -> anyhow::Result<bool> {
+/// The part of Ollama's `api.ShowResponse` that `llmman run` reads.
+#[derive(Debug, Default, Deserialize)]
+pub struct ShowResponse {
+    /// `"completion"`, `"vision"`, … — see `crate::modelpack::capabilities`.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+impl ShowResponse {
+    /// Ollama's `RunHandler`: `opts.MultiModal` = vision or audio.
+    pub fn multimodal(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c == crate::modelpack::CAPABILITY_VISION || c == "audio")
+    }
+}
+
+/// Ollama's `client.Show`: a read-only `/api/show` lookup. `Ok(None)` is
+/// a 404 only; any other failure is an error, as in `showOrPullModel`.
+pub fn show(reference: &str) -> anyhow::Result<Option<ShowResponse>> {
     let resp = reqwest::blocking::Client::new()
         .post(format!("{}/api/show", server()))
         .json(&serde_json::json!({"model": reference}))
         .send()
         .with_context(|| format!("request /api/show for {reference}"))?;
-    Ok(resp.status().is_success())
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!("{}", api_error(&body).unwrap_or(body));
+    }
+    // An older daemon omits `capabilities`; serde(default) handles it.
+    let body = resp
+        .json::<ShowResponse>()
+        .with_context(|| format!("decode /api/show for {reference}"))?;
+    Ok(Some(body))
 }
 
-/// Ensures `reference` is present in the daemon's local store, pulling it
-/// (and streaming progress the same way `llmman pull` does) if it isn't.
+/// Ensures `reference` is in the daemon's local store, pulling it (with
+/// `llmman pull`'s progress) if not, and returns its `/api/show` info.
 ///
-/// Mirrors ollama's `RunHandler`, which calls `client.Show` before ever
-/// entering the interactive/one-shot prompt loop and only falls back to
-/// `PullHandler` on a miss — so a bad reference (typo'd tag, malformed
-/// `hf.co/...` name, etc.) is reported and aborts the command immediately,
-/// instead of only surfacing once the first message is submitted to
-/// `/api/chat` (by which point the interactive `> ` prompt has already
-/// been shown and read from).
-pub fn ensure_model_pulled(reference: &str) -> anyhow::Result<()> {
-    if model_exists(reference).unwrap_or(false) {
-        return Ok(());
+/// Mirrors ollama's `showOrPullModel`: Show, Pull on a 404, Show again —
+/// so a bad reference fails before the prompt loop.
+pub fn ensure_model_pulled(reference: &str) -> anyhow::Result<ShowResponse> {
+    if let Some(info) = show(reference)? {
+        return Ok(info);
     }
-    stream_progress("/api/pull", reference)
+    stream_progress("/api/pull", reference)?;
+    show(reference)?.ok_or_else(|| anyhow::anyhow!("{reference}: not found after pull"))
 }
 
 /// Pushes `reference` via the daemon's `/api/push` and returns the
@@ -1043,26 +1066,37 @@ pub fn push(reference: &str) -> anyhow::Result<Option<String>> {
 /// Ollama's own `ollama stop` (`cmd/cmd.go`'s `loadOrUnloadModel`). Used
 /// by `llmman stop`.
 ///
-/// `Ok(false)` reports the daemon's 404, i.e. it holds no model by that
-/// name — the one outcome `llmman stop` renders as its own error rather
-/// than a transport failure. `Ok(true)` covers both a model that was
-/// loaded and one that simply was not, which the unload does not
-/// distinguish, matching ollama.
+/// `Ok(false)` is the daemon's "no such model" answer, which `llmman
+/// stop` renders as its error; `Ok(true)` covers a model loaded or not,
+/// which the unload does not distinguish, matching ollama. Any other
+/// failure is reported with its status and body, a 404 included: a proxy
+/// in front of the daemon answers 404 too, and "couldn't find model"
+/// would be the wrong story for that.
 pub fn unload(reference: &str) -> anyhow::Result<bool> {
     let resp = reqwest::blocking::Client::new()
         .post(format!("{}/api/generate", server()))
         .json(&serde_json::json!({"model": reference, "keep_alive": 0}))
         .send()
         .with_context(|| format!("request /api/generate (unload) for {reference}"))?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(true);
+    }
+    let body = resp.text().unwrap_or_default();
+    if status == reqwest::StatusCode::NOT_FOUND && is_model_not_found_body(&body, reference) {
         return Ok(false);
     }
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().unwrap_or_default();
-        anyhow::bail!("stop {reference}: server returned {status}: {body}");
-    }
-    Ok(true)
+    anyhow::bail!("stop {reference}: server returned {status}: {body}");
+}
+
+/// The `{"error":"model '<name>' not found"}` this daemon sends for
+/// `reference` (see `unload_model` in cmd::serve), with the name the
+/// daemon was asked for, a pair's local half; parsed through `api_error`,
+/// so an HTML page or a proxy's own JSON does not pass by containing the
+/// words, and a 404 about some other model does not pass either.
+pub(crate) fn is_model_not_found_body(body: &str, reference: &str) -> bool {
+    let expected = format!("model '{}' not found", crate::hybrid::local_half(reference));
+    api_error(body).is_some_and(|e| e == expected)
 }
 
 /// A plain `GET {server()}{path}` returning the parsed JSON body — for
@@ -1570,5 +1604,31 @@ mod tests {
             survived,
             "a process outside the targeted group was signalled too"
         );
+    }
+
+    #[test]
+    fn only_the_not_found_error_envelope_for_that_model_means_a_missing_model() {
+        let m = "docker.io/ai/m";
+        assert!(is_model_not_found_body(
+            r#"{"error":"model 'docker.io/ai/m' not found"}"#,
+            m
+        ));
+        // A pair is unloaded by its local half, which is what the daemon
+        // names.
+        assert!(is_model_not_found_body(
+            r#"{"error":"model 'gemma4' not found"}"#,
+            "llmman.hybrid/gemma4,anthropic/claude-sonnet-4-5"
+        ));
+        assert!(!is_model_not_found_body(
+            r#"{"error":"model 'other' not found"}"#,
+            m
+        ));
+        assert!(!is_model_not_found_body(r#"{"error":"no route"}"#, m));
+        assert!(!is_model_not_found_body("<html>404 Not Found</html>", m));
+        assert!(!is_model_not_found_body("", m));
+        assert!(!is_model_not_found_body(
+            r#"{"message":"model 'docker.io/ai/m' not found"}"#,
+            m
+        ));
     }
 }

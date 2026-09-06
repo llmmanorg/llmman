@@ -181,7 +181,8 @@ setting may not behave identically.
 |----------|--------|
 | `LLMMAN_DEBUG` | Enables verbose diagnostic logging (a spawned backend's full command line, per-GPU probe detail, etc). Accepts `1`/`true`/`yes`/`on`, or any other non-zero integer. |
 | `LLMMAN_HOST` | `[host][:port]` `llmman serve` binds to. Every `llmman` client in the same environment connects to it too, rewriting a wildcard host to loopback first. Defaults to `127.0.0.1:17434`. |
-| `LLMMAN_CONTEXT_LENGTH` | Context size for llama-server/vLLM when set. Defaults and backend-specific forwarding are below. |
+| `LLMMAN_CONTEXT_LENGTH` | Context size for llama-server/vLLM when set. Defaults to `262144` (256k) for llama-server, capped to each model's trained context; backend-specific forwarding is below. |
+| `LLMMAN_HYBRID_LOCAL_BYTES` | Largest request body, in bytes, that a [hybrid model pair](providers.md#hybrid-model-pairs) serves locally; anything larger goes to the hosted half. `0` disables the size rule; a request the local half then refuses as over its context is still retried on the hosted half. Defaults to four bytes per token of the context size. |
 | `LLMMAN_KEEP_ALIVE` | The daemon-wide default `keep_alive` (how long an idle, unused model stays loaded before being unloaded). Defaults to 5 minutes. Overridden per-request by `/api/chat`/`/api/generate`'s own `keep_alive` field. |
 | `LLMMAN_MAX_LOADED_MODELS` | Caps how many models this daemon keeps loaded at once, as one flat daemon-wide total (llmman has no per-model memory estimate to size an automatic per-GPU figure against). Once at the cap, the least-recently-used idle model is evicted to make room; if every loaded model is busy, the request gets a `503` instead. Defaults to `0` (unbounded, today's behavior, unchanged). |
 | `LLMMAN_MAX_QUEUE` | Caps how many requests `llmman serve` admits into scheduling at once; anything beyond that gets an immediate `503` (`server busy, please try again.  maximum pending requests exceeded`, two spaces included). Defaults to `512`. |
@@ -195,7 +196,6 @@ setting may not behave identically.
 | `LLMMAN_FLASH_ATTENTION` | Flash Attention mode (`--flash-attn`): `on`, `off`, or `auto` (llama-server's own default). Also accepts `1`/`0`/`true`/`false`. |
 | `LLMMAN_KV_CACHE_TYPE` | KV-cache quantization (`--cache-type-k`/`--cache-type-v`), e.g. `f16` (default), `q8_0`, `q4_0`. Trades output quality for memory at long context lengths. |
 | `LLMMAN_LLM_LIBRARY` | Forces which GPU backend `llmman serve`/`run` picks (`cpu`, `cuda`/`cuda12`/`cuda_v12`, `cuda13`/`cuda_v13`, `rocm`, `vulkan`, or macOS-only `metal`), bypassing autodetection. Has no effect when a `llama-server` binary is already on `PATH` (its own backend is fixed), or on macOS's local-binary download (one asset per architecture, no separate choice to make). |
-| `LLMMAN_GPU_OVERHEAD` | Bytes of VRAM to hold back from the VRAM-tiered `LLMMAN_CONTEXT_LENGTH` default, leaving headroom for whatever else shares the device. Applied as one combined-total subtraction rather than per-GPU (llmman only ever probes one combined VRAM total). |
 | `LLMMAN_IGPU_ENABLE` | Counts integrated GPUs (Vulkan only) when probing for an accelerator. Defaults to disabled, since an integrated GPU is usually a worse choice than the discrete/CPU fallback it would otherwise be skipped in favor of. |
 | `LLMMAN_LOAD_TIMEOUT` | How long to allow a model load to stall before giving up. Zero or negative means wait forever. Defaults to 10 minutes (`vllm` can take several minutes to load a large safetensors model). |
 | `LLMMAN_TMPDIR` | Staging directory for `llama-server` release downloads, overriding the default `tmp` subdirectory of the install root. |
@@ -208,7 +208,7 @@ setting may not behave identically.
 
 | Backend | When `LLMMAN_CONTEXT_LENGTH` is set | When unset or invalid |
 |---------|-------------------------------------|-----------------------|
-| `llama-server` | Passed as `--ctx-size`; oversized values may be capped to the model's trained context. | Uses llmman's VRAM-tiered default, which may defer to the backend default on high-VRAM hosts. |
+| `llama-server` | Passed as `--ctx-size` as-is for generation models (llama-server allocates the KV cache at that size and caps each request slot to the model's trained context). Embedding models are always capped to their trained context, and `0` means that context. | `--ctx-size 262144` (256k), or the model's trained context if smaller. If the load then fails with an out-of-memory error, llmman retries with the context halved (down to a 16384 floor) before giving up. |
 | `vLLM` | Positive values are passed as `--max-model-len`; oversized values are rejected by vLLM. `0` is not forwarded. | Uses vLLM's model-derived default. |
 | `mlx_lm.server` | Not currently forwarded. | Uses `mlx_lm.server` defaults. |
 

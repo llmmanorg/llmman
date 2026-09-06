@@ -368,10 +368,20 @@ func pushStreamLazy(ctx context.Context, pusher remotes.Pusher, desc ocispec.Des
 //
 //export llmman_login
 func llmman_login(cServer, cUsername, cPassword *C.char) *C.char {
-	server := C.GoString(cServer)
-	username := C.GoString(cUsername)
-	password := C.GoString(cPassword)
+	if err := dockerLogin(C.GoString(cServer), C.GoString(cUsername), C.GoString(cPassword)); err != nil {
+		return errResp(err)
+	}
+	return okResp("")
+}
 
+// dockerLogin is llmman_login's implementation, factored out so a test
+// can reach it — Go forbids cgo in _test.go files. Mirrors podmanLogin
+// in backend_podman.go.
+//
+// Unlike podman's commonauth.Login this never contacts the registry: it
+// only writes to the credential store, which is what makes its success
+// path testable offline (see backend_docker_auth_test.go).
+func dockerLogin(server, username, password string) error {
 	cfg := dockercliconfig.LoadDefaultConfigFile(io.Discard)
 	store := cfg.GetCredentialsStore(server)
 
@@ -380,29 +390,36 @@ func llmman_login(cServer, cUsername, cPassword *C.char) *C.char {
 		Username:      username,
 		Password:      password,
 	}); err != nil {
-		return errResp(fmt.Errorf("store credentials: %w", err))
+		return fmt.Errorf("store credentials: %w", err)
 	}
 	if err := cfg.Save(); err != nil {
-		return errResp(fmt.Errorf("save config: %w", err))
+		return fmt.Errorf("save config: %w", err)
 	}
-	return okResp("")
+	return nil
 }
 
 // llmman_logout removes credentials for a registry from the Docker credential store.
 //
 //export llmman_logout
 func llmman_logout(cServer *C.char) *C.char {
-	server := C.GoString(cServer)
+	if err := dockerLogout(C.GoString(cServer)); err != nil {
+		return errResp(err)
+	}
+	return okResp("")
+}
 
+// dockerLogout is llmman_logout's implementation. Factored out for the
+// same reason as dockerLogin above; mirrors podmanLogout.
+func dockerLogout(server string) error {
 	cfg := dockercliconfig.LoadDefaultConfigFile(io.Discard)
 	store := cfg.GetCredentialsStore(server)
 	if err := store.Erase(server); err != nil {
-		return errResp(fmt.Errorf("erase credentials: %w", err))
+		return fmt.Errorf("erase credentials: %w", err)
 	}
 	if err := cfg.Save(); err != nil {
-		return errResp(fmt.Errorf("save config: %w", err))
+		return fmt.Errorf("save config: %w", err)
 	}
-	return okResp("")
+	return nil
 }
 
 // llmman_push pushes an image from a local OCI layout directory to a registry.

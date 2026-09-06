@@ -10,6 +10,11 @@
 //! on its behalf. There is deliberately no path here that hands an
 //! integration a provider's URL directly — one endpoint, one place
 //! integrations are configured, whether or not the weights are local.
+//!
+//! `--overflow-provider`/`--overflow-model` hand the integration one
+//! reference naming the local `--model` and a hosted one, and the daemon
+//! picks a side per request (see [`crate::hybrid`]); the integration
+//! never learns two are involved.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -40,6 +45,17 @@ pub struct LaunchArgs {
     #[arg(long, short = 'p', value_name = "PROVIDER")]
     pub provider: Option<String>,
 
+    /// Send requests too large for the local --model to this provider
+    /// instead (openai, anthropic, openrouter, ...). Needs
+    /// --overflow-model; not combinable with --provider.
+    #[arg(long, value_name = "PROVIDER")]
+    pub overflow_provider: Option<String>,
+
+    /// The --overflow-provider model that serves requests too large for
+    /// the local --model. Everything that fits stays on this machine.
+    #[arg(long, value_name = "MODEL")]
+    pub overflow_model: Option<String>,
+
     /// Extra arguments forwarded to the integration binary (after --)
     #[arg(last = true, value_name = "ARGS")]
     pub extra_args: Vec<String>,
@@ -47,6 +63,11 @@ pub struct LaunchArgs {
 
 pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     let provider = providers::provider_flag(args.provider.as_deref())?;
+    let overflow = crate::hybrid::overflow_flags(
+        args.overflow_provider.as_deref(),
+        args.overflow_model.as_deref(),
+        provider,
+    )?;
 
     let Some(ref name) = args.integration else {
         print_integrations();
@@ -55,6 +76,10 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
 
     // Before either arm starts the daemon; see `check_model_flag`.
     check_model_flag(name, args.model.as_deref(), provider, &args.extra_args)?;
+    anyhow::ensure!(
+        overflow.is_none() || args.model.as_deref().is_some_and(|m| !m.trim().is_empty()),
+        "--overflow-model needs --model naming the local model to pair it with"
+    );
 
     let (model, api_key) = match provider {
         Some(provider) => {
@@ -100,7 +125,20 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             if !model.is_empty() {
                 crate::daemon::ensure_model_pulled(&model)?;
             }
-            (model, providers::PLACEHOLDER_API_KEY.to_string())
+            match overflow {
+                // The hosted half is validated and keyed exactly as a
+                // bare --provider model would be, then paired with the
+                // local model just pulled.
+                Some((provider, hosted)) => {
+                    check_provider_supported(name)?;
+                    let per_request =
+                        !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
+                    let (remote, api_key) =
+                        resolve_provider_model(provider, Some(hosted), name, per_request)?;
+                    (crate::hybrid::pair_with_local(&model, &remote)?, api_key)
+                }
+                None => (model, providers::PLACEHOLDER_API_KEY.to_string()),
+            }
         }
     };
 
@@ -447,10 +485,8 @@ fn find_on_path(binary: &str) -> Option<PathBuf> {
 
 /// The binary `launch` will run for `i`, so the listing does not report
 /// as missing what the launcher would find: `PATH`, then what the
-/// launcher knows. Talos's installer deliberately adds nothing to `PATH`
-/// (see [`talos_command`]) — without its own arm here every Talos
-/// install would show as "not installed", which would teach people to
-/// ignore the column.
+/// launcher knows. Talos supports its official PATH wrapper as well as
+/// prefix-local installs that have only a venv (see [`talos_command`]).
 fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
         "opencode" => find_opencode(),
@@ -621,13 +657,31 @@ fn write_codex_config() -> anyhow::Result<()> {
     }
 
     let profile_path = config_dir.join("llmman.config.toml");
-    let contents = format!("openai_base_url = \"{}/v1\"\n", daemon::server());
+    let contents = codex_profile(&daemon::server());
     // Avoid rewriting (and bumping the mtime of) a file that's already
     // correct.
     if std::fs::read_to_string(&profile_path).ok().as_deref() != Some(contents.as_str()) {
         std::fs::write(&profile_path, contents)?;
     }
     Ok(())
+}
+
+/// The contents of `~/.codex/llmman.config.toml`: a provider of llmman's
+/// own rather than `openai_base_url` on codex's built-in one, which codex
+/// treats as WebSocket-capable and so opened every session with five
+/// failed `ws://` attempts (~6s of "Reconnecting...") before HTTP.
+fn codex_profile(server: &str) -> String {
+    format!(
+        "# Written by `llmman launch codex`; edits are overwritten.\n\
+         model_provider = \"llmman\"\n\
+         \n\
+         [model_providers.llmman]\n\
+         name = \"llmman\"\n\
+         base_url = \"{server}/v1\"\n\
+         env_key = \"OPENAI_API_KEY\"\n\
+         wire_api = \"responses\"\n\
+         supports_websockets = false\n"
+    )
 }
 
 /// Removes a `[profiles.llmman]` table (and everything up to the next
@@ -884,25 +938,15 @@ fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 
 /// qwen: Qwen Code's OpenAI-compatible mode, pointed at our /v1 by the
 /// command line, the environment and its settings file together, since
-/// it reads the three in a different order for each value.
-///
-/// `--auth-type` and `--model` go on the command line: for those it
-/// reads `argv`, then `~/.qwen/settings.json`, then the `OPENAI_*`
-/// variables, and it writes that file itself on `/auth` and `/model`, so
-/// for anyone who has used it before the variables alone lose. For the
-/// base URL a `modelProviders` entry in the settings file whose id is the
-/// model beats both flag and variable (`resolveModelConfig` in its
-/// `packages/core/src/models/modelConfigResolver.ts`), which is what
-/// `write_qwen_settings` is for. The key stays in the environment: on the
-/// command line it shows in `ps`, and the file only names the variable,
-/// `LLMMAN_API_KEY`, exported with the same value as `OPENAI_API_KEY` so
-/// that llmman's entry is told from any other by its key name, the way
-/// ollama's is by `OLLAMA_API_KEY`. Ollama's `cmd/launch/qwen.go` does
-/// the same three. `--model` is
-/// required; `check_model_flag` refuses a launch without one before the
-/// daemon starts. A `--model` after `--` is the one Qwen Code will use
-/// (`qwen_args` yields to it), so the settings and `OPENAI_MODEL` follow
-/// it; `run` has resolved and preloaded the top-level one regardless.
+/// Qwen Code reads the three in a different order for each value:
+/// `--auth-type` and `--model` win on the command line, the base URL is
+/// won by a `modelProviders` entry for the model (`resolveModelConfig` in
+/// its `packages/core/src/models/modelConfigResolver.ts`), which is what
+/// `write_qwen_settings` is for, and the key stays in the environment,
+/// named in that entry as `LLMMAN_API_KEY` so llmman's entry is told from
+/// any other. Ollama's `cmd/launch/qwen.go` does the same three. A
+/// `--model` after `--` is the one Qwen Code uses, so the settings and
+/// `OPENAI_MODEL` follow it.
 fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_qwen().ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
     let model = forwarded_model(extra_args).unwrap_or(model);
@@ -1052,13 +1096,10 @@ fn launch_talos(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     }
     talos_check_env_overrides(model, |key| std::env::var(key).ok())?;
 
-    // Where to guess the env file lives: an explicit TALOS_PREFIX always
-    // wins (the operator's own claim), otherwise only the venv form's own
-    // `cwd` — where `talos_command` actually found Talos, not a guess.
-    // A shim on PATH carries no such location; `talos_env_file` is left
-    // to fall back to TALOS_SECRETS_ENV alone (or refuse) rather than aim
-    // at a `~/talos` that may not be where the shim's Talos lives.
-    let config_prefix = talos_prefix_override().or_else(|| talos.cwd.clone());
+    // A recognized wrapper or venv identifies the code that will actually
+    // run. Its local env file lives there, even if TALOS_PREFIX names a
+    // different installation. Only unknown shims need the explicit hint.
+    let config_prefix = talos.cwd.clone().or_else(talos_prefix_override);
     let secrets_env_absolute = absolute_env_path("TALOS_SECRETS_ENV")?;
     let env_file = talos_env_file(
         config_prefix.as_deref(),
@@ -1091,21 +1132,20 @@ fn launch_talos(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let base_url = format!("{}/v1", daemon::server());
     let (bin, args) = talos_exec_argv(&talos, extra_args);
     let mut extra_env: Vec<(&str, &str)> = vec![(TALOS_BASE_URL_KEY, base_url.as_str())];
-    // Talos's own cwd changes to the prefix for the venv form (see
-    // `TalosCommand`'s doc comment) — a relative TALOS_SECRETS_ENV would
-    // then resolve differently for Talos than it just did for the write
-    // above. Overlaying the absolute value keeps both resolutions the
-    // same file; the shim form's cwd never changes, so this only matters
-    // for the venv form.
-    let secrets_env_owned = if talos.cwd.is_some() {
-        secrets_env_absolute
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-    } else {
-        None
-    };
+    // Pin both paths before changing cwd so the child sees the same
+    // locations used for configuration. Recognized wrappers take precedence
+    // over a stale prefix override, just as they do in command resolution.
+    let secrets_env_owned = secrets_env_absolute
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    let prefix_owned = config_prefix
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
     if let Some(value) = &secrets_env_owned {
         extra_env.push(("TALOS_SECRETS_ENV", value.as_str()));
+    }
+    if let Some(value) = &prefix_owned {
+        extra_env.push(("TALOS_PREFIX", value.as_str()));
     }
     exec_with_env_in(&bin, &args, &extra_env, talos.cwd.as_deref())
 }
@@ -1153,17 +1193,18 @@ fn expand_and_absolutize(raw: &str, home: Option<&std::path::Path>) -> std::io::
 /// `-m talos` finds it on the current directory, which is why its own
 /// instructions read `cd ~/talos && .venv/bin/python -m talos …` — so
 /// the venv form carries the prefix as its working directory, and a
-/// `talos` shim on PATH carries none.
+/// recognized installer wrapper carries its resolved prefix too. Unknown
+/// shims inherit the caller's directory.
 #[derive(Debug, PartialEq)]
 struct TalosCommand {
     argv: Vec<String>,
     cwd: Option<PathBuf>,
 }
 
-/// How to invoke Talos: a `talos` shim on PATH when the user made one,
-/// else the venv interpreter under the install prefix plus `-m talos` —
-/// the canonical invocation, since the installer puts everything under
-/// `~/talos` (or `$TALOS_PREFIX`) and deliberately adds nothing to PATH.
+/// How to invoke Talos: its official wrapper (or a custom shim) on PATH,
+/// else the venv interpreter under the install prefix plus `-m talos`.
+/// The 0.18 installer adds the wrapper; older/prefix-local installs may
+/// still need the interpreter fallback.
 fn talos_command() -> Option<TalosCommand> {
     talos_command_in(find_on_path, talos_prefix().as_deref())
 }
@@ -1175,7 +1216,7 @@ fn find_talos() -> Option<PathBuf> {
     talos_command().map(|talos| PathBuf::from(&talos.argv[0]))
 }
 
-/// `$TALOS_PREFIX`, absolutized — `None` when unset or empty. Kept apart
+/// `$TALOS_PREFIX`, home-expanded and absolutized — `None` when unset or empty. Kept apart
 /// from [`talos_prefix`]'s `~/talos` default: an env-file target guessed
 /// from that default would aim at the wrong place for a `talos` shim
 /// installed somewhere else, so [`launch_talos`] only falls back to it
@@ -1194,7 +1235,7 @@ fn talos_prefix_override() -> Option<PathBuf> {
         .ok()
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())?;
-    Some(std::path::absolute(&raw).unwrap_or_else(|_| PathBuf::from(raw)))
+    expand_and_absolutize(&raw, dirs::home_dir().as_deref()).ok()
 }
 
 /// Talos's install directory: `$TALOS_PREFIX`, else `~/talos`, where the
@@ -1428,8 +1469,8 @@ fn find_qwen() -> Option<PathBuf> {
 /// and, on Windows, its `%LOCALAPPDATA%\qwen-code\bin`
 /// (`Get-QwenInstallBinDir` in Qwen Code's
 /// `scripts/installation/install-qwen-standalone.ps1`); the
-/// `~/.npm-global` prefix its older npm installer set; nvm's newest node
-/// that has it; Homebrew's prefixes and `/usr/local/bin`; and the rest of
+/// `~/.npm-global` prefix its older npm installer set; any node under
+/// `~/.nvm` that has it; Homebrew's prefixes and `/usr/local/bin`; and the rest of
 /// what ollama's `cmd/launch/qwen.go` probes, `~/.cargo/bin`, macOS's
 /// `~/Library/Application Support/qwen/bin`, and on Windows npm's global
 /// directory under both `%APPDATA%` and `%LOCALAPPDATA%`,
@@ -1476,7 +1517,7 @@ fn qwen_fallback_paths() -> Vec<PathBuf> {
                     .join("qwen"),
             );
         }
-        paths.extend(nvm_dirs(h).iter().filter_map(|d| nvm_qwen(d)));
+        paths.extend(nvm_qwen(h));
     }
     if cfg!(target_os = "macos") {
         paths.push(PathBuf::from("/opt/homebrew/bin/qwen"));
@@ -1487,49 +1528,14 @@ fn qwen_fallback_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// `$NVM_DIR`, `$XDG_CONFIG_HOME/nvm`, `~/.config/nvm` and `~/.nvm`: which
-/// one an install took depends on the environment nvm was installed in,
-/// not on this process's, so all are probed.
-fn nvm_dirs(home: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(dir) = std::env::var_os("NVM_DIR").filter(|d| !d.is_empty()) {
-        dirs.push(PathBuf::from(dir));
-    }
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()) {
-        dirs.push(PathBuf::from(xdg).join("nvm"));
-    }
-    dirs.push(home.join(".config").join("nvm"));
-    dirs.push(home.join(".nvm"));
-    dirs
-}
-
-/// The `qwen` under the newest node version nvm holds one for; nvm keeps
-/// one tree per version and picks between them by editing `PATH` in the
-/// shell.
-fn nvm_qwen(nvm_dir: &Path) -> Option<PathBuf> {
-    let node = nvm_dir.join("versions").join("node");
-    let mut versions: Vec<String> = std::fs::read_dir(&node)
+/// The `qwen` under any node version in `~/.nvm`, the way ollama's
+/// `cmd/launch/qwen.go` globs for it.
+fn nvm_qwen(home: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(home.join(".nvm").join("versions").join("node"))
         .ok()?
         .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    sort_node_versions_newest_first(&mut versions);
-    versions
-        .into_iter()
-        .map(|v| node.join(v).join("bin").join("qwen"))
+        .map(|e| e.path().join("bin").join("qwen"))
         .find(|p| p.is_file())
-}
-
-/// `v22.14.0` before `v22.9.1` before `v9.0.0`; a name that is not a
-/// version sorts last.
-fn sort_node_versions_newest_first(names: &mut [String]) {
-    fn key(name: &str) -> Option<Vec<u64>> {
-        name.strip_prefix('v')?
-            .split('.')
-            .map(|part| part.parse().ok())
-            .collect()
-    }
-    names.sort_by_key(|name| std::cmp::Reverse(key(name)));
 }
 
 /// `$QWEN_HOME` if set, else `~/.qwen`: `Storage.getGlobalQwenDir` in
@@ -1563,16 +1569,11 @@ fn write_qwen_settings(model: &str) -> anyhow::Result<()> {
 }
 
 /// Read as Qwen Code reads it, comments stripped and an empty file as
-/// `{}`. What is still not a JSON object is left alone, with a line to
-/// say so, and the launch goes on: Qwen Code moves a file it cannot parse
-/// to `settings.json.corrupted` and resets it to `{}`, so no entry in it
-/// survives to outrank the flags and variables `launch_qwen` passes. A
-/// file that parses but cannot be written is an error, since an entry in
-/// it may be exactly what the write was to outrank.
-/// The file as it was before llmman first wrote
-/// it stays as `settings.json.bak`, and a later one carrying comments,
-/// which the rewrite drops, replaces that copy; llmman's own renderings
-/// and Qwen Code's do not.
+/// `{}`. A file that is not a JSON object is left alone with a line
+/// printed, since Qwen Code resets such a file to `{}` itself; one that
+/// parses but cannot be written is an error, since an entry in it may be
+/// the one this write was to outrank. The user's own file, and any later
+/// one carrying comments, is kept as `settings.json.bak`.
 fn write_qwen_settings_at(dir: &Path, model: &str, base_url: &str) -> anyhow::Result<()> {
     let path = dir.join("settings.json");
     let raw = match std::fs::read_to_string(&path) {
@@ -1665,18 +1666,12 @@ fn strip_json_comments(raw: &str) -> String {
 /// as llmman's: a user can rename it in `/model`, but not re-key it.
 const QWEN_ENV_KEY: &str = "LLMMAN_API_KEY";
 
-/// `existing` with llmman's entry merged in; pure, so it is testable on a
-/// literal document. The keys are the ones Qwen Code's own `/auth` and
-/// `/model` write, and ollama's `applyQwenOllamaConfig` in
-/// `cmd/launch/qwen.go`: llmman's entry first in `modelProviders.openai`,
-/// with an earlier one of its own for this daemon replaced, the rest
-/// kept, and a `{ protocol, models }` wrapper an older Qwen Code wrote
-/// unwrapped as its `V5ToV4Migration` does, `$version` set to 4 with it;
-/// `security.auth.selectedType` and `baseUrl`; `model.name` with
-/// `model.baseUrl`, which Qwen Code sets together. Otherwise no
-/// `$version`, which Qwen Code stamps itself, and no key: the
-/// entry names `QWEN_ENV_KEY`, which `launch_qwen` exports. A value of
-/// the wrong type on the way down is replaced, as ollama's `qwenMap` does.
+/// `existing` with llmman's entry merged in, pure so a test can hand it
+/// a literal. The keys follow Qwen Code's own `/auth` and `/model` and
+/// ollama's `applyQwenOllamaConfig` in `cmd/launch/qwen.go`: the entry
+/// first in `modelProviders.openai`, an earlier one of llmman's replaced,
+/// the rest kept and a `{ protocol, models }` wrapper unwrapped with
+/// `$version` set to 4; `security.auth`; `model.name` and `model.baseUrl`.
 fn qwen_settings_merged(
     existing: &serde_json::Value,
     model: &str,
@@ -2012,24 +2007,10 @@ mod tests {
         );
     }
 
-    /// Newest node first; the directory order is not by version.
+    /// Any node version under `~/.nvm` that has qwen.
     #[test]
-    fn node_versions_sort_newest_first_with_other_names_last() {
-        let mut names: Vec<String> = ["v9.0.0", "v20.19.0", ".DS_Store", "v22.14.0", "v22.9.1"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        sort_node_versions_newest_first(&mut names);
-        assert_eq!(
-            names,
-            ["v22.14.0", "v22.9.1", "v20.19.0", "v9.0.0", ".DS_Store"]
-        );
-    }
-
-    /// Over nvm's layout, the newest version that has qwen wins.
-    #[test]
-    fn nvm_qwen_picks_the_newest_version_that_has_it() {
-        let dir = std::env::temp_dir().join(format!(
+    fn nvm_qwen_finds_it_under_a_node_version() {
+        let home = std::env::temp_dir().join(format!(
             "llmman-nvm-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -2037,15 +2018,13 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let node = dir.join("versions").join("node");
-        for v in ["v20.19.0", "v22.14.0", "v22.9.1"] {
-            std::fs::create_dir_all(node.join(v).join("bin")).unwrap();
-        }
-        std::fs::write(node.join("v20.19.0/bin/qwen"), "").unwrap();
-        std::fs::write(node.join("v22.9.1/bin/qwen"), "").unwrap();
-        assert_eq!(nvm_qwen(&dir), Some(node.join("v22.9.1/bin/qwen")));
-        assert_eq!(nvm_qwen(&dir.join("nowhere")), None);
-        let _ = std::fs::remove_dir_all(&dir);
+        let bin = home.join(".nvm/versions/node/v22.9.1/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(home.join(".nvm/versions/node/v20.19.0/bin")).unwrap();
+        std::fs::write(bin.join("qwen"), "").unwrap();
+        assert_eq!(nvm_qwen(&home), Some(bin.join("qwen")));
+        assert_eq!(nvm_qwen(&home.join("nowhere")), None);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// The documented targets are on the list (see `find_qwen`).
@@ -2314,6 +2293,26 @@ model = \"gpt-5\"
         assert_eq!(strip_legacy_llmman_profile(existing), "");
     }
 
+    #[test]
+    fn codex_profile_is_a_websocket_free_provider_at_the_daemon() {
+        let profile: toml::Value = codex_profile("http://127.0.0.1:17434")
+            .parse()
+            .expect("valid TOML");
+        assert_eq!(profile["model_provider"].as_str(), Some("llmman"));
+        let provider = &profile["model_providers"]["llmman"];
+        assert_eq!(
+            provider["base_url"].as_str(),
+            Some("http://127.0.0.1:17434/v1")
+        );
+        assert_eq!(provider["env_key"].as_str(), Some("OPENAI_API_KEY"));
+        assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+        assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
+        assert!(
+            profile.get("openai_base_url").is_none(),
+            "the built-in openai provider is not the one in use"
+        );
+    }
+
     /// Regression test for `write_hermes_config` preserving unrelated
     /// `config.yaml` content: only its own `model:`/`providers:` blocks
     /// are replaced, not a user's other settings.
@@ -2433,6 +2432,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
     /// this test's real regression coverage: without the fix, a plain
     /// `talos` on PATH from the official installer produced `cwd: None`
     /// and `launch_talos` could never find its own env file.
+    #[cfg(unix)]
     #[test]
     fn talos_command_resolves_the_installers_own_wrapper_to_its_prefix() {
         let dir = scratch_dir("talos-wrapper");
@@ -2497,10 +2497,15 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
             expand_and_absolutize("~other/y", Some(&home)).unwrap(),
             std::path::absolute("~other/y").unwrap()
         );
-        // No `~` at all: ordinary absolutizing, `home` unused.
+        // A real absolute path also carries the drive prefix on Windows.
+        let absolute = home.join("already-absolute");
         assert_eq!(
-            expand_and_absolutize("/already/absolute", None).unwrap(),
-            PathBuf::from("/already/absolute")
+            expand_and_absolutize(absolute.to_str().unwrap(), None).unwrap(),
+            absolute
+        );
+        assert_eq!(
+            expand_and_absolutize("relative/talos", None).unwrap(),
+            std::env::current_dir().unwrap().join("relative/talos")
         );
         std::fs::remove_dir_all(&home).unwrap();
     }
@@ -2508,6 +2513,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
     /// Writing through a symlink would sever it from whatever it pointed
     /// at instead of updating it — refused before that happens, matching
     /// Talos's own `write_key` ("refusing a symlink config file").
+    #[cfg(unix)]
     #[test]
     fn write_talos_env_refuses_a_symlink_target() {
         let dir = scratch_dir("talos-env-write-symlink");

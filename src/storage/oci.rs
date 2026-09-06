@@ -96,6 +96,19 @@ pub struct CncfModelConfig {
     pub modelfs: CncfModelFs,
 }
 
+/// `find`'s "no such reference" error, distinct from a broken store so
+/// callers (e.g. `/api/show`) can answer 404 for one and 500 for the other.
+#[derive(Debug)]
+pub struct NotFound(pub String);
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "image not found: {}", self.0)
+    }
+}
+
+impl std::error::Error for NotFound {}
+
 /// Summary of a locally stored image shown by `list`.
 #[derive(Debug)]
 pub struct ImageSummary {
@@ -358,7 +371,7 @@ impl OciStore {
         let refs = self.list_refs();
         matching_index(&refs, reference)
             .map(|i| refs[i].clone())
-            .ok_or_else(|| anyhow!("image not found: {}", reference))
+            .ok_or_else(|| NotFound(reference.to_string()).into())
     }
 
     /// The real total size of an image: the sum of its layer sizes, not

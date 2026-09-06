@@ -24,11 +24,19 @@
 //! prompt — mirrors `readline.Instance.Readline()`'s own enter/`defer`
 //! restore — which is why Ctrl-C while typing is read as byte 3 (ISIG
 //! off) but Ctrl-C during a response is a real SIGINT (ISIG back on).
+//!
+//! Image attachments are ported from ollama's `cmd/interactive.go`: when
+//! `/api/show` reports `vision`, image/audio paths in the prompt are
+//! read, base64-encoded onto the message's `images`, and removed from
+//! the text.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Seek, Write};
+use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Context;
+use base64::Engine as _;
 use clap::Args;
 use futures::TryStreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -52,6 +60,15 @@ pub struct RunArgs {
     /// provider's own model id. See `llmman providers`.
     #[arg(long, short = 'p', value_name = "PROVIDER")]
     pub provider: Option<String>,
+    /// Send requests too large for the local MODEL to this provider
+    /// instead (openai, anthropic, openrouter, ...). Needs
+    /// --overflow-model; not combinable with --provider.
+    #[arg(long, value_name = "PROVIDER")]
+    pub overflow_provider: Option<String>,
+    /// The --overflow-provider model that serves requests too large for
+    /// the local MODEL. Everything that fits stays on this machine.
+    #[arg(long, value_name = "MODEL")]
+    pub overflow_model: Option<String>,
     /// Forwarded as Ollama's own top-level `think` field on every request
     /// this sends (see cmd::serve's think_to_chat_template_kwargs) —
     /// `--think false` disables a reasoning model's thinking block
@@ -95,6 +112,9 @@ struct ChatOptions<'a> {
     /// `provider_model`), `None` for a local model. Applied as a default
     /// header, not a body field — see `chat_client`.
     api_key: Option<&'a str>,
+    /// Ollama's `runOptions.MultiModal`, from `/api/show`'s capabilities:
+    /// only then is a prompt scanned for image paths.
+    multimodal: bool,
 }
 
 impl Default for ChatOptions<'_> {
@@ -104,12 +124,18 @@ impl Default for ChatOptions<'_> {
             num_predict: None,
             word_wrap: true,
             api_key: None,
+            multimodal: false,
         }
     }
 }
 
 pub fn run(args: &RunArgs) -> anyhow::Result<()> {
     let provider = crate::providers::provider_flag(args.provider.as_deref())?;
+    let overflow = crate::hybrid::overflow_flags(
+        args.overflow_provider.as_deref(),
+        args.overflow_model.as_deref(),
+        provider,
+    )?;
     let prompt = args.prompt.join(" ");
 
     // resolve_ollama_api, not resolve: `llmman run` is an /api/chat client
@@ -147,8 +173,12 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
     // validates against, and it forwards the chat upstream.
     crate::daemon::ensure_server("")?;
 
-    let (model, api_key) = match route {
-        Route::Provider(provider) => provider_model(provider, &args.model)?,
+    let (model, api_key, multimodal) = match route {
+        Route::Provider(provider) => {
+            let (model, key) = provider_model(provider, &args.model)?;
+            // /api/show has no capabilities for a provider-routed model.
+            (model, key, false)
+        }
         Route::Local(model) => {
             // Fail fast on a bad/unresolvable reference — mirrors ollama's
             // RunHandler, which resolves (Show, falling back to Pull) the
@@ -156,9 +186,22 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
             // this, an error like an invalid `hf.co/...` reference wouldn't
             // surface until the first message was submitted to /api/chat,
             // well after the `> ` prompt had already been shown and read
-            // from.
-            crate::daemon::ensure_model_pulled(&model)?;
-            (model, None)
+            // from. The same Show also answers ollama's `opts.MultiModal`.
+            let info = crate::daemon::ensure_model_pulled(&model)?;
+            let multimodal = info.multimodal();
+            match overflow {
+                // The hosted half is validated and keyed as a bare
+                // --provider model is, then paired with the local model.
+                Some((provider, hosted)) => {
+                    let (remote, key) = provider_model(provider, hosted)?;
+                    (
+                        crate::hybrid::pair_with_local(&model, &remote)?,
+                        key,
+                        multimodal,
+                    )
+                }
+                None => (model, None, multimodal),
+            }
         }
     };
 
@@ -171,6 +214,7 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
         num_predict: args.num_predict,
         word_wrap: !args.nowordwrap,
         api_key: api_key.as_deref(),
+        multimodal,
     };
 
     if interactive {
@@ -256,6 +300,20 @@ struct Msg {
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<String>,
+    /// Ollama's `api.Message.Images`: standard base64, one per image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<String>>,
+}
+
+impl Msg {
+    fn text(role: &str, content: String) -> Self {
+        Self {
+            role: role.into(),
+            content,
+            thinking: None,
+            images: None,
+        }
+    }
 }
 
 /// Async, not `reqwest::blocking`, so a chat turn's response can be raced
@@ -302,6 +360,173 @@ struct ChatChunk {
     message: Option<Msg>,
     #[serde(default)]
     done: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Image attachments — ported from ollama's cmd/interactive.go
+// ---------------------------------------------------------------------------
+
+/// Ollama's `normalizeFilePath`: undoes shell escaping from a drag-and-drop
+/// (`My\ Photo.jpg` → `My Photo.jpg`). Same table and order as its
+/// `strings.NewReplacer`.
+fn normalize_file_path(fp: &str) -> String {
+    const PAIRS: &[(&str, &str)] = &[
+        ("\\ ", " "),
+        ("\\(", "("),
+        ("\\)", ")"),
+        ("\\[", "["),
+        ("\\]", "]"),
+        ("\\{", "{"),
+        ("\\}", "}"),
+        ("\\$", "$"),
+        ("\\&", "&"),
+        ("\\;", ";"),
+        ("\\'", "'"),
+        ("\\\\", "\\"),
+        ("\\*", "*"),
+        ("\\?", "?"),
+        ("\\~", "~"),
+    ];
+    let mut out = String::with_capacity(fp.len());
+    let mut rest = fp;
+    'outer: while !rest.is_empty() {
+        for (from, to) in PAIRS {
+            if let Some(tail) = rest.strip_prefix(from) {
+                out.push_str(to);
+                rest = tail;
+                continue 'outer;
+            }
+        }
+        let ch = rest.chars().next().expect("non-empty");
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
+}
+
+/// Ollama's `extractFileNames`, regex verbatim. Over-matches on purpose;
+/// `extract_file_data` drops anything that isn't a real file.
+fn extract_file_names(input: &str) -> Vec<&str> {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?:[a-zA-Z]:)?(?:\./|/|\\)[\S\\ ]+?\.(?i:jpg|jpeg|png|webp|wav)\b")
+            .expect("valid regex")
+    });
+    re.find_iter(input).map(|m| m.as_str()).collect()
+}
+
+/// Ollama's `extractFileData`: base64-encodes every existing image/audio
+/// file named in `input` and strips the paths (and surrounding single
+/// quotes) from the text. A missing path is left in place; an existing
+/// file of an unsupported type is an error.
+fn extract_file_data(input: &str) -> anyhow::Result<(String, Vec<String>)> {
+    let mut out = input.to_string();
+    let mut imgs = Vec::new();
+
+    for fp in extract_file_names(input) {
+        let nfp = normalize_file_path(fp);
+        let data = match get_image_data(&nfp) {
+            Ok(data) => data,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                eprintln!("Couldn't process file: {:?}", e.to_string());
+                return Err(e.into());
+            }
+        };
+        let ext = Path::new(&nfp)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "wav" => eprintln!("Added audio '{nfp}'"),
+            _ => eprintln!("Added image '{nfp}'"),
+        }
+        out = out.replace(&format!("'{nfp}'"), "");
+        out = out.replace(&format!("'{fp}'"), "");
+        out = out.replace(fp, "");
+        imgs.push(base64::engine::general_purpose::STANDARD.encode(&data));
+    }
+    Ok((out.trim().to_string(), imgs))
+}
+
+/// Ollama's `getImageData`: sniff the first 512 bytes, cap at 100MB, then
+/// read exactly the stat'd size (its `io.ReadFull` into a sized buffer).
+fn get_image_data(file_path: &str) -> io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(file_path)?;
+
+    let mut buf = [0u8; 512];
+    if file.read(&mut buf)? == 0 {
+        // Go's Read on an empty file is io.EOF: an error, not a skip.
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
+    }
+
+    let content_type = detect_content_type(&buf);
+    const ALLOWED: &[&str] = &[
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/webp",
+        "audio/wave",
+    ];
+    if !ALLOWED.contains(&content_type) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid file type: {content_type}"),
+        ));
+    }
+
+    let size = file.metadata()?.len();
+    const MAX_SIZE: u64 = 100 * 1024 * 1024;
+    if size > MAX_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file size exceeds maximum limit (100MB)",
+        ));
+    }
+
+    let mut data = Vec::with_capacity(size as usize);
+    file.seek(io::SeekFrom::Start(0))?;
+    file.take(size).read_to_end(&mut data)?;
+    if data.len() as u64 != size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "unexpected EOF",
+        ));
+    }
+    Ok(data)
+}
+
+/// The cases of Go's `http.DetectContentType` that `get_image_data` can
+/// accept; everything else is the sniffer's `application/octet-stream`.
+fn detect_content_type(data: &[u8]) -> &'static str {
+    fn masked(data: &[u8], mask: &[u8], pat: &[u8]) -> bool {
+        data.len() >= pat.len()
+            && data
+                .iter()
+                .zip(mask)
+                .zip(pat)
+                .all(|((d, m), p)| d & m == *p)
+    }
+    if data.starts_with(b"\xFF\xD8\xFF") {
+        "image/jpeg"
+    } else if data.starts_with(b"\x89PNG\x0D\x0A\x1A\x0A") {
+        "image/png"
+    } else if masked(
+        data,
+        b"\xFF\xFF\xFF\xFF\x00\x00\x00\x00\xFF\xFF\xFF\xFF\xFF\xFF",
+        b"RIFF\x00\x00\x00\x00WEBPVP",
+    ) {
+        "image/webp"
+    } else if masked(
+        data,
+        b"\xFF\xFF\xFF\xFF\x00\x00\x00\x00\xFF\xFF\xFF\xFF",
+        b"RIFF\x00\x00\x00\x00WAVE",
+    ) {
+        "audio/wave"
+    } else {
+        "application/octet-stream"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -552,8 +777,18 @@ fn run_interactive_unix(model: &str, opts: ChatOptions<'_>) -> anyhow::Result<()
                 continue;
             }
             s if s.starts_with('/') => {
-                eprintln!("Commands: /bye  /clear  \"\"\" (multiline)");
-                continue;
+                // Ollama: a line starting with an image path is a prompt,
+                // not an unknown command, when the model is multimodal.
+                let first_word = s.split_whitespace().next().unwrap_or(s);
+                let is_file = opts.multimodal
+                    && extract_file_names(s)
+                        .iter()
+                        .any(|f| f.starts_with(first_word));
+                if !is_file {
+                    eprintln!("Unknown command '{first_word}'.");
+                    eprintln!("Commands: /bye  /clear  \"\"\" (multiline)");
+                    continue;
+                }
             }
             _ => {}
         }
@@ -629,11 +864,17 @@ async fn chat_submit_async(
     content: String,
     opts: ChatOptions<'_>,
 ) -> anyhow::Result<()> {
-    messages.push(Msg {
-        role: "user".into(),
-        content,
-        thinking: None,
-    });
+    // Ollama: `if opts.MultiModal { ... extractFileData(opts.Prompt) }`.
+    // A non-vision model gets the path as plain text, as there.
+    let mut user = Msg::text("user", content);
+    if opts.multimodal {
+        let (text, images) = extract_file_data(&user.content)?;
+        user.content = text;
+        if !images.is_empty() {
+            user.images = Some(images);
+        }
+    }
+    messages.push(user);
 
     // Mirrors ollama's `progress.NewSpinner("")`: ticks on stderr until
     // the first token/thinking chunk arrives, so `llmman run` doesn't sit
@@ -745,11 +986,7 @@ async fn chat_submit_async(
     }
 
     println!("\n");
-    messages.push(Msg {
-        role: "assistant".into(),
-        content: full,
-        thinking: None,
-    });
+    messages.push(Msg::text("assistant", full));
     Ok(())
 }
 
@@ -1082,6 +1319,188 @@ mod tests {
         assert_eq!(opts.think, None);
         assert_eq!(opts.num_predict, None);
         assert!(opts.word_wrap);
+        assert!(!opts.multimodal);
+    }
+
+    // -- image attachments: ports of ollama's cmd/interactive_test.go ------
+
+    /// Ollama's `TestExtractFilenames`, unix-style half.
+    #[test]
+    fn extract_file_names_unix_style_paths() {
+        let input = " some preamble \n \
+./relative\\ path/one.png inbetween1 ./not a valid two.jpg inbetween2 ./1.svg\n\
+/unescaped space /three.jpeg inbetween3 /valid\\ path/dir/four.png \"./quoted with spaces/five.JPG\n\
+/unescaped space /six.webp inbetween6 /valid\\ path/dir/seven.WEBP";
+        let res = extract_file_names(input);
+        assert_eq!(res.len(), 7, "{res:?}");
+        assert!(res[0].contains("one.png"));
+        assert!(res[1].contains("two.jpg"));
+        assert!(res[2].contains("three.jpeg"));
+        assert!(res[3].contains("four.png"));
+        assert!(res[4].contains("five.JPG"));
+        assert!(res[5].contains("six.webp"));
+        assert!(res[6].contains("seven.WEBP"));
+        assert!(!res[4].contains('"'));
+        assert!(!res.contains(&"inbetween1"));
+        assert!(!res.contains(&"./1.svg"));
+    }
+
+    /// Ollama's `TestExtractFilenames`, windows-style half.
+    #[test]
+    fn extract_file_names_windows_style_paths() {
+        let input = " some preamble\n \
+c:/users/jdoe/one.png inbetween1 c:/program files/someplace/two.jpg inbetween2 \n \
+/absolute/nospace/three.jpeg inbetween3 /absolute/with space/four.png inbetween4\n\
+./relative\\ path/five.JPG inbetween5 \"./relative with/spaces/six.png inbetween6\n\
+d:\\path with\\spaces\\seven.JPEG inbetween7 c:\\users\\jdoe\\eight.png inbetween8 \n \
+d:\\program files\\someplace\\nine.png inbetween9 \"E:\\program files\\someplace\\ten.PNG\n\
+c:/users/jdoe/eleven.webp inbetween11 c:/program files/someplace/twelve.WebP inbetween12\n\
+d:\\path with\\spaces\\thirteen.WEBP some ending\n";
+        let res = extract_file_names(input);
+        assert_eq!(res.len(), 13, "{res:?}");
+        assert!(!res.contains(&"inbetween2"));
+        assert!(res[0].contains("one.png") && res[0].contains("c:"));
+        assert!(res[1].contains("two.jpg") && res[1].contains("c:"));
+        assert!(res[2].contains("three.jpeg"));
+        assert!(res[3].contains("four.png"));
+        assert!(res[4].contains("five.JPG"));
+        assert!(res[5].contains("six.png"));
+        assert!(res[6].contains("seven.JPEG") && res[6].contains("d:"));
+        assert!(res[7].contains("eight.png") && res[7].contains("c:"));
+        assert!(res[8].contains("nine.png") && res[8].contains("d:"));
+        assert!(res[9].contains("ten.PNG") && res[9].contains("E:"));
+        assert!(res[10].contains("eleven.webp") && res[10].contains("c:"));
+        assert!(res[11].contains("twelve.WebP") && res[11].contains("c:"));
+        assert!(res[12].contains("thirteen.WEBP") && res[12].contains("d:"));
+    }
+
+    #[test]
+    fn normalize_file_path_undoes_shell_escapes() {
+        assert_eq!(
+            normalize_file_path("/My\\ Photos/a\\(1\\)\\[x\\]\\{y\\}\\$\\&\\;\\'\\*\\?\\~.png"),
+            "/My Photos/a(1)[x]{y}$&;'*?~.png"
+        );
+        assert_eq!(normalize_file_path("a\\\\b"), "a\\b");
+        assert_eq!(normalize_file_path("/plain/path.jpg"), "/plain/path.jpg");
+    }
+
+    #[test]
+    fn detect_content_type_matches_gos_sniffer_for_the_allowed_types() {
+        assert_eq!(
+            detect_content_type(b"\xFF\xD8\xFF\xE0\x00\x10JFIF"),
+            "image/jpeg"
+        );
+        assert_eq!(
+            detect_content_type(b"\x89PNG\x0D\x0A\x1A\x0A\x00\x00\x00\x0DIHDR"),
+            "image/png"
+        );
+        assert_eq!(
+            detect_content_type(b"RIFF\x24\x00\x00\x00WEBPVP8 "),
+            "image/webp"
+        );
+        assert_eq!(
+            detect_content_type(b"RIFF\x58\x02\x00\x00WAVEfmt "),
+            "audio/wave"
+        );
+        assert_eq!(detect_content_type(b"GIF89a"), "application/octet-stream");
+        assert_eq!(detect_content_type(b"hello"), "application/octet-stream");
+        assert_eq!(detect_content_type(b"RIFF"), "application/octet-stream");
+    }
+
+    fn temp_file(name: &str, data: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-run-img-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fp = dir.join(name);
+        std::fs::write(&fp, data).unwrap();
+        fp
+    }
+
+    fn jpeg_bytes() -> Vec<u8> {
+        let mut data = vec![0u8; 600];
+        data[..22].copy_from_slice(&[
+            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xd9,
+        ]);
+        data
+    }
+
+    /// Ollama's `TestExtractFileDataRemovesQuotedFilepath`.
+    #[test]
+    fn extract_file_data_removes_quoted_filepath() {
+        let fp = temp_file("img.jpg", &jpeg_bytes());
+        let input = format!("before '{}' after", fp.display());
+        let (cleaned, imgs) = extract_file_data(&input).unwrap();
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(cleaned, "before  after");
+    }
+
+    /// Ollama's `TestExtractFileDataWAV`.
+    #[test]
+    fn extract_file_data_wav() {
+        let mut data = vec![0u8; 600];
+        data[..44].copy_from_slice(&[
+            b'R', b'I', b'F', b'F', //
+            0x58, 0x02, 0x00, 0x00, // file size - 8
+            b'W', b'A', b'V', b'E', //
+            b'f', b'm', b't', b' ', //
+            0x10, 0x00, 0x00, 0x00, // fmt chunk size
+            0x01, 0x00, // PCM
+            0x01, 0x00, // mono
+            0x80, 0x3e, 0x00, 0x00, // 16000 Hz
+            0x00, 0x7d, 0x00, 0x00, // byte rate
+            0x02, 0x00, // block align
+            0x10, 0x00, // 16-bit
+            b'd', b'a', b't', b'a', //
+            0x34, 0x02, 0x00, 0x00, // data size
+        ]);
+        let fp = temp_file("sample.wav", &data);
+        let input = format!("before {} after", fp.display());
+        let (cleaned, imgs) = extract_file_data(&input).unwrap();
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(cleaned, "before  after");
+    }
+
+    #[test]
+    fn extract_file_data_encodes_the_file_as_standard_base64() {
+        let bytes = jpeg_bytes();
+        let fp = temp_file("img.jpg", &bytes);
+        let (_, imgs) = extract_file_data(&format!("look: {}", fp.display())).unwrap();
+        assert_eq!(
+            imgs,
+            vec![base64::engine::general_purpose::STANDARD.encode(&bytes)]
+        );
+    }
+
+    #[test]
+    fn extract_file_data_leaves_a_nonexistent_path_in_the_prompt() {
+        let input = "what is in /definitely/not/here.png then";
+        let (cleaned, imgs) = extract_file_data(input).unwrap();
+        assert!(imgs.is_empty());
+        assert_eq!(cleaned, input);
+    }
+
+    #[test]
+    fn extract_file_data_rejects_an_existing_file_of_the_wrong_type() {
+        let fp = temp_file("fake.png", b"this is not a png at all, just text");
+        let err = extract_file_data(&format!("see {}", fp.display())).unwrap_err();
+        assert!(err.to_string().contains("invalid file type"), "{err:#}");
+    }
+
+    #[test]
+    fn msg_images_is_omitted_from_json_when_none() {
+        let json = serde_json::to_string(&Msg::text("user", "hi".into())).unwrap();
+        assert_eq!(json, r#"{"role":"user","content":"hi"}"#);
+        let mut with = Msg::text("user", "hi".into());
+        with.images = Some(vec!["QUJD".into()]);
+        let json = serde_json::to_string(&with).unwrap();
+        assert_eq!(json, r#"{"role":"user","content":"hi","images":["QUJD"]}"#);
     }
 
     #[test]

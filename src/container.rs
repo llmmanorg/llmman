@@ -148,9 +148,8 @@ fn backend_from_hostgpu(gpu: HostGpu) -> GpuBackend {
 /// Runs `llama-server` inside a container: `docker run --rm --init -t`
 /// (or `podman run` with the same flags), auto-selecting the image for
 /// whatever [`detect_backend`] found. Returns the running child process
-/// (the attached `docker`/`podman` CLI itself, not the container) — the
-/// container's own stdio is inherited through it, same as a local
-/// `llama-server` child's would be.
+/// (the attached `docker`/`podman` CLI itself, not the container), with
+/// its stdout/stderr piped for the caller to relay and tail.
 ///
 /// This runs *attached* (no `-d`) specifically so it can be managed like
 /// a normal child process: `--init` runs a real init (tini) as the
@@ -417,9 +416,15 @@ pub fn spawn(
     }
 
     crate::debug_log!("spawning {} {}", ociman.binary(), args.join(" "));
+    // Piped, not inherited, so cmd::serve can tail the container's
+    // startup output (an OOM abort, a missing library, ...) exactly as it
+    // does a local llama-server's. With `-t` the CLI merges the
+    // container's stdout+stderr onto its own stdout, CRLF-terminated.
     tokio::process::Command::new(ociman.binary())
         .args(&args)
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("spawn {} {}", ociman.binary(), args.join(" ")))
 }
