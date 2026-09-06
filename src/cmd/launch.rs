@@ -1036,8 +1036,8 @@ fn find_qwen() -> Option<PathBuf> {
 /// and, on Windows, its `%LOCALAPPDATA%\qwen-code\bin`
 /// (`Get-QwenInstallBinDir` in Qwen Code's
 /// `scripts/installation/install-qwen-standalone.ps1`); the
-/// `~/.npm-global` prefix its older npm installer set; nvm's newest node
-/// that has it; Homebrew's prefixes and `/usr/local/bin`; and the rest of
+/// `~/.npm-global` prefix its older npm installer set; any node under
+/// `~/.nvm` that has it; Homebrew's prefixes and `/usr/local/bin`; and the rest of
 /// what ollama's `cmd/launch/qwen.go` probes, `~/.cargo/bin`, macOS's
 /// `~/Library/Application Support/qwen/bin`, and on Windows npm's global
 /// directory under both `%APPDATA%` and `%LOCALAPPDATA%`,
@@ -1084,7 +1084,7 @@ fn qwen_fallback_paths() -> Vec<PathBuf> {
                     .join("qwen"),
             );
         }
-        paths.extend(nvm_dirs(h).iter().filter_map(|d| nvm_qwen(d)));
+        paths.extend(nvm_qwen(h));
     }
     if cfg!(target_os = "macos") {
         paths.push(PathBuf::from("/opt/homebrew/bin/qwen"));
@@ -1095,49 +1095,14 @@ fn qwen_fallback_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// `$NVM_DIR`, `$XDG_CONFIG_HOME/nvm`, `~/.config/nvm` and `~/.nvm`: which
-/// one an install took depends on the environment nvm was installed in,
-/// not on this process's, so all are probed.
-fn nvm_dirs(home: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(dir) = std::env::var_os("NVM_DIR").filter(|d| !d.is_empty()) {
-        dirs.push(PathBuf::from(dir));
-    }
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()) {
-        dirs.push(PathBuf::from(xdg).join("nvm"));
-    }
-    dirs.push(home.join(".config").join("nvm"));
-    dirs.push(home.join(".nvm"));
-    dirs
-}
-
-/// The `qwen` under the newest node version nvm holds one for; nvm keeps
-/// one tree per version and picks between them by editing `PATH` in the
-/// shell.
-fn nvm_qwen(nvm_dir: &Path) -> Option<PathBuf> {
-    let node = nvm_dir.join("versions").join("node");
-    let mut versions: Vec<String> = std::fs::read_dir(&node)
+/// The `qwen` under any node version in `~/.nvm`, the way ollama's
+/// `cmd/launch/qwen.go` globs for it.
+fn nvm_qwen(home: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(home.join(".nvm").join("versions").join("node"))
         .ok()?
         .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    sort_node_versions_newest_first(&mut versions);
-    versions
-        .into_iter()
-        .map(|v| node.join(v).join("bin").join("qwen"))
+        .map(|e| e.path().join("bin").join("qwen"))
         .find(|p| p.is_file())
-}
-
-/// `v22.14.0` before `v22.9.1` before `v9.0.0`; a name that is not a
-/// version sorts last.
-fn sort_node_versions_newest_first(names: &mut [String]) {
-    fn key(name: &str) -> Option<Vec<u64>> {
-        name.strip_prefix('v')?
-            .split('.')
-            .map(|part| part.parse().ok())
-            .collect()
-    }
-    names.sort_by_key(|name| std::cmp::Reverse(key(name)));
 }
 
 /// `$QWEN_HOME` if set, else `~/.qwen`: `Storage.getGlobalQwenDir` in
@@ -1605,24 +1570,10 @@ mod tests {
         );
     }
 
-    /// Newest node first; the directory order is not by version.
+    /// Any node version under `~/.nvm` that has qwen.
     #[test]
-    fn node_versions_sort_newest_first_with_other_names_last() {
-        let mut names: Vec<String> = ["v9.0.0", "v20.19.0", ".DS_Store", "v22.14.0", "v22.9.1"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        sort_node_versions_newest_first(&mut names);
-        assert_eq!(
-            names,
-            ["v22.14.0", "v22.9.1", "v20.19.0", "v9.0.0", ".DS_Store"]
-        );
-    }
-
-    /// Over nvm's layout, the newest version that has qwen wins.
-    #[test]
-    fn nvm_qwen_picks_the_newest_version_that_has_it() {
-        let dir = std::env::temp_dir().join(format!(
+    fn nvm_qwen_finds_it_under_a_node_version() {
+        let home = std::env::temp_dir().join(format!(
             "llmman-nvm-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1630,15 +1581,13 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let node = dir.join("versions").join("node");
-        for v in ["v20.19.0", "v22.14.0", "v22.9.1"] {
-            std::fs::create_dir_all(node.join(v).join("bin")).unwrap();
-        }
-        std::fs::write(node.join("v20.19.0/bin/qwen"), "").unwrap();
-        std::fs::write(node.join("v22.9.1/bin/qwen"), "").unwrap();
-        assert_eq!(nvm_qwen(&dir), Some(node.join("v22.9.1/bin/qwen")));
-        assert_eq!(nvm_qwen(&dir.join("nowhere")), None);
-        let _ = std::fs::remove_dir_all(&dir);
+        let bin = home.join(".nvm/versions/node/v22.9.1/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(home.join(".nvm/versions/node/v20.19.0/bin")).unwrap();
+        std::fs::write(bin.join("qwen"), "").unwrap();
+        assert_eq!(nvm_qwen(&home), Some(bin.join("qwen")));
+        assert_eq!(nvm_qwen(&home.join("nowhere")), None);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// The documented targets are on the list (see `find_qwen`).
