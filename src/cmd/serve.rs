@@ -10747,7 +10747,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            crate::daemon::is_model_not_found_body(std::str::from_utf8(&body).unwrap()),
+            crate::daemon::is_model_not_found_body(
+                std::str::from_utf8(&body).unwrap(),
+                "docker.io/ai/nothing-here"
+            ),
             "daemon::is_model_not_found_body must accept the body unload_model sends"
         );
     }

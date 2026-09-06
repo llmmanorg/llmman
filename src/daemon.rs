@@ -1083,17 +1083,20 @@ pub fn unload(reference: &str) -> anyhow::Result<bool> {
         return Ok(true);
     }
     let body = resp.text().unwrap_or_default();
-    if status == reqwest::StatusCode::NOT_FOUND && is_model_not_found_body(&body) {
+    if status == reqwest::StatusCode::NOT_FOUND && is_model_not_found_body(&body, reference) {
         return Ok(false);
     }
     anyhow::bail!("stop {reference}: server returned {status}: {body}");
 }
 
-/// The ollama-shaped `{"error":"model '…' not found"}` this daemon sends
-/// too (see `unload_model` in cmd::serve), parsed through `api_error` so
-/// an HTML page or a proxy's own JSON does not pass by containing the words.
-pub(crate) fn is_model_not_found_body(body: &str) -> bool {
-    api_error(body).is_some_and(|e| e.starts_with("model '") && e.ends_with("' not found"))
+/// The `{"error":"model '<name>' not found"}` this daemon sends for
+/// `reference` (see `unload_model` in cmd::serve), with the name the
+/// daemon was asked for, a pair's local half; parsed through `api_error`,
+/// so an HTML page or a proxy's own JSON does not pass by containing the
+/// words, and a 404 about some other model does not pass either.
+pub(crate) fn is_model_not_found_body(body: &str, reference: &str) -> bool {
+    let expected = format!("model '{}' not found", crate::hybrid::local_half(reference));
+    api_error(body).is_some_and(|e| e == expected)
 }
 
 /// A plain `GET {server()}{path}` returning the parsed JSON body — for
@@ -1604,15 +1607,28 @@ mod tests {
     }
 
     #[test]
-    fn only_the_not_found_error_envelope_means_a_missing_model() {
+    fn only_the_not_found_error_envelope_for_that_model_means_a_missing_model() {
+        let m = "docker.io/ai/m";
         assert!(is_model_not_found_body(
-            r#"{"error":"model 'docker.io/ai/m' not found"}"#
+            r#"{"error":"model 'docker.io/ai/m' not found"}"#,
+            m
         ));
-        assert!(!is_model_not_found_body(r#"{"error":"no route"}"#));
-        assert!(!is_model_not_found_body("<html>404 Not Found</html>"));
-        assert!(!is_model_not_found_body(""));
+        // A pair is unloaded by its local half, which is what the daemon
+        // names.
+        assert!(is_model_not_found_body(
+            r#"{"error":"model 'gemma4' not found"}"#,
+            "llmman.hybrid/gemma4,anthropic/claude-sonnet-4-5"
+        ));
         assert!(!is_model_not_found_body(
-            r#"{"message":"model 'x' not found"}"#
+            r#"{"error":"model 'other' not found"}"#,
+            m
+        ));
+        assert!(!is_model_not_found_body(r#"{"error":"no route"}"#, m));
+        assert!(!is_model_not_found_body("<html>404 Not Found</html>", m));
+        assert!(!is_model_not_found_body("", m));
+        assert!(!is_model_not_found_body(
+            r#"{"message":"model 'docker.io/ai/m' not found"}"#,
+            m
         ));
     }
 }
