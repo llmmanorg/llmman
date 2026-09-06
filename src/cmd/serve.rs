@@ -10999,6 +10999,18 @@ mod tests {
             .await
             .expect_err("an unknown model must not report a successful unload");
         assert_eq!(err.1, StatusCode::NOT_FOUND);
+        // `llmman stop` tells this 404 from any other by its body, so the
+        // body as rendered has to pass the check on the client side.
+        let body = axum::body::to_bytes(err.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            crate::daemon::is_model_not_found_body(
+                std::str::from_utf8(&body).unwrap(),
+                "docker.io/ai/nothing-here"
+            ),
+            "daemon::is_model_not_found_body must accept the body unload_model sends"
+        );
     }
 
     /// The 404 above is keyed on a model being absent from `running` and
