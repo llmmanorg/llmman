@@ -109,7 +109,8 @@ llmman serve                          # an Ollama/OpenAI/Anthropic-compatible en
 
 Run `llmman launch` with no arguments to see the supported agents and whether
 each is installed. Want a hosted model instead of a local one? Every command
-above takes `--provider`; see [Hosted providers](#hosted-providers).
+above takes `--provider`; see [Hosted providers](#hosted-providers). Want both
+at once, picked per request? See [Hybrid model pairs](#hybrid-model-pairs).
 
 ## Commands
 
@@ -268,6 +269,24 @@ travels per request; it is never written into an integration's config.
 Which integrations support `--provider`, where the key comes from, and
 why it is only ever sent to a loopback daemon are in
 [docs/providers.md](docs/providers.md).
+
+### Hybrid model pairs
+
+`--overflow-provider` and `--overflow-model` name a hosted model that
+takes over when a request is too large for the local `--model`, with
+`llmman serve` picking a side per request:
+
+```sh
+llmman launch opencode --model gemma4 --overflow-provider anthropic --overflow-model claude-sonnet-5
+llmman run gemma4 --overflow-provider anthropic --overflow-model claude-sonnet-5
+```
+
+A request pinned with `x-llmman-route: local` or `cloud` goes where it
+says; otherwise one too large for the local model's context goes to the
+provider, and everything else stays on this machine. The pair travels as
+one ordinary model name, `llmman.hybrid/gemma4,anthropic/claude-sonnet-5`,
+so it works from any client on every inference endpoint. Details in
+[docs/providers.md](docs/providers.md#hybrid-model-pairs).
 
 ## Documentation
 

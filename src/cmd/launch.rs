@@ -10,6 +10,11 @@
 //! on its behalf. There is deliberately no path here that hands an
 //! integration a provider's URL directly — one endpoint, one place
 //! integrations are configured, whether or not the weights are local.
+//!
+//! `--overflow-provider`/`--overflow-model` hand the integration one
+//! reference naming the local `--model` and a hosted one, and the daemon
+//! picks a side per request (see [`crate::hybrid`]); the integration
+//! never learns two are involved.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -40,6 +45,17 @@ pub struct LaunchArgs {
     #[arg(long, short = 'p', value_name = "PROVIDER")]
     pub provider: Option<String>,
 
+    /// Send requests too large for the local --model to this provider
+    /// instead (openai, anthropic, openrouter, ...). Needs
+    /// --overflow-model; not combinable with --provider.
+    #[arg(long, value_name = "PROVIDER")]
+    pub overflow_provider: Option<String>,
+
+    /// The --overflow-provider model that serves requests too large for
+    /// the local --model. Everything that fits stays on this machine.
+    #[arg(long, value_name = "MODEL")]
+    pub overflow_model: Option<String>,
+
     /// Extra arguments forwarded to the integration binary (after --)
     #[arg(last = true, value_name = "ARGS")]
     pub extra_args: Vec<String>,
@@ -47,6 +63,11 @@ pub struct LaunchArgs {
 
 pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     let provider = providers::provider_flag(args.provider.as_deref())?;
+    let overflow = crate::hybrid::overflow_flags(
+        args.overflow_provider.as_deref(),
+        args.overflow_model.as_deref(),
+        provider,
+    )?;
 
     let Some(ref name) = args.integration else {
         print_integrations();
@@ -55,6 +76,10 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
 
     // Before either arm starts the daemon; see `check_model_flag`.
     check_model_flag(name, args.model.as_deref(), provider, &args.extra_args)?;
+    anyhow::ensure!(
+        overflow.is_none() || args.model.as_deref().is_some_and(|m| !m.trim().is_empty()),
+        "--overflow-model needs --model naming the local model to pair it with"
+    );
 
     let (model, api_key) = match provider {
         Some(provider) => {
@@ -100,7 +125,20 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             if !model.is_empty() {
                 crate::daemon::ensure_model_pulled(&model)?;
             }
-            (model, providers::PLACEHOLDER_API_KEY.to_string())
+            match overflow {
+                // The hosted half is validated and keyed exactly as a
+                // bare --provider model would be, then paired with the
+                // local model just pulled.
+                Some((provider, hosted)) => {
+                    check_provider_supported(name)?;
+                    let per_request =
+                        !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
+                    let (remote, api_key) =
+                        resolve_provider_model(provider, Some(hosted), name, per_request)?;
+                    (crate::hybrid::pair_with_local(&model, &remote)?, api_key)
+                }
+                None => (model, providers::PLACEHOLDER_API_KEY.to_string()),
+            }
         }
     };
 
