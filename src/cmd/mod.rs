@@ -4,6 +4,7 @@ pub mod cp;
 pub mod gpu_discover;
 pub mod launch;
 pub mod list;
+pub mod log;
 pub mod login;
 pub mod logout;
 pub mod providers;

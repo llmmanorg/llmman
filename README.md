@@ -122,6 +122,7 @@ at once, picked per request? See [Hybrid model pairs](#hybrid-model-pairs).
 | `pull`    | Pull a model from a registry or HuggingFace |
 | `list` (`ls`) | List locally stored models, or a hosted provider's (`--provider`) models |
 | `ps`      | List models currently loaded |
+| `log`     | Show the prompts `serve` has seen, newest first, like `git log` |
 | `providers` | List the hosted providers `--provider` can route to |
 | `stop`    | Stop (unload) a running model |
 | `build`   | Package model files into a local OCI image |

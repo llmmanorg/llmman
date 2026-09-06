@@ -46,6 +46,8 @@ enum Commands {
     List(cmd::list::ListArgs),
     /// List models currently loaded by a running `llmman serve`
     Ps(cmd::ps::PsArgs),
+    /// Show the prompts `llmman serve` has seen, newest first (like `git log`)
+    Log(cmd::log::LogArgs),
     /// List the hosted providers `--provider` can route to
     Providers(cmd::providers::ProvidersArgs),
     /// Read and write llmman.conf settings
@@ -101,7 +103,7 @@ fn main() {
     // real E2E hang this fixes.
     daemon::disable_std_handle_inheritance();
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(cmd::log::expand_count_shorthand(std::env::args_os()));
     let result = match &cli.command {
         Commands::Launch(a) => cmd::launch::run(a),
         Commands::Run(a) => cmd::run::run(a),
@@ -115,6 +117,7 @@ fn main() {
         Commands::Verify(a) => cmd::verify::run(a),
         Commands::List(a) => cmd::list::run(a),
         Commands::Ps(a) => cmd::ps::run(a),
+        Commands::Log(a) => cmd::log::run(a),
         Commands::Providers(a) => cmd::providers::run(a),
         Commands::Config(a) => cmd::config::run(a),
         Commands::Cp(a) => cmd::cp::run(a),
