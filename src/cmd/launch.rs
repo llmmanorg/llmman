@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
+use base64::Engine as _;
 use clap::Args;
 
 use crate::daemon;
@@ -152,13 +153,15 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
 /// Integrations that cannot be launched without `--model`: Qwen Code has
 /// no notion of a missing model and sends its own built-in default
 /// (`qwen3.7-max` in 0.22.3), which the daemon would then try to pull.
+/// AGY needs an explicit model for its Gemini routing URL.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
-const MODEL_REQUIRED: &[&str] = &["qwen"];
+const MODEL_REQUIRED: &[&str] = &["qwen", "agy"];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
-/// `--provider` too. A second `--model` after `--` is the caller's to
-/// win (`qwen_args` yields to it), but `run` resolves the top-level one
-/// and, locally, preloads it, so that gets said.
+/// `--provider` too. Qwen Code honors a second `--model` after `--`
+/// (`qwen_args` yields to it), but `run` resolves the top-level one and,
+/// locally, preloads it, so that gets said. AGY instead pins its routing
+/// to the top-level model, regardless of forwarded arguments.
 fn check_model_flag(
     integration: &str,
     model: Option<&str>,
@@ -173,7 +176,7 @@ fn check_model_flag(
         let with_provider = provider.map_or(String::new(), |p| format!(" --provider {p}"));
         anyhow::bail!("{name} needs a model: llmman launch {name}{with_provider} --model <model>");
     };
-    if has_flag(extra_args, "--model", Some("-m")) {
+    if name == "qwen" && has_flag(extra_args, "--model", Some("-m")) {
         eprintln!(
             "[llmman] {name}: the --model after -- wins over --model {model}, the one llmman resolved"
         );
@@ -414,6 +417,11 @@ const INTEGRATIONS: &[Integration] = &[
         binary: "gemini",
     },
     Integration {
+        name: "agy",
+        description: "Google Antigravity CLI",
+        binary: "agy",
+    },
+    Integration {
         name: "hermes",
         description: "Hermes Agent",
         binary: "hermes",
@@ -513,6 +521,7 @@ fn launch(name: &str, model: &str, api_key: &str, extra_args: &[String]) -> anyh
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
         "kimi" => launch_simple("kimi", model, extra_args),
         "gemini" => launch_gemini(model, api_key, extra_args),
+        "agy" => launch_agy(model, api_key, extra_args),
         "hermes" => launch_hermes(model, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
         "qwen" => launch_qwen(model, api_key, extra_args),
@@ -755,6 +764,254 @@ fn launch_gemini(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
             ("GEMINI_API_KEY", api_key),
         ],
     )
+}
+
+/// AGY speaks Gemini's native generation protocol. The encoded model in the
+/// base URL is llmman's routing instruction; AGY also makes auxiliary calls
+/// with its own hard-coded model names, so the server deliberately ignores
+/// the model segment AGY appends and sends every call to the model selected
+/// here.
+fn launch_agy(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_on_path("agy").ok_or_else(|| anyhow::anyhow!("agy is not installed"))?;
+    anyhow::ensure!(
+        !model.is_empty(),
+        "agy needs a model: llmman launch agy --model <model>"
+    );
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let status = runtime.block_on(run_agy_session(
+        &bin,
+        model,
+        api_key,
+        extra_args,
+        &agy_settings_path()?,
+        &agy_session_root()?,
+    ))?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Keep the session directory alive until AGY has exited, including after signals.
+async fn run_agy_session(
+    bin: &PathBuf,
+    model: &str,
+    api_key: &str,
+    extra_args: &[String],
+    source_settings: &Path,
+    session_root: &Path,
+) -> anyhow::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(windows)]
+    let mut interrupt = tokio::signal::windows::ctrl_c()?;
+
+    cleanup_stale_agy_sessions_in(session_root).context("clean stale AGY sessions")?;
+    let session = agy_session_settings(source_settings, session_root)?;
+    let mut args = vec![format!("--gemini_dir={}", session.path().display())];
+    anyhow::ensure!(
+        !extra_args
+            .iter()
+            .any(|arg| matches!(arg.split('=').next(), Some("--gemini_dir" | "-gemini_dir"))),
+        "llmman manages AGY’s --gemini_dir for session isolation"
+    );
+    args.extend_from_slice(extra_args);
+
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(model.as_bytes());
+    let base_url = format!("{}/gemini/{encoded}", daemon::server());
+    let command = command_with_env(
+        bin,
+        &args,
+        &[
+            ("GOOGLE_GEMINI_BASE_URL", base_url.as_str()),
+            ("GEMINI_API_KEY", api_key),
+            // AGY prefers GOOGLE_API_KEY when both names exist. Override it
+            // too so an unrelated key inherited from the shell cannot bypass
+            // the credential llmman selected for this request.
+            ("GOOGLE_API_KEY", api_key),
+        ],
+    );
+
+    let mut child = tokio::process::Command::from(command)
+        .spawn()
+        .context("failed to run agy")?;
+    if let Some(pid) = child.id() {
+        if let Err(err) =
+            std::fs::write(session.path().join(AGY_SESSION_MARKER), format!("{pid}\n"))
+        {
+            // The child owns state under `session`; never drop that directory
+            // from beneath a still-running AGY process if marker setup fails.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(err).context("write AGY session marker");
+        }
+    }
+    let result = loop {
+        tokio::select! {
+            result = child.wait() => break result,
+            _ = interrupt.recv() => {
+                // On Unix, the terminal already sends SIGINT to AGY and
+                // llmman together. Do not deliver a second interrupt: AGY
+                // may treat one as a request to cancel its current turn.
+                #[cfg(unix)]
+                {}
+                #[cfg(windows)]
+                child.start_kill()?;
+            }
+            _ = async {
+                #[cfg(unix)]
+                terminate.recv().await;
+                #[cfg(not(unix))]
+                std::future::pending::<()>().await;
+            } => {
+                #[cfg(unix)]
+                if let Some(id) = child.id() {
+                    // SIGTERM may have targeted llmman directly (for
+                    // example from a service manager), unlike terminal
+                    // Ctrl-C. Forward it to AGY by PID in that case.
+                    unsafe { libc::kill(id as libc::pid_t, libc::SIGTERM); }
+                }
+            }
+        }
+    };
+    let status = result.context("wait for agy")?;
+    if let Err(err) = session.close() {
+        eprintln!("[llmman] warning: remove AGY session directory: {err}");
+    }
+    Ok(status)
+}
+
+fn agy_settings_path() -> anyhow::Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("no home directory")?
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("settings.json"))
+}
+
+const AGY_SESSION_MARKER: &str = ".llmman-active";
+
+/// The llmman-owned parent for AGY's per-session writable data directories.
+fn agy_session_root() -> anyhow::Result<PathBuf> {
+    let root = dirs::home_dir()
+        .context("no home directory")?
+        .join(".config")
+        .join("llmman")
+        .join("agy");
+    std::fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(root)
+}
+
+#[cfg(unix)]
+/// Checks whether a Unix process ID still exists without sending it a signal.
+fn pid_is_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(windows)]
+/// Checks whether a Windows process ID still appears in the process table.
+fn pid_is_alive(pid: u32) -> bool {
+    // `tasklist` is available on supported Windows versions. Treat a failed
+    // probe as live: retaining a stale directory is safer than deleting a
+    // session that may still belong to a running AGY process.
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|output| output.contains(&format!("\",\"{pid}\",")))
+        .unwrap_or(true)
+}
+
+#[cfg(any(unix, windows))]
+/// Reads the child PID recorded when an AGY session was launched.
+fn agy_session_pid(path: &Path) -> Option<u32> {
+    let marker = std::fs::read_to_string(path.join(AGY_SESSION_MARKER)).ok()?;
+    marker.trim().parse().ok()
+}
+
+#[cfg(any(unix, windows))]
+/// Removes abandoned llmman-owned AGY session directories from `temp_root`.
+fn cleanup_stale_agy_sessions_in(temp_root: &Path) -> anyhow::Result<()> {
+    let entries = match std::fs::read_dir(temp_root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).context("read temp directory for stale AGY sessions"),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("session-") {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        let Some(pid) = agy_session_pid(&path) else {
+            continue;
+        };
+        if pid_is_alive(pid) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+/// Leaves stale-session cleanup disabled on platforms without a PID probe.
+fn cleanup_stale_agy_sessions_in(_session_root: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Copy user preferences into a unique private Gemini directory, never editing the source.
+///
+/// This isolates AGY's mutable data root from the user's real installation, but AGY's
+/// own state is still scoped to the entire session directory. A force-kill or sudden
+/// power loss can therefore leave the session directory behind; that is a
+/// limitation of AGY's data-directory model, not of llmman's settings handling.
+///
+/// We do a best-effort cleanup pass on startup for stale session directories,
+/// but a hard kill or lost power still has no guaranteed cleanup hook at the process
+/// level.
+fn agy_session_settings(source: &Path, session_root: &Path) -> anyhow::Result<tempfile::TempDir> {
+    let mut settings = match std::fs::read_to_string(source) {
+        Ok(s) => serde_json::from_str::<serde_json::Value>(&s)
+            .with_context(|| format!("parse {}", source.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e).with_context(|| format!("read {}", source.display())),
+    };
+    settings
+        .as_object_mut()
+        .context("AGY settings must be a JSON object")?
+        .insert("modelProvider".into(), serde_json::json!("gemini"));
+    std::fs::create_dir_all(session_root)?;
+    let session = tempfile::Builder::new()
+        .prefix("session-")
+        .tempdir_in(session_root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(session.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    let dir = session.path().join("antigravity-cli");
+    std::fs::create_dir(&dir)?;
+    std::fs::write(
+        dir.join("settings.json"),
+        serde_json::to_vec_pretty(&settings)?,
+    )?;
+    Ok(session)
 }
 
 /// Generic launcher: just set OLLAMA_HOST and run the binary.
@@ -1296,6 +1553,13 @@ fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn exec_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
+    let status = command_with_env(bin, args, extra_env)
+        .status()
+        .with_context(|| format!("failed to run {}", bin.display()))?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+fn command_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> Command {
     let mut cmd = Command::new(bin);
     cmd.args(args);
     cmd.stdin(std::process::Stdio::inherit());
@@ -1310,16 +1574,208 @@ fn exec_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> 
     }
     cmd.envs(&env);
 
-    let status = cmd
-        .status()
-        .with_context(|| format!("failed to run {}", bin.display()))?;
-
-    std::process::exit(status.code().unwrap_or(1));
+    cmd
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agy_sessions_are_unique_preserve_preferences_and_clean_up() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("settings.json");
+        let session_root = source_dir.path().join("agy");
+        let original = b"{\n  \"enableTelemetry\": false,\n  \"theme\": \"dark\"\n}\n";
+        std::fs::write(&source, original).unwrap();
+        let first = agy_session_settings(&source, &session_root).unwrap();
+        let second = agy_session_settings(&source, &session_root).unwrap();
+        assert_ne!(first.path(), second.path());
+        let first_path = first.path().to_owned();
+        let settings: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(first.path().join("antigravity-cli/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["modelProvider"], "gemini");
+        assert_eq!(settings["enableTelemetry"], false);
+        assert_eq!(settings["theme"], "dark");
+        drop(first);
+        assert!(!first_path.exists());
+        assert!(second.path().exists());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn agy_settings_handle_missing_and_invalid_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("settings.json");
+        let session_root = dir.path().join("agy");
+        let session = agy_session_settings(&source, &session_root).unwrap();
+        assert!(!source.exists());
+        session.close().unwrap();
+        for invalid in ["{", "[]"] {
+            std::fs::write(&source, invalid).unwrap();
+            assert!(agy_session_settings(&source, &session_root).is_err());
+            assert_eq!(std::fs::read_to_string(&source).unwrap(), invalid);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_agy_temp_dirs_are_cleaned_up_on_startup() {
+        let root = tempfile::tempdir().unwrap();
+        let stale = root.path().join("session-stale-test");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join(AGY_SESSION_MARKER), "999999\n").unwrap();
+        cleanup_stale_agy_sessions_in(root.path()).unwrap();
+        assert!(!stale.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_agy_sessions_are_not_deleted_as_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let session = tempfile::Builder::new()
+            .prefix("session-")
+            .tempdir_in(root.path())
+            .unwrap();
+        let path = session.path().to_owned();
+        std::fs::write(
+            session.path().join(AGY_SESSION_MARKER),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        cleanup_stale_agy_sessions_in(root.path()).unwrap();
+        assert!(path.exists());
+        drop(session);
+    }
+
+    // Run signal-sensitive code in a subprocess so its signal handlers cannot
+    // change the test runner's behavior or interfere with parallel tests.
+    #[cfg(unix)]
+    #[test]
+    fn agy_session_process_fixture() {
+        let Ok(script) = std::env::var("LLMMAN_AGY_TEST_SCRIPT") else {
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let session_root = PathBuf::from(&script).with_file_name("agy-sessions");
+        let result = runtime.block_on(run_agy_session(
+            &PathBuf::from(&script),
+            "test-model",
+            "test-key",
+            &[],
+            &PathBuf::from(&script).with_file_name("settings.json"),
+            &session_root,
+        ));
+        if std::env::var_os("LLMMAN_AGY_TEST_SPAWN_FAILURE").is_some() {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("failed to run agy"));
+        } else {
+            let status = result.unwrap();
+            if std::env::var("LLMMAN_AGY_TEST_WAIT").as_deref() == Ok("no") {
+                assert_eq!(status.code(), Some(7));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agy_session_cleanup_after_spawn_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cmd::launch::tests::agy_session_process_fixture"])
+            .env("LLMMAN_AGY_TEST_SCRIPT", dir.path().join("missing-agy"))
+            .env("LLMMAN_AGY_TEST_SPAWN_FAILURE", "1")
+            .env("TMPDIR", dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let sessions = dir.path().join("agy-sessions");
+        assert_eq!(std::fs::read_dir(sessions).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agy_session_cleanup_after_exit_and_direct_termination() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        // Ctrl-C is terminal-process-group behavior, so this subprocess
+        // fixture only exercises direct termination of llmman. SIGTERM must
+        // still reach AGY when a service manager targets llmman by PID.
+        for signal in [None, Some(libc::SIGTERM)] {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("agy");
+            let marker = dir.path().join("session-path");
+            std::fs::write(
+                &script,
+                r#"#!/bin/sh
+session=${1#--gemini_dir=}
+trap 'exit 0' INT TERM
+printf '%s' "$session" > "$LLMMAN_AGY_TEST_MARKER"
+if [ "$LLMMAN_AGY_TEST_WAIT" = yes ]; then
+    while :; do sleep 0.1; done
+fi
+exit 7
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cmd::launch::tests::agy_session_process_fixture",
+                    "--nocapture",
+                ])
+                .env("LLMMAN_AGY_TEST_SCRIPT", &script)
+                .env("LLMMAN_AGY_TEST_MARKER", &marker)
+                .env(
+                    "LLMMAN_AGY_TEST_WAIT",
+                    if signal.is_some() { "yes" } else { "no" },
+                )
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let session = loop {
+                if let Ok(path) = std::fs::read_to_string(&marker) {
+                    if !path.is_empty() {
+                        break PathBuf::from(path);
+                    }
+                }
+                if Instant::now() >= deadline {
+                    child.kill().ok();
+                    child.wait().ok();
+                    panic!("AGY fixture did not start");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            if let Some(signal) = signal {
+                assert!(session.join("antigravity-cli/settings.json").exists());
+                assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, signal) }, 0);
+            }
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().ok();
+                    child.wait().ok();
+                    panic!("AGY fixture did not exit");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!session.exists(), "session directory was left behind");
+        }
+    }
+
+    #[test]
+    fn agy_is_listed_as_an_integration() {
+        let agy = INTEGRATIONS.iter().find(|i| i.name == "agy").unwrap();
+        assert_eq!(agy.binary, "agy");
+    }
 
     /// Every integration `--provider` refuses must be one `launch`
     /// actually dispatches, or the refusal is for a name nobody can type

@@ -1,0 +1,5 @@
+[tools]
+# Renovate's mise manager tracks this GitHub release pin. mise selects the
+# matching official archive for each CI runner and records its checksum in
+# mise.lock when the lockfile is refreshed.
+"github:google-antigravity/antigravity-cli" = { version = "1.1.13", rename_exe = { "antigravity" = "agy" }, filter_bins = "agy" }

@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`) — not mocks.
+//! (`claude`, `agy`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -762,6 +762,36 @@ fn launch_claude_with_model() {
     // scriptable equivalent of typing a message into the interactive TUI
     // `llmman launch claude --model qwen3.5:0.8b` would otherwise open.
     launch_and_assert("claude", &["-p", PROMPT]);
+}
+
+#[test]
+fn launch_agy_with_model() {
+    eprintln!("[test] launch_agy_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_agy_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("agy") {
+        eprintln!("skipping: agy not on PATH — https://antigravity.google/docs/cli/install/");
+        return;
+    }
+
+    // Real AGY print mode. Its built-in title and main-agent requests use
+    // different Google model names; the llmman route must pin both to MODEL.
+    launch_and_assert(
+        "agy",
+        &[
+            "-p",
+            PROMPT,
+            "--output-format",
+            "text",
+            "--print-timeout",
+            "5m",
+            "--disable-slash-commands",
+        ],
+    );
 }
 
 #[test]
