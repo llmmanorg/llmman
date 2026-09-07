@@ -5021,7 +5021,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         // deleted, exactly the situation /api/version exists to expose.
         exe: std::env::current_exe()
             .ok()
-            .map(|p| p.canonicalize().unwrap_or(p)),
+            .map(|p| dunce::canonicalize(&p).unwrap_or(p)),
         runtime,
         llama_cpp_version,
         vllm_version: _args.vllm_version.clone(),
