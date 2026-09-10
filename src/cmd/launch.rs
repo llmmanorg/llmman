@@ -158,10 +158,19 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
 const MODEL_REQUIRED: &[&str] = &["qwen", "dsh"];
 
+/// Integrations whose launcher yields to a `--model` after `--`, and so
+/// warrant the warning below. Only qwen: `qwen_args` drops its own
+/// `--model` when the caller spelled one, where `dsh_args` does not —
+/// dsh takes no `--model` flag at all (its model is the one
+/// `write_dsh_settings` records), so telling a dsh user theirs "wins"
+/// would be false, and dsh rejects the unknown flag on its own.
+const MODEL_FLAG_FORWARDED: &[&str] = &["qwen"];
+
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
 /// `--provider` too. A second `--model` after `--` is the caller's to
-/// win (`qwen_args` yields to it), but `run` resolves the top-level one
-/// and, locally, preloads it, so that gets said.
+/// win for the integrations in `MODEL_FLAG_FORWARDED`, but `run`
+/// resolves the top-level one and, locally, preloads it, so that gets
+/// said.
 fn check_model_flag(
     integration: &str,
     model: Option<&str>,
@@ -176,7 +185,8 @@ fn check_model_flag(
         let with_provider = provider.map_or(String::new(), |p| format!(" --provider {p}"));
         anyhow::bail!("{name} needs a model: llmman launch {name}{with_provider} --model <model>");
     };
-    if has_flag(extra_args, "--model", Some("-m")) {
+    if MODEL_FLAG_FORWARDED.contains(&name.as_str()) && has_flag(extra_args, "--model", Some("-m"))
+    {
         eprintln!(
             "[llmman] {name}: the --model after -- wins over --model {model}, the one llmman resolved"
         );
@@ -1319,22 +1329,30 @@ const DSH_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 /// after `--` wins instead — e.g. `--profile headless "<task>"` for a
 /// one-shot, scriptable run, the same way every other flag here already
 /// yields to what the caller explicitly asked for.
+///
+/// Both files sit at one fixed path, rewritten in place per launch:
+/// dsh hot-reloads the settings document, so two *concurrent* launches
+/// naming different models would retarget each other — accepted
+/// deliberately, since a per-launch directory costs a cleanup hook on
+/// every exit path (signals included) for a case that needs two
+/// simultaneous sessions on different models to bite at all.
 fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     if has_flag(extra_args, "--patch", None) {
         anyhow::bail!("llmman launch dsh manages --patch itself; pass other dsh flags after --");
     }
     let bin = find_on_path("dsh").ok_or_else(|| anyhow::anyhow!("dsh is not installed"))?;
 
-    let dir = dsh_launch_dir()?;
+    let dir = dsh_config_dir()?;
     let settings_path = dir.join("settings.yaml");
     write_dsh_settings(&settings_path, model)?;
     let patch_path = dir.join("llmman.cordis.yml");
     write_dsh_patch(&patch_path, &settings_path)?;
 
-    let args = dsh_args(&patch_path, extra_args);
-    exec_with_env_and_cleanup(&bin, &args, &[(DSH_API_KEY_ENV, api_key)], || {
-        let _ = std::fs::remove_dir_all(&dir);
-    })
+    exec_with_env(
+        &bin,
+        &dsh_args(&patch_path, extra_args),
+        &[(DSH_API_KEY_ENV, api_key)],
+    )
 }
 
 /// The argv dsh is invoked with. `--patch` is always injected; the
@@ -1364,18 +1382,6 @@ fn dsh_config_dir() -> anyhow::Result<PathBuf> {
         .join("dsh"))
 }
 
-/// A directory unique to this launch. dsh's settings-file provider
-/// watches and hot-reloads its document, so a second concurrent
-/// `llmman launch dsh` writing one shared path would silently retarget
-/// an already-running instance's model — see `launch_dsh`'s cleanup.
-fn dsh_launch_dir() -> anyhow::Result<PathBuf> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    Ok(dsh_config_dir()?.join(format!("{}-{nanos}", std::process::id())))
-}
-
 /// The settings document `llmman.cordis.yml` points dsh at: registers
 /// `llmman` as an `llm-pi-ai` provider route at this daemon's `/v1`, and
 /// selects it as the `agent-default-model`.
@@ -1394,12 +1400,18 @@ fn write_dsh_settings(path: &Path, model: &str) -> anyhow::Result<()> {
 
 /// dsh's patch shape: points its `settings` provider at the document above.
 fn write_dsh_patch(path: &Path, settings_path: &Path) -> anyhow::Result<()> {
+    write_dsh_file(path, &dsh_patch_document(settings_path))
+}
+
+/// Split from `write_dsh_patch` so a test can render a Windows-shaped
+/// path on any platform: `yaml_quote` escapes the `\` separators, and
+/// forgetting that is what once turned the Windows leg red.
+fn dsh_patch_document(settings_path: &Path) -> String {
     let quoted_settings_path = yaml_quote(&settings_path.to_string_lossy());
-    let contents = format!(
+    format!(
         "# Written by `llmman launch dsh`; edits are overwritten.\n\
          - id: settings\n  config:\n    path: {quoted_settings_path}\n"
-    );
-    write_dsh_file(path, &contents)
+    )
 }
 
 fn write_dsh_file(path: &Path, contents: &str) -> anyhow::Result<()> {
@@ -1415,19 +1427,6 @@ fn write_dsh_file(path: &Path, contents: &str) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn exec_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
-    exec_with_env_and_cleanup(bin, args, extra_env, || {})
-}
-
-/// [`exec_with_env`], running `cleanup` once the child has exited
-/// (success, failure, or a spawn error alike) and before this process
-/// exits in turn — for dsh's per-launch directory (see `dsh_launch_dir`),
-/// which must not outlive the launch that created it.
-fn exec_with_env_and_cleanup(
-    bin: &PathBuf,
-    args: &[String],
-    extra_env: &[(&str, &str)],
-    cleanup: impl FnOnce(),
-) -> anyhow::Result<()> {
     let mut cmd = Command::new(bin);
     cmd.args(args);
     cmd.stdin(std::process::Stdio::inherit());
@@ -1442,9 +1441,9 @@ fn exec_with_env_and_cleanup(
     }
     cmd.envs(&env);
 
-    let status = cmd.status();
-    cleanup();
-    let status = status.with_context(|| format!("failed to run {}", bin.display()))?;
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to run {}", bin.display()))?;
 
     std::process::exit(status.code().unwrap_or(1));
 }
@@ -1567,6 +1566,12 @@ mod tests {
             assert!(check_model_flag(id, Some("m"), None, &forwarded).is_ok());
         }
         assert!(check_model_flag("claude", None, None, &none).is_ok());
+        // The "yours wins" warning is only claimed for launchers that
+        // actually yield to it; dsh has no `--model` flag to yield to.
+        for id in MODEL_FLAG_FORWARDED {
+            assert!(MODEL_REQUIRED.contains(id), "{id} is not model-required");
+        }
+        assert!(!MODEL_FLAG_FORWARDED.contains(&"dsh"));
     }
 
     /// The found directory goes in front of `PATH` only when it is not
@@ -2027,8 +2032,22 @@ model = \"gpt-5\"
         write_dsh_patch(&patch_path, &settings_path).unwrap();
         let contents = std::fs::read_to_string(&patch_path).unwrap();
         assert!(contents.contains("id: settings"));
-        assert!(contents.contains(&format!("path: \"{}\"", settings_path.to_string_lossy())));
+        // Through `yaml_quote`, not the raw path: on Windows a path's
+        // `\` separators are escaped in the document, so the raw string
+        // never matches (a real red Windows CI leg).
+        assert!(contents.contains(&format!(
+            "path: {}",
+            yaml_quote(&settings_path.to_string_lossy())
+        )));
         let _ = std::fs::remove_dir_all(&dir);
+
+        // A Windows-shaped path on every platform, so the escaping this
+        // depends on is covered without needing the Windows CI leg to
+        // be the thing that catches it (which is how it was caught).
+        let win = Path::new(r"C:\Users\hb\.config\llmman\launch\dsh\settings.yaml");
+        let rendered = dsh_patch_document(win);
+        assert!(rendered.contains(r#"path: "C:\\Users\\hb\\"#), "{rendered}");
+        assert!(!rendered.contains(r#"path: "C:\Users"#), "{rendered}");
     }
 
     /// A caller-supplied `--patch` after `--` must be refused, however spelled.
@@ -2049,19 +2068,6 @@ model = \"gpt-5\"
         assert!(INTEGRATIONS.iter().any(|i| i.name == "dsh"));
         assert!(!PROVIDER_UNSUPPORTED.iter().any(|(id, _)| *id == "dsh"));
         assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"dsh"));
-    }
-
-    /// Two concurrent launches must land under different directories —
-    /// dsh's settings-file provider hot-reloads its document, so sharing
-    /// one path would let a second launch retarget the first (the bug
-    /// this regression test guards against).
-    #[test]
-    fn dsh_launch_dir_is_unique_per_call_and_nested_under_the_config_dir() {
-        let a = dsh_launch_dir().unwrap();
-        let b = dsh_launch_dir().unwrap();
-        assert_ne!(a, b);
-        assert_eq!(a.parent(), dsh_config_dir().ok().as_deref());
-        assert_eq!(b.parent(), dsh_config_dir().ok().as_deref());
     }
 
     /// A caller-supplied `--profile` (however spelled) must win over the
