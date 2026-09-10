@@ -1418,6 +1418,21 @@ fn launch_pool(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Res
     if cfg!(windows) {
         anyhow::bail!("pool is not supported on Windows");
     }
+
+    // When --provider is supplied (api_key is a real provider key, not the
+    // placeholder), reject --api-url arguments that would redirect the real
+    // key to an arbitrary endpoint. Local launches forward arguments as-is.
+    if api_key != providers::PLACEHOLDER_API_KEY {
+        for arg in extra_args {
+            if arg == "--api-url" || arg.starts_with("--api-url=") {
+                anyhow::bail!(
+                    "--api-url cannot be used with --provider: would send the provider's \
+                     API key to an overridden endpoint"
+                );
+            }
+        }
+    }
+
     let bin = find_on_path("pool").ok_or_else(|| anyhow::anyhow!("pool is not installed"))?;
 
     let base_url = format!("{}/v1", daemon::server());
