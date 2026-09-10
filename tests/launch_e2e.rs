@@ -1069,7 +1069,7 @@ fn launch_pool_with_model() {
     }
 
     // `exec <prompt>`: pool's non-interactive one-shot mode.
-    launch_and_assert("pool", &["exec", PROMPT]);
+    launch_and_assert("pool", &["exec", "-p", PROMPT]);
 }
 
 /// A tiny (135M-parameter, 8-bit-quantized) real safetensors model
