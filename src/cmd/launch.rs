@@ -160,11 +160,13 @@ fn integration_key() -> String {
 // Pre-flight
 // ---------------------------------------------------------------------------
 
-/// Integrations that cannot be launched without `--model`: Qwen Code has
+/// Integrations that cannot be launched without `--model`. Qwen Code has
 /// no notion of a missing model and sends its own built-in default
-/// (`qwen3.7-max` in 0.22.3), which the daemon would then try to pull.
+/// (`qwen3.7-max` in 0.22.3), which the daemon would then try to pull;
+/// goose instead refuses with "Run 'goose configure' first", advice that
+/// does not apply to a launch llmman configures through the environment.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
-const MODEL_REQUIRED: &[&str] = &["qwen"];
+const MODEL_REQUIRED: &[&str] = &["qwen", "goose"];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
 /// `--provider` too. A second `--model` after `--` is the caller's to
@@ -457,6 +459,11 @@ const INTEGRATIONS: &[Integration] = &[
         description: "Qwen Code",
         binary: "qwen",
     },
+    Integration {
+        name: "goose",
+        description: "Block goose",
+        binary: "goose",
+    },
 ];
 
 fn print_integrations() {
@@ -513,6 +520,7 @@ fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
         "opencode" => find_opencode(),
         "qwen" => find_qwen(),
+        "goose" => find_goose(),
         _ => find_on_path(i.binary),
     }
 }
@@ -551,6 +559,7 @@ fn launch(
         "hermes" => launch_hermes(model, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
         "qwen" => launch_qwen(model, api_key, extra_args),
+        "goose" => launch_goose(model, api_key, extra_args),
         other => anyhow::bail!(
             "unknown integration {:?}\nRun 'llmman launch' without arguments to list supported integrations.",
             other
@@ -1428,6 +1437,57 @@ fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
             .is_some_and(|u| u.trim_end_matches('/') == base_url.trim_end_matches('/'))
 }
 
+/// goose: configured entirely through the environment, which goose reads
+/// in preference to its own `config.yaml` — so unlike hermes and qwen
+/// nothing is written to disk and no key is persisted, and `--provider`
+/// needs no daemon-held key. Verified against goose 1.50.0 with no
+/// config file and no `goose configure`: these five variables alone are
+/// enough for `goose run` to answer.
+///
+/// `OPENAI_HOST` is the bare origin, not the `/v1` base URL the other
+/// OpenAI-compatible launchers pass — goose keeps the route in its own
+/// `OPENAI_BASE_PATH`, which `daemon::server()` already matches exactly.
+fn launch_goose(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_goose().ok_or_else(|| anyhow::anyhow!("goose is not installed"))?;
+    let host = daemon::server();
+    // No flags injected, so nothing to scan for or refuse: `goose run`'s
+    // own --model/--provider override these variables, which is the
+    // caller's to do (see `check_model_flag`).
+    exec_with_env(&bin, extra_args, &goose_env(model, api_key, &host))
+}
+
+/// Split out so the environment goose is handed can be asserted without
+/// running it: [`exec_with_env`] never returns (it `exec`s and exits), so
+/// a test that called [`launch_goose`] on a machine with goose installed
+/// would take the test runner with it.
+fn goose_env<'a>(model: &'a str, api_key: &'a str, host: &'a str) -> Vec<(&'a str, &'a str)> {
+    let mut env = vec![
+        ("GOOSE_PROVIDER", "openai"),
+        ("OPENAI_API_KEY", api_key),
+        ("OPENAI_HOST", host),
+        ("OPENAI_BASE_PATH", "v1/chat/completions"),
+    ];
+    // Empty would be worse than absent: goose reads it as a model named
+    // "" rather than falling through to its own configuration.
+    if !model.is_empty() {
+        env.push(("GOOSE_MODEL", model));
+    }
+    env
+}
+
+/// `PATH`, then goose's own installer target: `download_cli.sh` writes to
+/// `~/.local/bin` without putting it on `PATH`, so a machine that has
+/// goose would otherwise be reported as not having it.
+fn find_goose() -> Option<PathBuf> {
+    find_on_path("goose").or_else(|| {
+        dirs::home_dir().and_then(|h| {
+            let bin = if cfg!(windows) { "goose.exe" } else { "goose" };
+            let p = h.join(".local").join("bin").join(bin);
+            p.exists().then_some(p)
+        })
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Process execution helper
 // ---------------------------------------------------------------------------
@@ -1572,6 +1632,37 @@ mod tests {
             assert!(check_model_flag(id, Some("m"), None, &forwarded).is_ok());
         }
         assert!(check_model_flag("claude", None, None, &none).is_ok());
+    }
+
+    /// goose is configured only through these variables — there is no
+    /// file to fall back on, so a wrong or missing one sends the session
+    /// to api.openai.com instead of the daemon. `OPENAI_HOST` is the bare
+    /// origin: goose joins it with `OPENAI_BASE_PATH` itself, so a `/v1`
+    /// here would request `/v1/v1/chat/completions`.
+    #[test]
+    fn goose_env_points_at_the_daemon_and_carries_the_key() {
+        let env = goose_env("m", "k", "http://127.0.0.1:17434");
+        let get = |k| env.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+        assert_eq!(get("GOOSE_PROVIDER"), Some("openai"));
+        assert_eq!(get("GOOSE_MODEL"), Some("m"));
+        assert_eq!(get("OPENAI_API_KEY"), Some("k"));
+        assert_eq!(get("OPENAI_HOST"), Some("http://127.0.0.1:17434"));
+        assert_eq!(get("OPENAI_BASE_PATH"), Some("v1/chat/completions"));
+
+        // Absent, not empty: goose 1.50.0 refuses an empty model rather
+        // than falling through ("No model configured").
+        let env = goose_env("", "k", "http://127.0.0.1:17434");
+        assert!(!env.iter().any(|(n, _)| *n == "GOOSE_MODEL"));
+    }
+
+    /// goose takes the key in its own environment, so `--provider` needs
+    /// neither a refusal nor the daemon holding the key for it — unlike
+    /// the integrations configured through a file on disk.
+    #[test]
+    fn goose_carries_its_own_key_so_provider_works() {
+        assert!(INTEGRATIONS.iter().any(|i| i.name == "goose"));
+        assert!(check_provider_supported("goose").is_ok());
+        assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"goose"));
     }
 
     /// The found directory goes in front of `PATH` only when it is not

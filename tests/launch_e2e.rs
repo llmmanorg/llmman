@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`) — not mocks.
+//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`, `goose`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -606,7 +606,12 @@ fn run_launch(
         // Set, not cleared: a `QWEN_HOME` in the developer's shell would
         // send the settings `launch qwen` writes past this `HOME`, and on
         // Windows `dirs::home_dir` reads neither `HOME` nor `USERPROFILE`.
-        .env("QWEN_HOME", home.join(".qwen"));
+        .env("QWEN_HOME", home.join(".qwen"))
+        // goose asks before each tool call otherwise, which a headless run
+        // has nobody to answer. Set here rather than by `launch goose`
+        // itself: auto-approving an agent's writes is the user's call, not
+        // llmman's, so only this test grants it.
+        .env("GOOSE_MODE", "auto");
 
     try_spawn_with_timeout(
         cmd,
@@ -892,6 +897,32 @@ fn launch_qwen_with_model() {
 /// are (see `openclaw_pull_registry_flake` for the same shape).
 fn qwen_loop_detection(stderr: &str) -> bool {
     stderr.contains("Loop detection halted the run")
+}
+
+#[test]
+fn launch_goose_with_model() {
+    eprintln!("[test] launch_goose_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_goose_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    // Skipped rather than failed, unlike the npm CLIs: goose publishes no
+    // aarch64-pc-windows asset (v1.50.0), so the Windows arm64 leg has
+    // nothing to install and ci.yml's install step is a no-op there.
+    if !on_path("goose") {
+        eprintln!(
+            "skipping: goose not on PATH — https://github.com/aaif-goose/goose (download_cli.sh installs to ~/.local/bin)"
+        );
+        return;
+    }
+
+    // `run -t <prompt> --no-session`: goose's own headless mode — one
+    // instruction in, reply out, and no session file left behind. The
+    // GOOSE_MODE the run needs is set in `run_launch`, not here, since it
+    // has to reach the child's environment rather than its argv.
+    launch_and_assert("goose", &["run", "-t", PROMPT, "--no-session"]);
 }
 
 /// Verifies `daemon::ensure_server`'s fast-fail path end to end: when the
