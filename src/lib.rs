@@ -1,5 +1,7 @@
 #![recursion_limit = "256"]
 
+pub mod auth;
+pub mod chat_template;
 pub mod cmd;
 pub mod config;
 pub mod container;

@@ -205,15 +205,10 @@ fn extract_gguf_layer(
     }
 
     // Otherwise extract from tar layer.
-    let cached_dir = cache_path.join(layer_hex);
-    if cached_dir.exists() {
-        for e in std::fs::read_dir(&cached_dir)?.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                return Ok(p);
-            }
-        }
+    if let Some(p) = cached_gguf(cache_path, layer_hex) {
+        return Ok(p);
     }
+    let cached_dir = cache_path.join(layer_hex);
     std::fs::create_dir_all(&cached_dir)?;
     let blob = store
         .read_blob(&layer.digest)
@@ -365,6 +360,92 @@ pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) 
         caps.push(CAPABILITY_VISION.to_string());
     }
     caps
+}
+
+/// Ollama's `api.ShowResponse.Template`: the model's chat template, read
+/// without extracting anything (a read-only `/api/show` must not copy a
+/// checkout into the cache). A GGUF's `tokenizer.chat_template`, from
+/// the blob as stored or a tar layer already extracted; else a
+/// checkout's `chat_template.jinja`, or `tokenizer_config.json`'s
+/// `chat_template` (the `default` of Transformers' named templates).
+pub fn chat_template(
+    store: &OciStore,
+    store_path: &Path,
+    cache_path: &Path,
+    manifest: &crate::storage::oci::Manifest,
+) -> Option<String> {
+    if let Some((primary, _)) = gguf_layers(manifest) {
+        let path = raw_blob_path(store_path, primary)
+            .ok()
+            .filter(|p| blob_is_gguf(p))
+            .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))?;
+        return crate::gguf::read_info(&path)
+            .ok()?
+            .str("tokenizer.chat_template")
+            .map(str::to_string);
+    }
+    let file = |name: &str| {
+        manifest
+            .layers
+            .iter()
+            .find(|l| {
+                layer_filepath(l)
+                    .and_then(|p| Path::new(p).file_name())
+                    .is_some_and(|f| f == name)
+            })
+            .and_then(|l| read_layer_text(store, l).ok())
+    };
+    if let Some(jinja) = file("chat_template.jinja") {
+        return Some(jinja);
+    }
+    let config: serde_json::Value = serde_json::from_str(&file("tokenizer_config.json")?).ok()?;
+    let named_default = |entry: &serde_json::Value| {
+        entry.get("name").and_then(serde_json::Value::as_str) == Some("default")
+    };
+    match config.get("chat_template")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(named) => named.get("default")?.as_str().map(str::to_string),
+        serde_json::Value::Array(named) => named
+            .iter()
+            .find(|e| named_default(e))
+            .or_else(|| named.first())?
+            .get("template")?
+            .as_str()
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// A manifest layer's text: the one file of a single-file tar layer (as
+/// `llmman build` writes), else the blob itself (as HuggingFace and cloud
+/// pulls store docs and configs).
+pub fn read_layer_text(
+    store: &OciStore,
+    layer: &crate::storage::oci::Descriptor,
+) -> anyhow::Result<String> {
+    use std::io::Read as _;
+    let blob = store.read_blob(&layer.digest)?;
+    if blob.len() >= 512 {
+        let mut archive = tar::Archive::new(std::io::Cursor::new(&blob));
+        if let Ok(entries) = archive.entries() {
+            for mut entry in entries.flatten() {
+                let mut s = String::new();
+                if entry.read_to_string(&mut s).is_ok() && !s.is_empty() {
+                    return Ok(s);
+                }
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&blob).into_owned())
+}
+
+/// The GGUF a tar layer was already extracted to, if any.
+fn cached_gguf(cache_path: &Path, layer_hex: &str) -> Option<PathBuf> {
+    std::fs::read_dir(cache_path.join(layer_hex))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf"))
 }
 
 /// The manifest's primary GGUF layer and its companion mmproj layer, if
@@ -596,15 +677,20 @@ fn extract_safetensors_dir(
             continue;
         }
         let dest = cache_dir.join(rel_path);
-        if dest.exists() {
+        if cached_layer_file_matches(&dest, layer.size) {
             continue;
         }
 
         std::fs::create_dir_all(dest.parent().context("no parent")?)?;
-        let layer_hex = digest_hex(&layer.digest)?;
-        let blob = store_path.join("blobs").join("sha256").join(layer_hex);
-        std::fs::copy(&blob, &dest).with_context(|| format!("copy {rel_path} from blob store"))?;
-        eprintln!("[llmman] extracted {rel_path}");
+        match std::fs::remove_file(&dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("remove {}", dest.display())),
+        }
+        let blob = raw_blob_path(store_path, layer)?;
+        link_or_copy_file(&blob, &dest, layer.size)
+            .with_context(|| format!("cache {rel_path} from blob store"))?;
+        eprintln!("[llmman] cached {rel_path}");
     }
 
     let rel_paths: Vec<&str> = manifest
@@ -614,6 +700,66 @@ fn extract_safetensors_dir(
         .filter(|p| crate::sources::is_safe_relative_path(p))
         .collect();
     Ok(safetensors_model_dir(&cache_dir, &rel_paths))
+}
+
+fn cached_layer_file_matches(dest: &Path, layer_size: u64) -> bool {
+    dest.metadata()
+        .map(|m| m.is_file() && m.len() == layer_size)
+        .unwrap_or(false)
+}
+
+fn link_or_copy_file(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        match std::fs::hard_link(src, dest) {
+            Ok(()) => Ok(()),
+            Err(_) if cached_layer_file_matches(dest, layer_size) => Ok(()),
+            Err(hardlink_error) => copy_file_atomic(src, dest, layer_size).with_context(|| {
+                format!(
+                    "hardlink {} to {} failed: {hardlink_error}; copy failed",
+                    src.display(),
+                    dest.display()
+                )
+            }),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        copy_file_atomic(src, dest, layer_size)
+    }
+}
+
+fn copy_file_atomic(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result<()> {
+    let tmp = cache_copy_temp_path(dest);
+    let result = (|| {
+        let copied = std::fs::copy(src, &tmp)
+            .with_context(|| format!("copy {} to {}", src.display(), tmp.display()))?;
+        if copied != layer_size {
+            anyhow::bail!("copied {copied} bytes, expected {layer_size}");
+        }
+        match std::fs::rename(&tmp, dest) {
+            Ok(()) => Ok(()),
+            Err(_) if cached_layer_file_matches(dest, layer_size) => Ok(()),
+            Err(e) => {
+                Err(e).with_context(|| format!("rename {} to {}", tmp.display(), dest.display()))
+            }
+        }
+    })();
+    if result.is_err() || tmp.exists() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn cache_copy_temp_path(dest: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut tmp = dest.to_path_buf().into_os_string();
+    tmp.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    PathBuf::from(tmp)
 }
 
 #[cfg(test)]
@@ -919,6 +1065,104 @@ mod tests {
         assert_eq!(p.format(), "omni");
         assert_eq!(p.path(), Path::new("/cache/cosmos"));
         assert_eq!(p.mmproj(), None);
+    }
+
+    #[test]
+    fn extract_safetensors_dir_replaces_dest_shorter_than_layer_size() {
+        let weights = b"complete-weights-bytes";
+        let layer_hex = "aa".repeat(32);
+        let mut layer = descriptor(&format!("sha256:{layer_hex}"), "model.safetensors");
+        layer.media_type = "application/vnd.cncf.model.weight.v1.raw".into();
+        layer.size = weights.len() as u64;
+        let (store, manifest) = manifest_with(vec![layer]);
+
+        let blob = store.root().join("blobs").join("sha256").join(&layer_hex);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, weights).unwrap();
+
+        let cache = store.root().join("cache");
+        let dest = cache.join("bb".repeat(32)).join("model.safetensors");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"trunc").unwrap();
+
+        let digest = format!("sha256:{}", "bb".repeat(32));
+        extract_safetensors_dir(store.root(), &cache, &digest, &manifest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), weights);
+    }
+
+    #[test]
+    fn extract_safetensors_dir_skips_dest_that_already_matches_layer_size() {
+        let weights = b"complete-weights-bytes";
+        let layer_hex = "aa".repeat(32);
+        let mut layer = descriptor(&format!("sha256:{layer_hex}"), "model.safetensors");
+        layer.media_type = "application/vnd.cncf.model.weight.v1.raw".into();
+        layer.size = weights.len() as u64;
+        let (store, manifest) = manifest_with(vec![layer]);
+
+        let cache = store.root().join("cache");
+        let dest = cache.join("bb".repeat(32)).join("model.safetensors");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, weights).unwrap();
+
+        let digest = format!("sha256:{}", "bb".repeat(32));
+        extract_safetensors_dir(store.root(), &cache, &digest, &manifest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), weights);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_safetensors_dir_links_dest_to_blob() {
+        use std::os::unix::fs::MetadataExt;
+
+        let weights = b"complete-weights-bytes";
+        let layer_hex = "aa".repeat(32);
+        let mut layer = descriptor(&format!("sha256:{layer_hex}"), "model.safetensors");
+        layer.media_type = "application/vnd.cncf.model.weight.v1.raw".into();
+        layer.size = weights.len() as u64;
+        let (store, manifest) = manifest_with(vec![layer]);
+
+        let blob = store.root().join("blobs").join("sha256").join(&layer_hex);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, weights).unwrap();
+
+        let cache = store.root().join("cache");
+        let dest = cache.join("bb".repeat(32)).join("model.safetensors");
+        let digest = format!("sha256:{}", "bb".repeat(32));
+        extract_safetensors_dir(store.root(), &cache, &digest, &manifest).unwrap();
+
+        let dest_meta = std::fs::metadata(&dest).unwrap();
+        let blob_meta = std::fs::metadata(&blob).unwrap();
+        assert_eq!(
+            (dest_meta.dev(), dest_meta.ino()),
+            (blob_meta.dev(), blob_meta.ino())
+        );
+    }
+
+    #[test]
+    fn copy_file_atomic_replaces_dest_through_temp_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-modelpack-copy-file-atomic-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("blob");
+        let dest = dir.join("model.safetensors");
+        let weights = b"complete-weights-bytes";
+        std::fs::write(&src, weights).unwrap();
+        std::fs::write(&dest, b"trunc").unwrap();
+
+        copy_file_atomic(&src, &dest, weights.len() as u64).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), weights);
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().contains(".tmp")),
+            "copy temp file should not remain"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

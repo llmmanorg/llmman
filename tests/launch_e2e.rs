@@ -1177,3 +1177,20 @@ fn serve_mlx_safetensors_model() {
          — `llmman ps` row: {model_row:?}"
     );
 }
+
+/// llmman never links against llama.cpp: `mediagen::ffi` dlopens the
+/// ggml/llama libraries next to `llama-server` and mirrors two of its
+/// structs. Checked here against the release CI pins (on `PATH`), not
+/// only when a diffusion model loads: a dropped symbol fails `Api::load`,
+/// a moved struct `check_layout`.
+#[test]
+fn mediagen_ffi_binds_the_llama_cpp_on_path() {
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH");
+        return;
+    }
+    let dir = llmman::cmd::serve::llama_lib_dir(None).unwrap();
+    eprintln!("binding the ggml/llama libraries in {}", dir.display());
+    let api = llmman::mediagen::ffi::Api::load(&dir).unwrap();
+    api.check_layout().unwrap();
+}

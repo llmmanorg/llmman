@@ -44,11 +44,15 @@ A file carrying one must be `chmod 600` or its keys are ignored with a
 warning; an `export` overrides it. See
 [configuration.md](configuration.md#provider-api-keys).
 
-`--provider` needs a local `llmman serve`. The daemon is plain HTTP with
-no authentication, so `run` and `launch` never send a key to a remote
-`LLMMAN_HOST`, and a daemon bound off loopback never spends its own key
-for a caller that presented none. (`providers` and `list --provider`
-read the catalog only and work against any daemon.)
+`--provider` needs a local `llmman serve`, or one reached over TLS
+(`LLMMAN_HOST=https://...`): `run` and `launch` never send a key over
+plain http to a remote `LLMMAN_HOST`. A daemon bound off loopback spends
+its own key only for a caller that authenticated with the daemon's API
+key ([api.md](api.md#authentication)) — and since that key takes the
+`Authorization` header, `launch`'s integrations then rely on the
+daemon's provider key rather than carrying one; `run --provider` sends
+its own as `x-api-key`. (`providers` and `list --provider` read the
+catalog only and work against any daemon.)
 
 ## Your own endpoints
 
@@ -195,6 +199,26 @@ daemon tries the provider first and, on a 404/405/501 or 5xx, translates
 the request to a chat completion and the reply back, tool calls included.
 Providers that have the API (`openai`, `groq`, `openrouter`) are used
 natively; any other 4xx is relayed as-is.
+
+### Thinking
+
+Thinking depth is set from inside the integration and reaches the model
+as `reasoning_effort`: llama-server reads it natively (`none` turns
+thinking off; a level goes to the chat template), a provider gets it in
+its own form (see [wire formats](#wire-formats)). Nothing selected leaves
+the model's default.
+
+- `opencode`: variants read off the model's chat template (what `llmman
+  show` lists as `thinking`), cycled with `variant_cycle` (ctrl+t) or
+  `/variants`: `none`, each `reasoning_effort` level the template takes
+  (Qwen3.8: `low`, `medium`, `high`, `xhigh`), or `thinking` for a
+  template with only an `enable_thinking` switch (Gemma 4, Qwen3.5). A
+  provider's model gets `none`, `low`, `medium`, `high`.
+- `claude`: Claude Code's `/effort <low|medium|high|xhigh|max>`, sent as
+  spelled; a level the template rejects is a 400.
+- `codex`: `model_reasoning_effort`, e.g. `-- -c
+  model_reasoning_effort=high`; its `/model` picker lists only OpenAI's
+  catalog.
 
 ## Wire formats
 

@@ -97,6 +97,12 @@ cargo binstall llmman   # prebuilt binary
 cargo install llmman    # build from source; needs Go 1.25+ (and LLVM on Windows) as well as Rust
 ```
 
+**Container** (llmman in the llama.cpp server image, see [docs/backends.md](docs/backends.md#in-a-container)):
+
+```sh
+docker run -p 127.0.0.1:17434:17434 -e LLMMAN_API_KEYS=<key> -v llmman:/root/.local/share/llmman --entrypoint llmman ai/llmman serve
+```
+
 ## Quick start
 
 Three commands cover most of it:
@@ -127,47 +133,9 @@ Without a prompt it opens a `>>> ` loop where `/set width|height|steps|seed|cfg|
 adjusts the settings. The same model answers `/v1/images/generations`, `/v1/videos` and
 `/v1/audio/speech` on `llmman serve`.
 
-NVIDIA's Cosmos3 world models are published as GGUFs under `ai/` (`ai/cosmos3-edge`,
-`ai/cosmos3-nano`, `ai/cosmos3-super`; `:latest` is Q4_K_M, with `:q8_0` and `:bf16` tags) and run
-on the same ggml path — on Metal, CUDA and Vulkan, natively or with `--ociman docker`. They need
-no separate text encoder: the prompt goes through the transformer's own understanding stream.
-
-```sh
-llmman run ai/cosmos3-edge "A ginger cat on a woven mat in a sunlit room"                # 768x512 png, 35 steps
-llmman run ai/cosmos3-nano --video --seconds 2 --width 832 --height 480 "waves on a beach"  # 45-frame mp4 with sound
-llmman run ai/cosmos3-edge --video --image cat.png --seconds 2 "the cat looks around"       # image-to-video
-llmman run ai/cosmos3-edge --video --input-video clip.mp4 --seconds 2 "..."                # video-to-video: continues
-                                                                                           # the clip's first 5 frames
-```
-
-Nano and Super generate a synchronized soundtrack (`"audio": false` on `/v1/videos` turns it off;
-the 10-25 sound tokens are more sensitive to 4-bit weights than the video is, so prefer `:q8_0` when
-the soundtrack matters), and
-all three are world models: an action run rolls a robot or vehicle forward from an observation
-(`forward_dynamics`), reads the actions off an observed clip (`inverse_dynamics`), or predicts both
-the future video and the actions (`policy`), for the embodiment domains and canvas tiers of
-[`CosmosActionCondition`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/cosmos/pipeline_cosmos3_omni.py):
-
-```sh
-llmman run ai/cosmos3-nano --video --input-video bridge_0.mp4 --action-mode forward_dynamics \
-    --action-domain bridge_orig_lerobot --actions bridge_0.json --action-chunk 16 --fps 5 --steps 30 \
-    "Put the pot to the left of the purple item."            # the rollout as mp4
-llmman run ai/cosmos3-nano --video --input-video bridge_0.mp4 --action-mode inverse_dynamics \
-    --action-domain bridge_orig_lerobot --action-chunk 16 --fps 5 --steps 30 "..."   # plus the actions as json
-```
-
-Over HTTP the same runs are `POST /v1/videos` with `image` / `video` (base64) and
-`action: {mode, domain, chunk_size, actions, resolution_tier, view_point}`; the job carries `actions`.
-
-The same repositories as Diffusers-layout safetensors (a root `model_index.json`, e.g. `nvidia/Cosmos3-Edge`)
+Diffusion repositories published as Diffusers-layout safetensors (a root `model_index.json`)
 are instead served by [vLLM-Omni](https://github.com/vllm-project/vllm-omni) (`vllm serve
---omni`; install `vllm-omni` next to `vllm`, or use `--ociman docker` for the `vllm/vllm-omni` image):
-
-```sh
-llmman run nvidia/Cosmos3-Edge "A robot arm cleaning a plate in a kitchen"              # 640x640 png
-llmman run nvidia/Cosmos3-Edge --video --seconds 2 "A robot arm cleaning a plate"       # 832x480 mp4
-```
-
+--omni`; install `vllm-omni` next to `vllm`, or use `--ociman docker` for the `vllm/vllm-omni` image).
 See [docs/backends.md](docs/backends.md#vllm-omni-diffusers-pipelines).
 
 ## Commands
@@ -263,8 +231,10 @@ your GPU if no `llama-server` is on `PATH`; safetensors by
 [`vllm`](https://github.com/vllm-project/vllm), or by
 [`mlx-lm`](https://github.com/ml-explore/mlx-lm) on Apple Silicon. Tool
 calling, vision, structured output, embeddings (GGUF) and the Responses
-API (what Codex speaks) all work; there is a web UI at `/` and an
-optional Prometheus `/metrics`.
+API (what Codex speaks) all work; there is a [web UI](docs/webui.md) at
+`/` (chat with any local or hosted model, generate images, video and
+audio with a diffusion model, and a terminal) and an optional Prometheus
+`/metrics`.
 
 The full endpoint list and per-API notes are in [docs/api.md](docs/api.md);
 backend selection in [docs/backends.md](docs/backends.md); bind address,
@@ -280,6 +250,7 @@ the most room to load it:
 
 ```
 llmman config set aggregation.peers asahi,spark
+llmman config set auth.api_keys <shared-key>
 LLMMAN_HOST=0.0.0.0 llmman serve
 ```
 
@@ -287,6 +258,11 @@ LLMMAN_HOST=0.0.0.0 llmman serve
 aggregation, and `llmman stop` reaches a model wherever it was loaded.
 Nothing is elected and nothing is shared: every node is a whole llmman
 that knows the others' addresses. See [docs/aggregation.md](docs/aggregation.md).
+
+A daemon the network can reach requires an API key on every request
+(`LLMMAN_API_KEYS`, or `auth.api_keys` as above; the CLI sends
+`LLMMAN_API_KEY`) unless `LLMMAN_AUTH=off`, and can terminate TLS itself
+with `LLMMAN_TLS_CERT`/`LLMMAN_TLS_KEY`. See [docs/api.md](docs/api.md#authentication).
 
 ## Launch an integration
 
@@ -355,7 +331,7 @@ so it works from any client on every inference endpoint. Details in
 | [docs/aggregation.md](docs/aggregation.md) | Pooling several machines into one endpoint |
 | [docs/backends.md](docs/backends.md) | llama.cpp, vLLM, MLX, containers, and building from source |
 | [docs/compose.md](docs/compose.md) | Compose deployment behind a gateway, with persistent model storage |
-| [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, environment variables, store layout |
+| [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, registry mirrors, environment variables, store layout |
 | [docs/providers.md](docs/providers.md) | Hosted providers, API keys, and which integrations can use them |
 | [docs/verification.md](docs/verification.md) | Signing models and pull-time trust policy |
 | [docs/metrics.md](docs/metrics.md) | The Prometheus `/metrics` families |
