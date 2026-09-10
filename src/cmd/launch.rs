@@ -1091,9 +1091,7 @@ fn launch_talos(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
         anyhow::bail!("talos currently supports macOS and Linux");
     }
     let talos = talos_command().ok_or_else(|| anyhow::anyhow!("talos is not installed"))?;
-    if model.is_empty() {
-        anyhow::bail!("talos needs a model: llmman launch talos --model <model>");
-    }
+    talos_check_model(model)?;
     talos_check_env_overrides(model, |key| std::env::var(key).ok())?;
 
     // A recognized wrapper or venv identifies the code that will actually
@@ -1147,7 +1145,13 @@ fn launch_talos(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     if let Some(value) = &prefix_owned {
         extra_env.push(("TALOS_PREFIX", value.as_str()));
     }
-    exec_with_env_in(&bin, &args, &extra_env, talos.cwd.as_deref())
+    let inherited_pythonpath = std::env::var_os("PYTHONPATH").unwrap_or_default();
+    let pythonpath = talos_module_path(talos.module_path.as_deref(), &inherited_pythonpath)?;
+    let mut os_env = Vec::new();
+    if let Some(value) = pythonpath {
+        os_env.push((std::ffi::OsString::from("PYTHONPATH"), value));
+    }
+    exec_with_env_and_os(&bin, &args, &extra_env, &os_env)
 }
 
 /// `key`'s value, absolutized — `None` when unset or empty. `~` and
@@ -1189,17 +1193,15 @@ fn expand_and_absolutize(raw: &str, home: Option<&std::path::Path>) -> std::io::
 }
 
 /// How Talos is run: the command line, its installation prefix when known,
-/// and an optional required working directory. The installer does not install
-/// the package into the venv; `-m talos` finds it on the current directory,
-/// which is why its own instructions read
-/// `cd ~/talos && .venv/bin/python -m talos …`. The venv fallback therefore
-/// runs from the prefix. The official wrapper sets `PYTHONPATH` itself and,
-/// like unknown shims, deliberately inherits the caller's directory.
+/// and the module path needed by a legacy venv invocation. Every form inherits
+/// the caller's working directory so workspace-relative settings and arguments
+/// keep their meaning. The official wrapper sets `PYTHONPATH` itself; the venv
+/// fallback needs this launcher to prepend the installation prefix instead.
 #[derive(Debug, PartialEq)]
 struct TalosCommand {
     argv: Vec<String>,
     config_prefix: Option<PathBuf>,
-    cwd: Option<PathBuf>,
+    module_path: Option<PathBuf>,
 }
 
 /// How to invoke Talos: its official wrapper (or a custom shim) on PATH,
@@ -1225,10 +1227,9 @@ fn find_talos() -> Option<PathBuf> {
 /// found rather than a guess (see its own `config_prefix`).
 ///
 /// Absolutized because it is handed to Talos twice over: once here, to
-/// build the env-file path, and once as `current_dir` for the exec'd
-/// process. A relative value would resolve against llmman's cwd for the
-/// first and then AGAIN relative to itself for the second (Talos's own
-/// `current_dir` becoming its own base), doubling the path. Lexical only
+/// build the env-file path, and once as the legacy invocation's module
+/// path. A relative value would otherwise depend on how the child later
+/// interprets `PYTHONPATH`, instead of identifying one installation. Lexical only
 /// (`std::path::absolute`, no symlink resolution, no existence
 /// requirement) — the directory need not exist yet when this runs.
 fn talos_prefix_override() -> Option<PathBuf> {
@@ -1257,7 +1258,7 @@ fn talos_command_in(
         return Some(TalosCommand {
             argv: vec![path.to_string_lossy().into_owned()],
             config_prefix: talos_wrapper_prefix(&path),
-            cwd: None,
+            module_path: None,
         });
     }
     let prefix = prefix?;
@@ -1270,10 +1271,51 @@ fn talos_command_in(
                 "talos".to_string(),
             ],
             config_prefix: Some(prefix.to_path_buf()),
-            cwd: Some(prefix.to_path_buf()),
+            module_path: Some(prefix.to_path_buf()),
         });
     }
     None
+}
+
+/// Refuses a reference that Talos's env-file loader would silently trim. Local
+/// paths and object-store references may legitimately contain edge whitespace
+/// in llmman, so changing the value would make Talos ask for a different model.
+fn talos_check_model(model: &str) -> anyhow::Result<()> {
+    if model.is_empty() {
+        anyhow::bail!("talos needs a model: llmman launch talos --model <model>");
+    }
+    anyhow::ensure!(
+        model == model.trim(),
+        "talos cannot preserve a model reference with leading or trailing whitespace: {model:?}"
+    );
+    Ok(())
+}
+
+/// The legacy interpreter fallback runs `python -m talos` without changing
+/// cwd. Prepending its installation prefix makes the module importable while
+/// preserving the caller's workspace, exactly as the official wrapper does.
+fn talos_module_path(
+    prefix: Option<&std::path::Path>,
+    inherited: &std::ffi::OsStr,
+) -> anyhow::Result<Option<std::ffi::OsString>> {
+    let Some(prefix) = prefix else {
+        return Ok(None);
+    };
+    // Unlike PATH, an empty component in PYTHONPATH intentionally means the
+    // caller's cwd. Preserve such components just like the official wrapper's
+    // string prefix does; only an entirely empty/unset value contributes none.
+    let mut paths: Vec<PathBuf> = if inherited.is_empty() {
+        Vec::new()
+    } else {
+        std::env::split_paths(inherited).collect()
+    };
+    if paths.first().is_some_and(|path| path == prefix) {
+        return Ok(None);
+    }
+    paths.insert(0, prefix.to_path_buf());
+    std::env::join_paths(paths)
+        .map(Some)
+        .with_context(|| format!("cannot add {} to PYTHONPATH", prefix.display()))
 }
 
 /// Refuses a launch that an exported `TALOS_MODEL_PROVIDER`/`TALOS_MODEL`
@@ -1435,8 +1477,9 @@ fn write_talos_env(path: &std::path::Path, pairs: &[(&str, &str)]) -> anyhow::Re
 /// the same way (`Path(__file__).resolve().parent.parent`), so resolving
 /// the symlink and walking up two directories here mirrors exactly what
 /// running it would do, rather than guessing. Anything that does not
-/// match this exact shape — a different tool also named `talos`, or an
-/// install layout old enough to predate `bin/talos` — returns `None`
+/// match this exact shape, including Talos's module entry point — a different
+/// tool also named `talos`, or an install layout old enough to predate
+/// `bin/talos` — returns `None`
 /// rather than a wrong guess, same as an unrelated shim always has.
 fn talos_wrapper_prefix(shim: &std::path::Path) -> Option<PathBuf> {
     let real = std::fs::canonicalize(shim).ok()?;
@@ -1448,12 +1491,8 @@ fn talos_wrapper_prefix(shim: &std::path::Path) -> Option<PathBuf> {
         return None;
     }
     let prefix = bin_dir.parent()?.to_path_buf();
-    prefix
-        .join(".venv")
-        .join("bin")
-        .join("python")
-        .is_file()
-        .then_some(prefix)
+    let python = prefix.join(".venv").join("bin").join("python");
+    (python.is_file() && prefix.join("talos").join("__main__.py").is_file()).then_some(prefix)
 }
 
 /// The command `launch_talos` execs: `talos chat` plus the caller's own
@@ -1750,32 +1789,32 @@ fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn exec_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
-    exec_with_env_in(bin, args, extra_env, None)
+    exec_with_env_and_os(bin, args, extra_env, &[])
 }
 
-/// [`exec_with_env`] run from `cwd` when one is given — for an
-/// integration that has to be started from a particular directory (see
-/// [`TalosCommand`]). Everything else inherits the caller's.
-fn exec_with_env_in(
+/// [`exec_with_env`] plus path-safe environment entries. `OsString` keeps a
+/// valid non-UTF-8 Unix `PYTHONPATH` intact for Talos's legacy venv fallback.
+fn exec_with_env_and_os(
     bin: &PathBuf,
     args: &[String],
     extra_env: &[(&str, &str)],
-    cwd: Option<&std::path::Path>,
+    os_env: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> anyhow::Result<()> {
     let mut cmd = Command::new(bin);
     cmd.args(args);
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
     cmd.stdin(std::process::Stdio::inherit());
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
 
     // Inherit the current environment and overlay OLLAMA_HOST + integration vars.
-    let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
-    env.insert("OLLAMA_HOST".to_string(), daemon::server());
+    let mut env: std::collections::HashMap<std::ffi::OsString, std::ffi::OsString> =
+        std::env::vars_os().collect();
+    env.insert("OLLAMA_HOST".into(), daemon::server().into());
     for (k, v) in extra_env {
-        env.insert(k.to_string(), v.to_string());
+        env.insert((*k).into(), (*v).into());
+    }
+    for (k, v) in os_env {
+        env.insert(k.clone(), v.clone());
     }
     cmd.envs(&env);
 
@@ -2407,7 +2446,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         let shim_only = Some(TalosCommand {
             argv: vec![shim.to_string_lossy().into_owned()],
             config_prefix: None,
-            cwd: None,
+            module_path: None,
         });
         assert_eq!(
             talos_command_in(|_| Some(shim.clone()), Some(&prefix)),
@@ -2418,8 +2457,8 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert_eq!(talos_command_in(|_| None, Some(&prefix)), None);
         assert_eq!(talos_command_in(|_| None, None), None);
 
-        // The venv form runs from the prefix: the package is not installed
-        // into the venv, `-m talos` finds it on the current directory.
+        // The venv form exports the prefix as its module path: the package is
+        // not installed into the venv, but the caller's cwd must not change.
         let python = prefix.join(".venv").join("bin").join("python");
         std::fs::create_dir_all(python.parent().unwrap()).unwrap();
         std::fs::write(&python, "").unwrap();
@@ -2432,7 +2471,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
                     "talos".to_string(),
                 ],
                 config_prefix: Some(prefix.clone()),
-                cwd: Some(prefix.clone()),
+                module_path: Some(prefix.clone()),
             })
         );
         std::fs::remove_dir_all(&prefix).unwrap();
@@ -2453,8 +2492,10 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         let prefix = dir.join("prefix");
         std::fs::create_dir_all(prefix.join("bin")).unwrap();
         std::fs::create_dir_all(prefix.join(".venv").join("bin")).unwrap();
+        std::fs::create_dir_all(prefix.join("talos")).unwrap();
         std::fs::write(prefix.join("bin").join("talos"), "").unwrap();
         std::fs::write(prefix.join(".venv").join("bin").join("python"), "").unwrap();
+        std::fs::write(prefix.join("talos").join("__main__.py"), "").unwrap();
         let on_path = dir.join("talos");
         #[cfg(unix)]
         std::os::unix::fs::symlink(prefix.join("bin").join("talos"), &on_path).unwrap();
@@ -2464,7 +2505,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
             Some(TalosCommand {
                 argv: vec![on_path.to_string_lossy().into_owned()],
                 config_prefix: Some(prefix.canonicalize().unwrap()),
-                cwd: None,
+                module_path: None,
             })
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2489,8 +2530,10 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         let python = prefix.join(".venv").join("bin").join("python");
         std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
         std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(prefix.join("talos")).unwrap();
         std::fs::write(&wrapper, "").unwrap();
         std::fs::write(&python, "").unwrap();
+        std::fs::write(prefix.join("talos").join("__main__.py"), "").unwrap();
         let on_path = dir.join("path").join("talos");
         std::fs::create_dir_all(on_path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(std::path::absolute(&wrapper).unwrap(), &on_path).unwrap();
@@ -2500,13 +2543,13 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
             Some(TalosCommand {
                 argv: vec![on_path.to_string_lossy().into_owned()],
                 config_prefix: Some(prefix.canonicalize().unwrap()),
-                cwd: None,
+                module_path: None,
             })
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Three ways a `talos` on PATH can fail to match the installer's own
+    /// Four ways a `talos` on PATH can fail to match the installer's own
     /// shape — each has to fall back to "unknown shim", not a wrong guess.
     #[test]
     fn talos_wrapper_prefix_only_matches_the_installers_exact_layout() {
@@ -2530,6 +2573,56 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         std::fs::write(&no_venv, "").unwrap();
         assert_eq!(talos_wrapper_prefix(&no_venv), None);
 
+        // A neighboring Python project's venv is not enough: the official
+        // installation also has Talos's module entry point at the prefix.
+        let no_talos_module = dir.join("prefix3").join("bin").join("talos");
+        std::fs::create_dir_all(no_talos_module.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dir.join("prefix3").join(".venv").join("bin")).unwrap();
+        std::fs::write(&no_talos_module, "").unwrap();
+        std::fs::write(
+            dir.join("prefix3").join(".venv").join("bin").join("python"),
+            "",
+        )
+        .unwrap();
+        assert_eq!(talos_wrapper_prefix(&no_talos_module), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The legacy venv must find the Talos package without moving away from
+    /// the caller's workspace. Its prefix goes first, existing paths survive,
+    /// and a prefix already present does not need an overlay.
+    #[test]
+    fn talos_legacy_venv_prepends_its_prefix_to_pythonpath() {
+        let dir = scratch_dir("talos-pythonpath");
+        let prefix = dir.join("talos");
+        let existing = dir.join("existing");
+        let inherited = std::env::join_paths([existing.clone()]).unwrap();
+        let value = talos_module_path(Some(&prefix), &inherited)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::env::split_paths(&value).collect::<Vec<_>>(),
+            [prefix.clone(), existing]
+        );
+        assert_eq!(talos_module_path(Some(&prefix), &value).unwrap(), None);
+        assert_eq!(talos_module_path(None, &inherited).unwrap(), None);
+        // A later occurrence must not let another installation take precedence.
+        let later = std::env::join_paths([dir.join("other"), prefix.clone()]).unwrap();
+        let value = talos_module_path(Some(&prefix), &later).unwrap().unwrap();
+        assert_eq!(
+            std::env::split_paths(&value).collect::<Vec<_>>(),
+            [prefix.clone(), dir.join("other"), prefix.clone()]
+        );
+        // Empty components deliberately denote the caller's current directory.
+        let with_empty = std::env::join_paths([PathBuf::new(), dir.join("other")]).unwrap();
+        let value = talos_module_path(Some(&prefix), &with_empty)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::env::split_paths(&value).collect::<Vec<_>>(),
+            [prefix, PathBuf::new(), dir.join("other")]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2762,7 +2855,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
                 "talos".to_string(),
             ],
             config_prefix: Some(PathBuf::from("/x")),
-            cwd: Some(PathBuf::from("/x")),
+            module_path: Some(PathBuf::from("/x")),
         };
         let none: Vec<String> = vec![];
         assert_eq!(
@@ -2788,7 +2881,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         let shim = TalosCommand {
             argv: vec!["/usr/local/bin/talos".to_string()],
             config_prefix: None,
-            cwd: None,
+            module_path: None,
         };
         let extra = vec!["--verbose".to_string()];
         assert_eq!(
@@ -2838,6 +2931,20 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("TALOS_MODEL_PROVIDER"), "{err}");
+    }
+
+    /// Talos strips env-file values when reading them. Reject edge whitespace
+    /// instead of silently changing an otherwise valid local/object reference.
+    #[test]
+    fn talos_model_refuses_values_its_env_loader_would_change() {
+        assert!(talos_check_model("m:latest").is_ok());
+        assert!(talos_check_model("/models/My Model/model.gguf").is_ok());
+        assert!(talos_check_model("").is_err());
+        let err = talos_check_model("/models/checkpoint ")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("leading or trailing whitespace"), "{err}");
+        assert!(talos_check_model(" s3://bucket/model").is_err());
     }
 
     /// `talos` cannot carry a key (it is configured through a file, like
