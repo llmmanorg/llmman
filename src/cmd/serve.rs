@@ -5100,22 +5100,15 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     tokio::runtime::Runtime::new()?.block_on(serve_async(args))
 }
 
-/// The ggml/llama libraries of the `llama-server` we would run: next to
-/// it in a release archive, in `../lib` for an installed build.
-fn llama_lib_dir(pinned_version: Option<&str>) -> anyhow::Result<PathBuf> {
+/// The ggml/llama libraries of the `llama-server` we would run.
+pub fn llama_lib_dir(pinned_version: Option<&str>) -> anyhow::Result<PathBuf> {
     let bin = resolve_llama_server(pinned_version)?;
-    let dir = bin
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent directory", bin.display()))?;
-    [dir.to_path_buf(), dir.join("../lib"), dir.join("../lib64")]
-        .into_iter()
-        .find(|d| crate::mediagen::ffi::has_libs(d))
-        .ok_or_else(|| {
-            anyhow!(
-                "no ggml/llama shared libraries next to {}; media generation needs a llama.cpp release or installed build",
-                bin.display()
-            )
-        })
+    crate::mediagen::ffi::lib_dir_of(&bin).ok_or_else(|| {
+        anyhow!(
+            "no ggml/llama shared libraries next to {}; media generation needs a llama.cpp release or installed build",
+            bin.display()
+        )
+    })
 }
 
 /// `llmman serve MODEL --port PORT`: the media backend the daemon spawns

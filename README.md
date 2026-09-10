@@ -97,6 +97,12 @@ cargo binstall llmman   # prebuilt binary
 cargo install llmman    # build from source; needs Go 1.25+ (and LLVM on Windows) as well as Rust
 ```
 
+**Container** (llmman in the llama.cpp server image, see [docs/backends.md](docs/backends.md#in-a-container)):
+
+```sh
+docker run -p 127.0.0.1:17434:17434 -e LLMMAN_API_KEYS=<key> -v llmman:/root/.local/share/llmman --entrypoint llmman ai/llmman serve
+```
+
 ## Quick start
 
 Three commands cover most of it:

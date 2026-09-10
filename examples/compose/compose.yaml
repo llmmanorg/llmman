@@ -1,9 +1,10 @@
 services:
   llmman:
-    build:
-      context: .
-      args:
-        LLMMAN_VERSION: ${LLMMAN_VERSION:-0.1.336}
+    # llmman inside the llama.cpp CPU image (docs/backends.md); pin with
+    # LLMMAN_TAG=server-<version>, or pick a GPU variant.
+    image: docker.io/ai/llmman:${LLMMAN_TAG:-server}
+    entrypoint: llmman
+    command: serve
     cpus: ${LLMMAN_CPUS:-4}
     restart: unless-stopped
     environment:
@@ -15,7 +16,7 @@ services:
       LLMMAN_AUTH: ${LLMMAN_AUTH-off}
       LLMMAN_API_KEYS: ${LLMMAN_API_KEYS-}
     volumes:
-      - llmman-data:/var/lib/llmman
+      - llmman-data:/root/.local/share/llmman
 
   gateway:
     image: caddy:2-alpine

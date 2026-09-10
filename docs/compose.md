@@ -8,7 +8,7 @@ container replacements.
 From the repository root:
 
 ```sh
-docker compose -f examples/compose/compose.yaml up --build
+docker compose -f examples/compose/compose.yaml up
 ```
 
 Open <http://localhost:8080/> for the web UI. Its Shell tab is unavailable
@@ -28,24 +28,18 @@ To have the daemon check keys itself, clear that and set the keys —
 `LLMMAN_AUTH= LLMMAN_API_KEYS=<key> docker compose ... up`; the web UI
 then asks for one.
 
-The image includes checksum-verified, pinned llmman and llama.cpp CPU binaries.
-Override the llmman version at build time when needed:
+The service runs the published `ai/llmman:server` image
+([backends.md](backends.md#in-a-container)). Pin a release, or pick a GPU
+variant, with `LLMMAN_TAG`:
 
 ```sh
-LLMMAN_VERSION=0.1.336 docker compose \
-  -f examples/compose/compose.yaml build --pull
+LLMMAN_TAG=server-0.1.400 docker compose -f examples/compose/compose.yaml up
 ```
 
-To update llama.cpp, change `LLAMA_CPP_VERSION` and both architecture checksums
-in the Dockerfile together. A mismatched archive fails the image build.
-
-Bundling the pinned backend avoids depending on GitHub's rate-limited release
-API during startup. The defaults match versions exercised by this repository.
-
-The `llmman-data` volume is mounted at `/var/lib/llmman`, and its model store is
-`/var/lib/llmman/store`. Remove the deployment while retaining its models with
-`docker compose -f examples/compose/compose.yaml down`. Add `--volumes` only
-when the stored models should be deleted as well.
+The `llmman-data` volume is mounted at `/root/.local/share/llmman`, the store
+and cache's default location. Remove the deployment while retaining its models
+with `docker compose -f examples/compose/compose.yaml down`. Add `--volumes`
+only when the stored models should be deleted as well.
 
 ## CPU limits and container backends
 
