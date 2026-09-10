@@ -39,6 +39,22 @@ for the host.
 foreground and exits. `CUDA_VISIBLE_DEVICES` and friends are forwarded
 into the container.
 
+Each of those images is also published with llmman in it, as
+`docker.io/ai/llmman:<tag>` (`latest` is `server`) and `<tag>-<llmman
+version>`, built from [`packaging/Dockerfile`](../packaging/Dockerfile) on
+every release against the llama.cpp build CI tests. Same entrypoint and GPU
+flags as upstream, plus `/usr/local/bin/llmman`. `LLMMAN_HOST` is preset to
+`0.0.0.0:17434` (a loopback bind inside a container is unreachable even with
+`-p`), so the daemon requires `LLMMAN_API_KEYS` or `LLMMAN_AUTH=off`
+([configuration.md](configuration.md#authentication)); publish the port on
+the host's loopback to keep it local. The store is `/root/.local/share/llmman`:
+
+```sh
+docker run -p 127.0.0.1:17434:17434 -e LLMMAN_API_KEYS=<key> \
+  -v llmman:/root/.local/share/llmman --gpus all \
+  --entrypoint llmman ai/llmman:server-cuda serve
+```
+
 ## vLLM
 
 Safetensors models are served by a separately installed `vllm`. Plain

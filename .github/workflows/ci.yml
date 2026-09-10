@@ -25,8 +25,10 @@ env:
   # with this value at the "Install llama-server" step's own point of use
   # ("llama-${LLAMA_CPP_RELEASE}-bin-${{ matrix.llama-asset }}") rather
   # than each duplicating the full "llama-<release>-bin-..." filename
-  # independently.
-  LLAMA_CPP_RELEASE: b10293
+  # independently. Also the base of the docker.io/ai/llmman images, so it
+  # must be a build upstream published server-*-b<N> images for (not all
+  # are; the build job checks).
+  LLAMA_CPP_RELEASE: b10868
   # vLLM version the e2e job's "Install vLLM (e2e)" step installs, for
   # vllm-plugin/tests/test_e2e.py's real `vllm serve` test. Moves with
   # VLLM_METAL_VERSION below: a vllm-metal release names the vLLM
@@ -215,6 +217,30 @@ jobs:
             exit 1
           fi
           echo "OK: $bin is a docker-backend build"
+
+      # ── Container image (packaging/Dockerfile) ──────────────────────────────
+      # What publish-images ships, built and run on PRs so a broken
+      # Dockerfile or glibc mismatch fails before release. Only the CPU
+      # variant is built (the others differ in base tag alone, and run to
+      # 7 GiB), but every base publish-images needs must exist.
+      - name: Build and run the container image
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          for tag in server server-cuda server-cuda13 server-rocm server-vulkan; do
+            docker manifest inspect "ghcr.io/ggml-org/llama.cpp:$tag-$LLAMA_CPP_RELEASE" >/dev/null
+          done
+          cp dist-docker/llmman packaging/llmman-amd64
+          docker build packaging -t llmman-check \
+            --build-arg "BASE=ghcr.io/ggml-org/llama.cpp:server-$LLAMA_CPP_RELEASE"
+          out="$(docker run --rm --entrypoint llmman llmman-check --version)"
+          echo "$out"
+          case "$out" in
+          "llmman $(packaging/version.sh) ("*")") ;;
+          *) echo "::error::image reports \"$out\""; exit 1 ;;
+          esac
+          docker run --rm llmman-check --version
+          rm packaging/llmman-amd64
 
       # ── Diagnostics: inspect the Go shim library on Windows ARM64 ───────────
       - name: Inspect shim library (Windows aarch64)
@@ -1496,6 +1522,86 @@ jobs:
             dist/checksums.txt
 
   # --------------------------------------------------------------------------
+  # docker.io/ai/llmman: each ghcr.io/ggml-org/llama.cpp server image
+  # src/container.rs can pick, at LLAMA_CPP_RELEASE, with this release's
+  # llmman added (packaging/Dockerfile). Tagged like upstream plus
+  # <tag>-<version>; latest is the CPU image. Platforms as upstream minus
+  # s390x (no llmman binary). The package-manager publishes wait on this.
+  # Needs vars.DOCKER_HUB_USER + secrets.DOCKER_HUB_PAT, the credentials
+  # docker/llmman-publisher pushes ai/<model> with.
+  # --------------------------------------------------------------------------
+  publish-images:
+    name: Publish ${{ matrix.tag }} image
+    needs: [release]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tag: server
+            platforms: linux/amd64,linux/arm64
+          - tag: server-cuda
+            platforms: linux/amd64,linux/arm64
+          - tag: server-cuda13
+            platforms: linux/amd64,linux/arm64
+          - tag: server-rocm
+            platforms: linux/amd64
+          - tag: server-vulkan
+            platforms: linux/amd64,linux/arm64
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: llmman-docker-*-unknown-linux-gnu
+
+      # Artifacts drop the executable bit; COPY keeps the context's mode.
+      - name: Lay out the build context
+        run: |
+          install -m 755 dist/llmman-docker-x86_64-unknown-linux-gnu/llmman packaging/llmman-amd64
+          install -m 755 dist/llmman-docker-aarch64-unknown-linux-gnu/llmman packaging/llmman-arm64
+
+      - name: Log in to Docker Hub
+        env:
+          DOCKER_HUB_USER: ${{ vars.DOCKER_HUB_USER }}
+          DOCKER_HUB_PAT: ${{ secrets.DOCKER_HUB_PAT }}
+        run: printf '%s' "$DOCKER_HUB_PAT" | docker login docker.io --username "$DOCKER_HUB_USER" --password-stdin
+
+      # The versioned tag first (a docker-container builder: the default
+      # can't push multi-platform; no provenance/sbom, so the index lists
+      # only real platforms), then the floating ones — unless a newer
+      # release already exists, since runs are not ordered.
+      - name: Build and push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ matrix.tag }}
+          PLATFORMS: ${{ matrix.platforms }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          image=docker.io/ai/llmman
+          docker buildx create --use
+          docker buildx build packaging --push --provenance=false --sbom=false \
+            --platform "$PLATFORMS" \
+            --build-arg "BASE=ghcr.io/ggml-org/llama.cpp:$TAG-$LLAMA_CPP_RELEASE" \
+            --build-arg "VERSION=$VERSION" \
+            --build-arg "REVISION=$GITHUB_SHA" \
+            -t "$image:$TAG-$VERSION"
+          newest="$(gh release list --limit 10 --json tagName -q '.[].tagName' | grep '^v' | sort -V | tail -1)"
+          if [ "$newest" != "v$VERSION" ]; then
+            echo "::notice::$newest is newer; leaving the floating tags to it"
+            exit 0
+          fi
+          tags=(-t "$image:$TAG")
+          if [ "$TAG" = server ]; then tags+=(-t "$image:latest"); fi
+          docker buildx imagetools create "${tags[@]}" "$image:$TAG-$VERSION"
+
+  # --------------------------------------------------------------------------
   # crates.io: the `llmman` crate at the same version, on every commit to
   # main. Versions are immutable there, which is fine: the commit count
   # never repeats. `cargo install llmman` builds from source (needs Go);
@@ -1505,7 +1611,7 @@ jobs:
   # --------------------------------------------------------------------------
   publish-crate:
     name: Publish to crates.io
-    needs: [release]
+    needs: [release, publish-images]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -1573,7 +1679,7 @@ jobs:
   # --------------------------------------------------------------------------
   publish-homebrew:
     name: Publish Homebrew formula
-    needs: [release]
+    needs: [release, publish-images]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -1674,7 +1780,7 @@ jobs:
   # --------------------------------------------------------------------------
   publish-winget:
     name: Publish winget manifest
-    needs: [release]
+    needs: [release, publish-images]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: windows-2025
     timeout-minutes: 20
