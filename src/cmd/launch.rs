@@ -1337,8 +1337,16 @@ const DSH_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 /// every exit path (signals included) for a case that needs two
 /// simultaneous sessions on different models to bite at all.
 fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    if has_flag(dsh_launcher_args(extra_args), "--patch", None) {
+    let launcher = dsh_launcher(extra_args);
+    if has_flag(launcher.args, "--patch", None) {
         anyhow::bail!("llmman launch dsh manages --patch itself; pass other dsh flags after --");
+    }
+    if let Some(command) = launcher.command {
+        anyhow::bail!(
+            "dsh's `{command}` command cannot be combined with the --patch llmman passes it.\n\
+             Select a profile with `--profile {}` instead, or omit it for the default.",
+            if command == "web" { "web" } else { "<name>" }
+        );
     }
     let bin = find_on_path("dsh").ok_or_else(|| anyhow::anyhow!("dsh is not installed"))?;
 
@@ -1371,18 +1379,43 @@ fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Resu
 /// `--profile`/`--patch` are the two that take a value, which has to be
 /// stepped over so it isn't mistaken for the first app argument; every
 /// other dsh option (`--dump-config`, `--version`, ...) is a bare flag.
-fn dsh_launcher_args(extra_args: &[String]) -> &[String] {
+fn dsh_launcher(extra_args: &[String]) -> DshLauncher<'_> {
     let mut end = 0;
+    let mut command = None;
     while let Some(arg) = extra_args.get(end) {
-        if arg == "--" || !arg.starts_with('-') {
+        if arg == "--" {
             break;
         }
         end += match arg.as_str() {
+            // The two that take a value: step over it as well, so a
+            // profile or path isn't read as a command or as the first
+            // app argument (`--profile web`'s value is not the `web`
+            // command).
             "--profile" | "--patch" => 2,
-            _ => 1,
+            // dsh's command spellings, which it refuses to combine with
+            // any parent option — "web takes none of parent --profile,
+            // --patch, ..." — so no argument order pairs one with the
+            // `--patch` this injects.
+            found @ ("web" | "plugin") => {
+                command = command.or(Some(found));
+                1
+            }
+            _ if arg.starts_with('-') => 1,
+            // Anything else is dsh's first app argument.
+            _ => break,
         };
     }
-    &extra_args[..end.min(extra_args.len())]
+    DshLauncher {
+        args: &extra_args[..end.min(extra_args.len())],
+        command,
+    }
+}
+
+/// dsh's own launcher section: the tokens it reads rather than forwards,
+/// and the command spelling inside them, if any.
+struct DshLauncher<'a> {
+    args: &'a [String],
+    command: Option<&'a str>,
 }
 
 /// The argv dsh is invoked with. `--patch` is always injected; the
@@ -1392,7 +1425,7 @@ fn dsh_launcher_args(extra_args: &[String]) -> &[String] {
 /// does not accept it.
 fn dsh_args(patch_path: &Path, extra_args: &[String]) -> Vec<String> {
     let mut args = Vec::new();
-    if !has_flag(dsh_launcher_args(extra_args), "--profile", None) {
+    if !has_flag(dsh_launcher(extra_args).args, "--profile", None) {
         args.push("web".to_string());
     }
     args.push("--patch".to_string());
@@ -1401,15 +1434,13 @@ fn dsh_args(patch_path: &Path, extra_args: &[String]) -> Vec<String> {
     args
 }
 
-/// `~/.config/llmman/launch/dsh`, alongside `llmman.conf`. dsh never
-/// looks here on its own; only the `--patch` flag points it there.
+/// `~/.config/llmman/launch/dsh`. Derived from `llmman.conf`'s own
+/// directory rather than rebuilt by hand, so the two cannot drift.
+/// dsh never looks here on its own; only `--patch` points it there.
 fn dsh_config_dir() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir().context("no home directory")?;
-    Ok(home
-        .join(".config")
-        .join("llmman")
-        .join("launch")
-        .join("dsh"))
+    let conf = crate::config::user_path().context("no home directory")?;
+    let dir = conf.parent().context("llmman.conf has no directory")?;
+    Ok(dir.join("launch").join("dsh"))
 }
 
 /// The settings document `llmman.cordis.yml` points dsh at: registers
@@ -2095,17 +2126,17 @@ model = \"gpt-5\"
         // installed would take the test runner with it.
         let forwarded_patch = args(&["--profile", "headless", "--", "--patch"]);
         assert_eq!(
-            dsh_launcher_args(&forwarded_patch),
+            dsh_launcher(&forwarded_patch).args,
             args(&["--profile", "headless"])
         );
         assert!(!has_flag(
-            dsh_launcher_args(&forwarded_patch),
+            dsh_launcher(&forwarded_patch).args,
             "--patch",
             None
         ));
 
         let forwarded_profile = args(&["--", "--profile", "headless"]);
-        assert!(dsh_launcher_args(&forwarded_profile).is_empty());
+        assert!(dsh_launcher(&forwarded_profile).args.is_empty());
         assert_eq!(
             dsh_args(Path::new("/p.yml"), &forwarded_profile),
             ["web", "--patch", "/p.yml", "--", "--profile", "headless"]
@@ -2118,11 +2149,11 @@ model = \"gpt-5\"
         // first app argument.
         let task_mentions_patch = args(&["--profile", "headless", "explain", "the", "--patch"]);
         assert_eq!(
-            dsh_launcher_args(&task_mentions_patch),
+            dsh_launcher(&task_mentions_patch).args,
             args(&["--profile", "headless"])
         );
         assert!(!has_flag(
-            dsh_launcher_args(&task_mentions_patch),
+            dsh_launcher(&task_mentions_patch).args,
             "--patch",
             None
         ));
@@ -2130,7 +2161,7 @@ model = \"gpt-5\"
         // An app-level `--profile` past that boundary must not suppress
         // the default `web`.
         let app_level_profile = args(&["sometask", "--profile", "headless"]);
-        assert!(dsh_launcher_args(&app_level_profile).is_empty());
+        assert!(dsh_launcher(&app_level_profile).args.is_empty());
         assert_eq!(
             dsh_args(Path::new("/p.yml"), &app_level_profile),
             [
@@ -2146,21 +2177,45 @@ model = \"gpt-5\"
         // Bare flags take no value, and the `=`-joined spelling is dsh's
         // own either way.
         assert_eq!(
-            dsh_launcher_args(&args(&["--dump-config", "task"])),
+            dsh_launcher(&args(&["--dump-config", "task"])).args,
             args(&["--dump-config"])
         );
         assert_eq!(
-            dsh_launcher_args(&args(&["--profile=headless", "task"])),
+            dsh_launcher(&args(&["--profile=headless", "task"])).args,
             args(&["--profile=headless"])
         );
 
+        // dsh's command spellings are found where dsh itself reads them
+        // (before any app argument), so `launch_dsh` can refuse them up
+        // front: dsh rejects a command combined with a parent --patch,
+        // which this always injects (verified against 0.1.2-rc.1).
+        for command in ["web", "plugin"] {
+            let via_command = args(&[command, "--port", "8080"]);
+            assert_eq!(dsh_launcher(&via_command).command, Some(command));
+            let err = launch_dsh("m", "k", &via_command).unwrap_err();
+            assert!(err.to_string().contains("--profile"), "{err}");
+        }
+        // `--profile web`'s *value* is not the `web` command — refusing
+        // it would break the most ordinary explicit invocation there is
+        // (a real bug this caught, found only by running it).
+        let profile_web = args(&["--profile", "web", "--no-open"]);
+        assert_eq!(dsh_launcher(&profile_web).command, None);
+        assert_eq!(
+            dsh_args(Path::new("/p.yml"), &profile_web),
+            ["--patch", "/p.yml", "--profile", "web", "--no-open"]
+        );
+        // Same for a patch path that happens to be named `web`.
+        assert_eq!(dsh_launcher(&args(&["--patch", "web"])).command, None);
+        // Past the boundary it is app text, not a command.
+        assert_eq!(dsh_launcher(&args(&["sometask", "web"])).command, None);
+
         // All launcher flags, no app arguments: the whole slice is dsh's.
         let plain = args(&["--profile", "headless"]);
-        assert_eq!(dsh_launcher_args(&plain), plain);
+        assert_eq!(dsh_launcher(&plain).args, plain);
         // A value-taking flag with its value missing must not run past
         // the end of the slice.
         assert_eq!(
-            dsh_launcher_args(&args(&["--profile"])),
+            dsh_launcher(&args(&["--profile"])).args,
             args(&["--profile"])
         );
     }
