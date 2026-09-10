@@ -1355,17 +1355,34 @@ fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Resu
     )
 }
 
-/// The tokens dsh reads as its own launcher flags: everything up to its
-/// `--` boundary, past which it forwards tokens to the selected
-/// profile's app instead. Verified against dsh 0.1.2-rc.1: a `--patch`
-/// after `--` is reported as an app argument and its file never read,
-/// so scanning past the boundary would refuse a launch dsh accepts.
+/// The tokens dsh reads as its own launcher flags, rather than forwards
+/// to the selected profile's app. Verified against dsh 0.1.2-rc.1: it
+/// stops at `--`, and also at the first token that isn't one of its own
+/// options — `--dump-config sometask --patch <file>` reports `--patch`
+/// and the file as app arguments and never reads it.
+///
+/// Scanning past either boundary reads app arguments as launcher ones:
+/// an app-level `--profile` would count as a profile selection and drop
+/// the default `web`, and an app-level `--patch` would be refused here
+/// as though it were ours to manage. (The app may well reject that
+/// token itself — headless answers `unknown option '--patch'` — but
+/// that is dsh's own argument to make, in its own words.)
+///
+/// `--profile`/`--patch` are the two that take a value, which has to be
+/// stepped over so it isn't mistaken for the first app argument; every
+/// other dsh option (`--dump-config`, `--version`, ...) is a bare flag.
 fn dsh_launcher_args(extra_args: &[String]) -> &[String] {
-    let end = extra_args
-        .iter()
-        .position(|arg| arg == "--")
-        .unwrap_or(extra_args.len());
-    &extra_args[..end]
+    let mut end = 0;
+    while let Some(arg) = extra_args.get(end) {
+        if arg == "--" || !arg.starts_with('-') {
+            break;
+        }
+        end += match arg.as_str() {
+            "--profile" | "--patch" => 2,
+            _ => 1,
+        };
+    }
+    &extra_args[..end.min(extra_args.len())]
 }
 
 /// The argv dsh is invoked with. `--patch` is always injected; the
@@ -2094,9 +2111,58 @@ model = \"gpt-5\"
             ["web", "--patch", "/p.yml", "--", "--profile", "headless"]
         );
 
-        // No boundary: the whole slice is dsh's to parse, as before.
-        let plain = args(&["--profile", "headless", "hi"]);
+        // The same boundary without a `--`: dsh stops at the first
+        // token of its own it doesn't recognize, so a task's wording
+        // is app text, not flags. `--profile headless` before it is
+        // still dsh's, value stepped over rather than read as the
+        // first app argument.
+        let task_mentions_patch = args(&["--profile", "headless", "explain", "the", "--patch"]);
+        assert_eq!(
+            dsh_launcher_args(&task_mentions_patch),
+            args(&["--profile", "headless"])
+        );
+        assert!(!has_flag(
+            dsh_launcher_args(&task_mentions_patch),
+            "--patch",
+            None
+        ));
+
+        // An app-level `--profile` past that boundary must not suppress
+        // the default `web`.
+        let app_level_profile = args(&["sometask", "--profile", "headless"]);
+        assert!(dsh_launcher_args(&app_level_profile).is_empty());
+        assert_eq!(
+            dsh_args(Path::new("/p.yml"), &app_level_profile),
+            [
+                "web",
+                "--patch",
+                "/p.yml",
+                "sometask",
+                "--profile",
+                "headless"
+            ]
+        );
+
+        // Bare flags take no value, and the `=`-joined spelling is dsh's
+        // own either way.
+        assert_eq!(
+            dsh_launcher_args(&args(&["--dump-config", "task"])),
+            args(&["--dump-config"])
+        );
+        assert_eq!(
+            dsh_launcher_args(&args(&["--profile=headless", "task"])),
+            args(&["--profile=headless"])
+        );
+
+        // All launcher flags, no app arguments: the whole slice is dsh's.
+        let plain = args(&["--profile", "headless"]);
         assert_eq!(dsh_launcher_args(&plain), plain);
+        // A value-taking flag with its value missing must not run past
+        // the end of the slice.
+        assert_eq!(
+            dsh_launcher_args(&args(&["--profile"])),
+            args(&["--profile"])
+        );
     }
 
     /// A caller-supplied `--patch` after `--` must be refused, however spelled.
