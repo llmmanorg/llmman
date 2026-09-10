@@ -1337,7 +1337,7 @@ const DSH_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 /// every exit path (signals included) for a case that needs two
 /// simultaneous sessions on different models to bite at all.
 fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    if has_flag(extra_args, "--patch", None) {
+    if has_flag(dsh_launcher_args(extra_args), "--patch", None) {
         anyhow::bail!("llmman launch dsh manages --patch itself; pass other dsh flags after --");
     }
     let bin = find_on_path("dsh").ok_or_else(|| anyhow::anyhow!("dsh is not installed"))?;
@@ -1355,6 +1355,19 @@ fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Resu
     )
 }
 
+/// The tokens dsh reads as its own launcher flags: everything up to its
+/// `--` boundary, past which it forwards tokens to the selected
+/// profile's app instead. Verified against dsh 0.1.2-rc.1: a `--patch`
+/// after `--` is reported as an app argument and its file never read,
+/// so scanning past the boundary would refuse a launch dsh accepts.
+fn dsh_launcher_args(extra_args: &[String]) -> &[String] {
+    let end = extra_args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(extra_args.len());
+    &extra_args[..end]
+}
+
 /// The argv dsh is invoked with. `--patch` is always injected; the
 /// default `web` profile is omitted when the caller already named one
 /// (however spelled) after `--`, so `--profile headless "task"` selects
@@ -1362,7 +1375,7 @@ fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Resu
 /// does not accept it.
 fn dsh_args(patch_path: &Path, extra_args: &[String]) -> Vec<String> {
     let mut args = Vec::new();
-    if !has_flag(extra_args, "--profile", None) {
+    if !has_flag(dsh_launcher_args(extra_args), "--profile", None) {
         args.push("web".to_string());
     }
     args.push("--patch".to_string());
@@ -2048,6 +2061,42 @@ model = \"gpt-5\"
         let rendered = dsh_patch_document(win);
         assert!(rendered.contains(r#"path: "C:\\Users\\hb\\"#), "{rendered}");
         assert!(!rendered.contains(r#"path: "C:\Users"#), "{rendered}");
+    }
+
+    /// Past dsh's own `--` boundary, a token is an app argument rather
+    /// than a launcher flag (verified against dsh 0.1.2-rc.1), so
+    /// neither check may scan there: a task whose text is `--patch`
+    /// must not be refused, and one reading `--profile` must not
+    /// suppress the default `web`.
+    #[test]
+    fn dsh_checks_stop_at_dshs_own_argument_boundary() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Asserted on the boundary helper, never by calling `launch_dsh`
+        // itself: past the refusal it goes on to exec dsh and
+        // `std::process::exit`, which on a machine that has dsh
+        // installed would take the test runner with it.
+        let forwarded_patch = args(&["--profile", "headless", "--", "--patch"]);
+        assert_eq!(
+            dsh_launcher_args(&forwarded_patch),
+            args(&["--profile", "headless"])
+        );
+        assert!(!has_flag(
+            dsh_launcher_args(&forwarded_patch),
+            "--patch",
+            None
+        ));
+
+        let forwarded_profile = args(&["--", "--profile", "headless"]);
+        assert!(dsh_launcher_args(&forwarded_profile).is_empty());
+        assert_eq!(
+            dsh_args(Path::new("/p.yml"), &forwarded_profile),
+            ["web", "--patch", "/p.yml", "--", "--profile", "headless"]
+        );
+
+        // No boundary: the whole slice is dsh's to parse, as before.
+        let plain = args(&["--profile", "headless", "hi"]);
+        assert_eq!(dsh_launcher_args(&plain), plain);
     }
 
     /// A caller-supplied `--patch` after `--` must be refused, however spelled.
