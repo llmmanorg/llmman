@@ -607,10 +607,9 @@ fn run_launch(
         // send the settings `launch qwen` writes past this `HOME`, and on
         // Windows `dirs::home_dir` reads neither `HOME` nor `USERPROFILE`.
         .env("QWEN_HOME", home.join(".qwen"))
-        // goose asks before each tool call otherwise, which a headless run
-        // has nobody to answer. Set here rather than by `launch goose`
-        // itself: auto-approving an agent's writes is the user's call, not
-        // llmman's, so only this test grants it.
+        // goose asks before each tool call otherwise, and a headless run
+        // has nobody to answer. Granted here, not by `launch goose`:
+        // auto-approving an agent's writes is the user's call.
         .env("GOOSE_MODE", "auto");
 
     try_spawn_with_timeout(
@@ -909,19 +908,15 @@ fn launch_goose_with_model() {
         return;
     }
     // Skipped rather than failed, unlike the npm CLIs: goose publishes no
-    // aarch64-pc-windows asset (v1.50.0), so the Windows arm64 leg has
-    // nothing to install and ci.yml's install step is a no-op there.
+    // aarch64-pc-windows asset (v1.50.0), so there is nothing for ci.yml
+    // to install on that leg.
     if !on_path("goose") {
-        eprintln!(
-            "skipping: goose not on PATH — https://github.com/aaif-goose/goose (download_cli.sh installs to ~/.local/bin)"
-        );
+        eprintln!("skipping: goose not on PATH — https://github.com/aaif-goose/goose");
         return;
     }
 
     // `run -t <prompt> --no-session`: goose's own headless mode — one
-    // instruction in, reply out, and no session file left behind. The
-    // GOOSE_MODE the run needs is set in `run_launch`, not here, since it
-    // has to reach the child's environment rather than its argv.
+    // instruction in, reply out, no session file left behind.
     launch_and_assert("goose", &["run", "-t", PROMPT, "--no-session"]);
 }
 

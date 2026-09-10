@@ -834,20 +834,16 @@ jobs:
         run: |
           & ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -SkipSetup
 
-      # goose has no npm package either (a Rust binary via download_cli.sh
-      # or Homebrew), so install_cli above can't reach it. Pinned to a
-      # release tag for the same reason qwen/openclaw are — download_cli.sh
-      # is published per-release, and its default `stable` channel would
-      # otherwise move under tests/launch_e2e.rs's goose invocation.
-      # CONFIGURE=false skips the interactive `goose configure` wizard;
-      # `llmman launch goose` configures goose through the environment on
-      # every launch and never reads its config file.
+      # goose has no npm package either (a Rust binary via download_cli.sh),
+      # so install_cli above can't reach it. Pinned for the same reason
+      # qwen/openclaw are: its default `stable` channel would otherwise
+      # move under tests/launch_e2e.rs's goose invocation. CONFIGURE=false
+      # skips the `goose configure` wizard — `llmman launch goose`
+      # configures goose through the environment and never reads its file.
       #
-      # Warns rather than fails, unlike the npm CLIs: goose publishes no
-      # aarch64-pc-windows asset at v1.50.0, so there is nothing to install
-      # on the Windows arm64 leg and launch_goose_with_model skips itself
-      # there on its own on_path check. Git Bash maps $HOME/.local/bin to
-      # the %USERPROFILE%\.local\bin the installer uses on Windows.
+      # Warns rather than fails: goose publishes no aarch64-pc-windows
+      # asset at v1.50.0, so there is nothing to install on that leg and
+      # launch_goose_with_model skips itself there.
       - name: Install goose (e2e)
         shell: bash
         run: |
