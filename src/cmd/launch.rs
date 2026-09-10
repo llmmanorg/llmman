@@ -1192,14 +1192,17 @@ fn expand_and_absolutize(raw: &str, home: Option<&std::path::Path>) -> std::io::
     std::path::absolute(expanded)
 }
 
-/// How Talos is run: the command line, its installation prefix when known,
-/// and the module path needed by a legacy venv invocation. Every form inherits
-/// the caller's working directory so workspace-relative settings and arguments
-/// keep their meaning. The official wrapper sets `PYTHONPATH` itself; the venv
-/// fallback needs this launcher to prepend the installation prefix instead.
+/// How Talos is run: its executable and textual arguments, its installation
+/// prefix when known, and the module path needed by a legacy venv invocation.
+/// The executable remains a `PathBuf` so valid non-UTF-8 Unix paths are not
+/// changed before they reach `Command`. Every form inherits the caller's
+/// working directory so workspace-relative settings and arguments keep their
+/// meaning. The official wrapper sets `PYTHONPATH` itself; the venv fallback
+/// needs this launcher to prepend the installation prefix instead.
 #[derive(Debug, PartialEq)]
 struct TalosCommand {
-    argv: Vec<String>,
+    bin: PathBuf,
+    args: Vec<String>,
     config_prefix: Option<PathBuf>,
     module_path: Option<PathBuf>,
 }
@@ -1216,7 +1219,7 @@ fn talos_command() -> Option<TalosCommand> {
 /// else the venv interpreter under the prefix — whichever
 /// [`talos_command`] would run.
 fn find_talos() -> Option<PathBuf> {
-    talos_command().map(|talos| PathBuf::from(&talos.argv[0]))
+    talos_command().map(|talos| talos.bin)
 }
 
 /// `$TALOS_PREFIX`, home-expanded and absolutized — `None` when unset or empty. Kept apart
@@ -1255,9 +1258,11 @@ fn talos_command_in(
     prefix: Option<&std::path::Path>,
 ) -> Option<TalosCommand> {
     if let Some(path) = lookup("talos") {
+        let config_prefix = talos_wrapper_prefix(&path);
         return Some(TalosCommand {
-            argv: vec![path.to_string_lossy().into_owned()],
-            config_prefix: talos_wrapper_prefix(&path),
+            bin: path,
+            args: Vec::new(),
+            config_prefix,
             module_path: None,
         });
     }
@@ -1265,11 +1270,8 @@ fn talos_command_in(
     let python = prefix.join(".venv").join("bin").join("python");
     if python.is_file() {
         return Some(TalosCommand {
-            argv: vec![
-                python.to_string_lossy().into_owned(),
-                "-m".to_string(),
-                "talos".to_string(),
-            ],
+            bin: python,
+            args: vec!["-m".to_string(), "talos".to_string()],
             config_prefix: Some(prefix.to_path_buf()),
             module_path: Some(prefix.to_path_buf()),
         });
@@ -1500,13 +1502,12 @@ fn talos_wrapper_prefix(shim: &std::path::Path) -> Option<PathBuf> {
 /// `--`. Split into the binary and its arguments the way `exec_with_env`
 /// takes them.
 fn talos_exec_argv(talos: &TalosCommand, extra_args: &[String]) -> (PathBuf, Vec<String>) {
-    let argv = &talos.argv;
-    let mut args: Vec<String> = argv[1..].to_vec();
+    let mut args = talos.args.clone();
     if extra_args.first().map(String::as_str) != Some("ask") {
         args.push("chat".to_string());
     }
     args.extend_from_slice(extra_args);
-    (PathBuf::from(&argv[0]), args)
+    (talos.bin.clone(), args)
 }
 
 /// `PATH`, then the installers' own targets; see `qwen_fallback_paths`.
@@ -2444,7 +2445,8 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         let prefix = scratch_dir("talos-prefix");
         let shim = PathBuf::from("/opt/somewhere/bin/talos");
         let shim_only = Some(TalosCommand {
-            argv: vec![shim.to_string_lossy().into_owned()],
+            bin: shim.clone(),
+            args: Vec::new(),
             config_prefix: None,
             module_path: None,
         });
@@ -2465,16 +2467,29 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert_eq!(
             talos_command_in(|_| None, Some(&prefix)),
             Some(TalosCommand {
-                argv: vec![
-                    python.to_string_lossy().into_owned(),
-                    "-m".to_string(),
-                    "talos".to_string(),
-                ],
+                bin: python,
+                args: vec!["-m".to_string(), "talos".to_string()],
                 config_prefix: Some(prefix.clone()),
                 module_path: Some(prefix.clone()),
             })
         );
         std::fs::remove_dir_all(&prefix).unwrap();
+    }
+
+    /// Unix executable paths are byte strings, not necessarily UTF-8. Command
+    /// discovery must hand the exact path to `Command` instead of replacing
+    /// invalid bytes while turning it into a display string.
+    #[cfg(unix)]
+    #[test]
+    fn talos_command_preserves_non_utf8_executable_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let shim = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/llmman-talos-\xff".to_vec(),
+        ));
+        let command = talos_command_in(|_| Some(shim.clone()), None).unwrap();
+        assert_eq!(command.bin, shim);
+        assert_eq!(talos_exec_argv(&command, &[]).0, shim);
     }
 
     /// The exact layout Talos's own installer leaves since 0.18.0:
@@ -2503,7 +2518,8 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert_eq!(
             talos_command_in(|_| Some(on_path.clone()), None),
             Some(TalosCommand {
-                argv: vec![on_path.to_string_lossy().into_owned()],
+                bin: on_path,
+                args: Vec::new(),
                 config_prefix: Some(prefix.canonicalize().unwrap()),
                 module_path: None,
             })
@@ -2541,7 +2557,8 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert_eq!(
             talos_command_in(|_| Some(on_path.clone()), None),
             Some(TalosCommand {
-                argv: vec![on_path.to_string_lossy().into_owned()],
+                bin: on_path,
+                args: Vec::new(),
                 config_prefix: Some(prefix.canonicalize().unwrap()),
                 module_path: None,
             })
@@ -2849,11 +2866,8 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
     #[test]
     fn talos_exec_argv_runs_chat_unless_the_caller_asked_for_ask() {
         let venv = TalosCommand {
-            argv: vec![
-                "/x/.venv/bin/python".to_string(),
-                "-m".to_string(),
-                "talos".to_string(),
-            ],
+            bin: PathBuf::from("/x/.venv/bin/python"),
+            args: vec!["-m".to_string(), "talos".to_string()],
             config_prefix: Some(PathBuf::from("/x")),
             module_path: Some(PathBuf::from("/x")),
         };
@@ -2879,7 +2893,8 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
             )
         );
         let shim = TalosCommand {
-            argv: vec!["/usr/local/bin/talos".to_string()],
+            bin: PathBuf::from("/usr/local/bin/talos"),
+            args: Vec::new(),
             config_prefix: None,
             module_path: None,
         };
