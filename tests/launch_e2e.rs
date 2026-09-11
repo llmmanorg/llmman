@@ -5,7 +5,8 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`, `dsh`) — not mocks.
+//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`, `dsh`,
+//! `goose`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -606,7 +607,11 @@ fn run_launch(
         // Set, not cleared: a `QWEN_HOME` in the developer's shell would
         // send the settings `launch qwen` writes past this `HOME`, and on
         // Windows `dirs::home_dir` reads neither `HOME` nor `USERPROFILE`.
-        .env("QWEN_HOME", home.join(".qwen"));
+        .env("QWEN_HOME", home.join(".qwen"))
+        // goose asks before each tool call otherwise, and a headless run
+        // has nobody to answer. Granted here, not by `launch goose`:
+        // auto-approving an agent's writes is the user's call.
+        .env("GOOSE_MODE", "auto");
 
     try_spawn_with_timeout(
         cmd,
@@ -652,7 +657,18 @@ const MAX_ATTEMPTS: u32 = 3;
 /// sampling variance, not an llmman regression, so it must not turn CI
 /// red on its own.
 fn launch_and_assert(integration: &str, extra_args: &[&str]) {
-    launch_and_assert_tolerating(integration, extra_args, |_stderr| false);
+    launch_and_assert_with(integration, extra_args, |_stderr| false, |_stdout| false);
+}
+
+/// [`launch_and_assert`], for a CLI that reports failure without a
+/// non-zero exit: stdout matching `reject_stdout` panics instead of being
+/// retried as sampling variance — see `goose_request_failed`.
+fn launch_and_assert_rejecting(
+    integration: &str,
+    extra_args: &[&str],
+    reject_stdout: impl Fn(&str) -> bool,
+) {
+    launch_and_assert_with(integration, extra_args, |_stderr| false, reject_stdout);
 }
 
 /// [`launch_and_assert`], generalized with an extra tolerated failure
@@ -668,6 +684,17 @@ fn launch_and_assert_tolerating(
     integration: &str,
     extra_args: &[&str],
     tolerate_stderr: impl Fn(&str) -> bool,
+) {
+    launch_and_assert_with(integration, extra_args, tolerate_stderr, |_stdout| false);
+}
+
+/// The shared body: `tolerate_stderr` widens what a nonzero exit may be,
+/// `reject_stdout` narrows what a zero exit may be.
+fn launch_and_assert_with(
+    integration: &str,
+    extra_args: &[&str],
+    tolerate_stderr: impl Fn(&str) -> bool,
+    reject_stdout: impl Fn(&str) -> bool,
 ) {
     let mut last_failure = None;
     // Set when the loop gives up on a timeout (not retried) rather than
@@ -714,6 +741,13 @@ fn launch_and_assert_tolerating(
             ));
             continue;
         }
+        // A zero exit isn't proof the launch worked for every CLI: a
+        // self-reported failure is a bug, not sampling variance.
+        assert!(
+            !reject_stdout(&stdout),
+            "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` exited 0 but \
+             reported a failure of its own\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
         if stdout.to_lowercase().contains("pong") {
             return;
         }
@@ -916,6 +950,42 @@ fn launch_dsh_with_model() {
     // supplied `--profile` overrides it (see `dsh_args` in
     // `cmd::launch`) for exactly this case.
     launch_and_assert("dsh", &["--profile", "headless", PROMPT]);
+}
+
+#[test]
+fn launch_goose_with_model() {
+    eprintln!("[test] launch_goose_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_goose_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    // Skipped rather than failed, unlike the npm CLIs: ci.yml can't
+    // install goose on aarch64-pc-windows (no asset at v1.50.0) or on a
+    // Windows runner whose bash has no `unzip` — see its own comment.
+    if !on_path("goose") {
+        eprintln!("skipping: goose not on PATH — https://github.com/aaif-goose/goose");
+        return;
+    }
+
+    // `run -t <prompt> --no-session`: goose's own headless mode — one
+    // instruction in, reply out, no session file left behind.
+    launch_and_assert_rejecting(
+        "goose",
+        &["run", "-t", PROMPT, "--no-session"],
+        goose_request_failed,
+    );
+}
+
+/// goose exits 0 even when no request reached a model — verified against
+/// 1.50.0 at a dead port ("Network error: ...") and at a 500 ("Ran into
+/// this error: ..."). Without this a broken `goose_env` would read as the
+/// model not saying "pong": retried, warned, green. Its third zero-exit
+/// shape, "The model returned an empty response", stays retried — a 0.8b
+/// model can legitimately produce one.
+fn goose_request_failed(stdout: &str) -> bool {
+    stdout.contains("Network error:") || stdout.contains("Ran into this error:")
 }
 
 /// Verifies `daemon::ensure_server`'s fast-fail path end to end: when the

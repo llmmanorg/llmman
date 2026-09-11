@@ -179,6 +179,7 @@ installed:
 | `aider` | Aider | yes |
 | `qwen` | Qwen Code | yes |
 | `dsh` | DeepSeek Harness | yes |
+| `goose` | Block goose | yes |
 | `hermes` | Hermes Agent | yes, but the daemon holds the key (below) |
 | `gemini` | Gemini CLI | no: llmman cannot confirm the key would come here rather than go to Google |
 | `cline` | Cline | no: it picks its own model rather than taking llmman's |
