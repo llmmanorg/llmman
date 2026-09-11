@@ -388,7 +388,7 @@ enum Engine {
     Vllm,
     /// `vllm serve --omni` (the vLLM-Omni plugin) for a [`ModelPath::Omni`]
     /// model. Killed like [`Engine::Vllm`]; its media routes speak a
-    /// different dialect — see [`omni_images`] and [`omni_videos`].
+    /// different dialect — see `omni_images` and `omni_videos`.
     VllmOmni,
     /// `mlx_lm.server` (the `mlx-lm` PyPI package) — Apple Silicon's own
     /// Metal-accelerated alternative to `vllm` for a
