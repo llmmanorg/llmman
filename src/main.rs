@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use llmman::{cmd, daemon, ffi, hostgpu};
 
 // ---------------------------------------------------------------------------
@@ -14,7 +14,7 @@ use llmman::{cmd, daemon, ffi, hostgpu};
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -104,7 +104,15 @@ fn main() {
     daemon::disable_std_handle_inheritance();
 
     let cli = Cli::parse_from(cmd::log::expand_count_shorthand(std::env::args_os()));
-    let result = match &cli.command {
+    // A bare `llmman` is a request for help, not a usage error: print it
+    // and exit 0 rather than clap's 2 (which winget's validator flags).
+    let Some(command) = &cli.command else {
+        Cli::command()
+            .print_help()
+            .expect("failed to write help to stdout");
+        return;
+    };
+    let result = match command {
         Commands::Launch(a) => cmd::launch::run(a),
         Commands::Run(a) => cmd::run::run(a),
         Commands::Build(a) => cmd::build::run(a),

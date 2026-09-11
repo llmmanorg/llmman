@@ -162,16 +162,30 @@ fn integration_key() -> String {
 
 /// Integrations that cannot be launched without `--model`. Qwen Code has
 /// no notion of a missing model and sends its own built-in default
-/// (`qwen3.7-max` in 0.22.3), which the daemon would then try to pull;
+/// (`qwen3.7-max` in 0.22.3), which the daemon would then try to pull.
+/// dsh has no default of its own either — an empty `--model` would
+/// otherwise land a literal `"default"` in `agent-default-model.model`,
+/// which the first request then tries to resolve as a real model id.
 /// goose instead refuses with "Run 'goose configure' first", advice that
 /// does not apply to a launch llmman configures through the environment.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
-const MODEL_REQUIRED: &[&str] = &["qwen", "goose"];
+const MODEL_REQUIRED: &[&str] = &["qwen", "dsh", "goose"];
+
+/// Integrations whose launcher yields to a `--model` after `--`, and so
+/// warrant the warning below. qwen: `qwen_args` drops its own `--model`
+/// when the caller spelled one. goose: its model is `GOOSE_MODEL` in the
+/// environment, which goose's own `--model` documents itself as
+/// overriding. Not dsh: `dsh_args` does not yield, and dsh takes no
+/// `--model` flag at all (its model is the one `write_dsh_settings`
+/// records), so telling a dsh user theirs "wins" would be false, and dsh
+/// rejects the unknown flag on its own.
+const MODEL_FLAG_FORWARDED: &[&str] = &["qwen", "goose"];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
 /// `--provider` too. A second `--model` after `--` is the caller's to
-/// win (`qwen_args` yields to it), but `run` resolves the top-level one
-/// and, locally, preloads it, so that gets said.
+/// win for the integrations in `MODEL_FLAG_FORWARDED`, but `run`
+/// resolves the top-level one and, locally, preloads it, so that gets
+/// said.
 fn check_model_flag(
     integration: &str,
     model: Option<&str>,
@@ -186,7 +200,8 @@ fn check_model_flag(
         let with_provider = provider.map_or(String::new(), |p| format!(" --provider {p}"));
         anyhow::bail!("{name} needs a model: llmman launch {name}{with_provider} --model <model>");
     };
-    if has_flag(extra_args, "--model", Some("-m")) {
+    if MODEL_FLAG_FORWARDED.contains(&name.as_str()) && has_flag(extra_args, "--model", Some("-m"))
+    {
         eprintln!(
             "[llmman] {name}: the --model after -- wins over --model {model}, the one llmman resolved"
         );
@@ -460,6 +475,11 @@ const INTEGRATIONS: &[Integration] = &[
         binary: "qwen",
     },
     Integration {
+        name: "dsh",
+        description: "DeepSeek Harness",
+        binary: "dsh",
+    },
+    Integration {
         name: "goose",
         description: "Block goose",
         binary: "goose",
@@ -559,6 +579,7 @@ fn launch(
         "hermes" => launch_hermes(model, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
         "qwen" => launch_qwen(model, api_key, extra_args),
+        "dsh" => launch_dsh(model, api_key, extra_args),
         "goose" => launch_goose(model, api_key, extra_args),
         other => anyhow::bail!(
             "unknown integration {:?}\nRun 'llmman launch' without arguments to list supported integrations.",
@@ -1488,6 +1509,177 @@ fn goose_fallback(home: &Path) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// dsh (DeepSeek Harness)
+// ---------------------------------------------------------------------------
+
+/// The env var dsh's generated provider entry reads its key from, so no
+/// key value is ever written to disk (same role as `QWEN_ENV_KEY`).
+const DSH_API_KEY_ENV: &str = "LLMMAN_API_KEY";
+
+/// dsh: unlike qwen/hermes/codex above, nothing here merges into a file
+/// dsh reads by default. dsh's own `--patch` overlay mechanism lets both
+/// files live under llmman's own config dir and be rewritten in full on
+/// every launch, without ever touching the user's real `$DSH_HOME`.
+///
+/// Defaults to the `web` profile, but a caller-supplied `--profile`
+/// after `--` wins instead — e.g. `--profile headless "<task>"` for a
+/// one-shot, scriptable run, the same way every other flag here already
+/// yields to what the caller explicitly asked for.
+///
+/// Both files sit at one fixed path, rewritten in place per launch:
+/// dsh hot-reloads the settings document, so two *concurrent* launches
+/// naming different models would retarget each other — accepted
+/// deliberately, since a per-launch directory costs a cleanup hook on
+/// every exit path (signals included) for a case that needs two
+/// simultaneous sessions on different models to bite at all.
+fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let launcher = dsh_launcher(extra_args);
+    if has_flag(launcher.args, "--patch", None) {
+        anyhow::bail!("llmman launch dsh manages --patch itself; pass other dsh flags after --");
+    }
+    if let Some(command) = launcher.command {
+        anyhow::bail!(
+            "dsh's `{command}` command cannot be combined with the --patch llmman passes it.\n\
+             Select a profile with `--profile {}` instead, or omit it for the default.",
+            if command == "web" { "web" } else { "<name>" }
+        );
+    }
+    let bin = find_on_path("dsh").ok_or_else(|| anyhow::anyhow!("dsh is not installed"))?;
+
+    let dir = dsh_config_dir()?;
+    let settings_path = dir.join("settings.yaml");
+    write_dsh_settings(&settings_path, model)?;
+    let patch_path = dir.join("llmman.cordis.yml");
+    write_dsh_patch(&patch_path, &settings_path)?;
+
+    exec_with_env(
+        &bin,
+        &dsh_args(&patch_path, extra_args),
+        &[(DSH_API_KEY_ENV, api_key)],
+    )
+}
+
+/// The tokens dsh reads as its own launcher flags, rather than forwards
+/// to the selected profile's app. Verified against dsh 0.1.2-rc.1: it
+/// stops at `--`, and also at the first token that isn't one of its own
+/// options — `--dump-config sometask --patch <file>` reports `--patch`
+/// and the file as app arguments and never reads it.
+///
+/// Scanning past either boundary reads app arguments as launcher ones:
+/// an app-level `--profile` would count as a profile selection and drop
+/// the default `web`, and an app-level `--patch` would be refused here
+/// as though it were ours to manage. (The app may well reject that
+/// token itself — headless answers `unknown option '--patch'` — but
+/// that is dsh's own argument to make, in its own words.)
+///
+/// `--profile`/`--patch` are the two that take a value, which has to be
+/// stepped over so it isn't mistaken for the first app argument; every
+/// other dsh option (`--dump-config`, `--version`, ...) is a bare flag.
+fn dsh_launcher(extra_args: &[String]) -> DshLauncher<'_> {
+    let mut end = 0;
+    let mut command = None;
+    while let Some(arg) = extra_args.get(end) {
+        if arg == "--" {
+            break;
+        }
+        end += match arg.as_str() {
+            // The two that take a value: step over it as well, so a
+            // profile or path isn't read as a command or as the first
+            // app argument (`--profile web`'s value is not the `web`
+            // command).
+            "--profile" | "--patch" => 2,
+            // dsh's command spellings, which it refuses to combine with
+            // any parent option — "web takes none of parent --profile,
+            // --patch, ..." — so no argument order pairs one with the
+            // `--patch` this injects.
+            found @ ("web" | "plugin") => {
+                command = command.or(Some(found));
+                1
+            }
+            _ if arg.starts_with('-') => 1,
+            // Anything else is dsh's first app argument.
+            _ => break,
+        };
+    }
+    DshLauncher {
+        args: &extra_args[..end.min(extra_args.len())],
+        command,
+    }
+}
+
+/// dsh's own launcher section: the tokens it reads rather than forwards,
+/// and the command spelling inside them, if any.
+struct DshLauncher<'a> {
+    args: &'a [String],
+    command: Option<&'a str>,
+}
+
+/// The argv dsh is invoked with. `--patch` is always injected; the
+/// default `web` profile is omitted when the caller already named one
+/// (however spelled) after `--`, so `--profile headless "task"` selects
+/// dsh's real one-shot mode instead of being appended onto `web`, which
+/// does not accept it.
+fn dsh_args(patch_path: &Path, extra_args: &[String]) -> Vec<String> {
+    let mut args = Vec::new();
+    if !has_flag(dsh_launcher(extra_args).args, "--profile", None) {
+        args.push("web".to_string());
+    }
+    args.push("--patch".to_string());
+    args.push(patch_path.to_string_lossy().into_owned());
+    args.extend_from_slice(extra_args);
+    args
+}
+
+/// `~/.config/llmman/launch/dsh`. Derived from `llmman.conf`'s own
+/// directory rather than rebuilt by hand, so the two cannot drift.
+/// dsh never looks here on its own; only `--patch` points it there.
+fn dsh_config_dir() -> anyhow::Result<PathBuf> {
+    let conf = crate::config::user_path().context("no home directory")?;
+    let dir = conf.parent().context("llmman.conf has no directory")?;
+    Ok(dir.join("launch").join("dsh"))
+}
+
+/// The settings document `llmman.cordis.yml` points dsh at: registers
+/// `llmman` as an `llm-pi-ai` provider route at this daemon's `/v1`, and
+/// selects it as the `agent-default-model`.
+fn write_dsh_settings(path: &Path, model: &str) -> anyhow::Result<()> {
+    let quoted_model = yaml_quote(model);
+    let base_url = yaml_quote(&format!("{}/v1", daemon::server()));
+    let contents = format!(
+        "# Written by `llmman launch dsh`; edits are overwritten.\n\
+         agent-default-model:\n  provider: llmman\n  model: {quoted_model}\n\
+         llm-pi-ai:\n  providers:\n    llmman:\n      displayName: llmman\n      \
+         apiKeyEnv: {DSH_API_KEY_ENV}\n      api: openai-completions\n      baseURL: {base_url}\n      \
+         models:\n        - id: {quoted_model}\n          name: {quoted_model}\n          input: [text]\n"
+    );
+    write_dsh_file(path, &contents)
+}
+
+/// dsh's patch shape: points its `settings` provider at the document above.
+fn write_dsh_patch(path: &Path, settings_path: &Path) -> anyhow::Result<()> {
+    write_dsh_file(path, &dsh_patch_document(settings_path))
+}
+
+/// Split from `write_dsh_patch` so a test can render a Windows-shaped
+/// path on any platform: `yaml_quote` escapes the `\` separators, and
+/// forgetting that is what once turned the Windows leg red.
+fn dsh_patch_document(settings_path: &Path) -> String {
+    let quoted_settings_path = yaml_quote(&settings_path.to_string_lossy());
+    format!(
+        "# Written by `llmman launch dsh`; edits are overwritten.\n\
+         - id: settings\n  config:\n    path: {quoted_settings_path}\n"
+    )
+}
+
+fn write_dsh_file(path: &Path, contents: &str) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    crate::fsutil::write_atomic(path, contents.as_bytes())
+        .with_context(|| format!("write {}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
 // Process execution helper
 // ---------------------------------------------------------------------------
 
@@ -1631,6 +1823,12 @@ mod tests {
             assert!(check_model_flag(id, Some("m"), None, &forwarded).is_ok());
         }
         assert!(check_model_flag("claude", None, None, &none).is_ok());
+        // The "yours wins" warning is only claimed for launchers that
+        // actually yield to it; dsh has no `--model` flag to yield to.
+        for id in MODEL_FLAG_FORWARDED {
+            assert!(MODEL_REQUIRED.contains(id), "{id} is not model-required");
+        }
+        assert!(!MODEL_FLAG_FORWARDED.contains(&"dsh"));
     }
 
     /// The only configuration goose gets: a wrong or missing one sends
@@ -2191,6 +2389,233 @@ model = \"gpt-5\"
         assert!(
             profile.get("openai_base_url").is_none(),
             "the built-in openai provider is not the one in use"
+        );
+    }
+
+    /// A shortname like `qwen3.5:0.8b` must round-trip quoted, or the
+    /// `:` breaks YAML parsing; the key must never appear literally.
+    #[test]
+    fn write_dsh_settings_points_at_llmman_with_the_key_in_the_environment() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-dsh-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("settings.yaml");
+        write_dsh_settings(&path, "qwen3.5:0.8b").unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("provider: llmman"));
+        assert!(contents.contains("model: \"qwen3.5:0.8b\""));
+        assert!(contents.contains(&format!("apiKeyEnv: {DSH_API_KEY_ENV}")));
+        assert!(contents.contains("api: openai-completions"));
+        assert!(contents.contains(&format!("baseURL: \"{}/v1\"", daemon::server())));
+        assert!(contents.contains("id: \"qwen3.5:0.8b\""));
+        assert!(!contents.contains("apiKey:"), "no literal key in the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_dsh_patch_names_the_settings_document() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-dsh-patch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let settings_path = dir.join("settings.yaml");
+        let patch_path = dir.join("llmman.cordis.yml");
+        write_dsh_patch(&patch_path, &settings_path).unwrap();
+        let contents = std::fs::read_to_string(&patch_path).unwrap();
+        assert!(contents.contains("id: settings"));
+        // Through `yaml_quote`, not the raw path: on Windows a path's
+        // `\` separators are escaped in the document, so the raw string
+        // never matches (a real red Windows CI leg).
+        assert!(contents.contains(&format!(
+            "path: {}",
+            yaml_quote(&settings_path.to_string_lossy())
+        )));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A Windows-shaped path on every platform, so the escaping this
+        // depends on is covered without needing the Windows CI leg to
+        // be the thing that catches it (which is how it was caught).
+        let win = Path::new(r"C:\Users\hb\.config\llmman\launch\dsh\settings.yaml");
+        let rendered = dsh_patch_document(win);
+        assert!(rendered.contains(r#"path: "C:\\Users\\hb\\"#), "{rendered}");
+        assert!(!rendered.contains(r#"path: "C:\Users"#), "{rendered}");
+    }
+
+    /// Past dsh's own `--` boundary, a token is an app argument rather
+    /// than a launcher flag (verified against dsh 0.1.2-rc.1), so
+    /// neither check may scan there: a task whose text is `--patch`
+    /// must not be refused, and one reading `--profile` must not
+    /// suppress the default `web`.
+    #[test]
+    fn dsh_checks_stop_at_dshs_own_argument_boundary() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Asserted on the boundary helper, never by calling `launch_dsh`
+        // itself: past the refusal it goes on to exec dsh and
+        // `std::process::exit`, which on a machine that has dsh
+        // installed would take the test runner with it.
+        let forwarded_patch = args(&["--profile", "headless", "--", "--patch"]);
+        assert_eq!(
+            dsh_launcher(&forwarded_patch).args,
+            args(&["--profile", "headless"])
+        );
+        assert!(!has_flag(
+            dsh_launcher(&forwarded_patch).args,
+            "--patch",
+            None
+        ));
+
+        let forwarded_profile = args(&["--", "--profile", "headless"]);
+        assert!(dsh_launcher(&forwarded_profile).args.is_empty());
+        assert_eq!(
+            dsh_args(Path::new("/p.yml"), &forwarded_profile),
+            ["web", "--patch", "/p.yml", "--", "--profile", "headless"]
+        );
+
+        // The same boundary without a `--`: dsh stops at the first
+        // token of its own it doesn't recognize, so a task's wording
+        // is app text, not flags. `--profile headless` before it is
+        // still dsh's, value stepped over rather than read as the
+        // first app argument.
+        let task_mentions_patch = args(&["--profile", "headless", "explain", "the", "--patch"]);
+        assert_eq!(
+            dsh_launcher(&task_mentions_patch).args,
+            args(&["--profile", "headless"])
+        );
+        assert!(!has_flag(
+            dsh_launcher(&task_mentions_patch).args,
+            "--patch",
+            None
+        ));
+
+        // An app-level `--profile` past that boundary must not suppress
+        // the default `web`.
+        let app_level_profile = args(&["sometask", "--profile", "headless"]);
+        assert!(dsh_launcher(&app_level_profile).args.is_empty());
+        assert_eq!(
+            dsh_args(Path::new("/p.yml"), &app_level_profile),
+            [
+                "web",
+                "--patch",
+                "/p.yml",
+                "sometask",
+                "--profile",
+                "headless"
+            ]
+        );
+
+        // Bare flags take no value, and the `=`-joined spelling is dsh's
+        // own either way.
+        assert_eq!(
+            dsh_launcher(&args(&["--dump-config", "task"])).args,
+            args(&["--dump-config"])
+        );
+        assert_eq!(
+            dsh_launcher(&args(&["--profile=headless", "task"])).args,
+            args(&["--profile=headless"])
+        );
+
+        // dsh's command spellings are found where dsh itself reads them
+        // (before any app argument), so `launch_dsh` can refuse them up
+        // front: dsh rejects a command combined with a parent --patch,
+        // which this always injects (verified against 0.1.2-rc.1).
+        for command in ["web", "plugin"] {
+            let via_command = args(&[command, "--port", "8080"]);
+            assert_eq!(dsh_launcher(&via_command).command, Some(command));
+            let err = launch_dsh("m", "k", &via_command).unwrap_err();
+            assert!(err.to_string().contains("--profile"), "{err}");
+        }
+        // `--profile web`'s *value* is not the `web` command — refusing
+        // it would break the most ordinary explicit invocation there is
+        // (a real bug this caught, found only by running it).
+        let profile_web = args(&["--profile", "web", "--no-open"]);
+        assert_eq!(dsh_launcher(&profile_web).command, None);
+        assert_eq!(
+            dsh_args(Path::new("/p.yml"), &profile_web),
+            ["--patch", "/p.yml", "--profile", "web", "--no-open"]
+        );
+        // Same for a patch path that happens to be named `web`.
+        assert_eq!(dsh_launcher(&args(&["--patch", "web"])).command, None);
+        // Past the boundary it is app text, not a command.
+        assert_eq!(dsh_launcher(&args(&["sometask", "web"])).command, None);
+
+        // All launcher flags, no app arguments: the whole slice is dsh's.
+        let plain = args(&["--profile", "headless"]);
+        assert_eq!(dsh_launcher(&plain).args, plain);
+        // A value-taking flag with its value missing must not run past
+        // the end of the slice.
+        assert_eq!(
+            dsh_launcher(&args(&["--profile"])).args,
+            args(&["--profile"])
+        );
+    }
+
+    /// A caller-supplied `--patch` after `--` must be refused, however spelled.
+    #[test]
+    fn launch_dsh_refuses_a_conflicting_patch_flag() {
+        let word = vec!["--patch".to_string(), "/tmp/x.yml".to_string()];
+        let err = launch_dsh("m", "k", &word).unwrap_err();
+        assert!(err.to_string().contains("--patch"), "{err}");
+        let joined = vec!["--patch=/tmp/x.yml".to_string()];
+        let err = launch_dsh("m", "k", &joined).unwrap_err();
+        assert!(err.to_string().contains("--patch"), "{err}");
+    }
+
+    /// dsh carries a real key per launch, unlike hermes, so it belongs
+    /// on neither `--provider` refusal list.
+    #[test]
+    fn dsh_is_a_real_integration_and_not_on_a_provider_refusal_list() {
+        assert!(INTEGRATIONS.iter().any(|i| i.name == "dsh"));
+        assert!(!PROVIDER_UNSUPPORTED.iter().any(|(id, _)| *id == "dsh"));
+        assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"dsh"));
+    }
+
+    /// A caller-supplied `--profile` (however spelled) must win over the
+    /// default `web`, since `web` doesn't accept `--profile` at all;
+    /// `--patch` is injected either way and nothing else is reordered.
+    #[test]
+    fn dsh_args_defaults_to_web_but_yields_to_a_caller_supplied_profile() {
+        let path = Path::new("/tmp/x/llmman.cordis.yml");
+        let none: Vec<String> = vec![];
+        assert_eq!(
+            dsh_args(path, &none),
+            ["web", "--patch", "/tmp/x/llmman.cordis.yml"]
+        );
+
+        let headless = vec![
+            "--profile".to_string(),
+            "headless".to_string(),
+            "hi".to_string(),
+        ];
+        assert_eq!(
+            dsh_args(path, &headless),
+            [
+                "--patch",
+                "/tmp/x/llmman.cordis.yml",
+                "--profile",
+                "headless",
+                "hi"
+            ]
+        );
+
+        let joined = vec!["--profile=headless".to_string(), "hi".to_string()];
+        assert_eq!(
+            dsh_args(path, &joined),
+            [
+                "--patch",
+                "/tmp/x/llmman.cordis.yml",
+                "--profile=headless",
+                "hi"
+            ]
         );
     }
 
