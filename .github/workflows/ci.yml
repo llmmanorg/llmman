@@ -834,22 +834,56 @@ jobs:
         run: |
           & ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -SkipSetup
 
-      # goose has no npm package either (a Rust binary via download_cli.sh),
-      # so install_cli above can't reach it. Pinned for the same reason
-      # qwen/openclaw are: its default `stable` channel would otherwise
-      # move under tests/launch_e2e.rs's goose invocation. CONFIGURE=false
-      # skips the `goose configure` wizard — `llmman launch goose`
-      # configures goose through the environment and never reads its file.
+      # goose has no npm package (a Rust binary via download_cli.sh), so
+      # install_cli above can't reach it. The pin has to be
+      # GOOSE_VERSION, not the tag the script is fetched from: the script
+      # resolves its own download tag, and installs `stable` without it.
+      # GOOSE_BIN_DIR because its default differs on Windows
+      # ($USERPROFILE/goose) and $GITHUB_PATH below names one directory.
+      # CONFIGURE=false skips the `goose configure` wizard, which a launch
+      # configured through the environment never needs. Retried like
+      # install_cli: `release` needs this job, so a GitHub-releases blip
+      # must not block a release.
       #
-      # Warns rather than fails: goose publishes no aarch64-pc-windows
-      # asset at v1.50.0, so there is nothing to install on that leg and
-      # launch_goose_with_model skips itself there.
+      # Two legs can't install goose and warn instead of failing:
+      # aarch64-pc-windows (no asset at v1.50.0) and Windows bash without
+      # `unzip` (the script's only way to extract). Both leave
+      # launch_goose_with_model to skip itself; elsewhere a failed install
+      # fails the job rather than going silently untested.
       - name: Install goose (e2e)
         shell: bash
         run: |
-          curl -fsSL https://github.com/aaif-goose/goose/releases/download/v1.50.0/download_cli.sh \
-            | CONFIGURE=false bash || echo "::warning::goose install failed on ${{ runner.os }} ${{ runner.arch }}"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          set -o pipefail
+          bin_dir="$HOME/.local/bin"
+
+          if [ "${{ matrix.target }}" = "aarch64-pc-windows-msvc" ]; then
+            echo "::warning::skipping goose: no aarch64-pc-windows asset at v1.50.0"
+            exit 0
+          fi
+          if [ "${{ runner.os }}" = "Windows" ] && ! command -v unzip >/dev/null 2>&1; then
+            echo "::warning::skipping goose: download_cli.sh extracts with unzip, which this bash does not have"
+            exit 0
+          fi
+
+          max_attempts=6
+          for attempt in $(seq 1 "$max_attempts"); do
+            next="retrying"
+            [ "$attempt" -eq "$max_attempts" ] && next="giving up"
+            if ! curl -fsSL https://github.com/aaif-goose/goose/releases/download/v1.50.0/download_cli.sh \
+              | GOOSE_VERSION=v1.50.0 GOOSE_BIN_DIR="$bin_dir" CONFIGURE=false bash; then
+              echo "::warning::goose install failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next"
+            elif version_output=$("$bin_dir/goose" --version 2>&1); then
+              echo "$bin_dir" >> "$GITHUB_PATH"
+              exit 0
+            else
+              echo "::warning::goose installed but \"goose --version\" failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next — output: $version_output"
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              sleep "$((2 ** (attempt - 1)))"
+            fi
+          done
+          echo "::error::goose never produced a working binary on ${{ runner.os }} ${{ runner.arch }} after $max_attempts attempts"
+          exit 1
 
       # opencode installs its configured provider's npm package (here
       # @ai-sdk/openai-compatible — see launch::opencode_config) on demand

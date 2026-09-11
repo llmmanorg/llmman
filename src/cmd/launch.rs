@@ -1449,9 +1449,9 @@ fn launch_goose(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Re
     exec_with_env(&bin, extra_args, &goose_env(model, api_key, &host))
 }
 
-/// Split out so what goose is handed can be asserted without running it:
-/// [`exec_with_env`] never returns, so a test calling [`launch_goose`]
-/// would take the test runner with it.
+/// Split out so a test can assert what goose is handed: [`exec_with_env`]
+/// never returns, so calling [`launch_goose`] would take the test runner
+/// with it.
 fn goose_env<'a>(model: &'a str, api_key: &'a str, host: &'a str) -> Vec<(&'a str, &'a str)> {
     let mut env = vec![
         ("GOOSE_PROVIDER", "openai"),
@@ -1471,12 +1471,20 @@ fn find_goose() -> Option<PathBuf> {
 }
 
 /// goose's own installer target: `download_cli.sh` writes to
-/// `~/.local/bin` without putting it on `PATH`, so a machine that has
-/// goose would otherwise be reported as not having it.
+/// `$GOOSE_BIN_DIR` without putting it on `PATH`. Its default is
+/// `$USERPROFILE/goose` on Windows (what `dirs::home_dir` returns there)
+/// and `~/.local/bin` elsewhere; Windows probes both, since goose's
+/// install instructions and this repo's CI pass the latter (v1.50.0).
 fn goose_fallback(home: &Path) -> Option<PathBuf> {
     let bin = if cfg!(windows) { "goose.exe" } else { "goose" };
-    let p = home.join(".local").join("bin").join(bin);
-    p.exists().then_some(p)
+    let mut candidates = Vec::new();
+    if cfg!(windows) {
+        candidates.push(home.join("goose").join(bin));
+    }
+    candidates.push(home.join(".local").join("bin").join(bin));
+    // is_file, not exists: a directory of that name would be reported as
+    // installed and then fail to spawn.
+    candidates.into_iter().find(|p| p.is_file())
 }
 
 // ---------------------------------------------------------------------------
@@ -1653,25 +1661,39 @@ mod tests {
     }
 
     /// `download_cli.sh`'s target is off `PATH` on a fresh shell, so this
-    /// fallback is the one that fires for most installs.
+    /// fallback is the one that fires for most installs — at every
+    /// directory that installer writes to, Windows included.
     #[test]
     fn goose_fallback_finds_the_installers_target() {
-        let home = std::env::temp_dir().join(format!(
-            "llmman-goose-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let bin = home.join(".local").join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        assert_eq!(goose_fallback(&home), None);
-        let goose = bin.join(if cfg!(windows) { "goose.exe" } else { "goose" });
-        std::fs::write(&goose, "").unwrap();
-        assert_eq!(goose_fallback(&home), Some(goose));
-        assert_eq!(goose_fallback(&home.join("nowhere")), None);
-        let _ = std::fs::remove_dir_all(&home);
+        let name = if cfg!(windows) { "goose.exe" } else { "goose" };
+        let dirs: &[&[&str]] = if cfg!(windows) {
+            &[&["goose"], &[".local", "bin"]]
+        } else {
+            &[&[".local", "bin"]]
+        };
+        for (i, parts) in dirs.iter().enumerate() {
+            let home = std::env::temp_dir().join(format!(
+                "llmman-goose-{}-{}-{i}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let bin = parts.iter().fold(home.clone(), |p, part| p.join(part));
+            std::fs::create_dir_all(&bin).unwrap();
+            assert_eq!(goose_fallback(&home), None);
+            let goose = bin.join(name);
+            // A directory of that name is not the binary: returning it
+            // would report goose as installed and then fail to spawn.
+            std::fs::create_dir(&goose).unwrap();
+            assert_eq!(goose_fallback(&home), None);
+            std::fs::remove_dir(&goose).unwrap();
+            std::fs::write(&goose, "").unwrap();
+            assert_eq!(goose_fallback(&home), Some(goose));
+            assert_eq!(goose_fallback(&home.join("nowhere")), None);
+            let _ = std::fs::remove_dir_all(&home);
+        }
     }
 
     /// The found directory goes in front of `PATH` only when it is not

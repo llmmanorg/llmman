@@ -907,9 +907,9 @@ fn launch_goose_with_model() {
         eprintln!("skipping: llama-server not on PATH (required to serve any model)");
         return;
     }
-    // Skipped rather than failed, unlike the npm CLIs: goose publishes no
-    // aarch64-pc-windows asset (v1.50.0), so there is nothing for ci.yml
-    // to install on that leg.
+    // Skipped rather than failed, unlike the npm CLIs: ci.yml can't
+    // install goose on aarch64-pc-windows (no asset at v1.50.0) or on a
+    // Windows runner whose bash has no `unzip` — see its own comment.
     if !on_path("goose") {
         eprintln!("skipping: goose not on PATH — https://github.com/aaif-goose/goose");
         return;
