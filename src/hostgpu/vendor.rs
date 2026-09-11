@@ -14,7 +14,7 @@ use std::os::raw::c_char;
 
 use libloading::{Library, Symbol};
 
-use super::{igpu_enabled, HostGpu};
+use super::{igpu_policy, HostGpu, IgpuPolicy};
 
 // ---------------------------------------------------------------------------
 // Dynamic library loading — one candidate list per backend/OS, mirroring
@@ -213,11 +213,16 @@ pub(super) fn detect_rocm() -> Option<u64> {
 // ---------------------------------------------------------------------------
 // Vulkan — mirrors vulkan/probe.c: vkCreateInstance,
 // vkEnumeratePhysicalDevices, vkGetPhysicalDeviceProperties (skip
-// VK_PHYSICAL_DEVICE_TYPE_CPU always, and _INTEGRATED_GPU unless
-// LLMMAN_IGPU_ENABLE is set — llmman's own addition, not in probe.c —
-// and require apiVersion >= 1.2),
+// VK_PHYSICAL_DEVICE_TYPE_CPU always, and require apiVersion >= 1.2),
 // vkGetPhysicalDeviceQueueFamilyProperties (require a queue family with
 // both COMPUTE and TRANSFER bits set).
+//
+// llmman's own addition, not in probe.c: _INTEGRATED_GPU devices are
+// tallied separately from everything else and folded in per
+// `LLMMAN_IGPU_ENABLE` (see `super::IgpuPolicy`) — by default only when
+// no discrete GPU passed, so an iGPU-only host still gets Vulkan rather
+// than CPU, while a host with both doesn't have its VRAM total inflated
+// by the iGPU's shared-memory heap. See `combine_vulkan_devices`.
 // ---------------------------------------------------------------------------
 
 const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: i32 = 1;
@@ -305,6 +310,27 @@ pub(super) fn detect_vulkan() -> Option<u64> {
     unsafe { detect_vulkan_inner(&lib).unwrap_or(None) }
 }
 
+/// Folds the two per-type VRAM tallies `detect_vulkan_inner` builds —
+/// `discrete` for every usable non-integrated device (discrete, virtual,
+/// other), `integrated` for every usable `_INTEGRATED_GPU` — into the
+/// probe's single result per `policy`. `None` on either side means no
+/// device of that kind passed the filters; `Some(0)` means one did but
+/// advertised no `DEVICE_LOCAL` heap, which still counts as a usable GPU.
+fn combine_vulkan_devices(
+    policy: IgpuPolicy,
+    discrete: Option<u64>,
+    integrated: Option<u64>,
+) -> Option<u64> {
+    match policy {
+        IgpuPolicy::Fallback => discrete.or(integrated),
+        IgpuPolicy::Never => discrete,
+        IgpuPolicy::Always => match (discrete, integrated) {
+            (None, None) => None,
+            (d, i) => Some(d.unwrap_or(0) + i.unwrap_or(0)),
+        },
+    }
+}
+
 unsafe fn detect_vulkan_inner(lib: &Library) -> Option<Option<u64>> {
     let vk_create_instance: Symbol<
         unsafe extern "C" fn(*const VkInstanceCreateInfo, *const c_void, *mut VkInstance) -> i32,
@@ -351,7 +377,9 @@ unsafe fn detect_vulkan_inner(lib: &Library) -> Option<Option<u64>> {
         if vk_enumerate_physical_devices(instance, &mut count, devices.as_mut_ptr()) != VK_SUCCESS {
             None
         } else {
-            let mut found: Option<u64> = None;
+            let policy = igpu_policy();
+            let mut discrete: Option<u64> = None;
+            let mut integrated: Option<u64> = None;
             for &device in &devices {
                 let mut props_buf = RawPhysicalDeviceProperties([0u8; 1024]);
                 vk_get_physical_device_properties(device, props_buf.0.as_mut_ptr());
@@ -361,7 +389,8 @@ unsafe fn detect_vulkan_inner(lib: &Library) -> Option<Option<u64>> {
                 if device_type == VK_PHYSICAL_DEVICE_TYPE_CPU {
                     continue;
                 }
-                if device_type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && !igpu_enabled() {
+                let is_igpu = device_type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+                if is_igpu && policy == IgpuPolicy::Never {
                     continue;
                 }
                 if api_version < vk_make_api_version(0, 1, 2, 0) {
@@ -405,9 +434,14 @@ unsafe fn detect_vulkan_inner(lib: &Library) -> Option<Option<u64>> {
                     .filter(|h| h.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT != 0)
                     .map(|h| h.size)
                     .sum();
-                found = Some(found.unwrap_or(0) + vram);
+                let tally = if is_igpu {
+                    &mut integrated
+                } else {
+                    &mut discrete
+                };
+                *tally = Some(tally.unwrap_or(0) + vram);
             }
-            found
+            combine_vulkan_devices(policy, discrete, integrated)
         }
     };
 
@@ -431,6 +465,51 @@ mod tests {
         // VK_API_VERSION_1_2 per vulkan_core.h: VK_MAKE_API_VERSION(0, 1, 2, 0)
         assert_eq!(vk_make_api_version(0, 1, 2, 0), (1 << 22) | (2 << 12));
         assert_eq!(vk_make_api_version(0, 1, 0, 0), 1 << 22);
+    }
+
+    const DGPU: u64 = 16 << 30;
+    const IGPU: u64 = 8 << 30;
+
+    /// The bug this guards against: an iGPU-only host (nothing discrete,
+    /// no CUDA/ROCm) with `LLMMAN_IGPU_ENABLE` unset used to fall all the
+    /// way through to CPU. By default it must now be picked up as Vulkan.
+    #[test]
+    fn fallback_policy_uses_the_igpu_only_when_nothing_discrete_passed() {
+        let p = IgpuPolicy::Fallback;
+        assert_eq!(combine_vulkan_devices(p, None, Some(IGPU)), Some(IGPU));
+        // A usable iGPU with no DEVICE_LOCAL heap is still a GPU.
+        assert_eq!(combine_vulkan_devices(p, None, Some(0)), Some(0));
+        // A discrete GPU wins outright; the iGPU's shared-memory heap
+        // must not be summed into the VRAM total.
+        assert_eq!(
+            combine_vulkan_devices(p, Some(DGPU), Some(IGPU)),
+            Some(DGPU)
+        );
+        assert_eq!(combine_vulkan_devices(p, Some(DGPU), None), Some(DGPU));
+        assert_eq!(combine_vulkan_devices(p, None, None), None);
+    }
+
+    #[test]
+    fn always_policy_counts_the_igpu_alongside_a_discrete_one() {
+        let p = IgpuPolicy::Always;
+        assert_eq!(
+            combine_vulkan_devices(p, Some(DGPU), Some(IGPU)),
+            Some(DGPU + IGPU)
+        );
+        assert_eq!(combine_vulkan_devices(p, None, Some(IGPU)), Some(IGPU));
+        assert_eq!(combine_vulkan_devices(p, Some(DGPU), None), Some(DGPU));
+        assert_eq!(combine_vulkan_devices(p, None, None), None);
+    }
+
+    #[test]
+    fn never_policy_ignores_the_igpu_entirely() {
+        let p = IgpuPolicy::Never;
+        assert_eq!(combine_vulkan_devices(p, None, Some(IGPU)), None);
+        assert_eq!(
+            combine_vulkan_devices(p, Some(DGPU), Some(IGPU)),
+            Some(DGPU)
+        );
+        assert_eq!(combine_vulkan_devices(p, None, None), None);
     }
 
     /// Exercises the real dynamic-loaded CUDA/HIP/Vulkan probes against

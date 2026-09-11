@@ -96,20 +96,43 @@ fn parse_llm_library(value: Option<&str>) -> Option<HostGpu> {
     }
 }
 
-/// Whether integrated GPUs count during Vulkan probing, from
-/// `LLMMAN_IGPU_ENABLE` (mirrors Ollama's `OLLAMA_IGPU_ENABLE`).
-/// Defaults to disabled, same as Ollama — an integrated GPU is usually a
-/// worse pick than the discrete/CPU fallback.
-pub fn igpu_enabled() -> bool {
-    parse_igpu_enabled(std::env::var("LLMMAN_IGPU_ENABLE").ok().as_deref())
+/// How the Vulkan probe treats a `VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU`
+/// device — see [`igpu_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IgpuPolicy {
+    /// The default: an integrated GPU counts only when no discrete GPU
+    /// passed the probe. A laptop/APU whose only GPU is integrated
+    /// (Intel Arc/Iris, AMD Radeon 780M/8060S, ...) therefore lands on
+    /// the Vulkan build instead of falling all the way through to CPU —
+    /// llama.cpp's Vulkan backend on such a part is a large win over
+    /// CPU inference, not the "worse than CPU" it was once assumed to
+    /// be. When a discrete GPU *is* present the iGPU is still skipped,
+    /// so its shared-system-memory heap doesn't inflate the VRAM total.
+    Fallback,
+    /// Integrated GPUs always count, even alongside a discrete one, and
+    /// their memory is summed into the reported VRAM.
+    Always,
+    /// Integrated GPUs never count — the pre-`Fallback` default.
+    Never,
 }
 
-fn parse_igpu_enabled(value: Option<&str>) -> bool {
-    match value.map(str::trim) {
-        Some(v) if !v.is_empty() => {
-            matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-        }
-        _ => false,
+/// How integrated GPUs are treated during Vulkan probing, from
+/// `LLMMAN_IGPU_ENABLE` (named after Ollama's `OLLAMA_IGPU_ENABLE`).
+/// Unset, blank, or unrecognized → [`IgpuPolicy::Fallback`]; a truthy
+/// `1`/`true`/`yes`/`on` → [`IgpuPolicy::Always`]; a falsy
+/// `0`/`false`/`no`/`off` → [`IgpuPolicy::Never`]. Case-insensitive.
+pub fn igpu_policy() -> IgpuPolicy {
+    parse_igpu_policy(std::env::var("LLMMAN_IGPU_ENABLE").ok().as_deref())
+}
+
+fn parse_igpu_policy(value: Option<&str>) -> IgpuPolicy {
+    let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return IgpuPolicy::Fallback;
+    };
+    match v.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => IgpuPolicy::Always,
+        "0" | "false" | "no" | "off" => IgpuPolicy::Never,
+        _ => IgpuPolicy::Fallback,
     }
 }
 
@@ -439,17 +462,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_igpu_enabled_recognizes_truthy_spellings_only() {
-        assert!(!parse_igpu_enabled(None));
-        assert!(!parse_igpu_enabled(Some("")));
-        assert!(!parse_igpu_enabled(Some("0")));
-        assert!(!parse_igpu_enabled(Some("false")));
-        assert!(!parse_igpu_enabled(Some("no")));
-        assert!(!parse_igpu_enabled(Some("off")));
-        assert!(parse_igpu_enabled(Some("1")));
-        assert!(parse_igpu_enabled(Some("true")));
-        assert!(parse_igpu_enabled(Some("YES")));
-        assert!(parse_igpu_enabled(Some("on")));
+    fn parse_igpu_policy_defaults_to_fallback_when_unset_blank_or_unknown() {
+        assert_eq!(parse_igpu_policy(None), IgpuPolicy::Fallback);
+        assert_eq!(parse_igpu_policy(Some("")), IgpuPolicy::Fallback);
+        assert_eq!(parse_igpu_policy(Some("   ")), IgpuPolicy::Fallback);
+        assert_eq!(parse_igpu_policy(Some("maybe")), IgpuPolicy::Fallback);
+    }
+
+    #[test]
+    fn parse_igpu_policy_recognizes_truthy_and_falsy_spellings_case_insensitively() {
+        for v in ["1", "true", "YES", "on", " On "] {
+            assert_eq!(parse_igpu_policy(Some(v)), IgpuPolicy::Always, "{v:?}");
+        }
+        for v in ["0", "false", "NO", "off", " Off "] {
+            assert_eq!(parse_igpu_policy(Some(v)), IgpuPolicy::Never, "{v:?}");
+        }
     }
 
     #[test]

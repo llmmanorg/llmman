@@ -16,9 +16,13 @@ already exists for the model format it finds, and runs it unmodified.
 
 ## llama.cpp
 
-A `llama-server` on `PATH` is used as-is. Otherwise llmman probes for
+A `llama-server` on `PATH` is used as-is (whatever backend it was built
+with — a CPU-only one stays CPU-only). Otherwise llmman probes for
 CUDA, ROCm, Vulkan or Metal (in that order) and downloads the matching
-prebuilt release from llama.cpp's GitHub releases. `LLMMAN_LLM_LIBRARY`
+prebuilt release from llama.cpp's GitHub releases. The Vulkan probe
+prefers a discrete GPU but falls back to an integrated one when that is
+all the machine has (see `LLMMAN_IGPU_ENABLE` in
+[configuration.md](configuration.md) to change that). `LLMMAN_LLM_LIBRARY`
 overrides the probe; `LLMMAN_DEBUG=1` shows what it found.
 
 `--llama-cpp-version <tag>` pins a release (and forces the managed

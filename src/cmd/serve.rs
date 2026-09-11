@@ -111,7 +111,7 @@ Environment Variables:
       LLMMAN_FLASH_ATTENTION         Enable flash attention
       LLMMAN_KV_CACHE_TYPE           Quantization type for the K/V cache (default: f16)
       LLMMAN_LLM_LIBRARY             Set backend (cpu/cuda/cuda13/rocm/vulkan/metal) to bypass GPU autodetection
-      LLMMAN_IGPU_ENABLE             Enable integrated GPUs
+      LLMMAN_IGPU_ENABLE             Integrated GPUs: unset uses one only when no discrete GPU is found, truthy always, falsy never
       LLMMAN_LOAD_TIMEOUT            How long to allow model loads to stall before giving up (default \"10m\")
       LLMMAN_VLLM_OMNI_GUARDRAILS    Keep a Diffusers-layout model's vLLM-Omni safety guardrails on (default: off)
       LLMMAN_TMPDIR                  Staging directory for llama-server release downloads
