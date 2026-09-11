@@ -519,7 +519,7 @@ fn no_servable_layer(model_ref: &str, manifest: &crate::storage::oci::Manifest) 
 }
 
 /// What [`resolve_model`] would resolve `model_ref` to, read off its
-/// manifest without extracting anything (for `--pull-oci`, which only
+/// manifest without extracting anything (for `serve --pull-only`, which only
 /// needs to know which engine's image to pull).
 pub fn stored_format(store_path: &Path, model_ref: &str) -> anyhow::Result<ModelFormat> {
     let store = OciStore::open(store_path)?;

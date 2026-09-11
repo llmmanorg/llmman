@@ -38,6 +38,7 @@ mod messages;
 mod ollama;
 mod openai;
 mod responses;
+pub mod runtime;
 mod sched;
 mod shell;
 mod stream;
@@ -45,10 +46,10 @@ mod types;
 mod webui;
 
 use backend::{
-    find_free_port, local_llama_server_bin, resolve_llama_server, spawn_llama_server,
-    spawn_mlx_server, spawn_vllm_omni_server, spawn_vllm_server, tail_child_output,
-    use_mlx_for_safetensors, vllm_max_model_len, vllm_omni_serve_args_from_env, vllm_serve_args,
-    wait_for_ready, OutputTail, POLL_INTERVAL,
+    find_free_port, local_llama_server_bin, spawn_llama_server, spawn_mlx_server,
+    spawn_vllm_omni_server, spawn_vllm_server, tail_child_output, use_mlx_for_safetensors,
+    vllm_max_model_len, vllm_omni_serve_args_from_env, vllm_serve_args, wait_for_ready, OutputTail,
+    POLL_INTERVAL,
 };
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
 pub use config::DEFAULT_CTX_SIZE;
@@ -69,6 +70,7 @@ use openai::{
     handle_openai_completions, handle_openai_embeddings, handle_openai_models,
     proxy_openai_generation, proxy_openai_passthrough, resolve_openai_request,
 };
+pub use runtime::Runtime;
 use sched::{
     begin_activity, default_keep_alive, reap_idle_models, refresh_activity, ActivityGuard,
 };
@@ -110,6 +112,7 @@ Environment Variables:
       LLMMAN_SCHED_SPREAD            Always schedule model across all GPUs
       LLMMAN_FLASH_ATTENTION         Enable flash attention
       LLMMAN_KV_CACHE_TYPE           Quantization type for the K/V cache (default: f16)
+      LLMMAN_RUNTIME                 Where the inference engine comes from: auto (default), docker, podman, bin or path — same as --runtime
       LLMMAN_LLM_LIBRARY             Set backend (cpu/cuda/cuda13/rocm/vulkan/metal) to bypass GPU autodetection
       LLMMAN_IGPU_ENABLE             Enable integrated GPUs
       LLMMAN_LOAD_TIMEOUT            How long to allow model loads to stall before giving up (default \"10m\")
@@ -127,75 +130,43 @@ pub struct ServeArgs {
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Run the inference engine in a container (docker or podman) instead
-    /// of as a local process — Linux only. GGUF: llama-server from the
-    /// ghcr.io/ggml-org/llama.cpp:server-<backend> image; safetensors:
-    /// `vllm serve` from the vllm/vllm-openai (NVIDIA), rocm/vllm (AMD) or
-    /// vllm/vllm-openai-cpu image for the host's architecture. Both use
-    /// the same GPU probe (see crate::container); neither binary is
-    /// required on PATH.
-    #[arg(long, value_name = "docker|podman")]
-    pub ociman: Option<crate::container::ContainerManager>,
+    /// Where the inference engine comes from. `docker`/`podman` (Linux
+    /// only) run the ghcr.io/ggml-org/llama.cpp server image for the
+    /// host's GPU, and a vLLM image for safetensors models. `bin`
+    /// downloads llama.cpp's prebuilt `llama-server` for this
+    /// OS/arch/GPU. `path` uses the `llama-server` on PATH and never
+    /// downloads anything. `auto` tries docker, podman, bin, path in
+    /// turn (off Linux: bin, path). The choice is fetched before the
+    /// listener binds. Safetensors models outside a container use the
+    /// `vllm`/`mlx_lm.server` on PATH.
+    #[arg(long, value_enum, default_value = "auto", env = "LLMMAN_RUNTIME")]
+    pub runtime: Runtime,
 
-    /// Pin the llama.cpp release used for this server, instead of always
-    /// taking whatever is currently latest. With --ociman, this pins the
-    /// ghcr.io/ggml-org/llama.cpp container image tag (e.g. `b9994`
-    /// instead of the floating `server`/`server-cuda`/... tags — pick one
-    /// that's actually published for every backend variant you might run;
-    /// see docs/docker.md in ggml-org/llama.cpp). Without --ociman, this
-    /// pins which GitHub release of llama.cpp's own prebuilt
-    /// `llama-server` `llmman serve` downloads and caches (see
-    /// crate::llama_release) — set this to force that managed download
-    /// even when some other `llama-server` is already on PATH, which is
-    /// otherwise preferred untouched.
-    #[arg(long, value_name = "TAG")]
+    /// The llama.cpp release to run, as a `b<N>` tag: the GitHub release
+    /// `bin` downloads and the `-b<N>` image tag suffix the container
+    /// runtimes pull. Defaults to the release llmman's CI tests against;
+    /// `latest` takes upstream's floating latest. Ignored by `path`.
+    #[arg(long, value_name = "TAG|latest")]
     pub llama_cpp_version: Option<String>,
 
-    /// With --ociman, pin the vLLM image tag for safetensors models (e.g.
-    /// `v0.28.0`) instead of the floating `latest`. The architecture
-    /// suffix (`-x86_64`/`-aarch64`, `-arm64` for the CPU image) is added
-    /// automatically for the vllm/ images — pick a release that image
-    /// actually publishes; for rocm/vllm the value is the whole tag.
-    #[arg(long, value_name = "TAG", requires = "ociman")]
+    /// With a container runtime, pin the vLLM image tag for safetensors
+    /// models (e.g. `v0.28.0`) instead of the floating `latest`. The
+    /// architecture suffix (`-x86_64`/`-aarch64`, `-arm64` for the CPU
+    /// image) is added automatically for the vllm/ images — pick a
+    /// release that image actually publishes; for rocm/vllm the value is
+    /// the whole tag.
+    #[arg(long, value_name = "TAG")]
     pub vllm_version: Option<String>,
 
-    /// Proactively pull the image `--ociman` would run, as its own
-    /// explicit foreground step, then exit — this process does not go on
-    /// to bind the listener or serve — with the pull's own progress (a
-    /// real `docker pull`/`podman pull` progress bar) inherited directly
-    /// to this process's stdout/stderr — only meaningful together with
-    /// --ociman, ignored otherwise. Given a safetensors MODEL, this is the
-    /// vLLM image (see --vllm-version); given a GGUF MODEL or none, the
-    /// ghcr.io/ggml-org/llama.cpp one (see --llama-cpp-version). MODEL
-    /// must already be pulled.
-    ///
-    /// `--ociman`'s underlying `docker run`/`podman run` pulls an image
-    /// that isn't already cached on its own, but silently: `serve` is
-    /// normally started detached (see daemon.rs), its stdio redirected to
-    /// a log file, so a caller waiting on the first request that actually
-    /// needs the container (the first real prompt) sees nothing happen
-    /// for however long a multi-hundred-MB-to-GB image pull takes —
-    /// indistinguishable from a hang. Run `llmman serve --ociman ...
-    /// --pull-oci` first, in the foreground, to do that pull visibly and
-    /// finish as soon as it completes; then start the real, detached
-    /// `llmman serve --ociman ...` (without `--pull-oci`) separately.
-    #[arg(long, requires = "ociman")]
-    pub pull_oci: bool,
-
-    /// Proactively download and cache the local `llama-server` binary
-    /// `llmman serve` would otherwise fetch on first use (see
-    /// crate::llama_release), as its own explicit foreground step, then
-    /// exit — the non-container equivalent of --pull-oci: same rationale,
-    /// same "run this first, in the foreground, then start the real
-    /// `llmman serve` separately" pattern, just for the local-binary path
-    /// instead of --ociman's container path. Backend selection (CPU,
-    /// CUDA, ROCm, Vulkan, Metal) uses the same host detection
-    /// (crate::hostgpu) as a normal `llmman serve` would, mirroring
-    /// llama.cpp's own installer's CUDA > ROCm > Vulkan > CPU probing
-    /// order. Not meaningful together with --ociman (that path never
-    /// resolves a local binary at all).
-    #[arg(long, conflicts_with_all = ["ociman", "pull_oci"])]
-    pub pull_bin: bool,
+    /// Fetch what `--runtime` needs (the container image or the
+    /// `llama-server` release), with its progress on this terminal, then
+    /// exit instead of serving. With a container runtime and an
+    /// already-pulled safetensors MODEL, the vLLM image is fetched too.
+    /// A plain `serve` does the same fetch at startup, but detached with
+    /// its output in a log file, where a slow first pull looks like a
+    /// hang; run this first and the daemon then starts instantly.
+    #[arg(long)]
+    pub pull_only: bool,
 
     /// Run as the media backend for MODEL on this port, the way
     /// `llama-server --port` is for a GGUF; see `mediagen_backend`.
@@ -216,12 +187,12 @@ struct AppState(Arc<Inner>);
 
 struct Inner {
     manager: Mutex<ModelManager>,
-    // None when --ociman is set: llama-server then runs in a container, so
-    // no local binary is resolved (or required on PATH) at all. Behind a
-    // mutex because the path resolved at startup can be deleted while this
-    // daemon keeps running (an upgrade/uninstall of whatever install
-    // provided it) — see local_llama_server_bin, which re-resolves and
-    // stores a replacement in that case.
+    // None under a container runtime: llama-server then runs in a
+    // container, so no local binary is resolved (or required on PATH) at
+    // all. Behind a mutex because the path resolved at startup can be
+    // deleted while this daemon keeps running (an upgrade/uninstall of
+    // whatever install provided it) — see local_llama_server_bin, which
+    // re-resolves and stores a replacement in that case.
     llama_server_bin: StdMutex<Option<PathBuf>>,
     // This daemon's own executable path, canonicalized at startup (while
     // it still exists on disk). Reported by /api/version so clients — the
@@ -229,9 +200,11 @@ struct Inner {
     // after the install that provided its binary was deleted, instead of
     // blindly reusing it.
     exe: Option<PathBuf>,
-    ociman: Option<crate::container::ContainerManager>,
+    // The concrete `--runtime` (never `Auto`; see runtime::resolve).
+    runtime: Runtime,
+    // The llama.cpp pin; None only for `--llama-cpp-version latest`.
     llama_cpp_version: Option<String>,
-    // --vllm-version; only meaningful with --ociman.
+    // --vllm-version; only meaningful with a container runtime.
     vllm_version: Option<String>,
     // See context_length_from_env's doc comment — forwarded to
     // backends that expose a context-size flag.
@@ -1885,7 +1858,7 @@ async fn local_context_overflow(resp: Response) -> Result<Response, String> {
 /// per-request ctx change, the option only takes effect on a fresh
 /// load: the `check_running` short-circuits below reuse an
 /// already-running instance as-is, never reloading it for a different
-/// thread count. Under `--ociman` it is ignored along with the derived
+/// thread count. Under a container runtime it is ignored along with the derived
 /// value; see `container::LlamaOptions::threads` for why.
 async fn ensure_model(
     state: &AppState,
@@ -2106,7 +2079,7 @@ async fn ensure_model(
         let mut stderr_tail: Option<OutputTail> = None;
         let mut oom_retryable = false;
         let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
-        process = match (&model_path, state.0.ociman) {
+        process = match (&model_path, state.0.runtime.ociman()) {
             // container::spawn ignores llama_opts.threads; see that
             // field's doc comment.
             (ModelPath::Gguf(path, mmproj), Some(ociman)) => {
@@ -2149,8 +2122,8 @@ async fn ensure_model(
                 oom_retryable = true;
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }
-            // --ociman is Linux-only and mlx Metal-only, so this never
-            // competes with the mlx arm.
+            // Container runtimes are Linux-only and mlx Metal-only, so
+            // this never competes with the mlx arm.
             (ModelPath::SafeTensors(dir), Some(ociman)) => {
                 let mut child = crate::container::spawn_vllm(
                     ociman,
@@ -4653,9 +4626,11 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     tokio::runtime::Runtime::new()?.block_on(serve_async(args))
 }
 
-/// The ggml/llama libraries of the `llama-server` we would run.
-pub fn llama_lib_dir(pinned_version: Option<&str>) -> anyhow::Result<PathBuf> {
-    let bin = resolve_llama_server(pinned_version)?;
+/// The ggml/llama libraries of the `llama-server` we would run locally
+/// under `runtime` (see `runtime::resolve_local`), pinned to
+/// `pinned_version` for `bin`.
+pub fn llama_lib_dir(runtime: Runtime, pinned_version: Option<&str>) -> anyhow::Result<PathBuf> {
+    let bin = runtime::resolve_local(runtime, pinned_version)?;
     crate::mediagen::ffi::lib_dir_of(&bin).ok_or_else(|| {
         anyhow!(
             "no ggml/llama shared libraries next to {}; media generation needs a llama.cpp release or installed build",
@@ -4675,8 +4650,10 @@ async fn mediagen_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyho
     if paths.text_encoder.is_none() && crate::mediagen::needs_text_encoder(&paths.model) {
         anyhow::bail!("{model_ref}: no text encoder in the model pack");
     }
-    let pinned = args.llama_cpp_version.clone();
-    let lib_dir = tokio::task::spawn_blocking(move || llama_lib_dir(pinned.as_deref())).await??;
+    let pinned = runtime::llama_cpp_pin(args.llama_cpp_version.as_deref());
+    let runtime = args.runtime;
+    let lib_dir =
+        tokio::task::spawn_blocking(move || llama_lib_dir(runtime, pinned.as_deref())).await??;
     // the graph builders hold `&'static Api`
     let api: &'static crate::mediagen::ffi::Api =
         Box::leak(Box::new(crate::mediagen::ffi::Api::load(&lib_dir)?));
@@ -4726,9 +4703,13 @@ async fn spawn_mediagen_backend(
     let exe = std::env::current_exe().context("locating the llmman binary")?;
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.args(["serve", model_ref, "--port", &port.to_string()]);
-    if let Some(v) = &state.0.llama_cpp_version {
-        cmd.args(["--llama-cpp-version", v]);
-    }
+    // Explicit, so the child lands on the same build as this daemon
+    // rather than re-resolving `auto`/the default pin/LLMMAN_RUNTIME.
+    cmd.args(["--runtime", state.0.runtime.as_str()]);
+    cmd.args([
+        "--llama-cpp-version",
+        state.0.llama_cpp_version.as_deref().unwrap_or("latest"),
+    ]);
     for var in GPU_VISIBLE_DEVICE_VARS
         .iter()
         .chain(LLAMA_CPP_ENV_PASSTHROUGH_VARS)
@@ -4880,11 +4861,11 @@ fn metrics_router(enabled: bool) -> Router<AppState> {
         .layer(middleware::from_fn(track_metrics))
 }
 
-/// Which image `--pull-oci` warms up: the one `ensure_model` would run
-/// for `model` (read off its stored manifest), or llama-server's when no
-/// model is named — pulling both would cost a GGUF-only host the vLLM
-/// image's several GB for nothing.
-fn pull_oci_engine(model: Option<&str>) -> anyhow::Result<crate::container::ContainerEngine> {
+/// Which image `--pull-only` warms up under a container runtime: the one
+/// `ensure_model` would run for `model` (read off its stored manifest),
+/// or llama-server's when no model is named — pulling both would cost a
+/// GGUF-only host the vLLM image's several GB for nothing.
+fn pull_only_engine(model: Option<&str>) -> anyhow::Result<crate::container::ContainerEngine> {
     // Same guard as the pre-load below: a pair warms its local half, a
     // provider-routed reference has no local weights.
     let model = model
@@ -4896,7 +4877,7 @@ fn pull_oci_engine(model: Option<&str>) -> anyhow::Result<crate::container::Cont
     let model_ref = crate::shortnames::resolve_ollama_api(model)?;
     let store_path = default_store()?;
     let format = crate::modelpack::stored_format(&store_path, &model_ref).with_context(|| {
-        format!("--pull-oci: pull {model_ref} first to learn which image it needs")
+        format!("--pull-only: pull {model_ref} first to learn which image it needs")
     })?;
     Ok(match format {
         crate::modelpack::ModelFormat::SafeTensors => crate::container::ContainerEngine::Vllm,
@@ -4908,61 +4889,35 @@ fn pull_oci_engine(model: Option<&str>) -> anyhow::Result<crate::container::Cont
 }
 
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
-    if _args.ociman.is_some() && !cfg!(target_os = "linux") {
-        anyhow::bail!("--ociman is only supported on Linux");
+    let requested = _args.runtime;
+    if requested == Runtime::Path && _args.pull_only {
+        anyhow::bail!("--pull-only: --runtime path runs the llama-server on PATH; nothing to pull");
     }
-    // Must happen before daemon.rs's caller (if any) redirects this
-    // process's stdio to a log file — see ServeArgs::pull_oci's doc
-    // comment for why that would otherwise hide the pull's progress.
-    // This is meant as its own explicit, foreground warm-up step run
-    // before a separate, detached `serve` invocation — not a prelude to
-    // this same invocation going on to serve — so it returns as soon as
-    // the pull finishes instead of falling through into binding the
-    // listener and serving forever.
-    if _args.pull_oci {
-        let ociman = _args.ociman.context("--pull-oci requires --ociman")?;
-        let engine = pull_oci_engine(_args.model.as_deref())?;
-        let version = match engine {
-            crate::container::ContainerEngine::Vllm
-            | crate::container::ContainerEngine::VllmOmni => _args.vllm_version.as_deref(),
-            crate::container::ContainerEngine::LlamaServer => _args.llama_cpp_version.as_deref(),
-        };
-        crate::container::pull_image(ociman, engine, version)?;
-        return Ok(());
-    }
-    // Same idea as --pull-oci above, but for the local (non-container)
-    // llama-server binary path: resolve_llama_server's own download
-    // (crate::llama_release) normally happens further down regardless of
-    // --pull-bin, but by then this process may already be detached with
-    // its stdio redirected to a log file (see daemon.rs) — a caller
-    // waiting on the daemon to come up within ensure_server's short
-    // timeout would see nothing and could time out mid-download,
-    // indistinguishable from a hang. Run in the foreground first instead.
-    if _args.pull_bin {
-        let pinned_version = _args.llama_cpp_version.clone();
-        tokio::task::spawn_blocking(move || resolve_llama_server(pinned_version.as_deref()))
+    let llama_cpp_version = runtime::llama_cpp_pin(_args.llama_cpp_version.as_deref());
+
+    // Settle `--runtime` and fetch its llama.cpp before anything binds,
+    // so the first request is never stuck behind a silent download (this
+    // process is normally detached with its stdio in a log file).
+    // `--pull-only` is this step alone. Blocking, hence spawn_blocking.
+    let resolved = {
+        let pin = llama_cpp_version.clone();
+        tokio::task::spawn_blocking(move || runtime::resolve(requested, pin.as_deref()))
             .await
-            .context("resolve llama-server task panicked")??;
+            .context("resolve runtime task panicked")??
+    };
+    if _args.pull_only {
+        if let Some(ociman) = resolved.ociman() {
+            // resolve() pulled the llama.cpp image; a safetensors MODEL
+            // needs vLLM's too.
+            let engine = pull_only_engine(_args.model.as_deref())?;
+            if engine != crate::container::ContainerEngine::LlamaServer {
+                crate::container::pull_image(ociman, engine, _args.vllm_version.as_deref())?;
+            }
+        }
         return Ok(());
     }
-    // Only resolve (and require) a local llama-server binary when it'll
-    // actually be used: --ociman runs llama-server in a container instead,
-    // picking the image itself (see crate::container).
-    //
-    // resolve_llama_server does blocking network I/O (a GitHub API call,
-    // and possibly a multi-hundred-MB download) when no llama-server is
-    // already on PATH — spawn_blocking so that doesn't stall this async
-    // fn's own executor thread while it runs.
-    let llama_server_bin = if _args.ociman.is_none() {
-        let pinned_version = _args.llama_cpp_version.clone();
-        Some(
-            tokio::task::spawn_blocking(move || resolve_llama_server(pinned_version.as_deref()))
-                .await
-                .context("resolve llama-server task panicked")??,
-        )
-    } else {
-        None
-    };
+    let llama_server_bin = resolved.llama_server_bin().cloned();
+    let runtime = resolved.runtime();
     let store_path = default_store()?;
     let cache_path = crate::default_cache()?;
     std::fs::create_dir_all(&cache_path)?;
@@ -5021,11 +4976,11 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // See threads_from_env_or_host's doc comment. Resolved once here
     // rather than per load, and logged so a surprising thread count is
     // explainable from the startup output. Only the local spawn path
-    // consumes the derived value, so don't log it under --ociman (the
-    // container arm deliberately ignores it).
+    // consumes the derived value, so don't log it under a container
+    // runtime (that arm deliberately ignores it).
     let threads = threads_from_env_or_host();
     if let Some(n) = threads {
-        if _args.ociman.is_none() {
+        if runtime.ociman().is_none() {
             eprintln!("[llmman] llama-server gets --threads {n} (CPU quota/affinity limit below the online CPU count)");
         }
     } else if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
@@ -5067,8 +5022,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         exe: std::env::current_exe()
             .ok()
             .map(|p| p.canonicalize().unwrap_or(p)),
-        ociman: _args.ociman,
-        llama_cpp_version: _args.llama_cpp_version.clone(),
+        runtime,
+        llama_cpp_version,
         vllm_version: _args.vllm_version.clone(),
         ctx_size,
         ctx_size_explicit: ctx_size_explicit.is_some(),

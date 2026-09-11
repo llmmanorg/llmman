@@ -19,16 +19,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # The single place to bump when a newer llama.cpp release is needed —
-  # every matrix.llama-asset entry below (e2e job) is just this release's
-  # OS/arch-specific asset suffix (e.g. "ubuntu-x64.tar.gz"), combined
-  # with this value at the "Install llama-server" step's own point of use
-  # ("llama-${LLAMA_CPP_RELEASE}-bin-${{ matrix.llama-asset }}") rather
-  # than each duplicating the full "llama-<release>-bin-..." filename
-  # independently. Also the base of the docker.io/ai/llmman images, so it
-  # must be a build upstream published server-*-b<N> images for (not all
-  # are; the build job checks).
-  LLAMA_CPP_RELEASE: b10868
+  # The llama.cpp release is the repo-root LLAMA_CPP_RELEASE file (also
+  # the llmman binary's default pin, src/llama_release.rs); steps read it
+  # with `LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"`
+  # since a workflow-level env can't read a file. It must be a build
+  # upstream published server-*-b<N> images for (the build job checks).
+  #
   # vLLM version the e2e job's "Install vLLM (e2e)" step installs, for
   # vllm-plugin/tests/test_e2e.py's real `vllm serve` test. Moves with
   # VLLM_METAL_VERSION below: a vllm-metal release names the vLLM
@@ -227,6 +223,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           set -euo pipefail
+          LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"
           for tag in server server-cuda server-cuda13 server-rocm server-vulkan; do
             docker manifest inspect "ghcr.io/ggml-org/llama.cpp:$tag-$LLAMA_CPP_RELEASE" >/dev/null
           done
@@ -604,6 +601,10 @@ jobs:
     # small-model sampling variance), so unlike the 7 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
     timeout-minutes: 340
+    env:
+      # These tests are about the llama-server "Install llama-server" puts
+      # on PATH, which `--runtime auto` would try docker before.
+      LLMMAN_RUNTIME: path
     strategy:
       fail-fast: false
       matrix:
@@ -881,7 +882,7 @@ jobs:
       # ── llama-server (the inference backend `llmman serve` shells out to) ──
       # A prebuilt release straight from upstream llama.cpp, pinned so CI
       # doesn't silently pick up a build that changes behavior mid-flight;
-      # bump the top-level env's LLAMA_CPP_RELEASE deliberately when a
+      # bump the repo-root LLAMA_CPP_RELEASE file deliberately when a
       # newer one is needed — that one edit is enough, unlike the old
       # per-matrix-entry hardcoded filenames it replaced. `matrix.llama-asset`
       # is just this OS/arch's release asset *suffix* (the Windows ones are
@@ -894,6 +895,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"
           asset="llama-${LLAMA_CPP_RELEASE}-bin-${{ matrix.llama-asset }}"
           # $HOME, not $RUNNER_TEMP: on Windows the latter is a native
           # `D:\a\_temp`-style path, and Git Bash's tar.exe (bsdtar) reads
@@ -1590,6 +1592,7 @@ jobs:
           VERSION: ${{ needs.release.outputs.version }}
         run: |
           set -euo pipefail
+          LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"
           image=docker.io/ai/llmman
           docker buildx create --use
           docker buildx build packaging --push --provenance=false --sbom=false \

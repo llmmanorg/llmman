@@ -338,7 +338,7 @@ pub(super) async fn spawn_vllm_omni_server(
         anyhow::bail!(
             "{} has no vllm-omni plugin, which a Diffusers-layout model needs \
              (`uv pip install vllm-omni` into the same environment, or serve it \
-             with --ociman docker to use the vllm/vllm-omni image)",
+             with --runtime docker to use the vllm/vllm-omni image)",
             vllm.display()
         );
     }
@@ -429,23 +429,8 @@ pub(super) async fn spawn_mlx_server(port: u16) -> anyhow::Result<tokio::process
         .with_context(|| format!("spawn mlx_lm.server from {}", mlx.display()))
 }
 
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        // On Windows the executable must carry the .exe suffix.
-        #[cfg(windows)]
-        let candidate = dir.join(format!("{name}.exe"));
-        #[cfg(not(windows))]
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 fn which_binary(name: &str) -> anyhow::Result<PathBuf> {
-    find_on_path(name).ok_or_else(|| anyhow::anyhow!("{name} not found on PATH"))
+    crate::find_on_path(name).ok_or_else(|| anyhow::anyhow!("{name} not found on PATH"))
 }
 
 /// [`wait_for_ready`]'s default deadline — longer than Ollama's own 5m
@@ -572,35 +557,13 @@ pub const LLAMA_CPP_ENV_PASSTHROUGH_VARS: &[&str] = &[
     "LLAMA_ARG_N_GPU_LAYERS",
 ];
 
-/// Resolves the `llama-server` binary to run locally (no `--ociman`):
-/// prefers whatever is already on `PATH` untouched, unless
-/// `pinned_version` explicitly asks for a specific llama.cpp release, in
-/// which case that pin always wins. Falls back to downloading and caching
-/// a release build matching this host's OS/arch/GPU backend via
-/// `crate::llama_release` when nothing suitable is on PATH.
-pub(super) fn resolve_llama_server(pinned_version: Option<&str>) -> anyhow::Result<PathBuf> {
-    if pinned_version.is_none() {
-        if let Some(p) = find_on_path("llama-server") {
-            return Ok(p);
-        }
-    }
-    let resolved = crate::llama_release::ensure_llama_server(pinned_version)
-        .context("no llama-server on PATH and automatic download failed")?;
-    eprintln!(
-        "[llmman] using downloaded llama-server ({}): {}",
-        resolved.backend_label,
-        resolved.bin.display()
-    );
-    Ok(resolved.bin)
-}
-
 /// Returns the local llama-server binary to spawn: the one resolved at
 /// startup, unless that file has since disappeared from disk (the install
 /// that provided it was upgraded or removed while this daemon kept
-/// running), in which case it is re-resolved from the current PATH (or
-/// re-downloaded) and the replacement remembered for subsequent loads —
-/// instead of failing every model load forever with a spawn error against
-/// a path that no longer exists.
+/// running), in which case it is re-resolved the same way (from the
+/// current PATH, or re-downloaded) and the replacement remembered for
+/// subsequent loads — instead of failing every model load forever with a
+/// spawn error against a path that no longer exists.
 pub(super) async fn local_llama_server_bin(state: &AppState) -> anyhow::Result<PathBuf> {
     let current = state
         .0
@@ -609,7 +572,10 @@ pub(super) async fn local_llama_server_bin(state: &AppState) -> anyhow::Result<P
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     let Some(bin) = current else {
-        anyhow::bail!("no local llama-server binary resolved and --ociman was not set")
+        anyhow::bail!(
+            "no local llama-server binary resolved (--runtime {})",
+            state.0.runtime.as_str()
+        )
     };
     if bin.exists() {
         return Ok(bin);
@@ -619,9 +585,12 @@ pub(super) async fn local_llama_server_bin(state: &AppState) -> anyhow::Result<P
         bin.display()
     );
     let pinned = state.0.llama_cpp_version.clone();
-    let resolved = tokio::task::spawn_blocking(move || resolve_llama_server(pinned.as_deref()))
-        .await
-        .context("resolve llama-server task panicked")??;
+    let runtime = state.0.runtime;
+    let resolved = tokio::task::spawn_blocking(move || {
+        super::runtime::resolve_local(runtime, pinned.as_deref())
+    })
+    .await
+    .context("resolve llama-server task panicked")??;
     *state
         .0
         .llama_server_bin

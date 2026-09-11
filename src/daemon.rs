@@ -535,16 +535,15 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     // instead of the generic timeout.
     bail_if_exited(&mut child, log_path.as_deref())?;
     // Timed out with the daemon alive but not listening. If startup is
-    // mid-way through llama-server's one-time auto-download (which can
-    // far exceed this budget; see llama_release's 30-minute HTTP budget),
-    // killing the daemon would discard the partial download (no resume,
-    // pid-specific staging files) and make every retry start from zero.
-    // Leave it running and say so instead.
+    // mid-way through its one-time llama.cpp fetch (release download or
+    // container pull, either far longer than this budget), killing the
+    // daemon would discard the partial download (no resume) and make
+    // every retry start from zero. Leave it running and say so instead.
     if crate::llama_release::download_in_progress() {
         anyhow::bail!(
-            "llmman serve did not start within 60s: startup is still downloading \
-             llama-server. The daemon was left running so the download can finish; \
-             retry this command once it does{}",
+            "llmman serve did not start within 60s: startup is still fetching llama.cpp \
+             (a release download or container image pull). The daemon was left running \
+             so it can finish; retry this command once it does{}",
             log_tail(log_path.as_deref())
         );
     }

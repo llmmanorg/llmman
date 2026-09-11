@@ -1,9 +1,10 @@
 # A ghcr.io/ggml-org/llama.cpp:server-<backend> image (the ones `llmman
-# serve --ociman` picks, src/container.rs) plus the llmman release binary,
-# published as docker.io/ai/llmman:<same tag>. Same entrypoint as the base,
-# so it drops in for both --ociman paths; the daemon itself runs with
-# `--entrypoint llmman ... serve`. CI passes the pinned base; the default
-# is for local builds.
+# serve --runtime docker|podman` picks, src/container.rs) plus the llmman
+# release binary, published as docker.io/ai/llmman:<same tag>. Same
+# entrypoint as the base, so it drops in for both container runtimes; the
+# daemon itself runs with `--entrypoint llmman ... serve`. CI passes the
+# base pinned to the repo-root LLAMA_CPP_RELEASE; the default is for local
+# builds.
 #
 # The context holds executable llmman-amd64 and llmman-arm64 (TARGETARCH
 # names) from the build job. Nothing compiles, so no emulation; and with
@@ -22,9 +23,12 @@ LABEL org.opencontainers.image.title="llmman" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}"
 COPY --link llmman-${TARGETARCH} /usr/local/bin/llmman
-# llama-server and its libraries are in /app. A loopback bind inside a
-# container is unreachable even with -p, so bind everything; the daemon
-# then requires LLMMAN_API_KEYS unless LLMMAN_AUTH=off.
+# llama-server and its libraries are in /app; LLMMAN_RUNTIME=path runs
+# them rather than having `auto` download the same release again. A
+# loopback bind inside a container is unreachable even with -p, so bind
+# everything; the daemon then requires LLMMAN_API_KEYS unless
+# LLMMAN_AUTH=off.
 ENV PATH=/app:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LLMMAN_RUNTIME=path \
     LLMMAN_HOST=0.0.0.0:17434
 EXPOSE 17434
