@@ -9,6 +9,8 @@ already exists for the model format it finds, and runs it unmodified.
 | GGUF | [`llama-server`](https://github.com/ggml-org/llama.cpp) | `--runtime bin`: a prebuilt upstream release matching your OS/arch/GPU, downloaded and cached; `--runtime path`: the one on your `PATH` |
 | safetensors | `vllm` in a container | `--runtime docker` / `podman` (Linux only): the `vllm/vllm-openai`, `rocm/vllm` or `vllm/vllm-openai-cpu` image for your GPU and architecture |
 | safetensors | [`vllm`](https://github.com/vllm-project/vllm) | Your `PATH` (every non-container runtime) |
+| safetensors | `sglang` in a container | `--runtime docker` / `podman` (Linux only) with `LLMMAN_SAFETENSORS_ENGINE=sglang`: the `lmsysorg/sglang` image for your GPU |
+| safetensors | [`sglang`](https://github.com/sgl-project/sglang) | Your `PATH`, with `LLMMAN_SAFETENSORS_ENGINE=sglang` |
 | safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | Your `PATH`, on Apple Silicon macOS; preferred over `vllm` when present |
 | GGUF diffusion (LTX-2) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
 | Diffusers safetensors | [`vllm serve --omni`](https://github.com/vllm-project/vllm-omni) | Your `PATH`'s `vllm` with the `vllm-omni` package installed |
@@ -90,11 +92,15 @@ docker run -p 127.0.0.1:17434:17434 -e LLMMAN_API_KEYS=<key> \
 
 ## vLLM
 
-Safetensors models are served by a separately installed `vllm`. Plain
-`vllm` is CPU-only on macOS unless
+Safetensors models are served by a separately installed `vllm` unless
+`LLMMAN_SAFETENSORS_ENGINE` picks [SGLang](#sglang) (or, on Apple
+Silicon, `mlx_lm.server` is present — see [MLX](#mlx-apple-silicon)).
+Plain `vllm` is CPU-only on macOS unless
 [vllm-metal](https://github.com/vllm-project/vllm-metal) is installed.
 `LLMMAN_CONTEXT_LENGTH` is forwarded as `--max-model-len`;
 `LLMMAN_LOAD_TIMEOUT` (default 10 minutes) bounds a stalled load.
+`LLMMAN_VLLM_ARGS` appends anything else (`--dtype bfloat16 --tp 2`) to
+the `vllm serve` command line, local or in a container.
 
 ### In a container
 
@@ -154,12 +160,56 @@ plugin lets `vllm serve oci://<reference>` pull a CNCF ModelPack image
 from any OCI registry, via `llmman` (`LLMMAN_BIN` if it is not on
 `PATH`). See [vllm-plugin/README.md](../vllm-plugin/README.md).
 
+## SGLang
+
+`LLMMAN_SAFETENSORS_ENGINE=sglang` sends safetensors models to
+[SGLang](https://github.com/sgl-project/sglang) instead of `vllm`
+(`uv pip install sglang` puts its `sglang` console script on `PATH`):
+
+```sh
+LLMMAN_SAFETENSORS_ENGINE=sglang llmman serve
+llmman run Qwen/Qwen3-0.6B "hello"
+```
+
+llmman runs `sglang serve --model-path <dir> --served-model-name <ref>`
+on the model's directory; `LLMMAN_CONTEXT_LENGTH` is forwarded as
+`--context-length` and `LLMMAN_LOAD_TIMEOUT` bounds the load as for
+vLLM. `LLMMAN_SGLANG_ARGS` appends anything else (`--disable-cuda-graph
+--tp 2`). Which device SGLang uses is its own autodetection and
+environment, which a local child inherits: `SGLANG_USE_CPU_ENGINE=1` for
+its CPU engine (Linux; x86_64 needs AVX-512), `SGLANG_USE_MLX=1` for its
+MLX runtime on Apple Silicon. `llmman ps` shows `sglang (local)`.
+
+`LLMMAN_SAFETENSORS_ENGINE=vllm` is the other explicit choice — `vllm`
+even where `mlx_lm.server` would otherwise be preferred; unset leaves
+the choice to llmman as before.
+
+### In a container
+
+With `--runtime docker` (or `podman`) and `LLMMAN_SAFETENSORS_ENGINE=sglang`,
+`python3 -m sglang.launch_server` runs from the `lmsysorg/sglang` image
+(multi-arch, no arch suffix), picked by the same GPU probe:
+
+| Host GPU | Image |
+|----------|-------|
+| NVIDIA (CUDA 13) | `lmsysorg/sglang:latest` |
+| NVIDIA (CUDA 12) | `lmsysorg/sglang:latest-cu129` (upstream's last CUDA 12 lane is `v0.5.19`) |
+| AMD (ROCm) | no floating tag upstream: `--sglang-version` must be the whole tag for your GPU family, e.g. `v0.5.19-rocm700-mi30x` (x86_64 only) |
+| none | not offered: the `-xeon` CPU images need Intel AMX and launch flags llmman does not pass |
+
+`--sglang-version <tag>` pins the release (`-cu129` is added for CUDA 12).
+`llmman serve --runtime docker --pull-only <model>` pulls it for a pulled
+safetensors model when the variable is set. `CUDA_VISIBLE_DEVICES` and
+friends plus every `SGLANG_*` variable are forwarded into the container,
+which runs with `--ipc=host` like vLLM's.
+
 ## MLX (Apple Silicon)
 
 On Apple Silicon, `mlx_lm.server` (`pip install mlx-lm`) is preferred
-over `vllm` for safetensors when on `PATH`: Metal-accelerated, no vLLM
-dependency, more model families than vllm-metal. `LLMMAN_CONTEXT_LENGTH`
-is not forwarded and `/v1/embeddings` is unsupported.
+over `vllm` for safetensors when on `PATH` and `LLMMAN_SAFETENSORS_ENGINE`
+is unset: Metal-accelerated, no vLLM dependency, more model families
+than vllm-metal. `LLMMAN_CONTEXT_LENGTH` is not forwarded and
+`/v1/embeddings` is unsupported.
 
 ## Registry transport
 

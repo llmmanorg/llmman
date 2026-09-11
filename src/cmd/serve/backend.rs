@@ -1,7 +1,8 @@
 //! The backends `ensure_model` spawns: llama-server (local or in a
-//! container), vLLM and vLLM-Omni, and `mlx_lm.server`. Spawning, the
-//! stderr tail that turns a failed load into an error message, readiness
-//! polling, and where the `llama-server` binary itself comes from.
+//! container), vLLM and vLLM-Omni, SGLang, and `mlx_lm.server`. Spawning,
+//! the stderr tail that turns a failed load into an error message,
+//! readiness polling, and where the `llama-server` binary itself comes
+//! from.
 
 use std::collections::VecDeque;
 use std::net::TcpListener;
@@ -17,11 +18,57 @@ use super::sched::parse_keep_alive_str;
 use super::{canonical_ref, AppState, Engine, ModelProcess};
 use crate::modelpack::{resolve_model, ModelPath};
 
+/// `LLMMAN_SAFETENSORS_ENGINE`: which engine serves a
+/// [`ModelPath::SafeTensors`] directory, the one format more than one
+/// engine can. `Auto` (unset) is the pre-existing rule in
+/// [`use_mlx_for_safetensors`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SafetensorsEngine {
+    Auto,
+    /// `vllm`, even where `mlx_lm.server` would otherwise be preferred.
+    Vllm,
+    /// `sglang` — see [`spawn_sglang_server`].
+    Sglang,
+}
+
+pub(super) const SAFETENSORS_ENGINE_VAR: &str = "LLMMAN_SAFETENSORS_ENGINE";
+
+/// `vllm`/`sglang` (any case); unset or empty is `Auto`; anything else
+/// `None`, for the caller to warn about.
+pub(super) fn parse_safetensors_engine(value: Option<&str>) -> Option<SafetensorsEngine> {
+    let value = value.map(str::trim).unwrap_or_default();
+    if value.is_empty() {
+        return Some(SafetensorsEngine::Auto);
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "vllm" => Some(SafetensorsEngine::Vllm),
+        "sglang" => Some(SafetensorsEngine::Sglang),
+        _ => None,
+    }
+}
+
+/// [`parse_safetensors_engine`] on the environment; an unrecognized value
+/// is reported once and treated as `Auto`.
+pub(super) fn safetensors_engine_from_env() -> SafetensorsEngine {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let raw = std::env::var(SAFETENSORS_ENGINE_VAR).ok();
+    parse_safetensors_engine(raw.as_deref()).unwrap_or_else(|| {
+        WARNED.call_once(|| {
+            eprintln!(
+                "[llmman] warning: {SAFETENSORS_ENGINE_VAR}={:?} is not one of vllm/sglang; ignoring it",
+                raw.unwrap_or_default()
+            );
+        });
+        SafetensorsEngine::Auto
+    })
+}
+
 /// Which local engine backs a resolved `ModelPath::SafeTensors`
-/// directory: `mlx_lm.server` (see `spawn_mlx_server`) when this host is
-/// Apple Silicon macOS (`crate::hostgpu::detect() == HostGpu::Metal`)
-/// *and* `mlx_lm.server` is actually on `PATH`; `vllm` in every other
-/// case, unchanged from before this engine existed.
+/// directory when `LLMMAN_SAFETENSORS_ENGINE` is unset: `mlx_lm.server`
+/// (see `spawn_mlx_server`) when this host is Apple Silicon macOS
+/// (`crate::hostgpu::detect() == HostGpu::Metal`) *and* `mlx_lm.server`
+/// is actually on `PATH`; `vllm` in every other case, unchanged from
+/// before this engine existed.
 ///
 /// Plain `vllm` (no plugin) has no Metal backend of its own at all — its
 /// upstream-published macOS wheel is CPU-only. There *is* a way to make
@@ -39,7 +86,8 @@ use crate::modelpack::{resolve_model, ModelPath};
 /// falls back to plain (CPU-only, absent vllm-metal) `vllm` instead of
 /// failing outright.
 pub(super) fn use_mlx_for_safetensors() -> bool {
-    crate::hostgpu::detect() == crate::hostgpu::HostGpu::Metal
+    safetensors_engine_from_env() == SafetensorsEngine::Auto
+        && crate::hostgpu::detect() == crate::hostgpu::HostGpu::Metal
         && which_binary("mlx_lm.server").is_ok()
 }
 
@@ -225,7 +273,30 @@ pub(super) fn vllm_max_model_len(ctx_size: Option<u32>, ctx_size_explicit: bool)
     ctx_size.filter(|n| ctx_size_explicit && *n > 0)
 }
 
-/// argv after the `vllm` binary, shared with `container::spawn_vllm`
+/// Extra argv appended to every `vllm serve` (plain and `--omni`, local
+/// or in a container): the engine's own knobs, `--dtype bfloat16 --tp 2`.
+pub(super) const VLLM_ARGS_VAR: &str = "LLMMAN_VLLM_ARGS";
+
+/// The same for `sglang serve` / `sglang.launch_server`.
+pub(super) const SGLANG_ARGS_VAR: &str = "LLMMAN_SGLANG_ARGS";
+
+/// Splits an `LLMMAN_*_ARGS` value on whitespace, like `LLMMAN_SHELL` (no
+/// quoting). Appended after llmman's own flags, so a repeated flag wins
+/// on an argparse engine.
+pub(super) fn split_extra_args(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(String::from)
+        .collect()
+}
+
+/// [`split_extra_args`] on the environment variable `var`.
+fn extra_args_from_env(var: &str) -> Vec<String> {
+    split_extra_args(std::env::var(var).ok().as_deref())
+}
+
+/// argv after the `vllm` binary, shared with `container::spawn_engine`
 /// (which passes its `/models` mount and `0.0.0.0`) and kept separate so
 /// context forwarding is testable.
 pub(super) fn vllm_serve_args(
@@ -254,10 +325,24 @@ pub(super) fn vllm_serve_args(
     args
 }
 
-/// `vllm <args>`, in its own process group so [`ModelProcess`]'s Drop can
-/// kill vllm's whole worker tree (not just this pid) without killing us.
-fn vllm_command(vllm: &Path, args: Vec<String>) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(vllm);
+/// [`vllm_serve_args`] plus `LLMMAN_VLLM_ARGS`.
+pub(super) fn vllm_serve_args_from_env(
+    model_dir: &str,
+    host: &str,
+    port: u16,
+    model_name: &str,
+    max_model_len: Option<u32>,
+) -> Vec<String> {
+    let mut args = vllm_serve_args(model_dir, host, port, model_name, max_model_len);
+    args.extend(extra_args_from_env(VLLM_ARGS_VAR));
+    args
+}
+
+/// `<bin> <args>` in its own process group, so [`ModelProcess`]'s Drop can
+/// kill the engine's whole worker tree (not just this pid) without
+/// killing us. vllm and sglang both fork workers.
+fn grouped_command(bin: &Path, args: Vec<String>) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args).kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
@@ -271,15 +356,16 @@ pub(super) async fn spawn_vllm_server(
     max_model_len: Option<u32>,
 ) -> anyhow::Result<tokio::process::Child> {
     let vllm = which_binary("vllm")?;
-    let args = vllm_serve_args(
+    let args = vllm_serve_args_from_env(
         model_dir.to_str().context("non-UTF-8 model path")?,
         "127.0.0.1",
         port,
         model_name,
         max_model_len,
     );
-    vllm_command(&vllm, args)
-        .spawn()
+    let mut cmd = grouped_command(&vllm, args);
+    crate::debug_log!("spawning {}: {:?}", vllm.display(), cmd);
+    cmd.spawn()
         .with_context(|| format!("spawn vllm from {}", vllm.display()))
 }
 
@@ -315,8 +401,8 @@ fn vllm_omni_serve_args(
     args
 }
 
-/// [`vllm_omni_serve_args`] from the environment; an unbounded
-/// `LLMMAN_LOAD_TIMEOUT` becomes a day.
+/// [`vllm_omni_serve_args`] from the environment, plus `LLMMAN_VLLM_ARGS`;
+/// an unbounded `LLMMAN_LOAD_TIMEOUT` becomes a day.
 pub(super) fn vllm_omni_serve_args_from_env(
     model_dir: &str,
     host: &str,
@@ -325,11 +411,13 @@ pub(super) fn vllm_omni_serve_args_from_env(
 ) -> Vec<String> {
     let guardrails = crate::env_flag_set(VLLM_OMNI_GUARDRAILS_VAR);
     let init_timeout = load_timeout_from_env().unwrap_or(Duration::from_secs(24 * 3600));
-    vllm_omni_serve_args(model_dir, host, port, model_name, guardrails, init_timeout)
+    let mut args =
+        vllm_omni_serve_args(model_dir, host, port, model_name, guardrails, init_timeout);
+    args.extend(extra_args_from_env(VLLM_ARGS_VAR));
+    args
 }
 
-/// `vllm serve --omni` from the `vllm` on `PATH`. Stdio is piped like a
-/// llama-server's so a startup failure's reason reaches `wait_for_ready`.
+/// `vllm serve --omni` from the `vllm` on `PATH`.
 pub(super) async fn spawn_vllm_omni_server(
     model_dir: &Path,
     port: u16,
@@ -350,15 +438,98 @@ pub(super) async fn spawn_vllm_omni_server(
         port,
         model_name,
     );
-    let mut cmd = vllm_command(&vllm, args);
+    spawn_piped(grouped_command(&vllm, args), &vllm, "vllm --omni")
+}
+
+/// Spawns `cmd` with stdio piped, like a llama-server's, so a startup
+/// failure's reason reaches `wait_for_ready` through the returned tail.
+fn spawn_piped(
+    mut cmd: tokio::process::Command,
+    bin: &Path,
+    what: &str,
+) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    crate::debug_log!("spawning {}: {:?}", vllm.display(), cmd);
+    crate::debug_log!("spawning {}: {:?}", bin.display(), cmd);
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("spawn vllm --omni from {}", vllm.display()))?;
+        .with_context(|| format!("spawn {what} from {}", bin.display()))?;
     let tail = tail_child_output(&mut child);
     Ok((child, tail))
+}
+
+/// The name SGLang registers `model_ref` under. SGLang reads `:` in
+/// `--served-model-name` and in a request's `model` as its
+/// `model:lora-adapter` separator, so a reference's `:tag` becomes `-tag`;
+/// `backend_wire_model` rewrites requests to match.
+pub(super) fn sglang_served_model_name(model_ref: &str) -> String {
+    model_ref.replace(':', "-")
+}
+
+/// argv after SGLang's launcher (`sglang serve` locally, `python3 -m
+/// sglang.launch_server` in the `lmsysorg/sglang` image): the same shape
+/// as [`vllm_serve_args`] in SGLang's spelling, with `--context-length`
+/// fed by the [`vllm_max_model_len`] rule.
+pub(super) fn sglang_serve_args(
+    model_dir: &str,
+    host: &str,
+    port: u16,
+    model_name: &str,
+    context_length: Option<u32>,
+) -> Vec<String> {
+    let mut args = vec![
+        "--model-path".into(),
+        model_dir.into(),
+        "--port".into(),
+        port.to_string(),
+        "--host".into(),
+        host.into(),
+        "--served-model-name".into(),
+        sglang_served_model_name(model_name),
+    ];
+    if let Some(n) = context_length {
+        args.push("--context-length".into());
+        args.push(n.to_string());
+    }
+    args
+}
+
+/// [`sglang_serve_args`] plus `LLMMAN_SGLANG_ARGS`.
+pub(super) fn sglang_serve_args_from_env(
+    model_dir: &str,
+    host: &str,
+    port: u16,
+    model_name: &str,
+    context_length: Option<u32>,
+) -> Vec<String> {
+    let mut args = sglang_serve_args(model_dir, host, port, model_name, context_length);
+    args.extend(extra_args_from_env(SGLANG_ARGS_VAR));
+    args
+}
+
+/// `sglang serve <args>` from the `sglang` console script on `PATH`, in
+/// its own process group like vllm (it forks a scheduler and detokenizer).
+pub(super) async fn spawn_sglang_server(
+    model_dir: &Path,
+    port: u16,
+    model_name: &str,
+    context_length: Option<u32>,
+) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
+    let sglang = which_binary("sglang").map_err(|e| {
+        anyhow!(
+            "{e} (`uv pip install sglang` puts it there, or drop {SAFETENSORS_ENGINE_VAR}=sglang \
+             to serve this model with vllm)"
+        )
+    })?;
+    let mut args = vec!["serve".to_string()];
+    args.extend(sglang_serve_args_from_env(
+        model_dir.to_str().context("non-UTF-8 model path")?,
+        "127.0.0.1",
+        port,
+        model_name,
+        context_length,
+    ));
+    spawn_piped(grouped_command(&sglang, args), &sglang, "sglang")
 }
 
 /// Longest [`vllm_has_omni_plugin`] waits before assuming yes.
@@ -472,6 +643,12 @@ fn parse_load_timeout(value: &str) -> Option<Option<Duration>> {
 /// Poll interval between `/health` checks in [`wait_for_ready`].
 pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How long one `/health` request in [`wait_for_ready`] may take. Longer
+/// than [`POLL_INTERVAL`]: SGLang's `/health` runs a one-token generation,
+/// which on CPU takes about as long as the interval — bounded by it, every
+/// poll timed out and the load never became ready (seen in CI).
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Polls `process`'s `/health` endpoint until ready, bailing out early
 /// if `process` itself exits first (so a crash-on-startup doesn't hang
 /// the caller for the whole deadline). `stderr_tail`, when given (every
@@ -510,11 +687,11 @@ pub(super) async fn wait_for_ready(
                 None => anyhow!("inference server on port {port} exited before becoming ready"),
             });
         }
-        // Bound the request by POLL_INTERVAL, not the full remaining
+        // Bound the request by HEALTH_TIMEOUT, not the full remaining
         // deadline — otherwise a /health that connects but then stalls
         // could occupy up to the whole deadline (or forever, if unset)
         // without rechecking process liveness or the deadline.
-        let bound = remaining.map_or(POLL_INTERVAL, |r| r.min(POLL_INTERVAL));
+        let bound = remaining.map_or(HEALTH_TIMEOUT, |r| r.min(HEALTH_TIMEOUT));
         let attempt_start = Instant::now();
         if let Ok(resp) = client.get(&url).timeout(bound).send().await {
             // llama-server/vllm: 200 once loaded. mlx_lm.server: 200 as
@@ -784,6 +961,113 @@ mod tests {
         let args = vllm_omni_serve_args("/m", "127.0.0.1", 8000, "m", true, Duration::from_secs(1));
         assert!(args.contains(&"--omni".to_string()));
         assert!(!args.contains(&"--no-guardrails".to_string()));
+    }
+
+    #[test]
+    fn parse_safetensors_engine_accepts_vllm_sglang_or_nothing() {
+        assert_eq!(
+            parse_safetensors_engine(None),
+            Some(SafetensorsEngine::Auto)
+        );
+        assert_eq!(
+            parse_safetensors_engine(Some("")),
+            Some(SafetensorsEngine::Auto)
+        );
+        assert_eq!(
+            parse_safetensors_engine(Some("  ")),
+            Some(SafetensorsEngine::Auto)
+        );
+        assert_eq!(
+            parse_safetensors_engine(Some("vllm")),
+            Some(SafetensorsEngine::Vllm)
+        );
+        assert_eq!(
+            parse_safetensors_engine(Some("SGLang")),
+            Some(SafetensorsEngine::Sglang)
+        );
+        assert_eq!(
+            parse_safetensors_engine(Some(" sglang ")),
+            Some(SafetensorsEngine::Sglang)
+        );
+        // Unknown names are reported by the caller, not silently mapped.
+        assert_eq!(parse_safetensors_engine(Some("mlx")), None);
+        assert_eq!(parse_safetensors_engine(Some("tgi")), None);
+    }
+
+    #[test]
+    fn split_extra_args_splits_on_whitespace_only() {
+        assert_eq!(split_extra_args(None), Vec::<String>::new());
+        assert_eq!(split_extra_args(Some("")), Vec::<String>::new());
+        assert_eq!(split_extra_args(Some("   \t ")), Vec::<String>::new());
+        assert_eq!(
+            split_extra_args(Some("  --dtype bfloat16\t--enforce-eager\n--tp 2 ")),
+            ["--dtype", "bfloat16", "--enforce-eager", "--tp", "2"]
+        );
+        // No shell quoting: a quoted value is passed with its quotes.
+        assert_eq!(
+            split_extra_args(Some("--chat-template 'a b'")),
+            ["--chat-template", "'a", "b'"]
+        );
+    }
+
+    #[test]
+    fn sglang_serve_args_speak_sglangs_flag_names() {
+        let args = sglang_serve_args("/models", "0.0.0.0", 30000, "qwen3.5:0.8b", Some(4096));
+        // SGLang's own recipe: `--model-path <dir> --host --port`, no
+        // positional model and no `serve` subcommand here (the launcher
+        // prefix differs between a local `sglang serve` and the image's
+        // `python3 -m sglang.launch_server`).
+        assert_eq!(&args[..2], &["--model-path", "/models"]);
+        assert!(!args.contains(&"serve".to_string()));
+        let value = |flag: &str| {
+            let i = args.iter().position(|a| a == flag).unwrap();
+            args[i + 1].clone()
+        };
+        assert_eq!(value("--host"), "0.0.0.0");
+        assert_eq!(value("--port"), "30000");
+        // `:` is SGLang's LoRA-adapter separator (see sglang_served_model_name).
+        assert_eq!(value("--served-model-name"), "qwen3.5-0.8b");
+        assert_eq!(value("--context-length"), "4096");
+        assert!(!args.contains(&"--max-model-len".to_string()));
+    }
+
+    #[test]
+    fn sglang_served_model_name_drops_the_colon_sglang_reserves() {
+        assert_eq!(
+            sglang_served_model_name("docker.io/ai/qwen3.5:0.8b-safetensors"),
+            "docker.io/ai/qwen3.5-0.8b-safetensors"
+        );
+        assert_eq!(
+            sglang_served_model_name("hf.co/HuggingFaceTB/SmolLM2-135M-Instruct:latest"),
+            "hf.co/HuggingFaceTB/SmolLM2-135M-Instruct-latest"
+        );
+    }
+
+    #[test]
+    fn sglang_serve_args_leave_context_length_to_the_model_when_unset() {
+        let args = sglang_serve_args("/models", "127.0.0.1", 30000, "m", None);
+        assert!(!args.contains(&"--context-length".to_string()));
+    }
+
+    /// Local and container SGLang argv differ only in dir and host, like
+    /// vLLM's.
+    #[test]
+    fn sglang_serve_args_differ_between_local_and_container_only_in_dir_and_host() {
+        let local = sglang_serve_args("/cache/abc/model", "127.0.0.1", 30000, "m", Some(4096));
+        let container = sglang_serve_args("/models", "0.0.0.0", 30000, "m", Some(4096));
+        assert_eq!(local[1], "/cache/abc/model");
+        assert_eq!(container[1], "/models");
+        let host = |args: &[String]| {
+            let i = args.iter().position(|a| a == "--host").unwrap();
+            args[i + 1].clone()
+        };
+        assert_eq!(host(&local), "127.0.0.1");
+        assert_eq!(host(&container), "0.0.0.0");
+        let rest = |args: &[String]| {
+            let i = args.iter().position(|a| a == "--host").unwrap();
+            [&args[2..i], &args[i + 2..]].concat()
+        };
+        assert_eq!(rest(&local), rest(&container));
     }
 
     #[test]

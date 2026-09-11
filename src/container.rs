@@ -8,7 +8,8 @@
 //! the full image list and their `docker run` flags, which
 //! [`GpuBackend::engine_args`] mirrors for the subset detected here. The
 //! same host probe picks the vLLM image (`vllm/vllm-openai`, `rocm/vllm`
-//! or `vllm/vllm-openai-cpu`, per architecture) — see [`VllmBackend`].
+//! or `vllm/vllm-openai-cpu`, per architecture) — see [`VllmBackend`] —
+//! and SGLang's `lmsysorg/sglang` ([`VllmBackend::sglang_image_ref`]).
 //!
 //! This is the same problem ggml's own dynamic backend loading
 //! (`GGML_BACKEND_DL=ON`, `ggml_backend_load_all` in
@@ -355,6 +356,34 @@ impl VllmBackend {
         Ok(format!("docker.io/vllm/vllm-omni:{v}-{suffix}"))
     }
 
+    /// The `lmsysorg/sglang` image (multi-arch, no arch suffix): `<v>`
+    /// for CUDA 13 (`latest` floating), `<v>-cu129` for CUDA 12 (retired
+    /// upstream after v0.5.19). ROCm tags name a ROCm release and a GPU
+    /// family (`v0.5.19-rocm700-mi30x`) with no floating alias, so
+    /// `version` must be the whole tag, as for `rocm/vllm`. The CPU
+    /// (`-xeon`) images need Intel AMX and flags llmman does not pass.
+    fn sglang_image_ref(self, arch: HostArch, version: Option<&str>) -> Result<String> {
+        let v = version.unwrap_or("latest");
+        let tag = match (self, arch) {
+            (VllmBackend::Cuda13, _) => v.to_string(),
+            (VllmBackend::Cuda12, _) => format!("{v}-cu129"),
+            (VllmBackend::Rocm, HostArch::X86_64) => version.map(str::to_string).context(
+                "an AMD GPU was detected, but lmsysorg/sglang publishes no floating ROCm \
+                     tag: pass the whole tag for your GPU family as --sglang-version \
+                     (e.g. v0.5.19-rocm700-mi30x; see hub.docker.com/r/lmsysorg/sglang/tags)",
+            )?,
+            (VllmBackend::Rocm, HostArch::Aarch64) => anyhow::bail!(
+                "an AMD GPU was detected, but lmsysorg/sglang publishes no aarch64 ROCm image"
+            ),
+            (VllmBackend::Cpu, _) => anyhow::bail!(
+                "no CUDA or ROCm GPU was detected, and lmsysorg/sglang's CPU images (`-xeon`) \
+                 need Intel AMX and launch flags llmman does not pass (install sglang \
+                 locally and drop --ociman, or unset LLMMAN_SAFETENSORS_ENGINE to use vllm)"
+            ),
+        };
+        Ok(format!("docker.io/lmsysorg/sglang:{tag}"))
+    }
+
     /// GPU passthrough plus what vLLM's deployment docs ask for: `--ipc=host`
     /// (its workers share tensors over `/dev/shm`) and, for the CPU image,
     /// `SYS_NICE` and an unconfined seccomp profile for NUMA thread binding.
@@ -384,9 +413,11 @@ pub enum ContainerEngine {
     Vllm,
     /// `vllm/vllm-omni` (Diffusers-layout safetensors: `vllm serve --omni`).
     VllmOmni,
+    /// `lmsysorg/sglang` (safetensors, `LLMMAN_SAFETENSORS_ENGINE=sglang`).
+    Sglang,
 }
 
-/// The image [`spawn`] / [`spawn_vllm`] would run here for `engine`.
+/// The image [`spawn`] / [`spawn_engine`] would run here for `engine`.
 fn image_for(engine: ContainerEngine, version: Option<&str>) -> Result<String> {
     match engine {
         ContainerEngine::LlamaServer => Ok(detect_backend().image_ref(version)),
@@ -397,6 +428,10 @@ fn image_for(engine: ContainerEngine, version: Option<&str>) -> Result<String> {
         ContainerEngine::VllmOmni => {
             let (backend, arch) = VllmBackend::detect()?;
             backend.omni_image_ref(arch, version)
+        }
+        ContainerEngine::Sglang => {
+            let (backend, arch) = VllmBackend::detect()?;
+            backend.sglang_image_ref(arch, version)
         }
     }
 }
@@ -426,7 +461,7 @@ fn image_for(engine: ContainerEngine, version: Option<&str>) -> Result<String> {
 /// stdin isn't a real terminal — the common case, since `llmman serve`
 /// itself is normally daemonized with stdin closed (see daemon.rs).
 ///
-/// Pulls the image [`spawn`] or [`spawn_vllm`] would run for `engine` on
+/// Pulls the image [`spawn`] or [`spawn_engine`] would run for `engine` on
 /// this host, with the pull's own progress output (a real `docker pull`/
 /// `podman pull` progress bar — not something llmman re-implements)
 /// inherited directly to this process's stdout/stderr. `version` is the
@@ -717,29 +752,48 @@ fn run_args(
     args
 }
 
-/// The vLLM counterpart of [`spawn`]: `vllm serve` on a safetensors
-/// directory (mounted at `/models`) in the image [`VllmBackend`] picks for
-/// `engine` (`Vllm` or `VllmOmni`; same `vllm` binary and mount).
-/// `serve_args` builds the argv after `vllm` from the in-container model
-/// dir and bind address. `--entrypoint vllm` is explicit because
-/// `rocm/vllm`'s default is a shell and `vllm/vllm-omni`'s is empty.
-/// Every `VLLM_*` env var is forwarded, as a local child would inherit
-/// them, plus the Hub token variables (guardrail downloads).
-pub fn spawn_vllm(
+impl ContainerEngine {
+    /// The safetensors engines' image, launcher (`--entrypoint`, then
+    /// argv ahead of the serve flags) and the env-var prefix forwarded
+    /// into the container; `None` for llama-server (see [`spawn`]).
+    /// `--entrypoint` is explicit because `rocm/vllm`'s default is a
+    /// shell, `vllm/vllm-omni`'s empty and `lmsysorg/sglang`'s a shell;
+    /// `python3 -m sglang.launch_server` is SGLang's own Docker recipe.
+    fn launcher(self) -> Option<(&'static [&'static str], &'static str)> {
+        match self {
+            ContainerEngine::LlamaServer => None,
+            ContainerEngine::Vllm | ContainerEngine::VllmOmni => Some((&["vllm"], "VLLM_")),
+            ContainerEngine::Sglang => {
+                Some((&["python3", "-m", "sglang.launch_server"], "SGLANG_"))
+            }
+        }
+    }
+}
+
+/// The safetensors counterpart of [`spawn`]: `engine` (`Vllm`, `VllmOmni`
+/// or `Sglang`) serving a directory mounted at `/models`, in the image
+/// [`VllmBackend`] picks for it. `serve_args` builds the argv after the
+/// launcher from the in-container model dir and bind address. The
+/// engine's own env vars (`VLLM_*` / `SGLANG_*`) are forwarded, as a local
+/// child would inherit them, plus the Hub token variables.
+pub fn spawn_engine(
     ociman: ContainerManager,
     engine: ContainerEngine,
     model_dir: &Path,
-    vllm_version: Option<&str>,
+    version: Option<&str>,
     port: u16,
     cpus: Option<f64>,
     serve_args: impl FnOnce(&str, &str) -> Vec<String>,
 ) -> Result<tokio::process::Child> {
     let (backend, arch) = VllmBackend::detect()?;
     let image = match engine {
-        ContainerEngine::VllmOmni => backend.omni_image_ref(arch, vllm_version)?,
-        ContainerEngine::Vllm | ContainerEngine::LlamaServer => {
-            backend.image_ref(arch, vllm_version)?
-        }
+        ContainerEngine::VllmOmni => backend.omni_image_ref(arch, version)?,
+        ContainerEngine::Sglang => backend.sglang_image_ref(arch, version)?,
+        ContainerEngine::Vllm => backend.image_ref(arch, version)?,
+        ContainerEngine::LlamaServer => anyhow::bail!("llama-server containers go through spawn"),
+    };
+    let Some((launcher, env_prefix)) = engine.launcher() else {
+        unreachable!("LlamaServer bailed above");
     };
     eprintln!(
         "[llmman] {}: detected {:?} on {:?}, using image {:?}",
@@ -749,17 +803,18 @@ pub fn spawn_vllm(
         image
     );
     let model_dir = mount_source(model_dir)?;
-    let vllm_vars: Vec<String> = std::env::vars_os()
+    let vars: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())
         .filter(|k| {
-            k.starts_with("VLLM_") || matches!(k.as_str(), "HF_TOKEN" | "HUGGING_FACE_HUB_TOKEN")
+            k.starts_with(env_prefix) || matches!(k.as_str(), "HF_TOKEN" | "HUGGING_FACE_HUB_TOKEN")
         })
         .collect();
-    let vllm_vars: Vec<&str> = vllm_vars.iter().map(String::as_str).collect();
-    let args = vllm_run_args(
-        backend, image, &model_dir, port, &vllm_vars, cpus, serve_args,
-    );
-    run(ociman, args)
+    let vars: Vec<&str> = vars.iter().map(String::as_str).collect();
+    let prefix = run_args(backend.engine_args(), port, &vars, cpus);
+    run(
+        ociman,
+        engine_run_args(prefix, image, launcher, &model_dir, serve_args),
+    )
 }
 
 /// A bind-mount source: absolute (a relative `-v` source is a named
@@ -773,25 +828,24 @@ fn mount_source(dir: &Path) -> Result<String> {
         .with_context(|| format!("{} is not valid UTF-8", dir.display()))
 }
 
-/// [`spawn_vllm`]'s argv, split out so the ordering (`-v`/`--entrypoint`
-/// before the image, `serve ...` after) is testable without an engine.
-fn vllm_run_args(
-    backend: VllmBackend,
+/// [`spawn_engine`]'s argv after [`run_args`]'s `run` prefix, split out
+/// so the ordering (`-v`/`--entrypoint` before the image, the launcher's
+/// rest and serve flags after) is testable without an engine.
+fn engine_run_args(
+    mut args: Vec<String>,
     image: String,
+    launcher: &[&str],
     model_dir: &str,
-    port: u16,
-    passthrough_vars: &[&str],
-    cpus: Option<f64>,
     serve_args: impl FnOnce(&str, &str) -> Vec<String>,
 ) -> Vec<String> {
-    let mut args = run_args(backend.engine_args(), port, passthrough_vars, cpus);
     args.extend([
         "-v".into(),
         format!("{model_dir}:/models:ro"),
         "--entrypoint".into(),
-        "vllm".into(),
+        launcher[0].into(),
         image,
     ]);
+    args.extend(launcher[1..].iter().map(|a| a.to_string()));
     args.extend(serve_args("/models", "0.0.0.0"));
     args
 }
@@ -1170,6 +1224,102 @@ mod tests {
     }
 
     #[test]
+    fn sglang_image_refs_match_docker_hub_tag_spellings() {
+        // hub.docker.com/r/lmsysorg/sglang/tags: multi-arch `latest`,
+        // `v0.5.19`, `latest-cu129`, `v0.5.19-cu129` — no arch suffix.
+        for arch in [HostArch::X86_64, HostArch::Aarch64] {
+            assert_eq!(
+                VllmBackend::Cuda13.sglang_image_ref(arch, None).unwrap(),
+                "docker.io/lmsysorg/sglang:latest"
+            );
+            assert_eq!(
+                VllmBackend::Cuda13
+                    .sglang_image_ref(arch, Some("v0.5.19"))
+                    .unwrap(),
+                "docker.io/lmsysorg/sglang:v0.5.19"
+            );
+            assert_eq!(
+                VllmBackend::Cuda12.sglang_image_ref(arch, None).unwrap(),
+                "docker.io/lmsysorg/sglang:latest-cu129"
+            );
+            assert_eq!(
+                VllmBackend::Cuda12
+                    .sglang_image_ref(arch, Some("v0.5.19"))
+                    .unwrap(),
+                "docker.io/lmsysorg/sglang:v0.5.19-cu129"
+            );
+        }
+    }
+
+    #[test]
+    fn sglang_rocm_image_is_the_whole_pinned_tag_or_nothing() {
+        assert_eq!(
+            VllmBackend::Rocm
+                .sglang_image_ref(HostArch::X86_64, Some("v0.5.19-rocm700-mi30x"))
+                .unwrap(),
+            "docker.io/lmsysorg/sglang:v0.5.19-rocm700-mi30x"
+        );
+        let err = VllmBackend::Rocm
+            .sglang_image_ref(HostArch::X86_64, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--sglang-version"), "{err}");
+        assert!(err.contains("rocm700-mi30x"), "{err}");
+        let err = VllmBackend::Rocm
+            .sglang_image_ref(HostArch::Aarch64, Some("v0.5.19-rocm700-mi30x"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("aarch64"), "{err}");
+    }
+
+    #[test]
+    fn sglang_has_no_cpu_image_here() {
+        for arch in [HostArch::X86_64, HostArch::Aarch64] {
+            let err = VllmBackend::Cpu
+                .sglang_image_ref(arch, Some("v0.5.19"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("xeon"), "{err}");
+            assert!(err.contains("LLMMAN_SAFETENSORS_ENGINE"), "{err}");
+        }
+    }
+
+    #[test]
+    fn sglang_run_args_launch_the_module_after_the_image_and_flags_after_that() {
+        let (launcher, _) = ContainerEngine::Sglang.launcher().unwrap();
+        let args = engine_run_args(
+            run_args(VllmBackend::Cuda13.engine_args(), 30000, &[], None),
+            "docker.io/lmsysorg/sglang:latest".into(),
+            launcher,
+            "/cache/abc/model",
+            |dir: &str, host: &str| {
+                vec![
+                    "--model-path".into(),
+                    dir.into(),
+                    "--host".into(),
+                    host.into(),
+                ]
+            },
+        );
+        let image = args
+            .iter()
+            .position(|a| a == "docker.io/lmsysorg/sglang:latest")
+            .expect("image present");
+        assert_eq!(&args[image - 2..image], &["--entrypoint", "python3"]);
+        assert_eq!(
+            &args[image + 1..],
+            &[
+                "-m",
+                "sglang.launch_server",
+                "--model-path",
+                "/models",
+                "--host",
+                "0.0.0.0"
+            ]
+        );
+    }
+
+    #[test]
     fn vllm_engine_args_add_ipc_host_on_top_of_gpu_passthrough() {
         assert_eq!(
             VllmBackend::Cuda13.engine_args(),
@@ -1199,14 +1349,13 @@ mod tests {
 
     #[test]
     fn vllm_run_args_put_the_mount_and_entrypoint_before_the_image_and_serve_after() {
-        let args = vllm_run_args(
-            VllmBackend::Cuda13,
+        let (launcher, _) = ContainerEngine::Vllm.launcher().unwrap();
+        let args = engine_run_args(
+            run_args(VllmBackend::Cuda13.engine_args(), 8000, &[], None),
             "docker.io/vllm/vllm-openai:latest-x86_64".into(),
+            launcher,
             "/cache/abc/model",
-            8000,
-            &[],
-            None,
-            |dir, host| {
+            |dir: &str, host: &str| {
                 vec![
                     "serve".into(),
                     dir.into(),
@@ -1314,14 +1463,13 @@ mod tests {
 
     #[test]
     fn vllm_containers_get_cpus_too() {
-        let args = vllm_run_args(
-            VllmBackend::Cpu,
+        let (launcher, _) = ContainerEngine::Vllm.launcher().unwrap();
+        let args = engine_run_args(
+            run_args(VllmBackend::Cpu.engine_args(), 8000, &[], Some(3.0)),
             "docker.io/vllm/vllm-openai-cpu:latest-x86_64".into(),
+            launcher,
             "/cache/abc/model",
-            8000,
-            &[],
-            Some(3.0),
-            |dir, host| vec!["serve".into(), dir.into(), "--host".into(), host.into()],
+            |dir: &str, host: &str| vec!["serve".into(), dir.into(), "--host".into(), host.into()],
         );
         assert!(args.windows(2).any(|w| w == ["--cpus", "3"]), "{args:?}");
     }

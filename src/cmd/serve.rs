@@ -46,10 +46,11 @@ mod types;
 mod webui;
 
 use backend::{
-    find_free_port, local_llama_server_bin, spawn_llama_server, spawn_mlx_server,
-    spawn_vllm_omni_server, spawn_vllm_server, tail_child_output, use_mlx_for_safetensors,
-    vllm_max_model_len, vllm_omni_serve_args_from_env, vllm_serve_args, wait_for_ready, OutputTail,
-    POLL_INTERVAL,
+    find_free_port, local_llama_server_bin, safetensors_engine_from_env,
+    sglang_serve_args_from_env, sglang_served_model_name, spawn_llama_server, spawn_mlx_server,
+    spawn_sglang_server, spawn_vllm_omni_server, spawn_vllm_server, tail_child_output,
+    use_mlx_for_safetensors, vllm_max_model_len, vllm_omni_serve_args_from_env,
+    vllm_serve_args_from_env, wait_for_ready, OutputTail, SafetensorsEngine, POLL_INTERVAL,
 };
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
 pub use config::DEFAULT_CTX_SIZE;
@@ -96,7 +97,7 @@ Environment Variables:
       LLMMAN_TLS_CERT                PEM certificate chain to terminate TLS with (with LLMMAN_TLS_KEY)
       LLMMAN_TLS_KEY                 PEM private key for LLMMAN_TLS_CERT
       LLMMAN_TLS_CA                  PEM bundle of extra roots to trust when reaching peers (and, for the CLI, the daemon)
-      LLMMAN_CONTEXT_LENGTH          Context size for llama-server/vLLM when set (default 262144 for llama-server)
+      LLMMAN_CONTEXT_LENGTH          Context size for llama-server/vLLM/SGLang when set (default 262144 for llama-server)
       LLMMAN_HYBRID_LOCAL_BYTES      Largest request a hybrid pair serves locally, in bytes (0 disables; default: from the context length)
       LLMMAN_KEEP_ALIVE              The duration that models stay loaded in memory (default \"5m\")
       LLMMAN_MAX_LOADED_MODELS       Maximum number of loaded models (default: unbounded)
@@ -105,6 +106,9 @@ Environment Variables:
       LLMMAN_METRICS                 Serve a Prometheus scrape endpoint at /metrics (default: off)
       LLMMAN_MODELS                  The path to the models directory
       LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only)
+      LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on Apple Silicon when installed, else vllm)
+      LLMMAN_VLLM_ARGS               Extra whitespace-separated arguments appended to every `vllm serve` (e.g. \"--dtype bfloat16 --tp 2\")
+      LLMMAN_SGLANG_ARGS             Extra whitespace-separated arguments appended to every sglang launch (e.g. \"--disable-cuda-graph\")
       LLMMAN_NOHISTORY               Do not record prompts for `llmman log`
       LLMMAN_NOPRUNE                 Do not prune model blobs on startup
       LLMMAN_ORIGINS                 A comma separated list of allowed CORS origins
@@ -133,13 +137,14 @@ pub struct ServeArgs {
 
     /// Where the inference engine comes from. `docker`/`podman` (Linux
     /// only) run the ghcr.io/ggml-org/llama.cpp server image for the
-    /// host's GPU, and a vLLM image for safetensors models. `bin`
+    /// host's GPU, and a vLLM image for safetensors models (an SGLang
+    /// one under LLMMAN_SAFETENSORS_ENGINE=sglang). `bin`
     /// downloads llama.cpp's prebuilt `llama-server` for this
     /// OS/arch/GPU. `path` uses the `llama-server` on PATH and never
     /// downloads anything. `auto` tries docker, podman, bin, path in
     /// turn (off Linux: bin, path). The choice is fetched before the
     /// listener binds. Safetensors models outside a container use the
-    /// `vllm`/`mlx_lm.server` on PATH.
+    /// `vllm`/`sglang`/`mlx_lm.server` on PATH.
     #[arg(long, value_enum, default_value = "auto", env = "LLMMAN_RUNTIME")]
     pub runtime: Runtime,
 
@@ -159,13 +164,22 @@ pub struct ServeArgs {
     #[arg(long, value_name = "TAG")]
     pub vllm_version: Option<String>,
 
+    /// With a container runtime and LLMMAN_SAFETENSORS_ENGINE=sglang, pin
+    /// the lmsysorg/sglang image tag (e.g. `v0.5.19`; `-cu129` is added
+    /// for a CUDA 12 driver). For an AMD GPU the value is the whole tag
+    /// (e.g. `v0.5.19-rocm700-mi30x`) and required: upstream has no
+    /// floating one.
+    #[arg(long, value_name = "TAG")]
+    pub sglang_version: Option<String>,
+
     /// Fetch what `--runtime` needs (the container image or the
     /// `llama-server` release), with its progress on this terminal, then
     /// exit instead of serving. With a container runtime and an
-    /// already-pulled safetensors MODEL, the vLLM image is fetched too.
-    /// A plain `serve` does the same fetch at startup, but detached with
-    /// its output in a log file, where a slow first pull looks like a
-    /// hang; run this first and the daemon then starts instantly.
+    /// already-pulled safetensors MODEL, the vLLM (or SGLang) image is
+    /// fetched too. A plain `serve` does the same fetch at startup, but
+    /// detached with its output in a log file, where a slow first pull
+    /// looks like a hang; run this first and the daemon then starts
+    /// instantly.
     #[arg(long)]
     pub pull_only: bool,
 
@@ -207,6 +221,9 @@ struct Inner {
     llama_cpp_version: Option<String>,
     // --vllm-version; only meaningful with a container runtime.
     vllm_version: Option<String>,
+    // --sglang-version; only meaningful with a container runtime and
+    // LLMMAN_SAFETENSORS_ENGINE=sglang.
+    sglang_version: Option<String>,
     // See context_length_from_env's doc comment — forwarded to
     // backends that expose a context-size flag.
     ctx_size: Option<u32>,
@@ -307,13 +324,12 @@ struct RunningModel {
     /// `ActivityGuard`'s doc comment for why a generation slower than its
     /// own `keep_alive` must not be killed mid-stream.
     in_flight: u32,
-    /// `Some(<absolute model directory path>)` only for `Engine::Mlx`,
-    /// `None` for every other engine — see `backend_wire_model`'s own
-    /// doc comment for what this is actually for (the `"model"` field a
-    /// request must carry to reach *this* model on an `mlx_lm.server`
-    /// backend, since it has no `--served-model-name`-equivalent way to
-    /// register a human-readable alias for it up front the way `vllm`
-    /// does).
+    /// The `"model"` field a request must carry to reach this model on
+    /// its backend when that differs from the canonical reference — see
+    /// `backend_wire_model`. `Some(<absolute model directory>)` for
+    /// `Engine::Mlx` (no `--served-model-name` equivalent),
+    /// `Some(sglang_served_model_name(..))` for `Engine::Sglang` (`:` is
+    /// its LoRA separator), `None` otherwise.
     backend_model_path: Option<String>,
 }
 
@@ -345,7 +361,7 @@ impl RunningModel {
     /// container form carries the runtime binary, which would put
     /// `docker` and `podman` in a label for the same engine. A container
     /// reports as whichever engine it runs (llama-server via
-    /// `container::spawn`, vllm via `container::spawn_vllm`).
+    /// `container::spawn`, vllm/sglang via `container::spawn_engine`).
     fn engine_label(&self) -> &'static str {
         match &self.process {
             ModelProcess::Local(engine, _, _) | ModelProcess::Container(_, engine, _) => {
@@ -365,6 +381,12 @@ enum Engine {
     /// model. Killed like [`Engine::Vllm`]; its media routes speak a
     /// different dialect — see [`omni_images`] and [`omni_videos`].
     VllmOmni,
+    /// `sglang serve` (or the `lmsysorg/sglang` image) for a
+    /// [`ModelPath::SafeTensors`] directory under
+    /// `LLMMAN_SAFETENSORS_ENGINE=sglang` ([`SafetensorsEngine`]). Killed
+    /// like [`Engine::Vllm`]; addressed like [`Engine::Mlx`]
+    /// ([`RunningModel::backend_model_path`]).
+    Sglang,
     /// `mlx_lm.server` (the `mlx-lm` PyPI package) — Apple Silicon's own
     /// Metal-accelerated alternative to `vllm` for a
     /// [`ModelPath::SafeTensors`] directory, picked instead of it when
@@ -383,17 +405,19 @@ impl Engine {
             Engine::LlamaServer => "llama-server",
             Engine::Vllm => "vllm",
             Engine::VllmOmni => "vllm-omni",
+            Engine::Sglang => "sglang",
             Engine::Mlx => "mlx",
         }
     }
 }
 
 /// A running inference backend: either a local `llama-server`/`vllm`/
-/// `mlx_lm.server` process (killed via `Child::kill_on_drop`, except
-/// `Engine::Vllm` — see this Drop impl) or an attached `docker run`/
-/// `podman run` process running `Engine::LlamaServer` or `Engine::Vllm`,
-/// gracefully stopped via SIGTERM on drop since `kill_on_drop`'s SIGKILL
-/// can't be forwarded to (and so doesn't stop) the container.
+/// `sglang`/`mlx_lm.server` process (killed via `Child::kill_on_drop`,
+/// except `Engine::Vllm`-like engines — see this Drop impl) or an
+/// attached `docker run`/`podman run` process running
+/// `Engine::LlamaServer`, `Engine::Vllm` or `Engine::Sglang`, gracefully
+/// stopped via SIGTERM on drop since `kill_on_drop`'s SIGKILL can't be
+/// forwarded to (and so doesn't stop) the container.
 enum ModelProcess {
     // `Option<u32>` is the pid captured right after spawn, not
     // `child.id()` at drop time: `is_alive`'s `try_wait` reaps the child
@@ -424,26 +448,30 @@ impl Drop for ModelProcess {
                     crate::container::stop(pid);
                 }
             }
-            // vllm forks its own API-server/engine-core workers, which
-            // don't share a process tree `kill_on_drop`'s single-pid kill
-            // can reach — SIGKILLing just the top pid (e.g. on a
-            // cancelled load) orphans them, still holding GPU memory
-            // indefinitely. spawn_vllm_server puts this child in its own
-            // process group so the whole group can be killed here.
+            // vllm forks API-server/engine-core workers (sglang a
+            // scheduler and detokenizer) that `kill_on_drop`'s single-pid
+            // kill can't reach — SIGKILLing just the top pid orphans
+            // them, still holding GPU memory. `grouped_command` puts the
+            // child in its own process group so the whole group dies here.
             #[cfg(unix)]
-            ModelProcess::Local(Engine::Vllm | Engine::VllmOmni, _, pid) => {
+            ModelProcess::Local(
+                engine @ (Engine::Vllm | Engine::VllmOmni | Engine::Sglang),
+                _,
+                pid,
+            ) => {
                 if let Some(pid) = pid {
                     let result = unsafe { libc::kill(-(*pid as libc::pid_t), libc::SIGKILL) };
                     if result != 0 {
                         let err = std::io::Error::last_os_error();
                         eprintln!(
-                            "[llmman] warning: SIGKILL to vllm process group {pid} failed: {err}"
+                            "[llmman] warning: SIGKILL to {} process group {pid} failed: {err}",
+                            engine.label()
                         );
                     }
                 }
             }
             #[cfg(not(unix))]
-            ModelProcess::Local(Engine::Vllm | Engine::VllmOmni, _, _) => {}
+            ModelProcess::Local(Engine::Vllm | Engine::VllmOmni | Engine::Sglang, _, _) => {}
             // `mlx_lm.server` runs entirely as one process — a single
             // background generation thread plus a `ThreadingHTTPServer`,
             // no forked worker tree of its own the way vllm has above —
@@ -501,7 +529,7 @@ impl ModelProcess {
                 }
             }
             #[cfg(unix)]
-            ModelProcess::Local(Engine::Vllm | Engine::VllmOmni, _, pid) => {
+            ModelProcess::Local(Engine::Vllm | Engine::VllmOmni | Engine::Sglang, _, pid) => {
                 if let Some(pid) = pid {
                     unsafe { libc::kill(-(*pid as libc::pid_t), libc::SIGKILL) };
                 }
@@ -2083,6 +2111,8 @@ async fn ensure_model(
         let mut stderr_tail: Option<OutputTail> = None;
         let mut oom_retryable = false;
         let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
+        // Per load, like use_mlx_for_safetensors, which it gates.
+        let safetensors_engine = safetensors_engine_from_env();
         process = match (&model_path, state.0.runtime.ociman()) {
             (ModelPath::Gguf(path, mmproj), Some(ociman)) => {
                 let mut child = crate::container::spawn(
@@ -2126,26 +2156,57 @@ async fn ensure_model(
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }
             // Container runtimes are Linux-only and mlx Metal-only, so
-            // this never competes with the mlx arm.
+            // this never competes with the mlx arm. vllm unless
+            // LLMMAN_SAFETENSORS_ENGINE=sglang.
             (ModelPath::SafeTensors(dir), Some(ociman)) => {
-                let mut child = crate::container::spawn_vllm(
+                let sglang = safetensors_engine == SafetensorsEngine::Sglang;
+                let (engine, container_engine, version) = if sglang {
+                    (
+                        Engine::Sglang,
+                        crate::container::ContainerEngine::Sglang,
+                        state.0.sglang_version.as_deref(),
+                    )
+                } else {
+                    (
+                        Engine::Vllm,
+                        crate::container::ContainerEngine::Vllm,
+                        state.0.vllm_version.as_deref(),
+                    )
+                };
+                let mut child = crate::container::spawn_engine(
                     ociman,
-                    crate::container::ContainerEngine::Vllm,
+                    container_engine,
                     dir,
-                    state.0.vllm_version.as_deref(),
+                    version,
                     port,
                     state.0.cpu_limit,
                     |model_dir, host| {
-                        vllm_serve_args(model_dir, host, port, model_ref, max_model_len)
+                        if sglang {
+                            sglang_serve_args_from_env(
+                                model_dir,
+                                host,
+                                port,
+                                model_ref,
+                                max_model_len,
+                            )
+                        } else {
+                            vllm_serve_args_from_env(
+                                model_dir,
+                                host,
+                                port,
+                                model_ref,
+                                max_model_len,
+                            )
+                        }
                     },
                 )?;
                 stderr_tail = Some(tail_child_output(&mut child));
-                ModelProcess::Container(ociman, Engine::Vllm, child)
+                ModelProcess::Container(ociman, engine, child)
             }
             // Diffusers-layout models go to vLLM-Omni (`vllm serve --omni`),
             // never to plain vllm or mlx, which cannot load one.
             (ModelPath::Omni(dir), Some(ociman)) => {
-                let mut child = crate::container::spawn_vllm(
+                let mut child = crate::container::spawn_engine(
                     ociman,
                     crate::container::ContainerEngine::VllmOmni,
                     dir,
@@ -2164,6 +2225,17 @@ async fn ensure_model(
                 stderr_tail = Some(tail);
                 let pid = child.id();
                 ModelProcess::Local(Engine::VllmOmni, child, pid)
+            }
+            // An explicit engine choice also disables the mlx preference
+            // (see use_mlx_for_safetensors).
+            (ModelPath::SafeTensors(dir), None)
+                if safetensors_engine == SafetensorsEngine::Sglang =>
+            {
+                let (child, tail) =
+                    spawn_sglang_server(dir, port, model_ref, max_model_len).await?;
+                stderr_tail = Some(tail);
+                let pid = child.id();
+                ModelProcess::Local(Engine::Sglang, child, pid)
             }
             (ModelPath::SafeTensors(_dir), None) if use_mlx_for_safetensors() => {
                 let child = spawn_mlx_server(port).await?;
@@ -2250,14 +2322,11 @@ async fn ensure_model(
     }
     eprintln!("[llmman] {model_ref} ready on port {port}");
 
-    // See RunningModel::backend_model_path's own doc comment — only
-    // meaningful for Engine::Mlx, which is the only engine
-    // spawn_mlx_server deliberately doesn't preload via `--model` for
-    // (see its own doc comment), so every request must instead carry
-    // this exact directory as its own "model" field.
-    let backend_model_path = match &process {
-        ModelProcess::Local(Engine::Mlx, _, _) => model_path.path().to_str().map(|s| s.to_string()),
-        _ => None,
+    // See RunningModel::backend_model_path.
+    let backend_model_path = match process.engine() {
+        Engine::Mlx => model_path.path().to_str().map(|s| s.to_string()),
+        Engine::Sglang => Some(sglang_served_model_name(model_ref)),
+        Engine::LlamaServer | Engine::Vllm | Engine::VllmOmni => None,
     };
 
     let mut mgr = state.0.manager.lock().await;
@@ -2292,11 +2361,9 @@ async fn ensure_model(
 /// The `"model"` value to actually put in the JSON request body sent to
 /// `canonical_model`'s backend process — `canonical_model` itself
 /// (`ensure_model`'s return value, already the exact name every other
-/// engine needs — see its own doc comment) for everything except a
-/// running `Engine::Mlx` backend, for which it's that model's real
-/// on-disk directory path instead (`RunningModel::backend_model_path` —
-/// see `spawn_mlx_server`'s doc comment for why `mlx_lm.server` needs
-/// that rather than a human-readable name at all).
+/// engine needs — see its own doc comment) unless the running backend
+/// registered it differently (`RunningModel::backend_model_path`: an
+/// `Engine::Mlx` directory path, an `Engine::Sglang` colon-free name).
 ///
 /// Every caller must apply this only to the request forwarded to the
 /// backend — client-facing response bodies (an Ollama chunk's `model`
@@ -4885,6 +4952,11 @@ fn pull_only_engine(model: Option<&str>) -> anyhow::Result<crate::container::Con
         format!("--pull-only: pull {model_ref} first to learn which image it needs")
     })?;
     Ok(match format {
+        crate::modelpack::ModelFormat::SafeTensors
+            if safetensors_engine_from_env() == SafetensorsEngine::Sglang =>
+        {
+            crate::container::ContainerEngine::Sglang
+        }
         crate::modelpack::ModelFormat::SafeTensors => crate::container::ContainerEngine::Vllm,
         crate::modelpack::ModelFormat::Omni => crate::container::ContainerEngine::VllmOmni,
         crate::modelpack::ModelFormat::Gguf | crate::modelpack::ModelFormat::Diffusion => {
@@ -4913,10 +4985,18 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     if _args.pull_only {
         if let Some(ociman) = resolved.ociman() {
             // resolve() pulled the llama.cpp image; a safetensors MODEL
-            // needs vLLM's too.
+            // needs vLLM's (or SGLang's) too.
             let engine = pull_only_engine(_args.model.as_deref())?;
-            if engine != crate::container::ContainerEngine::LlamaServer {
-                crate::container::pull_image(ociman, engine, _args.vllm_version.as_deref())?;
+            let version = match engine {
+                crate::container::ContainerEngine::LlamaServer => None,
+                crate::container::ContainerEngine::Sglang => Some(_args.sglang_version.as_deref()),
+                crate::container::ContainerEngine::Vllm
+                | crate::container::ContainerEngine::VllmOmni => {
+                    Some(_args.vllm_version.as_deref())
+                }
+            };
+            if let Some(version) = version {
+                crate::container::pull_image(ociman, engine, version)?;
             }
         }
         return Ok(());
@@ -4991,6 +5071,19 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         eprintln!("[llmman] backend container gets --cpus {n} (this daemon's own CPU limit)");
     }
 
+    // Logged at startup so a typo is reported before the first request.
+    let chosen = match safetensors_engine_from_env() {
+        SafetensorsEngine::Auto => None,
+        SafetensorsEngine::Vllm => Some("vllm"),
+        SafetensorsEngine::Sglang => Some("sglang"),
+    };
+    if let Some(engine) = chosen {
+        eprintln!(
+            "[llmman] safetensors models go to {engine} ({})",
+            backend::SAFETENSORS_ENGINE_VAR
+        );
+    }
+
     // Before anything binds, so a misconfiguration fails at exec.
     let auth = auth::Policy::from_env()?;
     if auth.enforced() {
@@ -5029,6 +5122,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         runtime,
         llama_cpp_version,
         vllm_version: _args.vllm_version.clone(),
+        sglang_version: _args.sglang_version.clone(),
         ctx_size,
         ctx_size_explicit: ctx_size_explicit.is_some(),
         hybrid_local_bytes: crate::hybrid::local_budget_bytes_from_env(ctx_size),
