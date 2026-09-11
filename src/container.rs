@@ -505,19 +505,20 @@ pub struct LlamaOptions<'a> {
     /// needs a whole input in one ubatch.
     pub batch_size: Option<u32>,
 
-    /// `--threads <n>`: a request's Ollama `options.num_thread` when
-    /// set, else the derived host-limit value, which is `Some` only
-    /// when a CPU limit (cgroup quota or affinity) binds; see
-    /// `cmd::serve::ensure_model`'s `request_threads` parameter and
-    /// `cmd::serve::config::threads_from_env_or_host`. Deliberately ignored by
-    /// [`spawn`], whichever source it came from: the derived value
-    /// describes the daemon's cgroup, which says nothing about the
-    /// limits of the fresh container llama-server runs in, and a
-    /// request's num_thread counts host cores the container may not
-    /// have either, so both stay local-spawn-only until container CPU
-    /// limits are plumbed deliberately. An explicit LLAMA_ARG_THREADS
-    /// still reaches the container via LLAMA_CPP_ENV_PASSTHROUGH_VARS.
+    /// `--threads <n>`: a request's Ollama `options.num_thread`, else the
+    /// derived host-limit value (see `cmd::serve::ensure_model`'s
+    /// `request_threads` and `cmd::serve::config::threads_from_env_or_host`).
+    /// Forwarded into the container too, since `cpus` gives it the same
+    /// CPU budget the value was derived from. An explicit
+    /// LLAMA_ARG_THREADS leaves this `None` and reaches the container via
+    /// LLAMA_CPP_ENV_PASSTHROUGH_VARS instead.
     pub threads: Option<u32>,
+
+    /// `--cpus <n>` on the container: the daemon's own CPU limit, `Some`
+    /// only when one binds (see `cmd::serve::config::container_cpu_limit`).
+    /// Snapshotted at startup together with `threads`, so the two
+    /// always agree.
+    pub cpus: Option<f64>,
 }
 
 /// Callers must stop this gracefully (SIGTERM, not the default
@@ -542,6 +543,53 @@ pub fn spawn(
     llama_cpp_version: Option<&str>,
     opts: LlamaOptions<'_>,
 ) -> Result<tokio::process::Child> {
+    let backend = detect_backend();
+    let image = backend.image_ref(llama_cpp_version);
+    eprintln!(
+        "[llmman] {}: detected {:?}, using image {:?}",
+        ociman.binary(),
+        backend,
+        image
+    );
+    let (model_dir, model_file) = mount_split(model_path, "model")?;
+    let mmproj = mmproj_path.map(|p| mount_split(p, "mmproj")).transpose()?;
+    let args = llama_run_args(
+        backend,
+        image,
+        &model_dir,
+        &model_file,
+        mmproj.as_ref().map(|(d, f)| (d.as_str(), f.as_str())),
+        crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS,
+        opts,
+    );
+    run(ociman, args)
+}
+
+/// A file's bind-mount source directory (see [`mount_source`]) and its
+/// UTF-8 file name, for `-v <dir>:/x:ro` plus `/x/<file>`.
+fn mount_split(path: &Path, what: &str) -> Result<(String, String)> {
+    let dir = path
+        .parent()
+        .with_context(|| format!("{what} path has no parent directory"))?;
+    let file = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| format!("{what} path has no valid UTF-8 filename"))?;
+    Ok((mount_source(dir)?, file.to_owned()))
+}
+
+/// [`spawn`]'s argv, split out so the flags are testable without an
+/// engine. `mmproj` is the mmproj's `(mount dir, file name)`, mounted
+/// as its own `/mmproj` volume.
+fn llama_run_args(
+    backend: GpuBackend,
+    image: String,
+    model_dir: &str,
+    model_file: &str,
+    mmproj: Option<(&str, &str)>,
+    passthrough_vars: &[&str],
+    opts: LlamaOptions<'_>,
+) -> Vec<String> {
     let LlamaOptions {
         port,
         ctx_size,
@@ -552,45 +600,16 @@ pub fn spawn(
         num_parallel,
         embeddings,
         batch_size,
-        // See the field's doc comment: neither the derived value nor a
-        // request's num_thread describes the container's own CPU limits.
-        threads: _,
+        threads,
+        cpus,
     } = opts;
-    let backend = detect_backend();
-    let image = backend.image_ref(llama_cpp_version);
-    eprintln!(
-        "[llmman] {}: detected {:?}, using image {:?}",
-        ociman.binary(),
-        backend,
-        image
-    );
-
-    let model_dir = model_path
-        .parent()
-        .context("model path has no parent directory")?;
-    let model_file = model_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .context("model path has no valid UTF-8 filename")?;
-    let model_dir = mount_source(model_dir)?;
-
-    let mut args = run_args(
-        backend.engine_args(),
-        port,
-        crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS,
-    );
+    let mut args = run_args(backend.engine_args(), port, passthrough_vars, cpus);
     args.push("-v".into());
     args.push(format!("{model_dir}:/models:ro"));
-    let mmproj_file = mmproj_path
-        .map(|p| -> Result<&str> {
-            let dir = p.parent().context("mmproj path has no parent directory")?;
-            args.push("-v".into());
-            args.push(format!("{}:/mmproj:ro", mount_source(dir)?));
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .context("mmproj path has no valid UTF-8 filename")
-        })
-        .transpose()?;
+    if let Some((dir, _)) = mmproj {
+        args.push("-v".into());
+        args.push(format!("{dir}:/mmproj:ro"));
+    }
     args.push(image);
     args.extend([
         "-m".into(),
@@ -600,9 +619,9 @@ pub fn spawn(
         "--host".into(),
         "0.0.0.0".into(),
     ]);
-    if let Some(mmproj_file) = mmproj_file {
+    if let Some((_, file)) = mmproj {
         args.push("--mmproj".into());
-        args.push(format!("/mmproj/{mmproj_file}"));
+        args.push(format!("/mmproj/{file}"));
     }
     if let Some(n) = ctx_size {
         args.push("--ctx-size".into());
@@ -643,17 +662,36 @@ pub fn spawn(
         args.push("-ub".into());
         args.push(n.to_string());
     }
-
-    run(ociman, args)
+    // Pairs with `--cpus` (see run_args): a quota alone leaves
+    // autodetection starting a thread per host core.
+    if let Some(n) = threads {
+        args.push("--threads".into());
+        args.push(n.to_string());
+    }
+    args
 }
 
 /// The `run` prefix every container here starts with: attached with an
-/// init, the port published, the GPU passed through (`engine_args`), and
-/// the GPU-visibility env vars plus the engine's own `passthrough_vars`
+/// init, the port published, the daemon's CPU limit forwarded as
+/// `--cpus` (`cpus`), the GPU passed through (`engine_args`), and the
+/// GPU-visibility env vars plus the engine's own `passthrough_vars`
 /// forwarded (`docker run` does not inherit the environment). `-e NAME`
 /// without a value: the engine copies it from our environment, so a
 /// secret (`VLLM_API_KEY`) never appears in argv or the debug log.
-fn run_args(engine_args: Vec<String>, port: u16, passthrough_vars: &[&str]) -> Vec<String> {
+///
+/// `cpus`: the container is a sibling of the daemon in its own cgroup
+/// (under dockerd or the rootless user slice), so a quota on `llmman
+/// serve` never reaches it on its own, and all of the CPU work would
+/// run unlimited behind a capped proxy (llmmanorg/llmman#324). `None`
+/// (no limit binds) adds nothing. It is a CFS quota even when the
+/// daemon's limit is an affinity mask: the budget is what matters, and
+/// it is the one form both engines share.
+fn run_args(
+    engine_args: Vec<String>,
+    port: u16,
+    passthrough_vars: &[&str],
+    cpus: Option<f64>,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
         "--rm".into(),
@@ -662,6 +700,10 @@ fn run_args(engine_args: Vec<String>, port: u16, passthrough_vars: &[&str]) -> V
         "-p".into(),
         format!("127.0.0.1:{port}:{port}"),
     ];
+    if let Some(n) = cpus {
+        args.push("--cpus".into());
+        args.push(n.to_string());
+    }
     args.extend(engine_args);
     for var in crate::cmd::serve::GPU_VISIBLE_DEVICE_VARS
         .iter()
@@ -689,6 +731,7 @@ pub fn spawn_vllm(
     model_dir: &Path,
     vllm_version: Option<&str>,
     port: u16,
+    cpus: Option<f64>,
     serve_args: impl FnOnce(&str, &str) -> Vec<String>,
 ) -> Result<tokio::process::Child> {
     let (backend, arch) = VllmBackend::detect()?;
@@ -713,7 +756,9 @@ pub fn spawn_vllm(
         })
         .collect();
     let vllm_vars: Vec<&str> = vllm_vars.iter().map(String::as_str).collect();
-    let args = vllm_run_args(backend, image, &model_dir, port, &vllm_vars, serve_args);
+    let args = vllm_run_args(
+        backend, image, &model_dir, port, &vllm_vars, cpus, serve_args,
+    );
     run(ociman, args)
 }
 
@@ -736,9 +781,10 @@ fn vllm_run_args(
     model_dir: &str,
     port: u16,
     passthrough_vars: &[&str],
+    cpus: Option<f64>,
     serve_args: impl FnOnce(&str, &str) -> Vec<String>,
 ) -> Vec<String> {
-    let mut args = run_args(backend.engine_args(), port, passthrough_vars);
+    let mut args = run_args(backend.engine_args(), port, passthrough_vars, cpus);
     args.extend([
         "-v".into(),
         format!("{model_dir}:/models:ro"),
@@ -777,6 +823,7 @@ pub fn spawn_mediagen(
     cache_path: &Path,
     llama_cpp_version: Option<&str>,
     port: u16,
+    cpus: Option<f64>,
 ) -> Result<tokio::process::Child> {
     let backend = detect_backend();
     let image = backend.image_ref(llama_cpp_version);
@@ -798,7 +845,7 @@ pub fn spawn_mediagen(
         crate::cmd::serve::MEDIAGEN_ENV_PASSTHROUGH_VARS,
     ]
     .concat();
-    let mut args = run_args(backend.engine_args(), port, &passthrough);
+    let mut args = run_args(backend.engine_args(), port, &passthrough, cpus);
     args.extend([
         "-v".into(),
         format!("{exe}:/usr/local/bin/llmman:ro"),
@@ -1158,6 +1205,7 @@ mod tests {
             "/cache/abc/model",
             8000,
             &[],
+            None,
             |dir, host| {
                 vec![
                     "serve".into(),
@@ -1198,16 +1246,84 @@ mod tests {
     fn run_args_forward_only_the_requested_passthrough_vars() {
         const VAR: &str = "LLMMAN_TEST_RUN_ARGS_PASSTHROUGH";
         std::env::set_var(VAR, "1");
-        let args = run_args(vec![], 8080, &[]);
+        let args = run_args(vec![], 8080, &[], None);
         assert_eq!(
             &args[..6],
             &["run", "--rm", "--init", "-t", "-p", "127.0.0.1:8080:8080"]
         );
         assert!(!args.contains(&VAR.to_string()), "{args:?}");
-        let args = run_args(vec![], 8080, &[VAR]);
+        let args = run_args(vec![], 8080, &[VAR], None);
         assert!(args.windows(2).any(|w| w == ["-e", VAR]), "{args:?}");
         // The value stays out of argv (it may be a secret).
         assert!(!args.iter().any(|a| a.starts_with(&format!("{VAR}="))));
+    }
+
+    #[test]
+    fn cpus_is_forwarded_as_a_run_flag_only_when_a_limit_binds() {
+        let args = run_args(vec![], 8080, &[], None);
+        assert!(!args.contains(&"--cpus".to_string()), "{args:?}");
+        let args = run_args(vec!["--gpus".into(), "all".into()], 8080, &[], Some(2.0));
+        let cpus = args.iter().position(|a| a == "--cpus").unwrap();
+        assert_eq!(args[cpus + 1], "2");
+        // A `run` flag: before the engine args, image and engine argv.
+        assert!(cpus < args.iter().position(|a| a == "--gpus").unwrap());
+        // A fractional cgroup quota is kept, not rounded to a whole CPU.
+        let args = run_args(vec![], 8080, &[], Some(0.5));
+        assert!(args.windows(2).any(|w| w == ["--cpus", "0.5"]), "{args:?}");
+    }
+
+    #[test]
+    fn llama_container_gets_cpus_before_the_image_and_threads_after() {
+        let opts = |threads, cpus| LlamaOptions {
+            port: 8080,
+            ctx_size: None,
+            flash_attention: None,
+            kv_cache_type: None,
+            context_shift: true,
+            split_mode: None,
+            num_parallel: None,
+            embeddings: false,
+            batch_size: None,
+            threads,
+            cpus,
+        };
+        let image = "ghcr.io/ggml-org/llama.cpp:server";
+        let argv = |o| {
+            llama_run_args(
+                GpuBackend::Cpu,
+                image.into(),
+                "/cache/blobs",
+                "sha256-abc",
+                None,
+                &[],
+                o,
+            )
+        };
+        let args = argv(opts(Some(2), Some(2.0)));
+        let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+        assert!(at("--cpus") < at(image), "{args:?}");
+        assert!(at(image) < at("--threads"), "{args:?}");
+        assert_eq!(args[at("--cpus") + 1], "2");
+        assert_eq!(args[at("--threads") + 1], "2");
+        let args = argv(opts(None, None));
+        assert!(
+            !args.iter().any(|a| a == "--cpus" || a == "--threads"),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn vllm_containers_get_cpus_too() {
+        let args = vllm_run_args(
+            VllmBackend::Cpu,
+            "docker.io/vllm/vllm-openai-cpu:latest-x86_64".into(),
+            "/cache/abc/model",
+            8000,
+            &[],
+            Some(3.0),
+            |dir, host| vec!["serve".into(), dir.into(), "--host".into(), host.into()],
+        );
+        assert!(args.windows(2).any(|w| w == ["--cpus", "3"]), "{args:?}");
     }
 
     /// Exercises real end-to-end backend detection (via
