@@ -4,7 +4,10 @@ use super::ollama::{
     progress_line, staged_blob_path, staged_file, OllamaPullRequest, OllamaPushRequest,
     PushOutcome, StreamedOutcome,
 };
-use super::openai::{apply_reasoning_effort, mlx_embeddings_unsupported_response};
+use super::openai::{
+    apply_reasoning_effort, mlx_embeddings_unsupported_response, multipart_form,
+    multipart_text_field, omni_image_request, omni_video_fields,
+};
 use super::sched::{reap_idle_models_once, resolve_keep_alive, DEFAULT_KEEP_ALIVE};
 use super::stream::{fold_ollama_lines, stream_ollama};
 use super::*;
