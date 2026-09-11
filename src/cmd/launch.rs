@@ -929,19 +929,14 @@ fn launch_gemini(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
 fn launch_agy(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_on_path("agy").ok_or_else(|| anyhow::anyhow!("agy is not installed"))?;
     anyhow::ensure!(
-        !model.is_empty(),
-        "agy needs a model: llmman launch agy --model <model>"
-    );
-
-    let gemini_dir = agy_settings_dir()?;
-    write_agy_settings_at(&gemini_dir)?;
-    let mut args = vec![format!("--gemini_dir={}", gemini_dir.display())];
-    anyhow::ensure!(
         !extra_args
             .iter()
             .any(|arg| matches!(arg.split('=').next(), Some("--gemini_dir" | "-gemini_dir"))),
         "llmman manages AGY’s --gemini_dir"
     );
+    let gemini_dir = agy_settings_dir()?;
+    write_agy_settings_at(&gemini_dir)?;
+    let mut args = vec![format!("--gemini_dir={}", gemini_dir.display())];
     args.extend_from_slice(extra_args);
 
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(model.as_bytes());
@@ -1684,13 +1679,6 @@ fn write_dsh_file(path: &Path, contents: &str) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn exec_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
-    let status = command_with_env(bin, args, extra_env)
-        .status()
-        .with_context(|| format!("failed to run {}", bin.display()))?;
-    std::process::exit(status.code().unwrap_or(1));
-}
-
-fn command_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> Command {
     let mut cmd = Command::new(bin);
     cmd.args(args);
     cmd.stdin(std::process::Stdio::inherit());
@@ -1705,7 +1693,10 @@ fn command_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) 
     }
     cmd.envs(&env);
 
-    cmd
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to run {}", bin.display()))?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 #[cfg(test)]
