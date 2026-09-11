@@ -8,17 +8,15 @@
 //! `scripts/install.sh`'s `check_gpu`), applied here to llmman's
 //! PATH-optional `llama-server` dependency instead.
 //!
-//! `cmd::serve`'s local (non-`--ociman`) path still prefers whatever
-//! `llama-server` is already on `PATH` (see `resolve_llama_server`
-//! there) — this module is only reached as a fallback, or when
-//! `--llama-cpp-version` pins an explicit release. Once downloaded, a
-//! given release+backend combination is cached under
-//! [`install_root`]`/<tag>/<backend>/` and never re-fetched.
+//! This is `cmd::serve`'s `--runtime bin` (see `cmd::serve::runtime`).
+//! A given release+backend is cached under
+//! [`install_root`]`/<tag>/<backend>/` and never re-fetched; the release
+//! is [`default_release`] unless `--llama-cpp-version` says otherwise.
 //!
 //! Coverage gap (unavoidable, not an llmman limitation): llama.cpp does
 //! not publish a prebuilt **Linux** CUDA binary at all — only Windows
 //! gets prebuilt CUDA — so an NVIDIA GPU detected on Linux falls back to
-//! the CPU build here, with a message pointing at `llmman serve --ociman
+//! the CPU build here, with a message pointing at `llmman serve --runtime
 //! docker` (see `crate::container`, which *does* have a CUDA path via
 //! `ghcr.io/ggml-org/llama.cpp:server-cuda*`) as the GPU-accelerated
 //! alternative.
@@ -38,6 +36,15 @@ use crate::fmt::human_size;
 use crate::hostgpu::HostGpu;
 
 const REPO_API: &str = "https://api.github.com/repos/ggml-org/llama.cpp";
+
+/// The default `--llama-cpp-version`: the `b<N>` release
+/// [`ensure_llama_server`] downloads and the image tag suffix
+/// `crate::container` runs. From the repo-root `LLAMA_CPP_RELEASE` file,
+/// which CI also installs and bases the `ai/llmman` images on, so what
+/// ships is what was tested. The single place to bump.
+pub fn default_release() -> &'static str {
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/LLAMA_CPP_RELEASE")).trim()
+}
 
 // ---------------------------------------------------------------------------
 // GitHub Releases API
@@ -250,7 +257,7 @@ fn asset_query() -> AssetQuery {
                 eprintln!(
                     "[llmman] NVIDIA GPU detected, but llama.cpp does not publish a \
                      prebuilt Linux CUDA binary — falling back to the CPU build. Use \
-                     `llmman serve --ociman docker` (or `--ociman podman`) for GPU \
+                     `llmman serve --runtime docker` (or `--runtime podman`) for GPU \
                      acceleration on Linux, or build llama.cpp yourself with \
                      GGML_CUDA=ON and put llama-server on PATH."
                 );
@@ -363,7 +370,7 @@ fn parse_tmp_dir(value: Option<&str>) -> Option<PathBuf> {
 }
 
 /// Includes our own pid in the filename so two `llmman` processes
-/// downloading the same asset at once (e.g. two concurrent `--pull-bin`
+/// downloading the same asset at once (e.g. two concurrent `--pull-only`
 /// runs) never share a staging path.
 fn tmp_path(name: &str) -> Result<PathBuf> {
     let dir = tmp_dir()?;
@@ -416,9 +423,10 @@ fn download_marker_path() -> Result<PathBuf> {
     Ok(install_root()?.join(".downloading"))
 }
 
-/// Whether some process is currently mid-download of a llama-server
-/// release: the marker exists and was touched recently enough to belong
-/// to a live download rather than a crashed one.
+/// Whether some process is currently mid-download of llama.cpp — a
+/// release build here, or a container image (`cmd::serve::runtime` holds
+/// the same marker around its pulls): the marker exists and was touched
+/// recently enough to belong to a live download rather than a crashed one.
 pub fn download_in_progress() -> bool {
     download_marker_path().is_ok_and(|path| marker_is_fresh(&path, DOWNLOAD_MARKER_STALE_AFTER))
 }
@@ -438,11 +446,15 @@ fn marker_is_fresh(path: &Path, stale_after: Duration) -> bool {
 
 /// Creates the marker on construction and removes it on drop, so success
 /// and every early `?` return both clear it. Best-effort throughout: a
-/// marker failure must never fail the download itself.
-struct DownloadMarker(Option<PathBuf>);
+/// marker failure must never fail the download itself. Also held around
+/// container pulls (`cmd::serve::runtime`), which must [`touch`] it
+/// within [`DOWNLOAD_MARKER_STALE_AFTER`].
+///
+/// [`touch`]: DownloadMarker::touch
+pub(crate) struct DownloadMarker(Option<PathBuf>);
 
 impl DownloadMarker {
-    fn create() -> DownloadMarker {
+    pub(crate) fn create() -> DownloadMarker {
         match download_marker_path() {
             Ok(p) => Self::create_at(p),
             Err(_) => DownloadMarker(None),
@@ -461,7 +473,7 @@ impl DownloadMarker {
 
     /// Refreshes the marker's mtime so a reader can tell this live
     /// download from a crashed one whose Drop never ran.
-    fn touch(&self) {
+    pub(crate) fn touch(&self) {
         if let Some(path) = &self.0 {
             // Windows keeps the old mtime when a write is zero bytes,
             // so set it explicitly.
@@ -606,8 +618,7 @@ pub struct Resolved {
 /// `resolve_release`) and the pointer file is mutable upstream.
 ///
 /// Blocking (network + disk I/O) — callers on an async runtime must run
-/// this via `tokio::task::spawn_blocking` (see `cmd::serve`'s
-/// `resolve_llama_server`).
+/// this via `tokio::task::spawn_blocking` (see `cmd::serve::runtime::resolve`).
 pub fn ensure_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
     let query = asset_query();
     let bin_name = if cfg!(target_os = "windows") {

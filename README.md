@@ -15,8 +15,9 @@ running on your own machine, or at any hosted provider, in one command.
 llmman launch claude --model qwen3.8
 ```
 
-That starts a local inference server, downloads a `llama.cpp` build matching your
-GPU, loads the model, and execs an agent against it.
+That starts a local inference server, fetches the tested `llama.cpp` release for
+your GPU (as a container on Linux with Docker or Podman, otherwise a prebuilt
+binary), loads the model, and execs an agent against it.
 
 <p align="center">
   <img src="https://github.com/llmmanorg/llmman/releases/download/docs-assets/launch.gif" alt="llmman launch claude --model qwen3.8, answering from a local model" width="900">
@@ -135,7 +136,7 @@ adjusts the settings. The same model answers `/v1/images/generations`, `/v1/vide
 
 Diffusion repositories published as Diffusers-layout safetensors (a root `model_index.json`)
 are instead served by [vLLM-Omni](https://github.com/vllm-project/vllm-omni) (`vllm serve
---omni`; install `vllm-omni` next to `vllm`, or use `--ociman docker` for the `vllm/vllm-omni` image).
+--omni`; install `vllm-omni` next to `vllm`, or use `--runtime docker` for the `vllm/vllm-omni` image).
 See [docs/backends.md](docs/backends.md#vllm-omni-diffusers-pipelines).
 
 ## Commands
@@ -226,8 +227,10 @@ OLLAMA_HOST=127.0.0.1:17434 ollama run unsloth/Qwen3.5-0.8B-GGUF
 
 Models load on demand, each in its own backend process, and unload after
 five idle minutes (`keep_alive`, as in Ollama). GGUF is served by upstream
-[`llama.cpp`](https://github.com/ggml-org/llama.cpp), downloaded to match
-your GPU if no `llama-server` is on `PATH`; safetensors by
+[`llama.cpp`](https://github.com/ggml-org/llama.cpp) at a pinned release —
+in a Docker/Podman container, as a downloaded prebuilt binary, or from
+`PATH`, whichever `--runtime` picks ([docs/backends.md](docs/backends.md#choosing-a-runtime));
+safetensors by
 [`vllm`](https://github.com/vllm-project/vllm), or by
 [`mlx-lm`](https://github.com/ml-explore/mlx-lm) on Apple Silicon. Tool
 calling, vision, structured output, embeddings (GGUF) and the Responses

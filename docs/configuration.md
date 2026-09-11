@@ -294,7 +294,8 @@ setting may not behave identically.
 | `LLMMAN_SCHED_SPREAD` | Truthy forwards `--split-mode layer` (spread a model across every GPU, already llama-server's own default); falsey forwards `--split-mode none` (restrict to one GPU). |
 | `LLMMAN_FLASH_ATTENTION` | Flash Attention mode (`--flash-attn`): `on`, `off`, or `auto` (llama-server's own default). Also accepts `1`/`0`/`true`/`false`. |
 | `LLMMAN_KV_CACHE_TYPE` | KV-cache quantization (`--cache-type-k`/`--cache-type-v`), e.g. `f16` (default), `q8_0`, `q4_0`. Trades output quality for memory at long context lengths. |
-| `LLMMAN_LLM_LIBRARY` | Forces which GPU backend `llmman serve`/`run` picks (`cpu`, `cuda`/`cuda12`/`cuda_v12`, `cuda13`/`cuda_v13`, `rocm`, `vulkan`, or macOS-only `metal`), bypassing autodetection. Has no effect when a `llama-server` binary is already on `PATH` (its own backend is fixed), or on macOS's local-binary download (one asset per architecture, no separate choice to make). |
+| `LLMMAN_RUNTIME` | Where `llmman serve` gets its inference engine: `auto` (default), `docker`, `podman`, `bin` or `path` — the same setting as `serve --runtime`, as an environment variable so it also reaches the daemon `llmman run`/`launch` start for you. See [backends.md](backends.md#choosing-a-runtime). |
+| `LLMMAN_LLM_LIBRARY` | Forces which GPU backend `llmman serve`/`run` picks (`cpu`, `cuda`/`cuda12`/`cuda_v12`, `cuda13`/`cuda_v13`, `rocm`, `vulkan`, or macOS-only `metal`), bypassing autodetection. Has no effect under `--runtime path` (that binary's backend is fixed), or on macOS's local-binary download (one asset per architecture, no separate choice to make). |
 | `LLMMAN_IGPU_ENABLE` | Counts integrated GPUs (Vulkan only) when probing for an accelerator. Defaults to disabled, since an integrated GPU is usually a worse choice than the discrete/CPU fallback it would otherwise be skipped in favor of. |
 | `LLMMAN_LOAD_TIMEOUT` | How long to allow a model load to stall before giving up. Zero or negative means wait forever. Defaults to 10 minutes (`vllm` can take several minutes to load a large safetensors model). Also passed to vLLM-Omni as `--init-timeout` (a day when unbounded). |
 | `LLMMAN_VLLM_OMNI_GUARDRAILS` | When set (`1`/`true`/`yes`/`on`), a Diffusers-layout model served by vLLM-Omni keeps its safety guardrails on; llmman otherwise passes `--no-guardrails`. See [backends.md](backends.md#vllm-omni-diffusers-pipelines). |
@@ -303,7 +304,7 @@ setting may not behave identically.
 | `LLMMAN_SIGN_PASSWORD` | Passphrase for the `--sign-key` private key used by `push`/`transfer`, when it is an encrypted PEM. Falls back to `COSIGN_PASSWORD`. Read by the CLI process, which does the signing itself; neither key nor passphrase reaches the daemon. |
 | `LLMMAN_NOHISTORY` | When set (to anything other than `0`/`false`/`no`/`off`), `llmman serve` stops recording prompts for `llmman log`. Otherwise each request to a generation route (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`) appends its time, route, model, `User-Agent` and the last user message's text — not the transcript or the reply — to `prompts.jsonl` beside the store (`~/.local/share/llmman/prompts.jsonl` by default), readable only by its owner. Delete the file to clear the history. |
 | `LLMMAN_NOPRUNE` | When set (to anything other than `0`/`false`/`no`/`off`), skips the garbage-collection sweep that `llmman rm` and `llmman serve` startup otherwise run to delete blobs and extracted-cache entries no longer referenced by any local model. Note this is broader than skipping the daemon-startup catch-all: it also stops `llmman rm` itself from ever freeing disk space, so a removed model's (possibly multi-GB) weights stay on disk until a later sweep runs without this set. Useful for a shared/read-mostly store, or scripts that `rm` in a loop and prune once at the end. |
-| `LLAMA_ARG_FIT` / `LLAMA_ARG_FIT_TARGET` / `LLAMA_ARG_THREADS` | llama.cpp's own env-configurable `--fit`/`--fit-target`/`--threads` options. Not something llmman parses itself, just forwarded through to every `llama-server` (local or `--ociman` container) it spawns, same as `CUDA_VISIBLE_DEVICES`/etc. below. |
+| `LLAMA_ARG_FIT` / `LLAMA_ARG_FIT_TARGET` / `LLAMA_ARG_THREADS` | llama.cpp's own env-configurable `--fit`/`--fit-target`/`--threads` options. Not something llmman parses itself, just forwarded through to every `llama-server` (local or container) it spawns, same as `CUDA_VISIBLE_DEVICES`/etc. below. |
 
 ### Context length by backend
 
@@ -315,7 +316,7 @@ setting may not behave identically.
 | `mlx_lm.server` | Not currently forwarded. | Uses `mlx_lm.server` defaults. |
 
 GPU device-selection variables `llmman serve` forwards to every
-`llama-server` it spawns (local or `--ociman` container):
+`llama-server` it spawns (local or container):
 `CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`,
 `ROCR_VISIBLE_DEVICES`, `GGML_VK_VISIBLE_DEVICES`, `GPU_DEVICE_ORDINAL`,
 `HSA_OVERRIDE_GFX_VERSION`.

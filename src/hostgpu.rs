@@ -3,7 +3,7 @@
 //! prebuilt `llama-server` release asset to download for this machine,
 //! and by [`crate::container`] to pick which `ghcr.io/ggml-org/llama.cpp`
 //! (or, for a safetensors model, vLLM) container image to run instead
-//! (`--ociman`) — all share this one probe rather than detecting the host
+//! (`--runtime docker|podman`) — all share this one probe rather than detecting the host
 //! twice.
 //!
 //! Detection calls the real vendor APIs — the CUDA Driver API, the HIP
