@@ -84,8 +84,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
 
     // The local model's thinking controls (see `opencode_variants`) and
     // whether it takes images (see `write_dsh_settings`); a provider's
-    // model has neither a template nor a manifest to read, and stays at
-    // these defaults.
+    // model has neither a template nor a manifest to read.
     let mut thinking = None;
     let mut vision = false;
     let (model, api_key) = match provider {
@@ -140,6 +139,10 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                 // local model just pulled.
                 Some((provider, hosted)) => {
                     check_provider_supported(name)?;
+                    // A pair routes by request size (`hybrid::route`) and
+                    // an image usually clears the local budget, landing on
+                    // the hosted half, whose modality llmman never checked.
+                    vision = false;
                     let per_request =
                         !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
                     let (remote, api_key) =
@@ -492,11 +495,14 @@ const INTEGRATIONS: &[Integration] = &[
 fn print_integrations() {
     println!("Available integrations:\n");
     for i in INTEGRATIONS {
-        if find_integration_binary(i).is_some() {
-            println!("  {:<12} {}", i.name, i.description);
-        } else {
-            println!("  {:<12} {} (not installed)", i.name, i.description);
-        }
+        // dsh resolves to npx when it isn't installed (see `find_dsh`),
+        // and that launch downloads the package before running it.
+        let how = match find_integration_binary(i) {
+            Some(bin) if bin.file_stem().is_some_and(|s| s == "npx") => " (via npx)",
+            Some(_) => "",
+            None => " (not installed)",
+        };
+        println!("  {:<12} {}{}", i.name, i.description, how);
     }
     println!("\nUsage: llmman launch <integration> [--model <model>] [--provider <provider>]");
     println!("       llmman providers   (the providers --provider accepts)");
@@ -1513,6 +1519,10 @@ fn launch_dsh(
     write_dsh_patch(&patch_path, &settings_path)?;
 
     let mut args = prefix;
+    if !args.is_empty() {
+        // Said before it happens: this launch downloads a package.
+        eprintln!("[llmman] dsh is not installed; running {DSH_NPM_PACKAGE} with npx");
+    }
     args.extend(dsh_args(&patch_path, extra_args));
     exec_with_env(&bin, &args, &[(DSH_API_KEY_ENV, api_key)])
 }
@@ -1521,20 +1531,24 @@ fn launch_dsh(
 /// a one-off run gets what a global install would have.
 const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh@latest";
 
-/// dsh, and the arguments that have to lead whatever it is handed: none
-/// for an installed `dsh`, `--yes <package>` for the `npx` that stands in
-/// when there is none, so `llmman launch dsh` works without a global
-/// install. Both are reported by `find_integration_binary`, so the
-/// listing doesn't call dsh missing when a launch would still run it.
+/// dsh, and the arguments that must lead whatever it is handed: none for
+/// an installed `dsh`, `--yes <package>` for the `npx` that stands in when
+/// there is none. `find_integration_binary` resolves it the same way, so
+/// the listing agrees with what a launch would run.
 fn find_dsh() -> Option<(PathBuf, Vec<String>)> {
-    match find_on_path("dsh") {
-        Some(bin) => Some((bin, Vec::new())),
-        None => Some((find_on_path("npx")?, dsh_npx_args())),
-    }
+    dsh_command(find_on_path("dsh"), || find_on_path("npx"))
 }
 
-fn dsh_npx_args() -> Vec<String> {
-    vec!["--yes".to_string(), DSH_NPM_PACKAGE.to_string()]
+/// Split from [`find_dsh`] so which binary wins can be asserted without
+/// depending on what the test machine has installed.
+fn dsh_command(
+    dsh: Option<PathBuf>,
+    npx: impl FnOnce() -> Option<PathBuf>,
+) -> Option<(PathBuf, Vec<String>)> {
+    match dsh {
+        Some(bin) => Some((bin, Vec::new())),
+        None => Some((npx()?, vec!["--yes".into(), DSH_NPM_PACKAGE.into()])),
+    }
 }
 
 /// The tokens dsh reads as its own launcher flags, rather than forwards
@@ -1623,9 +1637,8 @@ fn dsh_config_dir() -> anyhow::Result<PathBuf> {
 fn write_dsh_settings(path: &Path, model: &str, vision: bool) -> anyhow::Result<()> {
     let quoted_model = yaml_quote(model);
     let base_url = yaml_quote(&format!("{}/v1", daemon::server()));
-    // What the pulled model actually accepts (`ShowResponse::vision`).
     // Claiming image input a text-only model can't serve would have dsh
-    // send an attachment the daemon then rejects.
+    // attach what the daemon then rejects.
     let input = if vision { "[text, image]" } else { "[text]" };
     let contents = format!(
         "# Written by `llmman launch dsh`; edits are overwritten.\n\
@@ -2336,9 +2349,8 @@ model = \"gpt-5\"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// dsh sends an image only to a model whose `input` lists one, so a
-    /// vision model has to be declared as such — and a text-only one must
-    /// not be, or dsh attaches what the daemon then rejects.
+    /// dsh sends an image only to a model whose `input` lists one — and
+    /// must not attach one to a text-only model the daemon would reject.
     #[test]
     fn write_dsh_settings_declares_image_input_only_for_a_vision_model() {
         let dir = std::env::temp_dir().join(format!(
@@ -2362,16 +2374,26 @@ model = \"gpt-5\"
     }
 
     /// The fallback that makes `llmman launch dsh` work without a global
-    /// install: whatever leads dsh's own arguments must name the package
-    /// for npx, and `--yes` so a first run isn't blocked on a prompt.
+    /// install — and stays out of the way of one that exists.
     #[test]
     fn dsh_falls_back_to_the_published_package_under_npx() {
-        assert_eq!(dsh_npx_args(), ["--yes", DSH_NPM_PACKAGE]);
+        let dsh = PathBuf::from("/usr/local/bin/dsh");
+        let npx = PathBuf::from("/usr/local/bin/npx");
+
+        // An install wins, and npx is never even looked for.
+        assert_eq!(
+            dsh_command(Some(dsh.clone()), || panic!("npx looked up anyway")),
+            Some((dsh, Vec::new()))
+        );
+        // Without one, npx runs the package: `--yes` so a first run
+        // isn't blocked on a prompt, ahead of dsh's own arguments.
+        assert_eq!(
+            dsh_command(None, || Some(npx.clone())),
+            Some((npx, vec!["--yes".to_string(), DSH_NPM_PACKAGE.to_string()]))
+        );
         assert!(DSH_NPM_PACKAGE.starts_with("@deepseek-ai/dsh@"));
-        // Whichever arm find_dsh takes, the listing reports the same
-        // binary the launcher would run.
-        let dsh = INTEGRATIONS.iter().find(|i| i.name == "dsh").unwrap();
-        assert_eq!(find_integration_binary(dsh), find_dsh().map(|(bin, _)| bin));
+        // Neither: "dsh is not installed", not an npm error.
+        assert_eq!(dsh_command(None, || None), None);
     }
 
     #[test]
