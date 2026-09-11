@@ -2017,6 +2017,7 @@ fn test_inner(store_path: PathBuf) -> Inner {
         split_mode: None,
         num_parallel: None,
         threads: None,
+        cpu_limit: None,
         // usize::MAX, not 0 — 0 now means "admit almost nothing"
         // (see try_admit_against's doc comment), and no test here
         // calls ensure_model (the only caller of try_admit) directly

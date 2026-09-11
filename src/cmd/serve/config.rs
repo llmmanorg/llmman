@@ -123,26 +123,29 @@ fn parse_num_parallel(value: Option<&str>) -> Option<u32> {
     (n != 0).then_some(n)
 }
 
-/// `--threads <n>` for local `llama-server` spawns, `Some` only when a
-/// CPU limit binds. llama-server's own autodetection
-/// (`cpu_get_num_math()`) already picks the physical/math cores, so an
-/// unconstrained host passes nothing and leaves that choice alone. The
-/// derived value only corrects the case autodetection cannot see: a
-/// cgroup CPU quota, or a narrowed affinity mask, both carried by
-/// `std::thread::available_parallelism` (std walks /proc/self/cgroup
-/// and the ancestor chain itself, v1 and v2). A limit binds when
-/// `available_parallelism` is below the online CPU count; then that
-/// smaller value is passed. Accepted tradeoff: a quota between the
-/// physical-core and SMT-thread counts (e.g. --cpus=12 on an
-/// 8-core/16-thread host) passes 12 where autodetection would pick 8.
-/// Any read or parse failure returns `None`: fail closed to
-/// autodetection. `LLAMA_ARG_THREADS` set in the environment wins:
-/// llama-server reads it itself via plain env inheritance, so `None`
-/// here keeps that explicit choice untouched.
+/// `--threads <n>` for every `llama-server` this daemon spawns, `Some`
+/// only when a CPU limit binds ([`host_cpu_limit`]). Unconstrained,
+/// llama-server's own autodetection (`cpu_get_num_math()`) already
+/// picks the math cores; the derived value only corrects what it
+/// cannot see: a cgroup quota or a narrowed affinity mask. Accepted
+/// tradeoff: a quota between the physical-core and SMT-thread counts
+/// (`--cpus=12` on 8c/16t) passes 12 where autodetection would pick 8.
+/// `LLAMA_ARG_THREADS` set wins: `None` here, llama-server reads it
+/// itself (in a container, via `LLAMA_CPP_ENV_PASSTHROUGH_VARS`).
 pub(super) fn threads_from_env_or_host() -> Option<u32> {
     if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         return None;
     }
+    host_cpu_limit()
+}
+
+/// This daemon's effective CPU limit in whole CPUs, `Some(n)` only when
+/// one binds: `std::thread::available_parallelism` — min(affinity,
+/// cgroup quota), floored, at least 1; std walks the cgroup ancestor
+/// chain itself, v1 and v2 — below the online CPU count from
+/// /sys/devices/system/cpu/online. Any read failure is `None`: fail
+/// closed. Linux only.
+pub(super) fn host_cpu_limit() -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
         let allowed = std::thread::available_parallelism().ok()?.get() as u32;
@@ -151,6 +154,62 @@ pub(super) fn threads_from_env_or_host() -> Option<u32> {
     }
     #[cfg(not(target_os = "linux"))]
     None
+}
+
+/// The backend container's `--cpus`: this daemon's cgroup v2 quota as a
+/// fraction (the tightest `cpu.max` on its own chain, so `0.5` stays
+/// `0.5`), capped by its affinity mask; without a v2 quota, the
+/// whole-CPU [`host_cpu_limit`] (a cgroup v1 quota is floored). `Some`
+/// only when it binds. Needed even when `LLAMA_ARG_THREADS` owns the
+/// thread count.
+pub(super) fn container_cpu_limit() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let online = online_cpu_count()?;
+        let limit = match cgroup_v2_cpu_quota() {
+            Some(q) => q.min(f64::from(affinity_cpu_count().unwrap_or(online))),
+            None => f64::from(host_cpu_limit()?),
+        };
+        (limit < f64::from(online)).then_some(limit)
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// CPUs in this process's affinity mask, from `Cpus_allowed_list` in
+/// /proc/self/status.
+#[cfg(target_os = "linux")]
+fn affinity_cpu_count() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let list = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))?;
+    cpu_list_count(list)
+}
+
+/// The tightest `cpu.max` quota, in CPUs, from this process's cgroup v2
+/// node up to the root; `None` without one.
+#[cfg(target_os = "linux")]
+fn cgroup_v2_cpu_quota() -> Option<f64> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let rel = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    root.join(rel.trim_start_matches('/'))
+        .ancestors()
+        .take_while(|d| d.starts_with(root))
+        .filter_map(|d| std::fs::read_to_string(d.join("cpu.max")).ok())
+        .filter_map(|s| parse_cpu_max(&s))
+        .reduce(f64::min)
+}
+
+/// `cpu.max`'s `<quota> <period>` in microseconds as CPUs; `max <period>`
+/// (unlimited) or malformed content is `None`.
+#[cfg(target_os = "linux")]
+fn parse_cpu_max(content: &str) -> Option<f64> {
+    let mut parts = content.split_whitespace();
+    let quota: f64 = parts.next()?.parse().ok()?;
+    let period: f64 = parts.next()?.parse().ok()?;
+    (quota > 0.0 && period > 0.0).then(|| quota / period)
 }
 
 /// Online CPUs from /sys/devices/system/cpu/online, the baseline
@@ -547,6 +606,17 @@ mod tests {
         ];
         for (list, expected) in &cases {
             assert_eq!(&cpu_list_count(list), expected, "list={list:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_cpu_max_reads_quota_over_period_and_treats_max_as_unlimited() {
+        assert_eq!(parse_cpu_max("200000 100000\n"), Some(2.0));
+        assert_eq!(parse_cpu_max("50000 100000\n"), Some(0.5));
+        assert_eq!(parse_cpu_max("150000 100000"), Some(1.5));
+        for bad in ["max 100000\n", "", "100000", "0 100000", "100000 0", "x y"] {
+            assert_eq!(parse_cpu_max(bad), None, "{bad:?}");
         }
     }
 

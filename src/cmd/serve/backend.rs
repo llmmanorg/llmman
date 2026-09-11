@@ -108,6 +108,8 @@ pub(super) async fn spawn_llama_server(
         embeddings,
         batch_size,
         threads,
+        // A local child shares the daemon's cgroup already.
+        cpus: _,
     } = opts;
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args([

@@ -47,11 +47,10 @@ only when the stored models should be deleted as well.
 uses llmman's default local backend, so the `llama-server` child shares the
 service's cgroup and llmman can derive its thread count from that limit.
 
-This differs from `llmman serve --runtime docker` or `--runtime podman`: those
-modes create a separate backend container, and the service's CPU quota is not
-forwarded to it yet ([#324](https://github.com/llmmanorg/llmman/issues/324)). If
-you adapt this example to use a container runtime, set `LLAMA_ARG_THREADS` explicitly or
-apply a CPU limit to the backend container separately.
+With `--runtime docker` or `--runtime podman` the backend runs in a separate
+container, a sibling of the service. The service's limit is forwarded to it as
+`--cpus`, with a matching `--threads` for `llama-server`; an unconstrained
+daemon starts an unconstrained container, and `LLAMA_ARG_THREADS` still wins.
 
 ## Customizing the gateway
 

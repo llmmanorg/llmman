@@ -54,11 +54,12 @@ use backend::{
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
 pub use config::DEFAULT_CTX_SIZE;
 use config::{
-    backend_ctx_size, context_length_from_env, effective_num_parallel, embedding_model_ctx,
-    flash_attention_from_env, gguf_trained_ctx, initial_ctx_size, kv_cache_type_from_env,
-    looks_like_oom, max_loaded_models_from_env, max_queue_from_env, metrics_enabled_from_env,
-    next_ctx_size_after_oom, num_parallel_from_env, sched_spread_from_env, supports_context_shift,
-    threads_from_env_or_host, tls_from_env, MAX_CTX_SHRINK_ATTEMPTS,
+    backend_ctx_size, container_cpu_limit, context_length_from_env, effective_num_parallel,
+    embedding_model_ctx, flash_attention_from_env, gguf_trained_ctx, initial_ctx_size,
+    kv_cache_type_from_env, looks_like_oom, max_loaded_models_from_env, max_queue_from_env,
+    metrics_enabled_from_env, next_ctx_size_after_oom, num_parallel_from_env,
+    sched_spread_from_env, supports_context_shift, threads_from_env_or_host, tls_from_env,
+    MAX_CTX_SHRINK_ATTEMPTS,
 };
 use ollama::{
     handle_blob_head, handle_blob_upload, handle_copy, handle_create, handle_delete, handle_embed,
@@ -234,10 +235,12 @@ struct Inner {
     // See num_parallel_from_env's doc comment.
     num_parallel: Option<u32>,
     // See threads_from_env_or_host's doc comment. Resolved once at
-    // startup (this daemon's cgroup doesn't change per load) and passed
-    // to every *local* spawn_llama_server call from ensure_model's OOM
-    // retry loop.
+    // startup and passed to every llama-server spawn.
     threads: Option<u32>,
+    // See container_cpu_limit's doc comment: the backend container's
+    // `--cpus`. Snapshotted with `threads` so a later cgroup change
+    // cannot leave the two disagreeing.
+    cpu_limit: Option<f64>,
     // See max_queue_from_env's doc comment; enforced by try_admit.
     max_queue: usize,
     // See max_loaded_models_from_env's doc comment.
@@ -1858,8 +1861,8 @@ async fn local_context_overflow(resp: Response) -> Result<Response, String> {
 /// per-request ctx change, the option only takes effect on a fresh
 /// load: the `check_running` short-circuits below reuse an
 /// already-running instance as-is, never reloading it for a different
-/// thread count. Under a container runtime it is ignored along with the derived
-/// value; see `container::LlamaOptions::threads` for why.
+/// thread count. A backend container gets the same `--threads`, plus
+/// the daemon's CPU limit as `--cpus`; see `container::run_args`.
 async fn ensure_model(
     state: &AppState,
     model_ref: &str,
@@ -2072,6 +2075,7 @@ async fn ensure_model(
             // See ensure_model's `request_threads` doc comment for the
             // full precedence chain this `.or` implements.
             threads: request_threads.or(state.0.threads),
+            cpus: state.0.cpu_limit,
         };
         // Every piped child gets an output tail for crash reasons; only
         // llama-server ones join the OOM retry loop below, whose
@@ -2080,8 +2084,6 @@ async fn ensure_model(
         let mut oom_retryable = false;
         let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
         process = match (&model_path, state.0.runtime.ociman()) {
-            // container::spawn ignores llama_opts.threads; see that
-            // field's doc comment.
             (ModelPath::Gguf(path, mmproj), Some(ociman)) => {
                 let mut child = crate::container::spawn(
                     ociman,
@@ -2111,6 +2113,7 @@ async fn ensure_model(
                     &state.0.cache_path,
                     state.0.llama_cpp_version.as_deref(),
                     port,
+                    state.0.cpu_limit,
                 )?;
                 stderr_tail = Some(tail_child_output(&mut child));
                 oom_retryable = true;
@@ -2131,6 +2134,7 @@ async fn ensure_model(
                     dir,
                     state.0.vllm_version.as_deref(),
                     port,
+                    state.0.cpu_limit,
                     |model_dir, host| {
                         vllm_serve_args(model_dir, host, port, model_ref, max_model_len)
                     },
@@ -2147,6 +2151,7 @@ async fn ensure_model(
                     dir,
                     state.0.vllm_version.as_deref(),
                     port,
+                    state.0.cpu_limit,
                     |model_dir, host| {
                         vllm_omni_serve_args_from_env(model_dir, host, port, model_ref)
                     },
@@ -4973,18 +4978,17 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         );
     }
 
-    // See threads_from_env_or_host's doc comment. Resolved once here
-    // rather than per load, and logged so a surprising thread count is
-    // explainable from the startup output. Only the local spawn path
-    // consumes the derived value, so don't log it under a container
-    // runtime (that arm deliberately ignores it).
+    // Resolved once and logged, so a surprising thread count or
+    // container limit is explainable from the startup output.
+    let cpu_limit = container_cpu_limit();
     let threads = threads_from_env_or_host();
     if let Some(n) = threads {
-        if runtime.ociman().is_none() {
-            eprintln!("[llmman] llama-server gets --threads {n} (CPU quota/affinity limit below the online CPU count)");
-        }
+        eprintln!("[llmman] llama-server gets --threads {n} (CPU quota/affinity limit below the online CPU count)");
     } else if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         eprintln!("[llmman] LLAMA_ARG_THREADS set: leaving llama-server thread count to it");
+    }
+    if let (Some(n), Some(_)) = (cpu_limit, runtime.ociman()) {
+        eprintln!("[llmman] backend container gets --cpus {n} (this daemon's own CPU limit)");
     }
 
     // Before anything binds, so a misconfiguration fails at exec.
@@ -5033,6 +5037,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         split_mode: sched_spread_from_env(),
         num_parallel: num_parallel_from_env(),
         threads,
+        cpu_limit,
         max_queue: max_queue_from_env(),
         max_loaded_models: max_loaded_models_from_env(),
         peers,
