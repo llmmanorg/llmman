@@ -3,7 +3,7 @@
 //! sub-processes from llama.cpp.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context};
@@ -31,10 +31,14 @@ use crate::storage::OciStore;
 
 mod aggregation;
 mod anthropic;
+mod auth;
 mod backend;
 mod config;
 mod messages;
+mod ollama;
+mod openai;
 mod responses;
+pub mod runtime;
 mod sched;
 mod shell;
 mod stream;
@@ -42,10 +46,10 @@ mod types;
 mod webui;
 
 use backend::{
-    find_free_port, local_llama_server_bin, resolve_llama_server, spawn_llama_server,
-    spawn_mlx_server, spawn_vllm_omni_server, spawn_vllm_server, tail_child_output,
-    use_mlx_for_safetensors, vllm_max_model_len, vllm_omni_serve_args_from_env, vllm_serve_args,
-    wait_for_ready, would_use_mlx, OutputTail, POLL_INTERVAL,
+    find_free_port, local_llama_server_bin, spawn_llama_server, spawn_mlx_server,
+    spawn_vllm_omni_server, spawn_vllm_server, tail_child_output, use_mlx_for_safetensors,
+    vllm_max_model_len, vllm_omni_serve_args_from_env, vllm_serve_args, wait_for_ready, OutputTail,
+    POLL_INTERVAL,
 };
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
 pub use config::DEFAULT_CTX_SIZE;
@@ -54,13 +58,23 @@ use config::{
     flash_attention_from_env, gguf_trained_ctx, initial_ctx_size, kv_cache_type_from_env,
     looks_like_oom, max_loaded_models_from_env, max_queue_from_env, metrics_enabled_from_env,
     next_ctx_size_after_oom, num_parallel_from_env, sched_spread_from_env, supports_context_shift,
-    threads_from_env_or_host, MAX_CTX_SHRINK_ATTEMPTS,
+    threads_from_env_or_host, tls_from_env, MAX_CTX_SHRINK_ATTEMPTS,
 };
+use ollama::{
+    handle_blob_head, handle_blob_upload, handle_copy, handle_create, handle_delete, handle_embed,
+    handle_embeddings, handle_ollama_chat, handle_ollama_generate, handle_ps, handle_pull,
+    handle_push, handle_show, handle_tags, handle_version,
+};
+use openai::{
+    apply_default_repeat_penalty, forward_openai_request, handle_openai_chat,
+    handle_openai_completions, handle_openai_embeddings, handle_openai_models,
+    proxy_openai_generation, proxy_openai_passthrough, resolve_openai_request,
+};
+pub use runtime::Runtime;
 use sched::{
-    begin_activity, default_keep_alive, is_explicit_unload, reap_idle_models, refresh_activity,
-    resolve_keep_alive, ActivityGuard,
+    begin_activity, default_keep_alive, reap_idle_models, refresh_activity, ActivityGuard,
 };
-use stream::{bytes_to_lines, stream_ollama};
+use stream::bytes_to_lines;
 use types::*;
 
 // ---------------------------------------------------------------------------
@@ -74,7 +88,13 @@ use types::*;
 const SERVE_ENV_HELP: &str = "\
 Environment Variables:
       LLMMAN_DEBUG                   Show additional debug information (e.g. LLMMAN_DEBUG=1)
-      LLMMAN_HOST                    [host][:port] to bind (default \"127.0.0.1:17434\")
+      LLMMAN_HOST                    [scheme://][host][:port] to bind (default \"127.0.0.1:17434\"; https:// tells clients to expect TLS)
+      LLMMAN_API_KEYS                Comma-separated API keys every request must present (overrides [auth] in llmman.conf; required off loopback)
+      LLMMAN_AUTH                    off: serve without keys even on a bind the network can reach
+      LLMMAN_PEER_API_KEY            The key presented to aggregation peers (default: the first of LLMMAN_API_KEYS)
+      LLMMAN_TLS_CERT                PEM certificate chain to terminate TLS with (with LLMMAN_TLS_KEY)
+      LLMMAN_TLS_KEY                 PEM private key for LLMMAN_TLS_CERT
+      LLMMAN_TLS_CA                  PEM bundle of extra roots to trust when reaching peers (and, for the CLI, the daemon)
       LLMMAN_CONTEXT_LENGTH          Context size for llama-server/vLLM when set (default 262144 for llama-server)
       LLMMAN_HYBRID_LOCAL_BYTES      Largest request a hybrid pair serves locally, in bytes (0 disables; default: from the context length)
       LLMMAN_KEEP_ALIVE              The duration that models stay loaded in memory (default \"5m\")
@@ -88,9 +108,11 @@ Environment Variables:
       LLMMAN_NOPRUNE                 Do not prune model blobs on startup
       LLMMAN_ORIGINS                 A comma separated list of allowed CORS origins
       LLMMAN_PEERS                   A comma separated list of peer daemons ([scheme://]host[:port]) to pool hardware with (overrides [aggregation] in llmman.conf)
+      LLMMAN_REGISTRY_MIRRORS        A comma separated list of Docker Hub mirrors ([scheme://]host[:port]) to try before docker.io (overrides [registries.\"docker.io\"] in llmman.conf)
       LLMMAN_SCHED_SPREAD            Always schedule model across all GPUs
       LLMMAN_FLASH_ATTENTION         Enable flash attention
       LLMMAN_KV_CACHE_TYPE           Quantization type for the K/V cache (default: f16)
+      LLMMAN_RUNTIME                 Where the inference engine comes from: auto (default), docker, podman, bin or path — same as --runtime
       LLMMAN_LLM_LIBRARY             Set backend (cpu/cuda/cuda13/rocm/vulkan/metal) to bypass GPU autodetection
       LLMMAN_IGPU_ENABLE             Enable integrated GPUs
       LLMMAN_LOAD_TIMEOUT            How long to allow model loads to stall before giving up (default \"10m\")
@@ -108,75 +130,43 @@ pub struct ServeArgs {
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Run the inference engine in a container (docker or podman) instead
-    /// of as a local process — Linux only. GGUF: llama-server from the
-    /// ghcr.io/ggml-org/llama.cpp:server-<backend> image; safetensors:
-    /// `vllm serve` from the vllm/vllm-openai (NVIDIA), rocm/vllm (AMD) or
-    /// vllm/vllm-openai-cpu image for the host's architecture. Both use
-    /// the same GPU probe (see crate::container); neither binary is
-    /// required on PATH.
-    #[arg(long, value_name = "docker|podman")]
-    pub ociman: Option<crate::container::ContainerManager>,
+    /// Where the inference engine comes from. `docker`/`podman` (Linux
+    /// only) run the ghcr.io/ggml-org/llama.cpp server image for the
+    /// host's GPU, and a vLLM image for safetensors models. `bin`
+    /// downloads llama.cpp's prebuilt `llama-server` for this
+    /// OS/arch/GPU. `path` uses the `llama-server` on PATH and never
+    /// downloads anything. `auto` tries docker, podman, bin, path in
+    /// turn (off Linux: bin, path). The choice is fetched before the
+    /// listener binds. Safetensors models outside a container use the
+    /// `vllm`/`mlx_lm.server` on PATH.
+    #[arg(long, value_enum, default_value = "auto", env = "LLMMAN_RUNTIME")]
+    pub runtime: Runtime,
 
-    /// Pin the llama.cpp release used for this server, instead of always
-    /// taking whatever is currently latest. With --ociman, this pins the
-    /// ghcr.io/ggml-org/llama.cpp container image tag (e.g. `b9994`
-    /// instead of the floating `server`/`server-cuda`/... tags — pick one
-    /// that's actually published for every backend variant you might run;
-    /// see docs/docker.md in ggml-org/llama.cpp). Without --ociman, this
-    /// pins which GitHub release of llama.cpp's own prebuilt
-    /// `llama-server` `llmman serve` downloads and caches (see
-    /// crate::llama_release) — set this to force that managed download
-    /// even when some other `llama-server` is already on PATH, which is
-    /// otherwise preferred untouched.
-    #[arg(long, value_name = "TAG")]
+    /// The llama.cpp release to run, as a `b<N>` tag: the GitHub release
+    /// `bin` downloads and the `-b<N>` image tag suffix the container
+    /// runtimes pull. Defaults to the release llmman's CI tests against;
+    /// `latest` takes upstream's floating latest. Ignored by `path`.
+    #[arg(long, value_name = "TAG|latest")]
     pub llama_cpp_version: Option<String>,
 
-    /// With --ociman, pin the vLLM image tag for safetensors models (e.g.
-    /// `v0.28.0`) instead of the floating `latest`. The architecture
-    /// suffix (`-x86_64`/`-aarch64`, `-arm64` for the CPU image) is added
-    /// automatically for the vllm/ images — pick a release that image
-    /// actually publishes; for rocm/vllm the value is the whole tag.
-    #[arg(long, value_name = "TAG", requires = "ociman")]
+    /// With a container runtime, pin the vLLM image tag for safetensors
+    /// models (e.g. `v0.28.0`) instead of the floating `latest`. The
+    /// architecture suffix (`-x86_64`/`-aarch64`, `-arm64` for the CPU
+    /// image) is added automatically for the vllm/ images — pick a
+    /// release that image actually publishes; for rocm/vllm the value is
+    /// the whole tag.
+    #[arg(long, value_name = "TAG")]
     pub vllm_version: Option<String>,
 
-    /// Proactively pull the image `--ociman` would run, as its own
-    /// explicit foreground step, then exit — this process does not go on
-    /// to bind the listener or serve — with the pull's own progress (a
-    /// real `docker pull`/`podman pull` progress bar) inherited directly
-    /// to this process's stdout/stderr — only meaningful together with
-    /// --ociman, ignored otherwise. Given a safetensors MODEL, this is the
-    /// vLLM image (see --vllm-version); given a GGUF MODEL or none, the
-    /// ghcr.io/ggml-org/llama.cpp one (see --llama-cpp-version). MODEL
-    /// must already be pulled.
-    ///
-    /// `--ociman`'s underlying `docker run`/`podman run` pulls an image
-    /// that isn't already cached on its own, but silently: `serve` is
-    /// normally started detached (see daemon.rs), its stdio redirected to
-    /// a log file, so a caller waiting on the first request that actually
-    /// needs the container (the first real prompt) sees nothing happen
-    /// for however long a multi-hundred-MB-to-GB image pull takes —
-    /// indistinguishable from a hang. Run `llmman serve --ociman ...
-    /// --pull-oci` first, in the foreground, to do that pull visibly and
-    /// finish as soon as it completes; then start the real, detached
-    /// `llmman serve --ociman ...` (without `--pull-oci`) separately.
-    #[arg(long, requires = "ociman")]
-    pub pull_oci: bool,
-
-    /// Proactively download and cache the local `llama-server` binary
-    /// `llmman serve` would otherwise fetch on first use (see
-    /// crate::llama_release), as its own explicit foreground step, then
-    /// exit — the non-container equivalent of --pull-oci: same rationale,
-    /// same "run this first, in the foreground, then start the real
-    /// `llmman serve` separately" pattern, just for the local-binary path
-    /// instead of --ociman's container path. Backend selection (CPU,
-    /// CUDA, ROCm, Vulkan, Metal) uses the same host detection
-    /// (crate::hostgpu) as a normal `llmman serve` would, mirroring
-    /// llama.cpp's own installer's CUDA > ROCm > Vulkan > CPU probing
-    /// order. Not meaningful together with --ociman (that path never
-    /// resolves a local binary at all).
-    #[arg(long, conflicts_with_all = ["ociman", "pull_oci"])]
-    pub pull_bin: bool,
+    /// Fetch what `--runtime` needs (the container image or the
+    /// `llama-server` release), with its progress on this terminal, then
+    /// exit instead of serving. With a container runtime and an
+    /// already-pulled safetensors MODEL, the vLLM image is fetched too.
+    /// A plain `serve` does the same fetch at startup, but detached with
+    /// its output in a log file, where a slow first pull looks like a
+    /// hang; run this first and the daemon then starts instantly.
+    #[arg(long)]
+    pub pull_only: bool,
 
     /// Run as the media backend for MODEL on this port, the way
     /// `llama-server --port` is for a GGUF; see `mediagen_backend`.
@@ -197,12 +187,12 @@ struct AppState(Arc<Inner>);
 
 struct Inner {
     manager: Mutex<ModelManager>,
-    // None when --ociman is set: llama-server then runs in a container, so
-    // no local binary is resolved (or required on PATH) at all. Behind a
-    // mutex because the path resolved at startup can be deleted while this
-    // daemon keeps running (an upgrade/uninstall of whatever install
-    // provided it) — see local_llama_server_bin, which re-resolves and
-    // stores a replacement in that case.
+    // None under a container runtime: llama-server then runs in a
+    // container, so no local binary is resolved (or required on PATH) at
+    // all. Behind a mutex because the path resolved at startup can be
+    // deleted while this daemon keeps running (an upgrade/uninstall of
+    // whatever install provided it) — see local_llama_server_bin, which
+    // re-resolves and stores a replacement in that case.
     llama_server_bin: StdMutex<Option<PathBuf>>,
     // This daemon's own executable path, canonicalized at startup (while
     // it still exists on disk). Reported by /api/version so clients — the
@@ -210,9 +200,11 @@ struct Inner {
     // after the install that provided its binary was deleted, instead of
     // blindly reusing it.
     exe: Option<PathBuf>,
-    ociman: Option<crate::container::ContainerManager>,
+    // The concrete `--runtime` (never `Auto`; see runtime::resolve).
+    runtime: Runtime,
+    // The llama.cpp pin; None only for `--llama-cpp-version latest`.
     llama_cpp_version: Option<String>,
-    // --vllm-version; only meaningful with --ociman.
+    // --vllm-version; only meaningful with a container runtime.
     vllm_version: Option<String>,
     // See context_length_from_env's doc comment — forwarded to
     // backends that expose a context-size flag.
@@ -260,6 +252,10 @@ struct Inner {
     prompt_log: Option<PathBuf>,
     // Who may open the web UI's terminal — see the `shell` module.
     shell: shell::Policy,
+    // Who may call this daemon — see the `auth` module.
+    auth: auth::Policy,
+    // Presented to peers — see `aggregation`; `None` sends the hop alone.
+    peer_key: Option<String>,
     client: Client,
 }
 
@@ -1352,11 +1348,26 @@ fn try_admit(max_queue: usize) -> Result<QueueGuard, AppError> {
 enum Target {
     /// A locally spawned backend listening on loopback.
     Local(u16),
-    /// Another `llmman serve`, by origin; speaks our dialect, so not
-    /// `is_remote`.
-    Peer(String),
+    /// Another `llmman serve`; speaks our dialect, so not `is_remote`.
+    Peer(Arc<PeerTarget>),
     /// A remote provider's API, in whichever [`Wire`] it speaks.
     Remote(Arc<RemoteTarget>),
+}
+
+/// A peer daemon and the key to present to it (`Inner::peer_key`).
+/// `Debug` is hand-written for the same reason as [`RemoteTarget`]'s.
+struct PeerTarget {
+    origin: String,
+    api_key: Option<String>,
+}
+
+impl std::fmt::Debug for PeerTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerTarget")
+            .field("origin", &self.origin)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// Everything needed to forward one request to a remote provider,
@@ -1408,14 +1419,14 @@ impl Target {
     fn url(&self, route: &str) -> String {
         match self {
             Self::Local(port) => format!("http://127.0.0.1:{port}{route}"),
-            Self::Peer(origin) => format!("{origin}{route}"),
+            Self::Peer(peer) => format!("{}{route}", peer.origin),
             Self::Remote(remote) => crate::providers::rebase_url(&remote.base_url, route),
         }
     }
 
     /// Attaches this target's credentials to an outgoing request, or for
-    /// a peer the hop marker: `Authorization: Bearer` for OpenAI,
-    /// `x-api-key` plus the API version for Anthropic.
+    /// a peer the hop marker and the peer key: `Authorization: Bearer`
+    /// for OpenAI, `x-api-key` plus the API version for Anthropic.
     ///
     /// A no-op for [`Target::Local`]: a loopback `llama-server` has no
     /// auth, which is why nothing below ever forwarded the client's own
@@ -1425,7 +1436,7 @@ impl Target {
     fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self {
             Self::Local(_) => req,
-            Self::Peer(_) => req.header(aggregation::HOP, "1"),
+            Self::Peer(peer) => aggregation::hop(req, peer.api_key.as_deref()),
             Self::Remote(remote) => match (remote.wire, remote.api_key.as_deref()) {
                 (Wire::OpenAi, Some(key)) => req.bearer_auth(key),
                 (Wire::OpenAi, None) => req,
@@ -1466,7 +1477,7 @@ impl Target {
     fn describe(&self) -> String {
         match self {
             Self::Local(_) => "inference backend".to_string(),
-            Self::Peer(origin) => format!("peer {origin}"),
+            Self::Peer(peer) => format!("peer {}", peer.origin),
             Self::Remote(remote) => format!("provider {}", remote.provider),
         }
     }
@@ -1496,16 +1507,7 @@ fn client_api_key(headers: Option<&HeaderMap>) -> Option<String> {
         let k = k.trim();
         (!k.is_empty() && k != PLACEHOLDER_API_KEY).then(|| k.to_string())
     };
-    // The scheme is case-insensitive per RFC 7235, and clients do send
-    // `bearer`. Matching one spelling would silently drop a real key.
-    let bearer = headers
-        .get(reqwest::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            let (scheme, token) = v.trim().split_once(' ')?;
-            scheme.eq_ignore_ascii_case("bearer").then_some(token)
-        })
-        .and_then(usable);
+    let bearer = auth::bearer(headers).and_then(usable);
     // Each candidate is filtered before the choice between them, not
     // after: a client that sends both a placeholder `Authorization` and a
     // real `x-api-key` still has a real key.
@@ -1542,6 +1544,14 @@ fn is_cross_site(headers: Option<&HeaderMap>) -> bool {
         })
 }
 
+/// Whether this daemon spends its own provider key for this request: the
+/// caller authenticated (every request reaching a handler under an
+/// enforced `auth::Policy` did), or only the operator can reach the
+/// daemon and this is not a browser acting for another site.
+fn daemon_key_spendable(state: &AppState, headers: Option<&HeaderMap>) -> bool {
+    state.0.auth.enforced() || (crate::daemon::reachable_only_locally() && !is_cross_site(headers))
+}
+
 /// The models.dev catalog, as everything in this module reaches it: off
 /// the runtime, since the first call fetches (and caches) it while every
 /// later one is memoized, and a 502 when that fetch fails — the failure
@@ -1562,6 +1572,7 @@ async fn provider_catalog() -> Result<Arc<crate::providers::Catalog>, AppError> 
 /// integration's requests, and a daemon started with the key already
 /// exported work.
 async fn resolve_remote_target(
+    state: &AppState,
     model_ref: &str,
     headers: Option<&HeaderMap>,
 ) -> Result<Option<Target>, AppError> {
@@ -1579,18 +1590,12 @@ async fn resolve_remote_target(
         )
     })?;
 
-    // This router has no authentication, so the daemon's own key is
-    // withheld from the two cases where the caller is plainly not the
-    // operator: a bind the whole network can reach, and a browser acting
-    // for another site. That is a blast-radius bound, not authentication
-    // — on a shared machine any local account can still reach a loopback
-    // daemon, as it can already reach every other thing this daemon does.
-    // Presenting a key per request is what avoids relying on this at all.
-    let own_key = || {
-        (crate::daemon::reachable_only_locally() && !is_cross_site(headers))
-            .then(|| provider.api_key())
-            .flatten()
-    };
+    // An authenticated caller is the operator. Without keys the daemon's
+    // own key is withheld where the caller plainly is not: a bind the
+    // network can reach, or a browser acting for another site. That is a
+    // blast-radius bound, not authentication — see `daemon_key_spendable`.
+    let trusted = daemon_key_spendable(state, headers);
+    let own_key = || trusted.then(|| provider.api_key()).flatten();
     let api_key = match client_api_key(headers).or_else(own_key) {
         Some(key) => Some(key),
         // A configured provider that takes no key goes up bare.
@@ -1600,11 +1605,11 @@ async fn resolve_remote_target(
                 anyhow!(
                     "no API key for provider {provider_id:?} — send it as an Authorization \
                      header{}",
-                    if is_cross_site(headers) {
+                    if is_cross_site(headers) && !state.0.auth.enforced() {
                         ". This request came from another site, so llmman serve's own \
                          environment is deliberately not used"
                             .to_string()
-                    } else if crate::daemon::reachable_only_locally() {
+                    } else if trusted {
                         format!(
                             ", or give llmman serve a key of its own: {}",
                             crate::providers::key_hint(&provider.id, provider.key_env.as_deref())
@@ -1853,7 +1858,7 @@ async fn local_context_overflow(resp: Response) -> Result<Response, String> {
 /// per-request ctx change, the option only takes effect on a fresh
 /// load: the `check_running` short-circuits below reuse an
 /// already-running instance as-is, never reloading it for a different
-/// thread count. Under `--ociman` it is ignored along with the derived
+/// thread count. Under a container runtime it is ignored along with the derived
 /// value; see `container::LlamaOptions::threads` for why.
 async fn ensure_model(
     state: &AppState,
@@ -1878,7 +1883,7 @@ async fn ensure_model(
     // `ActivityGuard` operation looks the model up in `running` and is a
     // no-op when absent (see its `Drop` impl and `begin_activity`), so a
     // remote target needs no separate no-op path.
-    if let Some(target) = resolve_remote_target(model_ref, headers).await? {
+    if let Some(target) = resolve_remote_target(state, model_ref, headers).await? {
         return Ok((
             model_ref.to_string(),
             target,
@@ -1919,7 +1924,7 @@ async fn ensure_model(
     if let Some(peer) = aggregation::route(state, model_ref, headers).await {
         return Ok((
             model_ref.to_string(),
-            Target::Peer(peer),
+            aggregation::target(state, peer),
             ActivityGuard::new(state, model_ref),
         ));
     }
@@ -2074,7 +2079,7 @@ async fn ensure_model(
         let mut stderr_tail: Option<OutputTail> = None;
         let mut oom_retryable = false;
         let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
-        process = match (&model_path, state.0.ociman) {
+        process = match (&model_path, state.0.runtime.ociman()) {
             // container::spawn ignores llama_opts.threads; see that
             // field's doc comment.
             (ModelPath::Gguf(path, mmproj), Some(ociman)) => {
@@ -2117,8 +2122,8 @@ async fn ensure_model(
                 oom_retryable = true;
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }
-            // --ociman is Linux-only and mlx Metal-only, so this never
-            // competes with the mlx arm.
+            // Container runtimes are Linux-only and mlx Metal-only, so
+            // this never competes with the mlx arm.
             (ModelPath::SafeTensors(dir), Some(ociman)) => {
                 let mut child = crate::container::spawn_vllm(
                     ociman,
@@ -3149,8 +3154,8 @@ struct ProviderSummary {
     models: usize,
 }
 
-impl From<&crate::providers::Provider> for ProviderSummary {
-    fn from(p: &crate::providers::Provider) -> Self {
+impl ProviderSummary {
+    fn new(state: &AppState, p: &crate::providers::Provider) -> Self {
         Self {
             id: p.id.clone(),
             name: p.name.clone(),
@@ -3158,7 +3163,7 @@ impl From<&crate::providers::Provider> for ProviderSummary {
             key_env: p.key_env.clone(),
             wire: p.wire.as_str(),
             key_set: p.api_key().is_some(),
-            key_usable: daemon_key_usable(p),
+            key_usable: daemon_key_usable(state, p),
             key_optional: p.key_optional,
             models: p.models.len(),
         }
@@ -3166,10 +3171,11 @@ impl From<&crate::providers::Provider> for ProviderSummary {
 }
 
 /// Whether this daemon would spend its own key for a request that
-/// presents none — the same two conditions `resolve_remote_target`
-/// applies, minus the per-request cross-site check no CLI can trip.
-fn daemon_key_usable(provider: &crate::providers::Provider) -> bool {
-    provider.api_key().is_some() && crate::daemon::reachable_only_locally()
+/// presents none — the same conditions `resolve_remote_target` applies
+/// (see `daemon_key_spendable`), minus the per-request cross-site check
+/// no CLI can trip.
+fn daemon_key_usable(state: &AppState, provider: &crate::providers::Provider) -> bool {
+    provider.api_key().is_some() && daemon_key_spendable(state, None)
 }
 
 /// `GET /llmman/providers`.
@@ -3215,8 +3221,8 @@ struct ProviderCostResponse {
     output: f64,
 }
 
-impl From<&crate::providers::Provider> for ProviderResponse {
-    fn from(p: &crate::providers::Provider) -> Self {
+impl ProviderResponse {
+    fn new(state: &AppState, p: &crate::providers::Provider) -> Self {
         Self {
             id: p.id.clone(),
             name: p.name.clone(),
@@ -3224,7 +3230,7 @@ impl From<&crate::providers::Provider> for ProviderResponse {
             key_env: p.key_env.clone(),
             wire: p.wire.as_str(),
             key_set: p.api_key().is_some(),
-            key_usable: daemon_key_usable(p),
+            key_usable: daemon_key_usable(state, p),
             key_optional: p.key_optional,
             models: p
                 .models
@@ -3242,10 +3248,15 @@ impl From<&crate::providers::Provider> for ProviderResponse {
 }
 
 /// `GET /llmman/providers` — every provider `--provider` accepts.
-async fn handle_llmman_providers() -> Result<impl IntoResponse, AppError> {
+async fn handle_llmman_providers(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
     let catalog = provider_catalog().await?;
     Ok(Json(ProvidersResponse {
-        providers: catalog.iter().map(ProviderSummary::from).collect(),
+        providers: catalog
+            .iter()
+            .map(|p| ProviderSummary::new(&state, p))
+            .collect(),
     }))
 }
 
@@ -3265,9 +3276,9 @@ async fn handle_llmman_provider(
             StatusCode::NOT_FOUND,
         )
     })?;
-    let mut response = ProviderResponse::from(provider);
+    let mut response = ProviderResponse::new(&state, provider);
     if provider.key_optional && provider.models.is_empty() {
-        response.models = configured_provider_models(&state.0.client, provider)
+        response.models = configured_provider_models(&state, provider)
             .await
             .into_iter()
             .map(|id| ProviderModelResponse { id, cost: None })
@@ -3287,7 +3298,7 @@ const CONFIGURED_MODELS_TIMEOUT: Duration = Duration::from_secs(5);
 /// requests. The daemon's own key is sent under the same bind rule as
 /// for a request (`daemon_key_usable`).
 async fn configured_provider_models(
-    client: &Client,
+    state: &AppState,
     provider: &crate::providers::Provider,
 ) -> Vec<String> {
     #[derive(Deserialize)]
@@ -3304,8 +3315,8 @@ async fn configured_provider_models(
         return Vec::new();
     }
     let url = provider.url("/v1/models");
-    let mut req = client.get(&url).timeout(CONFIGURED_MODELS_TIMEOUT);
-    if daemon_key_usable(provider) {
+    let mut req = state.0.client.get(&url).timeout(CONFIGURED_MODELS_TIMEOUT);
+    if daemon_key_usable(state, provider) {
         if let Some(key) = provider.api_key() {
             req = req.bearer_auth(key);
         }
@@ -3327,2013 +3338,6 @@ async fn configured_provider_models(
             Vec::new()
         }
     }
-}
-
-/// Ollama's GET /api/version, extended with this daemon's own identity —
-/// executable path (canonicalized at startup) and pid — so a client can
-/// tell whether a daemon it found listening still belongs to a live
-/// install (the exe still exists, and is the binary the client would
-/// launch) and stop/replace it if not. See daemon::ensure_server.
-async fn handle_version(State(state): State<AppState>) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "version": env!("LLMMAN_VERSION"),
-        "exe": state.0.exe.as_ref().map(|p| p.to_string_lossy()),
-        "pid": std::process::id(),
-    }))
-}
-
-async fn handle_tags(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, AppError> {
-    let store = OciStore::open(&state.0.store_path)?;
-    let list = store.list()?;
-    let mut models: Vec<OllamaModelInfo> = list
-        .into_iter()
-        .map(|img| OllamaModelInfo {
-            name: img.reference.clone(),
-            model: img.reference,
-            size: img.size,
-            digest: img.digest,
-            modified_at: img
-                .modified_at
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .and_then(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, 0))
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(now_rfc3339),
-            details: OllamaModelDetails {
-                format: "gguf".into(),
-                family: String::new(),
-                parameter_size: String::new(),
-                quantization_level: String::new(),
-            },
-        })
-        .collect();
-    // A peer's models are servable from here too, by forwarding.
-    if aggregation::aggregates(&state, &headers) {
-        for (_, peer) in aggregation::poll::<OllamaTagsResponse>(&state, "/api/tags").await {
-            for m in peer.models {
-                if !models.iter().any(|have| have.name == m.name) {
-                    models.push(m);
-                }
-            }
-        }
-    }
-    Ok(Json(OllamaTagsResponse { models }))
-}
-
-/// The subset of a [`RunningModel`] `handle_ps` needs, cloned out while
-/// holding `manager`'s lock (see `handle_ps`) so the per-model `/props`
-/// round trips afterward don't hold that lock for the duration.
-struct PsEntry {
-    name: String,
-    digest: String,
-    size: u64,
-    port: u16,
-    pid: Option<u32>,
-    processor: String,
-    started_at: String,
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-async fn handle_ps(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let entries: Vec<PsEntry> = {
-        let mgr = state.0.manager.lock().await;
-        mgr.running
-            .iter()
-            .map(|(name, m)| PsEntry {
-                name: name.clone(),
-                digest: m.digest.clone(),
-                size: m.size,
-                port: m.port,
-                pid: m.pid(),
-                processor: m.processor(),
-                started_at: m.started_at.clone(),
-                expires_at: m
-                    .keep_alive
-                    .and_then(|d| chrono::Duration::from_std(d).ok())
-                    .map(|d| m.last_active_wall + d),
-            })
-            .collect()
-    };
-
-    let mut models = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let context_length = query_context_length(&state.0.client, entry.port).await;
-        models.push(OllamaRunningModelInfo {
-            name: entry.name.clone(),
-            model: entry.name,
-            digest: entry.digest,
-            size: entry.size,
-            size_vram: 0, // not tracked — see RunningModel::processor's doc comment
-            pid: entry.pid,
-            port: entry.port,
-            processor: entry.processor,
-            context_length,
-            started_at: entry.started_at,
-            expires_at: entry
-                .expires_at
-                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
-            node: None,
-        });
-    }
-    // Loaded on a peer is loaded for this node's callers too.
-    if aggregation::aggregates(&state, &headers) {
-        for (origin, peer) in aggregation::poll::<OllamaPsResponse>(&state, "/api/ps").await {
-            models.extend(peer.models.into_iter().map(|m| OllamaRunningModelInfo {
-                node: Some(origin.clone()),
-                ..m
-            }));
-        }
-    }
-    Json(OllamaPsResponse { models })
-}
-
-/// Best-effort live context-length lookup via the running llama-server's own
-/// `/props` endpoint (`default_generation_settings.n_ctx`) — mirrors
-/// Ollama's own preference for live runner data over anything cached (see
-/// server.PsHandler's use of `v.llama.ContextLength()`). Returns `None` on
-/// any failure (short timeout, connection error, unexpected shape, or a
-/// vllm-backed model, which doesn't expose this endpoint at all) rather
-/// than failing the whole `ps` response over one unreachable model.
-async fn query_context_length(client: &Client, port: u16) -> Option<u64> {
-    let url = format!("http://127.0.0.1:{port}/props");
-    let resp = client
-        .get(&url)
-        .timeout(Duration::from_millis(500))
-        .send()
-        .await
-        .ok()?;
-    let body: serde_json::Value = resp.json().await.ok()?;
-    body.get("default_generation_settings")?
-        .get("n_ctx")?
-        .as_u64()
-}
-
-async fn handle_show(
-    State(state): State<AppState>,
-    Json(req): Json<OllamaShowRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    // ollama sends either {"name":"..."} or {"model":"..."} depending on call site;
-    // filter out empty strings so we always fall back to whichever field is populated.
-    let model_ref = req
-        .name
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&req.model);
-    // A provider-routed model is served by someone else and is never in
-    // the local store, so the lookup below would report it missing and
-    // send every caller that treats a 404 here as "needs pulling" — most
-    // of all `daemon::ensure_model_pulled`, which `llmman launch` and
-    // `llmman run` both call before their first request — off to pull a
-    // reference that names no registry. Answer for it directly instead.
-    if crate::providers::is_remote_ref(model_ref) {
-        eprintln!("[llmman] /api/show model={model_ref:?} (provider-routed)");
-        return Ok(Json(OllamaShowResponse {
-            model_info: serde_json::json!({ "digest": "", "size": 0 }),
-            details: OllamaModelDetails {
-                // Not "gguf": there are no local weights here at all, and
-                // claiming a format llmman never inspected would be a
-                // guess about someone else's serving stack.
-                format: String::new(),
-                family: String::new(),
-                parameter_size: String::new(),
-                quantization_level: String::new(),
-            },
-            // Nothing local to inspect.
-            capabilities: Vec::new(),
-            template: None,
-        }));
-    }
-    // Resolve the same way handle_pull stored it — otherwise a bare name
-    // (e.g. "gemma4", pulled and stored as "docker.io/ai/gemma4") would
-    // never be found by show/delete even though it's in the local store.
-    let model_ref =
-        crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
-    let model_ref = model_ref.as_str();
-    eprintln!("[llmman] /api/show model={model_ref:?}");
-    let store = OciStore::open(&state.0.store_path)?;
-    // 404 like ollama (`showOrPullModel` pulls only on not-found); a
-    // broken store entry stays a 500.
-    let desc = store.find(model_ref).map_err(|e| {
-        if e.downcast_ref::<crate::storage::oci::NotFound>().is_some() {
-            AppError::status(
-                StatusCode::NOT_FOUND,
-                format!("model not found: {model_ref}"),
-            )
-        } else {
-            AppError::from(e)
-        }
-    })?;
-    let manifest = store.read_manifest(&desc.digest)?;
-    let capabilities = crate::modelpack::capabilities(&store, &manifest);
-    let template = crate::modelpack::chat_template(
-        &store,
-        &state.0.store_path,
-        &state.0.cache_path,
-        &manifest,
-    );
-    Ok(Json(OllamaShowResponse {
-        model_info: serde_json::json!({ "digest": desc.digest, "size": desc.size }),
-        details: OllamaModelDetails {
-            format: "gguf".into(),
-            family: String::new(),
-            parameter_size: String::new(),
-            quantization_level: String::new(),
-        },
-        capabilities,
-        template,
-    }))
-}
-
-// -- Ollama /api/pull ---------------------------------------------------------
-// Mirrors `ollama.PullHandler`: streams newline-delimited JSON status objects
-// (`{"status": "..."}`, matching api.ProgressResponse) ending in either
-// `{"status": "success"}` or `{"error": "..."}`. Real Ollama also reports
-// per-layer `digest`/`total`/`completed` fields for a byte-level progress
-// bar; the Go shim's `llmman_pull` is a single opaque blocking call with no
-// progress callback, so this reports coarse status only — every field is
-// `omitempty` on the client side, so callers that only render `status` (as
-// `llmman pull`'s own CLI progress text does) see accurate text throughout.
-
-#[derive(Debug, Deserialize)]
-struct OllamaPullRequest {
-    #[serde(default)]
-    model: String,
-    // Real Ollama keeps `Name` as a deprecated fallback for `Model`
-    // (server/routes.go's `cmp.Or(req.Model, req.Name)`) — some clients
-    // only ever send `name`, which used to 422 outright since `model`
-    // was required. Falls back below like handle_show/handle_delete
-    // already do.
-    #[serde(default)]
-    name: String,
-}
-
-async fn handle_pull(
-    State(state): State<AppState>,
-    Json(req): Json<OllamaPullRequest>,
-) -> Result<Response, AppError> {
-    let model_ref = if req.model.is_empty() {
-        req.name.as_str()
-    } else {
-        req.model.as_str()
-    };
-    if model_ref.is_empty() {
-        return Err(AppError::status(
-            StatusCode::BAD_REQUEST,
-            "model is required",
-        ));
-    }
-    let model = crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
-    eprintln!("[llmman] /api/pull model={model:?}");
-    let store_path = state.0.store_path.clone();
-
-    // Everything, present or not, goes through pull_serialized. It
-    // re-checks presence under the per-model lock (this request's own
-    // check would have raced a concurrent pull anyway), and — the reason
-    // there is no fast-path return here — it applies the signature
-    // policy to a model that is *already* in the store. Being on disk is
-    // not being trusted: it may have been pulled before a policy
-    // existed, or under `warn`. With no policy configured this is an
-    // in-memory lookup and a store hit, as before.
-    let model_for_task = model.clone();
-    let pull_task =
-        tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_for_task));
-
-    Ok(stream_ffi_progress(
-        model,
-        "pull",
-        "pulling manifest",
-        pull_task,
-    ))
-}
-
-// -- Ollama /api/push ---------------------------------------------------------
-// Ollama's own /api/push has no equivalent in llmman's original design (the
-// route didn't exist at all before), but it's the same shape as /api/pull —
-// a streamed NDJSON status sequence — so `llmman push` becoming a thin
-// client of this endpoint (like `llmman pull`) gets both operations onto
-// the exact same Ollama-protocol wire format.
-
-#[derive(Debug, Deserialize)]
-struct OllamaPushRequest {
-    #[serde(default)]
-    model: String,
-    // See OllamaPullRequest's `name` field doc comment: same deprecated
-    // `Name`-falls-back-to-`Model` shape as real Ollama's PushRequest.
-    #[serde(default)]
-    name: String,
-}
-
-async fn handle_push(
-    State(state): State<AppState>,
-    Json(req): Json<OllamaPushRequest>,
-) -> Result<Response, AppError> {
-    let model_ref = if req.model.is_empty() {
-        req.name.as_str()
-    } else {
-        req.model.as_str()
-    };
-    push_impl(state, model_ref, "/api/push").await
-}
-
-/// The push both `/api/push` and `cmd::push` reach.
-///
-/// Deliberately takes no signing key. The daemon binds TCP loopback with
-/// no authentication, and loopback is not user-scoped — so accepting a
-/// caller-supplied key *path* would let any local user have this daemon
-/// read a file only its own user can read, and sign with it using its
-/// registry credentials. TCP carries no peer credentials, so there is no
-/// way to tell that caller apart. Instead the digest that was pushed is
-/// reported back and `cmd::push` signs it itself, which is also what
-/// `cmd::transfer` already does. Nothing the daemon holds is delegable.
-async fn push_impl(
-    state: AppState,
-    model_ref: &str,
-    route: &'static str,
-) -> Result<Response, AppError> {
-    if model_ref.is_empty() {
-        return Err(AppError::status(
-            StatusCode::BAD_REQUEST,
-            "model is required",
-        ));
-    }
-    let model = crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
-    eprintln!("[llmman] {route} model={model:?}");
-    let store_path = state.0.store_path.clone();
-
-    // Unlike pull, there's nothing sensible to do if the model isn't
-    // already in the local store: push has no "fetch it first" fallback.
-    if OciStore::open(&store_path)
-        .and_then(|s| s.find(&model))
-        .is_err()
-    {
-        return Err(AppError::status(
-            StatusCode::NOT_FOUND,
-            format!("model not found: {model}"),
-        ));
-    }
-
-    // See MODEL_LOCKS' doc comment: a push shares the same Go-side
-    // progressState entry (keyed by this model reference) as a pull of
-    // the same model, so they need the same per-model mutual exclusion —
-    // but a push of one model no longer blocks a pull/push of another.
-    let model_for_task = model.clone();
-    let push_task = tokio::task::spawn_blocking(move || {
-        let lock = model_lock(&model_for_task);
-        let result = (|| {
-            let _guard = lock.blocking_lock();
-            let layout_dir = store_path
-                .to_str()
-                .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
-            crate::ffi::push(layout_dir, &model_for_task)?;
-            // Read inside the lock, so this is the manifest this push
-            // put there and not one a concurrent push retagged.
-            let desc = OciStore::open(&store_path)?.find(&model_for_task)?;
-            Ok(PushOutcome {
-                digest: desc.digest,
-            })
-        })();
-        drop(lock);
-        release_model_lock(&model_for_task);
-        result
-    });
-
-    Ok(stream_ffi_progress(
-        model,
-        "push",
-        "retrieving manifest",
-        push_task,
-    ))
-}
-
-/// What a completed push reports back, for `cmd::push --sign-key` to
-/// sign. See `push_impl` for why the daemon does not sign it.
-struct PushOutcome {
-    digest: String,
-}
-
-/// Whatever a pull/push task needs to tell the client beyond "success",
-/// as NDJSON objects emitted ahead of the terminal line — a pull's
-/// verification notices, a push's digest. Both go out the one stream, so
-/// `stream_ffi_progress` serves either.
-trait StreamedOutcome {
-    fn into_lines(self) -> Vec<serde_json::Value>;
-}
-
-impl StreamedOutcome for Vec<String> {
-    fn into_lines(self) -> Vec<serde_json::Value> {
-        self.into_iter()
-            .map(|notice| serde_json::json!({"notice": notice}))
-            .collect()
-    }
-}
-
-impl StreamedOutcome for PushOutcome {
-    fn into_lines(self) -> Vec<serde_json::Value> {
-        vec![serde_json::json!({"digest": self.digest})]
-    }
-}
-
-/// One poll's worth of NDJSON, or `None` to send nothing. `saw_bytes`
-/// latches once real counts arrive: an empty snapshot after that means
-/// the transfer ended while the task finishes up, and heartbeating
-/// there printed a stray line under the finished bar.
-fn progress_line(
-    verb: &str,
-    model: &str,
-    snap: (String, i64, i64),
-    saw_bytes: &mut bool,
-) -> Option<serde_json::Value> {
-    let (status, total, completed) = snap;
-    if total > 0 {
-        *saw_bytes = true;
-        return Some(serde_json::json!({
-            "status": if status.is_empty() { format!("{verb}ing {model}") } else { status },
-            "total": total,
-            "completed": completed.clamp(0, total),
-        }));
-    }
-    if !status.is_empty() {
-        return Some(serde_json::json!({"status": status}));
-    }
-    if *saw_bytes {
-        return None;
-    }
-    Some(serde_json::json!({"status": format!("{verb}ing {model}")}))
-}
-
-/// Runs `task` (a blocking FFI call already dispatched via spawn_blocking)
-/// to completion, streaming an immediate `first_status` line, then polling
-/// `ffi::progress(&model)` every 200ms (matching the Go shim's own mpb
-/// refresh rate) until the task finishes, then a final `{"status": "success"}` or
-/// `{"error": ...}` line. Shared by handle_pull and handle_push.
-///
-/// Each polled line includes real `total`/`completed` byte counts (mirroring
-/// Ollama's own api.ProgressResponse fields) once the shim's shared
-/// `progressState` (go-shim/progress_state.go) has learned a nonzero total
-/// — before that, or if the FFI call is a kind that doesn't track
-/// byte-level progress at all, only `status` text is included, exactly
-/// like the old heartbeat-only version of this function. This is what
-/// lets `llmman pull`/`llmman push` render a real progress bar instead of
-/// just printing status text: the Go shim's own mpb bars
-/// (go-shim/shared_oci.go) already draw real bars for these exact
-/// numbers, but only reach an interactive terminal when the FFI call runs
-/// in the foreground CLI process (e.g. `llmman transfer`) — here it runs
-/// inside the daemon, whose stdio is redirected to a log file (see
-/// daemon::ensure_server), so polling and relaying over this NDJSON
-/// stream is the only way those numbers reach `llmman pull`/`llmman push`.
-fn stream_ffi_progress<T: StreamedOutcome + Send + 'static>(
-    model: String,
-    verb: &'static str,
-    first_status: &'static str,
-    task: tokio::task::JoinHandle<anyhow::Result<T>>,
-) -> Response {
-    let first_line = serde_json::json!({"status": first_status}).to_string() + "\n";
-    let stream = futures::stream::once(futures::future::ready(Bytes::from(first_line)))
-        .chain(futures::stream::unfold((Some(task), false), move |state| {
-            let (task, mut saw_bytes) = state;
-            let model = model.clone();
-            async move {
-                let mut task = task?;
-                tokio::select! {
-                    result = &mut task => {
-                        // Any notices the task produced (see
-                        // verify::Verdict) go out ahead of the terminal
-                        // line, each on its own NDJSON object, so the
-                        // client can print them somewhere a person is
-                        // actually looking — this daemon's own stderr is
-                        // a log file.
-                        let mut out = String::new();
-                        let line = match result {
-                            Ok(Ok(outcome)) => {
-                                for field in outcome.into_lines() {
-                                    out.push_str(&field.to_string());
-                                    out.push('\n');
-                                }
-                                serde_json::json!({"status": "success"}).to_string()
-                            }
-                            Ok(Err(e)) => serde_json::json!({"error": format!("{e:#}")}).to_string(),
-                            Err(e) => serde_json::json!({"error": format!("{verb} task panicked: {e}")}).to_string(),
-                        };
-                        out.push_str(&line);
-                        out.push('\n');
-                        Some((Bytes::from(out), (None, saw_bytes)))
-                    }
-                    _ = sleep(Duration::from_millis(200)) => {
-                        // A HuggingFace pull tracks its own progress natively
-                        // (crate::hf::progress) rather than through the Go
-                        // shim's — check that first, since only one of the
-                        // two will ever actually be tracking `model` for a
-                        // given task.
-                        let rust_snap = crate::hf::progress::poll(&model);
-                        let go_snap = (rust_snap.total == 0).then(|| crate::ffi::progress(&model).ok()).flatten();
-                        let (status, total, completed) = if rust_snap.total > 0 {
-                            (rust_snap.status, rust_snap.total, rust_snap.completed)
-                        } else if !rust_snap.status.is_empty() {
-                            (rust_snap.status, 0, 0)
-                        } else if let Some(p) = &go_snap {
-                            (p.status.clone(), p.total, p.completed)
-                        } else {
-                            (String::new(), 0, 0)
-                        };
-                        let line = progress_line(verb, &model, (status, total, completed), &mut saw_bytes);
-                        let out = line.map(|l| l.to_string() + "\n").unwrap_or_default();
-                        Some((Bytes::from(out), (Some(task), saw_bytes)))
-                    }
-                }
-            }
-        }))
-        .map(Ok::<_, std::convert::Infallible>);
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/x-ndjson")
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
-
-async fn handle_delete(
-    State(state): State<AppState>,
-    Json(req): Json<OllamaDeleteRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    let model_ref = req
-        .name
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&req.model);
-    // See handle_show: resolve the same way handle_pull stored it.
-    let model_ref =
-        crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
-    let store = OciStore::open(&state.0.store_path)?;
-    store.remove(&model_ref)?;
-    Ok(StatusCode::OK)
-}
-
-// -- Ollama /api/copy ---------------------------------------------------------
-
-/// Mirrors `ollama.CopyHandler`: `llmman cp` over the wire, with
-/// ollama's 404 for a missing source.
-async fn handle_copy(
-    State(state): State<AppState>,
-    Json(req): Json<OllamaCopyRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    if req.source.is_empty() || req.destination.is_empty() {
-        return Err(AppError::status(
-            StatusCode::BAD_REQUEST,
-            "source and destination are required",
-        ));
-    }
-    // Both resolved the way handle_pull stores a model, so a bare
-    // `mine:tag` destination is found by the /api/chat that follows.
-    let source =
-        crate::shortnames::resolve_ollama_api(&req.source).map_err(AppError::bad_request)?;
-    let destination =
-        crate::shortnames::resolve_ollama_api(&req.destination).map_err(AppError::bad_request)?;
-    eprintln!("[llmman] /api/copy {source:?} -> {destination:?}");
-    let store = OciStore::open(&state.0.store_path)?;
-    if store.find(&source).is_err() {
-        return Err(AppError::status(
-            StatusCode::NOT_FOUND,
-            format!("model '{}' not found", req.source),
-        ));
-    }
-    let digest = crate::cmd::cp::copy(&store, &source, &destination)?;
-    evict_if_retagged(&state, &destination, &digest).await;
-    Ok(StatusCode::OK)
-}
-
-/// Drops a loaded model whose tag `/api/copy` or `/api/create` just
-/// pointed at other content, so the next request loads that content.
-/// Keys are compared tag-defaulted, since a runner may be keyed `m:latest`
-/// for a tag written as `m`. In-flight requests on the old content are
-/// cut, as an explicit `keep_alive: 0` unload cuts them.
-async fn evict_if_retagged(state: &AppState, reference: &str, digest: &str) {
-    let want = crate::storage::default_tag(reference);
-    let mut mgr = state.0.manager.lock().await;
-    let stale: Vec<String> = mgr
-        .running
-        .iter()
-        .filter(|(k, m)| m.digest != digest && crate::storage::default_tag(k) == want)
-        .map(|(k, _)| k.clone())
-        .collect();
-    for key in stale {
-        mgr.running.remove(&key);
-        metrics::record_model_unload(&key, UnloadReason::Requested);
-    }
-}
-
-// -- Ollama /api/blobs, /api/create --------------------------------------------
-//
-// Ollama's import flow: `POST /api/blobs/sha256:<digest>` uploads each raw
-// file (after a `HEAD` to skip ones already present), then `POST
-// /api/create` names them under `files`. Uploads land in a staging
-// directory; `create` packages them with `OciStore::build`, the same path
-// as `llmman build`, so the result is an ordinary store image.
-
-/// Where uploads wait for a `create`. Kept afterwards, so one upload can
-/// back several creates; `storage::gc::prune_cache` sweeps the directory
-/// at the next startup once it has been idle for its grace period.
-fn blob_staging_dir(state: &AppState) -> PathBuf {
-    state.0.cache_path.join("blobs")
-}
-
-/// Per-process counter making concurrent requests' temp paths distinct
-/// (see `OciStore::write_ref`).
-static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn staging_temp_name(prefix: &str) -> String {
-    let n = STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{prefix}-{}-{n}", std::process::id())
-}
-
-/// The staging path for `digest`, or a 400 if it isn't `sha256:<64 hex>`
-/// — which is also what keeps the path inside the staging directory.
-fn staged_blob_path(state: &AppState, digest: &str) -> Result<PathBuf, AppError> {
-    let hex = digest.strip_prefix("sha256:").unwrap_or_default();
-    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(AppError::status(
-            StatusCode::BAD_REQUEST,
-            format!("invalid digest {digest:?}: expected sha256:<64 hex digits>"),
-        ));
-    }
-    Ok(blob_staging_dir(state).join(hex.to_ascii_lowercase()))
-}
-
-/// `HEAD /api/blobs/:digest` — mirrors `ollama.HeadBlobHandler`.
-async fn handle_blob_head(
-    State(state): State<AppState>,
-    UrlPath(digest): UrlPath<String>,
-) -> Result<StatusCode, AppError> {
-    let path = staged_blob_path(&state, &digest)?;
-    Ok(if path.is_file() {
-        StatusCode::OK
-    } else {
-        StatusCode::NOT_FOUND
-    })
-}
-
-/// `POST /api/blobs/:digest` — streams the body to staging, kept only if
-/// it hashes to `digest`. Mirrors `ollama.CreateBlobHandler`.
-async fn handle_blob_upload(
-    State(state): State<AppState>,
-    UrlPath(digest): UrlPath<String>,
-    body: Body,
-) -> Result<StatusCode, AppError> {
-    use sha2::Digest as _;
-    use tokio::io::AsyncWriteExt as _;
-
-    let dest = staged_blob_path(&state, &digest)?;
-    if dest.is_file() {
-        return Ok(StatusCode::OK);
-    }
-    let dir = blob_staging_dir(&state);
-    tokio::fs::create_dir_all(&dir).await?;
-    let tmp = dir.join(staging_temp_name("tmp"));
-    let mut file = tokio::fs::File::create(&tmp).await?;
-    let mut hasher = sha2::Sha256::new();
-    let mut stream = body.into_data_stream();
-    let written = async {
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("read upload body")?;
-            hasher.update(&chunk);
-            file.write_all(&chunk).await?;
-        }
-        file.flush().await?;
-        anyhow::Ok(())
-    }
-    .await;
-    if let Err(e) = written {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(e.into());
-    }
-    let actual = format!("sha256:{}", hex::encode(hasher.finalize()));
-    if !actual.eq_ignore_ascii_case(&digest) {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(AppError::status(
-            StatusCode::BAD_REQUEST,
-            format!("digest mismatch, expected {digest:?}, got {actual:?}"),
-        ));
-    }
-    tokio::fs::rename(&tmp, &dest).await?;
-    eprintln!("[llmman] /api/blobs stored {digest} ({})", dest.display());
-    Ok(StatusCode::CREATED)
-}
-
-/// The two halves of `ollama.CreateHandler` an OCI artifact can express:
-/// `from` (alias an existing model) and `files` (package uploaded blobs
-/// via `OciStore::build`). Modelfile fields — `system`, `template`,
-/// `parameters`, `quantize`, ... — have no counterpart here (the GGUF's
-/// own chat template applies), so each is refused with a 400 naming it
-/// rather than dropped: a caller that set a system prompt must not hear
-/// "success". Answers like ollama: `{"status": ...}` lines ending in
-/// `success`, or one object for `stream: false`.
-async fn handle_create(
-    State(state): State<AppState>,
-    Json(req): Json<OllamaCreateRequest>,
-) -> Result<Response, AppError> {
-    let model = if req.model.is_empty() {
-        req.name.as_str()
-    } else {
-        req.model.as_str()
-    };
-    if model.is_empty() {
-        return Err(AppError::status(
-            StatusCode::BAD_REQUEST,
-            "model is required",
-        ));
-    }
-    let refused: Vec<&str> = req
-        .unsupported
-        .iter()
-        .filter(|(_, v)| !is_empty_json(v))
-        .map(|(k, _)| k.as_str())
-        .collect();
-    if !refused.is_empty() {
-        let mut refused = refused;
-        refused.sort_unstable();
-        return Err(AppError::status(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "/api/create: {} not supported by llmman — models are plain OCI artifacts \
-                 whose GGUF carries its own chat template; only `from` (alias an existing \
-                 model) and `files` (package uploaded blobs) are honoured",
-                refused.join(", ")
-            ),
-        ));
-    }
-    // Resolved like handle_copy's destination. A `@digest` spelling names
-    // content, which a created model doesn't have yet (see cp.rs).
-    let model = &crate::shortnames::resolve_ollama_api(model).map_err(AppError::bad_request)?;
-    if crate::storage::split_ref_digest(model).1.is_some() {
-        return Err(AppError::status(
-            StatusCode::BAD_REQUEST,
-            "/api/create: the model name can't be a digest reference",
-        ));
-    }
-    let files = req.files.unwrap_or_default();
-    let from = req.from.filter(|f| !f.is_empty());
-    let statuses: Vec<String> = match (from, files.is_empty()) {
-        (Some(_), false) => {
-            return Err(AppError::status(
-                StatusCode::BAD_REQUEST,
-                "/api/create: `from` and `files` are mutually exclusive here",
-            ))
-        }
-        (None, true) => {
-            return Err(AppError::status(
-                StatusCode::BAD_REQUEST,
-                "/api/create: one of `from` or `files` is required",
-            ))
-        }
-        (Some(from), true) => {
-            let source =
-                crate::shortnames::resolve_ollama_api(&from).map_err(AppError::bad_request)?;
-            eprintln!("[llmman] /api/create {model:?} from {source:?}");
-            let store = OciStore::open(&state.0.store_path)?;
-            if store.find(&source).is_err() {
-                return Err(AppError::status(
-                    StatusCode::NOT_FOUND,
-                    format!("model '{from}' not found"),
-                ));
-            }
-            let digest = crate::cmd::cp::copy(&store, &source, model)?;
-            evict_if_retagged(&state, model, &digest).await;
-            vec![format!("using existing layer {source}")]
-        }
-        (None, false) => {
-            eprintln!(
-                "[llmman] /api/create {model:?} from {} uploaded file(s)",
-                files.len()
-            );
-            let staged = files
-                .iter()
-                .map(|(name, digest)| Ok((name.clone(), staged_file(&state, name, digest)?)))
-                .collect::<Result<Vec<_>, AppError>>()?;
-            let store_path = state.0.store_path.clone();
-            let staging = blob_staging_dir(&state);
-            let model_owned = model.to_string();
-            let (digest, statuses) = tokio::task::spawn_blocking(move || {
-                create_from_staged_blobs(&store_path, &staging, &model_owned, &staged)
-            })
-            .await
-            .context("create task panicked")??;
-            evict_if_retagged(&state, model, &digest).await;
-            statuses
-        }
-    };
-    let mut lines: Vec<serde_json::Value> = statuses
-        .into_iter()
-        .map(|s| serde_json::json!({"status": s}))
-        .collect();
-    lines.push(serde_json::json!({"status": "success"}));
-    Ok(if req.stream {
-        let body: String = lines.iter().map(|l| l.to_string() + "\n").collect();
-        ([("content-type", "application/x-ndjson")], body).into_response()
-    } else {
-        Json(lines.pop().unwrap_or_default()).into_response()
-    })
-}
-
-/// The placeholders a client sends for a Modelfile field it isn't using.
-fn is_empty_json(v: &serde_json::Value) -> bool {
-    match v {
-        serde_json::Value::Null => true,
-        serde_json::Value::String(s) => s.is_empty(),
-        serde_json::Value::Object(m) => m.is_empty(),
-        serde_json::Value::Array(a) => a.is_empty(),
-        _ => false,
-    }
-}
-
-/// One `files` entry, checked: a bare file name (`../` would escape the
-/// build directory), a well-formed digest, and an upload that has landed.
-fn staged_file(state: &AppState, name: &str, digest: &str) -> Result<PathBuf, AppError> {
-    let bare = Path::new(name)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n == name);
-    if !bare {
-        return Err(AppError::status(
-            StatusCode::BAD_REQUEST,
-            format!("files: {name:?} must be a bare file name"),
-        ));
-    }
-    let src = staged_blob_path(state, digest)?;
-    if !src.is_file() {
-        return Err(AppError::status(
-            StatusCode::NOT_FOUND,
-            format!("files: {digest} for {name:?} was never uploaded to /api/blobs"),
-        ));
-    }
-    Ok(src)
-}
-
-/// Hard-links (or copies) the staged uploads into a directory under the
-/// caller's file names — `build` classifies layers by extension, so
-/// `model.gguf` is what makes a servable model — and runs `OciStore::build`
-/// on it as `llmman build <dir>` would.
-fn create_from_staged_blobs(
-    store_path: &Path,
-    staging: &Path,
-    model: &str,
-    files: &[(String, PathBuf)],
-) -> anyhow::Result<(String, Vec<String>)> {
-    // `create_dir`, not `create_dir_all`: a leftover directory from a
-    // crashed daemon with a reused pid must not feed stale files to build.
-    let tmp = (0..3)
-        .map(|_| staging.join(staging_temp_name("create")))
-        .find_map(|dir| std::fs::create_dir(&dir).ok().map(|()| dir))
-        .ok_or_else(|| {
-            anyhow!(
-                "couldn't create a fresh build directory under {}",
-                staging.display()
-            )
-        })?;
-    let result = (|| {
-        let mut statuses = Vec::new();
-        for (name, src) in files {
-            let dst = tmp.join(name);
-            if std::fs::hard_link(src, &dst).is_err() {
-                std::fs::copy(src, &dst)
-                    .with_context(|| format!("stage {name} from {}", src.display()))?;
-            }
-            let digest = src.file_name().unwrap_or_default().to_string_lossy();
-            statuses.push(format!("using sha256:{digest} as {name}"));
-        }
-        let store = OciStore::open(store_path)?;
-        let desc = store.build(&tmp, model, &HashMap::new())?;
-        statuses.push(format!("writing manifest {}", desc.digest));
-        Ok((desc.digest, statuses))
-    })();
-    let _ = std::fs::remove_dir_all(&tmp);
-    result
-}
-
-// -- Ollama /api/chat ---------------------------------------------------------
-
-/// The body ollama answers a message-less `/api/chat` with. `Default` for
-/// the rest of `OllamaMessage`, not explicit `None`s: every other field is
-/// `skip_serializing_if`, so this reaches the wire as the bare
-/// `{"role":"assistant","content":""}` ollama 0.32.6 sends.
-fn empty_chat_chunk(model: String, done_reason: &str) -> OllamaChatChunk {
-    OllamaChatChunk {
-        model,
-        created_at: now_rfc3339(),
-        message: OllamaMessage {
-            role: "assistant".into(),
-            ..Default::default()
-        },
-        done: true,
-        done_reason: Some(done_reason.into()),
-        metrics: OllamaMetrics::default(),
-    }
-}
-
-async fn handle_ollama_chat(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<OllamaChatRequest>,
-) -> Result<Response, AppError> {
-    eprintln!(
-        "[llmman] /api/chat model={:?} messages={}",
-        req.model,
-        req.messages.len()
-    );
-
-    // Empty messages are ollama's unload request when paired with
-    // `keep_alive: 0`, and its load-only request on their own — the same
-    // two short-circuits `handle_ollama_generate` already implements for
-    // an empty `prompt`, which cites ollama's own `server/routes.go` for
-    // both; its `ChatHandler` carries the pair as well. Without them an
-    // empty `messages` array reaches `stream_ollama`, which asks the
-    // backend to continue from nothing: the caller gets a real, arbitrary
-    // generation and `done_reason: "stop"` where ollama answers with an
-    // empty message, and a `keep_alive: 0` never unloads anything.
-    if req.messages.is_empty() && is_explicit_unload(&req.keep_alive) {
-        unload_everywhere(&state, crate::hybrid::local_half(&req.model), &headers).await?;
-        return Ok(Json(empty_chat_chunk(req.model, "unload")).into_response());
-    }
-
-    // The options blob still applies to a load-only request (the
-    // empty-messages branch inside): a preload that names num_thread
-    // should start the process with it, same as a generating request
-    // would.
-    let model_ref = req.model.clone();
-    let request_threads = opt_num_thread(&req.options);
-    let started = Instant::now();
-    send_with_hybrid_fallback(
-        &state,
-        &model_ref,
-        Some(&headers),
-        request_threads,
-        |model, target, guard| {
-            ollama_chat_to(&state, &headers, &req, model, target, guard, started)
-        },
-    )
-    .await
-}
-
-/// [`handle_ollama_chat`] against one resolved target. `started` is when
-/// the request arrived; the time to here is its `load_duration`.
-#[allow(clippy::too_many_arguments)]
-async fn ollama_chat_to(
-    state: &AppState,
-    headers: &HeaderMap,
-    req: &OllamaChatRequest,
-    model: String,
-    target: Target,
-    guard: ActivityGuard,
-    started: Instant,
-) -> Result<Response, AppError> {
-    // A provider loads nothing; and the hosted half of a hybrid retry
-    // must not be charged the failed local attempt.
-    let load_duration = if target.is_remote() {
-        Duration::ZERO
-    } else {
-        started.elapsed()
-    };
-    if matches!(target, Target::Peer(_)) {
-        return forward_ollama(state, &target, "/api/chat", headers, req, &model, guard).await;
-    }
-    if req.messages.is_empty() {
-        refresh_activity(guard, resolve_keep_alive(&req.keep_alive)).await;
-        return Ok(Json(empty_chat_chunk(req.model.clone(), "load")).into_response());
-    }
-
-    let keep_alive = resolve_keep_alive(&req.keep_alive);
-    let activity = begin_activity(guard, Some(keep_alive)).await;
-    // See backend_wire_model's own doc comment — usually just `model`
-    // itself, but a different value for an Engine::Mlx backend or a
-    // remote provider. Only this one outgoing request field, never the
-    // response chunk's own `model` field below (which must keep echoing
-    // back `model` as-is).
-    let wire_model = backend_wire_model(state, &target, &model).await;
-    let oai = OAIChatRequest {
-        model: wire_model,
-        messages: req.messages.iter().map(ollama_message_to_oai).collect(),
-        stream: true,
-        chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
-        tools: req.tools.clone(),
-        response_format: format_to_response_format(&req.format),
-        ..options_to_oai(&req.options)
-    };
-    stream_ollama(
-        req.stream,
-        state.0.client.clone(),
-        target,
-        oai,
-        activity,
-        started,
-        load_duration,
-        move |delta| OllamaChatChunk {
-            model: model.clone(),
-            created_at: now_rfc3339(),
-            message: OllamaMessage {
-                role: "assistant".into(),
-                content: delta.content,
-                thinking: delta.thinking,
-                tool_calls: delta.tool_calls,
-                ..Default::default()
-            },
-            done: delta.done,
-            done_reason: delta.done_reason,
-            metrics: delta.metrics,
-        },
-    )
-    .await
-}
-
-/// Ollama's `options` under their OpenAI (or llama-server) names. The
-/// sampling knobs Ollama documents that have no equivalent on a chat
-/// completion (`num_ctx`, `num_keep`, `repeat_last_n`, `typical_p`,
-/// `mirostat*`) are left out; `num_ctx` is `LLMMAN_CONTEXT_LENGTH`.
-fn options_to_oai(options: &Option<serde_json::Value>) -> OAIChatRequest {
-    OAIChatRequest {
-        temperature: opt_f64(options, "temperature"),
-        top_p: opt_f64(options, "top_p"),
-        // `-1` (no limit) and `-2` (fill the context) both mean "no cap".
-        max_tokens: opt_u32(options, "num_predict"),
-        // Defaulted by post_chat; see apply_default_repeat_penalty_typed.
-        repeat_penalty: opt_f64(options, "repeat_penalty"),
-        seed: options.as_ref().and_then(|o| o.get("seed")?.as_u64()),
-        stop: opt_stop(options),
-        presence_penalty: opt_f64(options, "presence_penalty"),
-        frequency_penalty: opt_f64(options, "frequency_penalty"),
-        top_k: opt_u32(options, "top_k"),
-        min_p: opt_f64(options, "min_p"),
-        ..Default::default()
-    }
-}
-
-/// Ollama's `stop`: a string or an array of strings.
-fn opt_stop(options: &Option<serde_json::Value>) -> Option<Vec<String>> {
-    match options.as_ref()?.get("stop")? {
-        serde_json::Value::String(s) => Some(vec![s.clone()]),
-        serde_json::Value::Array(a) => Some(
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect(),
-        ),
-        _ => None,
-    }
-}
-
-// -- Ollama /api/generate -----------------------------------------------------
-
-async fn handle_ollama_generate(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<OllamaGenerateRequest>,
-) -> Result<Response, AppError> {
-    eprintln!(
-        "[llmman] /api/generate model={:?} prompt_len={}",
-        req.model,
-        req.prompt.len()
-    );
-
-    // Empty prompt + keep_alive:0 = unload request (ollama server/routes.go:354).
-    // is_explicit_unload, not resolve_keep_alive: it still accepts every
-    // zero form — the JSON number 0, but also "0"/"0s"/etc as a string —
-    // without treating an absent field as one, which under
-    // `LLMMAN_KEEP_ALIVE=0` turned a plain preload into an eviction.
-    let is_unload = req.prompt.is_empty() && is_explicit_unload(&req.keep_alive);
-    if is_unload {
-        unload_everywhere(&state, crate::hybrid::local_half(&req.model), &headers).await?;
-        return Ok(Json(OllamaGenerateChunk {
-            model: req.model,
-            created_at: now_rfc3339(),
-            response: String::new(),
-            thinking: None,
-            done: true,
-            done_reason: Some("unload".into()),
-            metrics: OllamaMetrics::default(),
-        })
-        .into_response());
-    }
-
-    // Ollama renders these itself; llmman leaves templating to the
-    // backend and has nothing to render them with (see the fields' doc).
-    let unsupported = if req.raw {
-        Some("raw")
-    } else if req.suffix.as_deref().is_some_and(|s| !s.is_empty()) {
-        Some("suffix")
-    } else if req.template.as_deref().is_some_and(|t| !t.is_empty()) {
-        Some("template")
-    } else {
-        None
-    };
-    if let Some(field) = unsupported {
-        return Err(AppError::status(
-            StatusCode::BAD_REQUEST,
-            format!("llmman does not support the {field:?} field of /api/generate"),
-        ));
-    }
-
-    let model_ref = req.model.clone();
-    let request_threads = opt_num_thread(&req.options);
-    let started = Instant::now();
-    send_with_hybrid_fallback(
-        &state,
-        &model_ref,
-        Some(&headers),
-        request_threads,
-        |model, target, guard| {
-            ollama_generate_to(&state, &headers, &req, model, target, guard, started)
-        },
-    )
-    .await
-}
-
-/// [`handle_ollama_generate`] against one resolved target; see
-/// [`ollama_chat_to`] for `started`.
-#[allow(clippy::too_many_arguments)]
-async fn ollama_generate_to(
-    state: &AppState,
-    headers: &HeaderMap,
-    req: &OllamaGenerateRequest,
-    model: String,
-    target: Target,
-    guard: ActivityGuard,
-    started: Instant,
-) -> Result<Response, AppError> {
-    // See ollama_chat_to.
-    let load_duration = if target.is_remote() {
-        Duration::ZERO
-    } else {
-        started.elapsed()
-    };
-    if matches!(target, Target::Peer(_)) {
-        return forward_ollama(state, &target, "/api/generate", headers, req, &model, guard).await;
-    }
-    // Empty prompt = load-only request (mirrors ollama server/routes.go:429)
-    // — including "preload with a custom keep_alive", so refresh it here
-    // even though no generation is happening.
-    if req.prompt.is_empty() {
-        refresh_activity(guard, resolve_keep_alive(&req.keep_alive)).await;
-        return Ok(Json(OllamaGenerateChunk {
-            model: req.model.clone(),
-            created_at: now_rfc3339(),
-            response: String::new(),
-            thinking: None,
-            done: true,
-            done_reason: Some("load".into()),
-            metrics: OllamaMetrics::default(),
-        })
-        .into_response());
-    }
-
-    let keep_alive = resolve_keep_alive(&req.keep_alive);
-    let activity = begin_activity(guard, Some(keep_alive)).await;
-    // See backend_wire_model's own doc comment.
-    let wire_model = backend_wire_model(state, &target, &model).await;
-    // The prompt is one user turn, with the request's images on it, under
-    // its system prompt when given.
-    let user = OllamaMessage {
-        role: "user".into(),
-        content: req.prompt.clone(),
-        images: req.images.clone(),
-        ..Default::default()
-    };
-    let messages = req
-        .system
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| OAIMessage::text("system", s))
-        .into_iter()
-        .chain(std::iter::once(ollama_message_to_oai(&user)))
-        .collect();
-    let oai = OAIChatRequest {
-        model: wire_model,
-        messages,
-        stream: true,
-        chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
-        tools: None,
-        response_format: format_to_response_format(&req.format),
-        ..options_to_oai(&req.options)
-    };
-    stream_ollama(
-        req.stream,
-        state.0.client.clone(),
-        target,
-        oai,
-        activity,
-        started,
-        load_duration,
-        move |delta| OllamaGenerateChunk {
-            model: model.clone(),
-            created_at: now_rfc3339(),
-            response: delta.content,
-            thinking: delta.thinking,
-            done: delta.done,
-            done_reason: delta.done_reason,
-            metrics: delta.metrics,
-        },
-    )
-    .await
-}
-
-// -- Ollama /api/embed, /api/embeddings ---------------------------------------
-//
-// Both ride on the backend's `/v1/embeddings`, as /api/chat rides on
-// /v1/chat/completions. llama-server is started with `--embeddings` for a
-// pooling model (see `embedding_model_ctx`), so that route is live.
-
-/// A string or an array of strings, as ollama accepts; an empty string or
-/// `null` is the load-only request.
-fn embed_inputs(input: &serde_json::Value) -> Result<Vec<String>, AppError> {
-    let invalid = || AppError::status(StatusCode::BAD_REQUEST, "invalid input type");
-    match input {
-        serde_json::Value::Null => Ok(Vec::new()),
-        serde_json::Value::String(s) if s.is_empty() => Ok(Vec::new()),
-        serde_json::Value::String(s) => Ok(vec![s.clone()]),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .map(|v| v.as_str().map(str::to_owned).ok_or_else(invalid))
-            .collect(),
-        _ => Err(invalid()),
-    }
-}
-
-/// Shared by both routes: load the model, refuse an `Engine::Mlx`
-/// backend, embed each input. Returns vectors in input order, total
-/// prompt tokens, and the load time.
-async fn embed_via_backend(
-    state: &AppState,
-    headers: &HeaderMap,
-    model_ref: &str,
-    inputs: &[String],
-    truncate: bool,
-    keep_alive: &Option<serde_json::Value>,
-) -> Result<(Vec<Vec<f32>>, u64, Duration), AppError> {
-    let mlx_unsupported = |model: &str| {
-        AppError::status(
-            StatusCode::NOT_IMPLEMENTED,
-            format!(
-                "{model} is served by mlx_lm.server, which llmman never starts with \
-                 --embedding-model; use a GGUF or vllm-served model for embeddings"
-            ),
-        )
-    };
-    // Before ensure_model, as proxy_openai_passthrough does, so a known
-    // MLX model isn't loaded for a request that can't succeed.
-    if !crate::providers::is_remote_ref(model_ref) {
-        if let Some(canonical) = would_use_mlx(state, model_ref).await {
-            return Err(mlx_unsupported(&canonical));
-        }
-    }
-    let started = Instant::now();
-    // No `request_threads`: OllamaEmbedRequest carries no `options`
-    // blob here, so there is no num_thread to forward.
-    let (model, target, guard) = ensure_model(state, model_ref, Some(headers), None).await?;
-    let loaded = started.elapsed();
-    if !target.is_remote() && would_use_mlx(state, &model).await.is_some() {
-        return Err(mlx_unsupported(&model));
-    }
-    if let Some(refusal) = wire_refusal(&target, "/v1/embeddings") {
-        return Err(AppError::status(StatusCode::NOT_IMPLEMENTED, refusal));
-    }
-    let keep_alive = resolve_keep_alive(keep_alive);
-    if inputs.is_empty() {
-        refresh_activity(guard, keep_alive).await;
-        return Ok((Vec::new(), 0, loaded));
-    }
-    let _activity = begin_activity(guard, Some(keep_alive)).await;
-    let wire_model = backend_wire_model(state, &target, &model).await;
-
-    // One call per input (llama-server fails a whole batch if any member
-    // overflows, and the retry needs to know which), a few at a time.
-    use futures::TryStreamExt as _;
-    let calls: Vec<_> = inputs
-        .iter()
-        .map(|text| embed_one(state, &target, &wire_model, text, truncate))
-        .collect();
-    let results: Vec<(Vec<f32>, u64)> = futures::stream::iter(calls)
-        .buffered(EMBED_CONCURRENCY)
-        .try_collect()
-        .await?;
-    let total_tokens = results.iter().map(|(_, n)| n).sum();
-    let embeddings = results
-        .into_iter()
-        .map(|(mut v, _)| {
-            // Ollama normalises every result regardless of backend.
-            normalize_in_place(&mut v)?;
-            Ok(v)
-        })
-        .collect::<Result<_, AppError>>()?;
-    Ok((embeddings, total_tokens, loaded))
-}
-
-/// How many of one `/api/embed` request's inputs are in flight at once.
-const EMBED_CONCURRENCY: usize = 8;
-
-/// One `/v1/embeddings` round trip with ollama's truncation on top:
-/// llama-server refuses an input longer than its batch (sized to the
-/// context) rather than cutting it, so on that failure the text is cut
-/// to the context via `/tokenize` + `/detokenize` and sent once more.
-/// Only on failure, unlike ollama, so a normal input pays no extra trips.
-async fn embed_one(
-    state: &AppState,
-    target: &Target,
-    wire_model: &str,
-    text: &str,
-    truncate: bool,
-) -> Result<(Vec<f32>, u64), AppError> {
-    match post_embeddings(&state.0.client, target, wire_model, text).await {
-        Ok(ok) => Ok(ok),
-        Err((status, body)) if truncate && !target.is_remote() && status.is_server_error() => {
-            let Target::Local(port) = target else {
-                unreachable!("guarded by !is_remote")
-            };
-            let limit = query_context_length(&state.0.client, *port)
-                .await
-                .ok_or_else(|| anyhow!("{} {status}: {body}", target.describe()))?;
-            // Room for the model's own BOS/EOS (ollama's `adjustTokenLimit`).
-            let limit = usize::try_from(limit)
-                .unwrap_or(usize::MAX)
-                .saturating_sub(2);
-            let truncated = truncate_to_tokens(&state.0.client, *port, text, limit).await?;
-            if truncated.len() >= text.len() {
-                return Err(AppError(
-                    anyhow!("{} {status}: {body}", target.describe()),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                ));
-            }
-            post_embeddings(&state.0.client, target, wire_model, &truncated)
-                .await
-                .map_err(|(status, body)| {
-                    AppError(
-                        anyhow!("{} {status}: {body}", target.describe()),
-                        remote_status(target, status),
-                    )
-                })
-        }
-        // Ollama's 400 for `truncate: false`; llama-server reports the
-        // overflow as a 500.
-        Err((status, body))
-            if !truncate
-                && !target.is_remote()
-                && status.is_server_error()
-                && body.contains("too large") =>
-        {
-            Err(AppError(
-                anyhow!("the input length exceeds the context length: {body}"),
-                StatusCode::BAD_REQUEST,
-            ))
-        }
-        Err((status, body)) => Err(AppError(
-            anyhow!("{} {status}: {body}", target.describe()),
-            remote_status(target, status),
-        )),
-    }
-}
-
-/// `POST /v1/embeddings` for one input; the error carries the upstream
-/// status and body so `embed_one` can recognise an overflow.
-async fn post_embeddings(
-    client: &Client,
-    target: &Target,
-    wire_model: &str,
-    text: &str,
-) -> Result<(Vec<f32>, u64), (StatusCode, String)> {
-    let resp = target
-        .authorize(
-            client
-                .post(target.url("/v1/embeddings"))
-                .timeout(EMBEDDINGS_TIMEOUT)
-                .json(&serde_json::json!({ "model": wire_model, "input": text })),
-        )
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("send to {}: {e}", target.describe()),
-            )
-        })?;
-    let status = resp.status();
-    let body = resp.bytes().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err((status, String::from_utf8_lossy(&body).into_owned()));
-    }
-    let mut parsed: OAIEmbeddingsResponse = serde_json::from_slice(&body).map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!(
-                "{} returned an unexpected embeddings body: {e}",
-                target.describe()
-            ),
-        )
-    })?;
-    parsed.data.sort_by_key(|d| d.index);
-    let vector = parsed
-        .data
-        .into_iter()
-        .next()
-        .map(|d| d.embedding)
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("{} returned no embedding", target.describe()),
-            )
-        })?;
-    Ok((vector, parsed.usage.prompt_tokens))
-}
-
-/// Bounds the two token-conversion calls in `truncate_to_tokens`: both
-/// are cheap and local, so a stall is a wedged backend.
-const TOKENIZE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Bounds one `/v1/embeddings` call; generous, since a context-length
-/// input on CPU is legitimately slow.
-const EMBEDDINGS_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// `text` cut to its first `limit` tokens via the backend's own
-/// `/tokenize` and `/detokenize`, so the cut lands on model boundaries.
-async fn truncate_to_tokens(
-    client: &Client,
-    port: u16,
-    text: &str,
-    limit: usize,
-) -> anyhow::Result<String> {
-    #[derive(Deserialize)]
-    struct Tokens {
-        tokens: Vec<i64>,
-    }
-    #[derive(Deserialize)]
-    struct Content {
-        content: String,
-    }
-    let base = format!("http://127.0.0.1:{port}");
-    let Tokens { mut tokens } = client
-        .post(format!("{base}/tokenize"))
-        .timeout(TOKENIZE_TIMEOUT)
-        .json(&serde_json::json!({ "content": text }))
-        .send()
-        .await
-        .context("tokenize for truncation")?
-        .error_for_status()?
-        .json()
-        .await?;
-    if limit == 0 {
-        anyhow::bail!("input after truncation exceeds maximum context length");
-    }
-    if tokens.len() <= limit {
-        return Ok(text.to_string());
-    }
-    tokens.truncate(limit);
-    let Content { content } = client
-        .post(format!("{base}/detokenize"))
-        .timeout(TOKENIZE_TIMEOUT)
-        .json(&serde_json::json!({ "tokens": tokens }))
-        .send()
-        .await
-        .context("detokenize for truncation")?
-        .error_for_status()?
-        .json()
-        .await?;
-    Ok(content)
-}
-
-/// Unit-length in place (a prefix of a unit vector isn't one); a zero
-/// vector is left alone, a non-finite one is an error, as on ollama.
-fn normalize_in_place(v: &mut [f32]) -> Result<(), AppError> {
-    if v.iter().any(|x| !x.is_finite()) {
-        return Err(AppError::status(
-            StatusCode::BAD_GATEWAY,
-            "embedding contains NaN or Inf values",
-        ));
-    }
-    // f64: the sum can't overflow, and any nonzero f32 vector has a
-    // positive norm.
-    let norm = v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
-    if norm > 0.0 {
-        for x in v.iter_mut() {
-            *x = (f64::from(*x) / norm) as f32;
-        }
-    }
-    Ok(())
-}
-
-/// Mirrors `ollama.EmbedHandler`; durations are nanoseconds, as there.
-async fn handle_embed(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<OllamaEmbedRequest>,
-) -> Result<Response, AppError> {
-    let started = Instant::now();
-    let inputs = embed_inputs(&req.input)?;
-    eprintln!(
-        "[llmman] /api/embed model={:?} inputs={}",
-        req.model,
-        inputs.len()
-    );
-    let (mut embeddings, tokens, loaded) = embed_via_backend(
-        &state,
-        &headers,
-        &req.model,
-        &inputs,
-        req.truncate != Some(false),
-        &req.keep_alive,
-    )
-    .await?;
-    if let Some(dims) = req.dimensions.filter(|d| *d > 0) {
-        for v in &mut embeddings {
-            if dims < v.len() {
-                v.truncate(dims);
-                normalize_in_place(v)?;
-            }
-        }
-    }
-    Ok(Json(OllamaEmbedResponse {
-        model: req.model,
-        embeddings,
-        total_duration: started.elapsed().as_nanos() as u64,
-        load_duration: loaded.as_nanos() as u64,
-        prompt_eval_count: tokens,
-    })
-    .into_response())
-}
-
-/// Mirrors `ollama.EmbeddingsHandler`: one prompt, one `float64` vector.
-async fn handle_embeddings(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<OllamaEmbeddingsRequest>,
-) -> Result<Response, AppError> {
-    eprintln!(
-        "[llmman] /api/embeddings model={:?} prompt_len={}",
-        req.model,
-        req.prompt.len()
-    );
-    let inputs = if req.prompt.is_empty() {
-        Vec::new()
-    } else {
-        vec![req.prompt.clone()]
-    };
-    let (embeddings, _tokens, _loaded) =
-        embed_via_backend(&state, &headers, &req.model, &inputs, true, &req.keep_alive).await?;
-    let embedding = embeddings
-        .into_iter()
-        .next()
-        .unwrap_or_default()
-        .into_iter()
-        .map(f64::from)
-        .collect();
-    Ok(Json(OllamaEmbeddingsResponse { embedding }).into_response())
-}
-
-// -- OpenAI pass-through handlers --------------------------------------------
-
-async fn handle_openai_models(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, AppError> {
-    let store = OciStore::open(&state.0.store_path)?;
-    let list = store.list()?;
-    let mut data: Vec<serde_json::Value> = {
-        let mgr = state.0.manager.lock().await;
-        list.into_iter()
-            .map(|img| {
-                let loaded = mgr.running.contains_key(&img.reference);
-                serde_json::json!({
-                    "id": img.reference,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "llmman",
-                    // status field consumed by the web UI to track loaded/unloaded state
-                    "status": { "value": if loaded { "loaded" } else { "unloaded" } },
-                })
-            })
-            .collect()
-    };
-    // As `handle_tags`; loaded anywhere counts as loaded.
-    if aggregation::aggregates(&state, &headers) {
-        for (_, peer) in aggregation::poll::<serde_json::Value>(&state, "/v1/models").await {
-            for m in peer["data"].as_array().into_iter().flatten() {
-                match data.iter_mut().find(|have| have["id"] == m["id"]) {
-                    Some(have) if m["status"]["value"] == "loaded" => {
-                        have["status"] = m["status"].clone();
-                    }
-                    Some(_) => {}
-                    None => data.push(m.clone()),
-                }
-            }
-        }
-    }
-    Ok(Json(serde_json::json!({ "object": "list", "data": data })))
-}
-
-/// Sets `repeat_penalty` to `DEFAULT_REPEAT_PENALTY` on `req` (an
-/// OpenAI-shaped chat/completions request body) unless the caller already
-/// supplied its own value. Every other entry point — `/api/chat`,
-/// `/api/generate`, and the Anthropic Messages API — already forwards this
-/// same default to llama-server via `post_chat` (see
-/// `DEFAULT_REPEAT_PENALTY`'s doc comment for the value itself); a plain
-/// OpenAI-compatible client has no llmman-specific reason to know it
-/// should set this itself, so `proxy_openai_generation` applies it here
-/// too, keeping every generation-capable API surface's behavior
-/// consistent instead of leaving this one raw-passthrough path the sole
-/// exception.
-fn apply_default_repeat_penalty(req: &mut serde_json::Value) {
-    if req.get("repeat_penalty").is_none() {
-        req["repeat_penalty"] = serde_json::json!(DEFAULT_REPEAT_PENALTY);
-    }
-}
-
-/// Mirrors a local chat completion's `reasoning_effort` into the
-/// `chat_template_kwargs` llama-server's templates read, as
-/// `think_to_chat_template_kwargs` does for Ollama's `think`: `none` is
-/// thinking off, a level is thinking on at that depth. Recent
-/// llama-server reads `reasoning_effort` itself; older builds and vLLM
-/// read only the kwargs. The caller's own kwargs win key by key.
-/// [`provider_compat`] is the reverse, for a provider.
-fn apply_reasoning_effort(req: &mut serde_json::Value) {
-    let Some(effort) = req.get("reasoning_effort").and_then(|v| v.as_str()) else {
-        return;
-    };
-    let think = if effort == "none" {
-        serde_json::Value::Bool(false)
-    } else {
-        serde_json::Value::String(effort.to_string())
-    };
-    let Some(serde_json::Value::Object(kwargs)) = think_to_chat_template_kwargs(&Some(think))
-    else {
-        return;
-    };
-    let Some(o) = req.as_object_mut() else {
-        return;
-    };
-    let slot = o
-        .entry("chat_template_kwargs")
-        .or_insert_with(|| serde_json::json!({}));
-    let Some(existing) = slot.as_object_mut() else {
-        return;
-    };
-    for (key, value) in kwargs {
-        existing.entry(key).or_insert(value);
-    }
-}
-
-/// Shared setup for every plain OpenAI-passthrough route: parse just
-/// enough of the request to find `model`, make sure it's loaded, rewrite
-/// `model` to its canonical name (see `ensure_model`), and open an
-/// activity guard for it. `proxy_openai_generation` and
-/// `proxy_openai_passthrough` below each finish shaping the parsed body
-/// their own way (the former also defaults `repeat_penalty`, the latter
-/// doesn't) before actually proxying it through.
-///
-/// The returned `Option<String>` is `Some(canonical_model)` only when
-/// the backend actually needed a different wire name than the one the
-/// client asked for (see `backend_wire_model`'s own doc comment — an
-/// `Engine::Mlx` backend, or any remote provider, which knows the model
-/// by its own unprefixed id) — the signal
-/// `proxy_openai_generation`/`proxy_openai_passthrough` need to decide
-/// whether the *response* also needs its own `"model"` field rewritten
-/// back before reaching the client, via `proxy_rewriting_model`/
-/// `stream_rewriting_model` instead of the plain `proxy`.
-async fn resolve_openai_request(
-    state: &AppState,
-    headers: &HeaderMap,
-    body: Bytes,
-) -> Result<(serde_json::Value, Target, ActivityGuard, Option<String>), AppError> {
-    let req = parse_openai_request(&body)?;
-    let model = req["model"].as_str().unwrap_or("").to_string();
-    // No `request_threads`: the OpenAI-compatible surface has no Ollama
-    // options blob, so there is no num_thread to forward.
-    let (model, target, guard) = ensure_model(state, &model, Some(headers), None).await?;
-    prepare_openai_request(state, req, model, target, guard).await
-}
-
-fn parse_openai_request(body: &Bytes) -> Result<serde_json::Value, AppError> {
-    Ok(serde_json::from_slice(body).context("parse OpenAI request body")?)
-}
-
-/// [`resolve_openai_request`] after `ensure_model`, for a caller that
-/// ran that itself (see [`send_with_hybrid_fallback`]).
-async fn prepare_openai_request(
-    state: &AppState,
-    mut req: serde_json::Value,
-    model: String,
-    target: Target,
-    guard: ActivityGuard,
-) -> Result<(serde_json::Value, Target, ActivityGuard, Option<String>), AppError> {
-    // The OpenAI-compatible surface has no `keep_alive` field of its own
-    // (real Ollama's doesn't either) — `None` leaves whatever this model
-    // already has untouched (its load-time default, or an explicit value
-    // pinned via `/api/chat`) rather than overwriting it, e.g. clobbering
-    // a `keep_alive: -1` ("never unload") pin with the daemon default the
-    // instant one OpenAI-compatible request comes in.
-    let activity = begin_activity(guard, None).await;
-    // See backend_wire_model's own doc comment — usually just `model`
-    // itself, but a different value for an Engine::Mlx backend or a
-    // remote provider.
-    let wire_model = backend_wire_model(state, &target, &model).await;
-    let response_model_override = (wire_model != model).then_some(model);
-    req["model"] = serde_json::Value::String(wire_model);
-    Ok((req, target, activity, response_model_override))
-}
-
-/// OpenAI-passthrough for the endpoints that actually generate tokens —
-/// chat completions, legacy completions, and the Responses API endpoint
-/// Codex uses. Always defaults `repeat_penalty` (see
-/// `apply_default_repeat_penalty`) rather than taking a bool flag callers
-/// could forget to set: whether a route defaults this is now a choice of
-/// *which function* it calls (this one, or `proxy_openai_passthrough`
-/// below for the two non-generation routes), not an easily-mis-set
-/// argument at the call site.
-///
-/// Picks which of the three proxy helpers actually relays the response
-/// based on `resolve_openai_request`'s `response_model_override`: plain
-/// `proxy` (untouched byte relay) when it's `None` — every engine
-/// except `Engine::Mlx`, unchanged from before that engine existed —
-/// otherwise `stream_rewriting_model`/`proxy_rewriting_model` depending
-/// on whether this request itself asked for a streamed response, both
-/// of which rewrite the response's own `"model"` field back to the
-/// canonical name before it reaches the client (see either's own doc
-/// comment for why that's needed at all).
-async fn proxy_openai_generation(
-    state: &AppState,
-    headers: &HeaderMap,
-    body: Bytes,
-    llama_path: &str,
-) -> Result<Response, AppError> {
-    let req = parse_openai_request(&body)?;
-    let model_ref = req["model"].as_str().unwrap_or("").to_string();
-    send_with_hybrid_fallback(
-        state,
-        &model_ref,
-        Some(headers),
-        None,
-        |model, target, guard| {
-            proxy_openai_generation_to(
-                state,
-                headers,
-                req.clone(),
-                llama_path,
-                model,
-                target,
-                guard,
-            )
-        },
-    )
-    .await
-}
-
-/// [`proxy_openai_generation`] against one resolved target.
-async fn proxy_openai_generation_to(
-    state: &AppState,
-    headers: &HeaderMap,
-    req: serde_json::Value,
-    llama_path: &str,
-    model: String,
-    target: Target,
-    guard: ActivityGuard,
-) -> Result<Response, AppError> {
-    let (mut req, target, activity, response_model_override) =
-        prepare_openai_request(state, req, model, target, guard).await?;
-    if let Some(refusal) = unsupported_on_wire(&target, llama_path) {
-        drop(activity);
-        return Ok(refusal);
-    }
-    if llama_path == RESPONSES_ROUTE && target.is_remote() {
-        strip_llama_fields(&mut req);
-        // A remote target always has an override (see backend_wire_model).
-        let canonical = response_model_override
-            .unwrap_or_else(|| req["model"].as_str().unwrap_or_default().to_string());
-        return remote_responses(&state.0.client, &target, headers, req, activity, canonical).await;
-    }
-    if llama_path == CHAT_COMPLETIONS_ROUTE && target.is_anthropic() {
-        let canonical = response_model_override
-            .unwrap_or_else(|| req["model"].as_str().unwrap_or_default().to_string());
-        // The translated reply already names the canonical model.
-        let upstream = send_chat_completion(&state.0.client, &target, &req, &canonical).await?;
-        return Ok(relay_chat_upstream(upstream, activity));
-    }
-    if is_responses_route(llama_path) && !target.is_remote() {
-        sanitize_responses_request(&mut req);
-    }
-    match &target {
-        Target::Remote(remote) if llama_path == CHAT_COMPLETIONS_ROUTE => {
-            provider_compat(remote, &mut req)
-        }
-        Target::Remote(_) => strip_llama_fields(&mut req),
-        _ => {
-            apply_default_repeat_penalty(&mut req);
-            if llama_path == CHAT_COMPLETIONS_ROUTE {
-                apply_reasoning_effort(&mut req);
-            }
-        }
-    }
-    let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
-    let resp = match response_model_override {
-        Some(canonical) if streaming => {
-            stream_rewriting_model(
-                &state.0.client,
-                &target,
-                llama_path,
-                headers,
-                body,
-                activity,
-                canonical,
-            )
-            .await
-        }
-        Some(canonical) => {
-            proxy_rewriting_model(
-                &state.0.client,
-                &target,
-                llama_path,
-                headers,
-                body,
-                activity,
-                &canonical,
-            )
-            .await
-        }
-        None => {
-            proxy(
-                &state.0.client,
-                &target,
-                llama_path,
-                headers,
-                body,
-                activity,
-            )
-            .await
-        }
-    }?;
-    Ok(explain_missing_route(&target, llama_path, resp))
-}
-
-/// OpenAI-passthrough for the routes that don't generate anything a
-/// repeat penalty could apply to — embeddings, and the Responses
-/// token-counting endpoint. Same model-loading/canonicalization as
-/// `proxy_openai_generation` (see `resolve_openai_request`), minus the
-/// `repeat_penalty` default. Neither route has a `stream` concept of
-/// its own, so unlike that function this only ever needs `proxy` or
-/// `proxy_rewriting_model` — never the streaming variant.
-///
-/// `/v1/embeddings` specifically gets two more checks around that:
-/// `Engine::Mlx` is never started with `mlx_lm.server`'s own
-/// `--embedding-model` flag (`spawn_mlx_server` has no way to know which
-/// model a caller would even want for that), so its conditional
-/// `/v1/embeddings` route is never registered there at all — forwarding
-/// anyway would just surface its own bare, unexplained 404, so this
-/// fails fast with [`mlx_embeddings_unsupported_response`] instead,
-/// twice over:
-///
-///   1. Before `resolve_openai_request` (and so `ensure_model`) ever
-///      runs, via [`would_use_mlx`]'s own cheap, spawn-free check —
-///      covering the overwhelmingly common case of a model that's
-///      already resolvable locally, so a repeated embeddings request
-///      against it never pays for spawning `mlx_lm.server` and loading
-///      however many GB of weights for a request that could never
-///      succeed there anyway.
-///   2. After, via `response_model_override` — the fallback for the one
-///      case (1) can't cheaply rule out ahead of time: a model that
-///      wasn't in the local store at all yet, so `ensure_model` above
-///      just pulled and loaded it for the first (and, thanks to (1),
-///      only ever) time, and it turned out to be `Engine::Mlx` after
-///      all.
-async fn proxy_openai_passthrough(
-    state: &AppState,
-    headers: &HeaderMap,
-    body: Bytes,
-    llama_path: &str,
-) -> Result<Response, AppError> {
-    let embeddings = llama_path == "/v1/embeddings";
-    if embeddings {
-        if let Ok(peek) = serde_json::from_slice::<serde_json::Value>(&body) {
-            if let Some(model_ref) = peek["model"].as_str() {
-                // A provider-routed model is never an `Engine::Mlx` one —
-                // it isn't local at all — so skip the whole check rather
-                // than letting `would_use_mlx` do a pointless store lookup
-                // against a reference that was never a store reference.
-                if !crate::providers::is_remote_ref(model_ref) {
-                    if let Some(canonical) = would_use_mlx(state, model_ref).await {
-                        return Ok(mlx_embeddings_unsupported_response(&canonical));
-                    }
-                }
-            }
-        }
-    }
-    let (req, target, activity, response_model_override) =
-        resolve_openai_request(state, headers, body).await?;
-    forward_openai_request(
-        state,
-        headers,
-        req,
-        target,
-        activity,
-        response_model_override,
-        llama_path,
-    )
-    .await
-}
-
-/// [`proxy_openai_passthrough`] after the model is loaded: wire checks,
-/// then the proxy. Split out for [`handle_openai_media`].
-async fn forward_openai_request(
-    state: &AppState,
-    headers: &HeaderMap,
-    mut req: serde_json::Value,
-    target: Target,
-    activity: ActivityGuard,
-    response_model_override: Option<String>,
-    llama_path: &str,
-) -> Result<Response, AppError> {
-    let embeddings = llama_path == "/v1/embeddings";
-    if let Some(refusal) = unsupported_on_wire(&target, llama_path) {
-        drop(activity);
-        return Ok(refusal);
-    }
-    if is_responses_route(llama_path) && !target.is_remote() {
-        sanitize_responses_request(&mut req);
-    }
-    // `!target.is_remote()`, not just `response_model_override.is_some()`:
-    // a remote target *always* sets that override (it addresses the model
-    // by its own unprefixed id — see `backend_wire_model`), so without
-    // this every provider-routed embeddings request would be rejected as
-    // an MLX one. Only a local backend can actually be `Engine::Mlx`.
-    if embeddings && !target.is_remote() {
-        if let Some(canonical) = &response_model_override {
-            drop(activity);
-            return Ok(mlx_embeddings_unsupported_response(canonical));
-        }
-    }
-    let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
-    let resp = match response_model_override {
-        Some(canonical) => {
-            proxy_rewriting_model(
-                &state.0.client,
-                &target,
-                llama_path,
-                headers,
-                body,
-                activity,
-                &canonical,
-            )
-            .await
-        }
-        None => {
-            proxy(
-                &state.0.client,
-                &target,
-                llama_path,
-                headers,
-                body,
-                activity,
-            )
-            .await
-        }
-    }?;
-    // `/v1/responses/input_tokens` comes through here, and a provider
-    // without the Responses API 404s it just the same.
-    Ok(explain_missing_route(&target, llama_path, resp))
-}
-
-/// The clear, specific error [`proxy_openai_passthrough`] returns
-/// instead of forwarding a `/v1/embeddings` request on to an
-/// `Engine::Mlx` backend — see that function's own doc comment on why
-/// that request could never succeed there anyway.
-fn mlx_embeddings_unsupported_response(canonical_model: &str) -> Response {
-    let body = serde_json::json!({
-        "error": {
-            "message": format!(
-                "{canonical_model} is served by mlx_lm.server, which llmman never starts with \
-                 --embedding-model — /v1/embeddings isn't supported for it; use a GGUF or \
-                 vllm-served model for embeddings instead"
-            ),
-            "type": "invalid_request_error",
-        }
-    });
-    (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()
-}
-
-async fn handle_openai_chat(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, AppError> {
-    proxy_openai_generation(&state, &headers, body, "/v1/chat/completions").await
-}
-
-async fn handle_openai_completions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, AppError> {
-    proxy_openai_generation(&state, &headers, body, "/v1/completions").await
-}
-
-async fn handle_openai_embeddings(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, AppError> {
-    proxy_openai_passthrough(&state, &headers, body, "/v1/embeddings").await
 }
 
 // -- OpenAI media generation (/v1/images/generations, /v1/videos,
@@ -6622,22 +4626,17 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     tokio::runtime::Runtime::new()?.block_on(serve_async(args))
 }
 
-/// The ggml/llama libraries of the `llama-server` we would run: next to
-/// it in a release archive, in `../lib` for an installed build.
-fn llama_lib_dir(pinned_version: Option<&str>) -> anyhow::Result<PathBuf> {
-    let bin = resolve_llama_server(pinned_version)?;
-    let dir = bin
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent directory", bin.display()))?;
-    [dir.to_path_buf(), dir.join("../lib"), dir.join("../lib64")]
-        .into_iter()
-        .find(|d| crate::mediagen::ffi::has_libs(d))
-        .ok_or_else(|| {
-            anyhow!(
-                "no ggml/llama shared libraries next to {}; media generation needs a llama.cpp release or installed build",
-                bin.display()
-            )
-        })
+/// The ggml/llama libraries of the `llama-server` we would run locally
+/// under `runtime` (see `runtime::resolve_local`), pinned to
+/// `pinned_version` for `bin`.
+pub fn llama_lib_dir(runtime: Runtime, pinned_version: Option<&str>) -> anyhow::Result<PathBuf> {
+    let bin = runtime::resolve_local(runtime, pinned_version)?;
+    crate::mediagen::ffi::lib_dir_of(&bin).ok_or_else(|| {
+        anyhow!(
+            "no ggml/llama shared libraries next to {}; media generation needs a llama.cpp release or installed build",
+            bin.display()
+        )
+    })
 }
 
 /// `llmman serve MODEL --port PORT`: the media backend the daemon spawns
@@ -6651,8 +4650,10 @@ async fn mediagen_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyho
     if paths.text_encoder.is_none() && crate::mediagen::needs_text_encoder(&paths.model) {
         anyhow::bail!("{model_ref}: no text encoder in the model pack");
     }
-    let pinned = args.llama_cpp_version.clone();
-    let lib_dir = tokio::task::spawn_blocking(move || llama_lib_dir(pinned.as_deref())).await??;
+    let pinned = runtime::llama_cpp_pin(args.llama_cpp_version.as_deref());
+    let runtime = args.runtime;
+    let lib_dir =
+        tokio::task::spawn_blocking(move || llama_lib_dir(runtime, pinned.as_deref())).await??;
     // the graph builders hold `&'static Api`
     let api: &'static crate::mediagen::ffi::Api =
         Box::leak(Box::new(crate::mediagen::ffi::Api::load(&lib_dir)?));
@@ -6702,9 +4703,13 @@ async fn spawn_mediagen_backend(
     let exe = std::env::current_exe().context("locating the llmman binary")?;
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.args(["serve", model_ref, "--port", &port.to_string()]);
-    if let Some(v) = &state.0.llama_cpp_version {
-        cmd.args(["--llama-cpp-version", v]);
-    }
+    // Explicit, so the child lands on the same build as this daemon
+    // rather than re-resolving `auto`/the default pin/LLMMAN_RUNTIME.
+    cmd.args(["--runtime", state.0.runtime.as_str()]);
+    cmd.args([
+        "--llama-cpp-version",
+        state.0.llama_cpp_version.as_deref().unwrap_or("latest"),
+    ]);
     for var in GPU_VISIBLE_DEVICE_VARS
         .iter()
         .chain(LLAMA_CPP_ENV_PASSTHROUGH_VARS)
@@ -6796,8 +4801,13 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         app
     };
 
-    app.layer(cors_layer())
-        .merge(metrics_router(metrics_enabled))
+    // Outside metrics (a refused request is not counted against a route it
+    // never reached), inside CORS (a preflight carries no credential). The
+    // scrape router is merged outside CORS, so it gets its own copy.
+    let require_key = || middleware::from_fn_with_state(app_state.clone(), auth::require_key);
+    app.layer(require_key())
+        .layer(cors_layer())
+        .merge(metrics_router(metrics_enabled).layer(require_key()))
         .with_state(app_state)
 }
 
@@ -6851,11 +4861,11 @@ fn metrics_router(enabled: bool) -> Router<AppState> {
         .layer(middleware::from_fn(track_metrics))
 }
 
-/// Which image `--pull-oci` warms up: the one `ensure_model` would run
-/// for `model` (read off its stored manifest), or llama-server's when no
-/// model is named — pulling both would cost a GGUF-only host the vLLM
-/// image's several GB for nothing.
-fn pull_oci_engine(model: Option<&str>) -> anyhow::Result<crate::container::ContainerEngine> {
+/// Which image `--pull-only` warms up under a container runtime: the one
+/// `ensure_model` would run for `model` (read off its stored manifest),
+/// or llama-server's when no model is named — pulling both would cost a
+/// GGUF-only host the vLLM image's several GB for nothing.
+fn pull_only_engine(model: Option<&str>) -> anyhow::Result<crate::container::ContainerEngine> {
     // Same guard as the pre-load below: a pair warms its local half, a
     // provider-routed reference has no local weights.
     let model = model
@@ -6867,7 +4877,7 @@ fn pull_oci_engine(model: Option<&str>) -> anyhow::Result<crate::container::Cont
     let model_ref = crate::shortnames::resolve_ollama_api(model)?;
     let store_path = default_store()?;
     let format = crate::modelpack::stored_format(&store_path, &model_ref).with_context(|| {
-        format!("--pull-oci: pull {model_ref} first to learn which image it needs")
+        format!("--pull-only: pull {model_ref} first to learn which image it needs")
     })?;
     Ok(match format {
         crate::modelpack::ModelFormat::SafeTensors => crate::container::ContainerEngine::Vllm,
@@ -6879,61 +4889,35 @@ fn pull_oci_engine(model: Option<&str>) -> anyhow::Result<crate::container::Cont
 }
 
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
-    if _args.ociman.is_some() && !cfg!(target_os = "linux") {
-        anyhow::bail!("--ociman is only supported on Linux");
+    let requested = _args.runtime;
+    if requested == Runtime::Path && _args.pull_only {
+        anyhow::bail!("--pull-only: --runtime path runs the llama-server on PATH; nothing to pull");
     }
-    // Must happen before daemon.rs's caller (if any) redirects this
-    // process's stdio to a log file — see ServeArgs::pull_oci's doc
-    // comment for why that would otherwise hide the pull's progress.
-    // This is meant as its own explicit, foreground warm-up step run
-    // before a separate, detached `serve` invocation — not a prelude to
-    // this same invocation going on to serve — so it returns as soon as
-    // the pull finishes instead of falling through into binding the
-    // listener and serving forever.
-    if _args.pull_oci {
-        let ociman = _args.ociman.context("--pull-oci requires --ociman")?;
-        let engine = pull_oci_engine(_args.model.as_deref())?;
-        let version = match engine {
-            crate::container::ContainerEngine::Vllm
-            | crate::container::ContainerEngine::VllmOmni => _args.vllm_version.as_deref(),
-            crate::container::ContainerEngine::LlamaServer => _args.llama_cpp_version.as_deref(),
-        };
-        crate::container::pull_image(ociman, engine, version)?;
-        return Ok(());
-    }
-    // Same idea as --pull-oci above, but for the local (non-container)
-    // llama-server binary path: resolve_llama_server's own download
-    // (crate::llama_release) normally happens further down regardless of
-    // --pull-bin, but by then this process may already be detached with
-    // its stdio redirected to a log file (see daemon.rs) — a caller
-    // waiting on the daemon to come up within ensure_server's short
-    // timeout would see nothing and could time out mid-download,
-    // indistinguishable from a hang. Run in the foreground first instead.
-    if _args.pull_bin {
-        let pinned_version = _args.llama_cpp_version.clone();
-        tokio::task::spawn_blocking(move || resolve_llama_server(pinned_version.as_deref()))
+    let llama_cpp_version = runtime::llama_cpp_pin(_args.llama_cpp_version.as_deref());
+
+    // Settle `--runtime` and fetch its llama.cpp before anything binds,
+    // so the first request is never stuck behind a silent download (this
+    // process is normally detached with its stdio in a log file).
+    // `--pull-only` is this step alone. Blocking, hence spawn_blocking.
+    let resolved = {
+        let pin = llama_cpp_version.clone();
+        tokio::task::spawn_blocking(move || runtime::resolve(requested, pin.as_deref()))
             .await
-            .context("resolve llama-server task panicked")??;
+            .context("resolve runtime task panicked")??
+    };
+    if _args.pull_only {
+        if let Some(ociman) = resolved.ociman() {
+            // resolve() pulled the llama.cpp image; a safetensors MODEL
+            // needs vLLM's too.
+            let engine = pull_only_engine(_args.model.as_deref())?;
+            if engine != crate::container::ContainerEngine::LlamaServer {
+                crate::container::pull_image(ociman, engine, _args.vllm_version.as_deref())?;
+            }
+        }
         return Ok(());
     }
-    // Only resolve (and require) a local llama-server binary when it'll
-    // actually be used: --ociman runs llama-server in a container instead,
-    // picking the image itself (see crate::container).
-    //
-    // resolve_llama_server does blocking network I/O (a GitHub API call,
-    // and possibly a multi-hundred-MB download) when no llama-server is
-    // already on PATH — spawn_blocking so that doesn't stall this async
-    // fn's own executor thread while it runs.
-    let llama_server_bin = if _args.ociman.is_none() {
-        let pinned_version = _args.llama_cpp_version.clone();
-        Some(
-            tokio::task::spawn_blocking(move || resolve_llama_server(pinned_version.as_deref()))
-                .await
-                .context("resolve llama-server task panicked")??,
-        )
-    } else {
-        None
-    };
+    let llama_server_bin = resolved.llama_server_bin().cloned();
+    let runtime = resolved.runtime();
     let store_path = default_store()?;
     let cache_path = crate::default_cache()?;
     std::fs::create_dir_all(&cache_path)?;
@@ -6992,16 +4976,39 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // See threads_from_env_or_host's doc comment. Resolved once here
     // rather than per load, and logged so a surprising thread count is
     // explainable from the startup output. Only the local spawn path
-    // consumes the derived value, so don't log it under --ociman (the
-    // container arm deliberately ignores it).
+    // consumes the derived value, so don't log it under a container
+    // runtime (that arm deliberately ignores it).
     let threads = threads_from_env_or_host();
     if let Some(n) = threads {
-        if _args.ociman.is_none() {
+        if runtime.ociman().is_none() {
             eprintln!("[llmman] llama-server gets --threads {n} (CPU quota/affinity limit below the online CPU count)");
         }
     } else if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         eprintln!("[llmman] LLAMA_ARG_THREADS set: leaving llama-server thread count to it");
     }
+
+    // Before anything binds, so a misconfiguration fails at exec.
+    let auth = auth::Policy::from_env()?;
+    if auth.enforced() {
+        eprintln!("[llmman] API key required on every request (LLMMAN_API_KEYS)");
+    } else if !crate::daemon::reachable_only_locally() {
+        eprintln!(
+            "[llmman] warning: LLMMAN_AUTH=off — serving everyone who can reach {} without a key",
+            crate::daemon::bind_addr()
+        );
+    }
+    let tls = tls_from_env()?;
+    anyhow::ensure!(
+        tls.is_some() == crate::daemon::tls_scheme(),
+        "LLMMAN_HOST and LLMMAN_TLS_CERT/LLMMAN_TLS_KEY disagree: an https:// host needs the \
+         certificate and key, and they need an https:// host, so clients in this \
+         environment connect the way the daemon listens"
+    );
+
+    // Outbound: peers and providers. `LLMMAN_TLS_CA` is trusted for both.
+    let client = crate::auth::trusted_client()?
+        .build()
+        .context("build http client")?;
 
     let state = AppState(Arc::new(Inner {
         manager: Mutex::new(ModelManager {
@@ -7015,8 +5022,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         exe: std::env::current_exe()
             .ok()
             .map(|p| p.canonicalize().unwrap_or(p)),
-        ociman: _args.ociman,
-        llama_cpp_version: _args.llama_cpp_version.clone(),
+        runtime,
+        llama_cpp_version,
         vllm_version: _args.vllm_version.clone(),
         ctx_size,
         ctx_size_explicit: ctx_size_explicit.is_some(),
@@ -7036,7 +5043,9 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             .then(crate::promptlog::path)
             .transpose()?,
         shell: shell::Policy::from_env(),
-        client: Client::new(),
+        auth,
+        peer_key: crate::auth::peer_key(),
+        client,
     }));
 
     let app = build_router(state.clone(), metrics_enabled_from_env());
@@ -7054,7 +5063,10 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    eprintln!("llmman serve listening on {addr}");
+    eprintln!(
+        "llmman serve listening on {addr}{}",
+        if tls.is_some() { " (TLS)" } else { "" }
+    );
 
     // Background idle-unload reaper — see reap_idle_models's doc comment.
     tokio::spawn(reap_idle_models(state.clone()));
@@ -7097,9 +5109,39 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         }
     }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    match tls {
+        None => {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?
+        }
+        Some((cert, key)) => {
+            // Both rustls providers are compiled in (reqwest's, the AWS
+            // SDK's), so none is the default until one is installed.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+                .await
+                .with_context(|| {
+                    format!(
+                        "load TLS certificate {} and key {}",
+                        cert.display(),
+                        key.display()
+                    )
+                })?;
+            let handle = axum_server::Handle::new();
+            tokio::spawn({
+                let handle = handle.clone();
+                async move {
+                    shutdown_signal().await;
+                    handle.graceful_shutdown(Some(Duration::from_secs(30)));
+                }
+            });
+            axum_server::from_tcp_rustls(listener.into_std()?, config)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?
+        }
+    }
 
     // Unload every running inference backend before exiting — the same
     // explicit unload `ollama serve` does when it traps SIGINT/SIGTERM

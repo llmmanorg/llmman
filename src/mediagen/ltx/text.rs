@@ -118,15 +118,7 @@ impl TextEncoder {
             let mut mp = (api.llama_model_default_params)();
             {
                 let p = mp.view_mut::<LlamaModelParams>();
-                // defaults at the mirrored offsets, or the library's struct layout moved
-                if p.split_mode != 1
-                    || p.main_gpu != 0
-                    || p.vocab_only
-                    || p.check_tensors
-                    || !p.use_extra_bufts
-                {
-                    bail!("llama_model_params layout does not match this libllama");
-                }
+                ffi::check_model_params(p)?;
                 p.n_gpu_layers = n_gpu_layers;
             }
             let cpath = CString::new(path)?;
@@ -158,17 +150,7 @@ impl TextEncoder {
             let mut cp = (api.llama_context_default_params)();
             {
                 let p = cp.view_mut::<LlamaContextParams>();
-                if p.n_batch != 2048
-                    || p.n_ubatch != 512
-                    || p.flash_attn_type != ffi::LLAMA_FLASH_ATTN_TYPE_AUTO
-                    || p.type_k != ffi::ty::F16
-                    || !p.offload_kqv
-                    || !p.op_offload
-                    || !p.swa_full
-                    || p.kv_unified
-                {
-                    bail!("llama_context_params layout does not match this libllama");
-                }
+                ffi::check_context_params(p)?;
                 p.n_ctx = self.n_ctx;
                 p.n_batch = self.n_ctx;
                 p.n_ubatch = self.n_ctx;

@@ -5,39 +5,81 @@ already exists for the model format it finds, and runs it unmodified.
 
 | Model format | Backend | Where it comes from |
 |--------------|---------|---------------------|
-| GGUF | [`llama-server`](https://github.com/ggml-org/llama.cpp) | Your `PATH` if it is there; otherwise a prebuilt upstream release matching your OS/arch/GPU, downloaded and cached on first use |
-| GGUF | `llama-server` in a container | `--ociman docker` / `--ociman podman` (Linux only): the `ghcr.io/ggml-org/llama.cpp:server-<backend>` image for your GPU |
-| safetensors | [`vllm`](https://github.com/vllm-project/vllm) | Your `PATH` |
-| safetensors | `vllm` in a container | `--ociman docker` / `--ociman podman` (Linux only): the `vllm/vllm-openai`, `rocm/vllm` or `vllm/vllm-openai-cpu` image for your GPU and architecture |
+| GGUF | `llama-server` in a container | `--runtime docker` / `podman` (Linux only; what `auto` tries first): the `ghcr.io/ggml-org/llama.cpp:server-<backend>` image for your GPU |
+| GGUF | [`llama-server`](https://github.com/ggml-org/llama.cpp) | `--runtime bin`: a prebuilt upstream release matching your OS/arch/GPU, downloaded and cached; `--runtime path`: the one on your `PATH` |
+| safetensors | `vllm` in a container | `--runtime docker` / `podman` (Linux only): the `vllm/vllm-openai`, `rocm/vllm` or `vllm/vllm-openai-cpu` image for your GPU and architecture |
+| safetensors | [`vllm`](https://github.com/vllm-project/vllm) | Your `PATH` (every non-container runtime) |
 | safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | Your `PATH`, on Apple Silicon macOS; preferred over `vllm` when present |
-| GGUF diffusion (LTX-2, Cosmos3) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
+| GGUF diffusion (LTX-2) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
 | Diffusers safetensors | [`vllm serve --omni`](https://github.com/vllm-project/vllm-omni) | Your `PATH`'s `vllm` with the `vllm-omni` package installed |
-| Diffusers safetensors | `vllm serve --omni` in a container | `--ociman docker` / `--ociman podman` (Linux only): the `vllm/vllm-omni` image (CUDA only) |
+| Diffusers safetensors | `vllm serve --omni` in a container | `--runtime docker` / `podman` (Linux only): the `vllm/vllm-omni` image (CUDA only) |
+
+## Choosing a runtime
+
+`llmman serve --runtime <auto|docker|podman|bin|path>` (or the
+`LLMMAN_RUNTIME` environment variable, which also reaches the daemon
+`llmman run`/`launch` start for you) says where the engine comes from:
+
+| Value | llama-server | Notes |
+|-------|--------------|-------|
+| `docker`, `podman` | `ghcr.io/ggml-org/llama.cpp:server-<backend>-<release>` container | Linux only; safetensors models get the vLLM images too |
+| `bin` | llmman's own download of llama.cpp's prebuilt release for this OS/arch/GPU | Cached under `~/.local/share/llmman/llama-server/<release>/`; nothing needed on `PATH` |
+| `path` | the `llama-server` already on `PATH`, as-is | Never downloads anything; `--llama-cpp-version` does not apply |
+| `auto` (default) | the first of `docker`, `podman`, `bin`, `path` that works here | Off Linux: `bin`, then `path` |
+
+Under `auto`, a container engine "works" when its CLI is on `PATH`, its
+daemon answers `docker info`/`podman info`, an NVIDIA host has the NVIDIA
+Container Toolkit, and the llama.cpp image pulls; `bin` works when the
+release downloads (or is already cached). Each step skipped is logged
+with the reason. Whatever is chosen is fetched before the listener binds,
+so the first request is never stuck behind a silent download.
+
+`llmman serve --pull-only` does exactly that fetch, in the foreground with
+the pull's own progress, then exits — run it once before starting a
+detached daemon. With a container runtime and a safetensors `MODEL`
+argument it pulls the vLLM image as well.
 
 ## llama.cpp
 
-A `llama-server` on `PATH` is used as-is. Otherwise llmman probes for
-CUDA, ROCm, Vulkan or Metal (in that order) and downloads the matching
-prebuilt release from llama.cpp's GitHub releases. `LLMMAN_LLM_LIBRARY`
-overrides the probe; `LLMMAN_DEBUG=1` shows what it found.
+The release is pinned: unless `--llama-cpp-version <tag>` says otherwise,
+both `bin` and the container images use the llama.cpp build llmman's own
+CI tested (the `LLAMA_CPP_RELEASE` file in the repository), so what runs
+is what was tested. `--llama-cpp-version latest` takes upstream's
+floating latest instead.
 
-`--llama-cpp-version <tag>` pins a release (and forces the managed
-download even with a `llama-server` on `PATH`). `--pull-bin` downloads
-it in the foreground and exits, so the first request is not stuck behind
-a silent download.
+For `bin`, llmman probes for CUDA, ROCm, Vulkan or Metal (in that order)
+and downloads the matching prebuilt asset from llama.cpp's GitHub
+releases. `LLMMAN_LLM_LIBRARY` overrides the probe; `LLMMAN_DEBUG=1`
+shows what it found. llama.cpp publishes no prebuilt Linux CUDA binary,
+so an NVIDIA host on Linux gets the CPU build from `bin` — the container
+runtimes (which `auto` prefers for that reason) have CUDA images.
 
 Context length, parallel slots, flash attention, KV-cache type and GPU
 split are environment variables; see [configuration.md](configuration.md).
 
 ### In a container
 
-On Linux, `--ociman docker` (or `podman`) runs `llama-server` from the
+On Linux, `--runtime docker` (or `podman`) runs `llama-server` from the
 `ghcr.io/ggml-org/llama.cpp` image instead, picking the
 `server-cuda`/`server-cuda13`/`server-rocm`/`server-vulkan`/`server` tag
-for the host.
-`--llama-cpp-version` pins the image tag; `--pull-oci` pulls it in the
-foreground and exits. `CUDA_VISIBLE_DEVICES` and friends are forwarded
-into the container.
+for the host, suffixed with the pinned release.
+`CUDA_VISIBLE_DEVICES` and friends are forwarded into the container.
+
+Each of those images is also published with llmman in it, as
+`docker.io/ai/llmman:<tag>` (`latest` is `server`) and `<tag>-<llmman
+version>`, built from [`packaging/Dockerfile`](../packaging/Dockerfile) on
+every release against the llama.cpp build CI tests. Same entrypoint and GPU
+flags as upstream, plus `/usr/local/bin/llmman`. `LLMMAN_HOST` is preset to
+`0.0.0.0:17434` (a loopback bind inside a container is unreachable even with
+`-p`), so the daemon requires `LLMMAN_API_KEYS` or `LLMMAN_AUTH=off`
+([configuration.md](configuration.md#authentication)); publish the port on
+the host's loopback to keep it local. The store is `/root/.local/share/llmman`:
+
+```sh
+docker run -p 127.0.0.1:17434:17434 -e LLMMAN_API_KEYS=<key> \
+  -v llmman:/root/.local/share/llmman --gpus all \
+  --entrypoint llmman ai/llmman:server-cuda serve
+```
 
 ## vLLM
 
@@ -49,7 +91,7 @@ Safetensors models are served by a separately installed `vllm`. Plain
 
 ### In a container
 
-On Linux, `--ociman docker` (or `podman`) runs `vllm serve` from a vLLM
+On Linux, `--runtime docker` (or `podman`) runs `vllm serve` from a vLLM
 image for a safetensors model, picked by the same GPU probe plus the
 host architecture:
 
@@ -62,7 +104,7 @@ host architecture:
 
 `--vllm-version <tag>` pins the release (the arch suffix is added for the
 `vllm/` images; for `rocm/vllm` it is the whole tag).
-`llmman serve --ociman docker --pull-oci <model>` pulls the image an
+`llmman serve --runtime docker --pull-only <model>` pulls the image an
 already-pulled model needs (without a model, the llama.cpp image).
 `CUDA_VISIBLE_DEVICES` and friends plus every `VLLM_*` variable are
 forwarded into the container.
@@ -70,15 +112,14 @@ forwarded into the container.
 ### vLLM-Omni (Diffusers pipelines)
 
 A safetensors repository laid out as a Diffusers pipeline (a root
-`model_index.json` next to `transformer/`, `vae/`, ...), such as
-[`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge), is
+`model_index.json` next to `transformer/`, `vae/`, ...) is
 served by [vLLM-Omni](https://github.com/vllm-project/vllm-omni): the same
 `vllm` launcher with `--omni`. Plain `vllm serve` cannot load one.
 
 ```sh
 uv pip install vllm==0.28.0 vllm-omni     # into the environment `vllm` runs from
-llmman run nvidia/Cosmos3-Edge "A robot arm cleaning a plate in a kitchen"
-llmman run nvidia/Cosmos3-Edge --video --seconds 2 "A robot arm cleaning a plate"
+llmman run ORG/MODEL "A robot arm cleaning a plate in a kitchen"
+llmman run ORG/MODEL --video --seconds 2 "A robot arm cleaning a plate"
 ```
 
 If `vllm` is a `#!/path/to/python` script whose Python cannot import
@@ -91,15 +132,13 @@ events, a video job with a `content_url`) and vLLM-Omni's own (`size`,
 unsent fields are left to the model's defaults. There is no
 `/v1/audio/speech` for these models.
 
-Cosmos3's safety guardrails are disabled (`--no-guardrails`): they need
-the `cosmos-guardrail` package and a runtime download of the gated
-`nvidia/Cosmos-1.0-Guardrail`, without which the server refuses to start.
-`LLMMAN_VLLM_OMNI_GUARDRAILS=1` leaves them on. `LLMMAN_LOAD_TIMEOUT` is
-also passed as `--init-timeout`.
+The server is started with `--no-guardrails`; `LLMMAN_VLLM_OMNI_GUARDRAILS=1`
+leaves the pipeline's safety guardrails on (they may need extra packages
+and gated weights). `LLMMAN_LOAD_TIMEOUT` is also passed as `--init-timeout`.
 
-With `--ociman`, the image is `vllm/vllm-omni:latest-x86_64` or
+With a container runtime, the image is `vllm/vllm-omni:latest-x86_64` or
 `latest-aarch64` (CUDA only; `--vllm-version` pins vLLM-Omni's release,
-e.g. `v0.28.0`). `--pull-oci <model>` picks it for a pulled Diffusers model.
+e.g. `v0.28.0`). `--pull-only <model>` picks it for a pulled Diffusers model.
 
 ### `vllm serve` from llmman's store
 

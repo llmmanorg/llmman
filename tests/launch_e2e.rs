@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`) — not mocks.
+//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`, `dsh`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -894,6 +894,30 @@ fn qwen_loop_detection(stderr: &str) -> bool {
     stderr.contains("Loop detection halted the run")
 }
 
+#[test]
+fn launch_dsh_with_model() {
+    eprintln!("[test] launch_dsh_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_dsh_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("dsh") {
+        eprintln!("skipping: dsh not on PATH — npm install -g @deepseek-ai/dsh");
+        return;
+    }
+
+    // `--profile headless <prompt>`: dsh's own one-shot mode — answers
+    // one task, prints the final assistant message, and exits. The
+    // default `web` profile `llmman launch dsh` execs otherwise boots a
+    // persistent server with no text reply, so it alone wouldn't fit
+    // this file's launch_and_assert/"pong" pattern at all; a caller-
+    // supplied `--profile` overrides it (see `dsh_args` in
+    // `cmd::launch`) for exactly this case.
+    launch_and_assert("dsh", &["--profile", "headless", PROMPT]);
+}
+
 /// Verifies `daemon::ensure_server`'s fast-fail path end to end: when the
 /// auto-spawned `llmman serve` dies during startup, the client command
 /// must report the daemon's exit within seconds (via the poll loop's
@@ -905,9 +929,10 @@ fn qwen_loop_detection(stderr: &str) -> bool {
 ///
 ///   - `LLMMAN_HOST` points at a loopback port nothing listens on, so
 ///     the client never reuses (or stops) the developer's real daemon;
-///   - a fake `llama-server` sits first on `PATH`, so serve's
-///     `resolve_llama_server` returns immediately without a download
-///     (it is found but never executed: serve dies before launching it);
+///   - `LLMMAN_RUNTIME=path` with a fake `llama-server` first on `PATH`,
+///     so serve's runtime resolution returns immediately without probing
+///     a container engine or downloading anything (it is found but never
+///     executed: serve dies before launching it);
 ///   - `LLMMAN_MODELS` points at `<tmp>/store` while `<tmp>/cache`
 ///     already exists as a regular FILE, so `serve_async`'s
 ///     `create_dir_all(cache)` fails right after resolving llama-server,
@@ -926,6 +951,7 @@ fn ensure_server_fails_fast_when_daemon_dies_at_startup() {
     cmd.arg("pull").arg(MODEL);
     cmd.env("LLMMAN_HOST", format!("127.0.0.1:{port}"))
         .env("LLMMAN_MODELS", dir.join("store"))
+        .env("LLMMAN_RUNTIME", "path")
         .env("PATH", path);
 
     let start = Instant::now();
@@ -973,6 +999,7 @@ fn launch_qwen_without_a_model_is_refused_before_the_daemon() {
         .env("QWEN_HOME", dir.join(".qwen"))
         .env("LLMMAN_HOST", format!("127.0.0.1:{port}"))
         .env("LLMMAN_MODELS", dir.join("store"))
+        .env("LLMMAN_RUNTIME", "path")
         .env("PATH", path);
 
     let start = Instant::now();
@@ -1171,4 +1198,21 @@ fn serve_mlx_safetensors_model() {
         "{MLX_MODEL} was not served by mlx_lm.server (use_mlx_for_safetensors regression?) \
          — `llmman ps` row: {model_row:?}"
     );
+}
+
+/// llmman never links against llama.cpp: `mediagen::ffi` dlopens the
+/// ggml/llama libraries next to `llama-server` and mirrors two of its
+/// structs. Checked here against the release CI pins (on `PATH`), not
+/// only when a diffusion model loads: a dropped symbol fails `Api::load`,
+/// a moved struct `check_layout`.
+#[test]
+fn mediagen_ffi_binds_the_llama_cpp_on_path() {
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH");
+        return;
+    }
+    let dir = llmman::cmd::serve::llama_lib_dir(llmman::cmd::serve::Runtime::Path, None).unwrap();
+    eprintln!("binding the ggml/llama libraries in {}", dir.display());
+    let api = llmman::mediagen::ffi::Api::load(&dir).unwrap();
+    api.check_layout().unwrap();
 }

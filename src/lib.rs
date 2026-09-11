@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+pub mod auth;
 pub mod chat_template;
 pub mod cmd;
 pub mod config;
@@ -120,6 +121,20 @@ fn parse_env_flag(value: Option<&str>) -> bool {
         v.to_ascii_lowercase().as_str(),
         "0" | "false" | "no" | "off"
     )
+}
+
+/// The first `name` (`name.exe` on Windows) that is a file in a `PATH`
+/// directory.
+pub fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(&file))
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]
