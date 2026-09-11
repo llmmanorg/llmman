@@ -13,10 +13,19 @@
 //! model-name rewriting and provider auth need no third case.
 //!
 //! [`route`] is mechanical, not semantic: a [`ROUTE_HEADER`] pin wins,
-//! otherwise a request too large for the local context goes to the
-//! provider, otherwise it stays here. Local is the default because the
-//! two mistakes are not equal: a worse local answer is recoverable,
-//! data sent to someone else's servers is not.
+//! otherwise a request carrying personal data stays here, otherwise a
+//! request too large for the local context goes to the provider,
+//! otherwise it stays here. Local is the default because the two
+//! mistakes are not equal: a worse local answer is recoverable, data
+//! sent to someone else's servers is not.
+//!
+//! The personal-data rule is the privacy gate: [`crate::pii`] reads the
+//! request body on this machine, and what it finds keeps the request on
+//! this machine. It is placed above the size rule deliberately — the
+//! size rule exists to get a better answer, and a better answer is not
+//! worth sending someone's card number to a third party. It is below
+//! the pin because a pin is the caller saying where its own data may
+//! go, which is the approval the gate would otherwise have to ask for.
 
 use crate::providers;
 
@@ -196,6 +205,11 @@ impl Side {
 pub enum Reason {
     /// The caller sent [`ROUTE_HEADER`].
     Pinned,
+    /// [`crate::pii`] confirmed personal data in the request body. The
+    /// variant carries no detail: the findings stay with the caller
+    /// that scanned, which is the only place that has them and the only
+    /// place that logs them.
+    Pii,
     /// The request is larger than the local side's context can hold.
     Overflow { bytes: u64, budget: u64 },
     /// Nothing said otherwise.
@@ -213,11 +227,25 @@ pub struct Decision {
 /// request that declared no length, `budget` is `None` when the overflow
 /// rule is disabled; both fall through to [`Side::Local`], since an
 /// unknown is not evidence a request has to leave the machine.
-pub fn route(pin: Option<Side>, request_bytes: Option<u64>, budget: Option<u64>) -> Decision {
+/// `pii` is whether [`crate::pii`] confirmed personal data in this
+/// body — `false` also for a body that was never scanned, which is
+/// why it can only ever hold a request back, never send one away.
+pub fn route(
+    pin: Option<Side>,
+    request_bytes: Option<u64>,
+    budget: Option<u64>,
+    pii: bool,
+) -> Decision {
     if let Some(side) = pin {
         return Decision {
             side,
             reason: Reason::Pinned,
+        };
+    }
+    if pii {
+        return Decision {
+            side: Side::Local,
+            reason: Reason::Pii,
         };
     }
     match (request_bytes, budget) {
@@ -230,6 +258,16 @@ pub fn route(pin: Option<Side>, request_bytes: Option<u64>, budget: Option<u64>)
             reason: Reason::LocalFirst,
         },
     }
+}
+
+/// Whether a request naming `model_ref` is worth a [`crate::pii`] scan:
+/// only a pair has somewhere else the request could go, so only a pair
+/// has a decision the scan could change. Anything else is a model on
+/// one side already, where scanning would cost every request some CPU
+/// to learn nothing actionable. `gate` is
+/// [`crate::pii::gate_enabled_from_env`], resolved once at startup.
+pub fn needs_pii_scan(model_ref: &str, gate: bool) -> bool {
+    gate && is_hybrid_ref(model_ref)
 }
 
 /// Reads [`ROUTE_HEADER`]: `None` when absent or blank, an error when
@@ -449,7 +487,7 @@ mod tests {
     #[test]
     fn nothing_in_particular_stays_local() {
         assert_eq!(
-            route(None, Some(1024), Some(262_144)),
+            route(None, Some(1024), Some(262_144), false),
             Decision {
                 side: Side::Local,
                 reason: Reason::LocalFirst
@@ -460,7 +498,7 @@ mod tests {
     #[test]
     fn a_request_past_the_local_budget_goes_to_the_provider() {
         assert_eq!(
-            route(None, Some(262_145), Some(262_144)),
+            route(None, Some(262_145), Some(262_144), false),
             Decision {
                 side: Side::Cloud,
                 reason: Reason::Overflow {
@@ -470,21 +508,24 @@ mod tests {
             }
         );
         // Exactly at the budget still fits.
-        assert_eq!(route(None, Some(262_144), Some(262_144)).side, Side::Local);
+        assert_eq!(
+            route(None, Some(262_144), Some(262_144), false).side,
+            Side::Local
+        );
     }
 
     #[test]
     fn an_unknown_size_or_no_budget_stays_local() {
-        assert_eq!(route(None, None, Some(1)).side, Side::Local);
-        assert_eq!(route(None, Some(u64::MAX), None).side, Side::Local);
-        assert_eq!(route(None, None, None).side, Side::Local);
+        assert_eq!(route(None, None, Some(1), false).side, Side::Local);
+        assert_eq!(route(None, Some(u64::MAX), None, false).side, Side::Local);
+        assert_eq!(route(None, None, None, false).side, Side::Local);
     }
 
     #[test]
     fn a_pinned_side_beats_every_other_rule() {
         // Cloud, despite fitting locally.
         assert_eq!(
-            route(Some(Side::Cloud), Some(1), Some(u64::MAX)),
+            route(Some(Side::Cloud), Some(1), Some(u64::MAX), false),
             Decision {
                 side: Side::Cloud,
                 reason: Reason::Pinned
@@ -492,12 +533,57 @@ mod tests {
         );
         // Local, despite overflowing.
         assert_eq!(
-            route(Some(Side::Local), Some(u64::MAX), Some(1)),
+            route(Some(Side::Local), Some(u64::MAX), Some(1), false),
             Decision {
                 side: Side::Local,
                 reason: Reason::Pinned
             }
         );
+    }
+
+    /// The privacy gate: personal data keeps a request here even when
+    /// the size rule would have sent it away, because the size rule
+    /// only buys a better answer.
+    #[test]
+    fn personal_data_outranks_the_size_rule() {
+        assert_eq!(
+            route(None, Some(u64::MAX), Some(1), true),
+            Decision {
+                side: Side::Local,
+                reason: Reason::Pii
+            }
+        );
+        assert_eq!(
+            route(None, Some(1024), Some(262_144), true),
+            Decision {
+                side: Side::Local,
+                reason: Reason::Pii
+            }
+        );
+    }
+
+    /// A pin is the caller stating where its own data may go, which is
+    /// the approval the gate exists to obtain. It is still recorded as
+    /// a pin, so the log shows a person chose this, not a rule.
+    #[test]
+    fn a_cloud_pin_is_the_approval_the_gate_asks_for() {
+        assert_eq!(
+            route(Some(Side::Cloud), Some(1), Some(u64::MAX), true),
+            Decision {
+                side: Side::Cloud,
+                reason: Reason::Pinned
+            }
+        );
+    }
+
+    /// Only a pair has a side to choose, so only a pair is scanned.
+    #[test]
+    fn nothing_but_a_pair_is_worth_scanning() {
+        let pair = "llmman.hybrid/gemma4,anthropic/claude-sonnet-4-5";
+        assert!(needs_pii_scan(pair, true));
+        assert!(!needs_pii_scan(pair, false));
+        assert!(!needs_pii_scan("gemma4", true));
+        assert!(!needs_pii_scan("llmman.provider/anthropic/claude", true));
     }
 
     #[test]
@@ -560,7 +646,7 @@ mod tests {
     #[test]
     fn zero_disables_the_overflow_rule_entirely() {
         assert_eq!(local_budget_bytes(Some(65536), Some("0")), None);
-        assert_eq!(route(None, Some(u64::MAX), None).side, Side::Local);
+        assert_eq!(route(None, Some(u64::MAX), None, false).side, Side::Local);
     }
 
     #[test]

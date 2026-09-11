@@ -979,9 +979,15 @@ async fn ensure_model_forwards_to_the_peer_that_has_the_model_loaded() {
     let (origin, _) = mock_peer(node(8 << 30, &["docker.io/ai/m:latest"], &[])).await;
     let state = state_with_peers(vec![origin.clone()], 0);
 
-    let (name, target, _) = ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()), None)
-        .await
-        .unwrap();
+    let (name, target, _) = ensure_model(
+        &state,
+        "docker.io/ai/m",
+        Some(&HeaderMap::new()),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(name, "docker.io/ai/m:latest");
     assert!(
         matches!(&target, Target::Peer(p) if p.origin == origin),
@@ -991,7 +997,7 @@ async fn ensure_model_forwards_to_the_peer_that_has_the_model_loaded() {
     // Hopped once: load here (failing on the fixture), never bounce.
     let mut hopped = HeaderMap::new();
     hopped.insert(aggregation::HOP, "1".parse().unwrap());
-    let err = ensure_model(&state, "docker.io/ai/m", Some(&hopped), None)
+    let err = ensure_model(&state, "docker.io/ai/m", Some(&hopped), None, None)
         .await
         .err()
         .expect("the fixture has no blobs to load");
@@ -1002,7 +1008,7 @@ async fn ensure_model_forwards_to_the_peer_that_has_the_model_loaded() {
     );
 
     // A pre-load names a model for *this* node.
-    let err = ensure_model(&state, "docker.io/ai/m", None, None)
+    let err = ensure_model(&state, "docker.io/ai/m", None, None, None)
         .await
         .err()
         .unwrap();
@@ -1019,9 +1025,15 @@ async fn ensure_model_forwards_to_the_peer_that_has_the_model_loaded() {
 async fn ensure_model_places_a_cold_model_on_the_roomiest_reachable_node() {
     let (roomy, _) = mock_peer(node(128 << 30, &[], &["docker.io/ai/m:latest"])).await;
     let state = state_with_peers(vec![roomy.clone()], 8 << 30);
-    let (_, target, _) = ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()), None)
-        .await
-        .unwrap();
+    let (_, target, _) = ensure_model(
+        &state,
+        "docker.io/ai/m",
+        Some(&HeaderMap::new()),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(&target, Target::Peer(p) if p.origin == roomy),
         "{target:?}"
@@ -1031,10 +1043,16 @@ async fn ensure_model_places_a_cold_model_on_the_roomiest_reachable_node() {
     let (bare, _) = mock_peer(node(128 << 30, &[], &[])).await;
     let dead = "http://127.0.0.1:9".to_string();
     let state = state_with_peers(vec![dead, bare], 8 << 30);
-    let err = ensure_model(&state, "docker.io/ai/m", Some(&HeaderMap::new()), None)
-        .await
-        .err()
-        .expect("loads (and fails on the fixture) locally");
+    let err = ensure_model(
+        &state,
+        "docker.io/ai/m",
+        Some(&HeaderMap::new()),
+        None,
+        None,
+    )
+    .await
+    .err()
+    .expect("loads (and fails on the fixture) locally");
     assert!(
         format!("{:#}", err.0).contains("resolve model"),
         "{:#}",
@@ -1235,13 +1253,14 @@ const HOSTED: &str = "llmman.provider/anthropic/claude-sonnet-4-5";
 #[test]
 fn a_pair_resolves_to_an_ordinary_reference_for_the_half_it_picks() {
     let state = test_state();
-    let local = resolve_hybrid_side(&state, &pair(PAIR), Some(&headers_with(&[]))).unwrap();
+    let local = resolve_hybrid_side(&state, &pair(PAIR), Some(&headers_with(&[])), None).unwrap();
     assert_eq!(local, "gemma4");
 
     let cloud = resolve_hybrid_side(
         &state,
         &pair(PAIR),
         Some(&headers_with(&[("x-llmman-route", "cloud")])),
+        None,
     )
     .unwrap();
     assert_eq!(cloud, HOSTED);
@@ -1253,7 +1272,7 @@ fn a_pair_resolves_to_an_ordinary_reference_for_the_half_it_picks() {
 fn a_pair_without_headers_stays_local() {
     let state = test_state();
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), None).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), None, None).unwrap(),
         "gemma4"
     );
 }
@@ -1265,14 +1284,90 @@ fn a_request_too_large_for_this_host_goes_to_the_hosted_half() {
     let state = test_state_with_budget(262_144);
     let fits = headers_with(&[("content-length", "262144")]);
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), Some(&fits)).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&fits), None).unwrap(),
         "gemma4"
     );
     let does_not = headers_with(&[("content-length", "262145")]);
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), Some(&does_not)).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&does_not), None).unwrap(),
         HOSTED
     );
+}
+
+/// A body the local scan found something in, as the handlers produce
+/// it.
+fn findings(body: serde_json::Value) -> crate::pii::Findings {
+    let found = crate::pii::scan_request(&body);
+    assert!(!found.is_empty(), "the fixture must contain something");
+    found
+}
+
+/// The privacy gate: the size rule exists to get a better answer, and
+/// a better answer is not worth sending someone's card number away.
+#[test]
+fn a_request_carrying_personal_data_stays_on_this_machine() {
+    let state = test_state_with_budget(1024);
+    let over_budget = headers_with(&[("content-length", "999999999")]);
+    let found = findings(serde_json::json!({
+        "messages": [{"role": "user", "content": "charge 4111 1111 1111 1111"}],
+    }));
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&over_budget), Some(&found)).unwrap(),
+        "gemma4"
+    );
+    // Scanned and clean routes exactly as an unscanned request does.
+    let clean = crate::pii::scan_request(&serde_json::json!({"messages": [{"content": "hi"}]}));
+    assert!(clean.is_empty());
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&over_budget), Some(&clean)).unwrap(),
+        HOSTED
+    );
+}
+
+/// The pin is the caller saying where its own data may go — the
+/// approval the gate would otherwise have to ask a human for.
+#[test]
+fn a_cloud_pin_still_wins_over_the_privacy_gate() {
+    let state = test_state();
+    let pinned = headers_with(&[("x-llmman-route", "cloud")]);
+    let found = findings(serde_json::json!({"prompt": "mail ada@example.com"}));
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&pinned), Some(&found)).unwrap(),
+        HOSTED
+    );
+}
+
+/// Otherwise the gate would hold only until the local model ran out of
+/// context, and then send the whole conversation to the provider —
+/// exactly what it exists to prevent.
+#[test]
+fn a_request_the_gate_kept_here_is_never_retried_on_the_provider() {
+    let found = findings(serde_json::json!({"prompt": "SSN 123-45-6789"}));
+    assert_eq!(
+        hybrid_fallback(PAIR, Some(&headers_with(&[])), Some(&found)).unwrap(),
+        None
+    );
+    // A clean body still falls back, as it did before the gate.
+    let clean = crate::pii::Findings::default();
+    assert_eq!(
+        hybrid_fallback(PAIR, Some(&headers_with(&[])), Some(&clean)).unwrap(),
+        Some(HOSTED.to_string())
+    );
+}
+
+/// Only a pair is scanned, and only with the gate on: every other
+/// request would pay for a decision it does not have to make.
+#[test]
+fn nothing_but_a_pair_is_scanned_and_only_with_the_gate_on() {
+    let state = test_state();
+    assert!(scans_for_pii(&state, PAIR));
+    assert!(!scans_for_pii(&state, "gemma4"));
+    assert!(!scans_for_pii(&state, HOSTED));
+
+    let mut inner = test_inner(std::env::temp_dir());
+    inner.pii_gate = false;
+    let off = AppState(Arc::new(inner));
+    assert!(!scans_for_pii(&off, PAIR));
 }
 
 /// `LLMMAN_HYBRID_LOCAL_BYTES=0`: size alone never routes away.
@@ -1281,7 +1376,7 @@ fn without_a_budget_size_never_routes_a_pair_away() {
     let state = test_state();
     let huge = headers_with(&[("content-length", "999999999")]);
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), Some(&huge)).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&huge), None).unwrap(),
         "gemma4"
     );
 }
@@ -1294,7 +1389,7 @@ fn a_transcription_pair_takes_its_local_half_whatever_its_size() {
     let state = test_state_with_budget(1);
     let huge = headers_with(&[("content-length", "99999999")]);
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), Some(&huge)).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&huge), None).unwrap(),
         HOSTED,
         "the generic path still routes on size"
     );
@@ -1312,7 +1407,7 @@ fn a_transcription_pair_takes_its_local_half_whatever_its_size() {
 fn an_unreadable_route_header_is_rejected_rather_than_guessed() {
     let state = test_state();
     let headers = headers_with(&[("x-llmman-route", "on-device")]);
-    let err = resolve_hybrid_side(&state, &pair(PAIR), Some(&headers))
+    let err = resolve_hybrid_side(&state, &pair(PAIR), Some(&headers), None)
         .expect_err("an unknown side must not be guessed at");
     assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
 }
@@ -1328,6 +1423,7 @@ async fn ensure_model_validates_the_local_half_of_a_pair() {
         &state,
         "llmman.hybrid/hf.co/../x,anthropic/claude-sonnet-4-5",
         Some(&headers),
+        None,
         None,
     )
     .await
@@ -1384,19 +1480,24 @@ fn a_local_context_refusal_is_recognised_in_every_shape_it_arrives_in() {
 #[test]
 fn only_an_unpinned_pair_has_a_hosted_half_to_fall_back_to() {
     assert_eq!(
-        hybrid_fallback(PAIR, Some(&headers_with(&[]))).unwrap(),
+        hybrid_fallback(PAIR, Some(&headers_with(&[])), None).unwrap(),
         Some(HOSTED.to_string())
     );
     assert_eq!(
-        hybrid_fallback(PAIR, None).unwrap(),
+        hybrid_fallback(PAIR, None, None).unwrap(),
         Some(HOSTED.to_string())
     );
     assert_eq!(
-        hybrid_fallback(PAIR, Some(&headers_with(&[("x-llmman-route", "local")]))).unwrap(),
+        hybrid_fallback(
+            PAIR,
+            Some(&headers_with(&[("x-llmman-route", "local")])),
+            None
+        )
+        .unwrap(),
         None
     );
-    assert_eq!(hybrid_fallback("gemma4", None).unwrap(), None);
-    assert_eq!(hybrid_fallback(HOSTED, None).unwrap(), None);
+    assert_eq!(hybrid_fallback("gemma4", None, None).unwrap(), None);
+    assert_eq!(hybrid_fallback(HOSTED, None, None).unwrap(), None);
 }
 
 /// Two pins is no pin: the header decides where data goes, so it is
@@ -1448,36 +1549,37 @@ async fn a_local_refusal_is_retried_on_the_hosted_half_unless_pinned() {
         let calls = AtomicUsize::new(0);
         let remote_seen = AtomicUsize::new(0);
         let (calls, remote_seen, local) = (&calls, &remote_seen, &local);
-        let result = with_hybrid_fallback(PAIR, Some(&headers), resolve, |model, target, _| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            async move {
-                if target.is_remote() {
-                    remote_seen.fetch_add(1, Ordering::SeqCst);
-                    assert_eq!(model, HOSTED);
-                    return Ok(StatusCode::OK.into_response());
+        let result =
+            with_hybrid_fallback(PAIR, Some(&headers), None, resolve, |model, target, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if target.is_remote() {
+                        remote_seen.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(model, HOSTED);
+                        return Ok(StatusCode::OK.into_response());
+                    }
+                    assert_eq!(model, "gemma4");
+                    match local {
+                        Local::Error => Err(AppError(
+                            anyhow::Error::new(ContextOverflow {
+                                message: refusal.into(),
+                                refusal: refusal.into(),
+                            }),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                        )),
+                        Local::Relayed => Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(Body::from(refusal))
+                            .unwrap()),
+                        Local::Fine => Ok(StatusCode::OK.into_response()),
+                        Local::OtherError => Err(AppError::status(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "backend died",
+                        )),
+                    }
                 }
-                assert_eq!(model, "gemma4");
-                match local {
-                    Local::Error => Err(AppError(
-                        anyhow::Error::new(ContextOverflow {
-                            message: refusal.into(),
-                            refusal: refusal.into(),
-                        }),
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                    )),
-                    Local::Relayed => Ok(Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .body(Body::from(refusal))
-                        .unwrap()),
-                    Local::Fine => Ok(StatusCode::OK.into_response()),
-                    Local::OtherError => Err(AppError::status(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "backend died",
-                    )),
-                }
-            }
-        })
-        .await;
+            })
+            .await;
         (
             result.map(|r| r.status()).map_err(|e| e.1),
             calls.load(Ordering::SeqCst),
@@ -2012,6 +2114,7 @@ fn test_inner(store_path: PathBuf) -> Inner {
         ctx_size: None,
         ctx_size_explicit: false,
         hybrid_local_bytes: None,
+        pii_gate: true,
         flash_attention: None,
         kv_cache_type: None,
         split_mode: None,
@@ -3140,7 +3243,7 @@ async fn a_tag_reaches_the_process_a_load_by_digest_registered() {
             .insert("docker.io/ai/m-df@sha256:df01".into(), running);
     }
 
-    let (key, target, guard) = ensure_model(&state, "docker.io/ai/m-df", None, None)
+    let (key, target, guard) = ensure_model(&state, "docker.io/ai/m-df", None, None, None)
         .await
         .expect("the tag must find the running content rather than load again");
     assert_eq!(key, "docker.io/ai/m-df@sha256:df01");
@@ -3330,7 +3433,14 @@ async fn a_load_by_digest_waits_on_the_tag_spellings_lock_and_takes_its_process(
 
     let loader = state.clone();
     let load = tokio::spawn(async move {
-        ensure_model(&loader, "docker.io/ai/m-digest@sha256:d16e", None, None).await
+        ensure_model(
+            &loader,
+            "docker.io/ai/m-digest@sha256:d16e",
+            None,
+            None,
+            None,
+        )
+        .await
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
@@ -4187,7 +4297,7 @@ fn ensure_model_key_pipeline_converges_aliases_before_the_lock() {
 #[tokio::test]
 async fn ensure_model_rejects_an_invalid_ref_with_400() {
     let state = test_state();
-    let err = ensure_model(&state, "hf.co/../x", None, None)
+    let err = ensure_model(&state, "hf.co/../x", None, None, None)
         .await
         .err()
         .expect("invalid ref must be rejected");

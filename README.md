@@ -317,11 +317,20 @@ llmman run gemma4 --overflow-provider anthropic --overflow-model claude-sonnet-5
 ```
 
 A request pinned with `x-llmman-route: local` or `cloud` goes where it
-says; otherwise one too large for the local model's context goes to the
-provider, and everything else stays on this machine. The pair travels as
-one ordinary model name, `llmman.hybrid/gemma4,anthropic/claude-sonnet-5`,
-so it works from any client on every inference endpoint. Details in
+says; otherwise one carrying personal data stays here, one too large for
+the local model's context goes to the provider, and everything else
+stays on this machine. The pair travels as one ordinary model name,
+`llmman.hybrid/gemma4,anthropic/claude-sonnet-5`, so it works from any
+client on every inference endpoint. Details in
 [docs/providers.md](docs/providers.md#hybrid-model-pairs).
+
+Before a request can take the hosted half, the daemon reads it here and
+looks for identifiers it can confirm — an email address, a card number
+that passes Luhn, an IBAN, an API key — and anything it finds keeps that
+request on the local model, including when it later turns out not to
+fit. It detects only what a deterministic check can be sure of, so it is
+a floor and not a promise; `LLMMAN_HYBRID_PII=off` turns it off. See
+[the privacy gate](docs/providers.md#the-privacy-gate).
 
 ## Documentation
 

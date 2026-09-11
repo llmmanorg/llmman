@@ -20,6 +20,7 @@ pub mod mediagen;
 pub mod metrics;
 pub mod modelpack;
 pub mod oauth;
+pub mod pii;
 pub mod promptlog;
 pub mod providers;
 pub mod shortnames;

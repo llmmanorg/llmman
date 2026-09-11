@@ -20,3 +20,10 @@ path = "fuzz_targets/parse_registry_ref.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "pii_scan"
+path = "fuzz_targets/pii_scan.rs"
+test = false
+doc = false
+bench = false

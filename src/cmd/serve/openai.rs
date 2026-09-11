@@ -15,7 +15,7 @@ use super::types::*;
 use super::{
     aggregation, backend_wire_model, ensure_model, explain_missing_route, is_responses_route,
     provider_compat, proxy, proxy_rewriting_model, relay_chat_upstream, remote_responses,
-    sanitize_responses_request, send_chat_completion, send_with_hybrid_fallback,
+    sanitize_responses_request, scans_for_pii, send_chat_completion, send_with_hybrid_fallback,
     stream_rewriting_model, strip_llama_fields, unsupported_on_wire, AppError, AppState, Target,
     CHAT_COMPLETIONS_ROUTE, RESPONSES_ROUTE,
 };
@@ -135,9 +135,13 @@ pub(super) async fn resolve_openai_request(
 ) -> Result<(serde_json::Value, Target, ActivityGuard, Option<String>), AppError> {
     let req = parse_openai_request(&body)?;
     let model = req["model"].as_str().unwrap_or("").to_string();
+    // Embeddings carry the same text a chat turn does, so a pair's
+    // privacy gate applies here too.
+    let pii = scans_for_pii(state, &model).then(|| crate::pii::scan_request(&req));
     // No `request_threads`: the OpenAI-compatible surface has no Ollama
     // options blob, so there is no num_thread to forward.
-    let (model, target, guard) = ensure_model(state, &model, Some(headers), None).await?;
+    let (model, target, guard) =
+        ensure_model(state, &model, Some(headers), None, pii.as_ref()).await?;
     prepare_openai_request(state, req, model, target, guard).await
 }
 
@@ -196,11 +200,13 @@ pub(super) async fn proxy_openai_generation(
 ) -> Result<Response, AppError> {
     let req = parse_openai_request(&body)?;
     let model_ref = req["model"].as_str().unwrap_or("").to_string();
+    let pii = scans_for_pii(state, &model_ref).then(|| crate::pii::scan_request(&req));
     send_with_hybrid_fallback(
         state,
         &model_ref,
         Some(headers),
         None,
+        pii.as_ref(),
         |model, target, guard| {
             proxy_openai_generation_to(
                 state,

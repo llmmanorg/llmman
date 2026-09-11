@@ -141,12 +141,16 @@ Which side serves a request:
 1. **`x-llmman-route: local` or `cloud`** on the request wins. Any other
    value, or the header given twice, is a `400`, never a guess; a blank
    value counts as absent.
-2. **Otherwise, size.** A request larger than the local context can hold
+2. **Otherwise, personal data.** A request whose body carries a
+   confirmed identifier stays local. See [The privacy
+   gate](#the-privacy-gate) below; `LLMMAN_HYBRID_PII=off` turns the
+   rule off.
+3. **Otherwise, size.** A request larger than the local context can hold
    goes to the provider. The budget is four bytes per token of the
    daemon's context size (`LLMMAN_CONTEXT_LENGTH`); `LLMMAN_HYBRID_LOCAL_BYTES`
    sets it directly, `0` turns the rule off. A request that declares no
    `Content-Length` stays local.
-3. **Otherwise, local.**
+4. **Otherwise, local.**
 
 Local is the default because the two mistakes are not equal: a worse
 local answer is recoverable, a request sent to someone else's servers is
@@ -158,13 +162,61 @@ Messages request it kept local is then refused by the local backend as
 larger than its context, the daemon sends it to the hosted half instead,
 before anything has reached the client. Without that an agent would see the local model's context error,
 compact its history and stay local. A `local` pin is never overridden
-this way, and `LLMMAN_HYBRID_LOCAL_BYTES=0` disables only the size rule,
-not this retry.
+this way, and neither is a request the privacy gate kept here;
+`LLMMAN_HYBRID_LOCAL_BYTES=0` disables only the size rule, not this
+retry.
 
 `/v1/audio/transcriptions` cannot forward to a provider, so a pair takes
 its local half there whatever the body size. An unload (`keep_alive: 0`)
 or a startup preload of a pair acts on its local half, the only one that
 loads.
+
+### The privacy gate
+
+Before a pair's request can go to a provider, the daemon reads the body
+on this machine and looks for identifiers it can confirm. Anything it
+finds keeps the request on the local half, and keeps it there: the
+context-overflow retry above does not apply to a request the gate held,
+or the gate would last exactly as long as the local model had room.
+
+Seven kinds are detected, each one confirmed rather than guessed at:
+
+| Kind | Confirmed by |
+|------|--------------|
+| Email address | an address with a real domain shape |
+| Phone number | `+` international form, or a separated 3-3-4 |
+| Payment card number | 13-19 digits passing the Luhn check |
+| IBAN | ISO 13616 mod-97 |
+| National ID number | US SSN format, in an issuable range |
+| Public IP address | a routable IPv4 — private, loopback and link-local are not personal data |
+| Credential | an issuer-prefixed API key, token, JWT or PEM private key header |
+
+Every mention is found, not the first: an identifier repeated across
+turns of a long conversation is the case a first-match scan gets wrong.
+The whole body is scanned — every turn, the system prompt, tool
+arguments and tool results — not just the last user message. Inline
+images and other base64 blobs are skipped.
+
+Names, addresses and anything else that needs a model to judge are **not
+detected**. This is a floor, not a promise: it catches the identifiers
+that are cheap to be certain about. Both kinds of mistake are
+deliberately one-sided — a false positive costs a local answer, a false
+negative cannot be undone — so anything ambiguous keeps the request
+here. A version string that looks like an IP address will, too.
+
+```
+[llmman] hybrid "gemma4" + "llmman.provider/anthropic/claude-sonnet-5" -> local (1 payment card number, 2 email addresses in the request)
+```
+
+Kinds and counts are logged; the values themselves never are.
+
+`x-llmman-route: cloud` still wins, and is how a caller approves one
+request to leave with its data — the gate holds everything it finds
+until something explicitly says otherwise. `LLMMAN_HYBRID_PII=off` (or
+`0`, `false`, `no`) turns the gate off entirely; any other value, and an
+unset one, leaves it on. Only a pair is ever scanned: a plain local
+model and a plain `--provider` model have no second side for the scan to
+choose between.
 
 ## Integrations
 

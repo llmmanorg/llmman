@@ -23,7 +23,8 @@ use super::types::*;
 use super::{
     aggregation, backend_wire_model, ensure_model, forward_ollama, model_lock, now_rfc3339,
     opt_f64, opt_num_thread, opt_u32, pull_serialized, release_model_lock, remote_status,
-    send_with_hybrid_fallback, unload_everywhere, wire_refusal, AppError, AppState, Target,
+    scans_for_pii, send_with_hybrid_fallback, unload_everywhere, wire_refusal, AppError, AppState,
+    Target,
 };
 use crate::metrics::{self, UnloadReason};
 use crate::storage::OciStore;
@@ -963,12 +964,20 @@ pub(super) async fn handle_ollama_chat(
     // would.
     let model_ref = req.model.clone();
     let request_threads = opt_num_thread(&req.options);
+    // This surface parsed its body into a struct rather than keeping
+    // the bytes, so the scan re-serializes it — only for a pair, and
+    // `OllamaChatRequest` round-trips (it is `Serialize` already, for
+    // the aggregation relay). An unserializable request scans as empty,
+    // which routes it exactly as before this gate existed.
+    let pii = scans_for_pii(&state, &model_ref)
+        .then(|| crate::pii::scan_request(&serde_json::to_value(&req).unwrap_or_default()));
     let started = Instant::now();
     send_with_hybrid_fallback(
         &state,
         &model_ref,
         Some(&headers),
         request_threads,
+        pii.as_ref(),
         |model, target, guard| {
             ollama_chat_to(&state, &headers, &req, model, target, guard, started)
         },
@@ -1134,12 +1143,16 @@ pub(super) async fn handle_ollama_generate(
 
     let model_ref = req.model.clone();
     let request_threads = opt_num_thread(&req.options);
+    // See handle_ollama_chat's own scan.
+    let pii = scans_for_pii(&state, &model_ref)
+        .then(|| crate::pii::scan_request(&serde_json::to_value(&req).unwrap_or_default()));
     let started = Instant::now();
     send_with_hybrid_fallback(
         &state,
         &model_ref,
         Some(&headers),
         request_threads,
+        pii.as_ref(),
         |model, target, guard| {
             ollama_generate_to(&state, &headers, &req, model, target, guard, started)
         },
@@ -1285,9 +1298,14 @@ async fn embed_via_backend(
         }
     }
     let started = Instant::now();
+    // The inputs are the whole body worth scanning here; the rest of an
+    // embed request is numbers and flags.
+    let pii = scans_for_pii(state, model_ref)
+        .then(|| crate::pii::scan_texts(inputs.iter().map(String::as_str)));
     // No `request_threads`: OllamaEmbedRequest carries no `options`
     // blob here, so there is no num_thread to forward.
-    let (model, target, guard) = ensure_model(state, model_ref, Some(headers), None).await?;
+    let (model, target, guard) =
+        ensure_model(state, model_ref, Some(headers), None, pii.as_ref()).await?;
     let loaded = started.elapsed();
     if !target.is_remote() && would_use_mlx(state, &model).await.is_some() {
         return Err(mlx_unsupported(&model));

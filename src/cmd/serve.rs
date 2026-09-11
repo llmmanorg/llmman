@@ -244,6 +244,11 @@ struct Inner {
     // Largest request a hybrid pair serves locally (see
     // crate::hybrid::local_budget_bytes). Resolved once at startup.
     hybrid_local_bytes: Option<u64>,
+    // Whether a hybrid pair's requests are scanned for personal data
+    // before one can be sent to the provider (LLMMAN_HYBRID_PII, see
+    // crate::pii::gate_enabled). Resolved once at startup; costs
+    // nothing for any model that is not a pair.
+    pii_gate: bool,
     // See flash_attention_from_env's doc comment — forwarded verbatim to
     // every spawn_llama_server/container::spawn call, local or
     // containerized.
@@ -1681,10 +1686,16 @@ async fn resolve_remote_target(
 /// Substitution rather than a third [`Target`] variant, so the rest of
 /// [`ensure_model`] and every proxy past it serve a pair unchanged. Does
 /// no I/O.
+///
+/// `pii` is what [`crate::pii`] found in this request's body, or `None`
+/// on the paths that have no body to scan (a startup preload, a
+/// multipart upload). `None` and "scanned, found nothing" route alike:
+/// the gate can only hold a request back, never send one away.
 fn resolve_hybrid_side(
     state: &AppState,
     pair: &crate::hybrid::Pair<'_>,
     headers: Option<&HeaderMap>,
+    pii: Option<&crate::pii::Findings>,
 ) -> Result<String, AppError> {
     let pin = request_pin(headers)?;
     // The declared length is all that is knowable before the body is
@@ -1693,10 +1704,20 @@ fn resolve_hybrid_side(
         .and_then(|h| h.get(reqwest::header::CONTENT_LENGTH))
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok());
-    let decision = crate::hybrid::route(pin, request_bytes, state.0.hybrid_local_bytes);
+    let decision = crate::hybrid::route(
+        pin,
+        request_bytes,
+        state.0.hybrid_local_bytes,
+        pii.is_some_and(|found| !found.is_empty()),
+    );
 
     let why = match decision.reason {
         crate::hybrid::Reason::Pinned => format!("pinned by {}", crate::hybrid::ROUTE_HEADER),
+        // Kinds and counts, never the values: this line is a log file.
+        crate::hybrid::Reason::Pii => format!(
+            "{} in the request",
+            pii.map(crate::pii::Findings::summary).unwrap_or_default()
+        ),
         crate::hybrid::Reason::Overflow { bytes, budget } => format!(
             "{} request exceeds the {} this host serves locally",
             crate::fmt::human_size(bytes),
@@ -1714,6 +1735,16 @@ fn resolve_hybrid_side(
         decision.side.as_str()
     );
     Ok(pair.side_ref(decision.side))
+}
+
+/// Whether this request's body should be scanned for personal data
+/// before it is routed: the gate is on and the model is a pair, the
+/// only case where what the scan finds can change anything (see
+/// [`crate::hybrid::needs_pii_scan`]). Call sites check this before
+/// building the JSON document they scan, so no other request pays for
+/// a feature it cannot use.
+fn scans_for_pii(state: &AppState, model_ref: &str) -> bool {
+    crate::hybrid::needs_pii_scan(model_ref, state.0.pii_gate)
 }
 
 /// The side a request pinned itself to, if any; a 400 when unreadable.
@@ -1737,15 +1768,28 @@ fn request_pin(headers: Option<&HeaderMap>) -> Result<Option<crate::hybrid::Side
 }
 
 /// The hosted half a hybrid pair falls back to when its local half
-/// refuses a request as too large: `None` for anything but a pair, and
-/// for a pair pinned local, whose pin is never overridden.
+/// refuses a request as too large: `None` for anything but a pair, for
+/// a pair pinned local, whose pin is never overridden, and for a
+/// request the privacy gate kept here.
+///
+/// The gate has to be checked here as well as in
+/// [`resolve_hybrid_side`], or it would hold for exactly as long as the
+/// local model had room: a conversation carrying a card number would be
+/// kept local until it outgrew the context and then sent to a provider
+/// wholesale, which is the one outcome the gate exists to prevent. A
+/// local model out of context is an error the client can see and act
+/// on; personal data at a third party is not.
 fn hybrid_fallback(
     model_ref: &str,
     headers: Option<&HeaderMap>,
+    pii: Option<&crate::pii::Findings>,
 ) -> Result<Option<String>, AppError> {
     let Some(pair) = crate::hybrid::split_ref(model_ref) else {
         return Ok(None);
     };
+    if pii.is_some_and(|found| !found.is_empty()) {
+        return Ok(None);
+    }
     Ok((request_pin(headers)? != Some(crate::hybrid::Side::Local)).then(|| pair.remote_ref()))
 }
 
@@ -1764,6 +1808,7 @@ async fn send_with_hybrid_fallback<F, Fut>(
     model_ref: &str,
     headers: Option<&HeaderMap>,
     request_threads: Option<u32>,
+    pii: Option<&crate::pii::Findings>,
     send: F,
 ) -> Result<Response, AppError>
 where
@@ -1771,8 +1816,8 @@ where
     Fut: std::future::Future<Output = Result<Response, AppError>>,
 {
     let resolve =
-        |m: String| async move { ensure_model(state, &m, headers, request_threads).await };
-    with_hybrid_fallback(model_ref, headers, resolve, send).await
+        |m: String| async move { ensure_model(state, &m, headers, request_threads, pii).await };
+    with_hybrid_fallback(model_ref, headers, pii, resolve, send).await
 }
 
 /// [`send_with_hybrid_fallback`] with `ensure_model` abstracted, so the
@@ -1780,6 +1825,7 @@ where
 async fn with_hybrid_fallback<R, RFut, F, Fut>(
     model_ref: &str,
     headers: Option<&HeaderMap>,
+    pii: Option<&crate::pii::Findings>,
     resolve: R,
     send: F,
 ) -> Result<Response, AppError>
@@ -1791,7 +1837,7 @@ where
 {
     let (model, target, guard) = resolve(model_ref.to_string()).await?;
     let fallback = match target {
-        Target::Local(_) => hybrid_fallback(model_ref, headers)?,
+        Target::Local(_) => hybrid_fallback(model_ref, headers, pii)?,
         _ => None,
     };
     let Some(cloud) = fallback else {
@@ -1887,16 +1933,24 @@ async fn local_context_overflow(resp: Response) -> Result<Response, String> {
 /// already-running instance as-is, never reloading it for a different
 /// thread count. Under `--ociman` it is ignored along with the derived
 /// value; see `container::LlamaOptions::threads` for why.
+///
+/// `pii` is the caller's [`crate::pii`] scan of this request's body,
+/// which only a hybrid pair reads (see [`resolve_hybrid_side`]) and
+/// only ever to keep the request on this machine. Scanned by the
+/// caller, not here: each surface has its body in its own shape, and
+/// scanning is skipped entirely for a model that has no second side to
+/// be kept off — see [`crate::hybrid::needs_pii_scan`].
 async fn ensure_model(
     state: &AppState,
     model_ref: &str,
     headers: Option<&HeaderMap>,
     request_threads: Option<u32>,
+    pii: Option<&crate::pii::Findings>,
 ) -> Result<(String, Target, ActivityGuard), AppError> {
     // First, so everything below sees one half rather than the pair. A
     // half is never itself a pair, so this cannot recurse.
     let hybrid_side = crate::hybrid::split_ref(model_ref)
-        .map(|pair| resolve_hybrid_side(state, &pair, headers))
+        .map(|pair| resolve_hybrid_side(state, &pair, headers, pii))
         .transpose()?;
     let model_ref = hybrid_side.as_deref().unwrap_or(model_ref);
 
@@ -3818,7 +3872,10 @@ async fn handle_openai_transcriptions(
         });
         return Ok((StatusCode::BAD_REQUEST, Json(body)).into_response());
     }
-    let (_, target, guard) = ensure_model(&state, &model, Some(&headers), None).await?;
+    // No `pii` either: this body is audio in a multipart envelope, not
+    // text this daemon can read, and the refusal just above means a
+    // pair is already on its local half whatever the scan would say.
+    let (_, target, guard) = ensure_model(&state, &model, Some(&headers), None, None).await?;
     // No `keep_alive` field on this API surface either — see
     // resolve_openai_request's own comment on the same choice.
     let activity = begin_activity(guard, None).await;
@@ -4205,6 +4262,7 @@ async fn handle_anthropic_messages(
         )
     })?;
     let model_ref = raw["model"].as_str().unwrap_or("").to_string();
+    let pii = scans_for_pii(&state, &model_ref).then(|| crate::pii::scan_request(&raw));
     // No `request_threads`: the Anthropic Messages API has no Ollama
     // options blob, so there is no num_thread to forward.
     send_with_hybrid_fallback(
@@ -4212,6 +4270,7 @@ async fn handle_anthropic_messages(
         &model_ref,
         Some(&headers),
         None,
+        pii.as_ref(),
         |model, target, guard| anthropic_messages_to(&state, &headers, &raw, model, target, guard),
     )
     .await
@@ -5073,6 +5132,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         ctx_size,
         ctx_size_explicit: ctx_size_explicit.is_some(),
         hybrid_local_bytes: crate::hybrid::local_budget_bytes_from_env(ctx_size),
+        pii_gate: crate::pii::gate_enabled_from_env(),
         flash_attention: flash_attention_from_env(),
         kv_cache_type: kv_cache_type_from_env(),
         split_mode: sched_spread_from_env(),
@@ -5134,7 +5194,10 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             Ok(model) => {
                 let state_clone = state.clone();
                 tokio::spawn(async move {
-                    match ensure_model(&state_clone, &model, None, None).await {
+                    // No headers and no body: a preload is not a
+                    // request, and `local_half` above already made this
+                    // the local side of any pair.
+                    match ensure_model(&state_clone, &model, None, None, None).await {
                         // ensure_model's own keep_alive (the daemon default, 5
                         // minutes) would otherwise start counting down the
                         // moment this finishes loading, with no request traffic
