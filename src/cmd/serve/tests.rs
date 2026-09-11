@@ -2009,6 +2009,7 @@ fn test_inner(store_path: PathBuf) -> Inner {
         runtime: Runtime::Path,
         llama_cpp_version: None,
         vllm_version: None,
+        sglang_version: None,
         ctx_size: None,
         ctx_size_explicit: false,
         hybrid_local_bytes: None,
@@ -2122,6 +2123,8 @@ async fn the_engine_label_names_the_engine_not_the_runtime() {
     for (engine, expected) in [
         (Engine::LlamaServer, "llama-server"),
         (Engine::Vllm, "vllm"),
+        (Engine::VllmOmni, "vllm-omni"),
+        (Engine::Sglang, "sglang"),
         (Engine::Mlx, "mlx"),
     ] {
         assert_eq!(
@@ -2145,6 +2148,10 @@ async fn backend_wire_model_is_the_canonical_name_for_every_engine_except_mlx() 
             running_model_fixture_with_engine(Engine::Vllm, None),
         );
         mgr.running.insert(
+            "sglang-model:latest".into(),
+            running_model_fixture_with_engine(Engine::Sglang, Some("sglang-model-latest")),
+        );
+        mgr.running.insert(
             "mlx-model".into(),
             running_model_fixture_with_engine(Engine::Mlx, Some("/cache/mlx-model/abcd")),
         );
@@ -2157,6 +2164,11 @@ async fn backend_wire_model_is_the_canonical_name_for_every_engine_except_mlx() 
     assert_eq!(
         backend_wire_model(&state, &Target::Local(0), "vllm-model").await,
         "vllm-model"
+    );
+    // sglang: the colon-free --served-model-name (see sglang_served_model_name).
+    assert_eq!(
+        backend_wire_model(&state, &Target::Local(0), "sglang-model:latest").await,
+        "sglang-model-latest"
     );
     assert_eq!(
             backend_wire_model(&state, &Target::Local(0), "mlx-model").await,

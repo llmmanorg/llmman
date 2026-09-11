@@ -513,7 +513,7 @@ fn no_servable_layer(model_ref: &str, manifest: &crate::storage::oci::Manifest) 
     } else {
         anyhow!(
             "no servable model layer in {model_ref} — found {exts:?} files; \
-             llmman serve supports GGUF (llama-server) and safetensors (vllm/vllm-omni/mlx)"
+             llmman serve supports GGUF (llama-server) and safetensors (vllm/vllm-omni/sglang/mlx)"
         )
     }
 }

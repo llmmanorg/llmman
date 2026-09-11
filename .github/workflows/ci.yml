@@ -7,6 +7,10 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  # `gh workflow run ci.yml --ref <branch>`: runs the `e2e` job on a
+  # branch (a pull_request skips it). Never releases: `release`'s `if:`
+  # still requires a push to main.
+  workflow_dispatch:
 
 # Workflow-wide default: read-only. Every job here only needs to check
 # out and build/test the repo except `release`, which needs to create a
@@ -38,6 +42,12 @@ env:
   # 404s within hours. The 0.3.0.dev20260825040033 pinned here before
   # went that way and took every macOS e2e run with it. Bump deliberately.
   VLLM_METAL_VERSION: "0.28.0"
+  # SGLang git tag (`v` added at use) the e2e job installs from source
+  # for tests/launch_e2e.rs's `serve_sglang_safetensors_model`: upstream's
+  # PyPI wheel and `sglang-kernel` are CUDA builds, so the CPU engine
+  # (Linux) and MLX runtime (macOS) come from the repo's own
+  # pyproject_cpu.toml / pyproject_other.toml.
+  SGLANG_VERSION: "0.5.19"
 
 jobs:
   # --------------------------------------------------------------------------
@@ -552,7 +562,10 @@ jobs:
   # Also runs vllm-plugin/tests/test_e2e.py (Linux x86_64/aarch64 and
   # macOS aarch64, both `matrix.backend` entries) against this job's own
   # installed `llmman` binary and a real `vllm serve` — CPU-only on
-  # Linux, Metal-GPU-backed (via vllm-metal) on macOS.
+  # Linux, Metal-GPU-backed (via vllm-metal) on macOS. The same `vllm`
+  # and an SGLang from source also back launch_e2e's
+  # `serve_vllm_safetensors_model` / `serve_sglang_safetensors_model`
+  # (`llmman serve`'s own vllm and sglang backends) on those entries.
   #
   # On the two macOS aarch64 legs (`matrix.backend` docker and podman —
   # see this job's own matrix below; "backend" there is the OCI-transport
@@ -569,14 +582,15 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/opencode/codex/qwen/hermes/openclaw/dsh, vllm-plugin, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/opencode/codex/qwen/hermes/openclaw/dsh, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
     # push event that leads to a release: a push to main — see the
     # `release` job's own `needs`, which includes this job for exactly
-    # that reason, and its own identical `if:` condition below.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # that reason, and its own identical `if:` condition below — or when
+    # dispatched by hand on a branch (see `workflow_dispatch` above).
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     # 7 tests run serialized (--test-threads=1 + lock_serial()), so the
     # worst case sums all 7's own retry budgets: MAX_ATTEMPTS * TIMEOUT
     # (3 * 600s = 30 min) each — a timeout itself never retries (see
@@ -600,7 +614,11 @@ jobs:
     # is always a deterministic llmman bug worth failing loudly on, not
     # small-model sampling variance), so unlike the 7 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
-    timeout-minutes: 340
+    #
+    # +60 more (400 total) for `serve_vllm_safetensors_model` and
+    # `serve_sglang_safetensors_model` (20 min each, no retries, like the
+    # mlx test) and "Install SGLang (e2e)"'s 40-minute budget.
+    timeout-minutes: 400
     env:
       # These tests are about the llama-server "Install llama-server" puts
       # on PATH, which `--runtime auto` would try docker before.
@@ -1181,6 +1199,160 @@ jobs:
           "$RUNNER_TEMP/mlx-lm-venv/bin/pip" install mlx-lm
           echo "$RUNNER_TEMP/mlx-lm-venv/bin" >> "$GITHUB_PATH"
 
+      # ── vLLM + vllm-plugin (Linux + macOS) ───────────────────────────────
+      # One `vllm` for two suites: vllm-plugin/tests/test_e2e.py further
+      # below, and launch_e2e's `serve_vllm_safetensors_model` (`llmman
+      # serve`'s own vllm backend), which needs it on PATH before the
+      # "cargo test --test launch_e2e" step — hence installed here, not
+      # next to the pytest step. CPU-only on Linux, Metal (vllm-metal) on
+      # macOS; no Windows backend exists.
+      #
+      # Uses a venv, not the bare system python3 (Ubuntu 24.04's is PEP
+      # 668-locked). Both vllm-plugin and vllm (next step) install into
+      # this same venv so the plugin's entry point (see pyproject.toml)
+      # is actually discoverable by the vllm process.
+      - name: Set up Python (vllm-plugin e2e)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install vllm-plugin (e2e)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/vllm-plugin-venv"
+          "$RUNNER_TEMP/vllm-plugin-venv/bin/pip" install -e ./vllm-plugin pytest
+          echo "$RUNNER_TEMP/vllm-plugin-venv/bin" >> "$GITHUB_PATH"
+
+      # No GPU assumed on Linux, so that leg installs vLLM's CPU wheel,
+      # not the default CUDA one. macOS installs that same upstream
+      # "+cpu" wheel (a GitHub release asset since v0.26.0; PyPI still
+      # has none) plus vllm-metal on top, which overrides vLLM's
+      # CpuPlatform autodetection with a real Metal-GPU MetalPlatform via
+      # its own `vllm.platform_plugins` entry point — building vLLM's
+      # CPU backend from source on macOS instead (this job's prior
+      # approach) hung forever inside its own CPU worker, regardless of
+      # --dtype (see git history).
+      # LD_PRELOAD (Linux x86_64 only): vLLM's CPU wheel needs Intel
+      # OpenMP preloaded; located via a glob scoped to this venv, and set
+      # by a `vllm` wrapper script ahead of the venv on PATH rather than
+      # in $GITHUB_ENV, which would preload it into cargo, llmman,
+      # llama-server and the agent CLIs launch_e2e runs too.
+      - name: Install vLLM (e2e)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/vllm-plugin-venv"
+
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            "$venv/bin/pip" install \
+              "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl"
+            "$venv/bin/pip" install \
+              "https://github.com/vllm-project/vllm-metal/releases/download/v${VLLM_METAL_VERSION}/vllm_metal-${VLLM_METAL_VERSION}-cp312-cp312-macosx_15_0_arm64.whl"
+          else
+            case "${{ matrix.target }}" in
+              x86_64-*) arch=x86_64 ;;
+              aarch64-*) arch=aarch64 ;;
+              *) echo "unhandled target for vLLM CPU wheel: ${{ matrix.target }}" >&2; exit 1 ;;
+            esac
+            wheel="vllm-${VLLM_VERSION}+cpu-cp38-abi3-manylinux_2_34_${arch}.whl"
+            "$venv/bin/pip" install \
+              "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/$wheel" \
+              --extra-index-url https://download.pytorch.org/whl/cpu
+
+            if [ "$arch" = "x86_64" ]; then
+              iomp=$("$venv/bin/python3" -c "import glob, sysconfig; m = glob.glob(sysconfig.get_paths()['purelib'] + '/**/libiomp5.so', recursive=True); print(m[0] if m else '')")
+              if [ -n "$iomp" ]; then
+                mkdir -p "$RUNNER_TEMP/vllm-bin"
+                printf '#!/bin/sh\nexport LD_PRELOAD=%s\nexec %s "$@"\n' "$iomp" "$venv/bin/vllm" > "$RUNNER_TEMP/vllm-bin/vllm"
+                chmod +x "$RUNNER_TEMP/vllm-bin/vllm"
+                echo "$RUNNER_TEMP/vllm-bin" >> "$GITHUB_PATH"
+              else
+                echo "::warning::libiomp5.so not found under $venv; LD_PRELOAD not set for vLLM CPU (x86_64)"
+              fi
+            fi
+          fi
+
+      # ── SGLang (Linux + macOS) ───────────────────────────────────────────
+      # For launch_e2e's `serve_sglang_safetensors_model` (`llmman serve`'s
+      # sglang backend). From the SGLANG_VERSION tag — see that variable:
+      #   Linux: the CPU engine (pyproject_cpu.toml, torch from the CPU
+      #   index via uv's index config) plus its kernel library from
+      #   python/sglang/kernels/aot, which it imports unconditionally.
+      #   gcc, not clang (GCC constexpr std::sqrt). On x86_64 that library
+      #   needs AVX-512 at import; the test skips itself without it.
+      #   macOS: the MLX runtime (pyproject_other.toml's srt_mps extra).
+      # Only the `sglang` console script goes on PATH, via a symlink dir:
+      # the venv's bin/ also has a python3 and pytest, and $GITHUB_PATH
+      # prepends, so it would shadow the vllm-plugin venv's pytest.
+      - name: Install SGLang (e2e)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        timeout-minutes: 40
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/sglang-src"
+          venv="$RUNNER_TEMP/sglang-venv"
+          git clone --depth 1 --branch "v${SGLANG_VERSION}" https://github.com/sgl-project/sglang.git "$src"
+          python3 -m venv "$venv"
+          "$venv/bin/pip" install --quiet uv
+
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            cp "$src/python/pyproject_other.toml" "$src/python/pyproject.toml"
+            VIRTUAL_ENV="$venv" "$venv/bin/uv" pip install --prerelease=allow "$src/python[srt_mps]"
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq libnuma-dev cmake ninja-build
+            cat > "$RUNNER_TEMP/sglang-uv.toml" <<'EOF'
+          [[index]]
+          name = "torch"
+          url = "https://download.pytorch.org/whl/cpu"
+          EOF
+            export UV_CONFIG_FILE="$RUNNER_TEMP/sglang-uv.toml" VIRTUAL_ENV="$venv"
+            cp "$src/python/pyproject_cpu.toml" "$src/python/pyproject.toml"
+            "$venv/bin/uv" pip install --prerelease=allow "$src/python"
+            cp "$src/python/sglang/kernels/aot/pyproject_cpu.toml" "$src/python/sglang/kernels/aot/pyproject.toml"
+            CC=gcc CXX=g++ "$venv/bin/uv" pip install --prerelease=allow "$src/python/sglang/kernels/aot"
+          fi
+
+          mkdir -p "$RUNNER_TEMP/sglang-bin"
+          ln -sf "$venv/bin/sglang" "$RUNNER_TEMP/sglang-bin/sglang"
+          echo "$RUNNER_TEMP/sglang-bin" >> "$GITHUB_PATH"
+          "$venv/bin/sglang" version
+
+      # What the two engine tests' daemons run their engine with, per
+      # platform: `LLMMAN_*_ARGS` is appended to the engine argv by `llmman
+      # serve`, the rest the engines read themselves. Lifted from
+      # vllm-plugin/tests/test_e2e.py (whose `env.setdefault`s agree) and
+      # SGLang's CPU and Apple-Metal guides.
+      - name: Engine environment for launch_e2e (vllm, sglang)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            {
+              echo "LLMMAN_VLLM_ARGS=--max-num-seqs 1"
+              echo "GLOO_SOCKET_IFNAME=lo0"
+              echo "VLLM_METAL_USE_PAGED_ATTENTION=1"
+              echo "VLLM_METAL_MEMORY_FRACTION=0.8"
+              echo "SGLANG_USE_MLX=1"
+              echo "LLMMAN_SGLANG_ARGS=--disable-cuda-graph"
+            } >> "$GITHUB_ENV"
+          else
+            {
+              echo "LLMMAN_VLLM_ARGS=--dtype bfloat16 --enforce-eager"
+              # vLLM CPU's KV-cache arena, in GiB — a demand, not a cap
+              # (see test_e2e.py); unset, vLLM 0.28 asks for 0.9 of RAM.
+              echo "VLLM_CPU_KVCACHE_SPACE=1"
+              echo "SGLANG_USE_CPU_ENGINE=1"
+            } >> "$GITHUB_ENV"
+          fi
+
       # --target: for the same reason as the Build llmman step above.
       # RUSTFLAGS no longer carries a Windows linker choice. This step
       # compiles its own test binary (tests/launch_e2e.rs) against the same
@@ -1250,76 +1422,6 @@ jobs:
             sleep 2
           fi
           if [ "${{ runner.os }}" = "Linux" ]; then free -m; else vm_stat; fi
-
-      # ── vllm-plugin e2e (Linux + macOS) ──────────────────────────────────
-      # `vllm-plugin/tests/test_e2e.py` against this job's own installed
-      # `llmman` binary and a real `vllm serve` — CPU-only on Linux,
-      # Metal-GPU-backed (via vllm-metal) on macOS. Excludes Windows: no
-      # vLLM CPU wheel/backend exists for it.
-      #
-      # Uses a venv, not the bare system python3 (Ubuntu 24.04's is PEP
-      # 668-locked). Both vllm-plugin and vllm (next step) install into
-      # this same venv so the plugin's entry point (see pyproject.toml)
-      # is actually discoverable by the vllm process.
-      - name: Set up Python (vllm-plugin e2e)
-        if: runner.os == 'Linux' || runner.os == 'macOS'
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.12"
-
-      - name: Install vllm-plugin (e2e)
-        if: runner.os == 'Linux' || runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m venv "$RUNNER_TEMP/vllm-plugin-venv"
-          "$RUNNER_TEMP/vllm-plugin-venv/bin/pip" install -e ./vllm-plugin pytest
-          echo "$RUNNER_TEMP/vllm-plugin-venv/bin" >> "$GITHUB_PATH"
-
-      # No GPU assumed on Linux, so that leg installs vLLM's CPU wheel,
-      # not the default CUDA one. macOS installs that same upstream
-      # "+cpu" wheel (a GitHub release asset since v0.26.0; PyPI still
-      # has none) plus vllm-metal on top, which overrides vLLM's
-      # CpuPlatform autodetection with a real Metal-GPU MetalPlatform via
-      # its own `vllm.platform_plugins` entry point — building vLLM's
-      # CPU backend from source on macOS instead (this job's prior
-      # approach) hung forever inside its own CPU worker, regardless of
-      # --dtype (see git history).
-      # LD_PRELOAD (Linux x86_64 only): vLLM's CPU wheel needs Intel
-      # OpenMP preloaded; located via a glob scoped to this venv.
-      - name: Install vLLM (e2e)
-        if: runner.os == 'Linux' || runner.os == 'macOS'
-        timeout-minutes: 60
-        shell: bash
-        run: |
-          set -euo pipefail
-          venv="$RUNNER_TEMP/vllm-plugin-venv"
-
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            "$venv/bin/pip" install \
-              "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl"
-            "$venv/bin/pip" install \
-              "https://github.com/vllm-project/vllm-metal/releases/download/v${VLLM_METAL_VERSION}/vllm_metal-${VLLM_METAL_VERSION}-cp312-cp312-macosx_15_0_arm64.whl"
-          else
-            case "${{ matrix.target }}" in
-              x86_64-*) arch=x86_64 ;;
-              aarch64-*) arch=aarch64 ;;
-              *) echo "unhandled target for vLLM CPU wheel: ${{ matrix.target }}" >&2; exit 1 ;;
-            esac
-            wheel="vllm-${VLLM_VERSION}+cpu-cp38-abi3-manylinux_2_34_${arch}.whl"
-            "$venv/bin/pip" install \
-              "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/$wheel" \
-              --extra-index-url https://download.pytorch.org/whl/cpu
-
-            if [ "$arch" = "x86_64" ]; then
-              iomp=$("$venv/bin/python3" -c "import glob, sysconfig; m = glob.glob(sysconfig.get_paths()['purelib'] + '/**/libiomp5.so', recursive=True); print(m[0] if m else '')")
-              if [ -n "$iomp" ]; then
-                echo "LD_PRELOAD=$iomp" >> "$GITHUB_ENV"
-              else
-                echo "::warning::libiomp5.so not found under $venv; LD_PRELOAD not set for vLLM CPU (x86_64)"
-              fi
-            fi
-          fi
 
       # LLMMAN_BIN isn't needed: `llmman` is already on PATH (added to
       # $GITHUB_PATH by "Install llmman (via install script)" above).

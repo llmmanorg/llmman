@@ -29,7 +29,7 @@ in a browser is llmman's own web UI ([webui.md](webui.md)).
 ## Model lifecycle
 
 Models load on demand, each in its own backend subprocess
-(`llama-server`, `vllm` or `mlx_lm.server`; see [backends.md](backends.md))
+(`llama-server`, `vllm`, `sglang` or `mlx_lm.server`; see [backends.md](backends.md))
 on a random loopback port, reused by later requests.
 
 An idle model unloads after `keep_alive` (default 5 minutes, as in
