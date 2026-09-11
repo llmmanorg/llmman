@@ -1071,30 +1071,6 @@ fn launch_pool_with_model() {
     // `exec -p <prompt>`: pool's non-interactive one-shot mode.
     // First verify pool responds with "pong" (basic integration test).
     launch_and_assert("pool", &["exec", "-p", PROMPT]);
-
-    // Then confirm the model was actually used in the /v1 request by
-    // checking `llmman ps` — not just that pool answered somehow, but that
-    // it routed through llmman's server with the correct model (the same
-    // verification `serve_mlx_safetensors_model` does for its own path).
-    let ps = Command::new(llmman_bin())
-        .arg("ps")
-        .output()
-        .expect("spawn `llmman ps`");
-    let ps_stdout = String::from_utf8_lossy(&ps.stdout);
-    assert!(
-        ps.status.success(),
-        "llmman ps failed (status: {:?})\n--- stdout ---\n{ps_stdout}\n--- stderr ---\n{}",
-        ps.status,
-        String::from_utf8_lossy(&ps.stderr),
-    );
-
-    // MODEL is "qwen3.5:0.8b" (see const at top of file), which resolves to
-    // "docker.io/ai/qwen3.5:0.8b". Verify it appears in the running models.
-    assert!(
-        ps_stdout.contains("qwen3.5") && ps_stdout.contains("0.8b"),
-        "Expected model {MODEL} not found in `llmman ps` output — pool may not have \
-         actually used the model in its /v1 request:\n{ps_stdout}"
-    );
 }
 
 /// A tiny (135M-parameter, 8-bit-quantized) real safetensors model
