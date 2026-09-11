@@ -52,8 +52,8 @@ impl ContainerManager {
 
     /// Whether `--runtime auto` should try this engine: its CLI is on
     /// `PATH`, `<cli> info` answers within [`PROBE_TIMEOUT`] (a wedged
-    /// daemon socket can hang it), and on a CUDA host the NVIDIA
-    /// Container Toolkit is present (else `run --gpus all` fails). `Err`
+    /// daemon socket can hang it), and when [`GpuBackend::engine_args`]
+    /// will pass `--gpus`, the NVIDIA Container Toolkit is present. `Err`
     /// says why not, for the log. An explicit `--runtime docker|podman`
     /// skips this and lets the engine report its own errors.
     pub fn probe(self) -> Result<()> {
@@ -71,9 +71,8 @@ impl ContainerManager {
             Some(_) => anyhow::bail!("{cli} info failed (is its daemon running?)"),
             None => anyhow::bail!("{cli} info did not answer within {PROBE_TIMEOUT:?}"),
         }
-        if matches!(detect_backend(), GpuBackend::Cuda12 | GpuBackend::Cuda13)
-            && !nvidia_toolkit_present(self)
-        {
+        let wants_gpus = detect_backend().engine_args().iter().any(|a| a == "--gpus");
+        if wants_gpus && !nvidia_toolkit_present(self) {
             anyhow::bail!(
                 "an NVIDIA GPU was detected but no NVIDIA Container Toolkit for {cli} \
                  (`{cli} run --gpus all` would fail)"
@@ -820,6 +819,9 @@ pub fn spawn_mediagen(
         port.to_string(),
         "--host".into(),
         "0.0.0.0".into(),
+        // The image's /app/llama-server, not a download inside it.
+        "--runtime".into(),
+        "path".into(),
     ]);
     run(ociman, args)
 }

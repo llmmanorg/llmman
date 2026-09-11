@@ -451,10 +451,10 @@ fn marker_is_fresh(path: &Path, stale_after: Duration) -> bool {
 /// within [`DOWNLOAD_MARKER_STALE_AFTER`].
 ///
 /// [`touch`]: DownloadMarker::touch
-pub struct DownloadMarker(Option<PathBuf>);
+pub(crate) struct DownloadMarker(Option<PathBuf>);
 
 impl DownloadMarker {
-    pub fn create() -> DownloadMarker {
+    pub(crate) fn create() -> DownloadMarker {
         match download_marker_path() {
             Ok(p) => Self::create_at(p),
             Err(_) => DownloadMarker(None),
@@ -473,7 +473,7 @@ impl DownloadMarker {
 
     /// Refreshes the marker's mtime so a reader can tell this live
     /// download from a crashed one whose Drop never ran.
-    pub fn touch(&self) {
+    pub(crate) fn touch(&self) {
         if let Some(path) = &self.0 {
             // Windows keeps the old mtime when a write is zero bytes,
             // so set it explicitly.
