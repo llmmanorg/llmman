@@ -1,6 +1,7 @@
 //! Runs `llama-server` (or, for a safetensors model, `vllm serve`) inside
-//! a container (Linux only, via `--ociman docker|podman`) instead of as a
-//! local process, auto-selecting the matching
+//! a container (Linux only, via `--runtime docker|podman`, and the first
+//! thing the default `--runtime auto` tries) instead of as a local
+//! process, auto-selecting the matching
 //! `ghcr.io/ggml-org/llama.cpp:server-<backend>` image for whatever GPU
 //! acceleration the host actually has — see
 //! <https://github.com/ggml-org/llama.cpp/blob/master/docs/docker.md> for
@@ -48,6 +49,102 @@ impl ContainerManager {
             ContainerManager::Podman => "podman",
         }
     }
+
+    /// Whether `--runtime auto` should try this engine: its CLI is on
+    /// `PATH`, `<cli> info` answers within [`PROBE_TIMEOUT`] (a wedged
+    /// daemon socket can hang it), and on a CUDA host the NVIDIA
+    /// Container Toolkit is present (else `run --gpus all` fails). `Err`
+    /// says why not, for the log. An explicit `--runtime docker|podman`
+    /// skips this and lets the engine report its own errors.
+    pub fn probe(self) -> Result<()> {
+        let cli = self.binary();
+        if crate::find_on_path(cli).is_none() {
+            anyhow::bail!("{cli} is not on PATH");
+        }
+        let mut cmd = std::process::Command::new(cli);
+        cmd.arg("info")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match run_with_timeout(cmd, PROBE_TIMEOUT).with_context(|| format!("run {cli} info"))? {
+            Some(status) if status.success() => {}
+            Some(_) => anyhow::bail!("{cli} info failed (is its daemon running?)"),
+            None => anyhow::bail!("{cli} info did not answer within {PROBE_TIMEOUT:?}"),
+        }
+        if matches!(detect_backend(), GpuBackend::Cuda12 | GpuBackend::Cuda13)
+            && !nvidia_toolkit_present(self)
+        {
+            anyhow::bail!(
+                "an NVIDIA GPU was detected but no NVIDIA Container Toolkit for {cli} \
+                 (`{cli} run --gpus all` would fail)"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// How long [`ContainerManager::probe`] waits on `docker info`/`podman
+/// info` before treating the engine as unusable.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Runs `cmd`, killing it after `timeout` (`Ok(None)`); `std::process`
+/// has no deadline of its own.
+fn run_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<Option<std::process::ExitStatus>> {
+    let mut child = cmd.spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Heuristic for the NVIDIA Container Toolkit, in any shape it comes in:
+/// its hook/CLI on `PATH`, a generated CDI spec, or (docker) an `nvidia`
+/// runtime registered with the daemon.
+fn nvidia_toolkit_present(ociman: ContainerManager) -> bool {
+    if [
+        "nvidia-container-runtime-hook",
+        "nvidia-container-toolkit",
+        "nvidia-ctk",
+    ]
+    .iter()
+    .any(|b| crate::find_on_path(b).is_some())
+    {
+        return true;
+    }
+    if ["/etc/cdi/nvidia.yaml", "/var/run/cdi/nvidia.yaml"]
+        .iter()
+        .any(|p| Path::new(p).exists())
+    {
+        return true;
+    }
+    if ociman == ContainerManager::Docker {
+        let runtimes = std::process::Command::new("docker")
+            .args([
+                "info",
+                "--format",
+                "{{range $k, $v := .Runtimes}}{{$k}} {{end}}",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        if runtimes.split_whitespace().any(|r| r == "nvidia") {
+            return true;
+        }
+    }
+    false
 }
 
 /// GPU backends this module can detect and run a matching
@@ -81,10 +178,9 @@ impl GpuBackend {
     /// when given, pins to that release (e.g. `server-b9994` instead of
     /// the floating `server`) — ghcr.io/ggml-org/llama.cpp publishes a
     /// versioned tag alongside every floating one, built from the same
-    /// release. llmman itself has no opinion on which (or whether) to
-    /// pin: reproducibility across runs is the caller's concern (see
-    /// `ServeArgs::llama_cpp_version` in cmd::serve), not something to
-    /// default or hardcode here.
+    /// release. Which pin is cmd::serve's decision (normally
+    /// `crate::llama_release::default_release`, or `--llama-cpp-version`);
+    /// `None` is the floating tag, for `--llama-cpp-version latest`.
     fn image_ref(self, version: Option<&str>) -> String {
         match version {
             Some(v) => format!("ghcr.io/ggml-org/llama.cpp:{}-{v}", self.image_tag()),
@@ -130,13 +226,12 @@ impl GpuBackend {
 /// Detects the best available GPU backend by delegating to
 /// [`crate::hostgpu::detect`] (real CUDA Driver/HIP runtime/Vulkan API
 /// probing — see that module) and mapping its result onto which
-/// `ghcr.io/ggml-org/llama.cpp` image to run. This can't verify the
-/// container engine itself is configured to pass a GPU through (e.g.
-/// whether nvidia-container-toolkit is actually registered with
-/// Docker/Podman) — `docker run --gpus all` surfaces that
-/// misconfiguration directly and clearly enough on its own if it's
-/// missing, so this stays a plain host probe rather than trying to fully
-/// replicate GPU passthrough validation too.
+/// `ghcr.io/ggml-org/llama.cpp` image to run. This doesn't verify the
+/// container engine itself is configured to pass a GPU through: for an
+/// explicit `--runtime docker|podman`, `docker run --gpus all` surfaces
+/// that misconfiguration directly and clearly enough on its own; only
+/// `--runtime auto`, which has to decide whether to try the engine at
+/// all, adds a heuristic ([`ContainerManager::probe`]).
 fn detect_backend() -> GpuBackend {
     backend_from_hostgpu(hostgpu::detect())
 }
@@ -147,7 +242,7 @@ fn detect_backend() -> GpuBackend {
 /// CUDA_VERSION 12.8.1, and `cuda13`, 13.3.0 — see docs/docker.md) can be
 /// tested directly without needing real GPU hardware. `HostGpu::Metal`
 /// has no container image (Docker/Podman GPU passthrough isn't a macOS
-/// concept, and `--ociman` is rejected on non-Linux before this is ever
+/// concept, and container runtimes are rejected on non-Linux before this is ever
 /// called — see `cmd::serve::serve_async`) and falls back to CPU here
 /// only so this match stays exhaustive.
 fn backend_from_hostgpu(gpu: HostGpu) -> GpuBackend {
@@ -252,7 +347,7 @@ impl VllmBackend {
             (VllmBackend::Cuda12 | VllmBackend::Cuda13, HostArch::Aarch64) => "aarch64",
             (VllmBackend::Rocm, _) => anyhow::bail!(
                 "an AMD GPU was detected, but vllm/vllm-omni publishes only CUDA images \
-                 (install vllm-omni locally and drop --ociman to serve this model)"
+                 (install vllm-omni locally and use --runtime path to serve this model)"
             ),
             (VllmBackend::Cpu, _) => anyhow::bail!(
                 "no CUDA GPU was detected, and vllm/vllm-omni publishes only CUDA images"
@@ -342,12 +437,10 @@ fn image_for(engine: ContainerEngine, version: Option<&str>) -> Result<String> {
 /// isn't already cached locally on its own, but silently and without any
 /// visible progress from the caller's perspective (its own stdio is
 /// redirected to a log file when started detached — see daemon.rs and
-/// cmd::serve). A caller that wants to warm this up as its own distinct,
-/// visible step first (typically right before starting `llmman serve
-/// --ociman ...` detached, so a slow first pull doesn't look like a stuck
-/// first prompt to whoever's waiting on it) should call this — in the
-/// foreground, before `serve` is even started — rather than relying on
-/// `spawn`'s own implicit pull.
+/// cmd::serve). So `cmd::serve` calls this itself before serving (and
+/// `--pull-only` stops right after it), rather than relying on `spawn`'s
+/// own implicit pull; under `--runtime auto` a failed pull is also what
+/// moves it on to the next engine.
 pub fn pull_image(
     ociman: ContainerManager,
     engine: ContainerEngine,
@@ -736,8 +829,8 @@ pub fn spawn_mediagen(
 /// for why this must be SIGTERM (forwarded to the container's `--init`
 /// PID 1) and not the default forceful kill. Best-effort: called from a
 /// synchronous `Drop` impl (see `ModelProcess` in cmd::serve), so errors
-/// are only logged, never propagated. Unix only (matching `--ociman`
-/// itself, which cmd::serve::serve_async already rejects on other
+/// are only logged, never propagated. Unix only (matching the container
+/// runtimes themselves, which cmd::serve::serve_async already rejects on other
 /// platforms) — `libc::kill` is not meaningful on Windows.
 #[cfg(unix)]
 pub fn stop(pid: u32) {
@@ -751,7 +844,7 @@ pub fn stop(pid: u32) {
     }
 }
 
-/// Unreachable in practice (`--ociman` is rejected on non-Linux before
+/// Unreachable in practice (container runtimes are rejected on non-Linux before
 /// `spawn` is ever called — see cmd::serve::serve_async), but this needs
 /// to compile on every platform llmman ships for, and a plain forceful
 /// kill here is at least no worse than the SIGKILL callers were already
@@ -1019,7 +1112,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("vllm/vllm-omni"), "{err}");
-        assert!(err.contains("--ociman"), "{err}");
+        assert!(err.contains("--runtime"), "{err}");
         let err = VllmBackend::Cpu
             .omni_image_ref(HostArch::X86_64, None)
             .unwrap_err()

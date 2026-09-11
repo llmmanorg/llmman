@@ -929,9 +929,10 @@ fn launch_dsh_with_model() {
 ///
 ///   - `LLMMAN_HOST` points at a loopback port nothing listens on, so
 ///     the client never reuses (or stops) the developer's real daemon;
-///   - a fake `llama-server` sits first on `PATH`, so serve's
-///     `resolve_llama_server` returns immediately without a download
-///     (it is found but never executed: serve dies before launching it);
+///   - `LLMMAN_RUNTIME=path` with a fake `llama-server` first on `PATH`,
+///     so serve's runtime resolution returns immediately without probing
+///     a container engine or downloading anything (it is found but never
+///     executed: serve dies before launching it);
 ///   - `LLMMAN_MODELS` points at `<tmp>/store` while `<tmp>/cache`
 ///     already exists as a regular FILE, so `serve_async`'s
 ///     `create_dir_all(cache)` fails right after resolving llama-server,
@@ -950,6 +951,7 @@ fn ensure_server_fails_fast_when_daemon_dies_at_startup() {
     cmd.arg("pull").arg(MODEL);
     cmd.env("LLMMAN_HOST", format!("127.0.0.1:{port}"))
         .env("LLMMAN_MODELS", dir.join("store"))
+        .env("LLMMAN_RUNTIME", "path")
         .env("PATH", path);
 
     let start = Instant::now();
@@ -997,6 +999,7 @@ fn launch_qwen_without_a_model_is_refused_before_the_daemon() {
         .env("QWEN_HOME", dir.join(".qwen"))
         .env("LLMMAN_HOST", format!("127.0.0.1:{port}"))
         .env("LLMMAN_MODELS", dir.join("store"))
+        .env("LLMMAN_RUNTIME", "path")
         .env("PATH", path);
 
     let start = Instant::now();
@@ -1189,7 +1192,7 @@ fn mediagen_ffi_binds_the_llama_cpp_on_path() {
         eprintln!("skipping: llama-server not on PATH");
         return;
     }
-    let dir = llmman::cmd::serve::llama_lib_dir(None).unwrap();
+    let dir = llmman::cmd::serve::llama_lib_dir(llmman::cmd::serve::Runtime::Path, None).unwrap();
     eprintln!("binding the ggml/llama libraries in {}", dir.display());
     let api = llmman::mediagen::ffi::Api::load(&dir).unwrap();
     api.check_layout().unwrap();

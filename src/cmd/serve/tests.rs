@@ -2006,7 +2006,7 @@ fn test_inner(store_path: PathBuf) -> Inner {
         }),
         llama_server_bin: StdMutex::new(None),
         exe: None,
-        ociman: None,
+        runtime: Runtime::Path,
         llama_cpp_version: None,
         vllm_version: None,
         ctx_size: None,
