@@ -68,8 +68,7 @@ base_url = "http://gpubox:8000/v1"
 
 ```console
 $ llmman config set providers.gpubox.base_url http://gpubox:8000/v1
-$ llmman providers gpubox
-PROVIDER    NAME      API KEY    KEY            MODELS
+$ llmman providers | grep gpubox
 gpubox      gpubox    -          none needed    -
 $ llmman list --provider gpubox                # asks the box's own /models
 $ llmman launch opencode --provider gpubox --model qwen3-coder
