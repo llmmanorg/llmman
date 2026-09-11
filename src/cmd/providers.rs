@@ -9,38 +9,22 @@ use clap::Args;
 
 use crate::daemon::{self, ProviderSummary};
 
+/// No arguments: a positional filter here read `llmman providers ls`
+/// as "providers containing `ls`" and printed modelscope and poolside.
 #[derive(Args, Debug)]
-pub struct ProvidersArgs {
-    /// Only show providers whose id or name contains this substring
-    #[arg(value_name = "FILTER")]
-    pub filter: Option<String>,
-}
+pub struct ProvidersArgs {}
 
-pub fn run(args: &ProvidersArgs) -> anyhow::Result<()> {
+pub fn run(_args: &ProvidersArgs) -> anyhow::Result<()> {
     // Same contract as `run`/`pull`/`launch`: start the daemon rather
     // than tell the user to. It owns the catalog, and whatever runs next
     // needs it anyway.
     daemon::ensure_server("")?;
 
-    let all = daemon::providers()?;
-    let total = all.len();
-    let filter = args
-        .filter
-        .as_deref()
-        .map(str::trim)
-        .filter(|f| !f.is_empty())
-        .map(str::to_lowercase);
-    let shown: Vec<&ProviderSummary> = all
-        .iter()
-        .filter(|p| matches(p, filter.as_deref()))
-        .collect();
+    let shown = daemon::providers()?;
 
     if shown.is_empty() {
         // A header with no rows would read as "there are none".
-        anyhow::bail!(
-            "no provider matches {:?} — run 'llmman providers' for all {total} of them",
-            args.filter.as_deref().unwrap_or_default()
-        );
+        anyhow::bail!("no providers available");
     }
 
     let id_w = shown.iter().map(|p| p.id.len()).max().unwrap_or(8).max(8);
@@ -80,11 +64,6 @@ pub fn run(args: &ProvidersArgs) -> anyhow::Result<()> {
     // something to skip past every time, and something a pipe into
     // `grep`/`awk` has to filter out. `--help` is where usage belongs.
     Ok(())
-}
-
-fn matches(provider: &ProviderSummary, needle: Option<&str>) -> bool {
-    let Some(needle) = needle else { return true };
-    provider.id.to_lowercase().contains(needle) || provider.name.to_lowercase().contains(needle)
 }
 
 /// The variable column: `-` for a configured provider that names none.
@@ -137,21 +116,6 @@ mod tests {
             key_optional: false,
             models: 0,
         }
-    }
-
-    /// Findable by the name a user knows, not only by its id.
-    #[test]
-    fn filter_matches_id_or_name_case_insensitively() {
-        let p = summary("togetherai", "Together AI");
-        assert!(matches(&p, None));
-        assert!(matches(&p, Some("together")));
-        assert!(matches(&p, Some("ai")));
-        assert!(!matches(&p, Some("groq")));
-
-        // The needle is lowercased by `run` before it gets here; the
-        // provider's own casing must not matter either way.
-        let p = summary("openai", "OpenAI");
-        assert!(matches(&p, Some("openai")));
     }
 
     /// Each way a key can be present is a different thing to do about
