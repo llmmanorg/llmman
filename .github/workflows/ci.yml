@@ -879,7 +879,15 @@ jobs:
               | GOOSE_VERSION=v1.50.0 GOOSE_BIN_DIR="$bin_dir" CONFIGURE=false bash; then
               echo "::warning::goose install failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next"
             elif version_output=$("$bin_dir/goose" --version 2>&1); then
-              echo "$bin_dir" >> "$GITHUB_PATH"
+              # cygpath: later steps read $GITHUB_PATH outside this bash,
+              # and tests/launch_e2e.rs's on_path splits PATH with Windows
+              # semantics — a `/c/...`-shaped entry would be a directory
+              # neither can resolve. A native path converts to itself.
+              if command -v cygpath >/dev/null 2>&1; then
+                cygpath -w "$bin_dir" >> "$GITHUB_PATH"
+              else
+                echo "$bin_dir" >> "$GITHUB_PATH"
+              fi
               exit 0
             else
               echo "::warning::goose installed but \"goose --version\" failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next — output: $version_output"
