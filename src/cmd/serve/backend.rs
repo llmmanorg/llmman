@@ -65,10 +65,12 @@ pub(super) fn safetensors_engine_from_env() -> SafetensorsEngine {
 
 /// Which local engine backs a resolved `ModelPath::SafeTensors`
 /// directory when `LLMMAN_SAFETENSORS_ENGINE` is unset: `mlx_lm.server`
-/// (see `spawn_mlx_server`) when this host is Apple Silicon macOS
-/// (`crate::hostgpu::detect() == HostGpu::Metal`) *and* `mlx_lm.server`
-/// is actually on `PATH`; `vllm` in every other case, unchanged from
-/// before this engine existed.
+/// (see `spawn_mlx_server`) on Apple Silicon macOS, `vllm` elsewhere.
+/// The macOS check is explicit because `LLMMAN_LLM_LIBRARY=metal` makes
+/// `detect()` say Metal on any OS; keeping `detect()` lets `=cpu` opt a
+/// Mac out. `mlx_lm.server` need not be on `PATH`: it is installed on
+/// first use (`crate::mlx_release`). `LLMMAN_SAFETENSORS_ENGINE=vllm`
+/// forces `vllm` on a Mac.
 ///
 /// Plain `vllm` (no plugin) has no Metal backend of its own at all — its
 /// upstream-published macOS wheel is CPU-only. There *is* a way to make
@@ -81,14 +83,12 @@ pub(super) fn safetensors_engine_from_env() -> SafetensorsEngine {
 /// families than `mlx_lm.server` does directly, and pulls in vLLM's own
 /// full dependency footprint for a user who may not want any of the rest
 /// of it. `mlx_lm.server` here is a separate, no-vLLM-at-all option: a
-/// Mac with `mlx-lm` installed gets real Metal acceleration through it
-/// without needing vllm-metal (or vllm) at all; a Mac with neither still
-/// falls back to plain (CPU-only, absent vllm-metal) `vllm` instead of
-/// failing outright.
+/// Mac gets real Metal acceleration through it without needing
+/// vllm-metal (or vllm) at all.
 pub(super) fn use_mlx_for_safetensors() -> bool {
-    safetensors_engine_from_env() == SafetensorsEngine::Auto
+    cfg!(target_os = "macos")
+        && safetensors_engine_from_env() == SafetensorsEngine::Auto
         && crate::hostgpu::detect() == crate::hostgpu::HostGpu::Metal
-        && which_binary("mlx_lm.server").is_ok()
 }
 
 pub(super) fn find_free_port() -> anyhow::Result<u16> {
@@ -568,11 +568,12 @@ fn console_script_interpreter(script: &Path) -> Option<PathBuf> {
     (!interp.ends_with("/env") && interp.contains("python")).then(|| PathBuf::from(interp))
 }
 
-/// Spawns `mlx_lm.server` (installed on `PATH` by `pip install mlx-lm`
-/// <https://github.com/ml-explore/mlx-lm>) — Apple Silicon's own
-/// Metal-accelerated alternative to `vllm` for a
+/// Spawns `mlx_lm.server` (<https://github.com/ml-explore/mlx-lm>) —
+/// Apple Silicon's own Metal-accelerated alternative to `vllm` for a
 /// [`ModelPath::SafeTensors`] directory, picked instead of it by
-/// [`use_mlx_for_safetensors`].
+/// [`use_mlx_for_safetensors`]. The binary comes from
+/// `crate::mlx_release::ensure_mlx_server` (`PATH`, or llmman's own
+/// `uv`-installed copy, installed now on first use).
 ///
 /// Deliberately does *not* pass `mlx_lm.server`'s own `--model` flag,
 /// even though that's its documented way to preload one: confirmed
@@ -594,7 +595,15 @@ fn console_script_interpreter(script: &Path) -> Option<PathBuf> {
 /// own `try`/`except` in the request-handling path instead, and so does
 /// report a real error back to that request on a bad model directory.
 pub(super) async fn spawn_mlx_server(port: u16) -> anyhow::Result<tokio::process::Child> {
-    let mlx = which_binary("mlx_lm.server")?;
+    let mlx = tokio::task::spawn_blocking(crate::mlx_release::ensure_mlx_server)
+        .await
+        .context("ensure mlx_lm.server task panicked")?
+        .map_err(|e| {
+            anyhow!(
+                "{e:#} (put `mlx_lm.server` on PATH yourself, or set \
+                 {SAFETENSORS_ENGINE_VAR}=vllm to serve this model with vllm)"
+            )
+        })?;
     let mut cmd = tokio::process::Command::new(&mlx);
     cmd.args(["--port", &port.to_string(), "--host", "127.0.0.1"]);
     cmd.kill_on_drop(true)

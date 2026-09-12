@@ -1136,7 +1136,9 @@ const MLX_MODEL: &str = "mlx-community/SmolLM2-135M-Instruct-8bit";
 /// Skips itself (rather than failing) on anything other than Apple
 /// Silicon macOS, or when `mlx_lm.server` isn't on `PATH` — mirrors every
 /// other test in this file's own "prerequisite not installed, not an
-/// llmman bug" convention. CI (see `.github/workflows/ci.yml`'s e2e job)
+/// llmman bug" convention (the daemon would install `mlx-lm` itself —
+/// `crate::mlx_release` — but that download is not what this measures).
+/// CI (see `.github/workflows/ci.yml`'s e2e job)
 /// installs `mlx-lm` before this suite ever runs, on exactly the two
 /// macOS aarch64 matrix legs (`backend: docker` and `backend: podman`)
 /// this is meant to actually exercise — see that job's own comment on

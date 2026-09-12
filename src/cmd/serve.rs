@@ -110,7 +110,8 @@ Environment Variables:
       LLMMAN_METRICS                 Serve a Prometheus scrape endpoint at /metrics (default: off)
       LLMMAN_MODELS                  The path to the models directory
       LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only)
-      LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on Apple Silicon when installed, else vllm)
+      LLMMAN_MLX_LM_VERSION          Exact mlx-lm release to install on Apple Silicon (default: PyPI's current)
+      LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on Apple Silicon, installed on first use; else vllm)
       LLMMAN_VLLM_ARGS               Extra whitespace-separated arguments appended to every `vllm serve` (e.g. \"--dtype bfloat16 --tp 2\")
       LLMMAN_SGLANG_ARGS             Extra whitespace-separated arguments appended to every sglang launch (e.g. \"--disable-cuda-graph\")
       LLMMAN_NOHISTORY               Do not record prompts for `llmman log`
@@ -4508,7 +4509,8 @@ fn metrics_router(enabled: bool) -> Router<AppState> {
 /// Which image `--pull-only` warms up under a container runtime: the one
 /// `ensure_model` would run for `model` (read off its stored manifest),
 /// or llama-server's when no model is named — pulling both would cost a
-/// GGUF-only host the vLLM image's several GB for nothing.
+/// GGUF-only host the vLLM image's several GB for nothing. A `Vllm`
+/// answer under a local runtime on Apple Silicon means `mlx-lm`.
 fn pull_only_engine(model: Option<&str>) -> anyhow::Result<crate::container::ContainerEngine> {
     // Same guard as the pre-load below: a pair warms its local half, a
     // provider-routed reference has no local weights.
@@ -4521,7 +4523,7 @@ fn pull_only_engine(model: Option<&str>) -> anyhow::Result<crate::container::Con
     let model_ref = crate::shortnames::resolve_ollama_api(model)?;
     let store_path = default_store()?;
     let format = crate::modelpack::stored_format(&store_path, &model_ref).with_context(|| {
-        format!("--pull-only: pull {model_ref} first to learn which image it needs")
+        format!("--pull-only: pull {model_ref} first to learn which backend it needs")
     })?;
     Ok(match format {
         crate::modelpack::ModelFormat::SafeTensors
@@ -4539,7 +4541,12 @@ fn pull_only_engine(model: Option<&str>) -> anyhow::Result<crate::container::Con
 
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let requested = _args.runtime;
-    if requested == Runtime::Path && _args.pull_only {
+    // On Apple Silicon a safetensors MODEL is served by mlx_lm.server,
+    // installed on first use; `--pull-only` does that install too.
+    let pull_only_mlx = _args.pull_only
+        && use_mlx_for_safetensors()
+        && pull_only_engine(_args.model.as_deref())? == crate::container::ContainerEngine::Vllm;
+    if requested == Runtime::Path && _args.pull_only && !pull_only_mlx {
         anyhow::bail!("--pull-only: --runtime path runs the llama-server on PATH; nothing to pull");
     }
     let llama_cpp_version = runtime::llama_cpp_pin(_args.llama_cpp_version.as_deref());
@@ -4570,6 +4577,10 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             if let Some(version) = version {
                 crate::container::pull_image(ociman, engine, version)?;
             }
+        } else if pull_only_mlx {
+            tokio::task::spawn_blocking(crate::mlx_release::ensure_mlx_server)
+                .await
+                .context("ensure mlx_lm.server task panicked")??;
         }
         return Ok(());
     }
