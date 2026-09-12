@@ -15,8 +15,9 @@ running on your own machine, or at any hosted provider, in one command.
 llmman launch claude --model qwen3.8
 ```
 
-That starts a local inference server, downloads a `llama.cpp` build matching your
-GPU, loads the model, and execs an agent against it.
+That starts a local inference server, fetches the tested `llama.cpp` release for
+your GPU (as a container on Linux with Docker or Podman, otherwise a prebuilt
+binary), loads the model, and execs an agent against it.
 
 <p align="center">
   <img src="https://github.com/llmmanorg/llmman/releases/download/docs-assets/launch.gif" alt="llmman launch claude --model qwen3.8, answering from a local model" width="900">
@@ -42,7 +43,7 @@ landing in your local store.
   or a self-hosted mirror, then `llmman run` it from there. No curated
   library, no account with llmman, no gatekeeper.
 - **Vanilla everything.** Upstream `llama.cpp` releases (or the
-  `llama-server` already on your `PATH`), `vllm` and `mlx-lm` as-is, serving
+  `llama-server` already on your `PATH`), `vllm`, `sglang` and `mlx-lm` as-is, serving
   unmodified GGUF and safetensors files. No fork to wait on, no import step,
   no private blob format: the store is a standard OCI Image Layout that all
   can read.
@@ -58,7 +59,7 @@ landing in your local store.
 |---|---|---|
 | Model registry | Hugging Face directly, or any OCI registry (Docker Hub, GHCR, quay, Harbor, self-hosted) | ollama.com library, own registry protocol |
 | Model format on disk | Unmodified GGUF / safetensors in a standard OCI Image Layout | GGUF and safetensors imported via `Modelfile` into Ollama's blob layout |
-| Inference engine | Upstream `llama.cpp` release, or your own `llama-server`; `vllm`; `mlx-lm` | Bundled `llama.cpp`/ggml fork plus Ollama's own engine |
+| Inference engine | Upstream `llama.cpp` release, or your own `llama-server`; `vllm`; `sglang`; `mlx-lm` | Bundled `llama.cpp`/ggml fork plus Ollama's own engine |
 | Hosted models | Any provider via `--provider` | Ollama Cloud |
 | Registry-to-registry transfer | `llmman transfer hf.co/... docker.io/...` in one step, nothing added to your local store | Pull, write a `Modelfile`, `create`, push to ollama.com |
 | Signing and verification | cosign-format signatures; `verify` command and per-repo pull-time trust policy | None |
@@ -97,6 +98,12 @@ cargo binstall llmman   # prebuilt binary
 cargo install llmman    # build from source; needs Go 1.25+ (and LLVM on Windows) as well as Rust
 ```
 
+**Container** (llmman in the llama.cpp server image, see [docs/backends.md](docs/backends.md#in-a-container)):
+
+```sh
+docker run -p 127.0.0.1:17434:17434 -e LLMMAN_API_KEYS=<key> -v llmman:/root/.local/share/llmman --entrypoint llmman ai/llmman serve
+```
+
 ## Quick start
 
 Three commands cover most of it:
@@ -112,6 +119,26 @@ each is installed. Want a hosted model instead of a local one? Every command
 above takes `--provider`; see [Hosted providers](#hosted-providers). Want both
 at once, picked per request? See [Hybrid model pairs](#hybrid-model-pairs).
 
+### Generate images, video and audio
+
+A diffusion model repository works like any other: `run` pulls the transformer, its VAEs, the text
+projection and the text encoder it was trained with.
+
+```sh
+llmman run unsloth/LTX-2.3-GGUF "Draw a cat"                              # Image saved to: draw-a-cat-<timestamp>.png
+llmman run unsloth/LTX-2.3-GGUF --video --seconds 2 "waves on a beach"   # an mp4 with an audio track (needs ffmpeg)
+llmman run unsloth/LTX-2.3-GGUF --audio --seconds 3 "a cat purring"      # a 48 kHz stereo wav
+```
+
+Without a prompt it opens a `>>> ` loop where `/set width|height|steps|seed|cfg|negative|seconds|media`
+adjusts the settings. The same model answers `/v1/images/generations`, `/v1/videos` and
+`/v1/audio/speech` on `llmman serve`.
+
+Diffusion repositories published as Diffusers-layout safetensors (a root `model_index.json`)
+are instead served by [vLLM-Omni](https://github.com/vllm-project/vllm-omni) (`vllm serve
+--omni`; install `vllm-omni` next to `vllm`, or use `--runtime docker` for the `vllm/vllm-omni` image).
+See [docs/backends.md](docs/backends.md#vllm-omni-diffusers-pipelines).
+
 ## Commands
 
 | Command | Description |
@@ -122,6 +149,7 @@ at once, picked per request? See [Hybrid model pairs](#hybrid-model-pairs).
 | `pull`    | Pull a model from a registry or HuggingFace |
 | `list` (`ls`) | List locally stored models, or a hosted provider's (`--provider`) models |
 | `ps`      | List models currently loaded |
+| `log`     | Show the prompts `serve` has seen, newest first, like `git log` |
 | `providers` | List the hosted providers `--provider` can route to |
 | `stop`    | Stop (unload) a running model |
 | `build`   | Package model files into a local OCI image |
@@ -199,13 +227,19 @@ OLLAMA_HOST=127.0.0.1:17434 ollama run unsloth/Qwen3.5-0.8B-GGUF
 
 Models load on demand, each in its own backend process, and unload after
 five idle minutes (`keep_alive`, as in Ollama). GGUF is served by upstream
-[`llama.cpp`](https://github.com/ggml-org/llama.cpp), downloaded to match
-your GPU if no `llama-server` is on `PATH`; safetensors by
-[`vllm`](https://github.com/vllm-project/vllm), or by
+[`llama.cpp`](https://github.com/ggml-org/llama.cpp) at a pinned release —
+in a Docker/Podman container, as a downloaded prebuilt binary, or from
+`PATH`, whichever `--runtime` picks ([docs/backends.md](docs/backends.md#choosing-a-runtime));
+safetensors by
+[`vllm`](https://github.com/vllm-project/vllm), by
+[`sglang`](https://github.com/sgl-project/sglang) with
+`LLMMAN_SAFETENSORS_ENGINE=sglang`, or by
 [`mlx-lm`](https://github.com/ml-explore/mlx-lm) on Apple Silicon. Tool
 calling, vision, structured output, embeddings (GGUF) and the Responses
-API (what Codex speaks) all work; there is a web UI at `/` and an
-optional Prometheus `/metrics`.
+API (what Codex speaks) all work; there is a [web UI](docs/webui.md) at
+`/` (chat with any local or hosted model, generate images, video and
+audio with a diffusion model, and a terminal) and an optional Prometheus
+`/metrics`.
 
 The full endpoint list and per-API notes are in [docs/api.md](docs/api.md);
 backend selection in [docs/backends.md](docs/backends.md); bind address,
@@ -221,6 +255,7 @@ the most room to load it:
 
 ```
 llmman config set aggregation.peers asahi,spark
+llmman config set auth.api_keys <shared-key>
 LLMMAN_HOST=0.0.0.0 llmman serve
 ```
 
@@ -228,6 +263,11 @@ LLMMAN_HOST=0.0.0.0 llmman serve
 aggregation, and `llmman stop` reaches a model wherever it was loaded.
 Nothing is elected and nothing is shared: every node is a whole llmman
 that knows the others' addresses. See [docs/aggregation.md](docs/aggregation.md).
+
+A daemon the network can reach requires an API key on every request
+(`LLMMAN_API_KEYS`, or `auth.api_keys` as above; the CLI sends
+`LLMMAN_API_KEY`) unless `LLMMAN_AUTH=off`, and can terminate TLS itself
+with `LLMMAN_TLS_CERT`/`LLMMAN_TLS_KEY`. See [docs/api.md](docs/api.md#authentication).
 
 ## Launch an integration
 
@@ -294,8 +334,9 @@ so it works from any client on every inference endpoint. Details in
 |---|---|
 | [docs/api.md](docs/api.md) | Every HTTP endpoint, and per-API notes |
 | [docs/aggregation.md](docs/aggregation.md) | Pooling several machines into one endpoint |
-| [docs/backends.md](docs/backends.md) | llama.cpp, vLLM, MLX, containers, and building from source |
-| [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, environment variables, store layout |
+| [docs/backends.md](docs/backends.md) | llama.cpp, vLLM, SGLang, MLX, containers, and building from source |
+| [docs/compose.md](docs/compose.md) | Compose deployment behind a gateway, with persistent model storage |
+| [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, registry mirrors, environment variables, store layout |
 | [docs/providers.md](docs/providers.md) | Hosted providers, API keys, and which integrations can use them |
 | [docs/verification.md](docs/verification.md) | Signing models and pull-time trust policy |
 | [docs/metrics.md](docs/metrics.md) | The Prometheus `/metrics` families |

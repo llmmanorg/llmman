@@ -10,28 +10,37 @@
 //! serves.
 //!
 //! Only a *subset* is exposed as [`Provider`]s, because `llmman serve`
-//! reaches an upstream exactly one way: an HTTPS POST of an OpenAI Chat
-//! Completions body with `Authorization: Bearer <key>` (see
-//! `Target::Remote` in `cmd::serve`). An entry is offered only if llmman
-//! can be *sure* it speaks that:
+//! reaches an upstream exactly two ways, one per [`Wire`]: an HTTPS POST
+//! of an OpenAI Chat Completions body with `Authorization: Bearer <key>`,
+//! or an HTTPS POST of an Anthropic Messages body with `x-api-key: <key>`
+//! (see `Target::Remote` in `cmd::serve`). An entry is offered only if
+//! llmman can be *sure* it speaks one of those:
 //!
-//! * its `npm` driver is one of [`OPENAI_COMPATIBLE_NPM`], as opposed to
-//!   `@ai-sdk/anthropic` (Messages wire format),
-//!   `@ai-sdk/amazon-bedrock` (SigV4 signing), `@ai-sdk/google-vertex`
-//!   (GCP credentials), and the rest;
+//! * its `npm` driver is one of [`OPENAI_COMPATIBLE_NPM`], or it is a
+//!   [`BUILTIN_ENDPOINTS`] entry vetted by hand (the one way onto the
+//!   Anthropic wire, since `@ai-sdk/anthropic` names a body format, not
+//!   an auth scheme), as opposed to `@ai-sdk/amazon-bedrock` (SigV4
+//!   signing), `@ai-sdk/google-vertex` (GCP credentials), and the rest;
 //! * it has one concrete `https` base URL. models.dev leaves `api` unset
 //!   where the SDK hardcodes the endpoint — recovered from
 //!   [`BUILTIN_ENDPOINTS`] — and templated (`${VAR}`) where it is
 //!   per-account, which llmman has nothing to interpolate from;
 //! * exactly one of its `env` entries is an API key. Multi-variable auth
 //!   (`CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_KEY`, ...) is not "one
-//!   bearer token".
+//!   API key".
 //!
 //! Everything filtered out is deliberately *absent* rather than
 //! half-supported: a provider llmman offers is one it can actually reach.
+//!
+//! The one way past the filter is `llmman.conf`: a `[providers.<id>]`
+//! with a `base_url` defines a provider by hand and is merged into the
+//! catalog in [`catalog`]. The rules above vet a list fetched from the
+//! network; a URL the user wrote needs none, so a defined provider may be
+//! plain `http` and may take no key ([`Provider::key_optional`]).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -54,36 +63,63 @@ const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// fetch falls back to any cached copy, however stale.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The AI SDK driver packages that speak the OpenAI wire format — the
-/// only ones `Target::Remote`'s "POST an OpenAI body with a bearer token"
-/// can actually drive. See this module's own doc comment.
+/// The AI SDK driver packages that speak the OpenAI wire format, which
+/// [`Wire::OpenAi`] drives. See this module's own doc comment.
 const OPENAI_COMPATIBLE_NPM: &[&str] = &[
     "@ai-sdk/openai-compatible",
     "@ai-sdk/openai",
     "@openrouter/ai-sdk-provider",
 ];
 
+/// The wire format `llmman serve` speaks to a provider: the route, the
+/// credential header, and whether a request is translated on the way.
+///
+/// `Deserialize` for the `wire = "openai"` field of a provider defined in
+/// `llmman.conf` (see [`crate::config`]), spelled as [`Wire::as_str`]
+/// reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Wire {
+    /// OpenAI Chat Completions, `Authorization: Bearer <key>`.
+    OpenAi,
+    /// Anthropic Messages, `x-api-key: <key>` + `anthropic-version`.
+    Anthropic,
+}
+
+impl Wire {
+    /// The lowercase name the daemon's own API reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Wire::OpenAi => "openai",
+            Wire::Anthropic => "anthropic",
+        }
+    }
+}
+
 /// A provider whose endpoint models.dev leaves unset because its AI SDK
 /// package hardcodes it, plus the one `env` entry that is its API key.
 struct Builtin {
     /// models.dev provider id.
     id: &'static str,
-    /// Base URL that `/chat/completions` is appended to.
+    /// Base URL that the wire's route (`/chat/completions`, `/messages`)
+    /// is appended to.
     base_url: &'static str,
     /// The API-key variable, picked out of the provider's `env` list.
     key_env: &'static str,
+    /// What is spoken at `base_url`.
+    wire: Wire,
 }
 
 /// Endpoints for providers models.dev has no `api` for, restricted to
-/// ones with a published, stable OpenAI-compatible endpoint that was
-/// checked by hand to answer `POST /chat/completions` at the URL below.
+/// ones with a published, stable endpoint that was checked by hand to
+/// answer its wire's route at the URL below.
 ///
 /// Not a second registry: an entry here must still be present in the
 /// fetched catalog to be offered, and supplies only the one field
 /// models.dev omits. The rest (`amazon-bedrock`, `azure`,
 /// `google-vertex`, `watsonx`, ...) are left out because their auth is
-/// not a bearer token, their endpoint is per-account, or their wire
-/// format is not OpenAI's. `v0` is left out for a third reason: nothing
+/// not an API key, their endpoint is per-account, or their wire format
+/// is neither of [`Wire`]'s. `v0` is left out for a third reason: nothing
 /// answers at its documented `https://api.v0.dev/v1`, so llmman has no
 /// endpoint it can vouch for.
 const BUILTIN_ENDPOINTS: &[Builtin] = &[
@@ -91,14 +127,15 @@ const BUILTIN_ENDPOINTS: &[Builtin] = &[
         id: "openai",
         base_url: "https://api.openai.com/v1",
         key_env: "OPENAI_API_KEY",
+        wire: Wire::OpenAi,
     },
-    // Anthropic publishes an OpenAI-compatible surface on its normal API
-    // host, keyed by the same ANTHROPIC_API_KEY as a bearer token, so it
-    // is reachable without llmman speaking the Messages wire format.
+    // Its own Messages API, never the OpenAI-compatibility shim, which
+    // has no thinking, cache control or beta headers.
     Builtin {
         id: "anthropic",
         base_url: "https://api.anthropic.com/v1",
         key_env: "ANTHROPIC_API_KEY",
+        wire: Wire::Anthropic,
     },
     // Gemini's OpenAI-compatibility endpoint, not the native
     // generateContent one. GEMINI_API_KEY of the three variables
@@ -107,57 +144,68 @@ const BUILTIN_ENDPOINTS: &[Builtin] = &[
         id: "google",
         base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         key_env: "GEMINI_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "groq",
         base_url: "https://api.groq.com/openai/v1",
         key_env: "GROQ_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "mistral",
         base_url: "https://api.mistral.ai/v1",
         key_env: "MISTRAL_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "xai",
         base_url: "https://api.x.ai/v1",
         key_env: "XAI_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "cerebras",
         base_url: "https://api.cerebras.ai/v1",
         key_env: "CEREBRAS_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "togetherai",
         base_url: "https://api.together.xyz/v1",
         key_env: "TOGETHER_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "deepinfra",
         base_url: "https://api.deepinfra.com/v1/openai",
         key_env: "DEEPINFRA_API_KEY",
+        wire: Wire::OpenAi,
     },
     // No `/v1`: Perplexity serves /chat/completions off the bare host.
     Builtin {
         id: "perplexity",
         base_url: "https://api.perplexity.ai",
         key_env: "PERPLEXITY_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "cohere",
         base_url: "https://api.cohere.ai/compatibility/v1",
         key_env: "COHERE_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "venice",
         base_url: "https://api.venice.ai/api/v1",
         key_env: "VENICE_API_KEY",
+        wire: Wire::OpenAi,
     },
     Builtin {
         id: "vercel",
         base_url: "https://ai-gateway.vercel.sh/v1",
         key_env: "AI_GATEWAY_API_KEY",
+        wire: Wire::OpenAi,
     },
 ];
 
@@ -226,14 +274,22 @@ pub struct Provider {
     pub id: String,
     /// Human-readable name, for listings and error messages.
     pub name: String,
-    /// OpenAI-compatible base URL that a route (`/chat/completions`, ...)
-    /// is appended to. Never has a trailing slash.
+    /// Base URL that the wire's route (`/chat/completions`, `/messages`,
+    /// ...) is appended to. Never has a trailing slash.
     pub base_url: String,
-    /// Environment variable holding this provider's API key.
-    pub key_env: String,
+    /// Environment variable holding this provider's API key. Always set
+    /// for a catalog provider; a configured one may name none.
+    pub key_env: Option<String>,
+    /// What is spoken at `base_url`.
+    pub wire: Wire,
+    /// Whether a request may go upstream with no credential. True only
+    /// for a provider `llmman.conf` defines; for a catalog one a keyless
+    /// request is a certain 401, better reported before the handoff.
+    pub key_optional: bool,
     /// Models this provider serves, sorted by id. Used to validate
     /// `--model`, to suggest values, and to answer `llmman list
-    /// --provider`; the id is never sent upstream verbatim.
+    /// --provider`; the id is never sent upstream verbatim. Empty for a
+    /// configured provider, whose endpoint is asked instead.
     pub models: Vec<Model>,
 }
 
@@ -245,6 +301,9 @@ pub struct Model {
     /// `None` where models.dev publishes no price, which is not the same
     /// as free and must not be rendered as one.
     pub cost: Option<Cost>,
+    /// models.dev's `limit.output`, the default `max_tokens` for a wire
+    /// that requires one. `None` where the catalog has none.
+    pub max_output: Option<u32>,
 }
 
 /// US dollars per million tokens — models.dev's own unit, unconverted so
@@ -259,13 +318,27 @@ impl Provider {
     /// This provider's API key, or `None` when neither the environment
     /// nor `llmman.conf` has one. See [`key_for`].
     pub fn api_key(&self) -> Option<String> {
-        key_for(&self.id, &self.key_env)
+        key_for(&self.id, self.key_env.as_deref())
     }
 
     /// Appends an OpenAI route to this provider's base URL. See
     /// [`rebase_url`].
     pub fn url(&self, route: &str) -> String {
         rebase_url(&self.base_url, route)
+    }
+
+    /// A provider as `llmman.conf` defines it. No models: `cmd::serve`
+    /// asks the endpoint when a caller wants the list.
+    pub fn from_configured(conf: &crate::config::ConfiguredProvider) -> Self {
+        Self {
+            id: conf.id.clone(),
+            name: conf.name.clone(),
+            base_url: conf.base_url.clone(),
+            key_env: conf.key_env.clone(),
+            wire: conf.wire,
+            key_optional: true,
+            models: Vec::new(),
+        }
     }
 }
 
@@ -280,8 +353,11 @@ impl Provider {
 ///
 /// Free-standing because a `/llmman/providers` client learns only the id
 /// and the variable's *name* from the daemon, never a [`Provider`].
-pub fn key_for(id: &str, var: &str) -> Option<String> {
-    resolve_key(key_from_env(var), crate::config::provider_api_key(id))
+pub fn key_for(id: &str, var: Option<&str>) -> Option<String> {
+    resolve_key(
+        var.and_then(key_from_env),
+        crate::config::provider_api_key(id),
+    )
 }
 
 /// Split out so the precedence is testable without touching the process
@@ -305,12 +381,19 @@ fn key_from_env(var: &str) -> Option<String> {
 /// Both places llmman looks, named, for an error that fires because it
 /// found neither. One string so every such message agrees: a user told
 /// only about the variable would never learn the file exists.
-pub fn key_hint(id: &str, var: &str) -> String {
-    format!(
-        "set {var} in the environment, or add a [providers.{}] api_key to {}",
-        toml_key(id),
-        crate::config::user_path_display()
-    )
+pub fn key_hint(id: &str, var: Option<&str>) -> String {
+    match var {
+        Some(var) => format!(
+            "set {var} in the environment, or add a [providers.{}] api_key to {}",
+            toml_key(id),
+            crate::config::user_path_display()
+        ),
+        None => format!(
+            "add an api_key to [providers.{}] in {}",
+            toml_key(id),
+            crate::config::user_path_display()
+        ),
+    }
 }
 
 /// `id` as a TOML key, quoted when it is not a bare one.
@@ -514,6 +597,39 @@ impl Catalog {
         );
         Ok(Self { providers })
     }
+
+    /// The providers `llmman.conf` defines and nothing else (see [`catalog`]).
+    pub fn from_configured(configured: &[crate::config::ConfiguredProvider]) -> Self {
+        Self::default().with_configured(configured)
+    }
+
+    /// Adds the providers `llmman.conf` defines. One with a catalog id
+    /// shadows the catalog entry — the way to put a proxy in front of
+    /// `api.openai.com`. A plain-http `base_url` with a key behind it is
+    /// warned about once per load, not refused: the URL is the user's own.
+    pub fn with_configured(mut self, configured: &[crate::config::ConfiguredProvider]) -> Self {
+        for conf in configured {
+            let provider = Provider::from_configured(conf);
+            if provider.base_url.starts_with("http://") && provider.api_key().is_some() {
+                eprintln!(
+                    "[llmman] warning: provider {} has an API key and a plain-http base_url \
+                     ({}); the key will cross the network in cleartext",
+                    provider.id, provider.base_url
+                );
+            }
+            if self
+                .providers
+                .insert(provider.id.clone(), provider)
+                .is_some()
+            {
+                crate::debug_log!(
+                    "provider catalog: {} from llmman.conf shadows the models.dev entry",
+                    conf.id
+                );
+            }
+        }
+        self
+    }
 }
 
 /// A models.dev catalog entry, narrowed to the fields llmman reads —
@@ -534,7 +650,7 @@ struct RawProvider {
 }
 
 /// A models.dev model entry — the id is the map key, so only the price
-/// is read out of the value.
+/// and the output ceiling are read out of the value.
 #[derive(Debug, Deserialize)]
 struct RawModel {
     /// Untyped on purpose: a typed `{input, output}` would let an
@@ -542,6 +658,16 @@ struct RawModel {
     /// and a listing column is not worth `--provider x` breaking over.
     #[serde(default)]
     cost: Option<serde_json::Value>,
+    /// Untyped for the same reason; only `output` is read.
+    #[serde(default)]
+    limit: Option<serde_json::Value>,
+}
+
+/// A models.dev `limit.output` as a token count, or `None` unless it is
+/// a positive whole number that fits.
+fn max_output_of(raw: &serde_json::Value) -> Option<u32> {
+    let n = raw.get("output")?.as_u64()?;
+    u32::try_from(n).ok().filter(|&n| n > 0)
 }
 
 /// A models.dev `cost` object as a [`Cost`], or `None` unless *both*
@@ -596,18 +722,16 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
     };
 
     // `npm` is the wire-format signal. A builtin has already been vetted
-    // by hand, so it stands in for a driver package this doesn't know:
-    // `anthropic`'s entry names `@ai-sdk/anthropic` even though the
-    // endpoint used here is its OpenAI-compatible one.
-    let openai_compatible = raw
-        .npm
-        .as_deref()
-        .is_some_and(|npm| OPENAI_COMPATIBLE_NPM.contains(&npm));
-    if !openai_compatible && builtin.is_none() {
-        return None;
-    }
+    // by hand, so its own `wire` stands in for a driver package this
+    // doesn't know (`google`'s entry names `@ai-sdk/google` even though
+    // the endpoint used here is its OpenAI-compatible one).
+    let wire = match (builtin, raw.npm.as_deref()) {
+        (Some(b), _) => b.wire,
+        (None, Some(npm)) if OPENAI_COMPATIBLE_NPM.contains(&npm) => Wire::OpenAi,
+        _ => return None,
+    };
 
-    // One bearer token, and llmman must know which variable holds it. A
+    // One API key, and llmman must know which variable holds it. A
     // builtin names it explicitly (`google` lists three aliases); for
     // everything else a single-entry `env` is the only unambiguous case.
     let key_env = match builtin {
@@ -622,7 +746,9 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
         id: id.to_string(),
         name: raw.name,
         base_url: base_url_of(base_url),
-        key_env,
+        key_env: Some(key_env),
+        wire,
+        key_optional: false,
         // Sorted by id, since `models` came out of a BTreeMap.
         models: raw
             .models
@@ -630,6 +756,7 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
             .map(|(id, model)| Model {
                 id,
                 cost: model.cost.as_ref().and_then(cost_of),
+                max_output: model.limit.as_ref().and_then(max_output_of),
             })
             .collect(),
     })
@@ -638,14 +765,15 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
 /// Normalizes a models.dev `api` into a base URL that a route can be
 /// appended to.
 ///
-/// Some entries give the full chat route rather than the base it hangs
-/// off (`bailing` is `.../v1/chat/completions` today). Appending to that
+/// Some entries give the full route rather than the base it hangs off
+/// (`bailing` is `.../v1/chat/completions` today). Appending to that
 /// yields `.../chat/completions/chat/completions`, which fails as a
 /// confusing 404 from the provider rather than anything llmman reports.
 /// Trailing slashes go for the same reason — `url` adds its own.
 fn base_url_of(api: &str) -> String {
     let api = api.trim_end_matches('/');
     api.strip_suffix("/chat/completions")
+        .or_else(|| api.strip_suffix("/messages"))
         .unwrap_or(api)
         .trim_end_matches('/')
         .to_string()
@@ -667,37 +795,85 @@ const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 type Cached = (Instant, Duration, Result<Arc<Catalog>, String>);
 static CATALOG: Mutex<Option<Cached>> = Mutex::new(None);
 
-/// The routable provider catalog, fetched from models.dev on first use.
+/// Whether a background refresh (see [`catalog`]) is in flight.
+static REFRESHING: AtomicBool = AtomicBool::new(false);
+
+/// The routable provider catalog, fetched from models.dev on first use,
+/// with the providers `llmman.conf` defines merged on top
+/// ([`Catalog::with_configured`]).
 ///
 /// Memoized, but not for the life of the process: `llmman serve` runs for
 /// days, so a success is re-checked after [`CACHE_TTL`] and a failure
-/// after [`RETRY_COOLDOWN`] — otherwise one blip at startup would leave a
-/// daemon with no providers until someone restarted it.
-///
-/// The lock is held across the fetch, so concurrent callers wait for one
-/// load rather than racing several. Blocking: callers on an async runtime
-/// (`cmd::serve`) must go through `spawn_blocking`.
+/// after [`RETRY_COOLDOWN`]. An expired *success* is served as-is while
+/// a background thread refreshes it, so a request never waits on
+/// models.dev once there is anything to serve — in particular on an
+/// offline machine, where the configured providers stand alone and the
+/// retry would otherwise block a request for [`FETCH_TIMEOUT`] every
+/// cooldown. Only the first load, or one after a total failure, runs
+/// inline; the lock is held across it so concurrent callers wait for one
+/// load rather than racing several. Blocking: callers on an async
+/// runtime (`cmd::serve`) must go through `spawn_blocking`.
 pub fn catalog() -> anyhow::Result<Arc<Catalog>> {
     let mut cached = CATALOG.lock().unwrap_or_else(|e| e.into_inner());
-    let live = cached
-        .as_ref()
-        .is_some_and(|(at, good_for, _)| at.elapsed() < *good_for);
-    if !live {
-        // A stale catalog is held only as long as a failure: what
-        // produced it was a failed refresh, whatever it managed to
-        // return. See Loaded.
-        *cached = Some(match load() {
-            Ok(loaded) => (
-                Instant::now(),
-                loaded.good_for(),
-                Ok(Arc::new(loaded.into_catalog())),
-            ),
-            Err(e) => (Instant::now(), RETRY_COOLDOWN, Err(format!("{e:#}"))),
-        });
+    match cached.as_ref() {
+        Some((at, good_for, result)) if at.elapsed() < *good_for => result_of(result),
+        Some((_, _, Ok(stale))) => {
+            let stale = stale.clone();
+            if !REFRESHING.swap(true, Ordering::AcqRel) {
+                std::thread::spawn(|| {
+                    // Cleared on the way out however the load ends.
+                    struct Done;
+                    impl Drop for Done {
+                        fn drop(&mut self) {
+                            REFRESHING.store(false, Ordering::Release);
+                        }
+                    }
+                    let _done = Done;
+                    let entry = load_entry();
+                    *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(entry);
+                });
+            }
+            Ok(stale)
+        }
+        _ => {
+            let entry = load_entry();
+            let result = result_of(&entry.2);
+            *cached = Some(entry);
+            result
+        }
     }
-    match &cached.as_ref().expect("just populated").2 {
-        Ok(catalog) => Ok(catalog.clone()),
-        Err(e) => Err(anyhow::anyhow!(e.clone())),
+}
+
+fn result_of(result: &Result<Arc<Catalog>, String>) -> anyhow::Result<Arc<Catalog>> {
+    result.clone().map_err(anyhow::Error::msg)
+}
+
+/// One load, as [`catalog`] caches it. A failed load still yields a
+/// catalog when `llmman.conf` defines providers: a machine with no route
+/// out and a vLLM on the LAN is exactly where those are wanted. A stale
+/// or configured-only result is held only for [`RETRY_COOLDOWN`], since
+/// what produced it was a failed refresh.
+fn load_entry() -> Cached {
+    let configured = crate::config::configured_providers();
+    let now = Instant::now();
+    match load() {
+        Ok(loaded) => (
+            now,
+            loaded.good_for(),
+            Ok(Arc::new(loaded.into_catalog().with_configured(configured))),
+        ),
+        Err(e) if !configured.is_empty() => {
+            eprintln!(
+                "[llmman] using only the {} provider(s) defined in llmman.conf ({e:#})",
+                configured.len()
+            );
+            (
+                now,
+                RETRY_COOLDOWN,
+                Ok(Arc::new(Catalog::from_configured(configured))),
+            )
+        }
+        Err(e) => (now, RETRY_COOLDOWN, Err(format!("{e:#}"))),
     }
 }
 
@@ -909,7 +1085,7 @@ mod tests {
                     "npm": "@openrouter/ai-sdk-provider",
                     "env": ["OPENROUTER_API_KEY"],
                     "models": {
-                        "z-model": { "cost": { "input": 2.5, "output": 10 } },
+                        "z-model": { "cost": { "input": 2.5, "output": 10 }, "limit": { "context": 200000, "output": 32000 } },
                         "a-model": {}
                     }
                 }
@@ -918,30 +1094,32 @@ mod tests {
         let p = catalog.get("openrouter").expect("openrouter is routable");
         assert_eq!(p.name, "OpenRouter");
         assert_eq!(p.base_url, "https://openrouter.ai/api/v1");
-        assert_eq!(p.key_env, "OPENROUTER_API_KEY");
+        assert_eq!(p.key_env.as_deref(), Some("OPENROUTER_API_KEY"));
+        assert_eq!(p.wire, Wire::OpenAi);
         // Sorted by id; an unpriced model keeps `None`, not a zero.
         assert_eq!(
             p.models,
             vec![
                 Model {
                     id: "a-model".into(),
-                    cost: None
+                    cost: None,
+                    max_output: None,
                 },
                 Model {
                     id: "z-model".into(),
                     cost: Some(Cost {
                         input: 2.5,
                         output: 10.0
-                    })
+                    }),
+                    max_output: Some(32000),
                 },
             ]
         );
     }
 
     /// models.dev leaves `api` unset for providers whose SDK hardcodes
-    /// the endpoint; those are recovered from `BUILTIN_ENDPOINTS`,
-    /// including `anthropic`, whose `npm` is not OpenAI-compatible but
-    /// whose builtin endpoint is.
+    /// the endpoint; those are recovered from `BUILTIN_ENDPOINTS`, each
+    /// with the wire format its builtin was vetted for.
     #[test]
     fn builtins_supply_endpoints_the_catalog_omits() {
         let catalog = catalog_from(
@@ -961,12 +1139,25 @@ mod tests {
         );
         let anthropic = catalog.get("anthropic").expect("anthropic is routable");
         assert_eq!(anthropic.base_url, "https://api.anthropic.com/v1");
-        assert_eq!(anthropic.key_env, "ANTHROPIC_API_KEY");
+        assert_eq!(anthropic.key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        // Its own Messages API, never the OpenAI-compatibility shim.
+        assert_eq!(anthropic.wire, Wire::Anthropic);
 
         // Three candidate variables in the catalog, one unambiguous
         // choice from the builtin.
         let google = catalog.get("google").expect("google is routable");
-        assert_eq!(google.key_env, "GEMINI_API_KEY");
+        assert_eq!(google.key_env.as_deref(), Some("GEMINI_API_KEY"));
+        assert_eq!(google.wire, Wire::OpenAi);
+    }
+
+    /// A full `/messages` route is trimmed to its base like
+    /// `/chat/completions` is.
+    #[test]
+    fn a_messages_route_is_trimmed_to_its_base() {
+        assert_eq!(
+            base_url_of("https://api.anthropic.com/v1/messages/"),
+            "https://api.anthropic.com/v1"
+        );
     }
 
     /// A concrete `api` tracks a provider moving hosts, so it wins over
@@ -988,8 +1179,8 @@ mod tests {
         assert_eq!(p.base_url, "https://api.openai.example/v2");
     }
 
-    /// Everything llmman cannot reach with a bearer-token OpenAI POST
-    /// must be absent rather than half-supported.
+    /// Everything llmman cannot reach with an API-key POST in one of its
+    /// two wire formats must be absent rather than half-supported.
     #[test]
     fn unreachable_providers_are_dropped() {
         let catalog = catalog_from(
@@ -1034,7 +1225,8 @@ mod tests {
                 }
             }"#,
         );
-        // Anthropic wire format, not OpenAI's.
+        // The Messages body format, but no vetted auth scheme: only the
+        // `anthropic` builtin rides that wire.
         assert!(catalog.get("minimax").is_none());
         // SigV4 signing, and no endpoint at all.
         assert!(catalog.get("amazon-bedrock").is_none());
@@ -1106,7 +1298,11 @@ mod tests {
             );
             assert!(!p.base_url.ends_with('/'), "{}: {}", p.id, p.base_url);
             assert!(!p.base_url.contains("${"), "{}: {}", p.id, p.base_url);
-            assert!(!p.key_env.is_empty(), "{} has no key variable", p.id);
+            assert!(
+                p.key_env.as_deref().is_some_and(|v| !v.is_empty()),
+                "{} has no key variable",
+                p.id
+            );
         }
 
         // The providers someone actually reaches for, at the endpoints
@@ -1303,7 +1499,9 @@ mod tests {
             id: "groq".into(),
             name: "Groq".into(),
             base_url: "https://api.groq.com/openai/v1".into(),
-            key_env: "GROQ_API_KEY".into(),
+            key_env: Some("GROQ_API_KEY".into()),
+            key_optional: false,
+            wire: Wire::OpenAi,
             models: vec![],
         };
         assert_eq!(
@@ -1341,7 +1539,9 @@ mod tests {
             id: "test".into(),
             name: "Test".into(),
             base_url: "https://example.invalid/v1".into(),
-            key_env: "LLMMAN_TEST_PROVIDER_KEY_UNSET".into(),
+            key_env: Some("LLMMAN_TEST_PROVIDER_KEY_UNSET".into()),
+            key_optional: false,
+            wire: Wire::OpenAi,
             models: vec![],
         };
         assert_eq!(p.api_key(), None);
@@ -1380,10 +1580,145 @@ mod tests {
     /// Both places, in one message.
     #[test]
     fn key_hint_names_the_variable_and_the_config_file() {
-        let hint = key_hint("openrouter", "OPENROUTER_API_KEY");
+        let hint = key_hint("openrouter", Some("OPENROUTER_API_KEY"));
         assert!(hint.contains("OPENROUTER_API_KEY"), "{hint}");
         assert!(hint.contains("[providers.openrouter]"), "{hint}");
         assert!(hint.contains("llmman.conf"), "{hint}");
+
+        // No variable to name: the file alone, and no dangling "or".
+        let hint = key_hint("gpubox", None);
+        assert!(hint.contains("[providers.gpubox]"), "{hint}");
+        assert!(hint.contains("llmman.conf"), "{hint}");
+        assert!(!hint.contains("environment"), "{hint}");
+    }
+
+    fn configured(id: &str, base_url: &str, wire: Wire) -> crate::config::ConfiguredProvider {
+        crate::config::ConfiguredProvider {
+            id: id.into(),
+            name: id.into(),
+            base_url: base_url.into(),
+            wire,
+            key_env: None,
+        }
+    }
+
+    /// A provider `llmman.conf` defines joins the catalog as a full
+    /// [`Provider`]: no models, no key demanded, plain `http` allowed —
+    /// none of which a catalog entry could get away with.
+    #[test]
+    fn configured_providers_join_the_catalog_with_key_optional() {
+        let catalog = catalog_from(
+            r#"{
+                "openrouter": {
+                    "id": "openrouter", "name": "OpenRouter",
+                    "api": "https://openrouter.ai/api/v1",
+                    "npm": "@openrouter/ai-sdk-provider",
+                    "env": ["OPENROUTER_API_KEY"],
+                    "models": { "m": {} }
+                }
+            }"#,
+        )
+        .with_configured(&[
+            configured("gpubox", "http://gpubox:8000/v1", Wire::OpenAi),
+            crate::config::ConfiguredProvider {
+                id: "relay".into(),
+                name: "Claude relay".into(),
+                base_url: "https://relay.example/v1".into(),
+                wire: Wire::Anthropic,
+                key_env: Some("RELAY_KEY".into()),
+            },
+        ]);
+
+        assert_eq!(catalog.len(), 3);
+        assert_eq!(
+            catalog.ids().collect::<Vec<_>>(),
+            ["gpubox", "openrouter", "relay"]
+        );
+
+        let gpubox = catalog.get("gpubox").unwrap();
+        assert_eq!(gpubox.base_url, "http://gpubox:8000/v1");
+        assert_eq!(gpubox.wire, Wire::OpenAi);
+        assert!(gpubox.key_optional);
+        assert_eq!(gpubox.key_env, None);
+        assert!(gpubox.models.is_empty());
+        assert_eq!(gpubox.api_key(), None);
+        assert_eq!(
+            gpubox.url("/v1/chat/completions"),
+            "http://gpubox:8000/v1/chat/completions"
+        );
+
+        let relay = catalog.get("relay").unwrap();
+        assert_eq!(relay.name, "Claude relay");
+        assert_eq!(relay.wire, Wire::Anthropic);
+        assert_eq!(relay.key_env.as_deref(), Some("RELAY_KEY"));
+        assert!(relay.key_optional);
+
+        // The catalog entry is as it was.
+        let openrouter = catalog.get("openrouter").unwrap();
+        assert!(!openrouter.key_optional);
+        assert_eq!(openrouter.models.len(), 1);
+    }
+
+    /// The file is the user's deliberate word, so it wins over the
+    /// catalog for the same id — the one way to point `openai` at a
+    /// proxy without renaming every integration's model.
+    #[test]
+    fn a_configured_provider_shadows_the_catalog_entry_with_its_id() {
+        let catalog = catalog_from(
+            r#"{
+                "openai": {
+                    "id": "openai", "name": "OpenAI",
+                    "npm": "@ai-sdk/openai", "env": ["OPENAI_API_KEY"],
+                    "models": { "gpt-5": {} }
+                }
+            }"#,
+        )
+        .with_configured(&[configured(
+            "openai",
+            "http://proxy.corp:4000/v1",
+            Wire::OpenAi,
+        )]);
+        assert_eq!(catalog.len(), 1);
+        let p = catalog.get("openai").unwrap();
+        assert_eq!(p.base_url, "http://proxy.corp:4000/v1");
+        assert!(p.key_optional);
+        assert!(
+            p.models.is_empty(),
+            "the catalog's models are not the proxy's"
+        );
+    }
+
+    /// With no models.dev at all — offline, or a first run with no cache
+    /// — the configured providers are still a catalog. That is the case
+    /// they exist for.
+    #[test]
+    fn configured_providers_stand_alone_without_the_catalog() {
+        let catalog = Catalog::from_configured(&[configured(
+            "gpubox",
+            "http://gpubox:8000/v1",
+            Wire::OpenAi,
+        )]);
+        assert_eq!(catalog.len(), 1);
+        assert!(catalog.get("gpubox").is_some());
+        assert!(Catalog::from_configured(&[]).is_empty());
+    }
+
+    /// `wire = "openai"` in the file is the same spelling the daemon's
+    /// API reports; anything else is a parse error, not a default.
+    #[test]
+    fn wire_deserializes_from_its_reported_name() {
+        #[derive(Deserialize)]
+        struct W {
+            wire: Wire,
+        }
+        let parse = |s: &str| toml::from_str::<W>(&format!("wire = {s:?}")).map(|w| w.wire);
+        assert_eq!(parse("openai").unwrap(), Wire::OpenAi);
+        assert_eq!(parse("anthropic").unwrap(), Wire::Anthropic);
+        assert!(parse("OpenAI").is_err());
+        assert!(parse("ollama").is_err());
+        for wire in [Wire::OpenAi, Wire::Anthropic] {
+            assert_eq!(parse(wire.as_str()).unwrap(), wire);
+        }
     }
 
     /// models.dev ships `wafer.ai`, and `[providers.wafer.ai]` is two
@@ -1392,9 +1727,9 @@ mod tests {
     #[test]
     fn key_hint_quotes_a_provider_id_that_is_not_a_bare_toml_key() {
         assert!(
-            key_hint("wafer.ai", "WAFER_API_KEY").contains(r#"[providers."wafer.ai"]"#),
+            key_hint("wafer.ai", Some("WAFER_API_KEY")).contains(r#"[providers."wafer.ai"]"#),
             "{}",
-            key_hint("wafer.ai", "WAFER_API_KEY")
+            key_hint("wafer.ai", Some("WAFER_API_KEY"))
         );
         assert_eq!(toml_key("openrouter"), "openrouter");
         assert_eq!(toml_key("z-ai"), "z-ai");

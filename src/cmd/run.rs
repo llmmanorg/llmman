@@ -70,7 +70,7 @@ pub struct RunArgs {
     #[arg(long, value_name = "MODEL")]
     pub overflow_model: Option<String>,
     /// Forwarded as Ollama's own top-level `think` field on every request
-    /// this sends (see cmd::serve's think_to_chat_template_kwargs) —
+    /// this sends (see cmd::serve::types's think_to_chat_template_kwargs) —
     /// `--think false` disables a reasoning model's thinking block
     /// entirely, `--think true` forces it on. Omitted (leaving the
     /// model's own template default in effect) if not passed at all.
@@ -92,6 +92,74 @@ pub struct RunArgs {
     /// terminal-width word wrap in `wrap_write` below.
     #[arg(long)]
     pub nowordwrap: bool,
+    /// Image generation models only (see `crate::imagegen`): output
+    /// width in pixels. Hidden, like ollama's own image flags.
+    #[arg(long, hide = true, default_value_t = 0)]
+    pub width: u32,
+    /// Image generation models only: output height in pixels.
+    #[arg(long, hide = true, default_value_t = 0)]
+    pub height: u32,
+    /// Image generation models only: denoising steps (0 = model default).
+    #[arg(long, hide = true, default_value_t = 0)]
+    pub steps: u32,
+    /// Image generation models only: random seed.
+    #[arg(long, hide = true)]
+    pub seed: Option<u32>,
+    /// Image generation models only: guidance scale (>1 enables --negative).
+    #[arg(long, hide = true, default_value_t = 0.0)]
+    pub cfg_scale: f32,
+    /// Image generation models only: negative prompt.
+    #[arg(long, hide = true, default_value = "")]
+    pub negative: String,
+    /// Media generation models only: generate a video (mp4) instead of
+    /// an image.
+    #[arg(long, hide = true, conflicts_with = "audio")]
+    pub video: bool,
+    /// Media generation models only: generate audio (wav) instead of an
+    /// image.
+    #[arg(long, hide = true)]
+    pub audio: bool,
+    /// Media generation models only: length of a --video / --audio clip.
+    #[arg(long, hide = true, default_value_t = 0.0)]
+    pub seconds: f32,
+    /// Media generation models only: conditioning image (PNG/JPEG) for
+    /// image-to-video, or an action run's first frame.
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub image: Option<std::path::PathBuf>,
+    /// Media generation models only: the conditioning video of a
+    /// video-to-video or action run.
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub input_video: Option<std::path::PathBuf>,
+    /// Video-to-video: latent frames kept from --input-video (default 0,1).
+    #[arg(long, hide = true, value_name = "IDX,IDX", default_value = "")]
+    pub condition_frames: String,
+    /// Video-to-video: take the conditioning frames from the end of the clip.
+    #[arg(long, hide = true)]
+    pub condition_keep_last: bool,
+    /// Cosmos3 action run: forward_dynamics, inverse_dynamics or policy.
+    #[arg(long, hide = true, value_name = "MODE")]
+    pub action_mode: Option<String>,
+    /// Cosmos3 action run: embodiment domain (bridge_orig_lerobot, av, ...).
+    #[arg(long, hide = true, default_value = "")]
+    pub action_domain: String,
+    /// Cosmos3 action run: JSON file with the [T][D] actions (forward dynamics).
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub actions: Option<std::path::PathBuf>,
+    /// Cosmos3 action run: action transitions in the chunk.
+    #[arg(long, hide = true, default_value_t = 0)]
+    pub action_chunk: u32,
+    /// Cosmos3 action run: conditioning canvas tier (256, 480, 704, 720).
+    #[arg(long, hide = true, default_value_t = 480)]
+    pub action_tier: u32,
+    /// Cosmos3 action run: camera viewpoint (ego_view, third_person_view, ...).
+    #[arg(long, hide = true, default_value = "ego_view")]
+    pub action_view: String,
+    /// Media generation models only: frames per second of the clip.
+    #[arg(long, hide = true, default_value_t = 0.0)]
+    pub fps: f32,
+    /// Cosmos3: scheduler flow shift (the reference action runs use 10).
+    #[arg(long, hide = true)]
+    pub flow_shift: Option<f32>,
     #[arg(
         value_name = "PROMPT",
         trailing_var_arg = true,
@@ -188,6 +256,47 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
             // well after the `> ` prompt had already been shown and read
             // from. The same Show also answers ollama's `opts.MultiModal`.
             let info = crate::daemon::ensure_model_pulled(&model)?;
+            // An image generation model has no chat at all: every prompt
+            // is a picture (ollama's `CapabilityImage` branch of
+            // RunHandler, before it dropped image generation).
+            if info.image() {
+                let interactive =
+                    prompt.is_empty() && io::stdin().is_terminal() && io::stdout().is_terminal();
+                let opts = crate::imagegen::ImageOptions {
+                    media: if args.video {
+                        crate::imagegen::Media::Video
+                    } else if args.audio {
+                        crate::imagegen::Media::Audio
+                    } else {
+                        crate::imagegen::Media::Image
+                    },
+                    width: args.width,
+                    height: args.height,
+                    steps: args.steps,
+                    seed: args.seed,
+                    cfg_scale: args.cfg_scale,
+                    negative: args.negative.clone(),
+                    seconds: args.seconds,
+                    fps: args.fps,
+                    flow_shift: args.flow_shift,
+                    image: args.image.clone(),
+                    input_video: args.input_video.clone(),
+                    condition_frames: args.condition_frames.clone(),
+                    condition_keep_last: args.condition_keep_last,
+                    action: args
+                        .action_mode
+                        .as_ref()
+                        .map(|mode| crate::imagegen::ActionOptions {
+                            mode: mode.clone(),
+                            domain: args.action_domain.clone(),
+                            actions: args.actions.clone(),
+                            chunk: args.action_chunk,
+                            tier: args.action_tier,
+                            view: args.action_view.clone(),
+                        }),
+                };
+                return crate::imagegen::run(&model, &prompt, interactive, opts);
+            }
             let multimodal = info.multimodal();
             match overflow {
                 // The hosted half is validated and keyed as a bare
@@ -257,13 +366,13 @@ enum Route<'a> {
 /// (see `client_api_key` in cmd::serve), never to disk.
 fn provider_model(provider: &str, model: &str) -> anyhow::Result<(String, Option<String>)> {
     // Same rule as `launch --provider` (see check_provider_supported in
-    // cmd::launch): the daemon has no TLS, so a key sent to one elsewhere
-    // on the network would cross it in cleartext. A wildcard bind is
-    // fine — that hop is still loopback.
+    // cmd::launch): a key sent to a daemon elsewhere on the network over
+    // plain http would cross it in cleartext. A wildcard bind is fine —
+    // that hop is still loopback — and so is an `https://` LLMMAN_HOST.
     anyhow::ensure!(
-        crate::daemon::connects_over_loopback(),
-        "--provider needs a local llmman serve: LLMMAN_HOST points at {}, and the provider \
-         key would cross the network in cleartext.\n\
+        crate::daemon::connects_securely(),
+        "--provider needs a local llmman serve, or one over TLS: LLMMAN_HOST points at {}, \
+         and the provider key would cross the network in cleartext.\n\
          Export the key where that daemon runs, and run llmman there.",
         crate::daemon::server()
     );
@@ -279,13 +388,13 @@ fn provider_model(provider: &str, model: &str) -> anyhow::Result<(String, Option
     entry.warn_unlisted(model);
 
     // Naming where the missing key goes beats a 401 mid-conversation —
-    // unless the daemon has the key, in which case it spends its own.
-    let key = entry.api_key();
+    // unless the daemon has one of its own, or the provider takes none.
+    let key = entry.client_key();
     anyhow::ensure!(
-        key.is_some() || entry.daemon_key_usable(),
+        key.is_some() || entry.daemon_key_usable() || entry.key_optional,
         "no API key for {} — {}",
         entry.name,
-        crate::providers::key_hint(&entry.id, &entry.key_env)
+        entry.key_hint()
     );
     Ok((crate::providers::format_remote_ref(provider, model), key))
 }
@@ -320,21 +429,28 @@ impl Msg {
 /// against `tokio::signal::ctrl_c()` in `chat_submit` — no `.timeout()`
 /// needed either, unlike the blocking client's own 30s default.
 ///
-/// A `--provider` key (see `provider_model`) rides along as a default
-/// `Authorization` header — this client has one destination, and that
-/// header is what `client_api_key` in cmd::serve reads. Sensitive, so a
-/// `Debug`-formatted client or request cannot print it.
+/// A `--provider` key rides along as a default header for `client_api_key`
+/// in cmd::serve to read: `Authorization: Bearer`, or `x-api-key` when
+/// the daemon's own key already occupies the bearer, so both arrive.
 fn chat_client(api_key: Option<&str>) -> anyhow::Result<Client> {
-    let mut builder = Client::builder();
+    let mut headers = crate::auth::client_headers()?;
     if let Some(key) = api_key {
-        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
-            .context("provider API key is not a valid HTTP header value")?;
-        value.set_sensitive(true);
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::AUTHORIZATION, value);
-        builder = builder.default_headers(headers);
+        if headers.contains_key(reqwest::header::AUTHORIZATION) {
+            let mut value = reqwest::header::HeaderValue::from_str(key)
+                .context("provider API key is not a valid HTTP header value")?;
+            value.set_sensitive(true);
+            headers.insert("x-api-key", value);
+        } else {
+            headers.insert(reqwest::header::AUTHORIZATION, crate::auth::bearer(key)?);
+        }
     }
-    builder.build().context("build http client")
+    // No redirects: reqwest drops `Authorization` across origins but not
+    // `x-api-key`, and the daemon never redirects anyway.
+    crate::daemon::async_client_builder()?
+        .default_headers(headers)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build http client")
 }
 
 #[derive(Serialize)]

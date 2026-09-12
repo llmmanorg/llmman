@@ -15,7 +15,7 @@ use super::api::{self, HfFile};
 use super::download::{self, FetchRequest};
 use super::oci::{self, Descriptor, ModelMeta};
 use super::progress;
-use crate::xet_fetch::XetFileRef;
+use crate::xet_fetch::{self, XetFileRef};
 
 /// Pulls `reference` (already stripped of any `hf://`/`huggingface://`
 /// scheme prefix) into `layout_dir`. `progress_key` is the exact,
@@ -57,7 +57,16 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
     .await
     .context("HF file list")?;
 
-    let manifest_desc = match api::select_gguf(&files, &tag) {
+    let diffusion = api::is_diffusion_repo(&files);
+    let selected = if diffusion {
+        api::select_diffusion_gguf(&files, &tag)
+    } else {
+        api::select_gguf(&files, &tag)
+    };
+    let manifest_desc = match selected {
+        Ok(shards) if diffusion && shards.len() != 1 => {
+            anyhow::bail!("{owner}/{repo}: split diffusion transformers are not supported");
+        }
         Ok(shards) => {
             meta.format = "gguf".to_string();
             let filepath_annotation = if shards.len() == 1 {
@@ -84,7 +93,43 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
                     .await?,
                 );
             }
-            if let Some(mmproj) = api::select_mmproj(&files) {
+            if diffusion {
+                let plan = api::diffusion_plan(&files, &shards[0].path);
+                meta.diffusion_outputs = plan.outputs;
+                for (role, file) in &plan.sidecars {
+                    let d = download_layer(
+                        &dl_client,
+                        &head_client,
+                        &endpoint,
+                        &owner,
+                        &repo,
+                        &commit,
+                        file,
+                        token.as_deref(),
+                        layout_dir,
+                        progress_key,
+                    )
+                    .await?;
+                    layers.push(api::sidecar_layer(d, file, role));
+                }
+                if let Some(te_ref) = plan.text_encoder {
+                    let mut d = pull_text_encoder(
+                        &api_client,
+                        &dl_client,
+                        &head_client,
+                        &host,
+                        te_ref,
+                        token.as_deref(),
+                        layout_dir,
+                        progress_key,
+                    )
+                    .await?;
+                    d.annotations
+                        .get_or_insert_with(BTreeMap::new)
+                        .insert(oci::ANNOTATION_ROLE.to_string(), "text_encoder".to_string());
+                    layers.push(d);
+                }
+            } else if let Some(mmproj) = api::select_mmproj(&files) {
                 layers.push(
                     download_layer(
                         &dl_client,
@@ -178,6 +223,12 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
                     .await?;
             indexed_layers.sort_by_key(|(i, _)| *i);
             let layers: Vec<Descriptor> = indexed_layers.into_iter().map(|(_, d)| d).collect();
+            // A Diffusers pipeline (served by vLLM-Omni) generates media,
+            // not text: say so in the config, as a GGUF diffusion pull does.
+            if api::is_diffusers_repo(&files) {
+                let class = api::diffusers_pipeline_class(layout_dir, &layers);
+                meta.diffusion_outputs = api::diffusers_outputs(class.as_deref());
+            }
             oci::build_cncf_manifest(layout_dir, &meta, &format!("{owner}/{repo}"), "", layers)?
         }
     };
@@ -187,6 +238,54 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
 
 fn basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+/// Downloads the text encoder GGUF of a diffusion model from its own
+/// repository (`owner/repo[:quant]`) into the same blob store, returning
+/// its layer descriptor. Blobs are content-addressed, so a text encoder
+/// shared by several diffusion models is stored once.
+#[allow(clippy::too_many_arguments)]
+async fn pull_text_encoder(
+    api_client: &reqwest::Client,
+    dl_client: &reqwest::Client,
+    head_client: &reqwest::Client,
+    host: &str,
+    reference: &str,
+    token: Option<&str>,
+    layout_dir: &Path,
+    progress_key: &str,
+) -> Result<Descriptor> {
+    let (_, owner, repo, tag) = api::parse_hf_ref(&format!("{host}/{reference}"))?;
+    let endpoint = super::hf_endpoint(host);
+    let info = api::fetch_model_info(api_client, &endpoint, &owner, &repo, token)
+        .await
+        .with_context(|| format!("HF model info for text encoder {reference}"))?;
+    let commit = info.commit().to_string();
+    let files = api::fetch_files(api_client, &endpoint, &owner, &repo, &commit, token)
+        .await
+        .with_context(|| format!("HF file list for text encoder {reference}"))?;
+    let shards = api::select_gguf(&files, &tag)?;
+    if shards.len() != 1 {
+        anyhow::bail!("text encoder {reference}: split GGUFs are not supported");
+    }
+    let mut d = download_layer(
+        dl_client,
+        head_client,
+        &endpoint,
+        &owner,
+        &repo,
+        &commit,
+        &shards[0],
+        token,
+        layout_dir,
+        progress_key,
+    )
+    .await?;
+    d.annotations = Some(BTreeMap::from([(
+        oci::ANNOTATION_FILEPATH.to_string(),
+        basename(&shards[0].path),
+    )]));
+    Ok(d)
 }
 
 /// Deletes its `.part` path on drop unless [`disarm`](Self::disarm) was
@@ -247,28 +346,51 @@ async fn download_layer(
     let url = format!("{endpoint}{owner}/{repo}/resolve/{commit}/{}", file.path);
     let label = format!("Pulling {}", basename(&file.path));
 
-    // Single attempt: this is a cheap metadata probe, so a bad or
-    // nonexistent host must fail fast rather than run the retry backoff.
-    // Failure is tolerated anyway (falls back to a plain, un-Xet'd GET
+    // Failure is tolerated (falls back to a plain, un-Xet'd GET
     // self-hashed after download).
-    let meta = super::client::once(&format!("HEAD {}", file.path), || {
+    let meta = super::client::probe(&format!("HEAD {}", file.path), || {
         download::head_metadata(head_client, url.clone(), token)
     })
     .await
     .unwrap_or_default();
+    // One size for both the progress total and the Xet download, so the
+    // bytes download_to_path credits can never exceed what was added.
+    let size = if meta.size > 0 { meta.size } else { file.size };
     let xet = meta.xet_hash.map(|hash| XetFileRef {
         endpoint: endpoint.to_string(),
         repo_type: "models".to_string(),
         owner_repo: format!("{owner}/{repo}"),
         revision: commit.to_string(),
         hash,
-        size: meta.size.max(file.size) as u64,
+        size: size as u64,
         sha256: meta.digest.clone(),
         hf_token: token.map(str::to_string),
     });
-
-    let size = if meta.size > 0 { meta.size } else { file.size };
     progress::add_total(progress_key, size);
+
+    // The blob store is content-addressed and HF's X-Linked-Etag is the
+    // file's sha256, so a blob already present (the same text encoder
+    // shared by two diffusion models, a re-pull after a manifest change)
+    // needs no download at all.
+    if let Some(want) = &meta.digest {
+        let dest = layout_dir.join("blobs").join("sha256").join(want);
+        if std::fs::metadata(&dest)
+            .map(|m| m.is_file() && m.len() as i64 == size)
+            .unwrap_or(false)
+        {
+            progress::add_completed(progress_key, size);
+            return Ok(Descriptor {
+                media_type: oci::MEDIA_TYPE_MODEL_WEIGHT_RAW.to_string(),
+                digest: format!("sha256:{want}"),
+                size,
+                annotations: Some(BTreeMap::from([(
+                    oci::ANNOTATION_FILEPATH.to_string(),
+                    basename(&file.path),
+                )])),
+                ..Default::default()
+            });
+        }
+    }
 
     let tmp_dir = layout_dir.join("blobs").join("tmp");
     std::fs::create_dir_all(&tmp_dir)?;
@@ -308,28 +430,45 @@ async fn download_layer(
             // (Progress reporting isn't undone on a retry — a retried
             // file's bar may briefly look ahead of itself; a cosmetic
             // wrinkle only, not worth this migration's added complexity.)
-            let f = std::fs::File::create(&tmp_path)?;
-            let mut writer = HashingProgressWriter {
-                file: f,
-                hasher: Sha256::new(),
-                progress_key,
-            };
-            let result = download::fetch_once(client, &req, &mut writer)
-                .await
-                .and_then(|_| {
-                    writer.file.flush()?;
-                    let got = format!("sha256:{:x}", writer.hasher.finalize());
-                    // meta.digest (from X-Linked-Etag) is a trusted claim
-                    // about the content ahead of downloading it — worth
-                    // checking the bytes we actually got still match, in
-                    // case of transient corruption, same as a failed fetch.
-                    match &meta.digest {
-                        Some(want) if format!("sha256:{want}") != got => {
-                            anyhow::bail!("digest mismatch: expected sha256:{want}, got {got}")
-                        }
-                        _ => Ok(got),
+            let got = match &req.xet {
+                // Xet: hf-xet owns the file so progress tracks the wire
+                // (see xet_fetch::download_to_path); hash it afterwards.
+                Some(xet) => {
+                    match xet_fetch::download_to_path(xet, &tmp_path, |n| {
+                        progress::add_completed(progress_key, n as i64)
+                    })
+                    .await
+                    .with_context(|| label.clone())
+                    {
+                        Ok(()) => sha256_of_file(&tmp_path).await,
+                        Err(e) => Err(e),
                     }
-                });
+                }
+                None => {
+                    let f = std::fs::File::create(&tmp_path)?;
+                    let mut writer = HashingProgressWriter {
+                        file: f,
+                        hasher: Sha256::new(),
+                        progress_key,
+                    };
+                    download::fetch_once(client, &req, &mut writer)
+                        .await
+                        .and_then(|_| {
+                            writer.file.flush()?;
+                            Ok(format!("sha256:{:x}", writer.hasher.finalize()))
+                        })
+                }
+            };
+            // meta.digest (from X-Linked-Etag) is a trusted claim about
+            // the content ahead of downloading it — worth checking the
+            // bytes we actually got still match, in case of transient
+            // corruption, same as a failed fetch.
+            let result = got.and_then(|got| match &meta.digest {
+                Some(want) if format!("sha256:{want}") != got => {
+                    anyhow::bail!("digest mismatch: expected sha256:{want}, got {got}")
+                }
+                _ => Ok(got),
+            });
             match result {
                 Ok(digest) => break 'attempts digest,
                 Err(e) => {
@@ -381,6 +520,31 @@ fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+/// `sha256:<hex>` of `path`'s content, for the one download path
+/// (`xet_fetch::download_to_path`) that bypasses [`HashingProgressWriter`].
+/// Off the async runtime: a full read of a possibly hundreds-of-GB file.
+async fn sha256_of_file(path: &Path) -> Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<String> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(&path)
+            .with_context(|| format!("open {} for hashing", path.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            match f.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(format!("sha256:{:x}", hasher.finalize()))
+    })
+    .await
+    .context("sha256 hashing task panicked")?
 }
 
 /// Writes to a local file while hashing every byte and reporting it to

@@ -7,6 +7,10 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  # `gh workflow run ci.yml --ref <branch>`: runs the `e2e` job on a
+  # branch (a pull_request skips it). Never releases: `release`'s `if:`
+  # still requires a push to main.
+  workflow_dispatch:
 
 # Workflow-wide default: read-only. Every job here only needs to check
 # out and build/test the repo except `release`, which needs to create a
@@ -19,14 +23,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # The single place to bump when a newer llama.cpp release is needed —
-  # every matrix.llama-asset entry below (e2e job) is just this release's
-  # OS/arch-specific asset suffix (e.g. "ubuntu-x64.tar.gz"), combined
-  # with this value at the "Install llama-server" step's own point of use
-  # ("llama-${LLAMA_CPP_RELEASE}-bin-${{ matrix.llama-asset }}") rather
-  # than each duplicating the full "llama-<release>-bin-..." filename
-  # independently.
-  LLAMA_CPP_RELEASE: b10293
+  # The llama.cpp release is the repo-root LLAMA_CPP_RELEASE file (also
+  # the llmman binary's default pin, src/llama_release.rs); steps read it
+  # with `LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"`
+  # since a workflow-level env can't read a file. It must be a build
+  # upstream published server-*-b<N> images for (the build job checks).
+  #
   # vLLM version the e2e job's "Install vLLM (e2e)" step installs, for
   # vllm-plugin/tests/test_e2e.py's real `vllm serve` test. Moves with
   # VLLM_METAL_VERSION below: a vllm-metal release names the vLLM
@@ -40,19 +42,33 @@ env:
   # 404s within hours. The 0.3.0.dev20260825040033 pinned here before
   # went that way and took every macOS e2e run with it. Bump deliberately.
   VLLM_METAL_VERSION: "0.28.0"
+  # SGLang git tag (`v` added at use) the e2e job installs from source
+  # for tests/launch_e2e.rs's `serve_sglang_safetensors_model`: upstream's
+  # PyPI wheel and `sglang-kernel` are CUDA builds, so the CPU engine
+  # (Linux) and MLX runtime (macOS) come from the repo's own
+  # pyproject_cpu.toml / pyproject_other.toml.
+  SGLANG_VERSION: "0.5.19"
 
 jobs:
+  # --------------------------------------------------------------------------
+  # Build + unit tests, one job per target: same profile/target/features,
+  # so deps, the Go shim (build.rs) and the non-test lib compile once.
+  # The binary uploads before clippy/test so it stays downloadable for
+  # debugging when they fail (`release` still needs the whole job).
+  #
+  # Tests run on all five targets: the crate links the Go shim via CGO
+  # everywhere and toolchain breakage has been per-platform. fmt and the
+  # fuzz checks are platform-independent and run once (check-fmt leg).
+  # Clippy runs everywhere: it only sees that target's `#[cfg]` arms.
+  # --------------------------------------------------------------------------
   build:
-    name: Build (${{ matrix.target }})
+    name: Build + test (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
-    # Every leg finishes in 2-7 min warm, so 60 is pure headroom — it
-    # exists only to bound a wedged runner. CI 33613527281's
-    # ubuntu-24.04-arm leg lost communication with the server mid-build
-    # and, with no timeout here, stalled 46 min before GitHub's own
-    # infrastructure gave up, blocking `release` (which `needs:` this)
-    # the whole time. A timeout can't keep a runner alive, just stop a
-    # dead one from stalling until the 6-hour default.
+    # Bounds a wedged runner (CI 33613527281 stalled 46 min); legs are
+    # far shorter warm.
     timeout-minutes: 60
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +78,7 @@ jobs:
             runner: ubuntu-24.04
             go-os: linux
             binary: llmman
+            check-fmt: true
 
           # ── Linux aarch64 ─────────────────────────────────────────────────
           - target: aarch64-unknown-linux-gnu
@@ -129,10 +146,12 @@ jobs:
           cache-dependency-path: go-shim/go.sum
 
       # ── Rust toolchain ────────────────────────────────────────────────────
+      # rustfmt only on the check-fmt leg; an empty extra component is fine.
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.target }}
+          components: clippy${{ matrix.check-fmt && ', rustfmt' || '' }}
 
       # The version step changes Cargo.lock every commit, so rust-cache
       # never gets an exact key hit; its prefix fallback still restores
@@ -169,8 +188,6 @@ jobs:
       # ── Build (Docker backend, default) ───────────────────────────────────
       - name: Build (docker backend)
         run: cargo build --release --target ${{ matrix.target }}
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
 
       # Both builds share an output path (same package, same triple, only
       # feature flags differ), so the podman build below overwrites this
@@ -187,8 +204,6 @@ jobs:
       - name: Build (podman backend)
         if: runner.os != 'Windows'
         run: cargo build --release --target ${{ matrix.target }} --no-default-features --features podman
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
 
       # Fail rather than ship a mislabelled binary if those paths ever
       # collide again. Go embeds each function's source path, and the two
@@ -209,6 +224,31 @@ jobs:
           fi
           echo "OK: $bin is a docker-backend build"
 
+      # ── Container image (packaging/Dockerfile) ──────────────────────────────
+      # What publish-images ships, built and run on PRs so a broken
+      # Dockerfile or glibc mismatch fails before release. Only the CPU
+      # variant is built (the others differ in base tag alone, and run to
+      # 7 GiB), but every base publish-images needs must exist.
+      - name: Build and run the container image
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"
+          for tag in server server-cuda server-cuda13 server-rocm server-vulkan; do
+            docker manifest inspect "ghcr.io/ggml-org/llama.cpp:$tag-$LLAMA_CPP_RELEASE" >/dev/null
+          done
+          cp dist-docker/llmman packaging/llmman-amd64
+          docker build packaging -t llmman-check \
+            --build-arg "BASE=ghcr.io/ggml-org/llama.cpp:server-$LLAMA_CPP_RELEASE"
+          out="$(docker run --rm --entrypoint llmman llmman-check --version)"
+          echo "$out"
+          case "$out" in
+          "llmman $(packaging/version.sh) ("*")") ;;
+          *) echo "::error::image reports \"$out\""; exit 1 ;;
+          esac
+          docker run --rm llmman-check --version
+          rm packaging/llmman-amd64
+
       # ── Diagnostics: inspect the Go shim library on Windows ARM64 ───────────
       - name: Inspect shim library (Windows aarch64)
         if: always() && matrix.target == 'aarch64-pc-windows-msvc'
@@ -224,279 +264,86 @@ jobs:
           }
 
       # ── Upload artefacts ──────────────────────────────────────────────────
+      # Two attempts: the upload's final "FinalizeArtifact" call gets a
+      # transient 403 from GitHub's blob store now and then, after every
+      # byte is up. The action has no retry of its own, so the second
+      # attempt overwrites whatever the first left behind.
       - name: Upload binary (docker)
+        id: upload
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: llmman-docker-${{ matrix.target }}
           path: dist-docker/${{ matrix.binary }}
           if-no-files-found: error
-
-  # --------------------------------------------------------------------------
-  # Unit tests: every #[cfg(test)] module under src/, which live in the
-  # lib target and the llmman-bench binary. These are pure-
-  # Rust logic tests with no OS-specific behavior, but the crate itself
-  # still links the Go shim via CGO, so a target-specific toolchain issue
-  # (the exact kind the `build`/`e2e` jobs' own git history is full of —
-  # lld-link vs MSVC link.exe, msvc-arch, ...) could just as easily break
-  # `cargo test` as `cargo build`. Mirrors the `build` job's own 5-target
-  # matrix exactly for that reason, rather than assuming Linux x86_64 is
-  # representative of the other four.
-  #
-  # `cargo fmt --check` also lives here rather than in its own job:
-  # formatting is platform-independent, so it only runs once, on the
-  # Linux x86_64 leg (matrix.check-fmt below), instead of duplicating the
-  # same check across all five targets.
-  #
-  # `cargo clippy` is the opposite case and runs on all five: clippy only
-  # sees the `#[cfg]` arms selected for the target it runs against, and
-  # this crate's platform-gated code is substantial (hostgpu/vendor.rs's
-  # CUDA/HIP/Vulkan FFI, ffi.rs's windows-msvc Go-runtime bootstrap,
-  # container::stop). Linting Linux alone is how ~22 dead-code warnings
-  # accumulated on macOS unseen. `--release` shares dependency artefacts
-  # with the `cargo test --release` step below.
-  # --------------------------------------------------------------------------
-  test:
-    name: Unit tests (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.timeout || 60 }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # ── Linux x86_64 ──────────────────────────────────────────────────
-          # check-fmt: true — this is the one leg that also runs
-          # `cargo fmt --check` (see the job's own comment above on why
-          # only here).
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-            go-os: linux
-            check-fmt: true
-
-          # ── Linux aarch64 ─────────────────────────────────────────────────
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            go-os: linux
-
-          # ── macOS aarch64 (Apple Silicon) ─────────────────────────────────
-          - target: aarch64-apple-darwin
-            runner: macos-15
-            go-os: darwin
-
-          # ── Windows x86_64 ────────────────────────────────────────────────
-          # No linker override; build.rs makes the default MSVC link.exe
-          # work — see the `build` job's own comment.
-          - target: x86_64-pc-windows-msvc
-            runner: windows-2025
-            go-os: windows
-            msvc-arch: amd64
-            rustflags: ""
-            timeout: 60
-
-          # ── Windows aarch64 ───────────────────────────────────────────────
-          # rustflags empty like x86_64, but for a simpler reason: ARM64's
-          # unwind encoding was never the problem, so it links with MSVC
-          # link.exe and build.rs leaves its unwind data intact.
-          - target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
-            go-os: windows
-            msvc-arch: arm64
-            rustflags: ""
-            timeout: 60
-
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - name: Upload binary (docker, retry)
+        if: steps.upload.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          go-version: "1.25"
-          cache-dependency-path: go-shim/go.sum
+          name: llmman-docker-${{ matrix.target }}
+          path: dist-docker/${{ matrix.binary }}
+          if-no-files-found: error
+          overwrite: true
 
-      # targets: matches the build job's own Set up Rust step — needed
-      # there for genuinely cross-compiled targets, harmless here where
-      # every target is actually native. components: rustfmt is only
-      # actually needed on the check-fmt leg (see this job's own comment
-      # above), but dtolnay/rust-toolchain accepts an empty components
-      # list fine on every other leg, so this stays a single step rather
-      # than a second, conditional "Set up Rust" step.
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          targets: ${{ matrix.target }}
-          components: clippy${{ matrix.check-fmt && ', rustfmt' || '' }}
-
-      - name: Cache Rust build artefacts
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-        with:
-          key: test-${{ matrix.target }}
-
-      # ── Windows: set up MSVC (needed for CGO, same as the `build` job) ────
-      # arch: matrix-driven (not a hardcoded amd64) — the ARM64 runner
-      # needs the ARM64 toolchain, or CGO compiling Go's ARM64 runtime
-      # stubs would use the wrong assembler (see the `build` job's own
-      # comment on its identical msvc-arch matrix field).
-      - name: Set up MSVC (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
-        with:
-          arch: ${{ matrix.msvc-arch }}
-
-      # ── Linux: C compiler (always needed for CGO). macOS/Windows need
-      # neither: Xcode's command-line tools already provide a C compiler
-      # on the macOS runner image, and Windows' MSVC setup above covers it.
-      - name: Install build dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get install -y gcc
-
-      # Only runs on the check-fmt leg (Linux x86_64) — see this job's
-      # own comment above on why formatting is checked once rather than
-      # once per matrix entry.
+      # ── Lint + unit tests ─────────────────────────────────────────────────
       - name: cargo fmt --check
         if: matrix.check-fmt
         run: cargo fmt --all -- --check
 
       # `fuzzing` gates fuzz_check_parse_registry_ref in src/shortnames.rs,
-      # which the fuzz/ crate below calls but nothing else in the tree
-      # references. Without this step, a rename of ParsedRef's fields, or
-      # of MAX_PART_LEN/MAX_HOST_LEN, compiles clean on every other leg
-      # and only breaks the fuzz harness, with no CI signal. This only
-      # compiles the feature; it does not run cargo-fuzz, which needs a
-      # nightly toolchain this job does not install (actual fuzzing runs
-      # on a developer's workstation, not in CI). Runs once, on the
-      # check-fmt leg, same reason as cargo fmt: pure Rust logic, no
-      # OS-specific `#[cfg]`.
+      # which only the fuzz/ crate calls; without this a rename there
+      # compiles clean everywhere and only breaks the fuzz harness. This
+      # compiles the feature, it does not run cargo-fuzz (needs nightly).
       - name: cargo clippy --features fuzzing
         if: matrix.check-fmt
         run: cargo clippy --features fuzzing --lib -- -D warnings
 
-      # fuzz/ is its own crate (cargo-fuzz's own convention), with its own
-      # Cargo.toml, so the workspace-level clippy/test steps above never
-      # touch it. A plain `cargo check` against its manifest catches it
-      # going stale against src/shortnames.rs's public surface, without
-      # needing cargo-fuzz or nightly. Same check-fmt gating as above: no
-      # OS-specific behavior to test per target.
+      # fuzz/ is its own crate (cargo-fuzz convention), so the workspace
+      # clippy/test steps never touch it. A plain check catches it going
+      # stale against src/shortnames.rs without cargo-fuzz or nightly.
       - name: cargo check fuzz/
         if: matrix.check-fmt
         run: cargo check --manifest-path fuzz/Cargo.toml
 
-      # -D warnings: the tree is clippy-clean as of this step being added,
-      # so anything new is a regression, not a wart to triage.
-      # --all-targets covers tests/ too. Default (docker) feature only:
-      # `podman` gates a handful of `ffi` items, not whole subsystems, and
-      # building its Go archive too would roughly double this job.
+      # -D warnings: the tree is clippy-clean, so anything new is a
+      # regression. --all-targets covers tests/ too. Default (docker)
+      # feature only: `podman` gates a handful of `ffi` items, and its Go
+      # archive would roughly double this step.
       - name: cargo clippy
         run: cargo clippy --release --target ${{ matrix.target }} --all-targets -- -D warnings
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
 
-      # --target: matches the build job's own invocation (every one of
-      # these is a native build, but explicit --target keeps the output
-      # path/build-plan identical to that job's). RUSTFLAGS no longer
-      # carries a Windows linker choice: build.rs fixes the archive as it
-      # produces it, so the separate test binary compiled here links the
-      # same way the main binary does with nothing repeated per step.
       - name: cargo test --lib --bins
         run: cargo test --release --target ${{ matrix.target }} --lib --bins
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
 
   # --------------------------------------------------------------------------
-  # Lint: static analysis of go-shim/, which until now had none. `test`
-  # above builds and runs the Go code but never checks it beyond what the
-  # compiler requires, and `cargo fmt --check` covers only the Rust half.
+  # Lint + packaging: cheap Linux-only checks, ~2 min total and off the
+  # critical path, so they share one runner. `release` gates on this.
   #
-  # Which linters, and why, lives in go-shim/.golangci.yml — the single
-  # source of truth, so a local `golangci-lint run` reproduces this job.
+  # Packaging (first, the faster half): version.sh and render.sh output
+  # (Homebrew formula, winget manifests, crate) is checked on every PR so a
+  # broken template fails here, not after it reaches the tap or winget-pkgs.
   #
-  # Scope: this is the Linux view. Go drops OS-tagged files before
-  # analysis, so push_stream_windows.go (19 lines) is compiled by the
-  # `build` matrix but not linted here; cross-GOOS linting would need a
-  # cross C toolchain, since dropping cgo breaks the typecheck.
+  # Lint: go-shim/ static analysis; linters live in go-shim/.golangci.yml.
+  # Linux view only: Go drops OS-tagged files (push_stream_windows.go)
+  # before analysis, and cross-GOOS linting would need a cross C toolchain.
   # --------------------------------------------------------------------------
-  lint:
-    name: Lint (go-shim)
+  lint-packaging:
+    name: Lint (go-shim) + Packaging (version, brew/winget templates, crate)
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 60
+    env:
+      GOLANGCI_LINT_VERSION: v2.13.2
+      # Mirrors build.rs's podman tag list exactly.
+      PODMAN_TAGS: podman,containers_image_openpgp,exclude_graphdriver_btrfs,exclude_graphdriver_devicemapper
     steps:
-      # persist-credentials: false — this job runs `go test` on the PR's own
-      # code, which has no reason to reach GITHUB_TOKEN via .git/config.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: "1.25"
-          cache-dependency-path: go-shim/go.sum
-
-      # Not golangci-lint's formatter support: this names the files.
-      - name: gofmt --check
-        working-directory: go-shim
-        run: |
-          unformatted="$(gofmt -l .)"
-          if [ -n "$unformatted" ]; then
-            echo "::error::gofmt would reformat these files:"
-            echo "$unformatted"
-            exit 1
-          fi
-
-      - name: golangci-lint (docker backend, production code)
-        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
-        with:
-          version: v2.13.2
-          working-directory: go-shim
-          args: --build-tags docker --tests=false --timeout=10m
-
-      # Second pass with tests: catches a helper stranded in a _test.go
-      # file once the test using it is deleted.
-      - name: golangci-lint (docker backend, including tests)
-        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
-        with:
-          version: v2.13.2
-          working-directory: go-shim
-          args: --build-tags docker --timeout=10m
-
-      # The podman-tagged files are invisible to the runs above. -D unused
-      # is deliberate: `unused` sees one build-tag view at a time, so
-      # docker-only helpers in shared files look dead from this side.
-      # Tags mirror build.rs's podman list exactly.
-      - name: golangci-lint (podman backend)
-        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
-        with:
-          version: v2.13.2
-          working-directory: go-shim
-          args: >-
-            --build-tags podman,containers_image_openpgp,exclude_graphdriver_btrfs,exclude_graphdriver_devicemapper
-            -D unused
-            --timeout=10m
-
-      # No CI job ran these before. Both backends: each has test files the
-      # other's tags exclude.
-      - name: go test (docker backend)
-        working-directory: go-shim
-        run: go test -tags docker ./...
-
-      - name: go test (podman backend)
-        working-directory: go-shim
-        run: go test -tags podman,containers_image_openpgp,exclude_graphdriver_btrfs,exclude_graphdriver_devicemapper ./...
-
-  # --------------------------------------------------------------------------
-  # Packaging: runs packaging/version.sh and packaging/render.sh on every PR
-  # and checks their output (Homebrew formula, winget manifests, the crate),
-  # so a broken template fails here rather than after it has been pushed to
-  # the tap or opened against winget-pkgs. `release` gates on this.
-  # --------------------------------------------------------------------------
-  packaging:
-    name: Packaging (version, brew/winget templates, crate)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
+      # fetch-depth: 0 — version.sh needs the full commit count.
+      # persist-credentials: false — `go test` runs the PR's own code.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
 
+      # ── Packaging ────────────────────────────────────────────────────────
       - name: shellcheck
         run: shellcheck packaging/version.sh packaging/render.sh
 
@@ -623,7 +470,7 @@ jobs:
           print(f"OK: x64 and arm64 portable installers for v{version}")
           PY
 
-      # `build`/`test` already compile this source on all five targets; this
+      # `build` already compiles this source on all five targets; this
       # checks the .crate carries what build.rs reads (go-shim/, webui/),
       # drops the dev-only paths, and fits crates.io's 10 MiB limit.
       # publish-crate does the verification build.
@@ -634,8 +481,8 @@ jobs:
           cargo package --no-verify --allow-dirty --list > "$files"
           for must in build.rs Cargo.toml Cargo.lock LICENSE README.md go-shim/go.mod go-shim/go.sum go-shim/shim.go \
                       go-shim/backend_docker.go go-shim/backend_podman.go \
-                      webui/index.html webui/bundle.js webui/bundle.css webui/loading.html \
-                      src/main.rs src/lib.rs src/webui.rs src/ffi.rs; do
+                      webui/index.html webui/app.js webui/app.css webui/vendor/xterm.js webui/vendor/addon-fit.js \
+                      src/main.rs src/lib.rs src/webui/mod.rs src/webui/content_type.rs src/ffi.rs; do
             grep -qx "$must" "$files" || { echo "::error::$must is missing from the .crate"; exit 1; }
           done
           for never in '^packaging/' '^vllm-plugin/' '^docs/' '^\.github/' '^fuzz/' '^go-shim/go-shim$'; do
@@ -650,8 +497,61 @@ jobs:
           [ "$size" -lt $((10 * 1024 * 1024)) ] || { echo "::error::$crate is over crates.io's 10 MiB limit"; exit 1; }
           echo "OK: crate contents ($(wc -l < "$files") files)"
 
+      # ── Lint (go-shim) ───────────────────────────────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: go-shim/go.sum
+
+      # Not golangci-lint's formatter support: this names the files.
+      - name: gofmt --check
+        working-directory: go-shim
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would reformat these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: golangci-lint (docker backend, production code)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          working-directory: go-shim
+          args: --build-tags docker --tests=false --timeout=10m
+
+      # Second pass with tests: catches a helper stranded in a _test.go
+      # file once the test using it is deleted.
+      - name: golangci-lint (docker backend, including tests)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          working-directory: go-shim
+          args: --build-tags docker --timeout=10m
+
+      # The podman-tagged files are invisible to the runs above. -D unused
+      # is deliberate: `unused` sees one build-tag view at a time, so
+      # docker-only helpers in shared files look dead from this side.
+      - name: golangci-lint (podman backend)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          working-directory: go-shim
+          args: --build-tags ${{ env.PODMAN_TAGS }} -D unused --timeout=10m
+
+      # Both backends: each has test files the other's tags exclude.
+      - name: go test (docker backend)
+        working-directory: go-shim
+        run: go test -tags docker ./...
+
+      - name: go test (podman backend)
+        working-directory: go-shim
+        run: go test -tags "$PODMAN_TAGS" ./...
+
   # --------------------------------------------------------------------------
-  # E2E: `llmman launch <claude|opencode|codex|qwen|hermes|openclaw|talos> --model
+  # E2E: `llmman launch <claude|opencode|codex|qwen|hermes|openclaw|talos|dsh> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
   # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
@@ -662,7 +562,10 @@ jobs:
   # Also runs vllm-plugin/tests/test_e2e.py (Linux x86_64/aarch64 and
   # macOS aarch64, both `matrix.backend` entries) against this job's own
   # installed `llmman` binary and a real `vllm serve` — CPU-only on
-  # Linux, Metal-GPU-backed (via vllm-metal) on macOS.
+  # Linux, Metal-GPU-backed (via vllm-metal) on macOS. The same `vllm`
+  # and an SGLang from source also back launch_e2e's
+  # `serve_vllm_safetensors_model` / `serve_sglang_safetensors_model`
+  # (`llmman serve`'s own vllm and sglang backends) on those entries.
   #
   # On the two macOS aarch64 legs (`matrix.backend` docker and podman —
   # see this job's own matrix below; "backend" there is the OCI-transport
@@ -679,38 +582,47 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/opencode/codex/qwen/hermes/openclaw/talos, vllm-plugin, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/opencode/codex/qwen/hermes/openclaw/talos/dsh, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
     # push event that leads to a release: a push to main — see the
     # `release` job's own `needs`, which includes this job for exactly
-    # that reason, and its own identical `if:` condition below.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    # 7 tests run serialized (--test-threads=1 + lock_serial()), so the
-    # worst case sums all 7's own retry budgets: MAX_ATTEMPTS * TIMEOUT
+    # that reason, and its own identical `if:` condition below — or when
+    # dispatched by hand on a branch (see `workflow_dispatch` above).
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    # 8 tests run serialized (--test-threads=1 + lock_serial()), so the
+    # worst case sums all 8's own retry budgets: MAX_ATTEMPTS * TIMEOUT
     # (3 * 600s = 30 min) each — a timeout itself never retries (see
     # launch_and_assert's own doc comment), so 30 min/test is only hit if
     # every attempt fails via a missing "pong" instead. Plus warm_model()'s
     # own separate TIMEOUT budget (10 min), paid at most once across all
-    # tests (guarded by WARM's own Once). 7*30 + 10 = 220 min; 240 leaves
+    # tests (guarded by WARM's own Once). 8*30 + 10 = 250 min; 270 leaves
     # headroom on top of that for setup/build overhead (5-8 min on
     # Windows). Exhausting every attempt doesn't fail this job either way
     # (see launch_and_assert's own doc comment) — a run can still
     # legitimately take this long in wall-clock time before giving up.
     #
-    # +90 on top of that 240 (330 total) for the vllm-plugin steps'
+    # +90 on top of that 270 (360 total) for the vllm-plugin steps'
     # own per-step budgets below: up to 60 min for "Install vLLM (e2e)"
     # (wheel downloads, but a slow/retried one on a bad connection) plus
     # up to 30 min for "pytest -m e2e (vllm-plugin)".
     #
-    # +10 more (340 total) for `serve_mlx_safetensors_model`'s own single
+    # +10 more (370 total) for `serve_mlx_safetensors_model`'s own single
     # TIMEOUT budget (10 min, same 600s as warm_model's) — it doesn't go
     # through launch_and_assert's retry loop at all (a real failure there
     # is always a deterministic llmman bug worth failing loudly on, not
-    # small-model sampling variance), so unlike the 7 launch tests above
+    # small-model sampling variance), so unlike the 8 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
-    timeout-minutes: 340
+    #
+    # +60 more (430 total) for `serve_vllm_safetensors_model` and
+    # `serve_sglang_safetensors_model` (20 min each, no retries, like the
+    # mlx test) and "Install SGLang (e2e)"'s 40-minute budget.
+    timeout-minutes: 430
+    env:
+      # These tests are about the llama-server "Install llama-server" puts
+      # on PATH, which `--runtime auto` would try docker before.
+      LLMMAN_RUNTIME: path
     strategy:
       fail-fast: false
       matrix:
@@ -736,7 +648,7 @@ jobs:
           # against go-shim/backend_podman.go (go.podman.io/image) instead
           # of go-shim/backend_docker.go — this is the only place that
           # backend's actual pull/push code path gets exercised end-to-end
-          # against a real registry; the `test` job's own unit tests never
+          # against a real registry; the `build` job's own unit tests never
           # touch the ffi::* boundary that differs between backends, and
           # the `build` job only compiles this backend, it doesn't run it.
           - target: x86_64-unknown-linux-gnu
@@ -787,7 +699,7 @@ jobs:
             feature-flags: ""
 
           # ── Windows aarch64 (docker backend) ─────────────────────────────
-          # rustflags empty; ARM64 keeps its unwind data — see `test`.
+          # rustflags empty; ARM64 keeps its unwind data — see `build`.
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             go-os: windows
@@ -855,7 +767,7 @@ jobs:
       # multi-line/array syntax; ubuntu/macOS already default to bash.
       #
       # Unlike hermes/mlx_lm.server (legitimately missing on some
-      # platforms), these five are plain npm packages expected to work
+      # platforms), these six are plain npm packages expected to work
       # everywhere — so install_cli fails the job, rather than letting
       # tests/launch_e2e.rs's on_path check silently skip, when one never
       # becomes a working binary.
@@ -868,7 +780,7 @@ jobs:
       # designed (npm tolerates one failed platform-tarball fetch, here
       # a registry blip, instead of failing the install), just not
       # detectable by a mere on_path/PATH check. Retrying rides that out.
-      - name: Install integration CLIs (claude, opencode, codex, qwen, openclaw)
+      - name: Install integration CLIs (claude, opencode, codex, qwen, openclaw, dsh)
         shell: bash
         run: |
           failed_clis=()
@@ -915,6 +827,12 @@ jobs:
           # so an unpinned upgrade could silently break the same way
           # again with no warning here.
           install_cli "openclaw@2026.7.1-2" "openclaw" "openclaw"
+          # Pinned (not @latest): dsh is pre-1.0 (0.1.2-rc.1) and
+          # tests/launch_e2e.rs's own invocation (--profile headless) was
+          # verified against this exact release; an unpinned upgrade
+          # could silently change that profile's flags or behavior with
+          # no warning here.
+          install_cli "@deepseek-ai/dsh@0.1.2-rc.1" "@deepseek-ai/dsh" "dsh"
 
           if [ "${#failed_clis[@]}" -gt 0 ]; then
             echo "::error::the following integration CLIs never became installable on ${{ runner.os }} after retries: ${failed_clis[*]}"
@@ -1005,29 +923,29 @@ jobs:
       # itself not being installed (see the step above) — `command -v`
       # guards against that rather than failing here instead.
       #
-      # `--kill-after=10`: confirmed live on a real x86_64-windows-2025 run
-      # that plain `timeout 45` (SIGTERM only) can leave this hanging far
-      # past its own 45s cap — the whole job ran to its 45-*minute*
-      # timeout-minutes instead and got force-cancelled. A Node process
-      # deep in this ai-sdk runtime's own indefinite connection-retry loop
-      # doesn't reliably act on SIGTERM promptly (a known Node.js/libuv
-      # quirk: a blocking native socket call in flight isn't necessarily
-      # interrupted by a signal the event loop hasn't gotten back to yet),
-      # so nothing here otherwise ever escalates to a harder kill.
-      # `--kill-after` sends SIGKILL 10s after the initial SIGTERM if the
-      # process is still alive, guaranteeing this step can't hang
-      # regardless of whether opencode's own process tree responds to
-      # SIGTERM at all.
+      # `--kill-after=10` escalates to SIGKILL, since a process deep in
+      # that retry loop doesn't reliably act on SIGTERM. Not enough on
+      # Windows: `opencode` on PATH there is npm's sh shim, which runs the
+      # real opencode.exe as a child (Git Bash can't exec a native binary
+      # in place), and `timeout` kills only the shim. The orphaned
+      # opencode.exe keeps this step's stdout open, so the step never ends
+      # — a real x86_64-windows-2025 run sat here 45 min until the runner
+      # itself died ("lost communication with the server"). So it is
+      # killed by name too, and `timeout-minutes` is the backstop
+      # (`continue-on-error`: the backstop firing is not a failed job).
       - name: Warm up opencode's on-demand provider install
         shell: bash
+        timeout-minutes: 10
+        continue-on-error: true
         run: |
           export OPENCODE_CONFIG_CONTENT='{"$schema":"https://opencode.ai/config.json","provider":{"ollama":{"npm":"@ai-sdk/openai-compatible","name":"Ollama","options":{"baseURL":"http://127.0.0.1:1/v1"},"models":{"warmup":{"name":"warmup"}}}},"model":"ollama/warmup"}'
           command -v opencode >/dev/null && timeout --kill-after=10 45 opencode run "hi" --print-logs --log-level DEBUG || true
+          [ "$RUNNER_OS" = Windows ] && taskkill //F //T //IM opencode.exe || true
 
       # ── llama-server (the inference backend `llmman serve` shells out to) ──
       # A prebuilt release straight from upstream llama.cpp, pinned so CI
       # doesn't silently pick up a build that changes behavior mid-flight;
-      # bump the top-level env's LLAMA_CPP_RELEASE deliberately when a
+      # bump the repo-root LLAMA_CPP_RELEASE file deliberately when a
       # newer one is needed — that one edit is enough, unlike the old
       # per-matrix-entry hardcoded filenames it replaced. `matrix.llama-asset`
       # is just this OS/arch's release asset *suffix* (the Windows ones are
@@ -1040,6 +958,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"
           asset="llama-${LLAMA_CPP_RELEASE}-bin-${{ matrix.llama-asset }}"
           # $HOME, not $RUNNER_TEMP: on Windows the latter is a native
           # `D:\a\_temp`-style path, and Git Bash's tar.exe (bsdtar) reads
@@ -1325,6 +1244,160 @@ jobs:
           "$RUNNER_TEMP/mlx-lm-venv/bin/pip" install mlx-lm
           echo "$RUNNER_TEMP/mlx-lm-venv/bin" >> "$GITHUB_PATH"
 
+      # ── vLLM + vllm-plugin (Linux + macOS) ───────────────────────────────
+      # One `vllm` for two suites: vllm-plugin/tests/test_e2e.py further
+      # below, and launch_e2e's `serve_vllm_safetensors_model` (`llmman
+      # serve`'s own vllm backend), which needs it on PATH before the
+      # "cargo test --test launch_e2e" step — hence installed here, not
+      # next to the pytest step. CPU-only on Linux, Metal (vllm-metal) on
+      # macOS; no Windows backend exists.
+      #
+      # Uses a venv, not the bare system python3 (Ubuntu 24.04's is PEP
+      # 668-locked). Both vllm-plugin and vllm (next step) install into
+      # this same venv so the plugin's entry point (see pyproject.toml)
+      # is actually discoverable by the vllm process.
+      - name: Set up Python (vllm-plugin e2e)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install vllm-plugin (e2e)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/vllm-plugin-venv"
+          "$RUNNER_TEMP/vllm-plugin-venv/bin/pip" install -e ./vllm-plugin pytest
+          echo "$RUNNER_TEMP/vllm-plugin-venv/bin" >> "$GITHUB_PATH"
+
+      # No GPU assumed on Linux, so that leg installs vLLM's CPU wheel,
+      # not the default CUDA one. macOS installs that same upstream
+      # "+cpu" wheel (a GitHub release asset since v0.26.0; PyPI still
+      # has none) plus vllm-metal on top, which overrides vLLM's
+      # CpuPlatform autodetection with a real Metal-GPU MetalPlatform via
+      # its own `vllm.platform_plugins` entry point — building vLLM's
+      # CPU backend from source on macOS instead (this job's prior
+      # approach) hung forever inside its own CPU worker, regardless of
+      # --dtype (see git history).
+      # LD_PRELOAD (Linux x86_64 only): vLLM's CPU wheel needs Intel
+      # OpenMP preloaded; located via a glob scoped to this venv, and set
+      # by a `vllm` wrapper script ahead of the venv on PATH rather than
+      # in $GITHUB_ENV, which would preload it into cargo, llmman,
+      # llama-server and the agent CLIs launch_e2e runs too.
+      - name: Install vLLM (e2e)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/vllm-plugin-venv"
+
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            "$venv/bin/pip" install \
+              "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl"
+            "$venv/bin/pip" install \
+              "https://github.com/vllm-project/vllm-metal/releases/download/v${VLLM_METAL_VERSION}/vllm_metal-${VLLM_METAL_VERSION}-cp312-cp312-macosx_15_0_arm64.whl"
+          else
+            case "${{ matrix.target }}" in
+              x86_64-*) arch=x86_64 ;;
+              aarch64-*) arch=aarch64 ;;
+              *) echo "unhandled target for vLLM CPU wheel: ${{ matrix.target }}" >&2; exit 1 ;;
+            esac
+            wheel="vllm-${VLLM_VERSION}+cpu-cp38-abi3-manylinux_2_34_${arch}.whl"
+            "$venv/bin/pip" install \
+              "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/$wheel" \
+              --extra-index-url https://download.pytorch.org/whl/cpu
+
+            if [ "$arch" = "x86_64" ]; then
+              iomp=$("$venv/bin/python3" -c "import glob, sysconfig; m = glob.glob(sysconfig.get_paths()['purelib'] + '/**/libiomp5.so', recursive=True); print(m[0] if m else '')")
+              if [ -n "$iomp" ]; then
+                mkdir -p "$RUNNER_TEMP/vllm-bin"
+                printf '#!/bin/sh\nexport LD_PRELOAD=%s\nexec %s "$@"\n' "$iomp" "$venv/bin/vllm" > "$RUNNER_TEMP/vllm-bin/vllm"
+                chmod +x "$RUNNER_TEMP/vllm-bin/vllm"
+                echo "$RUNNER_TEMP/vllm-bin" >> "$GITHUB_PATH"
+              else
+                echo "::warning::libiomp5.so not found under $venv; LD_PRELOAD not set for vLLM CPU (x86_64)"
+              fi
+            fi
+          fi
+
+      # ── SGLang (Linux + macOS) ───────────────────────────────────────────
+      # For launch_e2e's `serve_sglang_safetensors_model` (`llmman serve`'s
+      # sglang backend). From the SGLANG_VERSION tag — see that variable:
+      #   Linux: the CPU engine (pyproject_cpu.toml, torch from the CPU
+      #   index via uv's index config) plus its kernel library from
+      #   python/sglang/kernels/aot, which it imports unconditionally.
+      #   gcc, not clang (GCC constexpr std::sqrt). On x86_64 that library
+      #   needs AVX-512 at import; the test skips itself without it.
+      #   macOS: the MLX runtime (pyproject_other.toml's srt_mps extra).
+      # Only the `sglang` console script goes on PATH, via a symlink dir:
+      # the venv's bin/ also has a python3 and pytest, and $GITHUB_PATH
+      # prepends, so it would shadow the vllm-plugin venv's pytest.
+      - name: Install SGLang (e2e)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        timeout-minutes: 40
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/sglang-src"
+          venv="$RUNNER_TEMP/sglang-venv"
+          git clone --depth 1 --branch "v${SGLANG_VERSION}" https://github.com/sgl-project/sglang.git "$src"
+          python3 -m venv "$venv"
+          "$venv/bin/pip" install --quiet uv
+
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            cp "$src/python/pyproject_other.toml" "$src/python/pyproject.toml"
+            VIRTUAL_ENV="$venv" "$venv/bin/uv" pip install --prerelease=allow "$src/python[srt_mps]"
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq libnuma-dev cmake ninja-build
+            cat > "$RUNNER_TEMP/sglang-uv.toml" <<'EOF'
+          [[index]]
+          name = "torch"
+          url = "https://download.pytorch.org/whl/cpu"
+          EOF
+            export UV_CONFIG_FILE="$RUNNER_TEMP/sglang-uv.toml" VIRTUAL_ENV="$venv"
+            cp "$src/python/pyproject_cpu.toml" "$src/python/pyproject.toml"
+            "$venv/bin/uv" pip install --prerelease=allow "$src/python"
+            cp "$src/python/sglang/kernels/aot/pyproject_cpu.toml" "$src/python/sglang/kernels/aot/pyproject.toml"
+            CC=gcc CXX=g++ "$venv/bin/uv" pip install --prerelease=allow "$src/python/sglang/kernels/aot"
+          fi
+
+          mkdir -p "$RUNNER_TEMP/sglang-bin"
+          ln -sf "$venv/bin/sglang" "$RUNNER_TEMP/sglang-bin/sglang"
+          echo "$RUNNER_TEMP/sglang-bin" >> "$GITHUB_PATH"
+          "$venv/bin/sglang" version
+
+      # What the two engine tests' daemons run their engine with, per
+      # platform: `LLMMAN_*_ARGS` is appended to the engine argv by `llmman
+      # serve`, the rest the engines read themselves. Lifted from
+      # vllm-plugin/tests/test_e2e.py (whose `env.setdefault`s agree) and
+      # SGLang's CPU and Apple-Metal guides.
+      - name: Engine environment for launch_e2e (vllm, sglang)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            {
+              echo "LLMMAN_VLLM_ARGS=--max-num-seqs 1"
+              echo "GLOO_SOCKET_IFNAME=lo0"
+              echo "VLLM_METAL_USE_PAGED_ATTENTION=1"
+              echo "VLLM_METAL_MEMORY_FRACTION=0.8"
+              echo "SGLANG_USE_MLX=1"
+              echo "LLMMAN_SGLANG_ARGS=--disable-cuda-graph"
+            } >> "$GITHUB_ENV"
+          else
+            {
+              echo "LLMMAN_VLLM_ARGS=--dtype bfloat16 --enforce-eager"
+              # vLLM CPU's KV-cache arena, in GiB — a demand, not a cap
+              # (see test_e2e.py); unset, vLLM 0.28 asks for 0.9 of RAM.
+              echo "VLLM_CPU_KVCACHE_SPACE=1"
+              echo "SGLANG_USE_CPU_ENGINE=1"
+            } >> "$GITHUB_ENV"
+          fi
+
       # --target: for the same reason as the Build llmman step above.
       # RUSTFLAGS no longer carries a Windows linker choice. This step
       # compiles its own test binary (tests/launch_e2e.rs) against the same
@@ -1395,76 +1468,6 @@ jobs:
           fi
           if [ "${{ runner.os }}" = "Linux" ]; then free -m; else vm_stat; fi
 
-      # ── vllm-plugin e2e (Linux + macOS) ──────────────────────────────────
-      # `vllm-plugin/tests/test_e2e.py` against this job's own installed
-      # `llmman` binary and a real `vllm serve` — CPU-only on Linux,
-      # Metal-GPU-backed (via vllm-metal) on macOS. Excludes Windows: no
-      # vLLM CPU wheel/backend exists for it.
-      #
-      # Uses a venv, not the bare system python3 (Ubuntu 24.04's is PEP
-      # 668-locked). Both vllm-plugin and vllm (next step) install into
-      # this same venv so the plugin's entry point (see pyproject.toml)
-      # is actually discoverable by the vllm process.
-      - name: Set up Python (vllm-plugin e2e)
-        if: runner.os == 'Linux' || runner.os == 'macOS'
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.12"
-
-      - name: Install vllm-plugin (e2e)
-        if: runner.os == 'Linux' || runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m venv "$RUNNER_TEMP/vllm-plugin-venv"
-          "$RUNNER_TEMP/vllm-plugin-venv/bin/pip" install -e ./vllm-plugin pytest
-          echo "$RUNNER_TEMP/vllm-plugin-venv/bin" >> "$GITHUB_PATH"
-
-      # No GPU assumed on Linux, so that leg installs vLLM's CPU wheel,
-      # not the default CUDA one. macOS installs that same upstream
-      # "+cpu" wheel (a GitHub release asset since v0.26.0; PyPI still
-      # has none) plus vllm-metal on top, which overrides vLLM's
-      # CpuPlatform autodetection with a real Metal-GPU MetalPlatform via
-      # its own `vllm.platform_plugins` entry point — building vLLM's
-      # CPU backend from source on macOS instead (this job's prior
-      # approach) hung forever inside its own CPU worker, regardless of
-      # --dtype (see git history).
-      # LD_PRELOAD (Linux x86_64 only): vLLM's CPU wheel needs Intel
-      # OpenMP preloaded; located via a glob scoped to this venv.
-      - name: Install vLLM (e2e)
-        if: runner.os == 'Linux' || runner.os == 'macOS'
-        timeout-minutes: 60
-        shell: bash
-        run: |
-          set -euo pipefail
-          venv="$RUNNER_TEMP/vllm-plugin-venv"
-
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            "$venv/bin/pip" install \
-              "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl"
-            "$venv/bin/pip" install \
-              "https://github.com/vllm-project/vllm-metal/releases/download/v${VLLM_METAL_VERSION}/vllm_metal-${VLLM_METAL_VERSION}-cp312-cp312-macosx_15_0_arm64.whl"
-          else
-            case "${{ matrix.target }}" in
-              x86_64-*) arch=x86_64 ;;
-              aarch64-*) arch=aarch64 ;;
-              *) echo "unhandled target for vLLM CPU wheel: ${{ matrix.target }}" >&2; exit 1 ;;
-            esac
-            wheel="vllm-${VLLM_VERSION}+cpu-cp38-abi3-manylinux_2_34_${arch}.whl"
-            "$venv/bin/pip" install \
-              "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/$wheel" \
-              --extra-index-url https://download.pytorch.org/whl/cpu
-
-            if [ "$arch" = "x86_64" ]; then
-              iomp=$("$venv/bin/python3" -c "import glob, sysconfig; m = glob.glob(sysconfig.get_paths()['purelib'] + '/**/libiomp5.so', recursive=True); print(m[0] if m else '')")
-              if [ -n "$iomp" ]; then
-                echo "LD_PRELOAD=$iomp" >> "$GITHUB_ENV"
-              else
-                echo "::warning::libiomp5.so not found under $venv; LD_PRELOAD not set for vLLM CPU (x86_64)"
-              fi
-            fi
-          fi
-
       # LLMMAN_BIN isn't needed: `llmman` is already on PATH (added to
       # $GITHUB_PATH by "Install llmman (via install script)" above).
       - name: pytest -m e2e (vllm-plugin)
@@ -1533,7 +1536,7 @@ jobs:
     name: Release
     # Everything must be green first. e2e only runs on the same push event
     # this job fires on, so this never waits on a run that will not happen.
-    needs: [build, test, lint, e2e, packaging]
+    needs: [build, lint-packaging, e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -1624,12 +1627,23 @@ jobs:
             | xargs -0 sha256sum > checksums.txt
           cat checksums.txt
 
+      # Two attempts, as for the binaries above.
       - name: Upload checksums artifact
+        id: upload_checksums
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-checksums
           path: dist/checksums.txt
           if-no-files-found: error
+      - name: Upload checksums artifact (retry)
+        if: steps.upload_checksums.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-checksums
+          path: dist/checksums.txt
+          if-no-files-found: error
+          overwrite: true
 
       - name: Build release notes
         id: notes
@@ -1663,6 +1677,87 @@ jobs:
             dist/checksums.txt
 
   # --------------------------------------------------------------------------
+  # docker.io/ai/llmman: each ghcr.io/ggml-org/llama.cpp server image
+  # src/container.rs can pick, at LLAMA_CPP_RELEASE, with this release's
+  # llmman added (packaging/Dockerfile). Tagged like upstream plus
+  # <tag>-<version>; latest is the CPU image. Platforms as upstream minus
+  # s390x (no llmman binary). The package-manager publishes wait on this.
+  # Needs vars.DOCKER_HUB_USER + secrets.DOCKER_HUB_PAT, the credentials
+  # docker/llmman-publisher pushes ai/<model> with.
+  # --------------------------------------------------------------------------
+  publish-images:
+    name: Publish ${{ matrix.tag }} image
+    needs: [release]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tag: server
+            platforms: linux/amd64,linux/arm64
+          - tag: server-cuda
+            platforms: linux/amd64,linux/arm64
+          - tag: server-cuda13
+            platforms: linux/amd64,linux/arm64
+          - tag: server-rocm
+            platforms: linux/amd64
+          - tag: server-vulkan
+            platforms: linux/amd64,linux/arm64
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: llmman-docker-*-unknown-linux-gnu
+
+      # Artifacts drop the executable bit; COPY keeps the context's mode.
+      - name: Lay out the build context
+        run: |
+          install -m 755 dist/llmman-docker-x86_64-unknown-linux-gnu/llmman packaging/llmman-amd64
+          install -m 755 dist/llmman-docker-aarch64-unknown-linux-gnu/llmman packaging/llmman-arm64
+
+      - name: Log in to Docker Hub
+        env:
+          DOCKER_HUB_USER: ${{ vars.DOCKER_HUB_USER }}
+          DOCKER_HUB_PAT: ${{ secrets.DOCKER_HUB_PAT }}
+        run: printf '%s' "$DOCKER_HUB_PAT" | docker login docker.io --username "$DOCKER_HUB_USER" --password-stdin
+
+      # The versioned tag first (a docker-container builder: the default
+      # can't push multi-platform; no provenance/sbom, so the index lists
+      # only real platforms), then the floating ones — unless a newer
+      # release already exists, since runs are not ordered.
+      - name: Build and push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ matrix.tag }}
+          PLATFORMS: ${{ matrix.platforms }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"
+          image=docker.io/ai/llmman
+          docker buildx create --use
+          docker buildx build packaging --push --provenance=false --sbom=false \
+            --platform "$PLATFORMS" \
+            --build-arg "BASE=ghcr.io/ggml-org/llama.cpp:$TAG-$LLAMA_CPP_RELEASE" \
+            --build-arg "VERSION=$VERSION" \
+            --build-arg "REVISION=$GITHUB_SHA" \
+            -t "$image:$TAG-$VERSION"
+          newest="$(gh release list --limit 10 --json tagName -q '.[].tagName' | grep '^v' | sort -V | tail -1)"
+          if [ "$newest" != "v$VERSION" ]; then
+            echo "::notice::$newest is newer; leaving the floating tags to it"
+            exit 0
+          fi
+          tags=(-t "$image:$TAG")
+          if [ "$TAG" = server ]; then tags+=(-t "$image:latest"); fi
+          docker buildx imagetools create "${tags[@]}" "$image:$TAG-$VERSION"
+
+  # --------------------------------------------------------------------------
   # crates.io: the `llmman` crate at the same version, on every commit to
   # main. Versions are immutable there, which is fine: the commit count
   # never repeats. `cargo install llmman` builds from source (needs Go);
@@ -1672,7 +1767,7 @@ jobs:
   # --------------------------------------------------------------------------
   publish-crate:
     name: Publish to crates.io
-    needs: [release]
+    needs: [release, publish-images]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -1740,7 +1835,7 @@ jobs:
   # --------------------------------------------------------------------------
   publish-homebrew:
     name: Publish Homebrew formula
-    needs: [release]
+    needs: [release, publish-images]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -1841,7 +1936,7 @@ jobs:
   # --------------------------------------------------------------------------
   publish-winget:
     name: Publish winget manifest
-    needs: [release]
+    needs: [release, publish-images]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: windows-2025
     timeout-minutes: 20

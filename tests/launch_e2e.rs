@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`, `talos`) — not mocks.
+//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`, `talos`, `dsh`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -23,14 +23,18 @@
 //! store) is assumed available and NOT treated as skippable: a pull
 //! failure is a real failure here, not an environment-setup gap.
 //!
-//! [`serve_mlx_safetensors_model`] is the one test in this file that
-//! isn't about a third-party integration at all: it exercises
-//! `llmman serve`'s own `mlx_lm.server` backend for safetensors models
-//! (see `cmd::serve::use_mlx_for_safetensors`) directly via `llmman run`,
-//! against a real (tiny) safetensors model pulled from HuggingFace. Like
-//! every other test here it skips itself — rather than failing — when
-//! its own prerequisite (`mlx_lm.server` on `PATH`, and Apple Silicon
-//! macOS, the only platform that binary even runs on) isn't met.
+//! [`serve_mlx_safetensors_model`], [`serve_vllm_safetensors_model`] and
+//! [`serve_sglang_safetensors_model`] are the tests in this file that
+//! aren't about a third-party integration at all: they exercise `llmman
+//! serve`'s own safetensors backends — `mlx_lm.server` (see
+//! `cmd::serve::backend::use_mlx_for_safetensors`), `vllm` and `sglang`
+//! (`LLMMAN_SAFETENSORS_ENGINE`) — directly via `llmman run`, against a
+//! real safetensors model. Like every other test here they skip
+//! themselves — rather than failing — when their own prerequisite (the
+//! engine on `PATH`; for mlx, Apple Silicon macOS too) isn't met. The
+//! vllm and sglang ones run a daemon of their own on a fresh port (the
+//! engine choice is daemon-wide environment) — see
+//! `serve_safetensors_with_engine`.
 //!
 //! `llmman serve` is a process-wide singleton bound to a single loopback
 //! port (127.0.0.1:17434 by default, or wherever `LLMMAN_HOST` points —
@@ -1008,6 +1012,30 @@ fn qwen_loop_detection(stderr: &str) -> bool {
     stderr.contains("Loop detection halted the run")
 }
 
+#[test]
+fn launch_dsh_with_model() {
+    eprintln!("[test] launch_dsh_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_dsh_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("dsh") {
+        eprintln!("skipping: dsh not on PATH — npm install -g @deepseek-ai/dsh");
+        return;
+    }
+
+    // `--profile headless <prompt>`: dsh's own one-shot mode — answers
+    // one task, prints the final assistant message, and exits. The
+    // default `web` profile `llmman launch dsh` execs otherwise boots a
+    // persistent server with no text reply, so it alone wouldn't fit
+    // this file's launch_and_assert/"pong" pattern at all; a caller-
+    // supplied `--profile` overrides it (see `dsh_args` in
+    // `cmd::launch`) for exactly this case.
+    launch_and_assert("dsh", &["--profile", "headless", PROMPT]);
+}
+
 /// Verifies `daemon::ensure_server`'s fast-fail path end to end: when the
 /// auto-spawned `llmman serve` dies during startup, the client command
 /// must report the daemon's exit within seconds (via the poll loop's
@@ -1019,9 +1047,10 @@ fn qwen_loop_detection(stderr: &str) -> bool {
 ///
 ///   - `LLMMAN_HOST` points at a loopback port nothing listens on, so
 ///     the client never reuses (or stops) the developer's real daemon;
-///   - a fake `llama-server` sits first on `PATH`, so serve's
-///     `resolve_llama_server` returns immediately without a download
-///     (it is found but never executed: serve dies before launching it);
+///   - `LLMMAN_RUNTIME=path` with a fake `llama-server` first on `PATH`,
+///     so serve's runtime resolution returns immediately without probing
+///     a container engine or downloading anything (it is found but never
+///     executed: serve dies before launching it);
 ///   - `LLMMAN_MODELS` points at `<tmp>/store` while `<tmp>/cache`
 ///     already exists as a regular FILE, so `serve_async`'s
 ///     `create_dir_all(cache)` fails right after resolving llama-server,
@@ -1040,6 +1069,7 @@ fn ensure_server_fails_fast_when_daemon_dies_at_startup() {
     cmd.arg("pull").arg(MODEL);
     cmd.env("LLMMAN_HOST", format!("127.0.0.1:{port}"))
         .env("LLMMAN_MODELS", dir.join("store"))
+        .env("LLMMAN_RUNTIME", "path")
         .env("PATH", path);
 
     let start = Instant::now();
@@ -1087,6 +1117,7 @@ fn launch_qwen_without_a_model_is_refused_before_the_daemon() {
         .env("QWEN_HOME", dir.join(".qwen"))
         .env("LLMMAN_HOST", format!("127.0.0.1:{port}"))
         .env("LLMMAN_MODELS", dir.join("store"))
+        .env("LLMMAN_RUNTIME", "path")
         .env("PATH", path);
 
     let start = Instant::now();
@@ -1179,7 +1210,7 @@ fn openclaw_pull_registry_flake(stderr: &str) -> bool {
 const MLX_MODEL: &str = "mlx-community/SmolLM2-135M-Instruct-8bit";
 
 /// Exercises `llmman serve`'s `mlx_lm.server` backend
-/// (`cmd::serve::use_mlx_for_safetensors`/`spawn_mlx_server`) end to end:
+/// (`cmd::serve::backend::use_mlx_for_safetensors`/`spawn_mlx_server`) end to end:
 /// a real `llmman run` against [`MLX_MODEL`], pulled fresh from
 /// HuggingFace, served locally by a real `mlx_lm.server` process — not a
 /// third-party integration launch like every other test in this file
@@ -1266,4 +1297,268 @@ fn serve_mlx_safetensors_model() {
         "{MLX_MODEL} was not served by mlx_lm.server (use_mlx_for_safetensors regression?) \
          — `llmman ps` row: {model_row:?}"
     );
+}
+
+/// [`MODEL`]'s safetensors twin (`ai/qwen3.5:0.8b-safetensors`, ~1.7GB),
+/// which vllm-plugin/tests/test_e2e.py also pulls into the same store.
+#[cfg(unix)]
+const VLLM_MODEL: &str = "qwen3.5:0.8b-safetensors";
+
+/// A small dense model for [`serve_sglang_safetensors_model`], not
+/// [`VLLM_MODEL`]: Qwen3.5's SGLang model code binds the Intel AMX CPU
+/// kernels at import, and the MLX runtime has no Gated DeltaNet.
+#[cfg(unix)]
+const SGLANG_MODEL: &str = "hf.co/HuggingFaceTB/SmolLM2-135M-Instruct";
+
+/// A cold ~1.7GB pull plus the daemon's 15m load deadline (see
+/// `serve_safetensors_with_engine`).
+#[cfg(unix)]
+const ENGINE_TIMEOUT: Duration = Duration::from_secs(1200);
+
+/// A loopback port nothing is listening on right now, for a test's own
+/// daemon (see [`serve_safetensors_with_engine`]).
+#[cfg(unix)]
+fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral loopback port")
+        .local_addr()
+        .expect("local_addr of the ephemeral listener")
+        .port()
+}
+
+/// SGLang compiles its CPU kernel library `-march=x86-64-v4` (plus AMX)
+/// and it SIGILLs at import without AVX-512 — which GitHub's mixed
+/// AMD/Intel x86_64 fleet does not guarantee. Always true elsewhere
+/// (aarch64 builds `-march=native`; macOS uses MLX).
+#[cfg(unix)]
+fn host_can_run_sglang_cpu_kernels() -> bool {
+    if !(cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")) {
+        return true;
+    }
+    std::fs::read_to_string("/proc/cpuinfo")
+        .map(|s| s.contains(" avx512f") && s.contains(" avx512bw"))
+        .unwrap_or(false)
+}
+
+/// SIGTERMs the `daemon`'s process group (the engine shares it), SIGKILL
+/// after 30s. Reaps the daemon as it goes: a zombie still counts for
+/// `kill(pgid, 0)`.
+#[cfg(unix)]
+fn terminate_daemon(daemon: &mut std::process::Child) {
+    let pgid = -(daemon.id() as i32);
+    unsafe {
+        libc::kill(pgid, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let _ = daemon.try_wait();
+        // ESRCH once the group is empty.
+        if unsafe { libc::kill(pgid, 0) } != 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    eprintln!(
+        "[test] process group of daemon {} still alive 30s after SIGTERM; sending SIGKILL",
+        daemon.id()
+    );
+    unsafe {
+        libc::kill(pgid, libc::SIGKILL);
+    }
+    let _ = daemon.wait();
+}
+
+/// A `llmman serve` of the test's own on `host` with `env` added, in its
+/// own process group, returned once it accepts TCP connections — so
+/// its log is the test's to report and a slow start can't race
+/// `ensure_server` into a second, doomed spawn.
+#[cfg(unix)]
+fn spawn_test_daemon(host: &str, env: &[(&str, &str)]) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(llmman_bin());
+    cmd.arg("serve")
+        .env("LLMMAN_HOST", host)
+        // As CI's job env: `auto` would pull a llama.cpp image first.
+        .env(
+            "LLMMAN_RUNTIME",
+            std::env::var_os("LLMMAN_RUNTIME").unwrap_or_else(|| "path".into()),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .process_group(0);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn `llmman serve`");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if std::net::TcpStream::connect(host).is_ok() {
+            return child;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("`llmman serve` on {host} exited before listening: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "`llmman serve` on {host} did not start listening within 120s"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// `llmman run <model>` against a daemon of its own (fresh port,
+/// `LLMMAN_SAFETENSORS_ENGINE=<engine>` plus `env`), asserting `llmman ps`
+/// reports `<engine> (local)` — the engine asked for, not the one the
+/// daemon would pick alone (mlx on macOS, vllm on Linux; either could
+/// answer the prompt and mask a selection regression). The daemon is
+/// torn down afterwards. The shared daemon's [`MODEL`] is unloaded first:
+/// its 256k context is several GiB a CPU engine start on a 16GB runner
+/// cannot spare. `--think false --num-predict 32`: see `warm_model`.
+#[cfg(unix)]
+fn serve_safetensors_with_engine(engine: &str, model: &str, env: &[(&str, &str)]) {
+    let _ = Command::new(llmman_bin())
+        .args(["stop", MODEL])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let host = format!("127.0.0.1:{}", free_loopback_port());
+    // 15m: what vllm-plugin's e2e allows a CPU `vllm serve` to become
+    // healthy in; llmman's 10m default gave up first on slow runners.
+    let mut daemon_env = vec![
+        ("LLMMAN_SAFETENSORS_ENGINE", engine),
+        ("LLMMAN_LOAD_TIMEOUT", "15m"),
+    ];
+    daemon_env.extend_from_slice(env);
+    let mut daemon = spawn_test_daemon(&host, &daemon_env);
+    eprintln!("[test] {engine}: daemon pid {} on {host}", daemon.id());
+
+    let result = std::panic::catch_unwind(|| {
+        let mut cmd = Command::new(llmman_bin());
+        cmd.env("LLMMAN_HOST", &host)
+            .arg("run")
+            .arg(model)
+            .arg("--think")
+            .arg("false")
+            .arg("--num-predict")
+            .arg("32")
+            .arg(PROMPT);
+        let output = spawn_with_timeout(
+            cmd,
+            ENGINE_TIMEOUT,
+            &format!("llmman run ({engine} safetensors)"),
+        );
+        assert!(
+            output.status.success(),
+            "llmman run {model} {PROMPT:?} via {engine} failed (status: {:?})\n\
+             --- stdout ---\n{}\n--- stderr ---\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        eprintln!(
+            "[test] {engine}: reply: {}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+
+        let ps = Command::new(llmman_bin())
+            .env("LLMMAN_HOST", &host)
+            .arg("ps")
+            .output()
+            .expect("spawn `llmman ps`");
+        let ps_stdout = String::from_utf8_lossy(&ps.stdout);
+        assert!(
+            ps.status.success(),
+            "llmman ps failed (status: {:?})\n--- stdout ---\n{ps_stdout}\n--- stderr ---\n{}",
+            ps.status,
+            String::from_utf8_lossy(&ps.stderr),
+        );
+        // `ps` prints the canonical reference; match on the repo name,
+        // which every spelling of `model` contains.
+        let needle = model
+            .trim_start_matches("hf.co/")
+            .split(':')
+            .next()
+            .unwrap_or(model);
+        let model_row = ps_stdout
+            .lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{model} missing from `llmman ps` output:\n{ps_stdout}"));
+        let expected = format!("{engine} (local)");
+        assert!(
+            model_row.contains(&expected),
+            "{model} was not served by {engine} (LLMMAN_SAFETENSORS_ENGINE regression?) \
+             — `llmman ps` row: {model_row:?}"
+        );
+    });
+
+    terminate_daemon(&mut daemon);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// `llmman serve`'s `vllm` backend end to end, wherever CI installs vLLM
+/// (Linux: CPU wheel; macOS: vllm-metal). `LLMMAN_SAFETENSORS_ENGINE=vllm`
+/// is what makes the macOS leg deterministic, where mlx_lm.server is also
+/// installed. Platform flags (`--dtype bfloat16 --enforce-eager`,
+/// `--max-num-seqs 1`, `VLLM_*`) come from the CI step's environment as
+/// `LLMMAN_VLLM_ARGS`/`VLLM_*`; `LLMMAN_CONTEXT_LENGTH=1024` bounds the
+/// KV cache.
+#[cfg(unix)]
+#[test]
+fn serve_vllm_safetensors_model() {
+    eprintln!("[test] serve_vllm_safetensors_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] serve_vllm_safetensors_model: acquired SERIAL");
+
+    if !on_path("vllm") {
+        eprintln!("skipping: vllm not on PATH — see ci.yml's \"Install vLLM (e2e)\" step");
+        return;
+    }
+    serve_safetensors_with_engine("vllm", VLLM_MODEL, &[("LLMMAN_CONTEXT_LENGTH", "1024")]);
+}
+
+/// `llmman serve`'s `sglang` backend end to end, wherever CI installs
+/// SGLang (Linux: its CPU engine; macOS: its MLX runtime). Platform
+/// variables (`SGLANG_USE_CPU_ENGINE`/`SGLANG_USE_MLX`,
+/// `LLMMAN_SGLANG_ARGS=--disable-cuda-graph`) come from the CI step.
+/// Skips on x86_64 without AVX-512 ([`host_can_run_sglang_cpu_kernels`]).
+#[cfg(unix)]
+#[test]
+fn serve_sglang_safetensors_model() {
+    eprintln!("[test] serve_sglang_safetensors_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] serve_sglang_safetensors_model: acquired SERIAL");
+
+    if !on_path("sglang") {
+        eprintln!("skipping: sglang not on PATH — see ci.yml's \"Install SGLang (e2e)\" step");
+        return;
+    }
+    if !host_can_run_sglang_cpu_kernels() {
+        eprintln!(
+            "skipping: this x86_64 CPU has no AVX-512, which SGLang's CPU kernel library \
+             is compiled for (it SIGILLs at import)"
+        );
+        return;
+    }
+    serve_safetensors_with_engine("sglang", SGLANG_MODEL, &[("LLMMAN_CONTEXT_LENGTH", "1024")]);
+}
+
+/// llmman never links against llama.cpp: `mediagen::ffi` dlopens the
+/// ggml/llama libraries next to `llama-server` and mirrors two of its
+/// structs. Checked here against the release CI pins (on `PATH`), not
+/// only when a diffusion model loads: a dropped symbol fails `Api::load`,
+/// a moved struct `check_layout`.
+#[test]
+fn mediagen_ffi_binds_the_llama_cpp_on_path() {
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH");
+        return;
+    }
+    let dir = llmman::cmd::serve::llama_lib_dir(llmman::cmd::serve::Runtime::Path, None).unwrap();
+    eprintln!("binding the ggml/llama libraries in {}", dir.display());
+    let api = llmman::mediagen::ffi::Api::load(&dir).unwrap();
+    api.check_layout().unwrap();
 }

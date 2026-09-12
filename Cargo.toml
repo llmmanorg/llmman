@@ -34,7 +34,8 @@ name = "llmman"
 path = "src/main.rs"
 
 [dependencies]
-clap       = { version = "4", features = ["derive", "wrap_help"] }
+# `env`: `serve --runtime` doubles as LLMMAN_RUNTIME (cmd::serve::runtime).
+clap       = { version = "4", features = ["derive", "env", "wrap_help"] }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2       = "0.10"
@@ -48,8 +49,18 @@ walkdir    = "2"
 chrono     = { version = "0.4", features = ["serde"] }
 dirs       = "5"
 tar        = "0.4"
-axum       = "0.7"
+# `ws` for the web UI's terminal (`/llmman/shell`, src/cmd/serve/shell.rs).
+axum       = { version = "0.7", features = ["ws"] }
+# TLS termination for `llmman serve` (LLMMAN_TLS_CERT/LLMMAN_TLS_KEY).
+# `no-provider`: rustls's ring and aws-lc-rs providers are both already
+# in the tree (reqwest's and the AWS SDK's); serve installs ring itself
+# rather than have this pull a preference of its own.
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+rustls     = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tower-http = { version = "0.6", features = ["cors"] }
+# The pty behind that terminal: one crate for Unix ptys and Windows
+# ConPTY, and its default program is already "the user's login shell".
+portable-pty = "0.9"
 libc       = "0.2"
 tokio-util = { version = "0.7", features = ["io"] }
 toml       = { version = "0.8", default-features = false, features = ["parse"] }
@@ -66,6 +77,11 @@ flate2     = "1"
 zip        = { version = "2", default-features = false, features = ["deflate"] }
 libloading = "0.8"
 multer     = "3"
+# Cosmos3 prompts are tokenized from the pack's tokenizer.json (mediagen::cosmos3);
+# pure-Rust build, the pre-tokenizer regexes need fancy-regex's lookahead.
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+# conditioning images for image-to-video and action runs
+image      = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # Real Xet-protocol downloads for HuggingFace files too large for the
 # plain-HTTP path to reliably serve — see src/xet_fetch.rs. Its
@@ -99,8 +115,16 @@ podman = []
 # change any parsing behavior, only visibility.
 fuzzing = []
 
+[dev-dependencies]
+# A WebSocket client for the `/llmman/shell` tests; the same crate axum's
+# `ws` feature already builds, at the version it pins.
+tokio-tungstenite = "0.24"
+
 [build-dependencies]
 flate2 = "1"
+# build.rs pins the web UI's downloaded mark by hash (see FETCHED_ASSETS).
+sha2   = "0.10"
+hex    = "0.4"
 
 # `cargo binstall llmman` fetches the prebuilt release binary instead of
 # compiling, so it needs neither a Rust nor a Go toolchain.

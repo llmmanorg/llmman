@@ -43,12 +43,13 @@ fn parse_host(value: Option<&str>) -> (String, String, u16) {
     let mut default_port = DEFAULT_PORT;
     let (scheme, hostport) = match trimmed.split_once("://") {
         Some((scheme, rest)) => {
-            match scheme {
+            let scheme = scheme.to_ascii_lowercase();
+            match scheme.as_str() {
                 "http" => default_port = 80,
                 "https" => default_port = 443,
                 _ => {}
             }
-            (scheme.to_string(), rest)
+            (scheme, rest)
         }
         None => ("http".to_string(), trimmed),
     };
@@ -98,12 +99,53 @@ fn format_host_port(host: &str, port: u16) -> String {
     }
 }
 
-/// The `http://host:port` origin every client in this process talks to.
-/// Always `http` (`llmman serve` has no TLS support) and built from
-/// `connect_addr`, not the raw configured host, so a wildcard bind
-/// (`0.0.0.0`/`[::]`) still gets a host clients can actually reach.
+/// The `scheme://host:port` origin every client in this process talks
+/// to: `https` only when `LLMMAN_HOST` spells it, and built from
+/// `connect_addr` so a wildcard bind still gets a reachable host.
 pub fn server() -> String {
-    format!("http://{}", connect_addr())
+    format!("{}://{}", scheme(), connect_addr())
+}
+
+fn scheme() -> &'static str {
+    if parsed_host().0 == "https" {
+        "https"
+    } else {
+        "http"
+    }
+}
+
+/// Whether `LLMMAN_HOST` asks for TLS. `cmd::serve` requires this and
+/// `LLMMAN_TLS_CERT` to agree.
+pub fn tls_scheme() -> bool {
+    scheme() == "https"
+}
+
+/// Whether this process reaches the daemon without a cleartext network
+/// hop — over loopback or TLS — and so may send a credential along.
+pub fn connects_securely() -> bool {
+    connects_over_loopback() || tls_scheme()
+}
+
+/// A blocking client for the daemon: the process's key as a default
+/// header ([`crate::auth::client_headers`]) plus `LLMMAN_TLS_CA`'s roots.
+/// Every client of `server()` is built here or in
+/// [`async_client_builder`], so none can forget either.
+pub fn client_builder() -> anyhow::Result<reqwest::blocking::ClientBuilder> {
+    let mut builder =
+        reqwest::blocking::Client::builder().default_headers(crate::auth::client_headers()?);
+    for cert in crate::auth::tls_ca()? {
+        builder = builder.add_root_certificate(cert);
+    }
+    Ok(builder)
+}
+
+pub fn client() -> anyhow::Result<reqwest::blocking::Client> {
+    client_builder()?.build().context("build http client")
+}
+
+/// The async twin of [`client_builder`].
+pub fn async_client_builder() -> anyhow::Result<reqwest::ClientBuilder> {
+    Ok(crate::auth::trusted_client()?.default_headers(crate::auth::client_headers()?))
 }
 
 /// A peer's `scheme://host:port` origin from a `LLMMAN_HOST`-style spec
@@ -248,7 +290,8 @@ fn is_local_host(host: &str) -> bool {
 /// fetched/parsed at all — whatever is holding the port in that case,
 /// killing processes based on it would be a guess.
 fn stale_daemon() -> Option<DaemonIdentity> {
-    let resp = reqwest::blocking::Client::builder()
+    let resp = client_builder()
+        .ok()?
         .timeout(Some(Duration::from_secs(2)))
         .build()
         .ok()?
@@ -492,16 +535,15 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     // instead of the generic timeout.
     bail_if_exited(&mut child, log_path.as_deref())?;
     // Timed out with the daemon alive but not listening. If startup is
-    // mid-way through llama-server's one-time auto-download (which can
-    // far exceed this budget; see llama_release's 30-minute HTTP budget),
-    // killing the daemon would discard the partial download (no resume,
-    // pid-specific staging files) and make every retry start from zero.
-    // Leave it running and say so instead.
+    // mid-way through its one-time llama.cpp fetch (release download or
+    // container pull, either far longer than this budget), killing the
+    // daemon would discard the partial download (no resume) and make
+    // every retry start from zero. Leave it running and say so instead.
     if crate::llama_release::download_in_progress() {
         anyhow::bail!(
-            "llmman serve did not start within 60s: startup is still downloading \
-             llama-server. The daemon was left running so the download can finish; \
-             retry this command once it does{}",
+            "llmman serve did not start within 60s: startup is still fetching llama.cpp \
+             (a release download or container image pull). The daemon was left running \
+             so it can finish; retry this command once it does{}",
             log_tail(log_path.as_deref())
         );
     }
@@ -785,7 +827,7 @@ pub fn disable_std_handle_inheritance() {
 /// api.ProgressResponse) — status text plus an optional error, and
 /// (unlike real Ollama's per-layer digest/total/completed) our own
 /// aggregate total/completed byte counts across the whole pull/push, once
-/// cmd::serve's stream_ffi_progress has one to report — see that
+/// cmd::serve::ollama's stream_ffi_progress has one to report — see that
 /// function's own doc comment for where these come from.
 #[derive(Deserialize)]
 struct ProgressLine {
@@ -798,7 +840,7 @@ struct ProgressLine {
     #[serde(default)]
     notice: Option<String>,
     /// The manifest digest a push landed on, for `--sign-key` to sign
-    /// here rather than in the daemon. See `cmd::serve`'s `push_impl`.
+    /// here rather than in the daemon. See `cmd::serve::ollama`'s `push_impl`.
     #[serde(default)]
     digest: Option<String>,
     #[serde(default)]
@@ -863,7 +905,7 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
 pub fn stream_progress_with(path: &str, reference: &str) -> anyhow::Result<Option<String>> {
     let body = serde_json::json!({"model": reference});
 
-    let client = reqwest::blocking::Client::builder()
+    let client = client_builder()?
         .timeout(None) // model transfers can take much longer than any sane fixed timeout
         .build()
         .context("build http client")?;
@@ -997,27 +1039,45 @@ pub fn stream_progress_with(path: &str, reference: &str) -> anyhow::Result<Optio
     Ok(pushed_digest)
 }
 
-/// The part of Ollama's `api.ShowResponse` that `llmman run` reads.
+/// The part of Ollama's `api.ShowResponse` that `llmman run` and
+/// `llmman launch` read.
 #[derive(Debug, Default, Deserialize)]
 pub struct ShowResponse {
     /// `"completion"`, `"vision"`, … — see `crate::modelpack::capabilities`.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// The model's chat template, if any (see `crate::modelpack::chat_template`).
+    #[serde(default)]
+    pub template: Option<String>,
 }
 
 impl ShowResponse {
+    /// The template's thinking controls; `None` without a template.
+    pub fn thinking_controls(&self) -> Option<crate::chat_template::ThinkingControls> {
+        self.template
+            .as_deref()
+            .map(crate::chat_template::thinking_controls)
+    }
+
     /// Ollama's `RunHandler`: `opts.MultiModal` = vision or audio.
     pub fn multimodal(&self) -> bool {
         self.capabilities
             .iter()
             .any(|c| c == crate::modelpack::CAPABILITY_VISION || c == "audio")
     }
+
+    /// An image generation model (see `crate::imagegen`).
+    pub fn image(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c == crate::modelpack::CAPABILITY_IMAGE)
+    }
 }
 
 /// Ollama's `client.Show`: a read-only `/api/show` lookup. `Ok(None)` is
 /// a 404 only; any other failure is an error, as in `showOrPullModel`.
 pub fn show(reference: &str) -> anyhow::Result<Option<ShowResponse>> {
-    let resp = reqwest::blocking::Client::new()
+    let resp = client()?
         .post(format!("{}/api/show", server()))
         .json(&serde_json::json!({"model": reference}))
         .send()
@@ -1052,16 +1112,16 @@ pub fn ensure_model_pulled(reference: &str) -> anyhow::Result<ShowResponse> {
 /// Pushes `reference` via the daemon's `/api/push` and returns the
 /// manifest digest it landed on, for `cmd::push --sign-key` to sign.
 ///
-/// The daemon is deliberately not asked to sign: see `cmd::serve`'s
-/// `push_impl` for why a caller-supplied key path is not something an
-/// unauthenticated loopback endpoint may accept.
+/// The daemon is deliberately not asked to sign: see
+/// `cmd::serve::ollama`'s `push_impl` for why a caller-supplied key path
+/// is not something an unauthenticated loopback endpoint may accept.
 pub fn push(reference: &str) -> anyhow::Result<Option<String>> {
     stream_progress_with("/api/push", reference)
 }
 
 /// POSTs the Ollama unload sentinel (`{"model": reference, "keep_alive":
 /// 0}`, no `prompt` field — i.e. an empty prompt) to `/api/generate` —
-/// see `cmd::serve`'s `handle_ollama_generate` for the server side that
+/// see `cmd::serve::ollama`'s `handle_ollama_generate` for the server side that
 /// reads this exact shape as an immediate-unload request, mirroring real
 /// Ollama's own `ollama stop` (`cmd/cmd.go`'s `loadOrUnloadModel`). Used
 /// by `llmman stop`.
@@ -1073,7 +1133,7 @@ pub fn push(reference: &str) -> anyhow::Result<Option<String>> {
 /// in front of the daemon answers 404 too, and "couldn't find model"
 /// would be the wrong story for that.
 pub fn unload(reference: &str) -> anyhow::Result<bool> {
-    let resp = reqwest::blocking::Client::new()
+    let resp = client()?
         .post(format!("{}/api/generate", server()))
         .json(&serde_json::json!({"model": reference, "keep_alive": 0}))
         .send()
@@ -1104,7 +1164,9 @@ pub(crate) fn is_model_not_found_body(body: &str, reference: &str) -> bool {
 /// `stream_progress`'s newline-delimited-JSON streaming, just a single
 /// request/response.
 pub fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T> {
-    let resp = reqwest::blocking::get(format!("{}{path}", server()))
+    let resp = client()?
+        .get(format!("{}{path}", server()))
+        .send()
         .with_context(|| format!("request {path}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -1146,7 +1208,9 @@ pub fn api_error(body: &str) -> Option<String> {
 pub struct ProviderSummary {
     pub id: String,
     pub name: String,
-    pub key_env: String,
+    /// Absent for a configured provider that names no variable.
+    #[serde(default)]
+    pub key_env: Option<String>,
     /// Whether the key is set *where the daemon runs*. What this process
     /// itself holds is [`ProviderSummary::key_here`].
     pub key_set: bool,
@@ -1155,6 +1219,10 @@ pub struct ProviderSummary {
     /// bound, which this process's `LLMMAN_HOST` says nothing about.
     #[serde(default)]
     pub key_usable: bool,
+    /// Whether a keyless request is forwarded (see
+    /// `Provider::key_optional`); absent from an older daemon means no.
+    #[serde(default)]
+    pub key_optional: bool,
     pub models: usize,
 }
 
@@ -1167,7 +1235,7 @@ impl ProviderSummary {
     /// Whether *this* process holds the key — the other way one reaches
     /// a provider, sent per request (see `client_api_key` in cmd::serve).
     pub fn key_here(&self) -> bool {
-        crate::providers::key_for(&self.id, &self.key_env).is_some()
+        crate::providers::key_for(&self.id, self.key_env.as_deref()).is_some()
     }
 }
 
@@ -1183,12 +1251,17 @@ pub struct ProviderDetail {
     pub id: String,
     pub name: String,
     pub base_url: String,
-    pub key_env: String,
+    /// See [`ProviderSummary::key_env`].
+    #[serde(default)]
+    pub key_env: Option<String>,
     /// See [`ProviderSummary::key_set`].
     pub key_set: bool,
     /// See [`ProviderSummary::key_usable`].
     #[serde(default)]
     pub key_usable: bool,
+    /// See [`ProviderSummary::key_optional`].
+    #[serde(default)]
+    pub key_optional: bool,
     pub models: Vec<ProviderModel>,
 }
 
@@ -1219,7 +1292,7 @@ impl ProviderDetail {
     /// prompt, and every key, regardless. It does not name the
     /// `llmman.conf` entry, which is keyed by the provider id.
     pub fn api_key(&self) -> Option<String> {
-        crate::providers::key_for(&self.id, &self.key_env)
+        crate::providers::key_for(&self.id, self.key_env.as_deref())
     }
 
     /// Just the ids, for a caller that only needs to name one (see
@@ -1228,10 +1301,34 @@ impl ProviderDetail {
         self.models.iter().map(|m| m.id.as_str()).collect()
     }
 
+    /// Where a key for this provider would go (see
+    /// `crate::providers::key_hint`).
+    pub fn key_hint(&self) -> String {
+        crate::providers::key_hint(&self.id, self.key_env.as_deref())
+    }
+
+    /// Resolves the key this process would send, warning once if it is
+    /// about to cross the network in cleartext — the daemon's own
+    /// startup warning only covers the key *it* holds.
+    pub fn client_key(&self) -> Option<String> {
+        let key = self.api_key();
+        if key.is_some() && self.base_url.starts_with("http://") {
+            eprintln!(
+                "[llmman] warning: the API key for {} goes to {} over plain http",
+                self.name, self.base_url
+            );
+        }
+        key
+    }
+
     /// Warns when this provider does not list `model` — a warning, since
-    /// models.dev is a snapshot and a provider can serve a model (a new
-    /// release, a fine-tune, a private deployment) before it lists one.
+    /// models.dev is a snapshot and a provider can serve a model before it
+    /// lists one. Silent for a configured provider whose `/models` said
+    /// nothing: there is no list to be absent from.
     pub fn warn_unlisted(&self, model: &str) {
+        if self.key_optional && self.models.is_empty() {
+            return;
+        }
         if !self.models.iter().any(|m| m.id == model) {
             eprintln!(
                 "[llmman] warning: {} does not list model {model:?}\n{}",

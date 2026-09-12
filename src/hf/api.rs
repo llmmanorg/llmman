@@ -22,15 +22,14 @@ pub struct HfFile {
     pub kind: String, // "file" or "directory"
 }
 
-/// Issues an authenticated GET and decodes JSON in a single attempt. This
-/// is a cheap metadata request, so a bad or nonexistent host must fail
-/// fast rather than run the retry backoff.
+/// Issues an authenticated GET and decodes JSON; see `client::probe` for
+/// the (lack of) retries.
 async fn get_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
     token: Option<&str>,
 ) -> Result<T> {
-    let body = super::client::once(&format!("GET {url}"), || async {
+    let body = super::client::probe(&format!("GET {url}"), || async {
         let mut req = client.get(url);
         if let Some(t) = token {
             req = req.bearer_auth(t);
@@ -250,6 +249,242 @@ pub fn select_gguf(files: &[HfFile], tag: &str) -> Result<Vec<HfFile>> {
         .min_by_key(|f| f.size)
         .expect("models is non-empty");
     gguf_shards(&models, smallest)
+}
+
+// ---------------------------------------------------------------------------
+// Latent diffusion repositories (mirrors llama.cpp common/download.cpp)
+// ---------------------------------------------------------------------------
+
+fn is_weights_file(lower: &str) -> bool {
+    lower.ends_with(".gguf") || lower.ends_with(".safetensors")
+}
+
+/// True when the repo ships a diffusion model: a transformer GGUF next to
+/// VAE / text projection sidecars (e.g. `unsloth/LTX-2.3-GGUF`).
+pub fn is_diffusion_repo(files: &[HfFile]) -> bool {
+    files.iter().any(|f| {
+        let name = basename_lower(&f.path);
+        f.kind == "file"
+            && is_weights_file(&name)
+            && (name.contains("video_vae")
+                || name.contains("_vae.")
+                || name.contains("embeddings_connectors"))
+    })
+}
+
+fn basename_lower(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_lowercase()
+}
+
+/// A Diffusers pipeline in safetensors (a root `model_index.json`, e.g.
+/// `nvidia/Cosmos3-Edge`): pulled as safetensors, served by vLLM-Omni.
+pub fn is_diffusers_repo(files: &[HfFile]) -> bool {
+    files
+        .iter()
+        .any(|f| f.kind == "file" && f.path == crate::modelpack::DIFFUSERS_MODEL_INDEX)
+        && files
+            .iter()
+            .any(|f| f.kind == "file" && basename_lower(&f.path).ends_with(".safetensors"))
+}
+
+/// Substrings of the `_class_name`s vLLM-Omni registers with
+/// `final_output_type="video"` (its `diffusion/registry.py`), lowercased.
+const VIDEO_PIPELINE_HINTS: &[&str] = &[
+    "video",
+    "omni",
+    "cosmos",
+    "wan",
+    "ltx",
+    "magi",
+    "helios",
+    "lingbot",
+    "longcat",
+    "minimaxh3",
+];
+
+/// A Diffusers pipeline's `outputTypes` from its `_class_name`: the video
+/// families vLLM-Omni serves also make video, anything else only images.
+pub fn diffusers_outputs(class_name: Option<&str>) -> Vec<&'static str> {
+    let lower = class_name.unwrap_or("").to_lowercase();
+    if VIDEO_PIPELINE_HINTS.iter().any(|h| lower.contains(h)) {
+        vec!["image", "video"]
+    } else {
+        vec!["image"]
+    }
+}
+
+/// [`diffusers_pipeline_class`] for a transfer, which keeps no layers:
+/// fetches the index from the Hub. `None` on failure.
+pub async fn fetch_diffusers_pipeline_class(
+    client: &reqwest::Client,
+    endpoint: &str,
+    owner: &str,
+    repo: &str,
+    commit: &str,
+    token: Option<&str>,
+) -> Option<String> {
+    let url = format!(
+        "{endpoint}{owner}/{repo}/resolve/{commit}/{}",
+        crate::modelpack::DIFFUSERS_MODEL_INDEX
+    );
+    pipeline_class(&get_json(client, &url, token).await.ok()?)
+}
+
+fn pipeline_class(index: &serde_json::Value) -> Option<String> {
+    index.get("_class_name")?.as_str().map(str::to_string)
+}
+
+/// The `_class_name` of the pipeline index among `layers`, already
+/// downloaded into the OCI layout at `layout_dir`.
+pub fn diffusers_pipeline_class(
+    layout_dir: &std::path::Path,
+    layers: &[oci::Descriptor],
+) -> Option<String> {
+    let index = layers.iter().find(|d| {
+        d.annotations
+            .as_ref()
+            .and_then(|a| a.get(oci::ANNOTATION_FILEPATH))
+            .is_some_and(|p| p == crate::modelpack::DIFFUSERS_MODEL_INDEX)
+    })?;
+    let hex = index.digest.strip_prefix("sha256:")?;
+    let bytes = std::fs::read(layout_dir.join("blobs").join("sha256").join(hex)).ok()?;
+    pipeline_class(&serde_json::from_slice(&bytes).ok()?)
+}
+
+/// Like [`select_gguf`], but when no quant is requested prefers the fast
+/// `distilled` variant that diffusion repos ship next to the `dev` one.
+pub fn select_diffusion_gguf(files: &[HfFile], tag: &str) -> Result<Vec<HfFile>> {
+    // sidecars may be GGUFs too
+    let files: Vec<HfFile> = files
+        .iter()
+        .filter(|f| !is_diffusion_sidecar(&basename_lower(&f.path)))
+        .cloned()
+        .collect();
+    if tag.is_empty() || tag == "latest" {
+        // one file per transformer: a split cannot be served
+        let models: Vec<&HfFile> = files
+            .iter()
+            .filter(|f| {
+                f.kind == "file" && is_model_gguf(&f.path) && parse_gguf_shard(&f.path).is_none()
+            })
+            .collect();
+        for pref in QUANT_PREFERENCE {
+            let matching: Vec<&&HfFile> = models
+                .iter()
+                .filter(|f| f.path.to_uppercase().contains(pref))
+                .collect();
+            if let Some(f) = matching
+                .iter()
+                .find(|f| f.path.to_lowercase().contains("distilled"))
+                .or(matching.first())
+            {
+                return Ok(vec![(**f).clone()]);
+            }
+        }
+    }
+    select_gguf(&files, tag)
+}
+
+fn is_diffusion_sidecar(name: &str) -> bool {
+    ["vae", "connector", "text_encoder", "embeddings"]
+        .iter()
+        .any(|k| name.contains(k))
+}
+
+/// Everything a diffusion transformer needs next to it.
+pub struct DiffusionPlan {
+    /// `(role, file)` from the same repo: `vae`, `audio_vae`, `text_proj`.
+    pub sidecars: Vec<(&'static str, HfFile)>,
+    /// The `image` / `video` / `audio` capabilities the sidecars enable.
+    pub outputs: Vec<&'static str>,
+    /// `owner/repo:quant` of the text encoder the family was trained with.
+    pub text_encoder: Option<&'static str>,
+}
+
+/// See llama.cpp's `common_download_get_hf_plan` for the same resolution.
+pub fn diffusion_plan(files: &[HfFile], model_path: &str) -> DiffusionPlan {
+    let pick = |k| select_diffusion_sidecar(files, model_path, k);
+    let candidates = [
+        (
+            "vae",
+            pick("video_vae")
+                .or_else(|| pick("_vae.").filter(|f| !f.path.to_lowercase().contains("audio_vae"))),
+        ),
+        ("audio_vae", pick("audio_vae")),
+        ("text_proj", pick("embeddings_connectors")),
+    ];
+    let mut plan = DiffusionPlan {
+        sidecars: Vec::new(),
+        outputs: Vec::new(),
+        text_encoder: diffusion_default_text_encoder(model_path),
+    };
+    for (role, file) in candidates {
+        let Some(file) = file else { continue };
+        match role {
+            "vae" => plan.outputs.extend(["image", "video"]),
+            "audio_vae" => plan.outputs.push("audio"),
+            _ => {}
+        }
+        plan.sidecars.push((role, file));
+    }
+    plan
+}
+
+/// Media type and annotations of a sidecar layer.
+pub fn sidecar_layer(mut d: oci::Descriptor, file: &HfFile, role: &str) -> oci::Descriptor {
+    d.media_type = safetensors_media_type(&file.path).to_string();
+    let name = file
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&file.path)
+        .to_string();
+    d.annotations = Some(BTreeMap::from([
+        (oci::ANNOTATION_FILEPATH.to_string(), name),
+        (oci::ANNOTATION_ROLE.to_string(), role.to_string()),
+    ]));
+    d
+}
+
+/// The sidecar whose file name contains `keyword` and shares the longest
+/// prefix with the chosen transformer's file name — so the `distilled`
+/// VAE goes with the `distilled` transformer.
+pub fn select_diffusion_sidecar(
+    files: &[HfFile],
+    model_path: &str,
+    keyword: &str,
+) -> Option<HfFile> {
+    let model_name = basename_lower(model_path);
+    let mut best: Option<(usize, &HfFile)> = None;
+    for f in files.iter().filter(|f| f.kind == "file") {
+        let name = basename_lower(&f.path);
+        if !is_weights_file(&name) || !name.contains(keyword) {
+            continue;
+        }
+        let common = name
+            .bytes()
+            .zip(model_name.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if best.is_none_or(|(c, _)| common > c) {
+            best = Some((common, f));
+        }
+    }
+    best.map(|(_, f)| f.clone())
+}
+
+/// The text encoder repository a diffusion model family is trained with.
+/// LTX-2.x uses Gemma 3 12B; LTX-2.5 needs a fine-tuned Gemma 4 that
+/// ships with the model, so there is no generic default for it.
+pub fn diffusion_default_text_encoder(model_path: &str) -> Option<&'static str> {
+    let name = basename_lower(model_path);
+    if name.contains("ltx-2.5") || name.contains("ltx-2-5") {
+        return None;
+    }
+    if name.contains("ltx-2") || name.contains("ltx2") {
+        return Some("ggml-org/gemma-3-12b-it-GGUF:Q4_K_M");
+    }
+    None
 }
 
 const MMPROJ_PREFERENCE: &[&str] = &["F16", "BF16", "F32"];
@@ -488,6 +723,157 @@ mod tests {
         assert_eq!(
             safetensors_media_type("chat_template.jinja"),
             oci::MEDIA_TYPE_MODEL_WEIGHT_CONFIG_RAW
+        );
+    }
+
+    fn ltx_repo() -> Vec<HfFile> {
+        vec![
+            file("README.md", 10),
+            file("ltx-2.3-22b-dev-Q4_K_M.gguf", 14),
+            file("ltx-2.3-22b-dev-Q8_0.gguf", 22),
+            file("distilled/ltx-2.3-22b-distilled-Q4_K_M.gguf", 14),
+            file("distilled-1.1/ltx-2.3-22b-distilled-1.1-Q4_K_M.gguf", 14),
+            file("vae/ltx-2.3-22b-dev_video_vae.safetensors", 1),
+            file("vae/ltx-2.3-22b-distilled_video_vae.safetensors", 1),
+            file("vae/ltx-2.3-22b-dev_audio_vae.safetensors", 1),
+            file("vae/ltx-2.3-22b-distilled_audio_vae.safetensors", 1),
+            file(
+                "text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors",
+                2,
+            ),
+            file(
+                "text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors",
+                2,
+            ),
+        ]
+    }
+
+    #[test]
+    fn diffusion_repo_is_detected_by_its_sidecars() {
+        assert!(is_diffusion_repo(&ltx_repo()));
+        assert!(!is_diffusion_repo(&[
+            file("model-Q4_K_M.gguf", 1),
+            file("mmproj-F16.gguf", 1)
+        ]));
+    }
+
+    #[test]
+    fn diffusion_gguf_prefers_distilled_without_a_tag() {
+        let picked = select_diffusion_gguf(&ltx_repo(), "").unwrap();
+        assert_eq!(picked.len(), 1);
+        assert!(picked[0].path.contains("distilled"), "{}", picked[0].path);
+        assert!(picked[0].path.contains("Q4_K_M"));
+        // an explicit tag still wins
+        let dev = select_diffusion_gguf(&ltx_repo(), "dev-Q8_0").unwrap();
+        assert_eq!(dev[0].path, "ltx-2.3-22b-dev-Q8_0.gguf");
+    }
+
+    #[test]
+    fn diffusion_sidecars_follow_the_transformer_variant() {
+        let files = ltx_repo();
+        let model = "distilled-1.1/ltx-2.3-22b-distilled-1.1-Q4_K_M.gguf";
+        let vae = select_diffusion_sidecar(&files, model, "video_vae").unwrap();
+        assert_eq!(vae.path, "vae/ltx-2.3-22b-distilled_video_vae.safetensors");
+        let conn = select_diffusion_sidecar(&files, model, "embeddings_connectors").unwrap();
+        assert_eq!(
+            conn.path,
+            "text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors"
+        );
+        let dev_vae =
+            select_diffusion_sidecar(&files, "ltx-2.3-22b-dev-Q8_0.gguf", "audio_vae").unwrap();
+        assert_eq!(dev_vae.path, "vae/ltx-2.3-22b-dev_audio_vae.safetensors");
+        assert!(select_diffusion_sidecar(&files, model, "nothing").is_none());
+    }
+
+    #[test]
+    fn ltx2_defaults_to_gemma3_text_encoder() {
+        assert_eq!(
+            diffusion_default_text_encoder("distilled-1.1/ltx-2.3-22b-distilled-1.1-Q4_K_M.gguf"),
+            Some("ggml-org/gemma-3-12b-it-GGUF:Q4_K_M")
+        );
+        assert_eq!(
+            diffusion_default_text_encoder("ltx-2.5-22b-dev-Q8_0.gguf"),
+            None
+        );
+        assert_eq!(diffusion_default_text_encoder("flux-dev-Q8_0.gguf"), None);
+    }
+
+    /// `nvidia/Cosmos3-Edge`'s listing (weights only; assets elided).
+    fn cosmos3_repo() -> Vec<HfFile> {
+        vec![
+            file("README.md", 10),
+            file("config.json", 1),
+            file("model_index.json", 1),
+            file("model.safetensors.index.json", 1),
+            file("scheduler/scheduler_config.json", 1),
+            file("transformer/config.json", 1),
+            file(
+                "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+                5,
+            ),
+            file(
+                "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+                2,
+            ),
+            file("vae/config.json", 1),
+            file("vae/diffusion_pytorch_model.safetensors", 1),
+            file("vision_encoder/model.safetensors", 1),
+            file("assets/example_i2v_input.jpg", 1),
+        ]
+    }
+
+    #[test]
+    fn diffusers_repo_is_detected_by_its_root_pipeline_index() {
+        let files = cosmos3_repo();
+        assert!(is_diffusers_repo(&files));
+        // Not the GGUF-sidecar kind: nothing in it is named like an LTX VAE,
+        // so it must fall through to the safetensors pull, nested paths intact.
+        assert!(!is_diffusion_repo(&files));
+        assert!(select_gguf(&files, "").is_err());
+        let picked = select_downloadable_hf_files(&files);
+        let paths: Vec<&str> = picked.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"model_index.json"));
+        assert!(paths.contains(&"vae/diffusion_pytorch_model.safetensors"));
+        assert!(paths.contains(&"transformer/config.json"));
+        assert!(!paths.contains(&"assets/example_i2v_input.jpg"));
+        // A plain LLM repo, and an index without weights, are not one.
+        assert!(!is_diffusers_repo(&[
+            file("config.json", 1),
+            file("model.safetensors", 1)
+        ]));
+        assert!(!is_diffusers_repo(&[file("model_index.json", 1)]));
+        // A nested index does not make the repo a pipeline.
+        assert!(!is_diffusers_repo(&[
+            file("model.safetensors", 1),
+            file("demo/model_index.json", 1)
+        ]));
+    }
+
+    #[test]
+    fn diffusers_outputs_follow_the_pipeline_class() {
+        assert_eq!(
+            diffusers_outputs(Some("Cosmos3OmniPipeline")),
+            vec!["image", "video"]
+        );
+        for video in [
+            "WanPipeline",
+            "LTX2Pipeline",
+            "HunyuanVideo15Pipeline",
+            "Magi2Pipeline",
+        ] {
+            assert_eq!(
+                diffusers_outputs(Some(video)),
+                vec!["image", "video"],
+                "{video}"
+            );
+        }
+        for image in ["QwenImagePipeline", "FluxPipeline", "LancePipeline"] {
+            assert_eq!(diffusers_outputs(Some(image)), vec!["image"], "{image}");
+        }
+        assert_eq!(
+            diffusers_outputs(None),
+            vec!["image"],
+            "unknown: at least an image model"
         );
     }
 }

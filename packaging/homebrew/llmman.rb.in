@@ -37,17 +37,6 @@ class Llmman < Formula
     bin.install Dir["llmman-*"].first => "llmman"
   end
 
-  def caveats
-    <<~EOS
-      llmman downloads a llama.cpp build matching your GPU on first use. To
-      get started:
-
-        llmman launch claude --model qwen3.8
-
-      Models and cached llama.cpp builds live under ~/.local/share/llmman.
-    EOS
-  end
-
   test do
     # CI writes this version into Cargo.toml before building, so the
     # binary reports it.

@@ -99,7 +99,7 @@ pub fn prune_blobs(
         if !is_older_than(&path, grace) {
             continue;
         }
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let size = freed_file_size(&path);
         if let Err(e) = std::fs::remove_file(&path) {
             eprintln!("[llmman] couldn't remove unreferenced blob {name}: {e:#}");
             continue;
@@ -179,12 +179,29 @@ fn dir_size(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
-    entries
-        .flatten()
-        .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum()
+    entries.flatten().map(|e| freed_file_size(&e.path())).sum()
+}
+
+fn freed_file_size(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.is_file() && !has_multiple_links(&meta) {
+        meta.len()
+    } else {
+        0
+    }
+}
+
+#[cfg(unix)]
+fn has_multiple_links(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    meta.nlink() > 1
+}
+
+#[cfg(not(unix))]
+fn has_multiple_links(_meta: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Skips both the post-`rm` and startup GC sweeps when `LLMMAN_NOPRUNE` is
@@ -193,44 +210,12 @@ fn dir_size(dir: &Path) -> u64 {
 /// rather prune once at the end themselves. Read fresh at each call site,
 /// like every other `LLMMAN_*` var.
 pub fn noprune_from_env() -> bool {
-    parse_noprune(std::env::var("LLMMAN_NOPRUNE").ok().as_deref())
-}
-
-/// Split out from [`noprune_from_env`] for testing without touching the
-/// real environment. Unset, blank, or an explicit falsy value
-/// (`0`/`false`/`no`/`off`, case-insensitive) all mean "don't skip".
-fn parse_noprune(value: Option<&str>) -> bool {
-    let Some(v) = value else { return false };
-    let v = v.trim();
-    if v.is_empty() {
-        return false;
-    }
-    !matches!(
-        v.to_ascii_lowercase().as_str(),
-        "0" | "false" | "no" | "off"
-    )
+    crate::env_flag_set("LLMMAN_NOPRUNE")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_noprune_is_false_when_unset_blank_or_explicitly_falsy() {
-        assert!(!parse_noprune(None));
-        assert!(!parse_noprune(Some("")));
-        assert!(!parse_noprune(Some("   ")));
-        for falsy in ["0", "false", "no", "off", "FALSE", "Off", "  no  "] {
-            assert!(!parse_noprune(Some(falsy)), "{falsy:?} should be falsy");
-        }
-    }
-
-    #[test]
-    fn parse_noprune_is_true_for_any_other_value() {
-        for truthy in ["1", "true", "yes", "on", "anything"] {
-            assert!(parse_noprune(Some(truthy)), "{truthy:?} should be truthy");
-        }
-    }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -316,6 +301,30 @@ mod tests {
         assert!(!cache.join("bbbb").exists(), "orphan cache dir removed");
 
         std::fs::remove_dir_all(&cache).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_counts_hardlinked_blob_and_cache_bytes_once() {
+        let root = temp_dir("prune-hardlinked-cache");
+        let blobs = root.join("blobs").join("sha256");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(cache.join("bbbb")).unwrap();
+        let blob = blobs.join("aaaa");
+        let cache_file = cache.join("bbbb").join("model.safetensors");
+        let weights = b"complete-weights-bytes";
+        std::fs::write(&blob, weights).unwrap();
+        std::fs::hard_link(&blob, &cache_file).unwrap();
+
+        let live = HashSet::new();
+        let blob_stats = prune_blobs(&root, &live, Duration::ZERO).unwrap();
+        let cache_stats = prune_cache(&cache, &live, Duration::ZERO).unwrap();
+
+        assert_eq!(blob_stats.count, 1);
+        assert_eq!(cache_stats.count, 1);
+        assert_eq!(blob_stats.bytes + cache_stats.bytes, weights.len() as u64);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A corrupt (unparsable) manifest pointer file must abort the live-set

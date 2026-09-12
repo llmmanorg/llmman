@@ -22,6 +22,7 @@ use std::process::Command;
 use anyhow::Context;
 use clap::Args;
 
+use crate::chat_template::ThinkingControls;
 use crate::daemon;
 use crate::providers;
 
@@ -81,6 +82,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         "--overflow-model needs --model naming the local model to pair it with"
     );
 
+    // The local model's thinking controls (see `opencode_variants`); a
+    // provider's model has no template to read.
+    let mut thinking = None;
     let (model, api_key) = match provider {
         Some(provider) => {
             check_provider_supported(name)?;
@@ -123,7 +127,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // synchronously and with progress, before ever handing off to
             // the integration.
             if !model.is_empty() {
-                crate::daemon::ensure_model_pulled(&model)?;
+                thinking = crate::daemon::ensure_model_pulled(&model)?.thinking_controls();
             }
             match overflow {
                 // The hosted half is validated and keyed exactly as a
@@ -137,12 +141,19 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                         resolve_provider_model(provider, Some(hosted), name, per_request)?;
                     (crate::hybrid::pair_with_local(&model, &remote)?, api_key)
                 }
-                None => (model, providers::PLACEHOLDER_API_KEY.to_string()),
+                None => (model, integration_key()),
             }
         }
     };
 
-    launch(name, &model, &api_key, &args.extra_args)
+    launch(name, &model, &api_key, thinking.as_ref(), &args.extra_args)
+}
+
+/// What an integration authenticates with when no provider key travels:
+/// the daemon's key when this shell has one, else the placeholder that
+/// tells serve the header is not a credential.
+fn integration_key() -> String {
+    crate::auth::client_key().unwrap_or_else(|| providers::PLACEHOLDER_API_KEY.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -152,13 +163,25 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
 /// Integrations that cannot be launched without `--model`: Qwen Code has
 /// no notion of a missing model and sends its own built-in default
 /// (`qwen3.7-max` in 0.22.3), which the daemon would then try to pull.
+/// dsh has no default of its own either — an empty `--model` would
+/// otherwise land a literal `"default"` in `agent-default-model.model`,
+/// which the first request then tries to resolve as a real model id.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
-const MODEL_REQUIRED: &[&str] = &["qwen"];
+const MODEL_REQUIRED: &[&str] = &["qwen", "dsh"];
+
+/// Integrations whose launcher yields to a `--model` after `--`, and so
+/// warrant the warning below. Only qwen: `qwen_args` drops its own
+/// `--model` when the caller spelled one, where `dsh_args` does not —
+/// dsh takes no `--model` flag at all (its model is the one
+/// `write_dsh_settings` records), so telling a dsh user theirs "wins"
+/// would be false, and dsh rejects the unknown flag on its own.
+const MODEL_FLAG_FORWARDED: &[&str] = &["qwen"];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
 /// `--provider` too. A second `--model` after `--` is the caller's to
-/// win (`qwen_args` yields to it), but `run` resolves the top-level one
-/// and, locally, preloads it, so that gets said.
+/// win for the integrations in `MODEL_FLAG_FORWARDED`, but `run`
+/// resolves the top-level one and, locally, preloads it, so that gets
+/// said.
 fn check_model_flag(
     integration: &str,
     model: Option<&str>,
@@ -173,7 +196,8 @@ fn check_model_flag(
         let with_provider = provider.map_or(String::new(), |p| format!(" --provider {p}"));
         anyhow::bail!("{name} needs a model: llmman launch {name}{with_provider} --model <model>");
     };
-    if has_flag(extra_args, "--model", Some("-m")) {
+    if MODEL_FLAG_FORWARDED.contains(&name.as_str()) && has_flag(extra_args, "--model", Some("-m"))
+    {
         eprintln!(
             "[llmman] {name}: the --model after -- wins over --model {model}, the one llmman resolved"
         );
@@ -252,21 +276,23 @@ fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
     // The key would go to the integration in cleartext, and from there
     // over plain http to a daemon somewhere else on the network. llmman
     // controls neither hop, so it does not start the handoff. A wildcard
-    // bind is fine here — that hop is still loopback.
-    if !crate::daemon::connects_over_loopback() {
+    // bind is fine here — that hop is still loopback — and so is TLS.
+    if !crate::daemon::connects_securely() {
         anyhow::bail!(
-            "--provider needs a local llmman serve: LLMMAN_HOST points at {}, and the \
-             provider key would cross the network in cleartext.\n\
+            "--provider needs a local llmman serve, or one over TLS: LLMMAN_HOST points at {}, \
+             and the provider key would cross the network in cleartext.\n\
              Export the key where that daemon runs instead.",
             crate::daemon::server()
         );
     }
     // These reach the daemon over loopback, so the check above passes,
     // but they send the placeholder key and the daemon will not fall back
-    // to its own on a bind anyone can reach. Say so here rather than let
-    // it surface as a 401 from inside the integration.
+    // to its own on a bind anyone can reach — unless it authenticates
+    // callers, in which case they send its key and it will. Say so here
+    // rather than let it surface as a 401 from inside the integration.
     if PROVIDER_NEEDS_DAEMON_KEY.contains(&name.as_str())
         && !crate::daemon::reachable_only_locally()
+        && crate::auth::client_key().is_none()
     {
         anyhow::bail!(
             "--provider does not work with {name} while llmman serve is bound to {}: \
@@ -322,13 +348,23 @@ fn resolve_provider_model(
     // Read here, not left to the daemon, so a missing key names the
     // variable to set in llmman's own output. It travels per request in
     // the integration's own Authorization header (see client_api_key in
-    // cmd::serve), never to disk or a command line.
+    // cmd::serve), never to disk or a command line. The placeholder goes
+    // instead whenever the daemon's key is the one that matters — an
+    // integration that cannot carry one, or a shell without one where
+    // the daemon has it — or when the provider takes none at all
+    // (`key_optional`): it is what tells serve the header is not a
+    // credential.
     //
-    // The placeholder goes instead whenever the daemon's key is the one
-    // that matters — an integration that cannot carry one, or a shell
-    // without one where the daemon has it — since that is what makes
-    // serve fall back to its own.
-    let key = match (entry.api_key(), key_travels_per_request) {
+    // A daemon requiring a key takes that header for it, so the provider
+    // key cannot travel: the daemon's is the only one, and an
+    // authenticated caller may spend it.
+    let daemon_authenticates = crate::auth::client_key().is_some();
+    let key = if key_travels_per_request && !daemon_authenticates {
+        entry.client_key()
+    } else {
+        None
+    };
+    let key = match (key, key_travels_per_request) {
         (Some(key), true) => key,
         (_, false) => {
             // Fatal, not a warning: this integration cannot carry a key,
@@ -337,27 +373,33 @@ fn resolve_provider_model(
             // would spend it. Warning and handing off would surface as a
             // 401 inside someone else's TUI.
             anyhow::ensure!(
-                entry.key_usable,
+                entry.key_usable || entry.key_optional,
                 "{integration} is configured through a file, so it cannot send an API key: \
-                 llmman serve needs a key of its own, and must be bound to loopback to \
-                 spend it.\n\
+                 llmman serve needs a key of its own, and must be bound to loopback (or \
+                 require an API key) to spend it.\n\
                  Where the daemon runs, {}, then restart it.",
-                providers::key_hint(&entry.id, &entry.key_env)
+                entry.key_hint()
             );
-            providers::PLACEHOLDER_API_KEY.to_string()
+            integration_key()
         }
         (None, true) if entry.daemon_key_usable() => {
-            eprintln!(
-                "[llmman] warning: no API key for {} here; using the key llmman serve has",
-                entry.name
-            );
-            providers::PLACEHOLDER_API_KEY.to_string()
+            if !daemon_authenticates {
+                eprintln!(
+                    "[llmman] warning: no API key for {} here; using the key llmman serve has",
+                    entry.name
+                );
+            }
+            integration_key()
         }
-        (None, true) => anyhow::bail!(
-            "no API key for {} — {}",
+        (None, true) if entry.key_optional => integration_key(),
+        (None, true) if daemon_authenticates => anyhow::bail!(
+            "llmman serve requires an API key, so {integration} sends that one and cannot \
+             also carry a key for {}: llmman serve needs a key of its own.\n\
+             Where the daemon runs, {}, then restart it.",
             entry.name,
-            providers::key_hint(&entry.id, &entry.key_env)
+            entry.key_hint()
         ),
+        (None, true) => anyhow::bail!("no API key for {} — {}", entry.name, entry.key_hint()),
     };
 
     Ok((providers::format_remote_ref(provider, model), key))
@@ -433,6 +475,11 @@ const INTEGRATIONS: &[Integration] = &[
         name: "talos",
         description: "Talos",
         binary: "talos",
+    },
+    Integration {
+        name: "dsh",
+        description: "DeepSeek Harness",
+        binary: "dsh",
     },
 ];
 
@@ -511,10 +558,16 @@ fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
 /// the integration's environment can do this; the ones that go through a
 /// config file on disk keep the placeholder rather than persist a
 /// credential, and need the key in the daemon's own environment.
-fn launch(name: &str, model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch(
+    name: &str,
+    model: &str,
+    api_key: &str,
+    thinking: Option<&ThinkingControls>,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
     match name.to_lowercase().as_str() {
         "claude" => launch_claude(model, api_key, extra_args),
-        "opencode" => launch_opencode(model, api_key, extra_args),
+        "opencode" => launch_opencode(model, api_key, thinking, extra_args),
         "codex" => launch_codex(model, api_key, extra_args),
         "cline" => launch_simple("cline", model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
@@ -525,6 +578,7 @@ fn launch(name: &str, model: &str, api_key: &str, extra_args: &[String]) -> anyh
         "openclaw" => launch_openclaw(model, extra_args),
         "qwen" => launch_qwen(model, api_key, extra_args),
         "talos" => launch_talos(model, extra_args),
+        "dsh" => launch_dsh(model, api_key, extra_args),
         other => anyhow::bail!(
             "unknown integration {:?}\nRun 'llmman launch' without arguments to list supported integrations.",
             other
@@ -558,15 +612,59 @@ fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
     )
 }
 
-/// opencode: pass a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
-/// /v1 endpoint, matching exactly what ollama launch does.
-fn launch_opencode(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+/// opencode: a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
+/// /v1 endpoint, with the model's thinking variants.
+fn launch_opencode(
+    model: &str,
+    api_key: &str,
+    thinking: Option<&ThinkingControls>,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
     let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
 
     let effective_model = if model.is_empty() { "default" } else { model };
-    let config = opencode_config(effective_model, api_key);
+    let config = opencode_config(
+        &daemon::server(),
+        effective_model,
+        api_key,
+        &opencode_variants(thinking),
+    );
 
     exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
+}
+
+/// The choices offered when the model's template could not be read (a
+/// provider's model): thinking off, then the levels every wire accepts
+/// (`anthropic::portable_efforts`).
+const PORTABLE_THINKING_LEVELS: &[&str] = &["none", "low", "medium", "high"];
+
+/// opencode's `variants` for the model, in cycle order (`variant_cycle`,
+/// ctrl+t by default): the template's own choices (see
+/// [`ThinkingControls::choices`]), or [`PORTABLE_THINKING_LEVELS`] without
+/// a template. A model that does not think gets none. Each variant is the
+/// request options `@ai-sdk/openai-compatible` sends: `reasoningEffort`
+/// as `reasoning_effort`, other keys verbatim. opencode derives variants
+/// only for models it knows from models.dev, so without these a local
+/// model has nothing to cycle.
+fn opencode_variants(
+    thinking: Option<&ThinkingControls>,
+) -> Vec<(&'static str, serde_json::Value)> {
+    let choices = match thinking {
+        Some(controls) => controls.choices(),
+        None => PORTABLE_THINKING_LEVELS.to_vec(),
+    };
+    choices
+        .into_iter()
+        .map(|choice| {
+            let options = match choice {
+                "thinking" => {
+                    serde_json::json!({ "chat_template_kwargs": { "enable_thinking": true } })
+                }
+                level => serde_json::json!({ "reasoningEffort": level }),
+            };
+            (choice, options)
+        })
+        .collect()
 }
 
 /// `PATH`, then opencode's own installer target, `~/.opencode/bin`.
@@ -579,26 +677,84 @@ fn find_opencode() -> Option<PathBuf> {
     })
 }
 
-fn opencode_config(model: &str, api_key: &str) -> String {
-    let base_url = format!("{}/v1", daemon::server());
-    serde_json::json!({
-        "$schema": "https://opencode.ai/config.json",
-        "provider": {
-            "ollama": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "Ollama",
-                "options": {
-                    "baseURL": base_url,
-                    "apiKey": api_key
+/// The `OPENCODE_CONFIG_CONTENT` for `model` at `server`. Structs rather
+/// than `json!`, whose map sorts keys: opencode cycles variants in the
+/// order listed. No variants leaves the key out.
+fn opencode_config(
+    server: &str,
+    model: &str,
+    api_key: &str,
+    variants: &[(&'static str, serde_json::Value)],
+) -> String {
+    use serde::ser::{SerializeMap, Serializer};
+
+    /// An object with runtime keys, in the order given.
+    fn entries<S: Serializer, V: serde::Serialize>(
+        entries: &[(&str, V)],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(entries.len()))?;
+        for (key, value) in entries {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+
+    #[derive(serde::Serialize)]
+    struct Config<'a> {
+        #[serde(rename = "$schema")]
+        schema: &'static str,
+        provider: Providers<'a>,
+        model: String,
+    }
+    #[derive(serde::Serialize)]
+    struct Providers<'a> {
+        ollama: Provider<'a>,
+    }
+    #[derive(serde::Serialize)]
+    struct Provider<'a> {
+        npm: &'static str,
+        name: &'static str,
+        options: Options<'a>,
+        #[serde(serialize_with = "entries")]
+        models: [(&'a str, Model<'a>); 1],
+    }
+    #[derive(serde::Serialize)]
+    struct Options<'a> {
+        #[serde(rename = "baseURL")]
+        base_url: String,
+        #[serde(rename = "apiKey")]
+        api_key: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct Model<'a> {
+        name: &'a str,
+        #[serde(serialize_with = "entries", skip_serializing_if = "<[_]>::is_empty")]
+        variants: &'a [(&'static str, serde_json::Value)],
+    }
+
+    let config = Config {
+        schema: "https://opencode.ai/config.json",
+        provider: Providers {
+            ollama: Provider {
+                npm: "@ai-sdk/openai-compatible",
+                name: "Ollama",
+                options: Options {
+                    base_url: format!("{server}/v1"),
+                    api_key,
                 },
-                "models": {
-                    model: { "name": model }
-                }
-            }
+                models: [(
+                    model,
+                    Model {
+                        name: model,
+                        variants,
+                    },
+                )],
+            },
         },
-        "model": format!("ollama/{model}")
-    })
-    .to_string()
+        model: format!("ollama/{model}"),
+    };
+    serde_json::to_string(&config).expect("opencode config serializes")
 }
 
 /// codex: set OPENAI_API_KEY=llmman and write ~/.codex/config.toml with the
@@ -1786,6 +1942,177 @@ fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// dsh (DeepSeek Harness)
+// ---------------------------------------------------------------------------
+
+/// The env var dsh's generated provider entry reads its key from, so no
+/// key value is ever written to disk (same role as `QWEN_ENV_KEY`).
+const DSH_API_KEY_ENV: &str = "LLMMAN_API_KEY";
+
+/// dsh: unlike qwen/hermes/codex above, nothing here merges into a file
+/// dsh reads by default. dsh's own `--patch` overlay mechanism lets both
+/// files live under llmman's own config dir and be rewritten in full on
+/// every launch, without ever touching the user's real `$DSH_HOME`.
+///
+/// Defaults to the `web` profile, but a caller-supplied `--profile`
+/// after `--` wins instead — e.g. `--profile headless "<task>"` for a
+/// one-shot, scriptable run, the same way every other flag here already
+/// yields to what the caller explicitly asked for.
+///
+/// Both files sit at one fixed path, rewritten in place per launch:
+/// dsh hot-reloads the settings document, so two *concurrent* launches
+/// naming different models would retarget each other — accepted
+/// deliberately, since a per-launch directory costs a cleanup hook on
+/// every exit path (signals included) for a case that needs two
+/// simultaneous sessions on different models to bite at all.
+fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let launcher = dsh_launcher(extra_args);
+    if has_flag(launcher.args, "--patch", None) {
+        anyhow::bail!("llmman launch dsh manages --patch itself; pass other dsh flags after --");
+    }
+    if let Some(command) = launcher.command {
+        anyhow::bail!(
+            "dsh's `{command}` command cannot be combined with the --patch llmman passes it.\n\
+             Select a profile with `--profile {}` instead, or omit it for the default.",
+            if command == "web" { "web" } else { "<name>" }
+        );
+    }
+    let bin = find_on_path("dsh").ok_or_else(|| anyhow::anyhow!("dsh is not installed"))?;
+
+    let dir = dsh_config_dir()?;
+    let settings_path = dir.join("settings.yaml");
+    write_dsh_settings(&settings_path, model)?;
+    let patch_path = dir.join("llmman.cordis.yml");
+    write_dsh_patch(&patch_path, &settings_path)?;
+
+    exec_with_env(
+        &bin,
+        &dsh_args(&patch_path, extra_args),
+        &[(DSH_API_KEY_ENV, api_key)],
+    )
+}
+
+/// The tokens dsh reads as its own launcher flags, rather than forwards
+/// to the selected profile's app. Verified against dsh 0.1.2-rc.1: it
+/// stops at `--`, and also at the first token that isn't one of its own
+/// options — `--dump-config sometask --patch <file>` reports `--patch`
+/// and the file as app arguments and never reads it.
+///
+/// Scanning past either boundary reads app arguments as launcher ones:
+/// an app-level `--profile` would count as a profile selection and drop
+/// the default `web`, and an app-level `--patch` would be refused here
+/// as though it were ours to manage. (The app may well reject that
+/// token itself — headless answers `unknown option '--patch'` — but
+/// that is dsh's own argument to make, in its own words.)
+///
+/// `--profile`/`--patch` are the two that take a value, which has to be
+/// stepped over so it isn't mistaken for the first app argument; every
+/// other dsh option (`--dump-config`, `--version`, ...) is a bare flag.
+fn dsh_launcher(extra_args: &[String]) -> DshLauncher<'_> {
+    let mut end = 0;
+    let mut command = None;
+    while let Some(arg) = extra_args.get(end) {
+        if arg == "--" {
+            break;
+        }
+        end += match arg.as_str() {
+            // The two that take a value: step over it as well, so a
+            // profile or path isn't read as a command or as the first
+            // app argument (`--profile web`'s value is not the `web`
+            // command).
+            "--profile" | "--patch" => 2,
+            // dsh's command spellings, which it refuses to combine with
+            // any parent option — "web takes none of parent --profile,
+            // --patch, ..." — so no argument order pairs one with the
+            // `--patch` this injects.
+            found @ ("web" | "plugin") => {
+                command = command.or(Some(found));
+                1
+            }
+            _ if arg.starts_with('-') => 1,
+            // Anything else is dsh's first app argument.
+            _ => break,
+        };
+    }
+    DshLauncher {
+        args: &extra_args[..end.min(extra_args.len())],
+        command,
+    }
+}
+
+/// dsh's own launcher section: the tokens it reads rather than forwards,
+/// and the command spelling inside them, if any.
+struct DshLauncher<'a> {
+    args: &'a [String],
+    command: Option<&'a str>,
+}
+
+/// The argv dsh is invoked with. `--patch` is always injected; the
+/// default `web` profile is omitted when the caller already named one
+/// (however spelled) after `--`, so `--profile headless "task"` selects
+/// dsh's real one-shot mode instead of being appended onto `web`, which
+/// does not accept it.
+fn dsh_args(patch_path: &Path, extra_args: &[String]) -> Vec<String> {
+    let mut args = Vec::new();
+    if !has_flag(dsh_launcher(extra_args).args, "--profile", None) {
+        args.push("web".to_string());
+    }
+    args.push("--patch".to_string());
+    args.push(patch_path.to_string_lossy().into_owned());
+    args.extend_from_slice(extra_args);
+    args
+}
+
+/// `~/.config/llmman/launch/dsh`. Derived from `llmman.conf`'s own
+/// directory rather than rebuilt by hand, so the two cannot drift.
+/// dsh never looks here on its own; only `--patch` points it there.
+fn dsh_config_dir() -> anyhow::Result<PathBuf> {
+    let conf = crate::config::user_path().context("no home directory")?;
+    let dir = conf.parent().context("llmman.conf has no directory")?;
+    Ok(dir.join("launch").join("dsh"))
+}
+
+/// The settings document `llmman.cordis.yml` points dsh at: registers
+/// `llmman` as an `llm-pi-ai` provider route at this daemon's `/v1`, and
+/// selects it as the `agent-default-model`.
+fn write_dsh_settings(path: &Path, model: &str) -> anyhow::Result<()> {
+    let quoted_model = yaml_quote(model);
+    let base_url = yaml_quote(&format!("{}/v1", daemon::server()));
+    let contents = format!(
+        "# Written by `llmman launch dsh`; edits are overwritten.\n\
+         agent-default-model:\n  provider: llmman\n  model: {quoted_model}\n\
+         llm-pi-ai:\n  providers:\n    llmman:\n      displayName: llmman\n      \
+         apiKeyEnv: {DSH_API_KEY_ENV}\n      api: openai-completions\n      baseURL: {base_url}\n      \
+         models:\n        - id: {quoted_model}\n          name: {quoted_model}\n          input: [text]\n"
+    );
+    write_dsh_file(path, &contents)
+}
+
+/// dsh's patch shape: points its `settings` provider at the document above.
+fn write_dsh_patch(path: &Path, settings_path: &Path) -> anyhow::Result<()> {
+    write_dsh_file(path, &dsh_patch_document(settings_path))
+}
+
+/// Split from `write_dsh_patch` so a test can render a Windows-shaped
+/// path on any platform: `yaml_quote` escapes the `\` separators, and
+/// forgetting that is what once turned the Windows leg red.
+fn dsh_patch_document(settings_path: &Path) -> String {
+    let quoted_settings_path = yaml_quote(&settings_path.to_string_lossy());
+    format!(
+        "# Written by `llmman launch dsh`; edits are overwritten.\n\
+         - id: settings\n  config:\n    path: {quoted_settings_path}\n"
+    )
+}
+
+fn write_dsh_file(path: &Path, contents: &str) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    crate::fsutil::write_atomic(path, contents.as_bytes())
+        .with_context(|| format!("write {}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
 // Process execution helper
 // ---------------------------------------------------------------------------
 
@@ -1944,6 +2271,12 @@ mod tests {
             assert!(check_model_flag(id, Some("m"), None, &forwarded).is_ok());
         }
         assert!(check_model_flag("claude", None, None, &none).is_ok());
+        // The "yours wins" warning is only claimed for launchers that
+        // actually yield to it; dsh has no `--model` flag to yield to.
+        for id in MODEL_FLAG_FORWARDED {
+            assert!(MODEL_REQUIRED.contains(id), "{id} is not model-required");
+        }
+        assert!(!MODEL_FLAG_FORWARDED.contains(&"dsh"));
     }
 
     /// The found directory goes in front of `PATH` only when it is not
@@ -2344,6 +2677,86 @@ model = \"gpt-5\"
         assert_eq!(strip_legacy_llmman_profile(existing), "");
     }
 
+    /// The config points at the daemon's `/v1` and lists the variants in
+    /// the order given (a parsed `Value` would re-sort them).
+    #[test]
+    fn opencode_config_lists_the_variants_in_order() {
+        let variants = opencode_variants(None);
+        let text = opencode_config("http://127.0.0.1:17434", "qwen3.5:0.8b", "k", &variants);
+        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(config["$schema"], "https://opencode.ai/config.json");
+        assert_eq!(config["model"], "ollama/qwen3.5:0.8b");
+        let provider = &config["provider"]["ollama"];
+        assert_eq!(provider["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(provider["name"], "Ollama");
+        assert_eq!(provider["options"]["baseURL"], "http://127.0.0.1:17434/v1");
+        assert_eq!(provider["options"]["apiKey"], "k");
+        assert_eq!(provider["models"].as_object().map(|m| m.len()), Some(1));
+
+        let model = &provider["models"]["qwen3.5:0.8b"];
+        assert_eq!(model["name"], "qwen3.5:0.8b");
+        let written = model["variants"].as_object().expect("variants object");
+        assert_eq!(written.len(), variants.len());
+        for (name, options) in &variants {
+            assert_eq!(&written[*name], options, "variant {name}");
+        }
+        let positions: Vec<usize> = variants
+            .iter()
+            .map(|(name, _)| text.find(&format!("\"{name}\"")).expect(name))
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
+
+        let bare = opencode_config("http://h", "m", "k", &[]);
+        assert!(!bare.contains("variants"), "{bare}");
+    }
+
+    #[test]
+    fn opencode_config_escapes_the_model_name() {
+        let model = "we\"ird/mo\\del";
+        let config: serde_json::Value =
+            serde_json::from_str(&opencode_config("http://h", model, "k", &[]))
+                .expect("valid JSON");
+        assert_eq!(config["model"], format!("ollama/{model}"));
+        assert_eq!(config["provider"]["ollama"]["models"][model]["name"], model);
+    }
+
+    /// Each choice becomes the options that select it; no template means
+    /// the portable set, no thinking means no variants.
+    #[test]
+    fn opencode_variants_follow_the_templates_controls() {
+        let gemma4 = ThinkingControls {
+            thinks: true,
+            enable_thinking: true,
+            efforts: vec![],
+        };
+        assert_eq!(
+            opencode_variants(Some(&gemma4)),
+            [
+                ("none", serde_json::json!({ "reasoningEffort": "none" })),
+                (
+                    "thinking",
+                    serde_json::json!({ "chat_template_kwargs": { "enable_thinking": true } })
+                ),
+            ]
+        );
+        let qwen3_8 = ThinkingControls {
+            efforts: vec!["low", "xhigh"],
+            ..gemma4
+        };
+        assert_eq!(
+            opencode_variants(Some(&qwen3_8)),
+            [
+                ("none", serde_json::json!({ "reasoningEffort": "none" })),
+                ("low", serde_json::json!({ "reasoningEffort": "low" })),
+                ("xhigh", serde_json::json!({ "reasoningEffort": "xhigh" })),
+            ]
+        );
+        assert!(opencode_variants(Some(&ThinkingControls::default())).is_empty());
+        let fallback = opencode_variants(None);
+        assert_eq!(fallback.len(), PORTABLE_THINKING_LEVELS.len());
+        assert_eq!(fallback[0].0, "none");
+    }
+
     #[test]
     fn codex_profile_is_a_websocket_free_provider_at_the_daemon() {
         let profile: toml::Value = codex_profile("http://127.0.0.1:17434")
@@ -2361,6 +2774,233 @@ model = \"gpt-5\"
         assert!(
             profile.get("openai_base_url").is_none(),
             "the built-in openai provider is not the one in use"
+        );
+    }
+
+    /// A shortname like `qwen3.5:0.8b` must round-trip quoted, or the
+    /// `:` breaks YAML parsing; the key must never appear literally.
+    #[test]
+    fn write_dsh_settings_points_at_llmman_with_the_key_in_the_environment() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-dsh-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("settings.yaml");
+        write_dsh_settings(&path, "qwen3.5:0.8b").unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("provider: llmman"));
+        assert!(contents.contains("model: \"qwen3.5:0.8b\""));
+        assert!(contents.contains(&format!("apiKeyEnv: {DSH_API_KEY_ENV}")));
+        assert!(contents.contains("api: openai-completions"));
+        assert!(contents.contains(&format!("baseURL: \"{}/v1\"", daemon::server())));
+        assert!(contents.contains("id: \"qwen3.5:0.8b\""));
+        assert!(!contents.contains("apiKey:"), "no literal key in the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_dsh_patch_names_the_settings_document() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-dsh-patch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let settings_path = dir.join("settings.yaml");
+        let patch_path = dir.join("llmman.cordis.yml");
+        write_dsh_patch(&patch_path, &settings_path).unwrap();
+        let contents = std::fs::read_to_string(&patch_path).unwrap();
+        assert!(contents.contains("id: settings"));
+        // Through `yaml_quote`, not the raw path: on Windows a path's
+        // `\` separators are escaped in the document, so the raw string
+        // never matches (a real red Windows CI leg).
+        assert!(contents.contains(&format!(
+            "path: {}",
+            yaml_quote(&settings_path.to_string_lossy())
+        )));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A Windows-shaped path on every platform, so the escaping this
+        // depends on is covered without needing the Windows CI leg to
+        // be the thing that catches it (which is how it was caught).
+        let win = Path::new(r"C:\Users\hb\.config\llmman\launch\dsh\settings.yaml");
+        let rendered = dsh_patch_document(win);
+        assert!(rendered.contains(r#"path: "C:\\Users\\hb\\"#), "{rendered}");
+        assert!(!rendered.contains(r#"path: "C:\Users"#), "{rendered}");
+    }
+
+    /// Past dsh's own `--` boundary, a token is an app argument rather
+    /// than a launcher flag (verified against dsh 0.1.2-rc.1), so
+    /// neither check may scan there: a task whose text is `--patch`
+    /// must not be refused, and one reading `--profile` must not
+    /// suppress the default `web`.
+    #[test]
+    fn dsh_checks_stop_at_dshs_own_argument_boundary() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Asserted on the boundary helper, never by calling `launch_dsh`
+        // itself: past the refusal it goes on to exec dsh and
+        // `std::process::exit`, which on a machine that has dsh
+        // installed would take the test runner with it.
+        let forwarded_patch = args(&["--profile", "headless", "--", "--patch"]);
+        assert_eq!(
+            dsh_launcher(&forwarded_patch).args,
+            args(&["--profile", "headless"])
+        );
+        assert!(!has_flag(
+            dsh_launcher(&forwarded_patch).args,
+            "--patch",
+            None
+        ));
+
+        let forwarded_profile = args(&["--", "--profile", "headless"]);
+        assert!(dsh_launcher(&forwarded_profile).args.is_empty());
+        assert_eq!(
+            dsh_args(Path::new("/p.yml"), &forwarded_profile),
+            ["web", "--patch", "/p.yml", "--", "--profile", "headless"]
+        );
+
+        // The same boundary without a `--`: dsh stops at the first
+        // token of its own it doesn't recognize, so a task's wording
+        // is app text, not flags. `--profile headless` before it is
+        // still dsh's, value stepped over rather than read as the
+        // first app argument.
+        let task_mentions_patch = args(&["--profile", "headless", "explain", "the", "--patch"]);
+        assert_eq!(
+            dsh_launcher(&task_mentions_patch).args,
+            args(&["--profile", "headless"])
+        );
+        assert!(!has_flag(
+            dsh_launcher(&task_mentions_patch).args,
+            "--patch",
+            None
+        ));
+
+        // An app-level `--profile` past that boundary must not suppress
+        // the default `web`.
+        let app_level_profile = args(&["sometask", "--profile", "headless"]);
+        assert!(dsh_launcher(&app_level_profile).args.is_empty());
+        assert_eq!(
+            dsh_args(Path::new("/p.yml"), &app_level_profile),
+            [
+                "web",
+                "--patch",
+                "/p.yml",
+                "sometask",
+                "--profile",
+                "headless"
+            ]
+        );
+
+        // Bare flags take no value, and the `=`-joined spelling is dsh's
+        // own either way.
+        assert_eq!(
+            dsh_launcher(&args(&["--dump-config", "task"])).args,
+            args(&["--dump-config"])
+        );
+        assert_eq!(
+            dsh_launcher(&args(&["--profile=headless", "task"])).args,
+            args(&["--profile=headless"])
+        );
+
+        // dsh's command spellings are found where dsh itself reads them
+        // (before any app argument), so `launch_dsh` can refuse them up
+        // front: dsh rejects a command combined with a parent --patch,
+        // which this always injects (verified against 0.1.2-rc.1).
+        for command in ["web", "plugin"] {
+            let via_command = args(&[command, "--port", "8080"]);
+            assert_eq!(dsh_launcher(&via_command).command, Some(command));
+            let err = launch_dsh("m", "k", &via_command).unwrap_err();
+            assert!(err.to_string().contains("--profile"), "{err}");
+        }
+        // `--profile web`'s *value* is not the `web` command — refusing
+        // it would break the most ordinary explicit invocation there is
+        // (a real bug this caught, found only by running it).
+        let profile_web = args(&["--profile", "web", "--no-open"]);
+        assert_eq!(dsh_launcher(&profile_web).command, None);
+        assert_eq!(
+            dsh_args(Path::new("/p.yml"), &profile_web),
+            ["--patch", "/p.yml", "--profile", "web", "--no-open"]
+        );
+        // Same for a patch path that happens to be named `web`.
+        assert_eq!(dsh_launcher(&args(&["--patch", "web"])).command, None);
+        // Past the boundary it is app text, not a command.
+        assert_eq!(dsh_launcher(&args(&["sometask", "web"])).command, None);
+
+        // All launcher flags, no app arguments: the whole slice is dsh's.
+        let plain = args(&["--profile", "headless"]);
+        assert_eq!(dsh_launcher(&plain).args, plain);
+        // A value-taking flag with its value missing must not run past
+        // the end of the slice.
+        assert_eq!(
+            dsh_launcher(&args(&["--profile"])).args,
+            args(&["--profile"])
+        );
+    }
+
+    /// A caller-supplied `--patch` after `--` must be refused, however spelled.
+    #[test]
+    fn launch_dsh_refuses_a_conflicting_patch_flag() {
+        let word = vec!["--patch".to_string(), "/tmp/x.yml".to_string()];
+        let err = launch_dsh("m", "k", &word).unwrap_err();
+        assert!(err.to_string().contains("--patch"), "{err}");
+        let joined = vec!["--patch=/tmp/x.yml".to_string()];
+        let err = launch_dsh("m", "k", &joined).unwrap_err();
+        assert!(err.to_string().contains("--patch"), "{err}");
+    }
+
+    /// dsh carries a real key per launch, unlike hermes, so it belongs
+    /// on neither `--provider` refusal list.
+    #[test]
+    fn dsh_is_a_real_integration_and_not_on_a_provider_refusal_list() {
+        assert!(INTEGRATIONS.iter().any(|i| i.name == "dsh"));
+        assert!(!PROVIDER_UNSUPPORTED.iter().any(|(id, _)| *id == "dsh"));
+        assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"dsh"));
+    }
+
+    /// A caller-supplied `--profile` (however spelled) must win over the
+    /// default `web`, since `web` doesn't accept `--profile` at all;
+    /// `--patch` is injected either way and nothing else is reordered.
+    #[test]
+    fn dsh_args_defaults_to_web_but_yields_to_a_caller_supplied_profile() {
+        let path = Path::new("/tmp/x/llmman.cordis.yml");
+        let none: Vec<String> = vec![];
+        assert_eq!(
+            dsh_args(path, &none),
+            ["web", "--patch", "/tmp/x/llmman.cordis.yml"]
+        );
+
+        let headless = vec![
+            "--profile".to_string(),
+            "headless".to_string(),
+            "hi".to_string(),
+        ];
+        assert_eq!(
+            dsh_args(path, &headless),
+            [
+                "--patch",
+                "/tmp/x/llmman.cordis.yml",
+                "--profile",
+                "headless",
+                "hi"
+            ]
+        );
+
+        let joined = vec!["--profile=headless".to_string(), "hi".to_string()];
+        assert_eq!(
+            dsh_args(path, &joined),
+            [
+                "--patch",
+                "/tmp/x/llmman.cordis.yml",
+                "--profile=headless",
+                "hi"
+            ]
         );
     }
 
