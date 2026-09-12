@@ -184,6 +184,7 @@ installed:
 | `kimi` | Kimi Code CLI | no: it picks its own model rather than taking llmman's |
 | `copilot` | GitHub Copilot CLI (`gh`) | no: it has no way to send a key |
 | `openclaw` | OpenClaw | no: it only takes a model during first-run onboarding |
+| `pool` | Poolside | yes |
 
 Any extra arguments after `--` are forwarded to the integration's own CLI.
 

@@ -859,6 +859,12 @@ jobs:
         run: |
           & ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -SkipSetup
 
+      # pool has no npm package (install.sh/install.ps1 only, like
+      # llmman's own install scripts).
+      - name: Install pool
+        if: runner.os != 'Windows'
+        run: POOL_INSTALL_ACCEPT_EULA=1 curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh
+
       # opencode installs its configured provider's npm package (here
       # @ai-sdk/openai-compatible — see launch::opencode_config) on demand
       # into ~/.config/opencode/node_modules the first time a fresh HOME

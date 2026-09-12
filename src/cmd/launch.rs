@@ -475,6 +475,11 @@ const INTEGRATIONS: &[Integration] = &[
         description: "DeepSeek Harness",
         binary: "dsh",
     },
+    Integration {
+        name: "pool",
+        description: "Poolside CLI",
+        binary: "pool",
+    },
 ];
 
 fn print_integrations() {
@@ -569,6 +574,7 @@ fn launch(
         "hermes" => launch_hermes(model, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
         "qwen" => launch_qwen(model, api_key, extra_args),
+        "pool" => launch_pool(model, api_key, extra_args),
         "dsh" => launch_dsh(model, api_key, extra_args),
         other => anyhow::bail!(
             "unknown integration {:?}\nRun 'llmman launch' without arguments to list supported integrations.",
@@ -1445,6 +1451,44 @@ fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
     field("envKey") == Some(QWEN_ENV_KEY)
         && field("baseUrl")
             .is_some_and(|u| u.trim_end_matches('/') == base_url.trim_end_matches('/'))
+}
+
+/// pool: Poolside CLI, pointed at our /v1 endpoint.
+///
+/// Sets POOLSIDE_STANDALONE_BASE_URL and POOLSIDE_API_KEY.
+/// For `pool exec` (standalone mode), sets POOLSIDE_STANDALONE_MODEL.
+/// For interactive mode, passes -m flag.
+fn launch_pool(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    if cfg!(windows) {
+        anyhow::bail!("pool is not supported on Windows");
+    }
+
+    let bin = find_on_path("pool").ok_or_else(|| anyhow::anyhow!("pool is not installed"))?;
+    let base_url = format!("{}/v1", daemon::server());
+
+    // Check if user wants exec (standalone) mode vs interactive TUI
+    let is_exec_mode = extra_args.first().map(|s| s.as_str()) == Some("exec");
+
+    let mut env = vec![
+        ("POOLSIDE_STANDALONE_BASE_URL", base_url.as_str()),
+        ("POOLSIDE_API_KEY", api_key),
+    ];
+
+    let mut args = Vec::new();
+
+    if !model.is_empty() {
+        if is_exec_mode {
+            // Exec mode: use environment variable (pool exec doesn't use -m)
+            env.push(("POOLSIDE_STANDALONE_MODEL", model));
+        } else {
+            // Interactive TUI: use -m flag
+            args.extend(["-m".to_string(), model.to_string()]);
+        }
+    }
+
+    args.extend_from_slice(extra_args);
+
+    exec_with_env(&bin, &args, &env)
 }
 
 // ---------------------------------------------------------------------------
