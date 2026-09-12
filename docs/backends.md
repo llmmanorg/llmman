@@ -11,7 +11,7 @@ already exists for the model format it finds, and runs it unmodified.
 | safetensors | [`vllm`](https://github.com/vllm-project/vllm) | Your `PATH` (every non-container runtime) |
 | safetensors | `sglang` in a container | `--runtime docker` / `podman` (Linux only) with `LLMMAN_SAFETENSORS_ENGINE=sglang`: the `lmsysorg/sglang` image for your GPU |
 | safetensors | [`sglang`](https://github.com/sgl-project/sglang) | Your `PATH`, with `LLMMAN_SAFETENSORS_ENGINE=sglang` |
-| safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | Your `PATH`, on Apple Silicon macOS; preferred over `vllm` when present |
+| safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | Apple Silicon macOS (every non-container runtime): the one on your `PATH`, or else llmman's own `uv`-installed copy, installed on first use; preferred over `vllm` |
 | GGUF diffusion (LTX-2) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
 | Diffusers safetensors | [`vllm serve --omni`](https://github.com/vllm-project/vllm-omni) | Your `PATH`'s `vllm` with the `vllm-omni` package installed |
 | Diffusers safetensors | `vllm serve --omni` in a container | `--runtime docker` / `podman` (Linux only): the `vllm/vllm-omni` image (CUDA only) |
@@ -39,7 +39,8 @@ so the first request is never stuck behind a silent download.
 `llmman serve --pull-only` does exactly that fetch, in the foreground with
 the pull's own progress, then exits — run it once before starting a
 detached daemon. With a container runtime and a safetensors `MODEL`
-argument it pulls the vLLM image as well.
+argument it pulls the vLLM image as well; on Apple Silicon it installs
+`mlx-lm` for one (see [MLX](#mlx-apple-silicon)).
 
 ## llama.cpp
 
@@ -93,8 +94,8 @@ docker run -p 127.0.0.1:17434:17434 -e LLMMAN_API_KEYS=<key> \
 ## vLLM
 
 Safetensors models are served by a separately installed `vllm` unless
-`LLMMAN_SAFETENSORS_ENGINE` picks [SGLang](#sglang) (or, on Apple
-Silicon, `mlx_lm.server` is present — see [MLX](#mlx-apple-silicon)).
+`LLMMAN_SAFETENSORS_ENGINE` picks [SGLang](#sglang), or the host is
+Apple Silicon (see [MLX](#mlx-apple-silicon)).
 Plain `vllm` is CPU-only on macOS unless
 [vllm-metal](https://github.com/vllm-project/vllm-metal) is installed.
 `LLMMAN_CONTEXT_LENGTH` is forwarded as `--max-model-len`;
@@ -205,11 +206,22 @@ which runs with `--ipc=host` like vLLM's.
 
 ## MLX (Apple Silicon)
 
-On Apple Silicon, `mlx_lm.server` (`pip install mlx-lm`) is preferred
-over `vllm` for safetensors when on `PATH` and `LLMMAN_SAFETENSORS_ENGINE`
-is unset: Metal-accelerated, no vLLM dependency, more model families
-than vllm-metal. `LLMMAN_CONTEXT_LENGTH` is not forwarded and
-`/v1/embeddings` is unsupported.
+On Apple Silicon, `mlx_lm.server` is preferred over `vllm` for
+safetensors when `LLMMAN_SAFETENSORS_ENGINE` is unset: Metal-accelerated,
+no vLLM dependency, more model families than vllm-metal.
+`LLMMAN_CONTEXT_LENGTH` is not forwarded and `/v1/embeddings` is
+unsupported.
+
+Nothing needs installing first. When `mlx_lm.server` is not on `PATH`,
+the first load of an MLX model (or `llmman serve --pull-only <model>`
+for a pulled safetensors model) installs it with
+[`uv`](https://github.com/astral-sh/uv) — the one on `PATH`, or
+astral-sh's prebuilt release downloaded to `~/.local/share/llmman/uv/` —
+into `~/.local/share/llmman/mlx-lm/venv` (with a managed CPython 3.10+
+if the host has none). `LLMMAN_MLX_LM_VERSION=<version>` pins the
+release; deleting `~/.local/share/llmman/mlx-lm` reinstalls on the next
+load. An `mlx_lm.server` on `PATH` is used as-is;
+`LLMMAN_SAFETENSORS_ENGINE=vllm` skips MLX.
 
 ## Registry transport
 

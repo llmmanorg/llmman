@@ -2242,12 +2242,11 @@ async fn would_use_mlx_is_none_for_an_already_running_non_mlx_model() {
     assert_eq!(would_use_mlx(&state, model_ref).await, None);
 }
 
-/// On any host `use_mlx_for_safetensors` itself doesn't consider
-/// Apple-Silicon-macOS-with-`mlx_lm.server`-on-`PATH` (this test
-/// suite's own CI hosts included), `would_use_mlx` must say `None`
-/// for a model that isn't running yet at all — regardless of
-/// whatever is or isn't actually in the local store for it —
-/// without needing to fake either check to prove it.
+/// `would_use_mlx` must say `None` for a model that isn't running yet
+/// at all: on a host `use_mlx_for_safetensors` rules out (not Apple
+/// Silicon macOS) trivially, and on one it doesn't because the test
+/// state's empty store has nothing to resolve the reference to — in
+/// neither case does it touch a process or install anything.
 #[tokio::test(flavor = "multi_thread")]
 async fn would_use_mlx_is_none_when_not_running_and_this_host_never_uses_mlx() {
     let state = test_state();

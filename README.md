@@ -234,7 +234,8 @@ safetensors by
 [`vllm`](https://github.com/vllm-project/vllm), by
 [`sglang`](https://github.com/sgl-project/sglang) with
 `LLMMAN_SAFETENSORS_ENGINE=sglang`, or by
-[`mlx-lm`](https://github.com/ml-explore/mlx-lm) on Apple Silicon. Tool
+[`mlx-lm`](https://github.com/ml-explore/mlx-lm) on Apple Silicon
+(installed for you on first use). Tool
 calling, vision, structured output, embeddings (GGUF) and the Responses
 API (what Codex speaks) all work; there is a [web UI](docs/webui.md) at
 `/` (chat with any local or hosted model, generate images, video and
