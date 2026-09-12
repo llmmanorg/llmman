@@ -24,7 +24,7 @@ pub struct HfFile {
 
 /// Issues an authenticated GET and decodes JSON; see `client::probe` for
 /// the (lack of) retries.
-async fn get_json<T: serde::de::DeserializeOwned>(
+pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
     token: Option<&str>,
@@ -144,6 +144,49 @@ pub async fn fetch_files(
 ) -> Result<Vec<HfFile>> {
     let url = format!("{endpoint}api/models/{owner}/{repo}/tree/{commit}?recursive=true");
     get_json(client, &url, token).await.context("HF file list")
+}
+
+/// One row of `GET /api/models?search=...`, only what `llmman search`
+/// prints. `lastModified` is present because [`search_models`] asks for
+/// it via `expand[]`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchHit {
+    pub id: String,
+    #[serde(default)]
+    pub likes: u64,
+    #[serde(default)]
+    pub downloads: u64,
+    #[serde(default, rename = "lastModified")]
+    pub last_modified: Option<String>,
+}
+
+/// Full-text search of the Hub's models, most downloaded first (the
+/// query is a substring match over ids, so relevance order would rank
+/// forks above the model people mean).
+pub async fn search_models(
+    client: &reqwest::Client,
+    endpoint: &str,
+    query: &str,
+    limit: u32,
+    token: Option<&str>,
+) -> Result<Vec<SearchHit>> {
+    let limit = limit.to_string();
+    let url = reqwest::Url::parse_with_params(
+        &format!("{endpoint}api/models"),
+        [
+            ("search", query),
+            ("limit", limit.as_str()),
+            ("sort", "downloads"),
+            ("direction", "-1"),
+            ("expand[]", "lastModified"),
+            ("expand[]", "downloads"),
+            ("expand[]", "likes"),
+        ],
+    )
+    .context("build HF search URL")?;
+    get_json(client, url.as_str(), token)
+        .await
+        .context("HF model search")
 }
 
 // ---------------------------------------------------------------------------
