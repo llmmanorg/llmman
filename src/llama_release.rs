@@ -62,7 +62,7 @@ struct Asset {
     browser_download_url: String,
 }
 
-fn http_client() -> Result<reqwest::blocking::Client> {
+pub(crate) fn http_client() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         // Large Windows CUDA packages bundle the CUDA runtime itself
         // (hundreds of MB) — a short fixed timeout would abort a real,
@@ -331,17 +331,10 @@ fn asset_query() -> AssetQuery {
 
 /// `~/.local/share/llmman/llama-server` on Linux/macOS,
 /// `%LOCALAPPDATA%\llmman\llama-server` on Windows — sibling of
-/// [`crate::default_store`]'s own store directory.
+/// [`crate::default_store`]'s own store directory, under
+/// [`crate::data_root`].
 fn install_root() -> Result<PathBuf> {
-    #[cfg(not(target_os = "windows"))]
-    let base = dirs::home_dir()
-        .ok_or_else(|| anyhow!("could not determine home directory"))?
-        .join(".local")
-        .join("share");
-    #[cfg(target_os = "windows")]
-    let base = dirs::data_local_dir()
-        .ok_or_else(|| anyhow!("could not determine local data directory"))?;
-    Ok(base.join("llmman").join("llama-server"))
+    Ok(crate::data_root()?.join("llama-server"))
 }
 
 fn install_dir(tag: &str, label: &str) -> Result<PathBuf> {
@@ -372,7 +365,7 @@ fn parse_tmp_dir(value: Option<&str>) -> Option<PathBuf> {
 /// Includes our own pid in the filename so two `llmman` processes
 /// downloading the same asset at once (e.g. two concurrent `--pull-only`
 /// runs) never share a staging path.
-fn tmp_path(name: &str) -> Result<PathBuf> {
+pub(crate) fn tmp_path(name: &str) -> Result<PathBuf> {
     let dir = tmp_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     Ok(dir.join(format!("{name}.tmp-{}", std::process::id())))
@@ -380,7 +373,7 @@ fn tmp_path(name: &str) -> Result<PathBuf> {
 
 /// Removes the staging file on drop, so a failed download or extraction
 /// (an early `?` return) doesn't leave the archive behind.
-struct RemoveOnDrop<'a>(&'a Path);
+pub(crate) struct RemoveOnDrop<'a>(pub(crate) &'a Path);
 
 impl Drop for RemoveOnDrop<'_> {
     fn drop(&mut self) {
@@ -393,7 +386,7 @@ impl Drop for RemoveOnDrop<'_> {
 /// to hardcode each archive format's own internal layout (Linux/macOS
 /// tarballs nest everything under one `llama-<tag>/` directory; Windows
 /// zips ship every file flat at the archive root).
-fn find_binary(dir: &Path, name: &str) -> Option<PathBuf> {
+pub(crate) fn find_binary(dir: &Path, name: &str) -> Option<PathBuf> {
     walkdir::WalkDir::new(dir)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -521,12 +514,12 @@ fn create_new_file(dest: &Path) -> Result<std::fs::File> {
     }
 }
 
-fn download_to_file(
+pub(crate) fn download_to_file(
     client: &reqwest::blocking::Client,
     url: &str,
     dest: &Path,
     label: &str,
-    marker: &DownloadMarker,
+    marker: Option<&DownloadMarker>,
 ) -> Result<()> {
     let mut resp = client
         .get(url)
@@ -548,7 +541,9 @@ fn download_to_file(
         file.write_all(&buf[..n]).context("write downloaded data")?;
         downloaded += n as u64;
         if last_logged.elapsed() >= PROGRESS_LOG_INTERVAL {
-            marker.touch();
+            if let Some(marker) = marker {
+                marker.touch();
+            }
             if total > 0 {
                 eprintln!(
                     "[llmman] downloading {label}: {} / {} ({}%)",
@@ -564,7 +559,7 @@ fn download_to_file(
     Ok(())
 }
 
-fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
     let file = std::fs::File::open(archive_path)
         .with_context(|| format!("open {}", archive_path.display()))?;
@@ -709,7 +704,7 @@ fn try_ensure_from_network(
         &asset.browser_download_url,
         &tmp,
         &asset.name,
-        &marker,
+        Some(&marker),
     )?;
     marker.touch();
     extract(&tmp, &asset.name, &dest)?;
@@ -726,7 +721,7 @@ fn try_ensure_from_network(
                     &companion.browser_download_url,
                     &tmp2,
                     &companion.name,
-                    &marker,
+                    Some(&marker),
                 )?;
                 marker.touch();
                 extract(&tmp2, &companion.name, &dest)?;
@@ -753,7 +748,7 @@ fn try_ensure_from_network(
 }
 
 #[cfg(unix)]
-fn mark_executable(path: &Path) -> Result<()> {
+pub(crate) fn mark_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perm = std::fs::metadata(path)?.permissions();
     perm.set_mode(perm.mode() | 0o111);
@@ -761,7 +756,7 @@ fn mark_executable(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn mark_executable(_path: &Path) -> Result<()> {
+pub(crate) fn mark_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
 

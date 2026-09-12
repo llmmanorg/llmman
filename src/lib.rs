@@ -18,6 +18,7 @@ pub mod imagegen;
 pub mod llama_release;
 pub mod mediagen;
 pub mod metrics;
+pub mod mlx_release;
 pub mod modelpack;
 pub mod oauth;
 pub mod promptlog;
@@ -39,6 +40,16 @@ pub fn default_store() -> anyhow::Result<PathBuf> {
     if let Some(dir) = models_dir_from_env() {
         return Ok(dir);
     }
+    Ok(data_root()?.join("store"))
+}
+
+/// `~/.local/share/llmman` (`%LOCALAPPDATA%\llmman` on Windows): the
+/// parent of the default store and of everything else llmman keeps on
+/// disk for itself — the `llama-server` release cache
+/// (`llama_release`), the `uv` binary and `mlx-lm` environment
+/// (`mlx_release`). Not affected by `LLMMAN_MODELS`, which relocates
+/// only the store.
+pub fn data_root() -> anyhow::Result<PathBuf> {
     #[cfg(not(target_os = "windows"))]
     let base = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
@@ -47,7 +58,7 @@ pub fn default_store() -> anyhow::Result<PathBuf> {
     #[cfg(target_os = "windows")]
     let base = dirs::data_local_dir()
         .ok_or_else(|| anyhow::anyhow!("could not determine local data directory"))?;
-    Ok(base.join("llmman").join("store"))
+    Ok(base.join("llmman"))
 }
 
 fn models_dir_from_env() -> Option<PathBuf> {

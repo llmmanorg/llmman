@@ -551,7 +551,7 @@ jobs:
         run: go test -tags "$PODMAN_TAGS" ./...
 
   # --------------------------------------------------------------------------
-  # E2E: `llmman launch <claude|opencode|codex|qwen|hermes|openclaw|talos|dsh> --model
+  # E2E: `llmman launch <claude|agy|opencode|codex|qwen|hermes|openclaw|talos|dsh> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
   # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
@@ -582,7 +582,7 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/opencode/codex/qwen/hermes/openclaw/talos/dsh, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/agy/opencode/codex/qwen/hermes/openclaw/talos/dsh, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
@@ -591,34 +591,34 @@ jobs:
     # that reason, and its own identical `if:` condition below — or when
     # dispatched by hand on a branch (see `workflow_dispatch` above).
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
-    # 8 tests run serialized (--test-threads=1 + lock_serial()), so the
-    # worst case sums all 8's own retry budgets: MAX_ATTEMPTS * TIMEOUT
+    # 9 tests run serialized (--test-threads=1 + lock_serial()), so the
+    # worst case sums all 9's own retry budgets: MAX_ATTEMPTS * TIMEOUT
     # (3 * 600s = 30 min) each — a timeout itself never retries (see
     # launch_and_assert's own doc comment), so 30 min/test is only hit if
     # every attempt fails via a missing "pong" instead. Plus warm_model()'s
     # own separate TIMEOUT budget (10 min), paid at most once across all
-    # tests (guarded by WARM's own Once). 8*30 + 10 = 250 min; 270 leaves
+    # tests (guarded by WARM's own Once). 9*30 + 10 = 280 min; 300 leaves
     # headroom on top of that for setup/build overhead (5-8 min on
     # Windows). Exhausting every attempt doesn't fail this job either way
     # (see launch_and_assert's own doc comment) — a run can still
     # legitimately take this long in wall-clock time before giving up.
     #
-    # +90 on top of that 270 (360 total) for the vllm-plugin steps'
+    # +90 on top of that 300 (390 total) for the vllm-plugin steps'
     # own per-step budgets below: up to 60 min for "Install vLLM (e2e)"
     # (wheel downloads, but a slow/retried one on a bad connection) plus
     # up to 30 min for "pytest -m e2e (vllm-plugin)".
     #
-    # +10 more (370 total) for `serve_mlx_safetensors_model`'s own single
+    # +10 more (400 total) for `serve_mlx_safetensors_model`'s own single
     # TIMEOUT budget (10 min, same 600s as warm_model's) — it doesn't go
     # through launch_and_assert's retry loop at all (a real failure there
     # is always a deterministic llmman bug worth failing loudly on, not
-    # small-model sampling variance), so unlike the 8 launch tests above
+    # small-model sampling variance), so unlike the 9 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
     #
-    # +60 more (430 total) for `serve_vllm_safetensors_model` and
+    # +60 more (460 total) for `serve_vllm_safetensors_model` and
     # `serve_sglang_safetensors_model` (20 min each, no retries, like the
     # mlx test) and "Install SGLang (e2e)"'s 40-minute budget.
-    timeout-minutes: 430
+    timeout-minutes: 460
     env:
       # These tests are about the llama-server "Install llama-server" puts
       # on PATH, which `--runtime auto` would try docker before.
@@ -903,6 +903,60 @@ jobs:
             "$HOME/talos/.env.example" > "$HOME/talos/talos.env"
           chmod 600 "$HOME/talos/talos.env"
           (cd "$HOME/talos" && .venv/bin/python -c "import talos; print('talos', talos.__version__)")
+
+      # Pinned official AGY release; verify each runner's archive before installing.
+      - name: Install AGY (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          AGY_VERSION: 1.1.13
+          AGY_PLATFORM: ${{ runner.os }}-${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          case "$AGY_PLATFORM" in
+            Linux-X64) archive=agy_cli_linux_x64.tar.gz; checksum=edc7c32b5ab4fc2e4da03381fee83ed566dea6b56b56f9329cd13cd77947a1d9 ;;
+            Linux-ARM64) archive=agy_cli_linux_arm64.tar.gz; checksum=a9fdd2a386770c27dbf784436bd4de70d4d4901c832d5ec6abf27758d5c370f8 ;;
+            macOS-X64) archive=agy_cli_mac_x64.tar.gz; checksum=8eaf399051afbc67435220f7fbeddeaaa6f9d50a087a229e628a4b2510c05c69 ;;
+            macOS-ARM64) archive=agy_cli_mac_arm64.tar.gz; checksum=f8c27b70708843eeb2c8f6efff0119a27041980e95cba6c49b86a0950ed19ba1 ;;
+            *) echo "Unsupported AGY platform: $AGY_PLATFORM" >&2; exit 1 ;;
+          esac
+          install_dir="$RUNNER_TEMP/agy"
+          mkdir -p "$install_dir"
+          curl --fail --location --retry 3 "https://github.com/google-antigravity/antigravity-cli/releases/download/$AGY_VERSION/$archive" -o "$install_dir/$archive"
+          cd "$install_dir"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "$checksum  $archive" | sha256sum -c -
+          else
+            echo "$checksum  $archive" | shasum -a 256 -c -
+          fi
+          tar -xzf "$archive"
+          mv antigravity agy
+          chmod +x agy
+          echo "$install_dir" >> "$GITHUB_PATH"
+
+      - name: Install AGY (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          AGY_VERSION: 1.1.13
+          AGY_ARCH: ${{ runner.arch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          switch ($env:AGY_ARCH) {
+            'X64' { $archive = 'agy_cli_windows_x64.zip'; $checksum = '9e545832f77adccec08ad48a9db92b31e62c377aab57993946930e0d7d44cb01' }
+            'ARM64' { $archive = 'agy_cli_windows_arm64.zip'; $checksum = 'f9e173c4525178c0d0c4c1381e31debbaa7dc357bd92a97dbced53e74315fbe7' }
+            default { throw "Unsupported AGY architecture: $env:AGY_ARCH" }
+          }
+          $installDir = Join-Path $env:RUNNER_TEMP 'agy'
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+          $archivePath = Join-Path $installDir $archive
+          Invoke-WebRequest "https://github.com/google-antigravity/antigravity-cli/releases/download/$env:AGY_VERSION/$archive" -OutFile $archivePath
+          if ((Get-FileHash $archivePath -Algorithm SHA256).Hash -ne $checksum) {
+            throw 'AGY archive checksum mismatch'
+          }
+          Expand-Archive $archivePath -DestinationPath $installDir -Force
+          Rename-Item (Join-Path $installDir 'antigravity.exe') 'agy.exe'
+          $installDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       # opencode installs its configured provider's npm package (here
       # @ai-sdk/openai-compatible — see launch::opencode_config) on demand

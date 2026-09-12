@@ -592,6 +592,8 @@ pub(super) struct OAIChatRequest {
     /// See `OllamaChatRequest::tools` — passed straight through.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) tools: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) tool_choice: Option<serde_json::Value>,
     /// See `format_to_response_format`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) response_format: Option<serde_json::Value>,
@@ -667,6 +669,8 @@ pub(super) struct OAIUsage {
     pub(super) prompt_tokens: u64,
     #[serde(default)]
     pub(super) completion_tokens: u64,
+    #[serde(default)]
+    pub(super) total_tokens: u64,
     #[serde(default)]
     pub(super) prompt_tokens_details: OAIPromptTokensDetails,
 }

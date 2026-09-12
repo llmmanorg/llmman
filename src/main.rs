@@ -33,6 +33,8 @@ enum Commands {
     Push(cmd::push::PushArgs),
     /// Pull an image from a registry to the local store
     Pull(cmd::pull::PullArgs),
+    /// Search for models on Docker Hub and Hugging Face
+    Search(cmd::search::SearchArgs),
     /// Pull (if needed) and print a model's local path as JSON (internal,
     /// used by the vllm-llmman plugin)
     #[command(hide = true)]
@@ -120,6 +122,7 @@ fn main() {
         Commands::Logout(a) => cmd::logout::run(a),
         Commands::Push(a) => cmd::push::run(a),
         Commands::Pull(a) => cmd::pull::run(a),
+        Commands::Search(a) => cmd::search::run(a),
         Commands::Resolve(a) => cmd::resolve::run(a),
         Commands::Transfer(a) => cmd::transfer::run(a),
         Commands::Verify(a) => cmd::verify::run(a),

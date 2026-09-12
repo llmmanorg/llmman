@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`, `talos`, `dsh`) — not mocks.
+//! (`claude`, `agy`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`, `talos`, `dsh`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -777,6 +777,36 @@ fn launch_claude_with_model() {
 }
 
 #[test]
+fn launch_agy_with_model() {
+    eprintln!("[test] launch_agy_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_agy_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("agy") {
+        eprintln!("skipping: agy not on PATH — https://antigravity.google/docs/cli/install/");
+        return;
+    }
+
+    // Real AGY print mode. Its built-in title and main-agent requests use
+    // different Google model names; the llmman route must pin both to MODEL.
+    launch_and_assert(
+        "agy",
+        &[
+            "-p",
+            PROMPT,
+            "--output-format",
+            "text",
+            "--print-timeout",
+            "5m",
+            "--disable-slash-commands",
+        ],
+    );
+}
+
+#[test]
 fn launch_opencode_with_model() {
     eprintln!("[test] launch_opencode_with_model: acquiring SERIAL");
     let _guard = lock_serial();
@@ -1220,7 +1250,9 @@ const MLX_MODEL: &str = "mlx-community/SmolLM2-135M-Instruct-8bit";
 /// Skips itself (rather than failing) on anything other than Apple
 /// Silicon macOS, or when `mlx_lm.server` isn't on `PATH` — mirrors every
 /// other test in this file's own "prerequisite not installed, not an
-/// llmman bug" convention. CI (see `.github/workflows/ci.yml`'s e2e job)
+/// llmman bug" convention (the daemon would install `mlx-lm` itself —
+/// `crate::mlx_release` — but that download is not what this measures).
+/// CI (see `.github/workflows/ci.yml`'s e2e job)
 /// installs `mlx-lm` before this suite ever runs, on exactly the two
 /// macOS aarch64 matrix legs (`backend: docker` and `backend: podman`)
 /// this is meant to actually exercise — see that job's own comment on

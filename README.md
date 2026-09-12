@@ -147,6 +147,7 @@ See [docs/backends.md](docs/backends.md#vllm-omni-diffusers-pipelines).
 | `launch`  | Launch an integration (Claude Code, OpenCode, …) |
 | `run`     | Run a model interactively or with a one-shot prompt |
 | `pull`    | Pull a model from a registry or HuggingFace |
+| `search`  | Search for models on Docker Hub and Hugging Face (Docker Hub results first) |
 | `list` (`ls`) | List locally stored models, or a hosted provider's (`--provider`) models |
 | `ps`      | List models currently loaded |
 | `log`     | Show the prompts `serve` has seen, newest first, like `git log` |
@@ -234,7 +235,8 @@ safetensors by
 [`vllm`](https://github.com/vllm-project/vllm), by
 [`sglang`](https://github.com/sgl-project/sglang) with
 `LLMMAN_SAFETENSORS_ENGINE=sglang`, or by
-[`mlx-lm`](https://github.com/ml-explore/mlx-lm) on Apple Silicon. Tool
+[`mlx-lm`](https://github.com/ml-explore/mlx-lm) on Apple Silicon
+(installed for you on first use). Tool
 calling, vision, structured output, embeddings (GGUF) and the Responses
 API (what Codex speaks) all work; there is a [web UI](docs/webui.md) at
 `/` (chat with any local or hosted model, generate images, video and
@@ -278,13 +280,18 @@ integration:
 
 ```
 llmman launch claude --model qwen3.8
+llmman launch agy --model qwen3.8 -- -p "Explain this repository"
 ```
 
 Run `llmman launch` with no arguments to list the supported integrations
-(Claude Code, OpenCode, Codex, Aider, Qwen Code, Gemini CLI, ...) and
+(Claude Code, OpenCode, Codex, Aider, Qwen Code, Gemini CLI, AGY, ...) and
 whether each is installed. Any extra arguments after `--` are forwarded to
 the integration's own CLI. Short names work wherever a model reference is
 accepted.
+
+AGY requires version 1.1.13 or newer for Gemini API-key and custom-endpoint
+support. llmman writes Gemini mode to its own stable settings directory at
+`~/.gemini/llmman/`; your AGY settings stay untouched.
 
 ### Hosted providers
 

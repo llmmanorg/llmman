@@ -14,6 +14,7 @@ pub mod push;
 pub mod resolve;
 pub mod rm;
 pub mod run;
+pub mod search;
 pub mod serve;
 pub mod show;
 pub mod stop;

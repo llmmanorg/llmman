@@ -7,7 +7,7 @@
 //! so a client sending one gets the same treatment either way.
 //!
 //! A key is presented as `Authorization: Bearer` (OpenAI), `x-api-key`
-//! (Anthropic), or on a WebSocket upgrade as the subprotocol
+//! (Anthropic), `x-goog-api-key` (Gemini), or on a WebSocket upgrade as the subprotocol
 //! [`crate::auth::ws_protocol`] builds. Every header holding a daemon
 //! key is removed before the handler runs, so it is never relayed to a
 //! provider as the caller's own (see `client_api_key`).
@@ -140,13 +140,15 @@ pub(super) async fn require_key(
         headers.remove(AUTHORIZATION);
         admitted = true;
     }
-    if headers
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|k| policy.accepts(k))
-    {
-        headers.remove("x-api-key");
-        admitted = true;
+    for header in ["x-api-key", "x-goog-api-key"] {
+        if headers
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|key| policy.accepts(key))
+        {
+            headers.remove(header);
+            admitted = true;
+        }
     }
     // Left in place: the shell handler echoes it.
     if offered_ws_protocol(headers)
@@ -172,7 +174,7 @@ fn is_ui_asset(req: &Request) -> bool {
 fn refused() -> Response {
     let body = serde_json::json!({
         "error": "this llmman serve requires an API key: send it as `Authorization: Bearer <key>` \
-                  or `x-api-key: <key>` (for the CLI, set LLMMAN_API_KEY)"
+                  or `x-api-key: <key>` or `x-goog-api-key: <key>` (for the CLI, set LLMMAN_API_KEY)"
     });
     (
         StatusCode::UNAUTHORIZED,
