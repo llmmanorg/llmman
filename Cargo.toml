@@ -56,7 +56,7 @@ axum       = { version = "0.7", features = ["ws"] }
 # `no-provider`: rustls's ring and aws-lc-rs providers are both already
 # in the tree (reqwest's and the AWS SDK's); serve installs ring itself
 # rather than have this pull a preference of its own.
-axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 rustls     = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tower-http = { version = "0.6", features = ["cors"] }
 # The pty behind that terminal: one crate for Unix ptys and Windows

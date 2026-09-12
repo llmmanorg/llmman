@@ -179,6 +179,7 @@ installed:
 | `qwen` | Qwen Code | yes |
 | `dsh` | DeepSeek Harness | yes |
 | `hermes` | Hermes Agent | yes, but the daemon holds the key (below) |
+| `talos` | Talos | yes, but the daemon holds the key (below) |
 | `agy` | Antigravity CLI (requires `--model`) | yes |
 | `gemini` | Gemini CLI | no: llmman cannot confirm the key would come here rather than go to Google |
 | `cline` | Cline | no: it picks its own model rather than taking llmman's |
@@ -188,10 +189,10 @@ installed:
 
 Any extra arguments after `--` are forwarded to the integration's own CLI.
 
-`hermes` is configured through a file on disk, so it can't carry a key
-per request; `llmman serve` needs one of its own, spent only for a
-loopback daemon and never for a cross-site browser request. On a shared
-machine prefer an integration that sends its own key.
+`hermes` and `talos` are configured through a file on disk, so neither can
+carry a key per request; `llmman serve` needs one of its own, spent only
+for a loopback daemon and never for a cross-site browser request. On a
+shared machine prefer an integration that sends its own key.
 
 `codex` speaks only OpenAI's Responses API, which most providers lack
 (`mistral` 404s it, `opencode` 500s it for non-OpenAI models). The

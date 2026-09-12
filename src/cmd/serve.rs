@@ -4818,7 +4818,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
                     handle.graceful_shutdown(Some(Duration::from_secs(30)));
                 }
             });
-            axum_server::from_tcp_rustls(listener.into_std()?, config)
+            axum_server::from_tcp_rustls(listener.into_std()?, config)?
                 .handle(handle)
                 .serve(app.into_make_service())
                 .await?
