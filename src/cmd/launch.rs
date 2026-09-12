@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
+use base64::Engine as _;
 use clap::Args;
 
 use crate::chat_template::ThinkingControls;
@@ -163,11 +164,12 @@ fn integration_key() -> String {
 /// Integrations that cannot be launched without `--model`: Qwen Code has
 /// no notion of a missing model and sends its own built-in default
 /// (`qwen3.7-max` in 0.22.3), which the daemon would then try to pull.
+/// AGY needs an explicit model for its Gemini routing URL.
 /// dsh has no default of its own either — an empty `--model` would
 /// otherwise land a literal `"default"` in `agent-default-model.model`,
 /// which the first request then tries to resolve as a real model id.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
-const MODEL_REQUIRED: &[&str] = &["qwen", "dsh"];
+const MODEL_REQUIRED: &[&str] = &["qwen", "dsh", "agy"];
 
 /// Integrations whose launcher yields to a `--model` after `--`, and so
 /// warrant the warning below. Only qwen: `qwen_args` drops its own
@@ -456,6 +458,11 @@ const INTEGRATIONS: &[Integration] = &[
         binary: "gemini",
     },
     Integration {
+        name: "agy",
+        description: "Google Antigravity CLI",
+        binary: "agy",
+    },
+    Integration {
         name: "hermes",
         description: "Hermes Agent",
         binary: "hermes",
@@ -566,6 +573,7 @@ fn launch(
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
         "kimi" => launch_simple("kimi", model, extra_args),
         "gemini" => launch_gemini(model, api_key, extra_args),
+        "agy" => launch_agy(model, api_key, extra_args),
         "hermes" => launch_hermes(model, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
         "qwen" => launch_qwen(model, api_key, extra_args),
@@ -911,6 +919,54 @@ fn launch_gemini(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
             ("GEMINI_API_KEY", api_key),
         ],
     )
+}
+
+/// AGY speaks Gemini's native generation protocol. The encoded model in the
+/// base URL is llmman's routing instruction; AGY also makes auxiliary calls
+/// with its own hard-coded model names, so the server deliberately ignores
+/// the model segment AGY appends and sends every call to the model selected
+/// here.
+fn launch_agy(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_on_path("agy").ok_or_else(|| anyhow::anyhow!("agy is not installed"))?;
+    anyhow::ensure!(
+        !extra_args
+            .iter()
+            .any(|arg| matches!(arg.split('=').next(), Some("--gemini_dir" | "-gemini_dir"))),
+        "llmman manages AGY’s --gemini_dir"
+    );
+    let gemini_dir = agy_settings_dir()?;
+    write_agy_settings_at(&gemini_dir)?;
+    let mut args = vec![format!("--gemini_dir={}", gemini_dir.display())];
+    args.extend_from_slice(extra_args);
+
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(model.as_bytes());
+    let base_url = format!("{}/gemini/{encoded}", daemon::server());
+    exec_with_env(
+        &bin,
+        &args,
+        &[
+            ("GOOGLE_GEMINI_BASE_URL", base_url.as_str()),
+            ("GEMINI_API_KEY", api_key),
+            // AGY prefers GOOGLE_API_KEY when both names exist. Override it
+            // too so an unrelated key inherited from the shell cannot bypass
+            // the credential llmman selected for this request.
+            ("GOOGLE_API_KEY", api_key),
+        ],
+    )
+}
+
+fn agy_settings_dir() -> anyhow::Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("no home directory")?
+        .join(".gemini")
+        .join("llmman"))
+}
+
+fn write_agy_settings_at(gemini_dir: &Path) -> anyhow::Result<()> {
+    let settings_path = gemini_dir.join("antigravity-cli").join("settings.json");
+    std::fs::create_dir_all(settings_path.parent().expect("settings file has a parent"))?;
+    crate::fsutil::write_atomic(&settings_path, b"{\n  \"modelProvider\": \"gemini\"\n}\n")
+        .with_context(|| format!("write {}", settings_path.display()))
 }
 
 /// Generic launcher: just set OLLAMA_HOST and run the binary.
@@ -1640,13 +1696,29 @@ fn exec_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> 
     let status = cmd
         .status()
         .with_context(|| format!("failed to run {}", bin.display()))?;
-
     std::process::exit(status.code().unwrap_or(1));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agy_settings_are_written_to_the_llmman_owned_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agy_settings_at(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("antigravity-cli/settings.json")).unwrap(),
+            "{\n  \"modelProvider\": \"gemini\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn agy_is_listed_as_an_integration() {
+        let agy = INTEGRATIONS.iter().find(|i| i.name == "agy").unwrap();
+        assert_eq!(agy.binary, "agy");
+    }
 
     /// Every integration `--provider` refuses must be one `launch`
     /// actually dispatches, or the refusal is for a name nobody can type

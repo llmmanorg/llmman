@@ -47,6 +47,7 @@ pub fn is_generation_route(route: &str) -> bool {
             | "/v1/completions"
             | "/v1/responses"
             | "/v1/messages"
+            | "/gemini/:model/*gemini_path"
     )
 }
 
@@ -94,6 +95,14 @@ fn prompt_of(req: &serde_json::Value) -> String {
             .rev()
             .find(|m| m["role"] == "user")
             .map(|m| text_of(&m["content"]))
+            .unwrap_or_default();
+    }
+    if let Some(contents) = req["contents"].as_array() {
+        return contents
+            .iter()
+            .rev()
+            .find(|content| content["role"].as_str().unwrap_or("user") == "user")
+            .map(|content| text_of(&content["parts"]))
             .unwrap_or_default();
     }
     let prompt = if req["prompt"].is_null() {
@@ -222,6 +231,40 @@ mod tests {
     }
 
     #[test]
+    fn gemini_logs_only_the_last_user_turn_text() {
+        assert_eq!(
+            prompt(
+                r#"{"contents":[
+            {"role":"user","parts":[{"text":"older"}]},
+            {"role":"model","parts":[{"text":"answer"}]},
+            {"role":"user","parts":[{"text":" describe "},{"inlineData":{"data":"aGVsbG8="}},{"text":"this"}]}
+        ]}"#
+            ),
+            "describe\nthis"
+        );
+        assert_eq!(
+            prompt(r#"{"contents":[{"parts":[{"text":"hello"}]}]}"#),
+            "hello"
+        );
+        for parts in [
+            serde_json::json!([{"inlineData": {"data": "aGVsbG8="}}]),
+            serde_json::json!([{"functionResponse": {"name": "lookup", "response": {"text": "result"}}}]),
+        ] {
+            assert_eq!(
+                prompt_of(&serde_json::json!({"contents": [
+                    {"role": "user", "parts": [{"text": "older"}]},
+                    {"role": "user", "parts": parts}
+                ]})),
+                ""
+            );
+        }
+        assert_eq!(
+            prompt(r#"{"contents":[{"role":"model","parts":[{"text":"answer"}]}]}"#),
+            ""
+        );
+    }
+
+    #[test]
     fn empty_and_non_json_bodies_make_no_entry() {
         let t = || "2026-01-01T00:00:00Z".to_string();
         assert!(entry("/api/chat", br#"{"model":"m","messages":[]}"#, None, t()).is_none());
@@ -295,6 +338,7 @@ mod tests {
             "/v1/completions",
             "/v1/responses",
             "/v1/messages",
+            "/gemini/:model/*gemini_path",
         ] {
             assert!(is_generation_route(r), "{r}");
         }

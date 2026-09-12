@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context};
+use base64::Engine as _;
 // `HttpBody` is axum's re-export of the `http_body::Body` trait, in
 // scope only for `size_hint` in `track_metrics`.
 use axum::body::{Body, Bytes, HttpBody as _};
@@ -34,6 +35,7 @@ mod anthropic;
 mod auth;
 mod backend;
 mod config;
+mod gemini;
 mod messages;
 mod ollama;
 mod openai;
@@ -62,6 +64,7 @@ use config::{
     sched_spread_from_env, supports_context_shift, threads_from_env_or_host, tls_from_env,
     MAX_CTX_SHRINK_ATTEMPTS,
 };
+use gemini::{gemini_stream_model, handle_pinned_gemini};
 use ollama::{
     handle_blob_head, handle_blob_upload, handle_copy, handle_create, handle_delete, handle_embed,
     handle_embeddings, handle_ollama_chat, handle_ollama_generate, handle_ps, handle_pull,
@@ -1525,7 +1528,7 @@ const CHAT_COMPLETIONS_ROUTE: &str = "/v1/chat/completions";
 
 /// Extracts the caller's own API key from a request, in either spelling
 /// the surfaces below accept: `Authorization: Bearer <key>` (OpenAI) or
-/// `x-api-key: <key>` (Anthropic).
+/// `x-api-key: <key>` (Anthropic), or `x-goog-api-key: <key>` (Gemini).
 ///
 /// This is what lets provider routing work against a daemon that is
 /// *already running* — the common case, since `daemon::ensure_server`
@@ -1543,12 +1546,19 @@ fn client_api_key(headers: Option<&HeaderMap>) -> Option<String> {
     // Each candidate is filtered before the choice between them, not
     // after: a client that sends both a placeholder `Authorization` and a
     // real `x-api-key` still has a real key.
-    bearer.or_else(|| {
-        headers
-            .get("x-api-key")
-            .and_then(|v| v.to_str().ok())
-            .and_then(usable)
-    })
+    bearer
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .and_then(usable)
+        })
+        .or_else(|| {
+            headers
+                .get("x-goog-api-key")
+                .and_then(|v| v.to_str().ok())
+                .and_then(usable)
+        })
 }
 
 /// Whether a request was made by a browser on some other site's behalf.
@@ -4075,6 +4085,8 @@ async fn track_metrics(req: Request, next: Next) -> Response {
 /// extractor the handlers use, so the size limit and its 413 are
 /// unchanged; the handler then reads it back from memory.
 async fn record_prompt(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    use axum::extract::FromRequestParts;
+
     let Some(log) = state.0.prompt_log.as_deref() else {
         return next.run(req).await;
     };
@@ -4092,7 +4104,25 @@ async fn record_prompt(State(state): State<AppState>, req: Request, next: Next) 
     }) else {
         return next.run(req).await;
     };
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
+    let selected_model = if route == "/gemini/:model/*gemini_path" {
+        let model = UrlPath::<(String, String)>::from_request_parts(&mut parts, &())
+            .await
+            .ok()
+            .filter(|UrlPath((_, path))| gemini_stream_model(path).is_some())
+            .and_then(|UrlPath((encoded_model, _))| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(encoded_model)
+                    .ok()
+            })
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        let Some(model) = model else {
+            return next.run(Request::from_parts(parts, body)).await;
+        };
+        Some(model)
+    } else {
+        None
+    };
     let body = match Bytes::from_request(Request::from_parts(parts.clone(), body), &()).await {
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
@@ -4101,7 +4131,10 @@ async fn record_prompt(State(state): State<AppState>, req: Request, next: Next) 
         .headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok());
-    if let Some(entry) = crate::promptlog::entry(&route, &body, client, now_rfc3339()) {
+    if let Some(mut entry) = crate::promptlog::entry(&route, &body, client, now_rfc3339()) {
+        if let Some(model) = selected_model {
+            entry.model = model;
+        }
         if let Err(e) = crate::promptlog::append(log, &entry) {
             eprintln!("[llmman] warning: prompt log {}: {e}", log.display());
         }
@@ -4380,6 +4413,10 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .route("/v1/videos/:id", get(handle_openai_video_get))
         .route("/v1/videos/:id/content", get(handle_openai_video_get))
         .route("/v1/audio/speech", post(handle_openai_speech))
+        // Native Gemini compatibility. The public route accepts a model in
+        // Gemini's normal API path; the AGY route pins AGY's auxiliary calls
+        // to the model chosen by `llmman launch agy`.
+        .route("/gemini/:model/*gemini_path", post(handle_pinned_gemini))
         // Anthropic API
         .route("/v1/messages", post(handle_anthropic_messages));
 

@@ -74,7 +74,7 @@ fn progress_line_reports_status_only_snapshots_and_clamps_completed() {
 
 // -- request targets (local backend vs remote provider) -----------------
 
-fn remote_target(base_url: &str) -> Target {
+pub(super) fn remote_target(base_url: &str) -> Target {
     remote_target_on(base_url, Wire::OpenAi)
 }
 
@@ -1215,7 +1215,7 @@ async fn an_unload_is_forwarded_to_every_peer() {
 
 // -- hybrid pairs (one reference, a local and a hosted half) -------------
 
-fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
+pub(super) fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (name, value) in pairs {
         headers.insert(
@@ -1230,8 +1230,8 @@ fn pair(reference: &'static str) -> crate::hybrid::Pair<'static> {
     crate::hybrid::split_ref(reference).expect("test reference must be a pair")
 }
 
-const PAIR: &str = "llmman.hybrid/gemma4,anthropic/claude-sonnet-4-5";
-const HOSTED: &str = "llmman.provider/anthropic/claude-sonnet-4-5";
+pub(super) const PAIR: &str = "llmman.hybrid/gemma4,anthropic/claude-sonnet-4-5";
+pub(super) const HOSTED: &str = "llmman.provider/anthropic/claude-sonnet-4-5";
 
 /// What comes back is one half's own ordinary reference, with
 /// nothing left for anything downstream to special-case.
@@ -1983,7 +1983,7 @@ async fn a_configured_providers_models_are_asked_of_its_endpoint() {
 
 // -- Idle-timeout auto-unload reaper --------------------------------------
 
-fn test_state() -> AppState {
+pub(super) fn test_state() -> AppState {
     test_state_at(std::env::temp_dir())
 }
 
@@ -5162,6 +5162,7 @@ async fn record_prompt_logs_generation_requests_and_hands_the_body_on() {
         .route("/api/chat", echo())
         .route("/api/embed", echo())
         .route("/v1/chat/completions", echo())
+        .route("/gemini/:model/*gemini_path", echo())
         .layer(middleware::from_fn_with_state(state.clone(), record_prompt))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5230,13 +5231,39 @@ async fn record_prompt_logs_generation_requests_and_hands_the_body_on() {
     )
     .await;
 
+    let gemini = r#"{"model":"ignored-body-model","contents":[{"role":"user","parts":[{"text":"describe this"},{"inlineData":{"mimeType":"image/png","data":"aGVsbG8="}}]}]}"#;
+    let encoded_model = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(PAIR);
+    let base = format!("/gemini/{encoded_model}/v1beta/models/agy-helper-model");
+    assert_eq!(
+        send(&format!("{base}:streamGenerateContent"), gemini, &[]).await,
+        gemini
+    );
+    send(&format!("{base}:countTokens"), gemini, &[]).await;
+    send(
+        "/gemini/invalid!/v1beta/models/m:streamGenerateContent",
+        gemini,
+        &[],
+    )
+    .await;
+
     let entries = crate::promptlog::read(&log).unwrap();
     let _ = std::fs::remove_file(&log);
     let routes: Vec<&str> = entries.iter().map(|e| e.route.as_str()).collect();
-    assert_eq!(routes, ["/api/chat", "/v1/chat/completions"], "{entries:?}");
+    assert_eq!(
+        routes,
+        [
+            "/api/chat",
+            "/v1/chat/completions",
+            "/gemini/:model/*gemini_path"
+        ],
+        "{entries:?}"
+    );
     assert_eq!(entries[0].model, "m");
     assert_eq!(entries[0].prompt, "hello there");
     assert_eq!(entries[0].client.as_deref(), Some("test-agent/1"));
+    assert_eq!(entries[2].model, PAIR);
+    assert_eq!(entries[2].prompt, "describe this");
+    assert_eq!(entries[2].client.as_deref(), Some("test-agent/1"));
 }
 
 /// An over-limit body is refused as the extractor would refuse it.
@@ -5338,6 +5365,15 @@ async fn a_keyed_daemon_refuses_everything_but_its_own_page_without_the_key() {
         .await
         .unwrap();
     assert_eq!(x_api_key.status(), StatusCode::OK);
+    for (key, expected) in [("k2", StatusCode::OK), ("k3", StatusCode::UNAUTHORIZED)] {
+        let response = client
+            .get(format!("{url}/api/version"))
+            .header("x-goog-api-key", key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
     let scrape = client
         .get(format!("{url}/metrics"))
         .bearer_auth("k2")
@@ -5433,12 +5469,27 @@ async fn the_daemon_key_is_stripped_before_the_handler_sees_the_headers() {
         .get(&url)
         .bearer_auth("daemon-key")
         .header("x-api-key", "daemon-key")
+        .header("x-goog-api-key", "daemon-key")
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .get(&url)
+        .header("x-goog-api-key", "daemon-key")
+        .send()
+        .await
+        .unwrap();
+    client
+        .get(&url)
+        .bearer_auth("daemon-key")
+        .header("x-goog-api-key", "sk-provider")
         .send()
         .await
         .unwrap();
 
     let seen = seen.lock().await;
-    assert_eq!(seen.len(), 4);
+    assert_eq!(seen.len(), 6);
     assert!(seen[0].get("authorization").is_none());
     assert_eq!(client_api_key(Some(&seen[0])), None);
     assert!(seen[1].get("x-api-key").is_none());
@@ -5451,6 +5502,11 @@ async fn the_daemon_key_is_stripped_before_the_handler_sees_the_headers() {
         client_api_key(Some(&seen[2])).as_deref(),
         Some("sk-provider")
     );
+    assert!(seen[3].get("x-goog-api-key").is_none());
+    assert_eq!(client_api_key(Some(&seen[3])), None);
+    assert!(seen[4].get("x-goog-api-key").is_none());
+    assert_eq!(client_api_key(Some(&seen[4])), None);
+    assert_eq!(seen[5]["x-goog-api-key"], "sk-provider");
 }
 
 /// An authenticated caller is the operator, so the daemon's own provider
@@ -5574,12 +5630,14 @@ async fn an_unenforced_policy_strips_its_keys_without_refusing_anyone() {
         .get(&url)
         .bearer_auth("daemon-key")
         .header("x-api-key", "sk-provider")
+        .header("x-goog-api-key", "daemon-key")
         .send()
         .await
         .unwrap();
     assert_eq!(keyed.status(), StatusCode::OK);
     let seen = seen.lock().await;
     assert!(seen[1].get("authorization").is_none());
+    assert!(seen[1].get("x-goog-api-key").is_none());
     assert_eq!(
         client_api_key(Some(&seen[1])).as_deref(),
         Some("sk-provider")

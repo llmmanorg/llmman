@@ -116,6 +116,7 @@ podman = []
 fuzzing = []
 
 [dev-dependencies]
+tempfile = "3"
 # A WebSocket client for the `/llmman/shell` tests; the same crate axum's
 # `ws` feature already builds, at the version it pins.
 tokio-tungstenite = "0.24"
