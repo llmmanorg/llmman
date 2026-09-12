@@ -82,9 +82,11 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         "--overflow-model needs --model naming the local model to pair it with"
     );
 
-    // The local model's thinking controls (see `opencode_variants`); a
-    // provider's model has no template to read.
+    // The local model's thinking controls (see `opencode_variants`) and
+    // whether it takes images (see `write_dsh_settings`); a provider's
+    // model has neither a template nor a manifest to read.
     let mut thinking = None;
+    let mut vision = false;
     let (model, api_key) = match provider {
         Some(provider) => {
             check_provider_supported(name)?;
@@ -127,7 +129,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // synchronously and with progress, before ever handing off to
             // the integration.
             if !model.is_empty() {
-                thinking = crate::daemon::ensure_model_pulled(&model)?.thinking_controls();
+                let info = crate::daemon::ensure_model_pulled(&model)?;
+                thinking = info.thinking_controls();
+                vision = info.vision();
             }
             match overflow {
                 // The hosted half is validated and keyed exactly as a
@@ -135,6 +139,10 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                 // local model just pulled.
                 Some((provider, hosted)) => {
                     check_provider_supported(name)?;
+                    // A pair routes by request size (`hybrid::route`) and
+                    // an image usually clears the local budget, landing on
+                    // the hosted half, whose modality llmman never checked.
+                    vision = false;
                     let per_request =
                         !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
                     let (remote, api_key) =
@@ -146,7 +154,14 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         }
     };
 
-    launch(name, &model, &api_key, thinking.as_ref(), &args.extra_args)
+    launch(
+        name,
+        &model,
+        &api_key,
+        thinking.as_ref(),
+        vision,
+        &args.extra_args,
+    )
 }
 
 /// What an integration authenticates with when no provider key travels:
@@ -480,11 +495,14 @@ const INTEGRATIONS: &[Integration] = &[
 fn print_integrations() {
     println!("Available integrations:\n");
     for i in INTEGRATIONS {
-        if find_integration_binary(i).is_some() {
-            println!("  {:<12} {}", i.name, i.description);
-        } else {
-            println!("  {:<12} {} (not installed)", i.name, i.description);
-        }
+        // dsh resolves to npx when it isn't installed (see `find_dsh`),
+        // and that launch downloads the package before running it.
+        let how = match find_integration_binary(i) {
+            Some(bin) if bin.file_stem().is_some_and(|s| s == "npx") => " (via npx)",
+            Some(_) => "",
+            None => " (not installed)",
+        };
+        println!("  {:<12} {}{}", i.name, i.description, how);
     }
     println!("\nUsage: llmman launch <integration> [--model <model>] [--provider <provider>]");
     println!("       llmman providers   (the providers --provider accepts)");
@@ -531,6 +549,7 @@ fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
         "opencode" => find_opencode(),
         "qwen" => find_qwen(),
+        "dsh" => find_dsh().map(|(bin, _)| bin),
         _ => find_on_path(i.binary),
     }
 }
@@ -555,6 +574,7 @@ fn launch(
     model: &str,
     api_key: &str,
     thinking: Option<&ThinkingControls>,
+    vision: bool,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     match name.to_lowercase().as_str() {
@@ -569,7 +589,7 @@ fn launch(
         "hermes" => launch_hermes(model, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
         "qwen" => launch_qwen(model, api_key, extra_args),
-        "dsh" => launch_dsh(model, api_key, extra_args),
+        "dsh" => launch_dsh(model, api_key, vision, extra_args),
         other => anyhow::bail!(
             "unknown integration {:?}\nRun 'llmman launch' without arguments to list supported integrations.",
             other
@@ -1471,7 +1491,12 @@ const DSH_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 /// deliberately, since a per-launch directory costs a cleanup hook on
 /// every exit path (signals included) for a case that needs two
 /// simultaneous sessions on different models to bite at all.
-fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch_dsh(
+    model: &str,
+    api_key: &str,
+    vision: bool,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
     let launcher = dsh_launcher(extra_args);
     if has_flag(launcher.args, "--patch", None) {
         anyhow::bail!("llmman launch dsh manages --patch itself; pass other dsh flags after --");
@@ -1483,19 +1508,47 @@ fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Resu
             if command == "web" { "web" } else { "<name>" }
         );
     }
-    let bin = find_on_path("dsh").ok_or_else(|| anyhow::anyhow!("dsh is not installed"))?;
+    let (bin, prefix) = find_dsh().ok_or_else(|| {
+        anyhow::anyhow!("dsh is not installed, and there is no npx on PATH to run it with")
+    })?;
 
     let dir = dsh_config_dir()?;
     let settings_path = dir.join("settings.yaml");
-    write_dsh_settings(&settings_path, model)?;
+    write_dsh_settings(&settings_path, model, vision)?;
     let patch_path = dir.join("llmman.cordis.yml");
     write_dsh_patch(&patch_path, &settings_path)?;
 
-    exec_with_env(
-        &bin,
-        &dsh_args(&patch_path, extra_args),
-        &[(DSH_API_KEY_ENV, api_key)],
-    )
+    let mut args = prefix;
+    if !args.is_empty() {
+        // Said before it happens: this launch downloads a package.
+        eprintln!("[llmman] dsh is not installed; running {DSH_NPM_PACKAGE} with npx");
+    }
+    args.extend(dsh_args(&patch_path, extra_args));
+    exec_with_env(&bin, &args, &[(DSH_API_KEY_ENV, api_key)])
+}
+
+/// The npm package `npx` fetches when dsh isn't installed. Unpinned, so
+/// a one-off run gets what a global install would have.
+const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh@latest";
+
+/// dsh, and the arguments that must lead whatever it is handed: none for
+/// an installed `dsh`, `--yes <package>` for the `npx` that stands in when
+/// there is none. `find_integration_binary` resolves it the same way, so
+/// the listing agrees with what a launch would run.
+fn find_dsh() -> Option<(PathBuf, Vec<String>)> {
+    dsh_command(find_on_path("dsh"), || find_on_path("npx"))
+}
+
+/// Split from [`find_dsh`] so which binary wins can be asserted without
+/// depending on what the test machine has installed.
+fn dsh_command(
+    dsh: Option<PathBuf>,
+    npx: impl FnOnce() -> Option<PathBuf>,
+) -> Option<(PathBuf, Vec<String>)> {
+    match dsh {
+        Some(bin) => Some((bin, Vec::new())),
+        None => Some((npx()?, vec!["--yes".into(), DSH_NPM_PACKAGE.into()])),
+    }
 }
 
 /// The tokens dsh reads as its own launcher flags, rather than forwards
@@ -1581,15 +1634,18 @@ fn dsh_config_dir() -> anyhow::Result<PathBuf> {
 /// The settings document `llmman.cordis.yml` points dsh at: registers
 /// `llmman` as an `llm-pi-ai` provider route at this daemon's `/v1`, and
 /// selects it as the `agent-default-model`.
-fn write_dsh_settings(path: &Path, model: &str) -> anyhow::Result<()> {
+fn write_dsh_settings(path: &Path, model: &str, vision: bool) -> anyhow::Result<()> {
     let quoted_model = yaml_quote(model);
     let base_url = yaml_quote(&format!("{}/v1", daemon::server()));
+    // Claiming image input a text-only model can't serve would have dsh
+    // attach what the daemon then rejects.
+    let input = if vision { "[text, image]" } else { "[text]" };
     let contents = format!(
         "# Written by `llmman launch dsh`; edits are overwritten.\n\
          agent-default-model:\n  provider: llmman\n  model: {quoted_model}\n\
          llm-pi-ai:\n  providers:\n    llmman:\n      displayName: llmman\n      \
          apiKeyEnv: {DSH_API_KEY_ENV}\n      api: openai-completions\n      baseURL: {base_url}\n      \
-         models:\n        - id: {quoted_model}\n          name: {quoted_model}\n          input: [text]\n"
+         models:\n        - id: {quoted_model}\n          name: {quoted_model}\n          input: {input}\n"
     );
     write_dsh_file(path, &contents)
 }
@@ -2281,7 +2337,7 @@ model = \"gpt-5\"
                 .as_nanos()
         ));
         let path = dir.join("settings.yaml");
-        write_dsh_settings(&path, "qwen3.5:0.8b").unwrap();
+        write_dsh_settings(&path, "qwen3.5:0.8b", false).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("provider: llmman"));
         assert!(contents.contains("model: \"qwen3.5:0.8b\""));
@@ -2291,6 +2347,53 @@ model = \"gpt-5\"
         assert!(contents.contains("id: \"qwen3.5:0.8b\""));
         assert!(!contents.contains("apiKey:"), "no literal key in the file");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// dsh sends an image only to a model whose `input` lists one — and
+    /// must not attach one to a text-only model the daemon would reject.
+    #[test]
+    fn write_dsh_settings_declares_image_input_only_for_a_vision_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-dsh-vision-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("settings.yaml");
+        write_dsh_settings(&path, "m", true).unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("input: [text, image]"));
+        write_dsh_settings(&path, "m", false).unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("input: [text]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fallback that makes `llmman launch dsh` work without a global
+    /// install — and stays out of the way of one that exists.
+    #[test]
+    fn dsh_falls_back_to_the_published_package_under_npx() {
+        let dsh = PathBuf::from("/usr/local/bin/dsh");
+        let npx = PathBuf::from("/usr/local/bin/npx");
+
+        // An install wins, and npx is never even looked for.
+        assert_eq!(
+            dsh_command(Some(dsh.clone()), || panic!("npx looked up anyway")),
+            Some((dsh, Vec::new()))
+        );
+        // Without one, npx runs the package: `--yes` so a first run
+        // isn't blocked on a prompt, ahead of dsh's own arguments.
+        assert_eq!(
+            dsh_command(None, || Some(npx.clone())),
+            Some((npx, vec!["--yes".to_string(), DSH_NPM_PACKAGE.to_string()]))
+        );
+        assert!(DSH_NPM_PACKAGE.starts_with("@deepseek-ai/dsh@"));
+        // Neither: "dsh is not installed", not an npm error.
+        assert_eq!(dsh_command(None, || None), None);
     }
 
     #[test]
@@ -2407,7 +2510,7 @@ model = \"gpt-5\"
         for command in ["web", "plugin"] {
             let via_command = args(&[command, "--port", "8080"]);
             assert_eq!(dsh_launcher(&via_command).command, Some(command));
-            let err = launch_dsh("m", "k", &via_command).unwrap_err();
+            let err = launch_dsh("m", "k", false, &via_command).unwrap_err();
             assert!(err.to_string().contains("--profile"), "{err}");
         }
         // `--profile web`'s *value* is not the `web` command — refusing
@@ -2439,10 +2542,10 @@ model = \"gpt-5\"
     #[test]
     fn launch_dsh_refuses_a_conflicting_patch_flag() {
         let word = vec!["--patch".to_string(), "/tmp/x.yml".to_string()];
-        let err = launch_dsh("m", "k", &word).unwrap_err();
+        let err = launch_dsh("m", "k", false, &word).unwrap_err();
         assert!(err.to_string().contains("--patch"), "{err}");
         let joined = vec!["--patch=/tmp/x.yml".to_string()];
-        let err = launch_dsh("m", "k", &joined).unwrap_err();
+        let err = launch_dsh("m", "k", false, &joined).unwrap_err();
         assert!(err.to_string().contains("--patch"), "{err}");
     }
 

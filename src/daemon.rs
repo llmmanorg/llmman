@@ -1066,6 +1066,14 @@ impl ShowResponse {
             .any(|c| c == crate::modelpack::CAPABILITY_VISION || c == "audio")
     }
 
+    /// Takes images *in* — unlike [`Self::image`], which generates them,
+    /// and [`Self::multimodal`], which audio alone also satisfies.
+    pub fn vision(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c == crate::modelpack::CAPABILITY_VISION)
+    }
+
     /// An image generation model (see `crate::imagegen`).
     pub fn image(&self) -> bool {
         self.capabilities
