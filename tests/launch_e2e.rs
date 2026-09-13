@@ -67,8 +67,8 @@
 //!     template raises a hard Jinja error ("System message must be at the
 //!     beginning") the moment that happens, so every real multi-turn
 //!     request 500'd and Claude Code retried in a loop until giving up —
-//!     fixed in `cmd::serve::handle_anthropic_messages` by folding every
-//!     system-role turn into one leading message.
+//!     fixed in `cmd::serve::anthropic::handle_anthropic_messages` by
+//!     folding every system-role turn into one leading message.
 //!   - `codex`: the config `write_codex_config` wrote (a `[profiles.llmman]`
 //!     table in `config.toml`) is a format current codex (0.134+) refuses
 //!     to load at all — fixed by writing the sibling
@@ -611,7 +611,11 @@ fn run_launch(
         // Set, not cleared: a `QWEN_HOME` in the developer's shell would
         // send the settings `launch qwen` writes past this `HOME`, and on
         // Windows `dirs::home_dir` reads neither `HOME` nor `USERPROFILE`.
-        .env("QWEN_HOME", home.join(".qwen"));
+        .env("QWEN_HOME", home.join(".qwen"))
+        // AGY's background updater replaces its binary in place (seen
+        // within a minute of a first run), so without this a retry would
+        // run a different AGY than the one CI installed and checksummed.
+        .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
     // On top of the fresh HOME, for an integration that needs more than
     // a home directory to find itself or its operator (see
     // `launch_talos_with_model`).
@@ -792,6 +796,14 @@ fn launch_agy_with_model() {
 
     // Real AGY print mode. Its built-in title and main-agent requests use
     // different Google model names; the llmman route must pin both to MODEL.
+    //
+    // AGY's own `--print-timeout` (default 5m) is kept past TIMEOUT so the
+    // harness decides when a run is hung: AGY firing first is a nonzero
+    // exit `launch_and_assert` treats as a bug, though the cause (a CPU
+    // runner needing 83s to 300s+ just to prefill AGY's ~12k-token system
+    // prompt, per CI runs 34698882471..34703049223) is the timeout shape
+    // it already tolerates.
+    let print_timeout = format!("{}s", TIMEOUT.as_secs() * 2);
     launch_and_assert(
         "agy",
         &[
@@ -800,7 +812,7 @@ fn launch_agy_with_model() {
             "--output-format",
             "text",
             "--print-timeout",
-            "5m",
+            &print_timeout,
             "--disable-slash-commands",
         ],
     );

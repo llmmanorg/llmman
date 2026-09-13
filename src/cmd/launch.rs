@@ -2214,13 +2214,21 @@ mod tests {
 
     #[test]
     fn agy_settings_are_written_to_the_llmman_owned_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        write_agy_settings_at(dir.path()).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-agy-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_agy_settings_at(&dir).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("antigravity-cli/settings.json")).unwrap(),
+            std::fs::read_to_string(dir.join("antigravity-cli/settings.json")).unwrap(),
             "{\n  \"modelProvider\": \"gemini\"\n}\n"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

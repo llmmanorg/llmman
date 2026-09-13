@@ -3,7 +3,7 @@
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as UrlPath, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine as _;
 use futures::StreamExt;
@@ -13,8 +13,8 @@ use super::sched::{begin_activity, ActivityGuard};
 use super::stream::{bytes_to_lines, oai_chunk_to_content};
 use super::types::{OAIChatRequest, OAIChunk, OAIMessage, OAIToolCall, OAIToolCallFunction};
 use super::{
-    accumulate_tool_call_deltas, backend_wire_model, post_chat, send_with_hybrid_fallback,
-    AppError, AppState, Target, ToolCallAccumulator,
+    accumulate_tool_call_deltas, backend_wire_model, collect_body, post_chat,
+    send_with_hybrid_fallback, AppError, AppState, Target, ToolCallAccumulator,
 };
 
 // ---------------------------------------------------------------------------
@@ -348,17 +348,28 @@ fn gemini_sse_line(
     calls: &std::cell::RefCell<std::collections::BTreeMap<usize, ToolCallAccumulator>>,
     finished: &std::cell::Cell<bool>,
 ) -> String {
+    gemini_sse_event(payload, calls, finished)
+        .map(|event| format!("data: {event}\n\n"))
+        .unwrap_or_default()
+}
+
+/// The Gemini event one OpenAI SSE payload becomes, or `None` for a
+/// payload with nothing to relay (an empty delta, `[DONE]` after the
+/// finish chunk). A backend `{"error": ...}` payload is relayed as is.
+fn gemini_sse_event(
+    payload: &str,
+    calls: &std::cell::RefCell<std::collections::BTreeMap<usize, ToolCallAccumulator>>,
+    finished: &std::cell::Cell<bool>,
+) -> Option<serde_json::Value> {
     if let Ok(event) = serde_json::from_str::<serde_json::Value>(payload) {
         if event.get("error").is_some_and(|error| !error.is_null()) {
-            return format!("data: {event}\n\n");
+            return Some(event);
         }
     }
     accumulate_tool_call_deltas(payload, calls);
     let usage = gemini_usage_metadata(payload);
     let Some((content, thinking, done)) = oai_chunk_to_content(payload) else {
-        return usage
-            .map(|usage| format!("data: {}\n\n", serde_json::json!({"usageMetadata": usage})))
-            .unwrap_or_default();
+        return usage.map(|usage| serde_json::json!({"usageMetadata": usage}));
     };
     let finish_reason = serde_json::from_str::<OAIChunk>(payload)
         .ok()
@@ -387,45 +398,106 @@ fn gemini_sse_line(
                 })
             })
             .collect::<Vec<_>>();
-        let mut parts = Vec::new();
-        if let Some(thinking) = thinking.filter(|thinking| !thinking.is_empty()) {
-            parts.push(serde_json::json!({"text": thinking, "thought": true}));
-        }
-        if !content.is_empty() {
-            parts.push(serde_json::json!({"text": content}));
-        }
-        parts.extend(tool_parts);
-        let mut chunk = serde_json::json!({
-            "candidates": [{
-                "content": {"role": "model", "parts": parts},
-                "finishReason": finish_reason,
-            }]
-        });
-        if let Some(usage) = usage {
-            chunk["usageMetadata"] = usage;
-        }
-        format!("data: {chunk}\n\n")
-    } else if !content.is_empty()
-        || thinking
-            .as_deref()
-            .is_some_and(|thinking| !thinking.is_empty())
-    {
-        let mut parts = Vec::new();
-        if let Some(thinking) = thinking.filter(|thinking| !thinking.is_empty()) {
-            parts.push(serde_json::json!({"text": thinking, "thought": true}));
-        }
-        if !content.is_empty() {
-            parts.push(serde_json::json!({"text": content}));
-        }
-        let chunk = serde_json::json!({
-            "candidates": [{
-                "content": {"role": "model", "parts": parts}
-            }]
-        });
-        format!("data: {chunk}\n\n")
+        let parts = gemini_parts(thinking.as_deref(), &content, tool_parts);
+        Some(gemini_response(parts, Some(finish_reason), usage))
     } else {
-        String::new()
+        let parts = gemini_parts(thinking.as_deref(), &content, Vec::new());
+        (!parts.is_empty()).then(|| gemini_response(parts, None, None))
     }
+}
+
+/// A candidate's parts in Gemini's order: thoughts, visible text, calls.
+fn gemini_parts(
+    thought: Option<&str>,
+    text: &str,
+    calls: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let mut parts = Vec::new();
+    if let Some(thought) = thought.filter(|thought| !thought.is_empty()) {
+        parts.push(serde_json::json!({"text": thought, "thought": true}));
+    }
+    if !text.is_empty() {
+        parts.push(serde_json::json!({"text": text}));
+    }
+    parts.extend(calls);
+    parts
+}
+
+/// One `GenerateContentResponse` (or stream chunk) around a single candidate.
+fn gemini_response(
+    parts: Vec<serde_json::Value>,
+    finish_reason: Option<&str>,
+    usage: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut candidate = serde_json::json!({
+        "content": {"role": "model", "parts": parts},
+        "index": 0,
+    });
+    if let Some(reason) = finish_reason {
+        candidate["finishReason"] = reason.into();
+    }
+    let mut response = serde_json::json!({"candidates": [candidate]});
+    if let Some(usage) = usage {
+        response["usageMetadata"] = usage;
+    }
+    response
+}
+
+/// Folds a backend SSE stream into the one response a `generateContent`
+/// caller expects. `Err` carries the backend's `{"error": ...}` event, or
+/// one for a stream that ended before its finish chunk.
+fn fold_gemini_stream<I, S>(lines: I) -> Result<serde_json::Value, serde_json::Value>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let calls = std::cell::RefCell::new(std::collections::BTreeMap::new());
+    let finished = std::cell::Cell::new(false);
+    let mut thought = String::new();
+    let mut text = String::new();
+    let mut function_calls = Vec::new();
+    let mut finish_reason = None;
+    let mut usage = None;
+    for line in lines {
+        let Some(payload) = line.as_ref().strip_prefix("data: ") else {
+            continue;
+        };
+        let Some(event) = gemini_sse_event(payload, &calls, &finished) else {
+            continue;
+        };
+        if event.get("error").is_some() {
+            return Err(event);
+        }
+        if let Some(reported) = event.get("usageMetadata") {
+            usage = Some(reported.clone());
+        }
+        let candidate = &event["candidates"][0];
+        if let Some(reason) = candidate["finishReason"].as_str() {
+            finish_reason = Some(reason.to_string());
+        }
+        for part in candidate["content"]["parts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if part.get("functionCall").is_some() {
+                function_calls.push(part.clone());
+            } else if let Some(delta) = part["text"].as_str() {
+                if part["thought"] == true {
+                    thought.push_str(delta);
+                } else {
+                    text.push_str(delta);
+                }
+            }
+        }
+    }
+    let Some(finish_reason) = finish_reason else {
+        return Err(serde_json::json!({
+            "error": {"message": "upstream stream ended before completion"}
+        }));
+    };
+    let parts = gemini_parts(Some(&thought), &text, function_calls);
+    Ok(gemini_response(parts, Some(&finish_reason), usage))
 }
 
 /// Extracts OpenAI token usage into Gemini's usage metadata field names.
@@ -442,10 +514,38 @@ fn gemini_usage_metadata(payload: &str) -> Option<serde_json::Value> {
     }))
 }
 
-/// Extracts a Gemini model name from a streaming method path.
-pub(super) fn gemini_stream_model(path: &str) -> Option<&str> {
-    path.strip_suffix(":streamGenerateContent")
-        .filter(|model| !model.is_empty())
+/// The Gemini API methods the pinned route serves: `v1beta/models/<model>:<method>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GeminiMethod {
+    /// `streamGenerateContent`: the SSE stream AGY's agent loop reads.
+    Stream,
+    /// `generateContent`: the same answer folded into one JSON object.
+    Generate,
+    /// `countTokens`: the prompt's token count, no generation.
+    CountTokens,
+}
+
+impl GeminiMethod {
+    /// Whether the method's body is a prompt `llmman log` should record.
+    pub(super) fn generates(self) -> bool {
+        !matches!(self, Self::CountTokens)
+    }
+}
+
+/// Splits a Gemini method path into the model AGY named (ignored by the
+/// pinned route, but it must be present) and the method it called.
+pub(super) fn gemini_method(path: &str) -> Option<(&str, GeminiMethod)> {
+    let (model, method) = path.rsplit_once(':')?;
+    if model.is_empty() {
+        return None;
+    }
+    let method = match method {
+        "streamGenerateContent" => GeminiMethod::Stream,
+        "generateContent" => GeminiMethod::Generate,
+        "countTokens" => GeminiMethod::CountTokens,
+        _ => return None,
+    };
+    Some((model, method))
 }
 
 // -- Gemini /gemini/<model>/v1beta/models/... ------------------------------
@@ -459,7 +559,7 @@ pub(super) async fn handle_pinned_gemini(
     State(state): State<AppState>,
     UrlPath((encoded_model, gemini_path)): UrlPath<(String, String)>,
     headers: HeaderMap,
-    Json(req): Json<GeminiRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
     let model_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded_model)
@@ -467,58 +567,96 @@ pub(super) async fn handle_pinned_gemini(
     let selected_model = String::from_utf8(model_bytes)
         .map_err(|_| AppError::status(StatusCode::BAD_REQUEST, "invalid AGY model route"))?;
 
-    if gemini_stream_model(&gemini_path).is_some() {
-        return handle_gemini_request(state, &selected_model, headers, req).await;
+    let Some((_, method)) = gemini_method(&gemini_path) else {
+        return Err(AppError::status(
+            StatusCode::NOT_FOUND,
+            "AGY endpoint supports streamGenerateContent, generateContent and countTokens only",
+        ));
+    };
+    // `countTokens` may wrap the request in `generateContentRequest`.
+    let mut body = body;
+    if let Some(inner) = body
+        .get_mut("generateContentRequest")
+        .filter(|_| method == GeminiMethod::CountTokens)
+        .map(serde_json::Value::take)
+    {
+        body = inner;
     }
-    Err(AppError::status(
-        StatusCode::NOT_FOUND,
-        "AGY endpoint supports streamGenerateContent only",
-    ))
-}
-
-async fn handle_gemini_request(
-    state: AppState,
-    selected_model: &str,
-    headers: HeaderMap,
-    req: GeminiRequest,
-) -> Result<Response, AppError> {
+    let req: GeminiRequest = serde_json::from_value(body)
+        .map_err(|error| AppError::status(StatusCode::BAD_REQUEST, error.to_string()))?;
     send_with_hybrid_fallback(
         &state,
-        selected_model,
+        &selected_model,
         Some(&headers),
         None,
-        |model, target, guard| gemini_request_to(&state, &req, model, target, guard),
+        |model, target, guard| gemini_request_to(&state, &req, model, target, guard, method),
     )
     .await
 }
 
+/// One backend chat completion for any Gemini method. The backend always
+/// streams; `generateContent` folds that into one object, and
+/// `countTokens` asks for one unstreamed token and reports the backend's
+/// own `prompt_tokens` (exact for its tokenizer and template; the prefill
+/// stays in llama-server's prompt cache for the generation that follows).
 async fn gemini_request_to(
     state: &AppState,
     req: &GeminiRequest,
     canonical_model: String,
     target: Target,
     guard: ActivityGuard,
+    method: GeminiMethod,
 ) -> Result<Response, AppError> {
     let activity = begin_activity(guard, None).await;
     let wire_model = backend_wire_model(state, &target, &canonical_model).await;
     let mut oai = gemini_oai_request(wire_model, req)?;
+    if method == GeminiMethod::CountTokens {
+        oai.stream = false;
+        oai.stream_options = None;
+        oai.max_tokens = Some(1);
+    }
     let resp = post_chat(&state.0.client, &target, &mut oai).await?;
 
-    let calls = std::cell::RefCell::new(std::collections::BTreeMap::new());
-    let finished = std::cell::Cell::new(false);
-    let stream = bytes_to_lines(resp).map(move |line| {
-        let _activity = &activity;
-        let Some(payload) = line.strip_prefix("data: ") else {
-            return Ok::<_, std::convert::Infallible>(Bytes::new());
-        };
-        Ok(Bytes::from(gemini_sse_line(payload, &calls, &finished)))
-    });
-
-    Ok(Response::builder()
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(Body::from_stream(stream))
-        .unwrap())
+    match method {
+        GeminiMethod::Stream => {
+            let calls = std::cell::RefCell::new(std::collections::BTreeMap::new());
+            let finished = std::cell::Cell::new(false);
+            let stream = bytes_to_lines(resp).map(move |line| {
+                let _activity = &activity;
+                let Some(payload) = line.strip_prefix("data: ") else {
+                    return Ok::<_, std::convert::Infallible>(Bytes::new());
+                };
+                Ok(Bytes::from(gemini_sse_line(payload, &calls, &finished)))
+            });
+            Ok(Response::builder()
+                .header("content-type", "text/event-stream")
+                .header("cache-control", "no-cache")
+                .body(Body::from_stream(stream))
+                .unwrap())
+        }
+        GeminiMethod::Generate => {
+            let lines: Vec<String> = bytes_to_lines(resp).collect().await;
+            drop(activity);
+            Ok(match fold_gemini_stream(lines) {
+                Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+                Err(error) => (StatusCode::BAD_GATEWAY, Json(error)).into_response(),
+            })
+        }
+        GeminiMethod::CountTokens => {
+            let body = collect_body(resp).await;
+            drop(activity);
+            let total = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|completion| completion["usage"]["prompt_tokens"].as_u64())
+                .ok_or_else(|| {
+                    AppError::status(
+                        StatusCode::BAD_GATEWAY,
+                        format!("{} reported no prompt token usage", target.describe()),
+                    )
+                })?;
+            Ok(Json(serde_json::json!({"totalTokens": total})).into_response())
+        }
+    }
 }
 
 /// Builds the backend chat request for one Gemini request.
@@ -924,7 +1062,7 @@ mod tests {
             };
             let result =
                 with_hybrid_fallback(PAIR, Some(&headers), resolve, |model, target, guard| {
-                    gemini_request_to(&state, &req, model, target, guard)
+                    gemini_request_to(&state, &req, model, target, guard, GeminiMethod::Stream)
                 })
                 .await;
             if pinned {
@@ -951,6 +1089,191 @@ mod tests {
                 assert_eq!(requests[1]["temperature"], 0.25);
             }
         }
+    }
+
+    #[test]
+    fn gemini_method_parses_the_three_served_methods_only() {
+        assert_eq!(
+            gemini_method("v1beta/models/gemini-3.1-pro-preview:streamGenerateContent"),
+            Some(("v1beta/models/gemini-3.1-pro-preview", GeminiMethod::Stream))
+        );
+        assert_eq!(
+            gemini_method("v1beta/models/gemini-3.1-flash-lite-preview:generateContent"),
+            Some((
+                "v1beta/models/gemini-3.1-flash-lite-preview",
+                GeminiMethod::Generate
+            ))
+        );
+        assert_eq!(
+            gemini_method("v1beta/models/m:countTokens"),
+            Some(("v1beta/models/m", GeminiMethod::CountTokens))
+        );
+        for path in [
+            ":streamGenerateContent",
+            "v1beta/models/m:embedContent",
+            "v1beta/models/m",
+            "v1beta/models",
+        ] {
+            assert_eq!(gemini_method(path), None, "{path}");
+        }
+        assert!(GeminiMethod::Stream.generates());
+        assert!(GeminiMethod::Generate.generates());
+        assert!(!GeminiMethod::CountTokens.generates());
+    }
+
+    #[test]
+    fn folding_a_stream_joins_deltas_and_keeps_calls_finish_and_usage() {
+        let response = fold_gemini_stream([
+            r#"data: {"choices":[{"delta":{"reasoning_content":"hm"}}]}"#,
+            r#"data: {"choices":[{"delta":{"reasoning_content":"m."}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"po"}}]}"#,
+            "",
+            r#"data: {"choices":[{"delta":{"content":"ng"}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"id\":"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}"#,
+            "data: [DONE]",
+        ])
+        .expect("complete stream");
+
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [
+                        {"text": "hmm.", "thought": true},
+                        {"text": "pong"},
+                        {"functionCall": {"id": "call_1", "name": "lookup", "args": {"id": 1}}}
+                    ]},
+                    "finishReason": "STOP",
+                    "index": 0,
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 7,
+                    "candidatesTokenCount": 5,
+                    "totalTokenCount": 12,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn folding_a_stream_relays_a_backend_error_or_an_early_end() {
+        let error = fold_gemini_stream([
+            r#"data: {"choices":[{"delta":{"content":"partial"}}]}"#,
+            r#"data: {"error":{"message":"upstream failed","type":"api_error"}}"#,
+        ])
+        .unwrap_err();
+        assert_eq!(error["error"]["message"], "upstream failed");
+
+        let error = fold_gemini_stream([r#"data: {"choices":[{"delta":{"content":"partial"}}]}"#])
+            .unwrap_err();
+        assert_eq!(
+            error["error"]["message"],
+            "upstream stream ended before completion"
+        );
+    }
+
+    /// One mock backend for the two unstreamed methods: it answers
+    /// `/v1/chat/completions` with a one-object completion when not
+    /// asked to stream, and a short SSE stream otherwise.
+    async fn mock_backend(seen: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>) -> u16 {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let seen = seen.clone();
+                async move {
+                    let streaming = body["stream"] == true;
+                    seen.lock().await.push(body);
+                    if !streaming {
+                        return Json(serde_json::json!({
+                            "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "length"}],
+                            "usage": {"prompt_tokens": 42, "completion_tokens": 1, "total_tokens": 43}
+                        }))
+                        .into_response();
+                    }
+                    (
+                        [("content-type", "text/event-stream")],
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"po\"}}]}\n\n\
+                         data: {\"choices\":[{\"delta\":{\"content\":\"ng\"},\"finish_reason\":\"stop\"}]}\n\n\
+                         data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}}\n\n\
+                         data: [DONE]\n\n",
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
+    }
+
+    #[tokio::test]
+    async fn generate_content_folds_the_backend_stream_into_one_response() {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let port = mock_backend(seen.clone()).await;
+        let state = test_state();
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "ping"}]}]
+        }))
+        .unwrap();
+
+        let guard = ActivityGuard::new(&state, "local-model");
+        let response = gemini_request_to(
+            &state,
+            &req,
+            "local-model".into(),
+            Target::Local(port),
+            guard,
+            GeminiMethod::Generate,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["candidates"][0]["content"]["parts"][0]["text"], "pong");
+        assert_eq!(body["candidates"][0]["finishReason"], "STOP");
+        assert_eq!(body["usageMetadata"]["totalTokenCount"], 11);
+        assert_eq!(seen.lock().await[0]["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn count_tokens_reports_the_backends_prompt_token_usage() {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let port = mock_backend(seen.clone()).await;
+        let state = test_state();
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "ping"}]}]
+        }))
+        .unwrap();
+
+        let guard = ActivityGuard::new(&state, "local-model");
+        let response = gemini_request_to(
+            &state,
+            &req,
+            "local-model".into(),
+            Target::Local(port),
+            guard,
+            GeminiMethod::CountTokens,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body, serde_json::json!({"totalTokens": 42}));
+        let requests = seen.lock().await;
+        assert_eq!(requests[0]["stream"], false);
+        assert_eq!(requests[0]["max_tokens"], 1);
+        assert!(requests[0].get("stream_options").is_none());
     }
 
     #[test]
