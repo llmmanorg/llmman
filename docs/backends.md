@@ -218,10 +218,14 @@ for a pulled safetensors model) installs it with
 [`uv`](https://github.com/astral-sh/uv) — the one on `PATH`, or
 astral-sh's prebuilt release downloaded to `~/.local/share/llmman/uv/` —
 into `~/.local/share/llmman/mlx-lm/venv` (with a managed CPython 3.10+
-if the host has none). `LLMMAN_MLX_LM_VERSION=<version>` pins the
-release; deleting `~/.local/share/llmman/mlx-lm` reinstalls on the next
-load. An `mlx_lm.server` on `PATH` is used as-is;
-`LLMMAN_SAFETENSORS_ENGINE=vllm` skips MLX.
+if the host has none). `llmman run` and `llmman launch` do this install
+themselves, in the terminal with uv's progress, before their first
+request, rather than leaving it to the background daemon's first load
+(where it would only show up as a long wait for the first token).
+`LLMMAN_MLX_LM_VERSION=<version>` pins the release; deleting
+`~/.local/share/llmman/mlx-lm` reinstalls on the next load. An
+`mlx_lm.server` on `PATH` is used as-is; `LLMMAN_SAFETENSORS_ENGINE=vllm`
+skips MLX.
 
 ## Registry transport
 

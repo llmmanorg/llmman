@@ -10,6 +10,7 @@
 //! `mlx_lm.server` already on `PATH` always wins over the managed one.
 
 use std::ffi::OsStr;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -112,19 +113,41 @@ fn ensure_uv() -> Result<PathBuf> {
     Ok(uv)
 }
 
-/// Runs `uv` with `args`, output inherited (the daemon's log).
+/// Runs `uv` with `args`, output inherited. On a terminal that is uv's
+/// own live progress (resolver, wheel and managed-Python downloads); into
+/// the daemon's log it is plain lines instead, since a redrawn bar is
+/// noise there.
 fn run_uv(uv: &Path, args: &[&OsStr]) -> Result<()> {
     crate::debug_log!("running {} {:?}", uv.display(), args);
-    let status = std::process::Command::new(uv)
-        .args(args)
-        .env("UV_NO_PROGRESS", "1")
-        .stdin(std::process::Stdio::null())
+    let mut cmd = std::process::Command::new(uv);
+    cmd.args(args).stdin(std::process::Stdio::null());
+    if !std::io::stderr().is_terminal() {
+        cmd.env("UV_NO_PROGRESS", "1");
+    }
+    let status = cmd
         .status()
         .with_context(|| format!("spawn {}", uv.display()))?;
     if !status.success() {
         anyhow::bail!("{} {:?} exited with {status}", uv.display(), args);
     }
     Ok(())
+}
+
+/// Whether the managed venv at `venv` finished installing: the sentinel
+/// is written last, so its presence means the console script is usable.
+fn venv_complete(venv: &Path) -> bool {
+    venv.join(COMPLETE_SENTINEL).is_file() && server_in_venv(venv).is_file()
+}
+
+/// Whether [`ensure_mlx_server`] would have to install anything: no
+/// `mlx_lm.server` on `PATH` and no complete managed venv. A few `stat`s,
+/// so a client can ask on every run and only announce the (long) first
+/// install when there is one.
+pub fn needs_install() -> bool {
+    if crate::find_on_path("mlx_lm.server").is_some() {
+        return false;
+    }
+    mlx_lm_root().is_ok_and(|root| !venv_complete(&root.join("venv")))
 }
 
 /// The `mlx_lm.server` to run: the one on `PATH`, else the one in
@@ -137,16 +160,29 @@ pub fn ensure_mlx_server() -> Result<PathBuf> {
     let root = mlx_lm_root()?;
     let venv = root.join("venv");
     let server = server_in_venv(&venv);
-    let complete = || venv.join(COMPLETE_SENTINEL).is_file() && server.is_file();
-    if complete() {
+    if venv_complete(&venv) {
         return Ok(server);
     }
 
-    // One installer at a time, across daemons and CLI processes alike.
+    // One installer at a time, across daemons and CLI processes alike. A
+    // contended lock means another llmman (typically the daemon, whose
+    // output is in its log) is mid-install: say so, or this process looks
+    // hung until that one finishes.
     std::fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
     let lock = std::fs::File::create(root.join(".lock")).context("create install lock")?;
-    lock.lock().context("acquire install lock")?;
-    if complete() {
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            eprintln!(
+                "[llmman] another llmman process is installing mlx-lm; waiting for it to finish"
+            );
+            lock.lock().context("acquire install lock")?;
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            return Err(e).context("acquire install lock");
+        }
+    }
+    if venv_complete(&venv) {
         return Ok(server);
     }
     if venv.exists() {

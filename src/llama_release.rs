@@ -421,7 +421,30 @@ fn download_marker_path() -> Result<PathBuf> {
 /// the same marker around its pulls): the marker exists and was touched
 /// recently enough to belong to a live download rather than a crashed one.
 pub fn download_in_progress() -> bool {
-    download_marker_path().is_ok_and(|path| marker_is_fresh(&path, DOWNLOAD_MARKER_STALE_AFTER))
+    download_status().is_some()
+}
+
+/// [`download_in_progress`], with what the downloader last wrote into the
+/// marker via [`DownloadMarker::set_status`]: a one-line "`<asset>: 12 MB
+/// / 40 MB (30%)`"-style progress report, or `""` when the holder only
+/// [`touch`]es it (a container pull). `None` when no live download.
+///
+/// This is how a client (`daemon::ensure_server`) shows the user what a
+/// detached daemon is doing on its first start: the daemon's own stdio is
+/// in a log file, so the marker is the one channel between them.
+///
+/// [`touch`]: DownloadMarker::touch
+pub fn download_status() -> Option<String> {
+    let path = download_marker_path().ok()?;
+    marker_status(&path, DOWNLOAD_MARKER_STALE_AFTER)
+}
+
+/// Split out from [`download_status`] so tests can drive the path and
+/// threshold directly.
+fn marker_status(path: &Path, stale_after: Duration) -> Option<String> {
+    marker_is_fresh(path, stale_after)
+        .then(|| std::fs::read_to_string(path).unwrap_or_default())
+        .map(|text| text.trim().to_string())
 }
 
 /// Split out from [`download_in_progress`] so tests can drive the path
@@ -465,12 +488,23 @@ impl DownloadMarker {
     }
 
     /// Refreshes the marker's mtime so a reader can tell this live
-    /// download from a crashed one whose Drop never ran.
+    /// download from a crashed one whose Drop never ran. Clears any
+    /// earlier [`set_status`](Self::set_status) text.
     pub(crate) fn touch(&self) {
+        self.write("");
+    }
+
+    /// [`touch`](Self::touch), leaving `status` (one line of progress,
+    /// see [`download_status`]) in the marker for a client to display.
+    pub(crate) fn set_status(&self, status: &str) {
+        self.write(status);
+    }
+
+    fn write(&self, text: &str) {
         if let Some(path) = &self.0 {
             // Windows keeps the old mtime when a write is zero bytes,
             // so set it explicitly.
-            let _ = std::fs::write(path, b"");
+            let _ = std::fs::write(path, text.as_bytes());
             if let Ok(file) = std::fs::File::options().write(true).open(path) {
                 let _ = file.set_modified(std::time::SystemTime::now());
             }
@@ -541,22 +575,33 @@ pub(crate) fn download_to_file(
         file.write_all(&buf[..n]).context("write downloaded data")?;
         downloaded += n as u64;
         if last_logged.elapsed() >= PROGRESS_LOG_INTERVAL {
+            let progress = download_progress_text(label, downloaded, total);
             if let Some(marker) = marker {
-                marker.touch();
+                marker.set_status(&progress);
             }
             if total > 0 {
-                eprintln!(
-                    "[llmman] downloading {label}: {} / {} ({}%)",
-                    human_size(downloaded),
-                    human_size(total),
-                    downloaded.saturating_mul(100) / total
-                );
+                eprintln!("[llmman] downloading {progress}");
             }
             last_logged = Instant::now();
         }
     }
     eprintln!("[llmman] downloaded {label}: {}", human_size(downloaded));
     Ok(())
+}
+
+/// One line of download progress — the same text the daemon logs and
+/// leaves in the [`DownloadMarker`] for a waiting client to show.
+fn download_progress_text(label: &str, downloaded: u64, total: u64) -> String {
+    if total > 0 {
+        format!(
+            "{label}: {} / {} ({}%)",
+            human_size(downloaded),
+            human_size(total),
+            downloaded.saturating_mul(100) / total
+        )
+    } else {
+        format!("{label}: {}", human_size(downloaded))
+    }
 }
 
 pub(crate) fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<()> {
@@ -706,7 +751,7 @@ fn try_ensure_from_network(
         &asset.name,
         Some(&marker),
     )?;
-    marker.touch();
+    marker.set_status(&format!("extracting {}", asset.name));
     extract(&tmp, &asset.name, &dest)?;
 
     if let Some(companion_substr) = &query.companion_must_contain {
@@ -723,7 +768,7 @@ fn try_ensure_from_network(
                     &companion.name,
                     Some(&marker),
                 )?;
-                marker.touch();
+                marker.set_status(&format!("extracting {}", companion.name));
                 extract(&tmp2, &companion.name, &dest)?;
             }
             None => eprintln!(
@@ -1113,6 +1158,61 @@ mod tests {
         assert!(marker_is_fresh(&path, Duration::from_secs(60)));
         drop(marker);
         assert!(!path.exists(), "marker not removed on drop");
+    }
+
+    /// What a waiting client reads back: the status text while the
+    /// marker is fresh, `""` after a plain touch, `None` once stale or
+    /// gone.
+    #[test]
+    fn marker_status_reports_the_last_written_text_while_fresh() {
+        let path = std::env::temp_dir().join(format!(
+            "llmman-marker-status-{}/.downloading",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(marker_status(&path, Duration::from_secs(60)), None);
+        let marker = DownloadMarker::create_at(path.clone());
+        assert_eq!(
+            marker_status(&path, Duration::from_secs(60)).as_deref(),
+            Some("")
+        );
+        marker.set_status("llama.tar.gz: 12 MB / 40 MB (30%)");
+        assert_eq!(
+            marker_status(&path, Duration::from_secs(60)).as_deref(),
+            Some("llama.tar.gz: 12 MB / 40 MB (30%)")
+        );
+        // A plain touch clears the text but keeps the marker live.
+        marker.touch();
+        assert_eq!(
+            marker_status(&path, Duration::from_secs(60)).as_deref(),
+            Some("")
+        );
+        marker.set_status("extracting llama.tar.gz");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        assert_eq!(marker_status(&path, Duration::from_secs(60)), None);
+        drop(marker);
+        assert_eq!(marker_status(&path, Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn download_progress_text_includes_a_percentage_only_with_a_known_total() {
+        assert_eq!(
+            download_progress_text("x.tar.gz", 30 * 1024 * 1024, 120 * 1024 * 1024),
+            format!(
+                "x.tar.gz: {} / {} (25%)",
+                human_size(30 * 1024 * 1024),
+                human_size(120 * 1024 * 1024)
+            )
+        );
+        assert_eq!(
+            download_progress_text("x.tar.gz", 4096, 0),
+            format!("x.tar.gz: {}", human_size(4096))
+        );
     }
 
     #[test]

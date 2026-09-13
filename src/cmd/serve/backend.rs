@@ -85,7 +85,7 @@ pub(super) fn safetensors_engine_from_env() -> SafetensorsEngine {
 /// of it. `mlx_lm.server` here is a separate, no-vLLM-at-all option: a
 /// Mac gets real Metal acceleration through it without needing
 /// vllm-metal (or vllm) at all.
-pub(super) fn use_mlx_for_safetensors() -> bool {
+pub fn use_mlx_for_safetensors() -> bool {
     cfg!(target_os = "macos")
         && safetensors_engine_from_env() == SafetensorsEngine::Auto
         && crate::hostgpu::detect() == crate::hostgpu::HostGpu::Metal

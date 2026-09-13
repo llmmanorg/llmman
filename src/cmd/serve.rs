@@ -51,10 +51,13 @@ use backend::{
     find_free_port, local_llama_server_bin, safetensors_engine_from_env,
     sglang_serve_args_from_env, sglang_served_model_name, spawn_llama_server, spawn_mlx_server,
     spawn_sglang_server, spawn_vllm_omni_server, spawn_vllm_server, tail_child_output,
-    use_mlx_for_safetensors, vllm_max_model_len, vllm_omni_serve_args_from_env,
-    vllm_serve_args_from_env, wait_for_ready, OutputTail, SafetensorsEngine, POLL_INTERVAL,
+    vllm_max_model_len, vllm_omni_serve_args_from_env, vllm_serve_args_from_env, wait_for_ready,
+    OutputTail, SafetensorsEngine, POLL_INTERVAL,
 };
-pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
+// `use_mlx_for_safetensors` is also the client's (`daemon::ensure_backend_installed`).
+pub use backend::{
+    use_mlx_for_safetensors, GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS,
+};
 pub use config::DEFAULT_CTX_SIZE;
 use config::{
     backend_ctx_size, container_cpu_limit, context_length_from_env, effective_num_parallel,

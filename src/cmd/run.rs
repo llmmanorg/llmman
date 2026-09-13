@@ -297,6 +297,11 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
                 };
                 return crate::imagegen::run(&model, &prompt, interactive, opts);
             }
+            // A backend the daemon would otherwise install inside the
+            // first /api/chat — behind the bare first-token spinner, for
+            // minutes, looking like slow inference — is installed here,
+            // visibly, first. A no-op once installed.
+            crate::daemon::ensure_backend_installed(&model)?;
             let multimodal = info.multimodal();
             match overflow {
                 // The hosted half is validated and keyed as a bare

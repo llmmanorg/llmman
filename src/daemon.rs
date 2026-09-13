@@ -10,7 +10,7 @@
 //! [`providers`]) are always the daemon's, never duplicated
 //! per-invocation.
 
-use std::io::BufRead;
+use std::io::{BufRead, IsTerminal};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -506,7 +506,18 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     detach(&mut cmd);
     let mut child = cmd.spawn().context("spawn llmman serve")?;
 
-    for _ in 0..120 {
+    // The daemon fetches its llama.cpp (release download or container
+    // pull) before it binds, on its first start on this machine; that can
+    // run well past STARTUP_BUDGET. While the fetch is demonstrably live
+    // (see llama_release::download_status), keep waiting and show the
+    // user what it is doing rather than give up: killing the daemon would
+    // discard the partial download (no resume) and make every retry start
+    // from zero, and a silent minute followed by "retry later" reads as a
+    // hang. The budget only applies to a daemon that is neither listening
+    // nor visibly fetching anything.
+    let started = std::time::Instant::now();
+    let mut fetch_notice = FetchNotice::default();
+    loop {
         std::thread::sleep(Duration::from_millis(500));
         if server_alive() {
             // The connect proves the daemon was alive an instant ago, not
@@ -521,7 +532,13 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
         // try_wait catches an immediate startup failure (e.g. llama-server
         // auto-download failing) instead of polling a dead port for 60s.
         bail_if_exited(&mut child, log_path.as_deref())?;
+        match crate::llama_release::download_status() {
+            Some(status) => fetch_notice.update(&status),
+            None if started.elapsed() >= STARTUP_BUDGET => break,
+            None => {}
+        }
     }
+    drop(fetch_notice);
     // The last in-loop probe is up to 500ms stale by now; a daemon that
     // bound in that window is a healthy start, not a timeout. Same shape
     // as the in-loop success path: prove the daemon survived the accept
@@ -534,16 +551,15 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     // once more so that narrow window still reports the exit status
     // instead of the generic timeout.
     bail_if_exited(&mut child, log_path.as_deref())?;
-    // Timed out with the daemon alive but not listening. If startup is
-    // mid-way through its one-time llama.cpp fetch (release download or
-    // container pull, either far longer than this budget), killing the
-    // daemon would discard the partial download (no resume) and make
-    // every retry start from zero. Leave it running and say so instead.
+    // Timed out with the daemon alive but not listening. If a llama.cpp
+    // fetch began in the window since the loop's last look, leave the
+    // daemon to finish it (see above) and say so.
     if crate::llama_release::download_in_progress() {
         anyhow::bail!(
-            "llmman serve did not start within 60s: startup is still fetching llama.cpp \
+            "llmman serve did not start within {}s: startup is still fetching llama.cpp \
              (a release download or container image pull). The daemon was left running \
              so it can finish; retry this command once it does{}",
+            STARTUP_BUDGET.as_secs(),
             log_tail(log_path.as_deref())
         );
     }
@@ -555,10 +571,71 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     stop_group(child.id());
     let _ = child.wait();
     anyhow::bail!(
-        "llmman serve did not start within 60s and was stopped; run 'llmman serve' in the \
+        "llmman serve did not start within {}s and was stopped; run 'llmman serve' in the \
          foreground to watch what startup is doing{}",
+        STARTUP_BUDGET.as_secs(),
         log_tail(log_path.as_deref())
     )
+}
+
+/// How long [`ensure_server`] waits for a freshly spawned daemon that is
+/// neither listening nor reporting a live llama.cpp fetch.
+const STARTUP_BUDGET: Duration = Duration::from_secs(60);
+
+/// What [`ensure_server`] shows while the daemon it just spawned is still
+/// fetching llama.cpp: on a terminal, one spinner line carrying the
+/// daemon's latest progress text (redrawn in place); otherwise a single
+/// plain notice the first time, so a piped stderr gets the explanation
+/// without a stream of updates. Cleared on drop.
+#[derive(Default)]
+struct FetchNotice {
+    spinner: Option<ProgressBar>,
+    announced: bool,
+}
+
+impl FetchNotice {
+    /// `status` is the marker text: a progress line, or `""` for a fetch
+    /// that reports none (a container image pull).
+    fn update(&mut self, status: &str) {
+        let message = fetch_message(status);
+        if !std::io::stderr().is_terminal() {
+            if !self.announced {
+                eprintln!("[llmman] {message}");
+                self.announced = true;
+            }
+            return;
+        }
+        let spinner = self.spinner.get_or_insert_with(|| {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::with_template("{spinner} {msg}")
+                    .unwrap_or_else(|_| ProgressStyle::default_spinner())
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            );
+            pb.enable_steady_tick(Duration::from_millis(100));
+            pb
+        });
+        spinner.set_message(message);
+    }
+}
+
+impl Drop for FetchNotice {
+    fn drop(&mut self) {
+        if let Some(pb) = self.spinner.take() {
+            pb.finish_and_clear();
+        }
+    }
+}
+
+/// The user-facing line for a daemon-side llama.cpp fetch reporting
+/// `status` (see [`FetchNotice::update`]).
+fn fetch_message(status: &str) -> String {
+    let status = status.trim();
+    if status.is_empty() {
+        "first run: fetching llama.cpp for the llmman daemon (one-time)".to_string()
+    } else {
+        format!("first run: fetching llama.cpp for the llmman daemon (one-time): {status}")
+    }
 }
 
 /// Signals the process group led by `pid`; true if the group existed.
@@ -1109,6 +1186,54 @@ pub fn ensure_model_pulled(reference: &str) -> anyhow::Result<ShowResponse> {
     show(reference)?.ok_or_else(|| anyhow::anyhow!("{reference}: not found after pull"))
 }
 
+/// Installs, here and in the open, the one backend the daemon would
+/// otherwise install silently on the first request for `reference`:
+/// `mlx_lm.server`, which `cmd::serve` fetches lazily (`uv venv` + `uv
+/// pip install mlx-lm`, minutes) inside `spawn_mlx_server` — i.e. from
+/// within the user's first `/api/chat`, behind a detached daemon whose
+/// output is in serve.log. From `llmman run` that looked like a bare
+/// "waiting for the first token" spinner for several minutes, as if the
+/// model were just slow; from `launch` it was the integration's first
+/// request hanging with no explanation at all.
+///
+/// Doing the install from this process instead puts uv's own progress on
+/// the user's terminal, prefixed with what is happening and that it is a
+/// one-off. The daemon then finds the finished venv (same data root,
+/// same file lock — `mlx_release::ensure_mlx_server` serializes across
+/// processes) and skips straight to spawning it. A no-op whenever nothing
+/// needs installing (a few `stat`s), when the model is not a safetensors
+/// one this host would serve with MLX, or when the daemon is remote (its
+/// venv is on another machine). Must run after `reference` is in the
+/// store — call it after [`ensure_model_pulled`].
+pub fn ensure_backend_installed(reference: &str) -> anyhow::Result<()> {
+    if !host_is_local() || !crate::mlx_release::needs_install() {
+        return Ok(());
+    }
+    // Not this host's engine for safetensors, or not a safetensors model
+    // (a GGUF one wants llama-server, fetched by the daemon at startup).
+    // A store lookup failure is left for the daemon to report properly.
+    let store = crate::default_store()?;
+    let Ok(format) = crate::modelpack::stored_format(&store, reference) else {
+        return Ok(());
+    };
+    if format != crate::modelpack::ModelFormat::SafeTensors
+        || !crate::cmd::serve::use_mlx_for_safetensors()
+    {
+        return Ok(());
+    }
+    eprintln!(
+        "[llmman] first run: installing mlx-lm to serve {reference} with Metal on Apple Silicon \
+         (one-time; a few minutes)"
+    );
+    crate::mlx_release::ensure_mlx_server().map_err(|e| {
+        anyhow::anyhow!(
+            "{e:#} (put `mlx_lm.server` on PATH yourself, or set LLMMAN_SAFETENSORS_ENGINE=vllm \
+             to serve this model with vllm)"
+        )
+    })?;
+    Ok(())
+}
+
 /// Pushes `reference` via the daemon's `/api/push` and returns the
 /// manifest digest it landed on, for `cmd::push --sign-key` to sign.
 ///
@@ -1603,6 +1728,24 @@ mod tests {
     #[test]
     fn log_tail_none_path_is_empty() {
         assert_eq!(log_tail(None), "");
+    }
+
+    /// The daemon's marker text rides along when there is one (a release
+    /// download's byte counts); a bare marker (container pull) still says
+    /// what is happening and that it is a first-run one-off.
+    #[test]
+    fn fetch_message_carries_the_daemon_status_when_present() {
+        let bare = fetch_message("");
+        assert!(bare.contains("first run"), "got: {bare}");
+        assert!(bare.contains("llama.cpp"), "got: {bare}");
+        assert!(!bare.ends_with(':'), "got: {bare}");
+        assert_eq!(fetch_message("  \n"), bare);
+        let with = fetch_message("llama.tar.gz: 12 MB / 40 MB (30%)\n");
+        assert!(with.starts_with(&bare), "got: {with}");
+        assert!(
+            with.ends_with(": llama.tar.gz: 12 MB / 40 MB (30%)"),
+            "got: {with}"
+        );
     }
 
     #[test]
