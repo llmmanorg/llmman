@@ -68,8 +68,8 @@ pub(super) fn safetensors_engine_from_env() -> SafetensorsEngine {
 /// (see `spawn_mlx_server`) on Apple Silicon macOS, `vllm` elsewhere.
 /// The macOS check is explicit because `LLMMAN_LLM_LIBRARY=metal` makes
 /// `detect()` say Metal on any OS; keeping `detect()` lets `=cpu` opt a
-/// Mac out. `mlx_lm.server` need not be on `PATH`: it is installed on
-/// first use (`crate::mlx_release`). `LLMMAN_SAFETENSORS_ENGINE=vllm`
+/// Mac out. `mlx_lm.server` need not be on `PATH`: `serve` installs it at
+/// startup (`crate::mlx_release`). `LLMMAN_SAFETENSORS_ENGINE=vllm`
 /// forces `vllm` on a Mac.
 ///
 /// Plain `vllm` (no plugin) has no Metal backend of its own at all — its
@@ -573,7 +573,8 @@ fn console_script_interpreter(script: &Path) -> Option<PathBuf> {
 /// [`ModelPath::SafeTensors`] directory, picked instead of it by
 /// [`use_mlx_for_safetensors`]. The binary comes from
 /// `crate::mlx_release::ensure_mlx_server` (`PATH`, or llmman's own
-/// `uv`-installed copy, installed now on first use).
+/// `uv`-installed copy — normally installed already at daemon startup by
+/// `serve_async`; installed here only if that failed).
 ///
 /// Deliberately does *not* pass `mlx_lm.server`'s own `--model` flag,
 /// even though that's its documented way to preload one: confirmed

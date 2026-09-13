@@ -3,7 +3,22 @@
 //! duplicated per-file so the two commands' NAME/ID/SIZE columns always
 //! render identically for the same underlying digest/byte count.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+use indicatif::{ProgressBar, ProgressStyle};
+
+/// A running braille spinner with ollama's glyphs and 100ms tick;
+/// `template` is an indicatif template using `{spinner}` (and `{msg}`).
+pub fn braille_spinner(template: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template(template)
+            .unwrap_or_else(|_| ProgressStyle::default_spinner())
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb
+}
 
 /// First 12 hex chars of a `sha256:...` digest, matching `docker images`'s
 /// convention (and Ollama's `ollama ps`/`ollama list`, which truncate to 12

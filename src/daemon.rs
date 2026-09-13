@@ -10,7 +10,7 @@
 //! [`providers`]) are always the daemon's, never duplicated
 //! per-invocation.
 
-use std::io::BufRead;
+use std::io::{BufRead, IsTerminal};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -506,7 +506,16 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     detach(&mut cmd);
     let mut child = cmd.spawn().context("spawn llmman serve")?;
 
-    for _ in 0..120 {
+    // On its first start the daemon fetches its backends (llama.cpp; uv
+    // and mlx-lm on Apple Silicon) before it binds, which can run well
+    // past STARTUP_BUDGET. While a fetch is visibly live, keep waiting
+    // and show what it is doing: stopping the daemon would discard the
+    // partial work. The budget is the time spent neither listening nor
+    // fetching, and restarts after each fetch so the daemon gets a full
+    // budget to bind afterwards.
+    let mut idle_since = std::time::Instant::now();
+    let mut fetch_notice = FetchNotice::default();
+    loop {
         std::thread::sleep(Duration::from_millis(500));
         if server_alive() {
             // The connect proves the daemon was alive an instant ago, not
@@ -521,7 +530,16 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
         // try_wait catches an immediate startup failure (e.g. llama-server
         // auto-download failing) instead of polling a dead port for 60s.
         bail_if_exited(&mut child, log_path.as_deref())?;
+        match crate::llama_release::download_status() {
+            Some(status) => {
+                fetch_notice.update(&status);
+                idle_since = std::time::Instant::now();
+            }
+            None if idle_since.elapsed() >= STARTUP_BUDGET => break,
+            None => {}
+        }
     }
+    drop(fetch_notice);
     // The last in-loop probe is up to 500ms stale by now; a daemon that
     // bound in that window is a healthy start, not a timeout. Same shape
     // as the in-loop success path: prove the daemon survived the accept
@@ -534,16 +552,15 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     // once more so that narrow window still reports the exit status
     // instead of the generic timeout.
     bail_if_exited(&mut child, log_path.as_deref())?;
-    // Timed out with the daemon alive but not listening. If startup is
-    // mid-way through its one-time llama.cpp fetch (release download or
-    // container pull, either far longer than this budget), killing the
-    // daemon would discard the partial download (no resume) and make
-    // every retry start from zero. Leave it running and say so instead.
+    // Timed out with the daemon alive but not listening. If a backend
+    // fetch began in the window since the loop's last look, leave the
+    // daemon to finish it (see above) and say so.
     if crate::llama_release::download_in_progress() {
         anyhow::bail!(
-            "llmman serve did not start within 60s: startup is still fetching llama.cpp \
-             (a release download or container image pull). The daemon was left running \
+            "llmman serve did not start within {}s: startup is still fetching an inference \
+             backend (llama.cpp, or mlx-lm on Apple Silicon). The daemon was left running \
              so it can finish; retry this command once it does{}",
+            STARTUP_BUDGET.as_secs(),
             log_tail(log_path.as_deref())
         );
     }
@@ -555,10 +572,59 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     stop_group(child.id());
     let _ = child.wait();
     anyhow::bail!(
-        "llmman serve did not start within 60s and was stopped; run 'llmman serve' in the \
+        "llmman serve did not start within {}s and was stopped; run 'llmman serve' in the \
          foreground to watch what startup is doing{}",
+        STARTUP_BUDGET.as_secs(),
         log_tail(log_path.as_deref())
     )
+}
+
+/// How long [`ensure_server`] waits for a freshly spawned daemon that is
+/// neither listening nor reporting a live backend fetch.
+const STARTUP_BUDGET: Duration = Duration::from_secs(60);
+
+/// What [`ensure_server`] shows while its daemon is still fetching
+/// backends: a spinner line with the daemon's latest progress text on a
+/// terminal, else one plain notice the first time. Cleared on drop.
+#[derive(Default)]
+struct FetchNotice {
+    spinner: Option<ProgressBar>,
+    announced: bool,
+}
+
+impl FetchNotice {
+    /// `status` is the marker text, `""` for a fetch that never set one.
+    fn update(&mut self, status: &str) {
+        let message = fetch_message(status);
+        if !std::io::stderr().is_terminal() {
+            if !self.announced {
+                eprintln!("[llmman] {message}");
+                self.announced = true;
+            }
+            return;
+        }
+        self.spinner
+            .get_or_insert_with(|| crate::fmt::braille_spinner("{spinner} {msg}"))
+            .set_message(message);
+    }
+}
+
+impl Drop for FetchNotice {
+    fn drop(&mut self) {
+        if let Some(pb) = self.spinner.take() {
+            pb.finish_and_clear();
+        }
+    }
+}
+
+/// The user-facing line for a daemon-side fetch reporting `status`, which
+/// already names the backend ("downloading llama-…", "installing mlx-lm").
+fn fetch_message(status: &str) -> String {
+    const PREFIX: &str = "first run: setting up the llmman daemon's inference backends (one-time)";
+    match status.trim() {
+        "" => PREFIX.to_string(),
+        status => format!("{PREFIX}: {status}"),
+    }
 }
 
 /// Signals the process group led by `pid`; true if the group existed.
@@ -1603,6 +1669,24 @@ mod tests {
     #[test]
     fn log_tail_none_path_is_empty() {
         assert_eq!(log_tail(None), "");
+    }
+
+    /// The daemon's marker text rides along when there is one (a release
+    /// download's byte counts, an mlx-lm install step); a bare marker
+    /// still says what is happening and that it is a first-run one-off.
+    #[test]
+    fn fetch_message_carries_the_daemon_status_when_present() {
+        let bare = fetch_message("");
+        assert!(bare.contains("first run"), "got: {bare}");
+        assert!(bare.contains("backends"), "got: {bare}");
+        assert!(!bare.ends_with(':'), "got: {bare}");
+        assert_eq!(fetch_message("  \n"), bare);
+        let with = fetch_message("downloading llama.tar.gz: 12 MB / 40 MB (30%)\n");
+        assert!(with.starts_with(&bare), "got: {with}");
+        assert!(
+            with.ends_with(": downloading llama.tar.gz: 12 MB / 40 MB (30%)"),
+            "got: {with}"
+        );
     }
 
     #[test]

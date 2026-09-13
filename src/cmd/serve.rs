@@ -111,7 +111,7 @@ Environment Variables:
       LLMMAN_MODELS                  The path to the models directory
       LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only)
       LLMMAN_MLX_LM_VERSION          Exact mlx-lm release to install on Apple Silicon (default: PyPI's current)
-      LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on Apple Silicon, installed on first use; else vllm)
+      LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on Apple Silicon, installed at startup; else vllm)
       LLMMAN_VLLM_ARGS               Extra whitespace-separated arguments appended to every `vllm serve` (e.g. \"--dtype bfloat16 --tp 2\")
       LLMMAN_SGLANG_ARGS             Extra whitespace-separated arguments appended to every sglang launch (e.g. \"--disable-cuda-graph\")
       LLMMAN_NOHISTORY               Do not record prompts for `llmman log`
@@ -178,13 +178,12 @@ pub struct ServeArgs {
     pub sglang_version: Option<String>,
 
     /// Fetch what `--runtime` needs (the container image or the
-    /// `llama-server` release), with its progress on this terminal, then
-    /// exit instead of serving. With a container runtime and an
-    /// already-pulled safetensors MODEL, the vLLM (or SGLang) image is
-    /// fetched too. A plain `serve` does the same fetch at startup, but
-    /// detached with its output in a log file, where a slow first pull
-    /// looks like a hang; run this first and the daemon then starts
-    /// instantly.
+    /// `llama-server` release, plus `uv` and `mlx-lm` on Apple Silicon),
+    /// with its progress on this terminal, then exit instead of serving.
+    /// With a container runtime and an already-pulled safetensors MODEL,
+    /// the vLLM (or SGLang) image is fetched too. A plain `serve` does the
+    /// same fetch at startup, detached with its output in a log file; run
+    /// this first and the daemon then starts instantly.
     #[arg(long)]
     pub pull_only: bool,
 
@@ -4391,8 +4390,7 @@ fn metrics_router(enabled: bool) -> Router<AppState> {
 /// Which image `--pull-only` warms up under a container runtime: the one
 /// `ensure_model` would run for `model` (read off its stored manifest),
 /// or llama-server's when no model is named — pulling both would cost a
-/// GGUF-only host the vLLM image's several GB for nothing. A `Vllm`
-/// answer under a local runtime on Apple Silicon means `mlx-lm`.
+/// GGUF-only host the vLLM image's several GB for nothing.
 fn pull_only_engine(model: Option<&str>) -> anyhow::Result<crate::container::ContainerEngine> {
     // Same guard as the pre-load below: a pair warms its local half, a
     // provider-routed reference has no local weights.
@@ -4423,12 +4421,10 @@ fn pull_only_engine(model: Option<&str>) -> anyhow::Result<crate::container::Con
 
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let requested = _args.runtime;
-    // On Apple Silicon a safetensors MODEL is served by mlx_lm.server,
-    // installed on first use; `--pull-only` does that install too.
-    let pull_only_mlx = _args.pull_only
-        && use_mlx_for_safetensors()
-        && pull_only_engine(_args.model.as_deref())? == crate::container::ContainerEngine::Vllm;
-    if requested == Runtime::Path && _args.pull_only && !pull_only_mlx {
+    // Startup installs mlx_lm.server under any local runtime on Apple
+    // Silicon (below), so `--pull-only` has work even under `path`.
+    let installs_mlx = use_mlx_for_safetensors();
+    if requested == Runtime::Path && _args.pull_only && !installs_mlx {
         anyhow::bail!("--pull-only: --runtime path runs the llama-server on PATH; nothing to pull");
     }
     let llama_cpp_version = runtime::llama_cpp_pin(_args.llama_cpp_version.as_deref());
@@ -4443,6 +4439,26 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             .await
             .context("resolve runtime task panicked")??
     };
+
+    // Likewise uv and mlx-lm, rather than inside the first safetensors
+    // request (minutes behind a client's first-token spinner). Cheap once
+    // installed. A failure is not fatal to a daemon that may only serve
+    // GGUF: the first MLX load retries and reports it. Under `--pull-only`
+    // it is the whole point.
+    if resolved.ociman().is_none() && installs_mlx {
+        let installed = tokio::task::spawn_blocking(crate::mlx_release::ensure_mlx_server)
+            .await
+            .context("ensure mlx_lm.server task panicked")?;
+        match installed {
+            Ok(_) => {}
+            Err(e) if _args.pull_only => return Err(e.context("install mlx-lm")),
+            Err(e) => eprintln!(
+                "[llmman] warning: could not install mlx-lm at startup ({e:#}); \
+                 the first safetensors model load will retry it"
+            ),
+        }
+    }
+
     if _args.pull_only {
         if let Some(ociman) = resolved.ociman() {
             // resolve() pulled the llama.cpp image; a safetensors MODEL
@@ -4459,10 +4475,6 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             if let Some(version) = version {
                 crate::container::pull_image(ociman, engine, version)?;
             }
-        } else if pull_only_mlx {
-            tokio::task::spawn_blocking(crate::mlx_release::ensure_mlx_server)
-                .await
-                .context("ensure mlx_lm.server task panicked")??;
         }
         return Ok(());
     }
