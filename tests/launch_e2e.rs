@@ -67,8 +67,8 @@
 //!     template raises a hard Jinja error ("System message must be at the
 //!     beginning") the moment that happens, so every real multi-turn
 //!     request 500'd and Claude Code retried in a loop until giving up —
-//!     fixed in `cmd::serve::handle_anthropic_messages` by folding every
-//!     system-role turn into one leading message.
+//!     fixed in `cmd::serve::anthropic::handle_anthropic_messages` by
+//!     folding every system-role turn into one leading message.
 //!   - `codex`: the config `write_codex_config` wrote (a `[profiles.llmman]`
 //!     table in `config.toml`) is a format current codex (0.134+) refuses
 //!     to load at all — fixed by writing the sibling
