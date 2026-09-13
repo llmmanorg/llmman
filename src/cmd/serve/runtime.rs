@@ -225,26 +225,13 @@ fn try_one(
 }
 
 /// Runs `pull` (a `docker pull`, possibly minutes) holding
-/// `crate::llama_release`'s download marker, touched every 15s, so
+/// `crate::llama_release`'s download marker with its heartbeat, so
 /// `daemon::ensure_server` leaves a daemon still pulling alive past its
-/// startup budget, as it already does for the release download.
+/// startup budget, as it does for the release download.
 fn with_download_marker<T>(pull: impl FnOnce() -> T) -> T {
     let marker = crate::llama_release::DownloadMarker::create();
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    let out = std::thread::scope(|scope| {
-        let marker = &marker;
-        scope.spawn(move || loop {
-            match done_rx.recv_timeout(std::time::Duration::from_secs(15)) {
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => marker.touch(),
-                _ => return,
-            }
-        });
-        let out = pull();
-        drop(done_tx);
-        out
-    });
-    drop(marker);
-    out
+    marker.set_status("pulling the llama.cpp container image");
+    marker.keep_alive_during(pull)
 }
 
 /// `--llama-cpp-version` as a pin: unset is

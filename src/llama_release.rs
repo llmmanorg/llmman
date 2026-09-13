@@ -404,36 +404,45 @@ pub(crate) fn find_binary(dir: &Path, name: &str) -> Option<PathBuf> {
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long a `.downloading` marker stays credible without being touched.
-/// A live download refreshes it every [`PROGRESS_LOG_INTERVAL`], so a
-/// marker older than this belongs to a download whose process died
-/// without running the guard's Drop (e.g. a SIGKILLed daemon).
+/// A live fetch refreshes it every [`PROGRESS_LOG_INTERVAL`] (as bytes
+/// arrive) and every [`MARKER_HEARTBEAT`] (regardless), so a marker older
+/// than this belongs to a fetch whose process died without running the
+/// guard's Drop (e.g. a SIGKILLed daemon).
 const DOWNLOAD_MARKER_STALE_AFTER: Duration = Duration::from_secs(60);
 
-/// The download-in-progress marker: a fixed path under [`install_root`]
-/// that both the downloading daemon (writer) and a client polling it
-/// (reader, see `daemon::ensure_server`) can derive independently.
+/// How often [`DownloadMarker::keep_alive_during`] re-touches the marker
+/// while the holder is busy with something that reports no progress of
+/// its own (extracting an archive, a `docker pull`, a `uv pip install`).
+/// Well under [`DOWNLOAD_MARKER_STALE_AFTER`].
+const MARKER_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// The fetch-in-progress marker: a fixed path under [`install_root`] that
+/// both the fetching daemon (writer) and a client polling it (reader, see
+/// `daemon::ensure_server`) can derive independently. Shared by every
+/// backend the daemon fetches at startup — llama.cpp here, `uv` and
+/// `mlx-lm` in `crate::mlx_release` — since the client only needs to know
+/// that startup is legitimately busy, and with what.
 fn download_marker_path() -> Result<PathBuf> {
     Ok(install_root()?.join(".downloading"))
 }
 
-/// Whether some process is currently mid-download of llama.cpp — a
-/// release build here, or a container image (`cmd::serve::runtime` holds
-/// the same marker around its pulls): the marker exists and was touched
-/// recently enough to belong to a live download rather than a crashed one.
+/// Whether some process is currently fetching an inference backend — a
+/// llama.cpp release build here, a container image (`cmd::serve::runtime`
+/// holds the same marker around its pulls), or `uv`/`mlx-lm`
+/// (`crate::mlx_release`): the marker exists and was touched recently
+/// enough to belong to a live fetch rather than a crashed one.
 pub fn download_in_progress() -> bool {
     download_status().is_some()
 }
 
-/// [`download_in_progress`], with what the downloader last wrote into the
-/// marker via [`DownloadMarker::set_status`]: a one-line "`<asset>: 12 MB
-/// / 40 MB (30%)`"-style progress report, or `""` when the holder only
-/// [`touch`]es it (a container pull). `None` when no live download.
+/// [`download_in_progress`], with what the fetcher last wrote into the
+/// marker via [`DownloadMarker::set_status`]: a one-line "`downloading
+/// <asset>: 12 MB / 40 MB (30%)`"-style report, or `""` when the holder
+/// never set one (a container pull). `None` when no live fetch.
 ///
 /// This is how a client (`daemon::ensure_server`) shows the user what a
 /// detached daemon is doing on its first start: the daemon's own stdio is
 /// in a log file, so the marker is the one channel between them.
-///
-/// [`touch`]: DownloadMarker::touch
 pub fn download_status() -> Option<String> {
     let path = download_marker_path().ok()?;
     marker_status(&path, DOWNLOAD_MARKER_STALE_AFTER)
@@ -462,18 +471,36 @@ fn marker_is_fresh(path: &Path, stale_after: Duration) -> bool {
 
 /// Creates the marker on construction and removes it on drop, so success
 /// and every early `?` return both clear it. Best-effort throughout: a
-/// marker failure must never fail the download itself. Also held around
-/// container pulls (`cmd::serve::runtime`), which must [`touch`] it
-/// within [`DOWNLOAD_MARKER_STALE_AFTER`].
+/// marker failure must never fail the fetch itself. The holder must keep
+/// it fresh within [`DOWNLOAD_MARKER_STALE_AFTER`]: a download loop does
+/// so as bytes arrive ([`set_status`]); anything else runs under
+/// [`keep_alive_during`], whose heartbeat [`touch`]es it.
 ///
+/// [`set_status`]: DownloadMarker::set_status
+/// [`keep_alive_during`]: DownloadMarker::keep_alive_during
 /// [`touch`]: DownloadMarker::touch
-pub(crate) struct DownloadMarker(Option<PathBuf>);
+pub(crate) struct DownloadMarker {
+    path: Option<PathBuf>,
+    /// The last [`set_status`](Self::set_status) text, so a [`touch`]
+    /// (from the heartbeat thread, typically) rewrites the same line
+    /// rather than blanking what the client is displaying.
+    ///
+    /// [`touch`]: Self::touch
+    status: std::sync::Mutex<String>,
+}
 
 impl DownloadMarker {
     pub(crate) fn create() -> DownloadMarker {
         match download_marker_path() {
             Ok(p) => Self::create_at(p),
-            Err(_) => DownloadMarker(None),
+            Err(_) => Self::none(),
+        }
+    }
+
+    fn none() -> DownloadMarker {
+        DownloadMarker {
+            path: None,
+            status: std::sync::Mutex::new(String::new()),
         }
     }
 
@@ -484,24 +511,59 @@ impl DownloadMarker {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        DownloadMarker(std::fs::write(&path, b"").ok().map(|_| path))
+        DownloadMarker {
+            path: std::fs::write(&path, b"").ok().map(|_| path),
+            status: std::sync::Mutex::new(String::new()),
+        }
     }
 
-    /// Refreshes the marker's mtime so a reader can tell this live
-    /// download from a crashed one whose Drop never ran. Clears any
-    /// earlier [`set_status`](Self::set_status) text.
+    /// Refreshes the marker's mtime so a reader can tell this live fetch
+    /// from a crashed one whose Drop never ran. Keeps the current
+    /// [`set_status`](Self::set_status) text.
     pub(crate) fn touch(&self) {
-        self.write("");
+        let status = self.status.lock().map(|s| s.clone()).unwrap_or_default();
+        self.write(&status);
     }
 
     /// [`touch`](Self::touch), leaving `status` (one line of progress,
     /// see [`download_status`]) in the marker for a client to display.
     pub(crate) fn set_status(&self, status: &str) {
+        if let Ok(mut s) = self.status.lock() {
+            *s = status.to_string();
+        }
         self.write(status);
     }
 
+    /// Runs `work` while a background heartbeat [`touch`](Self::touch)es
+    /// the marker every [`MARKER_HEARTBEAT`], for work that reports no
+    /// progress of its own — extracting an archive, a `docker pull`, a
+    /// `uv pip install` — and would otherwise let the marker go stale
+    /// mid-way, at which point a waiting `daemon::ensure_server` stops
+    /// believing this daemon is busy and may stop it. `work` may still
+    /// [`set_status`](Self::set_status) as it goes.
+    pub(crate) fn keep_alive_during<T>(&self, work: impl FnOnce() -> T) -> T {
+        self.keep_alive_every(MARKER_HEARTBEAT, work)
+    }
+
+    /// [`keep_alive_during`](Self::keep_alive_during) with the heartbeat
+    /// interval exposed, for tests.
+    fn keep_alive_every<T>(&self, interval: Duration, work: impl FnOnce() -> T) -> T {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            scope.spawn(move || loop {
+                match done_rx.recv_timeout(interval) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => self.touch(),
+                    _ => return,
+                }
+            });
+            let out = work();
+            drop(done_tx);
+            out
+        })
+    }
+
     fn write(&self, text: &str) {
-        if let Some(path) = &self.0 {
+        if let Some(path) = &self.path {
             // Windows keeps the old mtime when a write is zero bytes,
             // so set it explicitly.
             let _ = std::fs::write(path, text.as_bytes());
@@ -518,7 +580,7 @@ impl Drop for DownloadMarker {
         // them), the first finisher removes the shared marker and the
         // survivor's next touch recreates it within PROGRESS_LOG_INTERVAL;
         // that short unprotected window is accepted.
-        if let Some(path) = &self.0 {
+        if let Some(path) = &self.path {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -577,7 +639,7 @@ pub(crate) fn download_to_file(
         if last_logged.elapsed() >= PROGRESS_LOG_INTERVAL {
             let progress = download_progress_text(label, downloaded, total);
             if let Some(marker) = marker {
-                marker.set_status(&progress);
+                marker.set_status(&format!("downloading {progress}"));
             }
             if total > 0 {
                 eprintln!("[llmman] downloading {progress}");
@@ -736,48 +798,51 @@ fn try_ensure_from_network(
         query.label, asset.name
     );
     // One marker for everything from here to the end of the function, so
-    // a client that gave up waiting for this daemon (see ensure_server's
-    // timeout path) knows not to kill it mid-download or mid-extract; the
-    // downloads' progress loops keep it fresh. Extraction of a large
-    // archive can outlive the last touch by more than the staleness
-    // window; that residual gap is accepted.
+    // a client waiting on this daemon (see ensure_server) knows it is
+    // legitimately busy and must not be stopped mid-download or
+    // mid-extract. The downloads' progress loops keep it fresh as bytes
+    // arrive; the heartbeat covers extraction, which reports nothing and
+    // can outlast the staleness window for a large archive.
     let marker = DownloadMarker::create();
-    let tmp = tmp_path(&asset.name)?;
-    let _cleanup = RemoveOnDrop(&tmp);
-    download_to_file(
-        &client,
-        &asset.browser_download_url,
-        &tmp,
-        &asset.name,
-        Some(&marker),
-    )?;
-    marker.set_status(&format!("extracting {}", asset.name));
-    extract(&tmp, &asset.name, &dest)?;
+    marker.keep_alive_during(|| -> Result<()> {
+        let tmp = tmp_path(&asset.name)?;
+        let _cleanup = RemoveOnDrop(&tmp);
+        download_to_file(
+            &client,
+            &asset.browser_download_url,
+            &tmp,
+            &asset.name,
+            Some(&marker),
+        )?;
+        marker.set_status(&format!("extracting {}", asset.name));
+        extract(&tmp, &asset.name, &dest)?;
 
-    if let Some(companion_substr) = &query.companion_must_contain {
-        match find_asset(&release, companion_substr) {
-            Some(companion) => {
-                let companion = companion.clone();
-                eprintln!("[llmman] downloading {}", companion.name);
-                let tmp2 = tmp_path(&companion.name)?;
-                let _cleanup = RemoveOnDrop(&tmp2);
-                download_to_file(
-                    &client,
-                    &companion.browser_download_url,
-                    &tmp2,
-                    &companion.name,
-                    Some(&marker),
-                )?;
-                marker.set_status(&format!("extracting {}", companion.name));
-                extract(&tmp2, &companion.name, &dest)?;
+        if let Some(companion_substr) = &query.companion_must_contain {
+            match find_asset(&release, companion_substr) {
+                Some(companion) => {
+                    let companion = companion.clone();
+                    eprintln!("[llmman] downloading {}", companion.name);
+                    let tmp2 = tmp_path(&companion.name)?;
+                    let _cleanup = RemoveOnDrop(&tmp2);
+                    download_to_file(
+                        &client,
+                        &companion.browser_download_url,
+                        &tmp2,
+                        &companion.name,
+                        Some(&marker),
+                    )?;
+                    marker.set_status(&format!("extracting {}", companion.name));
+                    extract(&tmp2, &companion.name, &dest)?;
+                }
+                None => eprintln!(
+                    "[llmman] warning: expected companion asset containing {companion_substr:?} \
+                     not found in release {tag} — {} may be missing runtime libraries it needs",
+                    query.label
+                ),
             }
-            None => eprintln!(
-                "[llmman] warning: expected companion asset containing {companion_substr:?} \
-                 not found in release {tag} — {} may be missing runtime libraries it needs",
-                query.label
-            ),
         }
-    }
+        Ok(())
+    })?;
 
     let bin = find_binary(&dest, bin_name).with_context(|| {
         format!(
@@ -1161,8 +1226,7 @@ mod tests {
     }
 
     /// What a waiting client reads back: the status text while the
-    /// marker is fresh, `""` after a plain touch, `None` once stale or
-    /// gone.
+    /// marker is fresh (a touch keeps it), `None` once stale or gone.
     #[test]
     fn marker_status_reports_the_last_written_text_while_fresh() {
         let path = std::env::temp_dir().join(format!(
@@ -1181,11 +1245,13 @@ mod tests {
             marker_status(&path, Duration::from_secs(60)).as_deref(),
             Some("llama.tar.gz: 12 MB / 40 MB (30%)")
         );
-        // A plain touch clears the text but keeps the marker live.
+        // A touch (the heartbeat's) refreshes without blanking the line
+        // the client is showing.
+        std::fs::write(&path, b"").unwrap();
         marker.touch();
         assert_eq!(
             marker_status(&path, Duration::from_secs(60)).as_deref(),
-            Some("")
+            Some("llama.tar.gz: 12 MB / 40 MB (30%)")
         );
         marker.set_status("extracting llama.tar.gz");
         std::fs::File::options()
@@ -1197,6 +1263,45 @@ mod tests {
         assert_eq!(marker_status(&path, Duration::from_secs(60)), None);
         drop(marker);
         assert_eq!(marker_status(&path, Duration::from_secs(60)), None);
+    }
+
+    /// Work that reports nothing (extraction, `uv pip install`) must not
+    /// let the marker go stale: the heartbeat re-touches it, keeping the
+    /// status, and stops with the work.
+    #[test]
+    fn keep_alive_heartbeat_refreshes_the_marker_while_work_runs() {
+        let path = std::env::temp_dir().join(format!(
+            "llmman-marker-heartbeat-{}/.downloading",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let marker = DownloadMarker::create_at(path.clone());
+        marker.set_status("extracting llama.tar.gz");
+        let stale = || {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+                .unwrap();
+        };
+        stale();
+        assert_eq!(marker_status(&path, Duration::from_secs(60)), None);
+        let out = marker.keep_alive_every(Duration::from_millis(5), || {
+            std::thread::sleep(Duration::from_millis(60));
+            7
+        });
+        assert_eq!(out, 7);
+        assert_eq!(
+            marker_status(&path, Duration::from_secs(60)).as_deref(),
+            Some("extracting llama.tar.gz")
+        );
+        // No heartbeat outside the closure: a backdated marker stays stale.
+        stale();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(marker_status(&path, Duration::from_secs(60)), None);
+        drop(marker);
+        assert!(!path.exists());
     }
 
     #[test]

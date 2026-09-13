@@ -114,16 +114,6 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                 .transpose()?
                 .unwrap_or_default();
 
-            // A cold daemon preloads `model` at once (below), which on
-            // Apple Silicon installs mlx-lm for an already-pulled
-            // safetensors model — silently, in its log. Install it here
-            // first, visibly, so the daemon finds it ready; a no-op when
-            // nothing needs installing or the model isn't pulled yet (the
-            // post-pull call below covers that case).
-            if !model.is_empty() {
-                crate::daemon::ensure_backend_installed(&model)?;
-            }
-
             // Ensure serve is running (start it in background if needed),
             // preloading the requested model so the integration's first
             // request finds it warm.
@@ -139,12 +129,6 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // the integration.
             if !model.is_empty() {
                 thinking = crate::daemon::ensure_model_pulled(&model)?.thinking_controls();
-                // Now that the model is in the store, the backend it
-                // needs is known: install it here rather than inside the
-                // integration's first request (mlx-lm on Apple Silicon:
-                // minutes, with nothing on screen but the integration
-                // waiting). A no-op once installed.
-                crate::daemon::ensure_backend_installed(&model)?;
             }
             match overflow {
                 // The hosted half is validated and keyed exactly as a

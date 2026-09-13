@@ -11,7 +11,7 @@ already exists for the model format it finds, and runs it unmodified.
 | safetensors | [`vllm`](https://github.com/vllm-project/vllm) | Your `PATH` (every non-container runtime) |
 | safetensors | `sglang` in a container | `--runtime docker` / `podman` (Linux only) with `LLMMAN_SAFETENSORS_ENGINE=sglang`: the `lmsysorg/sglang` image for your GPU |
 | safetensors | [`sglang`](https://github.com/sgl-project/sglang) | Your `PATH`, with `LLMMAN_SAFETENSORS_ENGINE=sglang` |
-| safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | Apple Silicon macOS (every non-container runtime): the one on your `PATH`, or else llmman's own `uv`-installed copy, installed on first use; preferred over `vllm` |
+| safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | Apple Silicon macOS (every non-container runtime): the one on your `PATH`, or else llmman's own `uv`-installed copy, installed when the daemon starts; preferred over `vllm` |
 | GGUF diffusion (LTX-2) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
 | Diffusers safetensors | [`vllm serve --omni`](https://github.com/vllm-project/vllm-omni) | Your `PATH`'s `vllm` with the `vllm-omni` package installed |
 | Diffusers safetensors | `vllm serve --omni` in a container | `--runtime docker` / `podman` (Linux only): the `vllm/vllm-omni` image (CUDA only) |
@@ -34,13 +34,14 @@ daemon answers `docker info`/`podman info`, an NVIDIA host has the NVIDIA
 Container Toolkit, and the llama.cpp image pulls; `bin` works when the
 release downloads (or is already cached). Each step skipped is logged
 with the reason. Whatever is chosen is fetched before the listener binds,
-so the first request is never stuck behind a silent download.
+so the first request is never stuck behind a silent download. On Apple
+Silicon, under `bin` or `path`, `uv` and `mlx-lm` are installed at the
+same point (see [MLX](#mlx-apple-silicon)).
 
-`llmman serve --pull-only` does exactly that fetch, in the foreground with
-the pull's own progress, then exits — run it once before starting a
+`llmman serve --pull-only` does exactly those fetches, in the foreground
+with their own progress, then exits — run it once before starting a
 detached daemon. With a container runtime and a safetensors `MODEL`
-argument it pulls the vLLM image as well; on Apple Silicon it installs
-`mlx-lm` for one (see [MLX](#mlx-apple-silicon)).
+argument it pulls the vLLM image as well.
 
 ## llama.cpp
 
@@ -213,19 +214,18 @@ no vLLM dependency, more model families than vllm-metal.
 unsupported.
 
 Nothing needs installing first. When `mlx_lm.server` is not on `PATH`,
-the first load of an MLX model (or `llmman serve --pull-only <model>`
-for a pulled safetensors model) installs it with
-[`uv`](https://github.com/astral-sh/uv) — the one on `PATH`, or
-astral-sh's prebuilt release downloaded to `~/.local/share/llmman/uv/` —
+`llmman serve` installs it at startup, before it starts listening —
+the same way it fetches `llama-server` — with
+[`uv`](https://github.com/astral-sh/uv) (the one on `PATH`, or
+astral-sh's prebuilt release downloaded to `~/.local/share/llmman/uv/`)
 into `~/.local/share/llmman/mlx-lm/venv` (with a managed CPython 3.10+
-if the host has none). `llmman run` and `llmman launch` do this install
-themselves, in the terminal with uv's progress, before their first
-request, rather than leaving it to the background daemon's first load
-(where it would only show up as a long wait for the first token).
-`LLMMAN_MLX_LM_VERSION=<version>` pins the release; deleting
-`~/.local/share/llmman/mlx-lm` reinstalls on the next load. An
+if the host has none). `llmman serve --pull-only` does the same install
+with its progress on your terminal, then exits. A `llmman run` or
+`launch` that starts the daemon shows what it is fetching while it
+waits. `LLMMAN_MLX_LM_VERSION=<version>` pins the release; deleting
+`~/.local/share/llmman/mlx-lm` reinstalls on the next daemon start. An
 `mlx_lm.server` on `PATH` is used as-is; `LLMMAN_SAFETENSORS_ENGINE=vllm`
-skips MLX.
+skips MLX (and the install).
 
 ## Registry transport
 

@@ -8,6 +8,12 @@
 //! creates `<data_root>/mlx-lm/venv` (fetching a managed CPython if the
 //! host has none new enough) and `uv pip install`s `mlx-lm` into it. An
 //! `mlx_lm.server` already on `PATH` always wins over the managed one.
+//!
+//! `llmman serve` does this at startup, before it binds (see
+//! `cmd::serve`'s `serve_async`), just as it fetches `llama-server`, so
+//! no request ever waits on it. The install holds
+//! [`crate::llama_release`]'s download marker, so a client waiting for
+//! that daemon (`daemon::ensure_server`) can show what it is doing.
 
 use std::ffi::OsStr;
 use std::io::IsTerminal;
@@ -17,7 +23,7 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::llama_release::{
     download_to_file, extract_tar_gz, find_binary, http_client, mark_executable, tmp_path,
-    RemoveOnDrop,
+    DownloadMarker, RemoveOnDrop,
 };
 
 /// `LLMMAN_MLX_LM_VERSION`: an exact `mlx-lm` release to install instead
@@ -77,7 +83,8 @@ fn sha256_of_file(path: &Path) -> Result<String> {
 /// A usable `uv`: from `PATH`, from an earlier download, or freshly
 /// downloaded (and checked against astral-sh's published `.sha256`).
 /// Never re-fetched once cached: it only ever installs `mlx-lm`.
-fn ensure_uv() -> Result<PathBuf> {
+/// `marker` receives the download's progress for a waiting client.
+fn ensure_uv(marker: &DownloadMarker) -> Result<PathBuf> {
     if let Some(uv) = crate::find_on_path("uv") {
         return Ok(uv);
     }
@@ -90,6 +97,7 @@ fn ensure_uv() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("no uv download for {os}/{arch} (mlx-lm needs macOS)"))?;
     let url = format!("{UV_LATEST_DOWNLOAD}/{asset}");
     eprintln!("[llmman] downloading uv (to install mlx-lm): {asset}");
+    marker.set_status(&format!("downloading {asset} (to install mlx-lm)"));
     let client = http_client()?;
     let expected = client
         .get(format!("{url}.sha256"))
@@ -101,11 +109,12 @@ fn ensure_uv() -> Result<PathBuf> {
         parse_sha256_file(&expected).ok_or_else(|| anyhow!("malformed {asset}.sha256"))?;
     let tmp = tmp_path(&asset)?;
     let _cleanup = RemoveOnDrop(&tmp);
-    download_to_file(&client, &url, &tmp, &asset, None)?;
+    download_to_file(&client, &url, &tmp, &asset, Some(marker))?;
     let actual = sha256_of_file(&tmp)?;
     if actual != expected {
         anyhow::bail!("{asset}: sha256 {actual} does not match published {expected}");
     }
+    marker.set_status(&format!("extracting {asset}"));
     extract_tar_gz(&tmp, &root)?;
     let uv = find_binary(&root, "uv")
         .with_context(|| format!("uv binary not found after extracting {asset}"))?;
@@ -139,20 +148,11 @@ fn venv_complete(venv: &Path) -> bool {
     venv.join(COMPLETE_SENTINEL).is_file() && server_in_venv(venv).is_file()
 }
 
-/// Whether [`ensure_mlx_server`] would have to install anything: no
-/// `mlx_lm.server` on `PATH` and no complete managed venv. A few `stat`s,
-/// so a client can ask on every run and only announce the (long) first
-/// install when there is one.
-pub fn needs_install() -> bool {
-    if crate::find_on_path("mlx_lm.server").is_some() {
-        return false;
-    }
-    mlx_lm_root().is_ok_and(|root| !venv_complete(&root.join("venv")))
-}
-
 /// The `mlx_lm.server` to run: the one on `PATH`, else the one in
 /// llmman's managed environment, installed first if it isn't complete.
-/// Blocking (network, disk, child `uv`): call via `spawn_blocking`.
+/// Cheap (a `PATH` search and two `stat`s) once installed, so `llmman
+/// serve` calls it on every startup. Blocking (network, disk, child
+/// `uv`): call via `spawn_blocking`.
 pub fn ensure_mlx_server() -> Result<PathBuf> {
     if let Some(bin) = crate::find_on_path("mlx_lm.server") {
         return Ok(bin);
@@ -190,28 +190,39 @@ pub fn ensure_mlx_server() -> Result<PathBuf> {
             .with_context(|| format!("remove partial {}", venv.display()))?;
     }
 
-    let uv = ensure_uv()?;
+    // Held, with its heartbeat, for the whole install: `uv` runs for
+    // minutes reporting nothing this process can see, and a client
+    // waiting for this daemon to bind must keep reading "busy" (and
+    // what with) the whole time — see `daemon::ensure_server`.
+    let marker = DownloadMarker::create();
     let requirement = mlx_lm_requirement(std::env::var(MLX_LM_VERSION_VAR).ok().as_deref());
-    eprintln!("[llmman] installing {requirement} into {}", venv.display());
-    run_uv(
-        &uv,
-        &[
-            "venv".as_ref(),
-            "--python".as_ref(),
-            PYTHON_REQUEST.as_ref(),
-            venv.as_os_str(),
-        ],
-    )?;
-    run_uv(
-        &uv,
-        &[
-            "pip".as_ref(),
-            "install".as_ref(),
-            "--python".as_ref(),
-            venv.join("bin").join("python").as_os_str(),
-            requirement.as_ref(),
-        ],
-    )?;
+    marker.keep_alive_during(|| -> Result<()> {
+        let uv = ensure_uv(&marker)?;
+        eprintln!("[llmman] installing {requirement} into {}", venv.display());
+        marker.set_status(&format!(
+            "installing {requirement}: creating its Python environment (uv venv)"
+        ));
+        run_uv(
+            &uv,
+            &[
+                "venv".as_ref(),
+                "--python".as_ref(),
+                PYTHON_REQUEST.as_ref(),
+                venv.as_os_str(),
+            ],
+        )?;
+        marker.set_status(&format!("installing {requirement}: uv pip install"));
+        run_uv(
+            &uv,
+            &[
+                "pip".as_ref(),
+                "install".as_ref(),
+                "--python".as_ref(),
+                venv.join("bin").join("python").as_os_str(),
+                requirement.as_ref(),
+            ],
+        )
+    })?;
     if !server.is_file() {
         anyhow::bail!(
             "{} missing after installing {requirement}",
