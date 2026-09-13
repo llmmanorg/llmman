@@ -525,7 +525,13 @@ impl OciStore {
             let rel = entry
                 .path()
                 .strip_prefix(&canonical_src)
-                .unwrap()
+                .with_context(|| {
+                    format!(
+                        "strip prefix {:?} from entry {:?}",
+                        canonical_src,
+                        entry.path()
+                    )
+                })?
                 .to_string_lossy()
                 .replace('\\', "/");
 
