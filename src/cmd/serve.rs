@@ -64,7 +64,7 @@ use config::{
     sched_spread_from_env, supports_context_shift, threads_from_env_or_host, tls_from_env,
     MAX_CTX_SHRINK_ATTEMPTS,
 };
-use gemini::{gemini_stream_model, handle_pinned_gemini};
+use gemini::{gemini_method, handle_pinned_gemini};
 use ollama::{
     handle_blob_head, handle_blob_upload, handle_copy, handle_create, handle_delete, handle_embed,
     handle_embeddings, handle_ollama_chat, handle_ollama_generate, handle_ps, handle_pull,
@@ -4110,7 +4110,9 @@ async fn record_prompt(State(state): State<AppState>, req: Request, next: Next) 
         let model = UrlPath::<(String, String)>::from_request_parts(&mut parts, &())
             .await
             .ok()
-            .filter(|UrlPath((_, path))| gemini_stream_model(path).is_some())
+            .filter(|UrlPath((_, path))| {
+                gemini_method(path).is_some_and(|(_, method)| method.generates())
+            })
             .and_then(|UrlPath((encoded_model, _))| {
                 base64::engine::general_purpose::URL_SAFE_NO_PAD
                     .decode(encoded_model)
