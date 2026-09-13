@@ -1,3 +1,4 @@
+use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
 use super::ollama::{
     embed_inputs, empty_chat_chunk, evict_if_retagged, normalize_in_place, options_to_oai,
@@ -5,8 +6,8 @@ use super::ollama::{
     PushOutcome, StreamedOutcome,
 };
 use super::openai::{
-    apply_reasoning_effort, mlx_embeddings_unsupported_response, multipart_form,
-    multipart_text_field, omni_image_request, omni_video_fields,
+    apply_default_repeat_penalty, apply_reasoning_effort, mlx_embeddings_unsupported_response,
+    multipart_form, multipart_text_field, omni_image_request, omni_video_fields,
 };
 use super::sched::{reap_idle_models_once, resolve_keep_alive, DEFAULT_KEEP_ALIVE};
 use super::stream::{fold_ollama_lines, stream_ollama};

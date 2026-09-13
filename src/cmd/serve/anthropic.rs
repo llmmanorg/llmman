@@ -1,4 +1,5 @@
-//! The Anthropic Messages API, for providers that speak only it.
+//! The Anthropic Messages API: the inbound `/v1/messages` route, and the
+//! translation for providers that speak only this dialect.
 //!
 //! Every surface the daemon offers becomes one OpenAI chat completion
 //! internally (see `CHAT_COMPLETIONS_ROUTE` in the parent), so a
@@ -10,13 +11,27 @@
 //! The provider is always asked to stream; a `stream: false` caller gets
 //! the stream folded into one object ([`StreamConverter::completion`]).
 //!
-//! Everything here is pure (JSON in, SSE text out), so it is testable
-//! without a network.
+//! The translation is pure — JSON in, SSE text out, testable without a
+//! network. [`handle_anthropic_messages`] is not: it resolves a target
+//! first, then relays or translates.
 
 use std::collections::BTreeMap;
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::Response;
+use reqwest::Client;
 use serde_json::{json, Value};
+
+use super::openai::apply_default_repeat_penalty;
+use super::sched::{begin_activity, ActivityGuard};
+use super::{
+    backend_wire_model, chat_body, convert_upstream, messages, relay_rewriting_model,
+    relay_stream_rewriting_model, repeat_penalty_applies, send_chat_completion,
+    send_with_hybrid_fallback, AppError, AppState, Target,
+};
 
 /// The generating Messages route, appended to a provider's base URL.
 pub(super) const MESSAGES_ROUTE: &str = "/v1/messages";
@@ -1071,6 +1086,127 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default()
+}
+
+// -- Anthropic /v1/messages --------------------------------------------------
+
+/// The Anthropic Messages surface. The body is kept raw until the target
+/// is known: a [`crate::providers::Wire::Anthropic`] provider gets it
+/// relayed as sent (see [`relay_anthropic_messages`]); anything else
+/// gets it translated into a chat completion and the reply back (see
+/// [`messages`]).
+pub(super) async fn handle_anthropic_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let raw: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        AppError(
+            anyhow!("parse Anthropic request: {e}"),
+            StatusCode::BAD_REQUEST,
+        )
+    })?;
+    let model_ref = raw["model"].as_str().unwrap_or("").to_string();
+    // No `request_threads`: the Anthropic Messages API has no Ollama
+    // options blob, so there is no num_thread to forward.
+    send_with_hybrid_fallback(
+        &state,
+        &model_ref,
+        Some(&headers),
+        None,
+        |model, target, guard| anthropic_messages_to(&state, &headers, &raw, model, target, guard),
+    )
+    .await
+}
+
+/// [`handle_anthropic_messages`] against one resolved target. The
+/// response echoes the client's own `model` back, unchanged from before.
+async fn anthropic_messages_to(
+    state: &AppState,
+    headers: &HeaderMap,
+    raw: &serde_json::Value,
+    canonical_model: String,
+    target: Target,
+    guard: ActivityGuard,
+) -> Result<Response, AppError> {
+    // The Anthropic Messages API has no `keep_alive` field of its own —
+    // `None` leaves it untouched, same as the OpenAI-compatible surface
+    // (see resolve_openai_request's own comment on why).
+    let activity = begin_activity(guard, None).await;
+
+    // See backend_wire_model's own doc comment — usually just
+    // canonical_model itself, but a different value for an Engine::Mlx
+    // backend or a remote provider.
+    let wire_model = backend_wire_model(state, &target, &canonical_model).await;
+
+    if target.is_anthropic() {
+        return relay_anthropic_messages(
+            &state.0.client,
+            &target,
+            headers,
+            raw,
+            &wire_model,
+            activity,
+        )
+        .await;
+    }
+
+    let client_model = raw["model"].as_str().unwrap_or_default().to_string();
+    let bad_request = |e| AppError(e, StatusCode::BAD_REQUEST);
+    let streaming = messages::streaming(raw).map_err(bad_request)?;
+    let (mut chat_req, tool_names) =
+        messages::from_messages_request(raw, &wire_model).map_err(bad_request)?;
+    if repeat_penalty_applies(&target) {
+        apply_default_repeat_penalty(&mut chat_req);
+    }
+    let upstream = send_chat_completion(&state.0.client, &target, &chat_req, &wire_model).await?;
+    let body = chat_body(&target, upstream).await?;
+
+    let converter = messages::StreamConverter::new(&client_model, tool_names);
+    Ok(convert_upstream(body, activity, converter, streaming).await)
+}
+
+/// Headers a `/v1/messages` caller sets for the provider: opt-in
+/// features and the API version it wrote against. Its credential is not
+/// among them (see `Target::authorize`).
+const ANTHROPIC_PASSTHROUGH_HEADERS: [&str; 2] = ["anthropic-beta", "anthropic-version"];
+
+/// `/v1/messages` to a provider that speaks it: relayed as sent, with
+/// only `model` rewritten out and back. Claude Code's cache breakpoints,
+/// thinking and betas, which the [`messages`] translation has no
+/// chat-completion form for, reach a provider intact.
+pub(super) async fn relay_anthropic_messages(
+    client: &Client,
+    target: &Target,
+    headers: &HeaderMap,
+    raw: &serde_json::Value,
+    wire_model: &str,
+    activity: ActivityGuard,
+) -> Result<Response, AppError> {
+    let client_model = raw["model"].as_str().unwrap_or_default().to_string();
+    let streaming = raw["stream"].as_bool().unwrap_or(false);
+    let mut body = raw.clone();
+    body["model"] = serde_json::Value::String(wire_model.to_string());
+
+    // `headers()` replaces the `authorize` default; `header()` would
+    // append a second `anthropic-version`.
+    let mut passthrough = HeaderMap::new();
+    for name in ANTHROPIC_PASSTHROUGH_HEADERS {
+        if let Some(value) = headers.get(name) {
+            passthrough.insert(name, value.clone());
+        }
+    }
+    let resp = target
+        .authorize(client.post(target.url(MESSAGES_ROUTE)))
+        .headers(passthrough)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("proxy request to {}", target.describe()))?;
+    if streaming {
+        return Ok(relay_stream_rewriting_model(resp, activity, client_model));
+    }
+    relay_rewriting_model(resp, activity, &client_model).await
 }
 
 #[cfg(test)]

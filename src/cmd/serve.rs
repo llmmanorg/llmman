@@ -71,10 +71,10 @@ use ollama::{
     handle_push, handle_show, handle_tags, handle_version,
 };
 use openai::{
-    apply_default_repeat_penalty, handle_openai_chat, handle_openai_completions,
-    handle_openai_embeddings, handle_openai_images, handle_openai_models, handle_openai_speech,
-    handle_openai_transcriptions, handle_openai_video_get, handle_openai_videos,
-    proxy_openai_generation, proxy_openai_passthrough, TRANSCRIPTION_BODY_LIMIT_BYTES,
+    handle_openai_chat, handle_openai_completions, handle_openai_embeddings, handle_openai_images,
+    handle_openai_models, handle_openai_speech, handle_openai_transcriptions,
+    handle_openai_video_get, handle_openai_videos, proxy_openai_generation,
+    proxy_openai_passthrough, TRANSCRIPTION_BODY_LIMIT_BYTES,
 };
 pub use runtime::Runtime;
 use sched::{
@@ -3778,126 +3778,6 @@ fn responses_input_item_text(item: &serde_json::Value) -> Option<String> {
     }
 }
 
-// -- Anthropic /v1/messages --------------------------------------------------
-
-/// The Anthropic Messages surface. The body is kept raw until the target
-/// is known: a [`Wire::Anthropic`] provider gets it relayed as sent (see
-/// [`relay_anthropic_messages`]); anything else gets it translated into
-/// a chat completion and the reply back (see [`messages`]).
-async fn handle_anthropic_messages(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, AppError> {
-    let raw: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
-        AppError(
-            anyhow!("parse Anthropic request: {e}"),
-            StatusCode::BAD_REQUEST,
-        )
-    })?;
-    let model_ref = raw["model"].as_str().unwrap_or("").to_string();
-    // No `request_threads`: the Anthropic Messages API has no Ollama
-    // options blob, so there is no num_thread to forward.
-    send_with_hybrid_fallback(
-        &state,
-        &model_ref,
-        Some(&headers),
-        None,
-        |model, target, guard| anthropic_messages_to(&state, &headers, &raw, model, target, guard),
-    )
-    .await
-}
-
-/// [`handle_anthropic_messages`] against one resolved target. The
-/// response echoes the client's own `model` back, unchanged from before.
-async fn anthropic_messages_to(
-    state: &AppState,
-    headers: &HeaderMap,
-    raw: &serde_json::Value,
-    canonical_model: String,
-    target: Target,
-    guard: ActivityGuard,
-) -> Result<Response, AppError> {
-    // The Anthropic Messages API has no `keep_alive` field of its own —
-    // `None` leaves it untouched, same as the OpenAI-compatible surface
-    // (see resolve_openai_request's own comment on why).
-    let activity = begin_activity(guard, None).await;
-
-    // See backend_wire_model's own doc comment — usually just
-    // canonical_model itself, but a different value for an Engine::Mlx
-    // backend or a remote provider.
-    let wire_model = backend_wire_model(state, &target, &canonical_model).await;
-
-    if target.is_anthropic() {
-        return relay_anthropic_messages(
-            &state.0.client,
-            &target,
-            headers,
-            raw,
-            &wire_model,
-            activity,
-        )
-        .await;
-    }
-
-    let client_model = raw["model"].as_str().unwrap_or_default().to_string();
-    let bad_request = |e| AppError(e, StatusCode::BAD_REQUEST);
-    let streaming = messages::streaming(raw).map_err(bad_request)?;
-    let (mut chat_req, tool_names) =
-        messages::from_messages_request(raw, &wire_model).map_err(bad_request)?;
-    if repeat_penalty_applies(&target) {
-        apply_default_repeat_penalty(&mut chat_req);
-    }
-    let upstream = send_chat_completion(&state.0.client, &target, &chat_req, &wire_model).await?;
-    let body = chat_body(&target, upstream).await?;
-
-    let converter = messages::StreamConverter::new(&client_model, tool_names);
-    Ok(convert_upstream(body, activity, converter, streaming).await)
-}
-
-/// Headers a `/v1/messages` caller sets for the provider: opt-in
-/// features and the API version it wrote against. Its credential is not
-/// among them (see `Target::authorize`).
-const ANTHROPIC_PASSTHROUGH_HEADERS: [&str; 2] = ["anthropic-beta", "anthropic-version"];
-
-/// `/v1/messages` to a provider that speaks it: relayed as sent, with
-/// only `model` rewritten out and back. Claude Code's cache breakpoints,
-/// thinking and betas, which the [`messages`] translation has no
-/// chat-completion form for, reach a provider intact.
-async fn relay_anthropic_messages(
-    client: &Client,
-    target: &Target,
-    headers: &HeaderMap,
-    raw: &serde_json::Value,
-    wire_model: &str,
-    activity: ActivityGuard,
-) -> Result<Response, AppError> {
-    let client_model = raw["model"].as_str().unwrap_or_default().to_string();
-    let streaming = raw["stream"].as_bool().unwrap_or(false);
-    let mut body = raw.clone();
-    body["model"] = serde_json::Value::String(wire_model.to_string());
-
-    // `headers()` replaces the `authorize` default; `header()` would
-    // append a second `anthropic-version`.
-    let mut passthrough = HeaderMap::new();
-    for name in ANTHROPIC_PASSTHROUGH_HEADERS {
-        if let Some(value) = headers.get(name) {
-            passthrough.insert(name, value.clone());
-        }
-    }
-    let resp = target
-        .authorize(client.post(target.url(anthropic::MESSAGES_ROUTE)))
-        .headers(passthrough)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("proxy request to {}", target.describe()))?;
-    if streaming {
-        return Ok(relay_stream_rewriting_model(resp, activity, client_model));
-    }
-    relay_rewriting_model(resp, activity, &client_model).await
-}
-
 // ---------------------------------------------------------------------------
 // Option extractors from Ollama options blob
 // ---------------------------------------------------------------------------
@@ -4419,7 +4299,7 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         // to the model chosen by `llmman launch agy`.
         .route("/gemini/:model/*gemini_path", post(handle_pinned_gemini))
         // Anthropic API
-        .route("/v1/messages", post(handle_anthropic_messages));
+        .route("/v1/messages", post(anthropic::handle_anthropic_messages));
 
     // Applied only when the operator asked for metrics. Nothing can read
     // the store while the endpoint is absent — enabling it needs a
