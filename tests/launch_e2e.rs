@@ -5,7 +5,8 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `agy`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`, `talos`, `dsh`) — not mocks.
+//! (`claude`, `agy`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`,
+//! `talos`, `dsh`, `goose`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -77,13 +78,14 @@
 //!     entries llama-server's `/v1/responses` rejects outright
 //!     (`"'type' of tool must be 'function'"` for a `"namespace"`-typed
 //!     sub-agent tool bundle, and for the bare `{"type":"web_search"}`
-//!     entry) — fixed in `cmd::serve::filter_non_function_tools`. Real
-//!     `codex exec` also always carries a `developer`-role item alongside
-//!     its top-level `instructions`, which llama-server's own Responses
+//!     entry) — fixed in
+//!     `cmd::serve::responses::filter_non_function_tools`. Real `codex
+//!     exec` also always carries a `developer`-role item alongside its
+//!     top-level `instructions`, which llama-server's own Responses
 //!     conversion turns into a second, misplaced `system`-role chat
 //!     message (a confirmed, unresolved upstream llama.cpp gap — see
 //!     ggml-org/llama.cpp#20733/#23423) — fixed in
-//!     `cmd::serve::consolidate_responses_instructions`.
+//!     `cmd::serve::responses::consolidate_responses_instructions`.
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -612,6 +614,10 @@ fn run_launch(
         // send the settings `launch qwen` writes past this `HOME`, and on
         // Windows `dirs::home_dir` reads neither `HOME` nor `USERPROFILE`.
         .env("QWEN_HOME", home.join(".qwen"))
+        // goose asks before each tool call otherwise, and a headless run
+        // has nobody to answer. Granted here, not by `launch goose`:
+        // auto-approving an agent's writes is the user's call.
+        .env("GOOSE_MODE", "auto")
         // AGY's background updater replaces its binary in place (seen
         // within a minute of a first run), so without this a retry would
         // run a different AGY than the one CI installed and checksummed.
@@ -667,7 +673,24 @@ const MAX_ATTEMPTS: u32 = 3;
 /// sampling variance, not an llmman regression, so it must not turn CI
 /// red on its own.
 fn launch_and_assert(integration: &str, extra_args: &[&str]) {
-    launch_and_assert_tolerating(integration, extra_args, &[], |_stderr| false);
+    launch_and_assert_with(
+        integration,
+        extra_args,
+        &[],
+        |_stderr| false,
+        |_stdout| false,
+    );
+}
+
+/// [`launch_and_assert`], for a CLI that reports failure without a
+/// non-zero exit: stdout matching `reject_stdout` panics instead of being
+/// retried as sampling variance — see `goose_request_failed`.
+fn launch_and_assert_rejecting(
+    integration: &str,
+    extra_args: &[&str],
+    reject_stdout: impl Fn(&str) -> bool,
+) {
+    launch_and_assert_with(integration, extra_args, &[], |_stderr| false, reject_stdout);
 }
 
 /// [`launch_and_assert`], generalized with an extra tolerated failure
@@ -684,6 +707,24 @@ fn launch_and_assert_tolerating(
     extra_args: &[&str],
     extra_env: &[(&str, String)],
     tolerate_stderr: impl Fn(&str) -> bool,
+) {
+    launch_and_assert_with(
+        integration,
+        extra_args,
+        extra_env,
+        tolerate_stderr,
+        |_stdout| false,
+    );
+}
+
+/// The shared body: `tolerate_stderr` widens what a nonzero exit may be,
+/// `reject_stdout` narrows what a zero exit may be.
+fn launch_and_assert_with(
+    integration: &str,
+    extra_args: &[&str],
+    extra_env: &[(&str, String)],
+    tolerate_stderr: impl Fn(&str) -> bool,
+    reject_stdout: impl Fn(&str) -> bool,
 ) {
     let mut last_failure = None;
     // Set when the loop gives up on a timeout (not retried) rather than
@@ -730,6 +771,13 @@ fn launch_and_assert_tolerating(
             ));
             continue;
         }
+        // A zero exit isn't proof the launch worked for every CLI: a
+        // self-reported failure is a bug, not sampling variance.
+        assert!(
+            !reject_stdout(&stdout),
+            "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` exited 0 but \
+             reported a failure of its own\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
         if stdout.to_lowercase().contains("pong") {
             return;
         }
@@ -1078,6 +1126,42 @@ fn launch_dsh_with_model() {
     launch_and_assert("dsh", &["--profile", "headless", PROMPT]);
 }
 
+#[test]
+fn launch_goose_with_model() {
+    eprintln!("[test] launch_goose_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_goose_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    // Skipped rather than failed, unlike the npm CLIs: ci.yml can't
+    // install goose on aarch64-pc-windows (no asset at v1.50.0) or on a
+    // Windows runner whose bash has no `unzip` — see its own comment.
+    if !on_path("goose") {
+        eprintln!("skipping: goose not on PATH — https://github.com/aaif-goose/goose");
+        return;
+    }
+
+    // `run -t <prompt> --no-session`: goose's own headless mode — one
+    // instruction in, reply out, no session file left behind.
+    launch_and_assert_rejecting(
+        "goose",
+        &["run", "-t", PROMPT, "--no-session"],
+        goose_request_failed,
+    );
+}
+
+/// goose exits 0 even when no request reached a model — verified against
+/// 1.50.0 at a dead port ("Network error: ...") and at a 500 ("Ran into
+/// this error: ..."). Without this a broken `goose_env` would read as the
+/// model not saying "pong": retried, warned, green. Its third zero-exit
+/// shape, "The model returned an empty response", stays retried — a 0.8b
+/// model can legitimately produce one.
+fn goose_request_failed(stdout: &str) -> bool {
+    stdout.contains("Network error:") || stdout.contains("Ran into this error:")
+}
+
 /// Verifies `daemon::ensure_server`'s fast-fail path end to end: when the
 /// auto-spawned `llmman serve` dies during startup, the client command
 /// must report the daemon's exit within seconds (via the poll loop's
@@ -1260,16 +1344,12 @@ const MLX_MODEL: &str = "mlx-community/SmolLM2-135M-Instruct-8bit";
 /// own backend selection).
 ///
 /// Skips itself (rather than failing) on anything other than Apple
-/// Silicon macOS, or when `mlx_lm.server` isn't on `PATH` — mirrors every
-/// other test in this file's own "prerequisite not installed, not an
-/// llmman bug" convention (the daemon would install `mlx-lm` itself —
-/// `crate::mlx_release` — but that download is not what this measures).
-/// CI (see `.github/workflows/ci.yml`'s e2e job)
-/// installs `mlx-lm` before this suite ever runs, on exactly the two
-/// macOS aarch64 matrix legs (`backend: docker` and `backend: podman`)
-/// this is meant to actually exercise — see that job's own comment on
-/// why installation has to happen before, not after, this file's shared
-/// daemon first starts.
+/// Silicon macOS, or when the `mlx_lm.server` the daemon would run is
+/// missing: under `LLMMAN_RUNTIME=path` (CI's setting) the one on `PATH`,
+/// otherwise llmman's own install (`crate::mlx_release`), which must be
+/// complete already — the download is not what this measures. CI
+/// installs `mlx-lm` onto `PATH` before this suite, on the two macOS
+/// aarch64 legs, since the shared daemon's PATH is fixed at its spawn.
 ///
 /// Unlike `launch_and_assert`'s small-model sampling-variance tolerance
 /// (this file's other tests, talking to real third-party agentic CLIs
@@ -1298,8 +1378,15 @@ fn serve_mlx_safetensors_model() {
         eprintln!("skipping: mlx_lm.server only runs on Apple Silicon macOS");
         return;
     }
-    if !on_path("mlx_lm.server") {
-        eprintln!("skipping: mlx_lm.server not on PATH — pip install mlx-lm");
+    let runtime_path = std::env::var("LLMMAN_RUNTIME").is_ok_and(|r| r == "path");
+    if runtime_path && !on_path("mlx_lm.server") {
+        eprintln!(
+            "skipping: LLMMAN_RUNTIME=path and mlx_lm.server not on PATH — pip install mlx-lm"
+        );
+        return;
+    }
+    if !runtime_path && !llmman::mlx_release::installed() {
+        eprintln!("skipping: llmman's mlx-lm is not installed — run `llmman serve --pull-only`");
         return;
     }
 

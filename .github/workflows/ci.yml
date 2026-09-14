@@ -551,7 +551,8 @@ jobs:
         run: go test -tags "$PODMAN_TAGS" ./...
 
   # --------------------------------------------------------------------------
-  # E2E: `llmman launch <claude|agy|opencode|codex|qwen|hermes|openclaw|talos|dsh> --model
+  # E2E: `llmman launch
+  # <claude|agy|opencode|codex|qwen|hermes|openclaw|talos|dsh|goose> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
   # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
@@ -582,7 +583,7 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/agy/opencode/codex/qwen/hermes/openclaw/talos/dsh, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/agy/opencode/codex/qwen/hermes/openclaw/talos/dsh/goose, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
@@ -597,28 +598,31 @@ jobs:
     # launch_and_assert's own doc comment), so 30 min/test is only hit if
     # every attempt fails via a missing "pong" instead. Plus warm_model()'s
     # own separate TIMEOUT budget (10 min), paid at most once across all
-    # tests (guarded by WARM's own Once). 9*30 + 10 = 280 min; 300 leaves
-    # headroom on top of that for setup/build overhead (5-8 min on
-    # Windows). Exhausting every attempt doesn't fail this job either way
-    # (see launch_and_assert's own doc comment) — a run can still
-    # legitimately take this long in wall-clock time before giving up.
+    # tests (guarded by WARM's own Once). 10*30 + 10 = 310 min. Exhausting
+    # every attempt doesn't fail this job either way (see
+    # launch_and_assert's own doc comment) — a run can still legitimately
+    # take this long in wall-clock time before giving up.
     #
-    # +90 on top of that 300 (390 total) for the vllm-plugin steps'
-    # own per-step budgets below: up to 60 min for "Install vLLM (e2e)"
-    # (wheel downloads, but a slow/retried one on a bad connection) plus
-    # up to 30 min for "pytest -m e2e (vllm-plugin)".
+    # +90 (400) for the vllm-plugin steps' own per-step budgets below: up
+    # to 60 min for "Install vLLM (e2e)" (wheel downloads, but a
+    # slow/retried one on a bad connection) plus up to 30 min for
+    # "pytest -m e2e (vllm-plugin)".
     #
-    # +10 more (400 total) for `serve_mlx_safetensors_model`'s own single
-    # TIMEOUT budget (10 min, same 600s as warm_model's) — it doesn't go
-    # through launch_and_assert's retry loop at all (a real failure there
-    # is always a deterministic llmman bug worth failing loudly on, not
-    # small-model sampling variance), so unlike the 9 launch tests above
+    # +10 (410) for `serve_mlx_safetensors_model`'s own single TIMEOUT
+    # budget (10 min, same 600s as warm_model's) — it doesn't go through
+    # launch_and_assert's retry loop at all (a real failure there is
+    # always a deterministic llmman bug worth failing loudly on, not
+    # small-model sampling variance), so unlike the 10 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
     #
-    # +60 more (460 total) for `serve_vllm_safetensors_model` and
+    # +60 more for `serve_vllm_safetensors_model` and
     # `serve_sglang_safetensors_model` (20 min each, no retries, like the
     # mlx test) and "Install SGLang (e2e)"'s 40-minute budget.
-    timeout-minutes: 460
+    #
+    # 470 in total, but 360 is GitHub's own hard limit for a hosted-runner
+    # job and kills a run past it regardless, so the number here stays at
+    # 400 rather than chasing a budget neither it nor GitHub can grant.
+    timeout-minutes: 400
     env:
       # These tests are about the llama-server "Install llama-server" puts
       # on PATH, which `--runtime auto` would try docker before.
@@ -903,6 +907,64 @@ jobs:
             "$HOME/talos/.env.example" > "$HOME/talos/talos.env"
           chmod 600 "$HOME/talos/talos.env"
           (cd "$HOME/talos" && .venv/bin/python -c "import talos; print('talos', talos.__version__)")
+
+      # goose has no npm package (a Rust binary via download_cli.sh), so
+      # install_cli above can't reach it. The pin has to be
+      # GOOSE_VERSION, not the tag the script is fetched from: the script
+      # resolves its own download tag, and installs `stable` without it.
+      # GOOSE_BIN_DIR because its default differs on Windows
+      # ($USERPROFILE/goose) and $GITHUB_PATH below names one directory.
+      # CONFIGURE=false skips the `goose configure` wizard, which a launch
+      # configured through the environment never needs. Retried like
+      # install_cli: `release` needs this job, so a GitHub-releases blip
+      # must not block a release.
+      #
+      # Two legs can't install goose and warn instead of failing:
+      # aarch64-pc-windows (no asset at v1.50.0) and Windows bash without
+      # `unzip` (the script's only way to extract). Both leave
+      # launch_goose_with_model to skip itself; elsewhere a failed install
+      # fails the job rather than going silently untested.
+      - name: Install goose (e2e)
+        shell: bash
+        run: |
+          set -o pipefail
+          bin_dir="$HOME/.local/bin"
+
+          if [ "${{ matrix.target }}" = "aarch64-pc-windows-msvc" ]; then
+            echo "::warning::skipping goose: no aarch64-pc-windows asset at v1.50.0"
+            exit 0
+          fi
+          if [ "${{ runner.os }}" = "Windows" ] && ! command -v unzip >/dev/null 2>&1; then
+            echo "::warning::skipping goose: download_cli.sh extracts with unzip, which this bash does not have"
+            exit 0
+          fi
+
+          max_attempts=6
+          for attempt in $(seq 1 "$max_attempts"); do
+            next="retrying"
+            [ "$attempt" -eq "$max_attempts" ] && next="giving up"
+            if ! curl -fsSL https://github.com/aaif-goose/goose/releases/download/v1.50.0/download_cli.sh \
+              | GOOSE_VERSION=v1.50.0 GOOSE_BIN_DIR="$bin_dir" CONFIGURE=false bash; then
+              echo "::warning::goose install failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next"
+            elif version_output=$("$bin_dir/goose" --version 2>&1); then
+              # Later steps read $GITHUB_PATH outside this bash, where a
+              # `/c/...`-shaped entry resolves to nothing; an already
+              # native path converts to itself.
+              if command -v cygpath >/dev/null 2>&1; then
+                cygpath -w "$bin_dir" >> "$GITHUB_PATH"
+              else
+                echo "$bin_dir" >> "$GITHUB_PATH"
+              fi
+              exit 0
+            else
+              echo "::warning::goose installed but \"goose --version\" failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next — output: $version_output"
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              sleep "$((2 ** (attempt - 1)))"
+            fi
+          done
+          echo "::error::goose never produced a working binary on ${{ runner.os }} ${{ runner.arch }} after $max_attempts attempts"
+          exit 1
 
       # Pinned official AGY release; verify each runner's archive before installing.
       - name: Install AGY (Unix)
@@ -1259,43 +1321,30 @@ jobs:
         run: echo "LLAMA_ARG_N_GPU_LAYERS=0" >> "$GITHUB_ENV"
 
       # ── mlx-lm (macOS arm64 only) ─────────────────────────────────────────
-      # Apple Silicon's own Metal-accelerated backend for safetensors
-      # models (see cmd::serve::use_mlx_for_safetensors) — installed, and
-      # its `mlx_lm.server` console script put on PATH, *before* "cargo
-      # test --test launch_e2e" below spawns this job's one shared
-      # `llmman serve` daemon (see tests/launch_e2e.rs's own module doc
-      # comment on why every test in that file shares one daemon): PATH is
-      # fixed at that daemon's own spawn time, like every other part of a
-      # child process's inherited environment, so installing this any
-      # later would leave the already-running daemon unable to find
-      # `mlx_lm.server` for the rest of this job — installing it here,
-      # before that daemon ever starts, is the only ordering that works.
-      # A separate venv from vllm-plugin's own (set up further below, for
-      # both Linux and macOS) rather than reusing it: that one doesn't
-      # exist yet at this point in the job, and giving mlx-lm its own
-      # keeps this step's ordering constraint independent of that one's.
-      #
-      # `serve_mlx_safetensors_model` (tests/launch_e2e.rs) is the only
-      # test that actually needs this — every other one in that file
-      # serves qwen3.5:0.8b (a GGUF model, llama-server's own territory,
-      # never mlx's) — and, like every other prerequisite in that file,
-      # skips itself (rather than failing) when `mlx_lm.server` isn't on
-      # PATH, so this step is deliberately scoped to macOS arm64 only:
-      # mlx-lm has no non-Apple-Silicon build to even attempt installing
-      # elsewhere.
+      # Apple Silicon's backend for safetensors models (see
+      # cmd::serve::use_mlx_for_safetensors). This job's daemon runs under
+      # LLMMAN_RUNTIME=path, which takes `mlx_lm.server`, like
+      # `llama-server`, from PATH — so it is installed onto PATH *before*
+      # "cargo test --test launch_e2e" spawns the job's one shared daemon
+      # (PATH is fixed at spawn time). Pinned to MLX_LM_RELEASE so this
+      # and llmman's own install (crate::mlx_release) test one version.
+      # Only `serve_mlx_safetensors_model` needs it, and that test skips
+      # itself when `mlx_lm.server` is not on PATH, hence macOS arm64 only.
+      # PYTHON_RELEASE's value (`with:` cannot read a file); keep in step.
       - name: Set up Python (mlx e2e)
         if: matrix.target == 'aarch64-apple-darwin'
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Install mlx-lm (macOS arm64, e2e)
         if: matrix.target == 'aarch64-apple-darwin'
         shell: bash
         run: |
           set -euo pipefail
+          MLX_LM_RELEASE="$(tr -d '[:space:]' < MLX_LM_RELEASE)"
           python3 -m venv "$RUNNER_TEMP/mlx-lm-venv"
-          "$RUNNER_TEMP/mlx-lm-venv/bin/pip" install mlx-lm
+          "$RUNNER_TEMP/mlx-lm-venv/bin/pip" install "mlx-lm==$MLX_LM_RELEASE"
           echo "$RUNNER_TEMP/mlx-lm-venv/bin" >> "$GITHUB_PATH"
 
       # ── vLLM + vllm-plugin (Linux + macOS) ───────────────────────────────

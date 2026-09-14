@@ -83,9 +83,11 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         "--overflow-model needs --model naming the local model to pair it with"
     );
 
-    // The local model's thinking controls (see `opencode_variants`); a
-    // provider's model has no template to read.
+    // The local model's thinking controls (see `opencode_variants`) and
+    // whether it takes images (see `write_dsh_settings`); a provider's
+    // model has neither a template nor a manifest to read.
     let mut thinking = None;
+    let mut vision = false;
     let (model, api_key) = match provider {
         Some(provider) => {
             check_provider_supported(name)?;
@@ -128,7 +130,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // synchronously and with progress, before ever handing off to
             // the integration.
             if !model.is_empty() {
-                thinking = crate::daemon::ensure_model_pulled(&model)?.thinking_controls();
+                let info = crate::daemon::ensure_model_pulled(&model)?;
+                thinking = info.thinking_controls();
+                vision = info.vision();
             }
             match overflow {
                 // The hosted half is validated and keyed exactly as a
@@ -147,7 +151,14 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         }
     };
 
-    launch(name, &model, &api_key, thinking.as_ref(), &args.extra_args)
+    launch(
+        name,
+        &model,
+        &api_key,
+        thinking.as_ref(),
+        vision,
+        &args.extra_args,
+    )
 }
 
 /// What an integration authenticates with when no provider key travels:
@@ -161,23 +172,27 @@ fn integration_key() -> String {
 // Pre-flight
 // ---------------------------------------------------------------------------
 
-/// Integrations that cannot be launched without `--model`: Qwen Code has
+/// Integrations that cannot be launched without `--model`. Qwen Code has
 /// no notion of a missing model and sends its own built-in default
 /// (`qwen3.7-max` in 0.22.3), which the daemon would then try to pull.
 /// AGY needs an explicit model for its Gemini routing URL.
 /// dsh has no default of its own either — an empty `--model` would
 /// otherwise land a literal `"default"` in `agent-default-model.model`,
 /// which the first request then tries to resolve as a real model id.
+/// goose instead refuses with "Run 'goose configure' first", advice that
+/// does not apply to a launch llmman configures through the environment.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
-const MODEL_REQUIRED: &[&str] = &["qwen", "dsh", "agy"];
+const MODEL_REQUIRED: &[&str] = &["qwen", "dsh", "agy", "goose"];
 
 /// Integrations whose launcher yields to a `--model` after `--`, and so
-/// warrant the warning below. Only qwen: `qwen_args` drops its own
-/// `--model` when the caller spelled one, where `dsh_args` does not —
-/// dsh takes no `--model` flag at all (its model is the one
-/// `write_dsh_settings` records), so telling a dsh user theirs "wins"
-/// would be false, and dsh rejects the unknown flag on its own.
-const MODEL_FLAG_FORWARDED: &[&str] = &["qwen"];
+/// warrant the warning below. qwen: `qwen_args` drops its own `--model`
+/// when the caller spelled one. goose: its model is `GOOSE_MODEL` in the
+/// environment, which goose's own `--model` documents itself as
+/// overriding. Not dsh: `dsh_args` does not yield, and dsh takes no
+/// `--model` flag at all (its model is the one `write_dsh_settings`
+/// records), so telling a dsh user theirs "wins" would be false, and dsh
+/// rejects the unknown flag on its own.
+const MODEL_FLAG_FORWARDED: &[&str] = &["qwen", "goose"];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
 /// `--provider` too. A second `--model` after `--` is the caller's to
@@ -488,16 +503,24 @@ const INTEGRATIONS: &[Integration] = &[
         description: "DeepSeek Harness",
         binary: "dsh",
     },
+    Integration {
+        name: "goose",
+        description: "Block goose",
+        binary: "goose",
+    },
 ];
 
 fn print_integrations() {
     println!("Available integrations:\n");
     for i in INTEGRATIONS {
-        if find_integration_binary(i).is_some() {
-            println!("  {:<12} {}", i.name, i.description);
-        } else {
-            println!("  {:<12} {} (not installed)", i.name, i.description);
-        }
+        // dsh resolves to npx when it isn't installed (see `find_dsh`),
+        // and that launch downloads the package before running it.
+        let how = match find_integration_binary(i) {
+            Some(bin) if bin.file_stem().is_some_and(|s| s == "npx") => " (via npx)",
+            Some(_) => "",
+            None => " (not installed)",
+        };
+        println!("  {:<12} {}{}", i.name, i.description, how);
     }
     println!("\nUsage: llmman launch <integration> [--model <model>] [--provider <provider>]");
     println!("       llmman providers   (the providers --provider accepts)");
@@ -546,6 +569,8 @@ fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
         "opencode" => find_opencode(),
         "qwen" => find_qwen(),
         "talos" => find_talos(),
+        "dsh" => find_dsh().map(|(bin, _)| bin),
+        "goose" => find_goose(),
         _ => find_on_path(i.binary),
     }
 }
@@ -570,6 +595,7 @@ fn launch(
     model: &str,
     api_key: &str,
     thinking: Option<&ThinkingControls>,
+    vision: bool,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     match name.to_lowercase().as_str() {
@@ -586,7 +612,8 @@ fn launch(
         "openclaw" => launch_openclaw(model, extra_args),
         "qwen" => launch_qwen(model, api_key, extra_args),
         "talos" => launch_talos(model, extra_args),
-        "dsh" => launch_dsh(model, api_key, extra_args),
+        "dsh" => launch_dsh(model, api_key, vision, extra_args),
+        "goose" => launch_goose(model, api_key, extra_args),
         other => anyhow::bail!(
             "unknown integration {:?}\nRun 'llmman launch' without arguments to list supported integrations.",
             other
@@ -1997,6 +2024,56 @@ fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
             .is_some_and(|u| u.trim_end_matches('/') == base_url.trim_end_matches('/'))
 }
 
+/// goose: configured entirely through the environment, which goose reads
+/// in preference to its own `config.yaml` — so unlike hermes and qwen
+/// nothing is written to disk and no key is persisted. `OPENAI_HOST` is
+/// the bare origin, not a `/v1` base URL: goose joins it with
+/// `OPENAI_BASE_PATH` itself. Verified against goose 1.50.0 with no
+/// config file and no `goose configure`.
+fn launch_goose(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_goose().ok_or_else(|| anyhow::anyhow!("goose is not installed"))?;
+    let host = daemon::server();
+    exec_with_env(&bin, extra_args, &goose_env(model, api_key, &host))
+}
+
+/// Split out so a test can assert what goose is handed: [`exec_with_env`]
+/// never returns, so calling [`launch_goose`] would take the test runner
+/// with it.
+fn goose_env<'a>(model: &'a str, api_key: &'a str, host: &'a str) -> Vec<(&'a str, &'a str)> {
+    let mut env = vec![
+        ("GOOSE_PROVIDER", "openai"),
+        ("OPENAI_API_KEY", api_key),
+        ("OPENAI_HOST", host),
+        ("OPENAI_BASE_PATH", "v1/chat/completions"),
+    ];
+    // Absent, not empty: goose reads "" as a model actually named "".
+    if !model.is_empty() {
+        env.push(("GOOSE_MODEL", model));
+    }
+    env
+}
+
+fn find_goose() -> Option<PathBuf> {
+    find_on_path("goose").or_else(|| goose_fallback(&dirs::home_dir()?))
+}
+
+/// goose's own installer target: `download_cli.sh` writes to
+/// `$GOOSE_BIN_DIR` without putting it on `PATH`. Its default is
+/// `$USERPROFILE/goose` on Windows (what `dirs::home_dir` returns there)
+/// and `~/.local/bin` elsewhere; Windows probes both, since goose's
+/// install instructions and this repo's CI pass the latter (v1.50.0).
+fn goose_fallback(home: &Path) -> Option<PathBuf> {
+    let bin = if cfg!(windows) { "goose.exe" } else { "goose" };
+    let mut candidates = Vec::new();
+    if cfg!(windows) {
+        candidates.push(home.join("goose").join(bin));
+    }
+    candidates.push(home.join(".local").join("bin").join(bin));
+    // is_file, not exists: a directory of that name would be reported as
+    // installed and then fail to spawn.
+    candidates.into_iter().find(|p| p.is_file())
+}
+
 // ---------------------------------------------------------------------------
 // dsh (DeepSeek Harness)
 // ---------------------------------------------------------------------------
@@ -2021,7 +2098,12 @@ const DSH_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 /// deliberately, since a per-launch directory costs a cleanup hook on
 /// every exit path (signals included) for a case that needs two
 /// simultaneous sessions on different models to bite at all.
-fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch_dsh(
+    model: &str,
+    api_key: &str,
+    vision: bool,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
     let launcher = dsh_launcher(extra_args);
     if has_flag(launcher.args, "--patch", None) {
         anyhow::bail!("llmman launch dsh manages --patch itself; pass other dsh flags after --");
@@ -2033,19 +2115,47 @@ fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Resu
             if command == "web" { "web" } else { "<name>" }
         );
     }
-    let bin = find_on_path("dsh").ok_or_else(|| anyhow::anyhow!("dsh is not installed"))?;
+    let (bin, prefix) = find_dsh().ok_or_else(|| {
+        anyhow::anyhow!("dsh is not installed, and there is no npx on PATH to run it with")
+    })?;
 
     let dir = dsh_config_dir()?;
     let settings_path = dir.join("settings.yaml");
-    write_dsh_settings(&settings_path, model)?;
+    write_dsh_settings(&settings_path, model, vision)?;
     let patch_path = dir.join("llmman.cordis.yml");
     write_dsh_patch(&patch_path, &settings_path)?;
 
-    exec_with_env(
-        &bin,
-        &dsh_args(&patch_path, extra_args),
-        &[(DSH_API_KEY_ENV, api_key)],
-    )
+    let mut args = prefix;
+    if !args.is_empty() {
+        // Said before it happens: this launch downloads a package.
+        eprintln!("[llmman] dsh is not installed; running {DSH_NPM_PACKAGE} with npx");
+    }
+    args.extend(dsh_args(&patch_path, extra_args));
+    exec_with_env(&bin, &args, &[(DSH_API_KEY_ENV, api_key)])
+}
+
+/// The npm package `npx` fetches when dsh isn't installed. Unpinned, so
+/// a one-off run gets what a global install would have.
+const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh@latest";
+
+/// dsh, and the arguments that must lead whatever it is handed: none for
+/// an installed `dsh`, `--yes <package>` for the `npx` that stands in when
+/// there is none. `find_integration_binary` resolves it the same way, so
+/// the listing agrees with what a launch would run.
+fn find_dsh() -> Option<(PathBuf, Vec<String>)> {
+    dsh_command(find_on_path("dsh"), || find_on_path("npx"))
+}
+
+/// Split from [`find_dsh`] so which binary wins can be asserted without
+/// depending on what the test machine has installed.
+fn dsh_command(
+    dsh: Option<PathBuf>,
+    npx: impl FnOnce() -> Option<PathBuf>,
+) -> Option<(PathBuf, Vec<String>)> {
+    match dsh {
+        Some(bin) => Some((bin, Vec::new())),
+        None => Some((npx()?, vec!["--yes".into(), DSH_NPM_PACKAGE.into()])),
+    }
 }
 
 /// The tokens dsh reads as its own launcher flags, rather than forwards
@@ -2131,15 +2241,18 @@ fn dsh_config_dir() -> anyhow::Result<PathBuf> {
 /// The settings document `llmman.cordis.yml` points dsh at: registers
 /// `llmman` as an `llm-pi-ai` provider route at this daemon's `/v1`, and
 /// selects it as the `agent-default-model`.
-fn write_dsh_settings(path: &Path, model: &str) -> anyhow::Result<()> {
+fn write_dsh_settings(path: &Path, model: &str, vision: bool) -> anyhow::Result<()> {
     let quoted_model = yaml_quote(model);
     let base_url = yaml_quote(&format!("{}/v1", daemon::server()));
+    // Claiming image input a text-only model can't serve would have dsh
+    // attach what the daemon then rejects.
+    let input = if vision { "[text, image]" } else { "[text]" };
     let contents = format!(
         "# Written by `llmman launch dsh`; edits are overwritten.\n\
          agent-default-model:\n  provider: llmman\n  model: {quoted_model}\n\
          llm-pi-ai:\n  providers:\n    llmman:\n      displayName: llmman\n      \
          apiKeyEnv: {DSH_API_KEY_ENV}\n      api: openai-completions\n      baseURL: {base_url}\n      \
-         models:\n        - id: {quoted_model}\n          name: {quoted_model}\n          input: [text]\n"
+         models:\n        - id: {quoted_model}\n          name: {quoted_model}\n          input: {input}\n"
     );
     write_dsh_file(path, &contents)
 }
@@ -2357,6 +2470,69 @@ mod tests {
             assert!(MODEL_REQUIRED.contains(id), "{id} is not model-required");
         }
         assert!(!MODEL_FLAG_FORWARDED.contains(&"dsh"));
+    }
+
+    /// The only configuration goose gets: a wrong or missing one sends
+    /// the session to api.openai.com instead of the daemon. `OPENAI_HOST`
+    /// is the bare origin — goose appends `OPENAI_BASE_PATH` itself, so a
+    /// `/v1` here would request `/v1/v1/chat/completions`.
+    #[test]
+    fn goose_env_points_at_the_daemon_and_carries_the_key() {
+        let env = goose_env("m", "k", "http://127.0.0.1:17434");
+        let get = |k| env.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+        assert_eq!(get("GOOSE_PROVIDER"), Some("openai"));
+        assert_eq!(get("GOOSE_MODEL"), Some("m"));
+        assert_eq!(get("OPENAI_API_KEY"), Some("k"));
+        assert_eq!(get("OPENAI_HOST"), Some("http://127.0.0.1:17434"));
+        assert_eq!(get("OPENAI_BASE_PATH"), Some("v1/chat/completions"));
+
+        let env = goose_env("", "k", "http://127.0.0.1:17434");
+        assert!(!env.iter().any(|(n, _)| *n == "GOOSE_MODEL"));
+    }
+
+    /// goose carries the key in its own environment, so `--provider`
+    /// needs neither a refusal nor the daemon holding the key.
+    #[test]
+    fn goose_carries_its_own_key_so_provider_works() {
+        assert!(INTEGRATIONS.iter().any(|i| i.name == "goose"));
+        assert!(check_provider_supported("goose").is_ok());
+        assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"goose"));
+    }
+
+    /// `download_cli.sh`'s target is off `PATH` on a fresh shell, so this
+    /// fallback is the one that fires for most installs — at every
+    /// directory that installer writes to, Windows included.
+    #[test]
+    fn goose_fallback_finds_the_installers_target() {
+        let name = if cfg!(windows) { "goose.exe" } else { "goose" };
+        let dirs: &[&[&str]] = if cfg!(windows) {
+            &[&["goose"], &[".local", "bin"]]
+        } else {
+            &[&[".local", "bin"]]
+        };
+        for (i, parts) in dirs.iter().enumerate() {
+            let home = std::env::temp_dir().join(format!(
+                "llmman-goose-{}-{}-{i}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let bin = parts.iter().fold(home.clone(), |p, part| p.join(part));
+            std::fs::create_dir_all(&bin).unwrap();
+            assert_eq!(goose_fallback(&home), None);
+            let goose = bin.join(name);
+            // A directory of that name is not the binary: returning it
+            // would report goose as installed and then fail to spawn.
+            std::fs::create_dir(&goose).unwrap();
+            assert_eq!(goose_fallback(&home), None);
+            std::fs::remove_dir(&goose).unwrap();
+            std::fs::write(&goose, "").unwrap();
+            assert_eq!(goose_fallback(&home), Some(goose));
+            assert_eq!(goose_fallback(&home.join("nowhere")), None);
+            let _ = std::fs::remove_dir_all(&home);
+        }
     }
 
     /// The found directory goes in front of `PATH` only when it is not
@@ -2870,7 +3046,7 @@ model = \"gpt-5\"
                 .as_nanos()
         ));
         let path = dir.join("settings.yaml");
-        write_dsh_settings(&path, "qwen3.5:0.8b").unwrap();
+        write_dsh_settings(&path, "qwen3.5:0.8b", false).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("provider: llmman"));
         assert!(contents.contains("model: \"qwen3.5:0.8b\""));
@@ -2880,6 +3056,53 @@ model = \"gpt-5\"
         assert!(contents.contains("id: \"qwen3.5:0.8b\""));
         assert!(!contents.contains("apiKey:"), "no literal key in the file");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// dsh sends an image only to a model whose `input` lists one — and
+    /// must not attach one to a text-only model the daemon would reject.
+    #[test]
+    fn write_dsh_settings_declares_image_input_only_for_a_vision_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-dsh-vision-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("settings.yaml");
+        write_dsh_settings(&path, "m", true).unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("input: [text, image]"));
+        write_dsh_settings(&path, "m", false).unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("input: [text]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fallback that makes `llmman launch dsh` work without a global
+    /// install — and stays out of the way of one that exists.
+    #[test]
+    fn dsh_falls_back_to_the_published_package_under_npx() {
+        let dsh = PathBuf::from("/usr/local/bin/dsh");
+        let npx = PathBuf::from("/usr/local/bin/npx");
+
+        // An install wins, and npx is never even looked for.
+        assert_eq!(
+            dsh_command(Some(dsh.clone()), || panic!("npx looked up anyway")),
+            Some((dsh, Vec::new()))
+        );
+        // Without one, npx runs the package: `--yes` so a first run
+        // isn't blocked on a prompt, ahead of dsh's own arguments.
+        assert_eq!(
+            dsh_command(None, || Some(npx.clone())),
+            Some((npx, vec!["--yes".to_string(), DSH_NPM_PACKAGE.to_string()]))
+        );
+        assert!(DSH_NPM_PACKAGE.starts_with("@deepseek-ai/dsh@"));
+        // Neither: "dsh is not installed", not an npm error.
+        assert_eq!(dsh_command(None, || None), None);
     }
 
     #[test]
@@ -2996,7 +3219,7 @@ model = \"gpt-5\"
         for command in ["web", "plugin"] {
             let via_command = args(&[command, "--port", "8080"]);
             assert_eq!(dsh_launcher(&via_command).command, Some(command));
-            let err = launch_dsh("m", "k", &via_command).unwrap_err();
+            let err = launch_dsh("m", "k", false, &via_command).unwrap_err();
             assert!(err.to_string().contains("--profile"), "{err}");
         }
         // `--profile web`'s *value* is not the `web` command — refusing
@@ -3028,10 +3251,10 @@ model = \"gpt-5\"
     #[test]
     fn launch_dsh_refuses_a_conflicting_patch_flag() {
         let word = vec!["--patch".to_string(), "/tmp/x.yml".to_string()];
-        let err = launch_dsh("m", "k", &word).unwrap_err();
+        let err = launch_dsh("m", "k", false, &word).unwrap_err();
         assert!(err.to_string().contains("--patch"), "{err}");
         let joined = vec!["--patch=/tmp/x.yml".to_string()];
-        let err = launch_dsh("m", "k", &joined).unwrap_err();
+        let err = launch_dsh("m", "k", false, &joined).unwrap_err();
         assert!(err.to_string().contains("--patch"), "{err}");
     }
 

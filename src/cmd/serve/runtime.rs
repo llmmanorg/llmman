@@ -3,8 +3,9 @@
 //! `bin` is llmman's own download of llama.cpp's prebuilt `llama-server`
 //! (`crate::llama_release`), `path` is whatever `llama-server` is on
 //! `PATH`. `auto`, the default, tries them in that order and takes the
-//! first that works. Safetensors models use vLLM's image under a
-//! container runtime and the `vllm`/`mlx_lm.server` on `PATH` otherwise.
+//! first that works. On macOS the same choice governs `mlx_lm.server`
+//! (`crate::mlx_release`): `bin` installs llmman's own, `path` uses
+//! `PATH`'s, `auto` installs and falls back to `PATH`.
 //!
 //! `LLMMAN_RUNTIME` is the same setting as an environment variable, since
 //! `llmman run`/`launch` start the daemon with a bare `llmman serve`.
@@ -28,7 +29,8 @@ pub enum Runtime {
     Podman,
     /// llmman's own download of llama.cpp's prebuilt `llama-server`.
     Bin,
-    /// Whatever `llama-server` is on `PATH`; nothing is ever downloaded.
+    /// Whatever `llama-server` (and, on macOS, `mlx_lm.server`) is on
+    /// `PATH`; nothing is ever downloaded.
     Path,
 }
 
@@ -100,6 +102,130 @@ impl Resolved {
             Resolved::Container(_) => None,
             Resolved::Local { bin, .. } => Some(bin),
         }
+    }
+}
+
+/// The daemon's runtime: [`resolve`]d at startup when that works, else
+/// on the first load that needs it, so a failed llama.cpp fetch is a
+/// startup warning rather than a dead daemon. A success is kept; a
+/// failure is not, so the next load retries.
+pub struct Lazy {
+    requested: Runtime,
+    llama_cpp_version: Option<String>,
+    resolved: std::sync::Mutex<Option<Resolved>>,
+    // One fetch at a time: loads of different models are not otherwise
+    // serialized.
+    resolving: tokio::sync::Mutex<()>,
+}
+
+impl Lazy {
+    /// `resolved` is startup's result, `None` if that failed.
+    pub fn new(
+        requested: Runtime,
+        llama_cpp_version: Option<String>,
+        resolved: Option<Resolved>,
+    ) -> Self {
+        Lazy {
+            requested,
+            llama_cpp_version,
+            resolved: std::sync::Mutex::new(resolved),
+            resolving: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// What `--runtime` asked for (possibly `auto`).
+    pub fn requested(&self) -> Runtime {
+        self.requested
+    }
+
+    /// The resolution so far, without attempting one.
+    pub fn known(&self) -> Option<Resolved> {
+        self.resolved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set(&self, resolved: Resolved) {
+        *self.resolved.lock().unwrap_or_else(|e| e.into_inner()) = Some(resolved);
+    }
+
+    /// The resolution, fetching llama.cpp now if startup could not.
+    pub async fn resolve(&self) -> Result<Resolved> {
+        if let Some(resolved) = self.known() {
+            return Ok(resolved);
+        }
+        let _one_at_a_time = self.resolving.lock().await;
+        if let Some(resolved) = self.known() {
+            return Ok(resolved);
+        }
+        eprintln!(
+            "[llmman] runtime {}: not set up at startup; fetching its llama.cpp now",
+            self.requested.as_str()
+        );
+        let requested = self.requested;
+        let pin = self.llama_cpp_version.clone();
+        let resolved = tokio::task::spawn_blocking(move || resolve(requested, pin.as_deref()))
+            .await
+            .context("resolve runtime task panicked")?
+            .context(
+                "the llama.cpp runtime could not be set up (this daemon started without it)",
+            )?;
+        self.set(resolved.clone());
+        Ok(resolved)
+    }
+
+    /// Whether engines run in containers. Answered without a fetch when
+    /// `requested` has no container step (`bin`, `path`, `auto` off
+    /// Linux), so a safetensors load never waits on a llama.cpp download
+    /// it does not use.
+    pub async fn ociman(&self) -> Result<Option<ContainerManager>> {
+        if let Some(resolved) = self.known() {
+            return Ok(resolved.ociman());
+        }
+        if !candidates(self.requested, false)
+            .iter()
+            .any(|c| c.ociman().is_some())
+        {
+            return Ok(None);
+        }
+        Ok(self.resolve().await?.ociman())
+    }
+
+    /// The local `llama-server` to spawn. Re-resolved (under the same
+    /// mutex as [`resolve`](Self::resolve)) if the file has gone — the
+    /// install that provided it was upgraded or removed while this
+    /// daemon ran — rather than failing every load against a dead path.
+    pub async fn local_llama_server_bin(&self) -> Result<PathBuf> {
+        let local = |resolved: Resolved| match resolved {
+            Resolved::Local { source, bin } => Ok((source, bin)),
+            Resolved::Container(m) => anyhow::bail!(
+                "no local llama-server binary: --runtime {} runs it in a container",
+                m.binary()
+            ),
+        };
+        let (_, bin) = local(self.resolve().await?)?;
+        if bin.exists() {
+            return Ok(bin);
+        }
+        let _one_at_a_time = self.resolving.lock().await;
+        let (source, bin) = local(self.known().expect("resolved above"))?;
+        if bin.exists() {
+            return Ok(bin);
+        }
+        eprintln!(
+            "[llmman] llama-server at {} no longer exists; re-resolving",
+            bin.display()
+        );
+        let pin = self.llama_cpp_version.clone();
+        let bin = tokio::task::spawn_blocking(move || resolve_local(source, pin.as_deref()))
+            .await
+            .context("resolve llama-server task panicked")??;
+        self.set(Resolved::Local {
+            source,
+            bin: bin.clone(),
+        });
+        Ok(bin)
     }
 }
 
@@ -225,26 +351,13 @@ fn try_one(
 }
 
 /// Runs `pull` (a `docker pull`, possibly minutes) holding
-/// `crate::llama_release`'s download marker, touched every 15s, so
+/// `crate::llama_release`'s download marker with its heartbeat, so
 /// `daemon::ensure_server` leaves a daemon still pulling alive past its
-/// startup budget, as it already does for the release download.
+/// startup budget, as it does for the release download.
 fn with_download_marker<T>(pull: impl FnOnce() -> T) -> T {
     let marker = crate::llama_release::DownloadMarker::create();
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    let out = std::thread::scope(|scope| {
-        let marker = &marker;
-        scope.spawn(move || loop {
-            match done_rx.recv_timeout(std::time::Duration::from_secs(15)) {
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => marker.touch(),
-                _ => return,
-            }
-        });
-        let out = pull();
-        drop(done_tx);
-        out
-    });
-    drop(marker);
-    out
+    marker.set_status("pulling the llama.cpp container image");
+    marker.keep_alive_during(pull)
 }
 
 /// `--llama-cpp-version` as a pin: unset is
@@ -320,5 +433,63 @@ mod tests {
         assert_eq!(container.runtime(), Runtime::Podman);
         assert_eq!(container.ociman(), Some(ContainerManager::Podman));
         assert_eq!(container.llama_server_bin(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lazy_keeps_a_startup_resolution_as_is() {
+        let startup = Resolved::Local {
+            source: Runtime::Path,
+            bin: PathBuf::from("/nonexistent/llama-server"),
+        };
+        // A resolve would fail on this path, proving none is made.
+        let lazy = Lazy::new(Runtime::Bin, Some("b0".into()), Some(startup));
+        assert_eq!(lazy.known().unwrap().runtime(), Runtime::Path);
+        assert_eq!(lazy.ociman().await.unwrap(), None);
+        assert_eq!(
+            lazy.resolve().await.unwrap().llama_server_bin(),
+            Some(&PathBuf::from("/nonexistent/llama-server"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lazy_answers_ociman_without_fetching_under_a_local_runtime() {
+        for requested in [Runtime::Bin, Runtime::Path] {
+            let lazy = Lazy::new(requested, Some("b0".into()), None);
+            assert_eq!(lazy.ociman().await.unwrap(), None);
+            assert!(lazy.known().is_none(), "{requested:?}");
+        }
+        if !cfg!(target_os = "linux") {
+            let lazy = Lazy::new(Runtime::Auto, Some("b0".into()), None);
+            assert_eq!(lazy.ociman().await.unwrap(), None);
+            assert!(lazy.known().is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lazy_does_not_cache_a_failed_resolution() {
+        if cfg!(target_os = "linux") {
+            return;
+        }
+        // Refused before any probe off Linux, so deterministic.
+        let lazy = Lazy::new(Runtime::Docker, None, None);
+        let err = lazy.ociman().await.unwrap_err().to_string();
+        assert!(err.contains("could not be set up"), "{err}");
+        assert!(lazy.known().is_none(), "a failure must not be remembered");
+        assert!(
+            lazy.resolve().await.is_err(),
+            "and the next attempt retries"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lazy_set_replaces_the_resolution() {
+        let lazy = Lazy::new(Runtime::Path, None, None);
+        lazy.set(Resolved::Container(ContainerManager::Docker));
+        assert_eq!(lazy.ociman().await.unwrap(), Some(ContainerManager::Docker));
+        lazy.set(Resolved::Local {
+            source: Runtime::Path,
+            bin: PathBuf::from("/x/llama-server"),
+        });
+        assert_eq!(lazy.resolve().await.unwrap().runtime(), Runtime::Path);
     }
 }

@@ -33,13 +33,12 @@
 use std::io::{self, IsTerminal, Read, Seek, Write};
 use std::path::Path;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use anyhow::Context;
 use base64::Engine as _;
 use clap::Args;
 use futures::TryStreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
@@ -760,14 +759,7 @@ fn start_spinner() -> Option<ProgressBar> {
     if !io::stderr().is_terminal() {
         return None;
     }
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("{spinner} ")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner())
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-    );
-    pb.enable_steady_tick(Duration::from_millis(100));
-    Some(pb)
+    Some(crate::fmt::braille_spinner("{spinner} "))
 }
 
 /// RAII wrapper around `start_spinner`'s result — mirrors ollama's own

@@ -48,11 +48,11 @@ mod types;
 mod webui;
 
 use backend::{
-    find_free_port, local_llama_server_bin, safetensors_engine_from_env,
-    sglang_serve_args_from_env, sglang_served_model_name, spawn_llama_server, spawn_mlx_server,
-    spawn_sglang_server, spawn_vllm_omni_server, spawn_vllm_server, tail_child_output,
-    use_mlx_for_safetensors, vllm_max_model_len, vllm_omni_serve_args_from_env,
-    vllm_serve_args_from_env, wait_for_ready, OutputTail, SafetensorsEngine, POLL_INTERVAL,
+    find_free_port, safetensors_engine_from_env, sglang_serve_args_from_env,
+    sglang_served_model_name, spawn_llama_server, spawn_mlx_server, spawn_sglang_server,
+    spawn_vllm_omni_server, spawn_vllm_server, tail_child_output, use_mlx_for_safetensors,
+    vllm_max_model_len, vllm_omni_serve_args_from_env, vllm_serve_args_from_env, wait_for_ready,
+    OutputTail, SafetensorsEngine, POLL_INTERVAL,
 };
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
 pub use config::DEFAULT_CTX_SIZE;
@@ -73,8 +73,7 @@ use ollama::{
 use openai::{
     handle_openai_chat, handle_openai_completions, handle_openai_embeddings, handle_openai_images,
     handle_openai_models, handle_openai_speech, handle_openai_transcriptions,
-    handle_openai_video_get, handle_openai_videos, proxy_openai_generation,
-    proxy_openai_passthrough, TRANSCRIPTION_BODY_LIMIT_BYTES,
+    handle_openai_video_get, handle_openai_videos, TRANSCRIPTION_BODY_LIMIT_BYTES,
 };
 pub use runtime::Runtime;
 use sched::{
@@ -110,8 +109,8 @@ Environment Variables:
       LLMMAN_METRICS                 Serve a Prometheus scrape endpoint at /metrics (default: off)
       LLMMAN_MODELS                  The path to the models directory
       LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only)
-      LLMMAN_MLX_LM_VERSION          Exact mlx-lm release to install on Apple Silicon (default: PyPI's current)
-      LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on Apple Silicon, installed on first use; else vllm)
+      LLMMAN_MLX_LM_VERSION          Exact mlx-lm release to install on macOS (default: PyPI's current)
+      LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on macOS, installed at startup; else vllm)
       LLMMAN_VLLM_ARGS               Extra whitespace-separated arguments appended to every `vllm serve` (e.g. \"--dtype bfloat16 --tp 2\")
       LLMMAN_SGLANG_ARGS             Extra whitespace-separated arguments appended to every sglang launch (e.g. \"--disable-cuda-graph\")
       LLMMAN_NOHISTORY               Do not record prompts for `llmman log`
@@ -148,8 +147,8 @@ pub struct ServeArgs {
     /// OS/arch/GPU. `path` uses the `llama-server` on PATH and never
     /// downloads anything. `auto` tries docker, podman, bin, path in
     /// turn (off Linux: bin, path). The choice is fetched before the
-    /// listener binds. Safetensors models outside a container use the
-    /// `vllm`/`sglang`/`mlx_lm.server` on PATH.
+    /// listener binds. On macOS `mlx_lm.server` follows the same rule;
+    /// `vllm`/`sglang` come from PATH.
     #[arg(long, value_enum, default_value = "auto", env = "LLMMAN_RUNTIME")]
     pub runtime: Runtime,
 
@@ -178,13 +177,12 @@ pub struct ServeArgs {
     pub sglang_version: Option<String>,
 
     /// Fetch what `--runtime` needs (the container image or the
-    /// `llama-server` release), with its progress on this terminal, then
-    /// exit instead of serving. With a container runtime and an
-    /// already-pulled safetensors MODEL, the vLLM (or SGLang) image is
-    /// fetched too. A plain `serve` does the same fetch at startup, but
-    /// detached with its output in a log file, where a slow first pull
-    /// looks like a hang; run this first and the daemon then starts
-    /// instantly.
+    /// `llama-server` release, plus `uv` and `mlx-lm` on macOS), with its
+    /// progress on this terminal, then exit instead of serving.
+    /// With a container runtime and an already-pulled safetensors MODEL,
+    /// the vLLM (or SGLang) image is fetched too. A plain `serve` does the
+    /// same fetch at startup, detached with its output in a log file; run
+    /// this first and the daemon then starts instantly.
     #[arg(long)]
     pub pull_only: bool,
 
@@ -207,21 +205,15 @@ struct AppState(Arc<Inner>);
 
 struct Inner {
     manager: Mutex<ModelManager>,
-    // None under a container runtime: llama-server then runs in a
-    // container, so no local binary is resolved (or required on PATH) at
-    // all. Behind a mutex because the path resolved at startup can be
-    // deleted while this daemon keeps running (an upgrade/uninstall of
-    // whatever install provided it) — see local_llama_server_bin, which
-    // re-resolves and stores a replacement in that case.
-    llama_server_bin: StdMutex<Option<PathBuf>>,
     // This daemon's own executable path, canonicalized at startup (while
     // it still exists on disk). Reported by /api/version so clients — the
     // CLI's daemon::ensure_server, sbx — can detect a daemon left running
     // after the install that provided its binary was deleted, instead of
     // blindly reusing it.
     exe: Option<PathBuf>,
-    // The concrete `--runtime` (never `Auto`; see runtime::resolve).
-    runtime: Runtime,
+    // `--runtime`, settled with its llama.cpp fetched — at startup, or on
+    // the first load that needs it if that failed.
+    runtime: runtime::Lazy,
     // The llama.cpp pin; None only for `--llama-cpp-version latest`.
     llama_cpp_version: Option<String>,
     // --vllm-version; only meaningful with a container runtime.
@@ -2125,7 +2117,9 @@ async fn ensure_model(
         let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
         // Per load, like use_mlx_for_safetensors, which it gates.
         let safetensors_engine = safetensors_engine_from_env();
-        process = match (&model_path, state.0.runtime.ociman()) {
+        // May fetch llama.cpp if startup could not (runtime::Lazy).
+        let ociman = state.0.runtime.ociman().await?;
+        process = match (&model_path, ociman) {
             (ModelPath::Gguf(path, mmproj), Some(ociman)) => {
                 let mut child = crate::container::spawn(
                     ociman,
@@ -2139,7 +2133,7 @@ async fn ensure_model(
                 ModelProcess::Container(ociman, Engine::LlamaServer, child)
             }
             (ModelPath::Gguf(path, mmproj), None) => {
-                let bin = local_llama_server_bin(state).await?;
+                let bin = state.0.runtime.local_llama_server_bin().await?;
                 let (child, tail) =
                     spawn_llama_server(&bin, path, mmproj.as_deref(), llama_opts).await?;
                 stderr_tail = Some(tail);
@@ -2167,7 +2161,7 @@ async fn ensure_model(
                 oom_retryable = true;
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }
-            // Container runtimes are Linux-only and mlx Metal-only, so
+            // Container runtimes are Linux-only and mlx macOS-only, so
             // this never competes with the mlx arm. vllm unless
             // LLMMAN_SAFETENSORS_ENGINE=sglang.
             (ModelPath::SafeTensors(dir), Some(ociman)) => {
@@ -2250,7 +2244,7 @@ async fn ensure_model(
                 ModelProcess::Local(Engine::Sglang, child, pid)
             }
             (ModelPath::SafeTensors(_dir), None) if use_mlx_for_safetensors() => {
-                let child = spawn_mlx_server(port).await?;
+                let child = spawn_mlx_server(state, port).await?;
                 let pid = child.id();
                 ModelProcess::Local(Engine::Mlx, child, pid)
             }
@@ -3424,42 +3418,8 @@ async fn configured_provider_models(
     }
 }
 
-// -- OpenAI Responses API (/v1/responses) ------------------------------------
-//
-// llama-server (llama.cpp) has its own native /v1/responses implementation
-// that converts a Responses-API request into a Chat Completions request
-// internally (see server_chat_convert_responses_to_chatcmpl in
-// tools/server/server-chat.cpp) — including the exact SSE event sequence
-// Codex requires (response.created -> response.output_item.added ->
-// response.output_text.delta -> ... -> response.completed, no `[DONE]`) and
-// re-mapping of tool_calls into function_call output items. Re-implementing
-// that translation here would just duplicate — and risk drifting out of
-// sync with — llama.cpp's own logic, so for a local backend this is a plain
-// pass-through exactly like the other /v1/* routes above, apart from
-// filter_non_function_tools (see its own doc comment) below. A remote
-// provider without /v1/responses gets the `responses` submodule's own
-// translation instead (see `remote_responses`).
-async fn handle_openai_responses(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, AppError> {
-    proxy_openai_generation(&state, &headers, body, RESPONSES_ROUTE).await
-}
+// -- Upstream SSE conversion -------------------------------------------------
 
-/// The generating Responses route, the one Codex talks to.
-const RESPONSES_ROUTE: &str = "/v1/responses";
-
-/// `/v1/responses` for a remote provider: natively when the provider has
-/// it, as a translated chat completion when it doesn't.
-///
-/// The provider is asked first rather than consulted in a list (models.dev
-/// has no capability data, and a list would go stale). A success is
-/// relayed; a status [`responses::falls_back`] recognises as the route
-/// being missing or broken (anthropic 404s, opencode 500s for non-OpenAI
-/// models) is retried as a chat completion; any other failure is the
-/// provider's own answer about the caller's key or request, relayed
-/// untouched. The retry happens before any body has been relayed.
 /// A converter of one upstream SSE stream into another, line by line:
 /// `responses::StreamConverter` and `messages::StreamConverter`.
 trait SseConverter: Send + 'static {
@@ -3527,96 +3487,7 @@ async fn convert_upstream(
         .unwrap()
 }
 
-async fn remote_responses(
-    client: &Client,
-    target: &Target,
-    headers: &HeaderMap,
-    req: serde_json::Value,
-    activity: ActivityGuard,
-    canonical_model: String,
-) -> Result<Response, AppError> {
-    let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    // The Messages API has no Responses route; skip the 404 round trip.
-    if !target.is_anthropic() {
-        let body =
-            Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
-        let mut native = target.authorize(client.post(target.url(RESPONSES_ROUTE)).body(body));
-        if let Some(ct) = headers.get("content-type") {
-            native = native.header("content-type", ct);
-        }
-        let resp = native
-            .send()
-            .await
-            .with_context(|| format!("proxy request to {}", target.describe()))?;
-        let status = resp.status();
-        if status.is_success() {
-            return if streaming {
-                Ok(relay_stream_rewriting_model(
-                    resp,
-                    activity,
-                    canonical_model,
-                ))
-            } else {
-                relay_rewriting_model(resp, activity, &canonical_model).await
-            };
-        }
-        if !responses::falls_back(status) {
-            return Ok(relay(resp, activity));
-        }
-        eprintln!(
-            "[llmman] {} answered {RESPONSES_ROUTE} with {status}; retrying as a chat completion",
-            target.describe()
-        );
-    }
-
-    let chat_req = responses::from_responses_request(&req)
-        .map_err(|e| AppError(e, StatusCode::BAD_REQUEST))?;
-    let upstream = send_chat_completion(client, target, &chat_req, &canonical_model).await?;
-    let status = upstream.status;
-    if status.is_client_error() {
-        // The provider's own error object, intact for a client that reads it.
-        return Ok(relay_chat_upstream(upstream, activity));
-    }
-    if !status.is_success() {
-        let body = upstream.text().await;
-        return Err(AppError(
-            anyhow!("{} {status}: {body}", target.describe()),
-            remote_status(target, status),
-        ));
-    }
-
-    let converter = responses::StreamConverter::new(&canonical_model, &req);
-    Ok(convert_upstream(upstream.body, activity, converter, streaming).await)
-}
-
-async fn handle_openai_responses_input_tokens(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, AppError> {
-    // A token-counting call, not a generation request — repeat_penalty has
-    // nothing to apply to here.
-    proxy_openai_passthrough(&state, &headers, body, "/v1/responses/input_tokens").await
-}
-
-/// Applies both `/v1/responses` request-shape workarounds below, to a
-/// body already parsed by `resolve_openai_request`.
-///
-/// Local targets only, and applied after the target is known rather than
-/// on the way in: both are workarounds for what *llama-server's*
-/// `/v1/responses` cannot accept. A provider that implements the
-/// Responses API natively accepts the request Codex actually sent, and
-/// forwarding a stripped one would silently cost it `web_search` and
-/// every other non-function tool.
-fn sanitize_responses_request(req: &mut serde_json::Value) {
-    filter_non_function_tools(req);
-    consolidate_responses_instructions(req);
-}
-
-/// The routes [`sanitize_responses_request`] applies to.
-fn is_responses_route(llama_path: &str) -> bool {
-    llama_path.starts_with("/v1/responses")
-}
+// -- Routes a target has no equivalent of ------------------------------------
 
 /// Routes the Messages API has no equivalent of (legacy completions,
 /// embeddings, Responses token counting), refused with a 501 instead of
@@ -3635,7 +3506,9 @@ fn wire_refusal(target: &Target, route: &str) -> Option<String> {
     let Target::Remote(remote) = target else {
         return None;
     };
-    if remote.wire != Wire::Anthropic || matches!(route, CHAT_COMPLETIONS_ROUTE | RESPONSES_ROUTE) {
+    if remote.wire != Wire::Anthropic
+        || matches!(route, CHAT_COMPLETIONS_ROUTE | responses::RESPONSES_ROUTE)
+    {
         return None;
     }
     Some(format!(
@@ -3649,12 +3522,13 @@ fn wire_refusal(target: &Target, route: &str) -> Option<String> {
 ///
 /// Being OpenAI-wire-format does not mean implementing every OpenAI
 /// route: `openai`, `groq` and `openrouter` answer `/v1/responses*`,
-/// `mistral` 404s. Generation is bridged by [`remote_responses`], so
-/// this only fires for `/v1/responses/input_tokens`, which has no
-/// chat-completions equivalent. It reports the 404 actually received
-/// rather than predicting one from a list that would go stale.
+/// `mistral` 404s. Generation is bridged by
+/// [`responses::remote_responses`], so this only fires for
+/// `/v1/responses/input_tokens`, which has no chat-completions
+/// equivalent. It reports the 404 actually received rather than
+/// predicting one from a list that would go stale.
 fn explain_missing_route(target: &Target, route: &str, resp: Response) -> Response {
-    if resp.status() != StatusCode::NOT_FOUND || !is_responses_route(route) {
+    if resp.status() != StatusCode::NOT_FOUND || !responses::is_responses_route(route) {
         return resp;
     }
     // A 404 on any other route means something else entirely — an
@@ -3676,106 +3550,6 @@ fn explain_missing_route(target: &Target, route: &str, resp: Response) -> Respon
         }
     });
     (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()
-}
-
-/// Strips any entry from the request's top-level `tools` array whose
-/// `"type"` isn't `"function"` before proxying to llama-server.
-///
-/// Real Codex always includes Responses-API tool types llama-server's own
-/// `/v1/responses` doesn't understand — a `"namespace"`-typed sub-agent
-/// tool bundle, the bare `{"type":"web_search"}` entry, etc. — and, unlike
-/// this module's other passthrough routes, llama-server hard-rejects the
-/// *entire* request the moment even one such entry is present ("'type' of
-/// tool must be 'function'"), rather than skipping just that entry. Since
-/// Codex's own default toolset always includes at least one of these,
-/// every real `codex`/`codex exec` invocation would 400 on its very first
-/// turn without this filter. Nested sub-tools inside a dropped
-/// `"namespace"` entry (e.g. its own agent-management functions) are
-/// dropped along with it rather than hoisted to the top level: the local
-/// model losing access to those secondary tools is harmless, whereas
-/// guessing how to flatten them would risk silently changing their
-/// semantics.
-fn filter_non_function_tools(req: &mut serde_json::Value) {
-    if let Some(tools) = req.get_mut("tools").and_then(|t| t.as_array_mut()) {
-        tools.retain(|t| t.get("type").and_then(|v| v.as_str()) == Some("function"));
-    }
-}
-
-/// Folds every `developer`/`system`-role item out of the request's `input`
-/// array into the top-level `instructions` string, removing them from
-/// `input`, before proxying to llama-server.
-///
-/// llama-server's own `/v1/responses` → chat-completions conversion
-/// (`server_chat_convert_responses_to_chatcmpl` in llama.cpp's
-/// `tools/server/server-chat.cpp`) unconditionally prepends one
-/// `system`-role chat message built from `instructions`, but otherwise
-/// forwards every `input` item's `role` field untouched. A later,
-/// model-agnostic pass in llama.cpp's own chat-template layer
-/// (`workaround::map_developer_role_to_system` in `common/chat.cpp`) then
-/// unconditionally rewrites *every* remaining `role: "developer"` message
-/// to `role: "system"`, wherever it sits in the array, with no
-/// repositioning or merging. Real Codex requests routinely carry a
-/// `developer`-role item further into `input` (permissions/skills
-/// instructions) alongside the top-level `instructions` string, which
-/// after that rewrite leaves two `system`-role messages in the
-/// chat-completions request llama-server builds — the second one not at
-/// index 0, which strict chat templates (Qwen3.5's included) reject
-/// outright with "System message must be at the beginning". This is a
-/// confirmed, currently-unresolved upstream llama.cpp gap (e.g.
-/// ggml-org/llama.cpp#20733, ggml-org/llama.cpp#23423; a fix was proposed
-/// and abandoned in ggml-org/llama.cpp#20079) rather than anything this
-/// module's own /v1/messages-style message-building does, so it can't be
-/// fixed the same way — this route is a pass-through by design (see the
-/// module doc comment above). Folding every developer/system input item
-/// into `instructions` here instead keeps the request in a shape
-/// llama-server can never turn into more than one system message,
-/// regardless of that upstream gap.
-fn consolidate_responses_instructions(req: &mut serde_json::Value) {
-    let mut instructions = req
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    if let Some(input) = req.get_mut("input").and_then(|v| v.as_array_mut()) {
-        input.retain(|item| {
-            let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            if role != "developer" && role != "system" {
-                return true;
-            }
-            if let Some(text) = responses_input_item_text(item) {
-                if !text.is_empty() {
-                    if !instructions.is_empty() {
-                        instructions.push_str("\n\n");
-                    }
-                    instructions.push_str(&text);
-                }
-            }
-            false
-        });
-    }
-
-    if !instructions.is_empty() {
-        req["instructions"] = serde_json::Value::String(instructions);
-    }
-}
-
-/// Extracts the plain text of a Responses-API `input` message item —
-/// `content` is either a bare string or an array of blocks (each with a
-/// `"text"` field, e.g. `{"type":"input_text","text":"..."}`), the same
-/// two shapes Anthropic's own message content takes.
-fn responses_input_item_text(item: &serde_json::Value) -> Option<String> {
-    match item.get("content")? {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Array(blocks) => Some(
-            blocks
-                .iter()
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join(""),
-        ),
-        _ => None,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4228,7 +4002,8 @@ async fn spawn_mediagen_backend(
     cmd.args(["serve", model_ref, "--port", &port.to_string()]);
     // Explicit, so the child lands on the same build as this daemon
     // rather than re-resolving `auto`/the default pin/LLMMAN_RUNTIME.
-    cmd.args(["--runtime", state.0.runtime.as_str()]);
+    let runtime = state.0.runtime.resolve().await?.runtime();
+    cmd.args(["--runtime", runtime.as_str()]);
     cmd.args([
         "--llama-cpp-version",
         state.0.llama_cpp_version.as_deref().unwrap_or("latest"),
@@ -4285,10 +4060,10 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
             post(handle_openai_transcriptions)
                 .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
         )
-        .route("/v1/responses", post(handle_openai_responses))
+        .route("/v1/responses", post(responses::handle_openai_responses))
         .route(
             "/v1/responses/input_tokens",
-            post(handle_openai_responses_input_tokens),
+            post(responses::handle_openai_responses_input_tokens),
         )
         // OpenAI media generation (crate::mediagen::server)
         .route("/v1/images/generations", post(handle_openai_images))
@@ -4391,8 +4166,7 @@ fn metrics_router(enabled: bool) -> Router<AppState> {
 /// Which image `--pull-only` warms up under a container runtime: the one
 /// `ensure_model` would run for `model` (read off its stored manifest),
 /// or llama-server's when no model is named — pulling both would cost a
-/// GGUF-only host the vLLM image's several GB for nothing. A `Vllm`
-/// answer under a local runtime on Apple Silicon means `mlx-lm`.
+/// GGUF-only host the vLLM image's several GB for nothing.
 fn pull_only_engine(model: Option<&str>) -> anyhow::Result<crate::container::ContainerEngine> {
     // Same guard as the pre-load below: a pair warms its local half, a
     // provider-routed reference has no local weights.
@@ -4423,28 +4197,64 @@ fn pull_only_engine(model: Option<&str>) -> anyhow::Result<crate::container::Con
 
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let requested = _args.runtime;
-    // On Apple Silicon a safetensors MODEL is served by mlx_lm.server,
-    // installed on first use; `--pull-only` does that install too.
-    let pull_only_mlx = _args.pull_only
-        && use_mlx_for_safetensors()
-        && pull_only_engine(_args.model.as_deref())? == crate::container::ContainerEngine::Vllm;
-    if requested == Runtime::Path && _args.pull_only && !pull_only_mlx {
-        anyhow::bail!("--pull-only: --runtime path runs the llama-server on PATH; nothing to pull");
+    // On macOS, mlx_lm.server is sourced the way llama-server is: own
+    // install under `bin`/`auto` (the latter with a PATH fallback), PATH
+    // alone under `path`. Container runtimes never reach mlx.
+    let installs_mlx = match backend::mlx_source(requested) {
+        Some(fallback) if use_mlx_for_safetensors() && requested.ociman().is_none() => {
+            Some(fallback)
+        }
+        _ => None,
+    };
+    if requested == Runtime::Path && _args.pull_only {
+        anyhow::bail!("--pull-only: --runtime path runs what is on PATH; nothing to pull");
     }
     let llama_cpp_version = runtime::llama_cpp_pin(_args.llama_cpp_version.as_deref());
 
     // Settle `--runtime` and fetch its llama.cpp before anything binds,
     // so the first request is never stuck behind a silent download (this
     // process is normally detached with its stdio in a log file).
-    // `--pull-only` is this step alone. Blocking, hence spawn_blocking.
+    // `--pull-only` is this step alone. A failure is fatal only there:
+    // otherwise the daemon starts and the first load that needs llama.cpp
+    // retries (runtime::Lazy).
     let resolved = {
         let pin = llama_cpp_version.clone();
         tokio::task::spawn_blocking(move || runtime::resolve(requested, pin.as_deref()))
             .await
-            .context("resolve runtime task panicked")??
+            .context("resolve runtime task panicked")?
     };
+    let resolved = match resolved {
+        Ok(resolved) => Some(resolved),
+        Err(e) if _args.pull_only => return Err(e),
+        Err(e) => {
+            eprintln!(
+                "[llmman] warning: could not set up the llama.cpp runtime at startup ({e:#}); \
+                 the first model load that needs it will retry"
+            );
+            None
+        }
+    };
+    let runtime = runtime::Lazy::new(requested, llama_cpp_version.clone(), resolved);
+
+    // Likewise uv and mlx-lm, with the same failure policy.
+    if let Some(fallback) = installs_mlx {
+        let installed =
+            tokio::task::spawn_blocking(move || crate::mlx_release::ensure_mlx_server(fallback))
+                .await
+                .context("ensure mlx_lm.server task panicked")?;
+        match installed {
+            Ok(_) => {}
+            Err(e) if _args.pull_only => return Err(e.context("install mlx-lm")),
+            Err(e) => eprintln!(
+                "[llmman] warning: could not install mlx-lm at startup ({e:#}); \
+                 the first safetensors model load will retry it"
+            ),
+        }
+    }
+
     if _args.pull_only {
-        if let Some(ociman) = resolved.ociman() {
+        // Resolved for certain: a failure returned above.
+        if let Some(ociman) = runtime.known().and_then(|r| r.ociman()) {
             // resolve() pulled the llama.cpp image; a safetensors MODEL
             // needs vLLM's (or SGLang's) too.
             let engine = pull_only_engine(_args.model.as_deref())?;
@@ -4459,15 +4269,9 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             if let Some(version) = version {
                 crate::container::pull_image(ociman, engine, version)?;
             }
-        } else if pull_only_mlx {
-            tokio::task::spawn_blocking(crate::mlx_release::ensure_mlx_server)
-                .await
-                .context("ensure mlx_lm.server task panicked")??;
         }
         return Ok(());
     }
-    let llama_server_bin = resolved.llama_server_bin().cloned();
-    let runtime = resolved.runtime();
     let store_path = default_store()?;
     let cache_path = crate::default_cache()?;
     std::fs::create_dir_all(&cache_path)?;
@@ -4532,7 +4336,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     } else if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         eprintln!("[llmman] LLAMA_ARG_THREADS set: leaving llama-server thread count to it");
     }
-    if let (Some(n), Some(_)) = (cpu_limit, runtime.ociman()) {
+    if let (Some(n), Some(_)) = (cpu_limit, runtime.known().and_then(|r| r.ociman())) {
         eprintln!("[llmman] backend container gets --cpus {n} (this daemon's own CPU limit)");
     }
 
@@ -4577,7 +4381,6 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             running: HashMap::new(),
             pending_loads: 0,
         }),
-        llama_server_bin: StdMutex::new(llama_server_bin),
         // Canonicalized now, while the file certainly still exists —
         // resolving later (in the handler) could fail once the install is
         // deleted, exactly the situation /api/version exists to expose.

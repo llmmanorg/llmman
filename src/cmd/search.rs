@@ -25,8 +25,8 @@ use crate::hf;
 /// protocol, so it doesn't go through the Go shim.
 const DOCKER_HUB_SEARCH_URL: &str = "https://hub.docker.com/api/search/v4";
 
-/// Docker Hub's search API rejects a page larger than 100.
-const MAX_LIMIT: u32 = 100;
+/// Page size requested from Docker Hub, and the cap on `--limit`.
+const MAX_LIMIT: u32 = 64;
 
 /// The manifest media type of a CNCF ModelPack artifact.
 const MODELPACK_MANIFEST: &str = "application/vnd.cncf.model.manifest.v1+json";
@@ -164,32 +164,54 @@ impl HubResult {
     }
 }
 
-/// Fetches Hub's largest page regardless of `limit`: `type=model` also
-/// matches Model Runner-only repos, which [`docker_hub_hits`] drops (most
-/// of them, today), so the cut to `limit` happens after filtering.
+/// Two Hub queries, merged: `type=model` only matches repos carrying
+/// Model Runner's media type, so it misses ModelPack-only repos like
+/// `ai/qwen3.8`; the unfiltered query finds those. Both are sorted by
+/// pulls, since Hub's relevance order puts every `<user>/qwen` image
+/// ahead of `ai/qwen3.8`. Each fetches a full page since
+/// [`docker_hub_hits`] drops most rows before the cut to `limit`. One
+/// failing page is tolerated.
 async fn search_docker_hub(client: &reqwest::Client, query: &str, limit: u32) -> Result<Vec<Hit>> {
-    let size = MAX_LIMIT.to_string();
-    let url = reqwest::Url::parse_with_params(
-        DOCKER_HUB_SEARCH_URL,
-        [
-            ("query", query),
-            ("type", "model"),
-            ("from", "0"),
-            ("size", size.as_str()),
-        ],
-    )
-    .context("build Docker Hub search URL")?;
-    let parsed: HubSearchResponse = hf::api::get_json(client, url.as_str(), None)
-        .await
-        .context("Docker Hub model search")?;
-    Ok(docker_hub_hits(parsed, limit))
+    let page = |kind| async move {
+        let url = docker_hub_search_url(query, kind)?;
+        hf::api::get_json::<HubSearchResponse>(client, url.as_str(), None).await
+    };
+    let (typed, untyped) = tokio::join!(page(Some("model")), page(None));
+    let pages = match (typed, untyped) {
+        (Ok(a), Ok(b)) => vec![a, b],
+        (Ok(a), Err(_)) | (Err(_), Ok(a)) => vec![a],
+        (Err(e), Err(_)) => return Err(e.context("Docker Hub model search")),
+    };
+    Ok(docker_hub_hits(pages, limit))
 }
 
-fn docker_hub_hits(response: HubSearchResponse, limit: u32) -> Vec<Hit> {
-    response
-        .results
+/// One page, most pulled first, optionally limited to a Hub `type`.
+fn docker_hub_search_url(query: &str, kind: Option<&'static str>) -> Result<reqwest::Url> {
+    let size = MAX_LIMIT.to_string();
+    let mut params = vec![
+        ("query", query),
+        ("from", "0"),
+        ("size", size.as_str()),
+        ("sort", "pull_count"),
+        ("order", "desc"),
+    ];
+    params.extend(kind.map(|k| ("type", k)));
+    reqwest::Url::parse_with_params(DOCKER_HUB_SEARCH_URL, params)
+        .context("build Docker Hub search URL")
+}
+
+/// Filters and merges Hub pages, dropping repeats, most pulled first;
+/// stable, so ties keep Hub's order.
+fn docker_hub_hits(pages: Vec<HubSearchResponse>, limit: u32) -> Vec<Hit> {
+    let mut seen = std::collections::HashSet::new();
+    let mut rows: Vec<HubResult> = pages
         .into_iter()
+        .flat_map(|r| r.results)
         .filter(|r| !r.archived && r.is_modelpack())
+        .filter(|r| seen.insert(r.name.clone()))
+        .collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.raw_pull_count.unwrap_or(0)));
+    rows.into_iter()
         .take(limit as usize)
         .map(|r| {
             // Hub omits the official namespace; a pullable reference needs it.
@@ -290,12 +312,31 @@ fn render(hits: &[Hit]) -> String {
 mod tests {
     use super::*;
 
-    /// Hub's `type=model` response shape, plus rows that must not print:
-    /// Model Runner-only, archived, a container image, and one past
-    /// `limit`.
+    /// Relevance order buries `ai/qwen3.8` under `<user>/qwen` images;
+    /// both pages must ask for pull-count order.
+    #[test]
+    fn docker_hub_search_url_sorts_by_pulls() {
+        for (kind, suffix) in [(Some("model"), "&type=model"), (None, "")] {
+            let url = docker_hub_search_url("qwen", kind).unwrap();
+            assert_eq!(
+                url.as_str(),
+                format!(
+                    "{DOCKER_HUB_SEARCH_URL}?query=qwen&from=0&size=64\
+                     &sort=pull_count&order=desc{suffix}"
+                )
+            );
+        }
+    }
+
+    /// A `type=model` page and an unfiltered page, plus rows that must
+    /// not print: Model Runner-only, archived, a container image, a raw
+    /// Hugging Face mirror, one repeated across pages, and one past
+    /// `limit`. ModelPack-only `ai/qwen3.8` appears only on the
+    /// unfiltered page and must print, ranked by pulls among the first
+    /// page's rows.
     #[test]
     fn docker_hub_rows_become_pullable_references() {
-        let body = r#"{"total": 6, "results": [
+        let typed = r#"{"total": 4, "results": [
             {"name": "ai/qwen3", "short_description": "Qwen3 LLM", "star_count": 210,
              "pull_count": "500K+", "raw_pull_count": 614283,
              "updated_at": "2026-08-17T14:03:18.618971Z", "archived": false,
@@ -305,23 +346,48 @@ mod tests {
             {"name": "ai/qwen2.5", "star_count": 13, "raw_pull_count": 163532,
              "media_types": ["application/vnd.docker.ai.model.config.v0.1+json"],
              "content_types": ["model"]},
-            {"name": "official-thing", "star_count": 1,
-             "media_types": ["application/vnd.cncf.model.manifest.v1+json"]},
+            {"name": "ai/qwen3-embedding", "star_count": 1, "raw_pull_count": 74850,
+             "media_types": ["application/vnd.cncf.model.manifest.v1+json",
+                             "application/vnd.docker.ai.model.config.v0.1+json"],
+             "content_types": ["model"]},
             {"name": "ai/old", "archived": true, "star_count": 0,
-             "media_types": ["application/vnd.cncf.model.manifest.v1+json"]},
-            {"name": "library/nginx", "star_count": 99999,
+             "media_types": ["application/vnd.cncf.model.manifest.v1+json",
+                             "application/vnd.docker.ai.model.config.v0.1+json"],
+             "content_types": ["model"]}
+        ]}"#;
+        let untyped = r#"{"total": 6, "results": [
+            {"name": "ai/qwen3", "star_count": 210, "raw_pull_count": 614283,
+             "media_types": ["application/vnd.cncf.model.manifest.v1+json",
+                             "application/vnd.docker.ai.model.config.v0.1+json"],
+             "content_types": ["model"]},
+            {"name": "library/nginx", "star_count": 99999, "raw_pull_count": 9999999,
              "media_types": ["application/vnd.docker.distribution.manifest.v2+json"],
              "content_types": ["image"]},
+            {"name": "ai/qwen3.8", "star_count": 4, "raw_pull_count": 98764,
+             "media_types": ["application/vnd.cncf.model.manifest.v1+json"],
+             "content_types": ["unrecognized"]},
+            {"name": "someone/qwen3.8-27b", "star_count": 0, "raw_pull_count": 90000,
+             "media_types": ["application/vnd.huggingface.model.v1"],
+             "content_types": ["unrecognized"]},
+            {"name": "official-thing", "star_count": 1,
+             "media_types": ["application/vnd.cncf.model.manifest.v1+json"]},
             {"name": "ai/third", "star_count": 0,
              "media_types": ["application/vnd.cncf.model.manifest.v1+json"]}
         ]}"#;
-        let parsed: HubSearchResponse = serde_json::from_str(body).unwrap();
-        let hits = docker_hub_hits(parsed, 2);
+        let typed: HubSearchResponse = serde_json::from_str(typed).unwrap();
+        let untyped: HubSearchResponse = serde_json::from_str(untyped).unwrap();
+        let hits = docker_hub_hits(vec![typed, untyped], 4);
         let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
-        // A bare name is the official `library/` namespace.
+        // A bare name is the official `library/` namespace. Rows with no
+        // pull count sort last, keeping Hub's order among themselves.
         assert_eq!(
             names,
-            ["docker.io/ai/qwen3", "docker.io/library/official-thing"]
+            [
+                "docker.io/ai/qwen3",
+                "docker.io/ai/qwen3.8",
+                "docker.io/ai/qwen3-embedding",
+                "docker.io/library/official-thing"
+            ]
         );
         assert_eq!(
             hits[0],
@@ -332,8 +398,8 @@ mod tests {
                 updated: Some("2026-08-17T14:03:18.618971Z".into()),
             }
         );
-        assert_eq!(hits[1].pulls, None);
-        assert_eq!(hits[1].updated, None);
+        assert_eq!(hits[3].pulls, None);
+        assert_eq!(hits[3].updated, None);
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub mod hostgpu;
 pub mod hybrid;
 pub mod imagegen;
 pub mod llama_release;
+pub(crate) mod managed;
 pub mod mediagen;
 pub mod metrics;
 pub mod mlx_release;
@@ -45,10 +46,10 @@ pub fn default_store() -> anyhow::Result<PathBuf> {
 
 /// `~/.local/share/llmman` (`%LOCALAPPDATA%\llmman` on Windows): the
 /// parent of the default store and of everything else llmman keeps on
-/// disk for itself — the `llama-server` release cache
-/// (`llama_release`), the `uv` binary and `mlx-lm` environment
-/// (`mlx_release`). Not affected by `LLMMAN_MODELS`, which relocates
-/// only the store.
+/// disk for itself — the `llama.cpp` release (`llama_release`), the
+/// `uv` binary and `mlx-lm` environment (`mlx_release`), each in the
+/// shape `managed` describes. Not affected by `LLMMAN_MODELS`, which
+/// relocates only the store.
 pub fn data_root() -> anyhow::Result<PathBuf> {
     #[cfg(not(target_os = "windows"))]
     let base = dirs::home_dir()
