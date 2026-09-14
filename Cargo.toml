@@ -63,6 +63,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 # ConPTY, and its default program is already "the user's login shell".
 portable-pty = "0.9"
 libc       = "0.2"
+nix = { version = "0.29", features = ["user"] }
 tokio-util = { version = "0.7", features = ["io"] }
 toml       = { version = "0.8", default-features = false, features = ["parse"] }
 # `llmman config set` edits a file people also hand-edit, so comments and

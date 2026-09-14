@@ -551,8 +551,8 @@ jobs:
         run: go test -tags "$PODMAN_TAGS" ./...
 
   # --------------------------------------------------------------------------
-  # E2E: `llmman launch <claude|agy|opencode|codex|qwen|hermes|openclaw|dsh> --model
-  # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
+  # E2E: `llmman launch <claude|opencode|codex|qwen|hermes|openclaw|vibe>
+  # --model qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
   # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
   # (same runners, same msvc-arch/rustflags choices), so the launch/env/
@@ -582,15 +582,14 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/agy/opencode/codex/qwen/hermes/openclaw/dsh, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/opencode/codex/qwen/hermes/openclaw/vibe, vllm-plugin, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
     # push event that leads to a release: a push to main — see the
     # `release` job's own `needs`, which includes this job for exactly
-    # that reason, and its own identical `if:` condition below — or when
-    # dispatched by hand on a branch (see `workflow_dispatch` above).
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    # that reason, and its own identical `if:` condition below.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     # 7 tests run serialized (--test-threads=1 + lock_serial()), so the
     # worst case sums all 7's own retry budgets: MAX_ATTEMPTS * TIMEOUT
     # (3 * 600s = 30 min) each — a timeout itself never retries (see
@@ -614,15 +613,7 @@ jobs:
     # is always a deterministic llmman bug worth failing loudly on, not
     # small-model sampling variance), so unlike the 7 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
-    #
-    # +60 more (400 total) for `serve_vllm_safetensors_model` and
-    # `serve_sglang_safetensors_model` (20 min each, no retries, like the
-    # mlx test) and "Install SGLang (e2e)"'s 40-minute budget.
-    timeout-minutes: 400
-    env:
-      # These tests are about the llama-server "Install llama-server" puts
-      # on PATH, which `--runtime auto` would try docker before.
-      LLMMAN_RUNTIME: path
+    timeout-minutes: 340
     strategy:
       fail-fast: false
       matrix:
@@ -950,6 +941,48 @@ jobs:
           export OPENCODE_CONFIG_CONTENT='{"$schema":"https://opencode.ai/config.json","provider":{"ollama":{"npm":"@ai-sdk/openai-compatible","name":"Ollama","options":{"baseURL":"http://127.0.0.1:1/v1"},"models":{"warmup":{"name":"warmup"}}}},"model":"ollama/warmup"}'
           command -v opencode >/dev/null && timeout --kill-after=10 45 opencode run "hi" --print-logs --log-level DEBUG || true
           [ "$RUNNER_OS" = Windows ] && taskkill //F //T //IM opencode.exe || true
+
+      # ── vibe (Mistral Vibe CLI) ──────────────────────────────────────────
+      # Installed via uv, not npm: vibe is a Python package (`mistral-vibe`
+      # on PyPI), unlike the five Node-based CLIs above. Pinned to 2.25.0,
+      # not the latest release — tests/launch_e2e.rs's own
+      # `launch_vibe_with_model` test was verified against exactly this
+      # version, so an unpinned upgrade could silently change Vibe's own
+      # CLI flags or config format under it with no warning here (the same
+      # reasoning as the qwen/openclaw pins above).
+      #
+      # Installed, and put on PATH, before "Install llama-server"/this
+      # job's "cargo test --test launch_e2e" below spawns the one shared
+      # `llmman serve` daemon every test in that file reuses — same
+      # ordering constraint as "Install mlx-lm" further down (see that
+      # step's own comment): PATH is fixed at that daemon's own spawn
+      # time, so installing vibe any later would leave it unable to find
+      # `vibe` for the rest of this job.
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      # UV_TOOL_BIN_DIR is set explicitly rather than relying on uv's own
+      # per-platform default (`~/.local/bin` on Unix; a location that,
+      # unlike that default, needs no separate PATH registration on
+      # Windows — see astral-sh/setup-uv#83): one fixed location under
+      # `runner.temp` resolves the same way on every OS this job runs on,
+      # so only the "add it to PATH" step below has to differ by platform,
+      # not this one.
+      - name: Install Mistral Vibe CLI
+        shell: bash
+        env:
+          UV_TOOL_BIN_DIR: ${{ runner.temp }}/uv-tool-bin
+        run: uv tool install mistral-vibe==2.25.0
+
+      - name: Add vibe to PATH (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: echo "${{ runner.temp }}/uv-tool-bin" >> "$GITHUB_PATH"
+
+      - name: Add vibe to PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: echo "${{ runner.temp }}\uv-tool-bin" >> $env:GITHUB_PATH
 
       # ── llama-server (the inference backend `llmman serve` shells out to) ──
       # A prebuilt release straight from upstream llama.cpp, pinned so CI
