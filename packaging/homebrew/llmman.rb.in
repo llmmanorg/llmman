@@ -37,6 +37,19 @@ class Llmman < Formula
     bin.install Dir["llmman-*"].first => "llmman"
   end
 
+  # `serve` runs in the foreground and logs to stderr, so launchd/systemd
+  # can own it directly. See README.md for usage.
+  service do
+    run [opt_bin/"llmman", "serve"]
+    keep_alive true
+    # Launchd's default PATH omits the Homebrew prefix, where docker/podman
+    # and llama-server usually live.
+    environment_variables PATH: std_service_path_env
+    working_dir var
+    log_path var/"log/llmman.log"
+    error_log_path var/"log/llmman.log"
+  end
+
   test do
     # CI writes this version into Cargo.toml before building, so the
     # binary reports it.
