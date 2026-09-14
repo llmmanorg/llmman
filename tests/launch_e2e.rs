@@ -77,13 +77,14 @@
 //!     entries llama-server's `/v1/responses` rejects outright
 //!     (`"'type' of tool must be 'function'"` for a `"namespace"`-typed
 //!     sub-agent tool bundle, and for the bare `{"type":"web_search"}`
-//!     entry) — fixed in `cmd::serve::filter_non_function_tools`. Real
-//!     `codex exec` also always carries a `developer`-role item alongside
-//!     its top-level `instructions`, which llama-server's own Responses
+//!     entry) — fixed in
+//!     `cmd::serve::responses::filter_non_function_tools`. Real `codex
+//!     exec` also always carries a `developer`-role item alongside its
+//!     top-level `instructions`, which llama-server's own Responses
 //!     conversion turns into a second, misplaced `system`-role chat
 //!     message (a confirmed, unresolved upstream llama.cpp gap — see
 //!     ggml-org/llama.cpp#20733/#23423) — fixed in
-//!     `cmd::serve::consolidate_responses_instructions`.
+//!     `cmd::serve::responses::consolidate_responses_instructions`.
 
 use std::collections::VecDeque;
 use std::io::Read;
