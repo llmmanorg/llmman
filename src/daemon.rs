@@ -507,7 +507,7 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     let mut child = cmd.spawn().context("spawn llmman serve")?;
 
     // On its first start the daemon fetches its backends (llama.cpp; uv
-    // and mlx-lm on Apple Silicon) before it binds, which can run well
+    // and mlx-lm on macOS) before it binds, which can run well
     // past STARTUP_BUDGET. While a fetch is visibly live, keep waiting
     // and show what it is doing: stopping the daemon would discard the
     // partial work. The budget is the time spent neither listening nor
@@ -527,8 +527,9 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
             return Ok(());
         }
         // The daemon is in its own process group but still our child, so
-        // try_wait catches an immediate startup failure (e.g. llama-server
-        // auto-download failing) instead of polling a dead port for 60s.
+        // try_wait catches an immediate startup failure (a bad LLMMAN_HOST,
+        // say; a failed backend fetch is only a warning there) instead of
+        // polling a dead port for 60s.
         bail_if_exited(&mut child, log_path.as_deref())?;
         match crate::llama_release::download_status() {
             Some(status) => {
@@ -558,7 +559,7 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     if crate::llama_release::download_in_progress() {
         anyhow::bail!(
             "llmman serve did not start within {}s: startup is still fetching an inference \
-             backend (llama.cpp, or mlx-lm on Apple Silicon). The daemon was left running \
+             backend (llama.cpp, or mlx-lm on macOS). The daemon was left running \
              so it can finish; retry this command once it does{}",
             STARTUP_BUDGET.as_secs(),
             log_tail(log_path.as_deref())

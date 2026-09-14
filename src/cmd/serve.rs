@@ -48,11 +48,11 @@ mod types;
 mod webui;
 
 use backend::{
-    find_free_port, local_llama_server_bin, safetensors_engine_from_env,
-    sglang_serve_args_from_env, sglang_served_model_name, spawn_llama_server, spawn_mlx_server,
-    spawn_sglang_server, spawn_vllm_omni_server, spawn_vllm_server, tail_child_output,
-    use_mlx_for_safetensors, vllm_max_model_len, vllm_omni_serve_args_from_env,
-    vllm_serve_args_from_env, wait_for_ready, OutputTail, SafetensorsEngine, POLL_INTERVAL,
+    find_free_port, safetensors_engine_from_env, sglang_serve_args_from_env,
+    sglang_served_model_name, spawn_llama_server, spawn_mlx_server, spawn_sglang_server,
+    spawn_vllm_omni_server, spawn_vllm_server, tail_child_output, use_mlx_for_safetensors,
+    vllm_max_model_len, vllm_omni_serve_args_from_env, vllm_serve_args_from_env, wait_for_ready,
+    OutputTail, SafetensorsEngine, POLL_INTERVAL,
 };
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
 pub use config::DEFAULT_CTX_SIZE;
@@ -109,8 +109,8 @@ Environment Variables:
       LLMMAN_METRICS                 Serve a Prometheus scrape endpoint at /metrics (default: off)
       LLMMAN_MODELS                  The path to the models directory
       LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only)
-      LLMMAN_MLX_LM_VERSION          Exact mlx-lm release to install on Apple Silicon (default: PyPI's current)
-      LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on Apple Silicon, installed at startup; else vllm)
+      LLMMAN_MLX_LM_VERSION          Exact mlx-lm release to install on macOS (default: PyPI's current)
+      LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on macOS, installed at startup; else vllm)
       LLMMAN_VLLM_ARGS               Extra whitespace-separated arguments appended to every `vllm serve` (e.g. \"--dtype bfloat16 --tp 2\")
       LLMMAN_SGLANG_ARGS             Extra whitespace-separated arguments appended to every sglang launch (e.g. \"--disable-cuda-graph\")
       LLMMAN_NOHISTORY               Do not record prompts for `llmman log`
@@ -147,8 +147,8 @@ pub struct ServeArgs {
     /// OS/arch/GPU. `path` uses the `llama-server` on PATH and never
     /// downloads anything. `auto` tries docker, podman, bin, path in
     /// turn (off Linux: bin, path). The choice is fetched before the
-    /// listener binds. Safetensors models outside a container use the
-    /// `vllm`/`sglang`/`mlx_lm.server` on PATH.
+    /// listener binds. On macOS `mlx_lm.server` follows the same rule;
+    /// `vllm`/`sglang` come from PATH.
     #[arg(long, value_enum, default_value = "auto", env = "LLMMAN_RUNTIME")]
     pub runtime: Runtime,
 
@@ -177,8 +177,8 @@ pub struct ServeArgs {
     pub sglang_version: Option<String>,
 
     /// Fetch what `--runtime` needs (the container image or the
-    /// `llama-server` release, plus `uv` and `mlx-lm` on Apple Silicon),
-    /// with its progress on this terminal, then exit instead of serving.
+    /// `llama-server` release, plus `uv` and `mlx-lm` on macOS), with its
+    /// progress on this terminal, then exit instead of serving.
     /// With a container runtime and an already-pulled safetensors MODEL,
     /// the vLLM (or SGLang) image is fetched too. A plain `serve` does the
     /// same fetch at startup, detached with its output in a log file; run
@@ -205,21 +205,15 @@ struct AppState(Arc<Inner>);
 
 struct Inner {
     manager: Mutex<ModelManager>,
-    // None under a container runtime: llama-server then runs in a
-    // container, so no local binary is resolved (or required on PATH) at
-    // all. Behind a mutex because the path resolved at startup can be
-    // deleted while this daemon keeps running (an upgrade/uninstall of
-    // whatever install provided it) — see local_llama_server_bin, which
-    // re-resolves and stores a replacement in that case.
-    llama_server_bin: StdMutex<Option<PathBuf>>,
     // This daemon's own executable path, canonicalized at startup (while
     // it still exists on disk). Reported by /api/version so clients — the
     // CLI's daemon::ensure_server, sbx — can detect a daemon left running
     // after the install that provided its binary was deleted, instead of
     // blindly reusing it.
     exe: Option<PathBuf>,
-    // The concrete `--runtime` (never `Auto`; see runtime::resolve).
-    runtime: Runtime,
+    // `--runtime`, settled with its llama.cpp fetched — at startup, or on
+    // the first load that needs it if that failed.
+    runtime: runtime::Lazy,
     // The llama.cpp pin; None only for `--llama-cpp-version latest`.
     llama_cpp_version: Option<String>,
     // --vllm-version; only meaningful with a container runtime.
@@ -2123,7 +2117,9 @@ async fn ensure_model(
         let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
         // Per load, like use_mlx_for_safetensors, which it gates.
         let safetensors_engine = safetensors_engine_from_env();
-        process = match (&model_path, state.0.runtime.ociman()) {
+        // May fetch llama.cpp if startup could not (runtime::Lazy).
+        let ociman = state.0.runtime.ociman().await?;
+        process = match (&model_path, ociman) {
             (ModelPath::Gguf(path, mmproj), Some(ociman)) => {
                 let mut child = crate::container::spawn(
                     ociman,
@@ -2137,7 +2133,7 @@ async fn ensure_model(
                 ModelProcess::Container(ociman, Engine::LlamaServer, child)
             }
             (ModelPath::Gguf(path, mmproj), None) => {
-                let bin = local_llama_server_bin(state).await?;
+                let bin = state.0.runtime.local_llama_server_bin().await?;
                 let (child, tail) =
                     spawn_llama_server(&bin, path, mmproj.as_deref(), llama_opts).await?;
                 stderr_tail = Some(tail);
@@ -2165,7 +2161,7 @@ async fn ensure_model(
                 oom_retryable = true;
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }
-            // Container runtimes are Linux-only and mlx Metal-only, so
+            // Container runtimes are Linux-only and mlx macOS-only, so
             // this never competes with the mlx arm. vllm unless
             // LLMMAN_SAFETENSORS_ENGINE=sglang.
             (ModelPath::SafeTensors(dir), Some(ociman)) => {
@@ -2248,7 +2244,7 @@ async fn ensure_model(
                 ModelProcess::Local(Engine::Sglang, child, pid)
             }
             (ModelPath::SafeTensors(_dir), None) if use_mlx_for_safetensors() => {
-                let child = spawn_mlx_server(port).await?;
+                let child = spawn_mlx_server(state, port).await?;
                 let pid = child.id();
                 ModelProcess::Local(Engine::Mlx, child, pid)
             }
@@ -4006,7 +4002,8 @@ async fn spawn_mediagen_backend(
     cmd.args(["serve", model_ref, "--port", &port.to_string()]);
     // Explicit, so the child lands on the same build as this daemon
     // rather than re-resolving `auto`/the default pin/LLMMAN_RUNTIME.
-    cmd.args(["--runtime", state.0.runtime.as_str()]);
+    let runtime = state.0.runtime.resolve().await?.runtime();
+    cmd.args(["--runtime", runtime.as_str()]);
     cmd.args([
         "--llama-cpp-version",
         state.0.llama_cpp_version.as_deref().unwrap_or("latest"),
@@ -4200,34 +4197,51 @@ fn pull_only_engine(model: Option<&str>) -> anyhow::Result<crate::container::Con
 
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let requested = _args.runtime;
-    // Startup installs mlx_lm.server under any local runtime on Apple
-    // Silicon (below), so `--pull-only` has work even under `path`.
-    let installs_mlx = use_mlx_for_safetensors();
-    if requested == Runtime::Path && _args.pull_only && !installs_mlx {
-        anyhow::bail!("--pull-only: --runtime path runs the llama-server on PATH; nothing to pull");
+    // On macOS, mlx_lm.server is sourced the way llama-server is: own
+    // install under `bin`/`auto` (the latter with a PATH fallback), PATH
+    // alone under `path`. Container runtimes never reach mlx.
+    let installs_mlx = match backend::mlx_source(requested) {
+        Some(fallback) if use_mlx_for_safetensors() && requested.ociman().is_none() => {
+            Some(fallback)
+        }
+        _ => None,
+    };
+    if requested == Runtime::Path && _args.pull_only {
+        anyhow::bail!("--pull-only: --runtime path runs what is on PATH; nothing to pull");
     }
     let llama_cpp_version = runtime::llama_cpp_pin(_args.llama_cpp_version.as_deref());
 
     // Settle `--runtime` and fetch its llama.cpp before anything binds,
     // so the first request is never stuck behind a silent download (this
     // process is normally detached with its stdio in a log file).
-    // `--pull-only` is this step alone. Blocking, hence spawn_blocking.
+    // `--pull-only` is this step alone. A failure is fatal only there:
+    // otherwise the daemon starts and the first load that needs llama.cpp
+    // retries (runtime::Lazy).
     let resolved = {
         let pin = llama_cpp_version.clone();
         tokio::task::spawn_blocking(move || runtime::resolve(requested, pin.as_deref()))
             .await
-            .context("resolve runtime task panicked")??
+            .context("resolve runtime task panicked")?
     };
+    let resolved = match resolved {
+        Ok(resolved) => Some(resolved),
+        Err(e) if _args.pull_only => return Err(e),
+        Err(e) => {
+            eprintln!(
+                "[llmman] warning: could not set up the llama.cpp runtime at startup ({e:#}); \
+                 the first model load that needs it will retry"
+            );
+            None
+        }
+    };
+    let runtime = runtime::Lazy::new(requested, llama_cpp_version.clone(), resolved);
 
-    // Likewise uv and mlx-lm, rather than inside the first safetensors
-    // request (minutes behind a client's first-token spinner). Cheap once
-    // installed. A failure is not fatal to a daemon that may only serve
-    // GGUF: the first MLX load retries and reports it. Under `--pull-only`
-    // it is the whole point.
-    if resolved.ociman().is_none() && installs_mlx {
-        let installed = tokio::task::spawn_blocking(crate::mlx_release::ensure_mlx_server)
-            .await
-            .context("ensure mlx_lm.server task panicked")?;
+    // Likewise uv and mlx-lm, with the same failure policy.
+    if let Some(fallback) = installs_mlx {
+        let installed =
+            tokio::task::spawn_blocking(move || crate::mlx_release::ensure_mlx_server(fallback))
+                .await
+                .context("ensure mlx_lm.server task panicked")?;
         match installed {
             Ok(_) => {}
             Err(e) if _args.pull_only => return Err(e.context("install mlx-lm")),
@@ -4239,7 +4253,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     }
 
     if _args.pull_only {
-        if let Some(ociman) = resolved.ociman() {
+        // Resolved for certain: a failure returned above.
+        if let Some(ociman) = runtime.known().and_then(|r| r.ociman()) {
             // resolve() pulled the llama.cpp image; a safetensors MODEL
             // needs vLLM's (or SGLang's) too.
             let engine = pull_only_engine(_args.model.as_deref())?;
@@ -4257,8 +4272,6 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    let llama_server_bin = resolved.llama_server_bin().cloned();
-    let runtime = resolved.runtime();
     let store_path = default_store()?;
     let cache_path = crate::default_cache()?;
     std::fs::create_dir_all(&cache_path)?;
@@ -4323,7 +4336,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     } else if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         eprintln!("[llmman] LLAMA_ARG_THREADS set: leaving llama-server thread count to it");
     }
-    if let (Some(n), Some(_)) = (cpu_limit, runtime.ociman()) {
+    if let (Some(n), Some(_)) = (cpu_limit, runtime.known().and_then(|r| r.ociman())) {
         eprintln!("[llmman] backend container gets --cpus {n} (this daemon's own CPU limit)");
     }
 
@@ -4368,7 +4381,6 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             running: HashMap::new(),
             pending_loads: 0,
         }),
-        llama_server_bin: StdMutex::new(llama_server_bin),
         // Canonicalized now, while the file certainly still exists —
         // resolving later (in the handler) could fail once the install is
         // deleted, exactly the situation /api/version exists to expose.

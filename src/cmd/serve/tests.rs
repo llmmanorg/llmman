@@ -2012,9 +2012,9 @@ fn test_inner(store_path: PathBuf) -> Inner {
             running: HashMap::new(),
             pending_loads: 0,
         }),
-        llama_server_bin: StdMutex::new(None),
         exe: None,
-        runtime: Runtime::Path,
+        // `path`, so a resolve could never download.
+        runtime: runtime::Lazy::new(Runtime::Path, None, None),
         llama_cpp_version: None,
         vllm_version: None,
         sglang_version: None,

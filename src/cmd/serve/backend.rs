@@ -65,12 +65,8 @@ pub(super) fn safetensors_engine_from_env() -> SafetensorsEngine {
 
 /// Which local engine backs a resolved `ModelPath::SafeTensors`
 /// directory when `LLMMAN_SAFETENSORS_ENGINE` is unset: `mlx_lm.server`
-/// (see `spawn_mlx_server`) on Apple Silicon macOS, `vllm` elsewhere.
-/// The macOS check is explicit because `LLMMAN_LLM_LIBRARY=metal` makes
-/// `detect()` say Metal on any OS; keeping `detect()` lets `=cpu` opt a
-/// Mac out. `mlx_lm.server` need not be on `PATH`: `serve` installs it at
-/// startup (`crate::mlx_release`). `LLMMAN_SAFETENSORS_ENGINE=vllm`
-/// forces `vllm` on a Mac.
+/// (see `spawn_mlx_server`) on macOS, `vllm` elsewhere. Every Mac is
+/// taken to have Metal; `LLMMAN_SAFETENSORS_ENGINE=vllm` opts out.
 ///
 /// Plain `vllm` (no plugin) has no Metal backend of its own at all — its
 /// upstream-published macOS wheel is CPU-only. There *is* a way to make
@@ -86,9 +82,7 @@ pub(super) fn safetensors_engine_from_env() -> SafetensorsEngine {
 /// Mac gets real Metal acceleration through it without needing
 /// vllm-metal (or vllm) at all.
 pub(super) fn use_mlx_for_safetensors() -> bool {
-    cfg!(target_os = "macos")
-        && safetensors_engine_from_env() == SafetensorsEngine::Auto
-        && crate::hostgpu::detect() == crate::hostgpu::HostGpu::Metal
+    cfg!(target_os = "macos") && safetensors_engine_from_env() == SafetensorsEngine::Auto
 }
 
 pub(super) fn find_free_port() -> anyhow::Result<u16> {
@@ -571,10 +565,9 @@ fn console_script_interpreter(script: &Path) -> Option<PathBuf> {
 /// Spawns `mlx_lm.server` (<https://github.com/ml-explore/mlx-lm>) —
 /// Apple Silicon's own Metal-accelerated alternative to `vllm` for a
 /// [`ModelPath::SafeTensors`] directory, picked instead of it by
-/// [`use_mlx_for_safetensors`]. The binary comes from
-/// `crate::mlx_release::ensure_mlx_server` (`PATH`, or llmman's own
-/// `uv`-installed copy — normally installed already at daemon startup by
-/// `serve_async`; installed here only if that failed).
+/// [`use_mlx_for_safetensors`]. The binary is chosen the way `--runtime`
+/// chooses `llama-server` (see [`mlx_source`]); normally installed at
+/// daemon startup, here only if that failed.
 ///
 /// Deliberately does *not* pass `mlx_lm.server`'s own `--model` flag,
 /// even though that's its documented way to preload one: confirmed
@@ -595,21 +588,41 @@ fn console_script_interpreter(script: &Path) -> Option<PathBuf> {
 /// [`backend_wire_model`](super::backend_wire_model) — which goes through `ModelProvider.load`'s
 /// own `try`/`except` in the request-handling path instead, and so does
 /// report a real error back to that request on a bad model directory.
-pub(super) async fn spawn_mlx_server(port: u16) -> anyhow::Result<tokio::process::Child> {
-    let mlx = tokio::task::spawn_blocking(crate::mlx_release::ensure_mlx_server)
-        .await
-        .context("ensure mlx_lm.server task panicked")?
-        .map_err(|e| {
-            anyhow!(
-                "{e:#} (put `mlx_lm.server` on PATH yourself, or set \
-                 {SAFETENSORS_ENGINE_VAR}=vllm to serve this model with vllm)"
-            )
-        })?;
+pub(super) async fn spawn_mlx_server(
+    state: &AppState,
+    port: u16,
+) -> anyhow::Result<tokio::process::Child> {
+    let mlx =
+        match mlx_source(state.0.runtime.requested()) {
+            None => which_binary("mlx_lm.server").context("--runtime path")?,
+            Some(fallback) => tokio::task::spawn_blocking(move || {
+                crate::mlx_release::ensure_mlx_server(fallback)
+            })
+            .await
+            .context("ensure mlx_lm.server task panicked")?
+            .map_err(|e| {
+                anyhow!("{e:#} (set {SAFETENSORS_ENGINE_VAR}=vllm to serve this model with vllm)")
+            })?,
+        };
     let mut cmd = tokio::process::Command::new(&mlx);
     cmd.args(["--port", &port.to_string(), "--host", "127.0.0.1"]);
     cmd.kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawn mlx_lm.server from {}", mlx.display()))
+}
+
+/// How `runtime` sources `mlx_lm.server`, mirroring `llama-server`:
+/// `None` is `PATH` only (`path`); otherwise llmman's own install, with
+/// or without a `PATH` fallback (`auto` and `bin`). Container runtimes
+/// never reach mlx (Linux only) and get `bin`'s answer.
+pub(super) fn mlx_source(runtime: super::runtime::Runtime) -> Option<crate::mlx_release::Fallback> {
+    use super::runtime::Runtime;
+    use crate::mlx_release::Fallback;
+    match runtime {
+        Runtime::Path => None,
+        Runtime::Auto => Some(Fallback::Path),
+        Runtime::Bin | Runtime::Docker | Runtime::Podman => Some(Fallback::None),
+    }
 }
 
 fn which_binary(name: &str) -> anyhow::Result<PathBuf> {
@@ -745,48 +758,6 @@ pub const LLAMA_CPP_ENV_PASSTHROUGH_VARS: &[&str] = &[
     "LLAMA_ARG_THREADS",
     "LLAMA_ARG_N_GPU_LAYERS",
 ];
-
-/// Returns the local llama-server binary to spawn: the one resolved at
-/// startup, unless that file has since disappeared from disk (the install
-/// that provided it was upgraded or removed while this daemon kept
-/// running), in which case it is re-resolved the same way (from the
-/// current PATH, or re-downloaded) and the replacement remembered for
-/// subsequent loads — instead of failing every model load forever with a
-/// spawn error against a path that no longer exists.
-pub(super) async fn local_llama_server_bin(state: &AppState) -> anyhow::Result<PathBuf> {
-    let current = state
-        .0
-        .llama_server_bin
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let Some(bin) = current else {
-        anyhow::bail!(
-            "no local llama-server binary resolved (--runtime {})",
-            state.0.runtime.as_str()
-        )
-    };
-    if bin.exists() {
-        return Ok(bin);
-    }
-    eprintln!(
-        "[llmman] llama-server at {} no longer exists; re-resolving",
-        bin.display()
-    );
-    let pinned = state.0.llama_cpp_version.clone();
-    let runtime = state.0.runtime;
-    let resolved = tokio::task::spawn_blocking(move || {
-        super::runtime::resolve_local(runtime, pinned.as_deref())
-    })
-    .await
-    .context("resolve llama-server task panicked")??;
-    *state
-        .0
-        .llama_server_bin
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(resolved.clone());
-    Ok(resolved)
-}
 
 /// If `model_ref` would be served by `Engine::Mlx` were it loaded right
 /// now, returns its canonical name (see `ensure_model`'s own doc

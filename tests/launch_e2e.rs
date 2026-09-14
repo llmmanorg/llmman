@@ -1217,16 +1217,12 @@ const MLX_MODEL: &str = "mlx-community/SmolLM2-135M-Instruct-8bit";
 /// own backend selection).
 ///
 /// Skips itself (rather than failing) on anything other than Apple
-/// Silicon macOS, or when `mlx_lm.server` isn't on `PATH` — mirrors every
-/// other test in this file's own "prerequisite not installed, not an
-/// llmman bug" convention (the daemon would install `mlx-lm` itself —
-/// `crate::mlx_release` — but that download is not what this measures).
-/// CI (see `.github/workflows/ci.yml`'s e2e job)
-/// installs `mlx-lm` before this suite ever runs, on exactly the two
-/// macOS aarch64 matrix legs (`backend: docker` and `backend: podman`)
-/// this is meant to actually exercise — see that job's own comment on
-/// why installation has to happen before, not after, this file's shared
-/// daemon first starts.
+/// Silicon macOS, or when the `mlx_lm.server` the daemon would run is
+/// missing: under `LLMMAN_RUNTIME=path` (CI's setting) the one on `PATH`,
+/// otherwise llmman's own install (`crate::mlx_release`), which must be
+/// complete already — the download is not what this measures. CI
+/// installs `mlx-lm` onto `PATH` before this suite, on the two macOS
+/// aarch64 legs, since the shared daemon's PATH is fixed at its spawn.
 ///
 /// Unlike `launch_and_assert`'s small-model sampling-variance tolerance
 /// (this file's other tests, talking to real third-party agentic CLIs
@@ -1255,8 +1251,15 @@ fn serve_mlx_safetensors_model() {
         eprintln!("skipping: mlx_lm.server only runs on Apple Silicon macOS");
         return;
     }
-    if !on_path("mlx_lm.server") {
-        eprintln!("skipping: mlx_lm.server not on PATH — pip install mlx-lm");
+    let runtime_path = std::env::var("LLMMAN_RUNTIME").is_ok_and(|r| r == "path");
+    if runtime_path && !on_path("mlx_lm.server") {
+        eprintln!(
+            "skipping: LLMMAN_RUNTIME=path and mlx_lm.server not on PATH — pip install mlx-lm"
+        );
+        return;
+    }
+    if !runtime_path && !llmman::mlx_release::installed() {
+        eprintln!("skipping: llmman's mlx-lm is not installed — run `llmman serve --pull-only`");
         return;
     }
 

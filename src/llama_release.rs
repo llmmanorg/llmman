@@ -9,9 +9,9 @@
 //! PATH-optional `llama-server` dependency instead.
 //!
 //! This is `cmd::serve`'s `--runtime bin` (see `cmd::serve::runtime`).
-//! A given release+backend is cached under
-//! [`install_root`]`/<tag>/<backend>/` and never re-fetched; the release
-//! is [`default_release`] unless `--llama-cpp-version` says otherwise.
+//! A release+backend is installed under [`install_root`]`/<tag>/<backend>/`
+//! in [`crate::managed`]'s shape and never re-fetched; the release is
+//! [`default_release`] unless `--llama-cpp-version` says otherwise.
 //!
 //! Coverage gap (unavoidable, not an llmman limitation): llama.cpp does
 //! not publish a prebuilt **Linux** CUDA binary at all — only Windows
@@ -329,14 +329,13 @@ fn asset_query() -> AssetQuery {
 // On-disk cache layout
 // ---------------------------------------------------------------------------
 
-/// `~/.local/share/llmman/llama-server` on Linux/macOS,
-/// `%LOCALAPPDATA%\llmman\llama-server` on Windows — sibling of
-/// [`crate::default_store`]'s own store directory, under
-/// [`crate::data_root`].
+/// `<data_root>/llama.cpp` — the project, not one binary: the archive
+/// carries every llama.cpp tool and the libraries `mediagen` loads.
 fn install_root() -> Result<PathBuf> {
-    Ok(crate::data_root()?.join("llama-server"))
+    Ok(crate::data_root()?.join("llama.cpp"))
 }
 
+/// `<tag>/<label>`: one archive per GPU backend per release.
 fn install_dir(tag: &str, label: &str) -> Result<PathBuf> {
     Ok(install_root()?.join(tag).join(label))
 }
@@ -714,7 +713,7 @@ pub fn ensure_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
     // given release's assets never change after being published.
     if let Some(tag) = pinned_version {
         let dest = install_dir(tag, &query.label)?;
-        if let Some(bin) = find_binary(&dest, bin_name) {
+        if let Some(bin) = crate::managed::completed_binary(&dest, bin_name) {
             return Ok(Resolved {
                 bin,
                 backend_label: query.label,
@@ -757,68 +756,62 @@ fn try_ensure_from_network(
     let tag = release.tag_name.clone();
     let dest = install_dir(&tag, &query.label)?;
 
-    if let Some(bin) = find_binary(&dest, bin_name) {
-        return Ok(Resolved {
-            bin,
-            backend_label: query.label.clone(),
-        });
-    }
-
-    let asset = find_asset(&release, &query.must_contain)
-        .with_context(|| {
-            format!(
-                "no {} llama.cpp release asset found in {tag} (looked for a name containing {:?})",
-                query.label, query.must_contain
-            )
-        })?
-        .clone();
-
-    eprintln!(
-        "[llmman] downloading llama-server ({}) {tag}: {}",
-        query.label, asset.name
-    );
-    // One marker for download and extraction, so a waiting ensure_server
-    // knows this daemon is busy; the heartbeat covers extraction, which
-    // reports nothing and can outlast the staleness window.
-    let marker = DownloadMarker::create();
-    let fetch = |asset: &Asset| -> Result<()> {
-        let tmp = tmp_path(&asset.name)?;
-        let _cleanup = RemoveOnDrop(&tmp);
-        download_to_file(
-            &client,
-            &asset.browser_download_url,
-            &tmp,
-            &asset.name,
-            Some(&marker),
-        )?;
-        marker.set_status(&format!("extracting {}", asset.name));
-        extract(&tmp, &asset.name, &dest)
-    };
-    marker.keep_alive_during(|| -> Result<()> {
-        fetch(&asset)?;
-        if let Some(companion_substr) = &query.companion_must_contain {
-            match find_asset(&release, companion_substr) {
-                Some(companion) => {
-                    eprintln!("[llmman] downloading {}", companion.name);
-                    fetch(companion)?;
+    let cached = |dest: &Path| crate::managed::completed_binary(dest, bin_name);
+    let bin = crate::managed::ensure(&install_root()?, &dest, "llama.cpp", cached, |dest| {
+        let asset = find_asset(&release, &query.must_contain)
+            .with_context(|| {
+                format!(
+                    "no {} llama.cpp release asset found in {tag} (looked for a name containing {:?})",
+                    query.label, query.must_contain
+                )
+            })?
+            .clone();
+        eprintln!(
+            "[llmman] downloading llama-server ({}) {tag}: {}",
+            query.label, asset.name
+        );
+        // One marker for download and extraction; the heartbeat covers
+        // extraction, which reports no progress of its own.
+        let marker = DownloadMarker::create();
+        let fetch = |asset: &Asset| -> Result<()> {
+            let tmp = tmp_path(&asset.name)?;
+            let _cleanup = RemoveOnDrop(&tmp);
+            download_to_file(
+                &client,
+                &asset.browser_download_url,
+                &tmp,
+                &asset.name,
+                Some(&marker),
+            )?;
+            marker.set_status(&format!("extracting {}", asset.name));
+            extract(&tmp, &asset.name, dest)
+        };
+        marker.keep_alive_during(|| -> Result<()> {
+            fetch(&asset)?;
+            if let Some(companion_substr) = &query.companion_must_contain {
+                match find_asset(&release, companion_substr) {
+                    Some(companion) => {
+                        eprintln!("[llmman] downloading {}", companion.name);
+                        fetch(companion)?;
+                    }
+                    None => eprintln!(
+                        "[llmman] warning: expected companion asset containing {companion_substr:?} \
+                         not found in release {tag} — {} may be missing runtime libraries it needs",
+                        query.label
+                    ),
                 }
-                None => eprintln!(
-                    "[llmman] warning: expected companion asset containing {companion_substr:?} \
-                     not found in release {tag} — {} may be missing runtime libraries it needs",
-                    query.label
-                ),
             }
-        }
-        Ok(())
+            Ok(())
+        })?;
+        let bin = find_binary(dest, bin_name).with_context(|| {
+            format!(
+                "llama-server binary not found after extracting {}",
+                asset.name
+            )
+        })?;
+        mark_executable(&bin)?;
+        Ok(bin)
     })?;
-
-    let bin = find_binary(&dest, bin_name).with_context(|| {
-        format!(
-            "llama-server binary not found after extracting {}",
-            asset.name
-        )
-    })?;
-    mark_executable(&bin)?;
     Ok(Resolved {
         bin,
         backend_label: query.label.clone(),
@@ -847,8 +840,8 @@ fn build_number(tag: &str) -> Option<u64> {
     tag.strip_prefix('b')?.parse().ok()
 }
 
-/// Finds the most recently downloaded `<tag>/<label>` install under
-/// [`install_root`] that already has `bin_name` extracted into it.
+/// The newest complete `<tag>/<label>` install under [`install_root`]
+/// (normally the only one: `managed::ensure` prunes the rest).
 fn newest_cached(label: &str, bin_name: &str) -> Result<Option<PathBuf>> {
     let root = install_root()?;
     let Ok(entries) = std::fs::read_dir(&root) else {
@@ -864,7 +857,7 @@ fn newest_cached(label: &str, bin_name: &str) -> Result<Option<PathBuf>> {
             continue;
         };
         let dest = entry.path().join(label);
-        let Some(bin) = find_binary(&dest, bin_name) else {
+        let Some(bin) = crate::managed::completed_binary(&dest, bin_name) else {
             continue;
         };
         if best.as_ref().map(|(b, _)| build > *b).unwrap_or(true) {

@@ -11,7 +11,7 @@ already exists for the model format it finds, and runs it unmodified.
 | safetensors | [`vllm`](https://github.com/vllm-project/vllm) | Your `PATH` (every non-container runtime) |
 | safetensors | `sglang` in a container | `--runtime docker` / `podman` (Linux only) with `LLMMAN_SAFETENSORS_ENGINE=sglang`: the `lmsysorg/sglang` image for your GPU |
 | safetensors | [`sglang`](https://github.com/sgl-project/sglang) | Your `PATH`, with `LLMMAN_SAFETENSORS_ENGINE=sglang` |
-| safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | Apple Silicon macOS (every non-container runtime): the one on your `PATH`, or else llmman's own `uv`-installed copy, installed when the daemon starts; preferred over `vllm` |
+| safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | macOS: llmman's own `uv`-installed copy, installed when the daemon starts, or the one on your `PATH` — per `--runtime`, as for `llama-server`; preferred over `vllm` |
 | GGUF diffusion (LTX-2) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
 | Diffusers safetensors | [`vllm serve --omni`](https://github.com/vllm-project/vllm-omni) | Your `PATH`'s `vllm` with the `vllm-omni` package installed |
 | Diffusers safetensors | `vllm serve --omni` in a container | `--runtime docker` / `podman` (Linux only): the `vllm/vllm-omni` image (CUDA only) |
@@ -25,8 +25,8 @@ already exists for the model format it finds, and runs it unmodified.
 | Value | llama-server | Notes |
 |-------|--------------|-------|
 | `docker`, `podman` | `ghcr.io/ggml-org/llama.cpp:server-<backend>-<release>` container | Linux only; safetensors models get the vLLM images too |
-| `bin` | llmman's own download of llama.cpp's prebuilt release for this OS/arch/GPU | Cached under `~/.local/share/llmman/llama-server/<release>/`; nothing needed on `PATH` |
-| `path` | the `llama-server` already on `PATH`, as-is | Never downloads anything; `--llama-cpp-version` does not apply |
+| `bin` | llmman's own download of llama.cpp's prebuilt release for this OS/arch/GPU | Installed under `~/.local/share/llmman/llama.cpp/<release>/`; nothing needed on `PATH` |
+| `path` | the `llama-server` already on `PATH`, as-is (and, on macOS, the `mlx_lm.server` on `PATH`) | Never downloads anything; `--llama-cpp-version` does not apply |
 | `auto` (default) | the first of `docker`, `podman`, `bin`, `path` that works here | Off Linux: `bin`, then `path` |
 
 Under `auto`, a container engine "works" when its CLI is on `PATH`, its
@@ -34,9 +34,26 @@ daemon answers `docker info`/`podman info`, an NVIDIA host has the NVIDIA
 Container Toolkit, and the llama.cpp image pulls; `bin` works when the
 release downloads (or is already cached). Each step skipped is logged
 with the reason. Whatever is chosen is fetched before the listener binds,
-so the first request is never stuck behind a silent download. On Apple
-Silicon, under `bin` or `path`, `uv` and `mlx-lm` are installed at the
-same point (see [MLX](#mlx-apple-silicon)).
+so the first request is never stuck behind a silent download. On macOS
+`mlx_lm.server` follows the same rule at the same point: `bin` installs
+llmman's own `uv` and `mlx-lm`, `path` uses `PATH`'s, `auto` installs
+and falls back to `PATH` (see [MLX](#mlx-macos)).
+
+Everything llmman installs for itself — llama.cpp, `uv`, `mlx-lm` — has
+one shape on disk: `~/.local/share/llmman/<tool>/<version>/`, a
+`.llmman-complete` sentinel written last (without it the directory is
+rebuilt), one installer at a time across processes (`<tool>/.lock`), and
+earlier versions deleted once a new one completes. The pins are the
+repo-root `LLAMA_CPP_RELEASE`, `UV_RELEASE`, `MLX_LM_RELEASE` and
+`PYTHON_RELEASE` files, which CI tests against.
+
+If that fetch fails, the daemon still starts: the failure is a warning,
+and the first model load that needs llama.cpp retries it and, failing
+again, reports that to the request. Nothing remembers the failure. A
+safetensors model under `bin` or `path` needs no llama.cpp and loads
+regardless. `mlx-lm` is the same: a failed install is a warning, retried
+by the first safetensors load. Only `--pull-only` treats a failed fetch
+as an error.
 
 `llmman serve --pull-only` does exactly those fetches, in the foreground
 with their own progress, then exits — run it once before starting a
@@ -95,8 +112,8 @@ docker run -p 127.0.0.1:17434:17434 -e LLMMAN_API_KEYS=<key> \
 ## vLLM
 
 Safetensors models are served by a separately installed `vllm` unless
-`LLMMAN_SAFETENSORS_ENGINE` picks [SGLang](#sglang), or the host is
-Apple Silicon (see [MLX](#mlx-apple-silicon)).
+`LLMMAN_SAFETENSORS_ENGINE` picks [SGLang](#sglang), or the host is a
+Mac (see [MLX](#mlx-macos)).
 Plain `vllm` is CPU-only on macOS unless
 [vllm-metal](https://github.com/vllm-project/vllm-metal) is installed.
 `LLMMAN_CONTEXT_LENGTH` is forwarded as `--max-model-len`;
@@ -205,27 +222,32 @@ safetensors model when the variable is set. `CUDA_VISIBLE_DEVICES` and
 friends plus every `SGLANG_*` variable are forwarded into the container,
 which runs with `--ipc=host` like vLLM's.
 
-## MLX (Apple Silicon)
+## MLX (macOS)
 
-On Apple Silicon, `mlx_lm.server` is preferred over `vllm` for
-safetensors when `LLMMAN_SAFETENSORS_ENGINE` is unset: Metal-accelerated,
-no vLLM dependency, more model families than vllm-metal.
-`LLMMAN_CONTEXT_LENGTH` is not forwarded and `/v1/embeddings` is
-unsupported.
+On macOS, `mlx_lm.server` is preferred over `vllm` for safetensors when
+`LLMMAN_SAFETENSORS_ENGINE` is unset: Metal-accelerated (every Mac is
+assumed to have Metal), no vLLM dependency, more model families than
+vllm-metal. `LLMMAN_CONTEXT_LENGTH` is not forwarded and `/v1/embeddings`
+is unsupported.
 
-Nothing needs installing first. When `mlx_lm.server` is not on `PATH`,
-`llmman serve` installs it at startup, before it starts listening —
-the same way it fetches `llama-server` — with
-[`uv`](https://github.com/astral-sh/uv) (the one on `PATH`, or
-astral-sh's prebuilt release downloaded to `~/.local/share/llmman/uv/`)
-into `~/.local/share/llmman/mlx-lm/venv` (with a managed CPython 3.10+
-if the host has none). `llmman serve --pull-only` does the same install
-with its progress on your terminal, then exits. A `llmman run` or
-`launch` that starts the daemon shows what it is fetching while it
-waits. `LLMMAN_MLX_LM_VERSION=<version>` pins the release; deleting
-`~/.local/share/llmman/mlx-lm` reinstalls on the next daemon start. An
-`mlx_lm.server` on `PATH` is used as-is; `LLMMAN_SAFETENSORS_ENGINE=vllm`
-skips MLX (and the install).
+Nothing needs installing first. `llmman serve` installs its own
+`mlx_lm.server` at startup, before it starts listening — the same way it
+fetches `llama-server` — with its own [`uv`](https://github.com/astral-sh/uv)
+(the repo-root `UV_RELEASE` pin, under `~/.local/share/llmman/uv/<version>/`).
+`uv` installs the `mlx-lm` in `MLX_LM_RELEASE` on a uv-managed CPython at
+the `PYTHON_RELEASE` pin — never your own Python; a version `mlx`, `vllm`
+and `sglang` all publish wheels for — under
+`~/.local/share/llmman/mlx-lm/<mlx-lm>-py<python>/` (`python/` and
+`venv/`). `--runtime` applies as it does to `llama-server`: `bin` runs
+only this install, `path` only the `mlx_lm.server` on `PATH`, `auto`
+(the default) this install with `PATH` as the fallback if it fails.
+
+`llmman serve --pull-only` does the same install with its progress on
+your terminal, then exits. A `llmman run` or `launch` that starts the
+daemon shows what it is fetching while it waits. If the install fails,
+the daemon starts anyway and the first safetensors load retries it.
+`LLMMAN_MLX_LM_VERSION=<version>` overrides the `mlx-lm` pin.
+`LLMMAN_SAFETENSORS_ENGINE=vllm` skips MLX (and the install).
 
 ## Registry transport
 

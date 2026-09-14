@@ -1276,43 +1276,30 @@ jobs:
         run: echo "LLAMA_ARG_N_GPU_LAYERS=0" >> "$GITHUB_ENV"
 
       # ── mlx-lm (macOS arm64 only) ─────────────────────────────────────────
-      # Apple Silicon's own Metal-accelerated backend for safetensors
-      # models (see cmd::serve::use_mlx_for_safetensors) — installed, and
-      # its `mlx_lm.server` console script put on PATH, *before* "cargo
-      # test --test launch_e2e" below spawns this job's one shared
-      # `llmman serve` daemon (see tests/launch_e2e.rs's own module doc
-      # comment on why every test in that file shares one daemon): PATH is
-      # fixed at that daemon's own spawn time, like every other part of a
-      # child process's inherited environment, so installing this any
-      # later would leave the already-running daemon unable to find
-      # `mlx_lm.server` for the rest of this job — installing it here,
-      # before that daemon ever starts, is the only ordering that works.
-      # A separate venv from vllm-plugin's own (set up further below, for
-      # both Linux and macOS) rather than reusing it: that one doesn't
-      # exist yet at this point in the job, and giving mlx-lm its own
-      # keeps this step's ordering constraint independent of that one's.
-      #
-      # `serve_mlx_safetensors_model` (tests/launch_e2e.rs) is the only
-      # test that actually needs this — every other one in that file
-      # serves qwen3.5:0.8b (a GGUF model, llama-server's own territory,
-      # never mlx's) — and, like every other prerequisite in that file,
-      # skips itself (rather than failing) when `mlx_lm.server` isn't on
-      # PATH, so this step is deliberately scoped to macOS arm64 only:
-      # mlx-lm has no non-Apple-Silicon build to even attempt installing
-      # elsewhere.
+      # Apple Silicon's backend for safetensors models (see
+      # cmd::serve::use_mlx_for_safetensors). This job's daemon runs under
+      # LLMMAN_RUNTIME=path, which takes `mlx_lm.server`, like
+      # `llama-server`, from PATH — so it is installed onto PATH *before*
+      # "cargo test --test launch_e2e" spawns the job's one shared daemon
+      # (PATH is fixed at spawn time). Pinned to MLX_LM_RELEASE so this
+      # and llmman's own install (crate::mlx_release) test one version.
+      # Only `serve_mlx_safetensors_model` needs it, and that test skips
+      # itself when `mlx_lm.server` is not on PATH, hence macOS arm64 only.
+      # PYTHON_RELEASE's value (`with:` cannot read a file); keep in step.
       - name: Set up Python (mlx e2e)
         if: matrix.target == 'aarch64-apple-darwin'
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Install mlx-lm (macOS arm64, e2e)
         if: matrix.target == 'aarch64-apple-darwin'
         shell: bash
         run: |
           set -euo pipefail
+          MLX_LM_RELEASE="$(tr -d '[:space:]' < MLX_LM_RELEASE)"
           python3 -m venv "$RUNNER_TEMP/mlx-lm-venv"
-          "$RUNNER_TEMP/mlx-lm-venv/bin/pip" install mlx-lm
+          "$RUNNER_TEMP/mlx-lm-venv/bin/pip" install "mlx-lm==$MLX_LM_RELEASE"
           echo "$RUNNER_TEMP/mlx-lm-venv/bin" >> "$GITHUB_PATH"
 
       # ── vLLM + vllm-plugin (Linux + macOS) ───────────────────────────────
