@@ -9,6 +9,10 @@ use super::openai::{
     apply_default_repeat_penalty, apply_reasoning_effort, mlx_embeddings_unsupported_response,
     multipart_form, multipart_text_field, omni_image_request, omni_video_fields,
 };
+use super::responses::{
+    consolidate_responses_instructions, filter_non_function_tools, remote_responses,
+    responses_input_item_text, RESPONSES_ROUTE,
+};
 use super::sched::{reap_idle_models_once, resolve_keep_alive, DEFAULT_KEEP_ALIVE};
 use super::stream::{fold_ollama_lines, stream_ollama};
 use super::*;

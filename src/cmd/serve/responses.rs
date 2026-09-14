@@ -1,4 +1,5 @@
-//! The Responses API for providers that don't speak it.
+//! The Responses API: the inbound `/v1/responses` routes, and the
+//! translation for providers that don't speak it.
 //!
 //! Codex speaks only `/v1/responses` (`wire_api = "responses"` is the only
 //! value it accepts). llama-server, `openai`, `groq` and `openrouter`
@@ -22,15 +23,30 @@
 //! - `namespace` members flatten to `namespace_member`, not
 //!   `namespace.member`: providers enforce `^[a-zA-Z0-9_-]{1,128}$`.
 //!
-//! Everything here is pure — JSON in, SSE text out — so it is testable
-//! without a network. `remote_responses` in the parent decides when to
-//! use it: only after the provider answered the native route with a
-//! [`falls_back`] status, so a provider that has the API keeps it.
+//! The request and stream conversion is pure — a JSON request in, SSE
+//! text out — and is tested with no network. The routes at the end of
+//! the file are not: [`handle_openai_responses`] proxies to whichever
+//! target the request resolved to, and [`remote_responses`] reaches for
+//! the conversion only once that provider has answered the native route
+//! with a [`falls_back`] status, so one that implements the API keeps
+//! it.
 
 use std::collections::BTreeMap;
 
-use axum::http::StatusCode;
+use anyhow::{anyhow, Context};
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::Response;
+use reqwest::Client;
 use serde_json::{json, Value};
+
+use super::openai::{proxy_openai_generation, proxy_openai_passthrough};
+use super::sched::ActivityGuard;
+use super::{
+    convert_upstream, relay, relay_chat_upstream, relay_rewriting_model,
+    relay_stream_rewriting_model, remote_status, send_chat_completion, AppError, AppState, Target,
+};
 
 /// Whether a provider's answer on `/v1/responses` means "retry as a chat
 /// completion": 404/405/501 (no such route) or any 5xx (`opencode` 500s
@@ -1087,6 +1103,233 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default()
+}
+
+// -- OpenAI Responses API (/v1/responses) ------------------------------------
+//
+// llama-server (llama.cpp) has its own native /v1/responses implementation
+// that converts a Responses-API request into a Chat Completions request
+// internally (see server_chat_convert_responses_to_chatcmpl in
+// tools/server/server-chat.cpp) — including the exact SSE event sequence
+// Codex requires (response.created -> response.output_item.added ->
+// response.output_text.delta -> ... -> response.completed, no `[DONE]`) and
+// re-mapping of tool_calls into function_call output items. Re-implementing
+// that translation here would just duplicate — and risk drifting out of
+// sync with — llama.cpp's own logic, so for a local backend this is a plain
+// pass-through exactly like the /v1/* routes in the `openai` sibling
+// module, apart from filter_non_function_tools (see its own doc comment)
+// below. A remote provider without /v1/responses gets this module's own
+// translation instead (see `remote_responses`).
+pub(super) async fn handle_openai_responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    proxy_openai_generation(&state, &headers, body, RESPONSES_ROUTE).await
+}
+
+/// The generating Responses route, the one Codex talks to.
+pub(super) const RESPONSES_ROUTE: &str = "/v1/responses";
+
+/// `/v1/responses` for a remote provider: natively when the provider has
+/// it, as a translated chat completion when it doesn't.
+///
+/// The provider is asked first rather than consulted in a list (models.dev
+/// has no capability data, and a list would go stale). A success is
+/// relayed; a status [`falls_back`] recognises as the route
+/// being missing or broken (anthropic 404s, opencode 500s for non-OpenAI
+/// models) is retried as a chat completion; any other failure is the
+/// provider's own answer about the caller's key or request, relayed
+/// untouched. The retry happens before any body has been relayed.
+pub(super) async fn remote_responses(
+    client: &Client,
+    target: &Target,
+    headers: &HeaderMap,
+    req: serde_json::Value,
+    activity: ActivityGuard,
+    canonical_model: String,
+) -> Result<Response, AppError> {
+    let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    // The Messages API has no Responses route; skip the 404 round trip.
+    if !target.is_anthropic() {
+        let body =
+            Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
+        let mut native = target.authorize(client.post(target.url(RESPONSES_ROUTE)).body(body));
+        if let Some(ct) = headers.get("content-type") {
+            native = native.header("content-type", ct);
+        }
+        let resp = native
+            .send()
+            .await
+            .with_context(|| format!("proxy request to {}", target.describe()))?;
+        let status = resp.status();
+        if status.is_success() {
+            return if streaming {
+                Ok(relay_stream_rewriting_model(
+                    resp,
+                    activity,
+                    canonical_model,
+                ))
+            } else {
+                relay_rewriting_model(resp, activity, &canonical_model).await
+            };
+        }
+        if !falls_back(status) {
+            return Ok(relay(resp, activity));
+        }
+        eprintln!(
+            "[llmman] {} answered {RESPONSES_ROUTE} with {status}; retrying as a chat completion",
+            target.describe()
+        );
+    }
+
+    let chat_req =
+        from_responses_request(&req).map_err(|e| AppError(e, StatusCode::BAD_REQUEST))?;
+    let upstream = send_chat_completion(client, target, &chat_req, &canonical_model).await?;
+    let status = upstream.status;
+    if status.is_client_error() {
+        // The provider's own error object, intact for a client that reads it.
+        return Ok(relay_chat_upstream(upstream, activity));
+    }
+    if !status.is_success() {
+        let body = upstream.text().await;
+        return Err(AppError(
+            anyhow!("{} {status}: {body}", target.describe()),
+            remote_status(target, status),
+        ));
+    }
+
+    let converter = StreamConverter::new(&canonical_model, &req);
+    Ok(convert_upstream(upstream.body, activity, converter, streaming).await)
+}
+
+pub(super) async fn handle_openai_responses_input_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    // A token-counting call, not a generation request — repeat_penalty has
+    // nothing to apply to here.
+    proxy_openai_passthrough(&state, &headers, body, "/v1/responses/input_tokens").await
+}
+
+/// Applies both `/v1/responses` request-shape workarounds below, to a
+/// body already parsed by `resolve_openai_request`.
+///
+/// Local targets only, and applied after the target is known rather than
+/// on the way in: both are workarounds for what *llama-server's*
+/// `/v1/responses` cannot accept. A provider that implements the
+/// Responses API natively accepts the request Codex actually sent, and
+/// forwarding a stripped one would silently cost it `web_search` and
+/// every other non-function tool.
+pub(super) fn sanitize_responses_request(req: &mut serde_json::Value) {
+    filter_non_function_tools(req);
+    consolidate_responses_instructions(req);
+}
+
+/// The routes [`sanitize_responses_request`] applies to.
+pub(super) fn is_responses_route(llama_path: &str) -> bool {
+    llama_path.starts_with("/v1/responses")
+}
+
+/// Strips any entry from the request's top-level `tools` array whose
+/// `"type"` isn't `"function"` before proxying to llama-server.
+///
+/// Real Codex always includes Responses-API tool types llama-server's own
+/// `/v1/responses` doesn't understand — a `"namespace"`-typed sub-agent
+/// tool bundle, the bare `{"type":"web_search"}` entry, etc. — and, unlike
+/// this module's other passthrough routes, llama-server hard-rejects the
+/// *entire* request the moment even one such entry is present ("'type' of
+/// tool must be 'function'"), rather than skipping just that entry. Since
+/// Codex's own default toolset always includes at least one of these,
+/// every real `codex`/`codex exec` invocation would 400 on its very first
+/// turn without this filter. Nested sub-tools inside a dropped
+/// `"namespace"` entry (e.g. its own agent-management functions) are
+/// dropped along with it rather than hoisted to the top level: the local
+/// model losing access to those secondary tools is harmless, whereas
+/// guessing how to flatten them would risk silently changing their
+/// semantics.
+pub(super) fn filter_non_function_tools(req: &mut serde_json::Value) {
+    if let Some(tools) = req.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        tools.retain(|t| t.get("type").and_then(|v| v.as_str()) == Some("function"));
+    }
+}
+
+/// Folds every `developer`/`system`-role item out of the request's `input`
+/// array into the top-level `instructions` string, removing them from
+/// `input`, before proxying to llama-server.
+///
+/// llama-server's own `/v1/responses` → chat-completions conversion
+/// (`server_chat_convert_responses_to_chatcmpl` in llama.cpp's
+/// `tools/server/server-chat.cpp`) unconditionally prepends one
+/// `system`-role chat message built from `instructions`, but otherwise
+/// forwards every `input` item's `role` field untouched. A later,
+/// model-agnostic pass in llama.cpp's own chat-template layer
+/// (`workaround::map_developer_role_to_system` in `common/chat.cpp`) then
+/// unconditionally rewrites *every* remaining `role: "developer"` message
+/// to `role: "system"`, wherever it sits in the array, with no
+/// repositioning or merging. Real Codex requests routinely carry a
+/// `developer`-role item further into `input` (permissions/skills
+/// instructions) alongside the top-level `instructions` string, which
+/// after that rewrite leaves two `system`-role messages in the
+/// chat-completions request llama-server builds — the second one not at
+/// index 0, which strict chat templates (Qwen3.5's included) reject
+/// outright with "System message must be at the beginning". This is a
+/// confirmed, currently-unresolved upstream llama.cpp gap (e.g.
+/// ggml-org/llama.cpp#20733, ggml-org/llama.cpp#23423; a fix was proposed
+/// and abandoned in ggml-org/llama.cpp#20079) rather than anything this
+/// module's own /v1/messages-style message-building does, so it can't be
+/// fixed the same way — this route is a pass-through by design (see the
+/// module doc comment above). Folding every developer/system input item
+/// into `instructions` here instead keeps the request in a shape
+/// llama-server can never turn into more than one system message,
+/// regardless of that upstream gap.
+pub(super) fn consolidate_responses_instructions(req: &mut serde_json::Value) {
+    let mut instructions = req
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if let Some(input) = req.get_mut("input").and_then(|v| v.as_array_mut()) {
+        input.retain(|item| {
+            let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            if role != "developer" && role != "system" {
+                return true;
+            }
+            if let Some(text) = responses_input_item_text(item) {
+                if !text.is_empty() {
+                    if !instructions.is_empty() {
+                        instructions.push_str("\n\n");
+                    }
+                    instructions.push_str(&text);
+                }
+            }
+            false
+        });
+    }
+
+    if !instructions.is_empty() {
+        req["instructions"] = serde_json::Value::String(instructions);
+    }
+}
+
+/// Extracts the plain text of a Responses-API `input` message item —
+/// `content` is either a bare string or an array of blocks (each with a
+/// `"text"` field, e.g. `{"type":"input_text","text":"..."}`), the same
+/// two shapes Anthropic's own message content takes.
+pub(super) fn responses_input_item_text(item: &serde_json::Value) -> Option<String> {
+    match item.get("content")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(blocks) => Some(
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(""),
+        ),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
