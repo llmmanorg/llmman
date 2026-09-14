@@ -12,12 +12,9 @@ on:
   # still requires a push to main.
   workflow_dispatch:
 
-# Workflow-wide default: read-only. Every job here only needs to check
-# out and build/test the repo except `tag`, `release` and `untag`, which
-# create the release tag, the GitHub Release, and remove the tag again if
-# the release never happens — those override this with their own
-# `permissions: contents: write` rather than every job inheriting broad
-# default repo permissions for no reason.
+# Workflow-wide default: read-only. Only `tag`, `release` and `untag`
+# write to the repo (the release tag and the GitHub Release); they set
+# their own `permissions: contents: write`.
 permissions:
   contents: read
 
@@ -346,7 +343,7 @@ jobs:
 
       # ── Packaging ────────────────────────────────────────────────────────
       - name: shellcheck
-        run: shellcheck packaging/version.sh packaging/render.sh
+        run: shellcheck packaging/version.sh packaging/render.sh packaging/release-tag.sh
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -1583,17 +1580,13 @@ jobs:
           fi
 
   # --------------------------------------------------------------------------
-  # Tag: v<version> on this commit, created the moment the run starts
-  # rather than by `release` an hour later. GITHUB_TOKEN may only create
-  # a ref whose .github/workflows/ matches main's current tip — it lacks
-  # the `workflows` permission, which `permissions:` cannot grant, and
-  # GitHub treats a ref to any other workflow content as writing a
-  # workflow (git push says so; the Releases and git-refs APIs only say
-  # "403 Resource not accessible by integration"). So whenever a merge
-  # touching ci.yml landed during the previous commit's run, that commit's
-  # release failed (v0.1.389, .396, .409-.411). Right now this commit is
-  # the tip, so the diff is empty. Lightweight, like the tags the Releases
-  # API used to make. If the release never happens, `untag` removes it.
+  # Tag: v<version> on this commit, as soon as the run starts. GITHUB_TOKEN
+  # can only create a ref whose .github/workflows/ matches main's tip (see
+  # packaging/release-tag.sh), so when `release` did this an hour after
+  # the push, any merge touching ci.yml in between failed it with a 403
+  # (v0.1.389, .396, .409-.411). Now the commit is the tip, bar a merge
+  # landing before this job gets a runner. `untag` removes the tag if the
+  # release never happens.
   # --------------------------------------------------------------------------
   tag:
     name: Tag
@@ -1604,7 +1597,6 @@ jobs:
       contents: write
 
     outputs:
-      version: ${{ steps.version.outputs.version }}
       tag_name: ${{ steps.version.outputs.tag_name }}
 
     steps:
@@ -1616,33 +1608,13 @@ jobs:
 
       - name: Determine version and tag
         id: version
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="$(packaging/version.sh)"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag_name=v$version" >> "$GITHUB_OUTPUT"
-          echo "Tagging llmman $version as v$version"
+        run: echo "tag_name=v$(packaging/version.sh)" >> "$GITHUB_OUTPUT"
 
-      # A re-run finds the tag it made before; that is fine as long as it
-      # still points here. Any other commit under this name is a bug.
       - name: Create tag
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag_name }}
-        run: |
-          set -euo pipefail
-          if existing="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null)"; then
-            [ "$existing" = "$GITHUB_SHA" ] || { echo "::error::tag $TAG already exists at $existing, not $GITHUB_SHA"; exit 1; }
-            echo "$TAG already points at $GITHUB_SHA"
-            exit 0
-          fi
-          if ! gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
-              -f "ref=refs/tags/$TAG" -f "sha=$GITHUB_SHA" --jq .ref; then
-            echo "::error::could not create $TAG at $GITHUB_SHA. A 403 means a commit that changes .github/workflows/ reached main before this job started; re-running will not help, and this commit will not be released."
-            exit 1
-          fi
+        run: packaging/release-tag.sh ensure "$TAG" "$GITHUB_SHA"
 
   # --------------------------------------------------------------------------
   # Release: a GitHub Release per commit on main, tagged v<version> where
@@ -1679,40 +1651,22 @@ jobs:
       - name: Determine version and tag
         id: version
         shell: bash
-        env:
-          TAGGED: ${{ needs.tag.outputs.tag_name }}
         run: |
           set -euo pipefail
           version="$(packaging/version.sh)"
-          [ "v$version" = "$TAGGED" ] || { echo "::error::version.sh says v$version but the tag job created $TAGGED"; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag_name=v$version" >> "$GITHUB_OUTPUT"
           echo "Releasing llmman $version as tag v$version"
 
-      # The tag job made this ref when the run started, and the Releases
-      # API below must find it, or it creates one itself and can hit the
-      # 403 described at the tag job. It is gone only if `untag` removed
-      # it after a failure and the failed jobs were then re-run (or
-      # someone deleted it): try again here, which works as long as
-      # nothing under .github/workflows/ has changed on main since.
+      # The tag job made this; check it is still here and at this commit
+      # before the Releases API would try to create it itself. Recreating
+      # it (after `untag` ran and the failed jobs were re-run) works only
+      # while ci.yml is unchanged on main.
       - name: Verify release tag
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag_name }}
-        run: |
-          set -euo pipefail
-          if existing="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null)"; then
-            [ "$existing" = "$GITHUB_SHA" ] || { echo "::error::tag $TAG points at $existing, not $GITHUB_SHA"; exit 1; }
-            echo "$TAG points at $GITHUB_SHA"
-            exit 0
-          fi
-          echo "::warning::tag $TAG is missing (removed after an earlier failure of this run?); recreating it"
-          if ! gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
-              -f "ref=refs/tags/$TAG" -f "sha=$GITHUB_SHA" --jq .ref; then
-            echo "::error::could not recreate $TAG at $GITHUB_SHA. A 403 means .github/workflows/ has changed on main since this commit, which GITHUB_TOKEN may not tag across; this commit cannot be released any more."
-            exit 1
-          fi
+        run: packaging/release-tag.sh ensure "$TAG" "$GITHUB_SHA"
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -1813,10 +1767,7 @@ jobs:
               ' > release-notes.md
           cat release-notes.md
 
-      # The tag already exists (verified above), so GitHub ignores
-      # target_commitish and creates no ref here — the step that used to
-      # 403. It is kept so the intent is explicit should the tag ever be
-      # missing anyway.
+      # The tag exists, so this creates no ref (the call that used to 403).
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -1830,19 +1781,15 @@ jobs:
             dist/checksums.txt
 
   # --------------------------------------------------------------------------
-  # No release, no tag. `tag` runs before anything is built, so a failed
-  # or cancelled run would otherwise leave v<version> on a commit that
-  # was never released, and tags are meant to mean releases here. Only
-  # the ref this run made is touched, and never one a release exists for
-  # (a release that failed while uploading assets is fixed by re-running,
-  # not by orphaning it). Deleting a ref creates no workflow content, so
-  # the restriction described at `tag` does not apply.
+  # No release, no tag: a failed or cancelled run must not leave
+  # v<version> on an unreleased commit. Leaves a tag that has a release
+  # (an upload failure is fixed by re-running). Deleting a ref is not
+  # subject to the workflows restriction.
   # --------------------------------------------------------------------------
   untag:
     name: Remove unreleased tag
     needs: [tag, release]
-    # always(): also after a cancellation. Skipped when `tag` itself was
-    # skipped (not a push to main) or failed (nothing to remove).
+    # always(): also after a cancellation. Skipped unless `tag` made one.
     if: always() && needs.tag.result == 'success' && needs.release.result != 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -1850,27 +1797,15 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
       - name: Delete tag
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.tag.outputs.tag_name }}
-        run: |
-          set -euo pipefail
-          if ! existing="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null)"; then
-            echo "$TAG does not exist; nothing to do"
-            exit 0
-          fi
-          if [ "$existing" != "$GITHUB_SHA" ]; then
-            echo "::warning::$TAG points at $existing, not this run's $GITHUB_SHA; leaving it alone"
-            exit 0
-          fi
-          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json tagName --jq .tagName >/dev/null 2>&1; then
-            echo "::warning::a release exists for $TAG; leaving the tag alone (re-run the failed jobs to finish it)"
-            exit 0
-          fi
-          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG"
-          echo "deleted $TAG ($GITHUB_SHA was not released)"
+        run: packaging/release-tag.sh remove "$TAG" "$GITHUB_SHA"
 
   # --------------------------------------------------------------------------
   # docker.io/ai/llmman: each ghcr.io/ggml-org/llama.cpp server image
