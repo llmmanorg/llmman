@@ -1881,7 +1881,7 @@ async fn local_context_overflow(resp: Response) -> Result<Response, String> {
 /// from a surface that has none to offer, which keeps a pair local.
 ///
 /// `request_threads` is the caller's Ollama `options.num_thread` (see
-/// [`opt_num_thread`]); `None` from every surface without an Ollama
+/// [`ollama::opt_num_thread`]); `None` from every surface without an Ollama
 /// options blob (OpenAI-compat, Anthropic, embeddings, preload).
 /// Precedence for the thread count a local llama-server ends up with:
 /// request option > `LLAMA_ARG_THREADS` > the derived `state.threads`
@@ -3499,33 +3499,6 @@ async fn convert_upstream(
         .header("cache-control", "no-cache")
         .body(Body::from_stream(sse_stream))
         .unwrap()
-}
-
-// ---------------------------------------------------------------------------
-// Option extractors from Ollama options blob
-// ---------------------------------------------------------------------------
-
-fn opt_f64(opts: &Option<serde_json::Value>, key: &str) -> Option<f32> {
-    opts.as_ref()?.get(key)?.as_f64().map(|f| f as f32)
-}
-
-fn opt_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32> {
-    opts.as_ref()?.get(key)?.as_u64().map(|n| n as u32)
-}
-
-/// `num_thread` from the Ollama options blob: the per-request
-/// `--threads <n>` for a fresh local llama-server load (see
-/// `ensure_model`'s `request_threads` parameter for the full precedence
-/// chain and the reuse/container caveats). Zero, negative, fractional,
-/// or above-u32 numbers are dropped, falling back down that chain, the
-/// same way `parse_num_parallel` rejects zero for `--parallel`. Unlike
-/// that env-string parser this value arrives as a JSON number (Ollama's
-/// `num_thread` is an int field), so `as_u64` does the type filtering;
-/// not built on [`opt_u32`], whose `as u32` truncation is harmless for
-/// `num_predict` but would turn e.g. 2^32+1 into `--threads 1` here.
-fn opt_num_thread(opts: &Option<serde_json::Value>) -> Option<u32> {
-    let n = opts.as_ref()?.get("num_thread")?.as_u64()?;
-    u32::try_from(n).ok().filter(|&n| n != 0)
 }
 
 // ---------------------------------------------------------------------------

@@ -23,8 +23,8 @@ use super::stream::*;
 use super::types::*;
 use super::{
     aggregation, backend_wire_model, ensure_model, forward_ollama, model_lock, now_rfc3339,
-    opt_f64, opt_num_thread, opt_u32, pull_serialized, release_model_lock, remote_status,
-    send_with_hybrid_fallback, unload_everywhere, AppError, AppState, Target,
+    pull_serialized, release_model_lock, remote_status, send_with_hybrid_fallback,
+    unload_everywhere, AppError, AppState, Target,
 };
 use crate::metrics::{self, UnloadReason};
 use crate::storage::OciStore;
@@ -1584,4 +1584,29 @@ pub(super) async fn handle_embeddings(
         .map(f64::from)
         .collect();
     Ok(Json(OllamaEmbeddingsResponse { embedding }).into_response())
+}
+
+// -- Ollama options blob -----------------------------------------------------
+
+pub(super) fn opt_f64(opts: &Option<serde_json::Value>, key: &str) -> Option<f32> {
+    opts.as_ref()?.get(key)?.as_f64().map(|f| f as f32)
+}
+
+pub(super) fn opt_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32> {
+    opts.as_ref()?.get(key)?.as_u64().map(|n| n as u32)
+}
+
+/// `num_thread` from the Ollama options blob: the per-request
+/// `--threads <n>` for a fresh local llama-server load (see
+/// `ensure_model`'s `request_threads` parameter for the full precedence
+/// chain and the reuse/container caveats). Zero, negative, fractional,
+/// or above-u32 numbers are dropped, falling back down that chain, the
+/// same way `parse_num_parallel` rejects zero for `--parallel`. Unlike
+/// that env-string parser this value arrives as a JSON number (Ollama's
+/// `num_thread` is an int field), so `as_u64` does the type filtering;
+/// not built on [`opt_u32`], whose `as u32` truncation is harmless for
+/// `num_predict` but would turn e.g. 2^32+1 into `--threads 1` here.
+pub(super) fn opt_num_thread(opts: &Option<serde_json::Value>) -> Option<u32> {
+    let n = opts.as_ref()?.get("num_thread")?.as_u64()?;
+    u32::try_from(n).ok().filter(|&n| n != 0)
 }
