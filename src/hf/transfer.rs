@@ -103,9 +103,8 @@ mod docker {
         let session = crate::ffi::push_session_open(destination)?;
 
         progress::set_status(destination, "pushing");
-        let info = api::fetch_model_info(&api_client, &endpoint, &owner, &repo, token.as_deref())
-            .await
-            .context("HF model info")?;
+        let info =
+            api::fetch_model_info(&api_client, &endpoint, &owner, &repo, token.as_deref()).await?;
         let commit = info.commit().to_string();
         let mut meta = ModelMeta {
             licenses: info.license().into_iter().collect(),
@@ -120,8 +119,7 @@ mod docker {
             &commit,
             token.as_deref(),
         )
-        .await
-        .context("HF file list")?;
+        .await?;
 
         let mut changed = false;
         let diffusion = api::is_diffusion_repo(&files);
@@ -310,11 +308,11 @@ mod docker {
         let endpoint = super::super::hf_endpoint(host);
         let info = api::fetch_model_info(api_client, &endpoint, &owner, &repo, token)
             .await
-            .with_context(|| format!("HF model info for text encoder {reference}"))?;
+            .with_context(|| format!("text encoder {reference}"))?;
         let commit = info.commit().to_string();
         let files = api::fetch_files(api_client, &endpoint, &owner, &repo, &commit, token)
             .await
-            .with_context(|| format!("HF file list for text encoder {reference}"))?;
+            .with_context(|| format!("text encoder {reference}"))?;
         let shards = api::select_gguf(&files, &tag)?;
         if shards.len() != 1 {
             anyhow::bail!("text encoder {reference}: split GGUFs are not supported");
