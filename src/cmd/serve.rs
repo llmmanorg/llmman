@@ -2938,7 +2938,7 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
     let messages_req = anthropic::from_chat_request(&req, default_max_tokens)
         .map_err(|e| AppError(e, StatusCode::BAD_REQUEST))?;
     let mut upstream = target.authorize(client.post(target.url(anthropic::MESSAGES_ROUTE)));
-    if anthropic::thinks(&messages_req) {
+    if anthropic::manual_thinking(&messages_req) {
         upstream = upstream.header("anthropic-beta", anthropic::INTERLEAVED_THINKING_BETA);
     }
     let resp = upstream

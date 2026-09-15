@@ -679,6 +679,65 @@ async fn max_tokens_is_clamped_to_the_catalogs_ceiling_for_an_anthropic_provider
     assert_eq!(calls[2].2["max_tokens"], 65_535);
 }
 
+/// `reasoning_effort` reaches Sonnet 5 as adaptive thinking and effort
+/// without a beta, and an older Claude as the budget with it.
+#[tokio::test]
+async fn a_thinking_level_reaches_each_claude_in_its_own_form() {
+    let (base, seen) = mock_anthropic(MOCK_MESSAGES_STREAM).await;
+    for (model, effort) in [
+        ("claude-sonnet-5", "high"),
+        ("claude-sonnet-5", "none"),
+        ("claude-sonnet-4-5", "high"),
+    ] {
+        let target = Target::Remote(Arc::new(RemoteTarget {
+            provider: "anthropic".into(),
+            base_url: base.clone(),
+            wire: Wire::Anthropic,
+            model: model.into(),
+            max_output: Some(64_000),
+            api_key: Some("sk-test".into()),
+        }));
+        let req = serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "reasoning_effort": effort, "max_tokens": 64_000, "temperature": 0.2
+        });
+        let upstream = send_chat_completion(&Client::new(), &target, &req, "m")
+            .await
+            .unwrap();
+        assert_eq!(upstream.status, StatusCode::OK, "{model} {effort}");
+    }
+    let calls = seen.lock().await;
+
+    let (_, headers, sent) = &calls[0];
+    assert_eq!(
+        sent["thinking"],
+        serde_json::json!({ "type": "adaptive", "display": "summarized" })
+    );
+    assert_eq!(
+        sent["output_config"],
+        serde_json::json!({ "effort": "high" })
+    );
+    assert!(sent.get("temperature").is_none(), "{sent}");
+    assert!(headers.get("anthropic-beta").is_none(), "{headers:?}");
+
+    let (_, headers, sent) = &calls[1];
+    assert_eq!(sent["thinking"], serde_json::json!({ "type": "disabled" }));
+    assert!(sent.get("output_config").is_none(), "{sent}");
+    assert!(headers.get("anthropic-beta").is_none());
+
+    let (_, headers, sent) = &calls[2];
+    assert_eq!(
+        sent["thinking"],
+        serde_json::json!({ "type": "enabled", "budget_tokens": 16_384 })
+    );
+    assert!(sent.get("output_config").is_none(), "{sent}");
+    assert_eq!(
+        headers["anthropic-beta"],
+        anthropic::INTERLEAVED_THINKING_BETA
+    );
+}
+
 /// `/v1/messages` is relayed whole, `model` rewritten, the client's
 /// `anthropic-beta` forwarded and its credential not.
 #[tokio::test]

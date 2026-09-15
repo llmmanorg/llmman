@@ -246,7 +246,7 @@ the surface it arrived on:
 | Arrived on | Sent as |
 |------------|---------|
 | `/v1/messages` (Claude Code) | The same request, relayed intact: cache breakpoints, thinking, tools and `anthropic-beta` headers included. Only `model` is rewritten. |
-| `/v1/chat/completions` (OpenCode, Aider, Qwen Code, Hermes), `/api/chat`, `/api/generate` | A Messages request, and the reply back as chat-completion chunks: system turns to `system`, tool calls to `tool_use`/`tool_result`, `reasoning_effort` to a thinking budget, thinking back as `reasoning_content`. |
+| `/v1/chat/completions` (OpenCode, Aider, Qwen Code, Hermes), `/api/chat`, `/api/generate` | A Messages request, and the reply back as chat-completion chunks: system turns to `system`, tool calls to `tool_use`/`tool_result`, `reasoning_effort` to thinking (see below), thinking back as `reasoning_content`. |
 | `/v1/responses` (Codex) | The Responses bridge above, then the same translation. The provider is not probed for `/v1/responses`. |
 
 `max_tokens` is required by the Messages API; a translated request
@@ -256,10 +256,18 @@ without one gets the model's `limit.output` from the catalog, or 4096
 `/v1/responses/input_tokens` have no Messages equivalent and are refused
 with a 501.
 
+`reasoning_effort` takes the form the model accepts, by the version in
+a Claude's name. From Claude 4.6 (Sonnet 5, Opus 4.7, an unversioned
+preview) it is adaptive thinking with the level as `output_config.effort`
+(`minimal` as `low`); `none` turns thinking off, or on Fable and Mythos,
+which always think, is `low`. Through Claude 4.5, and on another
+vendor's Messages endpoint, it is a budget spent from `max_tokens`, left
+off for the continuation of a tool call or a forced tool, which want a
+signed thinking block no OpenAI client can hand back.
+
 The translation also does what the API needs that an OpenAI client would
 not know to: prompt caching is on (breakpoints on the last tool, system
 block and user block), a `response_format` JSON schema becomes a forced
 tool whose arguments are returned as the reply, tools used earlier in
-the history are declared back when the client offers none, an unanswered
-tool call gets a placeholder result, and thinking is left off for the
-continuation of a tool call or a forced tool.
+the history are declared back when the client offers none, and an
+unanswered tool call gets a placeholder result.
