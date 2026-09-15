@@ -55,16 +55,6 @@ landing in your local store.
   them runs on whichever node has the model loaded or the most room for
   it. A laptop, a workstation and a Spark look like one endpoint.
 
-| | llmman | Ollama |
-|---|---|---|
-| Model registry | Hugging Face directly, or any OCI registry (Docker Hub, GHCR, quay, Harbor, self-hosted) | ollama.com library, own registry protocol |
-| Model format on disk | Unmodified GGUF / safetensors in a standard OCI Image Layout | GGUF and safetensors imported via `Modelfile` into Ollama's blob layout |
-| Inference engine | Upstream `llama.cpp` release, or your own `llama-server`; `vllm`; `sglang`; `mlx-lm` | Bundled `llama.cpp`/ggml fork plus Ollama's own engine |
-| Hosted models | Any provider via `--provider` | Ollama Cloud |
-| Registry-to-registry transfer | `llmman transfer hf.co/... docker.io/...` in one step, nothing added to your local store | Pull, write a `Modelfile`, `create`, push to ollama.com |
-| Signing and verification | cosign-format signatures; `verify` command and per-repo pull-time trust policy | None |
-| Multiple machines | Aggregation: daemons pool hardware, any node answers for all | One host per endpoint |
-
 ## Install
 
 **Linux, macOS:**
@@ -139,37 +129,18 @@ are instead served by [vLLM-Omni](https://github.com/vllm-project/vllm-omni) (`v
 --omni`; install `vllm-omni` next to `vllm`, or use `--runtime docker` for the `vllm/vllm-omni` image).
 See [docs/backends.md](docs/backends.md#vllm-omni-diffusers-pipelines).
 
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `serve`   | Start an inference server (Ollama / OpenAI / Anthropic APIs) |
-| `launch`  | Launch an integration (Claude Code, OpenCode, …) |
-| `run`     | Run a model interactively or with a one-shot prompt |
-| `pull`    | Pull a model from a registry or HuggingFace |
-| `search`  | Search for models on Docker Hub and Hugging Face (Docker Hub results first) |
-| `list` (`ls`) | List locally stored models, or a hosted provider's (`--provider`) models |
-| `ps`      | List models currently loaded |
-| `log`     | Show the prompts `serve` has seen, newest first, like `git log` |
-| `providers` | List the hosted providers `--provider` can route to |
-| `stop`    | Stop (unload) a running model |
-| `build`   | Package model files into a local OCI image |
-| `push`    | Push a local image to a registry |
-| `transfer` | Transfer an image directly from one location to another (e.g. HuggingFace to an OCI registry) |
-| `cp`      | Copy a local image to a new reference |
-| `rm`      | Remove a local image |
-| `show`    | Show a local model's architecture, parameters, license, and template |
-| `verify`  | Check a registry model's signatures against trusted public keys |
-| `login`   | Log in to a container registry or HuggingFace |
-| `logout`  | Log out from a container registry or HuggingFace |
-| `config`  | Read and write `llmman.conf` settings (aliases, API keys, trust policy, aggregation peers) |
-
-## Models are OCI artifacts
+## OCI-native models
 
 Models are packaged as standard OCI artifacts and stored in any compatible
-registry: Docker Hub, GHCR, quay, self-hosted. There is no curated library and
-no gatekeeper: push a model anywhere you can push a container image, and anyone
-can `llmman run` it straight from there.
+registry: Docker Hub, GHCR, quay, Harbor, self-hosted. There is no curated
+library and no gatekeeper: push a model anywhere you can push a container
+image, and anyone can `llmman run` it straight from there.
+
+That means the registry, mirroring, access control, retention and
+signing infrastructure you already run for containers works for models
+too. Pull from the registry you already trust, `transfer` a model from
+Hugging Face into your own registry without it ever touching a laptop,
+and sign it with cosign so `pull` can refuse anything unsigned.
 
 ### Pull a model
 
@@ -205,6 +176,22 @@ A `[verify]` trust policy turns that into an automatic check on every
 `pull`, warning or refusing outright per repository. Off by default —
 there is nothing to check against until you have said whom you trust.
 See [docs/verification.md](docs/verification.md).
+
+### Compared with Ollama
+
+Ollama stores models in its own blob layout behind its own registry
+protocol; llmman uses the OCI standard end to end, so the model
+supply chain looks like the container supply chain:
+
+| | llmman | Ollama |
+|---|---|---|
+| Model registry | Hugging Face directly, or any OCI registry (Docker Hub, GHCR, quay, Harbor, self-hosted) | ollama.com library, own registry protocol |
+| Model format on disk | Unmodified GGUF / safetensors in a standard OCI Image Layout | GGUF and safetensors imported via `Modelfile` into Ollama's blob layout |
+| Registry-to-registry transfer | `llmman transfer hf.co/... docker.io/...` in one step, nothing added to your local store | Pull, write a `Modelfile`, `create`, push to ollama.com |
+| Signing and verification | cosign-format signatures; `verify` command and per-repo pull-time trust policy | None |
+| Inference engine | Upstream `llama.cpp` release, or your own `llama-server`; `vllm`; `sglang`; `mlx-lm` | Bundled `llama.cpp`/ggml fork plus Ollama's own engine |
+| Hosted models | Any provider via `--provider` | Ollama Cloud |
+| Multiple machines | Aggregation: daemons pool hardware, any node answers for all | One host per endpoint |
 
 ## Serve
 
@@ -340,6 +327,7 @@ so it works from any client on every inference endpoint. Details in
 
 | | |
 |---|---|
+| [docs/commands.md](docs/commands.md) | Every subcommand, one line each |
 | [docs/api.md](docs/api.md) | Every HTTP endpoint, and per-API notes |
 | [docs/aggregation.md](docs/aggregation.md) | Pooling several machines into one endpoint |
 | [docs/backends.md](docs/backends.md) | llama.cpp, vLLM, SGLang, MLX, containers, and building from source |
