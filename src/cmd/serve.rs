@@ -2753,7 +2753,8 @@ fn strip_llama_fields(req: &mut serde_json::Value) {
 /// wire, which has a budget to turn on or off, since an OpenAI provider
 /// 400s `reasoning_effort` on a model that does not reason. OpenAI's
 /// reasoning models then take `max_completion_tokens`, not `max_tokens`,
-/// and reject sampling overrides (litellm's o-series and gpt-5 rules).
+/// and reject sampling overrides (litellm's o-series and gpt-5 rules);
+/// so do the newer Claude models ([`anthropic::sampling_compat`]).
 fn provider_compat(remote: &RemoteTarget, req: &mut serde_json::Value) {
     let Some(o) = req.as_object_mut() else {
         return;
@@ -2778,6 +2779,9 @@ fn provider_compat(remote: &RemoteTarget, req: &mut serde_json::Value) {
     // Cohere's compatibility API rejects `stream_options`.
     if remote.provider == "cohere" {
         o.remove("stream_options");
+    }
+    if remote.wire == Wire::Anthropic {
+        anthropic::sampling_compat(&remote.model, o);
     }
     if remote.provider != "openai" {
         return;
@@ -2916,11 +2920,20 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
         .get("stream")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let default_max_tokens = match target {
-        Target::Remote(remote) => remote.max_output,
-        _ => None,
+    // The API 400s a `max_tokens` above the model's ceiling; agents ask
+    // every model for the same large number.
+    if let Some(ceiling) = remote.max_output {
+        for key in ["max_tokens", "max_completion_tokens"] {
+            if req
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|n| n > u64::from(ceiling))
+            {
+                req[key] = serde_json::json!(ceiling);
+            }
+        }
     }
-    .unwrap_or(anthropic::DEFAULT_MAX_TOKENS);
+    let default_max_tokens = remote.max_output.unwrap_or(anthropic::DEFAULT_MAX_TOKENS);
     let messages_req = anthropic::from_chat_request(&req, default_max_tokens)
         .map_err(|e| AppError(e, StatusCode::BAD_REQUEST))?;
     let mut upstream = target.authorize(client.post(target.url(anthropic::MESSAGES_ROUTE)));

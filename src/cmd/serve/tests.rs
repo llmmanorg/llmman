@@ -641,6 +641,43 @@ async fn a_non_streaming_request_to_an_anthropic_provider_is_folded() {
     assert_eq!(seen.lock().await[0].2["stream"], true);
 }
 
+/// `max_tokens` is clamped to the catalog's ceiling; without one it
+/// passes as asked.
+#[tokio::test]
+async fn max_tokens_is_clamped_to_the_catalogs_ceiling_for_an_anthropic_provider() {
+    let (base, seen) = mock_anthropic(MOCK_MESSAGES_STREAM).await;
+    let capped = Target::Remote(Arc::new(RemoteTarget {
+        provider: "mockprov".into(),
+        base_url: base.clone(),
+        wire: Wire::Anthropic,
+        model: "mock-model".into(),
+        max_output: Some(64_000),
+        api_key: Some("sk-test".into()),
+    }));
+    let send = |target: &Target, req: serde_json::Value| {
+        let target = target.clone();
+        async move {
+            send_chat_completion(&Client::new(), &target, &req, "m")
+                .await
+                .unwrap()
+        }
+    };
+    let ask = |max_tokens: u64| {
+        serde_json::json!({
+            "model": "mock-model",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "max_tokens": max_tokens
+        })
+    };
+    send(&capped, ask(65_535)).await;
+    send(&capped, ask(1_000)).await;
+    send(&remote_target_on(&base, Wire::Anthropic), ask(65_535)).await;
+    let calls = seen.lock().await;
+    assert_eq!(calls[0].2["max_tokens"], 64_000);
+    assert_eq!(calls[1].2["max_tokens"], 1_000);
+    assert_eq!(calls[2].2["max_tokens"], 65_535);
+}
+
 /// `/v1/messages` is relayed whole, `model` rewritten, the client's
 /// `anthropic-beta` forwarded and its credential not.
 #[tokio::test]
@@ -870,6 +907,55 @@ fn provider_compat_applies_openais_reasoning_model_rules() {
     ] {
         assert_eq!(openai_reasoning_model(model), reasoning, "{model}");
     }
+}
+
+/// Claude on the Anthropic wire loses `top_p` beside `temperature`, and
+/// both after Opus 4.6 (bar `temperature` 1.0); other wires and vendors
+/// keep theirs.
+#[test]
+fn provider_compat_drops_claudes_rejected_sampling_parameters() {
+    let both =
+        serde_json::json!({ "model": "m", "temperature": 0.2, "top_p": 0.9, "max_tokens": 5 });
+    let with = |provider: &str, model: &str, wire: Wire, req: &serde_json::Value| {
+        let mut req = req.clone();
+        provider_compat(&remote(provider, model, wire), &mut req);
+        req
+    };
+    // agy: sonnet-5 with both set, which is what 400'd.
+    assert_eq!(
+        with("anthropic", "claude-sonnet-5", Wire::Anthropic, &both),
+        serde_json::json!({ "model": "m", "max_tokens": 5 })
+    );
+    let one = serde_json::json!({ "model": "m", "temperature": 1.0, "top_p": 0.9 });
+    assert_eq!(
+        with("anthropic", "claude-opus-4-7", Wire::Anthropic, &one),
+        serde_json::json!({ "model": "m", "temperature": 1.0 })
+    );
+    // Up to Opus 4.6: temperature wins over top_p; top_p alone stays.
+    assert_eq!(
+        with(
+            "anthropic",
+            "claude-sonnet-4-5-20250929",
+            Wire::Anthropic,
+            &both
+        ),
+        serde_json::json!({ "model": "m", "temperature": 0.2, "max_tokens": 5 })
+    );
+    let nucleus = serde_json::json!({ "model": "m", "top_p": 0.9, "temperature": null });
+    assert_eq!(
+        with("anthropic", "claude-opus-4-6", Wire::Anthropic, &nucleus),
+        nucleus
+    );
+    assert_eq!(
+        with(
+            "openrouter",
+            "anthropic/claude-sonnet-5",
+            Wire::OpenAi,
+            &both
+        ),
+        both
+    );
+    assert_eq!(with("minimax", "MiniMax-M2", Wire::Anthropic, &both), both);
 }
 
 // -- aggregation (peer daemons) ------------------------------------------

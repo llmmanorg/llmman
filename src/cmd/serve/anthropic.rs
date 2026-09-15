@@ -234,6 +234,45 @@ pub(super) fn from_chat_request(req: &Value, default_max_tokens: u32) -> anyhow:
     Ok(out)
 }
 
+/// Drops the sampling overrides Claude 400s. `top_p` is deprecated:
+/// from Opus 4.1/Sonnet 4.5 it cannot join `temperature`, and a model
+/// after Opus 4.6 rejects any non-default value of either, so `top_p`
+/// yields to `temperature`, and both go on a later model bar a
+/// `temperature` of 1.0. Other vendors' models keep theirs.
+pub(super) fn sampling_compat(model: &str, req: &mut serde_json::Map<String, Value>) {
+    if !model.to_ascii_lowercase().contains("claude") {
+        return;
+    }
+    let fixed = fixed_sampling(model);
+    let temperature = req.get("temperature").and_then(Value::as_f64);
+    if fixed || temperature.is_some() {
+        req.remove("top_p");
+    }
+    if fixed && temperature != Some(1.0) {
+        req.remove("temperature");
+    }
+}
+
+/// Whether a Claude is newer than Opus 4.6: versioned above it, or
+/// unversioned (a preview).
+fn fixed_sampling(model: &str) -> bool {
+    claude_version(model).is_none_or(|v| v > (4, 6))
+}
+
+/// The version in a Claude model name: `claude-sonnet-4-5-20250929` and
+/// `claude-3-5-sonnet-20241022` are (4, 5) and (3, 5), `claude-sonnet-5`
+/// is (5, 0). A date or build suffix is not a version segment.
+fn claude_version(model: &str) -> Option<(u32, u32)> {
+    let is_version = |s: &&str| (1..=2).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit());
+    let mut numbers = model
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .skip_while(|s| !is_version(s))
+        .take_while(is_version)
+        .filter_map(|s| s.parse::<u32>().ok());
+    let major = numbers.next()?;
+    Some((major, numbers.next().unwrap_or(0)))
+}
+
 /// Whether thinking is on in a translated request; the caller adds
 /// [`INTERLEAVED_THINKING_BETA`] for it.
 pub(super) fn thinks(messages_req: &Value) -> bool {
@@ -1677,6 +1716,35 @@ mod tests {
         assert_eq!(fallback["metadata"], json!({ "user_id": "s1" }));
         // No Messages equivalent: dropped rather than sent to be 400'd.
         assert!(out.get("frequency_penalty").is_none());
+    }
+
+    /// The version is read from either side of the family name, never
+    /// from a date; above 4.6 or absent means fixed sampling.
+    #[test]
+    fn claude_versions_tell_fixed_sampling_apart() {
+        for (model, version, fixed) in [
+            ("claude-sonnet-5", Some((5, 0)), true),
+            ("claude-fable-5-1", Some((5, 1)), true),
+            ("claude-opus-4-7", Some((4, 7)), true),
+            ("claude-mythos-preview", None, true),
+            ("claude", None, true),
+            ("claude-opus-4-6", Some((4, 6)), false),
+            ("claude-sonnet-4-6", Some((4, 6)), false),
+            ("claude-haiku-4-5-20251001", Some((4, 5)), false),
+            ("claude-sonnet-4-20250514", Some((4, 0)), false),
+            ("claude-opus-4-1@20250805", Some((4, 1)), false),
+            (
+                "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                Some((3, 5)),
+                false,
+            ),
+            ("claude-2.1", Some((2, 1)), false),
+            ("Claude-3-7-Sonnet-Latest", Some((3, 7)), false),
+        ] {
+            assert_eq!(claude_version(model), version, "{model}");
+            assert_eq!(fixed_sampling(model), fixed, "{model}");
+        }
+        assert_eq!(claude_version("MiniMax-M2"), None);
     }
 
     /// Calls become `tool_use` blocks with decoded arguments, and every
