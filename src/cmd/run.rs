@@ -76,7 +76,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub think: Option<bool>,
     /// Forwarded as `options.num_predict` (Ollama's own name for
-    /// llama-server's `max_tokens` — see opt_u32 in cmd::serve) on every
+    /// llama-server's `max_tokens` — see opt_u32 in cmd::serve::ollama) on every
     /// request this sends: a hard ceiling on how many tokens a single
     /// reply may generate, regardless of *why* it might otherwise run
     /// away (a real, no-stopping-condition-hit degenerate loop, observed

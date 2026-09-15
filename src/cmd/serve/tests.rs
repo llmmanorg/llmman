@@ -1,9 +1,9 @@
 use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
 use super::ollama::{
-    embed_inputs, empty_chat_chunk, evict_if_retagged, normalize_in_place, options_to_oai,
-    progress_line, staged_blob_path, staged_file, OllamaPullRequest, OllamaPushRequest,
-    PushOutcome, StreamedOutcome,
+    embed_inputs, empty_chat_chunk, evict_if_retagged, normalize_in_place, opt_f64, opt_num_thread,
+    opt_u32, options_to_oai, progress_line, staged_blob_path, staged_file, OllamaPullRequest,
+    OllamaPushRequest, PushOutcome, StreamedOutcome,
 };
 use super::openai::{
     apply_default_repeat_penalty, apply_reasoning_effort, mlx_embeddings_unsupported_response,
