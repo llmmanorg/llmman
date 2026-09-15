@@ -9,6 +9,7 @@ use super::openai::{
     apply_default_repeat_penalty, apply_reasoning_effort, mlx_embeddings_unsupported_response,
     multipart_form, multipart_text_field, omni_image_request, omni_video_fields,
 };
+use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::responses::{
     consolidate_responses_instructions, filter_non_function_tools, remote_responses,
     responses_input_item_text, RESPONSES_ROUTE,

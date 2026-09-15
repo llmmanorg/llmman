@@ -17,13 +17,14 @@ use serde::Deserialize;
 use tokio::time::{sleep, Duration, Instant};
 
 use super::backend::*;
+use super::refusal::wire_refusal;
 use super::sched::*;
 use super::stream::*;
 use super::types::*;
 use super::{
     aggregation, backend_wire_model, ensure_model, forward_ollama, model_lock, now_rfc3339,
     opt_f64, opt_num_thread, opt_u32, pull_serialized, release_model_lock, remote_status,
-    send_with_hybrid_fallback, unload_everywhere, wire_refusal, AppError, AppState, Target,
+    send_with_hybrid_fallback, unload_everywhere, AppError, AppState, Target,
 };
 use crate::metrics::{self, UnloadReason};
 use crate::storage::OciStore;
