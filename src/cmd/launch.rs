@@ -592,7 +592,7 @@ fn launch(
 ) -> anyhow::Result<()> {
     match name.to_lowercase().as_str() {
         "claude" => launch_claude(model, api_key, extra_args),
-        "opencode" => launch_opencode(model, api_key, thinking, extra_args),
+        "opencode" => launch_opencode(model, api_key, thinking, vision, extra_args),
         "codex" => launch_codex(model, api_key, extra_args),
         "cline" => launch_simple("cline", model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
@@ -639,11 +639,13 @@ fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
 }
 
 /// opencode: a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
-/// /v1 endpoint, with the model's thinking variants.
+/// /v1 endpoint, with the model's thinking variants and, for a vision
+/// model, image input.
 fn launch_opencode(
     model: &str,
     api_key: &str,
     thinking: Option<&ThinkingControls>,
+    vision: bool,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
@@ -654,6 +656,7 @@ fn launch_opencode(
         effective_model,
         api_key,
         &opencode_variants(thinking),
+        vision,
     );
 
     exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
@@ -711,6 +714,7 @@ fn opencode_config(
     model: &str,
     api_key: &str,
     variants: &[(&'static str, serde_json::Value)],
+    vision: bool,
 ) -> String {
     use serde::ser::{SerializeMap, Serializer};
 
@@ -757,7 +761,23 @@ fn opencode_config(
         name: &'a str,
         #[serde(serialize_with = "entries", skip_serializing_if = "<[_]>::is_empty")]
         variants: &'a [(&'static str, serde_json::Value)],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        modalities: Option<Modalities>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attachment: Option<bool>,
     }
+    #[derive(serde::Serialize)]
+    struct Modalities {
+        input: &'static [&'static str],
+        output: &'static [&'static str],
+    }
+
+    // Declare image input for a vision model so opencode will attach
+    // images; a text-only model gets neither key.
+    let modalities = vision.then_some(Modalities {
+        input: &["text", "image"],
+        output: &["text"],
+    });
 
     let config = Config {
         schema: "https://opencode.ai/config.json",
@@ -774,6 +794,8 @@ fn opencode_config(
                     Model {
                         name: model,
                         variants,
+                        modalities,
+                        attachment: vision.then_some(true),
                     },
                 )],
             },
@@ -2429,7 +2451,13 @@ model = \"gpt-5\"
     #[test]
     fn opencode_config_lists_the_variants_in_order() {
         let variants = opencode_variants(None);
-        let text = opencode_config("http://127.0.0.1:17434", "qwen3.5:0.8b", "k", &variants);
+        let text = opencode_config(
+            "http://127.0.0.1:17434",
+            "qwen3.5:0.8b",
+            "k",
+            &variants,
+            false,
+        );
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert_eq!(config["$schema"], "https://opencode.ai/config.json");
         assert_eq!(config["model"], "ollama/qwen3.5:0.8b");
@@ -2453,15 +2481,31 @@ model = \"gpt-5\"
             .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
 
-        let bare = opencode_config("http://h", "m", "k", &[]);
+        let bare = opencode_config("http://h", "m", "k", &[], false);
         assert!(!bare.contains("variants"), "{bare}");
+    }
+
+    #[test]
+    fn opencode_config_declares_image_input_only_for_a_vision_model() {
+        let text = opencode_config("http://h", "m", "k", &[], true);
+        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let model = &config["provider"]["ollama"]["models"]["m"];
+        assert_eq!(
+            model["modalities"],
+            serde_json::json!({ "input": ["text", "image"], "output": ["text"] })
+        );
+        assert_eq!(model["attachment"], true);
+
+        let text_only = opencode_config("http://h", "m", "k", &[], false);
+        assert!(!text_only.contains("modalities"), "{text_only}");
+        assert!(!text_only.contains("attachment"), "{text_only}");
     }
 
     #[test]
     fn opencode_config_escapes_the_model_name() {
         let model = "we\"ird/mo\\del";
         let config: serde_json::Value =
-            serde_json::from_str(&opencode_config("http://h", model, "k", &[]))
+            serde_json::from_str(&opencode_config("http://h", model, "k", &[], false))
                 .expect("valid JSON");
         assert_eq!(config["model"], format!("ollama/{model}"));
         assert_eq!(config["provider"]["ollama"]["models"][model]["name"], model);
