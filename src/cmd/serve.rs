@@ -123,7 +123,7 @@ Environment Variables:
       LLMMAN_FLASH_ATTENTION         Enable flash attention
       LLMMAN_KV_CACHE_TYPE           Quantization type for the K/V cache (default: f16)
       LLMMAN_RUNTIME                 Where the inference engine comes from: auto (default), docker, podman, bin or path — same as --runtime
-      LLMMAN_LLM_LIBRARY             Set backend (cpu/cuda/cuda13/rocm/vulkan/metal) to bypass GPU autodetection
+      LLMMAN_LLM_LIBRARY             Set backend (cpu/cuda/cuda13/rocm/opencl/vulkan/metal) to bypass GPU autodetection
       LLMMAN_IGPU_ENABLE             Enable integrated GPUs
       LLMMAN_LOAD_TIMEOUT            How long to allow model loads to stall before giving up (default \"10m\")
       LLMMAN_VLLM_OMNI_GUARDRAILS    Keep a Diffusers-layout model's vLLM-Omni safety guardrails on (default: off)
