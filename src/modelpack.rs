@@ -496,9 +496,21 @@ pub enum ModelFormat {
     Omni,
 }
 
+impl ModelFormat {
+    /// The same vocabulary [`ModelPath::format`] reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelFormat::Gguf => "gguf",
+            ModelFormat::SafeTensors => "safetensors",
+            ModelFormat::Diffusion => "diffusion",
+            ModelFormat::Omni => "omni",
+        }
+    }
+}
+
 /// [`resolve_model`]'s classification: diffusion > GGUF > Diffusers
 /// (omni) > safetensors, `None` for "no servable model layer".
-fn manifest_format(manifest: &crate::storage::oci::Manifest) -> Option<ModelFormat> {
+pub fn manifest_format(manifest: &crate::storage::oci::Manifest) -> Option<ModelFormat> {
     if manifest.layers.iter().any(|l| layer_role(l).is_some()) {
         Some(ModelFormat::Diffusion)
     } else if gguf_layers(manifest).is_some() {
@@ -996,6 +1008,15 @@ mod tests {
         assert_eq!(manifest_format(&m), Some(ModelFormat::Diffusion));
         let (_, m) = manifest_with(vec![descriptor("sha256:a", "README.md")]);
         assert_eq!(manifest_format(&m), None);
+    }
+
+    /// `/api/show` reports these strings, so they are the wire contract.
+    #[test]
+    fn model_format_as_str_matches_model_paths_vocabulary() {
+        assert_eq!(ModelFormat::Gguf.as_str(), "gguf");
+        assert_eq!(ModelFormat::SafeTensors.as_str(), "safetensors");
+        assert_eq!(ModelFormat::Diffusion.as_str(), "diffusion");
+        assert_eq!(ModelFormat::Omni.as_str(), "omni");
     }
 
     /// The layers `llmman pull nvidia/Cosmos3-Edge` records (the

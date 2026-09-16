@@ -253,7 +253,13 @@ pub(super) async fn handle_show(
             .map_or_else(|| serde_json::json!({}), model_info_json),
         details: OllamaModelDetails {
             parent_model: String::new(),
-            format: "gguf".into(),
+            // What resolve_model would serve this as, read off the
+            // manifest. Empty rather than a guess when no layer is
+            // servable at all.
+            format: crate::modelpack::manifest_format(&manifest)
+                .map(crate::modelpack::ModelFormat::as_str)
+                .unwrap_or_default()
+                .to_string(),
             family: arch.unwrap_or_default().to_string(),
             families: arch.map(|a| vec![a.to_string()]).unwrap_or_default(),
             parameter_size: gguf
