@@ -245,8 +245,15 @@ pub(super) struct OllamaModelInfo {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct OllamaModelDetails {
+    /// Always empty: llmman has no equivalent of ollama's `FROM <model>`
+    /// derivation, but clients read the field.
+    #[serde(default)]
+    pub(super) parent_model: String,
     pub(super) format: String,
     pub(super) family: String,
+    /// `family` in a list, as ollama reports it.
+    #[serde(default)]
+    pub(super) families: Vec<String>,
     pub(super) parameter_size: String,
     pub(super) quantization_level: String,
 }

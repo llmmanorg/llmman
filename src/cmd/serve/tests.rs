@@ -1,9 +1,9 @@
 use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
 use super::ollama::{
-    embed_inputs, empty_chat_chunk, evict_if_retagged, normalize_in_place, opt_f64, opt_num_thread,
-    opt_u32, options_to_oai, progress_line, staged_blob_path, staged_file, OllamaPullRequest,
-    OllamaPushRequest, PushOutcome, StreamedOutcome,
+    embed_inputs, empty_chat_chunk, evict_if_retagged, model_info_json, normalize_in_place,
+    opt_f64, opt_num_thread, opt_u32, options_to_oai, progress_line, staged_blob_path, staged_file,
+    OllamaPullRequest, OllamaPushRequest, PushOutcome, StreamedOutcome,
 };
 use super::openai::{
     apply_default_repeat_penalty, apply_reasoning_effort, mlx_embeddings_unsupported_response,
@@ -4433,6 +4433,41 @@ async fn handle_delete_rejects_an_invalid_ref_with_400() {
     };
     let resp = handle_delete(State(state), Json(req)).await.into_response();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// ollama sends every GGUF metadata key verbatim but replaces a
+/// non-empty array with `null`: `tokenizer.ggml.tokens` and `merges`
+/// alone run to megabytes.
+#[test]
+fn model_info_json_sends_scalars_verbatim_and_nulls_non_empty_arrays() {
+    use crate::gguf::Value;
+    let mut info = crate::gguf::Info::default();
+    for (k, v) in [
+        ("general.architecture", Value::String("llama".into())),
+        ("llama.context_length", Value::U32(4096)),
+        ("tokenizer.ggml.add_eos_token", Value::Bool(false)),
+        ("tokenizer.ggml.tokens", Value::Array(vec![Value::U32(1)])),
+        ("llama.vision.indexes", Value::Array(Vec::new())),
+        (
+            "tokenizer.chat_template",
+            Value::String("{{ bulk }}".into()),
+        ),
+    ] {
+        info.metadata.insert(k.to_string(), v);
+    }
+    let json = model_info_json(&info);
+    assert_eq!(json["general.architecture"], serde_json::json!("llama"));
+    assert_eq!(json["llama.context_length"], serde_json::json!(4096));
+    assert_eq!(
+        json["tokenizer.ggml.add_eos_token"],
+        serde_json::json!(false)
+    );
+    assert_eq!(json["tokenizer.ggml.tokens"], serde_json::Value::Null);
+    // An empty array stays one, as ollama reports it.
+    assert_eq!(json["llama.vision.indexes"], serde_json::json!([]));
+    // The template has its own field on this response; ollama leaves it
+    // out of model_info and so do we.
+    assert_eq!(json.get("tokenizer.chat_template"), None);
 }
 
 /// /api/show resolves (and so validates) the client ref before it ever
