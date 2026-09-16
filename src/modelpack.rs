@@ -362,6 +362,17 @@ pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) 
     caps
 }
 
+/// How many primary GGUF layers the manifest holds. More than one is a
+/// `gguf-split` set, whose tensors are spread across the shards, so no
+/// single header's tensor list describes the whole model.
+pub fn gguf_shard_count(manifest: &crate::storage::oci::Manifest) -> usize {
+    manifest
+        .layers
+        .iter()
+        .filter(|l| is_gguf_layer(l) && layer_role(l).is_none() && !is_mmproj_layer(l))
+        .count()
+}
+
 /// The model's parsed GGUF header: the blob as stored, or a tar layer
 /// already extracted. Like [`chat_template`] it extracts nothing itself,
 /// so a read-only caller never copies a checkout into the cache. `None`
@@ -1008,6 +1019,22 @@ mod tests {
         assert_eq!(manifest_format(&m), Some(ModelFormat::Diffusion));
         let (_, m) = manifest_with(vec![descriptor("sha256:a", "README.md")]);
         assert_eq!(manifest_format(&m), None);
+    }
+
+    #[test]
+    fn gguf_shard_count_counts_only_the_primary_weights() {
+        let (_, m) = manifest_with(vec![
+            descriptor("sha256:a", "model-00001-of-00003.gguf"),
+            descriptor("sha256:b", "model-00002-of-00003.gguf"),
+            descriptor("sha256:c", "model-00003-of-00003.gguf"),
+            descriptor("sha256:d", "mmproj-F16.gguf"),
+        ]);
+        assert_eq!(gguf_shard_count(&m), 3);
+        let (_, m) = manifest_with(vec![
+            descriptor("sha256:a", "model.Q4_K_M.gguf"),
+            descriptor("sha256:b", "mmproj-F16.gguf"),
+        ]);
+        assert_eq!(gguf_shard_count(&m), 1);
     }
 
     /// `/api/show` reports these strings, so they are the wire contract.

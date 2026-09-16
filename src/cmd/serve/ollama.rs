@@ -275,9 +275,18 @@ pub(super) async fn handle_show(
                 .to_string(),
             family: arch.unwrap_or_default().to_string(),
             families: arch.map(|a| vec![a.to_string()]).unwrap_or_default(),
+            // The header's own figure when it declares one. Otherwise
+            // the sum of this file's tensors, which describes the whole
+            // model only when it is not a split set — shard 1 of six
+            // would understate it, and nothing beats no answer there.
             parameter_size: gguf
                 .as_ref()
-                .map(|i| i.parameter_count)
+                .and_then(|i| {
+                    i.u64("general.parameter_count").or_else(|| {
+                        (crate::modelpack::gguf_shard_count(&manifest) == 1)
+                            .then_some(i.parameter_count)
+                    })
+                })
                 .filter(|n| *n > 0)
                 .map(crate::fmt::human_count)
                 .unwrap_or_default(),
