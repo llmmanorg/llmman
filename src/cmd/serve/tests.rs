@@ -4470,13 +4470,17 @@ fn model_info_json_sends_scalars_verbatim_and_nulls_non_empty_arrays() {
     assert_eq!(json.get("tokenizer.chat_template"), None);
 }
 
-/// The whole `/api/show` wiring over a stored GGUF: the fields below are
-/// public API, and a handler that read the architecture into the wrong
-/// one would still pass the unit tests for the pieces.
-#[tokio::test]
-async fn handle_show_reports_the_stored_ggufs_own_metadata() {
+/// The `/api/show` body for a store holding one model whose single
+/// layer is `(media_type, filepath, blob)`. The two cases below differ
+/// only in that layer, and in what they then assert.
+async fn show_one_model(
+    name: &str,
+    media_type: &str,
+    filepath: &str,
+    blob: &[u8],
+) -> serde_json::Value {
     let dir = std::env::temp_dir().join(format!(
-        "llmman-show-meta-{}-{}",
+        "llmman-show-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4487,17 +4491,10 @@ async fn handle_show_reports_the_stored_ggufs_own_metadata() {
     let state = test_state_at(dir.clone());
     let store = OciStore::open(&dir).unwrap();
 
-    // file_type 15 is Q4_K_M while the fixture's lone tensor is Q4_K, so
-    // the assertion below says which of the two sources won.
-    let path = crate::gguf::write_test_gguf_with(&[("general.file_type", 15)]);
-    let bytes = std::fs::read(&path).unwrap();
-    let _ = std::fs::remove_file(&path);
-    let mut layer = store
-        .write_blob("application/vnd.docker.ai.gguf.v3", &bytes)
-        .unwrap();
+    let mut layer = store.write_blob(media_type, blob).unwrap();
     layer.annotations = Some(HashMap::from([(
         "org.cncf.model.filepath".to_string(),
-        "model.gguf".to_string(),
+        filepath.to_string(),
     )]));
     let config = store
         .write_blob("application/vnd.cncf.model.config.v1+json", b"{}")
@@ -4516,10 +4513,12 @@ async fn handle_show_reports_the_stored_ggufs_own_metadata() {
             &serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
-    store.tag(mdesc, "docker.io/ai/showmeta:latest").unwrap();
+    store
+        .tag(mdesc, &format!("docker.io/ai/{name}:latest"))
+        .unwrap();
 
     let req = OllamaShowRequest {
-        model: "docker.io/ai/showmeta".to_string(),
+        model: format!("docker.io/ai/{name}"),
         name: None,
     };
     let resp = handle_show(State(state), Json(req)).await.into_response();
@@ -4527,7 +4526,27 @@ async fn handle_show_reports_the_stored_ggufs_own_metadata() {
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// The whole `/api/show` wiring over a stored GGUF: the fields below are
+/// public API, and a handler that read the architecture into the wrong
+/// one would still pass the unit tests for the pieces.
+#[tokio::test]
+async fn handle_show_reports_the_stored_ggufs_own_metadata() {
+    // file_type 15 is Q4_K_M while the fixture's lone tensor is Q4_K, so
+    // the assertion below says which of the two sources won.
+    let path = crate::gguf::write_test_gguf_with(&[("general.file_type", 15)]);
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let v = show_one_model(
+        "showmeta",
+        "application/vnd.docker.ai.gguf.v3",
+        "model.gguf",
+        &bytes,
+    )
+    .await;
 
     // write_test_gguf_with's header: llama, 4096, one 2-D Q4_K tensor.
     assert_eq!(v["details"]["format"], "gguf");
@@ -4539,8 +4558,6 @@ async fn handle_show_reports_the_stored_ggufs_own_metadata() {
     // The old stub keys are gone.
     assert_eq!(v["model_info"].get("digest"), None);
     assert_eq!(v["model_info"].get("size"), None);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The other half: a checkout-layout model has no GGUF header, so the
@@ -4548,62 +4565,19 @@ async fn handle_show_reports_the_stored_ggufs_own_metadata() {
 /// hardcode, and the metadata fields stay empty rather than guessing.
 #[tokio::test]
 async fn handle_show_reports_a_safetensors_model_as_safetensors() {
-    let dir = std::env::temp_dir().join(format!(
-        "llmman-show-st-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    let state = test_state_at(dir.clone());
-    let store = OciStore::open(&dir).unwrap();
-
-    let mut layer = store
-        .write_blob("application/vnd.cncf.model.weight.v1.tar", b"weights")
-        .unwrap();
-    layer.annotations = Some(HashMap::from([(
-        "org.cncf.model.filepath".to_string(),
-        "model.safetensors".to_string(),
-    )]));
-    let config = store
-        .write_blob("application/vnd.cncf.model.config.v1+json", b"{}")
-        .unwrap();
-    let manifest = crate::storage::oci::Manifest {
-        schema_version: 2,
-        media_type: "application/vnd.oci.image.manifest.v1+json".into(),
-        artifact_type: None,
-        config,
-        layers: vec![layer],
-        annotations: None,
-    };
-    let mdesc = store
-        .write_blob(
-            "application/vnd.oci.image.manifest.v1+json",
-            &serde_json::to_vec(&manifest).unwrap(),
-        )
-        .unwrap();
-    store.tag(mdesc, "docker.io/ai/showst:latest").unwrap();
-
-    let req = OllamaShowRequest {
-        model: "docker.io/ai/showst".to_string(),
-        name: None,
-    };
-    let resp = handle_show(State(state), Json(req)).await.into_response();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let v = show_one_model(
+        "showst",
+        "application/vnd.cncf.model.weight.v1.tar",
+        "model.safetensors",
+        b"weights",
+    )
+    .await;
 
     assert_eq!(v["details"]["format"], "safetensors");
     assert_eq!(v["details"]["family"], "");
     assert_eq!(v["details"]["families"], serde_json::json!([]));
     assert_eq!(v["model_info"], serde_json::json!({}));
     assert_eq!(v["template"], serde_json::Value::Null);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// /api/show resolves (and so validates) the client ref before it ever
