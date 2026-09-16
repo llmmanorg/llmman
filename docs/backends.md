@@ -68,9 +68,9 @@ CI tested (the `LLAMA_CPP_RELEASE` file in the repository), so what runs
 is what was tested. `--llama-cpp-version latest` takes upstream's
 floating latest instead.
 
-For `bin`, llmman probes for CUDA, ROCm, OpenCL, Vulkan or Metal (in that order)
-and downloads the matching prebuilt asset from llama.cpp's GitHub
-releases. `LLMMAN_LLM_LIBRARY` overrides the probe; `LLMMAN_DEBUG=1`
+For `bin`, llmman probes for CUDA, ROCm, OpenCL (Windows ARM64 Adreno only),
+Vulkan or Metal (in that order) and downloads the matching prebuilt asset from
+llama.cpp's GitHub releases. `LLMMAN_LLM_LIBRARY` overrides the probe; `LLMMAN_DEBUG=1`
 shows what it found. llama.cpp publishes no prebuilt Linux CUDA binary,
 so an NVIDIA host on Linux gets the CPU build from `bin` — the container
 runtimes (which `auto` prefers for that reason) have CUDA images.
