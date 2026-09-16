@@ -362,6 +362,23 @@ pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) 
     caps
 }
 
+/// The model's parsed GGUF header: the blob as stored, or a tar layer
+/// already extracted. Like [`chat_template`] it extracts nothing itself,
+/// so a read-only caller never copies a checkout into the cache. `None`
+/// for a checkout-layout model, or a header that will not parse.
+pub fn gguf_info(
+    store_path: &Path,
+    cache_path: &Path,
+    manifest: &crate::storage::oci::Manifest,
+) -> Option<crate::gguf::Info> {
+    let (primary, _) = gguf_layers(manifest)?;
+    let path = raw_blob_path(store_path, primary)
+        .ok()
+        .filter(|p| blob_is_gguf(p))
+        .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))?;
+    crate::gguf::read_info(&path).ok()
+}
+
 /// Ollama's `api.ShowResponse.Template`: the model's chat template, read
 /// without extracting anything (a read-only `/api/show` must not copy a
 /// checkout into the cache). A GGUF's `tokenizer.chat_template`, from
@@ -374,13 +391,8 @@ pub fn chat_template(
     cache_path: &Path,
     manifest: &crate::storage::oci::Manifest,
 ) -> Option<String> {
-    if let Some((primary, _)) = gguf_layers(manifest) {
-        let path = raw_blob_path(store_path, primary)
-            .ok()
-            .filter(|p| blob_is_gguf(p))
-            .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))?;
-        return crate::gguf::read_info(&path)
-            .ok()?
+    if gguf_layers(manifest).is_some() {
+        return gguf_info(store_path, cache_path, manifest)?
             .str("tokenizer.chat_template")
             .map(str::to_string);
     }
@@ -883,6 +895,30 @@ mod tests {
             descriptor("sha256:b", "mmproj-F16.gguf"),
         ]);
         assert_eq!(capabilities(&store, &m), vec!["completion", "vision"]);
+    }
+
+    #[test]
+    fn gguf_info_reads_the_header_of_the_stored_primary_layer() {
+        let path = crate::gguf::write_test_gguf_with(&[]);
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let (store, mut m) = manifest_with(vec![]);
+        let mut d = store.write_blob(HF_GGUF_MEDIA_TYPE, &bytes).unwrap();
+        d.annotations.get_or_insert_with(Default::default).insert(
+            "org.cncf.model.filepath".to_string(),
+            "model.gguf".to_string(),
+        );
+        m.layers = vec![d];
+        let info = gguf_info(store.root(), Path::new("/nonexistent"), &m).expect("header");
+        assert_eq!(info.architecture(), Some("llama"));
+        assert_eq!(info.context_length(), Some(4096));
+    }
+
+    /// A checkout-layout model has no GGUF layer to read.
+    #[test]
+    fn gguf_info_is_none_without_a_gguf_layer() {
+        let (store, m) = manifest_with(vec![descriptor("sha256:a", "model.safetensors")]);
+        assert!(gguf_info(store.root(), Path::new("/nonexistent"), &m).is_none());
     }
 
     #[test]
