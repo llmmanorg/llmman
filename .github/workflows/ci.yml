@@ -972,6 +972,11 @@ jobs:
           Expand-Archive $archivePath -DestinationPath $installDir -Force
           Rename-Item (Join-Path $installDir 'antigravity.exe') 'agy.exe'
           $installDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      # pool has no npm package (install.sh/install.ps1 only, like
+      # llmman's own install scripts).
+      - name: Install pool
+        if: runner.os != 'Windows'
+        run: POOL_INSTALL_ACCEPT_EULA=1 curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh
 
       # opencode installs its configured provider's npm package (here
       # @ai-sdk/openai-compatible — see launch::opencode_config) on demand
