@@ -234,7 +234,20 @@ pub(super) async fn handle_show(
     })?;
     let manifest = store.read_manifest(&desc.digest)?;
     let capabilities = crate::modelpack::capabilities(&store, &manifest);
-    let gguf = crate::modelpack::gguf_info(&state.0.store_path, &state.0.cache_path, &manifest);
+    // Off the worker: parsing a GGUF header is 30-50ms of blocking reads
+    // on this host's models, and every /api/show pays it.
+    let gguf = {
+        let (store_path, cache_path, manifest) = (
+            state.0.store_path.clone(),
+            state.0.cache_path.clone(),
+            manifest.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            crate::modelpack::gguf_info(&store_path, &cache_path, &manifest)
+        })
+        .await
+        .map_err(|e| AppError::from(anyhow::anyhow!("reading GGUF metadata: {e}")))?
+    };
     // Read from the header already in hand rather than reading it twice;
     // a checkout-layout model has no header and takes the longer route.
     let template = match &gguf {
