@@ -366,11 +366,20 @@ pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) 
 /// `gguf-split` set, whose tensors are spread across the shards, so no
 /// single header's tensor list describes the whole model.
 pub fn gguf_shard_count(manifest: &crate::storage::oci::Manifest) -> usize {
-    manifest
+    let layers: Vec<_> = manifest
         .layers
         .iter()
-        .filter(|l| is_gguf_layer(l) && layer_role(l).is_none() && !is_mmproj_layer(l))
-        .count()
+        .filter(|l| is_gguf_layer(l) && layer_role(l).is_none())
+        .collect();
+    let weights = layers.iter().filter(|l| !is_mmproj_layer(l)).count();
+    if weights > 0 {
+        return weights;
+    }
+    // [`gguf_layers`] falls back to the first layer when every one looks
+    // like mmproj, so a lone one is the model and its header describes
+    // it. Several, and which is the model is a guess — stay plural, so
+    // the caller reports nothing rather than one of them.
+    layers.len()
 }
 
 /// The model's parsed GGUF header: the blob as stored, or a tar layer
@@ -1035,6 +1044,15 @@ mod tests {
             descriptor("sha256:b", "mmproj-F16.gguf"),
         ]);
         assert_eq!(gguf_shard_count(&m), 1);
+        // A lone mmproj-named GGUF is the model here (see gguf_layers).
+        let (_, m) = manifest_with(vec![descriptor("sha256:a", "mmproj-F16.gguf")]);
+        assert_eq!(gguf_shard_count(&m), 1);
+        // Several, and which one is the model is a guess.
+        let (_, m) = manifest_with(vec![
+            descriptor("sha256:a", "mmproj-F16.gguf"),
+            descriptor("sha256:b", "mmproj-Q8.gguf"),
+        ]);
+        assert_eq!(gguf_shard_count(&m), 2);
     }
 
     /// `/api/show` reports these strings, so they are the wire contract.
