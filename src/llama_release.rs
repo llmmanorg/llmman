@@ -687,8 +687,8 @@ fn extract(archive_path: &Path, archive_name: &str, dest: &Path) -> Result<()> {
 /// A resolved, ready-to-run local `llama-server`.
 pub struct Resolved {
     pub bin: PathBuf,
-    /// Short backend label (`"cpu"`, `"vulkan"`, `"rocm"`, `"cuda-12.4"`,
-    /// `"metal"`) — surfaced only for logging.
+    /// Short backend label (`"cpu"`, `"vulkan"`, `"rocm"`, `"opencl"`,
+    /// `"cuda-12.4"`, `"metal"`) — surfaced only for logging.
     pub backend_label: String,
 }
 

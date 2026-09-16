@@ -1,7 +1,7 @@
 //! The dynamically-loaded CUDA/HIP/OpenCL/Vulkan probes behind
 //! [`super::detect_gpu_api_uncontained`]. Its own file purely so the
 //! whole section hangs off the one `#[cfg]` on its `mod` declaration:
-//! macOS has none of these three runtimes (it uses Metal — see
+//! macOS has none of these four runtimes (it uses Metal — see
 //! [`super::detect_macos`]), so gating them one attribute at a time is
 //! what let ~22 `dead_code` warnings accumulate there unnoticed.
 //!

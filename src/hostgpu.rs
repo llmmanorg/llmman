@@ -13,7 +13,8 @@
 //! reached here via runtime dynamic loading ([`libloading`]) instead of
 //! being separately compiled probe binaries downloaded and executed by
 //! `install.sh`/`install.ps1`: `libcuda`/`nvcuda.dll` (CUDA), `libamdhip64`/
-//! `amdhip64.dll` (HIP/ROCm), and `libvulkan`/`vulkan-1.dll` (Vulkan) are
+//! `amdhip64.dll` (HIP/ROCm), `OpenCL.dll` (OpenCL), and `libvulkan`/
+//! `vulkan-1.dll` (Vulkan) are
 //! all loader/runtime libraries that ship with the vendor's driver or
 //! runtime install itself, so a successful load and a real, successful
 //! API call against them is as strong a signal of "this backend actually
@@ -387,7 +388,7 @@ fn detect_gpu_api_uncontained() -> (HostGpu, u64) {
     (HostGpu::None, 0)
 }
 
-/// One `#[cfg]` for the whole file: none of those three runtimes exists
+/// One `#[cfg]` for the whole file: none of those four runtimes exists
 /// on macOS, where compiling them is not just wasted work but ~22
 /// `dead_code` warnings — see the module's own doc comment.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
