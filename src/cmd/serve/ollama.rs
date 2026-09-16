@@ -290,9 +290,17 @@ pub(super) async fn handle_show(
                 .filter(|n| *n > 0)
                 .map(crate::fmt::human_count)
                 .unwrap_or_default(),
+            // The declared file type, which keeps the mixed-quant
+            // variant; the modal tensor type reads Q4_K for both
+            // Q4_K_M and Q4_K_S, so it is only the fallback.
             quantization_level: gguf
                 .as_ref()
-                .and_then(|i| i.quantization.clone())
+                .and_then(|i| {
+                    i.u64("general.file_type")
+                        .and_then(crate::gguf::file_type_name)
+                        .map(str::to_string)
+                        .or_else(|| i.quantization.clone())
+                })
                 .unwrap_or_default(),
         },
         capabilities,

@@ -4487,7 +4487,9 @@ async fn handle_show_reports_the_stored_ggufs_own_metadata() {
     let state = test_state_at(dir.clone());
     let store = OciStore::open(&dir).unwrap();
 
-    let path = crate::gguf::write_test_gguf_with(&[]);
+    // file_type 15 is Q4_K_M while the fixture's lone tensor is Q4_K, so
+    // the assertion below says which of the two sources won.
+    let path = crate::gguf::write_test_gguf_with(&[("general.file_type", 15)]);
     let bytes = std::fs::read(&path).unwrap();
     let _ = std::fs::remove_file(&path);
     let mut layer = store
@@ -4531,7 +4533,7 @@ async fn handle_show_reports_the_stored_ggufs_own_metadata() {
     assert_eq!(v["details"]["format"], "gguf");
     assert_eq!(v["details"]["family"], "llama");
     assert_eq!(v["details"]["families"], serde_json::json!(["llama"]));
-    assert_eq!(v["details"]["quantization_level"], "Q4_K");
+    assert_eq!(v["details"]["quantization_level"], "Q4_K_M");
     assert_eq!(v["model_info"]["general.architecture"], "llama");
     assert_eq!(v["model_info"]["llama.context_length"], 4096);
     // The old stub keys are gone.
