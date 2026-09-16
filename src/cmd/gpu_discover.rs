@@ -20,6 +20,7 @@ pub fn run(_args: &GpuDiscoverArgs) -> anyhow::Result<()> {
         crate::hostgpu::HostGpu::None => "none".to_string(),
         crate::hostgpu::HostGpu::Cuda { major } => format!("cuda (driver major version {major})"),
         crate::hostgpu::HostGpu::Rocm => "rocm".to_string(),
+        crate::hostgpu::HostGpu::Opencl => "opencl".to_string(),
         crate::hostgpu::HostGpu::Vulkan => "vulkan".to_string(),
         crate::hostgpu::HostGpu::Metal => "metal".to_string(),
     };

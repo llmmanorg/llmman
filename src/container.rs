@@ -17,10 +17,10 @@
 //! several installed backend libraries, pick the best one for this
 //! machine at runtime — except there's no shared library to load and
 //! score here, just one container image to run, so detection below is a
-//! fixed priority order (CUDA > ROCm > Vulkan > CPU) rather than a
+//! fixed container-image priority order (CUDA > ROCm > Vulkan > CPU) rather than a
 //! numeric score.
 //!
-//! Host GPU detection itself (the real CUDA Driver/HIP runtime/Vulkan API
+//! Host GPU detection itself (the real CUDA Driver/HIP runtime/OpenCL/Vulkan API
 //! probing) is entirely [`crate::hostgpu::detect`]'s job, shared with the
 //! local (non-container) `llama-server` binary path in
 //! `crate::llama_release` — this module only adds the mapping from that
@@ -147,12 +147,14 @@ fn nvidia_toolkit_present(ociman: ContainerManager) -> bool {
     false
 }
 
-/// GPU backends this module can detect and run a matching
+/// Container GPU backends this module can run with a matching
 /// `ghcr.io/ggml-org/llama.cpp:server-*` image for. Deliberately a subset
 /// of every tag llama.cpp publishes (musa/intel/openvino are skipped): as
 /// of writing, rocm/vulkan images are amd64-only upstream and cuda/vulkan
 /// support arm64 too — see docs/docker.md for the authoritative list if
-/// more get added here later.
+/// more get added here later. OpenCL is intentionally absent: llama.cpp's
+/// OpenCL release is a Windows ARM64 Adreno binary, not a published Linux
+/// container image, and this module is used only for Linux containers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GpuBackend {
     Cpu,
@@ -224,7 +226,7 @@ impl GpuBackend {
 }
 
 /// Detects the best available GPU backend by delegating to
-/// [`crate::hostgpu::detect`] (real CUDA Driver/HIP runtime/Vulkan API
+/// [`crate::hostgpu::detect`] (real CUDA Driver/HIP/OpenCL/Vulkan API
 /// probing — see that module) and mapping its result onto which
 /// `ghcr.io/ggml-org/llama.cpp` image to run. This doesn't verify the
 /// container engine itself is configured to pass a GPU through: for an
@@ -236,22 +238,23 @@ fn detect_backend() -> GpuBackend {
     backend_from_hostgpu(hostgpu::detect())
 }
 
-/// Pure mapping from [`HostGpu`] to [`GpuBackend`], split out from
+/// Pure mapping from [`HostGpu`] to the available container [`GpuBackend`], split out from
 /// [`detect_backend`] so the CUDA 12-vs-13 image split (llama.cpp's own
 /// CUDA Dockerfile split between the `cuda`/`cuda12` tag, built against
 /// CUDA_VERSION 12.8.1, and `cuda13`, 13.3.0 — see docs/docker.md) can be
 /// tested directly without needing real GPU hardware. `HostGpu::Metal`
 /// has no container image (Docker/Podman GPU passthrough isn't a macOS
 /// concept, and container runtimes are rejected on non-Linux before this is ever
-/// called — see `cmd::serve::serve_async`) and falls back to CPU here
-/// only so this match stays exhaustive.
+/// called — see `cmd::serve::serve_async`). `HostGpu::Opencl` also falls back
+/// to CPU here because there is no OpenCL container image; it remains a real
+/// backend in [`crate::llama_release`] for the local Windows ARM64 binary.
 fn backend_from_hostgpu(gpu: HostGpu) -> GpuBackend {
     match gpu {
         HostGpu::Cuda { major } if major >= 13 => GpuBackend::Cuda13,
         HostGpu::Cuda { .. } => GpuBackend::Cuda12,
         HostGpu::Rocm => GpuBackend::Rocm,
         HostGpu::Vulkan => GpuBackend::Vulkan,
-        HostGpu::Metal | HostGpu::None => GpuBackend::Cpu,
+        HostGpu::Metal | HostGpu::None | HostGpu::Opencl => GpuBackend::Cpu,
     }
 }
 
@@ -993,6 +996,7 @@ mod tests {
     #[test]
     fn non_cuda_hostgpu_variants_map_to_their_matching_backend() {
         assert_eq!(backend_from_hostgpu(HostGpu::Rocm), GpuBackend::Rocm);
+        assert_eq!(backend_from_hostgpu(HostGpu::Opencl), GpuBackend::Cpu);
         assert_eq!(backend_from_hostgpu(HostGpu::Vulkan), GpuBackend::Vulkan);
         assert_eq!(backend_from_hostgpu(HostGpu::None), GpuBackend::Cpu);
         assert_eq!(backend_from_hostgpu(HostGpu::Metal), GpuBackend::Cpu);

@@ -1,4 +1,4 @@
-//! The dynamically-loaded CUDA/HIP/Vulkan probes behind
+//! The dynamically-loaded CUDA/HIP/OpenCL/Vulkan probes behind
 //! [`super::detect_gpu_api_uncontained`]. Its own file purely so the
 //! whole section hangs off the one `#[cfg]` on its `mod` declaration:
 //! macOS has none of these three runtimes (it uses Metal — see
@@ -53,6 +53,11 @@ fn open_hip_lib() -> Option<Library> {
             .or_else(|_| Library::new("libamdhip64.so"))
             .ok()
     }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+fn open_opencl_lib() -> Option<Library> {
+    unsafe { Library::new("OpenCL.dll").ok() }
 }
 
 #[cfg(target_os = "windows")]
@@ -208,6 +213,119 @@ pub(super) fn detect_rocm() -> Option<u64> {
         }
         Some(vram)
     }
+}
+
+// ---------------------------------------------------------------------------
+// OpenCL — Windows ARM64 only: llama.cpp's sole OpenCL release asset is
+// the win-opencl-adreno-arm64 build, so this matches Adreno GPU devices
+// and nothing else. On every other target it is a no-op that lets
+// detection fall through to Vulkan.
+// ---------------------------------------------------------------------------
+
+/// `Some(total_global_mem_bytes)` if at least one Adreno OpenCL GPU is
+/// present, summed across devices like `detect_cuda`.
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+pub(super) fn detect_opencl() -> Option<u64> {
+    const CL_SUCCESS: i32 = 0;
+    const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
+    const CL_DEVICE_GLOBAL_MEM_SIZE: u32 = 0x101F;
+    const CL_DEVICE_NAME: u32 = 0x102B;
+
+    let lib = open_opencl_lib()?;
+    unsafe {
+        let get_platform_ids: Symbol<unsafe extern "C" fn(u32, *mut *mut c_void, *mut u32) -> i32> =
+            lib.get(b"clGetPlatformIDs\0").ok()?;
+        let get_device_ids: Symbol<
+            unsafe extern "C" fn(*mut c_void, u64, u32, *mut *mut c_void, *mut u32) -> i32,
+        > = lib.get(b"clGetDeviceIDs\0").ok()?;
+        let get_device_info: Symbol<
+            unsafe extern "C" fn(*mut c_void, u32, usize, *mut c_void, *mut usize) -> i32,
+        > = lib.get(b"clGetDeviceInfo\0").ok()?;
+
+        let mut platform_count: u32 = 0;
+        if get_platform_ids(0, std::ptr::null_mut(), &mut platform_count) != CL_SUCCESS
+            || platform_count == 0
+        {
+            return None;
+        }
+        let mut platforms = vec![std::ptr::null_mut(); platform_count as usize];
+        if get_platform_ids(platform_count, platforms.as_mut_ptr(), std::ptr::null_mut())
+            != CL_SUCCESS
+        {
+            return None;
+        }
+
+        let mut found: Option<u64> = None;
+        for platform in platforms {
+            let mut device_count: u32 = 0;
+            if get_device_ids(
+                platform,
+                CL_DEVICE_TYPE_GPU,
+                0,
+                std::ptr::null_mut(),
+                &mut device_count,
+            ) != CL_SUCCESS
+                || device_count == 0
+            {
+                continue;
+            }
+            let mut devices = vec![std::ptr::null_mut(); device_count as usize];
+            if get_device_ids(
+                platform,
+                CL_DEVICE_TYPE_GPU,
+                device_count,
+                devices.as_mut_ptr(),
+                std::ptr::null_mut(),
+            ) != CL_SUCCESS
+            {
+                continue;
+            }
+            for device in devices {
+                let mut size: usize = 0;
+                if get_device_info(device, CL_DEVICE_NAME, 0, std::ptr::null_mut(), &mut size)
+                    != CL_SUCCESS
+                    || size == 0
+                {
+                    continue;
+                }
+                let mut name = vec![0u8; size];
+                if get_device_info(
+                    device,
+                    CL_DEVICE_NAME,
+                    name.len(),
+                    name.as_mut_ptr().cast(),
+                    std::ptr::null_mut(),
+                ) != CL_SUCCESS
+                {
+                    continue;
+                }
+                if !String::from_utf8_lossy(&name)
+                    .to_ascii_lowercase()
+                    .contains("adreno")
+                {
+                    continue;
+                }
+                let mut mem: u64 = 0;
+                if get_device_info(
+                    device,
+                    CL_DEVICE_GLOBAL_MEM_SIZE,
+                    std::mem::size_of::<u64>(),
+                    (&mut mem as *mut u64).cast(),
+                    std::ptr::null_mut(),
+                ) != CL_SUCCESS
+                {
+                    mem = 0;
+                }
+                found = Some(found.unwrap_or(0) + mem);
+            }
+        }
+        found
+    }
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+pub(super) fn detect_opencl() -> Option<u64> {
+    None
 }
 
 // ---------------------------------------------------------------------------

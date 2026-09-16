@@ -302,6 +302,11 @@ fn asset_query() -> AssetQuery {
                 companion_must_contain: None,
                 label: "rocm".into(),
             },
+            HostGpu::Opencl if arch == "arm64" => AssetQuery {
+                must_contain: "-bin-win-opencl-adreno-arm64.zip".into(),
+                companion_must_contain: None,
+                label: "opencl".into(),
+            },
             HostGpu::Vulkan if arch == "x64" => AssetQuery {
                 must_contain: format!("-bin-win-vulkan-{arch}.zip"),
                 companion_must_contain: None,
