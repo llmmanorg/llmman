@@ -37,9 +37,8 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
     let head_client = super::head_client()?;
 
     progress::set_status(progress_key, "pulling");
-    let info = api::fetch_model_info(&api_client, &endpoint, &owner, &repo, token.as_deref())
-        .await
-        .context("HF model info")?;
+    let info =
+        api::fetch_model_info(&api_client, &endpoint, &owner, &repo, token.as_deref()).await?;
     let commit = info.commit().to_string();
     let mut meta = ModelMeta {
         licenses: info.license().into_iter().collect(),
@@ -54,8 +53,7 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
         &commit,
         token.as_deref(),
     )
-    .await
-    .context("HF file list")?;
+    .await?;
 
     let diffusion = api::is_diffusion_repo(&files);
     let selected = if diffusion {
@@ -259,7 +257,7 @@ async fn pull_text_encoder(
     let endpoint = super::hf_endpoint(host);
     let info = api::fetch_model_info(api_client, &endpoint, &owner, &repo, token)
         .await
-        .with_context(|| format!("HF model info for text encoder {reference}"))?;
+        .with_context(|| format!("text encoder {reference}"))?;
     let commit = info.commit().to_string();
     let files = api::fetch_files(api_client, &endpoint, &owner, &repo, &commit, token)
         .await
