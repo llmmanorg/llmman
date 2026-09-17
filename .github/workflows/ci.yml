@@ -292,10 +292,12 @@ jobs:
         if: matrix.check-fmt
         run: cargo fmt --all -- --check
 
-      # `fuzzing` gates fuzz_check_parse_registry_ref in src/shortnames.rs,
+      # `fuzzing` gates the fuzz_check_* wrappers in src/shortnames.rs
+      # (parse_registry_ref, validate_reference, resolve_ollama_api),
       # which only the fuzz/ crate calls; without this a rename there
       # compiles clean everywhere and only breaks the fuzz harness. This
-      # compiles the feature, it does not run cargo-fuzz (needs nightly).
+      # compiles the feature, it does not run cargo-fuzz (needs nightly;
+      # actual fuzzing runs nightly in fuzz-nightly.yml).
       - name: cargo clippy --features fuzzing
         if: matrix.check-fmt
         run: cargo clippy --features fuzzing --lib -- -D warnings
