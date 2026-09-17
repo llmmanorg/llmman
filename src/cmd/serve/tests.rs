@@ -10,6 +10,7 @@ use super::openai::{
     multipart_form, multipart_text_field, omni_image_request, omni_video_fields,
 };
 use super::refusal::{explain_missing_route, unsupported_on_wire};
+use super::relay::{rewrite_json_response_model, rewrite_sse_line_model, set_response_model};
 use super::responses::{
     consolidate_responses_instructions, filter_non_function_tools, remote_responses,
     responses_input_item_text, RESPONSES_ROUTE,
