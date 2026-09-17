@@ -308,15 +308,30 @@ pub(super) async fn handle_show(
     }))
 }
 
+/// Elements past this many are not carried. A non-verbose `/api/show`
+/// reads the header with the same ceiling and discards any longer array
+/// outright rather than reading it (`fs/gguf/metadata.go`,
+/// `fs/gguf/gguf.go`), which reaches the response as `[]`, not `null`.
+/// `tokenizer.ggml.tokens` and `merges` alone run to megabytes.
+const MODEL_INFO_MAX_ARRAY: usize = 1024;
+
 /// The GGUF header as ollama's `/api/show` reports it: every metadata key
-/// verbatim, minus the two kinds of bulk ollama also leaves out. A
-/// non-empty array becomes `null` (`tokenizer.ggml.tokens` and `merges`
-/// alone run to megabytes), and the chat template is dropped because it
-/// already has its own field on this response — carrying it here too made
-/// it 82% of the body on a Qwen3.5 header.
+/// verbatim, minus the bulk [`MODEL_INFO_MAX_ARRAY`] cuts and the chat
+/// template, which already has its own field on this response — carrying
+/// it here too made it 82% of the body on a Qwen3.5 header.
 pub(super) fn model_info_json(info: &crate::gguf::Info) -> serde_json::Value {
+    info.metadata
+        .iter()
+        .filter(|(k, _)| k.as_str() != "tokenizer.chat_template")
+        .map(|(k, v)| (k.clone(), metadata_cell(v)))
+        .collect::<serde_json::Map<String, serde_json::Value>>()
+        .into()
+}
+
+/// One metadata value as JSON — see [`model_info_json`].
+fn metadata_cell(v: &crate::gguf::Value) -> serde_json::Value {
     use crate::gguf::Value;
-    let cell = |v: &Value| match v {
+    match v {
         Value::U8(n) => serde_json::Value::from(*n),
         Value::I8(n) => serde_json::Value::from(*n),
         Value::U16(n) => serde_json::Value::from(*n),
@@ -329,15 +344,9 @@ pub(super) fn model_info_json(info: &crate::gguf::Info) -> serde_json::Value {
         Value::F64(f) => serde_json::Value::from(*f),
         Value::Bool(b) => serde_json::Value::from(*b),
         Value::String(s) => serde_json::Value::from(s.as_str()),
-        Value::Array(a) if a.is_empty() => serde_json::Value::Array(Vec::new()),
-        Value::Array(_) => serde_json::Value::Null,
-    };
-    info.metadata
-        .iter()
-        .filter(|(k, _)| k.as_str() != "tokenizer.chat_template")
-        .map(|(k, v)| (k.clone(), cell(v)))
-        .collect::<serde_json::Map<String, serde_json::Value>>()
-        .into()
+        Value::Array(a) if a.len() > MODEL_INFO_MAX_ARRAY => serde_json::Value::Array(Vec::new()),
+        Value::Array(a) => serde_json::Value::Array(a.iter().map(metadata_cell).collect()),
+    }
 }
 
 // -- Ollama /api/pull ---------------------------------------------------------

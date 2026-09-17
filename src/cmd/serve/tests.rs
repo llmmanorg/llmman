@@ -4435,18 +4435,20 @@ async fn handle_delete_rejects_an_invalid_ref_with_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-/// ollama sends every GGUF metadata key verbatim but replaces a
-/// non-empty array with `null`: `tokenizer.ggml.tokens` and `merges`
-/// alone run to megabytes.
+/// ollama sends every GGUF metadata key verbatim and carries an array
+/// whole unless it is longer than its own ceiling.
 #[test]
-fn model_info_json_sends_scalars_verbatim_and_nulls_non_empty_arrays() {
+fn model_info_json_sends_scalars_and_short_arrays_verbatim() {
     use crate::gguf::Value;
     let mut info = crate::gguf::Info::default();
     for (k, v) in [
         ("general.architecture", Value::String("llama".into())),
         ("llama.context_length", Value::U32(4096)),
         ("tokenizer.ggml.add_eos_token", Value::Bool(false)),
-        ("tokenizer.ggml.tokens", Value::Array(vec![Value::U32(1)])),
+        (
+            "tokenizer.ggml.token_type",
+            Value::Array(vec![Value::I32(1), Value::I32(3)]),
+        ),
         ("llama.vision.indexes", Value::Array(Vec::new())),
         (
             "tokenizer.chat_template",
@@ -4462,12 +4464,27 @@ fn model_info_json_sends_scalars_verbatim_and_nulls_non_empty_arrays() {
         json["tokenizer.ggml.add_eos_token"],
         serde_json::json!(false)
     );
-    assert_eq!(json["tokenizer.ggml.tokens"], serde_json::Value::Null);
-    // An empty array stays one, as ollama reports it.
+    // A short array is the value itself, not a placeholder for one.
+    assert_eq!(json["tokenizer.ggml.token_type"], serde_json::json!([1, 3]));
     assert_eq!(json["llama.vision.indexes"], serde_json::json!([]));
     // The template has its own field on this response; ollama leaves it
     // out of model_info and so do we.
     assert_eq!(json.get("tokenizer.chat_template"), None);
+}
+
+/// The ceiling is ollama's: an array of exactly 1024 elements is still
+/// sent, and a longer one is elided as `[]` rather than `null`, which a
+/// client would read as "this key has no value" instead of "not carried".
+#[test]
+fn model_info_json_elides_only_arrays_past_the_ceiling() {
+    use crate::gguf::Value;
+    let array = |n: usize| Value::Array(vec![Value::U32(7); n]);
+    let mut info = crate::gguf::Info::default();
+    info.metadata.insert("at.ceiling".into(), array(1024));
+    info.metadata.insert("past.ceiling".into(), array(1025));
+    let json = model_info_json(&info);
+    assert_eq!(json["at.ceiling"].as_array().map(Vec::len), Some(1024));
+    assert_eq!(json["past.ceiling"], serde_json::json!([]));
 }
 
 /// The `/api/show` body for a store holding one model whose single
