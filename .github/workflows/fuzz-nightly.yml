@@ -44,8 +44,12 @@ jobs:
         with:
           toolchain: nightly
 
+      # --locked installs from cargo-fuzz's own published lockfile instead
+      # of freshly-resolved dependency versions. The cargo-fuzz release
+      # itself still floats to latest each night; only its dependency
+      # resolution is pinned.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
 
       # Run from the repo root, not fuzz/: cargo-fuzz auto-discovers the
       # fuzz/ subdirectory from the workspace root, and running it from
