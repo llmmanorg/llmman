@@ -2,10 +2,13 @@
 //! way to the client, and — for the pass-through helpers — the request
 //! on its way out.
 //!
-//! Two shapes, by how much of the body each has to read. [`relay`]
+//! Three shapes, by how much of the body each has to read. [`relay`]
 //! forwards the bytes untouched; the `*_rewriting_model` family reads
 //! far enough to put the canonical name back in the `"model"` field a
-//! backend addressed by another name echoes (see `backend_wire_model`).
+//! backend addressed by another name echoes (see `backend_wire_model`);
+//! [`convert_upstream`] rebuilds the whole stream through an
+//! [`SseConverter`], so a chat-completions answer can come back on
+//! `/v1/messages` or `/v1/responses`.
 //!
 //! Each of them moves the [`ActivityGuard`] into the stream it returns
 //! rather than dropping it on the way out — see that guard's own doc
@@ -13,14 +16,15 @@
 
 use anyhow::Context;
 use axum::body::{Body, Bytes};
-use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use futures::StreamExt;
 use reqwest::Client;
 
 use super::sched::ActivityGuard;
 use super::stream::bytes_to_lines;
-use super::{AppError, ChatUpstream, Target};
+use super::{messages, responses, AppError, ChatBody, ChatUpstream, Target};
 
 pub(super) async fn proxy(
     client: &Client,
@@ -289,4 +293,71 @@ pub(super) fn relay_chat_upstream(upstream: ChatUpstream, activity: ActivityGuar
         builder = builder.header(k, v);
     }
     builder.body(Body::from_stream(stream)).unwrap()
+}
+
+/// A converter of one upstream SSE stream into another, line by line:
+/// `responses::StreamConverter` and `messages::StreamConverter`.
+pub(super) trait SseConverter: Send + 'static {
+    fn line(&mut self, line: &str) -> String;
+    fn finish(&mut self) -> String;
+    fn failed(&self) -> bool;
+    fn fold(&mut self, lines: Vec<String>) -> serde_json::Value;
+}
+
+macro_rules! sse_converter {
+    ($($t:ty),*) => {$(
+        impl SseConverter for $t {
+            fn line(&mut self, line: &str) -> String {
+                Self::line(self, line)
+            }
+            fn finish(&mut self) -> String {
+                Self::finish(self)
+            }
+            fn failed(&self) -> bool {
+                Self::failed(self)
+            }
+            fn fold(&mut self, lines: Vec<String>) -> serde_json::Value {
+                Self::fold(self, lines)
+            }
+        }
+    )*};
+}
+sse_converter!(responses::StreamConverter, messages::StreamConverter);
+
+/// `body` translated by `converter`: streamed as SSE, with a trailing
+/// `None` so the converter can close a stream ended without `[DONE]`, or
+/// folded into one JSON object (502 when the converter failed).
+pub(super) async fn convert_upstream(
+    body: ChatBody,
+    activity: ActivityGuard,
+    mut converter: impl SseConverter,
+    streaming: bool,
+) -> Response {
+    if !streaming {
+        let lines: Vec<String> = bytes_to_lines(body).collect().await;
+        drop(activity);
+        let response = converter.fold(lines);
+        let status = if converter.failed() {
+            StatusCode::BAD_GATEWAY
+        } else {
+            StatusCode::OK
+        };
+        return (status, Json(response)).into_response();
+    }
+    let sse_stream = bytes_to_lines(body)
+        .map(Some)
+        .chain(futures::stream::once(futures::future::ready(None)))
+        .map(move |line| {
+            let _activity = &activity;
+            let out = match line {
+                Some(line) => converter.line(&line),
+                None => converter.finish(),
+            };
+            Ok::<_, std::convert::Infallible>(Bytes::from(out))
+        });
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(sse_stream))
+        .unwrap()
 }
