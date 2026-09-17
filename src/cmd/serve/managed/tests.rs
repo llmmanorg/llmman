@@ -477,6 +477,25 @@ fn config(directory: &Path) -> Config {
     }
 }
 
+fn write_private(path: &Path, content: impl AsRef<[u8]>) {
+    std::fs::write(path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+fn write_tls_fixture(config: &Config) -> String {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(["127.0.0.1".to_owned()]).unwrap();
+    let cert_pem = cert.pem();
+    write_private(&config.tls_cert_file, &cert_pem);
+    write_private(&config.tls_key_file, signing_key.serialize_pem());
+    write_private(&config.connection_key_file, b"connection-secret");
+    cert_pem
+}
+
 #[test]
 fn configuration_contract_and_secret_debug_are_fail_closed() {
     let directory = std::env::temp_dir();
@@ -519,24 +538,7 @@ async fn tls_listener_publishes_authenticated_readiness_and_cleans_up() {
     ));
     std::fs::create_dir(&directory).unwrap();
     let config = config(&directory);
-    for (path, content) in [
-        (
-            &config.tls_cert_file,
-            include_bytes!("test-cert.pem").as_slice(),
-        ),
-        (
-            &config.tls_key_file,
-            include_bytes!("test-key.pem").as_slice(),
-        ),
-        (&config.connection_key_file, b"connection-secret".as_slice()),
-    ] {
-        std::fs::write(path, content).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-    }
+    let cert_pem = write_tls_fixture(&config);
     // `serve_async` installs the provider before binding; the test stands
     // in for it.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -566,9 +568,7 @@ async fn tls_listener_publishes_authenticated_readiness_and_cleans_up() {
     let task = tokio::spawn(listener.serve(std::future::pending()));
     let client = reqwest::Client::builder()
         .no_proxy()
-        .add_root_certificate(
-            reqwest::Certificate::from_pem(include_bytes!("test-cert.pem")).unwrap(),
-        )
+        .add_root_certificate(reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
     let got: Value = client
@@ -611,24 +611,7 @@ async fn drop_retracts_only_its_own_ready_file() {
     ));
     std::fs::create_dir(&directory).unwrap();
     let config = config(&directory);
-    for (path, content) in [
-        (
-            &config.tls_cert_file,
-            include_bytes!("test-cert.pem").as_slice(),
-        ),
-        (
-            &config.tls_key_file,
-            include_bytes!("test-key.pem").as_slice(),
-        ),
-        (&config.connection_key_file, b"connection-secret".as_slice()),
-    ] {
-        std::fs::write(path, content).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-    }
+    write_tls_fixture(&config);
     let ready_file = config.ready_file.clone();
     let _ = rustls::crypto::ring::default_provider().install_default();
 

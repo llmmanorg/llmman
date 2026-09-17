@@ -120,6 +120,9 @@ fuzzing = []
 # A WebSocket client for the `/llmman/shell` tests; the same crate axum's
 # `ws` feature already builds, at the version it pins.
 tokio-tungstenite = "0.24"
+# Managed-listener tests create short-lived TLS identities instead of storing
+# a private key in the repository.
+rcgen = "0.14"
 
 [build-dependencies]
 flate2 = "1"
