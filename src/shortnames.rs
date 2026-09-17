@@ -905,6 +905,9 @@ mod tests {
                 continue;
             };
             if s.starts_with('/') || PASSTHROUGH_SCHEMES.iter().any(|p| s.starts_with(p)) {
+                // Same no-panic check the fuzz wrapper applies to these
+                // early-return seeds; the grammar oracle below does not apply.
+                let _ = validate_reference(s);
                 continue;
             }
             if validate_reference(s).is_ok() {
