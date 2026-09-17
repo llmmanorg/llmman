@@ -227,6 +227,7 @@ impl ManagedInner {
             .resolve(profile.host(), SocketAddr::new(ip, 443))
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(30))
+            .read_timeout(std::time::Duration::from_secs(60))
             .build()
             .context("build managed provider transport")?;
         if clients.len() >= CLIENT_CACHE_LIMIT {

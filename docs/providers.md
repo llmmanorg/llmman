@@ -375,8 +375,9 @@ or an `x-api-key`. Connection/profile/IP headers never leave llmman.
 Request IDs, retry timing, and provider rate-limit response headers are relayed.
 Native response bodies stream with downstream backpressure and cancellation;
 provider error statuses are preserved, with request credentials redacted
-from error bodies. The managed routes have no prompt-history, shell, UI, or
-administration surface. The public listener rejects managed auth profiles.
+from error bodies; an error body above 1 MiB is answered as a 502 instead.
+The managed routes have no prompt-history, shell, UI, or administration
+surface. The public listener rejects managed auth profiles.
 For a managed child, also set `LLMMAN_SHELL=off` and `LLMMAN_NOHISTORY=1`, and
 avoid inheriting provider credentials in its startup environment.
 
