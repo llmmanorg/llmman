@@ -1,6 +1,7 @@
 name: Fuzz (nightly)
 
-# Actually *runs* the parse_registry_ref fuzz target with a real time budget.
+# Actually *runs* the fuzz targets (one job per target) with a real time
+# budget.
 # ci.yml's own "cargo check fuzz/" step (see its "fuzz/ is its own crate..."
 # comment) only compiles the fuzz/ crate on every push/PR; it deliberately
 # does not run cargo-fuzz because that needs a nightly toolchain the main
@@ -28,8 +29,14 @@ env:
 
 jobs:
   fuzz:
-    name: Fuzz parse_registry_ref
+    name: Fuzz ${{ matrix.target }}
     runs-on: ubuntu-24.04
+    strategy:
+      # One target crashing or timing out must not cancel the other runs;
+      # each target's findings are independent.
+      fail-fast: false
+      matrix:
+        target: [parse_registry_ref, validate_reference, resolve_ollama_api]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -57,10 +64,10 @@ jobs:
       # -max_total_time bounds the run to 5 minutes so a stuck or
       # slow-to-converge fuzz run can't hang the nightly job indefinitely.
       - name: Run cargo-fuzz
-        run: cargo +nightly fuzz run parse_registry_ref -- -max_total_time=300
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
 
       # On failure, cargo-fuzz has already written the crashing input(s) to
-      # fuzz/artifacts/parse_registry_ref/. Automatically committing those
+      # fuzz/artifacts/<target>/. Automatically committing those
       # back into fuzz/corpus/ as new regression seeds is a deliberate
       # future follow-up, gated on choosing a bot-commit mechanism: this
       # repo has no bot PAT or GitHub App token configured anywhere, no
@@ -76,8 +83,8 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: parse_registry_ref-crash-artifacts
-          path: fuzz/artifacts/parse_registry_ref/
+          name: ${{ matrix.target }}-crash-artifacts
+          path: fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
 
       # Always uploaded, success or failure: cargo-fuzz grows the corpus
@@ -89,6 +96,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: parse_registry_ref-corpus
-          path: fuzz/corpus/parse_registry_ref/
+          name: ${{ matrix.target }}-corpus
+          path: fuzz/corpus/${{ matrix.target }}/
           if-no-files-found: error
