@@ -4435,8 +4435,8 @@ async fn handle_delete_rejects_an_invalid_ref_with_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-/// ollama sends every GGUF metadata key verbatim and carries an array
-/// whole unless it is longer than its own ceiling.
+/// ollama sends every GGUF metadata key verbatim, drops two of them, and
+/// carries an array whole unless it is longer than its own ceiling.
 #[test]
 fn model_info_json_sends_scalars_and_short_arrays_verbatim() {
     use crate::gguf::Value;
@@ -4450,6 +4450,7 @@ fn model_info_json_sends_scalars_and_short_arrays_verbatim() {
             Value::Array(vec![Value::I32(1), Value::I32(3)]),
         ),
         ("llama.vision.indexes", Value::Array(Vec::new())),
+        ("general.name", Value::String("Qwen3.5 0.8B".into())),
         (
             "tokenizer.chat_template",
             Value::String("{{ bulk }}".into()),
@@ -4467,8 +4468,9 @@ fn model_info_json_sends_scalars_and_short_arrays_verbatim() {
     // A short array is the value itself, not a placeholder for one.
     assert_eq!(json["tokenizer.ggml.token_type"], serde_json::json!([1, 3]));
     assert_eq!(json["llama.vision.indexes"], serde_json::json!([]));
-    // The template has its own field on this response; ollama leaves it
-    // out of model_info and so do we.
+    // Both keys ollama's GetModelInfo deletes. The template has its own
+    // field on this response.
+    assert_eq!(json.get("general.name"), None);
     assert_eq!(json.get("tokenizer.chat_template"), None);
 }
 

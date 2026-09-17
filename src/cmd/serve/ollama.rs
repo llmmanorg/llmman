@@ -315,14 +315,19 @@ pub(super) async fn handle_show(
 /// `tokenizer.ggml.tokens` and `merges` alone run to megabytes.
 const MODEL_INFO_MAX_ARRAY: usize = 1024;
 
+/// Keys ollama's own `GetModelInfo` deletes before answering
+/// (`server/routes.go`). The chat template already has its own field on
+/// this response; carrying it here too made it 82% of the body on a
+/// Qwen3.5 header.
+const MODEL_INFO_OMITTED: [&str; 2] = ["general.name", "tokenizer.chat_template"];
+
 /// The GGUF header as ollama's `/api/show` reports it: every metadata key
-/// verbatim, minus the bulk [`MODEL_INFO_MAX_ARRAY`] cuts and the chat
-/// template, which already has its own field on this response — carrying
-/// it here too made it 82% of the body on a Qwen3.5 header.
+/// verbatim, minus [`MODEL_INFO_OMITTED`] and the bulk
+/// [`MODEL_INFO_MAX_ARRAY`] cuts.
 pub(super) fn model_info_json(info: &crate::gguf::Info) -> serde_json::Value {
     info.metadata
         .iter()
-        .filter(|(k, _)| k.as_str() != "tokenizer.chat_template")
+        .filter(|(k, _)| !MODEL_INFO_OMITTED.contains(&k.as_str()))
         .map(|(k, v)| (k.clone(), metadata_cell(v)))
         .collect::<serde_json::Map<String, serde_json::Value>>()
         .into()
