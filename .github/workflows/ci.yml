@@ -550,7 +550,7 @@ jobs:
 
   # --------------------------------------------------------------------------
   # E2E: `llmman launch
-  # <claude|agy|opencode|codex|qwen|hermes|openclaw|dsh|goose> --model
+  # <claude|agy|opencode|codex|qwen|hermes|openclaw|talos|dsh|goose> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
   # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
@@ -581,7 +581,7 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/agy/opencode/codex/qwen/hermes/openclaw/dsh/goose, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/agy/opencode/codex/qwen/hermes/openclaw/talos/dsh/goose, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
@@ -596,28 +596,28 @@ jobs:
     # launch_and_assert's own doc comment), so 30 min/test is only hit if
     # every attempt fails via a missing "pong" instead. Plus warm_model()'s
     # own separate TIMEOUT budget (10 min), paid at most once across all
-    # tests (guarded by WARM's own Once). 9*30 + 10 = 280 min. Exhausting
+    # tests (guarded by WARM's own Once). 10*30 + 10 = 310 min. Exhausting
     # every attempt doesn't fail this job either way (see
     # launch_and_assert's own doc comment) — a run can still legitimately
     # take this long in wall-clock time before giving up.
     #
-    # +90 (370) for the vllm-plugin steps' own per-step budgets below: up
+    # +90 (400) for the vllm-plugin steps' own per-step budgets below: up
     # to 60 min for "Install vLLM (e2e)" (wheel downloads, but a
     # slow/retried one on a bad connection) plus up to 30 min for
     # "pytest -m e2e (vllm-plugin)".
     #
-    # +10 (380) for `serve_mlx_safetensors_model`'s own single TIMEOUT
+    # +10 (410) for `serve_mlx_safetensors_model`'s own single TIMEOUT
     # budget (10 min, same 600s as warm_model's) — it doesn't go through
     # launch_and_assert's retry loop at all (a real failure there is
     # always a deterministic llmman bug worth failing loudly on, not
-    # small-model sampling variance), so unlike the 9 launch tests above
+    # small-model sampling variance), so unlike the 10 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
     #
     # +60 more for `serve_vllm_safetensors_model` and
     # `serve_sglang_safetensors_model` (20 min each, no retries, like the
     # mlx test) and "Install SGLang (e2e)"'s 40-minute budget.
     #
-    # 440 in total, but 360 is GitHub's own hard limit for a hosted-runner
+    # 470 in total, but 360 is GitHub's own hard limit for a hosted-runner
     # job and kills a run past it regardless, so the number here stays at
     # 400 rather than chasing a budget neither it nor GitHub can grant.
     timeout-minutes: 400
@@ -860,6 +860,51 @@ jobs:
         continue-on-error: true
         run: |
           & ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -SkipSetup
+
+      # talos has no npm package either (macOS/Linux only). Its installer
+      # verifies a sha256 and an Ed25519 signature before unpacking, but the
+      # script itself would arrive unpinned — so this does what the installer
+      # does, against a release pinned here: the versioned tarball, checked
+      # against the digest below before anything is unpacked, then a venv
+      # with Talos's requirements under ~/talos (nothing on PATH — that is
+      # where launch_talos looks, and tests/launch_e2e.rs's
+      # launch_talos_with_model hands the prefix on as TALOS_PREFIX).
+      # Bounded retries, then a real failure: a missing Talos would turn
+      # that test into a skip and this job green without it (the ask on
+      # #332, again). Bump version and digest together when moving on.
+      # Needs Python 3.11+, which every non-Windows runner here has.
+      - name: Install Talos (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TALOS_VERSION: 0.18.0-alpha
+          TALOS_SHA256: 05b4e3345a0027474b7c479a62fdb16681a9ca0f9f277f1b5c872eb45cee9d33
+        run: |
+          set -euo pipefail
+          tarball="talos-${TALOS_VERSION}.tar.gz"
+          for attempt in 1 2 3; do
+            if curl -fsSL --connect-timeout 20 --max-time 120 -o "$tarball" "https://talos-agent.ch/dist/${tarball}"; then
+              break
+            fi
+            echo "talos download attempt ${attempt} failed"
+            rm -f "$tarball"
+            [ "$attempt" -lt 3 ] && sleep 10
+          done
+          [ -s "$tarball" ] || { echo "::error::talos ${TALOS_VERSION} never downloaded"; exit 1; }
+          echo "${TALOS_SHA256}  ${tarball}" | shasum -a 256 -c -
+          mkdir -p "$HOME/talos"
+          tar xzf "$tarball" --strip-components=1 -C "$HOME/talos"
+          rm -f "$tarball"
+          python3 -m venv "$HOME/talos/.venv"
+          "$HOME/talos/.venv/bin/python" -m pip install --quiet --require-hashes -r "$HOME/talos/requirements.lock"
+          # The installer's own first-run file: its template carries an
+          # illustrative Telegram principal, so the installer clears that
+          # placeholder before the first CLI run. Mirror that transformation;
+          # the e2e grants its own terminal separately.
+          sed 's/^TALOS_ALLOWED_PRINCIPALS=.*/TALOS_ALLOWED_PRINCIPALS=/' \
+            "$HOME/talos/.env.example" > "$HOME/talos/talos.env"
+          chmod 600 "$HOME/talos/talos.env"
+          (cd "$HOME/talos" && .venv/bin/python -c "import talos; print('talos', talos.__version__)")
 
       # goose has no npm package (a Rust binary via download_cli.sh), so
       # install_cli above can't reach it. The pin has to be
