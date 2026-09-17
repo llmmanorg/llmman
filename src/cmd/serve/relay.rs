@@ -20,7 +20,7 @@ use reqwest::Client;
 
 use super::sched::ActivityGuard;
 use super::stream::bytes_to_lines;
-use super::{AppError, Target};
+use super::{AppError, ChatUpstream, Target};
 
 pub(super) async fn proxy(
     client: &Client,
@@ -272,6 +272,20 @@ pub(super) fn relay_stream_rewriting_model(
 
     let mut builder = Response::builder().status(status.as_u16());
     for (k, v) in &resp_headers {
+        builder = builder.header(k, v);
+    }
+    builder.body(Body::from_stream(stream)).unwrap()
+}
+
+/// [`relay`] for a [`ChatUpstream`]: `activity` lives until the whole
+/// body has been relayed (see `ActivityGuard`).
+pub(super) fn relay_chat_upstream(upstream: ChatUpstream, activity: ActivityGuard) -> Response {
+    let stream = upstream.body.map(move |item| {
+        let _activity = &activity;
+        item.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    });
+    let mut builder = Response::builder().status(upstream.status.as_u16());
+    for (k, v) in &upstream.headers {
         builder = builder.header(k, v);
     }
     builder.body(Body::from_stream(stream)).unwrap()

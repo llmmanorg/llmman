@@ -42,12 +42,11 @@ use reqwest::Client;
 use serde_json::{json, Value};
 
 use super::openai::{proxy_openai_generation, proxy_openai_passthrough};
-use super::relay::{relay, relay_rewriting_model, relay_stream_rewriting_model};
-use super::sched::ActivityGuard;
-use super::{
-    convert_upstream, relay_chat_upstream, remote_status, send_chat_completion, AppError, AppState,
-    Target,
+use super::relay::{
+    relay, relay_chat_upstream, relay_rewriting_model, relay_stream_rewriting_model,
 };
+use super::sched::ActivityGuard;
+use super::{convert_upstream, remote_status, send_chat_completion, AppError, AppState, Target};
 
 /// Whether a provider's answer on `/v1/responses` means "retry as a chat
 /// completion": 404/405/501 (no such route) or any 5xx (`opencode` 500s

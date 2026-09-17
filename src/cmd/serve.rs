@@ -2747,20 +2747,6 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
     })
 }
 
-/// [`relay`] for a [`ChatUpstream`]: `activity` lives until the whole
-/// body has been relayed (see `ActivityGuard`).
-fn relay_chat_upstream(upstream: ChatUpstream, activity: ActivityGuard) -> Response {
-    let stream = upstream.body.map(move |item| {
-        let _activity = &activity;
-        item.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-    });
-    let mut builder = Response::builder().status(upstream.status.as_u16());
-    for (k, v) in &upstream.headers {
-        builder = builder.header(k, v);
-    }
-    builder.body(Body::from_stream(stream)).unwrap()
-}
-
 /// POSTs oai_req to url and returns the still-streaming, OpenAI-shaped
 /// body, converting a non-2xx status into an AppError carrying the
 /// backend's error body.
