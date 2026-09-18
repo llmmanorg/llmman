@@ -678,6 +678,9 @@ fn upstream_ip_admission_rejects_special_use_addresses() {
         "ff02::1",
         "2001:db8::1",
         "2001::1",
+        "2002:7f00:1::",   // embeds 127.0.0.1
+        "2002:0a00:1::",   // embeds 10.0.0.1
+        "2002:6812:201::", // embeds public 104.18.2.1; all 6to4 is rejected
     ] {
         assert!(!public_upstream_ip(&ip.parse().unwrap()), "{ip}");
     }

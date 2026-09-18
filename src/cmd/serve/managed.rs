@@ -510,6 +510,7 @@ fn public_upstream_ip(ip: &IpAddr) -> bool {
         IpAddr::V6(ip) => {
             let words = ip.segments();
             words[0] & 0xe000 == 0x2000
+                && words[0] != 0x2002
                 && !(words[0] == 0x2001 && (words[1] < 0x0200 || words[1] == 0x0db8))
         }
     }
