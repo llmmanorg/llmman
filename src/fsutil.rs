@@ -16,6 +16,18 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// old file's permissions go on the temp before it holds anything, and
 /// the temp is synced before the rename.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_inner(path, bytes, None)
+}
+
+/// [`write_atomic`], but the file ends up with exactly `mode` (Unix)
+/// whether or not it already existed, for documents that must stay
+/// owner-only regardless of the umask or what a previous writer left.
+/// Elsewhere the mode is ignored.
+pub fn write_atomic_with_mode(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    write_atomic_inner(path, bytes, Some(mode))
+}
+
+fn write_atomic_inner(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
     let path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut tmp = path.clone().into_os_string();
     tmp.push(format!(
@@ -24,12 +36,26 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let written = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        if let Ok(meta) = std::fs::metadata(&path) {
-            file.set_permissions(meta.permissions())?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(mode);
+        }
+        let mut file = options.open(&tmp)?;
+        match mode {
+            // `mode` on create is masked by the umask, so set it again.
+            #[cfg(unix)]
+            Some(mode) => {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            }
+            _ => {
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    file.set_permissions(meta.permissions())?;
+                }
+            }
         }
         file.write_all(bytes)?;
         file.sync_all()
@@ -88,6 +114,25 @@ mod tests {
         let got = std::fs::read(&path).unwrap();
         assert_eq!(got.len(), 4096);
         assert!(got.iter().all(|b| *b == got[0]));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An explicit mode wins over the umask and over what the old file had.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_with_mode_sets_exactly_that_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir("mode");
+        let path = dir.join("ready.json");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic_with_mode(&path, b"new", 0o600).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

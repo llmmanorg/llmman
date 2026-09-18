@@ -130,6 +130,17 @@ pub(super) async fn require_key(
     mut req: Request,
     next: Next,
 ) -> Response {
+    // Managed provider credentials are accepted only on the separate TLS
+    // listener. Never reinterpret that profile as ordinary API-key traffic.
+    if req.headers().contains_key(super::managed::AUTH_PROFILE) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "managed auth profiles require the managed inference listener"
+            })),
+        )
+            .into_response();
+    }
     let policy = &state.0.auth;
     if policy.digests.is_empty() || is_ui_asset(&req) {
         return next.run(req).await;
