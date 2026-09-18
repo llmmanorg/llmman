@@ -183,7 +183,7 @@ installed:
 | `hermes` | Hermes Agent | yes, but the daemon holds the key (below) |
 | `agy` | Antigravity CLI (requires `--model`) | yes |
 | `gemini` | Gemini CLI | no: llmman cannot confirm the key would come here rather than go to Google |
-| `cline` | Cline | no: it picks its own model rather than taking llmman's |
+| `cline` | Cline (requires `--model`) | yes |
 | `kimi` | Kimi Code CLI | no: it picks its own model rather than taking llmman's |
 | `copilot` | GitHub Copilot CLI (`gh`) | no: it has no way to send a key |
 | `openclaw` | OpenClaw | no: it only takes a model during first-run onboarding |
