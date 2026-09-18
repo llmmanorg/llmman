@@ -181,21 +181,23 @@ fn integration_key() -> String {
 /// which the first request then tries to resolve as a real model id.
 /// goose instead refuses with "Run 'goose configure' first", advice that
 /// does not apply to a launch llmman configures through the environment.
-/// Grok Build has a hosted default of its own; without an explicit local
-/// model it would send that id to llmman's endpoint instead.
+/// Grok Build and Cline have hosted defaults of their own; without an
+/// explicit local model they would send those ids to llmman's endpoint
+/// instead.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
-const MODEL_REQUIRED: &[&str] = &["qwen", "dsh", "agy", "goose", "grok"];
+const MODEL_REQUIRED: &[&str] = &["qwen", "dsh", "agy", "goose", "grok", "cline"];
 
 /// Integrations whose launcher yields to a `--model` after `--`, and so
 /// warrant the warning below. qwen: `qwen_args` drops its own `--model`
 /// when the caller spelled one. goose: its model is `GOOSE_MODEL` in the
 /// environment, which goose's own `--model` documents itself as
-/// overriding. grok: `grok_args` likewise drops its generated `--model`.
+/// overriding. grok and cline: their argument builders likewise drop the
+/// generated `--model`.
 /// Not dsh: `dsh_args` does not yield, and dsh takes no
 /// `--model` flag at all (its model is the one `write_dsh_settings`
 /// records), so telling a dsh user theirs "wins" would be false, and dsh
 /// rejects the unknown flag on its own.
-const MODEL_FLAG_FORWARDED: &[&str] = &["qwen", "goose", "grok"];
+const MODEL_FLAG_FORWARDED: &[&str] = &["qwen", "goose", "grok", "cline"];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
 /// `--provider` too. A second `--model` after `--` is the caller's to
@@ -241,16 +243,12 @@ fn has_flag(extra_args: &[String], long: &str, short: Option<&str>) -> bool {
 /// Integrations `--provider` cannot drive, and why.
 ///
 /// `launch_simple` only exports `OLLAMA_HOST`: it never passes a model,
-/// so the integration picks its own and the provider-routed reference
-/// never reaches the daemon. `copilot` takes a model but has no way to
-/// carry a key. Refusing is the same call the catalog filter makes — a
+/// so Kimi picks its own and the provider-routed reference never reaches
+/// the daemon. `copilot` takes a model but has no way to carry a key.
+/// Refusing is the same call the catalog filter makes — a
 /// combination llmman cannot actually drive is absent, not offered and
 /// then broken at the first request.
 const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
-    (
-        "cline",
-        "it selects its own model rather than taking one from llmman",
-    ),
     (
         "kimi",
         "it selects its own model rather than taking one from llmman",
@@ -611,7 +609,7 @@ fn launch(
         "claude" => launch_claude(model, api_key, extra_args),
         "opencode" => launch_opencode(model, api_key, thinking, vision, extra_args),
         "codex" => launch_codex(model, api_key, vision, extra_args),
-        "cline" => launch_simple("cline", model, extra_args),
+        "cline" => launch_cline(model, api_key, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
         "kimi" => launch_simple("kimi", model, extra_args),
@@ -1690,6 +1688,116 @@ fn goose_fallback(home: &Path) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// cline
+// ---------------------------------------------------------------------------
+
+/// Cline's built-in `openai-compatible` provider reads this at request
+/// time. Keeping the value in the child environment is important: passing
+/// `--key` would make Cline persist the credential in providers.json.
+const CLINE_API_KEY_ENV: &str = "OPENAI_API_KEY";
+
+/// cline: use an isolated, llmman-owned data directory and a keyless
+/// OpenAI-compatible provider entry. The user's Cline login and provider
+/// settings remain untouched, while provider-routed credentials can still
+/// travel with this one process through `OPENAI_API_KEY`.
+fn launch_cline(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_on_path("cline").ok_or_else(|| anyhow::anyhow!("cline is not installed"))?;
+    let args = cline_args(model, extra_args)?;
+    let effective_model = forwarded_model(extra_args).unwrap_or(model);
+    let root = cline_config_dir()?;
+    let data = root.join("data");
+    let providers = data.join("settings").join("providers.json");
+    let base_url = format!("{}/v1", daemon::server());
+    write_cline_settings(&providers, effective_model, &base_url)?;
+
+    let root = root.to_string_lossy().into_owned();
+    let data = data.to_string_lossy().into_owned();
+    let providers = providers.to_string_lossy().into_owned();
+    exec_with_env(&bin, &args, &cline_env(api_key, &root, &data, &providers))
+}
+
+/// Flags that could select another endpoint, expose a key to Cline's
+/// persistence layer, or escape the isolated data directory are owned by
+/// llmman. A forwarded model remains allowed and wins over the top-level one.
+fn cline_args(model: &str, extra_args: &[String]) -> anyhow::Result<Vec<String>> {
+    for (long, short) in [
+        ("--provider", Some("-P")),
+        ("--key", Some("-k")),
+        ("--config", None),
+        ("--data-dir", None),
+    ] {
+        if has_flag(extra_args, long, short) {
+            anyhow::bail!(
+                "cline argument {long} is managed by llmman and cannot be passed after --"
+            );
+        }
+    }
+
+    let mut args = Vec::with_capacity(extra_args.len() + 4);
+    args.extend(["--provider".to_string(), "openai-compatible".to_string()]);
+    if !has_flag(extra_args, "--model", Some("-m")) {
+        args.extend(["--model".to_string(), model.to_string()]);
+    }
+    args.extend_from_slice(extra_args);
+    Ok(args)
+}
+
+fn cline_env<'a>(
+    api_key: &'a str,
+    root: &'a str,
+    data: &'a str,
+    providers: &'a str,
+) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("CLINE_DIR", root),
+        ("CLINE_DATA_DIR", data),
+        ("CLINE_PROVIDER_SETTINGS_PATH", providers),
+        ("CLINE_SESSION_BACKEND_MODE", "local"),
+        // An inherited `1` makes Cline overwrite all paths above with its
+        // sandbox directory during startup, defeating this isolation.
+        ("CLINE_SANDBOX", "0"),
+        // Keep the tested CLI contract stable for the life of this process.
+        ("CLINE_NO_AUTO_UPDATE", "1"),
+        (CLINE_API_KEY_ENV, api_key),
+    ]
+}
+
+/// `~/.config/llmman/launch/cline`, derived from llmman's own config path
+/// so Cline never reads or rewrites the user's `~/.cline` state.
+fn cline_config_dir() -> anyhow::Result<PathBuf> {
+    let conf = crate::config::user_path().context("no home directory")?;
+    let dir = conf.parent().context("llmman.conf has no directory")?;
+    Ok(dir.join("launch").join("cline"))
+}
+
+fn write_cline_settings(path: &Path, model: &str, base_url: &str) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .context("Cline settings path has no directory")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let document = serde_json::json!({
+        "version": 1,
+        "lastUsedProvider": "openai-compatible",
+        "modes": {},
+        "providers": {
+            "openai-compatible": {
+                "settings": {
+                    "provider": "openai-compatible",
+                    "model": model,
+                    "baseUrl": base_url
+                },
+                "updatedAt": "1970-01-01T00:00:00Z",
+                "tokenSource": "manual"
+            }
+        }
+    });
+    let mut contents = serde_json::to_vec_pretty(&document).context("serialize Cline settings")?;
+    contents.push(b'\n');
+    crate::fsutil::write_atomic(path, &contents)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
 // grok (Grok Build)
 // ---------------------------------------------------------------------------
 
@@ -2245,6 +2353,121 @@ mod tests {
             assert_eq!(goose_fallback(&home.join("nowhere")), None);
             let _ = std::fs::remove_dir_all(&home);
         }
+    }
+
+    #[test]
+    fn cline_settings_select_the_daemon_without_persisting_a_key() {
+        let root = std::env::temp_dir().join(format!(
+            "llmman-cline-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("settings/providers.json");
+        let model = r#"org/model.\"quoted\""#;
+        write_cline_settings(&path, model, "http://127.0.0.1:17434/v1").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let entry = &parsed["providers"]["openai-compatible"];
+        assert_eq!(parsed["version"], 1);
+        assert_eq!(parsed["lastUsedProvider"], "openai-compatible");
+        assert_eq!(entry["settings"]["provider"], "openai-compatible");
+        assert_eq!(entry["settings"]["model"], model);
+        assert_eq!(entry["settings"]["baseUrl"], "http://127.0.0.1:17434/v1");
+        assert_eq!(entry["tokenSource"], "manual");
+        assert!(entry["settings"].get("apiKey").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cline_env_isolates_all_state_and_carries_the_key_in_memory() {
+        let env = cline_env(
+            "secret-provider-key",
+            "/tmp/llmman/cline",
+            "/tmp/llmman/cline/data",
+            "/tmp/llmman/cline/data/settings/providers.json",
+        );
+        let get = |key| {
+            env.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| *value)
+        };
+        assert_eq!(get("CLINE_DIR"), Some("/tmp/llmman/cline"));
+        assert_eq!(get("CLINE_DATA_DIR"), Some("/tmp/llmman/cline/data"));
+        assert_eq!(
+            get("CLINE_PROVIDER_SETTINGS_PATH"),
+            Some("/tmp/llmman/cline/data/settings/providers.json")
+        );
+        assert_eq!(get("CLINE_SESSION_BACKEND_MODE"), Some("local"));
+        assert_eq!(get("CLINE_SANDBOX"), Some("0"));
+        assert_eq!(get("CLINE_NO_AUTO_UPDATE"), Some("1"));
+        assert_eq!(get(CLINE_API_KEY_ENV), Some("secret-provider-key"));
+    }
+
+    #[test]
+    fn cline_args_pin_provider_and_yield_only_the_model() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            cline_args("m:latest", &args(&["--json", "hi"])).unwrap(),
+            [
+                "--provider",
+                "openai-compatible",
+                "--model",
+                "m:latest",
+                "--json",
+                "hi"
+            ]
+        );
+        assert_eq!(
+            cline_args("m:latest", &args(&["-m", "theirs", "--json", "hi"])).unwrap(),
+            [
+                "--provider",
+                "openai-compatible",
+                "-m",
+                "theirs",
+                "--json",
+                "hi"
+            ]
+        );
+        assert_eq!(
+            cline_args("m:latest", &args(&["--model=theirs"])).unwrap(),
+            ["--provider", "openai-compatible", "--model=theirs"]
+        );
+    }
+
+    #[test]
+    fn cline_args_reject_endpoint_key_and_state_overrides() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for forbidden in [
+            vec!["--provider", "openai"],
+            vec!["--provider=openai"],
+            vec!["-P", "openai"],
+            vec!["-P=openai"],
+            vec!["--key", "secret"],
+            vec!["--key=secret"],
+            vec!["-k", "secret"],
+            vec!["-k=secret"],
+            vec!["--config", "other.json"],
+            vec!["--config=other.json"],
+            vec!["--data-dir", "/tmp/elsewhere"],
+            vec!["--data-dir=/tmp/elsewhere"],
+        ] {
+            let error = cline_args("m", &args(&forbidden)).unwrap_err().to_string();
+            assert!(error.contains("managed by llmman"), "{error}");
+        }
+    }
+
+    #[test]
+    fn cline_is_model_required_and_supports_provider_routes() {
+        assert!(INTEGRATIONS.iter().any(|i| i.name == "cline"));
+        assert!(MODEL_REQUIRED.contains(&"cline"));
+        assert!(MODEL_FLAG_FORWARDED.contains(&"cline"));
+        assert!(!PROVIDER_UNSUPPORTED.iter().any(|(id, _)| *id == "cline"));
+        assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"cline"));
+        assert!(check_provider_supported("cline").is_ok());
     }
 
     /// Grok Build uses the custom-model endpoint for both catalog lookup

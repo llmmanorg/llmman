@@ -268,11 +268,12 @@ integration:
 ```
 llmman launch claude --model qwen3.8
 llmman launch agy --model qwen3.8 -- -p "Explain this repository"
+llmman launch cline --model qwen3.8 -- --json "Explain this repository"
 llmman launch grok --model qwen3.8 -- -p "Explain this repository"
 ```
 
 Run `llmman launch` with no arguments to list the supported integrations
-(Claude Code, OpenCode, Codex, Aider, Qwen Code, Gemini CLI, Grok Build,
+(Claude Code, OpenCode, Codex, Cline, Aider, Qwen Code, Gemini CLI, Grok Build,
 AGY, DeepSeek Harness, ...) and whether each is installed. `dsh` runs under
 `npx` when
 it isn't installed globally. Any extra arguments after `--` are forwarded to
@@ -282,6 +283,11 @@ accepted.
 AGY requires version 1.1.13 or newer for Gemini API-key and custom-endpoint
 support. llmman writes Gemini mode to its own stable settings directory at
 `~/.gemini/llmman/`; your AGY settings stay untouched.
+
+Cline is tested against CLI 3.0.62. llmman keeps its launch state under
+`~/.config/llmman/launch/cline/`, separate from your normal `~/.cline`
+login and settings, and supplies the launch credential only through the
+child process environment rather than writing it to disk.
 
 ### Hosted providers
 

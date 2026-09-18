@@ -50,6 +50,10 @@ env:
   # Pinned because its command-line and custom-model contracts are what
   # the test verifies; bump deliberately and rerun the launch suite.
   GROK_CLI_VERSION: "1.0.34"
+  # Official Cline CLI used by launch_e2e's real `launch cline` test.
+  # Pinned because its provider-settings schema and CLI flags are the
+  # integration contract under test; bump deliberately.
+  CLINE_CLI_VERSION: "3.0.62"
 
 jobs:
   # --------------------------------------------------------------------------
@@ -554,7 +558,7 @@ jobs:
 
   # --------------------------------------------------------------------------
   # E2E: `llmman launch
-  # <claude|agy|opencode|codex|grok|qwen|hermes|openclaw|dsh|goose> --model
+  # <claude|agy|opencode|codex|cline|grok|qwen|hermes|openclaw|dsh|goose> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
   # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
@@ -585,7 +589,7 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/agy/opencode/codex/grok/qwen/hermes/openclaw/dsh/goose, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/agy/opencode/codex/cline/grok/qwen/hermes/openclaw/dsh/goose, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
@@ -594,23 +598,23 @@ jobs:
     # that reason, and its own identical `if:` condition below — or when
     # dispatched by hand on a branch (see `workflow_dispatch` above).
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
-    # 9 tests run serialized (--test-threads=1 + lock_serial()), so the
-    # worst case sums all 9's own retry budgets: MAX_ATTEMPTS * TIMEOUT
+    # 11 tests run serialized (--test-threads=1 + lock_serial()), so the
+    # worst case sums all 11's own retry budgets: MAX_ATTEMPTS * TIMEOUT
     # (3 * 600s = 30 min) each — a timeout itself never retries (see
     # launch_and_assert's own doc comment), so 30 min/test is only hit if
     # every attempt fails via a missing "pong" instead. Plus warm_model()'s
     # own separate TIMEOUT budget (10 min), paid at most once across all
-    # tests (guarded by WARM's own Once). 9*30 + 10 = 280 min. Exhausting
+    # tests (guarded by WARM's own Once). 11*30 + 10 = 340 min. Exhausting
     # every attempt doesn't fail this job either way (see
     # launch_and_assert's own doc comment) — a run can still legitimately
     # take this long in wall-clock time before giving up.
     #
-    # +90 (370) for the vllm-plugin steps' own per-step budgets below: up
+    # +90 (430) for the vllm-plugin steps' own per-step budgets below: up
     # to 60 min for "Install vLLM (e2e)" (wheel downloads, but a
     # slow/retried one on a bad connection) plus up to 30 min for
     # "pytest -m e2e (vllm-plugin)".
     #
-    # +10 (380) for `serve_mlx_safetensors_model`'s own single TIMEOUT
+    # +10 (440) for `serve_mlx_safetensors_model`'s own single TIMEOUT
     # budget (10 min, same 600s as warm_model's) — it doesn't go through
     # launch_and_assert's retry loop at all (a real failure there is
     # always a deterministic llmman bug worth failing loudly on, not
@@ -621,7 +625,7 @@ jobs:
     # `serve_sglang_safetensors_model` (20 min each, no retries, like the
     # mlx test) and "Install SGLang (e2e)"'s 40-minute budget.
     #
-    # 440 in total, but 360 is GitHub's own hard limit for a hosted-runner
+    # 500 in total, but 360 is GitHub's own hard limit for a hosted-runner
     # job and kills a run past it regardless, so the number here stays at
     # 400 rather than chasing a budget neither it nor GitHub can grant.
     timeout-minutes: 400
@@ -773,7 +777,7 @@ jobs:
       # multi-line/array syntax; ubuntu/macOS already default to bash.
       #
       # Unlike hermes/mlx_lm.server (legitimately missing on some
-      # platforms), these six are plain npm packages expected to work
+      # platforms), these seven are plain npm packages expected to work
       # everywhere — so install_cli fails the job, rather than letting
       # tests/launch_e2e.rs's on_path check silently skip, when one never
       # becomes a working binary.
@@ -786,7 +790,7 @@ jobs:
       # designed (npm tolerates one failed platform-tarball fetch, here
       # a registry blip, instead of failing the install), just not
       # detectable by a mere on_path/PATH check. Retrying rides that out.
-      - name: Install integration CLIs (claude, opencode, codex, qwen, openclaw, dsh)
+      - name: Install integration CLIs (claude, opencode, codex, cline, qwen, openclaw, dsh)
         shell: bash
         run: |
           failed_clis=()
@@ -804,9 +808,31 @@ jobs:
               [ "$attempt" -eq "$max_attempts" ] && next="giving up"
               if ! npm install -g "$install_spec"; then
                 echo "::warning::$pkg_name install failed on ${{ runner.os }} (attempt $attempt/$max_attempts); $next"
-              elif version_output=$("$bin" --version 2>&1); then
-                return 0
               else
+                # Cline 3.0.62's published macOS Mach-O has an invalid
+                # embedded ad-hoc signature and is killed with status 137
+                # before `--version` can run. Re-sign both the wrapper's
+                # cached copy and its platform-package fallback. This is
+                # confined to CI's npm install; shipped llmman code never
+                # modifies another program.
+                if [ "$bin" = cline ] && [ "${{ runner.os }}" = macOS ]; then
+                  global_root=$(npm root -g)
+                  case "${{ runner.arch }}" in
+                    ARM64) cline_arch=arm64 ;;
+                    X64) cline_arch=x64 ;;
+                    *) cline_arch=unknown ;;
+                  esac
+                  for cline_binary in \
+                    "$global_root/cline/bin/.cline" \
+                    "$global_root/@cline/cli-darwin-$cline_arch/bin/cline"; do
+                    if [ -f "$cline_binary" ]; then
+                      codesign --force --sign - "$cline_binary"
+                    fi
+                  done
+                fi
+                if version_output=$("$bin" --version 2>&1); then
+                  return 0
+                fi
                 echo "::warning::$pkg_name installed but \"$bin --version\" failed on ${{ runner.os }} (attempt $attempt/$max_attempts); $next — output: $version_output"
               fi
               # Exponential backoff: 1s, 2s, 4s, 8s, 16s.
@@ -821,6 +847,9 @@ jobs:
           install_cli "@anthropic-ai/claude-code" "@anthropic-ai/claude-code" "claude"
           install_cli "opencode-ai" "opencode-ai" "opencode"
           install_cli "@openai/codex" "@openai/codex" "codex"
+          # Pinned: launch_cline depends on this release's provider-settings
+          # schema and openai-compatible CLI flags.
+          install_cli "cline@${CLINE_CLI_VERSION}" "cline" "cline"
           # Pinned (not @latest): tests/launch_e2e.rs's qwen test relies on
           # this release's tool set under --safe-mode and on the
           # report_findings schema it excludes by name; a newer release can
