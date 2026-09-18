@@ -4449,6 +4449,10 @@ fn model_info_json_sends_scalars_and_short_arrays_verbatim() {
             "tokenizer.ggml.token_type",
             Value::Array(vec![Value::I32(1), Value::I32(3)]),
         ),
+        (
+            "tokenizer.ggml.precompiled_charsmap",
+            Value::Array(vec![Value::U8(1), Value::U8(2), Value::U8(3)]),
+        ),
         ("llama.vision.indexes", Value::Array(Vec::new())),
         ("general.name", Value::String("Qwen3.5 0.8B".into())),
         (
@@ -4464,6 +4468,12 @@ fn model_info_json_sends_scalars_and_short_arrays_verbatim() {
     assert_eq!(
         json["tokenizer.ggml.add_eos_token"],
         serde_json::json!(false)
+    );
+    // A UINT8 array is Go's []byte, which encoding/json writes as a
+    // base64 string — "AQID" is [1, 2, 3].
+    assert_eq!(
+        json["tokenizer.ggml.precompiled_charsmap"],
+        serde_json::json!("AQID")
     );
     // A short array is the value itself, not a placeholder for one.
     assert_eq!(json["tokenizer.ggml.token_type"], serde_json::json!([1, 3]));

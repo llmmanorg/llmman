@@ -350,6 +350,21 @@ fn metadata_cell(v: &crate::gguf::Value) -> serde_json::Value {
         Value::Bool(b) => serde_json::Value::from(*b),
         Value::String(s) => serde_json::Value::from(s.as_str()),
         Value::Array(a) if a.len() > MODEL_INFO_MAX_ARRAY => serde_json::Value::Array(Vec::new()),
+        // ollama holds a UINT8 array as Go's `[]byte`, which
+        // `encoding/json` writes as a base64 string rather than a number
+        // array, so that is the wire value for this element type. An
+        // empty array carries no element type to go on and stays `[]`.
+        Value::Array(a) if !a.is_empty() && a.iter().all(|v| matches!(v, Value::U8(_))) => {
+            use base64::Engine as _;
+            let bytes: Vec<u8> = a
+                .iter()
+                .filter_map(|v| match v {
+                    Value::U8(n) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            serde_json::Value::from(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
         Value::Array(a) => serde_json::Value::Array(a.iter().map(metadata_cell).collect()),
     }
 }
