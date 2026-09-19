@@ -82,11 +82,13 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         overflow.is_none() || args.model.as_deref().is_some_and(|m| !m.trim().is_empty()),
         "--overflow-model needs --model naming the local model to pair it with"
     );
-    // The local model's thinking controls (see `opencode_variants`) and
-    // whether it takes images (see `write_dsh_settings`); a provider's
-    // model has neither a template nor a manifest to read.
+    // The local model's thinking controls (see `opencode_variants`),
+    // whether it takes images (see `write_dsh_settings`) and its trained
+    // context (see `codex_context_window`); a provider's model has none
+    // of these to read.
     let mut thinking = None;
     let mut vision = false;
+    let mut context_length = None;
     let (model, api_key) = match provider {
         Some(provider) => {
             check_provider_supported(name)?;
@@ -132,6 +134,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                 let info = crate::daemon::ensure_model_pulled(&model)?;
                 thinking = info.thinking_controls();
                 vision = info.vision();
+                context_length = info.context_length();
             }
             match overflow {
                 // The hosted half is validated and keyed exactly as a
@@ -156,6 +159,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         &api_key,
         thinking.as_ref(),
         vision,
+        context_length,
         &args.extra_args,
     )
 }
@@ -604,12 +608,13 @@ fn launch(
     api_key: &str,
     thinking: Option<&ThinkingControls>,
     vision: bool,
+    context_length: Option<u64>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     match name.to_lowercase().as_str() {
         "claude" => launch_claude(model, api_key, extra_args),
         "opencode" => launch_opencode(model, api_key, thinking, vision, extra_args),
-        "codex" => launch_codex(model, api_key, vision, extra_args),
+        "codex" => launch_codex(model, api_key, vision, context_length, extra_args),
         "cline" => launch_simple("cline", model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
@@ -853,10 +858,11 @@ fn launch_codex(
     model: &str,
     api_key: &str,
     vision: bool,
+    context_length: Option<u64>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     // Write codex config
-    write_codex_config(model, vision)?;
+    write_codex_config(model, vision, context_length)?;
 
     // Regression: this used to pass a bare PathBuf::from("codex") straight
     // to exec_with_env instead of resolving it via find_on_path like every
@@ -895,7 +901,11 @@ fn launch_codex(
 /// leftover copy of that table is stripped from `config.toml` first, then
 /// the real settings are (re)written to the profile overlay file codex
 /// actually reads.
-fn write_codex_config(model: &str, vision: bool) -> anyhow::Result<()> {
+fn write_codex_config(
+    model: &str,
+    vision: bool,
+    context_length: Option<u64>,
+) -> anyhow::Result<()> {
     let home = dirs::home_dir().context("no home directory")?;
     let config_dir = home.join(".codex");
     std::fs::create_dir_all(&config_dir)?;
@@ -910,8 +920,13 @@ fn write_codex_config(model: &str, vision: bool) -> anyhow::Result<()> {
     // Without a model there is nothing to describe; codex keeps its defaults.
     let catalog_path = config_dir.join("llmman-model.json");
     let catalog = (!model.is_empty()).then(|| {
-        write_codex_file(&catalog_path, &codex_model_catalog(model, vision))
-            .map(|()| catalog_path.clone())
+        let context_window =
+            codex_context_window(super::serve::context_length_from_env(), context_length);
+        write_codex_file(
+            &catalog_path,
+            &codex_model_catalog(model, vision, context_window),
+        )
+        .map(|()| catalog_path.clone())
     });
     let catalog = catalog.transpose()?;
 
@@ -930,22 +945,24 @@ fn write_codex_file(path: &Path, contents: &str) -> anyhow::Result<()> {
     std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))
 }
 
-/// The catalog's `context_window` without `LLMMAN_CONTEXT_LENGTH`; ollama's
-/// fallback too.
+/// The catalog's `context_window` with neither `LLMMAN_CONTEXT_LENGTH` nor
+/// a trained context; ollama's fallback too.
 const CODEX_FALLBACK_CONTEXT_WINDOW: u64 = 128_000;
 
-fn codex_context_window() -> u64 {
-    std::env::var("LLMMAN_CONTEXT_LENGTH")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|n| *n > 0)
+/// What codex compacts against: a positive `LLMMAN_CONTEXT_LENGTH`
+/// (`env`), the `--ctx-size` the daemon serves, else the model's
+/// `trained` context, else [`CODEX_FALLBACK_CONTEXT_WINDOW`].
+fn codex_context_window(env: Option<u32>, trained: Option<u64>) -> u64 {
+    env.filter(|n| *n > 0)
+        .map(u64::from)
+        .or(trained)
         .unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
 }
 
 /// The `model_catalog_json` for `model`, declaring its image input in
 /// `input_modalities`. The other fields are ones codex requires, valued
 /// as ollama's `buildCodexModelEntry` does.
-fn codex_model_catalog(model: &str, vision: bool) -> String {
+fn codex_model_catalog(model: &str, vision: bool, context_window: u64) -> String {
     let input: &[&str] = if vision {
         &["text", "image"]
     } else {
@@ -954,7 +971,7 @@ fn codex_model_catalog(model: &str, vision: bool) -> String {
     let entry = serde_json::json!({
         "slug": model,
         "display_name": model,
-        "context_window": codex_context_window(),
+        "context_window": context_window,
         "shell_type": "default",
         "visibility": "list",
         "supported_in_api": true,
@@ -2958,7 +2975,7 @@ model = \"gpt-5\"
     #[test]
     fn codex_model_catalog_declares_image_input_only_for_a_vision_model() {
         let catalog: serde_json::Value =
-            serde_json::from_str(&codex_model_catalog("m", true)).expect("valid JSON");
+            serde_json::from_str(&codex_model_catalog("m", true, 32768)).expect("valid JSON");
         let entry = &catalog["models"][0];
         assert_eq!(
             entry["input_modalities"],
@@ -2966,6 +2983,7 @@ model = \"gpt-5\"
         );
         assert_eq!(entry["slug"], "m");
         assert_eq!(entry["display_name"], "m");
+        assert_eq!(entry["context_window"], 32768);
         // Fields codex requires of an entry.
         for key in [
             "context_window",
@@ -2982,11 +3000,34 @@ model = \"gpt-5\"
         }
 
         let text_only: serde_json::Value =
-            serde_json::from_str(&codex_model_catalog("m", false)).expect("valid JSON");
+            serde_json::from_str(&codex_model_catalog("m", false, 32768)).expect("valid JSON");
         assert_eq!(
             text_only["models"][0]["input_modalities"],
             serde_json::json!(["text"])
         );
+    }
+
+    #[test]
+    fn codex_context_window_is_what_the_daemon_serves() {
+        let cases = [
+            // A positive LLMMAN_CONTEXT_LENGTH is the served --ctx-size.
+            (Some(16384), Some(32768), 16384),
+            (Some(65536), Some(32768), 65536),
+            (Some(16384), None, 16384),
+            // Unset or 0: the trained context.
+            (None, Some(32768), 32768),
+            (Some(0), Some(32768), 32768),
+            (None, Some(1 << 20), 1 << 20),
+            (Some(0), None, CODEX_FALLBACK_CONTEXT_WINDOW),
+            (None, None, CODEX_FALLBACK_CONTEXT_WINDOW),
+        ];
+        for (env, trained, want) in cases {
+            assert_eq!(
+                codex_context_window(env, trained),
+                want,
+                "env={env:?} trained={trained:?}"
+            );
+        }
     }
 
     /// A shortname like `qwen3.5:0.8b` must round-trip quoted, or the

@@ -15,7 +15,7 @@ use std::path::PathBuf;
 /// when 0.
 ///
 /// Unset or unparseable, this falls back to [`DEFAULT_CTX_SIZE`].
-pub(super) fn context_length_from_env() -> Option<u32> {
+pub fn context_length_from_env() -> Option<u32> {
     parse_context_length(std::env::var("LLMMAN_CONTEXT_LENGTH").ok().as_deref())
 }
 

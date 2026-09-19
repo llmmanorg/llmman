@@ -1116,9 +1116,23 @@ pub struct ShowResponse {
     /// The model's chat template, if any (see `crate::modelpack::chat_template`).
     #[serde(default)]
     pub template: Option<String>,
+    /// The GGUF header's metadata keys. Untyped so that any shape an
+    /// older daemon sends decodes.
+    #[serde(default)]
+    pub model_info: serde_json::Value,
 }
 
 impl ShowResponse {
+    /// The trained context, `{general.architecture}.context_length`;
+    /// `None` when absent or zero.
+    pub fn context_length(&self) -> Option<u64> {
+        let arch = self.model_info.get("general.architecture")?.as_str()?;
+        self.model_info
+            .get(format!("{arch}.context_length"))?
+            .as_u64()
+            .filter(|n| *n > 0)
+    }
+
     /// The template's thinking controls; `None` without a template.
     pub fn thinking_controls(&self) -> Option<crate::chat_template::ThinkingControls> {
         self.template
@@ -1449,6 +1463,45 @@ fn encode_path_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn show_response(body: serde_json::Value) -> ShowResponse {
+        serde_json::from_value(body).expect("a ShowResponse")
+    }
+
+    #[test]
+    fn context_length_is_read_under_the_declared_architecture() {
+        let info = show_response(serde_json::json!({
+            "model_info": {
+                "general.architecture": "qwen35",
+                "qwen35.context_length": 32768,
+                "llama.context_length": 4096,
+            }
+        }));
+        assert_eq!(info.context_length(), Some(32768));
+    }
+
+    #[test]
+    fn context_length_is_none_without_a_usable_header() {
+        assert_eq!(show_response(serde_json::json!({})).context_length(), None);
+        for model_info in [
+            // What a daemon older than #512 sends.
+            serde_json::json!({ "digest": "sha256:a", "size": 1 }),
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({ "llama.context_length": 4096 }),
+            serde_json::json!({
+                "general.architecture": "llama",
+                "llama.context_length": "4096",
+            }),
+            serde_json::json!({
+                "general.architecture": "llama",
+                "llama.context_length": 0,
+            }),
+        ] {
+            let info = show_response(serde_json::json!({ "model_info": model_info.clone() }));
+            assert_eq!(info.context_length(), None, "{model_info}");
+        }
+    }
 
     /// The two locality questions differ on exactly one host, and it is
     /// the one that matters: a wildcard bind is reached over loopback

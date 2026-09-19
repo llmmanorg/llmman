@@ -57,15 +57,14 @@ use backend::{
     OutputTail, SafetensorsEngine, POLL_INTERVAL,
 };
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
-pub use config::DEFAULT_CTX_SIZE;
 use config::{
-    backend_ctx_size, container_cpu_limit, context_length_from_env, effective_num_parallel,
-    embedding_model_ctx, flash_attention_from_env, gguf_trained_ctx, initial_ctx_size,
-    kv_cache_type_from_env, looks_like_oom, max_loaded_models_from_env, max_queue_from_env,
-    metrics_enabled_from_env, next_ctx_size_after_oom, num_parallel_from_env,
-    sched_spread_from_env, supports_context_shift, threads_from_env_or_host, tls_from_env,
-    MAX_CTX_SHRINK_ATTEMPTS,
+    backend_ctx_size, container_cpu_limit, effective_num_parallel, embedding_model_ctx,
+    flash_attention_from_env, gguf_trained_ctx, initial_ctx_size, kv_cache_type_from_env,
+    looks_like_oom, max_loaded_models_from_env, max_queue_from_env, metrics_enabled_from_env,
+    next_ctx_size_after_oom, num_parallel_from_env, sched_spread_from_env, supports_context_shift,
+    threads_from_env_or_host, tls_from_env, MAX_CTX_SHRINK_ATTEMPTS,
 };
+pub use config::{context_length_from_env, DEFAULT_CTX_SIZE};
 use gemini::{gemini_method, handle_pinned_gemini};
 use ollama::{
     handle_blob_head, handle_blob_upload, handle_copy, handle_create, handle_delete, handle_embed,
