@@ -2328,6 +2328,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "rustls",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.10.9",

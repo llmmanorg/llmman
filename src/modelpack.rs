@@ -266,7 +266,7 @@ fn raw_blob_path(
     Ok(p)
 }
 
-/// A raw layer's blob under its original file name, as a symlink
+/// A raw layer's blob under its original file name as
 /// `<cache>/<digest>/<filename>`: the name carries the variant
 /// (`distilled` selects the sampling schedule).
 fn named_blob_path(
@@ -278,21 +278,9 @@ fn named_blob_path(
     let Some(name) = layer_filepath(layer).and_then(|p| Path::new(p).file_name()) else {
         return Ok(blob);
     };
-    // absolute: LLMMAN_MODELS may be relative
-    let blob = dunce::canonicalize(&blob)?;
     let dir = cache_path.join(digest_hex(&layer.digest)?);
-    std::fs::create_dir_all(&dir)?;
     let link = dir.join(name);
-    if !link.exists() {
-        // a link left dangling by blob GC
-        let _ = std::fs::remove_file(&link);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&blob, &link)
-            .with_context(|| format!("link {} -> {}", link.display(), blob.display()))?;
-        #[cfg(not(unix))]
-        std::fs::hard_link(&blob, &link)
-            .with_context(|| format!("link {} -> {}", link.display(), blob.display()))?;
-    }
+    cache_layer_file(&blob, &link, layer.size)?;
     Ok(link)
 }
 
@@ -725,14 +713,8 @@ fn extract_safetensors_dir(
             continue;
         }
 
-        std::fs::create_dir_all(dest.parent().context("no parent")?)?;
-        match std::fs::remove_file(&dest) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("remove {}", dest.display())),
-        }
         let blob = raw_blob_path(store_path, layer)?;
-        link_or_copy_file(&blob, &dest, layer.size)
+        cache_layer_file(&blob, &dest, layer.size)
             .with_context(|| format!("cache {rel_path} from blob store"))?;
         eprintln!("[llmman] cached {rel_path}");
     }
@@ -747,29 +729,39 @@ fn extract_safetensors_dir(
 }
 
 fn cached_layer_file_matches(dest: &Path, layer_size: u64) -> bool {
-    dest.metadata()
+    dest.symlink_metadata()
         .map(|m| m.is_file() && m.len() == layer_size)
         .unwrap_or(false)
 }
 
-fn link_or_copy_file(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        match std::fs::hard_link(src, dest) {
-            Ok(()) => Ok(()),
-            Err(_) if cached_layer_file_matches(dest, layer_size) => Ok(()),
-            Err(hardlink_error) => copy_file_atomic(src, dest, layer_size).with_context(|| {
-                format!(
-                    "hardlink {} to {} failed: {hardlink_error}; copy failed",
-                    src.display(),
-                    dest.display()
-                )
-            }),
-        }
+fn cache_layer_file(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result<()> {
+    if cached_layer_file_matches(dest, layer_size) {
+        return Ok(());
     }
-    #[cfg(not(unix))]
-    {
-        copy_file_atomic(src, dest, layer_size)
+    std::fs::create_dir_all(dest.parent().context("no parent")?)?;
+    match std::fs::remove_file(dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("remove {}", dest.display())),
+    }
+    link_or_copy_file(src, dest, layer_size)
+}
+
+fn link_or_copy_file(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result<()> {
+    match std::fs::hard_link(src, dest) {
+        Ok(()) if cached_layer_file_matches(dest, layer_size) => Ok(()),
+        Ok(()) => {
+            let _ = std::fs::remove_file(dest);
+            copy_file_atomic(src, dest, layer_size)
+        }
+        Err(_) if cached_layer_file_matches(dest, layer_size) => Ok(()),
+        Err(hardlink_error) => copy_file_atomic(src, dest, layer_size).with_context(|| {
+            format!(
+                "hardlink {} to {} failed: {hardlink_error}; copy failed",
+                src.display(),
+                dest.display()
+            )
+        }),
     }
 }
 
@@ -1240,6 +1232,41 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn named_blob_path_replaces_symlink_with_hardlink() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        let weights = b"complete-weights-bytes";
+        let layer_hex = "aa".repeat(32);
+        let mut layer = descriptor(&format!("sha256:{layer_hex}"), "model.safetensors");
+        layer.media_type = "application/vnd.cncf.model.weight.v1.raw".into();
+        layer.size = weights.len() as u64;
+        let (store, _) = manifest_with(vec![layer.clone()]);
+
+        let blob = store.root().join("blobs").join("sha256").join(&layer_hex);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, weights).unwrap();
+
+        let cache = store.root().join("cache");
+        let dest = cache.join(&layer_hex).join("model.safetensors");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        symlink(&blob, &dest).unwrap();
+
+        assert_eq!(named_blob_path(store.root(), &cache, &layer).unwrap(), dest);
+        assert!(!std::fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let dest_meta = std::fs::metadata(&dest).unwrap();
+        let blob_meta = std::fs::metadata(&blob).unwrap();
+        assert_eq!(
+            (dest_meta.dev(), dest_meta.ino()),
+            (blob_meta.dev(), blob_meta.ino())
+        );
+    }
+
     #[test]
     fn copy_file_atomic_replaces_dest_through_temp_file() {
         let dir = std::env::temp_dir().join(format!(
@@ -1264,6 +1291,23 @@ mod tests {
                 .all(|e| !e.file_name().to_string_lossy().contains(".tmp")),
             "copy temp file should not remain"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn link_or_copy_file_rejects_a_short_blob() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-modelpack-short-blob-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("blob");
+        let dest = dir.join("model.safetensors");
+        std::fs::write(&src, b"short").unwrap();
+
+        assert!(link_or_copy_file(&src, &dest, 22).is_err());
+        assert!(!dest.exists(), "short linked dest should be removed");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
