@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `agy`, `opencode`, `codex`, `grok`, `qwen`, `hermes`,
+//! (`claude`, `agy`, `opencode`, `codex`, `cline`, `grok`, `qwen`, `hermes`,
 //! `openclaw`, `dsh`, `goose`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
@@ -673,6 +673,7 @@ fn launch_and_assert(integration: &str, extra_args: &[&str]) {
         |_stderr| false,
         |_stdout| false,
         false,
+        |_home| {},
     );
 }
 
@@ -686,6 +687,25 @@ fn launch_and_assert_strict(integration: &str, extra_args: &[&str]) {
         |_stderr| false,
         |_stdout| false,
         true,
+        |_home| {},
+    );
+}
+
+/// Strict inference plus assertions over the fresh HOME after the real CLI
+/// exits. This catches launchers that infer correctly but leak credentials or
+/// mutate user-owned state while doing it.
+fn launch_and_assert_strict_inspecting(
+    integration: &str,
+    extra_args: &[&str],
+    inspect_home: impl Fn(&Path),
+) {
+    launch_and_assert_with(
+        integration,
+        extra_args,
+        |_stderr| false,
+        |_stdout| false,
+        true,
+        inspect_home,
     );
 }
 
@@ -703,6 +723,7 @@ fn launch_and_assert_rejecting(
         |_stderr| false,
         reject_stdout,
         false,
+        |_home| {},
     );
 }
 
@@ -726,6 +747,7 @@ fn launch_and_assert_tolerating(
         tolerate_stderr,
         |_stdout| false,
         false,
+        |_home| {},
     );
 }
 
@@ -738,6 +760,7 @@ fn launch_and_assert_with(
     tolerate_stderr: impl Fn(&str) -> bool,
     reject_stdout: impl Fn(&str) -> bool,
     strict: bool,
+    inspect_home: impl Fn(&Path),
 ) {
     let mut last_failure = None;
     // Set when the loop gives up on a timeout (not retried) rather than
@@ -792,6 +815,7 @@ fn launch_and_assert_with(
              reported a failure of its own\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
         );
         if stdout.to_lowercase().contains("pong") {
+            inspect_home(&home);
             return;
         }
         eprintln!(
@@ -928,6 +952,49 @@ fn launch_codex_with_model() {
 
     // `exec <prompt>`: codex's non-interactive one-shot mode.
     launch_and_assert("codex", &["exec", PROMPT]);
+}
+
+#[test]
+fn launch_cline_with_model() {
+    eprintln!("[test] launch_cline_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_cline_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("cline") {
+        eprintln!("skipping: cline not on PATH — npm install -g cline");
+        return;
+    }
+
+    // `--json <prompt>` is Cline's non-interactive NDJSON mode. Requiring
+    // `pong` verifies the real OpenAI-compatible inference path, not just
+    // a zero exit from CLI startup.
+    launch_and_assert_strict_inspecting("cline", &["--json", PROMPT], |home| {
+        let path = home.join(".config/llmman/launch/cline/data/settings/providers.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let settings: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+        let provider = &settings["providers"]["openai-compatible"]["settings"];
+        assert_eq!(settings["lastUsedProvider"], "openai-compatible");
+        assert_eq!(provider["provider"], "openai-compatible");
+        assert_eq!(provider["model"], "docker.io/ai/qwen3.5:0.8b");
+        assert_eq!(
+            provider["baseUrl"],
+            format!("{}/v1", llmman::daemon::server())
+        );
+        assert!(
+            provider.get("apiKey").is_none(),
+            "Cline persisted the launch credential in {}: {text}",
+            path.display()
+        );
+        assert!(
+            !home.join(".cline").exists(),
+            "Cline wrote user-owned state outside llmman's isolated directory"
+        );
+    });
 }
 
 #[test]
