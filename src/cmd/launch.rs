@@ -616,9 +616,9 @@ fn launch(
         "kimi" => launch_simple("kimi", model, extra_args),
         "gemini" => launch_gemini(model, api_key, extra_args),
         "agy" => launch_agy(model, api_key, extra_args),
-        "hermes" => launch_hermes(model, extra_args),
+        "hermes" => launch_hermes(model, vision, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
-        "qwen" => launch_qwen(model, api_key, extra_args),
+        "qwen" => launch_qwen(model, api_key, vision, extra_args),
         "dsh" => launch_dsh(model, api_key, vision, extra_args),
         "goose" => launch_goose(model, api_key, extra_args),
         "grok" => launch_grok(model, api_key, extra_args),
@@ -1140,9 +1140,9 @@ fn launch_simple(binary: &str, _model: &str, extra_args: &[String]) -> anyhow::R
 /// pointing at our /v1 endpoint, skipping the messaging-gateway/
 /// desktop-build setup a full wizard would also handle, which llmman's
 /// own launch has no equivalent for.
-fn launch_hermes(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch_hermes(model: &str, vision: bool, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_on_path("hermes").ok_or_else(|| anyhow::anyhow!("hermes is not installed"))?;
-    write_hermes_config(if model.is_empty() { "default" } else { model })?;
+    write_hermes_config(if model.is_empty() { "default" } else { model }, vision)?;
     exec_with_env(&bin, extra_args, &[])
 }
 
@@ -1175,7 +1175,7 @@ fn hermes_home() -> anyhow::Result<PathBuf> {
 /// providers, toolsets, etc.) is preserved, the same way
 /// `write_codex_config`/`strip_legacy_llmman_profile` avoid clobbering
 /// unrelated `config.toml` content.
-fn write_hermes_config(model: &str) -> anyhow::Result<()> {
+fn write_hermes_config(model: &str, vision: bool) -> anyhow::Result<()> {
     let config_dir = hermes_home()?;
     std::fs::create_dir_all(&config_dir)?;
     let config_path = config_dir.join("config.yaml");
@@ -1183,18 +1183,29 @@ fn write_hermes_config(model: &str) -> anyhow::Result<()> {
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
     let preserved =
         strip_yaml_top_level_key(&strip_yaml_top_level_key(&existing, "model"), "providers");
+    let ours = hermes_config_blocks(model, &format!("{}/v1", daemon::server()), vision);
+    std::fs::write(&config_path, format!("{preserved}{ours}"))?;
+    Ok(())
+}
 
+/// The `model:`/`providers:` blocks [`write_hermes_config`] owns. A
+/// vision model gets `model.supports_vision`, the override hermes's image
+/// routing reads; without it hermes describes images through a text tool.
+fn hermes_config_blocks(model: &str, base_url: &str, vision: bool) -> String {
     // Double-quoted (not bare) so a model name that happens to be a YAML
     // keyword (`null`, `true`, ...) or contain metacharacters (`:`, `#`,
     // ...) still parses back as the literal string it is.
     let model = yaml_quote(model);
-    let base_url = yaml_quote(&format!("{}/v1", daemon::server()));
-    let ours = format!(
-        "model:\n  provider: llmman\n  default: {model}\n  base_url: {base_url}\n  api_key: llmman\n\
+    let base_url = yaml_quote(base_url);
+    let vision = if vision {
+        "  supports_vision: true\n"
+    } else {
+        ""
+    };
+    format!(
+        "model:\n  provider: llmman\n  default: {model}\n  base_url: {base_url}\n  api_key: llmman\n{vision}\
          providers:\n  llmman:\n    name: llmman\n    api: {base_url}\n    default_model: {model}\n    models:\n      - {model}\n"
-    );
-    std::fs::write(&config_path, format!("{preserved}{ours}"))?;
-    Ok(())
+    )
 }
 
 /// Renders `s` as a double-quoted YAML scalar, escaping backslashes and
@@ -1310,12 +1321,20 @@ fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 /// any other. Ollama's `cmd/launch/qwen.go` does the same three. A
 /// `--model` after `--` is the one Qwen Code uses, so the settings and
 /// `OPENAI_MODEL` follow it.
-fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch_qwen(
+    model: &str,
+    api_key: &str,
+    vision: bool,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
     let bin = find_qwen().ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
-    let model = forwarded_model(extra_args).unwrap_or(model);
+    // `vision` describes `model`, not a different one forwarded after `--`.
+    let forwarded = forwarded_model(extra_args).filter(|f| *f != model);
+    let vision = vision && forwarded.is_none();
+    let model = forwarded.unwrap_or(model);
     // After the lookup, so nothing is written for an integration that is
     // not there; `check_model_flag` has made sure there is a model.
-    write_qwen_settings(model)?;
+    write_qwen_settings(model, vision)?;
 
     let base_url = format!("{}/v1", daemon::server());
     let mut env = vec![
@@ -1493,8 +1512,13 @@ fn expand_tilde(dir: &str, home: &Path) -> PathBuf {
 /// Records llmman as the `openai` provider for `model` in Qwen Code's
 /// `settings.json`, as `write_codex_config` and `write_hermes_config` do
 /// for theirs. See `qwen_settings_merged` for what goes in.
-fn write_qwen_settings(model: &str) -> anyhow::Result<()> {
-    write_qwen_settings_at(&qwen_home()?, model, &format!("{}/v1", daemon::server()))
+fn write_qwen_settings(model: &str, vision: bool) -> anyhow::Result<()> {
+    write_qwen_settings_at(
+        &qwen_home()?,
+        model,
+        &format!("{}/v1", daemon::server()),
+        vision,
+    )
 }
 
 /// Read as Qwen Code reads it, comments stripped and an empty file as
@@ -1503,7 +1527,12 @@ fn write_qwen_settings(model: &str) -> anyhow::Result<()> {
 /// parses but cannot be written is an error, since an entry in it may be
 /// the one this write was to outrank. The user's own file, and any later
 /// one carrying comments, is kept as `settings.json.bak`.
-fn write_qwen_settings_at(dir: &Path, model: &str, base_url: &str) -> anyhow::Result<()> {
+fn write_qwen_settings_at(
+    dir: &Path,
+    model: &str,
+    base_url: &str,
+    vision: bool,
+) -> anyhow::Result<()> {
     let path = dir.join("settings.json");
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => Some(raw),
@@ -1523,7 +1552,7 @@ fn write_qwen_settings_at(dir: &Path, model: &str, base_url: &str) -> anyhow::Re
             }
         },
     };
-    let merged = qwen_settings_merged(&existing, model, base_url);
+    let merged = qwen_settings_merged(&existing, model, base_url, vision);
     if merged == existing {
         return Ok(());
     }
@@ -1601,18 +1630,24 @@ const QWEN_ENV_KEY: &str = "LLMMAN_API_KEY";
 /// first in `modelProviders.openai`, an earlier one of llmman's replaced,
 /// the rest kept and a `{ protocol, models }` wrapper unwrapped with
 /// `$version` set to 4; `security.auth`; `model.name` and `model.baseUrl`.
+/// A vision model's entry declares image input, which Qwen Code reads
+/// only off the provider entry, not the top-level `model.generationConfig`.
 fn qwen_settings_merged(
     existing: &serde_json::Value,
     model: &str,
     base_url: &str,
+    vision: bool,
 ) -> serde_json::Value {
     let mut doc = existing.as_object().cloned().unwrap_or_default();
-    let ours = serde_json::json!({
+    let mut ours = serde_json::json!({
         "id": model,
         "name": format!("{model} (llmman)"),
         "baseUrl": base_url,
         "envKey": QWEN_ENV_KEY,
     });
+    if vision {
+        ours["generationConfig"] = serde_json::json!({ "modalities": { "image": true } });
+    }
     let openai = object_under(&mut doc, "modelProviders")
         .entry("openai")
         .or_insert_with(|| serde_json::json!([]));
@@ -2590,7 +2625,7 @@ mod tests {
             "model": { "name": "gemini-2.5-pro", "generationConfig": { "temperature": 0.1 } }
         });
         let url = "http://127.0.0.1:17434/v1";
-        let merged = qwen_settings_merged(&existing, "docker.io/ai/m:latest", url);
+        let merged = qwen_settings_merged(&existing, "docker.io/ai/m:latest", url, false);
         assert_eq!(merged["$version"], 4);
         assert_eq!(merged["ui"]["theme"], "keep-me");
         assert_eq!(
@@ -2623,7 +2658,7 @@ mod tests {
     #[test]
     fn qwen_settings_merge_is_complete_from_nothing_and_idempotent() {
         let url = "http://127.0.0.1:17434/v1";
-        let once = qwen_settings_merged(&serde_json::json!({}), "m:latest", url);
+        let once = qwen_settings_merged(&serde_json::json!({}), "m:latest", url, false);
         assert_eq!(
             once,
             serde_json::json!({
@@ -2634,10 +2669,26 @@ mod tests {
                 "model": { "name": "m:latest", "baseUrl": url }
             })
         );
-        assert_eq!(qwen_settings_merged(&once, "m:latest", url), once);
+        assert_eq!(qwen_settings_merged(&once, "m:latest", url, false), once);
         let text = once.to_string();
         assert!(!text.contains("apiKey") && !text.contains("\"env\""));
         assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"qwen"));
+    }
+
+    /// Relaunching with a text model drops the declaration, since
+    /// llmman's entry is replaced whole.
+    #[test]
+    fn qwen_settings_declare_image_input_only_for_a_vision_model() {
+        let url = "http://h/v1";
+        let vision = qwen_settings_merged(&serde_json::json!({}), "m", url, true);
+        assert_eq!(
+            vision["modelProviders"]["openai"][0]["generationConfig"],
+            serde_json::json!({ "modalities": { "image": true } })
+        );
+        assert!(vision["model"].get("generationConfig").is_none());
+
+        let text_only = qwen_settings_merged(&vision, "m", url, false);
+        assert!(!text_only.to_string().contains("modalities"), "{text_only}");
     }
 
     /// A wrong-typed value on the path is replaced, a non-object root
@@ -2648,11 +2699,11 @@ mod tests {
         let existing = serde_json::json!({
             "security": 3, "modelProviders": { "openai": "x" }, "model": []
         });
-        let merged = qwen_settings_merged(&existing, "m", "http://h/v1");
+        let merged = qwen_settings_merged(&existing, "m", "http://h/v1", false);
         assert_eq!(merged["security"]["auth"]["selectedType"], "openai");
         assert_eq!(merged["modelProviders"]["openai"][0]["id"], "m");
         assert_eq!(merged["model"]["name"], "m");
-        let from_null = qwen_settings_merged(&serde_json::json!(null), "m", "http://h/v1");
+        let from_null = qwen_settings_merged(&serde_json::json!(null), "m", "http://h/v1", false);
         assert_eq!(from_null["model"]["name"], "m");
 
         let wrapped = serde_json::json!({
@@ -2661,7 +2712,7 @@ mod tests {
                 { "id": "gpt-5", "baseUrl": "https://api.openai.com/v1", "envKey": "MY_KEY" }
             ] } }
         });
-        let merged = qwen_settings_merged(&wrapped, "m", "http://h/v1");
+        let merged = qwen_settings_merged(&wrapped, "m", "http://h/v1", false);
         let openai = merged["modelProviders"]["openai"].as_array().unwrap();
         assert_eq!(openai.len(), 2);
         assert_eq!(openai[1]["id"], "gpt-5");
@@ -2737,12 +2788,12 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
         };
 
-        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false).unwrap();
         assert_eq!(read()["model"]["name"], "m:latest");
         assert!(!bak.exists(), "nothing to back up on a first write");
         let written = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             written
@@ -2750,11 +2801,11 @@ mod tests {
 
         let commented = "{\n  // mine\n  \"ui\": { \"theme\": \"x\" }\n}\n";
         std::fs::write(&path, commented).unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false).unwrap();
         assert_eq!(read()["ui"]["theme"], "x");
         assert_eq!(read()["model"]["name"], "m:latest");
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), commented);
-        write_qwen_settings_at(&dir, "other:latest", url).unwrap();
+        write_qwen_settings_at(&dir, "other:latest", url, false).unwrap();
         assert_eq!(read()["model"]["name"], "other:latest");
         assert_eq!(
             std::fs::read_to_string(&bak).unwrap(),
@@ -2763,18 +2814,18 @@ mod tests {
         );
         let edited = "{\n  // edited by hand\n  \"ui\": { \"theme\": \"y\" }\n}\n";
         std::fs::write(&path, edited).unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false).unwrap();
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), edited);
 
         std::fs::write(&path, "  \n").unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false).unwrap();
         assert_eq!(read()["model"]["name"], "m:latest");
 
         std::fs::write(&path, "{ not json").unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
         std::fs::write(&path, "[]").unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3279,6 +3330,20 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert!(cleaned.contains("  - web"));
         assert!(cleaned.contains("channels:"));
         assert!(cleaned.contains("  telegram: {}"));
+    }
+
+    #[test]
+    fn hermes_config_declares_image_input_only_for_a_vision_model() {
+        let vision = hermes_config_blocks("m", "http://h/v1", true);
+        let model_block = strip_yaml_top_level_key(&vision, "providers");
+        assert!(
+            model_block.contains("\n  supports_vision: true\n"),
+            "{vision}"
+        );
+
+        let text_only = hermes_config_blocks("m", "http://h/v1", false);
+        assert!(!text_only.contains("supports_vision"), "{text_only}");
+        assert_eq!(text_only, vision.replace("  supports_vision: true\n", ""));
     }
 
     #[test]
