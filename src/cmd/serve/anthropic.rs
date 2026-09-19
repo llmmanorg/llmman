@@ -25,12 +25,13 @@ use axum::response::Response;
 use reqwest::Client;
 use serde_json::{json, Value};
 
+use super::hybrid::send_with_hybrid_fallback;
 use super::openai::apply_default_repeat_penalty;
 use super::relay::{convert_upstream, relay_rewriting_model, relay_stream_rewriting_model};
 use super::sched::{begin_activity, ActivityGuard};
 use super::{
     backend_wire_model, chat_body, messages, repeat_penalty_applies, send_chat_completion,
-    send_with_hybrid_fallback, AppError, AppState, Target,
+    AppError, AppState, Target,
 };
 
 /// The generating Messages route, appended to a provider's base URL.

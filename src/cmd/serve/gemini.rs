@@ -9,12 +9,13 @@ use base64::Engine as _;
 use futures::StreamExt;
 use serde::Deserialize;
 
+use super::hybrid::send_with_hybrid_fallback;
 use super::sched::{begin_activity, ActivityGuard};
 use super::stream::{bytes_to_lines, oai_chunk_to_content};
 use super::types::{OAIChatRequest, OAIChunk, OAIMessage, OAIToolCall, OAIToolCallFunction};
 use super::{
-    accumulate_tool_call_deltas, backend_wire_model, collect_body, post_chat,
-    send_with_hybrid_fallback, AppError, AppState, Target, ToolCallAccumulator,
+    accumulate_tool_call_deltas, backend_wire_model, collect_body, post_chat, AppError, AppState,
+    Target, ToolCallAccumulator,
 };
 
 // ---------------------------------------------------------------------------
@@ -735,8 +736,9 @@ fn gemini_oai_request(model: String, req: &GeminiRequest) -> Result<OAIChatReque
 
 #[cfg(test)]
 mod tests {
+    use super::super::hybrid::with_hybrid_fallback;
     use super::super::tests::{headers_with, remote_target, test_state, HOSTED, PAIR};
-    use super::super::{with_hybrid_fallback, ContextOverflow};
+    use super::super::ContextOverflow;
     use super::*;
     use axum::{response::IntoResponse, routing::post, Router};
     use std::sync::Arc;
