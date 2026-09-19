@@ -22,7 +22,6 @@ use std::process::Command;
 use anyhow::Context;
 use base64::Engine as _;
 use clap::Args;
-use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
 use crate::chat_template::ThinkingControls;
 use crate::daemon;
@@ -84,9 +83,11 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         "--overflow-model needs --model naming the local model to pair it with"
     );
 
-    // The local model's thinking controls (see `opencode_variants`); a
-    // provider's model has no template to read.
+    // The local model's thinking controls (see `opencode_variants`) and
+    // whether it takes images (see `write_dsh_settings`); a provider's
+    // model has neither a template nor a manifest to read.
     let mut thinking = None;
+    let mut vision = false;
     let (model, api_key) = match provider {
         Some(provider) => {
             check_provider_supported(name)?;
@@ -129,7 +130,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // synchronously and with progress, before ever handing off to
             // the integration.
             if !model.is_empty() {
-                thinking = crate::daemon::ensure_model_pulled(&model)?.thinking_controls();
+                let info = crate::daemon::ensure_model_pulled(&model)?;
+                thinking = info.thinking_controls();
+                vision = info.multimodal();
             }
             match overflow {
                 // The hosted half is validated and keyed exactly as a
@@ -148,7 +151,14 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         }
     };
 
-    launch(name, &model, &api_key, thinking.as_ref(), &args.extra_args)
+    launch(
+        name,
+        &model,
+        &api_key,
+        thinking.as_ref(),
+        vision,
+        &args.extra_args,
+    )
 }
 
 /// What an integration authenticates with when no provider key travels:
@@ -162,23 +172,30 @@ fn integration_key() -> String {
 // Pre-flight
 // ---------------------------------------------------------------------------
 
-/// Integrations that cannot be launched without `--model`: Qwen Code has
+/// Integrations that cannot be launched without `--model`. Qwen Code has
 /// no notion of a missing model and sends its own built-in default
 /// (`qwen3.7-max` in 0.22.3), which the daemon would then try to pull.
 /// AGY needs an explicit model for its Gemini routing URL.
 /// dsh has no default of its own either — an empty `--model` would
 /// otherwise land a literal `"default"` in `agent-default-model.model`,
 /// which the first request then tries to resolve as a real model id.
+/// goose instead refuses with "Run 'goose configure' first", advice that
+/// does not apply to a launch llmman configures through the environment.
+/// Grok Build has a hosted default of its own; without an explicit local
+/// model it would send that id to llmman's endpoint instead.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
-const MODEL_REQUIRED: &[&str] = &["qwen", "dsh", "agy"];
+const MODEL_REQUIRED: &[&str] = &["qwen", "dsh", "agy", "goose", "grok"];
 
 /// Integrations whose launcher yields to a `--model` after `--`, and so
-/// warrant the warning below. Only qwen: `qwen_args` drops its own
-/// `--model` when the caller spelled one, where `dsh_args` does not —
-/// dsh takes no `--model` flag at all (its model is the one
-/// `write_dsh_settings` records), so telling a dsh user theirs "wins"
-/// would be false, and dsh rejects the unknown flag on its own.
-const MODEL_FLAG_FORWARDED: &[&str] = &["qwen"];
+/// warrant the warning below. qwen: `qwen_args` drops its own `--model`
+/// when the caller spelled one. goose: its model is `GOOSE_MODEL` in the
+/// environment, which goose's own `--model` documents itself as
+/// overriding. grok: `grok_args` likewise drops its generated `--model`.
+/// Not dsh: `dsh_args` does not yield, and dsh takes no
+/// `--model` flag at all (its model is the one `write_dsh_settings`
+/// records), so telling a dsh user theirs "wins" would be false, and dsh
+/// rejects the unknown flag on its own.
+const MODEL_FLAG_FORWARDED: &[&str] = &["qwen", "goose", "grok"];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
 /// `--provider` too. A second `--model` after `--` is the caller's to
@@ -210,14 +227,11 @@ fn check_model_flag(
 
 /// Whether `extra_args` spells `long` or `short`, as a word or `=`-joined.
 fn has_flag(extra_args: &[String], long: &str, short: Option<&str>) -> bool {
-    extra_args
-        .iter()
-        .take_while(|a| a.as_str() != "--")
-        .any(|a| {
-            a == long
-                || a.starts_with(&format!("{long}="))
-                || short.is_some_and(|s| a == s || a.starts_with(&format!("{s}=")))
-        })
+    extra_args.iter().any(|a| {
+        a == long
+            || a.starts_with(&format!("{long}="))
+            || short.is_some_and(|s| a == s || a.starts_with(&format!("{s}=")))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +273,14 @@ const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
     (
         "openclaw",
         "it only takes a model during first-run onboarding",
+    ),
+    // Grok Build refuses `-m` values absent from the custom endpoint's
+    // `/v1/models` catalog. llmman's endpoint lists stored local models,
+    // not the synthetic provider or hybrid routing refs, so one of those
+    // launches would fail before making its first request.
+    (
+        "grok",
+        "its model catalog cannot represent llmman's provider or hybrid routing reference",
     ),
 ];
 
@@ -477,25 +499,43 @@ const INTEGRATIONS: &[Integration] = &[
         binary: "openclaw",
     },
     Integration {
+        name: "vibe",
+        description: "Mistral Vibe CLI",
+        binary: "vibe",
+    },
+    Integration {
         name: "qwen",
         description: "Qwen Code",
         binary: "qwen",
     },
     Integration {
-        name: "vibe",
-        description: "Mistral Vibe CLI",
-        binary: "vibe",
+        name: "dsh",
+        description: "DeepSeek Harness",
+        binary: "dsh",
+    },
+    Integration {
+        name: "goose",
+        description: "Block goose",
+        binary: "goose",
+    },
+    Integration {
+        name: "grok",
+        description: "Grok Build",
+        binary: "grok",
     },
 ];
 
 fn print_integrations() {
     println!("Available integrations:\n");
     for i in INTEGRATIONS {
-        if find_integration_binary(i).is_some() {
-            println!("  {:<12} {}", i.name, i.description);
-        } else {
-            println!("  {:<12} {} (not installed)", i.name, i.description);
-        }
+        // dsh resolves to npx when it isn't installed (see `find_dsh`),
+        // and that launch downloads the package before running it.
+        let how = match find_integration_binary(i) {
+            Some(bin) if bin.file_stem().is_some_and(|s| s == "npx") => " (via npx)",
+            Some(_) => "",
+            None => " (not installed)",
+        };
+        println!("  {:<12} {}{}", i.name, i.description, how);
     }
     println!("\nUsage: llmman launch <integration> [--model <model>] [--provider <provider>]");
     println!("       llmman providers   (the providers --provider accepts)");
@@ -542,6 +582,9 @@ fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
         "opencode" => find_opencode(),
         "qwen" => find_qwen(),
+        "dsh" => find_dsh().map(|(bin, _)| bin),
+        "goose" => find_goose(),
+        "grok" => find_grok(),
         _ => find_on_path(i.binary),
     }
 }
@@ -566,12 +609,13 @@ fn launch(
     model: &str,
     api_key: &str,
     thinking: Option<&ThinkingControls>,
+    vision: bool,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     match name.to_lowercase().as_str() {
         "claude" => launch_claude(model, api_key, extra_args),
-        "opencode" => launch_opencode(model, api_key, thinking, extra_args),
-        "codex" => launch_codex(model, api_key, extra_args),
+        "opencode" => launch_opencode(model, api_key, thinking, vision, extra_args),
+        "codex" => launch_codex(model, api_key, vision, extra_args),
         "cline" => launch_simple("cline", model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
@@ -580,8 +624,11 @@ fn launch(
         "agy" => launch_agy(model, api_key, extra_args),
         "hermes" => launch_hermes(model, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
-        "qwen" => launch_qwen(model, api_key, extra_args),
         "vibe" => launch_vibe(model, api_key, extra_args),
+        "qwen" => launch_qwen(model, api_key, extra_args),
+        "dsh" => launch_dsh(model, api_key, vision, extra_args),
+        "goose" => launch_goose(model, api_key, extra_args),
+        "grok" => launch_grok(model, api_key, extra_args),
         other => anyhow::bail!(
             "unknown integration {:?}\nRun 'llmman launch' without arguments to list supported integrations.",
             other
@@ -616,11 +663,13 @@ fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
 }
 
 /// opencode: a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
-/// /v1 endpoint, with the model's thinking variants.
+/// /v1 endpoint, with the model's thinking variants and, for a vision
+/// model, image input.
 fn launch_opencode(
     model: &str,
     api_key: &str,
     thinking: Option<&ThinkingControls>,
+    vision: bool,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
@@ -631,6 +680,7 @@ fn launch_opencode(
         effective_model,
         api_key,
         &opencode_variants(thinking),
+        vision,
     );
 
     exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
@@ -688,6 +738,7 @@ fn opencode_config(
     model: &str,
     api_key: &str,
     variants: &[(&'static str, serde_json::Value)],
+    vision: bool,
 ) -> String {
     use serde::ser::{SerializeMap, Serializer};
 
@@ -734,7 +785,23 @@ fn opencode_config(
         name: &'a str,
         #[serde(serialize_with = "entries", skip_serializing_if = "<[_]>::is_empty")]
         variants: &'a [(&'static str, serde_json::Value)],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        modalities: Option<Modalities>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attachment: Option<bool>,
     }
+    #[derive(serde::Serialize)]
+    struct Modalities {
+        input: &'static [&'static str],
+        output: &'static [&'static str],
+    }
+
+    // Declare image input for a vision model so opencode will attach
+    // images; a text-only model gets neither key.
+    let modalities = vision.then_some(Modalities {
+        input: &["text", "image"],
+        output: &["text"],
+    });
 
     let config = Config {
         schema: "https://opencode.ai/config.json",
@@ -751,6 +818,8 @@ fn opencode_config(
                     Model {
                         name: model,
                         variants,
+                        modalities,
+                        attachment: vision.then_some(true),
                     },
                 )],
             },
@@ -762,9 +831,14 @@ fn opencode_config(
 
 /// codex: set OPENAI_API_KEY=llmman and write ~/.codex/config.toml with the
 /// ollama provider pointing at our /v1 endpoint.
-fn launch_codex(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch_codex(
+    model: &str,
+    api_key: &str,
+    vision: bool,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
     // Write codex config
-    write_codex_config()?;
+    write_codex_config(model, vision)?;
 
     // Regression: this used to pass a bare PathBuf::from("codex") straight
     // to exec_with_env instead of resolving it via find_on_path like every
@@ -803,7 +877,7 @@ fn launch_codex(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Re
 /// leftover copy of that table is stripped from `config.toml` first, then
 /// the real settings are (re)written to the profile overlay file codex
 /// actually reads.
-fn write_codex_config() -> anyhow::Result<()> {
+fn write_codex_config(model: &str, vision: bool) -> anyhow::Result<()> {
     let home = dirs::home_dir().context("no home directory")?;
     let config_dir = home.join(".codex");
     std::fs::create_dir_all(&config_dir)?;
@@ -815,24 +889,88 @@ fn write_codex_config() -> anyhow::Result<()> {
         }
     }
 
+    // Without a model there is nothing to describe; codex keeps its defaults.
+    let catalog_path = config_dir.join("llmman-model.json");
+    let catalog = (!model.is_empty()).then(|| {
+        write_codex_file(&catalog_path, &codex_model_catalog(model, vision))
+            .map(|()| catalog_path.clone())
+    });
+    let catalog = catalog.transpose()?;
+
     let profile_path = config_dir.join("llmman.config.toml");
-    let contents = codex_profile(&daemon::server());
-    // Avoid rewriting (and bumping the mtime of) a file that's already
-    // correct.
-    if std::fs::read_to_string(&profile_path).ok().as_deref() != Some(contents.as_str()) {
-        std::fs::write(&profile_path, contents)?;
+    write_codex_file(
+        &profile_path,
+        &codex_profile(&daemon::server(), catalog.as_deref()),
+    )
+}
+
+/// Writes `contents` to `path` unless it already holds exactly that.
+fn write_codex_file(path: &Path, contents: &str) -> anyhow::Result<()> {
+    if std::fs::read_to_string(path).ok().as_deref() == Some(contents) {
+        return Ok(());
     }
-    Ok(())
+    std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))
+}
+
+/// The catalog's `context_window` without `LLMMAN_CONTEXT_LENGTH`; ollama's
+/// fallback too.
+const CODEX_FALLBACK_CONTEXT_WINDOW: u64 = 128_000;
+
+fn codex_context_window() -> u64 {
+    std::env::var("LLMMAN_CONTEXT_LENGTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
+}
+
+/// The `model_catalog_json` for `model`, declaring its image input in
+/// `input_modalities`. The other fields are ones codex requires, valued
+/// as ollama's `buildCodexModelEntry` does.
+fn codex_model_catalog(model: &str, vision: bool) -> String {
+    let input: &[&str] = if vision {
+        &["text", "image"]
+    } else {
+        &["text"]
+    };
+    let entry = serde_json::json!({
+        "slug": model,
+        "display_name": model,
+        "context_window": codex_context_window(),
+        "shell_type": "default",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": 0,
+        "truncation_policy": { "mode": "bytes", "limit": 10000 },
+        "input_modalities": input,
+        "base_instructions": "",
+        "support_verbosity": true,
+        "default_verbosity": "low",
+        "supports_parallel_tool_calls": false,
+        "supports_reasoning_summaries": false,
+        "supported_reasoning_levels": [],
+        "experimental_supported_tools": [],
+    });
+    let catalog = serde_json::json!({ "models": [entry] });
+    serde_json::to_string_pretty(&catalog).expect("codex catalog serializes") + "\n"
 }
 
 /// The contents of `~/.codex/llmman.config.toml`: a provider of llmman's
 /// own rather than `openai_base_url` on codex's built-in one, which codex
 /// treats as WebSocket-capable and so opened every session with five
 /// failed `ws://` attempts (~6s of "Reconnecting...") before HTTP.
-fn codex_profile(server: &str) -> String {
+fn codex_profile(server: &str, catalog: Option<&Path>) -> String {
+    // A JSON string is also a valid TOML string.
+    let catalog = catalog
+        .map(|p| {
+            let quoted = serde_json::Value::from(p.display().to_string());
+            format!("model_catalog_json = {quoted}\n")
+        })
+        .unwrap_or_default();
     format!(
         "# Written by `llmman launch codex`; edits are overwritten.\n\
          model_provider = \"llmman\"\n\
+         {catalog}\
          \n\
          [model_providers.llmman]\n\
          name = \"llmman\"\n\
@@ -1507,9 +1645,6 @@ fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
             .is_some_and(|u| u.trim_end_matches('/') == base_url.trim_end_matches('/'))
 }
 
-/// The variable llmman's vibe provider entry names as its key — same
-/// convention as [`QWEN_ENV_KEY`], its own constant since the two entries
-/// live in unrelated config files and nothing is gained by coupling them.
 const VIBE_ENV_KEY: &str = "LLMMAN_API_KEY";
 
 /// vibe: Mistral Vibe CLI's `config.toml` custom-provider form, pointed at our
@@ -1705,14 +1840,14 @@ fn write_vibe_config(model: &str, base_url: &str) -> anyhow::Result<()> {
 /// tables, or an array holding something other than inline tables, a
 /// shape Vibe would reject too and this file does not try to interpret
 /// further (see `vibe_config_merged_rejects_what_it_cannot_safely_merge_into`).
-fn normalize_vibe_array_of_tables(table: &mut Table, key: &str) {
-    let Some(array) = table.get(key).and_then(Item::as_array) else {
+fn normalize_vibe_array_of_tables(table: &mut toml_edit::Table, key: &str) {
+    let Some(array) = table.get(key).and_then(toml_edit::Item::as_array) else {
         return;
     };
     if !array.iter().all(|v| v.is_inline_table()) {
         return;
     }
-    let mut converted = ArrayOfTables::new();
+    let mut converted = toml_edit::ArrayOfTables::new();
     for value in array.iter() {
         let inline = value
             .as_inline_table()
@@ -1720,7 +1855,7 @@ fn normalize_vibe_array_of_tables(table: &mut Table, key: &str) {
             .clone();
         converted.push(inline.into_table());
     }
-    table.insert(key, Item::ArrayOfTables(converted));
+    table.insert(key, toml_edit::Item::ArrayOfTables(converted));
 }
 
 /// `existing` with llmman's provider and model entry merged in, pure so a
@@ -1732,8 +1867,8 @@ fn normalize_vibe_array_of_tables(table: &mut Table, key: &str) {
 /// pointing a project-local `.vibe/config.toml` at it); llmman treats it as
 /// its own rather than second-guessing why it is there.
 fn vibe_config_merged(existing: &str, model: &str, base_url: &str) -> anyhow::Result<String> {
-    let mut doc: DocumentMut = if existing.trim().is_empty() {
-        DocumentMut::new()
+    let mut doc: toml_edit::DocumentMut = if existing.trim().is_empty() {
+        toml_edit::DocumentMut::new()
     } else {
         existing.parse().context("invalid TOML")?
     };
@@ -1751,38 +1886,199 @@ fn vibe_config_merged(existing: &str, model: &str, base_url: &str) -> anyhow::Re
     let providers = doc
         .as_table_mut()
         .entry("providers")
-        .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
+        .or_insert(toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
         .as_array_of_tables_mut()
         .ok_or_else(|| anyhow::anyhow!("`providers` is not an array of tables"))?;
-    providers.retain(|t| t.get("name").and_then(Item::as_str) != Some("llmman"));
-    let mut provider = Table::new();
-    provider.insert("name", value("llmman"));
-    provider.insert("api_base", value(base_url));
-    provider.insert("api_key_env_var", value(VIBE_ENV_KEY));
-    provider.insert("api_style", value("openai"));
-    provider.insert("backend", value("generic"));
+    providers.retain(|t| t.get("name").and_then(toml_edit::Item::as_str) != Some("llmman"));
+    let mut provider = toml_edit::Table::new();
+    provider.insert("name", toml_edit::value("llmman"));
+    provider.insert("api_base", toml_edit::value(base_url));
+    provider.insert("api_key_env_var", toml_edit::value(VIBE_ENV_KEY));
+    provider.insert("api_style", toml_edit::value("openai"));
+    provider.insert("backend", toml_edit::value("generic"));
     providers.push(provider);
 
     let models = doc
         .as_table_mut()
         .entry("models")
-        .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
+        .or_insert(toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
         .as_array_of_tables_mut()
         .ok_or_else(|| anyhow::anyhow!("`models` is not an array of tables"))?;
-    models.retain(|t| t.get("provider").and_then(Item::as_str) != Some("llmman"));
-    let mut model_table = Table::new();
-    model_table.insert("name", value(model));
-    model_table.insert("provider", value("llmman"));
+    models.retain(|t| t.get("provider").and_then(toml_edit::Item::as_str) != Some("llmman"));
+    let mut model_table = toml_edit::Table::new();
+    model_table.insert("name", toml_edit::value(model));
+    model_table.insert("provider", toml_edit::value("llmman"));
     // The model name itself, not a synthetic alias — hermes records
     // `default: {model}` the same way, and this is what `VIBE_ACTIVE_MODEL`
     // is set to in `launch_vibe`, so Vibe shows the user their actual model
     // name as the active model rather than an internal placeholder.
-    model_table.insert("alias", value(model));
+    model_table.insert("alias", toml_edit::value(model));
     models.push(model_table);
 
     Ok(doc.to_string())
 }
 
+/// goose: configured entirely through the environment, which goose reads
+/// in preference to its own `config.yaml` — so unlike hermes and qwen
+/// nothing is written to disk and no key is persisted. `OPENAI_HOST` is
+/// the bare origin, not a `/v1` base URL: goose joins it with
+/// `OPENAI_BASE_PATH` itself. Verified against goose 1.50.0 with no
+/// config file and no `goose configure`.
+fn launch_goose(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_goose().ok_or_else(|| anyhow::anyhow!("goose is not installed"))?;
+    let host = daemon::server();
+    exec_with_env(&bin, extra_args, &goose_env(model, api_key, &host))
+}
+
+/// Split out so a test can assert what goose is handed: [`exec_with_env`]
+/// never returns, so calling [`launch_goose`] would take the test runner
+/// with it.
+fn goose_env<'a>(model: &'a str, api_key: &'a str, host: &'a str) -> Vec<(&'a str, &'a str)> {
+    let mut env = vec![
+        ("GOOSE_PROVIDER", "openai"),
+        ("OPENAI_API_KEY", api_key),
+        ("OPENAI_HOST", host),
+        ("OPENAI_BASE_PATH", "v1/chat/completions"),
+    ];
+    // Absent, not empty: goose reads "" as a model actually named "".
+    if !model.is_empty() {
+        env.push(("GOOSE_MODEL", model));
+    }
+    env
+}
+
+fn find_goose() -> Option<PathBuf> {
+    find_on_path("goose").or_else(|| goose_fallback(&dirs::home_dir()?))
+}
+
+/// goose's own installer target: `download_cli.sh` writes to
+/// `$GOOSE_BIN_DIR` without putting it on `PATH`. Its default is
+/// `$USERPROFILE/goose` on Windows (what `dirs::home_dir` returns there)
+/// and `~/.local/bin` elsewhere; Windows probes both, since goose's
+/// install instructions and this repo's CI pass the latter (v1.50.0).
+fn goose_fallback(home: &Path) -> Option<PathBuf> {
+    let bin = if cfg!(windows) { "goose.exe" } else { "goose" };
+    let mut candidates = Vec::new();
+    if cfg!(windows) {
+        candidates.push(home.join("goose").join(bin));
+    }
+    candidates.push(home.join(".local").join("bin").join(bin));
+    // is_file, not exists: a directory of that name would be reported as
+    // installed and then fail to spawn.
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+// ---------------------------------------------------------------------------
+// grok (Grok Build)
+// ---------------------------------------------------------------------------
+
+/// The per-model `env_key` in llmman's Grok config reads this variable.
+/// A model credential outranks both Grok's signed-in session and its global
+/// `XAI_API_KEY`, without putting the actual key on disk.
+const GROK_API_KEY_ENV: &str = "LLMMAN_GROK_API_KEY";
+
+/// grok: point its custom-model catalog and inference client at llmman's
+/// OpenAI-compatible surface. Every auxiliary model is pinned too: without
+/// this, Grok Build keeps built-in hosted ids for title/summary, image
+/// description, web search, and prompt suggestions, then asks the local
+/// daemon to load one after the main model already answered successfully.
+///
+/// The model flag is injected only when the caller did not provide one
+/// after `--`. This matches Qwen's behavior above and lets an explicit
+/// integration argument win without passing a duplicate flag.
+fn launch_grok(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_grok().ok_or_else(|| anyhow::anyhow!("grok is not installed"))?;
+    let effective_model = forwarded_model(extra_args).unwrap_or(model);
+    let base_url = format!("{}/v1", daemon::server());
+    let models_url = format!("{base_url}/models");
+    // Never edit the user's config.toml. This child is wholly llmman-owned,
+    // and setting GROK_HOME below scopes it to this launched process.
+    let home = grok_home()?.join("llmman");
+    write_grok_config(&home, effective_model, &base_url)?;
+    let home = home.to_string_lossy().into_owned();
+    let args = grok_args(model, extra_args);
+    exec_with_env(
+        &bin,
+        &args,
+        &grok_env(effective_model, api_key, &base_url, &models_url, &home),
+    )
+}
+
+fn grok_env<'a>(
+    model: &'a str,
+    api_key: &'a str,
+    base_url: &'a str,
+    models_url: &'a str,
+    home: &'a str,
+) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("GROK_HOME", home),
+        ("GROK_MODELS_BASE_URL", base_url),
+        // Override an inherited custom catalog too. If it points elsewhere,
+        // the selected local model is absent and Grok refuses `--model`
+        // before making an inference request.
+        ("GROK_MODELS_LIST_URL", models_url),
+        ("GROK_DEFAULT_MODEL", model),
+        ("GROK_WEB_SEARCH_MODEL", model),
+        ("GROK_SESSION_SUMMARY_MODEL", model),
+        ("GROK_IMAGE_DESCRIPTION_MODEL", model),
+        ("GROK_PROMPT_SUGGESTIONS_MODEL", model),
+        (GROK_API_KEY_ENV, api_key),
+        // Grok uses this global fallback while fetching the remote catalog;
+        // inference uses the higher-priority per-model env_key above.
+        ("XAI_API_KEY", api_key),
+    ]
+}
+
+/// Grok's configured home, or its documented `~/.grok` default.
+fn grok_home() -> anyhow::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("GROK_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(dirs::home_dir().context("no home directory")?.join(".grok"))
+}
+
+fn write_grok_config(home: &Path, model: &str, base_url: &str) -> anyhow::Result<()> {
+    let path = home.join("config.toml");
+    std::fs::create_dir_all(home).with_context(|| format!("create {}", home.display()))?;
+    let contents = grok_config_document(model, base_url);
+    crate::fsutil::write_atomic(&path, contents.as_bytes())
+        .with_context(|| format!("write {}", path.display()))
+}
+
+fn grok_config_document(model: &str, base_url: &str) -> String {
+    let mut entry = toml_edit::Table::new();
+    entry["model"] = toml_edit::value(model);
+    entry["base_url"] = toml_edit::value(base_url);
+    entry["env_key"] = toml_edit::value(GROK_API_KEY_ENV);
+    entry["api_backend"] = toml_edit::value("chat_completions");
+
+    let mut models = toml_edit::Table::new();
+    models.insert(model, toml_edit::Item::Table(entry));
+    let mut document = toml_edit::DocumentMut::new();
+    document.insert("model", toml_edit::Item::Table(models));
+    document.to_string()
+}
+
+fn grok_args(model: &str, extra_args: &[String]) -> Vec<String> {
+    let mut args = Vec::with_capacity(extra_args.len() + 2);
+    if !has_flag(extra_args, "--model", Some("-m")) {
+        args.extend(["--model".to_string(), model.to_string()]);
+    }
+    args.extend_from_slice(extra_args);
+    args
+}
+
+/// `PATH`, then the official installer's target, `~/.grok/bin`.
+fn find_grok() -> Option<PathBuf> {
+    find_on_path("grok").or_else(|| grok_fallback(&dirs::home_dir()?))
+}
+
+fn grok_fallback(home: &Path) -> Option<PathBuf> {
+    let binary = if cfg!(windows) { "grok.exe" } else { "grok" };
+    let candidate = home.join(".grok").join("bin").join(binary);
+    candidate.is_file().then_some(candidate)
+}
 
 // ---------------------------------------------------------------------------
 // dsh (DeepSeek Harness)
@@ -1808,7 +2104,12 @@ const DSH_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 /// deliberately, since a per-launch directory costs a cleanup hook on
 /// every exit path (signals included) for a case that needs two
 /// simultaneous sessions on different models to bite at all.
-fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch_dsh(
+    model: &str,
+    api_key: &str,
+    vision: bool,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
     let launcher = dsh_launcher(extra_args);
     if has_flag(launcher.args, "--patch", None) {
         anyhow::bail!("llmman launch dsh manages --patch itself; pass other dsh flags after --");
@@ -1820,19 +2121,47 @@ fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Resu
             if command == "web" { "web" } else { "<name>" }
         );
     }
-    let bin = find_on_path("dsh").ok_or_else(|| anyhow::anyhow!("dsh is not installed"))?;
+    let (bin, prefix) = find_dsh().ok_or_else(|| {
+        anyhow::anyhow!("dsh is not installed, and there is no npx on PATH to run it with")
+    })?;
 
     let dir = dsh_config_dir()?;
     let settings_path = dir.join("settings.yaml");
-    write_dsh_settings(&settings_path, model)?;
+    write_dsh_settings(&settings_path, model, vision)?;
     let patch_path = dir.join("llmman.cordis.yml");
     write_dsh_patch(&patch_path, &settings_path)?;
 
-    exec_with_env(
-        &bin,
-        &dsh_args(&patch_path, extra_args),
-        &[(DSH_API_KEY_ENV, api_key)],
-    )
+    let mut args = prefix;
+    if !args.is_empty() {
+        // Said before it happens: this launch downloads a package.
+        eprintln!("[llmman] dsh is not installed; running {DSH_NPM_PACKAGE} with npx");
+    }
+    args.extend(dsh_args(&patch_path, extra_args));
+    exec_with_env(&bin, &args, &[(DSH_API_KEY_ENV, api_key)])
+}
+
+/// The npm package `npx` fetches when dsh isn't installed. Unpinned, so
+/// a one-off run gets what a global install would have.
+const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh@latest";
+
+/// dsh, and the arguments that must lead whatever it is handed: none for
+/// an installed `dsh`, `--yes <package>` for the `npx` that stands in when
+/// there is none. `find_integration_binary` resolves it the same way, so
+/// the listing agrees with what a launch would run.
+fn find_dsh() -> Option<(PathBuf, Vec<String>)> {
+    dsh_command(find_on_path("dsh"), || find_on_path("npx"))
+}
+
+/// Split from [`find_dsh`] so which binary wins can be asserted without
+/// depending on what the test machine has installed.
+fn dsh_command(
+    dsh: Option<PathBuf>,
+    npx: impl FnOnce() -> Option<PathBuf>,
+) -> Option<(PathBuf, Vec<String>)> {
+    match dsh {
+        Some(bin) => Some((bin, Vec::new())),
+        None => Some((npx()?, vec!["--yes".into(), DSH_NPM_PACKAGE.into()])),
+    }
 }
 
 /// The tokens dsh reads as its own launcher flags, rather than forwards
@@ -1918,15 +2247,18 @@ fn dsh_config_dir() -> anyhow::Result<PathBuf> {
 /// The settings document `llmman.cordis.yml` points dsh at: registers
 /// `llmman` as an `llm-pi-ai` provider route at this daemon's `/v1`, and
 /// selects it as the `agent-default-model`.
-fn write_dsh_settings(path: &Path, model: &str) -> anyhow::Result<()> {
+fn write_dsh_settings(path: &Path, model: &str, vision: bool) -> anyhow::Result<()> {
     let quoted_model = yaml_quote(model);
     let base_url = yaml_quote(&format!("{}/v1", daemon::server()));
+    // Claiming image input a text-only model can't serve would have dsh
+    // attach what the daemon then rejects.
+    let input = if vision { "[text, image]" } else { "[text]" };
     let contents = format!(
         "# Written by `llmman launch dsh`; edits are overwritten.\n\
          agent-default-model:\n  provider: llmman\n  model: {quoted_model}\n\
          llm-pi-ai:\n  providers:\n    llmman:\n      displayName: llmman\n      \
          apiKeyEnv: {DSH_API_KEY_ENV}\n      api: openai-completions\n      baseURL: {base_url}\n      \
-         models:\n        - id: {quoted_model}\n          name: {quoted_model}\n          input: [text]\n"
+         models:\n        - id: {quoted_model}\n          name: {quoted_model}\n          input: {input}\n"
     );
     write_dsh_file(path, &contents)
 }
@@ -1986,13 +2318,21 @@ mod tests {
 
     #[test]
     fn agy_settings_are_written_to_the_llmman_owned_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        write_agy_settings_at(dir.path()).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-agy-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_agy_settings_at(&dir).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("antigravity-cli/settings.json")).unwrap(),
+            std::fs::read_to_string(dir.join("antigravity-cli/settings.json")).unwrap(),
             "{\n  \"modelProvider\": \"gemini\"\n}\n"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2001,491 +2341,10 @@ mod tests {
         assert_eq!(agy.binary, "agy");
     }
 
-    /// Every integration `--provider` refuses must be one `launch`
-    /// actually dispatches, or the refusal is for a name nobody can type
-    /// and the real one is still silently broken.
     #[test]
-    fn every_provider_unsupported_integration_is_a_real_one() {
-        for (id, why) in PROVIDER_UNSUPPORTED {
-            assert!(
-                INTEGRATIONS.iter().any(|i| i.name == *id) || *id == "copilot-cli",
-                "{id} is not an integration"
-            );
-            assert!(!why.is_empty(), "{id} has no reason");
-            assert!(check_provider_supported(id).is_err(), "{id} was accepted");
-            // Case-insensitively, the way `launch` dispatches.
-            assert!(check_provider_supported(&id.to_uppercase()).is_err());
-        }
-        // Same for the ones that depend on the daemon holding the key:
-        // a name nobody can type protects nobody.
-        for id in PROVIDER_NEEDS_DAEMON_KEY {
-            assert!(
-                INTEGRATIONS.iter().any(|i| i.name == *id),
-                "{id} is not an integration"
-            );
-            assert!(
-                !PROVIDER_UNSUPPORTED.iter().any(|(u, _)| u == id),
-                "{id} is both refused outright and expected to work"
-            );
-        }
-    }
-
-    /// Regression test for a real CodeRabbit finding: an unquoted model
-    /// value in generated YAML could be misparsed as a non-string
-    /// (`null`, `true`, ...) or broken outright by metacharacters.
-    #[test]
-    fn yaml_quote_escapes_keywords_and_metacharacters() {
-        assert_eq!(yaml_quote("qwen3.5:0.8b"), "\"qwen3.5:0.8b\"");
-        assert_eq!(yaml_quote("null"), "\"null\"");
-        assert_eq!(yaml_quote("true"), "\"true\"");
-        assert_eq!(
-            yaml_quote(r#"a "quoted" \ value"#),
-            r#""a \"quoted\" \\ value""#
-        );
-    }
-
-    /// A provider-routed `--model` must come out under
-    /// `providers::REMOTE_PREFIX`, which is the only thing that stops the
-    /// daemon resolving it as a HuggingFace or registry reference — and
-    /// must keep an `<vendor>/<model>` id (openrouter's shape) intact.
-    #[test]
-    fn provider_models_are_encoded_under_the_remote_prefix() {
-        assert_eq!(
-            providers::format_remote_ref("openrouter", "qwen/qwen3-coder"),
-            "llmman.provider/openrouter/qwen/qwen3-coder"
-        );
-        assert_eq!(
-            providers::split_remote_ref(&providers::format_remote_ref("groq", "llama-3.3-70b")),
-            Some(("groq", "llama-3.3-70b"))
-        );
-    }
-
-    /// The default path must be untouched by provider support: no
-    /// `--provider` means the same shortname resolution, and so the same
-    /// daemon behavior, as before it existed.
-    #[test]
-    fn local_models_are_unaffected_by_the_remote_prefix() {
-        for local in ["qwen3.5:0.8b", "hf.co/unsloth/Qwen3.5-0.8B-GGUF"] {
-            let resolved = crate::shortnames::resolve_ollama_api(local).unwrap();
-            assert!(
-                !providers::is_remote_ref(&resolved),
-                "{local} resolved to a provider-routed reference: {resolved}"
-            );
-        }
-    }
-
-    /// Regression test for the real openclaw onboarding failure
-    /// described on `openclaw_model_id`'s own doc comment.
-    #[test]
-    fn openclaw_model_id_strips_the_docker_ai_prefix() {
-        assert_eq!(
-            openclaw_model_id("docker.io/ai/qwen3.5:0.8b"),
-            "qwen3.5:0.8b"
-        );
-        assert_eq!(openclaw_model_id("qwen3.5:0.8b"), "qwen3.5:0.8b");
-        assert_eq!(
-            openclaw_model_id("hf.co/unsloth/Qwen3.5-0.8B-GGUF"),
-            "hf.co/unsloth/Qwen3.5-0.8B-GGUF"
-        );
-        assert_eq!(openclaw_model_id(""), "default");
-        assert_eq!(openclaw_model_id("docker.io/ai/"), "default");
-    }
-
-    /// Every integration `check_model_flag` holds to a model must be one
-    /// `launch` dispatches; it is refused without one, under `--provider`
-    /// too, and a `--model` after `--` is let through.
-    #[test]
-    fn model_required_integrations_are_refused_without_a_model() {
-        let none: Vec<String> = vec![];
-        for id in MODEL_REQUIRED {
-            assert!(
-                INTEGRATIONS.iter().any(|i| i.name == *id),
-                "{id} is not an integration"
-            );
-            assert!(check_model_flag(id, None, None, &none).is_err());
-            assert!(check_model_flag(id, Some(" "), None, &none).is_err());
-            assert!(check_model_flag(&id.to_uppercase(), None, None, &none).is_err());
-            let err = check_model_flag(id, None, Some("openrouter"), &none).unwrap_err();
-            assert!(
-                err.to_string().contains("--provider openrouter --model"),
-                "{err}"
-            );
-            assert!(check_model_flag(id, Some("m"), None, &none).is_ok());
-            let forwarded = vec!["--model".to_string(), "theirs".to_string()];
-            assert!(check_model_flag(id, Some("m"), None, &forwarded).is_ok());
-        }
-        assert!(check_model_flag("claude", None, None, &none).is_ok());
-        // The "yours wins" warning is only claimed for launchers that
-        // actually yield to it; dsh has no `--model` flag to yield to.
-        for id in MODEL_FLAG_FORWARDED {
-            assert!(MODEL_REQUIRED.contains(id), "{id} is not model-required");
-        }
-        assert!(!MODEL_FLAG_FORWARDED.contains(&"dsh"));
-    }
-
-    /// The found directory goes in front of `PATH` only when it is not
-    /// there, with no empty component either way.
-    #[test]
-    fn path_with_dir_prepended_only_when_it_is_missing() {
-        let path_var =
-            std::env::join_paths([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap();
-        assert_eq!(
-            path_with_dir_prepended(Some(Path::new("/usr/bin")), &path_var),
-            None
-        );
-        assert_eq!(
-            path_with_dir_prepended(Some(Path::new("/opt/nvm/bin")), &path_var),
-            Some(
-                std::env::join_paths([
-                    PathBuf::from("/opt/nvm/bin"),
-                    PathBuf::from("/usr/bin"),
-                    PathBuf::from("/bin"),
-                ])
-                .unwrap()
-            )
-        );
-        assert_eq!(path_with_dir_prepended(None, &path_var), None);
-        assert_eq!(
-            path_with_dir_prepended(Some(Path::new("/opt/nvm/bin")), std::ffi::OsStr::new("")),
-            Some(std::ffi::OsString::from("/opt/nvm/bin"))
-        );
-        let gappy = std::env::join_paths([
-            PathBuf::from("/usr/bin"),
-            PathBuf::from(""),
-            PathBuf::from("/bin"),
-        ])
-        .unwrap();
-        assert_eq!(
-            path_with_dir_prepended(Some(Path::new("/opt/nvm/bin")), &gappy),
-            Some(
-                std::env::join_paths([
-                    PathBuf::from("/opt/nvm/bin"),
-                    PathBuf::from("/usr/bin"),
-                    PathBuf::from("/bin"),
-                ])
-                .unwrap()
-            )
-        );
-    }
-
-    /// The last forwarded model wins, in either spelling; none is none.
-    #[test]
-    fn forwarded_model_takes_the_last_spelling() {
-        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(forwarded_model(&args(&["--model", "b"])), Some("b"));
-        assert_eq!(forwarded_model(&args(&["-m=b", "--model", "c"])), Some("c"));
-        assert_eq!(forwarded_model(&args(&["--model=b", "-m", "c"])), Some("c"));
-        assert_eq!(forwarded_model(&args(&["-p", "x"])), None);
-        assert_eq!(forwarded_model(&args(&["--model"])), None);
-        assert_eq!(forwarded_model(&args(&["--model="])), None);
-    }
-
-    /// A word or `=`-joined, and nothing looser: `-sm` is not `-m`.
-    #[test]
-    fn has_flag_takes_the_exact_and_joined_forms_only() {
-        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(has_flag(&args(&["--model", "x"]), "--model", Some("-m")));
-        assert!(has_flag(&args(&["--model=x"]), "--model", Some("-m")));
-        assert!(has_flag(&args(&["-m", "x"]), "--model", Some("-m")));
-        assert!(has_flag(&args(&["-m=x"]), "--model", Some("-m")));
-        assert!(!has_flag(&args(&["-sm", "x"]), "--model", Some("-m")));
-        assert!(!has_flag(
-            &args(&["--model-context", "x"]),
-            "--model",
-            Some("-m")
-        ));
-        assert!(!has_flag(
-            &args(&["--", "--model", "x"]),
-            "--model",
-            Some("-m")
-        ));
-    }
-
-    /// The two flags `launch_qwen` relies on to beat a persisted
-    /// `~/.qwen/settings.json` (see its doc comment) go first, and each
-    /// yields to the caller's own spelling of it — a repeated `--model`
-    /// crashes Qwen Code.
-    #[test]
-    fn qwen_args_prefix_auth_type_and_model_unless_the_caller_passed_them() {
-        let none: Vec<String> = vec![];
-        assert_eq!(
-            qwen_args("m:latest", &none),
-            ["--auth-type", "openai", "--model", "m:latest"]
-        );
-
-        let user_model = vec![
-            "--model".to_string(),
-            "theirs".to_string(),
-            "-p".to_string(),
-        ];
-        assert_eq!(
-            qwen_args("m:latest", &user_model),
-            ["--auth-type", "openai", "--model", "theirs", "-p"]
-        );
-        let user_short = vec!["-m=theirs".to_string()];
-        assert_eq!(
-            qwen_args("m:latest", &user_short),
-            ["--auth-type", "openai", "-m=theirs"]
-        );
-
-        let user_auth = vec!["--auth-type=qwen-oauth".to_string()];
-        assert_eq!(
-            qwen_args("m:latest", &user_auth),
-            ["--model", "m:latest", "--auth-type=qwen-oauth"]
-        );
-        let user_camel = vec!["--authType".to_string(), "openai".to_string()];
-        assert_eq!(
-            qwen_args("m:latest", &user_camel),
-            ["--model", "m:latest", "--authType", "openai"]
-        );
-    }
-
-    /// Any node version under `~/.nvm` that has qwen.
-    #[test]
-    fn nvm_qwen_finds_it_under_a_node_version() {
-        let home = std::env::temp_dir().join(format!(
-            "llmman-nvm-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let bin = home.join(".nvm/versions/node/v22.9.1/bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::create_dir_all(home.join(".nvm/versions/node/v20.19.0/bin")).unwrap();
-        std::fs::write(bin.join("qwen"), "").unwrap();
-        assert_eq!(nvm_qwen(&home), Some(bin.join("qwen")));
-        assert_eq!(nvm_qwen(&home.join("nowhere")), None);
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// The documented targets are on the list (see `find_qwen`).
-    #[cfg(unix)]
-    #[test]
-    fn qwen_fallback_paths_name_the_documented_targets() {
-        let home = dirs::home_dir().unwrap();
-        let paths = qwen_fallback_paths();
-        assert!(paths.contains(&home.join(".local/bin/qwen")));
-        assert!(paths.contains(&home.join(".npm-global/bin/qwen")));
-        assert!(paths.contains(&home.join(".cargo/bin/qwen")));
-        assert!(paths.contains(&PathBuf::from("/usr/local/bin/qwen")));
-    }
-
-    /// A file a Qwen Code user already has: llmman's entry goes first, an
-    /// older one of its own for this daemon goes, and everything else
-    /// stays, a hand-written entry at this daemon's address included.
-    #[test]
-    fn qwen_settings_merge_keeps_what_is_not_llmmans() {
-        let existing = serde_json::json!({
-            "$version": 4,
-            "ui": { "theme": "keep-me" },
-            "modelProviders": {
-                "gemini": [ { "id": "gemini-2.5-pro" } ],
-                "openai": [
-                    { "id": "docker.io/ai/m:latest", "name": "cloud copy",
-                      "baseUrl": "https://cloud.example/v1",
-                      "envKey": "QWEN_CUSTOM_API_KEY_X", "customField": 1 },
-                    { "id": "old:latest", "name": "renamed by the user",
-                      "baseUrl": "http://127.0.0.1:17434/v1/", "envKey": "LLMMAN_API_KEY" },
-                    { "id": "other:latest", "name": "other:latest (llmman)",
-                      "baseUrl": "http://10.0.0.2:17434/v1", "envKey": "LLMMAN_API_KEY" },
-                    { "id": "local-alias", "name": "my alias for the daemon",
-                      "baseUrl": "http://127.0.0.1:17434/v1", "envKey": "OPENAI_API_KEY",
-                      "generationConfig": { "temperature": 0.2 } }
-                ]
-            },
-            "security": { "auth": { "selectedType": "qwen-oauth", "apiKey": "keep-too" } },
-            "model": { "name": "gemini-2.5-pro", "generationConfig": { "temperature": 0.1 } }
-        });
-        let url = "http://127.0.0.1:17434/v1";
-        let merged = qwen_settings_merged(&existing, "docker.io/ai/m:latest", url);
-        assert_eq!(merged["$version"], 4);
-        assert_eq!(merged["ui"]["theme"], "keep-me");
-        assert_eq!(
-            merged["modelProviders"]["gemini"],
-            existing["modelProviders"]["gemini"]
-        );
-        let before = existing["modelProviders"]["openai"].as_array().unwrap();
-        let openai = merged["modelProviders"]["openai"].as_array().unwrap();
-        assert_eq!(
-            openai[0],
-            serde_json::json!({ "id": "docker.io/ai/m:latest",
-                "name": "docker.io/ai/m:latest (llmman)", "baseUrl": url,
-                "envKey": "LLMMAN_API_KEY" })
-        );
-        assert_eq!(
-            openai[1..],
-            [before[0].clone(), before[2].clone(), before[3].clone()]
-        );
-        assert_eq!(merged["security"]["auth"]["selectedType"], "openai");
-        assert_eq!(merged["security"]["auth"]["baseUrl"], url);
-        assert_eq!(merged["security"]["auth"]["apiKey"], "keep-too");
-        assert_eq!(merged["model"]["name"], "docker.io/ai/m:latest");
-        assert_eq!(merged["model"]["baseUrl"], url);
-        assert_eq!(merged["model"]["generationConfig"]["temperature"], 0.1);
-    }
-
-    /// From nothing, and then again: the second merge changes nothing,
-    /// so `write_qwen_settings_at` leaves a correct file alone. No key
-    /// value and no `env` block anywhere in it.
-    #[test]
-    fn qwen_settings_merge_is_complete_from_nothing_and_idempotent() {
-        let url = "http://127.0.0.1:17434/v1";
-        let once = qwen_settings_merged(&serde_json::json!({}), "m:latest", url);
-        assert_eq!(
-            once,
-            serde_json::json!({
-                "modelProviders": { "openai": [ { "id": "m:latest",
-                    "name": "m:latest (llmman)", "baseUrl": url,
-                    "envKey": "LLMMAN_API_KEY" } ] },
-                "security": { "auth": { "selectedType": "openai", "baseUrl": url } },
-                "model": { "name": "m:latest", "baseUrl": url }
-            })
-        );
-        assert_eq!(qwen_settings_merged(&once, "m:latest", url), once);
-        let text = once.to_string();
-        assert!(!text.contains("apiKey") && !text.contains("\"env\""));
-        assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"qwen"));
-    }
-
-    /// A wrong-typed value on the path is replaced, a non-object root
-    /// counts as empty, and a `{ protocol, models }` wrapper keeps its
-    /// entries.
-    #[test]
-    fn qwen_settings_merge_replaces_a_wrong_typed_value_on_its_path() {
-        let existing = serde_json::json!({
-            "security": 3, "modelProviders": { "openai": "x" }, "model": []
-        });
-        let merged = qwen_settings_merged(&existing, "m", "http://h/v1");
-        assert_eq!(merged["security"]["auth"]["selectedType"], "openai");
-        assert_eq!(merged["modelProviders"]["openai"][0]["id"], "m");
-        assert_eq!(merged["model"]["name"], "m");
-        let from_null = qwen_settings_merged(&serde_json::json!(null), "m", "http://h/v1");
-        assert_eq!(from_null["model"]["name"], "m");
-
-        let wrapped = serde_json::json!({
-            "$version": 5,
-            "modelProviders": { "openai": { "protocol": "openai", "models": [
-                { "id": "gpt-5", "baseUrl": "https://api.openai.com/v1", "envKey": "MY_KEY" }
-            ] } }
-        });
-        let merged = qwen_settings_merged(&wrapped, "m", "http://h/v1");
-        let openai = merged["modelProviders"]["openai"].as_array().unwrap();
-        assert_eq!(openai.len(), 2);
-        assert_eq!(openai[1]["id"], "gpt-5");
-        assert_eq!(merged["$version"], 4, "the version follows the shape");
-    }
-
-    /// Ownership is the key name at this daemon's address, whatever the
-    /// entry was renamed to; a trailing slash does not make a second
-    /// daemon of the same one.
-    #[test]
-    fn qwen_entry_is_ours_needs_the_key_name_and_the_address() {
-        let url = "http://127.0.0.1:17434/v1";
-        let ours = serde_json::json!({ "id": "anything", "name": "renamed by the user",
-            "baseUrl": "http://127.0.0.1:17434/v1/", "envKey": "LLMMAN_API_KEY" });
-        assert!(qwen_entry_is_ours(&ours, url));
-        let hand_written = serde_json::json!({ "id": "local-alias", "name": "m (llmman)",
-            "baseUrl": url, "envKey": "OPENAI_API_KEY" });
-        assert!(!qwen_entry_is_ours(&hand_written, url));
-        let elsewhere = serde_json::json!({ "id": "m:latest", "name": "m:latest (llmman)",
-            "baseUrl": "http://10.0.0.2:17434/v1", "envKey": "LLMMAN_API_KEY" });
-        assert!(!qwen_entry_is_ours(&elsewhere, url));
-        assert!(!qwen_entry_is_ours(
-            &serde_json::json!("not an object"),
-            url
-        ));
-    }
-
-    /// Comments go, as `strip-json-comments` takes them out for Qwen Code,
-    /// and nothing else moves: not a `//` inside a string, not a column.
-    #[test]
-    fn strip_json_comments_keeps_strings_and_columns() {
-        let raw =
-            "{\n  // note\n  \"url\": \"http://h//v1\", /* block\n  */ \"q\": \"a\\\"//b\"\n}\n";
-        let stripped = strip_json_comments(raw);
-        assert_eq!(stripped.chars().count(), raw.chars().count());
-        assert_eq!(stripped.lines().count(), raw.lines().count());
-        let v: serde_json::Value = serde_json::from_str(&stripped).unwrap();
-        assert_eq!(v["url"], "http://h//v1");
-        assert_eq!(v["q"], "a\"//b");
-        assert_eq!(strip_json_comments("{\"a\": 1}"), "{\"a\": 1}");
-    }
-
-    /// A leading `~` is the home directory; anything else is as given.
-    #[test]
-    fn expand_tilde_reads_the_forms_qwen_code_reads() {
-        let home = Path::new("/h");
-        assert_eq!(expand_tilde("~/alt", home), PathBuf::from("/h/alt"));
-        assert_eq!(expand_tilde("~", home), PathBuf::from("/h"));
-        assert_eq!(expand_tilde("/abs", home), PathBuf::from("/abs"));
-        assert_eq!(expand_tilde("~user/x", home), PathBuf::from("~user/x"));
-    }
-
-    /// The reading and writing half over a directory of its own: a fresh
-    /// one gets the file, a correct file is not touched, a commented one
-    /// merges with its text kept as `.bak`, a later rewrite of llmman's
-    /// own rendering leaves that `.bak` alone while a hand edit with
-    /// comments refreshes it, an empty file counts as `{}`, and what is
-    /// not JSON is left alone without an error.
-    #[test]
-    fn write_qwen_settings_at_writes_once_keeps_a_bak_and_refuses_non_json() {
-        let dir = std::env::temp_dir().join(format!(
-            "llmman-qwen-settings-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let url = "http://127.0.0.1:17434/v1";
-        let path = dir.join("settings.json");
-        let bak = dir.join("settings.json.bak");
-        let read = || -> serde_json::Value {
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
-        };
-
-        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
-        assert_eq!(read()["model"]["name"], "m:latest");
-        assert!(!bak.exists(), "nothing to back up on a first write");
-        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().modified().unwrap(),
-            written
-        );
-
-        let commented = "{\n  // mine\n  \"ui\": { \"theme\": \"x\" }\n}\n";
-        std::fs::write(&path, commented).unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
-        assert_eq!(read()["ui"]["theme"], "x");
-        assert_eq!(read()["model"]["name"], "m:latest");
-        assert_eq!(std::fs::read_to_string(&bak).unwrap(), commented);
-        write_qwen_settings_at(&dir, "other:latest", url).unwrap();
-        assert_eq!(read()["model"]["name"], "other:latest");
-        assert_eq!(
-            std::fs::read_to_string(&bak).unwrap(),
-            commented,
-            "llmman's own rendering must not replace the user's backup"
-        );
-        let edited = "{\n  // edited by hand\n  \"ui\": { \"theme\": \"y\" }\n}\n";
-        std::fs::write(&path, edited).unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
-        assert_eq!(std::fs::read_to_string(&bak).unwrap(), edited);
-
-        std::fs::write(&path, "  \n").unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
-        assert_eq!(read()["model"]["name"], "m:latest");
-
-        std::fs::write(&path, "{ not json").unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
-        std::fs::write(&path, "[]").unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
-        let _ = std::fs::remove_dir_all(&dir);
+    fn vibe_is_listed_as_an_integration() {
+        let vibe = INTEGRATIONS.iter().find(|i| i.name == "vibe").unwrap();
+        assert_eq!(vibe.binary, "vibe");
     }
 
     /// A fresh file gets exactly one provider/model pair in the shape
@@ -2794,6 +2653,699 @@ models = [{ name = \"mistralai/codestral\", provider = \"openrouter\", alias = \
         assert!(out.contains("alias = \"m\""));
     }
 
+    /// Every integration `--provider` refuses must be one `launch`
+    /// actually dispatches, or the refusal is for a name nobody can type
+    /// and the real one is still silently broken.
+    #[test]
+    fn every_provider_unsupported_integration_is_a_real_one() {
+        for (id, why) in PROVIDER_UNSUPPORTED {
+            assert!(
+                INTEGRATIONS.iter().any(|i| i.name == *id) || *id == "copilot-cli",
+                "{id} is not an integration"
+            );
+            assert!(!why.is_empty(), "{id} has no reason");
+            assert!(check_provider_supported(id).is_err(), "{id} was accepted");
+            // Case-insensitively, the way `launch` dispatches.
+            assert!(check_provider_supported(&id.to_uppercase()).is_err());
+        }
+        // Same for the ones that depend on the daemon holding the key:
+        // a name nobody can type protects nobody.
+        for id in PROVIDER_NEEDS_DAEMON_KEY {
+            assert!(
+                INTEGRATIONS.iter().any(|i| i.name == *id),
+                "{id} is not an integration"
+            );
+            assert!(
+                !PROVIDER_UNSUPPORTED.iter().any(|(u, _)| u == id),
+                "{id} is both refused outright and expected to work"
+            );
+        }
+    }
+
+    /// Regression test for a real CodeRabbit finding: an unquoted model
+    /// value in generated YAML could be misparsed as a non-string
+    /// (`null`, `true`, ...) or broken outright by metacharacters.
+    #[test]
+    fn yaml_quote_escapes_keywords_and_metacharacters() {
+        assert_eq!(yaml_quote("qwen3.5:0.8b"), "\"qwen3.5:0.8b\"");
+        assert_eq!(yaml_quote("null"), "\"null\"");
+        assert_eq!(yaml_quote("true"), "\"true\"");
+        assert_eq!(
+            yaml_quote(r#"a "quoted" \ value"#),
+            r#""a \"quoted\" \\ value""#
+        );
+    }
+
+    /// A provider-routed `--model` must come out under
+    /// `providers::REMOTE_PREFIX`, which is the only thing that stops the
+    /// daemon resolving it as a HuggingFace or registry reference — and
+    /// must keep an `<vendor>/<model>` id (openrouter's shape) intact.
+    #[test]
+    fn provider_models_are_encoded_under_the_remote_prefix() {
+        assert_eq!(
+            providers::format_remote_ref("openrouter", "qwen/qwen3-coder"),
+            "llmman.provider/openrouter/qwen/qwen3-coder"
+        );
+        assert_eq!(
+            providers::split_remote_ref(&providers::format_remote_ref("groq", "llama-3.3-70b")),
+            Some(("groq", "llama-3.3-70b"))
+        );
+    }
+
+    /// The default path must be untouched by provider support: no
+    /// `--provider` means the same shortname resolution, and so the same
+    /// daemon behavior, as before it existed.
+    #[test]
+    fn local_models_are_unaffected_by_the_remote_prefix() {
+        for local in ["qwen3.5:0.8b", "hf.co/unsloth/Qwen3.5-0.8B-GGUF"] {
+            let resolved = crate::shortnames::resolve_ollama_api(local).unwrap();
+            assert!(
+                !providers::is_remote_ref(&resolved),
+                "{local} resolved to a provider-routed reference: {resolved}"
+            );
+        }
+    }
+
+    /// Regression test for the real openclaw onboarding failure
+    /// described on `openclaw_model_id`'s own doc comment.
+    #[test]
+    fn openclaw_model_id_strips_the_docker_ai_prefix() {
+        assert_eq!(
+            openclaw_model_id("docker.io/ai/qwen3.5:0.8b"),
+            "qwen3.5:0.8b"
+        );
+        assert_eq!(openclaw_model_id("qwen3.5:0.8b"), "qwen3.5:0.8b");
+        assert_eq!(
+            openclaw_model_id("hf.co/unsloth/Qwen3.5-0.8B-GGUF"),
+            "hf.co/unsloth/Qwen3.5-0.8B-GGUF"
+        );
+        assert_eq!(openclaw_model_id(""), "default");
+        assert_eq!(openclaw_model_id("docker.io/ai/"), "default");
+    }
+
+    /// Every integration `check_model_flag` holds to a model must be one
+    /// `launch` dispatches; it is refused without one, under `--provider`
+    /// too, and a `--model` after `--` is let through.
+    #[test]
+    fn model_required_integrations_are_refused_without_a_model() {
+        let none: Vec<String> = vec![];
+        for id in MODEL_REQUIRED {
+            assert!(
+                INTEGRATIONS.iter().any(|i| i.name == *id),
+                "{id} is not an integration"
+            );
+            assert!(check_model_flag(id, None, None, &none).is_err());
+            assert!(check_model_flag(id, Some(" "), None, &none).is_err());
+            assert!(check_model_flag(&id.to_uppercase(), None, None, &none).is_err());
+            let err = check_model_flag(id, None, Some("openrouter"), &none).unwrap_err();
+            assert!(
+                err.to_string().contains("--provider openrouter --model"),
+                "{err}"
+            );
+            assert!(check_model_flag(id, Some("m"), None, &none).is_ok());
+            let forwarded = vec!["--model".to_string(), "theirs".to_string()];
+            assert!(check_model_flag(id, Some("m"), None, &forwarded).is_ok());
+        }
+        assert!(check_model_flag("claude", None, None, &none).is_ok());
+        // The "yours wins" warning is only claimed for launchers that
+        // actually yield to it; dsh has no `--model` flag to yield to.
+        for id in MODEL_FLAG_FORWARDED {
+            assert!(MODEL_REQUIRED.contains(id), "{id} is not model-required");
+        }
+        assert!(!MODEL_FLAG_FORWARDED.contains(&"dsh"));
+    }
+
+    /// The only configuration goose gets: a wrong or missing one sends
+    /// the session to api.openai.com instead of the daemon. `OPENAI_HOST`
+    /// is the bare origin — goose appends `OPENAI_BASE_PATH` itself, so a
+    /// `/v1` here would request `/v1/v1/chat/completions`.
+    #[test]
+    fn goose_env_points_at_the_daemon_and_carries_the_key() {
+        let env = goose_env("m", "k", "http://127.0.0.1:17434");
+        let get = |k| env.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+        assert_eq!(get("GOOSE_PROVIDER"), Some("openai"));
+        assert_eq!(get("GOOSE_MODEL"), Some("m"));
+        assert_eq!(get("OPENAI_API_KEY"), Some("k"));
+        assert_eq!(get("OPENAI_HOST"), Some("http://127.0.0.1:17434"));
+        assert_eq!(get("OPENAI_BASE_PATH"), Some("v1/chat/completions"));
+
+        let env = goose_env("", "k", "http://127.0.0.1:17434");
+        assert!(!env.iter().any(|(n, _)| *n == "GOOSE_MODEL"));
+    }
+
+    /// goose carries the key in its own environment, so `--provider`
+    /// needs neither a refusal nor the daemon holding the key.
+    #[test]
+    fn goose_carries_its_own_key_so_provider_works() {
+        assert!(INTEGRATIONS.iter().any(|i| i.name == "goose"));
+        assert!(check_provider_supported("goose").is_ok());
+        assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"goose"));
+    }
+
+    /// `download_cli.sh`'s target is off `PATH` on a fresh shell, so this
+    /// fallback is the one that fires for most installs — at every
+    /// directory that installer writes to, Windows included.
+    #[test]
+    fn goose_fallback_finds_the_installers_target() {
+        let name = if cfg!(windows) { "goose.exe" } else { "goose" };
+        let dirs: &[&[&str]] = if cfg!(windows) {
+            &[&["goose"], &[".local", "bin"]]
+        } else {
+            &[&[".local", "bin"]]
+        };
+        for (i, parts) in dirs.iter().enumerate() {
+            let home = std::env::temp_dir().join(format!(
+                "llmman-goose-{}-{}-{i}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let bin = parts.iter().fold(home.clone(), |p, part| p.join(part));
+            std::fs::create_dir_all(&bin).unwrap();
+            assert_eq!(goose_fallback(&home), None);
+            let goose = bin.join(name);
+            // A directory of that name is not the binary: returning it
+            // would report goose as installed and then fail to spawn.
+            std::fs::create_dir(&goose).unwrap();
+            assert_eq!(goose_fallback(&home), None);
+            std::fs::remove_dir(&goose).unwrap();
+            std::fs::write(&goose, "").unwrap();
+            assert_eq!(goose_fallback(&home), Some(goose));
+            assert_eq!(goose_fallback(&home.join("nowhere")), None);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+    }
+
+    /// Grok Build uses the custom-model endpoint for both catalog lookup
+    /// and inference. Its auxiliary samplers must follow the selected
+    /// model too, rather than asking llmman for Grok's hosted defaults.
+    #[test]
+    fn grok_env_points_every_model_path_at_llmman() {
+        let env = grok_env(
+            "docker.io/ai/qwen3.5:0.8b",
+            "k",
+            "http://127.0.0.1:17434/v1",
+            "http://127.0.0.1:17434/v1/models",
+            "/tmp/grok/llmman",
+        );
+        let get = |key| {
+            env.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| *value)
+        };
+        assert_eq!(
+            get("GROK_MODELS_BASE_URL"),
+            Some("http://127.0.0.1:17434/v1")
+        );
+        assert_eq!(get("GROK_HOME"), Some("/tmp/grok/llmman"));
+        assert_eq!(
+            get("GROK_MODELS_LIST_URL"),
+            Some("http://127.0.0.1:17434/v1/models")
+        );
+        assert_eq!(get("GROK_DEFAULT_MODEL"), Some("docker.io/ai/qwen3.5:0.8b"));
+        assert_eq!(
+            get("GROK_WEB_SEARCH_MODEL"),
+            Some("docker.io/ai/qwen3.5:0.8b")
+        );
+        assert_eq!(
+            get("GROK_SESSION_SUMMARY_MODEL"),
+            Some("docker.io/ai/qwen3.5:0.8b")
+        );
+        assert_eq!(
+            get("GROK_IMAGE_DESCRIPTION_MODEL"),
+            Some("docker.io/ai/qwen3.5:0.8b")
+        );
+        assert_eq!(
+            get("GROK_PROMPT_SUGGESTIONS_MODEL"),
+            Some("docker.io/ai/qwen3.5:0.8b")
+        );
+        assert_eq!(get(GROK_API_KEY_ENV), Some("k"));
+        assert_eq!(get("XAI_API_KEY"), Some("k"));
+    }
+
+    /// A per-model env_key beats both an existing Grok login and the global
+    /// XAI_API_KEY. The generated config contains only the environment
+    /// variable's name, never the credential itself.
+    #[test]
+    fn grok_config_uses_the_model_credential_without_persisting_it() {
+        let model = r#"org/model.\"quoted\""#;
+        let text = grok_config_document(model, "http://127.0.0.1:17434/v1");
+
+        let parsed: toml::Value = text.parse().expect("valid TOML");
+        let entry = &parsed["model"][model];
+        assert_eq!(entry["model"].as_str(), Some(model));
+        assert_eq!(
+            entry["base_url"].as_str(),
+            Some("http://127.0.0.1:17434/v1")
+        );
+        assert_eq!(entry["env_key"].as_str(), Some(GROK_API_KEY_ENV));
+        assert_eq!(entry["api_backend"].as_str(), Some("chat_completions"));
+        assert!(entry.get("api_key").is_none());
+    }
+
+    #[test]
+    fn grok_config_is_written_only_inside_the_isolated_child_home() {
+        let root = std::env::temp_dir().join(format!(
+            "llmman-grok-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let user_config = root.join("config.toml");
+        std::fs::write(&user_config, "[model.mine]\napi_key = \"keep-me\"\n").unwrap();
+
+        let isolated = root.join("llmman");
+        write_grok_config(&isolated, "m", "http://127.0.0.1:17434/v1").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(user_config).unwrap(),
+            "[model.mine]\napi_key = \"keep-me\"\n"
+        );
+        assert!(std::fs::read_to_string(isolated.join("config.toml"))
+            .unwrap()
+            .contains("LLMMAN_GROK_API_KEY"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// llmman supplies Grok's model flag unless the caller explicitly
+    /// supplied one after `--`; no duplicate flag is handed to the CLI.
+    #[test]
+    fn grok_args_add_the_model_and_yield_to_an_explicit_override() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            grok_args("m:latest", &args(&["--single", "hi"])),
+            ["--model", "m:latest", "--single", "hi"]
+        );
+        assert_eq!(
+            grok_args("m:latest", &args(&["-m", "theirs", "--single", "hi"])),
+            ["-m", "theirs", "--single", "hi"]
+        );
+        assert_eq!(
+            grok_args("m:latest", &args(&["--model=theirs"])),
+            ["--model=theirs"]
+        );
+    }
+
+    /// The official installer puts Grok under `~/.grok/bin`, which is
+    /// commonly invisible to a non-login process even though the CLI is
+    /// installed and usable from the user's shell.
+    #[test]
+    fn grok_fallback_finds_the_official_installers_target() {
+        let home = std::env::temp_dir().join(format!(
+            "llmman-grok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = home.join(".grok").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        assert_eq!(grok_fallback(&home), None);
+        let grok = bin.join(if cfg!(windows) { "grok.exe" } else { "grok" });
+        std::fs::create_dir(&grok).unwrap();
+        assert_eq!(grok_fallback(&home), None, "a directory is not a binary");
+        std::fs::remove_dir(&grok).unwrap();
+        std::fs::write(&grok, "").unwrap();
+        assert_eq!(grok_fallback(&home), Some(grok));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn grok_is_model_required_and_refuses_unrepresentable_provider_routes() {
+        assert!(INTEGRATIONS.iter().any(|i| i.name == "grok"));
+        assert!(MODEL_REQUIRED.contains(&"grok"));
+        assert!(MODEL_FLAG_FORWARDED.contains(&"grok"));
+        let error = check_provider_supported("grok").unwrap_err().to_string();
+        assert!(error.contains("model catalog"), "{error}");
+        assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"grok"));
+    }
+
+    /// The found directory goes in front of `PATH` only when it is not
+    /// there, with no empty component either way.
+    #[test]
+    fn path_with_dir_prepended_only_when_it_is_missing() {
+        let path_var =
+            std::env::join_paths([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap();
+        assert_eq!(
+            path_with_dir_prepended(Some(Path::new("/usr/bin")), &path_var),
+            None
+        );
+        assert_eq!(
+            path_with_dir_prepended(Some(Path::new("/opt/nvm/bin")), &path_var),
+            Some(
+                std::env::join_paths([
+                    PathBuf::from("/opt/nvm/bin"),
+                    PathBuf::from("/usr/bin"),
+                    PathBuf::from("/bin"),
+                ])
+                .unwrap()
+            )
+        );
+        assert_eq!(path_with_dir_prepended(None, &path_var), None);
+        assert_eq!(
+            path_with_dir_prepended(Some(Path::new("/opt/nvm/bin")), std::ffi::OsStr::new("")),
+            Some(std::ffi::OsString::from("/opt/nvm/bin"))
+        );
+        let gappy = std::env::join_paths([
+            PathBuf::from("/usr/bin"),
+            PathBuf::from(""),
+            PathBuf::from("/bin"),
+        ])
+        .unwrap();
+        assert_eq!(
+            path_with_dir_prepended(Some(Path::new("/opt/nvm/bin")), &gappy),
+            Some(
+                std::env::join_paths([
+                    PathBuf::from("/opt/nvm/bin"),
+                    PathBuf::from("/usr/bin"),
+                    PathBuf::from("/bin"),
+                ])
+                .unwrap()
+            )
+        );
+    }
+
+    /// The last forwarded model wins, in either spelling; none is none.
+    #[test]
+    fn forwarded_model_takes_the_last_spelling() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(forwarded_model(&args(&["--model", "b"])), Some("b"));
+        assert_eq!(forwarded_model(&args(&["-m=b", "--model", "c"])), Some("c"));
+        assert_eq!(forwarded_model(&args(&["--model=b", "-m", "c"])), Some("c"));
+        assert_eq!(forwarded_model(&args(&["-p", "x"])), None);
+        assert_eq!(forwarded_model(&args(&["--model"])), None);
+        assert_eq!(forwarded_model(&args(&["--model="])), None);
+    }
+
+    /// A word or `=`-joined, and nothing looser: `-sm` is not `-m`.
+    #[test]
+    fn has_flag_takes_the_exact_and_joined_forms_only() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(has_flag(&args(&["--model", "x"]), "--model", Some("-m")));
+        assert!(has_flag(&args(&["--model=x"]), "--model", Some("-m")));
+        assert!(has_flag(&args(&["-m", "x"]), "--model", Some("-m")));
+        assert!(has_flag(&args(&["-m=x"]), "--model", Some("-m")));
+        assert!(!has_flag(&args(&["-sm", "x"]), "--model", Some("-m")));
+        assert!(!has_flag(
+            &args(&["--model-context", "x"]),
+            "--model",
+            Some("-m")
+        ));
+    }
+
+    /// The two flags `launch_qwen` relies on to beat a persisted
+    /// `~/.qwen/settings.json` (see its doc comment) go first, and each
+    /// yields to the caller's own spelling of it — a repeated `--model`
+    /// crashes Qwen Code.
+    #[test]
+    fn qwen_args_prefix_auth_type_and_model_unless_the_caller_passed_them() {
+        let none: Vec<String> = vec![];
+        assert_eq!(
+            qwen_args("m:latest", &none),
+            ["--auth-type", "openai", "--model", "m:latest"]
+        );
+
+        let user_model = vec![
+            "--model".to_string(),
+            "theirs".to_string(),
+            "-p".to_string(),
+        ];
+        assert_eq!(
+            qwen_args("m:latest", &user_model),
+            ["--auth-type", "openai", "--model", "theirs", "-p"]
+        );
+        let user_short = vec!["-m=theirs".to_string()];
+        assert_eq!(
+            qwen_args("m:latest", &user_short),
+            ["--auth-type", "openai", "-m=theirs"]
+        );
+
+        let user_auth = vec!["--auth-type=qwen-oauth".to_string()];
+        assert_eq!(
+            qwen_args("m:latest", &user_auth),
+            ["--model", "m:latest", "--auth-type=qwen-oauth"]
+        );
+        let user_camel = vec!["--authType".to_string(), "openai".to_string()];
+        assert_eq!(
+            qwen_args("m:latest", &user_camel),
+            ["--model", "m:latest", "--authType", "openai"]
+        );
+    }
+
+    /// Any node version under `~/.nvm` that has qwen.
+    #[test]
+    fn nvm_qwen_finds_it_under_a_node_version() {
+        let home = std::env::temp_dir().join(format!(
+            "llmman-nvm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = home.join(".nvm/versions/node/v22.9.1/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(home.join(".nvm/versions/node/v20.19.0/bin")).unwrap();
+        std::fs::write(bin.join("qwen"), "").unwrap();
+        assert_eq!(nvm_qwen(&home), Some(bin.join("qwen")));
+        assert_eq!(nvm_qwen(&home.join("nowhere")), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The documented targets are on the list (see `find_qwen`).
+    #[cfg(unix)]
+    #[test]
+    fn qwen_fallback_paths_name_the_documented_targets() {
+        let home = dirs::home_dir().unwrap();
+        let paths = qwen_fallback_paths();
+        assert!(paths.contains(&home.join(".local/bin/qwen")));
+        assert!(paths.contains(&home.join(".npm-global/bin/qwen")));
+        assert!(paths.contains(&home.join(".cargo/bin/qwen")));
+        assert!(paths.contains(&PathBuf::from("/usr/local/bin/qwen")));
+    }
+
+    /// A file a Qwen Code user already has: llmman's entry goes first, an
+    /// older one of its own for this daemon goes, and everything else
+    /// stays, a hand-written entry at this daemon's address included.
+    #[test]
+    fn qwen_settings_merge_keeps_what_is_not_llmmans() {
+        let existing = serde_json::json!({
+            "$version": 4,
+            "ui": { "theme": "keep-me" },
+            "modelProviders": {
+                "gemini": [ { "id": "gemini-2.5-pro" } ],
+                "openai": [
+                    { "id": "docker.io/ai/m:latest", "name": "cloud copy",
+                      "baseUrl": "https://cloud.example/v1",
+                      "envKey": "QWEN_CUSTOM_API_KEY_X", "customField": 1 },
+                    { "id": "old:latest", "name": "renamed by the user",
+                      "baseUrl": "http://127.0.0.1:17434/v1/", "envKey": "LLMMAN_API_KEY" },
+                    { "id": "other:latest", "name": "other:latest (llmman)",
+                      "baseUrl": "http://10.0.0.2:17434/v1", "envKey": "LLMMAN_API_KEY" },
+                    { "id": "local-alias", "name": "my alias for the daemon",
+                      "baseUrl": "http://127.0.0.1:17434/v1", "envKey": "OPENAI_API_KEY",
+                      "generationConfig": { "temperature": 0.2 } }
+                ]
+            },
+            "security": { "auth": { "selectedType": "qwen-oauth", "apiKey": "keep-too" } },
+            "model": { "name": "gemini-2.5-pro", "generationConfig": { "temperature": 0.1 } }
+        });
+        let url = "http://127.0.0.1:17434/v1";
+        let merged = qwen_settings_merged(&existing, "docker.io/ai/m:latest", url);
+        assert_eq!(merged["$version"], 4);
+        assert_eq!(merged["ui"]["theme"], "keep-me");
+        assert_eq!(
+            merged["modelProviders"]["gemini"],
+            existing["modelProviders"]["gemini"]
+        );
+        let before = existing["modelProviders"]["openai"].as_array().unwrap();
+        let openai = merged["modelProviders"]["openai"].as_array().unwrap();
+        assert_eq!(
+            openai[0],
+            serde_json::json!({ "id": "docker.io/ai/m:latest",
+                "name": "docker.io/ai/m:latest (llmman)", "baseUrl": url,
+                "envKey": "LLMMAN_API_KEY" })
+        );
+        assert_eq!(
+            openai[1..],
+            [before[0].clone(), before[2].clone(), before[3].clone()]
+        );
+        assert_eq!(merged["security"]["auth"]["selectedType"], "openai");
+        assert_eq!(merged["security"]["auth"]["baseUrl"], url);
+        assert_eq!(merged["security"]["auth"]["apiKey"], "keep-too");
+        assert_eq!(merged["model"]["name"], "docker.io/ai/m:latest");
+        assert_eq!(merged["model"]["baseUrl"], url);
+        assert_eq!(merged["model"]["generationConfig"]["temperature"], 0.1);
+    }
+
+    /// From nothing, and then again: the second merge changes nothing,
+    /// so `write_qwen_settings_at` leaves a correct file alone. No key
+    /// value and no `env` block anywhere in it.
+    #[test]
+    fn qwen_settings_merge_is_complete_from_nothing_and_idempotent() {
+        let url = "http://127.0.0.1:17434/v1";
+        let once = qwen_settings_merged(&serde_json::json!({}), "m:latest", url);
+        assert_eq!(
+            once,
+            serde_json::json!({
+                "modelProviders": { "openai": [ { "id": "m:latest",
+                    "name": "m:latest (llmman)", "baseUrl": url,
+                    "envKey": "LLMMAN_API_KEY" } ] },
+                "security": { "auth": { "selectedType": "openai", "baseUrl": url } },
+                "model": { "name": "m:latest", "baseUrl": url }
+            })
+        );
+        assert_eq!(qwen_settings_merged(&once, "m:latest", url), once);
+        let text = once.to_string();
+        assert!(!text.contains("apiKey") && !text.contains("\"env\""));
+        assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"qwen"));
+    }
+
+    /// A wrong-typed value on the path is replaced, a non-object root
+    /// counts as empty, and a `{ protocol, models }` wrapper keeps its
+    /// entries.
+    #[test]
+    fn qwen_settings_merge_replaces_a_wrong_typed_value_on_its_path() {
+        let existing = serde_json::json!({
+            "security": 3, "modelProviders": { "openai": "x" }, "model": []
+        });
+        let merged = qwen_settings_merged(&existing, "m", "http://h/v1");
+        assert_eq!(merged["security"]["auth"]["selectedType"], "openai");
+        assert_eq!(merged["modelProviders"]["openai"][0]["id"], "m");
+        assert_eq!(merged["model"]["name"], "m");
+        let from_null = qwen_settings_merged(&serde_json::json!(null), "m", "http://h/v1");
+        assert_eq!(from_null["model"]["name"], "m");
+
+        let wrapped = serde_json::json!({
+            "$version": 5,
+            "modelProviders": { "openai": { "protocol": "openai", "models": [
+                { "id": "gpt-5", "baseUrl": "https://api.openai.com/v1", "envKey": "MY_KEY" }
+            ] } }
+        });
+        let merged = qwen_settings_merged(&wrapped, "m", "http://h/v1");
+        let openai = merged["modelProviders"]["openai"].as_array().unwrap();
+        assert_eq!(openai.len(), 2);
+        assert_eq!(openai[1]["id"], "gpt-5");
+        assert_eq!(merged["$version"], 4, "the version follows the shape");
+    }
+
+    /// Ownership is the key name at this daemon's address, whatever the
+    /// entry was renamed to; a trailing slash does not make a second
+    /// daemon of the same one.
+    #[test]
+    fn qwen_entry_is_ours_needs_the_key_name_and_the_address() {
+        let url = "http://127.0.0.1:17434/v1";
+        let ours = serde_json::json!({ "id": "anything", "name": "renamed by the user",
+            "baseUrl": "http://127.0.0.1:17434/v1/", "envKey": "LLMMAN_API_KEY" });
+        assert!(qwen_entry_is_ours(&ours, url));
+        let hand_written = serde_json::json!({ "id": "local-alias", "name": "m (llmman)",
+            "baseUrl": url, "envKey": "OPENAI_API_KEY" });
+        assert!(!qwen_entry_is_ours(&hand_written, url));
+        let elsewhere = serde_json::json!({ "id": "m:latest", "name": "m:latest (llmman)",
+            "baseUrl": "http://10.0.0.2:17434/v1", "envKey": "LLMMAN_API_KEY" });
+        assert!(!qwen_entry_is_ours(&elsewhere, url));
+        assert!(!qwen_entry_is_ours(
+            &serde_json::json!("not an object"),
+            url
+        ));
+    }
+
+    /// Comments go, as `strip-json-comments` takes them out for Qwen Code,
+    /// and nothing else moves: not a `//` inside a string, not a column.
+    #[test]
+    fn strip_json_comments_keeps_strings_and_columns() {
+        let raw =
+            "{\n  // note\n  \"url\": \"http://h//v1\", /* block\n  */ \"q\": \"a\\\"//b\"\n}\n";
+        let stripped = strip_json_comments(raw);
+        assert_eq!(stripped.chars().count(), raw.chars().count());
+        assert_eq!(stripped.lines().count(), raw.lines().count());
+        let v: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(v["url"], "http://h//v1");
+        assert_eq!(v["q"], "a\"//b");
+        assert_eq!(strip_json_comments("{\"a\": 1}"), "{\"a\": 1}");
+    }
+
+    /// A leading `~` is the home directory; anything else is as given.
+    #[test]
+    fn expand_tilde_reads_the_forms_qwen_code_reads() {
+        let home = Path::new("/h");
+        assert_eq!(expand_tilde("~/alt", home), PathBuf::from("/h/alt"));
+        assert_eq!(expand_tilde("~", home), PathBuf::from("/h"));
+        assert_eq!(expand_tilde("/abs", home), PathBuf::from("/abs"));
+        assert_eq!(expand_tilde("~user/x", home), PathBuf::from("~user/x"));
+    }
+
+    /// The reading and writing half over a directory of its own: a fresh
+    /// one gets the file, a correct file is not touched, a commented one
+    /// merges with its text kept as `.bak`, a later rewrite of llmman's
+    /// own rendering leaves that `.bak` alone while a hand edit with
+    /// comments refreshes it, an empty file counts as `{}`, and what is
+    /// not JSON is left alone without an error.
+    #[test]
+    fn write_qwen_settings_at_writes_once_keeps_a_bak_and_refuses_non_json() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-qwen-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let url = "http://127.0.0.1:17434/v1";
+        let path = dir.join("settings.json");
+        let bak = dir.join("settings.json.bak");
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        };
+
+        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        assert_eq!(read()["model"]["name"], "m:latest");
+        assert!(!bak.exists(), "nothing to back up on a first write");
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            written
+        );
+
+        let commented = "{\n  // mine\n  \"ui\": { \"theme\": \"x\" }\n}\n";
+        std::fs::write(&path, commented).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        assert_eq!(read()["ui"]["theme"], "x");
+        assert_eq!(read()["model"]["name"], "m:latest");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), commented);
+        write_qwen_settings_at(&dir, "other:latest", url).unwrap();
+        assert_eq!(read()["model"]["name"], "other:latest");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            commented,
+            "llmman's own rendering must not replace the user's backup"
+        );
+        let edited = "{\n  // edited by hand\n  \"ui\": { \"theme\": \"y\" }\n}\n";
+        std::fs::write(&path, edited).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), edited);
+
+        std::fs::write(&path, "  \n").unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        assert_eq!(read()["model"]["name"], "m:latest");
+
+        std::fs::write(&path, "{ not json").unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+        std::fs::write(&path, "[]").unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression test for the codex config bug described on
     /// `write_codex_config`'s own doc comment: an older llmman's
     /// `[profiles.llmman]` table (a format current codex refuses to load
@@ -2837,7 +3389,13 @@ model = \"gpt-5\"
     #[test]
     fn opencode_config_lists_the_variants_in_order() {
         let variants = opencode_variants(None);
-        let text = opencode_config("http://127.0.0.1:17434", "qwen3.5:0.8b", "k", &variants);
+        let text = opencode_config(
+            "http://127.0.0.1:17434",
+            "qwen3.5:0.8b",
+            "k",
+            &variants,
+            false,
+        );
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert_eq!(config["$schema"], "https://opencode.ai/config.json");
         assert_eq!(config["model"], "ollama/qwen3.5:0.8b");
@@ -2861,15 +3419,31 @@ model = \"gpt-5\"
             .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
 
-        let bare = opencode_config("http://h", "m", "k", &[]);
+        let bare = opencode_config("http://h", "m", "k", &[], false);
         assert!(!bare.contains("variants"), "{bare}");
+    }
+
+    #[test]
+    fn opencode_config_declares_image_input_only_for_a_vision_model() {
+        let text = opencode_config("http://h", "m", "k", &[], true);
+        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let model = &config["provider"]["ollama"]["models"]["m"];
+        assert_eq!(
+            model["modalities"],
+            serde_json::json!({ "input": ["text", "image"], "output": ["text"] })
+        );
+        assert_eq!(model["attachment"], true);
+
+        let text_only = opencode_config("http://h", "m", "k", &[], false);
+        assert!(!text_only.contains("modalities"), "{text_only}");
+        assert!(!text_only.contains("attachment"), "{text_only}");
     }
 
     #[test]
     fn opencode_config_escapes_the_model_name() {
         let model = "we\"ird/mo\\del";
         let config: serde_json::Value =
-            serde_json::from_str(&opencode_config("http://h", model, "k", &[]))
+            serde_json::from_str(&opencode_config("http://h", model, "k", &[], false))
                 .expect("valid JSON");
         assert_eq!(config["model"], format!("ollama/{model}"));
         assert_eq!(config["provider"]["ollama"]["models"][model]["name"], model);
@@ -2914,7 +3488,7 @@ model = \"gpt-5\"
 
     #[test]
     fn codex_profile_is_a_websocket_free_provider_at_the_daemon() {
-        let profile: toml::Value = codex_profile("http://127.0.0.1:17434")
+        let profile: toml::Value = codex_profile("http://127.0.0.1:17434", None)
             .parse()
             .expect("valid TOML");
         assert_eq!(profile["model_provider"].as_str(), Some("llmman"));
@@ -2929,6 +3503,56 @@ model = \"gpt-5\"
         assert!(
             profile.get("openai_base_url").is_none(),
             "the built-in openai provider is not the one in use"
+        );
+        assert!(
+            profile.get("model_catalog_json").is_none(),
+            "no model, no catalog to point at"
+        );
+    }
+
+    #[test]
+    fn codex_profile_names_the_catalog_it_was_given() {
+        let path = PathBuf::from("/home/we\"ird/.codex/llmman-model.json");
+        let profile: toml::Value = codex_profile("http://h", Some(&path))
+            .parse()
+            .expect("valid TOML");
+        assert_eq!(
+            profile["model_catalog_json"].as_str(),
+            Some(path.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn codex_model_catalog_declares_image_input_only_for_a_vision_model() {
+        let catalog: serde_json::Value =
+            serde_json::from_str(&codex_model_catalog("m", true)).expect("valid JSON");
+        let entry = &catalog["models"][0];
+        assert_eq!(
+            entry["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(entry["slug"], "m");
+        assert_eq!(entry["display_name"], "m");
+        // Fields codex requires of an entry.
+        for key in [
+            "context_window",
+            "shell_type",
+            "visibility",
+            "supported_in_api",
+            "priority",
+            "truncation_policy",
+            "support_verbosity",
+            "supported_reasoning_levels",
+            "experimental_supported_tools",
+        ] {
+            assert!(entry.get(key).is_some(), "missing {key}");
+        }
+
+        let text_only: serde_json::Value =
+            serde_json::from_str(&codex_model_catalog("m", false)).expect("valid JSON");
+        assert_eq!(
+            text_only["models"][0]["input_modalities"],
+            serde_json::json!(["text"])
         );
     }
 
@@ -2945,7 +3569,7 @@ model = \"gpt-5\"
                 .as_nanos()
         ));
         let path = dir.join("settings.yaml");
-        write_dsh_settings(&path, "qwen3.5:0.8b").unwrap();
+        write_dsh_settings(&path, "qwen3.5:0.8b", false).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("provider: llmman"));
         assert!(contents.contains("model: \"qwen3.5:0.8b\""));
@@ -2955,6 +3579,53 @@ model = \"gpt-5\"
         assert!(contents.contains("id: \"qwen3.5:0.8b\""));
         assert!(!contents.contains("apiKey:"), "no literal key in the file");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// dsh sends an image only to a model whose `input` lists one — and
+    /// must not attach one to a text-only model the daemon would reject.
+    #[test]
+    fn write_dsh_settings_declares_image_input_only_for_a_vision_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-dsh-vision-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("settings.yaml");
+        write_dsh_settings(&path, "m", true).unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("input: [text, image]"));
+        write_dsh_settings(&path, "m", false).unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("input: [text]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fallback that makes `llmman launch dsh` work without a global
+    /// install — and stays out of the way of one that exists.
+    #[test]
+    fn dsh_falls_back_to_the_published_package_under_npx() {
+        let dsh = PathBuf::from("/usr/local/bin/dsh");
+        let npx = PathBuf::from("/usr/local/bin/npx");
+
+        // An install wins, and npx is never even looked for.
+        assert_eq!(
+            dsh_command(Some(dsh.clone()), || panic!("npx looked up anyway")),
+            Some((dsh, Vec::new()))
+        );
+        // Without one, npx runs the package: `--yes` so a first run
+        // isn't blocked on a prompt, ahead of dsh's own arguments.
+        assert_eq!(
+            dsh_command(None, || Some(npx.clone())),
+            Some((npx, vec!["--yes".to_string(), DSH_NPM_PACKAGE.to_string()]))
+        );
+        assert!(DSH_NPM_PACKAGE.starts_with("@deepseek-ai/dsh@"));
+        // Neither: "dsh is not installed", not an npm error.
+        assert_eq!(dsh_command(None, || None), None);
     }
 
     #[test]
@@ -3071,7 +3742,7 @@ model = \"gpt-5\"
         for command in ["web", "plugin"] {
             let via_command = args(&[command, "--port", "8080"]);
             assert_eq!(dsh_launcher(&via_command).command, Some(command));
-            let err = launch_dsh("m", "k", &via_command).unwrap_err();
+            let err = launch_dsh("m", "k", false, &via_command).unwrap_err();
             assert!(err.to_string().contains("--profile"), "{err}");
         }
         // `--profile web`'s *value* is not the `web` command — refusing
@@ -3103,10 +3774,10 @@ model = \"gpt-5\"
     #[test]
     fn launch_dsh_refuses_a_conflicting_patch_flag() {
         let word = vec!["--patch".to_string(), "/tmp/x.yml".to_string()];
-        let err = launch_dsh("m", "k", &word).unwrap_err();
+        let err = launch_dsh("m", "k", false, &word).unwrap_err();
         assert!(err.to_string().contains("--patch"), "{err}");
         let joined = vec!["--patch=/tmp/x.yml".to_string()];
-        let err = launch_dsh("m", "k", &joined).unwrap_err();
+        let err = launch_dsh("m", "k", false, &joined).unwrap_err();
         assert!(err.to_string().contains("--patch"), "{err}");
     }
 
