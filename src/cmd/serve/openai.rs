@@ -13,6 +13,7 @@ use futures::StreamExt;
 use tokio::time::{sleep, Duration, Instant};
 
 use super::backend::would_use_mlx;
+use super::hybrid::{request_pin, send_with_hybrid_fallback};
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::relay::{
     proxy, proxy_rewriting_model, relay, relay_chat_upstream, stream_rewriting_model,
@@ -23,9 +24,8 @@ use super::responses::{
 use super::sched::{begin_activity, ActivityGuard};
 use super::types::*;
 use super::{
-    aggregation, backend_wire_model, ensure_model, provider_compat, request_pin,
-    send_chat_completion, send_with_hybrid_fallback, strip_llama_fields, AppError, AppState,
-    Engine, Target, CHAT_COMPLETIONS_ROUTE,
+    aggregation, backend_wire_model, ensure_model, provider_compat, send_chat_completion,
+    strip_llama_fields, AppError, AppState, Engine, Target, CHAT_COMPLETIONS_ROUTE,
 };
 use crate::storage::OciStore;
 

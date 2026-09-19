@@ -1,5 +1,9 @@
 use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
+use super::hybrid::{
+    hybrid_fallback, local_context_overflow, request_pin, resolve_hybrid_side,
+    with_hybrid_fallback, OVERFLOW_BODY_LIMIT,
+};
 use super::ollama::{
     embed_inputs, empty_chat_chunk, evict_if_retagged, model_info_json, normalize_in_place,
     opt_f64, opt_num_thread, opt_u32, options_to_oai, progress_line, staged_blob_path, staged_file,
