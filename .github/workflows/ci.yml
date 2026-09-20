@@ -320,6 +320,138 @@ jobs:
         run: cargo test --release --target ${{ matrix.target }} --lib --bins
 
   # --------------------------------------------------------------------------
+  # Android app (android/, docs/android.md): the web UI in a WebView over
+  # an embedded `llmman serve`, cross-compiled for aarch64-linux-android
+  # and bundled with llama.cpp's own Android release (the LLAMA_CPP_RELEASE
+  # pin). Gradle drives both (`cargo ndk`, the tarball fetch), so this is
+  # one `assembleRelease`. Runs on PRs so a broken NDK cross-compile or
+  # Gradle project fails before release; the APK is a release asset.
+  #
+  # Signing: with the LLMMAN_ANDROID_* secrets the APK is release-signed;
+  # without them (PRs from forks, local builds) it is debug-signed, which
+  # still installs by sideload but not over a release-signed install.
+  # --------------------------------------------------------------------------
+  android:
+    name: Build Android app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ANDROID_NDK_VERSION: "27.2.12479018"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Same version as the other binaries; app/build.gradle.kts reads it
+      # from Cargo.toml.
+      - name: Set release version
+        shell: bash
+        run: |
+          packaging/version.sh --apply
+          echo "LLMMAN_GIT_DESCRIBE=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: go-shim/go.sum
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: aarch64-linux-android
+          cache-bin: true
+
+      # cargo-ndk sets CC_<triple>/CFLAGS_<triple>; build.rs takes GOOS,
+      # GOARCH and the Go CC wrapper from those.
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Set up JDK
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+
+      # The runner image ships the SDK and cmdline-tools; the NDK version
+      # is the one app/build.gradle.kts names (AGP uses it to strip the
+      # staged .so files, not to compile anything).
+      - name: Install Android NDK
+        run: |
+          set -euo pipefail
+          yes 2>/dev/null | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ANDROID_NDK_VERSION" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Build APK
+        working-directory: android
+        env:
+          LLMMAN_ANDROID_KEYSTORE: ${{ secrets.LLMMAN_ANDROID_KEYSTORE }}
+          LLMMAN_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.LLMMAN_ANDROID_KEYSTORE_PASSWORD }}
+          LLMMAN_ANDROID_KEY_ALIAS: ${{ secrets.LLMMAN_ANDROID_KEY_ALIAS }}
+          LLMMAN_ANDROID_KEY_PASSWORD: ${{ secrets.LLMMAN_ANDROID_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon assembleRelease
+
+      # The APK must carry this commit's version and the full native
+      # payload: the daemon, its shim, and llama-server with its libraries.
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          aapt2="$(ls -d "$ANDROID_HOME"/build-tools/35.0.0)/aapt2"
+          version="$(packaging/version.sh)"
+          badging="$("$aapt2" dump badging "$apk")"
+          echo "$badging" | grep -E "^package:|^native-code:"
+          case "$badging" in
+          *"versionName='$version'"*) ;;
+          *) echo "::error::APK versionName is not $version"; exit 1 ;;
+          esac
+          for lib in libllmman.so libllmman_shim.so libllama-server.so libllama-server-impl.so libllama.so libggml.so libggml-base.so libmtmd.so libllama-common.so; do
+            unzip -l "$apk" "lib/arm64-v8a/$lib" >/dev/null || { echo "::error::$lib missing from APK"; exit 1; }
+          done
+          unzip -l "$apk" | grep -q "lib/arm64-v8a/libggml-cpu-android_" || { echo "::error::no ggml-cpu variants in APK"; exit 1; }
+          # A release must be signed with the release key: the debug key is
+          # generated per runner, so a debug-signed release could never be
+          # installed over the previous one.
+          signer="$("$(dirname "$aapt2")/apksigner" verify --print-certs "$apk" | grep 'certificate DN')"
+          echo "$signer"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            case "$signer" in
+            *"CN=Android Debug"*)
+              echo "::error::release APK is debug-signed; set the LLMMAN_ANDROID_KEYSTORE, LLMMAN_ANDROID_KEYSTORE_PASSWORD, LLMMAN_ANDROID_KEY_ALIAS and LLMMAN_ANDROID_KEY_PASSWORD secrets"
+              exit 1 ;;
+            esac
+          fi
+          mkdir -p dist-android
+          cp "$apk" dist-android/llmman-aarch64-linux-android.apk
+
+      - name: Upload APK
+        id: upload
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: llmman-android-aarch64-linux-android
+          path: dist-android/llmman-aarch64-linux-android.apk
+          if-no-files-found: error
+      - name: Upload APK (retry)
+        if: steps.upload.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: llmman-android-aarch64-linux-android
+          path: dist-android/llmman-aarch64-linux-android.apk
+          if-no-files-found: error
+          overwrite: true
+
+  # --------------------------------------------------------------------------
   # Lint + packaging: cheap Linux-only checks, ~2 min total and off the
   # critical path, so they share one runner. `release` gates on this.
   #
@@ -1670,7 +1802,7 @@ jobs:
     name: Release
     # Everything must be green first. e2e only runs on the same push event
     # this job fires on, so this never waits on a run that will not happen.
-    needs: [tag, build, lint-packaging, e2e]
+    needs: [tag, build, android, lint-packaging, e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -1715,6 +1847,12 @@ jobs:
           pattern: llmman-docker-*
           merge-multiple: false
 
+      # The APK is already named for release (llmman-<triple>.apk).
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          name: llmman-android-aarch64-linux-android
+
       - name: Rename binaries for release
         shell: bash
         run: |
@@ -1729,7 +1867,7 @@ jobs:
             fi
           done
 
-      # All five assets, by name, before anything is published, and the
+      # All six assets, by name, before anything is published, and the
       # one binary this runner can execute must report this version.
       - name: Verify release assets
         shell: bash
@@ -1743,7 +1881,8 @@ jobs:
             llmman-aarch64-unknown-linux-gnu \
             llmman-aarch64-apple-darwin \
             llmman-x86_64-pc-windows-msvc.exe \
-            llmman-aarch64-pc-windows-msvc.exe; do
+            llmman-aarch64-pc-windows-msvc.exe \
+            llmman-aarch64-linux-android.apk; do
             [ -s "$asset" ] || { echo "::error::release asset $asset is missing or empty"; exit 1; }
           done
           chmod +x llmman-x86_64-unknown-linux-gnu

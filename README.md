@@ -88,6 +88,9 @@ cargo binstall llmman   # prebuilt binary
 cargo install llmman    # build from source; needs Go 1.25+ (and LLVM on Windows) as well as Rust
 ```
 
+**Android** (the web UI over an on-device daemon, see [docs/android.md](docs/android.md)):
+`llmman-aarch64-linux-android.apk` from the [latest release](https://github.com/llmmanorg/llmman/releases/latest).
+
 **Container** (llmman in the llama.cpp server image, see [docs/backends.md](docs/backends.md#in-a-container)):
 
 ```sh
@@ -332,6 +335,7 @@ so it works from any client on every inference endpoint. Details in
 | [docs/commands.md](docs/commands.md) | Every subcommand, one line each |
 | [docs/api.md](docs/api.md) | Every HTTP endpoint, and per-API notes |
 | [docs/aggregation.md](docs/aggregation.md) | Pooling several machines into one endpoint |
+| [docs/android.md](docs/android.md) | The Android app: install, what runs on the phone, building the APK |
 | [docs/backends.md](docs/backends.md) | llama.cpp, vLLM, SGLang, MLX, containers, and building from source |
 | [docs/compose.md](docs/compose.md) | Compose deployment behind a gateway, with persistent model storage |
 | [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, registry mirrors, environment variables, store layout |

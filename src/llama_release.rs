@@ -320,7 +320,24 @@ fn asset_query() -> AssetQuery {
         }
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    // llama.cpp publishes one Android build (NDK, arm64, CPU with runtime
+    // dispatch across armv8.x/armv9 ggml-cpu variants). Its shared objects
+    // carry no RUNPATH, so spawn_llama_server sets LD_LIBRARY_PATH for it.
+    #[cfg(target_os = "android")]
+    {
+        AssetQuery {
+            must_contain: format!("-bin-android-{arch}.tar.gz"),
+            companion_must_contain: None,
+            label: "cpu".into(),
+        }
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "android"
+    )))]
     {
         AssetQuery {
             must_contain: format!("-bin-ubuntu-{arch}.tar.gz"),

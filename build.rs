@@ -219,6 +219,77 @@ fn is_docs_rs() -> bool {
     env::var_os("DOCS_RS").is_some()
 }
 
+/// Read a `cc`-crate style per-target variable: `NAME_aarch64_linux_android`,
+/// then `NAME_aarch64-linux-android`, then `TARGET_NAME`. This is the
+/// convention `cargo ndk` (and `cc`'s own users) already populate, so a
+/// plain `cargo ndk -t arm64-v8a build` needs no extra setup.
+fn target_env_var(name: &str, triple: &str) -> Option<String> {
+    let underscored = triple.replace('-', "_");
+    for key in [
+        format!("{name}_{underscored}"),
+        format!("{name}_{triple}"),
+        format!("TARGET_{name}"),
+    ] {
+        println!("cargo:rerun-if-env-changed={key}");
+        if let Some(v) = env::var(&key).ok().filter(|v| !v.trim().is_empty()) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Point `go build` at the Android NDK for a `*-linux-android` target.
+///
+/// Sets GOOS/GOARCH from Cargo's target and hands Go a CC wrapper that
+/// hard-codes the NDK clang plus `CFLAGS_<triple>` (`--target=<triple><api>`,
+/// which also fixes the minimum API level). The wrapper exists for the same
+/// reason as the MSVC one in `main`: Go's CGO flag filter may drop flags it
+/// does not recognise from `CGO_CFLAGS`, but cannot touch the compiler
+/// command itself. Go also runs `$CC` as the link driver for cgo's dynamic
+/// import probe, so the wrapper must forward every argument verbatim.
+fn configure_go_for_android(cmd: &mut Command, out_dir: &Path) {
+    let triple = env::var("TARGET").unwrap();
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let goarch = match arch.as_str() {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        "x86" => "386",
+        "arm" => "arm",
+        other => panic!("unsupported Android arch for the Go shim: {other}"),
+    };
+    let cc = target_env_var("CC", &triple).unwrap_or_else(|| {
+        panic!(
+            "cross-compiling the Go shim for {triple} needs CC_{} pointing at the \
+             NDK clang (run the build through `cargo ndk`, which sets it)",
+            triple.replace('-', "_")
+        )
+    });
+    let cflags = target_env_var("CFLAGS", &triple).unwrap_or_default();
+    let wrapper = out_dir.join("cgo_cc.sh");
+    fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nexec \"{cc}\" {cflags} \"$@\"\n"),
+    )
+    .expect("write CGO CC wrapper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
+            .expect("chmod CGO CC wrapper");
+    }
+    cmd.env("GOOS", "android")
+        .env("GOARCH", goarch)
+        .env("CC", &wrapper);
+    if goarch == "arm" {
+        cmd.env("GOARM", "7");
+    }
+    // Android 15+ devices may run with 16 KiB pages and refuse to load an
+    // ELF whose LOAD segments are only 4 KiB-aligned. The NDK clang used
+    // for the Rust side already emits 16 KiB alignment; Go's external link
+    // needs telling.
+    cmd.arg("-ldflags=-extldflags=-Wl,-z,max-page-size=16384");
+}
+
 fn main() {
     emit_version();
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -257,10 +328,17 @@ fn main() {
     // `llmman` lib crate's own compilation checks a `#[link(kind =
     // "static")]` dependency's presence itself first, by each target's
     // canonical name, with no such leniency.
-    let lib_name = if target_os == "windows" && target_env == "msvc" {
-        "llmman_shim.lib"
+    //
+    // Android is the exception to static linking: Go's `c-archive` buildmode
+    // is not implemented for android/* (only `c-shared` is), so there the
+    // shim is a shared object that ships next to the binary, found through
+    // the `$ORIGIN` RUNPATH emitted further down.
+    let (lib_name, buildmode) = if target_os == "windows" && target_env == "msvc" {
+        ("llmman_shim.lib", "c-archive")
+    } else if target_os == "android" {
+        ("libllmman_shim.so", "c-shared")
     } else {
-        "libllmman_shim.a"
+        ("libllmman_shim.a", "c-archive")
     };
     let lib_path = out_dir.join(lib_name);
 
@@ -275,10 +353,9 @@ fn main() {
         .env("CGO_ENABLED", "1")
         .arg("build")
         .arg(format!("-tags={}", go_tags))
-        .arg("-buildmode=c-archive")
+        .arg(format!("-buildmode={buildmode}"))
         .arg("-o")
-        .arg(&lib_path)
-        .arg(".");
+        .arg(&lib_path);
 
     // On *-pc-windows-msvc targets the Rust linker (lld-link, set via
     // RUSTFLAGS in CI) requires MSVC-ABI COFF objects from Go's CGO.
@@ -318,6 +395,17 @@ fn main() {
         cmd.env("MACOSX_DEPLOYMENT_TARGET", "11.0");
     }
 
+    // Android is the one target we cross-compile (from a macOS or Linux host,
+    // via `cargo ndk` or a hand-set `CC_<triple>`). Go picks GOOS/GOARCH from
+    // the host unless told otherwise, so translate Cargo's target vocabulary
+    // and point CGO at the NDK clang. See configure_go_for_android.
+    if target_os == "android" {
+        configure_go_for_android(&mut cmd, &out_dir);
+    }
+
+    // The package pattern must come last: Go stops parsing flags at it, and
+    // the per-OS hooks above may add some.
+    cmd.arg(".");
     let status = cmd
         .status()
         .expect("Failed to invoke `go build` — is Go (1.22+) installed and on PATH?");
@@ -344,7 +432,15 @@ fn main() {
     }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=llmman_shim");
+    if buildmode == "c-shared" {
+        println!("cargo:rustc-link-lib=dylib=llmman_shim");
+        // Bionic honours DT_RUNPATH with $ORIGIN (API 24+), so a binary
+        // installed beside libllmman_shim.so — an APK's native-lib dir, or a
+        // Termux prefix — runs without LD_LIBRARY_PATH.
+        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN");
+    } else {
+        println!("cargo:rustc-link-lib=static=llmman_shim");
+    }
 
     // Platform-specific link dependencies required by Go runtime and shim libraries
     match target_os.as_str() {
@@ -367,6 +463,13 @@ fn main() {
             // With CC=cl the CGO objects are compiled by MSVC which links the CRT
             // automatically; legacy_stdio_definitions is not needed and causes
             // LNK4078 / LNK1223 when mixed with MSVC-format objects.
+        }
+        "android" => {
+            // Go's runtime/cgo on Android reports fatal errors through
+            // __android_log_print (runtime/cgo/gcc_android.c), which lives in
+            // Bionic's liblog rather than libc.
+            println!("cargo:rustc-link-lib=log");
+            println!("cargo:rustc-link-lib=dl");
         }
         _ => {}
     }

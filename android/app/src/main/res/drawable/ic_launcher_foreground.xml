@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A rounded speech bubble with a cursor bar: chat + terminal, the two
+     modes the web UI has. Adaptive-icon safe zone is the centre 66 dp. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#3B7DDD"
+        android:pathData="M30,32 h48 a8,8 0 0 1 8,8 v26 a8,8 0 0 1 -8,8 h-30 l-12,10 v-10 h-6 a8,8 0 0 1 -8,-8 v-26 a8,8 0 0 1 8,-8 z" />
+    <path
+        android:fillColor="#F6F7FB"
+        android:pathData="M40,45 l8,8 l-8,8 l-3,-3 l5,-5 l-5,-5 z" />
+    <path
+        android:fillColor="#F6F7FB"
+        android:pathData="M52,58 h16 v4 h-16 z" />
+</vector>

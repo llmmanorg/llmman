@@ -122,7 +122,7 @@ pub fn memory_bytes(vram_bytes: u64) -> u64 {
     if vram_bytes > 0 {
         return vram_bytes;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         std::fs::read_to_string("/proc/meminfo")
             .ok()
@@ -137,7 +137,12 @@ pub fn memory_bytes(vram_bytes: u64) -> u64 {
     {
         windows_memory_bytes().unwrap_or(0)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )))]
     {
         0
     }
@@ -177,7 +182,7 @@ fn windows_memory_bytes() -> Option<u64> {
 }
 
 /// `MemTotal:       16384000 kB` -> bytes.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn parse_meminfo_total(meminfo: &str) -> Option<u64> {
     let kib = meminfo
         .lines()

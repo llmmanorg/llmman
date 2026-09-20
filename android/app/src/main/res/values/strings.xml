@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">llmman</string>
+    <string name="notification_channel">llmman server</string>
+    <string name="notification_channel_description">Shows while the local model server is running.</string>
+    <string name="notification_starting">Starting server…</string>
+    <string name="notification_running">Server running on 127.0.0.1:17434</string>
+    <string name="notification_restarting">Server exited, restarting…</string>
+    <string name="notification_stop">Stop</string>
+    <string name="status_starting">Starting llmman…</string>
+    <string name="status_waiting">Waiting for the server…</string>
+    <string name="status_failed">The server stopped unexpectedly</string>
+    <string name="status_ui_failed">The web UI failed to load</string>
+    <string name="action_retry">Retry</string>
+    <string name="action_show_log">Show log</string>
+    <string name="action_hide_log">Hide log</string>
+    <string name="download_saved">Saved to Downloads: %1$s</string>
+    <string name="download_failed">Could not save download</string>
+</resources>

@@ -229,6 +229,29 @@ pub(super) async fn spawn_llama_server(
             cmd.env(var, val);
         }
     }
+    // llama.cpp's Android release is a 7 KiB `llama-server` launcher whose
+    // real code is in sibling `libllama-server-impl.so`/`libggml*.so`, none
+    // of which carry a RUNPATH (the Ubuntu, macOS and Windows builds embed
+    // one, or are static). Bionic's linker only searches LD_LIBRARY_PATH
+    // and system dirs, so name the binary's own directory — after
+    // resolving a symlink, which is how the Android app exposes it on PATH.
+    #[cfg(target_os = "android")]
+    {
+        let lib_dir = std::fs::canonicalize(bin)
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .or_else(|| bin.parent().map(Path::to_path_buf));
+        if let Some(lib_dir) = lib_dir {
+            let mut value = lib_dir.into_os_string();
+            if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
+                if !existing.is_empty() {
+                    value.push(":");
+                    value.push(existing);
+                }
+            }
+            cmd.env("LD_LIBRARY_PATH", value);
+        }
+    }
     crate::debug_log!("spawning {}: {:?}", bin.display(), cmd);
     // Piped (not inherited) so a startup crash's own explanation — e.g. a
     // dynamic linker's "error while loading shared libraries" — can be
