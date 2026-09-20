@@ -82,6 +82,11 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         overflow.is_none() || args.model.as_deref().is_some_and(|m| !m.trim().is_empty()),
         "--overflow-model needs --model naming the local model to pair it with"
     );
+    // Cline follows the install-on-demand behavior expected by its launch
+    // integration. Do this before starting the daemon or pulling a model.
+    if name.eq_ignore_ascii_case("cline") {
+        ensure_cline_installed()?;
+    }
     // The local model's thinking controls (see `opencode_variants`),
     // whether it takes images (see `write_dsh_settings`) and its trained
     // context (see `codex_context_window`); a provider's model has none
@@ -194,8 +199,9 @@ const MODEL_REQUIRED: &[&str] = &["qwen", "dsh", "agy", "goose", "grok", "cline"
 /// warrant the warning below. qwen: `qwen_args` drops its own `--model`
 /// when the caller spelled one. goose: its model is `GOOSE_MODEL` in the
 /// environment, which goose's own `--model` documents itself as
-/// overriding. grok and cline: their argument builders likewise drop the
-/// generated `--model`.
+/// overriding. grok: its argument builder likewise drops the generated
+/// `--model`. Cline receives no generated arguments, so its own `--model`
+/// also wins over the provider selected in its settings.
 /// Not dsh: `dsh_args` does not yield, and dsh takes no
 /// `--model` flag at all (its model is the one `write_dsh_settings`
 /// records), so telling a dsh user theirs "wins" would be false, and dsh
@@ -291,7 +297,7 @@ const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
 /// a credential, which this feature promises not to do. They rely on
 /// `llmman serve` having the variable itself — which it only uses for a
 /// daemon nobody else can reach (see `reachable_only_locally`).
-const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes"];
+const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes", "cline"];
 
 fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
     let name = integration.to_lowercase();
@@ -586,6 +592,62 @@ fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Cline install on demand
+// ---------------------------------------------------------------------------
+
+const CLINE_NPM_INSTALL_ARGS: &[&str] = &["install", "-g", "cline@latest"];
+const CLINE_INSTALL_PROMPT: &str = "Cline is not installed. Install with npm? [y/N] ";
+const CLINE_INSTALL_CANCELLED: &str = "cline installation cancelled";
+
+/// Offers the official npm install when Cline is missing. This runs before
+/// the daemon starts, so declining or lacking npm has no model-pull side
+/// effects. Re-resolving from PATH after npm exits also catches a global npm
+/// prefix that the current shell does not yet know about.
+fn ensure_cline_installed() -> anyhow::Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    if find_on_path("cline").is_some() {
+        return Ok(());
+    }
+    let npm = find_on_path("npm").ok_or_else(|| {
+        anyhow::anyhow!(
+            "cline is not installed and npm is not on PATH\n\n\
+             Install Node.js from https://nodejs.org/, then re-run:\n  \
+             llmman launch cline"
+        )
+    })?;
+    anyhow::ensure!(
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+        "cline is not installed\n\nInstall it with:\n  npm install -g cline@latest\n\n\
+         Then re-run:\n  llmman launch cline"
+    );
+
+    eprint!("{CLINE_INSTALL_PROMPT}");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    anyhow::ensure!(accepts_install(&answer), CLINE_INSTALL_CANCELLED);
+
+    eprintln!("\nInstalling Cline...");
+    let status = Command::new(&npm)
+        .args(CLINE_NPM_INSTALL_ARGS)
+        .status()
+        .with_context(|| format!("failed to run {}", npm.display()))?;
+    anyhow::ensure!(status.success(), "failed to install cline: {status}");
+    anyhow::ensure!(
+        find_on_path("cline").is_some(),
+        "cline was installed but the binary was not found on PATH\n\n\
+         You may need to restart your shell"
+    );
+    eprintln!("Cline installed successfully\n");
+    Ok(())
+}
+
+fn accepts_install(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+// ---------------------------------------------------------------------------
 // Launch dispatcher
 // ---------------------------------------------------------------------------
 
@@ -613,7 +675,7 @@ fn launch(
         "claude" => launch_claude(model, api_key, extra_args),
         "opencode" => launch_opencode(model, api_key, thinking, vision, extra_args),
         "codex" => launch_codex(model, api_key, vision, context_length, extra_args),
-        "cline" => launch_cline(model, api_key, extra_args),
+        "cline" => launch_cline(model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
         "kimi" => launch_simple("kimi", model, extra_args),
@@ -1782,110 +1844,154 @@ fn goose_fallback(home: &Path) -> Option<PathBuf> {
 // cline
 // ---------------------------------------------------------------------------
 
-/// Cline's built-in `openai-compatible` provider reads this at request
-/// time. Keeping the value in the child environment is important: passing
-/// `--key` would make Cline persist the credential in providers.json.
-const CLINE_API_KEY_ENV: &str = "OPENAI_API_KEY";
-
-/// cline: use an isolated, llmman-owned data directory and a keyless
-/// OpenAI-compatible provider entry. The user's Cline login and provider
-/// settings remain untouched, while provider-routed credentials can still
-/// travel with this one process through `OPENAI_API_KEY`.
-fn launch_cline(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+/// cline: merge llmman's Ollama route into Cline's own settings, then pass
+/// through exactly the arguments supplied after `--`. Cline reads both the
+/// current provider store and legacy global-state fields, so keep them in
+/// sync while preserving unrelated user settings in each file.
+fn launch_cline(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_on_path("cline").ok_or_else(|| anyhow::anyhow!("cline is not installed"))?;
-    let args = cline_args(model, extra_args)?;
-    let effective_model = forwarded_model(extra_args).unwrap_or(model);
-    let root = cline_config_dir()?;
-    let data = root.join("data");
-    let providers = data.join("settings").join("providers.json");
-    let base_url = format!("{}/v1", daemon::server());
-    write_cline_settings(&providers, effective_model, &base_url)?;
-
-    let root = root.to_string_lossy().into_owned();
-    let data = data.to_string_lossy().into_owned();
-    let providers = providers.to_string_lossy().into_owned();
-    exec_with_env(&bin, &args, &cline_env(api_key, &root, &data, &providers))
+    write_cline_settings(model)?;
+    exec_with_env(&bin, extra_args, &[])
 }
 
-/// Flags that could select another endpoint, expose a key to Cline's
-/// persistence layer, or escape the isolated data directory are owned by
-/// llmman. A forwarded model remains allowed and wins over the top-level one.
-fn cline_args(model: &str, extra_args: &[String]) -> anyhow::Result<Vec<String>> {
-    for (long, short) in [
-        ("--provider", Some("-P")),
-        ("--key", Some("-k")),
-        ("--config", None),
-        ("--data-dir", None),
-    ] {
-        if has_flag(extra_args, long, short) {
-            anyhow::bail!(
-                "cline argument {long} is managed by llmman and cannot be passed after --"
-            );
-        }
+fn cline_data_dir() -> anyhow::Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("no home directory")?
+        .join(".cline/data"))
+}
+
+fn write_cline_settings(model: &str) -> anyhow::Result<()> {
+    let server = daemon::server();
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    write_cline_settings_at(&cline_data_dir()?, model, &server, &now)
+}
+
+fn read_cline_json(path: &Path) -> anyhow::Result<(Option<Vec<u8>>, serde_json::Value)> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => Some(raw),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let document = match raw.as_deref().map(|bytes| String::from_utf8_lossy(bytes)) {
+        None => serde_json::json!({}),
+        Some(text) if text.trim().is_empty() => serde_json::json!({}),
+        Some(text) => serde_json::from_str(&text)
+            .with_context(|| format!("parse {} as JSON", path.display()))?,
+    };
+    anyhow::ensure!(
+        document.is_object(),
+        "{} is not a JSON object",
+        path.display()
+    );
+    Ok((raw, document))
+}
+
+/// Writes a changed Cline JSON document atomically, copying the exact prior
+/// bytes to `<name>.json.bak` before replacing it.
+fn write_cline_json(
+    path: &Path,
+    raw: Option<&[u8]>,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> anyhow::Result<()> {
+    if before == after {
+        return Ok(());
     }
-
-    let mut args = Vec::with_capacity(extra_args.len() + 4);
-    args.extend(["--provider".to_string(), "openai-compatible".to_string()]);
-    if !has_flag(extra_args, "--model", Some("-m")) {
-        args.extend(["--model".to_string(), model.to_string()]);
-    }
-    args.extend_from_slice(extra_args);
-    Ok(args)
-}
-
-fn cline_env<'a>(
-    api_key: &'a str,
-    root: &'a str,
-    data: &'a str,
-    providers: &'a str,
-) -> Vec<(&'a str, &'a str)> {
-    vec![
-        ("CLINE_DIR", root),
-        ("CLINE_DATA_DIR", data),
-        ("CLINE_PROVIDER_SETTINGS_PATH", providers),
-        ("CLINE_SESSION_BACKEND_MODE", "local"),
-        // An inherited `1` makes Cline overwrite all paths above with its
-        // sandbox directory during startup, defeating this isolation.
-        ("CLINE_SANDBOX", "0"),
-        // Keep the tested CLI contract stable for the life of this process.
-        ("CLINE_NO_AUTO_UPDATE", "1"),
-        (CLINE_API_KEY_ENV, api_key),
-    ]
-}
-
-/// `~/.config/llmman/launch/cline`, derived from llmman's own config path
-/// so Cline never reads or rewrites the user's `~/.cline` state.
-fn cline_config_dir() -> anyhow::Result<PathBuf> {
-    let conf = crate::config::user_path().context("no home directory")?;
-    let dir = conf.parent().context("llmman.conf has no directory")?;
-    Ok(dir.join("launch").join("cline"))
-}
-
-fn write_cline_settings(path: &Path, model: &str, base_url: &str) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .context("Cline settings path has no directory")?;
     std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    let document = serde_json::json!({
-        "version": 1,
-        "lastUsedProvider": "openai-compatible",
-        "modes": {},
-        "providers": {
-            "openai-compatible": {
-                "settings": {
-                    "provider": "openai-compatible",
-                    "model": model,
-                    "baseUrl": base_url
-                },
-                "updatedAt": "1970-01-01T00:00:00Z",
-                "tokenSource": "manual"
-            }
-        }
-    });
-    let mut contents = serde_json::to_vec_pretty(&document).context("serialize Cline settings")?;
+    if let Some(raw) = raw {
+        let backup = path.with_extension("json.bak");
+        std::fs::write(&backup, raw)
+            .with_context(|| format!("back up {} to {}", path.display(), backup.display()))?;
+    }
+    let mut contents = serde_json::to_vec_pretty(after).context("serialize Cline settings")?;
     contents.push(b'\n');
     crate::fsutil::write_atomic(path, &contents)
         .with_context(|| format!("write {}", path.display()))
+}
+
+fn write_cline_settings_at(
+    data_dir: &Path,
+    model: &str,
+    server: &str,
+    now: &str,
+) -> anyhow::Result<()> {
+    let providers_path = data_dir.join("settings/providers.json");
+    let (providers_raw, mut providers_document) = read_cline_json(&providers_path)?;
+    let providers_before = providers_document.clone();
+    let base_url = format!("{server}/v1");
+    let model_or_base_changed = providers_document
+        .pointer("/providers/ollama/settings/model")
+        .and_then(serde_json::Value::as_str)
+        != Some(model)
+        || providers_document
+            .pointer("/providers/ollama/settings/baseUrl")
+            .and_then(serde_json::Value::as_str)
+            != Some(base_url.as_str());
+
+    let root = providers_document
+        .as_object_mut()
+        .expect("read_cline_json returns an object");
+    root.insert("version".to_string(), serde_json::json!(1));
+    root.insert("lastUsedProvider".to_string(), serde_json::json!("ollama"));
+    let providers = root
+        .entry("providers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("Cline providers is not a JSON object")?;
+    let ollama = providers
+        .entry("ollama")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("Cline providers.ollama is not a JSON object")?;
+    let settings = ollama
+        .entry("settings")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("Cline providers.ollama.settings is not a JSON object")?;
+    settings.insert("provider".to_string(), serde_json::json!("ollama"));
+    settings.insert("model".to_string(), serde_json::json!(model));
+    settings.insert("baseUrl".to_string(), serde_json::json!(base_url));
+    settings.remove("apiKey");
+    ollama.insert("tokenSource".to_string(), serde_json::json!("manual"));
+    if model_or_base_changed {
+        ollama.insert("updatedAt".to_string(), serde_json::json!(now));
+    }
+    write_cline_json(
+        &providers_path,
+        providers_raw.as_deref(),
+        &providers_before,
+        &providers_document,
+    )?;
+
+    let global_state_path = data_dir.join("globalState.json");
+    let (global_raw, mut global_document) = read_cline_json(&global_state_path)?;
+    let global_before = global_document.clone();
+    let global = global_document
+        .as_object_mut()
+        .expect("read_cline_json returns an object");
+    for key in [
+        "ollamaBaseUrl",
+        "actModeOllamaBaseUrl",
+        "planModeOllamaBaseUrl",
+    ] {
+        global.insert(key.to_string(), serde_json::json!(server));
+    }
+    for key in ["actModeApiProvider", "planModeApiProvider"] {
+        global.insert(key.to_string(), serde_json::json!("ollama"));
+    }
+    for key in ["actModeOllamaModelId", "planModeOllamaModelId"] {
+        global.insert(key.to_string(), serde_json::json!(model));
+    }
+    global.insert("welcomeViewCompleted".to_string(), serde_json::json!(true));
+    write_cline_json(
+        &global_state_path,
+        global_raw.as_deref(),
+        &global_before,
+        &global_document,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2447,7 +2553,7 @@ mod tests {
     }
 
     #[test]
-    fn cline_settings_select_the_daemon_without_persisting_a_key() {
+    fn cline_settings_merge_ollama_and_preserve_user_state() {
         let root = std::env::temp_dir().join(format!(
             "llmman-cline-settings-{}-{}",
             std::process::id(),
@@ -2456,98 +2562,115 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let path = root.join("settings/providers.json");
+        let providers_path = root.join("settings/providers.json");
+        let global_path = root.join("globalState.json");
         let model = r#"org/model.\"quoted\""#;
-        write_cline_settings(&path, model, "http://127.0.0.1:17434/v1").unwrap();
+        let providers_original = r#"{
+  "version": 7,
+  "lastUsedProvider": "anthropic",
+  "mine": true,
+  "providers": {
+    "anthropic": { "settings": { "model": "mine" } },
+    "ollama": {
+      "settings": { "provider": "ollama", "model": "old", "baseUrl": "http://old", "apiKey": "delete-me", "keep": 1 },
+      "updatedAt": "2000-01-01T00:00:00Z",
+      "other": true
+    }
+  }
+}"#;
+        let global_original = r#"{"theme":"mine","welcomeViewCompleted":false}"#;
+        std::fs::create_dir_all(providers_path.parent().unwrap()).unwrap();
+        std::fs::write(&providers_path, providers_original).unwrap();
+        std::fs::write(&global_path, global_original).unwrap();
 
-        let text = std::fs::read_to_string(&path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let entry = &parsed["providers"]["openai-compatible"];
+        write_cline_settings_at(
+            &root,
+            model,
+            "http://127.0.0.1:17434",
+            "2026-09-20T06:00:00Z",
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&providers_path).unwrap()).unwrap();
+        let entry = &parsed["providers"]["ollama"];
         assert_eq!(parsed["version"], 1);
-        assert_eq!(parsed["lastUsedProvider"], "openai-compatible");
-        assert_eq!(entry["settings"]["provider"], "openai-compatible");
+        assert_eq!(parsed["lastUsedProvider"], "ollama");
+        assert_eq!(parsed["mine"], true);
+        assert_eq!(
+            parsed["providers"]["anthropic"]["settings"]["model"],
+            "mine"
+        );
+        assert_eq!(entry["settings"]["provider"], "ollama");
         assert_eq!(entry["settings"]["model"], model);
         assert_eq!(entry["settings"]["baseUrl"], "http://127.0.0.1:17434/v1");
-        assert_eq!(entry["tokenSource"], "manual");
+        assert_eq!(entry["settings"]["keep"], 1);
         assert!(entry["settings"].get("apiKey").is_none());
+        assert_eq!(entry["tokenSource"], "manual");
+        assert_eq!(entry["updatedAt"], "2026-09-20T06:00:00Z");
+        assert_eq!(entry["other"], true);
+        assert_eq!(
+            std::fs::read_to_string(root.join("settings/providers.json.bak")).unwrap(),
+            providers_original
+        );
+
+        let global: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&global_path).unwrap()).unwrap();
+        assert_eq!(global["theme"], "mine");
+        assert_eq!(global["ollamaBaseUrl"], "http://127.0.0.1:17434");
+        assert_eq!(global["actModeApiProvider"], "ollama");
+        assert_eq!(global["planModeApiProvider"], "ollama");
+        assert_eq!(global["actModeOllamaModelId"], model);
+        assert_eq!(global["planModeOllamaModelId"], model);
+        assert_eq!(global["actModeOllamaBaseUrl"], "http://127.0.0.1:17434");
+        assert_eq!(global["planModeOllamaBaseUrl"], "http://127.0.0.1:17434");
+        assert_eq!(global["welcomeViewCompleted"], true);
+        assert_eq!(
+            std::fs::read_to_string(root.join("globalState.json.bak")).unwrap(),
+            global_original
+        );
+
+        let providers_written = std::fs::read(&providers_path).unwrap();
+        let global_written = std::fs::read(&global_path).unwrap();
+        write_cline_settings_at(
+            &root,
+            model,
+            "http://127.0.0.1:17434",
+            "2026-09-20T07:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&providers_path).unwrap(), providers_written);
+        assert_eq!(std::fs::read(&global_path).unwrap(), global_written);
+
+        write_cline_settings_at(
+            &root,
+            "new-model",
+            "http://127.0.0.1:17434",
+            "2026-09-20T08:00:00Z",
+        )
+        .unwrap();
+        let changed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&providers_path).unwrap()).unwrap();
+        assert_eq!(
+            changed["providers"]["ollama"]["updatedAt"],
+            "2026-09-20T08:00:00Z"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn cline_env_isolates_all_state_and_carries_the_key_in_memory() {
-        let env = cline_env(
-            "secret-provider-key",
-            "/tmp/llmman/cline",
-            "/tmp/llmman/cline/data",
-            "/tmp/llmman/cline/data/settings/providers.json",
-        );
-        let get = |key| {
-            env.iter()
-                .find(|(name, _)| *name == key)
-                .map(|(_, value)| *value)
-        };
-        assert_eq!(get("CLINE_DIR"), Some("/tmp/llmman/cline"));
-        assert_eq!(get("CLINE_DATA_DIR"), Some("/tmp/llmman/cline/data"));
+    fn cline_install_contract_uses_latest_and_only_yes_accepts() {
+        assert_eq!(CLINE_NPM_INSTALL_ARGS, ["install", "-g", "cline@latest"]);
         assert_eq!(
-            get("CLINE_PROVIDER_SETTINGS_PATH"),
-            Some("/tmp/llmman/cline/data/settings/providers.json")
+            CLINE_INSTALL_PROMPT,
+            "Cline is not installed. Install with npm? [y/N] "
         );
-        assert_eq!(get("CLINE_SESSION_BACKEND_MODE"), Some("local"));
-        assert_eq!(get("CLINE_SANDBOX"), Some("0"));
-        assert_eq!(get("CLINE_NO_AUTO_UPDATE"), Some("1"));
-        assert_eq!(get(CLINE_API_KEY_ENV), Some("secret-provider-key"));
-    }
-
-    #[test]
-    fn cline_args_pin_provider_and_yield_only_the_model() {
-        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(
-            cline_args("m:latest", &args(&["--json", "hi"])).unwrap(),
-            [
-                "--provider",
-                "openai-compatible",
-                "--model",
-                "m:latest",
-                "--json",
-                "hi"
-            ]
-        );
-        assert_eq!(
-            cline_args("m:latest", &args(&["-m", "theirs", "--json", "hi"])).unwrap(),
-            [
-                "--provider",
-                "openai-compatible",
-                "-m",
-                "theirs",
-                "--json",
-                "hi"
-            ]
-        );
-        assert_eq!(
-            cline_args("m:latest", &args(&["--model=theirs"])).unwrap(),
-            ["--provider", "openai-compatible", "--model=theirs"]
-        );
-    }
-
-    #[test]
-    fn cline_args_reject_endpoint_key_and_state_overrides() {
-        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        for forbidden in [
-            vec!["--provider", "openai"],
-            vec!["--provider=openai"],
-            vec!["-P", "openai"],
-            vec!["-P=openai"],
-            vec!["--key", "secret"],
-            vec!["--key=secret"],
-            vec!["-k", "secret"],
-            vec!["-k=secret"],
-            vec!["--config", "other.json"],
-            vec!["--config=other.json"],
-            vec!["--data-dir", "/tmp/elsewhere"],
-            vec!["--data-dir=/tmp/elsewhere"],
-        ] {
-            let error = cline_args("m", &args(&forbidden)).unwrap_err().to_string();
-            assert!(error.contains("managed by llmman"), "{error}");
+        assert_eq!(CLINE_INSTALL_CANCELLED, "cline installation cancelled");
+        for answer in ["y", "Y", "yes", "YES", " yes\n"] {
+            assert!(accepts_install(answer));
+        }
+        for answer in ["", "\n", "n", "no", "yep"] {
+            assert!(!accepts_install(answer));
         }
     }
 
@@ -2557,7 +2680,7 @@ mod tests {
         assert!(MODEL_REQUIRED.contains(&"cline"));
         assert!(MODEL_FLAG_FORWARDED.contains(&"cline"));
         assert!(!PROVIDER_UNSUPPORTED.iter().any(|(id, _)| *id == "cline"));
-        assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"cline"));
+        assert!(PROVIDER_NEEDS_DAEMON_KEY.contains(&"cline"));
         assert!(check_provider_supported("cline").is_ok());
     }
 

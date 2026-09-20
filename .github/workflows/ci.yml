@@ -52,8 +52,9 @@ env:
   GROK_CLI_VERSION: "1.0.34"
   # Official Cline CLI used by launch_e2e's real `launch cline` test.
   # Pinned because its provider-settings schema and CLI flags are the
-  # integration contract under test; bump deliberately.
-  CLINE_CLI_VERSION: "3.0.62"
+  # integration contract under test; 3.0.60-3.0.62 ship a macOS binary
+  # with an invalid signature, while 2.18.0 runs unmodified on macOS.
+  CLINE_CLI_VERSION: "2.18.0"
 
 jobs:
   # --------------------------------------------------------------------------
@@ -946,27 +947,6 @@ jobs:
               if ! npm install -g "$install_spec"; then
                 echo "::warning::$pkg_name install failed on ${{ runner.os }} (attempt $attempt/$max_attempts); $next"
               else
-                # Cline 3.0.62's published macOS Mach-O has an invalid
-                # embedded ad-hoc signature and is killed with status 137
-                # before `--version` can run. Re-sign both the wrapper's
-                # cached copy and its platform-package fallback. This is
-                # confined to CI's npm install; shipped llmman code never
-                # modifies another program.
-                if [ "$bin" = cline ] && [ "${{ runner.os }}" = macOS ]; then
-                  global_root=$(npm root -g)
-                  case "${{ runner.arch }}" in
-                    ARM64) cline_arch=arm64 ;;
-                    X64) cline_arch=x64 ;;
-                    *) cline_arch=unknown ;;
-                  esac
-                  for cline_binary in \
-                    "$global_root/cline/bin/.cline" \
-                    "$global_root/@cline/cli-darwin-$cline_arch/bin/cline"; do
-                    if [ -f "$cline_binary" ]; then
-                      codesign --force --sign - "$cline_binary"
-                    fi
-                  done
-                fi
                 if version_output=$("$bin" --version 2>&1); then
                   return 0
                 fi
@@ -985,7 +965,7 @@ jobs:
           install_cli "opencode-ai" "opencode-ai" "opencode"
           install_cli "@openai/codex" "@openai/codex" "codex"
           # Pinned: launch_cline depends on this release's provider-settings
-          # schema and openai-compatible CLI flags.
+          # schema and headless JSON/yolo flags.
           install_cli "cline@${CLINE_CLI_VERSION}" "cline" "cline"
           # Pinned (not @latest): tests/launch_e2e.rs's qwen test relies on
           # this release's tool set under --safe-mode and on the
