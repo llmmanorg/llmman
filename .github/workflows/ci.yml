@@ -755,7 +755,7 @@ jobs:
     # budget (10 min, same 600s as warm_model's) — it doesn't go through
     # launch_and_assert's retry loop at all (a real failure there is
     # always a deterministic llmman bug worth failing loudly on, not
-    # small-model sampling variance), so unlike the 9 launch tests above
+    # small-model sampling variance), so unlike the 11 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
     #
     # +60 more for `serve_vllm_safetensors_model` and
