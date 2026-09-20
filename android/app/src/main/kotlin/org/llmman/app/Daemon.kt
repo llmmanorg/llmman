@@ -3,11 +3,13 @@ package org.llmman.app
 import android.content.Context
 import android.system.ErrnoException
 import android.system.Os
+import android.util.Base64
 import android.util.Log
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.SecureRandom
 
 /**
  * One `llmman serve` child process and the filesystem it needs.
@@ -18,8 +20,13 @@ import java.net.URL
  * finds `llama-server` through a symlink on PATH (the kernel resolves the
  * link; SELinux checks the target), and the shared objects through
  * `LD_LIBRARY_PATH` (llama.cpp's Android build carries no RUNPATH).
+ *
+ * Loopback is shared by every app on the phone, and the daemon offers a
+ * shell, so it runs with an API key ([apiKey]) that only this app knows:
+ * the WebView is handed it at document start, `llmman` in the Shell tab
+ * gets it as `LLMMAN_API_KEY`, and anything else on 127.0.0.1 gets a 401.
  */
-class Daemon(context: Context) {
+class Daemon(private val context: Context) {
     private val nativeDir = File(context.applicationInfo.nativeLibraryDir)
 
     /** `$HOME`: the daemon puts its store under `~/.local/share/llmman`. */
@@ -54,6 +61,10 @@ class Daemon(context: Context) {
             put("SHELL", "/system/bin/sh")
             put("LLMMAN_SHELL", "/system/bin/sh")
             put("LLMMAN_HOST", "127.0.0.1:$PORT")
+            val key = apiKey(context)
+            put("LLMMAN_API_KEYS", key)
+            // The CLI's own key, so `llmman ps` works in the Shell tab.
+            put("LLMMAN_API_KEY", key)
             // Bionic's getpwuid() gives app UIDs a placeholder; tools that
             // ask for a user name (Go's os/user, git) prefer these.
             put("USER", "llmman")
@@ -89,6 +100,7 @@ class Daemon(context: Context) {
                 connectTimeout = 1000
                 readTimeout = 1000
                 requestMethod = "GET"
+                setRequestProperty("Authorization", "Bearer ${apiKey(context)}")
             }
         } catch (e: IOException) {
             return false
@@ -155,5 +167,25 @@ class Daemon(context: Context) {
         private const val STOP_GRACE_MS = 5000L
         private const val LOG_ROTATE_BYTES = 2L * 1024 * 1024
         fun logFile(context: Context): File = File(context.filesDir, "serve.log")
+
+        private val keyLock = Any()
+
+        /**
+         * This install's API key, generated once (256 bits, base64url) into
+         * the app's private files — which no other app can read — and
+         * reused for the life of the install. The Service and the Activity
+         * both call this; the lock keeps the first call the only writer.
+         */
+        fun apiKey(context: Context): String = synchronized(keyLock) {
+            val file = File(context.filesDir, "api-key")
+            val existing = if (file.isFile) file.readText().trim() else ""
+            if (existing.isNotEmpty()) return existing
+            val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val key = Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+            val tmp = File(file.path + ".tmp")
+            tmp.writeText(key)
+            if (!tmp.renameTo(file)) throw IOException("rename ${tmp.path}")
+            key
+        }
     }
 }

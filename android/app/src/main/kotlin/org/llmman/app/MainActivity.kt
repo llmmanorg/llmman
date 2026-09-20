@@ -33,6 +33,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.addCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -68,6 +69,26 @@ class MainActivity : ComponentActivity() {
 
     private val requestNotifications =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    /** Bytes awaiting the ACTION_CREATE_DOCUMENT result (API 28 saves). */
+    private var pendingSave: ByteArray? = null
+
+    private val createDocument = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val bytes = pendingSave ?: return@registerForActivityResult
+        pendingSave = null
+        val uri = result.data?.data ?: return@registerForActivityResult
+        Thread {
+            try {
+                contentResolver.openOutputStream(uri)?.use { it.write(bytes) } ?: throw IOException("cannot open $uri")
+                runOnUiThread {
+                    Toast.makeText(this, getString(R.string.download_saved, uri.lastPathSegment ?: ""), Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: IOException) {
+                Log.w(Daemon.TAG, "save to $uri failed", e)
+                runOnUiThread { Toast.makeText(this, R.string.download_failed, Toast.LENGTH_SHORT).show() }
+            }
+        }.start()
+    }
 
     private val stateListener: (LlmmanService.State) -> Unit = { onState(it) }
 
@@ -153,8 +174,9 @@ class MainActivity : ComponentActivity() {
             allowContentAccess = false
         }
         webView.addJavascriptInterface(Bridge(), "LlmmanAndroid")
+        val startScript = startScript(Daemon.apiKey(this))
         val startScriptInjected = if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-            WebViewCompat.addDocumentStartJavaScript(webView, DOWNLOAD_NAME_SCRIPT, setOf(Daemon.BASE_URL.trimEnd('/')))
+            WebViewCompat.addDocumentStartJavaScript(webView, startScript, setOf(Daemon.BASE_URL.trimEnd('/')))
             true
         } else {
             false
@@ -164,7 +186,7 @@ class MainActivity : ComponentActivity() {
                 // Older WebViews: before the page's own module scripts run
                 // is the best available approximation of document start.
                 if (!startScriptInjected && isOurOrigin(Uri.parse(url))) {
-                    view.evaluateJavascript(DOWNLOAD_NAME_SCRIPT, null)
+                    view.evaluateJavascript(startScript, null)
                 }
             }
 
@@ -285,14 +307,20 @@ class MainActivity : ComponentActivity() {
         val request = DownloadManager.Request(Uri.parse(url))
             .setMimeType(mimeType)
             .setTitle(name)
-            .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
             .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
+        } else {
+            // Below Q the public directory needs WRITE_EXTERNAL_STORAGE,
+            // which the app does not ask for.
+            request.setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, name)
+        }
         getSystemService(DownloadManager::class.java).enqueue(request)
     }
 
     /** Reads the blob in-page and hands it to [Bridge.saveBlob] as base64. */
     private fun blobToBridgeScript(url: String, fallbackName: String, mimeType: String?): String {
-        fun js(s: String) = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+        val js = ::jsString
         return """
             (async () => {
               try {
@@ -322,9 +350,24 @@ class MainActivity : ComponentActivity() {
                 return
             }
             val safeName = File(name).name.ifBlank { "download" }
+            val type = mimeType.ifBlank { "application/octet-stream" }
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                // No MediaStore.Downloads before Q and no storage permission
+                // requested: the user picks where it goes.
+                pendingSave = bytes
+                runOnUiThread {
+                    createDocument.launch(
+                        Intent(Intent.ACTION_CREATE_DOCUMENT)
+                            .addCategory(Intent.CATEGORY_OPENABLE)
+                            .setType(type)
+                            .putExtra(Intent.EXTRA_TITLE, safeName),
+                    )
+                }
+                return
+            }
             Thread {
                 try {
-                    writeToDownloads(safeName, mimeType.ifBlank { "application/octet-stream" }, bytes)
+                    writeToDownloads(safeName, type, bytes)
                     runOnUiThread {
                         Toast.makeText(this@MainActivity, getString(R.string.download_saved, safeName), Toast.LENGTH_SHORT).show()
                     }
@@ -345,6 +388,19 @@ class MainActivity : ComponentActivity() {
     }
 
     private companion object {
+        /**
+         * Runs before any page script: stores the daemon's API key where
+         * webui/api.js reads it (the same localStorage key it would write
+         * after asking the user), then [DOWNLOAD_NAME_SCRIPT].
+         */
+        fun startScript(apiKey: String): String = """
+            try {
+              localStorage.setItem("llmman.apiKey:" + new URL(document.baseURI).pathname, ${jsString(apiKey)});
+            } catch (e) {}
+        """.trimIndent() + "\n" + DOWNLOAD_NAME_SCRIPT
+
+        fun jsString(s: String) = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
         /**
          * Remembers the `download` attribute of every blob: anchor clicked,
          * by href, so the DownloadListener can name the file the way the
@@ -369,27 +425,21 @@ class MainActivity : ComponentActivity() {
         """.trimIndent()
     }
 
+    /** Into the public Downloads collection, no permission needed on Q+. */
+    @RequiresApi(Build.VERSION_CODES.Q)
     @Throws(IOException::class)
     private fun writeToDownloads(name: String, mimeType: String, bytes: ByteArray) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val values = ContentValues().apply {
-                put(MediaStore.Downloads.DISPLAY_NAME, name)
-                put(MediaStore.Downloads.MIME_TYPE, mimeType)
-                put(MediaStore.Downloads.IS_PENDING, 1)
-            }
-            val resolver = contentResolver
-            val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: throw IOException("MediaStore refused $name")
-            resolver.openOutputStream(uri)?.use { it.write(bytes) } ?: throw IOException("cannot open $uri")
-            values.clear()
-            values.put(MediaStore.Downloads.IS_PENDING, 0)
-            resolver.update(uri, values, null, null)
-        } else {
-            // API 28: no scoped storage yet and no WRITE_EXTERNAL_STORAGE
-            // requested, so the app's own external dir is what is writable.
-            val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-                ?: throw IOException("no external storage")
-            File(dir, name).writeBytes(bytes)
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, name)
+            put(MediaStore.Downloads.MIME_TYPE, mimeType)
+            put(MediaStore.Downloads.IS_PENDING, 1)
         }
+        val resolver = contentResolver
+        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: throw IOException("MediaStore refused $name")
+        resolver.openOutputStream(uri)?.use { it.write(bytes) } ?: throw IOException("cannot open $uri")
+        values.clear()
+        values.put(MediaStore.Downloads.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
     }
 }

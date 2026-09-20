@@ -87,7 +87,9 @@ class LlmmanService : Service() {
             notification(getString(R.string.notification_starting)),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
         )
-        if (supervisor == null) {
+        // A supervisor that gave up (Failed) or was stopped is dead but still
+        // referenced; Retry must get a new one.
+        if (supervisor?.isAlive != true) {
             stopping = false
             supervisor = Thread(::supervise, "llmman-supervisor").also { it.start() }
         }
@@ -105,7 +107,10 @@ class LlmmanService : Service() {
             } catch (e: IOException) {
                 Log.e(Daemon.TAG, "cannot start daemon", e)
                 State.publish(State.Failed(e.message ?: e.toString()))
-                break
+                notify(getString(R.string.notification_failed))
+                // Failed stays the visible state; the loop ends without
+                // publishing Stopped so the reason is what the user sees.
+                return
             }
             val healthy = waitForHealth(proc)
             if (healthy) {
@@ -157,7 +162,9 @@ class LlmmanService : Service() {
     override fun onDestroy() {
         stopping = true
         supervisor?.interrupt()
-        daemon.stop()
+        // stop() waits up to STOP_GRACE_MS for the SIGTERM to take; not on
+        // the main thread.
+        Thread { daemon.stop() }.start()
         State.publish(State.Stopped)
         super.onDestroy()
     }

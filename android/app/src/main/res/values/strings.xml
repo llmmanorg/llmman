@@ -6,6 +6,7 @@
     <string name="notification_starting">Starting server…</string>
     <string name="notification_running">Server running on 127.0.0.1:17434</string>
     <string name="notification_restarting">Server exited, restarting…</string>
+    <string name="notification_failed">Server could not start</string>
     <string name="notification_stop">Stop</string>
     <string name="status_starting">Starting llmman…</string>
     <string name="status_waiting">Waiting for the server…</string>
@@ -14,6 +15,6 @@
     <string name="action_retry">Retry</string>
     <string name="action_show_log">Show log</string>
     <string name="action_hide_log">Hide log</string>
-    <string name="download_saved">Saved to Downloads: %1$s</string>
+    <string name="download_saved">Saved %1$s</string>
     <string name="download_failed">Could not save download</string>
 </resources>

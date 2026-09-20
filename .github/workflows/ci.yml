@@ -391,13 +391,16 @@ jobs:
           yes 2>/dev/null | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ANDROID_NDK_VERSION" "platforms;android-35" "build-tools;35.0.0"
 
+      # The signing key reaches only the push-to-main run that releases:
+      # a same-repository PR runs the PR's own Gradle scripts, which would
+      # otherwise see it. Everything else builds debug-signed.
       - name: Build APK
         working-directory: android
         env:
-          LLMMAN_ANDROID_KEYSTORE: ${{ secrets.LLMMAN_ANDROID_KEYSTORE }}
-          LLMMAN_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.LLMMAN_ANDROID_KEYSTORE_PASSWORD }}
-          LLMMAN_ANDROID_KEY_ALIAS: ${{ secrets.LLMMAN_ANDROID_KEY_ALIAS }}
-          LLMMAN_ANDROID_KEY_PASSWORD: ${{ secrets.LLMMAN_ANDROID_KEY_PASSWORD }}
+          LLMMAN_ANDROID_KEYSTORE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.LLMMAN_ANDROID_KEYSTORE || '' }}
+          LLMMAN_ANDROID_KEYSTORE_PASSWORD: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.LLMMAN_ANDROID_KEYSTORE_PASSWORD || '' }}
+          LLMMAN_ANDROID_KEY_ALIAS: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.LLMMAN_ANDROID_KEY_ALIAS || '' }}
+          LLMMAN_ANDROID_KEY_PASSWORD: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.LLMMAN_ANDROID_KEY_PASSWORD || '' }}
         run: ./gradlew --no-daemon assembleRelease
 
       # The APK must carry this commit's version and the full native

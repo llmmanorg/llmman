@@ -32,15 +32,18 @@ app.
 
 Everything the web UI can do on a desktop works here: *Pull a model…* with
 any reference `llmman pull` takes (`docker.io/ai/…`, `hf.co/…`, …), chat
-with streaming replies, the model picker, Export chats (into Downloads),
-and the *Shell* tab — a `/system/bin/sh` in the app's sandbox, with
+with streaming replies, the model picker, Export chats (into Downloads;
+on Android 9 a file picker asks where), and the *Shell* tab — a `/system/bin/sh` in the app's sandbox, with
 `llmman` on `PATH`. Diffusion models are not supported: the mediagen
 backend needs GPU libraries the phone lacks.
 
-The daemon binds loopback only, so nothing else on the phone or the
-network can reach it; the app exposes no `LLMMAN_HOST` setting. Other
-apps on the same phone can, at `http://127.0.0.1:17434` — the Ollama,
-OpenAI, Anthropic and Gemini APIs from [api.md](api.md), no key.
+The daemon binds loopback only, which keeps the network out but not other
+apps on the phone — Android's loopback is shared. So it runs with an API
+key ([api.md](api.md#authentication)) generated once per install into the
+app's private files: the WebView is handed it before the page loads, the
+Shell tab's `llmman` has it as `LLMMAN_API_KEY`, and any other app that
+connects to `127.0.0.1:17434` gets a `401`. There is no setting to expose
+the API or change the bind address.
 
 Model storage is the app's private data (`Android/data` is not used) and
 is removed with the app or by *Clear storage*. Conversations live in the
@@ -49,7 +52,7 @@ WebView's IndexedDB, as in a browser.
 ## Building
 
 Needs, in addition to the [usual build tools](../README.md#install) (Rust,
-Go 1.22+): a JDK 17, the Android SDK with `platforms;android-35`,
+Go 1.25+): a JDK 17, the Android SDK with `platforms;android-35`,
 `build-tools;35.0.0` and `ndk;27.2.12479018` (Android Studio or
 `sdkmanager` installs them), `rustup target add aarch64-linux-android` and
 `cargo install cargo-ndk`.

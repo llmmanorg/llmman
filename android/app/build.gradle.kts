@@ -36,6 +36,9 @@ val generatedAssetsDir: Provider<Directory> = layout.buildDirectory.dir("generat
 val cargoTarget = "aarch64-linux-android"
 val cargoOutDir: File = repoRoot.resolve("target/$cargoTarget/release")
 
+val releaseKeystoreBase64: Provider<String> = providers.environmentVariable("LLMMAN_ANDROID_KEYSTORE")
+val releaseKeystore: Provider<RegularFile> = layout.buildDirectory.file("release.keystore")
+
 android {
     namespace = "org.llmman.app"
     compileSdk = 35
@@ -55,16 +58,15 @@ android {
     // CI passes a release key through LLMMAN_ANDROID_* (see ci.yml's
     // android job). Without one the release APK is debug-signed: it still
     // installs by sideload, just not on top of a release-signed install.
-    val keystoreBase64 = System.getenv("LLMMAN_ANDROID_KEYSTORE")
-    if (!keystoreBase64.isNullOrBlank()) {
+    // The keystore file itself is written by the writeKeystore task below,
+    // not here: configuration is skipped on a configuration-cache hit, so
+    // a file written during it would be missing after `clean`.
+    if (releaseKeystoreBase64.orNull?.isNotBlank() == true) {
         signingConfigs.create("release") {
-            val keystore = layout.buildDirectory.file("release.keystore").get().asFile
-            keystore.parentFile.mkdirs()
-            keystore.writeBytes(Base64.getDecoder().decode(keystoreBase64.trim()))
-            storeFile = keystore
-            storePassword = System.getenv("LLMMAN_ANDROID_KEYSTORE_PASSWORD")
-            keyAlias = System.getenv("LLMMAN_ANDROID_KEY_ALIAS")
-            keyPassword = System.getenv("LLMMAN_ANDROID_KEY_PASSWORD")
+            storeFile = releaseKeystore.get().asFile
+            storePassword = providers.environmentVariable("LLMMAN_ANDROID_KEYSTORE_PASSWORD").orNull
+            keyAlias = providers.environmentVariable("LLMMAN_ANDROID_KEY_ALIAS").orNull
+            keyPassword = providers.environmentVariable("LLMMAN_ANDROID_KEY_PASSWORD").orNull
         }
     }
 
@@ -175,6 +177,10 @@ val stageLlmman by tasks.registering {
     dependsOn(buildLlmman)
     val dest = nativeLibsDir
     val out = cargoOutDir
+    // With outputs alone Gradle would call this up-to-date while cargo had
+    // rebuilt the binary underneath it; the inputs are what cargo wrote.
+    inputs.file(out.resolve("llmman"))
+    inputs.files(fileTree(out.resolve("build")) { include("llmman-*/out/libllmman_shim.so") })
     outputs.dir(dest)
     doLast {
         val destDir = dest.get().asFile.also { it.mkdirs() }
@@ -190,6 +196,22 @@ val stageLlmman by tasks.registering {
     }
 }
 
+// ── Release keystore from the environment, as a task so it exists
+// whenever signing runs (see the signingConfigs comment). ─────────────────
+val writeKeystore by tasks.registering {
+    description = "Decode LLMMAN_ANDROID_KEYSTORE into build/"
+    val encoded = releaseKeystoreBase64
+    val target = releaseKeystore
+    onlyIf { encoded.orNull?.isNotBlank() == true }
+    inputs.property("keystore", encoded).optional(true)
+    outputs.file(target)
+    doLast {
+        val out = target.get().asFile
+        out.parentFile.mkdirs()
+        out.writeBytes(Base64.getDecoder().decode(encoded.get().trim()))
+    }
+}
+
 tasks.named("preBuild") {
-    dependsOn(stageLlamaCpp, stageLlamaCppLicense, stageLlmman)
+    dependsOn(stageLlamaCpp, stageLlamaCppLicense, stageLlmman, writeKeystore)
 }
