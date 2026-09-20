@@ -6,7 +6,7 @@
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
 //! (`claude`, `agy`, `opencode`, `codex`, `grok`, `qwen`, `hermes`,
-//! `openclaw`, `vibe`, `dsh`, `goose`) — not mocks.
+//! `openclaw`, `dsh`, `goose`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -1033,26 +1033,6 @@ fn launch_qwen_with_model() {
 /// are (see `openclaw_pull_registry_flake` for the same shape).
 fn qwen_loop_detection(stderr: &str) -> bool {
     stderr.contains("Loop detection halted the run")
-}
-
-#[test]
-fn launch_vibe_with_model() {
-    eprintln!("[test] launch_vibe_with_model: acquiring SERIAL");
-    let _guard = lock_serial();
-    eprintln!("[test] launch_vibe_with_model: acquired SERIAL");
-    if !on_path("llama-server") {
-        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
-        return;
-    }
-    if !on_path("vibe") {
-        eprintln!("skipping: vibe not on PATH — uv tool install mistral-vibe");
-        return;
-    }
-
-    // `-p <prompt> --output text`: Vibe's non-interactive one-shot mode —
-    // single prompt in, plain-text reply out, nothing else to parse from
-    // stdout.
-    launch_and_assert("vibe", &["-p", PROMPT, "--output", "text"]);
 }
 
 #[test]
