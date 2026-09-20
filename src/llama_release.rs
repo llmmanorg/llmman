@@ -204,6 +204,21 @@ struct AssetQuery {
     label: String,
 }
 
+/// Windows CUDA's companion is `cudart-llama-bin-win-cuda-<ver>-<arch>.zip`,
+/// whose name contains the primary's `-bin-win-cuda-<ver>-<arch>.zip`, so a
+/// bare [`find_asset`] can return the runtime-DLL bundle — which carries no
+/// llama-server — depending only on the order the release lists assets in.
+/// The primary is therefore the match that is not the companion.
+fn find_primary_asset<'a>(release: &'a Release, query: &AssetQuery) -> Option<&'a Asset> {
+    release.assets.iter().find(|a| {
+        a.name.contains(&query.must_contain)
+            && match &query.companion_must_contain {
+                Some(companion) => !a.name.contains(companion.as_str()),
+                None => true,
+            }
+    })
+}
+
 fn host_arch_token() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "x64",
@@ -763,7 +778,7 @@ fn try_ensure_from_network(
 
     let cached = |dest: &Path| crate::managed::completed_binary(dest, bin_name);
     let bin = crate::managed::ensure(&install_root()?, &dest, "llama.cpp", cached, |dest| {
-        let asset = find_asset(&release, &query.must_contain)
+        let asset = find_primary_asset(&release, query)
             .with_context(|| {
                 format!(
                     "no {} llama.cpp release asset found in {tag} (looked for a name containing {:?})",
@@ -948,6 +963,68 @@ mod tests {
             "llama-b10360-bin-ubuntu-rocm-7.14-x64.tar.gz"
         );
         assert!(find_asset(&release, "-bin-win-cpu-x64.zip").is_none());
+    }
+
+    #[test]
+    fn primary_cuda_asset_is_never_the_cudart_companion() {
+        // The companion sorts ahead of the build it accompanies in the
+        // release's own asset list, which is what made a plain substring
+        // match download 391 MB of runtime DLLs and then report
+        // "llama-server binary not found".
+        let release = Release {
+            tag_name: "b10951".into(),
+            assets: vec![
+                Asset {
+                    name: "cudart-llama-bin-win-cuda-13.3-x64.zip".into(),
+                    browser_download_url: String::new(),
+                },
+                Asset {
+                    name: "llama-b10951-bin-win-cuda-13.3-x64.zip".into(),
+                    browser_download_url: String::new(),
+                },
+            ],
+        };
+        let query = AssetQuery {
+            must_contain: "-bin-win-cuda-13.3-x64.zip".into(),
+            companion_must_contain: Some("cudart-llama-bin-win-cuda-13.3-x64.zip".into()),
+            label: "cuda-13.3".into(),
+        };
+        // The trap this guards: a plain substring match selects the
+        // companion, because its name embeds the primary's.
+        assert_eq!(
+            find_asset(&release, &query.must_contain).unwrap().name,
+            "cudart-llama-bin-win-cuda-13.3-x64.zip"
+        );
+        assert_eq!(
+            find_primary_asset(&release, &query).unwrap().name,
+            "llama-b10951-bin-win-cuda-13.3-x64.zip"
+        );
+        assert_eq!(
+            find_asset(&release, query.companion_must_contain.as_ref().unwrap())
+                .unwrap()
+                .name,
+            "cudart-llama-bin-win-cuda-13.3-x64.zip"
+        );
+    }
+
+    #[test]
+    fn primary_asset_without_a_companion_matches_the_only_build() {
+        let release = Release {
+            tag_name: "b10951".into(),
+            assets: vec![Asset {
+                name: "llama-b10951-bin-win-vulkan-x64.zip".into(),
+                browser_download_url: String::new(),
+            }],
+        };
+        let query = AssetQuery {
+            must_contain: "-bin-win-vulkan-x64.zip".into(),
+            companion_must_contain: None,
+            label: "vulkan".into(),
+        };
+        assert_eq!(
+            find_primary_asset(&release, &query).unwrap().name,
+            "llama-b10951-bin-win-vulkan-x64.zip"
+        );
     }
 
     #[test]
