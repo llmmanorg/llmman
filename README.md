@@ -291,7 +291,10 @@ support. llmman writes Gemini mode to its own stable settings directory at
 Cline is tested against CLI 2.18.0. llmman backs up and merges the Ollama
 provider into Cline's own `~/.cline/data/settings/providers.json` and
 `globalState.json`, preserving other providers and settings. Arguments after
-`--` are passed to Cline unchanged.
+`--` are passed to Cline unchanged. On macOS, the install prompt uses 2.18.0
+because the current `latest` package has an invalid executable signature;
+other platforms install `cline@latest`. A new install must also pass
+`cline --version` before launch continues.
 
 ### Hosted providers
 

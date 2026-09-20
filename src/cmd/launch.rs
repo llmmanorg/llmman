@@ -595,9 +595,22 @@ fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
 // Cline install on demand
 // ---------------------------------------------------------------------------
 
-const CLINE_NPM_INSTALL_ARGS: &[&str] = &["install", "-g", "cline@latest"];
+const CLINE_NPM_LATEST_ARGS: &[&str] = &["install", "-g", "cline@latest"];
+const CLINE_NPM_MACOS_ARGS: &[&str] = &["install", "-g", "cline@2.18.0"];
 const CLINE_INSTALL_PROMPT: &str = "Cline is not installed. Install with npm? [y/N] ";
 const CLINE_INSTALL_CANCELLED: &str = "cline installation cancelled";
+
+fn cline_npm_install_args(macos: bool) -> &'static [&'static str] {
+    if macos {
+        // 3.0.60 through the current 3.0.62 `latest` publish an invalidly
+        // signed macOS executable (killed with status 137 before main).
+        // 2.18.0 is the newest release verified to run without modifying
+        // another program's signature; CI exercises this same version.
+        CLINE_NPM_MACOS_ARGS
+    } else {
+        CLINE_NPM_LATEST_ARGS
+    }
+}
 
 /// Offers the official npm install when Cline is missing. This runs before
 /// the daemon starts, so declining or lacking npm has no model-pull side
@@ -630,14 +643,23 @@ fn ensure_cline_installed() -> anyhow::Result<()> {
 
     eprintln!("\nInstalling Cline...");
     let status = Command::new(&npm)
-        .args(CLINE_NPM_INSTALL_ARGS)
+        .args(cline_npm_install_args(cfg!(target_os = "macos")))
         .status()
         .with_context(|| format!("failed to run {}", npm.display()))?;
     anyhow::ensure!(status.success(), "failed to install cline: {status}");
-    anyhow::ensure!(
-        find_on_path("cline").is_some(),
-        "cline was installed but the binary was not found on PATH\n\n\
+    let cline = find_on_path("cline").ok_or_else(|| {
+        anyhow::anyhow!(
+            "cline was installed but the binary was not found on PATH\n\n\
          You may need to restart your shell"
+        )
+    })?;
+    let version = Command::new(&cline)
+        .arg("--version")
+        .status()
+        .with_context(|| format!("failed to run {} --version", cline.display()))?;
+    anyhow::ensure!(
+        version.success(),
+        "cline was installed but failed to start ({version})"
     );
     eprintln!("Cline installed successfully\n");
     Ok(())
@@ -2659,8 +2681,15 @@ mod tests {
     }
 
     #[test]
-    fn cline_install_contract_uses_latest_and_only_yes_accepts() {
-        assert_eq!(CLINE_NPM_INSTALL_ARGS, ["install", "-g", "cline@latest"]);
+    fn cline_install_contract_selects_safe_macos_version_and_only_yes_accepts() {
+        assert_eq!(
+            cline_npm_install_args(false),
+            ["install", "-g", "cline@latest"]
+        );
+        assert_eq!(
+            cline_npm_install_args(true),
+            ["install", "-g", "cline@2.18.0"]
+        );
         assert_eq!(
             CLINE_INSTALL_PROMPT,
             "Cline is not installed. Install with npm? [y/N] "
