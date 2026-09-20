@@ -70,24 +70,42 @@ class MainActivity : ComponentActivity() {
     private val requestNotifications =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
-    /** Bytes awaiting the ACTION_CREATE_DOCUMENT result (API 28 saves). */
-    private var pendingSave: ByteArray? = null
+    private class PendingSave(val name: String, val mimeType: String, val bytes: ByteArray)
+
+    /**
+     * API 28 saves go through ACTION_CREATE_DOCUMENT, one picker at a time:
+     * the launcher has a single result callback, so saves queue here (main
+     * thread only) and the head is the one whose picker is showing.
+     */
+    private val pendingSaves = ArrayDeque<PendingSave>()
 
     private val createDocument = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        val bytes = pendingSave ?: return@registerForActivityResult
-        pendingSave = null
+        val save = pendingSaves.removeFirstOrNull()
+        launchNextSavePicker()
+        if (save == null) return@registerForActivityResult
         val uri = result.data?.data ?: return@registerForActivityResult
         Thread {
             try {
-                contentResolver.openOutputStream(uri)?.use { it.write(bytes) } ?: throw IOException("cannot open $uri")
+                contentResolver.openOutputStream(uri)?.use { it.write(save.bytes) } ?: throw IOException("cannot open $uri")
                 runOnUiThread {
-                    Toast.makeText(this, getString(R.string.download_saved, uri.lastPathSegment ?: ""), Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, getString(R.string.download_saved, save.name), Toast.LENGTH_SHORT).show()
                 }
             } catch (e: IOException) {
-                Log.w(Daemon.TAG, "save to $uri failed", e)
+                Log.w(Daemon.TAG, "save ${save.name} to $uri failed", e)
                 runOnUiThread { Toast.makeText(this, R.string.download_failed, Toast.LENGTH_SHORT).show() }
             }
         }.start()
+    }
+
+    /** Main thread. Shows the picker for the queue's head if none is up. */
+    private fun launchNextSavePicker() {
+        val head = pendingSaves.firstOrNull() ?: return
+        createDocument.launch(
+            Intent(Intent.ACTION_CREATE_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType(head.mimeType)
+                .putExtra(Intent.EXTRA_TITLE, head.name),
+        )
     }
 
     private val stateListener: (LlmmanService.State) -> Unit = { onState(it) }
@@ -228,10 +246,13 @@ class MainActivity : ComponentActivity() {
         // which no system component can fetch: only the page can read them.
         // The WebView also drops the anchor's `download` name for those
         // (empty Content-Disposition), so DOWNLOAD_NAME_SCRIPT keeps it.
+        // Daemon URLs go the same way: the page holds the API key and adds
+        // it to its fetch, where DownloadManager would get a 401. Only a
+        // foreign host's attachment goes to DownloadManager, without the key.
         webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
             val name = URLUtil.guessFileName(url, contentDisposition, mimeType)
-            if (url.startsWith("blob:")) {
-                webView.evaluateJavascript(blobToBridgeScript(url, name, mimeType), null)
+            if (url.startsWith("blob:") || isOurOrigin(Uri.parse(url))) {
+                webView.evaluateJavascript(fetchToBridgeScript(url, name, mimeType), null)
             } else {
                 downloadViaManager(url, name, mimeType)
             }
@@ -318,14 +339,25 @@ class MainActivity : ComponentActivity() {
         getSystemService(DownloadManager::class.java).enqueue(request)
     }
 
-    /** Reads the blob in-page and hands it to [Bridge.saveBlob] as base64. */
-    private fun blobToBridgeScript(url: String, fallbackName: String, mimeType: String?): String {
+    /**
+     * Fetches `url` in-page — a blob: URL, or a daemon URL with the page's
+     * own API key — and hands the bytes to [Bridge.saveBlob] as base64.
+     */
+    private fun fetchToBridgeScript(url: String, fallbackName: String, mimeType: String?): String {
         val js = ::jsString
         return """
             (async () => {
               try {
                 const name = (window.__llmmanDownloadName && window.__llmmanDownloadName(${js(url)})) || ${js(fallbackName)};
-                const blob = await (await fetch(${js(url)})).blob();
+                const url = ${js(url)};
+                const headers = {};
+                if (!url.startsWith("blob:")) {
+                  const key = localStorage.getItem("llmman.apiKey:" + new URL(document.baseURI).pathname);
+                  if (key) headers["Authorization"] = "Bearer " + key;
+                }
+                const res = await fetch(url, { headers });
+                if (!res.ok) throw new Error("HTTP " + res.status);
+                const blob = await res.blob();
                 const buf = new Uint8Array(await blob.arrayBuffer());
                 let bin = "";
                 for (let i = 0; i < buf.length; i += 0x8000) {
@@ -354,14 +386,9 @@ class MainActivity : ComponentActivity() {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
                 // No MediaStore.Downloads before Q and no storage permission
                 // requested: the user picks where it goes.
-                pendingSave = bytes
                 runOnUiThread {
-                    createDocument.launch(
-                        Intent(Intent.ACTION_CREATE_DOCUMENT)
-                            .addCategory(Intent.CATEGORY_OPENABLE)
-                            .setType(type)
-                            .putExtra(Intent.EXTRA_TITLE, safeName),
-                    )
+                    pendingSaves.addLast(PendingSave(safeName, type, bytes))
+                    if (pendingSaves.size == 1) launchNextSavePicker()
                 }
                 return
             }
