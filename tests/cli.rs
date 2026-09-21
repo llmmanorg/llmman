@@ -7,7 +7,7 @@ fn llmman() -> Command {
 }
 
 /// A bare `llmman` prints help and exits 0 (clap's default for a missing
-/// subcommand is 2, which winget's package validator flags as an error).
+/// subcommand is 2, which package validators flag as a broken install).
 #[test]
 fn bare_invocation_prints_help_and_exits_0() {
     let out = llmman().output().expect("spawn llmman");

@@ -1,4 +1,4 @@
-# GENERATED FILE -- DO NOT EDIT. Rendered from packaging/homebrew/llmman.rb.in
+# GENERATED FILE -- DO NOT EDIT. Rendered from packaging/homebrew/Formula/llmman.rb.in
 # in github.com/llmmanorg/llmman and pushed here by its CI on every release.
 #
 # Installs the prebuilt release binary: building from source would need Go

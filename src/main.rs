@@ -107,7 +107,8 @@ fn main() {
 
     let cli = Cli::parse_from(cmd::log::expand_count_shorthand(std::env::args_os()));
     // A bare `llmman` is a request for help, not a usage error: print it
-    // and exit 0 rather than clap's 2 (which winget's validator flags).
+    // and exit 0 rather than clap's 2 (package validators flag a non-zero
+    // exit from a bare invocation as a broken install).
     let Some(command) = &cli.command else {
         Cli::command()
             .print_help()

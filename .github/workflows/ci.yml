@@ -135,7 +135,7 @@ jobs:
 
       # Writes MAJOR.MINOR.<commit count> into Cargo.toml/Cargo.lock before
       # compiling, so `llmman --version`, the release tag, the crate and
-      # the brew/winget packages all carry the same version. Runs on PRs
+      # the brew/scoop packages all carry the same version. Runs on PRs
       # too, so a broken script fails before it can ship. That edit would
       # make build.rs's `git describe --dirty` report -dirty, so the commit
       # hash is passed explicitly instead.
@@ -464,15 +464,15 @@ jobs:
   # critical path, so they share one runner. `release` gates on this.
   #
   # Packaging (first, the faster half): version.sh and render.sh output
-  # (Homebrew formula, winget manifests, crate) is checked on every PR so a
-  # broken template fails here, not after it reaches the tap or winget-pkgs.
+  # (Homebrew formula, scoop manifest, crate) is checked on every PR so a
+  # broken template fails here, not after it reaches the tap or bucket.
   #
   # Lint: go-shim/ static analysis; linters live in go-shim/.golangci.yml.
   # Linux view only: Go drops OS-tagged files (push_stream_windows.go)
   # before analysis, and cross-GOOS linting would need a cross C toolchain.
   # --------------------------------------------------------------------------
   lint-packaging:
-    name: Lint (go-shim) + Packaging (version, brew/winget templates, crate)
+    name: Lint (go-shim) + Packaging (version, brew/scoop templates, crate)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -516,7 +516,7 @@ jobs:
 
       # Synthetic checksums: this checks rendering, not hashes. Everything
       # goes to $RUNNER_TEMP so `cargo package` below sees a clean tree.
-      - name: Render formula and manifests
+      - name: Render formula and manifest
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -550,7 +550,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          f="$RUNNER_TEMP/out/Formula/llmman.rb"
+          f="$RUNNER_TEMP/out/homebrew/Formula/llmman.rb"
           ruby -c "$f"
           grep -q '^class Llmman < Formula$' "$f" || { echo "::error::$f does not declare 'class Llmman'"; exit 1; }
           grep -q "^  version \"$VERSION\"$" "$f" || { echo "::error::$f does not declare version $VERSION"; exit 1; }
@@ -561,57 +561,41 @@ jobs:
           if grep -q '^ *url ".*x86_64-apple-darwin' "$f"; then
             echo "::error::$f has a url for x86_64-apple-darwin, which llmman does not publish"; exit 1
           fi
-          test -f "$RUNNER_TEMP/out/README.md"
+          test -f "$RUNNER_TEMP/out/homebrew/README.md"
           echo "OK: $f"
 
-      # Against the real 1.12.0 manifest schemas. The timestamp override
-      # keeps ReleaseDate a string, as winget's YAML parser does.
-      - name: Check winget manifests
+      # Against scoop's real manifest schema.
+      - name: Check scoop manifest
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet pyyaml jsonschema
-          dir="$RUNNER_TEMP/out/manifests/l/llmmanorg/llmman/$VERSION"
-          for t in version installer defaultLocale; do
-            curl -fsSL --retry 3 -o "$RUNNER_TEMP/schema-$t.json" \
-              "https://raw.githubusercontent.com/microsoft/winget-cli/master/schemas/JSON/manifests/v1.12.0/manifest.$t.1.12.0.json"
-          done
-          "$RUNNER_TEMP/venv/bin/python" - "$dir" "$VERSION" "$RUNNER_TEMP" <<'PY'
-          import json, sys, yaml, jsonschema
-          d, version, tmp = sys.argv[1], sys.argv[2], sys.argv[3]
-          class L(yaml.SafeLoader): pass
-          L.add_constructor('tag:yaml.org,2002:timestamp', lambda l, n: l.construct_scalar(n))
-          files = {
-              "version": "llmmanorg.llmman.yaml",
-              "installer": "llmmanorg.llmman.installer.yaml",
-              "defaultLocale": "llmmanorg.llmman.locale.en-US.yaml",
-          }
-          docs = {}
-          for t, name in files.items():
-              with open(f"{d}/{name}") as fh:
-                  doc = yaml.load(fh, Loader=L)
-              jsonschema.validate(doc, json.load(open(f"{tmp}/schema-{t}.json")), format_checker=jsonschema.FormatChecker())
-              assert doc["PackageIdentifier"] == "llmmanorg.llmman", name
-              assert doc["PackageVersion"] == version, (name, doc["PackageVersion"])
-              docs[t] = doc
-              print(f"OK {name}: valid against manifest.{t}.1.12.0")
-          inst = docs["installer"]
-          assert inst["InstallerType"] == "portable", inst["InstallerType"]
-          assert inst.get("Commands") == ["llmman"], inst.get("Commands")  # names the PATH symlink
-          arches = {i["Architecture"]: i for i in inst["Installers"]}
-          assert set(arches) == {"x64", "arm64"}, sorted(arches)
-          for arch, triple in (("x64", "x86_64-pc-windows-msvc"), ("arm64", "aarch64-pc-windows-msvc")):
-              i = arches[arch]
-              assert i["InstallerUrl"] == f"https://github.com/llmmanorg/llmman/releases/download/v{version}/llmman-{triple}.exe", i["InstallerUrl"]
-              assert len(i["InstallerSha256"]) == 64 and i["InstallerSha256"] == i["InstallerSha256"].upper(), i["InstallerSha256"]
-              deps = [d["PackageIdentifier"] for d in i["Dependencies"]["PackageDependencies"]]
-              assert deps == [f"Microsoft.VCRedist.2015+.{arch}"], (arch, deps)  # binaries import VCRUNTIME140.dll
-          loc = docs["defaultLocale"]
-          for key in ("Publisher", "PackageName", "License", "LicenseUrl", "ShortDescription", "Description", "Moniker", "ReleaseNotesUrl"):
-              assert loc.get(key), f"locale manifest lacks {key}"
-          print(f"OK: x64 and arm64 portable installers for v{version}")
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet jsonschema
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/scoop-schema.json" \
+            https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json
+          "$RUNNER_TEMP/venv/bin/python" - "$RUNNER_TEMP/out/scoop/bucket/llmman.json" "$VERSION" "$RUNNER_TEMP/scoop-schema.json" <<'PY'
+          import json, sys, jsonschema
+          path, version, schema = sys.argv[1], sys.argv[2], sys.argv[3]
+          with open(path) as fh:
+              doc = json.load(fh)
+          jsonschema.validate(doc, json.load(open(schema)), format_checker=jsonschema.FormatChecker())
+          print(f"OK {path}: valid against scoop schema.json")
+          assert doc["version"] == version, doc["version"]
+          assert doc["bin"] == "llmman.exe", doc["bin"]  # the PATH shim's name
+          for key in ("description", "homepage", "license", "checkver", "autoupdate"):
+              assert doc.get(key), f"manifest lacks {key}"
+          arches = doc["architecture"]
+          assert set(arches) == {"64bit", "arm64"}, sorted(arches)
+          base = f"https://github.com/llmmanorg/llmman/releases/download/v{version}"
+          for arch, triple in (("64bit", "x86_64-pc-windows-msvc"), ("arm64", "aarch64-pc-windows-msvc")):
+              a = arches[arch]
+              assert a["url"] == f"{base}/llmman-{triple}.exe#/llmman.exe", a["url"]  # fragment names the exe for `bin`
+              assert len(a["hash"]) == 64 and a["hash"] == a["hash"].lower(), a["hash"]
+              assert doc["autoupdate"]["architecture"][arch]["url"] == a["url"].replace(f"v{version}", "v$version"), arch
+          # scoop strips the fragment for $baseurl and looks the hash up by the asset's real name.
+          assert doc["autoupdate"]["hash"]["url"] == "$baseurl/checksums.txt", doc["autoupdate"]["hash"]
+          print(f"OK: 64bit and arm64 portable exes for v{version}")
           PY
 
       # `build` already compiles this source on all five targets; this
@@ -1909,8 +1893,8 @@ jobs:
           esac
 
       # checksums.txt: a release asset for users, and (as an artifact) the
-      # hashes publish-homebrew/publish-winget embed, so what brew/winget
-      # enforce is the hash of the bytes uploaded here. Run from dist/ so
+      # hashes publish-packages embeds, so what brew/scoop enforce is the
+      # hash of the bytes uploaded here. Run from dist/ so
       # names are bare basenames, which render.sh expects.
       - name: Generate checksums
         shell: bash
@@ -2151,24 +2135,42 @@ jobs:
         run: cargo publish --locked --allow-dirty
 
   # --------------------------------------------------------------------------
-  # Homebrew (#385): macOS arm64, Linux x86_64/aarch64. Pushes the rendered
-  # Formula/llmman.rb to llmmanorg/homebrew-tap, which needs
-  # secrets.TAP_GITHUB_TOKEN (contents:write there). Users run
-  # `brew install llmmanorg/tap/llmman`.
+  # Package repos, one matrix entry each. render.sh lays rendered/<id> out
+  # as the target repo, so the job body is shared:
+  #   Homebrew (#385): macOS arm64, Linux x86_64/aarch64 -> homebrew-tap
+  #                    (`brew install llmmanorg/tap/llmman`)
+  #   scoop (#390):    Windows x64/arm64 -> scoop-bucket
+  #                    (`scoop bucket add llmman <url>; scoop install llmman`)
+  # Pushes use secrets.TAP_GITHUB_TOKEN (contents:write on both repos).
   # --------------------------------------------------------------------------
-  publish-homebrew:
-    name: Publish Homebrew formula
+  publish-packages:
+    name: Publish ${{ matrix.name }}
     needs: [release, publish-images]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # Queue, never cancel: two close merges must not interleave their tap
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Homebrew formula
+            id: homebrew
+            repo: llmmanorg/homebrew-tap
+            # file carries the version; version_sed reads it.
+            file: Formula/llmman.rb
+            version_sed: 's/^  version "\(.*\)"$/\1/p'
+          - name: scoop manifest
+            id: scoop
+            repo: llmmanorg/scoop-bucket
+            file: bucket/llmman.json
+            version_sed: 's/^    "version": "\(.*\)",$/\1/p'
+    # Queue, never cancel: two close merges must not interleave their
     # pushes, and cancelling would drop an already-released version.
     concurrency:
-      group: publish-homebrew
+      group: publish-${{ matrix.id }}
       cancel-in-progress: false
     steps:
-      # persist-credentials: false -- only the tap checkout needs a token.
+      # persist-credentials: false -- only the target repo checkout needs a token.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
@@ -2177,7 +2179,7 @@ jobs:
         with:
           name: release-checksums
 
-      - name: Render formula
+      - name: Render
         env:
           VERSION: ${{ needs.release.outputs.version }}
         run: |
@@ -2186,19 +2188,23 @@ jobs:
             --checksums checksums.txt \
             --out-dir rendered
 
-      - name: Check out the tap
+      - name: Check out ${{ matrix.repo }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          repository: llmmanorg/homebrew-tap
+          repository: ${{ matrix.repo }}
           token: ${{ secrets.TAP_GITHUB_TOKEN }}
-          path: tap
+          path: target-repo
 
       - name: Commit and push
-        working-directory: tap
+        working-directory: target-repo
         env:
           VERSION: ${{ needs.release.outputs.version }}
           TAG: ${{ needs.release.outputs.tag_name }}
           SRC: ${{ github.sha }}
+          PKG: ${{ matrix.id }}
+          REPO: ${{ matrix.repo }}
+          FILE: ${{ matrix.file }}
+          VERSION_SED: ${{ matrix.version_sed }}
         run: |
           set -euo pipefail
           git config user.name "llmman-ci"
@@ -2210,30 +2216,27 @@ jobs:
           fi
           echo "Target branch: $branch"
 
-          # The formula is generated output, so on a rejected push just
-          # re-sync and regenerate on top rather than rebase.
+          # Generated output: on a rejected push, re-sync and regenerate
+          # on top rather than rebase.
           for attempt in 1 2 3 4 5; do
             git fetch --quiet origin "$branch"
             git reset --quiet --hard FETCH_HEAD
 
-            # Never move the tap backwards: two main pushes can finish out
-            # of order, and a downgrade would hit every `brew upgrade`.
-            if [ -f Formula/llmman.rb ]; then
-              have="$(sed -n 's/^  version "\(.*\)"$/\1/p' Formula/llmman.rb | head -n1)"
+            # Never downgrade: two main pushes can finish out of order.
+            if [ -f "$FILE" ]; then
+              have="$(sed -n "$VERSION_SED" "$FILE" | head -n1)"
               if [ -n "$have" ] && [ "$have" != "$VERSION" ] \
                  && [ "$(printf '%s\n%s\n' "$have" "$VERSION" | sort -V | tail -n1)" = "$have" ]; then
-                echo "::notice::tap already has llmman $have, newer than $VERSION; leaving it"
+                echo "::notice::$REPO already has llmman $have, newer than $VERSION; leaving it"
                 exit 0
               fi
             fi
 
-            mkdir -p Formula
-            cp ../rendered/Formula/llmman.rb Formula/llmman.rb
-            cp ../rendered/README.md README.md
-            git add Formula README.md
+            cp -R "../rendered/$PKG/." .
+            git add -A .
 
             if git diff --cached --quiet; then
-              echo "::notice::tap already up to date for $TAG"
+              echo "::notice::$REPO already up to date for $TAG"
               exit 0
             fi
 
@@ -2241,104 +2244,11 @@ jobs:
               -m "Generated from llmmanorg/llmman@$SRC by packaging/render.sh."
 
             if git push --quiet origin "HEAD:$branch"; then
-              echo "Pushed llmman $VERSION to the tap"
+              echo "Pushed llmman $VERSION to $REPO"
               exit 0
             fi
-            echo "::warning::push to homebrew-tap rejected (attempt $attempt/5); re-syncing"
+            echo "::warning::push to $REPO rejected (attempt $attempt/5); re-syncing"
             sleep "$((attempt * 3))"
           done
-          echo "::error::could not push llmman $VERSION to homebrew-tap after 5 attempts"
+          echo "::error::could not push llmman $VERSION to $REPO after 5 attempts"
           exit 1
-
-  # --------------------------------------------------------------------------
-  # winget (#390): Windows x64/arm64. Every version is a PR against
-  # microsoft/winget-pkgs, opened with Microsoft's wingetcreate (Windows
-  # only) using secrets.WINGET_GITHUB_TOKEN, a PAT for an account that can
-  # fork winget-pkgs. Their bot validates, a moderator merges. Users run
-  # `winget install llmmanorg.llmman`.
-  # --------------------------------------------------------------------------
-  publish-winget:
-    name: Publish winget manifest
-    needs: [release, publish-images]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: windows-2025
-    timeout-minutes: 20
-    concurrency:
-      group: publish-winget
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-checksums
-
-      - name: Render manifests
-        shell: bash
-        env:
-          VERSION: ${{ needs.release.outputs.version }}
-        run: |
-          packaging/render.sh \
-            --version "$VERSION" \
-            --checksums checksums.txt \
-            --out-dir rendered
-
-      # Re-runs must not open a duplicate PR moderators have to close:
-      # skip if the version is already merged or already has an open PR.
-      - name: Skip if this version is already in winget-pkgs
-        id: exists
-        shell: bash
-        env:
-          VERSION: ${{ needs.release.outputs.version }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if gh api "repos/microsoft/winget-pkgs/contents/manifests/l/llmmanorg/llmman/$VERSION" >/dev/null 2>&1; then
-            echo "::notice::winget-pkgs already has llmman $VERSION; skipping"
-            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          open="$(gh api "search/issues?q=repo:microsoft/winget-pkgs+is:pr+is:open+in:title+%22llmmanorg.llmman+version+$VERSION%22" --jq .total_count)"
-          if [ "$open" != "0" ]; then
-            echo "::notice::an open winget-pkgs PR for llmman $VERSION already exists; skipping"
-            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-
-      # Pinned release + checksum, not aka.ms/wingetcreate/latest: this
-      # binary runs with a PAT in its environment.
-      - name: Install wingetcreate
-        if: steps.exists.outputs.skip != 'true'
-        shell: pwsh
-        env:
-          WINGETCREATE_VERSION: v1.12.13.0
-          WINGETCREATE_SHA256: 24042BD37915805615E6CF969AC57C6439124C3FE85823327F5F3FB24BD9FFEA
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $url = "https://github.com/microsoft/winget-create/releases/download/$env:WINGETCREATE_VERSION/wingetcreate.exe"
-          Invoke-WebRequest -Uri $url -OutFile wingetcreate.exe
-          $got = (Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash
-          if ($got -ne $env:WINGETCREATE_SHA256) { throw "wingetcreate.exe sha256 $got != $env:WINGETCREATE_SHA256" }
-          # Smoke test. `info` is the only real "print the version" command:
-          # `version` and `help` are listed in the help text by
-          # CommandLineParser but are not registered verbs, so they (like
-          # `--version`) print help and exit 1. `info` also skips the GitHub
-          # client, so it needs no token or network.
-          .\wingetcreate.exe info
-          if ($LASTEXITCODE -ne 0) { throw "wingetcreate info failed with exit code $LASTEXITCODE" }
-
-      # WINGET_CREATE_GITHUB_TOKEN is wingetcreate's env var for CI
-      # (https://aka.ms/winget-create-token); --token may be logged.
-      - name: Submit to microsoft/winget-pkgs
-        if: steps.exists.outputs.skip != 'true'
-        shell: pwsh
-        env:
-          VERSION: ${{ needs.release.outputs.version }}
-          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $dir = "rendered/manifests/l/llmmanorg/llmman/$env:VERSION"
-          Get-ChildItem $dir
-          .\wingetcreate.exe submit $dir
-          if ($LASTEXITCODE -ne 0) { throw "wingetcreate submit failed with exit code $LASTEXITCODE" }

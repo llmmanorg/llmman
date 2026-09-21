@@ -1,23 +1,18 @@
 #!/usr/bin/env bash
-# Render the Homebrew formula and winget manifests for one llmman release
-# from the templates next to this script. Used by the publish-homebrew and
-# publish-winget CI jobs; a standalone script so the output can be
-# reproduced locally:
+# Render the Homebrew formula and scoop manifest for one llmman release.
+# Used by the publish-packages CI job; standalone so it can be run locally:
 #
 #   packaging/render.sh --version 0.1.324 --checksums checksums.txt --out-dir /tmp/out
 #
-# Output (mirrors where each file is pushed):
+# packaging/<pkg>/ mirrors the repo it is pushed to (*.in are rendered,
+# the rest copied), so <out>/homebrew -> llmmanorg/homebrew-tap and
+# <out>/scoop -> llmmanorg/scoop-bucket.
 #
-#   <out>/Formula/llmman.rb, <out>/README.md            -> llmmanorg/homebrew-tap
-#   <out>/manifests/l/llmmanorg/llmman/<version>/*.yaml -> microsoft/winget-pkgs
-#
-# winget notes (kept out of the manifests, which winget-pkgs likes bare):
-#   - InstallerType `portable`: the assets are bare .exe files. winget
-#     symlinks the exe onto PATH under the first `Commands` entry, so
-#     `Commands: [llmman]` is what makes the command `llmman`.
-#   - Both binaries import VCRUNTIME140.dll, hence the per-architecture
-#     Microsoft.VCRedist.2015+ dependency.
-#   - InstallerSha256 is upper-cased, matching wingetcreate's output.
+# scoop notes (JSON has no comments): the `#/llmman.exe` URL fragment
+# names the downloaded exe for `bin` to shim. VCRUNTIME140.dll is a
+# `suggest` for extras/vcredist2022, not `depends`, which aborts the
+# install without the extras bucket. checkver/autoupdate serve scoop's own
+# tooling; CI pushes every release directly.
 
 set -euo pipefail
 
@@ -29,15 +24,14 @@ die() {
 usage() {
 	cat >&2 <<-EOF
 		usage: render.sh --version <x.y.z> --checksums <file> --out-dir <dir>
-		                 [--repo <owner/repo>] [--tag <tag>] [--date <YYYY-MM-DD>]
+		                 [--repo <owner/repo>] [--tag <tag>]
 
 		  --version    release version, as printed by packaging/version.sh
 		  --checksums  sha256sum-format file covering the release's assets
-		  --out-dir    directory to write Formula/ and manifests/ into
+		  --out-dir    directory to write homebrew/ and scoop/ into
 		  --repo       GitHub repo the download URLs point at (default: llmmanorg/llmman)
 		  --tag        release tag the assets live under (default: v<version>;
 		               only differs for releases cut before the tag scheme changed, e.g. b321)
-		  --date       winget ReleaseDate (default: today, UTC)
 	EOF
 	exit 2
 }
@@ -47,7 +41,6 @@ CHECKSUMS=""
 OUT_DIR=""
 REPO="llmmanorg/llmman"
 TAG=""
-RELEASE_DATE=""
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -56,7 +49,6 @@ while [ $# -gt 0 ]; do
 	--out-dir) OUT_DIR="${2:-}"; shift 2 ;;
 	--repo) REPO="${2:-}"; shift 2 ;;
 	--tag) TAG="${2:-}"; shift 2 ;;
-	--date) RELEASE_DATE="${2:-}"; shift 2 ;;
 	-h | --help) usage ;;
 	*) die "unknown argument: $1" ;;
 	esac
@@ -66,19 +58,14 @@ done
 [ -n "$CHECKSUMS" ] || usage
 [ -n "$OUT_DIR" ] || usage
 [ -f "$CHECKSUMS" ] || die "no such checksums file: $CHECKSUMS"
-[ -z "$RELEASE_DATE" ] && RELEASE_DATE="$(date -u +%Y-%m-%d)"
 
-# Strictly MAJOR.MINOR.PATCH: it lands in Ruby, YAML and a URL, and is
-# what Homebrew and winget sort by.
+# Strictly MAJOR.MINOR.PATCH: it lands in Ruby, JSON and a URL, and is
+# what Homebrew and scoop sort by.
 case "$VERSION" in
 *[!0-9.]* | . | *..* | .* | *.) die "version \"$VERSION\" is not MAJOR.MINOR.PATCH" ;;
 esac
 dots="${VERSION//[!.]/}"
 [ "${#dots}" -eq 2 ] || die "version \"$VERSION\" is not MAJOR.MINOR.PATCH"
-case "$RELEASE_DATE" in
-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
-*) die "date \"$RELEASE_DATE\" is not YYYY-MM-DD" ;;
-esac
 
 TEMPLATE_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(dirname -- "$TEMPLATE_DIR")"
@@ -88,7 +75,7 @@ case "$TAG" in
 esac
 BASE_URL="https://github.com/$REPO/releases/download/$TAG"
 
-# One description for the crate, the formula and the winget listing.
+# One description for the crate, the formula and the scoop manifest.
 DESCRIPTION="$(awk '
 	/^\[package\]/ { in_pkg = 1; next }
 	/^\[/          { in_pkg = 0 }
@@ -122,8 +109,6 @@ SHA_LINUX_X86_64="$(sha_for llmman-x86_64-unknown-linux-gnu)"
 SHA_LINUX_AARCH64="$(sha_for llmman-aarch64-unknown-linux-gnu)"
 SHA_WINDOWS_X86_64="$(sha_for llmman-x86_64-pc-windows-msvc.exe)"
 SHA_WINDOWS_AARCH64="$(sha_for llmman-aarch64-pc-windows-msvc.exe)"
-SHA_WINDOWS_X86_64_UPPER="$(printf '%s' "$SHA_WINDOWS_X86_64" | tr '[:lower:]' '[:upper:]')"
-SHA_WINDOWS_AARCH64_UPPER="$(printf '%s' "$SHA_WINDOWS_AARCH64" | tr '[:lower:]' '[:upper:]')"
 
 # `|` delimiter since several values are URLs; no value can contain a
 # placeholder (the description is checked above).
@@ -134,30 +119,30 @@ render() {
 		-e "s|@REPO@|$REPO|g" \
 		-e "s|@DESCRIPTION@|$DESCRIPTION|g" \
 		-e "s|@BASE_URL@|$BASE_URL|g" \
-		-e "s|@RELEASE_DATE@|$RELEASE_DATE|g" \
 		-e "s|@SHA_MACOS_ARM64@|$SHA_MACOS_ARM64|g" \
 		-e "s|@SHA_LINUX_X86_64@|$SHA_LINUX_X86_64|g" \
 		-e "s|@SHA_LINUX_AARCH64@|$SHA_LINUX_AARCH64|g" \
-		-e "s|@SHA_WINDOWS_X86_64_UPPER@|$SHA_WINDOWS_X86_64_UPPER|g" \
-		-e "s|@SHA_WINDOWS_AARCH64_UPPER@|$SHA_WINDOWS_AARCH64_UPPER|g" \
+		-e "s|@SHA_WINDOWS_X86_64@|$SHA_WINDOWS_X86_64|g" \
+		-e "s|@SHA_WINDOWS_AARCH64@|$SHA_WINDOWS_AARCH64|g" \
 		"$1"
 }
 
-WINGET_DIR="$OUT_DIR/manifests/l/llmmanorg/llmman/$VERSION"
-mkdir -p "$OUT_DIR/Formula" "$WINGET_DIR"
-
-render "$TEMPLATE_DIR/homebrew/llmman.rb.in" >"$OUT_DIR/Formula/llmman.rb"
-cp "$TEMPLATE_DIR/homebrew/README.md" "$OUT_DIR/README.md"
-for name in llmmanorg.llmman.yaml llmmanorg.llmman.installer.yaml llmmanorg.llmman.locale.en-US.yaml; do
-	render "$TEMPLATE_DIR/winget/$name.in" >"$WINGET_DIR/$name"
-done
-
-# A leftover @PLACEHOLDER@ is a template/script mismatch; never publish it.
-for rendered in "$OUT_DIR/Formula/llmman.rb" "$WINGET_DIR"/*.yaml; do
-	if grep -n '@[A-Z_]\{2,\}@' "$rendered"; then
-		die "unsubstituted placeholder(s) left in $rendered (see above)"
-	fi
-done
-
 printf 'rendered llmman %s (tag %s)\n' "$VERSION" "$TAG" >&2
-printf '  %s\n' "$OUT_DIR/Formula/llmman.rb" "$OUT_DIR/README.md" "$WINGET_DIR"/*.yaml >&2
+for pkg in homebrew scoop; do
+	while IFS= read -r src; do
+		dest="$OUT_DIR/${src#"$TEMPLATE_DIR/"}"
+		mkdir -p "$(dirname -- "$dest")"
+		case "$src" in
+		*.in)
+			dest="${dest%.in}"
+			render "$src" >"$dest"
+			# A leftover @PLACEHOLDER@ is a template/script mismatch; never publish it.
+			if grep -n '@[A-Z_]\{2,\}@' "$dest"; then
+				die "unsubstituted placeholder(s) left in $dest (see above)"
+			fi
+			;;
+		*) cp "$src" "$dest" ;;
+		esac
+		printf '  %s\n' "$dest" >&2
+	done < <(find "$TEMPLATE_DIR/$pkg" -type f | sort)
+done

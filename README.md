@@ -75,10 +75,11 @@ irm https://llmmanorg.github.io/install.ps1 | iex
 brew install llmmanorg/tap/llmman
 ```
 
-**winget:**
+**Scoop:**
 
 ```powershell
-winget install llmmanorg.llmman
+scoop bucket add llmman https://github.com/llmmanorg/scoop-bucket
+scoop install llmman
 ```
 
 **Cargo:**

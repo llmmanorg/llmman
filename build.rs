@@ -137,7 +137,7 @@ fn warn_missing_msvc_tools(target_arch: &str) {
         println!(
             "cargo:warning=clang was not found on PATH. Building llmman for \
              *-pc-windows-msvc needs it as cgo's C compiler; install LLVM \
-             (https://releases.llvm.org) or `winget install LLVM.LLVM`."
+             (https://releases.llvm.org) or `scoop install llvm`."
         );
     }
 

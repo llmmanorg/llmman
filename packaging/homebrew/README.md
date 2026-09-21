@@ -57,4 +57,4 @@ is no separate stable channel.
 [`packaging/render.sh`](https://github.com/llmmanorg/llmman/blob/main/packaging/render.sh)
 in the main repo and pushed here by its CI on every release. **Edits made
 directly in this repo are overwritten by the next release** — change
-`packaging/homebrew/llmman.rb.in` upstream instead.
+`packaging/homebrew/Formula/llmman.rb.in` upstream instead.
