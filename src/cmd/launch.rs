@@ -577,6 +577,13 @@ fn find_on_path(binary: &str) -> Option<PathBuf> {
     None
 }
 
+/// `key` as a path, treating an empty value as unset like the tools do.
+fn env_dir(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 /// The binary `launch` will run for `i`, so the listing does not report
 /// as missing what the launcher would find: `PATH`, then what the
 /// launcher knows.
@@ -1863,10 +1870,38 @@ fn launch_cline(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     exec_with_env(&bin, extra_args, &[])
 }
 
+/// Cline's own resolution: `CLINE_DIR || path.join(os.homedir(), ".cline")`.
+/// Node's `os.homedir()` reads `USERPROFILE` on Windows, which
+/// `dirs::home_dir` ignores; disagreeing with Cline there means it
+/// never sees the settings and exits "Not authenticated".
+fn cline_dir() -> anyhow::Result<PathBuf> {
+    let user_profile = if cfg!(windows) {
+        env_dir("USERPROFILE")
+    } else {
+        None
+    };
+    resolve_cline_dir(env_dir("CLINE_DIR"), user_profile, || {
+        dirs::home_dir().context("no home directory")
+    })
+}
+
+fn resolve_cline_dir(
+    cline_dir: Option<PathBuf>,
+    user_profile: Option<PathBuf>,
+    home: impl FnOnce() -> anyhow::Result<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(dir) = cline_dir {
+        return Ok(dir);
+    }
+    Ok(match user_profile {
+        Some(profile) => profile,
+        None => home()?,
+    }
+    .join(".cline"))
+}
+
 fn cline_data_dir() -> anyhow::Result<PathBuf> {
-    Ok(dirs::home_dir()
-        .context("no home directory")?
-        .join(".cline/data"))
+    Ok(cline_dir()?.join("data"))
 }
 
 fn write_cline_settings(model: &str) -> anyhow::Result<()> {
@@ -2085,8 +2120,8 @@ fn grok_env<'a>(
 
 /// Grok's configured home, or its documented `~/.grok` default.
 fn grok_home() -> anyhow::Result<PathBuf> {
-    if let Some(path) = std::env::var_os("GROK_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path));
+    if let Some(path) = env_dir("GROK_HOME") {
+        return Ok(path);
     }
     Ok(dirs::home_dir().context("no home directory")?.join(".grok"))
 }
@@ -2745,6 +2780,24 @@ mod tests {
         assert!(!PROVIDER_UNSUPPORTED.iter().any(|(id, _)| *id == "cline"));
         assert!(PROVIDER_NEEDS_DAEMON_KEY.contains(&"cline"));
         assert!(check_provider_supported("cline").is_ok());
+    }
+
+    /// Same precedence as Cline: `CLINE_DIR`, then `USERPROFILE` (Windows'
+    /// `os.homedir()`), then the process home.
+    #[test]
+    fn cline_dir_follows_cline_dir_then_userprofile_then_home() {
+        let p = |s: &str| Some(PathBuf::from(s));
+        let home = || Ok(PathBuf::from("/home"));
+        let resolve = |dir, profile| resolve_cline_dir(dir, profile, home).unwrap();
+        assert_eq!(
+            resolve(p("/explicit"), p("/profile")),
+            PathBuf::from("/explicit")
+        );
+        assert_eq!(
+            resolve(None, p("/profile")),
+            PathBuf::from("/profile/.cline")
+        );
+        assert_eq!(resolve(None, None), PathBuf::from("/home/.cline"));
     }
 
     /// Grok Build uses the custom-model endpoint for both catalog lookup

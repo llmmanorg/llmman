@@ -290,7 +290,7 @@ support. llmman writes Gemini mode to its own stable settings directory at
 `~/.gemini/llmman/`; your AGY settings stay untouched.
 
 Cline merges the Ollama provider into `~/.cline/data/settings/providers.json`
-and `globalState.json`.
+and `globalState.json`, honouring `CLINE_DIR` like Cline does.
 
 ### Hosted providers
 

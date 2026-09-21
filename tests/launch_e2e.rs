@@ -647,11 +647,13 @@ fn run_launch(
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
-        // Set, not cleared: a `QWEN_HOME` in the developer's shell would
-        // send the settings `launch qwen` writes past this `HOME`, and on
-        // Windows `dirs::home_dir` reads neither `HOME` nor `USERPROFILE`.
+        // Set, not cleared: a `QWEN_HOME` (or `GROK_HOME`, `CLINE_DIR`) in
+        // the developer's shell would send the settings a launch writes
+        // past this `HOME`, and on Windows `dirs::home_dir` reads neither
+        // `HOME` nor `USERPROFILE`.
         .env("QWEN_HOME", home.join(".qwen"))
         .env("GROK_HOME", home.join(".grok"))
+        .env("CLINE_DIR", home.join(".cline"))
         // goose asks before each tool call otherwise, and a headless run
         // has nobody to answer. Granted here, not by `launch goose`:
         // auto-approving an agent's writes is the user's call.
