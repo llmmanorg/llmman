@@ -288,13 +288,8 @@ AGY requires version 1.1.13 or newer for Gemini API-key and custom-endpoint
 support. llmman writes Gemini mode to its own stable settings directory at
 `~/.gemini/llmman/`; your AGY settings stay untouched.
 
-Cline is tested against CLI 2.18.0. llmman backs up and merges the Ollama
-provider into Cline's own `~/.cline/data/settings/providers.json` and
-`globalState.json`, preserving other providers and settings. Arguments after
-`--` are passed to Cline unchanged. On macOS, the install prompt uses 2.18.0
-because the current `latest` package has an invalid executable signature;
-other platforms install `cline@latest`. A new install must also pass
-`cline --version` before launch continues.
+Cline merges the Ollama provider into `~/.cline/data/settings/providers.json`
+and `globalState.json`.
 
 ### Hosted providers
 

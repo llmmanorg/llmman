@@ -52,8 +52,8 @@ env:
   GROK_CLI_VERSION: "1.0.34"
   # Official Cline CLI used by launch_e2e's real `launch cline` test.
   # Pinned because its provider-settings schema and CLI flags are the
-  # integration contract under test; 3.0.60-3.0.62 ship a macOS binary
-  # with an invalid signature, while 2.18.0 runs unmodified on macOS.
+  # integration contract under test. The macOS GitHub runner kills 3.0.62;
+  # that failure is runner-specific, not a general macOS release failure.
   CLINE_CLI_VERSION: "2.18.0"
 
 jobs:
