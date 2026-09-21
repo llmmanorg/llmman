@@ -8,6 +8,9 @@
 # main's tip (it can never hold the `workflows` permission); the API
 # reports anything else as "403 Resource not accessible by integration".
 # So `ensure` runs first thing in a run, while its commit is the tip.
+# The same check runs on a release's `target_commitish` whenever one is
+# sent, even for a tag that already exists -- so the release job must
+# not send one (see ci.yml's "Create GitHub Release").
 # Lookups treat only a 404 as "absent"; any other error is fatal.
 
 set -euo pipefail

@@ -565,15 +565,8 @@ fn try_spawn_with_timeout(
 fn warm_model() {
     WARM.call_once(|| {
         eprintln!("[warm_model] starting");
-        let mut cmd = Command::new(llmman_bin());
-        cmd.arg("run")
-            .arg(MODEL)
-            .arg("--think")
-            .arg("false")
-            .arg("--num-predict")
-            .arg("64")
-            .arg(PROMPT);
-        let output = spawn_with_timeout(cmd, TIMEOUT, "llmman run (model warm-up)");
+        let output = run_model_prompt(TIMEOUT, "llmman run (model warm-up)")
+            .unwrap_or_else(|timed_out| panic!("{}", timed_out.message));
         eprintln!("[warm_model] done, status={:?}", output.status);
         assert!(
             output.status.success(),
@@ -584,6 +577,51 @@ fn warm_model() {
             String::from_utf8_lossy(&output.stderr),
         );
     });
+}
+
+/// `llmman run MODEL PROMPT` with `warm_model`'s guard flags, bounded by
+/// `timeout`. Shared by `warm_model` and `daemon_still_answers`.
+fn run_model_prompt(
+    timeout: Duration,
+    description: &str,
+) -> Result<std::process::Output, TimedOut> {
+    let mut cmd = Command::new(llmman_bin());
+    cmd.arg("run")
+        .arg(MODEL)
+        .arg("--think")
+        .arg("false")
+        .arg("--num-predict")
+        .arg("64")
+        .arg(PROMPT);
+    try_spawn_with_timeout(cmd, timeout, description)
+}
+
+/// After a launch was killed at `TIMEOUT`: does the daemon still answer
+/// our own client? Yes means the third-party CLI was the slow party (a
+/// slow runner or a degenerate sampling loop); no means a daemon stall,
+/// which a strict test must report.
+fn daemon_still_answers(integration: &str) -> bool {
+    match run_model_prompt(
+        Duration::from_secs(180),
+        &format!("llmman run (daemon probe after {integration} timed out)"),
+    ) {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            eprintln!(
+                "[test] {integration}: daemon probe failed (status: {:?})\n--- stderr ---\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            false
+        }
+        Err(timed_out) => {
+            eprintln!(
+                "[test] {integration}: daemon probe hung\n{}",
+                timed_out.message
+            );
+            false
+        }
+    }
 }
 
 /// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
@@ -652,10 +690,14 @@ const MAX_ATTEMPTS: u32 = 3;
 ///     real chance of a different, correct answer.
 ///   - killed at `TIMEOUT` — an endless agent loop (small-model sampling
 ///     degenerating under real concurrent batching, observed decoding
-///     thousands of tokens at ~14 t/s on a CPU-only runner). NOT
-///     retried: a fresh `HOME` doesn't fix a slow runner or the model's
-///     own sampling, and CI run 32633829292 already showed retrying this
-///     shape doesn't reliably help — only costs more CI time.
+///     thousands of tokens at ~14 t/s on a CPU-only runner), or a slow
+///     runner: aarch64 Linux prefills the same ~10k-token system prompt
+///     at ~44 t/s where x86_64 does ~200 t/s (CI run 35602511987), so a
+///     CLI needing several such requests per answer can't fit in
+///     `TIMEOUT` there. NOT retried: a fresh `HOME` doesn't fix a slow
+///     runner or the model's own sampling, and CI run 32633829292
+///     already showed retrying this shape doesn't reliably help — only
+///     costs more CI time.
 ///
 /// A real regression (non-zero exit: a crash, a rejected request, a 500)
 /// is never retried — it panics immediately via the `assert!` below, on
@@ -665,7 +707,11 @@ const MAX_ATTEMPTS: u32 = 3;
 /// Exhausting attempts via only the two shapes above (never the
 /// `assert!`) is logged loudly but does not panic: it's the model's own
 /// sampling variance, not an llmman regression, so it must not turn CI
-/// red on its own.
+/// red on its own. The `strict` variants fail on the first shape (a CLI
+/// that *completed* without saying "pong"); on a timeout they fail only
+/// if `daemon_still_answers` finds the daemon stalled. CI run
+/// 35602511987 went red on all six E2E targets through the two strict
+/// tests timing out on these very shapes (cline on five, grok on one).
 enum NonzeroDisposition {
     Reject,
     Retry,
@@ -684,8 +730,9 @@ fn launch_and_assert(integration: &str, extra_args: &[&str]) {
     );
 }
 
-/// [`launch_and_assert`], but exhausting the attempts without a `pong`
-/// is a test failure. Used where the integration is expected to be
+/// [`launch_and_assert`], but a *completed* run that never said `pong`
+/// is a test failure, and a timeout is one unless the daemon still
+/// answers afterwards. Used where the integration is expected to be
 /// deterministic enough that a zero exit without inference is not success.
 fn launch_and_assert_strict(integration: &str, extra_args: &[&str]) {
     launch_and_assert_with(
@@ -783,7 +830,8 @@ fn reply_contains_pong(stdout: &str) -> bool {
 /// The shared body: `nonzero_disposition` rejects, retries, or conditionally
 /// accepts a nonzero exit, `reject_stdout` narrows what a zero exit may be,
 /// `accept_stdout` defines a successful model reply, and `strict` makes
-/// exhausting the sampling attempts a test failure.
+/// exhausting the sampling attempts a test failure — for a timeout, only
+/// when the daemon has stopped answering (see [`launch_and_assert`]).
 fn launch_and_assert_with(
     integration: &str,
     extra_args: &[&str],
@@ -870,13 +918,17 @@ fn launch_and_assert_with(
         ));
     }
     let last_failure = last_failure.expect("loop runs at least once, so this is always set");
-    let why = if gave_up_after_timeout.is_some() {
+    let timed_out = gave_up_after_timeout.is_some();
+    let why = if timed_out {
         "a timeout"
     } else {
         "an unexpected model reply (or a known non-llmman-caused failure)"
     };
+    // A strict timeout is tolerated only once the daemon is shown to be
+    // fine: then the CLI, not llmman, was the slow party.
+    let tolerated = !strict || (timed_out && daemon_still_answers(integration));
     assert!(
-        !strict,
+        tolerated,
         "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` gave up via {why}\n\
          {last_failure}"
     );
@@ -1028,6 +1080,11 @@ fn launch_cline_with_model() {
             assert_eq!(
                 provider["baseUrl"],
                 format!("{}/v1", llmman::daemon::server())
+            );
+            // See CLINE_RESPONSE_START_TIMEOUT_MS in launch.rs.
+            assert!(
+                provider["timeout"].as_u64().is_some_and(|ms| ms > 300_000),
+                "expected `llmman launch cline` to raise Cline's response-start timeout: {text}"
             );
             assert!(
                 provider.get("apiKey").is_none(),

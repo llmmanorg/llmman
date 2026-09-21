@@ -1875,6 +1875,18 @@ fn write_cline_settings(model: &str) -> anyhow::Result<()> {
     write_cline_settings_at(&cline_data_dir()?, model, &server, &now)
 }
 
+/// Cline's `providers.<id>.settings.timeout` (ms): how long its Ollama
+/// vendor waits for a response to *start*; its default is 5 minutes,
+/// sized for Ollama's model load. Through llmman it also has to cover
+/// llama-server prefilling Cline's ~12k-token system prompt, since no
+/// bytes are sent before the first token: on CPU that takes minutes (a
+/// 4-vCPU aarch64 runner manages ~44 tok/s even on a 0.8B model), and
+/// llmman's own load deadline is already 10 minutes. In CI run
+/// 35602511987 Cline dropped its first request 5:00 into the prefill and
+/// re-sent it. 30 minutes covers load plus a long prefill; connection
+/// failures still fail fast, and a user-set value is kept.
+const CLINE_RESPONSE_START_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
 fn read_cline_json(path: &Path) -> anyhow::Result<(Option<Vec<u8>>, serde_json::Value)> {
     let raw = match std::fs::read(path) {
         Ok(raw) => Some(raw),
@@ -1931,14 +1943,17 @@ fn write_cline_settings_at(
     let (providers_raw, mut providers_document) = read_cline_json(&providers_path)?;
     let providers_before = providers_document.clone();
     let base_url = format!("{server}/v1");
-    let model_or_base_changed = providers_document
+    let route_changed = providers_document
         .pointer("/providers/ollama/settings/model")
         .and_then(serde_json::Value::as_str)
         != Some(model)
         || providers_document
             .pointer("/providers/ollama/settings/baseUrl")
             .and_then(serde_json::Value::as_str)
-            != Some(base_url.as_str());
+            != Some(base_url.as_str())
+        || providers_document
+            .pointer("/providers/ollama/settings/timeout")
+            .is_none();
 
     let root = providers_document
         .as_object_mut()
@@ -1963,9 +1978,12 @@ fn write_cline_settings_at(
     settings.insert("provider".to_string(), serde_json::json!("ollama"));
     settings.insert("model".to_string(), serde_json::json!(model));
     settings.insert("baseUrl".to_string(), serde_json::json!(base_url));
+    settings
+        .entry("timeout")
+        .or_insert_with(|| serde_json::json!(CLINE_RESPONSE_START_TIMEOUT_MS));
     settings.remove("apiKey");
     ollama.insert("tokenSource".to_string(), serde_json::json!("manual"));
-    if model_or_base_changed {
+    if route_changed {
         ollama.insert("updatedAt".to_string(), serde_json::json!(now));
     }
     write_cline_json(
@@ -2614,6 +2632,10 @@ mod tests {
         assert_eq!(entry["settings"]["model"], model);
         assert_eq!(entry["settings"]["baseUrl"], "http://127.0.0.1:17434/v1");
         assert_eq!(entry["settings"]["keep"], 1);
+        assert_eq!(
+            entry["settings"]["timeout"], CLINE_RESPONSE_START_TIMEOUT_MS,
+            "a missing response-start timeout gets llmman's slow-prefill default"
+        );
         assert!(entry["settings"].get("apiKey").is_none());
         assert_eq!(entry["tokenSource"], "manual");
         assert_eq!(entry["updatedAt"], "2026-09-20T06:00:00Z");
@@ -2664,6 +2686,38 @@ mod tests {
             changed["providers"]["ollama"]["updatedAt"],
             "2026-09-20T08:00:00Z"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cline_settings_keep_a_user_set_response_start_timeout() {
+        let root = std::env::temp_dir().join(format!(
+            "llmman-cline-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let providers_path = root.join("settings/providers.json");
+        std::fs::create_dir_all(providers_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &providers_path,
+            r#"{"providers":{"ollama":{"settings":{"timeout":45000}}}}"#,
+        )
+        .unwrap();
+
+        write_cline_settings_at(
+            &root,
+            "some-model",
+            "http://127.0.0.1:17434",
+            "2026-09-20T06:00:00Z",
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&providers_path).unwrap()).unwrap();
+        assert_eq!(parsed["providers"]["ollama"]["settings"]["timeout"], 45000);
         let _ = std::fs::remove_dir_all(root);
     }
 

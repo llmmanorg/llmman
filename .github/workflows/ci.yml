@@ -1943,14 +1943,19 @@ jobs:
               ' > release-notes.md
           cat release-notes.md
 
-      # The tag exists, so this creates no ref (the call that used to 403).
+      # The tag exists (verified above), so this creates no ref. It must
+      # not send target_commitish either: GITHUB_TOKEN's workflows check
+      # (see packaging/release-tag.sh) runs on that field whenever it is
+      # present, tag or no tag, and 403'd v0.1.438/.439 once a later
+      # ci.yml merge was main's tip. Probed here: the same POST fails with
+      # it and succeeds without; asset upload and the draft-publishing
+      # PATCH succeed too. Unset, the action omits the field.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.version.outputs.tag_name }}
           name: ${{ steps.version.outputs.tag_name }}
           body_path: release-notes.md
-          target_commitish: ${{ github.sha }}
           prerelease: false
           files: |
             dist/llmman-*
