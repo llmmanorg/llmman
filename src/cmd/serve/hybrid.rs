@@ -82,7 +82,7 @@ pub(super) fn request_pin(
 /// The hosted half a hybrid pair falls back to when its local half
 /// refuses a request as too large: `None` for anything but a pair, and
 /// for a pair pinned local, whose pin is never overridden.
-pub(super) fn hybrid_fallback(
+fn hybrid_fallback(
     model_ref: &str,
     headers: Option<&HeaderMap>,
 ) -> Result<Option<String>, AppError> {
@@ -157,13 +157,13 @@ where
 
 /// Largest 400 body [`local_context_overflow`] reads to classify it.
 /// llama-server's is one short JSON object.
-pub(super) const OVERFLOW_BODY_LIMIT: usize = 64 * 1024;
+const OVERFLOW_BODY_LIMIT: usize = 64 * 1024;
 
 /// Splits a relayed response into the backend's context refusal (`Err`,
 /// with its message) or anything else (`Ok`, the response intact). Only
 /// a 400 is read, up to [`OVERFLOW_BODY_LIMIT`]; whatever was read is
 /// put back in front of the rest when it is some other error.
-pub(super) async fn local_context_overflow(resp: Response) -> Result<Response, String> {
+async fn local_context_overflow(resp: Response) -> Result<Response, String> {
     if resp.status() != StatusCode::BAD_REQUEST {
         return Ok(resp);
     }
