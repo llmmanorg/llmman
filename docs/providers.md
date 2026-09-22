@@ -175,6 +175,7 @@ installed:
 | `claude` | Claude Code | yes |
 | `opencode` | OpenCode | yes |
 | `codex` | OpenAI Codex CLI | yes (below) |
+| `pi` | Pi coding agent | yes |
 | `aider` | Aider | yes |
 | `qwen` | Qwen Code | yes |
 | `dsh` | DeepSeek Harness | yes |

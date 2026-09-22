@@ -277,7 +277,8 @@ llmman launch grok --model qwen3.8 -- -p "Explain this repository"
 ```
 
 Run `llmman launch` with no arguments to list the supported integrations
-(Claude Code, OpenCode, Codex, Cline, Aider, Qwen Code, Gemini CLI, Grok Build,
+(Claude Code, OpenCode, Codex, Pi, Cline, Aider, Qwen Code, Gemini CLI,
+Grok Build,
 AGY, DeepSeek Harness, ...) and whether each is installed. Installing an
 integration is up to you; llmman only execs what is already on your
 machine, except that a missing Cline can be installed with npm after an
