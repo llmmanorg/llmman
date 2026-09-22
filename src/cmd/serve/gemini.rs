@@ -737,7 +737,7 @@ fn gemini_oai_request(model: String, req: &GeminiRequest) -> Result<OAIChatReque
 #[cfg(test)]
 mod tests {
     use super::super::hybrid::with_hybrid_fallback;
-    use super::super::tests::{headers_with, remote_target, test_state, HOSTED, PAIR};
+    use super::super::test_support::{headers_with, remote_target, test_state, HOSTED, PAIR};
     use super::super::ContextOverflow;
     use super::*;
     use axum::{response::IntoResponse, routing::post, Router};

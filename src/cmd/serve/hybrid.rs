@@ -193,7 +193,7 @@ async fn local_context_overflow(resp: Response) -> Result<Response, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{headers_with, HOSTED, PAIR};
+    use super::super::test_support::{headers_with, HOSTED, PAIR};
     use super::*;
 
     /// Only a pair falls back, and never one the caller pinned local:
