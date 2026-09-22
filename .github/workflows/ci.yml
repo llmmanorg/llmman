@@ -271,26 +271,11 @@ jobs:
           }
 
       # ── Upload artefacts ──────────────────────────────────────────────────
-      # Two attempts: the upload's final "FinalizeArtifact" call gets a
-      # transient 403 from GitHub's blob store now and then, after every
-      # byte is up. The action has no retry of its own, so the second
-      # attempt overwrites whatever the first left behind.
       - name: Upload binary (docker)
-        id: upload
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: llmman-docker-${{ matrix.target }}
           path: dist-docker/${{ matrix.binary }}
-          if-no-files-found: error
-      - name: Upload binary (docker, retry)
-        if: steps.upload.outcome == 'failure'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: llmman-docker-${{ matrix.target }}
-          path: dist-docker/${{ matrix.binary }}
-          if-no-files-found: error
-          overwrite: true
 
       # ── Lint + unit tests ─────────────────────────────────────────────────
       - name: cargo fmt --check
@@ -443,21 +428,10 @@ jobs:
           cp "$apk" dist-android/llmman-aarch64-linux-android.apk
 
       - name: Upload APK
-        id: upload
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: llmman-android-aarch64-linux-android
           path: dist-android/llmman-aarch64-linux-android.apk
-          if-no-files-found: error
-      - name: Upload APK (retry)
-        if: steps.upload.outcome == 'failure'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: llmman-android-aarch64-linux-android
-          path: dist-android/llmman-aarch64-linux-android.apk
-          if-no-files-found: error
-          overwrite: true
 
   # --------------------------------------------------------------------------
   # Lint + packaging: cheap Linux-only checks, ~2 min total and off the
@@ -1837,6 +1811,7 @@ jobs:
           TAG: ${{ steps.version.outputs.tag_name }}
         run: packaging/release-tag.sh ensure "$TAG" "$GITHUB_SHA"
 
+      # Patterns: a retried upload is `<name>-retry` (upload-artifact-retry).
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
@@ -1847,15 +1822,18 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
-          name: llmman-android-aarch64-linux-android
+          pattern: llmman-android-aarch64-linux-android*
+          merge-multiple: true
 
       - name: Rename binaries for release
         shell: bash
         run: |
+          set -euo pipefail
           cd dist
-          for dir in */; do
-            target="${dir%/}"          # e.g. llmman-docker-x86_64-unknown-linux-gnu
+          for dir in llmman-docker-*/; do
+            target="${dir%/}"          # e.g. llmman-docker-x86_64-unknown-linux-gnu[-retry]
             triple="${target#llmman-docker-}"
+            triple="${triple%-retry}"
             if [ -f "${dir}llmman.exe" ]; then
               cp "${dir}llmman.exe" "llmman-${triple}.exe"
             else
@@ -1906,23 +1884,11 @@ jobs:
             | xargs -0 sha256sum > checksums.txt
           cat checksums.txt
 
-      # Two attempts, as for the binaries above.
       - name: Upload checksums artifact
-        id: upload_checksums
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: release-checksums
           path: dist/checksums.txt
-          if-no-files-found: error
-      - name: Upload checksums artifact (retry)
-        if: steps.upload_checksums.outcome == 'failure'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-checksums
-          path: dist/checksums.txt
-          if-no-files-found: error
-          overwrite: true
 
       - name: Build release notes
         id: notes
@@ -2022,16 +1988,21 @@ jobs:
         with:
           persist-credentials: false
 
+      # Trailing `*`: a retried upload is `<name>-retry` (upload-artifact-retry).
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
-          pattern: llmman-docker-*-unknown-linux-gnu
+          pattern: llmman-docker-*-unknown-linux-gnu*
 
       # Artifacts drop the executable bit; COPY keeps the context's mode.
+      # An unmatched glob stays literal, so a missing binary fails install.
       - name: Lay out the build context
         run: |
-          install -m 755 dist/llmman-docker-x86_64-unknown-linux-gnu/llmman packaging/llmman-amd64
-          install -m 755 dist/llmman-docker-aarch64-unknown-linux-gnu/llmman packaging/llmman-arm64
+          set -euo pipefail
+          for pair in x86_64:amd64 aarch64:arm64; do
+            src=(dist/llmman-docker-"${pair%%:*}"-unknown-linux-gnu*/llmman)
+            install -m 755 "${src[0]}" "packaging/llmman-${pair##*:}"
+          done
 
       - name: Log in to Docker Hub
         env:
@@ -2180,9 +2151,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # Pattern: a retried upload is `<name>-retry` (upload-artifact-retry).
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: release-checksums
+          pattern: release-checksums*
+          merge-multiple: true
 
       - name: Render
         env:
