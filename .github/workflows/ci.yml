@@ -654,7 +654,8 @@ jobs:
 
   # --------------------------------------------------------------------------
   # E2E: `llmman launch
-  # <claude|agy|opencode|codex|cline|grok|qwen|hermes|openclaw|dsh|goose> --model
+  # <claude|agy|opencode|pi|codex|cline|grok|qwen|hermes|openclaw|dsh|goose>
+  # --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
   # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
@@ -685,7 +686,7 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/agy/opencode/codex/cline/grok/qwen/hermes/openclaw/dsh/goose, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/agy/opencode/pi/codex/cline/grok/qwen/hermes/openclaw/dsh/goose, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
@@ -694,23 +695,23 @@ jobs:
     # that reason, and its own identical `if:` condition below — or when
     # dispatched by hand on a branch (see `workflow_dispatch` above).
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
-    # 11 tests run serialized (--test-threads=1 + lock_serial()), so the
-    # worst case sums all 11's own retry budgets: MAX_ATTEMPTS * TIMEOUT
+    # 12 tests run serialized (--test-threads=1 + lock_serial()), so the
+    # worst case sums all 12's own retry budgets: MAX_ATTEMPTS * TIMEOUT
     # (3 * 600s = 30 min) each — a timeout itself never retries (see
     # launch_and_assert's own doc comment), so 30 min/test is only hit if
     # every attempt fails via a missing "pong" instead. Plus warm_model()'s
     # own separate TIMEOUT budget (10 min), paid at most once across all
-    # tests (guarded by WARM's own Once). 11*30 + 10 = 340 min. Exhausting
+    # tests (guarded by WARM's own Once). 12*30 + 10 = 370 min. Exhausting
     # every attempt doesn't fail this job either way (see
     # launch_and_assert's own doc comment) — a run can still legitimately
     # take this long in wall-clock time before giving up.
     #
-    # +90 (430) for the vllm-plugin steps' own per-step budgets below: up
+    # +90 (460) for the vllm-plugin steps' own per-step budgets below: up
     # to 60 min for "Install vLLM (e2e)" (wheel downloads, but a
     # slow/retried one on a bad connection) plus up to 30 min for
     # "pytest -m e2e (vllm-plugin)".
     #
-    # +10 (440) for `serve_mlx_safetensors_model`'s own single TIMEOUT
+    # +10 (470) for `serve_mlx_safetensors_model`'s own single TIMEOUT
     # budget (10 min, same 600s as warm_model's) — it doesn't go through
     # launch_and_assert's retry loop at all (a real failure there is
     # always a deterministic llmman bug worth failing loudly on, not
@@ -721,7 +722,7 @@ jobs:
     # `serve_sglang_safetensors_model` (20 min each, no retries, like the
     # mlx test) and "Install SGLang (e2e)"'s 40-minute budget.
     #
-    # 500 in total, but 360 is GitHub's own hard limit for a hosted-runner
+    # 530 in total, but 360 is GitHub's own hard limit for a hosted-runner
     # job and kills a run past it regardless, so the number here stays at
     # 400 rather than chasing a budget neither it nor GitHub can grant.
     timeout-minutes: 400
@@ -873,7 +874,7 @@ jobs:
       # multi-line/array syntax; ubuntu/macOS already default to bash.
       #
       # Unlike hermes/mlx_lm.server (legitimately missing on some
-      # platforms), these seven are plain npm packages expected to work
+      # platforms), these eight are plain npm packages expected to work
       # everywhere — so install_cli fails the job, rather than letting
       # tests/launch_e2e.rs's on_path check silently skip, when one never
       # becomes a working binary.
@@ -886,7 +887,7 @@ jobs:
       # designed (npm tolerates one failed platform-tarball fetch, here
       # a registry blip, instead of failing the install), just not
       # detectable by a mere on_path/PATH check. Retrying rides that out.
-      - name: Install integration CLIs (claude, opencode, codex, cline, qwen, openclaw, dsh)
+      - name: Install integration CLIs (claude, opencode, pi, codex, cline, qwen, openclaw, dsh)
         shell: bash
         run: |
           failed_clis=()
@@ -925,6 +926,11 @@ jobs:
           # Pinned: launch_cline depends on this release's provider-settings
           # schema and headless JSON/yolo flags.
           install_cli "cline@${CLINE_CLI_VERSION}" "cline" "cline"
+          # Pinned (not @latest): pi is pre-1.0 and tests/launch_e2e.rs's
+          # own invocation (-p) plus the models.json/settings.json shapes
+          # `launch pi` writes were verified against this exact release;
+          # an unpinned upgrade could change either with no warning here.
+          install_cli "@earendil-works/pi-coding-agent@0.86.1" "@earendil-works/pi-coding-agent" "pi"
           # Pinned (not @latest): tests/launch_e2e.rs's qwen test relies on
           # this release's tool set under --safe-mode and on the
           # report_findings schema it excludes by name; a newer release can
