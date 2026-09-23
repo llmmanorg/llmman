@@ -1057,8 +1057,13 @@ fn launch_omp(
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_on_path("omp").ok_or_else(|| anyhow::anyhow!("omp is not installed"))?;
-    write_omp_config(model, vision, context_length)?;
-    exec_with_env(&bin, &omp_args(model, extra_args), &[])
+    let server = daemon::server();
+    write_omp_config(model, vision, context_length, &server)?;
+    exec_with_env(
+        &bin,
+        &omp_args(model, extra_args),
+        &[("OLLAMA_BASE_URL", server.as_str())],
+    )
 }
 
 const OMP_PROVIDER: &str = "ollama";
@@ -1084,9 +1089,14 @@ fn omp_agent_dir() -> anyhow::Result<PathBuf> {
     })
 }
 
-fn write_omp_config(model: &str, vision: bool, context_length: Option<u64>) -> anyhow::Result<()> {
+fn write_omp_config(
+    model: &str,
+    vision: bool,
+    context_length: Option<u64>,
+    server: &str,
+) -> anyhow::Result<()> {
     let path = omp_agent_dir()?.join("models.yml");
-    write_omp_config_at(&path, model, vision, context_length, &daemon::server())
+    write_omp_config_at(&path, model, vision, context_length, server)
 }
 
 fn write_omp_config_at(

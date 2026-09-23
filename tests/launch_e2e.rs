@@ -1084,7 +1084,7 @@ fn launch_omp_with_model() {
     // `-p <prompt>` is OMP's print-and-exit mode. The launcher selects
     // `ollama/<model>` while run_launch's fresh HOME ensures the test does
     // not succeed because of a developer's pre-existing OMP configuration.
-    launch_and_assert("omp", &["-p", PROMPT]);
+    launch_and_assert_strict("omp", &["-p", PROMPT]);
 }
 
 #[test]
