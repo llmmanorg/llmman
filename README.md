@@ -277,15 +277,16 @@ integration:
 
 ```
 llmman launch claude --model qwen3.8
+llmman launch omp --model qwen3.8 -- -p "Explain this repository"
 llmman launch agy --model qwen3.8 -- -p "Explain this repository"
 llmman launch cline --model qwen3.8 -- --json "Explain this repository"
 llmman launch grok --model qwen3.8 -- -p "Explain this repository"
 ```
 
 Run `llmman launch` with no arguments to list the supported integrations
-(Claude Code, OpenCode, Codex, Pi, Cline, Aider, Qwen Code, Gemini CLI,
-Grok Build, AGY, DeepSeek Harness, Docker Agent, ...) and whether each is
-installed. Installing an
+(Claude Code, OpenCode, Codex, Pi, OMP, Cline, Aider, Qwen Code,
+Gemini CLI, Grok Build, AGY, DeepSeek Harness, Docker Agent, ...) and whether
+each is installed. Installing an
 integration is up to you; llmman only execs what is already on your
 machine, except that a missing Cline can be installed with npm after an
 interactive confirmation. `dsh` runs under `npx` when it isn't installed

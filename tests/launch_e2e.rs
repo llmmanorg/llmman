@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `agy`, `opencode`, `pi`, `codex`, `cline`, `grok`, `qwen`,
+//! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `cline`, `grok`, `qwen`,
 //! `hermes`,
 //! `openclaw`, `dsh`, `goose`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
@@ -1065,6 +1065,26 @@ fn launch_pi_with_model() {
     // fresh HOME and PI_CODING_AGENT_DIR, so this exercises writing
     // models.json and settings.json from nothing as well as the request.
     launch_and_assert("pi", &["-p", PROMPT]);
+}
+
+#[test]
+fn launch_omp_with_model() {
+    eprintln!("[test] launch_omp_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_omp_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("omp") {
+        eprintln!("skipping: omp not on PATH — https://omp.sh/");
+        return;
+    }
+
+    // `-p <prompt>` is OMP's print-and-exit mode. The launcher selects
+    // `ollama/<model>` while run_launch's fresh HOME ensures the test does
+    // not succeed because of a developer's pre-existing OMP configuration.
+    launch_and_assert("omp", &["-p", PROMPT]);
 }
 
 #[test]

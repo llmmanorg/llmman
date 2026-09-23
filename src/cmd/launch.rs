@@ -206,6 +206,8 @@ fn integration_key() -> String {
 /// docker-agent's "auto" selection takes the first cloud provider with a
 /// credential, then a local Docker Model Runner model, so without an
 /// explicit model the request never reaches llmman at all.
+/// OMP needs a model so the launcher can select the matching entry its
+/// Ollama discovery reads from llmman's `/api/tags`.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
 const MODEL_REQUIRED: &[&str] = &[
     "qwen",
@@ -215,6 +217,7 @@ const MODEL_REQUIRED: &[&str] = &[
     "grok",
     "cline",
     "pi",
+    "omp",
     "docker-agent",
 ];
 
@@ -225,6 +228,8 @@ const MODEL_REQUIRED: &[&str] = &[
 /// overriding. grok: its argument builder likewise drops the generated
 /// `--model`. Cline receives no generated arguments, so its own `--model`
 /// also wins over the provider selected in its settings.
+/// OMP's argument builder drops the generated Ollama model when the caller
+/// supplies one.
 /// Not docker-agent: its `--model` replaces the whole model entry
 /// `docker_agent_document` wrote, `base_url` included, so a forwarded one
 /// reaches api.openai.com. `check_docker_agent_args` refuses it rather
@@ -233,7 +238,7 @@ const MODEL_REQUIRED: &[&str] = &[
 /// `--model` flag at all (its model is the one `write_dsh_settings`
 /// records), so telling a dsh user theirs "wins" would be false, and dsh
 /// rejects the unknown flag on its own.
-const MODEL_FLAG_FORWARDED: &[&str] = &["qwen", "goose", "grok", "cline"];
+const MODEL_FLAG_FORWARDED: &[&str] = &["qwen", "goose", "grok", "cline", "omp"];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
 /// `--provider` too. A second `--model` after `--` is the caller's to
@@ -315,6 +320,14 @@ const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
     (
         "grok",
         "its model catalog cannot represent llmman's provider or hybrid routing reference",
+    ),
+    // OMP discovers the Ollama catalog from /api/tags. That endpoint lists
+    // stored models, not the synthetic provider or hybrid routing refs the
+    // daemon accepts at request time, and OMP rejects a model absent from the
+    // catalog before it sends a request.
+    (
+        "omp",
+        "its Ollama catalog cannot represent llmman's provider or hybrid routing reference",
     ),
 ];
 
@@ -501,6 +514,11 @@ const INTEGRATIONS: &[Integration] = &[
         name: "pi",
         description: "Pi coding agent",
         binary: "pi",
+    },
+    Integration {
+        name: "omp",
+        description: "OMP coding agent",
+        binary: "omp",
     },
     Integration {
         name: "cline",
@@ -741,6 +759,7 @@ fn launch(
             context_length,
             extra_args,
         ),
+        "omp" => launch_omp(model, extra_args),
         "cline" => launch_cline(model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
@@ -1022,6 +1041,28 @@ fn launch_pi(
     let bin = find_on_path("pi").ok_or_else(|| anyhow::anyhow!("pi is not installed"))?;
     write_pi_config(model, thinking, vision, context_length)?;
     exec_with_env(&bin, extra_args, &[])
+}
+
+/// omp: use its built-in Ollama provider, which discovers models from
+/// `OLLAMA_HOST`. [`exec_with_env`] points that variable at llmman serve;
+/// selecting `ollama/<model>` keeps OMP on that route without touching the
+/// user's `~/.omp` configuration.
+fn launch_omp(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_on_path("omp").ok_or_else(|| anyhow::anyhow!("omp is not installed"))?;
+    exec_with_env(&bin, &omp_args(model, extra_args), &[])
+}
+
+/// Select llmman's model through OMP's Ollama provider unless the caller
+/// explicitly supplied an OMP model after `--`. Avoiding a duplicate matters
+/// both for predictable precedence and for keeping OMP's argument parser out
+/// of version-specific repeated-option behavior.
+fn omp_args(model: &str, extra_args: &[String]) -> Vec<String> {
+    let mut args = Vec::with_capacity(extra_args.len() + 2);
+    if !has_flag(extra_args, "--model", Some("-m")) {
+        args.extend(["--model".to_string(), format!("ollama/{model}")]);
+    }
+    args.extend_from_slice(extra_args);
+    args
 }
 
 /// The provider key llmman owns in pi's `models.json`.
@@ -3028,6 +3069,37 @@ mod tests {
             assert!(MODEL_REQUIRED.contains(id), "{id} is not model-required");
         }
         assert!(!MODEL_FLAG_FORWARDED.contains(&"dsh"));
+    }
+
+    #[test]
+    fn omp_is_listed_and_selects_the_model_through_ollama() {
+        let omp = INTEGRATIONS.iter().find(|i| i.name == "omp").unwrap();
+        assert_eq!(omp.binary, "omp");
+        assert!(MODEL_REQUIRED.contains(&"omp"));
+        assert!(MODEL_FLAG_FORWARDED.contains(&"omp"));
+
+        assert_eq!(
+            omp_args("docker.io/ai/qwen3.5:0.8b", &[]),
+            vec!["--model", "ollama/docker.io/ai/qwen3.5:0.8b"]
+        );
+    }
+
+    #[test]
+    fn omp_model_argument_after_separator_wins_without_a_duplicate() {
+        let strings = |values: &[&str]| values.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        for forwarded in [
+            strings(&["--model", "openrouter/anthropic/claude-sonnet-4"]),
+            strings(&["-m", "ollama/other"]),
+            strings(&["--model=ollama/other"]),
+            strings(&["-m=ollama/other"]),
+        ] {
+            assert_eq!(omp_args("local", &forwarded), forwarded);
+        }
+
+        assert_eq!(
+            omp_args("local", &strings(&["-p", "ping"])),
+            strings(&["--model", "ollama/local", "-p", "ping"])
+        );
     }
 
     /// The only configuration goose gets: a wrong or missing one sends
