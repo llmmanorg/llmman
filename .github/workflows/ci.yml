@@ -660,7 +660,7 @@ jobs:
 
   # --------------------------------------------------------------------------
   # E2E: `llmman launch
-  # <claude|agy|opencode|pi|codex|cline|grok|qwen|hermes|openclaw|dsh|
+  # <claude|agy|opencode|pi|omp|codex|cline|grok|qwen|hermes|openclaw|dsh|
   # goose|docker-agent> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
@@ -692,7 +692,7 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/agy/opencode/pi/codex/cline/grok/qwen/hermes/openclaw/dsh/goose, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/agy/opencode/pi/omp/codex/cline/grok/qwen/hermes/openclaw/dsh/goose, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
@@ -721,7 +721,7 @@ jobs:
     # budget (10 min, same 600s as warm_model's) — it doesn't go through
     # launch_and_assert's retry loop at all (a real failure there is
     # always a deterministic llmman bug worth failing loudly on, not
-    # small-model sampling variance), so unlike the 13 launch tests above
+    # small-model sampling variance), so unlike the 14 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
     #
     # +60 more for `serve_vllm_safetensors_model` and
@@ -893,6 +893,19 @@ jobs:
       # designed (npm tolerates one failed platform-tarball fetch, here
       # a registry blip, instead of failing the install), just not
       # detectable by a mere on_path/PATH check. Retrying rides that out.
+      - name: Set up Bun for OMP
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install OMP
+        shell: bash
+        run: |
+          # Pinned with the minimum Bun version its package declares. The E2E
+          # invocation and models.yml schema are verified against this pair.
+          bun install -g @oh-my-pi/pi-coding-agent@18.2.11
+          omp --version
+
       - name: Install integration CLIs (claude, opencode, pi, codex, cline, qwen, openclaw, dsh)
         shell: bash
         run: |
