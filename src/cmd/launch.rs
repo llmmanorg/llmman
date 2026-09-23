@@ -1058,7 +1058,7 @@ fn launch_omp(
 ) -> anyhow::Result<()> {
     let bin = find_on_path("omp").ok_or_else(|| anyhow::anyhow!("omp is not installed"))?;
     let server = daemon::server();
-    write_omp_config(model, vision, context_length, &server)?;
+    write_omp_config(model, vision, context_length, &server, extra_args)?;
     exec_with_env(
         &bin,
         &omp_args(model, extra_args),
@@ -1068,25 +1068,118 @@ fn launch_omp(
 
 const OMP_PROVIDER: &str = "ollama";
 
-/// OMP's agent directory, matching its own `PI_CODING_AGENT_DIR` and
-/// `PI_CONFIG_DIR` resolution before falling back to `~/.omp/agent`.
-fn omp_agent_dir() -> anyhow::Result<PathBuf> {
-    if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
-        if !dir.trim().is_empty() {
-            return Ok(PathBuf::from(dir.trim()));
+/// The named profile OMP will use. Its explicit `--profile` wins over the
+/// environment; otherwise `OMP_PROFILE` wins over `PI_PROFILE` even when it is
+/// explicitly empty. This mirrors OMP's CLI bootstrap before it resolves paths.
+fn omp_profile(extra_args: &[String]) -> anyhow::Result<Option<String>> {
+    let mut forwarded = None;
+    let mut args = extra_args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        match arg {
+            "--" => break,
+            "--profile" => {
+                forwarded = Some(
+                    args.next()
+                        .context("omp --profile requires a profile name")?
+                        .to_string(),
+                );
+            }
+            _ => {
+                if let Some(value) = arg.strip_prefix("--profile=") {
+                    forwarded = Some(value.to_string());
+                }
+            }
         }
     }
+
+    let omp_env = match std::env::var("OMP_PROFILE") {
+        Ok(profile) => Some(profile),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error).context("read OMP_PROFILE"),
+    };
+    let pi_env = std::env::var("PI_PROFILE").ok();
+    resolve_omp_profile(forwarded.as_deref(), omp_env.as_deref(), pi_env.as_deref())
+}
+
+fn resolve_omp_profile(
+    forwarded: Option<&str>,
+    omp_env: Option<&str>,
+    pi_env: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    normalize_omp_profile(forwarded.or(omp_env).or(pi_env))
+}
+
+fn normalize_omp_profile(profile: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(profile) = profile.map(str::trim) else {
+        return Ok(None);
+    };
+    if profile.is_empty() || profile == "default" {
+        return Ok(None);
+    }
+    let bytes = profile.as_bytes();
+    let valid_chars = bytes.len() <= 64
+        && bytes
+            .first()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && bytes.iter().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(*c, b'.' | b'_' | b'-')
+        });
+    let basename = profile.split('.').next().unwrap_or_default();
+    let upper = basename.to_ascii_uppercase();
+    let upper = upper.as_bytes();
+    let windows_reserved = matches!(upper, b"CON" | b"PRN" | b"AUX" | b"NUL")
+        || (upper.len() == 4
+            && matches!(&upper[..3], b"COM" | b"LPT")
+            && upper[3].is_ascii_digit());
+    anyhow::ensure!(
+        valid_chars
+            && profile != "."
+            && profile != ".."
+            && !profile.ends_with('.')
+            && !windows_reserved,
+        "invalid OMP profile {profile:?}"
+    );
+    Ok(Some(profile.to_string()))
+}
+
+/// OMP's agent directory, including named-profile relocation. A named profile
+/// ignores `PI_CODING_AGENT_DIR`; the default profile honors it.
+fn omp_agent_dir(extra_args: &[String]) -> anyhow::Result<PathBuf> {
+    let profile = omp_profile(extra_args)?;
     let home = node_home_dir().context("no home directory")?;
     let config = std::env::var("PI_CONFIG_DIR")
         .ok()
         .filter(|dir| !dir.trim().is_empty())
         .unwrap_or_else(|| ".omp".to_string());
-    let config = PathBuf::from(config.trim());
-    Ok(if config.is_absolute() {
-        config.join("agent")
+    let override_dir = std::env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty());
+    Ok(omp_agent_dir_from(
+        &home,
+        config.trim(),
+        override_dir.as_deref(),
+        profile.as_deref(),
+    ))
+}
+
+fn omp_agent_dir_from(
+    home: &Path,
+    config: &str,
+    override_dir: Option<&str>,
+    profile: Option<&str>,
+) -> PathBuf {
+    let config = PathBuf::from(config);
+    let root = if config.is_absolute() {
+        config
     } else {
-        home.join(config).join("agent")
-    })
+        home.join(config)
+    };
+    match profile {
+        Some(profile) => root.join("profiles").join(profile).join("agent"),
+        None => override_dir
+            .map(|dir| PathBuf::from(dir.trim()))
+            .unwrap_or_else(|| root.join("agent")),
+    }
 }
 
 fn write_omp_config(
@@ -1094,8 +1187,9 @@ fn write_omp_config(
     vision: bool,
     context_length: Option<u64>,
     server: &str,
+    extra_args: &[String],
 ) -> anyhow::Result<()> {
-    let path = omp_agent_dir()?.join("models.yml");
+    let path = omp_agent_dir(extra_args)?.join("models.yml");
     write_omp_config_at(&path, model, vision, context_length, server)
 }
 
@@ -1199,10 +1293,8 @@ fn write_yaml_merged(
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     if raw.is_some() {
         let backup = path.with_extension("yml.bak");
-        if !backup.exists() {
-            std::fs::copy(path, &backup)
-                .with_context(|| format!("back up {} to {}", path.display(), backup.display()))?;
-        }
+        std::fs::copy(path, &backup)
+            .with_context(|| format!("back up {} to {}", path.display(), backup.display()))?;
     }
     let out = serde_yaml::to_string(&merged)?;
     crate::fsutil::write_atomic(path, out.as_bytes())
@@ -3288,6 +3380,38 @@ mod tests {
     }
 
     #[test]
+    fn omp_profile_relocates_the_agent_dir_and_ignores_the_default_override() {
+        let strings = |values: &[&str]| values.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            omp_profile(&strings(&["--profile", "work", "-p", "ping"])).unwrap(),
+            Some("work".to_string())
+        );
+        assert_eq!(
+            omp_profile(&strings(&["--profile=default", "-p", "ping"])).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_omp_profile(None, Some(""), Some("legacy")).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_omp_profile(None, None, Some("legacy")).unwrap(),
+            Some("legacy".to_string())
+        );
+        assert!(normalize_omp_profile(Some("../escape")).is_err());
+
+        let home = Path::new("/home/tester");
+        assert_eq!(
+            omp_agent_dir_from(home, ".omp", Some("/custom/agent"), Some("work")),
+            home.join(".omp/profiles/work/agent")
+        );
+        assert_eq!(
+            omp_agent_dir_from(home, ".omp", Some("/custom/agent"), None),
+            PathBuf::from("/custom/agent")
+        );
+    }
+
+    #[test]
     fn omp_models_yml_is_created_for_a_fresh_home_and_round_trips() {
         let dir = std::env::temp_dir().join(format!(
             "llmman-omp-models-{}-{}",
@@ -3317,6 +3441,52 @@ mod tests {
             serde_json::json!(["text", "image"])
         );
         assert_eq!(provider["models"][0]["contextWindow"], 32_768);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn omp_models_yml_backs_up_the_exact_commented_file_before_rewriting() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-omp-models-backup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("models.yml");
+        let original = r#"# my own notes, do not delete
+providers:
+  openai:
+    apiKey: sk-mine
+defaults:
+  temperature: 0.2   # tuned by hand
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        write_omp_config_at(
+            &path,
+            "docker.io/ai/qwen3.5:0.8b",
+            false,
+            None,
+            "http://127.0.0.1:17434",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("yml.bak")).unwrap(),
+            original
+        );
+        let parsed: serde_json::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["providers"]["openai"]["apiKey"], "sk-mine");
+        assert_eq!(parsed["defaults"]["temperature"], 0.2);
+        assert_eq!(
+            parsed["providers"]["ollama"]["models"][0]["id"],
+            "docker.io/ai/qwen3.5:0.8b"
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }
