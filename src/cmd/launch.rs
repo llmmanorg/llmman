@@ -759,7 +759,7 @@ fn launch(
             context_length,
             extra_args,
         ),
-        "omp" => launch_omp(model, vision, context_length, extra_args),
+        "omp" => launch_omp(model, api_key, vision, context_length, extra_args),
         "cline" => launch_cline(model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
@@ -1052,31 +1052,60 @@ fn launch_pi(
 /// makes the first launch work while preserving unrelated user configuration.
 fn launch_omp(
     model: &str,
+    api_key: &str,
     vision: bool,
     context_length: Option<u64>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_on_path("omp").ok_or_else(|| anyhow::anyhow!("omp is not installed"))?;
     let server = daemon::server();
-    write_omp_config(model, vision, context_length, &server)?;
+    let (configured_model, configured_vision, configured_context) =
+        omp_model_config(model, vision, context_length, extra_args);
+    write_omp_config(
+        configured_model,
+        configured_vision,
+        configured_context,
+        &server,
+    )?;
     exec_with_env(
         &bin,
         &omp_args(model, extra_args),
-        &[("OLLAMA_BASE_URL", server.as_str())],
+        &[
+            ("OLLAMA_BASE_URL", server.as_str()),
+            (OMP_API_KEY_ENV, api_key),
+        ],
     )
 }
 
 const OMP_PROVIDER: &str = "ollama";
+const OMP_API_KEY_ENV: &str = "LLMMAN_API_KEY";
+
+fn omp_model_config<'a>(
+    model: &'a str,
+    vision: bool,
+    context_length: Option<u64>,
+    extra_args: &'a [String],
+) -> (&'a str, bool, Option<u64>) {
+    let configured = forwarded_model(extra_args).unwrap_or(model);
+    let configured = configured.strip_prefix("ollama/").unwrap_or(configured);
+    let same =
+        crate::shortnames::resolve_ollama_api(configured).is_ok_and(|resolved| resolved == model);
+    (configured, vision && same, context_length.filter(|_| same))
+}
 
 /// OMP's agent directory. These are the paths OMP exposes for callers to
 /// configure; profile layout remains OMP's responsibility.
 fn omp_agent_dir() -> anyhow::Result<PathBuf> {
-    if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
-        if !dir.trim().is_empty() {
-            return Ok(PathBuf::from(dir.trim()));
-        }
+    let home = || node_home_dir().context("no home directory");
+    match std::env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+    {
+        Some(dir) if !dir.trim().starts_with('~') => return Ok(PathBuf::from(dir.trim())),
+        Some(dir) => return Ok(expand_tilde(dir.trim(), &home()?)),
+        None => {}
     }
-    let home = node_home_dir().context("no home directory")?;
+    let home = home()?;
     let config = std::env::var("PI_CONFIG_DIR")
         .ok()
         .filter(|dir| !dir.trim().is_empty())
@@ -1188,7 +1217,9 @@ fn omp_models_merged(
         serde_json::json!(format!("{}/v1", server.trim_end_matches('/'))),
     );
     provider.insert("api".into(), serde_json::json!("openai-responses"));
-    provider.insert("auth".into(), serde_json::json!("none"));
+    provider.remove("auth");
+    provider.insert("apiKey".into(), serde_json::json!(OMP_API_KEY_ENV));
+    provider.insert("authHeader".into(), serde_json::json!(true));
     provider.insert("discovery".into(), serde_json::json!({ "type": "ollama" }));
     provider.insert("models".into(), serde_json::json!(models));
     root
@@ -1205,7 +1236,7 @@ fn write_yaml_merged(
         ("YAML", "yml.bak"),
         |text| Ok(yaml_serde::from_str(text)?),
         |value| Ok(yaml_serde::to_string(value)?),
-        |_, _| true,
+        |_, backup| !backup.exists(),
         merge,
     )
 }
@@ -3271,6 +3302,7 @@ mod tests {
             "providers": {
                 "other": { "baseUrl": "https://example.com" },
                 "ollama": {
+                    "auth": "none",
                     "headers": { "X-Custom": "kept" },
                     "models": [
                         {
@@ -3293,7 +3325,9 @@ mod tests {
         let provider = &merged["providers"]["ollama"];
         assert_eq!(provider["baseUrl"], "http://127.0.0.1:17434/v1");
         assert_eq!(provider["api"], "openai-responses");
-        assert_eq!(provider["auth"], "none");
+        assert!(provider.get("auth").is_none());
+        assert_eq!(provider["apiKey"], OMP_API_KEY_ENV);
+        assert_eq!(provider["authHeader"], true);
         assert_eq!(provider["discovery"]["type"], "ollama");
         assert_eq!(provider["headers"]["X-Custom"], "kept");
         assert_eq!(provider["models"][0]["name"], entry["name"]);
@@ -3321,6 +3355,20 @@ mod tests {
         assert_eq!(
             omp_args("local", &strings(&["-p", "ping"])),
             strings(&["--model", "ollama/local", "-p", "ping"])
+        );
+
+        assert_eq!(
+            omp_model_config("docker.io/ai/a:1", true, Some(8192), &[]),
+            ("docker.io/ai/a:1", true, Some(8192))
+        );
+        assert_eq!(
+            omp_model_config(
+                "docker.io/ai/a:1",
+                true,
+                Some(8192),
+                &strings(&["--model", "ollama/docker.io/ai/b:2"]),
+            ),
+            ("docker.io/ai/b:2", false, None)
         );
     }
 
@@ -3391,6 +3439,14 @@ defaults:
             "docker.io/ai/qwen3.5:0.8b",
             false,
             None,
+            "http://127.0.0.1:17434",
+        )
+        .unwrap();
+        write_omp_config_in_dir(
+            &dir,
+            "docker.io/ai/qwen3.5:0.8b",
+            false,
+            Some(4096),
             "http://127.0.0.1:17434",
         )
         .unwrap();
