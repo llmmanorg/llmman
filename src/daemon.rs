@@ -1361,6 +1361,9 @@ pub struct ProviderModel {
     /// `None` where models.dev publishes no price, which is not free.
     #[serde(default)]
     pub cost: Option<ModelCost>,
+    /// See `crate::providers::Model::thinking`; `None` from an older daemon too.
+    #[serde(default)]
+    pub thinking: Option<Vec<String>>,
 }
 
 /// US dollars per million tokens (see [`crate::providers::Cost`]).
@@ -1388,6 +1391,14 @@ impl ProviderDetail {
     /// `crate::providers::example_models`).
     pub fn model_ids(&self) -> Vec<&str> {
         self.models.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    /// The catalog's thinking levels for `model`, if it lists any.
+    pub fn thinking_levels(&self, model: &str) -> Option<Vec<String>> {
+        self.models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.thinking.clone())
     }
 
     /// Where a key for this provider would go (see

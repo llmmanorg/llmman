@@ -214,9 +214,11 @@ the model's default.
 - `opencode`: variants read off the model's chat template (what `llmman
   show` lists as `thinking`), cycled with `variant_cycle` (ctrl+t) or
   `/variants`: `none`, each `reasoning_effort` level the template takes
-  (Qwen3.8: `low`, `medium`, `high`, `xhigh`), or `thinking` for a
-  template with only an `enable_thinking` switch (Gemma 4, Qwen3.5). A
-  provider's model gets `none`, `low`, `medium`, `high`.
+  (Qwen3.8: `low`, `medium`, `xhigh`), or `thinking` for a template with
+  only an `enable_thinking` switch (Gemma 4, Qwen3.5). A provider's model
+  gets the levels models.dev's `reasoning_options` list, as opencode
+  does (Claude Opus 5.5: `low` to `max`), else `none`, `low`, `medium`,
+  `high`.
 - `claude`: Claude Code's `/effort <low|medium|high|xhigh|max>`, sent as
   spelled; a level the template rejects is a 400.
 - `codex`: `model_reasoning_effort`, e.g. `-- -c

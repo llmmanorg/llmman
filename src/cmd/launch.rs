@@ -87,10 +87,10 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     if name.eq_ignore_ascii_case("cline") {
         ensure_cline_installed()?;
     }
-    // The local model's thinking controls (see `opencode_variants`),
-    // whether it takes images (see `write_dsh_settings`) and its trained
-    // context (see `codex_context_window`); a provider's model has none
-    // of these to read.
+    // The model's thinking choices (see `opencode_variants`), from its
+    // template or the catalog; whether it takes images (see
+    // `write_dsh_settings`) and its trained context (see
+    // `codex_context_window`) only a local model has.
     let mut thinking = None;
     let mut vision = false;
     let mut context_length = None;
@@ -105,7 +105,10 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // is what forwards upstream.
             crate::daemon::ensure_server("")?;
             let per_request = !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
-            resolve_provider_model(provider, args.model.as_deref(), name, per_request)?
+            let (model, api_key, levels) =
+                resolve_provider_model(provider, args.model.as_deref(), name, per_request)?;
+            thinking = levels.map(Thinking::Listed);
+            (model, api_key)
         }
         None => {
             // resolve_ollama_api, not resolve: every integration this
@@ -137,7 +140,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // the integration.
             if !model.is_empty() {
                 let info = crate::daemon::ensure_model_pulled(&model)?;
-                thinking = info.thinking_controls();
+                thinking = info.thinking_controls().map(Thinking::Template);
                 vision = info.vision();
                 context_length = info.context_length();
             }
@@ -149,7 +152,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                     check_provider_supported(name)?;
                     let per_request =
                         !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
-                    let (remote, api_key) =
+                    // The local half, which serves by default, keeps
+                    // its thinking choices.
+                    let (remote, api_key, _) =
                         resolve_provider_model(provider, Some(hosted), name, per_request)?;
                     (crate::hybrid::pair_with_local(&model, &remote)?, api_key)
                 }
@@ -341,8 +346,9 @@ fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
 
 /// Validates `--provider`/`--model` against the running daemon's catalog
 /// (see [`crate::daemon::provider`]), returning the reference the daemon
-/// routes on (see [`crate::providers::REMOTE_PREFIX`]) and the key
-/// `integration` should authenticate with.
+/// routes on (see [`crate::providers::REMOTE_PREFIX`]), the key
+/// `integration` should authenticate with, and the model's catalog
+/// thinking levels (see [`Thinking::Listed`]).
 ///
 /// `key_travels_per_request` is false for the integrations in
 /// [`PROVIDER_NEEDS_DAEMON_KEY`], which get the placeholder because they
@@ -361,7 +367,7 @@ fn resolve_provider_model(
     model: Option<&str>,
     integration: &str,
     key_travels_per_request: bool,
-) -> anyhow::Result<(String, String)> {
+) -> anyhow::Result<(String, String, Option<Vec<String>>)> {
     // Asked of the daemon, not models.dev: it routes the request, so it
     // is the authority on whether this provider exists — and on whether
     // *it* has the key, which this shell cannot see.
@@ -436,7 +442,11 @@ fn resolve_provider_model(
         (None, true) => anyhow::bail!("no API key for {} — {}", entry.name, entry.key_hint()),
     };
 
-    Ok((providers::format_remote_ref(provider, model), key))
+    Ok((
+        providers::format_remote_ref(provider, model),
+        key,
+        entry.thinking_levels(model),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -687,7 +697,7 @@ fn launch(
     name: &str,
     model: &str,
     api_key: &str,
-    thinking: Option<&ThinkingControls>,
+    thinking: Option<&Thinking>,
     vision: bool,
     context_length: Option<u64>,
     extra_args: &[String],
@@ -696,7 +706,13 @@ fn launch(
         "claude" => launch_claude(model, api_key, extra_args),
         "opencode" => launch_opencode(model, api_key, thinking, vision, extra_args),
         "codex" => launch_codex(model, api_key, vision, context_length, extra_args),
-        "pi" => launch_pi(model, thinking, vision, context_length, extra_args),
+        "pi" => launch_pi(
+            model,
+            thinking.and_then(Thinking::template),
+            vision,
+            context_length,
+            extra_args,
+        ),
         "cline" => launch_cline(model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
@@ -748,7 +764,7 @@ fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
 fn launch_opencode(
     model: &str,
     api_key: &str,
-    thinking: Option<&ThinkingControls>,
+    thinking: Option<&Thinking>,
     vision: bool,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
@@ -766,24 +782,47 @@ fn launch_opencode(
     exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
 }
 
-/// The choices offered when the model's template could not be read (a
-/// provider's model): thinking off, then the levels every wire accepts
+/// The thinking choices a model offers an integration, in cycle order.
+enum Thinking {
+    /// A local model's, read off its chat template.
+    Template(ThinkingControls),
+    /// A provider's model's, from the catalog (see
+    /// `crate::providers::Model::thinking`).
+    Listed(Vec<String>),
+}
+
+impl Thinking {
+    fn choices(&self) -> Vec<&str> {
+        match self {
+            Thinking::Template(controls) => controls.choices(),
+            Thinking::Listed(levels) => levels.iter().map(String::as_str).collect(),
+        }
+    }
+
+    fn template(&self) -> Option<&ThinkingControls> {
+        match self {
+            Thinking::Template(controls) => Some(controls),
+            Thinking::Listed(_) => None,
+        }
+    }
+}
+
+/// The choices offered when neither a template nor the catalog says:
+/// thinking off, then the levels every wire accepts
 /// (`anthropic::portable_efforts`).
 const PORTABLE_THINKING_LEVELS: &[&str] = &["none", "low", "medium", "high"];
 
 /// opencode's `variants` for the model, in cycle order (`variant_cycle`,
-/// ctrl+t by default): the template's own choices (see
-/// [`ThinkingControls::choices`]), or [`PORTABLE_THINKING_LEVELS`] without
-/// a template. A model that does not think gets none. Each variant is the
-/// request options `@ai-sdk/openai-compatible` sends: `reasoningEffort`
-/// as `reasoning_effort`, other keys verbatim. opencode derives variants
-/// only for models it knows from models.dev, so without these a local
-/// model has nothing to cycle.
-fn opencode_variants(
-    thinking: Option<&ThinkingControls>,
-) -> Vec<(&'static str, serde_json::Value)> {
+/// ctrl+t by default): [`Thinking::choices`], or
+/// [`PORTABLE_THINKING_LEVELS`] without them. A model that does not think
+/// gets none. Each variant is the request options
+/// `@ai-sdk/openai-compatible` sends: `reasoningEffort` as
+/// `reasoning_effort`, other keys verbatim. opencode derives variants
+/// only for models it knows from models.dev, so without these a model
+/// has nothing to cycle.
+fn opencode_variants(thinking: Option<&Thinking>) -> Vec<(&str, serde_json::Value)> {
     let choices = match thinking {
-        Some(controls) => controls.choices(),
+        Some(thinking) => thinking.choices(),
         None => PORTABLE_THINKING_LEVELS.to_vec(),
     };
     choices
@@ -842,7 +881,7 @@ fn opencode_config(
     server: &str,
     model: &str,
     api_key: &str,
-    variants: &[(&'static str, serde_json::Value)],
+    variants: &[(&str, serde_json::Value)],
     vision: bool,
 ) -> String {
     use serde::ser::{SerializeMap, Serializer};
@@ -889,7 +928,7 @@ fn opencode_config(
     struct Model<'a> {
         name: &'a str,
         #[serde(serialize_with = "entries", skip_serializing_if = "<[_]>::is_empty")]
-        variants: &'a [(&'static str, serde_json::Value)],
+        variants: &'a [(&'a str, serde_json::Value)],
         #[serde(skip_serializing_if = "Option::is_none")]
         modalities: Option<Modalities>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -3772,7 +3811,7 @@ model = \"gpt-5\"
             efforts: vec![],
         };
         assert_eq!(
-            opencode_variants(Some(&gemma4)),
+            opencode_variants(Some(&Thinking::Template(gemma4.clone()))),
             [
                 ("none", serde_json::json!({ "reasoningEffort": "none" })),
                 (
@@ -3782,21 +3821,45 @@ model = \"gpt-5\"
             ]
         );
         let qwen3_8 = ThinkingControls {
-            efforts: vec!["low", "xhigh"],
+            efforts: vec!["low", "medium", "xhigh"],
             ..gemma4
         };
         assert_eq!(
-            opencode_variants(Some(&qwen3_8)),
+            opencode_variants(Some(&Thinking::Template(qwen3_8))),
             [
                 ("none", serde_json::json!({ "reasoningEffort": "none" })),
                 ("low", serde_json::json!({ "reasoningEffort": "low" })),
+                ("medium", serde_json::json!({ "reasoningEffort": "medium" })),
                 ("xhigh", serde_json::json!({ "reasoningEffort": "xhigh" })),
             ]
         );
-        assert!(opencode_variants(Some(&ThinkingControls::default())).is_empty());
+        let plain = Thinking::Template(ThinkingControls::default());
+        assert!(opencode_variants(Some(&plain)).is_empty());
         let fallback = opencode_variants(None);
         assert_eq!(fallback.len(), PORTABLE_THINKING_LEVELS.len());
         assert_eq!(fallback[0].0, "none");
+    }
+
+    /// A provider's model cycles exactly the catalog's levels, with no
+    /// added `none`; an empty list means no variants, not the portable set.
+    #[test]
+    fn opencode_variants_follow_the_catalogs_levels() {
+        let claude = Thinking::Listed(
+            ["low", "medium", "high", "xhigh", "max"]
+                .map(String::from)
+                .to_vec(),
+        );
+        let variants = opencode_variants(Some(&claude));
+        assert_eq!(
+            variants.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            variants[4].1,
+            serde_json::json!({ "reasoningEffort": "max" })
+        );
+        assert!(opencode_variants(Some(&Thinking::Listed(Vec::new()))).is_empty());
+        assert!(claude.template().is_none());
     }
 
     #[test]

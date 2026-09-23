@@ -304,6 +304,10 @@ pub struct Model {
     /// models.dev's `limit.output`, the default `max_tokens` for a wire
     /// that requires one. `None` where the catalog has none.
     pub max_output: Option<u32>,
+    /// The `reasoning_effort` levels opencode offers, in cycle order (see
+    /// [`thinking_levels_of`]). Empty for a model that does not reason;
+    /// `None` where the catalog does not say.
+    pub thinking: Option<Vec<String>>,
 }
 
 /// US dollars per million tokens — models.dev's own unit, unconverted so
@@ -649,8 +653,7 @@ struct RawProvider {
     models: BTreeMap<String, RawModel>,
 }
 
-/// A models.dev model entry — the id is the map key, so only the price
-/// and the output ceiling are read out of the value.
+/// A models.dev model entry; the id is the map key.
 #[derive(Debug, Deserialize)]
 struct RawModel {
     /// Untyped on purpose: a typed `{input, output}` would let an
@@ -661,6 +664,13 @@ struct RawModel {
     /// Untyped for the same reason; only `output` is read.
     #[serde(default)]
     limit: Option<serde_json::Value>,
+    /// Untyped for the same reason.
+    #[serde(default)]
+    reasoning: Option<serde_json::Value>,
+    /// Untyped for the same reason, e.g.
+    /// `[{"type": "effort", "values": ["low", "high"]}]`.
+    #[serde(default)]
+    reasoning_options: Option<serde_json::Value>,
 }
 
 /// A models.dev `limit.output` as a token count, or `None` unless it is
@@ -668,6 +678,47 @@ struct RawModel {
 fn max_output_of(raw: &serde_json::Value) -> Option<u32> {
     let n = raw.get("output")?.as_u64()?;
     u32::try_from(n).ok().filter(|&n| n > 0)
+}
+
+/// The levels opencode derives from a models.dev entry
+/// (`ProviderTransform.reasoningVariants`, which also reads the options
+/// before `reasoning`):
+///
+/// - an `effort` option: its `values`, `null` spelled `none`;
+/// - else `budget_tokens` on the Anthropic wire: `high` and `max`;
+/// - an empty list, or `reasoning: false` with nothing usable: none;
+/// - anything else: `None`; opencode's per-model heuristics are not copied.
+fn thinking_levels_of(raw: &RawModel, wire: Wire, max_output: Option<u32>) -> Option<Vec<String>> {
+    let options = raw
+        .reasoning_options
+        .as_ref()
+        .and_then(serde_json::Value::as_array);
+    let of_type = |kind: &str| options?.iter().find(|o| o["type"] == kind);
+    if options.is_some_and(Vec::is_empty) {
+        return Some(Vec::new());
+    }
+    if let Some(effort) = of_type("effort") {
+        let mut levels: Vec<String> = Vec::new();
+        for value in effort["values"].as_array().into_iter().flatten() {
+            let level = match value {
+                serde_json::Value::Null => "none",
+                serde_json::Value::String(s) => s.trim(),
+                _ => continue,
+            };
+            if !level.is_empty() && !levels.iter().any(|l| l == level) {
+                levels.push(level.to_string());
+            }
+        }
+        return Some(levels);
+    }
+    // opencode caps the budget at `limit.output - 1`.
+    if wire == Wire::Anthropic
+        && of_type("budget_tokens").is_some()
+        && max_output.is_some_and(|n| n > 1)
+    {
+        return Some(vec!["high".to_string(), "max".to_string()]);
+    }
+    (raw.reasoning.as_ref().and_then(serde_json::Value::as_bool) == Some(false)).then(Vec::new)
 }
 
 /// A models.dev `cost` object as a [`Cost`], or `None` unless *both*
@@ -753,10 +804,14 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
         models: raw
             .models
             .into_iter()
-            .map(|(id, model)| Model {
-                id,
-                cost: model.cost.as_ref().and_then(cost_of),
-                max_output: model.limit.as_ref().and_then(max_output_of),
+            .map(|(id, model)| {
+                let max_output = model.limit.as_ref().and_then(max_output_of);
+                Model {
+                    cost: model.cost.as_ref().and_then(cost_of),
+                    thinking: thinking_levels_of(&model, wire, max_output),
+                    max_output,
+                    id,
+                }
             })
             .collect(),
     })
@@ -1104,6 +1159,7 @@ mod tests {
                     id: "a-model".into(),
                     cost: None,
                     max_output: None,
+                    thinking: None,
                 },
                 Model {
                     id: "z-model".into(),
@@ -1112,9 +1168,80 @@ mod tests {
                         output: 10.0
                     }),
                     max_output: Some(32000),
+                    thinking: None,
                 },
             ]
         );
+    }
+
+    /// The levels opencode's `reasoningVariants` offers for each entry.
+    #[test]
+    fn thinking_levels_follow_the_catalogs_reasoning_options() {
+        let catalog = catalog_from(
+            r#"{
+                "anthropic": {
+                    "id": "anthropic", "name": "Anthropic",
+                    "npm": "@ai-sdk/anthropic", "env": ["ANTHROPIC_API_KEY"],
+                    "models": {
+                        "claude-opus-5-5": { "reasoning": true, "limit": { "output": 128000 },
+                            "reasoning_options": [{ "type": "effort", "values": ["low", "medium", "high", "xhigh", "max"] }] },
+                        "claude-sonnet-5": { "reasoning": true, "limit": { "output": 128000 },
+                            "reasoning_options": [{ "type": "toggle" }, { "type": "effort", "values": ["low", "high"] }] },
+                        "claude-haiku-4-5": { "reasoning": true, "limit": { "output": 64000 },
+                            "reasoning_options": [{ "type": "budget_tokens", "min": 1024 }] },
+                        "claude-no-ceiling": { "reasoning": true,
+                            "reasoning_options": [{ "type": "budget_tokens", "min": 1024 }] },
+                        "claude-3-haiku": { "reasoning": false, "limit": { "output": 4096 } }
+                    }
+                },
+                "cheap": {
+                    "id": "cheap", "name": "Cheap", "api": "https://cheap.example/v1",
+                    "npm": "@ai-sdk/openai-compatible", "env": ["CHEAP_API_KEY"],
+                    "models": {
+                        "gpt-x": { "reasoning": true,
+                            "reasoning_options": [{ "type": "effort", "values": [null, "low", "low", 3, "", "xhigh"] }] },
+                        "qwen-budget": { "reasoning": true, "limit": { "output": 32000 },
+                            "reasoning_options": [{ "type": "toggle" }, { "type": "budget_tokens", "max": 32768 }] },
+                        "no-reasoning": { "reasoning": false,
+                            "reasoning_options": [{ "type": "toggle" }] },
+                        "switch-off": { "reasoning": true, "reasoning_options": [] },
+                        "unsaid": { "reasoning": true },
+                        "odd": { "reasoning": "yes", "reasoning_options": { "type": "effort" } }
+                    }
+                }
+            }"#,
+        );
+        let levels = |provider: &str, model: &str| {
+            catalog
+                .get(provider)
+                .and_then(|p| p.models.iter().find(|m| m.id == model))
+                .unwrap_or_else(|| panic!("{provider}/{model}"))
+                .thinking
+                .clone()
+        };
+        let some = |levels: &[&str]| Some(levels.iter().map(|l| l.to_string()).collect());
+
+        assert_eq!(
+            levels("anthropic", "claude-opus-5-5"),
+            some(&["low", "medium", "high", "xhigh", "max"])
+        );
+        assert_eq!(
+            levels("anthropic", "claude-sonnet-5"),
+            some(&["low", "high"])
+        );
+        assert_eq!(
+            levels("anthropic", "claude-haiku-4-5"),
+            some(&["high", "max"])
+        );
+        assert_eq!(levels("anthropic", "claude-no-ceiling"), None);
+        assert_eq!(levels("anthropic", "claude-3-haiku"), some(&[]));
+
+        assert_eq!(levels("cheap", "gpt-x"), some(&["none", "low", "xhigh"]));
+        assert_eq!(levels("cheap", "qwen-budget"), None);
+        assert_eq!(levels("cheap", "no-reasoning"), some(&[]));
+        assert_eq!(levels("cheap", "switch-off"), some(&[]));
+        assert_eq!(levels("cheap", "unsaid"), None);
+        assert_eq!(levels("cheap", "odd"), None);
     }
 
     /// models.dev leaves `api` unset for providers whose SDK hardcodes

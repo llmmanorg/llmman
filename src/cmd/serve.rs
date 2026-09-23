@@ -2861,6 +2861,9 @@ struct ProviderModelResponse {
     /// "unknown" as "free" lies about someone's bill.
     #[serde(skip_serializing_if = "Option::is_none")]
     cost: Option<ProviderCostResponse>,
+    /// See [`crate::providers::Model::thinking`]; absent is not empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Vec<String>>,
 }
 
 /// US dollars per million tokens, models.dev's own unit (see
@@ -2891,6 +2894,7 @@ impl ProviderResponse {
                         input: c.input,
                         output: c.output,
                     }),
+                    thinking: m.thinking.clone(),
                 })
                 .collect(),
         }
@@ -2931,7 +2935,11 @@ async fn handle_llmman_provider(
         response.models = configured_provider_models(&state, provider)
             .await
             .into_iter()
-            .map(|id| ProviderModelResponse { id, cost: None })
+            .map(|id| ProviderModelResponse {
+                id,
+                cost: None,
+                thinking: None,
+            })
             .collect();
     }
     Ok(Json(response))
