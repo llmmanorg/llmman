@@ -7,6 +7,8 @@
 //! `llmman launch` offers an integration exactly these (see
 //! `cmd::launch::opencode_variants`), never a level the model rejects.
 
+use std::ops::Range;
+
 /// Every `reasoning_effort` level any template or provider spells,
 /// lowest first.
 pub const EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
@@ -50,8 +52,9 @@ impl ThinkingControls {
 
 /// Reads the thinking controls off `template`. Levels are the
 /// [`EFFORT_LEVELS`] quoted in a Jinja block that names
-/// `reasoning_effort` (or a variable derived from it), narrowed to an
-/// `in (...)` test naming two or more so an alias rewritten before it
+/// `reasoning_effort` (or a variable derived from it), outside another
+/// variable's `in (...)` list, narrowed to an `in (...)` test of
+/// `reasoning_effort` naming two or more so an alias rewritten before it
 /// (Docker's Qwen3.8 `high`) is not offered. Fewer than two named —
 /// gpt-oss's `default("medium")` alone — means
 /// [`DEFAULT_EFFORT_LEVELS`]. `none` is a switch, not a level.
@@ -74,19 +77,21 @@ pub fn thinking_controls(template: &str) -> ThinkingControls {
                 .filter(|level| literals.contains(level))
                 .collect()
         };
-        let accepted = levels_among(
-            effort_blocks
-                .iter()
-                .flat_map(|block| membership_lists(block))
-                .flat_map(quoted_literals)
-                .collect(),
-        );
-        let named = levels_among(
-            effort_blocks
-                .iter()
-                .flat_map(|block| quoted_literals(block))
-                .collect(),
-        );
+        // Literals in effort lists, and all but another variable's list's.
+        let (mut accepted, mut named) = (Vec::new(), Vec::new());
+        for block in effort_blocks {
+            let mut from = 0;
+            for (list, of_effort) in membership_lists(block) {
+                if of_effort {
+                    accepted.extend(quoted_literals(&block[list]));
+                } else if list.start >= from {
+                    named.extend(quoted_literals(&block[from..list.start]));
+                    from = list.end;
+                }
+            }
+            named.extend(quoted_literals(&block[from..]));
+        }
+        let (accepted, named) = (levels_among(accepted), levels_among(named));
         if accepted.len() >= 2 {
             accepted
         } else if named.len() >= 2 {
@@ -136,23 +141,57 @@ fn blocks(template: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// The inside of each `in (...)` or `in [...]` list in `block`.
-fn membership_lists(block: &str) -> impl Iterator<Item = &str> {
+/// The span inside each `in (...)` or `in [...]` list in `block`, and
+/// whether its left operand names `reasoning_effort` (or a variable
+/// derived from it).
+fn membership_lists(block: &str) -> impl Iterator<Item = (Range<usize>, bool)> + '_ {
     block.match_indices("in").filter_map(|(at, _)| {
         // `in` as a word: not the tail of `min` or `join`.
         let before = block[..at].chars().next_back()?;
         if !(before.is_whitespace() || before == ')') {
             return None;
         }
-        let rest = block[at + 2..].trim_start();
-        let close = match rest.chars().next()? {
+        let after = &block[at + 2..];
+        let open = at + 2 + (after.len() - after.trim_start().len());
+        let close = match block[open..].chars().next()? {
             '(' => ')',
             '[' => ']',
             _ => return None,
         };
-        let end = rest.find(close)?;
-        Some(&rest[1..end])
+        let end = open + block[open..].find(close)?;
+        let lhs = block[..at].trim_end();
+        let lhs = lhs.strip_suffix("not").map_or(lhs, str::trim_end);
+        Some((
+            open + 1..end,
+            left_operand(lhs).contains("reasoning_effort"),
+        ))
     })
+}
+
+/// The operand `before` ends with: `x.y`, `x | f`, `x|f('a')`, `( x | f )`.
+fn left_operand(before: &str) -> &str {
+    let bytes = before.as_bytes();
+    let (mut start, mut depth) = (bytes.len(), 0usize);
+    while start > 0 {
+        let c = bytes[start - 1];
+        match c {
+            b')' | b']' => depth += 1,
+            b'(' | b'[' if depth > 0 => depth -= 1,
+            _ if depth > 0 => {}
+            // Space joins only around a filter's `|`.
+            _ if c.is_ascii_whitespace() => {
+                let pipe_after = before[start..].trim_start().starts_with('|');
+                let pipe_before = before[..start - 1].trim_end().ends_with('|');
+                if !(pipe_after || pipe_before) {
+                    break;
+                }
+            }
+            _ if c.is_ascii_alphanumeric() || b"_.|".contains(&c) => {}
+            _ => break,
+        }
+        start -= 1;
+    }
+    &before[start..]
 }
 
 /// The contents of every `'...'` and `"..."` in `text`, in order.
@@ -214,8 +253,8 @@ mod tests {
         assert_eq!(thinking_controls(&upstream), controls);
     }
 
-    /// A test naming fewer than two levels, or a word ending in `in`,
-    /// does not narrow.
+    /// A test naming fewer than two levels, a word ending in `in`, or a
+    /// test of another variable does not narrow.
     #[test]
     fn a_membership_test_narrows_the_named_levels() {
         let t = "{%- if reasoning_effort == 'max' %}{% set reasoning_effort = 'high' %}{% endif %}\
@@ -228,9 +267,24 @@ mod tests {
             thinking_controls(join).efforts,
             vec!["low", "medium", "high", "max"]
         );
+        let other = "{%- if mode in ('low', 'high') and reasoning_effort in ('medium', 'max') %}";
+        assert_eq!(thinking_controls(other).efforts, vec!["medium", "max"]);
+        let bare = "{%- if mode in ('low', 'high') and reasoning_effort %}";
+        assert_eq!(thinking_controls(bare).efforts, DEFAULT_EFFORT_LEVELS);
+        let block = "reasoning_effort not in ('a', 'b') and y in ('c', 'd') \
+                     or (reasoning_effort|lower) in[1] or reasoning_effort | lower in [2] \
+                     or ( reasoning_effort | default('x') ) in (3) or reasoning_effort in (";
         assert_eq!(
-            membership_lists("x not in ('a', 'b') and y in[1] or z in (").collect::<Vec<_>>(),
-            ["'a', 'b'", "1"]
+            membership_lists(block)
+                .map(|(list, of_effort)| (&block[list], of_effort))
+                .collect::<Vec<_>>(),
+            [
+                ("'a', 'b'", true),
+                ("'c', 'd'", false),
+                ("1", true),
+                ("2", true),
+                ("3", true)
+            ]
         );
     }
 
