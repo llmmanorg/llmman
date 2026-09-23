@@ -665,13 +665,6 @@ fn run_launch(
         // run a different AGY than the one CI installed and checksummed.
         .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
 
-    // A named OMP profile ignores PI_CODING_AGENT_DIR and relocates its
-    // catalog under ~/.omp/profiles/<name>/agent. Exercise that path rather
-    // than only the default profile, where both locations happen to work.
-    if integration == "omp" {
-        cmd.env("OMP_PROFILE", "work");
-    }
-
     try_spawn_with_timeout(
         cmd,
         TIMEOUT,
