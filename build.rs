@@ -378,10 +378,22 @@ fn main() {
         };
         // The wrapper calls clang with a fixed --target then forwards all other
         // args (%*).  Go treats this .cmd as the C compiler.
+        //
+        // Go before 1.27 adds -mthreads to every cgo compile on GOOS=windows.
+        // That flag is MinGW-only (it links mingwthrd); clang 21+ rejects it
+        // for *-msvc targets ("unsupported option '-mthreads'"), so drop it.
+        // The leading space keeps the variable defined and anchors the
+        // match to an argument boundary. Both %* and %VAR:x=y% expand in the
+        // same parsing phase, so every other argument reaches clang exactly
+        // as it did through a bare %*.
         let wrapper = out_dir.join("cgo_cc.cmd");
         fs::write(
             &wrapper,
-            format!("@echo off\r\nclang --target={} %*\r\n", msvc_triple),
+            format!(
+                "@echo off\r\nsetlocal\r\nset LLMMAN_CGO_ARGS= %*\r\n\
+                 clang --target={} %LLMMAN_CGO_ARGS: -mthreads=%\r\n",
+                msvc_triple
+            ),
         )
         .expect("write CGO CC wrapper");
         cmd.env("CC", &wrapper);

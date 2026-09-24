@@ -1539,10 +1539,15 @@ jobs:
       # Only the `sglang` console script goes on PATH, via a symlink dir:
       # the venv's bin/ also has a python3 and pytest, and $GITHUB_PATH
       # prepends, so it would shadow the vllm-plugin venv's pytest.
+      # UV_HTTP_RETRIES: uv's default of 3 exponential-backoff retries spans
+      # ~10s, shorter than a PyPI 503 blip; a real run failed on exactly
+      # that ("Request failed after 3 retries in 10.1s"). 8 spans minutes.
       - name: Install SGLang (e2e)
         if: runner.os == 'Linux' || runner.os == 'macOS'
         timeout-minutes: 40
         shell: bash
+        env:
+          UV_HTTP_RETRIES: "8"
         run: |
           set -euo pipefail
           src="$RUNNER_TEMP/sglang-src"
