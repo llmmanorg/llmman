@@ -96,3 +96,156 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
         client: Client::new(),
     }
 }
+
+/// `/llmman/node` answers `node`; every other route records its call.
+pub(super) async fn mock_peer(
+    node: aggregation::Node,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<(String, HeaderMap, Bytes)>>>,
+) {
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let app = Router::new()
+        .route("/llmman/node", get(move || async move { Json(node) }))
+        .fallback(move |req: Request| async move {
+            let (parts, body) = req.into_parts();
+            let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            captured
+                .lock()
+                .await
+                .push((parts.uri.path().to_string(), parts.headers, body));
+            ([("content-type", "application/json")], "{}")
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (origin, seen)
+}
+
+pub(super) fn node(memory: u64, loaded: &[&str], stored: &[&str]) -> aggregation::Node {
+    let map = |names: &[&str]| names.iter().map(|n| (n.to_string(), 1 << 30)).collect();
+    aggregation::Node {
+        memory,
+        loaded: map(loaded),
+        stored: map(stored),
+    }
+}
+
+/// A long-lived, harmless real child process to back a test
+/// `RunningModel` — `ModelProcess::is_alive`/`Drop` both need a real
+/// `tokio::process::Child`, not a mock. `sleep` isn't on `PATH` on
+/// Windows (which this project does target — see the `#[cfg(windows)]`
+/// branches elsewhere in this module), so it's spawned differently per
+/// platform rather than assuming a Unix-only test environment.
+///
+/// Its own process group (matching `spawn_vllm_server`'s own real
+/// spawn — see its doc comment), not just the bare default: a
+/// fixture backing an `Engine::Vllm` `RunningModel` hits
+/// `ModelProcess::Drop`'s process-group-SIGKILL arm, which needs
+/// this to actually *be* one, or that kill fails and prints a
+/// spurious "SIGKILL to vllm process group ... failed" warning on
+/// every test run that uses one — confirmed live via CodeRabbit
+/// review on this repo's own git history.
+#[cfg(unix)]
+fn spawn_placeholder_process() -> tokio::process::Child {
+    tokio::process::Command::new("sleep")
+        .arg("60")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn placeholder `sleep` process")
+}
+
+#[cfg(windows)]
+fn spawn_placeholder_process() -> tokio::process::Child {
+    tokio::process::Command::new("cmd")
+        .args(["/C", "timeout", "/T", "60", "/NOBREAK"])
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn placeholder `cmd /C timeout` process")
+}
+
+pub(super) fn running_model_fixture(
+    keep_alive: Option<Duration>,
+    idle_for: Duration,
+    in_flight: u32,
+) -> RunningModel {
+    RunningModel {
+        process: ModelProcess::Local(Engine::LlamaServer, spawn_placeholder_process(), None),
+        port: 0,
+        digest: String::new(),
+        size: 0,
+        started_at: now_rfc3339(),
+        last_active: Instant::now() - idle_for,
+        last_active_wall: chrono::Utc::now(),
+        backend_model_path: None,
+        keep_alive,
+        in_flight,
+    }
+}
+
+/// Like `running_model_fixture`, but with a caller-chosen `Engine`
+/// and `backend_model_path` — used by `backend_wire_model`'s own
+/// tests below, which need to distinguish an `Engine::Mlx` backend
+/// from every other one, and by the `engine_label` test.
+pub(super) fn running_model_fixture_with_engine(
+    engine: Engine,
+    backend_model_path: Option<&str>,
+) -> RunningModel {
+    RunningModel {
+        process: ModelProcess::Local(engine, spawn_placeholder_process(), None),
+        port: 0,
+        digest: String::new(),
+        size: 0,
+        started_at: now_rfc3339(),
+        last_active: Instant::now(),
+        last_active_wall: chrono::Utc::now(),
+        backend_model_path: backend_model_path.map(|s| s.to_string()),
+        keep_alive: None,
+        in_flight: 0,
+    }
+}
+
+/// The process-wide registry against placeholder gauges.
+pub(super) fn rendered_registry() -> String {
+    metrics::render(&metrics::Snapshot {
+        version: "test".into(),
+        start_time_seconds: 0,
+        scheduling_requests_in_flight: 0,
+        scheduling_capacity: 1,
+        models_loaded: 0,
+        models_loading: 0,
+        models: Vec::new(),
+    })
+}
+
+/// Binds `build_router(state, false)` on a free loopback port.
+pub(super) async fn serve_router(state: AppState) -> String {
+    serve_router_with(state, false).await
+}
+
+pub(super) async fn serve_router_with(state: AppState, metrics: bool) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = build_router(state, metrics);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://127.0.0.1:{}", addr.port())
+}
+
+pub(super) fn ws_upgrade(
+    client: &Client,
+    url: &str,
+    origin: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut req = client
+        .get(url)
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+    if let Some(origin) = origin {
+        req = req.header("origin", origin);
+    }
+    req
+}

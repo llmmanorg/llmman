@@ -19,8 +19,9 @@ use super::responses::{
 use super::sched::{reap_idle_models_once, resolve_keep_alive, DEFAULT_KEEP_ALIVE};
 use super::stream::{fold_ollama_lines, stream_ollama};
 use super::test_support::{
-    headers_with, remote_target, remote_target_on, test_inner, test_state, test_state_at,
-    test_state_with_budget, HOSTED, PAIR,
+    headers_with, mock_peer, node, remote_target, remote_target_on, rendered_registry,
+    running_model_fixture, running_model_fixture_with_engine, serve_router, serve_router_with,
+    test_inner, test_state, test_state_at, test_state_with_budget, ws_upgrade, HOSTED, PAIR,
 };
 use super::*;
 
@@ -1030,32 +1031,6 @@ fn a_peer_target_is_a_local_backend_in_all_but_address() {
     }
 }
 
-/// `/llmman/node` answers `node`; every other route records its call.
-async fn mock_peer(
-    node: aggregation::Node,
-) -> (
-    String,
-    Arc<tokio::sync::Mutex<Vec<(String, HeaderMap, Bytes)>>>,
-) {
-    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let captured = seen.clone();
-    let app = Router::new()
-        .route("/llmman/node", get(move || async move { Json(node) }))
-        .fallback(move |req: Request| async move {
-            let (parts, body) = req.into_parts();
-            let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-            captured
-                .lock()
-                .await
-                .push((parts.uri.path().to_string(), parts.headers, body));
-            ([("content-type", "application/json")], "{}")
-        });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (origin, seen)
-}
-
 /// Store tags `docker.io/ai/m:latest` with no blobs, so a local load
 /// fails offline instead of pulling.
 fn state_with_peers(peers: Vec<String>, memory: u64) -> AppState {
@@ -1081,15 +1056,6 @@ fn state_with_peers(peers: Vec<String>, memory: u64) -> AppState {
     inner.peers = peers;
     inner.memory = memory;
     AppState(Arc::new(inner))
-}
-
-fn node(memory: u64, loaded: &[&str], stored: &[&str]) -> aggregation::Node {
-    let map = |names: &[&str]| names.iter().map(|n| (n.to_string(), 1 << 30)).collect();
-    aggregation::Node {
-        memory,
-        loaded: map(loaded),
-        stored: map(stored),
-    }
 }
 
 /// A peer gets llmman's own dialect, the hop marker, no credential.
@@ -2042,81 +2008,6 @@ async fn a_configured_providers_models_are_asked_of_its_endpoint() {
 }
 
 // -- Idle-timeout auto-unload reaper --------------------------------------
-
-/// A long-lived, harmless real child process to back a test
-/// `RunningModel` — `ModelProcess::is_alive`/`Drop` both need a real
-/// `tokio::process::Child`, not a mock. `sleep` isn't on `PATH` on
-/// Windows (which this project does target — see the `#[cfg(windows)]`
-/// branches elsewhere in this module), so it's spawned differently per
-/// platform rather than assuming a Unix-only test environment.
-///
-/// Its own process group (matching `spawn_vllm_server`'s own real
-/// spawn — see its doc comment), not just the bare default: a
-/// fixture backing an `Engine::Vllm` `RunningModel` hits
-/// `ModelProcess::Drop`'s process-group-SIGKILL arm, which needs
-/// this to actually *be* one, or that kill fails and prints a
-/// spurious "SIGKILL to vllm process group ... failed" warning on
-/// every test run that uses one — confirmed live via CodeRabbit
-/// review on this repo's own git history.
-#[cfg(unix)]
-fn spawn_placeholder_process() -> tokio::process::Child {
-    tokio::process::Command::new("sleep")
-        .arg("60")
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn placeholder `sleep` process")
-}
-
-#[cfg(windows)]
-fn spawn_placeholder_process() -> tokio::process::Child {
-    tokio::process::Command::new("cmd")
-        .args(["/C", "timeout", "/T", "60", "/NOBREAK"])
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn placeholder `cmd /C timeout` process")
-}
-
-fn running_model_fixture(
-    keep_alive: Option<Duration>,
-    idle_for: Duration,
-    in_flight: u32,
-) -> RunningModel {
-    RunningModel {
-        process: ModelProcess::Local(Engine::LlamaServer, spawn_placeholder_process(), None),
-        port: 0,
-        digest: String::new(),
-        size: 0,
-        started_at: now_rfc3339(),
-        last_active: Instant::now() - idle_for,
-        last_active_wall: chrono::Utc::now(),
-        backend_model_path: None,
-        keep_alive,
-        in_flight,
-    }
-}
-
-/// Like `running_model_fixture`, but with a caller-chosen `Engine`
-/// and `backend_model_path` — used by `backend_wire_model`'s own
-/// tests below, which need to distinguish an `Engine::Mlx` backend
-/// from every other one, and by the `engine_label` test.
-fn running_model_fixture_with_engine(
-    engine: Engine,
-    backend_model_path: Option<&str>,
-) -> RunningModel {
-    RunningModel {
-        process: ModelProcess::Local(engine, spawn_placeholder_process(), None),
-        port: 0,
-        digest: String::new(),
-        size: 0,
-        started_at: now_rfc3339(),
-        last_active: Instant::now(),
-        last_active_wall: chrono::Utc::now(),
-        backend_model_path: backend_model_path.map(|s| s.to_string()),
-        keep_alive: None,
-        in_flight: 0,
-    }
-}
 
 /// The container arm reports the engine it runs, not the runtime that
 /// runs it. `tokio::test` because the fixture spawns a real child.
@@ -4729,19 +4620,6 @@ async fn stream_ollama_true_returns_ndjson_chunks() {
     assert!(chunks[0].get("eval_count").is_none());
 }
 
-/// The process-wide registry against placeholder gauges.
-fn rendered_registry() -> String {
-    metrics::render(&metrics::Snapshot {
-        version: "test".into(),
-        start_time_seconds: 0,
-        scheduling_requests_in_flight: 0,
-        scheduling_capacity: 1,
-        models_loaded: 0,
-        models_loading: 0,
-        models: Vec::new(),
-    })
-}
-
 /// One model's unload counter from the process-wide registry; `0`
 /// while the series does not exist yet.
 fn unload_count(model: &str, reason: &str) -> u64 {
@@ -4960,19 +4838,6 @@ async fn the_scrape_endpoint_is_absent_unless_the_operator_enabled_it() {
 
 // -- web UI ---------------------------------------------------------
 
-/// Binds `build_router(state, false)` on a free loopback port.
-async fn serve_router(state: AppState) -> String {
-    serve_router_with(state, false).await
-}
-
-async fn serve_router_with(state: AppState, metrics: bool) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = build_router(state, metrics);
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://127.0.0.1:{}", addr.port())
-}
-
 /// `/` is the page only for a client that asks for HTML; everything
 /// else gets the liveness line scripts have always seen.
 #[tokio::test]
@@ -5074,19 +4939,6 @@ fn shell_state(policy: shell::Policy) -> AppState {
     let mut inner = test_inner(std::env::temp_dir());
     inner.shell = policy;
     AppState(Arc::new(inner))
-}
-
-fn ws_upgrade(client: &Client, url: &str, origin: Option<&str>) -> reqwest::RequestBuilder {
-    let mut req = client
-        .get(url)
-        .header("connection", "upgrade")
-        .header("upgrade", "websocket")
-        .header("sec-websocket-version", "13")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
-    if let Some(origin) = origin {
-        req = req.header("origin", origin);
-    }
-    req
 }
 
 /// A plain GET reports the policy; an upgrade under a disabled policy
