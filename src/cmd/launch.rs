@@ -650,6 +650,7 @@ fn env_dir(key: &str) -> Option<PathBuf> {
 fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
         "opencode" => find_opencode(),
+        "omp" => find_omp(),
         "qwen" => find_qwen(),
         "dsh" => find_dsh().map(|(bin, _)| bin),
         "goose" => find_goose(),
@@ -759,7 +760,7 @@ fn launch(
             context_length,
             extra_args,
         ),
-        "omp" => launch_omp(model, api_key, vision, context_length, extra_args),
+        "omp" => launch_omp(model, vision, context_length, extra_args),
         "cline" => launch_cline(model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
@@ -1052,46 +1053,47 @@ fn launch_pi(
 /// makes the first launch work while preserving unrelated user configuration.
 fn launch_omp(
     model: &str,
-    api_key: &str,
     vision: bool,
     context_length: Option<u64>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
-    let bin = find_on_path("omp").ok_or_else(|| anyhow::anyhow!("omp is not installed"))?;
+    let bin = find_omp().ok_or_else(|| anyhow::anyhow!("omp is not installed"))?;
     let server = daemon::server();
-    let (configured_model, configured_vision, configured_context) =
-        omp_model_config(model, vision, context_length, extra_args);
-    write_omp_config(
-        configured_model,
-        configured_vision,
-        configured_context,
-        &server,
-    )?;
+    write_omp_config(model, vision, context_length, &server)?;
     exec_with_env(
         &bin,
         &omp_args(model, extra_args),
-        &[
-            ("OLLAMA_BASE_URL", server.as_str()),
-            (OMP_API_KEY_ENV, api_key),
-        ],
+        &[("OLLAMA_BASE_URL", server.as_str())],
     )
 }
 
 const OMP_PROVIDER: &str = "ollama";
-const OMP_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 const OMP_SETUP_VERSION: u64 = 2;
 
-fn omp_model_config<'a>(
-    model: &'a str,
-    vision: bool,
-    context_length: Option<u64>,
-    extra_args: &'a [String],
-) -> (&'a str, bool, Option<u64>) {
-    let configured = forwarded_model(extra_args).unwrap_or(model);
-    let configured = configured.strip_prefix("ollama/").unwrap_or(configured);
-    let same =
-        crate::shortnames::resolve_ollama_api(configured).is_ok_and(|resolved| resolved == model);
-    (configured, vision && same, context_length.filter(|_| same))
+/// `PATH`, then Bun's and the standalone installer's usual user-local bins.
+fn find_omp() -> Option<PathBuf> {
+    find_on_path("omp").or_else(|| omp_fallback_paths().into_iter().find(|path| path.is_file()))
+}
+
+fn omp_fallback_paths() -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let dirs = [
+        home.join(".bun").join("bin"),
+        home.join(".local").join("bin"),
+    ];
+    if cfg!(windows) {
+        return dirs
+            .into_iter()
+            .flat_map(|dir| {
+                WINDOWS_PATH_EXTS
+                    .iter()
+                    .map(move |ext| dir.join(format!("omp.{ext}")))
+            })
+            .collect();
+    }
+    dirs.into_iter().map(|dir| dir.join("omp")).collect()
 }
 
 /// OMP's agent directory. These are the paths OMP exposes for callers to
@@ -1226,7 +1228,10 @@ fn omp_models_merged(
     );
     provider.insert("api".into(), serde_json::json!("openai-responses"));
     provider.remove("auth");
-    provider.insert("apiKey".into(), serde_json::json!(OMP_API_KEY_ENV));
+    provider.insert(
+        "apiKey".into(),
+        serde_json::json!(providers::PLACEHOLDER_API_KEY),
+    );
     provider.insert("authHeader".into(), serde_json::json!(true));
     provider.insert("discovery".into(), serde_json::json!({ "type": "ollama" }));
     provider.insert("models".into(), serde_json::json!(models));
@@ -3341,7 +3346,7 @@ mod tests {
         assert_eq!(provider["baseUrl"], "http://127.0.0.1:17434/v1");
         assert_eq!(provider["api"], "openai-responses");
         assert!(provider.get("auth").is_none());
-        assert_eq!(provider["apiKey"], OMP_API_KEY_ENV);
+        assert_eq!(provider["apiKey"], providers::PLACEHOLDER_API_KEY);
         assert_eq!(provider["authHeader"], true);
         assert_eq!(provider["discovery"]["type"], "ollama");
         assert_eq!(provider["headers"]["X-Custom"], "kept");
@@ -3378,20 +3383,18 @@ mod tests {
             omp_args("local", &strings(&["-p", "ping"])),
             strings(&["--model", "ollama/local", "-p", "ping"])
         );
+    }
 
-        assert_eq!(
-            omp_model_config("docker.io/ai/a:1", true, Some(8192), &[]),
-            ("docker.io/ai/a:1", true, Some(8192))
-        );
-        assert_eq!(
-            omp_model_config(
-                "docker.io/ai/a:1",
-                true,
-                Some(8192),
-                &strings(&["--model", "ollama/docker.io/ai/b:2"]),
-            ),
-            ("docker.io/ai/b:2", false, None)
-        );
+    #[test]
+    fn omp_fallback_paths_cover_bun_and_local_bin() {
+        let paths = omp_fallback_paths();
+        let binary = if cfg!(windows) { "omp.exe" } else { "omp" };
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with(Path::new(".bun").join("bin").join(binary))));
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with(Path::new(".local").join("bin").join(binary))));
     }
 
     #[test]
