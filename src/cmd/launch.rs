@@ -1079,6 +1079,7 @@ fn launch_omp(
 
 const OMP_PROVIDER: &str = "ollama";
 const OMP_API_KEY_ENV: &str = "LLMMAN_API_KEY";
+const OMP_SETUP_VERSION: u64 = 2;
 
 fn omp_model_config<'a>(
     model: &'a str,
@@ -1142,13 +1143,20 @@ fn write_omp_config_in_dir(
         context_length,
         server,
     )?;
-    write_yaml_merged(&dir.join("config.yml"), "omp", |existing| {
-        let mut config = existing.clone();
-        if let Some(config) = config.as_object_mut() {
-            config.insert("setupVersion".into(), serde_json::json!(1));
-        }
-        config
-    })
+    write_yaml_merged(&dir.join("config.yml"), "omp", omp_config_merged)
+}
+
+fn omp_config_merged(existing: &serde_json::Value) -> serde_json::Value {
+    let mut config = existing.clone();
+    if let Some(config) = config.as_object_mut() {
+        let setup_version = config
+            .get("setupVersion")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+            .max(OMP_SETUP_VERSION);
+        config.insert("setupVersion".into(), serde_json::json!(setup_version));
+    }
+    config
 }
 
 fn write_omp_models_config_at(
@@ -1236,7 +1244,14 @@ fn write_yaml_merged(
         ("YAML", "yml.bak"),
         |text| Ok(yaml_serde::from_str(text)?),
         |value| Ok(yaml_serde::to_string(value)?),
-        |_, backup| !backup.exists(),
+        |raw, backup| {
+            if !backup.exists() {
+                return true;
+            }
+            yaml_serde::from_str::<serde_json::Value>(raw)
+                .and_then(|value| yaml_serde::to_string(&value))
+                .is_ok_and(|canonical| canonical != raw)
+        },
         merge,
     )
 }
@@ -3338,6 +3353,13 @@ mod tests {
             merged["providers"]["other"]["baseUrl"],
             "https://example.com"
         );
+
+        let config = omp_config_merged(&serde_json::json!({
+            "setupVersion": OMP_SETUP_VERSION + 3,
+            "theme": "dark"
+        }));
+        assert_eq!(config["setupVersion"], OMP_SETUP_VERSION + 3);
+        assert_eq!(config["theme"], "dark");
     }
 
     #[test]
@@ -3405,7 +3427,7 @@ mod tests {
         let config: serde_json::Value =
             yaml_serde::from_str(&std::fs::read_to_string(dir.join("config.yml")).unwrap())
                 .unwrap();
-        assert_eq!(config["setupVersion"], 1);
+        assert_eq!(config["setupVersion"], OMP_SETUP_VERSION);
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3455,6 +3477,21 @@ defaults:
             std::fs::read_to_string(path.with_extension("yml.bak")).unwrap(),
             original
         );
+        let mut hand_edited = std::fs::read_to_string(&path).unwrap();
+        hand_edited.push_str("# added after the first launch\n");
+        std::fs::write(&path, &hand_edited).unwrap();
+        write_omp_config_in_dir(
+            &dir,
+            "docker.io/ai/qwen3.5:0.8b",
+            false,
+            Some(8192),
+            "http://127.0.0.1:17434",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("yml.bak")).unwrap(),
+            hand_edited
+        );
         let parsed: serde_json::Value =
             yaml_serde::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed["providers"]["openai"]["apiKey"], "sk-mine");
@@ -3470,7 +3507,7 @@ defaults:
         let config: serde_json::Value =
             yaml_serde::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
         assert_eq!(config["theme"], "dark");
-        assert_eq!(config["setupVersion"], 1);
+        assert_eq!(config["setupVersion"], OMP_SETUP_VERSION);
 
         std::fs::remove_dir_all(dir).unwrap();
     }
