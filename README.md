@@ -128,9 +128,15 @@ Without a prompt it opens a `>>> ` loop where `/set width|height|steps|seed|cfg|
 adjusts the settings. The same model answers `/v1/images/generations`, `/v1/videos` and
 `/v1/audio/speech` on `llmman serve`.
 
-Diffusion repositories published as Diffusers-layout safetensors (a root `model_index.json`)
-are instead served by [vLLM-Omni](https://github.com/vllm-project/vllm-omni) (`vllm serve
---omni`; install `vllm-omni` next to `vllm`, or use `--runtime docker` for the `vllm/vllm-omni` image).
+Qwen-Image 2.1 runs from its Diffusers-layout safetensors the same way:
+
+```sh
+llmman run qwen-image-2.1 "A manatee in a sunlit lagoon"               # an RGBA png
+```
+
+Other Diffusers-layout repositories (a root `model_index.json`) are served by
+[vLLM-Omni](https://github.com/vllm-project/vllm-omni) (`vllm serve --omni`; install
+`vllm-omni` next to `vllm`, or use `--runtime docker` for the `vllm/vllm-omni` image).
 See [docs/backends.md](docs/backends.md#vllm-omni-diffusers-pipelines).
 
 ## OCI-native models

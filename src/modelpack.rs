@@ -35,7 +35,8 @@ pub enum ModelPath {
     /// A latent diffusion model (image / video / audio generation) —
     /// served in-process by `crate::mediagen` from the transformer GGUF
     /// plus the sidecars pulled next to it (see
-    /// `crate::hf::oci::ANNOTATION_ROLE`).
+    /// `crate::hf::oci::ANNOTATION_ROLE`), or from a Diffusers pack whose
+    /// pipeline it runs (`crate::mediagen::is_native_pipeline`).
     Diffusion(DiffusionPaths),
     /// A Diffusers-layout safetensors directory (a root `model_index.json`,
     /// weights in `transformer/`, `vae/`, ...) such as `nvidia/Cosmos3-Edge`
@@ -49,7 +50,8 @@ pub const DIFFUSERS_MODEL_INDEX: &str = "model_index.json";
 /// The files of a resolved [`ModelPath::Diffusion`] model.
 #[derive(Debug, Clone, Default)]
 pub struct DiffusionPaths {
-    /// The diffusion transformer GGUF (`--model`).
+    /// The diffusion transformer GGUF (`--model`), or a Diffusers pack's
+    /// `model_index.json` (its components are in `files`).
     pub model: PathBuf,
     /// Video VAE (`--vae`).
     pub vae: Option<PathBuf>,
@@ -532,6 +534,36 @@ pub fn manifest_format(manifest: &crate::storage::oci::Manifest) -> Option<Model
     }
 }
 
+/// A Diffusers pack whose pipeline `crate::mediagen` runs itself.
+fn is_native_diffusers(store: &OciStore, manifest: &crate::storage::oci::Manifest) -> bool {
+    manifest
+        .layers
+        .iter()
+        .find(|l| is_diffusers_index_layer(l))
+        .and_then(|l| store.read_blob(&l.digest).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| {
+            v.get("_class_name")?
+                .as_str()
+                .map(crate::mediagen::is_native_pipeline)
+        })
+        .unwrap_or(false)
+}
+
+/// [`manifest_format`], but a Diffusers pack whose pipeline `crate::mediagen`
+/// runs is [`ModelFormat::Diffusion`] rather than [`ModelFormat::Omni`].
+pub fn stored_manifest_format(
+    store: &OciStore,
+    manifest: &crate::storage::oci::Manifest,
+) -> Option<ModelFormat> {
+    match manifest_format(manifest) {
+        Some(ModelFormat::Omni) if is_native_diffusers(store, manifest) => {
+            Some(ModelFormat::Diffusion)
+        }
+        f => f,
+    }
+}
+
 /// The "nothing servable" error, naming the file extensions that were there.
 fn no_servable_layer(model_ref: &str, manifest: &crate::storage::oci::Manifest) -> anyhow::Error {
     let exts: std::collections::HashSet<String> = manifest
@@ -559,7 +591,7 @@ pub fn stored_format(store_path: &Path, model_ref: &str) -> anyhow::Result<Model
         .find(model_ref)
         .with_context(|| format!("model not found in store: {model_ref}"))?;
     let manifest = store.read_manifest(&desc.digest)?;
-    manifest_format(&manifest).ok_or_else(|| no_servable_layer(model_ref, &manifest))
+    stored_manifest_format(&store, &manifest).ok_or_else(|| no_servable_layer(model_ref, &manifest))
 }
 
 /// Resolve `model_ref` (already present in the `OciStore` at `store_path`)
@@ -576,9 +608,31 @@ pub fn resolve_model(
         .with_context(|| format!("model not found in store: {model_ref}"))?;
     let manifest = store.read_manifest(&desc.digest)?;
 
-    let Some(format) = manifest_format(&manifest) else {
+    let Some(format) = stored_manifest_format(&store, &manifest) else {
         return Err(no_servable_layer(model_ref, &manifest));
     };
+
+    // ── Diffusers pipeline → crate::mediagen ──────────────────────────────
+    if format == ModelFormat::Diffusion && manifest_format(&manifest) == Some(ModelFormat::Omni) {
+        extract_safetensors_dir(store_path, cache_path, &desc.digest, &manifest)?;
+        let root = cache_path.join(digest_hex(&desc.digest)?);
+        let files: std::collections::BTreeMap<String, PathBuf> = manifest
+            .layers
+            .iter()
+            .filter_map(layer_filepath)
+            .filter(|p| crate::sources::is_safe_relative_path(p) && root.join(p).is_file())
+            .map(|p| (p.to_string(), root.join(p)))
+            .collect();
+        let model = files
+            .get(DIFFUSERS_MODEL_INDEX)
+            .cloned()
+            .ok_or_else(|| anyhow!("{model_ref}: {DIFFUSERS_MODEL_INDEX} was not extracted"))?;
+        return Ok(ModelPath::Diffusion(DiffusionPaths {
+            model,
+            files,
+            ..Default::default()
+        }));
+    }
 
     // ── diffusion → crate::mediagen ───────────────────────────────────────
     if format == ModelFormat::Diffusion {
@@ -1098,6 +1152,29 @@ mod tests {
         layers.push(vae);
         let (_, m) = manifest_with(layers);
         assert_eq!(manifest_format(&m), Some(ModelFormat::Diffusion));
+    }
+
+    #[test]
+    fn a_pipeline_mediagen_runs_is_diffusion_not_omni() {
+        let with_index = |class: &str| {
+            let (store, mut m) = manifest_with(cosmos3_layers());
+            let index = store
+                .write_blob(
+                    "application/vnd.cncf.model.weight.config.v1.raw",
+                    format!(r#"{{"_class_name": "{class}"}}"#).as_bytes(),
+                )
+                .unwrap();
+            m.layers[1].digest = index.digest;
+            stored_manifest_format(&store, &m)
+        };
+        assert_eq!(
+            with_index("QwenImage21Pipeline"),
+            Some(ModelFormat::Diffusion)
+        );
+        assert_eq!(with_index("Cosmos3OmniPipeline"), Some(ModelFormat::Omni));
+        // an index missing from the store leaves it to vLLM-Omni
+        let (store, m) = manifest_with(cosmos3_layers());
+        assert_eq!(stored_manifest_format(&store, &m), Some(ModelFormat::Omni));
     }
 
     #[test]

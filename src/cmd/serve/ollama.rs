@@ -270,7 +270,7 @@ pub(super) async fn handle_show(
             // What resolve_model would serve this as, read off the
             // manifest. Empty rather than a guess when no layer is
             // servable at all.
-            format: crate::modelpack::manifest_format(&manifest)
+            format: crate::modelpack::stored_manifest_format(&store, &manifest)
                 .map(crate::modelpack::ModelFormat::as_str)
                 .unwrap_or_default()
                 .to_string(),

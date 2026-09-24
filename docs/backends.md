@@ -13,6 +13,7 @@ already exists for the model format it finds, and runs it unmodified.
 | safetensors | [`sglang`](https://github.com/sgl-project/sglang) | Your `PATH`, with `LLMMAN_SAFETENSORS_ENGINE=sglang` |
 | safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | macOS: llmman's own `uv`-installed copy, installed when the daemon starts, or the one on your `PATH` — per `--runtime`, as for `llama-server`; preferred over `vllm` |
 | GGUF diffusion (LTX-2) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
+| Diffusers safetensors (Qwen-Image 2.1) | llmman itself, on ggml | The same libraries; see [below](#qwen-image-21) |
 | Diffusers safetensors | [`vllm serve --omni`](https://github.com/vllm-project/vllm-omni) | Your `PATH`'s `vllm` with the `vllm-omni` package installed |
 | Diffusers safetensors | `vllm serve --omni` in a container | `--runtime docker` / `podman` (Linux only): the `vllm/vllm-omni` image (CUDA only) |
 
@@ -146,7 +147,8 @@ forwarded into the container.
 A safetensors repository laid out as a Diffusers pipeline (a root
 `model_index.json` next to `transformer/`, `vae/`, ...) is
 served by [vLLM-Omni](https://github.com/vllm-project/vllm-omni): the same
-`vllm` launcher with `--omni`. Plain `vllm serve` cannot load one.
+`vllm` launcher with `--omni`. Plain `vllm serve` cannot load one. The
+exception is a pipeline llmman runs itself (see [Qwen-Image 2.1](#qwen-image-21)).
 
 ```sh
 uv pip install vllm==0.28.0 vllm-omni     # into the environment `vllm` runs from
@@ -171,6 +173,19 @@ and gated weights). `LLMMAN_LOAD_TIMEOUT` is also passed as `--init-timeout`.
 With a container runtime, the image is `vllm/vllm-omni:latest-x86_64` or
 `latest-aarch64` (CUDA only; `--vllm-version` pins vLLM-Omni's release,
 e.g. `v0.28.0`). `--pull-only <model>` picks it for a pulled Diffusers model.
+
+### Qwen-Image 2.1
+
+`QwenImage21Pipeline` repositories (`docker.io/ai/qwen-image-2.1`,
+`Qwen/Qwen-Image-2.1`) run in llmman on the same ggml libraries, straight
+from their bf16 safetensors:
+
+```sh
+llmman run qwen-image-2.1 "A manatee in a sunlit lagoon"
+```
+
+Text to image only: 1024x1024, 40 steps, RGBA PNG. The text encoder and the
+transformer load on first use and take turns when both do not fit.
 
 ### `vllm serve` from llmman's store
 

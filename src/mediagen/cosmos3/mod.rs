@@ -7,7 +7,6 @@ pub mod audio;
 pub mod dit;
 pub mod sched;
 pub mod tokenizer;
-pub mod vae;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +17,7 @@ use serde_json::Value;
 
 use super::backend::Backend;
 use super::ffi::Api;
+use super::wan_vae as vae;
 use super::weights::{Index, LoadOpts, Weights};
 use super::{dump, ActionMode, Frames, GenParams, Mt19937, Output};
 use dit::UndCache;
@@ -64,6 +64,11 @@ impl Hparams {
                 .ok_or_else(|| anyhow!("GGUF has no cosmos3.transformer_config_json"))?,
         )
         .context("cosmos3.transformer_config_json")?;
+        Self::from_config(&cfg)
+    }
+
+    /// From a transformer config; a Qwen3-VL `text_config` gives its text model.
+    pub fn from_config(cfg: &Value) -> Result<Hparams> {
         let i = |k: &str, d: i64| cfg.get(k).and_then(Value::as_i64).unwrap_or(d);
         let f = |k: &str, d: f64| cfg.get(k).and_then(Value::as_f64).unwrap_or(d);
         let b = |k: &str, d: bool| cfg.get(k).and_then(Value::as_bool).unwrap_or(d);
@@ -160,7 +165,7 @@ pub struct Model {
     ncond: Option<(Vec<u32>, UndCache)>,
 }
 
-fn read_json(path: &Path) -> Result<Value> {
+pub(crate) fn read_json(path: &Path) -> Result<Value> {
     serde_json::from_slice(&std::fs::read(path)?).with_context(|| path.display().to_string())
 }
 
@@ -755,7 +760,15 @@ impl Model {
                 f
             })
             .collect();
-        let dec = vae::decode(&self.vae, be, &frames, hp.latent_channels, lh, lw);
+        let dec = vae::decode(
+            &self.vae,
+            be,
+            &frames,
+            hp.latent_channels,
+            lh,
+            lw,
+            &vae::Layout::wan22(),
+        );
         be.release_compute()?;
         let dec = dec?;
         eprintln!(
@@ -813,7 +826,7 @@ impl Model {
 }
 
 /// Debugging aid: fills `out` from the raw f32 file named by `var` (shared noise with a reference run).
-fn noise_from_env(var: &str, out: &mut [f32]) -> Result<bool> {
+pub(crate) fn noise_from_env(var: &str, out: &mut [f32]) -> Result<bool> {
     let Ok(path) = std::env::var(var) else {
         return Ok(false);
     };

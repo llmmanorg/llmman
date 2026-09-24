@@ -88,15 +88,25 @@ impl Backend {
     /// Free and total GPU memory in bytes as the backend reports it (Metal:
     /// the process's working set); `None` without a GPU.
     pub fn gpu_memory(&self) -> Option<(usize, usize)> {
-        if self.gpu.is_null() {
-            return None;
-        }
+        (!self.gpu.is_null()).then(|| self.dev_memory(self.gpu))
+    }
+
+    /// Free and total bytes where the weights live: the GPU's, else host memory.
+    pub fn weight_memory(&self) -> (usize, usize) {
+        self.dev_memory(if self.gpu.is_null() {
+            self.cpu
+        } else {
+            self.gpu
+        })
+    }
+
+    fn dev_memory(&self, backend: GgmlBackend) -> (usize, usize) {
         let (mut free, mut total) = (0usize, 0usize);
         unsafe {
-            let dev = (self.api.ggml_backend_get_device)(self.gpu);
+            let dev = (self.api.ggml_backend_get_device)(backend);
             (self.api.ggml_backend_dev_memory)(dev, &mut free, &mut total);
         }
-        Some((free, total))
+        (free, total)
     }
 
     /// The GPU backend's name (`"Metal"`, `"CUDA0"`, `"Vulkan0"`, ...), `""` without one.
@@ -242,12 +252,14 @@ ops! {
     sub => ggml_sub(a: Tensor, b: Tensor);
     mul => ggml_mul(a: Tensor, b: Tensor);
     scale => ggml_scale(a: Tensor, s: f32);
+    scale_bias => ggml_scale_bias(a: Tensor, s: f32, b: f32);
     mul_mat => ggml_mul_mat(a: Tensor, b: Tensor);
     rms_norm => ggml_rms_norm(a: Tensor, eps: f32);
     norm => ggml_norm(a: Tensor, eps: f32);
     silu => ggml_silu(a: Tensor);
     gelu => ggml_gelu(a: Tensor);
     sigmoid => ggml_sigmoid(a: Tensor);
+    tanh => ggml_tanh(a: Tensor);
     sin => ggml_sin(a: Tensor);
     sqr => ggml_sqr(a: Tensor);
     sqrt => ggml_sqrt(a: Tensor);
@@ -302,9 +314,10 @@ impl Ctx {
         unsafe { (self.api.ggml_set_name)(t, name.as_ptr()) };
     }
 
-    /// x * (1 + scale) + shift
+    /// x * (1 + scale) + shift; not `x * scale + x`, which Metal's
+    /// norm + mul + add fusion miscomputes when `x` is a norm's output.
     pub fn modulate(&self, x: Tensor, scale: Tensor, shift: Option<Tensor>) -> Tensor {
-        let y = self.add(self.mul(x, scale), x);
+        let y = self.mul(x, self.scale_bias(scale, 1.0, 1.0));
         match shift {
             Some(s) => self.add(y, s),
             None => y,
@@ -317,6 +330,43 @@ impl Ctx {
             Some(b) => self.add(y, b),
             None => y,
         }
+    }
+}
+
+/// Tensors in their own backend buffer, outliving the graphs that use them:
+/// caches one graph writes ([`Graph::store`]) and the next ones read.
+pub struct Resident {
+    ctx: Ctx,
+    buf: ffi::GgmlBackendBuffer,
+    pub tensors: Vec<Tensor>,
+}
+
+unsafe impl Send for Resident {}
+
+impl Resident {
+    pub fn new(be: &Backend, ty: u32, shapes: &[&[i64]]) -> Result<Resident> {
+        let api = be.api;
+        let ctx = Ctx::new(
+            api,
+            unsafe { (api.ggml_tensor_overhead)() } * (shapes.len() + 1),
+            true,
+        )?;
+        let tensors = shapes.iter().map(|ne| ctx.new_tensor(ty, ne)).collect();
+        let buf =
+            unsafe { (api.ggml_backend_alloc_ctx_tensors_from_buft)(ctx.raw, be.weight_buft) };
+        if buf.is_null() {
+            return Err(anyhow!(
+                "allocating {} resident tensors failed",
+                shapes.len()
+            ));
+        }
+        Ok(Resident { ctx, buf, tensors })
+    }
+}
+
+impl Drop for Resident {
+    fn drop(&mut self) {
+        unsafe { (self.ctx.api.ggml_backend_buffer_free)(self.buf) }
     }
 }
 
@@ -362,6 +412,11 @@ impl Graph {
         debug_assert_eq!(unsafe { (self.ctx.api.ggml_nbytes)(t) }, bytes.len());
         self.inputs.push((t, bytes));
         t
+    }
+
+    /// Copies `src` into the [`Resident`] tensor `dst` when the graph runs.
+    pub fn store(&self, src: Tensor, dst: Tensor) {
+        self.mark_output(unsafe { (self.ctx.api.ggml_cpy)(self.ctx.raw, src, dst) });
     }
 
     pub fn mark_output(&self, t: Tensor) {
