@@ -219,6 +219,17 @@ fn find_primary_asset<'a>(release: &'a Release, query: &AssetQuery) -> Option<&'
     })
 }
 
+/// A Windows CUDA build and its `cudart-llama-bin-win-cuda-<ver>-<arch>.zip`
+/// runtime-DLL companion.
+#[cfg(any(target_os = "windows", test))]
+fn windows_cuda_query(cuda: &str, arch: &str) -> AssetQuery {
+    AssetQuery {
+        must_contain: format!("-bin-win-cuda-{cuda}-{arch}.zip"),
+        companion_must_contain: Some(format!("cudart-llama-bin-win-cuda-{cuda}-{arch}.zip")),
+        label: format!("cuda-{cuda}"),
+    }
+}
+
 fn host_arch_token() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "x64",
@@ -302,13 +313,7 @@ fn asset_query() -> AssetQuery {
                 } else {
                     "12.4"
                 };
-                AssetQuery {
-                    must_contain: format!("-bin-win-cuda-{cuda}-{arch}.zip"),
-                    companion_must_contain: Some(format!(
-                        "cudart-llama-bin-win-cuda-{cuda}-{arch}.zip"
-                    )),
-                    label: format!("cuda-{cuda}"),
-                }
+                windows_cuda_query(cuda, arch)
             }
             HostGpu::Rocm if arch == "x64" => AssetQuery {
                 must_contain: "-bin-win-rocm-".into(),
@@ -944,38 +949,47 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A release of the pinned llama.cpp build carrying `names`.
+    fn pinned_release(names: impl IntoIterator<Item = String>) -> Release {
+        Release {
+            tag_name: default_release().into(),
+            assets: names
+                .into_iter()
+                .map(|name| Asset {
+                    name,
+                    browser_download_url: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The pinned build's `llama-<tag>-bin-<suffix>` asset name.
+    fn pinned_asset(suffix: &str) -> String {
+        format!("llama-{}-bin-{suffix}", default_release())
+    }
+
     #[test]
     fn find_asset_matches_only_the_intended_substring() {
-        let release = Release {
-            tag_name: "b10360".into(),
-            assets: vec![
-                Asset {
-                    name: "llama-b10360-bin-ubuntu-x64.tar.gz".into(),
-                    browser_download_url: String::new(),
-                },
-                Asset {
-                    name: "llama-b10360-bin-ubuntu-vulkan-x64.tar.gz".into(),
-                    browser_download_url: String::new(),
-                },
-                Asset {
-                    name: "llama-b10360-bin-ubuntu-rocm-7.14-x64.tar.gz".into(),
-                    browser_download_url: String::new(),
-                },
-            ],
-        };
+        let [cpu, vulkan, rocm] = [
+            "ubuntu-x64.tar.gz",
+            "ubuntu-vulkan-x64.tar.gz",
+            "ubuntu-rocm-7.14-x64.tar.gz",
+        ]
+        .map(pinned_asset);
+        let release = pinned_release([cpu.clone(), vulkan.clone(), rocm.clone()]);
         assert_eq!(
             find_asset(&release, "-bin-ubuntu-x64.tar.gz").unwrap().name,
-            "llama-b10360-bin-ubuntu-x64.tar.gz"
+            cpu
         );
         assert_eq!(
             find_asset(&release, "-bin-ubuntu-vulkan-x64.tar.gz")
                 .unwrap()
                 .name,
-            "llama-b10360-bin-ubuntu-vulkan-x64.tar.gz"
+            vulkan
         );
         assert_eq!(
             find_asset(&release, "-bin-ubuntu-rocm-").unwrap().name,
-            "llama-b10360-bin-ubuntu-rocm-7.14-x64.tar.gz"
+            rocm
         );
         assert!(find_asset(&release, "-bin-win-cpu-x64.zip").is_none());
     }
@@ -986,60 +1000,30 @@ mod tests {
         // release's own asset list, which is what made a plain substring
         // match download 391 MB of runtime DLLs and then report
         // "llama-server binary not found".
-        let release = Release {
-            tag_name: "b11146".into(),
-            assets: vec![
-                Asset {
-                    name: "cudart-llama-bin-win-cuda-13.4-x64.zip".into(),
-                    browser_download_url: String::new(),
-                },
-                Asset {
-                    name: "llama-b11146-bin-win-cuda-13.4-x64.zip".into(),
-                    browser_download_url: String::new(),
-                },
-            ],
-        };
-        let query = AssetQuery {
-            must_contain: "-bin-win-cuda-13.4-x64.zip".into(),
-            companion_must_contain: Some("cudart-llama-bin-win-cuda-13.4-x64.zip".into()),
-            label: "cuda-13.4".into(),
-        };
+        let query = windows_cuda_query("13.4", "x64");
+        let companion = query.companion_must_contain.clone().unwrap();
+        let primary = pinned_asset(query.must_contain.strip_prefix("-bin-").unwrap());
+        let release = pinned_release([companion.clone(), primary.clone()]);
         // The trap this guards: a plain substring match selects the
         // companion, because its name embeds the primary's.
         assert_eq!(
             find_asset(&release, &query.must_contain).unwrap().name,
-            "cudart-llama-bin-win-cuda-13.4-x64.zip"
+            companion
         );
-        assert_eq!(
-            find_primary_asset(&release, &query).unwrap().name,
-            "llama-b11146-bin-win-cuda-13.4-x64.zip"
-        );
-        assert_eq!(
-            find_asset(&release, query.companion_must_contain.as_ref().unwrap())
-                .unwrap()
-                .name,
-            "cudart-llama-bin-win-cuda-13.4-x64.zip"
-        );
+        assert_eq!(find_primary_asset(&release, &query).unwrap().name, primary);
+        assert_eq!(find_asset(&release, &companion).unwrap().name, companion);
     }
 
     #[test]
     fn primary_asset_without_a_companion_matches_the_only_build() {
-        let release = Release {
-            tag_name: "b11146".into(),
-            assets: vec![Asset {
-                name: "llama-b11146-bin-win-vulkan-x64.zip".into(),
-                browser_download_url: String::new(),
-            }],
-        };
+        let build = pinned_asset("win-vulkan-x64.zip");
+        let release = pinned_release([build.clone()]);
         let query = AssetQuery {
             must_contain: "-bin-win-vulkan-x64.zip".into(),
             companion_must_contain: None,
             label: "vulkan".into(),
         };
-        assert_eq!(
-            find_primary_asset(&release, &query).unwrap().name,
-            "llama-b11146-bin-win-vulkan-x64.zip"
-        );
+        assert_eq!(find_primary_asset(&release, &query).unwrap().name, build);
     }
 
     #[test]
