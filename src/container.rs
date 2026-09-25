@@ -506,22 +506,46 @@ const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// The engine's own error goes to stderr, like [`pull_image`]'s progress.
 pub fn verify_llama_server_runs(ociman: ContainerManager, version: Option<&str>) -> Result<()> {
     let cli = ociman.binary();
+    let name = format!(
+        "llmman-verify-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
     let mut cmd = std::process::Command::new(cli);
-    cmd.args(verify_args(detect_backend(), version))
+    cmd.args(verify_args(detect_backend(), version, &name))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
     match run_with_timeout(cmd, VERIFY_TIMEOUT).with_context(|| format!("run {cli} run"))? {
         Some(status) if status.success() => Ok(()),
         Some(status) => anyhow::bail!("{cli} could not start a llama.cpp container ({status})"),
         None => {
+            // Killing the attached CLI leaves its container running; --rm
+            // only acts once the container exits.
+            let mut rm = std::process::Command::new(cli);
+            rm.args(["rm", "-f", &name])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let _ = run_with_timeout(rm, PROBE_TIMEOUT);
             anyhow::bail!("{cli} did not start a llama.cpp container within {VERIFY_TIMEOUT:?}")
         }
     }
 }
 
-fn verify_args(backend: GpuBackend, version: Option<&str>) -> Vec<String> {
-    let mut args: Vec<String> = vec!["run".into(), "--rm".into(), "--init".into()];
+/// The GPU passthrough and GPU-visibility environment match what [`spawn`]
+/// serves with.
+fn verify_args(backend: GpuBackend, version: Option<&str>, name: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "--init".into(),
+        "--name".into(),
+        name.into(),
+    ];
     args.extend(backend.engine_args());
+    args.extend(forwarded_env_args(&[]));
     args.push(backend.image_ref(version));
     args.push("--version".into());
     args
@@ -775,16 +799,19 @@ fn run_args(
         args.push(n.to_string());
     }
     args.extend(engine_args);
-    for var in crate::cmd::serve::GPU_VISIBLE_DEVICE_VARS
+    args.extend(forwarded_env_args(passthrough_vars));
+    args
+}
+
+/// `-e NAME` for each GPU-visibility variable and each of
+/// `passthrough_vars` set in our environment.
+fn forwarded_env_args(passthrough_vars: &[&str]) -> Vec<String> {
+    crate::cmd::serve::GPU_VISIBLE_DEVICE_VARS
         .iter()
         .chain(passthrough_vars)
-    {
-        if std::env::var_os(var).is_some() {
-            args.push("-e".into());
-            args.push(var.to_string());
-        }
-    }
-    args
+        .filter(|var| std::env::var_os(var).is_some())
+        .flat_map(|var| ["-e".to_string(), var.to_string()])
+        .collect()
 }
 
 impl ContainerEngine {
@@ -1445,23 +1472,24 @@ mod tests {
 
     #[test]
     fn verify_runs_the_served_image_with_its_gpu_passthrough() {
-        assert_eq!(
-            verify_args(GpuBackend::Cpu, Some("b9994")),
-            [
-                "run",
-                "--rm",
-                "--init",
-                "ghcr.io/ggml-org/llama.cpp:server-b9994",
-                "--version"
-            ]
-        );
-        let args = verify_args(GpuBackend::Cuda13, Some("b9994"));
-        let image = args
-            .iter()
-            .position(|a| a == "ghcr.io/ggml-org/llama.cpp:server-cuda13-b9994")
-            .expect("image present");
-        assert_eq!(&args[3..image], GpuBackend::Cuda13.engine_args().as_slice());
-        assert_eq!(&args[image + 1..], ["--version"]);
+        for (backend, image) in [
+            (GpuBackend::Cpu, "ghcr.io/ggml-org/llama.cpp:server-b9994"),
+            (
+                GpuBackend::Cuda13,
+                "ghcr.io/ggml-org/llama.cpp:server-cuda13-b9994",
+            ),
+        ] {
+            let args = verify_args(backend, Some("b9994"), "llmman-verify-1");
+            assert_eq!(
+                &args[..5],
+                ["run", "--rm", "--init", "--name", "llmman-verify-1"]
+            );
+            let at = args.iter().position(|a| a == image).expect("image present");
+            let mut between = backend.engine_args();
+            between.extend(forwarded_env_args(&[]));
+            assert_eq!(&args[5..at], between.as_slice(), "{backend:?}");
+            assert_eq!(&args[at + 1..], ["--version"]);
+        }
     }
 
     #[test]
