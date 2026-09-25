@@ -760,7 +760,13 @@ fn launch(
             context_length,
             extra_args,
         ),
-        "omp" => launch_omp(model, vision, context_length, extra_args),
+        "omp" => launch_omp(
+            model,
+            thinking.and_then(Thinking::template),
+            vision,
+            context_length,
+            extra_args,
+        ),
         "cline" => launch_cline(model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
@@ -1053,13 +1059,14 @@ fn launch_pi(
 /// makes the first launch work while preserving unrelated user configuration.
 fn launch_omp(
     model: &str,
+    thinking: Option<&ThinkingControls>,
     vision: bool,
     context_length: Option<u64>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_omp().ok_or_else(|| anyhow::anyhow!("omp is not installed"))?;
     let server = daemon::server();
-    write_omp_config(model, vision, context_length, &server)?;
+    write_omp_config(model, thinking, vision, context_length, &server)?;
     exec_with_env(
         &bin,
         &omp_args(model, extra_args),
@@ -1099,16 +1106,10 @@ fn omp_fallback_paths() -> Vec<PathBuf> {
 /// OMP's agent directory. These are the paths OMP exposes for callers to
 /// configure; profile layout remains OMP's responsibility.
 fn omp_agent_dir() -> anyhow::Result<PathBuf> {
-    let home = || node_home_dir().context("no home directory");
-    match std::env::var("PI_CODING_AGENT_DIR")
-        .ok()
-        .filter(|dir| !dir.trim().is_empty())
-    {
-        Some(dir) if !dir.trim().starts_with('~') => return Ok(PathBuf::from(dir.trim())),
-        Some(dir) => return Ok(expand_tilde(dir.trim(), &home()?)),
-        None => {}
+    if let Some(dir) = configured_pi_agent_dir()? {
+        return Ok(dir);
     }
-    let home = home()?;
+    let home = crate::config::home_dir().context("no home directory")?;
     let config = std::env::var("PI_CONFIG_DIR")
         .ok()
         .filter(|dir| !dir.trim().is_empty())
@@ -1123,17 +1124,19 @@ fn omp_agent_dir() -> anyhow::Result<PathBuf> {
 
 fn write_omp_config(
     model: &str,
+    thinking: Option<&ThinkingControls>,
     vision: bool,
     context_length: Option<u64>,
     server: &str,
 ) -> anyhow::Result<()> {
     let dir = omp_agent_dir()?;
-    write_omp_config_in_dir(&dir, model, vision, context_length, server)
+    write_omp_config_in_dir(&dir, model, thinking, vision, context_length, server)
 }
 
 fn write_omp_config_in_dir(
     dir: &Path,
     model: &str,
+    thinking: Option<&ThinkingControls>,
     vision: bool,
     context_length: Option<u64>,
     server: &str,
@@ -1141,6 +1144,7 @@ fn write_omp_config_in_dir(
     write_omp_models_config_at(
         &dir.join("models.yml"),
         model,
+        thinking,
         vision,
         context_length,
         server,
@@ -1164,23 +1168,12 @@ fn omp_config_merged(existing: &serde_json::Value) -> serde_json::Value {
 fn write_omp_models_config_at(
     path: &Path,
     model: &str,
+    thinking: Option<&ThinkingControls>,
     vision: bool,
     context_length: Option<u64>,
     server: &str,
 ) -> anyhow::Result<()> {
-    let input: &[&str] = if vision {
-        &["text", "image"]
-    } else {
-        &["text"]
-    };
-    let mut entry = serde_json::json!({
-        "id": model,
-        "name": model,
-        "input": input,
-    });
-    if let Some(context) = context_length {
-        entry["contextWindow"] = serde_json::json!(context);
-    }
+    let entry = pi_model_entry(model, thinking, vision, context_length);
     write_yaml_merged(path, "omp", |existing| {
         omp_models_merged(existing, server, &entry)
     })
@@ -1195,47 +1188,20 @@ fn omp_models_merged(
     server: &str,
     entry: &serde_json::Value,
 ) -> serde_json::Value {
-    let mut root = existing.clone();
-    let old_models = root
-        .get("providers")
-        .and_then(|p| p.get(OMP_PROVIDER))
-        .and_then(|p| p.get("models"))
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut selected = old_models
-        .iter()
-        .find(|candidate| candidate.get("id") == entry.get("id"))
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    if let (Some(selected), Some(update)) = (selected.as_object_mut(), entry.as_object()) {
-        selected.extend(update.clone());
-    }
-    let mut models = vec![selected];
-    models.extend(
-        old_models
-            .into_iter()
-            .filter(|candidate| candidate.get("id") != entry.get("id")),
-    );
-
-    let Some(root_map) = root.as_object_mut() else {
-        return serde_json::json!({});
-    };
-    let provider = object_under(object_under(root_map, "providers"), OMP_PROVIDER);
-    provider.insert(
-        "baseUrl".into(),
-        serde_json::json!(format!("{}/v1", server.trim_end_matches('/'))),
-    );
-    provider.insert("api".into(), serde_json::json!("openai-responses"));
-    provider.remove("auth");
-    provider.insert(
-        "apiKey".into(),
-        serde_json::json!(providers::PLACEHOLDER_API_KEY),
-    );
-    provider.insert("authHeader".into(), serde_json::json!(true));
-    provider.insert("discovery".into(), serde_json::json!({ "type": "ollama" }));
-    provider.insert("models".into(), serde_json::json!(models));
-    root
+    provider_models_merged(existing, OMP_PROVIDER, entry, true, |provider| {
+        provider.insert(
+            "baseUrl".into(),
+            serde_json::json!(format!("{}/v1", server.trim_end_matches('/'))),
+        );
+        provider.insert("api".into(), serde_json::json!("openai-responses"));
+        provider.remove("auth");
+        provider.insert(
+            "apiKey".into(),
+            serde_json::json!(providers::PLACEHOLDER_API_KEY),
+        );
+        provider.insert("authHeader".into(), serde_json::json!(true));
+        provider.insert("discovery".into(), serde_json::json!({ "type": "ollama" }));
+    })
 }
 
 fn write_yaml_merged(
@@ -1277,6 +1243,22 @@ fn omp_args(model: &str, extra_args: &[String]) -> Vec<String> {
 /// The provider key llmman owns in pi's `models.json`.
 const PI_PROVIDER: &str = "llmman";
 
+/// The explicit agent directory understood by both Pi and OMP.
+fn configured_pi_agent_dir() -> anyhow::Result<Option<PathBuf>> {
+    let Some(dir) = std::env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let dir = dir.trim();
+    if !dir.starts_with('~') {
+        return Ok(Some(PathBuf::from(dir)));
+    }
+    let home = crate::config::home_dir().context("no home directory")?;
+    Ok(Some(expand_tilde(dir, &home)))
+}
+
 /// pi's config directory: `PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
 ///
 /// The home half is [`cline_dir`]'s, not [`qwen_home`]'s: pi is node as
@@ -1284,15 +1266,13 @@ const PI_PROVIDER: &str = "llmman";
 /// `cline_dir`'s own doc comment for what disagreeing there cost. The
 /// `~` handling is qwen's, for the quoted export that leaves one behind.
 fn pi_agent_dir() -> anyhow::Result<PathBuf> {
-    let home = || crate::config::home_dir().context("no home directory");
-    match std::env::var("PI_CODING_AGENT_DIR")
-        .ok()
-        .filter(|d| !d.trim().is_empty())
-    {
-        Some(dir) if !dir.trim().starts_with('~') => Ok(PathBuf::from(dir.trim())),
-        Some(dir) => Ok(expand_tilde(dir.trim(), &home()?)),
-        None => Ok(home()?.join(".pi").join("agent")),
+    if let Some(dir) = configured_pi_agent_dir()? {
+        return Ok(dir);
     }
+    Ok(crate::config::home_dir()
+        .context("no home directory")?
+        .join(".pi")
+        .join("agent"))
 }
 
 /// Writes pi's `models.json` provider and points `settings.json` at it.
@@ -1313,8 +1293,9 @@ fn write_pi_config(
     })
 }
 
-/// The model pi is told about: what it can take in, whether it thinks,
-/// and how much it can hold. Every example in pi's own `models.md`
+/// The model entry Pi and OMP are told about: its display name, what it can
+/// take in, whether it thinks, and how much it can hold. Every example in
+/// Pi's own `models.md`
 /// declares these, and what it assumes for an entry that omits them is
 /// not written down, so they are stated rather than left to it.
 fn pi_model_entry(
@@ -1330,6 +1311,7 @@ fn pi_model_entry(
     };
     let mut entry = serde_json::json!({
         "id": model,
+        "name": model,
         "input": input,
     });
     if thinking.is_some_and(|t| t.thinks) {
@@ -1339,6 +1321,57 @@ fn pi_model_entry(
         entry["contextWindow"] = serde_json::json!(context);
     }
     entry
+}
+
+/// Merge one model into a named provider while retaining unrelated providers,
+/// provider options, and models. OMP also retains unowned fields on the
+/// matching model; Pi rebuilds its matching entry from daemon metadata.
+fn provider_models_merged(
+    existing: &serde_json::Value,
+    provider_name: &str,
+    entry: &serde_json::Value,
+    preserve_existing_model_fields: bool,
+    configure: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> serde_json::Value {
+    let mut root = existing.clone();
+    let Some(root_map) = root.as_object_mut() else {
+        return serde_json::json!({});
+    };
+    let provider = object_under(object_under(root_map, "providers"), provider_name);
+    let old_models = provider
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut replaced = false;
+    let mut models = Vec::with_capacity(old_models.len() + 1);
+    for old in old_models {
+        if old.get("id") != entry.get("id") {
+            models.push(old);
+            continue;
+        }
+        if replaced {
+            continue;
+        }
+        let mut merged = if preserve_existing_model_fields {
+            old
+        } else {
+            serde_json::json!({})
+        };
+        if let (Some(merged), Some(update)) = (merged.as_object_mut(), entry.as_object()) {
+            merged.extend(update.clone());
+        } else {
+            merged = entry.clone();
+        }
+        models.push(merged);
+        replaced = true;
+    }
+    if !replaced {
+        models.push(entry.clone());
+    }
+    configure(provider);
+    provider.insert("models".into(), serde_json::json!(models));
+    root
 }
 
 /// `existing` with llmman's provider updated around `entry`, keeping
@@ -1355,41 +1388,17 @@ fn pi_models_merged(
     server: &str,
     entry: &serde_json::Value,
 ) -> serde_json::Value {
-    let mut root = existing.clone();
-    let kept: Vec<serde_json::Value> = root
-        .get("providers")
-        .and_then(|p| p.get(PI_PROVIDER))
-        .and_then(|p| p.get("models"))
-        .and_then(serde_json::Value::as_array)
-        .map(|models| {
-            models
-                .iter()
-                .filter(|m| m.get("id") != entry.get("id"))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut models = kept;
-    models.push(entry.clone());
-
-    // Both levels go through object_under: a file may legitimately hold
-    // `"providers": []`, and indexing that with a key panics.
-    let root_map = match root.as_object_mut() {
-        Some(map) => map,
-        None => return serde_json::json!({}),
-    };
-    let provider = object_under(object_under(root_map, "providers"), PI_PROVIDER);
-    provider.insert("baseUrl".into(), serde_json::json!(format!("{server}/v1")));
-    provider
-        .entry("api")
-        .or_insert_with(|| serde_json::json!("openai-completions"));
-    // A literal, not a `"$VAR"` reference pi would interpolate: see
-    // launch_pi's own doc comment.
-    provider
-        .entry("apiKey")
-        .or_insert_with(|| serde_json::json!("llmman"));
-    provider.insert("models".into(), serde_json::json!(models));
-    root
+    provider_models_merged(existing, PI_PROVIDER, entry, false, |provider| {
+        provider.insert("baseUrl".into(), serde_json::json!(format!("{server}/v1")));
+        provider
+            .entry("api")
+            .or_insert_with(|| serde_json::json!("openai-completions"));
+        // A literal, not a `"$VAR"` reference pi would interpolate: see
+        // launch_pi's own doc comment.
+        provider
+            .entry("apiKey")
+            .or_insert_with(|| serde_json::json!("llmman"));
+    })
 }
 
 /// `existing` with pi's startup provider and model pointed at this launch,
@@ -3408,9 +3417,15 @@ mod tests {
                 .as_nanos()
         ));
         let models_path = dir.join("models.yml");
+        let thinks = ThinkingControls {
+            thinks: true,
+            enable_thinking: true,
+            efforts: vec!["low", "high"],
+        };
         write_omp_config_in_dir(
             &dir,
             "docker.io/ai/qwen3.5:0.8b",
+            Some(&thinks),
             true,
             Some(32_768),
             "http://127.0.0.1:17434",
@@ -3422,6 +3437,8 @@ mod tests {
         let provider = &parsed["providers"]["ollama"];
         assert_eq!(provider["baseUrl"], "http://127.0.0.1:17434/v1");
         assert_eq!(provider["models"][0]["id"], "docker.io/ai/qwen3.5:0.8b");
+        assert_eq!(provider["models"][0]["name"], "docker.io/ai/qwen3.5:0.8b");
+        assert_eq!(provider["models"][0]["reasoning"], true);
         assert_eq!(
             provider["models"][0]["input"],
             serde_json::json!(["text", "image"])
@@ -3462,6 +3479,7 @@ defaults:
         write_omp_config_in_dir(
             &dir,
             "docker.io/ai/qwen3.5:0.8b",
+            None,
             false,
             None,
             "http://127.0.0.1:17434",
@@ -3470,6 +3488,7 @@ defaults:
         write_omp_config_in_dir(
             &dir,
             "docker.io/ai/qwen3.5:0.8b",
+            None,
             false,
             Some(4096),
             "http://127.0.0.1:17434",
@@ -3486,6 +3505,7 @@ defaults:
         write_omp_config_in_dir(
             &dir,
             "docker.io/ai/qwen3.5:0.8b",
+            None,
             false,
             Some(8192),
             "http://127.0.0.1:17434",
@@ -4264,6 +4284,7 @@ defaults:
         };
         let entry = pi_model_entry("qwen3.5:0.8b", Some(&thinks), true, Some(32768));
         assert_eq!(entry["id"], "qwen3.5:0.8b");
+        assert_eq!(entry["name"], "qwen3.5:0.8b");
         assert_eq!(entry["input"], serde_json::json!(["text", "image"]));
         assert_eq!(entry["reasoning"], true);
         assert_eq!(entry["contextWindow"], 32768);
