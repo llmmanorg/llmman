@@ -139,3 +139,44 @@ func TestDockerHubLoginIsVisibleUnderConnectionHost(t *testing.T) {
 		t.Fatalf("dockerCredentials(registry-1.docker.io) after logout = (%q, %q, %v), want empty", user, pass, err)
 	}
 }
+
+// TestDockerHubCredentialsSkipOAuthTokens seeds the layout `docker login`'s
+// web-based flow leaves: the Hub PAT under https://index.docker.io/v1/ and
+// its OAuth access and refresh tokens under sibling keys. The file store
+// resolves "index.docker.io" to any of the three in map order, and Hub
+// rejects both tokens as registry credentials, so a pull used to fail with
+// a 401 from auth.docker.io two runs in three.
+func TestDockerHubCredentialsSkipOAuthTokens(t *testing.T) {
+	isolatedDockerConfigDir(t)
+
+	for server, password := range map[string]string{
+		dockerIndexServer:                   "dckr_pat_hub",
+		dockerIndexServer + "access-token":  "expired.jwt.token",
+		dockerIndexServer + "refresh-token": "refresh..client",
+	} {
+		if err := dockerLogin(server, "hubuser", password); err != nil {
+			t.Fatalf("dockerLogin(%q): %v", server, err)
+		}
+	}
+
+	for _, host := range []string{"registry-1.docker.io", "index.docker.io", "docker.io"} {
+		for range 50 {
+			user, pass, err := dockerCredentials(host)
+			if err != nil {
+				t.Fatalf("dockerCredentials(%q): %v", host, err)
+			}
+			if user != "hubuser" || pass != "dckr_pat_hub" {
+				t.Fatalf("dockerCredentials(%q) = (%q, %q), want (hubuser, dckr_pat_hub)", host, user, pass)
+			}
+		}
+	}
+
+	if err := dockerLogout(dockerIndexServer); err != nil {
+		t.Fatalf("dockerLogout(%q): %v", dockerIndexServer, err)
+	}
+	for range 50 {
+		if user, pass, err := dockerCredentials("registry-1.docker.io"); err != nil || user != "" || pass != "" {
+			t.Fatalf("dockerCredentials(registry-1.docker.io) with only OAuth tokens stored = (%q, %q, %v), want empty", user, pass, err)
+		}
+	}
+}

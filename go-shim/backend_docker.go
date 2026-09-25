@@ -65,6 +65,9 @@ func dockerCredentials(host string) (string, string, error) {
 		if creds.Username == "" && creds.Password == "" && creds.IdentityToken == "" {
 			continue
 		}
+		if isDockerOAuthTokenKey(creds.ServerAddress) {
+			continue
+		}
 		if creds.IdentityToken != "" {
 			return "", creds.IdentityToken, nil
 		}
@@ -125,11 +128,25 @@ func getCredentialsWithTimeout(store credentials.Store, lookup string) (clitypes
 // host itself, unchanged.
 func dockerHubCredentialKeys(host string) []string {
 	switch host {
-	case "registry-1.docker.io", "index.docker.io", "docker.io", "https://index.docker.io/v1/":
-		return []string{"docker.io", "index.docker.io", "https://index.docker.io/v1/", "registry-1.docker.io"}
+	case "registry-1.docker.io", "index.docker.io", "docker.io", dockerIndexServer:
+		return []string{"docker.io", dockerIndexServer, "index.docker.io", "registry-1.docker.io"}
 	default:
 		return []string{host}
 	}
+}
+
+// dockerIndexServer is the key `docker login` stores Docker Hub
+// credentials under.
+const dockerIndexServer = "https://index.docker.io/v1/"
+
+// isDockerOAuthTokenKey reports whether key is one of the entries
+// `docker login`'s web-based flow keeps beside the Hub PAT it stores under
+// dockerIndexServer: the OAuth access token (a JWT that expires) and the
+// refresh token. Neither is a registry credential — auth.docker.io answers
+// 401 to both — yet docker/cli's file store resolves "index.docker.io" to
+// whichever of the three map iteration reaches first.
+func isDockerOAuthTokenKey(key string) bool {
+	return key == dockerIndexServer+"access-token" || key == dockerIndexServer+"refresh-token"
 }
 
 func newResolver(ctx context.Context) remotes.Resolver {
