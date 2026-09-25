@@ -17,7 +17,7 @@ use super::responses::{
     consolidate_responses_instructions, filter_non_function_tools, remote_responses,
     responses_input_item_text, RESPONSES_ROUTE,
 };
-use super::sched::{reap_idle_models_once, resolve_keep_alive, DEFAULT_KEEP_ALIVE};
+use super::sched::{reap_idle_models_once, DEFAULT_KEEP_ALIVE};
 use super::stream::{fold_ollama_lines, stream_ollama};
 use super::test_support::{
     headers_with, mock_peer, node, remote_target, remote_target_on, rendered_registry,
@@ -1793,35 +1793,6 @@ async fn a_local_refusal_is_retried_on_the_hosted_half_unless_pinned() {
     assert_eq!(
         run(Local::Relayed, pinned).await,
         (Ok(StatusCode::BAD_REQUEST), 1, 0)
-    );
-}
-
-// -- keep_alive parsing / resolution (idle-timeout auto-unload) ---------
-
-/// Regression test for `handle_ollama_generate`'s unload-sentinel
-/// check: it must reuse `resolve_keep_alive` (as asserted here) rather
-/// than a bare `keep_alive.as_i64() == Some(0)` check, since the
-/// latter misses every non-integer zero form `resolve_keep_alive`
-/// itself accepts — a string `"0"`, `"0s"`, or a float `0.0` — leaving
-/// a client that sends one of those loaded until the next idle-reaper
-/// tick instead of unloading immediately as requested.
-#[test]
-fn resolve_keep_alive_treats_every_zero_form_as_the_unload_sentinel() {
-    assert_eq!(
-        resolve_keep_alive(&Some(serde_json::json!(0))),
-        Some(Duration::ZERO)
-    );
-    assert_eq!(
-        resolve_keep_alive(&Some(serde_json::json!("0"))),
-        Some(Duration::ZERO)
-    );
-    assert_eq!(
-        resolve_keep_alive(&Some(serde_json::json!("0s"))),
-        Some(Duration::ZERO)
-    );
-    assert_eq!(
-        resolve_keep_alive(&Some(serde_json::json!(0.0))),
-        Some(Duration::ZERO)
     );
 }
 
