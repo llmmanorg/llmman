@@ -241,7 +241,7 @@ fn detect_backend() -> GpuBackend {
 /// Pure mapping from [`HostGpu`] to the available container [`GpuBackend`], split out from
 /// [`detect_backend`] so the CUDA 12-vs-13 image split (llama.cpp's own
 /// CUDA Dockerfile split between the `cuda`/`cuda12` tag, built against
-/// CUDA_VERSION 12.8.1, and `cuda13`, 13.3.0 — see docs/docker.md) can be
+/// CUDA_VERSION 12.8.1, and `cuda13`, 13.4.1 — see docs/docker.md) can be
 /// tested directly without needing real GPU hardware. `HostGpu::Metal`
 /// has no container image (Docker/Podman GPU passthrough isn't a macOS
 /// concept, and container runtimes are rejected on non-Linux before this is ever

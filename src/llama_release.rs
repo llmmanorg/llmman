@@ -294,13 +294,11 @@ fn asset_query() -> AssetQuery {
     {
         match crate::hostgpu::detect() {
             HostGpu::Cuda { major } => {
-                // llama.cpp publishes CUDA 12.4 and 13.3 for x64, and a
-                // 13.4 "preview" build for arm64 (no CUDA 12 on arm64) —
-                // see the windows-cuda job's matrix.
-                let cuda = if arch == "arm64" {
+                // llama.cpp publishes CUDA 12.4 and 13.4 for x64, and 13.4
+                // alone for arm64 (no CUDA 12 on arm64) — see the
+                // windows-cuda job's matrix.
+                let cuda = if arch == "arm64" || major >= 13 {
                     "13.4"
-                } else if major >= 13 {
-                    "13.3"
                 } else {
                     "12.4"
                 };
@@ -989,47 +987,47 @@ mod tests {
         // match download 391 MB of runtime DLLs and then report
         // "llama-server binary not found".
         let release = Release {
-            tag_name: "b10951".into(),
+            tag_name: "b11146".into(),
             assets: vec![
                 Asset {
-                    name: "cudart-llama-bin-win-cuda-13.3-x64.zip".into(),
+                    name: "cudart-llama-bin-win-cuda-13.4-x64.zip".into(),
                     browser_download_url: String::new(),
                 },
                 Asset {
-                    name: "llama-b10951-bin-win-cuda-13.3-x64.zip".into(),
+                    name: "llama-b11146-bin-win-cuda-13.4-x64.zip".into(),
                     browser_download_url: String::new(),
                 },
             ],
         };
         let query = AssetQuery {
-            must_contain: "-bin-win-cuda-13.3-x64.zip".into(),
-            companion_must_contain: Some("cudart-llama-bin-win-cuda-13.3-x64.zip".into()),
-            label: "cuda-13.3".into(),
+            must_contain: "-bin-win-cuda-13.4-x64.zip".into(),
+            companion_must_contain: Some("cudart-llama-bin-win-cuda-13.4-x64.zip".into()),
+            label: "cuda-13.4".into(),
         };
         // The trap this guards: a plain substring match selects the
         // companion, because its name embeds the primary's.
         assert_eq!(
             find_asset(&release, &query.must_contain).unwrap().name,
-            "cudart-llama-bin-win-cuda-13.3-x64.zip"
+            "cudart-llama-bin-win-cuda-13.4-x64.zip"
         );
         assert_eq!(
             find_primary_asset(&release, &query).unwrap().name,
-            "llama-b10951-bin-win-cuda-13.3-x64.zip"
+            "llama-b11146-bin-win-cuda-13.4-x64.zip"
         );
         assert_eq!(
             find_asset(&release, query.companion_must_contain.as_ref().unwrap())
                 .unwrap()
                 .name,
-            "cudart-llama-bin-win-cuda-13.3-x64.zip"
+            "cudart-llama-bin-win-cuda-13.4-x64.zip"
         );
     }
 
     #[test]
     fn primary_asset_without_a_companion_matches_the_only_build() {
         let release = Release {
-            tag_name: "b10951".into(),
+            tag_name: "b11146".into(),
             assets: vec![Asset {
-                name: "llama-b10951-bin-win-vulkan-x64.zip".into(),
+                name: "llama-b11146-bin-win-vulkan-x64.zip".into(),
                 browser_download_url: String::new(),
             }],
         };
@@ -1040,7 +1038,7 @@ mod tests {
         };
         assert_eq!(
             find_primary_asset(&release, &query).unwrap().name,
-            "llama-b10951-bin-win-vulkan-x64.zip"
+            "llama-b11146-bin-win-vulkan-x64.zip"
         );
     }
 
