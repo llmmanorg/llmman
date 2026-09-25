@@ -50,6 +50,8 @@ enum Commands {
     Ps(cmd::ps::PsArgs),
     /// Show the prompts `llmman serve` has seen, newest first (like `git log`)
     Log(cmd::log::LogArgs),
+    /// Show the tokens and cost of what `llmman serve` has served, per model
+    Usage(cmd::usage::UsageArgs),
     /// List the hosted providers `--provider` can route to
     Providers(cmd::providers::ProvidersArgs),
     /// Read and write llmman.conf settings
@@ -130,6 +132,7 @@ fn main() {
         Commands::List(a) => cmd::list::run(a),
         Commands::Ps(a) => cmd::ps::run(a),
         Commands::Log(a) => cmd::log::run(a),
+        Commands::Usage(a) => cmd::usage::run(a),
         Commands::Providers(a) => cmd::providers::run(a),
         Commands::Config(a) => cmd::config::run(a),
         Commands::Cp(a) => cmd::cp::run(a),

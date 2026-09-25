@@ -13,6 +13,7 @@ reference; this is the one-line summary of each subcommand.
 | `list` (`ls`) | List locally stored models, or a hosted provider's (`--provider`) models |
 | `ps`      | List models currently loaded |
 | `log`     | Show the prompts `serve` has seen, newest first, like `git log` |
+| `usage`   | Show the tokens and cost of what `serve` has served, per model, provider, client, day or route |
 | `providers` | List the hosted providers `--provider` can route to |
 | `stop`    | Stop (unload) a running model |
 | `build`   | Package model files into a local OCI image |

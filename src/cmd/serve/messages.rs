@@ -913,18 +913,20 @@ fn tool_input(arguments: &str) -> Option<Value> {
         .filter(Value::is_object)
 }
 
-/// `usage` as the Messages API reports it: a cached prefix counted once,
-/// under `cache_read_input_tokens`.
+/// `usage` as the Messages API reports it: cache reads and writes beside
+/// `input_tokens`, not in it.
 fn usage_of(usage: &Value) -> Value {
     let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
-    let cached = usage["prompt_tokens_details"]["cached_tokens"]
+    let details = &usage["prompt_tokens_details"];
+    let cached = details["cached_tokens"].as_u64().unwrap_or(0).min(prompt);
+    let written = details["cache_write_tokens"]
         .as_u64()
         .unwrap_or(0)
-        .min(prompt);
+        .min(prompt - cached);
     json!({
-        "input_tokens": prompt - cached,
+        "input_tokens": prompt - cached - written,
         "output_tokens": usage["completion_tokens"].as_u64().unwrap_or(0),
-        "cache_creation_input_tokens": 0,
+        "cache_creation_input_tokens": written,
         "cache_read_input_tokens": cached,
     })
 }
@@ -1456,6 +1458,24 @@ mod tests {
         );
         assert!(!converter.failed());
         assert_eq!(converter.line("data: {\"ignored\":true}"), "");
+    }
+
+    #[test]
+    fn a_cache_write_is_reported_apart_from_the_input() {
+        let usage = json!({
+            "prompt_tokens": 100, "completion_tokens": 2,
+            "prompt_tokens_details": { "cached_tokens": 60, "cache_write_tokens": 30 }
+        });
+        assert_eq!(
+            usage_of(&usage),
+            json!({"input_tokens": 10, "output_tokens": 2, "cache_creation_input_tokens": 30, "cache_read_input_tokens": 60})
+        );
+        let over = json!({
+            "prompt_tokens": 10,
+            "prompt_tokens_details": { "cached_tokens": 8, "cache_write_tokens": 30 }
+        });
+        assert_eq!(usage_of(&over)["input_tokens"], 0);
+        assert_eq!(usage_of(&over)["cache_creation_input_tokens"], 2);
     }
 
     #[test]

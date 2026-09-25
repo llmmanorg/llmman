@@ -96,6 +96,12 @@ A local `/v1/chat/completions` with `reasoning_effort` also gets the
 `reasoning_effort`), so it works on llama-server builds that do not read
 `reasoning_effort` themselves. The caller's own kwargs are kept.
 
+A streamed `/v1/chat/completions` or `/v1/completions` to an `openai`-wire
+provider (Cohere aside) or a non-llama.cpp backend goes upstream with
+`stream_options.include_usage` for [`llmman usage`](commands.md); a
+client that did not ask gets the usage chunk stripped back out.
+llama-server's `timings` need no asking.
+
 `/v1/audio/transcriptions` is likewise a pass-through. The model needs
 audio support (an `--mmproj` projector, supplied when the model image
 carries one). Bodies up to 200 MiB are accepted.
@@ -128,7 +134,7 @@ this daemon can route to, each with its API-key variable, whether the
 daemon has that key, and how many models it serves;
 `/llmman/providers/{id}` adds those models and what each costs in US
 dollars per million tokens (absent, not zero, where models.dev publishes
-no price). `llmman providers`, `list --provider`, `run --provider` and
+no price), including `cache_read`/`cache_write`/`reasoning` where it publishes those. `llmman providers`, `list --provider`, `run --provider` and
 `launch --provider` are all clients of it, so the catalog is fetched and
 cached in one process: the one that forwards the request upstream.
 

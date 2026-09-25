@@ -322,6 +322,7 @@ llmman providers                                    # which providers, and is th
 llmman list --provider openrouter                   # its models, and $/Mtok in and out
 llmman run --provider openrouter qwen/qwen3-coder   # chat with one directly
 llmman launch opencode --provider openrouter --model qwen/qwen3-coder
+llmman usage --since yesterday                      # what that session cost, per model
 ```
 
 The provider list comes from [models.dev](https://models.dev), the same

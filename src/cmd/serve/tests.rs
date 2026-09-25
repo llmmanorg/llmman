@@ -646,6 +646,7 @@ async fn max_tokens_is_clamped_to_the_catalogs_ceiling_for_an_anthropic_provider
         wire: Wire::Anthropic,
         model: "mock-model".into(),
         max_output: Some(64_000),
+        cost: None,
         api_key: Some("sk-test".into()),
     }));
     let send = |target: &Target, req: serde_json::Value| {
@@ -688,6 +689,7 @@ async fn a_thinking_level_reaches_each_claude_in_its_own_form() {
             wire: Wire::Anthropic,
             model: model.into(),
             max_output: Some(64_000),
+            cost: None,
             api_key: Some("sk-test".into()),
         }));
         let req = serde_json::json!({
@@ -834,6 +836,7 @@ fn remote(provider: &str, model: &str, wire: Wire) -> RemoteTarget {
         wire,
         model: model.into(),
         max_output: None,
+        cost: None,
         api_key: Some("k".into()),
     }
 }
@@ -1035,6 +1038,11 @@ fn a_peer_target_is_a_local_backend_in_all_but_address() {
 /// Store tags `docker.io/ai/m:latest` with no blobs, so a local load
 /// fails offline instead of pulling.
 fn state_with_peers(peers: Vec<String>, memory: u64) -> AppState {
+    AppState(Arc::new(inner_with_peers(peers, memory)))
+}
+
+/// [`state_with_peers`]'s `Inner`, for a test that sets more.
+fn inner_with_peers(peers: Vec<String>, memory: u64) -> Inner {
     let dir = std::env::temp_dir().join(format!(
         "llmman-aggregation-{}-{}",
         std::process::id(),
@@ -1056,7 +1064,7 @@ fn state_with_peers(peers: Vec<String>, memory: u64) -> AppState {
     let mut inner = test_inner(dir);
     inner.peers = peers;
     inner.memory = memory;
-    AppState(Arc::new(inner))
+    inner
 }
 
 /// A peer gets llmman's own dialect, the hop marker, no credential.
@@ -1507,6 +1515,7 @@ async fn a_local_refusal_is_retried_on_the_hosted_half_unless_pinned() {
                     wire: Wire::OpenAi,
                     model: "claude".into(),
                     max_output: None,
+                    cost: None,
                     api_key: Some("k".into()),
                 }))
             } else {
@@ -1914,6 +1923,7 @@ fn a_keyless_remote_target_sends_no_credential_header() {
             wire,
             model: "m".into(),
             max_output: None,
+            cost: None,
             api_key: None,
         }))
     };
@@ -5925,4 +5935,295 @@ async fn an_unenforced_policy_strips_its_keys_without_refusing_anyone() {
         client_api_key(Some(&seen[1])).as_deref(),
         Some("sk-provider")
     );
+}
+
+// -- usage ledger ------------------------------------------------------------
+
+fn temp_log(label: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "llmman-{label}-{}-{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+/// The ledger once it holds `n` entries: a stream's is written when hyper
+/// drops the body, which can be after the client read the last byte.
+async fn ledger_of(path: &std::path::Path, n: usize) -> Vec<crate::usage::Entry> {
+    for _ in 0..100 {
+        let entries = crate::usage::read(path).unwrap();
+        if entries.len() >= n {
+            return entries;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    crate::usage::read(path).unwrap()
+}
+
+/// A peer with `docker.io/ai/m:latest` loaded that streams as llama-server
+/// does: `timings` on the finish chunk, or with `include_usage` on the
+/// usage chunk after it. Records each request body.
+async fn usage_peer() -> (String, Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>) {
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let node = node(8 << 30, &["docker.io/ai/m:latest"], &[]);
+    let app = Router::new()
+        .route("/llmman/node", get(move || async move { Json(node) }))
+        .route(
+            "/v1/chat/completions",
+            post(move |Json(req): Json<serde_json::Value>| async move {
+                captured.lock().await.push(req.clone());
+                let usage = serde_json::json!({
+                    "prompt_tokens": 120, "completion_tokens": 7,
+                    "prompt_tokens_details": { "cached_tokens": 100 }
+                });
+                if req["stream"] != true {
+                    let body = serde_json::json!({
+                        "choices": [{ "message": { "content": "hi" } }],
+                        "usage": usage,
+                    });
+                    return ([("content-type", "application/json")], body.to_string());
+                }
+                let timings =
+                    serde_json::json!({ "prompt_n": 20, "cache_n": 100, "predicted_n": 7 });
+                let finish =
+                    serde_json::json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] });
+                let mut sse =
+                    String::from("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
+                if req["stream_options"]["include_usage"] == true {
+                    let last =
+                        serde_json::json!({ "choices": [], "usage": usage, "timings": timings });
+                    sse.push_str(&format!("data: {finish}\n\ndata: {last}\n\n"));
+                } else {
+                    let mut finish = finish;
+                    finish["timings"] = timings;
+                    sse.push_str(&format!("data: {finish}\n\n"));
+                }
+                sse.push_str("data: [DONE]\n\n");
+                ([("content-type", "text/event-stream")], sse)
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (origin, seen)
+}
+
+/// A local stream is not asked for usage (its `timings` report it), so the
+/// client's stream is untouched; each request is one ledger line, joined
+/// to the prompt log.
+#[tokio::test]
+async fn the_usage_ledger_records_each_reply_and_leaves_the_stream_as_asked() {
+    let (origin, seen) = usage_peer().await;
+    let usage_log = temp_log("usage");
+    let prompt_log = temp_log("prompts");
+    let mut inner = inner_with_peers(vec![origin], 0);
+    inner.usage_log = Some(usage_log.clone());
+    inner.prompt_log = Some(prompt_log.clone());
+    let base = serve_router(AppState(Arc::new(inner))).await;
+
+    let chat = |extra: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "model": "docker.io/ai/m",
+            "messages": [{ "role": "user", "content": "hello" }],
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let url = format!("{base}/v1/chat/completions");
+        async move {
+            let resp = Client::new()
+                .post(url)
+                .header("user-agent", "test-agent/1")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp.text().await.unwrap()
+        }
+    };
+
+    let unasked = chat(serde_json::json!({ "stream": true })).await;
+    assert!(unasked.ends_with("data: [DONE]\n\n"), "{unasked}");
+    assert!(!unasked.contains("usage"), "not asked for: {unasked}");
+    assert!(unasked.contains("\"timings\""), "{unasked}");
+    assert!(seen.lock().await[0].get("stream_options").is_none());
+
+    let asked = chat(serde_json::json!({
+        "stream": true, "stream_options": { "include_usage": true }
+    }))
+    .await;
+    assert!(asked.contains("\"prompt_tokens\":120"), "{asked}");
+
+    let whole = chat(serde_json::json!({})).await;
+    assert!(whole.contains("\"usage\""), "{whole}");
+    assert!(
+        seen.lock().await[2].get("stream_options").is_none(),
+        "an unstreamed request is left alone"
+    );
+
+    let entries = ledger_of(&usage_log, 3).await;
+    let prompts = crate::promptlog::read(&prompt_log).unwrap();
+    let _ = std::fs::remove_file(&usage_log);
+    let _ = std::fs::remove_file(&prompt_log);
+    assert_eq!(entries.len(), 3, "{entries:?}");
+    assert_eq!(prompts.len(), 3, "{prompts:?}");
+    for (entry, prompt) in entries.iter().zip(&prompts) {
+        assert_eq!(entry.id, prompt.id, "the two logs join");
+        assert_eq!(entry.route, "/v1/chat/completions");
+        assert_eq!(entry.model, "docker.io/ai/m:latest");
+        assert_eq!(entry.provider, None, "a peer is not a provider");
+        assert_eq!(entry.client.as_deref(), Some("test-agent/1"));
+        assert_eq!(entry.tokens, crate::usage::Tokens::new(120, 100, 0, 7));
+        assert_eq!((entry.rate, entry.cost), (None, None), "no price, not free");
+    }
+}
+
+/// A provider's reply is priced and keeps its `Content-Length`, even under
+/// a (client-settable) hop header; a provider stream is asked for usage,
+/// which the client then doesn't see. No target, a failure, or a local
+/// reply to a hop records nothing.
+#[tokio::test]
+async fn the_usage_ledger_prices_a_provider_reply_and_skips_the_rest() {
+    let usage_log = temp_log("usage-priced");
+    let mut inner = test_inner(std::env::temp_dir());
+    inner.usage_log = Some(usage_log.clone());
+    let state = AppState(Arc::new(inner));
+
+    fn routed() {
+        let cost = crate::providers::Cost {
+            cache_read: Some(0.3),
+            cache_write: Some(3.75),
+            ..crate::providers::Cost::flat(3.0, 15.0)
+        };
+        let target = Target::Remote(Arc::new(RemoteTarget {
+            provider: "openrouter".into(),
+            base_url: "https://openrouter.invalid/api/v1".into(),
+            wire: Wire::OpenAi,
+            model: "anthropic/claude-sonnet-4".into(),
+            max_output: None,
+            cost: Some(cost),
+            api_key: None,
+        }));
+        usage::note_target(
+            "llmman.provider/openrouter/anthropic/claude-sonnet-4",
+            &target,
+        );
+    }
+    let messages = r#"{"type":"message","usage":{"input_tokens":130,"cache_read_input_tokens":17010,"cache_creation_input_tokens":1000,"output_tokens":412}}"#;
+    let app = Router::new()
+        .route(
+            "/v1/messages",
+            post(move || async move {
+                routed();
+                ([("content-type", "application/json")], messages)
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(|| async {
+                // No target: an error before resolution, say.
+                r#"{"usage":{"prompt_tokens":5,"completion_tokens":5}}"#
+            }),
+        )
+        .route(
+            "/v1/completions",
+            post(|| async {
+                let mut req = serde_json::json!({ "stream": true });
+                usage::ask_for_stream_usage(&mut req);
+                assert_eq!(req["stream_options"]["include_usage"], true);
+                routed();
+                let sse = "data: {\"choices\":[{\"text\":\"hi\",\"finish_reason\":\"stop\"}]}\n\n\
+                    data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n\
+                    data: [DONE]\n\n";
+                let body = futures::stream::iter(sse.as_bytes().chunks(7).map(|c| {
+                    Ok::<_, std::convert::Infallible>(Bytes::copy_from_slice(c))
+                }));
+                ([("content-type", "text/event-stream")], Body::from_stream(body))
+            }),
+        )
+        .route(
+            "/api/generate",
+            post(|| async {
+                usage::note_target("m", &Target::Local(1));
+                r#"{"done":true,"prompt_eval_count":5,"eval_count":5}"#
+            }),
+        )
+        .route(
+            "/api/chat",
+            post(|| async {
+                routed();
+                (
+                    StatusCode::BAD_GATEWAY,
+                    r#"{"prompt_eval_count":5,"eval_count":5}"#,
+                )
+            }),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            usage::record_usage,
+        ))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = Client::new();
+    let resp = client
+        .post(format!("{base}/v1/messages"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers().get("content-length").map(|v| v.as_bytes()),
+        Some(messages.len().to_string().as_bytes()),
+        "an in-memory reply stays unchunked"
+    );
+    assert_eq!(resp.text().await.unwrap(), messages);
+    let stream = client
+        .post(format!("{base}/v1/completions"))
+        .send()
+        .await
+        .unwrap();
+    assert!(!stream.text().await.unwrap().contains("usage"));
+    for route in ["/v1/chat/completions", "/api/chat"] {
+        client.post(format!("{base}{route}")).send().await.unwrap();
+    }
+    for route in ["/api/generate", "/v1/messages"] {
+        client
+            .post(format!("{base}{route}"))
+            .header(aggregation::HOP, "1")
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let mut entries = ledger_of(&usage_log, 3).await;
+    let _ = std::fs::remove_file(&usage_log);
+    assert_eq!(entries.len(), 3, "{entries:?}");
+    let streamed = entries
+        .iter()
+        .position(|e| e.route == "/v1/completions")
+        .unwrap();
+    assert_eq!(
+        entries.remove(streamed).tokens,
+        crate::usage::Tokens::new(10, 0, 0, 1)
+    );
+    assert_eq!(entries[0].tokens, entries[1].tokens);
+    let entry = &entries[0];
+    assert_eq!(entry.id.len(), 40);
+    assert_eq!(entry.provider.as_deref(), Some("openrouter"));
+    assert_eq!(
+        entry.tokens,
+        crate::usage::Tokens::new(18_140, 17_010, 1_000, 412)
+    );
+    let want = (130.0 * 3.0 + 17_010.0 * 0.3 + 1_000.0 * 3.75 + 412.0 * 15.0) / 1e6;
+    assert!((entry.cost.unwrap() - want).abs() < 1e-12, "{entry:?}");
+    assert_eq!(entry.rate.unwrap().cache_read, 0.3);
 }
