@@ -329,6 +329,9 @@ fn try_one(
                     llama_cpp_version,
                 )
             })?;
+            if !explicit {
+                crate::container::verify_llama_server_runs(ociman, llama_cpp_version)?;
+            }
             Ok(Resolved::Container(ociman))
         }
         Runtime::Bin => {

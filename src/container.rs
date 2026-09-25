@@ -495,6 +495,38 @@ pub fn pull_image(
     Ok(())
 }
 
+/// How long [`verify_llama_server_runs`] waits for its container.
+const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Runs `llama-server --version` in the llama.cpp image [`spawn`] would
+/// run, with the same GPU passthrough: `<cli> info` answering does not
+/// mean the engine can start a container (rootless podman without a
+/// reachable systemd fails every `run` in crun), and `--runtime auto`
+/// must not settle on an engine every model load would then fail on.
+/// The engine's own error goes to stderr, like [`pull_image`]'s progress.
+pub fn verify_llama_server_runs(ociman: ContainerManager, version: Option<&str>) -> Result<()> {
+    let cli = ociman.binary();
+    let mut cmd = std::process::Command::new(cli);
+    cmd.args(verify_args(detect_backend(), version))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    match run_with_timeout(cmd, VERIFY_TIMEOUT).with_context(|| format!("run {cli} run"))? {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => anyhow::bail!("{cli} could not start a llama.cpp container ({status})"),
+        None => {
+            anyhow::bail!("{cli} did not start a llama.cpp container within {VERIFY_TIMEOUT:?}")
+        }
+    }
+}
+
+fn verify_args(backend: GpuBackend, version: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec!["run".into(), "--rm".into(), "--init".into()];
+    args.extend(backend.engine_args());
+    args.push(backend.image_ref(version));
+    args.push("--version".into());
+    args
+}
+
 /// Every `llama-server` knob `cmd::serve` resolves once per load and
 /// forwards identically to both a local child
 /// (`cmd::serve::backend::spawn_llama_server`) and a containerized one ([`spawn`]).
@@ -1409,6 +1441,27 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-e", VAR]), "{args:?}");
         // The value stays out of argv (it may be a secret).
         assert!(!args.iter().any(|a| a.starts_with(&format!("{VAR}="))));
+    }
+
+    #[test]
+    fn verify_runs_the_served_image_with_its_gpu_passthrough() {
+        assert_eq!(
+            verify_args(GpuBackend::Cpu, Some("b9994")),
+            [
+                "run",
+                "--rm",
+                "--init",
+                "ghcr.io/ggml-org/llama.cpp:server-b9994",
+                "--version"
+            ]
+        );
+        let args = verify_args(GpuBackend::Cuda13, Some("b9994"));
+        let image = args
+            .iter()
+            .position(|a| a == "ghcr.io/ggml-org/llama.cpp:server-cuda13-b9994")
+            .expect("image present");
+        assert_eq!(&args[3..image], GpuBackend::Cuda13.engine_args().as_slice());
+        assert_eq!(&args[image + 1..], ["--version"]);
     }
 
     #[test]
