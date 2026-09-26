@@ -1675,10 +1675,8 @@ jobs:
           set -euo pipefail
           if [ "${{ runner.os }}" = "macOS" ]; then
             {
-              echo "LLMMAN_VLLM_ARGS=--max-num-seqs 1"
+              echo "LLMMAN_VLLM_ARGS=--max-num-seqs 1 --gpu-memory-utilization 0.8"
               echo "GLOO_SOCKET_IFNAME=lo0"
-              echo "VLLM_METAL_USE_PAGED_ATTENTION=1"
-              echo "VLLM_METAL_MEMORY_FRACTION=0.8"
               echo "SGLANG_USE_MLX=1"
               echo "LLMMAN_SGLANG_ARGS=--disable-cuda-graph"
             } >> "$GITHUB_ENV"

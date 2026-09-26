@@ -265,7 +265,7 @@ def test_vllm_serve_resolves_and_serves_a_real_oci_reference(tmp_path):
       env here are lifted from vllm-metal's own CI smoke test
       (scripts/test.sh) for this same model family: no `--dtype`/
       `--enforce-eager`; `--max-num-seqs 1` plus
-      `VLLM_METAL_MEMORY_FRACTION` bound GDN linear-attention state
+      `--gpu-memory-utilization 0.8` bound GDN linear-attention state
       under a CI runner's limited Metal memory.
 
     `--max-model-len 1024`: bounds the KV-cache either way, for this
@@ -294,10 +294,8 @@ def test_vllm_serve_resolves_and_serves_a_real_oci_reference(tmp_path):
     ]
     env = dict(os.environ)
     if sys.platform == "darwin":
-        cmd += ["--max-num-seqs", "1"]
+        cmd += ["--max-num-seqs", "1", "--gpu-memory-utilization", "0.8"]
         env.setdefault("GLOO_SOCKET_IFNAME", "lo0")
-        env.setdefault("VLLM_METAL_USE_PAGED_ATTENTION", "1")
-        env.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.8")
     else:
         cmd += ["--dtype", "bfloat16", "--enforce-eager"]
         # vLLM CPU's KV-cache arena, in GiB. A demand, not a cap: the CPU
