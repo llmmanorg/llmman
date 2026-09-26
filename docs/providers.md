@@ -9,11 +9,16 @@ llmman providers                                    # which providers, and is th
 llmman list --provider openrouter                   # its models, and $/Mtok in and out
 llmman run --provider openrouter qwen/qwen3-coder   # chat with one directly
 llmman launch opencode --provider openrouter --model qwen/qwen3-coder
+llmman usage --since yesterday                      # what that session cost, per model
 ```
 
 Requests still go through `llmman serve`; `--provider` changes where the
 daemon forwards them, not who the client talks to, so local and hosted
 models share one endpoint and one integration config.
+
+The daemon also records each reply's tokens, priced at the catalog's
+rates (cache, reasoning and long-context included); `llmman usage` sums them. See
+`LLMMAN_NOUSAGE` in [configuration.md](configuration.md).
 
 ## The catalog
 

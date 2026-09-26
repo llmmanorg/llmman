@@ -312,10 +312,38 @@ pub struct Model {
 
 /// US dollars per million tokens — models.dev's own unit, unconverted so
 /// a printed figure matches the provider's pricing page.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Cost {
     pub input: f64,
     pub output: f64,
+    /// `None` where models.dev publishes none, which is not free.
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+    pub reasoning: Option<f64>,
+    /// Rates for a prompt past a context size, ascending by `above`.
+    pub tiers: Vec<Tier>,
+}
+
+impl Cost {
+    /// A price with no cache rates or tiers.
+    pub fn flat(input: f64, output: f64) -> Self {
+        Self {
+            input,
+            output,
+            cache_read: None,
+            cache_write: None,
+            reasoning: None,
+            tiers: Vec::new(),
+        }
+    }
+}
+
+/// The price, itself without tiers, of a prompt longer than `above`
+/// tokens.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tier {
+    pub above: u64,
+    pub price: Cost,
 }
 
 impl Provider {
@@ -721,17 +749,48 @@ fn thinking_levels_of(raw: &RawModel, wire: Wire, max_output: Option<u32>) -> Op
     (raw.reasoning.as_ref().and_then(serde_json::Value::as_bool) == Some(false)).then(Vec::new)
 }
 
-/// A models.dev `cost` object as a [`Cost`], or `None` unless *both*
-/// figures are there and sane — half a price misleads worse than none.
+/// A models.dev `cost` object as a [`Cost`], or `None` unless both
+/// `input` and `output` are there and sane — half a price misleads worse
+/// than none. Tiers come from `tiers` (which names the real size, e.g.
+/// OpenAI's 272k), else `context_over_200k`.
 fn cost_of(raw: &serde_json::Value) -> Option<Cost> {
+    let tier = |above: u64, raw: &serde_json::Value| {
+        Some(Tier {
+            above,
+            price: flat_cost_of(raw)?,
+        })
+    };
+    let mut tiers: Vec<Tier> = raw
+        .get("tiers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|t| t["tier"]["type"] == "context")
+        .filter_map(|t| tier(t["tier"]["size"].as_u64()?, t))
+        .collect();
+    if tiers.is_empty() {
+        tiers.extend(raw.get("context_over_200k").and_then(|t| tier(200_000, t)));
+    }
+    tiers.sort_by_key(|t| t.above);
+    tiers.dedup_by_key(|t| t.above);
+    Some(Cost {
+        tiers,
+        ..flat_cost_of(raw)?
+    })
+}
+
+/// One rate set, without tiers.
+fn flat_cost_of(raw: &serde_json::Value) -> Option<Cost> {
     let field = |name: &str| -> Option<f64> {
         raw.get(name)?
             .as_f64()
             .filter(|v| v.is_finite() && *v >= 0.0)
     };
     Some(Cost {
-        input: field("input")?,
-        output: field("output")?,
+        cache_read: field("cache_read"),
+        cache_write: field("cache_write"),
+        reasoning: field("reasoning"),
+        ..Cost::flat(field("input")?, field("output")?)
     })
 }
 
@@ -1163,10 +1222,7 @@ mod tests {
                 },
                 Model {
                     id: "z-model".into(),
-                    cost: Some(Cost {
-                        input: 2.5,
-                        output: 10.0
-                    }),
+                    cost: Some(Cost::flat(2.5, 10.0)),
                     max_output: Some(32000),
                     thinking: None,
                 },
@@ -1896,25 +1952,78 @@ mod tests {
         let cost = |json: &str| cost_of(&serde_json::from_str(json).unwrap());
         assert_eq!(
             cost(r#"{"input": 2.5, "output": 10}"#),
-            Some(Cost {
-                input: 2.5,
-                output: 10.0
-            })
+            Some(Cost::flat(2.5, 10.0))
         );
         // A genuinely free model is a price, not a missing one.
         assert_eq!(
-            cost(r#"{"input": 0, "output": 0, "cache_read": 1}"#),
-            Some(Cost {
-                input: 0.0,
-                output: 0.0
-            })
+            cost(r#"{"input": 0, "output": 0}"#),
+            Some(Cost::flat(0.0, 0.0))
         );
         // Half a price, no price, and a shape llmman doesn't recognize.
         assert_eq!(cost(r#"{"input": 2.5}"#), None);
+        assert_eq!(cost(r#"{"cache_read": 1}"#), None);
         assert_eq!(cost(r#"{}"#), None);
         assert_eq!(cost(r#"{"input": "2.5", "output": "10"}"#), None);
         assert_eq!(cost(r#"{"input": -1, "output": 10}"#), None);
         assert_eq!(cost(r#"[]"#), None);
+    }
+
+    /// Cache and reasoning rates are kept when published, `None` (not
+    /// zero) when not.
+    #[test]
+    fn cost_of_keeps_the_cache_rates() {
+        let cost = |json: &str| cost_of(&serde_json::from_str(json).unwrap()).unwrap();
+        let sonnet = cost(
+            r#"{"input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75, "reasoning": 20}"#,
+        );
+        assert_eq!(sonnet.cache_read, Some(0.3));
+        assert_eq!(sonnet.cache_write, Some(3.75));
+        assert_eq!(sonnet.reasoning, Some(20.0));
+        let partial = cost(r#"{"input": 2.5, "output": 10, "cache_read": "0.25"}"#);
+        assert_eq!(partial, Cost::flat(2.5, 10.0));
+    }
+
+    /// `tiers` wins over `context_over_200k`, the fallback when it has
+    /// nothing usable.
+    #[test]
+    fn cost_of_reads_context_tiers() {
+        let cost = |json: &str| cost_of(&serde_json::from_str(json).unwrap()).unwrap();
+        let gpt = cost(
+            r#"{"input": 2.5, "output": 15, "cache_read": 0.25,
+                "tiers": [{"input": 5, "output": 22.5, "cache_read": 0.5, "tier": {"type": "context", "size": 272000}}],
+                "context_over_200k": {"input": 5, "output": 22.5, "cache_read": 0.5}}"#,
+        );
+        assert_eq!(
+            gpt.tiers,
+            vec![Tier {
+                above: 272_000,
+                price: Cost {
+                    cache_read: Some(0.5),
+                    ..Cost::flat(5.0, 22.5)
+                },
+            }]
+        );
+        let legacy = cost(
+            r#"{"input": 3, "output": 15, "context_over_200k": {"input": 6, "output": 22.5}}"#,
+        );
+        assert_eq!(legacy.tiers.len(), 1);
+        assert_eq!(legacy.tiers[0].above, 200_000);
+        // Sorted, deduplicated, and a tier llmman can't read is skipped.
+        let many = cost(
+            r#"{"input": 1, "output": 2, "tiers": [
+                {"input": 4, "output": 8, "tier": {"type": "context", "size": 128000}},
+                {"input": 2, "output": 4, "tier": {"type": "context", "size": 32000}},
+                {"input": 9, "output": 9, "tier": {"type": "context", "size": 32000}},
+                {"input": 3, "output": 6, "tier": {"type": "time_of_day", "size": 64000}},
+                {"input": 3, "tier": {"type": "context", "size": 64000}}]}"#,
+        );
+        let above: Vec<u64> = many.tiers.iter().map(|t| t.above).collect();
+        assert_eq!(above, [32_000, 128_000]);
+        let unusable = cost(
+            r#"{"input": 3, "output": 15, "tiers": [{"input": 6, "tier": {"type": "context", "size": 1}}],
+                "context_over_200k": {"input": 6, "output": 22.5}}"#,
+        );
+        assert_eq!(unusable.tiers[0].above, 200_000);
     }
 
     /// The reason `cost` is untyped: a shape llmman doesn't know costs

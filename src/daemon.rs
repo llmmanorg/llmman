@@ -1371,6 +1371,13 @@ pub struct ProviderModel {
 pub struct ModelCost {
     pub input: f64,
     pub output: f64,
+    /// `None` where models.dev publishes none, or from an older daemon.
+    #[serde(default)]
+    pub cache_read: Option<f64>,
+    #[serde(default)]
+    pub cache_write: Option<f64>,
+    #[serde(default)]
+    pub reasoning: Option<f64>,
 }
 
 impl ProviderDetail {

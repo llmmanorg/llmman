@@ -28,6 +28,7 @@ pub mod shortnames;
 pub mod sources;
 pub mod storage;
 pub mod thinking;
+pub mod usage;
 pub mod verify;
 pub mod webui;
 pub mod xet_fetch;

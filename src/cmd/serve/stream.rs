@@ -375,15 +375,27 @@ impl OllamaLineDecoder {
         let usage = self.usage.get();
         let timings = self.timings.get();
         let total = self.started.elapsed();
+        // `prompt_tokens` includes the cached prefix; `prompt_eval_count`
+        // is what was evaluated, as llama-server's `prompt_n`.
+        let cached = usage.map(|u| {
+            let details = &u.prompt_tokens_details;
+            let read = details.cached_tokens.unwrap_or(0).min(u.prompt_tokens);
+            let written = details
+                .cache_write_tokens
+                .unwrap_or(0)
+                .min(u.prompt_tokens - read);
+            (
+                u.prompt_tokens - read,
+                details.cached_tokens.map(|_| read),
+                written,
+            )
+        });
         OllamaMetrics {
             total_duration: Some(total.as_nanos() as u64),
             load_duration: Some(self.load_duration.as_nanos() as u64),
-            prompt_eval_count: timings
-                .map(|t| t.prompt_n)
-                .or(usage.map(|u| u.prompt_tokens)),
-            prompt_eval_cached_count: timings
-                .and_then(|t| t.cache_n)
-                .or(usage.and_then(|u| u.prompt_tokens_details.cached_tokens)),
+            prompt_eval_count: timings.map(|t| t.prompt_n).or(cached.map(|c| c.0)),
+            prompt_eval_cached_count: timings.and_then(|t| t.cache_n).or(cached.and_then(|c| c.1)),
+            prompt_eval_cache_write_count: cached.map(|c| c.2).filter(|&n| n > 0),
             prompt_eval_duration: timings.map(|t| ns(t.prompt_ms)),
             eval_count: timings
                 .map(|t| t.predicted_n)
@@ -621,6 +633,33 @@ mod tests {
         assert_eq!(fold.metrics.prompt_eval_count, Some(12));
         assert_eq!(fold.metrics.eval_count, Some(7));
         assert!(fold.metrics.total_duration.is_some());
+    }
+
+    /// A provider's cached prefix is not counted as evaluated too, and an
+    /// over-report is clamped to the prompt.
+    #[test]
+    fn a_providers_cached_prefix_is_not_counted_as_evaluated() {
+        let metrics = |usage: &str| {
+            let lines = [
+                r#"data: {"choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]}"#
+                    .to_string(),
+                format!(r#"data: {{"choices":[],"usage":{usage}}}"#),
+                "data: [DONE]".to_string(),
+            ];
+            fold_ollama_lines(lines).metrics
+        };
+        let m = metrics(
+            r#"{"prompt_tokens":100,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":80,"cache_write_tokens":15}}"#,
+        );
+        assert_eq!(m.prompt_eval_count, Some(20));
+        assert_eq!(m.prompt_eval_cached_count, Some(80));
+        assert_eq!(m.prompt_eval_cache_write_count, Some(15));
+        let m = metrics(r#"{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":80}}"#);
+        assert_eq!(
+            (m.prompt_eval_count, m.prompt_eval_cached_count),
+            (Some(0), Some(10))
+        );
+        assert_eq!(m.prompt_eval_cache_write_count, None);
     }
 
     /// The done chunk is sent once, at `[DONE]`, never at the finish

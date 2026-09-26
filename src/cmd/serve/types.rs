@@ -219,6 +219,9 @@ pub(super) struct OllamaMetrics {
     pub(super) prompt_eval_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) prompt_eval_cached_count: Option<u64>,
+    /// llmman's too: of `prompt_eval_count`, written to a provider's cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) prompt_eval_cache_write_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) prompt_eval_duration: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -680,12 +683,22 @@ pub(super) struct OAIUsage {
     pub(super) total_tokens: u64,
     #[serde(default)]
     pub(super) prompt_tokens_details: OAIPromptTokensDetails,
+    #[serde(default)]
+    pub(super) completion_tokens_details: OAICompletionTokensDetails,
+}
+
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+pub(super) struct OAICompletionTokensDetails {
+    #[serde(default)]
+    pub(super) reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy)]
 pub(super) struct OAIPromptTokensDetails {
     #[serde(default)]
     pub(super) cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub(super) cache_write_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy)]

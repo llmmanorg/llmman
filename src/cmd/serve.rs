@@ -49,6 +49,7 @@ mod sched;
 mod shell;
 mod stream;
 mod types;
+mod usage;
 mod webui;
 
 use backend::{
@@ -119,6 +120,7 @@ Environment Variables:
       LLMMAN_VLLM_ARGS               Extra whitespace-separated arguments appended to every `vllm serve` (e.g. \"--dtype bfloat16 --tp 2\")
       LLMMAN_SGLANG_ARGS             Extra whitespace-separated arguments appended to every sglang launch (e.g. \"--disable-cuda-graph\")
       LLMMAN_NOHISTORY               Do not record prompts for `llmman log`
+      LLMMAN_NOUSAGE                 Do not record token usage and cost for `llmman usage`
       LLMMAN_NOPRUNE                 Do not prune model blobs on startup
       LLMMAN_ORIGINS                 A comma separated list of allowed CORS origins
       LLMMAN_PEERS                   A comma separated list of peer daemons ([scheme://]host[:port]) to pool hardware with (overrides [aggregation] in llmman.conf)
@@ -272,6 +274,8 @@ struct Inner {
     cache_path: PathBuf,
     // `record_prompt`'s file; None under LLMMAN_NOHISTORY (and in tests).
     prompt_log: Option<PathBuf>,
+    // `usage::record_usage`'s file; None under LLMMAN_NOUSAGE (and in tests).
+    usage_log: Option<PathBuf>,
     // Who may open the web UI's terminal — see the `shell` module.
     shell: shell::Policy,
     // Who may call this daemon — see the `auth` module.
@@ -1424,10 +1428,19 @@ struct RemoteTarget {
     /// The catalog's output ceiling, for a wire that requires
     /// `max_tokens` (see [`anthropic::DEFAULT_MAX_TOKENS`]).
     max_output: Option<u32>,
+    /// The catalog's price, for the usage ledger.
+    cost: Option<crate::providers::Cost>,
     /// API key for this request, or `None` for a provider that takes
     /// none (see `Provider::key_optional`). See [`resolve_remote_target`]
     /// for where it comes from.
     api_key: Option<String>,
+}
+
+impl RemoteTarget {
+    /// Cohere's compatibility API rejects `stream_options`.
+    fn refuses_stream_options(&self) -> bool {
+        self.provider == "cohere"
+    }
 }
 
 impl std::fmt::Debug for RemoteTarget {
@@ -1665,15 +1678,13 @@ async fn resolve_remote_target(
         }
     };
 
+    let listed = provider.models.iter().find(|m| m.id == model);
     let target = RemoteTarget {
         provider: provider_id,
         base_url: provider.base_url.clone(),
         wire: provider.wire,
-        max_output: provider
-            .models
-            .iter()
-            .find(|m| m.id == model)
-            .and_then(|m| m.max_output),
+        max_output: listed.and_then(|m| m.max_output),
+        cost: listed.and_then(|m| m.cost.clone()),
         model,
         api_key,
     };
@@ -1729,6 +1740,20 @@ async fn resolve_remote_target(
 /// thread count. A backend container gets the same `--threads`, plus
 /// the daemon's CPU limit as `--cpus`; see `container::run_args`.
 async fn ensure_model(
+    state: &AppState,
+    model_ref: &str,
+    headers: Option<&HeaderMap>,
+    request_threads: Option<u32>,
+) -> Result<(String, Target, ActivityGuard), AppError> {
+    let resolved = resolve_target(state, model_ref, headers, request_threads).await?;
+    // Every surface resolves here, so the usage ledger learns the target
+    // here; a hybrid retry's overwrites the first.
+    usage::note_target(&resolved.0, &resolved.1);
+    Ok(resolved)
+}
+
+/// [`ensure_model`], before the usage ledger is told the outcome.
+async fn resolve_target(
     state: &AppState,
     model_ref: &str,
     headers: Option<&HeaderMap>,
@@ -2350,8 +2375,7 @@ fn provider_compat(remote: &RemoteTarget, req: &mut serde_json::Value) {
     for field in LLAMA_FIELDS {
         o.remove(*field);
     }
-    // Cohere's compatibility API rejects `stream_options`.
-    if remote.provider == "cohere" {
+    if remote.refuses_stream_options() {
         o.remove("stream_options");
     }
     if remote.wire == Wire::Anthropic {
@@ -2873,6 +2897,12 @@ struct ProviderModelResponse {
 struct ProviderCostResponse {
     input: f64,
     output: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_read: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_write: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<f64>,
 }
 
 impl ProviderResponse {
@@ -2891,9 +2921,12 @@ impl ProviderResponse {
                 .iter()
                 .map(|m| ProviderModelResponse {
                     id: m.id.clone(),
-                    cost: m.cost.map(|c| ProviderCostResponse {
+                    cost: m.cost.as_ref().map(|c| ProviderCostResponse {
                         input: c.input,
                         output: c.output,
+                        cache_read: c.cache_read,
+                        cache_write: c.cache_write,
+                        reasoning: c.reasoning,
                     }),
                     thinking: m.thinking.clone(),
                 })
@@ -3212,8 +3245,13 @@ async fn record_prompt(State(state): State<AppState>, req: Request, next: Next) 
         if let Some(model) = selected_model {
             entry.model = model;
         }
-        if let Err(e) = crate::promptlog::append(log, &entry) {
-            eprintln!("[llmman] warning: prompt log {}: {e}", log.display());
+        match crate::promptlog::append(log, &entry) {
+            Ok(()) => {
+                parts
+                    .extensions
+                    .insert(crate::promptlog::PromptId(entry.id));
+            }
+            Err(e) => eprintln!("[llmman] warning: prompt log {}: {e}", log.display()),
         }
     }
     next.run(Request::from_parts(parts, Body::from(body))).await
@@ -3512,10 +3550,16 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
     // daemon did any work for.
     // Innermost, so `track_metrics` times its body read as the handler's
     // and CORS answers preflights before it.
-    let app = app.layer(middleware::from_fn_with_state(
-        app_state.clone(),
-        record_prompt,
-    ));
+    // `record_usage` inside `record_prompt`, to read the prompt's id.
+    let app = app
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            usage::record_usage,
+        ))
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            record_prompt,
+        ));
 
     let app = if metrics_enabled {
         app.layer(middleware::from_fn(track_metrics))
@@ -3840,13 +3884,17 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         prompt_log: crate::promptlog::enabled_from_env()
             .then(crate::promptlog::path)
             .transpose()?,
+        usage_log: crate::usage::enabled_from_env()
+            .then(crate::usage::path)
+            .transpose()?,
         shell: shell::Policy::from_env(),
         auth,
         peer_key: crate::auth::peer_key(),
         client,
     }));
 
-    // Managed routes have their own mandatory auth and bypass prompt logging.
+    // Managed routes have their own mandatory auth and bypass prompt logging
+    // and the usage ledger.
     let app = build_router(state.clone(), metrics_enabled_from_env()).merge(managed_routes);
 
     // Before the listener binds, so uptime counts from the daemon coming

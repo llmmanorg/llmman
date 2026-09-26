@@ -19,4 +19,5 @@ pub mod serve;
 pub mod show;
 pub mod stop;
 pub mod transfer;
+pub mod usage;
 pub mod verify;

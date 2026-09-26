@@ -804,6 +804,7 @@ pub(super) struct StreamConverter {
     finish_reason: Option<&'static str>,
     prompt_tokens: u64,
     cached_tokens: u64,
+    cache_write_tokens: u64,
     completion_tokens: u64,
     error: Option<Value>,
 }
@@ -837,6 +838,7 @@ impl StreamConverter {
             finish_reason: None,
             prompt_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             completion_tokens: 0,
             error: None,
         }
@@ -1129,7 +1131,8 @@ impl StreamConverter {
 
     /// `message_start` carries input usage, `message_delta` output usage.
     /// Cache reads and writes are billed input, so they count into
-    /// `prompt_tokens` as OpenAI counts them.
+    /// `prompt_tokens` as OpenAI counts them; writes are also given as
+    /// OpenRouter's `cache_write_tokens`, billed above input.
     fn read_usage(&mut self, usage: Option<&Value>) {
         let Some(usage) = usage else {
             return;
@@ -1140,6 +1143,7 @@ impl StreamConverter {
             let written = n("cache_creation_input_tokens").unwrap_or(0);
             self.prompt_tokens = input + read + written;
             self.cached_tokens = read;
+            self.cache_write_tokens = written;
         }
         if let Some(output) = n("output_tokens") {
             self.completion_tokens = output;
@@ -1151,7 +1155,10 @@ impl StreamConverter {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.prompt_tokens + self.completion_tokens,
-            "prompt_tokens_details": { "cached_tokens": self.cached_tokens },
+            "prompt_tokens_details": {
+                "cached_tokens": self.cached_tokens,
+                "cache_write_tokens": self.cache_write_tokens,
+            },
         })
     }
 }
@@ -2112,7 +2119,7 @@ mod tests {
             ev[3]["usage"],
             json!({
                 "prompt_tokens": 35, "completion_tokens": 4, "total_tokens": 39,
-                "prompt_tokens_details": { "cached_tokens": 10 }
+                "prompt_tokens_details": { "cached_tokens": 10, "cache_write_tokens": 0 }
             })
         );
         assert_eq!(ev[4], "[DONE]");

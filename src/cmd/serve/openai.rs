@@ -385,6 +385,11 @@ async fn proxy_openai_generation_to(
     if is_responses_route(llama_path) && !target.is_remote() {
         sanitize_responses_request(&mut req);
     }
+    if (llama_path == CHAT_COMPLETIONS_ROUTE || llama_path == "/v1/completions")
+        && asks_for_usage(state, &target).await
+    {
+        super::usage::ask_for_stream_usage(&mut req);
+    }
     match &target {
         Target::Remote(remote) if llama_path == CHAT_COMPLETIONS_ROUTE => {
             provider_compat(remote, &mut req)
@@ -438,6 +443,18 @@ async fn proxy_openai_generation_to(
         }
     }?;
     Ok(explain_missing_route(&target, llama_path, resp))
+}
+
+/// Whether a stream's usage has to be asked for. Not of llama-server
+/// (a peer's too), whose `timings` report it unasked and which moves them
+/// onto the usage chunk the client would then lose; nor of Cohere, which
+/// refuses `stream_options`.
+async fn asks_for_usage(state: &AppState, target: &Target) -> bool {
+    match target {
+        Target::Remote(remote) => !remote.refuses_stream_options(),
+        Target::Local(_) => local_engine(state, target).await != Some(Engine::LlamaServer),
+        Target::Peer(_) => false,
+    }
 }
 
 /// OpenAI-passthrough for the routes that don't generate anything a

@@ -18,6 +18,7 @@ pub(super) fn remote_target_on(base_url: &str, wire: Wire) -> Target {
         wire,
         model: "mock-model".into(),
         max_output: None,
+        cost: None,
         api_key: Some("sk-test".into()),
     }))
 }
@@ -86,6 +87,7 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
         store_path,
         cache_path: std::env::temp_dir(),
         prompt_log: None,
+        usage_log: None,
         shell: shell::Policy {
             disabled: None,
             origins: default_allowed_origins(),
