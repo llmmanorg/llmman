@@ -304,6 +304,12 @@ pub struct Model {
     /// models.dev's `limit.output`, the default `max_tokens` for a wire
     /// that requires one. `None` where the catalog has none.
     pub max_output: Option<u32>,
+    /// models.dev's `limit.context`, the window this model can hold —
+    /// what a hybrid pair's ceiling is measured against (see
+    /// `cmd::launch`'s `pair_context_window`). `None` where the catalog
+    /// has none, and for a provider defined in `llmman.conf`, which has
+    /// no catalog entry at all.
+    pub max_context: Option<u64>,
     /// The `reasoning_effort` levels opencode offers, in cycle order (see
     /// [`thinking_levels_of`]). Empty for a model that does not reason;
     /// `None` where the catalog does not say.
@@ -708,6 +714,11 @@ fn max_output_of(raw: &serde_json::Value) -> Option<u32> {
     u32::try_from(n).ok().filter(|&n| n > 0)
 }
 
+/// [`max_output_of`]'s sibling for `limit.context`.
+fn max_context_of(raw: &serde_json::Value) -> Option<u64> {
+    raw.get("context")?.as_u64().filter(|&n| n > 0)
+}
+
 /// The levels opencode derives from a models.dev entry
 /// (`ProviderTransform.reasoningVariants`, which also reads the options
 /// before `reasoning`):
@@ -868,6 +879,7 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
                 Model {
                     cost: model.cost.as_ref().and_then(cost_of),
                     thinking: thinking_levels_of(&model, wire, max_output),
+                    max_context: model.limit.as_ref().and_then(max_context_of),
                     max_output,
                     id,
                 }
@@ -1218,12 +1230,15 @@ mod tests {
                     id: "a-model".into(),
                     cost: None,
                     max_output: None,
+                    max_context: None,
                     thinking: None,
                 },
                 Model {
                     id: "z-model".into(),
                     cost: Some(Cost::flat(2.5, 10.0)),
                     max_output: Some(32000),
+                    // The fixture's `limit.context`, now carried too.
+                    max_context: Some(200_000),
                     thinking: None,
                 },
             ]

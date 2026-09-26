@@ -1238,6 +1238,49 @@ pub fn unload(reference: &str) -> anyhow::Result<bool> {
     anyhow::bail!("stop {reference}: server returned {status}: {body}");
 }
 
+/// Loads `reference` and reports the context window the runner actually
+/// got, from `/api/ps` — the post-load `n_ctx`, not the trained context
+/// `/api/show` reports. `None` when the daemon does not report one: a
+/// vLLM- or MLX-backed model, or a load that failed.
+///
+/// The load is the point. `ensure_model_pulled` only pulls, and
+/// `ensure_server` preloads only when it spawns, so on a reused daemon
+/// the model is usually still cold — and an OOM retry halves `--ctx-size`
+/// during that load, which is exactly the value a caller needs to read
+/// back rather than predict.
+pub fn loaded_context_length(reference: &str) -> Option<u64> {
+    // Ollama's load sentinel: no prompt, a non-zero keep_alive. The
+    // daemon's own reaper decides how long it stays; this only asks for
+    // it now so `/api/ps` has something to report.
+    client()
+        .ok()?
+        .post(format!("{}/api/generate", server()))
+        .json(&serde_json::json!({"model": reference}))
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    let ps: PsWindows = get_json("/api/ps").ok()?;
+    let local = crate::hybrid::local_half(reference);
+    ps.models
+        .into_iter()
+        .find(|m| m.name == local)
+        .and_then(|m| m.context_length)
+}
+
+/// The two `/api/ps` fields [`loaded_context_length`] needs; the CLI's
+/// own `cmd::ps` parses the rest for display.
+#[derive(serde::Deserialize)]
+struct PsWindows {
+    models: Vec<PsWindow>,
+}
+
+#[derive(serde::Deserialize)]
+struct PsWindow {
+    name: String,
+    context_length: Option<u64>,
+}
+
 /// The `{"error":"model '<name>' not found"}` this daemon sends for
 /// `reference` (see `unload_model` in cmd::serve), with the name the
 /// daemon was asked for, a pair's local half; parsed through `api_error`,
@@ -1364,6 +1407,11 @@ pub struct ProviderModel {
     /// See `crate::providers::Model::thinking`; `None` from an older daemon too.
     #[serde(default)]
     pub thinking: Option<Vec<String>>,
+    /// The window this model can hold (models.dev `limit.context`).
+    /// `None` from an older daemon, and for a provider defined in
+    /// `llmman.conf`, which has no catalog entry.
+    #[serde(default)]
+    pub context: Option<u64>,
 }
 
 /// US dollars per million tokens (see [`crate::providers::Cost`]).
@@ -1406,6 +1454,16 @@ impl ProviderDetail {
             .iter()
             .find(|m| m.id == model)
             .and_then(|m| m.thinking.clone())
+    }
+
+    /// The catalog's window for `model` (models.dev `limit.context`).
+    /// `None` from an older daemon, and for a provider defined in
+    /// `llmman.conf`.
+    pub fn context_window(&self, model: &str) -> Option<u64> {
+        self.models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.context)
     }
 
     /// Where a key for this provider would go (see
