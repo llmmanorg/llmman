@@ -354,6 +354,25 @@ one ordinary model name, `llmman.hybrid/gemma4,anthropic/claude-sonnet-5`,
 so it works from any client on every inference endpoint. Details in
 [docs/providers.md](docs/providers.md#hybrid-model-pairs).
 
+### Sandboxes
+
+`--sandbox` runs the integration inside a sandbox. It can write to the
+current Git work tree and to its own settings, but not to the rest of your
+files. Under seatbelt it can also write to the temporary and cache
+directories.
+
+```sh
+llmman launch claude --model qwen3.8 --sandbox docker
+llmman launch opencode --model qwen3.8 --sandbox seatbelt
+```
+
+The choices are `sbx` (Docker Sandboxes), `seatbelt` (macOS
+`sandbox-exec`), `docker`, `podman`, `apple-container`, `microsandbox`
+and `openshell`. The image-based sandboxes default to Docker Sandboxes'
+agent images, so the integration does not need to be installed on your
+machine. What each sandbox shares, and how it reaches `llmman serve`, is
+in [docs/sandbox.md](docs/sandbox.md).
+
 ## Documentation
 
 | | |
@@ -366,5 +385,6 @@ so it works from any client on every inference endpoint. Details in
 | [docs/compose.md](docs/compose.md) | Compose deployment behind a gateway, with persistent model storage |
 | [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, registry mirrors, environment variables, store layout |
 | [docs/providers.md](docs/providers.md) | Hosted providers, API keys, and which integrations can use them |
+| [docs/sandbox.md](docs/sandbox.md) | `launch --sandbox`: what each sandbox shares and how it reaches the daemon |
 | [docs/verification.md](docs/verification.md) | Signing models and pull-time trust policy |
 | [docs/metrics.md](docs/metrics.md) | The Prometheus `/metrics` families |

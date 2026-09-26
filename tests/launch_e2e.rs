@@ -1047,6 +1047,64 @@ fn launch_codex_with_model() {
     launch_and_assert("codex", &["exec", PROMPT]);
 }
 
+/// `launch codex --sandbox docker|podman`: codex from Docker Sandboxes'
+/// image, reading the profile the launcher wrote on the host. That needs
+/// both halves of the container plumbing: the state directory mounted at
+/// its host path, and the daemon reachable from inside. codex need not be
+/// installed here. Opt-in, since it pulls a multi-GB image:
+///
+///   LLMMAN_E2E_SANDBOX=docker cargo test --release --test launch_e2e \
+///     launch_codex_in_a_container_sandbox -- --nocapture
+#[test]
+fn launch_codex_in_a_container_sandbox() {
+    let _guard = lock_serial();
+    let Some(engine) = std::env::var("LLMMAN_E2E_SANDBOX")
+        .ok()
+        .filter(|e| e == "docker" || e == "podman")
+    else {
+        eprintln!("skipping: set LLMMAN_E2E_SANDBOX=docker or podman (pulls a multi-GB image)");
+        return;
+    };
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path(&engine) {
+        eprintln!("skipping: {engine} not on PATH");
+        return;
+    }
+    warm_model();
+
+    let home = fresh_home("codex-sandbox");
+    let mut cmd = Command::new(llmman_bin());
+    cmd.args(["launch", "codex", "--model", MODEL, "--sandbox", &engine])
+        .args(["--", "exec", "--skip-git-repo-check", PROMPT])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"));
+    let output = spawn_with_timeout(cmd, TIMEOUT, "`llmman launch codex --sandbox`");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "`llmman launch codex --sandbox {engine}` failed (status: {:?})\n\
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        output.status
+    );
+    // The sandbox's home is llmman's own, under this HOME, not HOME itself.
+    assert!(
+        home.join(".local/share/llmman/sandbox/codex").is_dir(),
+        "no sandbox home under {}",
+        home.display()
+    );
+    if !reply_contains_pong(&stdout) {
+        eprintln!(
+            "[test] codex --sandbox: WARNING — exited 0 without saying pong (sampling \
+             variance, see launch_and_assert)\n--- stdout ---\n{stdout}"
+        );
+    }
+}
+
 #[test]
 fn launch_pi_with_model() {
     eprintln!("[test] launch_pi_with_model: acquiring SERIAL");

@@ -27,6 +27,10 @@ use crate::chat_template::ThinkingControls;
 use crate::daemon;
 use crate::providers;
 
+mod sandbox;
+
+pub use sandbox::Sandbox;
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -58,6 +62,10 @@ pub struct LaunchArgs {
     #[arg(long, value_name = "MODEL")]
     pub overflow_model: Option<String>,
 
+    /// Run the integration in a sandbox. See docs/sandbox.md.
+    #[arg(long, value_enum, value_name = "SANDBOX")]
+    pub sandbox: Option<Sandbox>,
+
     /// Extra arguments forwarded to the integration binary (after --)
     #[arg(last = true, value_name = "ARGS")]
     pub extra_args: Vec<String>,
@@ -76,12 +84,38 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         return Ok(());
     };
 
+    // sbx serves the model itself and validates its own flags, so none
+    // of what follows applies.
+    if args.sandbox == Some(Sandbox::Sbx) {
+        return sandbox::run_sbx(
+            name,
+            args.model.as_deref(),
+            provider,
+            overflow,
+            &args.extra_args,
+        );
+    }
+
     // Before either arm starts the daemon; see `check_model_flag`.
     check_model_flag(name, args.model.as_deref(), provider, &args.extra_args)?;
     anyhow::ensure!(
         overflow.is_none() || args.model.as_deref().is_some_and(|m| !m.trim().is_empty()),
         "--overflow-model needs --model naming the local model to pair it with"
     );
+    // Before the Cline install check, which an image-based sandbox makes
+    // moot (see `find_on_path`), and before the daemon starts.
+    if let Some(kind) = args.sandbox {
+        let id = name.to_lowercase();
+        let carries_key =
+            provider.is_some() || overflow.is_some() || crate::auth::client_key().is_some();
+        sandbox::prepare(
+            kind,
+            &id,
+            sandbox_state(&id)?,
+            CONFIGURED_BY_FILE.contains(&id.as_str()),
+            carries_key,
+        )?;
+    }
     // Cline follows the install-on-demand behavior expected by its launch
     // integration. Do this before starting the daemon or pulling a model.
     if name.eq_ignore_ascii_case("cline") {
@@ -599,7 +633,9 @@ fn print_integrations() {
         };
         println!("  {:<12} {}{}", i.name, i.description, how);
     }
-    println!("\nUsage: llmman launch <integration> [--model <model>] [--provider <provider>]");
+    println!(
+        "\nUsage: llmman launch <integration> [--model <model>] [--provider <provider>] [--sandbox <sandbox>]"
+    );
     println!("       llmman providers   (the providers --provider accepts)");
 }
 
@@ -617,7 +653,12 @@ fn print_integrations() {
 /// `.cmd` alongside it, so there's no case where only the `.ps1` exists.
 const WINDOWS_PATH_EXTS: &[&str] = &["exe", "cmd", "bat"];
 
+/// Under an image-based `--sandbox` the image's copy runs, found on the
+/// image's `PATH`, so this machine need not have one.
 fn find_on_path(binary: &str) -> Option<PathBuf> {
+    if sandbox::runs_from_image() {
+        return Some(PathBuf::from(binary));
+    }
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         if cfg!(windows) {
@@ -780,11 +821,83 @@ fn launch(
         "goose" => launch_goose(model, api_key, extra_args),
         "grok" => launch_grok(model, api_key, extra_args),
         "docker-agent" => launch_docker_agent(model, api_key, extra_args),
-        other => anyhow::bail!(
-            "unknown integration {:?}\nRun 'llmman launch' without arguments to list supported integrations.",
-            other
-        ),
+        other => Err(unknown_integration(other)),
     }
+}
+
+fn unknown_integration(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "unknown integration {name:?}\nRun 'llmman launch' without arguments to list supported integrations."
+    )
+}
+
+/// Integrations whose launcher writes their configuration to files
+/// under the home directory, rather than handing it over in the
+/// environment and arguments alone.
+const CONFIGURED_BY_FILE: &[&str] = &[
+    "agy",
+    "cline",
+    "codex",
+    "docker-agent",
+    "dsh",
+    "grok",
+    "hermes",
+    "omp",
+    "openclaw",
+    "pi",
+    "qwen",
+];
+
+/// What `name` keeps on this machine, which `--sandbox` lets it write:
+/// the directories its launcher writes config into, and its own
+/// settings and session state, found the way the integration finds them.
+fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
+    use sandbox::State::{Dir, Files};
+    let home = dirs::home_dir().context("no home directory")?;
+    let xdg = |var: &str, default: &str| env_dir(var).unwrap_or_else(|| home.join(default));
+    let config = xdg("XDG_CONFIG_HOME", ".config");
+    let data = xdg("XDG_DATA_HOME", ".local/share");
+    let state = xdg("XDG_STATE_HOME", ".local/state");
+    Ok(match name {
+        "claude" => match env_dir("CLAUDE_CONFIG_DIR") {
+            Some(dir) => vec![Dir(dir)],
+            None => vec![Dir(home.join(".claude")), Files(home.join(".claude.json"))],
+        },
+        "opencode" => vec![
+            Dir(config.join("opencode")),
+            Dir(data.join("opencode")),
+            Dir(state.join("opencode")),
+            Dir(xdg("XDG_CACHE_HOME", ".cache").join("opencode")),
+        ],
+        "codex" => vec![Dir(codex_dir()?)],
+        "pi" => vec![Dir(pi_agent_dir()?)],
+        "omp" => vec![Dir(omp_agent_dir()?)],
+        "cline" => vec![Dir(cline_dir()?)],
+        "aider" => vec![Dir(home.join(".aider"))],
+        "copilot" | "copilot-cli" => vec![
+            Dir(home.join(".copilot")),
+            Dir(env_dir("GH_CONFIG_DIR").unwrap_or_else(|| config.join("gh"))),
+        ],
+        "kimi" => vec![Dir(home.join(".kimi"))],
+        "gemini" => vec![Dir(home.join(".gemini"))],
+        "agy" => vec![Dir(agy_settings_dir()?)],
+        "hermes" => vec![Dir(hermes_home()?)],
+        // `launch_openclaw` takes the legacy config as onboarded too.
+        "openclaw" => std::iter::once(home.join(".openclaw"))
+            .chain(Some(home.join(".clawdbot")).filter(|d| d.is_dir()))
+            .map(Dir)
+            .collect(),
+        "qwen" => vec![Dir(qwen_home()?)],
+        "dsh" => vec![Dir(dsh_config_dir()?)],
+        "goose" => vec![
+            Dir(config.join("goose")),
+            Dir(data.join("goose")),
+            Dir(state.join("goose")),
+        ],
+        "grok" => vec![Dir(grok_home()?)],
+        "docker-agent" => vec![Dir(docker_agent_config_dir()?), Dir(home.join(".cagent"))],
+        other => return Err(unknown_integration(other)),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -802,7 +915,7 @@ fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
     }
     args.extend_from_slice(extra_args);
 
-    let server = daemon::server();
+    let server = server();
     exec_with_env(
         &bin,
         &args,
@@ -827,7 +940,7 @@ fn launch_opencode(
 
     let effective_model = if model.is_empty() { "default" } else { model };
     let config = opencode_config(
-        &daemon::server(),
+        &server(),
         effective_model,
         api_key,
         &opencode_variants(thinking),
@@ -1065,7 +1178,7 @@ fn launch_omp(
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_omp().ok_or_else(|| anyhow::anyhow!("omp is not installed"))?;
-    let server = daemon::server();
+    let server = server();
     write_omp_config(model, thinking, vision, context_length, &server)?;
     exec_with_env(
         &bin,
@@ -1286,7 +1399,7 @@ fn write_pi_config(
     let dir = pi_agent_dir()?;
     let entry = pi_model_entry(model, thinking, vision, context_length);
     write_json_merged(&dir.join("models.json"), "pi", |existing| {
-        pi_models_merged(existing, &daemon::server(), &entry)
+        pi_models_merged(existing, &server(), &entry)
     })?;
     write_json_merged(&dir.join("settings.json"), "pi", |existing| {
         pi_settings_merged(existing, model)
@@ -1464,8 +1577,7 @@ fn write_codex_config(
     vision: bool,
     context_length: Option<u64>,
 ) -> anyhow::Result<()> {
-    let home = dirs::home_dir().context("no home directory")?;
-    let config_dir = home.join(".codex");
+    let config_dir = codex_dir()?;
     std::fs::create_dir_all(&config_dir)?;
 
     let config_path = config_dir.join("config.toml");
@@ -1489,10 +1601,13 @@ fn write_codex_config(
     let catalog = catalog.transpose()?;
 
     let profile_path = config_dir.join("llmman.config.toml");
-    write_codex_file(
-        &profile_path,
-        &codex_profile(&daemon::server(), catalog.as_deref()),
-    )
+    write_codex_file(&profile_path, &codex_profile(&server(), catalog.as_deref()))
+}
+
+fn codex_dir() -> anyhow::Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("no home directory")?
+        .join(".codex"))
 }
 
 /// Writes `contents` to `path` unless it already holds exactly that.
@@ -1602,7 +1717,7 @@ fn strip_legacy_llmman_profile(existing: &str) -> String {
 
 /// aider: set OPENAI_API_KEY and OPENAI_BASE_URL.
 fn launch_aider(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let base_url = format!("{}/v1", daemon::server());
+    let base_url = format!("{}/v1", server());
     let mut args: Vec<String> = Vec::new();
     if !model.is_empty() {
         args.extend(["--model".to_string(), format!("openai/{model}")]);
@@ -1625,7 +1740,7 @@ fn launch_copilot(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin =
         find_on_path("gh").ok_or_else(|| anyhow::anyhow!("gh (GitHub CLI) is not installed"))?;
 
-    let base_url = format!("{}/v1", daemon::server());
+    let base_url = format!("{}/v1", server());
     let mut args = vec!["copilot".to_string()];
     if !model.is_empty() {
         args.extend(["--model".to_string(), model.to_string()]);
@@ -1645,7 +1760,7 @@ fn launch_gemini(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
     }
     args.extend_from_slice(extra_args);
 
-    let base_url = format!("{}/v1", daemon::server());
+    let base_url = format!("{}/v1", server());
     exec_with_env(
         &bin,
         &args,
@@ -1675,7 +1790,7 @@ fn launch_agy(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Resu
     args.extend_from_slice(extra_args);
 
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(model.as_bytes());
-    let base_url = format!("{}/gemini/{encoded}", daemon::server());
+    let base_url = format!("{}/gemini/{encoded}", server());
     exec_with_env(
         &bin,
         &args,
@@ -1707,7 +1822,7 @@ fn write_agy_settings_at(gemini_dir: &Path) -> anyhow::Result<()> {
 /// Generic launcher: just set OLLAMA_HOST and run the binary.
 fn launch_simple(binary: &str, _model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_on_path(binary).ok_or_else(|| anyhow::anyhow!("{binary} is not installed"))?;
-    let server = daemon::server();
+    let server = server();
     exec_with_env(&bin, extra_args, &[("OLLAMA_HOST", server.as_str())])
 }
 
@@ -1758,7 +1873,7 @@ fn write_hermes_config(model: &str, vision: bool) -> anyhow::Result<()> {
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
     let preserved =
         strip_yaml_top_level_key(&strip_yaml_top_level_key(&existing, "model"), "providers");
-    let ours = hermes_config_blocks(model, &format!("{}/v1", daemon::server()), vision);
+    let ours = hermes_config_blocks(model, &format!("{}/v1", server()), vision);
     std::fs::write(&config_path, format!("{preserved}{ours}"))?;
     Ok(())
 }
@@ -1863,24 +1978,24 @@ fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     });
     if !onboarded {
         let effective_model = openclaw_model_id(model);
-        let status = Command::new(&bin)
-            .args([
-                "onboard",
-                "--non-interactive",
-                "--accept-risk",
-                "--auth-choice",
-                "ollama",
-                "--custom-base-url",
-                &format!("{}/v1", daemon::server()),
-                "--custom-model-id",
-                effective_model,
-                "--skip-health",
-                "--skip-channels",
-                "--skip-skills",
-            ])
-            .status()
-            .with_context(|| format!("failed to run {}", bin.display()))?;
-        anyhow::ensure!(status.success(), "openclaw onboarding failed");
+        // Through run_with_env so a --sandbox onboards the copy it runs.
+        let onboard = [
+            "onboard",
+            "--non-interactive",
+            "--accept-risk",
+            "--auth-choice",
+            "ollama",
+            "--custom-base-url",
+            &format!("{}/v1", server()),
+            "--custom-model-id",
+            effective_model,
+            "--skip-health",
+            "--skip-channels",
+            "--skip-skills",
+        ]
+        .map(String::from);
+        let code = run_with_env(&bin, &onboard, &[])?;
+        anyhow::ensure!(code == 0, "openclaw onboarding failed");
     }
 
     exec_with_env(&bin, extra_args, &[])
@@ -1909,7 +2024,7 @@ fn launch_qwen(
     // not there; `check_model_flag` has made sure there is a model.
     write_qwen_settings(model, vision)?;
 
-    let base_url = format!("{}/v1", daemon::server());
+    let base_url = format!("{}/v1", server());
     let mut env = vec![
         ("OPENAI_BASE_URL", base_url.as_str()),
         ("OPENAI_API_KEY", api_key),
@@ -2103,12 +2218,7 @@ fn expand_tilde(dir: &str, home: &Path) -> PathBuf {
 /// `settings.json`, as `write_codex_config` and `write_hermes_config` do
 /// for theirs. See `qwen_settings_merged` for what goes in.
 fn write_qwen_settings(model: &str, vision: bool) -> anyhow::Result<()> {
-    write_qwen_settings_at(
-        &qwen_home()?,
-        model,
-        &format!("{}/v1", daemon::server()),
-        vision,
-    )
+    write_qwen_settings_at(&qwen_home()?, model, &format!("{}/v1", server()), vision)
 }
 
 /// Read as Qwen Code reads it, comments stripped and an empty file as
@@ -2345,7 +2455,7 @@ fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
 /// config file and no `goose configure`.
 fn launch_goose(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_goose().ok_or_else(|| anyhow::anyhow!("goose is not installed"))?;
-    let host = daemon::server();
+    let host = server();
     exec_with_env(&bin, extra_args, &goose_env(model, api_key, &host))
 }
 
@@ -2438,7 +2548,7 @@ fn cline_data_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn write_cline_settings(model: &str) -> anyhow::Result<()> {
-    let server = daemon::server();
+    let server = server();
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     write_cline_settings_at(&cline_data_dir()?, model, &server, &now)
 }
@@ -2610,7 +2720,7 @@ const GROK_API_KEY_ENV: &str = "LLMMAN_GROK_API_KEY";
 fn launch_grok(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_grok().ok_or_else(|| anyhow::anyhow!("grok is not installed"))?;
     let effective_model = forwarded_model(extra_args).unwrap_or(model);
-    let base_url = format!("{}/v1", daemon::server());
+    let base_url = format!("{}/v1", server());
     let models_url = format!("{base_url}/models");
     // Never edit the user's config.toml. This child is wholly llmman-owned,
     // and setting GROK_HOME below scopes it to this launched process.
@@ -2870,7 +2980,7 @@ fn dsh_config_dir() -> anyhow::Result<PathBuf> {
 /// selects it as the `agent-default-model`.
 fn write_dsh_settings(path: &Path, model: &str, vision: bool) -> anyhow::Result<()> {
     let quoted_model = yaml_quote(model);
-    let base_url = yaml_quote(&format!("{}/v1", daemon::server()));
+    let base_url = yaml_quote(&format!("{}/v1", server()));
     // Claiming image input a text-only model can't serve would have dsh
     // attach what the daemon then rejects.
     let input = if vision { "[text, image]" } else { "[text]" };
@@ -2940,7 +3050,7 @@ fn launch_docker_agent(model: &str, api_key: &str, extra_args: &[String]) -> any
     })?;
 
     let path = docker_agent_agent_file(&docker_agent_config_dir()?, model);
-    write_docker_agent_file(&path, model, &format!("{}/v1", daemon::server()))?;
+    write_docker_agent_file(&path, model, &format!("{}/v1", server()))?;
 
     let args = docker_agent_args(&path, extra_args);
     exec_with_env(&bin, &args, &[(DOCKER_AGENT_API_KEY_ENV, api_key)])
@@ -3143,25 +3253,42 @@ fn docker_agent_fallback(home: &Path) -> Option<PathBuf> {
 // Process execution helper
 // ---------------------------------------------------------------------------
 
-fn exec_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
+fn exec_with_env(bin: &Path, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
+    std::process::exit(run_with_env(bin, args, extra_env)?);
+}
+
+/// Runs the integration — in the `--sandbox`, when there is one — and
+/// returns its exit code.
+fn run_with_env(bin: &Path, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<i32> {
+    // The inherited environment, overlaid with OLLAMA_HOST and the
+    // integration's variables, later ones winning.
+    let mut overlay = vec![("OLLAMA_HOST".to_string(), server())];
+    overlay.extend(
+        extra_env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
+    if sandbox::active() {
+        return sandbox::run(bin, args, &overlay);
+    }
+
     let mut cmd = Command::new(bin);
     cmd.args(args);
     cmd.stdin(std::process::Stdio::inherit());
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
-
-    // Inherit the current environment and overlay OLLAMA_HOST + integration vars.
-    let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
-    env.insert("OLLAMA_HOST".to_string(), daemon::server());
-    for (k, v) in extra_env {
-        env.insert(k.to_string(), v.to_string());
-    }
-    cmd.envs(&env);
+    cmd.envs(overlay);
 
     let status = cmd
         .status()
         .with_context(|| format!("failed to run {}", bin.display()))?;
-    std::process::exit(status.code().unwrap_or(1));
+    Ok(status.code().unwrap_or(1))
+}
+
+/// The daemon's URL as the integration reaches it: `daemon::server()`,
+/// or the `--sandbox`'s name for this machine.
+fn server() -> String {
+    sandbox::agent_server()
 }
 
 #[cfg(test)]
@@ -3220,6 +3347,58 @@ mod tests {
                 "{id} is both refused outright and expected to work"
             );
         }
+    }
+
+    /// `--sandbox` must know what every integration writes, or the first
+    /// one it misses fails on a read-only home directory, not up front.
+    #[test]
+    fn every_integration_has_sandbox_state() {
+        for i in INTEGRATIONS {
+            let state = sandbox_state(i.name).unwrap();
+            assert!(!state.is_empty(), "{} has no sandbox state", i.name);
+        }
+        assert!(sandbox_state("copilot-cli").is_ok());
+        assert!(sandbox_state("nope").is_err());
+        for id in CONFIGURED_BY_FILE {
+            assert!(
+                INTEGRATIONS.iter().any(|i| i.name == *id),
+                "{id} is not an integration"
+            );
+        }
+    }
+
+    /// The directory a file-configured launcher writes into must be one
+    /// the sandbox mounts, or the integration never sees its config.
+    #[test]
+    fn sandbox_state_covers_where_the_launchers_write() {
+        let covers = |name: &str, written: PathBuf| {
+            let state = sandbox_state(name).unwrap();
+            assert!(
+                state.iter().any(|s| matches!(
+                    s,
+                    sandbox::State::Dir(dir) if written.starts_with(dir)
+                )),
+                "{name}'s {} is outside its sandbox state {state:?}",
+                written.display()
+            );
+        };
+        covers("codex", codex_dir().unwrap());
+        covers("pi", pi_agent_dir().unwrap());
+        covers("omp", omp_agent_dir().unwrap());
+        covers("cline", cline_data_dir().unwrap());
+        covers("agy", agy_settings_dir().unwrap());
+        covers("hermes", hermes_home().unwrap());
+        covers("qwen", qwen_home().unwrap());
+        covers("dsh", dsh_config_dir().unwrap());
+        covers("grok", grok_home().unwrap().join("llmman"));
+        covers("docker-agent", docker_agent_config_dir().unwrap());
+        covers(
+            "openclaw",
+            dirs::home_dir()
+                .unwrap()
+                .join(".openclaw")
+                .join("openclaw.json"),
+        );
     }
 
     /// Regression test for a real CodeRabbit finding: an unquoted model
