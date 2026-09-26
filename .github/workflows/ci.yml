@@ -31,7 +31,7 @@ env:
   # vllm-plugin/tests/test_e2e.py's real `vllm serve` test. Moves with
   # VLLM_METAL_VERSION below: a vllm-metal release names the vLLM
   # release it was built against in its `.github/vllm-release-tag.commit`.
-  VLLM_VERSION: "0.28.0"
+  VLLM_VERSION: "0.30.0"
   # vllm-metal (github.com/vllm-project/vllm-metal), macOS's Metal-GPU
   # vLLM platform below. A stable release, cut from its `releases/vX.Y.Z`
   # branch and numbered after the vLLM release it pairs with — never a
@@ -39,7 +39,7 @@ env:
   # and each one deletes the previous (vllm-metal#662), so a pinned one
   # 404s within hours. The 0.3.0.dev20260825040033 pinned here before
   # went that way and took every macOS e2e run with it. Bump deliberately.
-  VLLM_METAL_VERSION: "0.28.0"
+  VLLM_METAL_VERSION: "0.30.0"
   # SGLang git tag (`v` added at use) the e2e job installs from source
   # for tests/launch_e2e.rs's `serve_sglang_safetensors_model`: upstream's
   # PyPI wheel and `sglang-kernel` are CUDA builds, so the CPU engine
@@ -1593,7 +1593,7 @@ jobs:
               aarch64-*) arch=aarch64 ;;
               *) echo "unhandled target for vLLM CPU wheel: ${{ matrix.target }}" >&2; exit 1 ;;
             esac
-            wheel="vllm-${VLLM_VERSION}+cpu-cp38-abi3-manylinux_2_34_${arch}.whl"
+            wheel="vllm-${VLLM_VERSION}+cpu-cp38-abi3-manylinux_2_39_${arch}.whl"
             "$venv/bin/pip" install \
               "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/$wheel" \
               --extra-index-url https://download.pytorch.org/whl/cpu
@@ -1675,10 +1675,8 @@ jobs:
           set -euo pipefail
           if [ "${{ runner.os }}" = "macOS" ]; then
             {
-              echo "LLMMAN_VLLM_ARGS=--max-num-seqs 1"
+              echo "LLMMAN_VLLM_ARGS=--max-num-seqs 1 --gpu-memory-utilization 0.8"
               echo "GLOO_SOCKET_IFNAME=lo0"
-              echo "VLLM_METAL_USE_PAGED_ATTENTION=1"
-              echo "VLLM_METAL_MEMORY_FRACTION=0.8"
               echo "SGLANG_USE_MLX=1"
               echo "LLMMAN_SGLANG_ARGS=--disable-cuda-graph"
             } >> "$GITHUB_ENV"
