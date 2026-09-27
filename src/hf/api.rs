@@ -50,15 +50,28 @@ pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&body).with_context(|| format!("decode JSON from {url}"))
 }
 
-/// The subset of `GET /api/models/{owner}/{repo}` this needs — mirrors `hfModelInfo`.
+/// The subset of `GET /api/models/{owner}/{repo}` this needs — mirrors
+/// `hfModelInfo`, plus what `llmman serve`'s `/llmman/search/model` shows.
 #[derive(Debug, Deserialize, Default)]
 pub struct ModelInfo {
     #[serde(default)]
     sha: String,
     #[serde(default)]
-    tags: Vec<String>,
+    pub tags: Vec<String>,
     #[serde(default, rename = "cardData")]
     card_data: CardData,
+    #[serde(default)]
+    pub downloads: Option<u64>,
+    #[serde(default)]
+    pub likes: Option<u64>,
+    #[serde(default, rename = "lastModified")]
+    pub last_modified: Option<String>,
+    /// The Hub's task tag (`text-generation`, ...).
+    #[serde(default)]
+    pub pipeline_tag: Option<String>,
+    /// `false`, or the gating mode (`"auto"`, `"manual"`).
+    #[serde(default)]
+    gated: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -68,6 +81,14 @@ struct CardData {
 }
 
 impl ModelInfo {
+    /// Whether downloading needs an accepted license and a token.
+    pub fn gated(&self) -> bool {
+        !matches!(
+            self.gated,
+            serde_json::Value::Null | serde_json::Value::Bool(false)
+        )
+    }
+
     /// The commit SHA to pin resolve URLs to, falling back to "main".
     pub fn commit(&self) -> &str {
         if self.sha.is_empty() {

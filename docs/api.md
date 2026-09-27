@@ -9,7 +9,7 @@ Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
 | Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/pull`, `/api/push`, `/api/copy`, `/api/create`, `/api/blobs/{digest}`, `/api/ps`, `/api/delete`, `/api/version` |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`) |
 | Anthropic | `/v1/messages` |
-| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node`, `/llmman/shell` |
+| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/avatar`, `/llmman/shell` |
 | Web UI | `/` and `/ui/*` — see [webui.md](webui.md) |
 | llama.cpp | `/props` |
 | Prometheus | `/metrics` (off unless `LLMMAN_METRICS` is `1`, `true`, `yes` or `on`) |
@@ -146,6 +146,20 @@ reports, unpriced.
 
 `/llmman/node` reports this node's memory and loaded/stored models; it
 is what aggregation peers ask each other. See [aggregation.md](aggregation.md).
+
+`/llmman/search?q=<query>` is `llmman search` over HTTP: the same Docker
+Hub and Hugging Face rows in the same order, as `{"models": [{name,
+pulls, likes, updated}]}`, each `name` ready for `/api/pull`. `limit`
+caps the rows per registry as `--limit` does (default 25, at most 64).
+`/llmman/search/model?name=<a row's name>` expands one row: every tag
+`pull` can take for it with its size (`variants`, the one a tagless
+`pull` takes marked `default`), plus the repo's pulls, likes, license
+and tags. For a GGUF repo on Hugging Face the variants are its
+quantizations, each one that resolves to its own file the way `pull`
+picks one. `/llmman/search/avatar?name=` redirects to the repo owner's
+picture on Hugging Face or Gravatar, or is a `404` when it has none.
+These ask the registries live; a registry that cannot be reached is a
+`502`.
 
 ## Authentication
 

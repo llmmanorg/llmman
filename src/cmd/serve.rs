@@ -46,6 +46,7 @@ mod relay;
 mod responses;
 pub mod runtime;
 mod sched;
+mod search;
 mod shell;
 mod stream;
 mod types;
@@ -3500,6 +3501,9 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .route("/llmman/providers", get(handle_llmman_providers))
         .route("/llmman/providers/:id", get(handle_llmman_provider))
         .route("/llmman/node", get(aggregation::handle_node))
+        .route("/llmman/search", get(search::handle_search))
+        .route("/llmman/search/model", get(search::handle_model))
+        .route("/llmman/search/avatar", get(search::handle_avatar))
         .route("/llmman/shell", get(shell::handle_shell))
         // Ollama API
         .merge(ollama_router())
