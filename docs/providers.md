@@ -232,6 +232,28 @@ the model's default.
   model_reasoning_effort=high`; its `/model` picker lists only OpenAI's
   catalog.
 
+`--variant`, as on opencode's `run`, picks one of those up front:
+`llmman run qwen3.8 --variant xhigh` sends it as is; `llmman launch`
+first checks the model has it, then hands it over in the integration's
+own form, still changeable from inside:
+
+| Integration | As | Takes |
+|---|---|---|
+| `opencode` | the model's default options | every variant |
+| `claude`, `copilot` | `--effort` | `low` to `max` |
+| `codex` | `-c model_reasoning_effort=` | all |
+| `pi`, `omp` | `--thinking` | `none`, `minimal` to `high` (omp: `xhigh`) |
+| `cline` | `--thinking` | `none`, `low` to `high` |
+| `aider` | `--reasoning-effort` | all |
+| `hermes` | `--reasoning` (not with `--tui`) | all |
+| `grok` | `--effort` | all |
+| `qwen` | its model entry | all but `minimal` |
+| `dsh` | its route | all |
+
+`thinking` goes to all but opencode as `medium`, which llmman serves as
+thinking on. `kimi`, `openclaw`, `gemini`, `agy`, `goose` and
+`docker-agent` cannot carry a variant here, so they refuse one.
+
 ## Wire formats
 
 Each provider is spoken to in one of two wire formats, reported as

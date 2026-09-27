@@ -23,7 +23,7 @@ use anyhow::Context;
 use base64::Engine as _;
 use clap::Args;
 
-use crate::chat_template::ThinkingControls;
+use crate::chat_template::{ThinkingControls, EFFORT_LEVELS};
 use crate::daemon;
 use crate::providers;
 
@@ -66,6 +66,11 @@ pub struct LaunchArgs {
     #[arg(long, value_enum, value_name = "SANDBOX")]
     pub sandbox: Option<Sandbox>,
 
+    /// Start at this variant of the model (see `llmman show`), as
+    /// opencode's `run --variant`.
+    #[arg(long, value_name = "VARIANT", value_parser = super::run::variant_parser())]
+    pub variant: Option<String>,
+
     /// Extra arguments forwarded to the integration binary (after --)
     #[arg(last = true, value_name = "ARGS")]
     pub extra_args: Vec<String>,
@@ -83,6 +88,22 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         print_integrations();
         return Ok(());
     };
+
+    // Before the daemon starts. A forwarded --model would get the
+    // variant checked against this one.
+    let variant = args.variant.as_deref();
+    if let Some(variant) = variant {
+        anyhow::ensure!(
+            args.sandbox != Some(Sandbox::Sbx),
+            "--variant does not work with --sandbox sbx"
+        );
+        anyhow::ensure!(
+            !(MODEL_FLAG_FORWARDED.contains(&name.to_lowercase().as_str())
+                && has_flag(&args.extra_args, "--model", Some("-m"))),
+            "--variant needs the model as llmman's --model, not after --"
+        );
+        spell_variant(name, variant)?;
+    }
 
     // sbx serves the model itself and validates its own flags, so none
     // of what follows applies.
@@ -208,6 +229,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         &model,
         &api_key,
         thinking.as_ref(),
+        variant,
         vision,
         context_length,
         &args.extra_args,
@@ -767,6 +789,103 @@ fn accepts_install(answer: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Variants
+// ---------------------------------------------------------------------------
+
+/// Integrations that cannot carry a `--variant` to llmman, and why.
+const VARIANT_UNSUPPORTED: &[(&str, &str)] = &[
+    ("kimi", "it picks its own model"),
+    ("openclaw", "it only takes settings at onboarding"),
+    ("gemini", "llmman's Gemini API ignores thinkingConfig"),
+    ("agy", "llmman's Gemini API ignores thinkingConfig"),
+    ("goose", "it sends effort only for OpenAI's models"),
+    ("docker-agent", "it ignores thinking_budget here"),
+];
+
+const LOW_TO_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Each other integration's word for thinking off, if any, and the
+/// levels it takes for an unknown model without clamping (pi, omp and
+/// Cline clamp the rest). opencode takes llmman's own variants.
+const VARIANT_SPELLINGS: &[(&str, Option<&str>, &[&str])] = &[
+    ("claude", None, LOW_TO_MAX),
+    ("codex", Some("none"), EFFORT_LEVELS),
+    ("pi", Some("off"), &["minimal", "low", "medium", "high"]),
+    (
+        "omp",
+        Some("off"),
+        &["minimal", "low", "medium", "high", "xhigh"],
+    ),
+    ("cline", Some("none"), &["low", "medium", "high"]),
+    ("aider", Some("none"), EFFORT_LEVELS),
+    ("copilot", None, LOW_TO_MAX),
+    ("copilot-cli", None, LOW_TO_MAX),
+    ("hermes", Some("none"), EFFORT_LEVELS),
+    ("qwen", Some("none"), LOW_TO_MAX),
+    ("grok", Some("none"), EFFORT_LEVELS),
+    ("dsh", Some("off"), EFFORT_LEVELS),
+];
+
+/// `variant` as `integration` spells it. `thinking` (a switch-only
+/// template's on) goes as `medium`, which llmman serves as thinking on.
+fn spell_variant<'a>(integration: &str, variant: &'a str) -> anyhow::Result<&'a str> {
+    let name = integration.to_lowercase();
+    if name == "opencode" {
+        return Ok(variant);
+    }
+    if let Some((_, why)) = VARIANT_UNSUPPORTED.iter().find(|(id, _)| *id == name) {
+        anyhow::bail!("--variant does not work with {name}: {why}");
+    }
+    let Some(&(_, off, levels)) = VARIANT_SPELLINGS.iter().find(|(id, ..)| *id == name) else {
+        return Err(unknown_integration(&name));
+    };
+    let spelled = match variant {
+        "none" => off,
+        "thinking" => Some("medium"),
+        level => levels.iter().copied().find(|l| *l == level),
+    };
+    spelled.ok_or_else(|| {
+        let takes: Vec<&str> = off
+            .map(|_| "none")
+            .into_iter()
+            .chain(levels.iter().copied())
+            .chain(Some("thinking"))
+            .collect();
+        anyhow::anyhow!(
+            "{name} cannot start at --variant {variant}; it takes {}",
+            takes.join(", ")
+        )
+    })
+}
+
+/// A `--variant` and the model's other levels, as the integration spells
+/// them, for those configured with the list.
+struct Effort<'a> {
+    default: &'a str,
+    levels: Vec<&'a str>,
+}
+
+/// The flags that start `integration` at `effort`; opencode, qwen and
+/// dsh take it in their configuration instead.
+fn effort_args(integration: &str, effort: &str) -> Vec<String> {
+    let flags: &[&str] = match integration {
+        "claude" | "copilot" | "copilot-cli" | "grok" => &["--effort"],
+        "pi" | "omp" | "cline" => &["--thinking"],
+        "hermes" => &["--reasoning"],
+        // Else aider drops the effort for a model it does not know.
+        "aider" => &["--no-check-model-accepts-settings", "--reasoning-effort"],
+        "codex" => return vec!["-c".into(), format!("model_reasoning_effort={effort}")],
+        _ => return Vec::new(),
+    };
+    flags
+        .iter()
+        .copied()
+        .chain(Some(effort))
+        .map(String::from)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Launch dispatcher
 // ---------------------------------------------------------------------------
 
@@ -781,33 +900,53 @@ fn accepts_install(answer: &str) -> bool {
 /// the integration's environment can do this; the ones that go through a
 /// config file on disk keep the placeholder rather than persist a
 /// credential, and need the key in the daemon's own environment.
+#[allow(clippy::too_many_arguments)]
 fn launch(
     name: &str,
     model: &str,
     api_key: &str,
     thinking: Option<&Thinking>,
+    variant: Option<&str>,
     vision: bool,
     context_length: Option<u64>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
-    match name.to_lowercase().as_str() {
+    let name = name.to_lowercase();
+    if let Some(variant) = variant {
+        let choices = thinking_choices(thinking);
+        let shown = if model.is_empty() { "the model" } else { model };
+        anyhow::ensure!(!choices.is_empty(), "{shown} does not think");
+        anyhow::ensure!(
+            choices.contains(&variant),
+            "{shown} has no variant {variant}; it has {}",
+            choices.join(", ")
+        );
+    }
+    let effort = variant.map(|v| spell_variant(&name, v)).transpose()?;
+    let listed = effort.map(|default| Effort {
+        default,
+        levels: thinking_choices(thinking)
+            .into_iter()
+            .filter_map(|c| spell_variant(&name, c).ok())
+            .collect(),
+    });
+    let extra_args = &[
+        effort.map_or_else(Vec::new, |e| effort_args(&name, e)),
+        extra_args.to_vec(),
+    ]
+    .concat();
+    // pi and omp force thinking off for a model not marked as reasoning;
+    // a model with the variant reasons.
+    let reasons = variant.is_some()
+        || thinking
+            .and_then(Thinking::template)
+            .is_some_and(|t| t.thinks);
+    match name.as_str() {
         "claude" => launch_claude(model, api_key, extra_args),
-        "opencode" => launch_opencode(model, api_key, thinking, vision, extra_args),
+        "opencode" => launch_opencode(model, api_key, thinking, variant, vision, extra_args),
         "codex" => launch_codex(model, api_key, vision, context_length, extra_args),
-        "pi" => launch_pi(
-            model,
-            thinking.and_then(Thinking::template),
-            vision,
-            context_length,
-            extra_args,
-        ),
-        "omp" => launch_omp(
-            model,
-            thinking.and_then(Thinking::template),
-            vision,
-            context_length,
-            extra_args,
-        ),
+        "pi" => launch_pi(model, reasons, vision, context_length, extra_args),
+        "omp" => launch_omp(model, reasons, vision, context_length, extra_args),
         "cline" => launch_cline(model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
@@ -816,10 +955,10 @@ fn launch(
         "agy" => launch_agy(model, api_key, extra_args),
         "hermes" => launch_hermes(model, vision, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
-        "qwen" => launch_qwen(model, api_key, vision, extra_args),
-        "dsh" => launch_dsh(model, api_key, vision, extra_args),
+        "qwen" => launch_qwen(model, api_key, vision, listed.as_ref(), extra_args),
+        "dsh" => launch_dsh(model, api_key, vision, listed.as_ref(), extra_args),
         "goose" => launch_goose(model, api_key, extra_args),
-        "grok" => launch_grok(model, api_key, extra_args),
+        "grok" => launch_grok(model, api_key, listed.as_ref(), extra_args),
         "docker-agent" => launch_docker_agent(model, api_key, extra_args),
         other => Err(unknown_integration(other)),
     }
@@ -928,22 +1067,26 @@ fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
 
 /// opencode: a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
 /// /v1 endpoint, with the model's thinking variants and, for a vision
-/// model, image input.
+/// model, image input. `--variant` becomes the model's default options.
 fn launch_opencode(
     model: &str,
     api_key: &str,
     thinking: Option<&Thinking>,
+    variant: Option<&str>,
     vision: bool,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
 
     let effective_model = if model.is_empty() { "default" } else { model };
+    let variants = opencode_variants(thinking);
+    let options = variant.and_then(|v| variants.iter().find(|(name, _)| *name == v));
     let config = opencode_config(
         &server(),
         effective_model,
         api_key,
-        &opencode_variants(thinking),
+        &variants,
+        options.map(|(_, options)| options),
         vision,
     );
 
@@ -980,26 +1123,38 @@ impl Thinking {
 /// (`anthropic::portable_efforts`).
 const PORTABLE_THINKING_LEVELS: &[&str] = &["none", "low", "medium", "high"];
 
+/// The model's variants in cycle order, [`PORTABLE_THINKING_LEVELS`] if
+/// unknown.
+fn thinking_choices(thinking: Option<&Thinking>) -> Vec<&str> {
+    match thinking {
+        Some(thinking) => thinking.choices(),
+        None => PORTABLE_THINKING_LEVELS.to_vec(),
+    }
+}
+
 /// opencode's `variants` for the model, in cycle order (`variant_cycle`,
-/// ctrl+t by default): [`Thinking::choices`], or
-/// [`PORTABLE_THINKING_LEVELS`] without them. A model that does not think
-/// gets none. Each variant is the request options
-/// `@ai-sdk/openai-compatible` sends: `reasoningEffort` as
+/// ctrl+t by default): [`thinking_choices`]. Each variant is the request
+/// options `@ai-sdk/openai-compatible` sends: `reasoningEffort` as
 /// `reasoning_effort`, other keys verbatim. opencode derives variants
 /// only for models it knows from models.dev, so without these a model
 /// has nothing to cycle.
+/// A switch-only model's two variants set both keys, so either overrides
+/// the other when `--variant` put it in the model's options.
 fn opencode_variants(thinking: Option<&Thinking>) -> Vec<(&str, serde_json::Value)> {
-    let choices = match thinking {
-        Some(thinking) => thinking.choices(),
-        None => PORTABLE_THINKING_LEVELS.to_vec(),
-    };
+    let choices = thinking_choices(thinking);
+    let switch = choices.contains(&"thinking");
     choices
         .into_iter()
         .map(|choice| {
             let options = match choice {
-                "thinking" => {
-                    serde_json::json!({ "chat_template_kwargs": { "enable_thinking": true } })
-                }
+                "none" if switch => serde_json::json!({
+                    "reasoningEffort": "none",
+                    "chat_template_kwargs": { "enable_thinking": false },
+                }),
+                "thinking" => serde_json::json!({
+                    "reasoningEffort": "medium",
+                    "chat_template_kwargs": { "enable_thinking": true },
+                }),
                 level => serde_json::json!({ "reasoningEffort": level }),
             };
             (choice, options)
@@ -1050,6 +1205,7 @@ fn opencode_config(
     model: &str,
     api_key: &str,
     variants: &[(&str, serde_json::Value)],
+    options: Option<&serde_json::Value>,
     vision: bool,
 ) -> String {
     use serde::ser::{SerializeMap, Serializer};
@@ -1098,6 +1254,8 @@ fn opencode_config(
         #[serde(serialize_with = "entries", skip_serializing_if = "<[_]>::is_empty")]
         variants: &'a [(&'a str, serde_json::Value)],
         #[serde(skip_serializing_if = "Option::is_none")]
+        options: Option<&'a serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         modalities: Option<Modalities>,
         #[serde(skip_serializing_if = "Option::is_none")]
         attachment: Option<bool>,
@@ -1130,6 +1288,7 @@ fn opencode_config(
                     Model {
                         name: model,
                         variants,
+                        options,
                         modalities,
                         attachment: vision.then_some(true),
                     },
@@ -1153,13 +1312,13 @@ fn opencode_config(
 /// "unresolved" outside `llmman launch` and take the provider down.
 fn launch_pi(
     model: &str,
-    thinking: Option<&ThinkingControls>,
+    reasons: bool,
     vision: bool,
     context_length: Option<u64>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_on_path("pi").ok_or_else(|| anyhow::anyhow!("pi is not installed"))?;
-    write_pi_config(model, thinking, vision, context_length)?;
+    write_pi_config(model, reasons, vision, context_length)?;
     exec_with_env(&bin, extra_args, &[])
 }
 
@@ -1172,14 +1331,14 @@ fn launch_pi(
 /// makes the first launch work while preserving unrelated user configuration.
 fn launch_omp(
     model: &str,
-    thinking: Option<&ThinkingControls>,
+    reasons: bool,
     vision: bool,
     context_length: Option<u64>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_omp().ok_or_else(|| anyhow::anyhow!("omp is not installed"))?;
     let server = server();
-    write_omp_config(model, thinking, vision, context_length, &server)?;
+    write_omp_config(model, reasons, vision, context_length, &server)?;
     exec_with_env(
         &bin,
         &omp_args(model, extra_args),
@@ -1237,19 +1396,19 @@ fn omp_agent_dir() -> anyhow::Result<PathBuf> {
 
 fn write_omp_config(
     model: &str,
-    thinking: Option<&ThinkingControls>,
+    reasons: bool,
     vision: bool,
     context_length: Option<u64>,
     server: &str,
 ) -> anyhow::Result<()> {
     let dir = omp_agent_dir()?;
-    write_omp_config_in_dir(&dir, model, thinking, vision, context_length, server)
+    write_omp_config_in_dir(&dir, model, reasons, vision, context_length, server)
 }
 
 fn write_omp_config_in_dir(
     dir: &Path,
     model: &str,
-    thinking: Option<&ThinkingControls>,
+    reasons: bool,
     vision: bool,
     context_length: Option<u64>,
     server: &str,
@@ -1257,7 +1416,7 @@ fn write_omp_config_in_dir(
     write_omp_models_config_at(
         &dir.join("models.yml"),
         model,
-        thinking,
+        reasons,
         vision,
         context_length,
         server,
@@ -1281,12 +1440,12 @@ fn omp_config_merged(existing: &serde_json::Value) -> serde_json::Value {
 fn write_omp_models_config_at(
     path: &Path,
     model: &str,
-    thinking: Option<&ThinkingControls>,
+    reasons: bool,
     vision: bool,
     context_length: Option<u64>,
     server: &str,
 ) -> anyhow::Result<()> {
-    let entry = pi_model_entry(model, thinking, vision, context_length);
+    let entry = pi_model_entry(model, reasons, vision, context_length);
     write_yaml_merged(path, "omp", |existing| {
         omp_models_merged(existing, server, &entry)
     })
@@ -1392,12 +1551,12 @@ fn pi_agent_dir() -> anyhow::Result<PathBuf> {
 /// Both go through [`write_json_merged`], which qwen writes through too.
 fn write_pi_config(
     model: &str,
-    thinking: Option<&ThinkingControls>,
+    reasons: bool,
     vision: bool,
     context_length: Option<u64>,
 ) -> anyhow::Result<()> {
     let dir = pi_agent_dir()?;
-    let entry = pi_model_entry(model, thinking, vision, context_length);
+    let entry = pi_model_entry(model, reasons, vision, context_length);
     write_json_merged(&dir.join("models.json"), "pi", |existing| {
         pi_models_merged(existing, &server(), &entry)
     })?;
@@ -1413,7 +1572,7 @@ fn write_pi_config(
 /// not written down, so they are stated rather than left to it.
 fn pi_model_entry(
     model: &str,
-    thinking: Option<&ThinkingControls>,
+    reasons: bool,
     vision: bool,
     context_length: Option<u64>,
 ) -> serde_json::Value {
@@ -1427,7 +1586,7 @@ fn pi_model_entry(
         "name": model,
         "input": input,
     });
-    if thinking.is_some_and(|t| t.thinks) {
+    if reasons {
         entry["reasoning"] = serde_json::json!(true);
     }
     if let Some(context) = context_length {
@@ -2016,13 +2175,14 @@ fn launch_qwen(
     model: &str,
     api_key: &str,
     vision: bool,
+    effort: Option<&Effort>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_qwen().ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
     let (model, vision) = qwen_model_and_vision(model, vision, extra_args);
     // After the lookup, so nothing is written for an integration that is
     // not there; `check_model_flag` has made sure there is a model.
-    write_qwen_settings(model, vision)?;
+    write_qwen_settings(model, vision, effort)?;
 
     let base_url = format!("{}/v1", server());
     let mut env = vec![
@@ -2217,8 +2377,14 @@ fn expand_tilde(dir: &str, home: &Path) -> PathBuf {
 /// Records llmman as the `openai` provider for `model` in Qwen Code's
 /// `settings.json`, as `write_codex_config` and `write_hermes_config` do
 /// for theirs. See `qwen_settings_merged` for what goes in.
-fn write_qwen_settings(model: &str, vision: bool) -> anyhow::Result<()> {
-    write_qwen_settings_at(&qwen_home()?, model, &format!("{}/v1", server()), vision)
+fn write_qwen_settings(model: &str, vision: bool, effort: Option<&Effort>) -> anyhow::Result<()> {
+    write_qwen_settings_at(
+        &qwen_home()?,
+        model,
+        &format!("{}/v1", server()),
+        vision,
+        effort,
+    )
 }
 
 /// Read as Qwen Code reads it, comments stripped and an empty file as
@@ -2232,9 +2398,10 @@ fn write_qwen_settings_at(
     model: &str,
     base_url: &str,
     vision: bool,
+    effort: Option<&Effort>,
 ) -> anyhow::Result<()> {
     write_json_merged(&dir.join("settings.json"), "qwen", |existing| {
-        qwen_settings_merged(existing, model, base_url, vision)
+        qwen_settings_merged(existing, model, base_url, vision, effort)
     })
 }
 
@@ -2381,11 +2548,15 @@ const QWEN_ENV_KEY: &str = "LLMMAN_API_KEY";
 /// `$version` set to 4; `security.auth`; `model.name` and `model.baseUrl`.
 /// A vision model's entry declares image input, which Qwen Code reads
 /// only off the provider entry, not the top-level `model.generationConfig`.
+/// A `--variant` declares the model's levels there too and starts the
+/// entry at it, dropping the `model.reasoningEffort` `/effort` saved,
+/// which Qwen Code would merge over it.
 fn qwen_settings_merged(
     existing: &serde_json::Value,
     model: &str,
     base_url: &str,
     vision: bool,
+    effort: Option<&Effort>,
 ) -> serde_json::Value {
     let mut doc = existing.as_object().cloned().unwrap_or_default();
     let mut ours = serde_json::json!({
@@ -2396,6 +2567,28 @@ fn qwen_settings_merged(
     });
     if vision {
         ours["generationConfig"] = serde_json::json!({ "modalities": { "image": true } });
+    }
+    if let Some(effort) = effort {
+        let efforts: Vec<&str> = effort
+            .levels
+            .iter()
+            .copied()
+            .filter(|l| *l != "none")
+            .collect();
+        let mut reasoning = serde_json::json!({
+            "thinking": true,
+            "disableField": "reasoning_effort",
+            "profile": "openai-effort",
+            "efforts": efforts,
+        });
+        ours["generationConfig"]["reasoning"] = match effort.default {
+            "none" => serde_json::json!(false),
+            level => {
+                reasoning["defaultEffort"] = level.into();
+                serde_json::json!({ "effort": level })
+            }
+        };
+        ours["capabilities"] = serde_json::json!({ "reasoning": reasoning });
     }
     let openai = object_under(&mut doc, "modelProviders")
         .entry("openai")
@@ -2421,6 +2614,9 @@ fn qwen_settings_merged(
     let model_cfg = object_under(&mut doc, "model");
     model_cfg.insert("name".into(), model.into());
     model_cfg.insert("baseUrl".into(), base_url.into());
+    if effort.is_some() {
+        model_cfg.remove("reasoningEffort");
+    }
     serde_json::Value::Object(doc)
 }
 
@@ -2717,7 +2913,12 @@ const GROK_API_KEY_ENV: &str = "LLMMAN_GROK_API_KEY";
 /// The model flag is injected only when the caller did not provide one
 /// after `--`. This matches Qwen's behavior above and lets an explicit
 /// integration argument win without passing a duplicate flag.
-fn launch_grok(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch_grok(
+    model: &str,
+    api_key: &str,
+    effort: Option<&Effort>,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
     let bin = find_grok().ok_or_else(|| anyhow::anyhow!("grok is not installed"))?;
     let effective_model = forwarded_model(extra_args).unwrap_or(model);
     let base_url = format!("{}/v1", server());
@@ -2725,7 +2926,8 @@ fn launch_grok(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Res
     // Never edit the user's config.toml. This child is wholly llmman-owned,
     // and setting GROK_HOME below scopes it to this launched process.
     let home = grok_home()?.join("llmman");
-    write_grok_config(&home, effective_model, &base_url)?;
+    let efforts = effort.map_or(&[][..], |e| &e.levels);
+    write_grok_config(&home, effective_model, &base_url, efforts)?;
     let home = home.to_string_lossy().into_owned();
     let args = grok_args(model, extra_args);
     exec_with_env(
@@ -2769,20 +2971,30 @@ fn grok_home() -> anyhow::Result<PathBuf> {
     Ok(dirs::home_dir().context("no home directory")?.join(".grok"))
 }
 
-fn write_grok_config(home: &Path, model: &str, base_url: &str) -> anyhow::Result<()> {
+fn write_grok_config(
+    home: &Path,
+    model: &str,
+    base_url: &str,
+    efforts: &[&str],
+) -> anyhow::Result<()> {
     let path = home.join("config.toml");
     std::fs::create_dir_all(home).with_context(|| format!("create {}", home.display()))?;
-    let contents = grok_config_document(model, base_url);
+    let contents = grok_config_document(model, base_url, efforts);
     crate::fsutil::write_atomic(&path, contents.as_bytes())
         .with_context(|| format!("write {}", path.display()))
 }
 
-fn grok_config_document(model: &str, base_url: &str) -> String {
+/// Grok Build ignores `--effort` for a model without `efforts` listed.
+fn grok_config_document(model: &str, base_url: &str, efforts: &[&str]) -> String {
     let mut entry = toml_edit::Table::new();
     entry["model"] = toml_edit::value(model);
     entry["base_url"] = toml_edit::value(base_url);
     entry["env_key"] = toml_edit::value(GROK_API_KEY_ENV);
     entry["api_backend"] = toml_edit::value("chat_completions");
+    if !efforts.is_empty() {
+        entry["reasoning_efforts"] =
+            toml_edit::value(efforts.iter().copied().collect::<toml_edit::Array>());
+    }
 
     let mut models = toml_edit::Table::new();
     models.insert(model, toml_edit::Item::Table(entry));
@@ -2839,6 +3051,7 @@ fn launch_dsh(
     model: &str,
     api_key: &str,
     vision: bool,
+    effort: Option<&Effort>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let launcher = dsh_launcher(extra_args);
@@ -2858,7 +3071,7 @@ fn launch_dsh(
 
     let dir = dsh_config_dir()?;
     let settings_path = dir.join("settings.yaml");
-    write_dsh_settings(&settings_path, model, vision)?;
+    write_dsh_settings(&settings_path, model, vision, effort)?;
     let patch_path = dir.join("llmman.cordis.yml");
     write_dsh_patch(&patch_path, &settings_path)?;
 
@@ -2977,19 +3190,36 @@ fn dsh_config_dir() -> anyhow::Result<PathBuf> {
 
 /// The settings document `llmman.cordis.yml` points dsh at: registers
 /// `llmman` as an `llm-pi-ai` provider route at this daemon's `/v1`, and
-/// selects it as the `agent-default-model`.
-fn write_dsh_settings(path: &Path, model: &str, vision: bool) -> anyhow::Result<()> {
+/// selects it as the `agent-default-model`. A `--variant` becomes the
+/// route's default `reasoning`, among the model's `reasoningEfforts`.
+fn write_dsh_settings(
+    path: &Path,
+    model: &str,
+    vision: bool,
+    effort: Option<&Effort>,
+) -> anyhow::Result<()> {
     let quoted_model = yaml_quote(model);
     let base_url = yaml_quote(&format!("{}/v1", server()));
     // Claiming image input a text-only model can't serve would have dsh
     // attach what the daemon then rejects.
     let input = if vision { "[text, image]" } else { "[text]" };
+    let (reasoning, efforts) = effort.map_or_else(Default::default, |e| {
+        let map: Vec<String> = (e.levels.iter())
+            .map(|&l| format!("{l}: {}", if l == "off" { "none" } else { l }))
+            .collect();
+        (
+            format!("      reasoning: {}\n", e.default),
+            format!("          reasoningEfforts: {{ {} }}\n", map.join(", ")),
+        )
+    });
     let contents = format!(
         "# Written by `llmman launch dsh`; edits are overwritten.\n\
          agent-default-model:\n  provider: llmman\n  model: {quoted_model}\n\
          llm-pi-ai:\n  providers:\n    llmman:\n      displayName: llmman\n      \
-         apiKeyEnv: {DSH_API_KEY_ENV}\n      api: openai-completions\n      baseURL: {base_url}\n      \
-         models:\n        - id: {quoted_model}\n          name: {quoted_model}\n          input: {input}\n"
+         apiKeyEnv: {DSH_API_KEY_ENV}\n      api: openai-completions\n      baseURL: {base_url}\n\
+         {reasoning}      \
+         models:\n        - id: {quoted_model}\n          name: {quoted_model}\n          input: {input}\n\
+         {efforts}"
     );
     write_dsh_file(path, &contents)
 }
@@ -3596,15 +3826,10 @@ mod tests {
                 .as_nanos()
         ));
         let models_path = dir.join("models.yml");
-        let thinks = ThinkingControls {
-            thinks: true,
-            enable_thinking: true,
-            efforts: vec!["low", "high"],
-        };
         write_omp_config_in_dir(
             &dir,
             "docker.io/ai/qwen3.5:0.8b",
-            Some(&thinks),
+            true,
             true,
             Some(32_768),
             "http://127.0.0.1:17434",
@@ -3658,7 +3883,7 @@ defaults:
         write_omp_config_in_dir(
             &dir,
             "docker.io/ai/qwen3.5:0.8b",
-            None,
+            false,
             false,
             None,
             "http://127.0.0.1:17434",
@@ -3667,7 +3892,7 @@ defaults:
         write_omp_config_in_dir(
             &dir,
             "docker.io/ai/qwen3.5:0.8b",
-            None,
+            false,
             false,
             Some(4096),
             "http://127.0.0.1:17434",
@@ -3684,7 +3909,7 @@ defaults:
         write_omp_config_in_dir(
             &dir,
             "docker.io/ai/qwen3.5:0.8b",
-            None,
+            false,
             false,
             Some(8192),
             "http://127.0.0.1:17434",
@@ -4016,7 +4241,7 @@ defaults:
     #[test]
     fn grok_config_uses_the_model_credential_without_persisting_it() {
         let model = r#"org/model.\"quoted\""#;
-        let text = grok_config_document(model, "http://127.0.0.1:17434/v1");
+        let text = grok_config_document(model, "http://127.0.0.1:17434/v1", &[]);
 
         let parsed: toml::Value = text.parse().expect("valid TOML");
         let entry = &parsed["model"][model];
@@ -4045,7 +4270,7 @@ defaults:
         std::fs::write(&user_config, "[model.mine]\napi_key = \"keep-me\"\n").unwrap();
 
         let isolated = root.join("llmman");
-        write_grok_config(&isolated, "m", "http://127.0.0.1:17434/v1").unwrap();
+        write_grok_config(&isolated, "m", "http://127.0.0.1:17434/v1", &[]).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(user_config).unwrap(),
@@ -4282,7 +4507,7 @@ defaults:
             "model": { "name": "gemini-2.5-pro", "generationConfig": { "temperature": 0.1 } }
         });
         let url = "http://127.0.0.1:17434/v1";
-        let merged = qwen_settings_merged(&existing, "docker.io/ai/m:latest", url, false);
+        let merged = qwen_settings_merged(&existing, "docker.io/ai/m:latest", url, false, None);
         assert_eq!(merged["$version"], 4);
         assert_eq!(merged["ui"]["theme"], "keep-me");
         assert_eq!(
@@ -4315,7 +4540,7 @@ defaults:
     #[test]
     fn qwen_settings_merge_is_complete_from_nothing_and_idempotent() {
         let url = "http://127.0.0.1:17434/v1";
-        let once = qwen_settings_merged(&serde_json::json!({}), "m:latest", url, false);
+        let once = qwen_settings_merged(&serde_json::json!({}), "m:latest", url, false, None);
         assert_eq!(
             once,
             serde_json::json!({
@@ -4326,7 +4551,10 @@ defaults:
                 "model": { "name": "m:latest", "baseUrl": url }
             })
         );
-        assert_eq!(qwen_settings_merged(&once, "m:latest", url, false), once);
+        assert_eq!(
+            qwen_settings_merged(&once, "m:latest", url, false, None),
+            once
+        );
         let text = once.to_string();
         assert!(!text.contains("apiKey") && !text.contains("\"env\""));
         assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"qwen"));
@@ -4362,14 +4590,14 @@ defaults:
     #[test]
     fn qwen_settings_declare_image_input_only_for_a_vision_model() {
         let url = "http://h/v1";
-        let vision = qwen_settings_merged(&serde_json::json!({}), "m", url, true);
+        let vision = qwen_settings_merged(&serde_json::json!({}), "m", url, true, None);
         assert_eq!(
             vision["modelProviders"]["openai"][0]["generationConfig"],
             serde_json::json!({ "modalities": { "image": true } })
         );
         assert!(vision["model"].get("generationConfig").is_none());
 
-        let text_only = qwen_settings_merged(&vision, "m", url, false);
+        let text_only = qwen_settings_merged(&vision, "m", url, false, None);
         assert!(!text_only.to_string().contains("modalities"), "{text_only}");
     }
 
@@ -4381,11 +4609,12 @@ defaults:
         let existing = serde_json::json!({
             "security": 3, "modelProviders": { "openai": "x" }, "model": []
         });
-        let merged = qwen_settings_merged(&existing, "m", "http://h/v1", false);
+        let merged = qwen_settings_merged(&existing, "m", "http://h/v1", false, None);
         assert_eq!(merged["security"]["auth"]["selectedType"], "openai");
         assert_eq!(merged["modelProviders"]["openai"][0]["id"], "m");
         assert_eq!(merged["model"]["name"], "m");
-        let from_null = qwen_settings_merged(&serde_json::json!(null), "m", "http://h/v1", false);
+        let from_null =
+            qwen_settings_merged(&serde_json::json!(null), "m", "http://h/v1", false, None);
         assert_eq!(from_null["model"]["name"], "m");
 
         let wrapped = serde_json::json!({
@@ -4394,7 +4623,7 @@ defaults:
                 { "id": "gpt-5", "baseUrl": "https://api.openai.com/v1", "envKey": "MY_KEY" }
             ] } }
         });
-        let merged = qwen_settings_merged(&wrapped, "m", "http://h/v1", false);
+        let merged = qwen_settings_merged(&wrapped, "m", "http://h/v1", false, None);
         let openai = merged["modelProviders"]["openai"].as_array().unwrap();
         assert_eq!(openai.len(), 2);
         assert_eq!(openai[1]["id"], "gpt-5");
@@ -4456,12 +4685,7 @@ defaults:
 
     #[test]
     fn pi_model_entry_declares_what_the_daemon_serves() {
-        let thinks = crate::chat_template::ThinkingControls {
-            thinks: true,
-            enable_thinking: true,
-            efforts: vec!["low", "high"],
-        };
-        let entry = pi_model_entry("qwen3.5:0.8b", Some(&thinks), true, Some(32768));
+        let entry = pi_model_entry("qwen3.5:0.8b", true, true, Some(32768));
         assert_eq!(entry["id"], "qwen3.5:0.8b");
         assert_eq!(entry["name"], "qwen3.5:0.8b");
         assert_eq!(entry["input"], serde_json::json!(["text", "image"]));
@@ -4470,7 +4694,7 @@ defaults:
 
         // A text-only model that does not think, and no trained context to
         // declare: pi keeps its own default rather than being told a guess.
-        let plain = pi_model_entry("smol", None, false, None);
+        let plain = pi_model_entry("smol", false, false, None);
         assert_eq!(plain["input"], serde_json::json!(["text"]));
         assert_eq!(plain.get("reasoning"), None);
         assert_eq!(plain.get("contextWindow"), None);
@@ -4491,7 +4715,7 @@ defaults:
             }"#,
         )
         .unwrap();
-        let entry = pi_model_entry("qwen3.5:0.8b", None, false, None);
+        let entry = pi_model_entry("qwen3.5:0.8b", false, false, None);
         let merged = pi_models_merged(&existing, "http://127.0.0.1:17434", &entry);
 
         assert_eq!(
@@ -4523,7 +4747,7 @@ defaults:
     fn pi_models_merged_survives_a_wrong_shaped_providers_value() {
         for raw in [r#"{"providers": []}"#, r#"{"providers": "x"}"#, r#"{}"#] {
             let existing: serde_json::Value = serde_json::from_str(raw).unwrap();
-            let entry = pi_model_entry("m", None, false, None);
+            let entry = pi_model_entry("m", false, false, None);
             let merged = pi_models_merged(&existing, "http://s", &entry);
             assert_eq!(merged["providers"]["llmman"]["baseUrl"], "http://s/v1");
             assert_eq!(merged["providers"]["llmman"]["models"][0]["id"], "m");
@@ -4533,7 +4757,7 @@ defaults:
     /// Nothing was there before, so llmman fills in the fields it owns.
     #[test]
     fn pi_models_merged_writes_the_placeholder_key_into_a_fresh_provider() {
-        let entry = pi_model_entry("m", None, false, None);
+        let entry = pi_model_entry("m", false, false, None);
         let merged = pi_models_merged(&serde_json::json!({}), "http://127.0.0.1:17434", &entry);
         let provider = &merged["providers"]["llmman"];
         assert_eq!(provider["baseUrl"], "http://127.0.0.1:17434/v1");
@@ -4545,9 +4769,9 @@ defaults:
     /// Launching a second model must not drop the first.
     #[test]
     fn pi_models_merged_keeps_a_previously_launched_model() {
-        let first = pi_model_entry("a", None, false, None);
+        let first = pi_model_entry("a", false, false, None);
         let one = pi_models_merged(&serde_json::json!({}), "http://s", &first);
-        let two = pi_models_merged(&one, "http://s", &pi_model_entry("b", None, false, None));
+        let two = pi_models_merged(&one, "http://s", &pi_model_entry("b", false, false, None));
         let ids: Vec<&str> = two["providers"]["llmman"]["models"]
             .as_array()
             .unwrap()
@@ -4599,12 +4823,12 @@ defaults:
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
         };
 
-        write_qwen_settings_at(&dir, "m:latest", url, false).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false, None).unwrap();
         assert_eq!(read()["model"]["name"], "m:latest");
         assert!(!bak.exists(), "nothing to back up on a first write");
         let written = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        write_qwen_settings_at(&dir, "m:latest", url, false).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false, None).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             written
@@ -4612,11 +4836,11 @@ defaults:
 
         let commented = "{\n  // mine\n  \"ui\": { \"theme\": \"x\" }\n}\n";
         std::fs::write(&path, commented).unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url, false).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false, None).unwrap();
         assert_eq!(read()["ui"]["theme"], "x");
         assert_eq!(read()["model"]["name"], "m:latest");
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), commented);
-        write_qwen_settings_at(&dir, "other:latest", url, false).unwrap();
+        write_qwen_settings_at(&dir, "other:latest", url, false, None).unwrap();
         assert_eq!(read()["model"]["name"], "other:latest");
         assert_eq!(
             std::fs::read_to_string(&bak).unwrap(),
@@ -4625,18 +4849,18 @@ defaults:
         );
         let edited = "{\n  // edited by hand\n  \"ui\": { \"theme\": \"y\" }\n}\n";
         std::fs::write(&path, edited).unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url, false).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false, None).unwrap();
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), edited);
 
         std::fs::write(&path, "  \n").unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url, false).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false, None).unwrap();
         assert_eq!(read()["model"]["name"], "m:latest");
 
         std::fs::write(&path, "{ not json").unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url, false).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false, None).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
         std::fs::write(&path, "[]").unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url, false).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false, None).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4689,6 +4913,7 @@ model = \"gpt-5\"
             "qwen3.5:0.8b",
             "k",
             &variants,
+            None,
             false,
         );
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
@@ -4714,13 +4939,32 @@ model = \"gpt-5\"
             .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
 
-        let bare = opencode_config("http://h", "m", "k", &[], false);
+        let bare = opencode_config("http://h", "m", "k", &[], None, false);
         assert!(!bare.contains("variants"), "{bare}");
+    }
+
+    /// `--variant` makes its options the model's own, which requests carry
+    /// until a cycled-to variant overrides them.
+    #[test]
+    fn opencode_config_starts_the_model_at_the_variant() {
+        let variants = opencode_variants(None);
+        let high = variants.iter().find(|(name, _)| *name == "high").unwrap();
+        let text = opencode_config("http://h", "m", "k", &variants, Some(&high.1), false);
+        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let model = &config["provider"]["ollama"]["models"]["m"];
+        assert_eq!(
+            model["options"],
+            serde_json::json!({ "reasoningEffort": "high" })
+        );
+
+        let text = opencode_config("http://h", "m", "k", &variants, None, false);
+        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert!(config["provider"]["ollama"]["models"]["m"]["options"].is_null());
     }
 
     #[test]
     fn opencode_config_declares_image_input_only_for_a_vision_model() {
-        let text = opencode_config("http://h", "m", "k", &[], true);
+        let text = opencode_config("http://h", "m", "k", &[], None, true);
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         let model = &config["provider"]["ollama"]["models"]["m"];
         assert_eq!(
@@ -4729,7 +4973,7 @@ model = \"gpt-5\"
         );
         assert_eq!(model["attachment"], true);
 
-        let text_only = opencode_config("http://h", "m", "k", &[], false);
+        let text_only = opencode_config("http://h", "m", "k", &[], None, false);
         assert!(!text_only.contains("modalities"), "{text_only}");
         assert!(!text_only.contains("attachment"), "{text_only}");
     }
@@ -4738,7 +4982,7 @@ model = \"gpt-5\"
     fn opencode_config_escapes_the_model_name() {
         let model = "we\"ird/mo\\del";
         let config: serde_json::Value =
-            serde_json::from_str(&opencode_config("http://h", model, "k", &[], false))
+            serde_json::from_str(&opencode_config("http://h", model, "k", &[], None, false))
                 .expect("valid JSON");
         assert_eq!(config["model"], format!("ollama/{model}"));
         assert_eq!(config["provider"]["ollama"]["models"][model]["name"], model);
@@ -4756,10 +5000,19 @@ model = \"gpt-5\"
         assert_eq!(
             opencode_variants(Some(&Thinking::Template(gemma4.clone()))),
             [
-                ("none", serde_json::json!({ "reasoningEffort": "none" })),
+                (
+                    "none",
+                    serde_json::json!({
+                        "reasoningEffort": "none",
+                        "chat_template_kwargs": { "enable_thinking": false },
+                    })
+                ),
                 (
                     "thinking",
-                    serde_json::json!({ "chat_template_kwargs": { "enable_thinking": true } })
+                    serde_json::json!({
+                        "reasoningEffort": "medium",
+                        "chat_template_kwargs": { "enable_thinking": true },
+                    })
                 ),
             ]
         );
@@ -4912,7 +5165,7 @@ model = \"gpt-5\"
                 .as_nanos()
         ));
         let path = dir.join("settings.yaml");
-        write_dsh_settings(&path, "qwen3.5:0.8b", false).unwrap();
+        write_dsh_settings(&path, "qwen3.5:0.8b", false, None).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("provider: llmman"));
         assert!(contents.contains("model: \"qwen3.5:0.8b\""));
@@ -4937,11 +5190,11 @@ model = \"gpt-5\"
                 .as_nanos()
         ));
         let path = dir.join("settings.yaml");
-        write_dsh_settings(&path, "m", true).unwrap();
+        write_dsh_settings(&path, "m", true, None).unwrap();
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("input: [text, image]"));
-        write_dsh_settings(&path, "m", false).unwrap();
+        write_dsh_settings(&path, "m", false, None).unwrap();
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("input: [text]"));
@@ -5085,7 +5338,7 @@ model = \"gpt-5\"
         for command in ["web", "plugin"] {
             let via_command = args(&[command, "--port", "8080"]);
             assert_eq!(dsh_launcher(&via_command).command, Some(command));
-            let err = launch_dsh("m", "k", false, &via_command).unwrap_err();
+            let err = launch_dsh("m", "k", false, None, &via_command).unwrap_err();
             assert!(err.to_string().contains("--profile"), "{err}");
         }
         // `--profile web`'s *value* is not the `web` command — refusing
@@ -5117,10 +5370,10 @@ model = \"gpt-5\"
     #[test]
     fn launch_dsh_refuses_a_conflicting_patch_flag() {
         let word = vec!["--patch".to_string(), "/tmp/x.yml".to_string()];
-        let err = launch_dsh("m", "k", false, &word).unwrap_err();
+        let err = launch_dsh("m", "k", false, None, &word).unwrap_err();
         assert!(err.to_string().contains("--patch"), "{err}");
         let joined = vec!["--patch=/tmp/x.yml".to_string()];
-        let err = launch_dsh("m", "k", false, &joined).unwrap_err();
+        let err = launch_dsh("m", "k", false, None, &joined).unwrap_err();
         assert!(err.to_string().contains("--patch"), "{err}");
     }
 
@@ -5574,5 +5827,174 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         let error = docker_agent_own_agent_file_error(windows);
         assert!(error.contains(windows), "{error}");
         assert!(!error.contains(r"\\"), "separators were doubled: {error}");
+    }
+
+    // -- --variant ---------------------------------------------------------
+
+    #[test]
+    fn spell_variant_uses_each_integrations_own_words() {
+        let ok = |name, variant| spell_variant(name, variant).unwrap();
+        assert_eq!(ok("opencode", "thinking"), "thinking");
+        assert_eq!(ok("codex", "none"), "none");
+        assert_eq!(ok("pi", "none"), "off");
+        assert_eq!(ok("dsh", "none"), "off");
+        assert_eq!(ok("claude", "max"), "max");
+        // A switch-only template's on is a level llmman serves as on.
+        assert_eq!(ok("cline", "thinking"), "medium");
+        assert_eq!(ok("Claude", "high"), "high");
+    }
+
+    #[test]
+    fn spell_variant_refuses_what_the_integration_cannot_start_at() {
+        let err = |name, variant| spell_variant(name, variant).unwrap_err().to_string();
+        let claude = err("claude", "none");
+        assert!(
+            claude.contains("low, medium, high, xhigh, max, thinking"),
+            "{claude}"
+        );
+        assert!(!claude.contains("none,"), "{claude}");
+        // Would clamp to high rather than start where asked.
+        assert!(err("pi", "xhigh").contains("none, minimal"));
+        assert!(err("cline", "minimal").contains("cline cannot start"));
+        assert!(err("kimi", "high").contains("--variant does not work with kimi"));
+        assert!(err("nope", "high").contains("unknown integration"));
+    }
+
+    /// Every integration is either spelled or refused, never silently
+    /// launched without its variant.
+    #[test]
+    fn every_integration_takes_or_refuses_a_variant() {
+        for i in INTEGRATIONS {
+            let spelled = spell_variant(i.name, "thinking").is_ok();
+            let refused = VARIANT_UNSUPPORTED.iter().any(|(id, _)| *id == i.name);
+            let configured = matches!(i.name, "opencode" | "qwen" | "dsh");
+            assert!(spelled != refused, "{}", i.name);
+            assert!(
+                refused || configured || !effort_args(i.name, "medium").is_empty(),
+                "{} is spelled but never told",
+                i.name
+            );
+        }
+    }
+
+    #[test]
+    fn effort_args_lead_with_each_integrations_flag() {
+        let args = |name| effort_args(name, "high");
+        assert_eq!(args("claude"), ["--effort", "high"]);
+        assert_eq!(args("pi"), ["--thinking", "high"]);
+        assert_eq!(args("hermes"), ["--reasoning", "high"]);
+        assert_eq!(args("codex"), ["-c", "model_reasoning_effort=high"]);
+        assert_eq!(
+            args("aider"),
+            [
+                "--no-check-model-accepts-settings",
+                "--reasoning-effort",
+                "high"
+            ]
+        );
+        assert!(args("qwen").is_empty());
+    }
+
+    #[test]
+    fn launch_variant_is_one_of_llmmans() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: LaunchArgs,
+        }
+        let parse = |v: &str| <Cli as clap::Parser>::try_parse_from(["l", "pi", "--variant", v]);
+        assert_eq!(
+            parse("xhigh").unwrap().args.variant.as_deref(),
+            Some("xhigh")
+        );
+        assert!(parse("turbo").is_err());
+
+        // Refused before the daemon starts: the variant is checked
+        // against llmman's --model, not the one Qwen Code would use.
+        let args = <Cli as clap::Parser>::try_parse_from([
+            "l",
+            "qwen",
+            "-m",
+            "a",
+            "--variant",
+            "high",
+            "--",
+            "--model",
+            "b",
+        ])
+        .unwrap()
+        .args;
+        let err = run(&args).unwrap_err().to_string();
+        assert!(err.contains("not after --"), "{err}");
+    }
+
+    #[test]
+    fn qwen_settings_start_the_entry_at_the_variant() {
+        let url = "http://h/v1";
+        let high = Effort {
+            default: "high",
+            levels: vec!["none", "low", "high"],
+        };
+        let saved = serde_json::json!({ "model": { "reasoningEffort": "low" } });
+        let doc = qwen_settings_merged(&saved, "m", url, true, Some(&high));
+        assert!(doc["model"]["reasoningEffort"].is_null());
+        let ours = &doc["modelProviders"]["openai"][0];
+        assert_eq!(
+            ours["capabilities"]["reasoning"],
+            serde_json::json!({
+                "thinking": true,
+                "disableField": "reasoning_effort",
+                "profile": "openai-effort",
+                "efforts": ["low", "high"],
+                "defaultEffort": "high",
+            })
+        );
+        assert_eq!(
+            ours["generationConfig"],
+            serde_json::json!({ "modalities": { "image": true }, "reasoning": { "effort": "high" } })
+        );
+
+        let off = Effort {
+            default: "none",
+            ..high
+        };
+        let doc = qwen_settings_merged(&serde_json::json!({}), "m", url, false, Some(&off));
+        let ours = &doc["modelProviders"]["openai"][0];
+        assert_eq!(ours["generationConfig"]["reasoning"], false);
+        assert!(ours["capabilities"]["reasoning"]["defaultEffort"].is_null());
+    }
+
+    #[test]
+    fn grok_config_lists_the_variants_levels() {
+        let text = grok_config_document("m", "http://h/v1", &["none", "high"]);
+        let parsed: toml::Value = text.parse().expect("valid TOML");
+        assert_eq!(
+            parsed["model"]["m"]["reasoning_efforts"],
+            toml::Value::Array(vec!["none".into(), "high".into()])
+        );
+        let text = grok_config_document("m", "http://h/v1", &[]);
+        assert!(!text.contains("reasoning_efforts"), "{text}");
+    }
+
+    #[test]
+    fn dsh_settings_start_the_route_at_the_variant() {
+        let path = std::env::temp_dir()
+            .join(format!("llmman-dsh-variant-{}", std::process::id()))
+            .join("settings.yaml");
+        let effort = Effort {
+            default: "low",
+            levels: vec!["off", "low", "high"],
+        };
+        write_dsh_settings(&path, "m", false, Some(&effort)).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let doc: serde_json::Value = yaml_serde::from_str(&contents).expect("valid YAML");
+        let route = &doc["llm-pi-ai"]["providers"]["llmman"];
+        assert_eq!(route["reasoning"], "low");
+        assert_eq!(route["baseURL"], format!("{}/v1", daemon::server()));
+        assert_eq!(
+            route["models"][0]["reasoningEfforts"],
+            serde_json::json!({ "off": "none", "low": "low", "high": "high" })
+        );
     }
 }

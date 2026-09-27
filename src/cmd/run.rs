@@ -75,6 +75,10 @@ pub struct RunArgs {
     /// model's own template default in effect) if not passed at all.
     #[arg(long)]
     pub think: Option<bool>,
+    /// Model variant, as opencode's `run --variant`: `none`, `thinking`
+    /// or a level (see `llmman show`). Sent as `think`.
+    #[arg(long, value_name = "VARIANT", conflicts_with = "think", value_parser = variant_parser())]
+    pub variant: Option<String>,
     /// Forwarded as `options.num_predict` (Ollama's own name for
     /// llama-server's `max_tokens` — see opt_u32 in cmd::serve::ollama) on every
     /// request this sends: a hard ceiling on how many tokens a single
@@ -167,10 +171,36 @@ pub struct RunArgs {
     pub prompt: Vec<String>,
 }
 
+/// Every `--variant`, here and on `launch`.
+pub(crate) fn variant_parser() -> clap::builder::PossibleValuesParser {
+    let levels = crate::chat_template::EFFORT_LEVELS.iter().copied();
+    clap::builder::PossibleValuesParser::new(["none", "thinking"].into_iter().chain(levels))
+}
+
+/// Ollama's `think`: a switch or a reasoning level.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(untagged)]
+enum Think<'a> {
+    Switch(bool),
+    Level(&'a str),
+}
+
+impl<'a> Think<'a> {
+    /// `--variant`, else `--think`; clap rejects both.
+    fn from_args(args: &'a RunArgs) -> Option<Self> {
+        match args.variant.as_deref() {
+            Some("none") => Some(Think::Switch(false)),
+            Some("thinking") => Some(Think::Switch(true)),
+            Some(level) => Some(Think::Level(level)),
+            None => args.think.map(Think::Switch),
+        }
+    }
+}
+
 /// Per-request knobs threaded through unchanged from `RunArgs`.
 #[derive(Debug, Clone, Copy)]
 struct ChatOptions<'a> {
-    think: Option<bool>,
+    think: Option<Think<'a>>,
     num_predict: Option<u32>,
     /// Inverse of `RunArgs::nowordwrap`, matching ollama's
     /// `runOptions.WordWrap` (defaults `true`).
@@ -318,7 +348,7 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
     // raw-moded and starts emitting ANSI escapes into it.
     let interactive = prompt.is_empty() && io::stdin().is_terminal() && io::stdout().is_terminal();
     let opts = ChatOptions {
-        think: args.think,
+        think: Think::from_args(args),
         num_predict: args.num_predict,
         word_wrap: !args.nowordwrap,
         api_key: api_key.as_deref(),
@@ -458,7 +488,7 @@ struct ChatReq<'a> {
     messages: &'a [Msg],
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    think: Option<bool>,
+    think: Option<Think<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<ChatReqOptions>,
 }
@@ -1428,6 +1458,35 @@ mod tests {
         assert_eq!(opts.num_predict, None);
         assert!(opts.word_wrap);
         assert!(!opts.multimodal);
+    }
+
+    fn parse(argv: &[&str]) -> Result<RunArgs, clap::Error> {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: RunArgs,
+        }
+        let argv = ["run", "m"].iter().chain(argv);
+        <Cli as clap::Parser>::try_parse_from(argv).map(|c| c.args)
+    }
+
+    fn think_json(argv: &[&str]) -> serde_json::Value {
+        serde_json::to_value(Think::from_args(&parse(argv).unwrap())).unwrap()
+    }
+
+    #[test]
+    fn variant_is_sent_as_ollamas_think() {
+        assert_eq!(think_json(&[]), serde_json::Value::Null);
+        assert_eq!(think_json(&["--variant", "none"]), false);
+        assert_eq!(think_json(&["--variant", "thinking"]), true);
+        assert_eq!(think_json(&["--variant", "xhigh"]), "xhigh");
+        assert_eq!(think_json(&["--think", "false"]), false);
+    }
+
+    #[test]
+    fn variant_rejects_unknown_names_and_think() {
+        assert!(parse(&["--variant", "turbo"]).is_err());
+        assert!(parse(&["--variant", "high", "--think", "true"]).is_err());
     }
 
     // -- image attachments: ports of ollama's cmd/interactive_test.go ------
