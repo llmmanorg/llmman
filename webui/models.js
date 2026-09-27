@@ -465,7 +465,7 @@ export function initModelsPage() {
       mb.filter = tab.dataset.filter;
       for (const t of document.querySelectorAll("#mb-tabs [data-filter]")) {
         t.classList.toggle("active", t === tab);
-        t.setAttribute("aria-selected", String(t === tab));
+        t.setAttribute("aria-pressed", String(t === tab));
       }
       renderBrowserList();
     });
@@ -585,6 +585,7 @@ function renderBrowserList() {
     if (mb.popular === "loading" || mb.popular === null) return list.appendChild(emptyRow("Loading popular models…"));
     if (mb.popular instanceof Error) return list.appendChild(emptyRow(mb.popular.message));
     const rows = shown(mb.popular);
+    if (!rows.length) return list.appendChild(emptyRow("No popular models from this registry right now. Search above."));
     for (const [registry, heading] of [
       ["docker", "Featured on Docker Hub"],
       ["hf", "Popular GGUF on Hugging Face"],
@@ -784,7 +785,9 @@ function cardView(name, info) {
   if (!info) return wrap;
 
   // Tags to pull, with sizes and fit.
-  if (info.variants.length) {
+  if (!info.variants.length) {
+    wrap.appendChild(emptyRow("Nothing in this repository that llmman can pull."));
+  } else {
     wrap.appendChild(sectionTitle(info.variants.length > 1 ? `Pick a version · ${info.variants.length}` : "Download"));
     const list = document.createElement("div");
     list.className = "variants";

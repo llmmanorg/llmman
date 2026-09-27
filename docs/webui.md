@@ -40,9 +40,9 @@ sidebar:
   the repo's README. The README's HTML is reduced to its links, headings
   and text, and its images are left out, so it renders like a reply.
   A model already here can be chatted with, unloaded or deleted from
-  its card. The search box also takes any reference `llmman pull` does
-  — an OCI image, `hf.co/…`, `ms://…`, `ngc://…`, `s3://…`, `gs://…` —
-  and pulls it on Enter. Owners' pictures load from Hugging Face and
+  its card. The search box also takes a full reference, with its registry
+  or scheme — an OCI image, `hf.co/…`, `ms://…`, `ngc://…`, `s3://…`,
+  `gs://…` — and pulls it on Enter; anything shorter is a search. Owners' pictures load from Hugging Face and
   Gravatar through `/llmman/search/avatar`, the one thing the page
   fetches from outside the daemon; without one, or with an API key the
   browser cannot attach to an image request, the row shows initials.

@@ -96,12 +96,14 @@ const AVATARS_KEPT: usize = 4096;
 /// `GET /llmman/search/avatar?name=<a search row's name>`: a redirect to
 /// the owner's avatar image, or 404 for none (the page draws initials).
 pub(super) async fn handle_avatar(Query(params): Query<NameParam>) -> Response {
-    let owner = params
+    // The row's name less the repo: `hf.co/<owner>`, `docker.io/<owner>`,
+    // so the same owner name on two registries is two entries.
+    let key = params
         .name
         .rsplit_once('/')
         .map(|(o, _)| o.to_owned())
         .unwrap_or_default();
-    let cached = AVATARS.lock().unwrap().get(&owner).cloned();
+    let cached = AVATARS.lock().unwrap().get(&key).cloned();
     let url = match cached {
         Some(url) => url,
         None => match search::avatar(&params.name).await {
@@ -110,7 +112,7 @@ pub(super) async fn handle_avatar(Query(params): Query<NameParam>) -> Response {
                 if avatars.len() >= AVATARS_KEPT {
                     avatars.clear();
                 }
-                avatars.insert(owner, url.clone());
+                avatars.insert(key, url.clone());
                 url
             }
             Err(_) => None,

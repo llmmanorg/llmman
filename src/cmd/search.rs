@@ -420,7 +420,8 @@ async fn hugging_face_card(client: &reqwest::Client, name: &str, repo: &str) -> 
             info.commit(),
             token.as_deref()
         ),
-        hf::api::get_bytes(client, &readme_url, token.as_deref()),
+        // One byte past the cap tells `cap_readme` the file went on.
+        hf::api::get_prefix(client, &readme_url, token.as_deref(), README_MAX + 1),
     );
     let files = files?;
     // A repo without a README (404), or one that failed to load, still has a card.
@@ -451,7 +452,8 @@ async fn hugging_face_card(client: &reqwest::Client, name: &str, repo: &str) -> 
 /// back to exactly the files it is listed with, plus the projector `pull`
 /// adds, so what is shown is what `pull` fetches. A diffusion repo (whose
 /// pull picks and adds files its own way) or a safetensors one is its one
-/// default download, under the `:latest` a tagless pull is stored as.
+/// default download, under the `:latest` a tagless pull is stored as. A
+/// repo `pull` would refuse has none.
 fn hugging_face_variants(name: &str, files: &[hf::api::HfFile]) -> Vec<Variant> {
     let size =
         |picked: &[hf::api::HfFile]| picked.iter().map(|f| f.size.max(0) as u64).sum::<u64>();
@@ -464,10 +466,17 @@ fn hugging_face_variants(name: &str, files: &[hf::api::HfFile]) -> Vec<Variant> 
         }]
     };
     if hf::api::is_diffusion_repo(files) {
-        return only(None);
+        // Pull refuses a split diffusion transformer, or none at all.
+        return match hf::api::select_diffusion_gguf(files, "") {
+            Ok(picked) if picked.len() == 1 => only(None),
+            _ => Vec::new(),
+        };
     }
     let Ok(default) = hf::api::select_gguf(files, "") else {
         let weights = hf::api::select_downloadable_hf_files(files);
+        if weights.is_empty() {
+            return Vec::new();
+        }
         return only(Some(size(&weights)).filter(|&s| s > 0));
     };
     let projector = hf::api::select_mmproj(files).map_or(0, |f| f.size.max(0) as u64);
@@ -531,9 +540,9 @@ struct HubTags {
     next: Option<String>,
 }
 
-/// Pages of tags read before giving up on the rest: `ai/` repos run to a
-/// couple of hundred.
-const HUB_TAG_PAGES: usize = 5;
+/// A bound on the pages of tags read, only against a runaway repo: `ai/`
+/// ones run to a couple of hundred tags, well inside it.
+const HUB_TAG_PAGES: usize = 20;
 
 #[derive(Debug, Deserialize)]
 struct HubTag {
@@ -797,13 +806,24 @@ mod tests {
         assert_eq!(gguf_quant_label("README.md"), None);
     }
 
-    #[test]
-    fn hugging_face_variants_are_tags_that_pull_their_own_file() {
-        let file = |path: &str, size| hf::api::HfFile {
+    fn file_of(path: &str, size: i64) -> hf::api::HfFile {
+        hf::api::HfFile {
             path: path.into(),
             size,
             kind: "file".into(),
-        };
+        }
+    }
+
+    #[test]
+    fn hugging_face_variants_are_tags_that_pull_their_own_file() {
+        // Nothing `pull` can take (it would refuse the repo): no variant.
+        let none = hugging_face_variants(
+            "hf.co/o/N",
+            &[file_of("model.onnx", 99), file_of(".gitattributes", 1)],
+        );
+        assert!(none.is_empty());
+
+        let file = file_of;
         let files = [
             file("M-Q4_K_M.gguf", 500),
             file("M-Q8_0-00001-of-00002.gguf", 400),

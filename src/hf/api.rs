@@ -29,34 +29,61 @@ pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
     url: &str,
     token: Option<&str>,
 ) -> Result<T> {
-    let body = get_bytes(client, url, token).await?;
-    serde_json::from_slice(&body).with_context(|| format!("decode JSON from {url}"))
-}
-
-/// [`get_json`]'s authenticated GET, for a body that isn't JSON.
-pub(crate) async fn get_bytes(
-    client: &reqwest::Client,
-    url: &str,
-    token: Option<&str>,
-) -> Result<bytes::Bytes> {
-    super::client::probe(&format!("GET {url}"), || async {
-        let mut req = client.get(url);
-        if let Some(t) = token {
-            req = req.bearer_auth(t);
-        }
-        let resp = req.send().await.with_context(|| format!("GET {url}"))?;
-        let status = resp.status();
-        if status != reqwest::StatusCode::OK {
-            let headers = resp.headers().clone();
-            return Err(
-                HttpStatusError::new(format!("GET {url}"), status.as_u16(), &headers).into(),
-            );
-        }
-        resp.bytes()
+    let body = super::client::probe(&format!("GET {url}"), || async {
+        send_ok(client, url, token)
+            .await?
+            .bytes()
             .await
             .with_context(|| format!("read body of GET {url}"))
     })
+    .await?;
+    serde_json::from_slice(&body).with_context(|| format!("decode JSON from {url}"))
+}
+
+/// [`get_json`]'s authenticated GET for a body that isn't JSON, reading at
+/// most `max` bytes of it: for a caller that keeps only the start of what
+/// could be a large file.
+pub(crate) async fn get_prefix(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+    max: usize,
+) -> Result<Vec<u8>> {
+    super::client::probe(&format!("GET {url}"), || async {
+        let mut resp = send_ok(client, url, token).await?;
+        let mut body = Vec::new();
+        while body.len() < max {
+            let chunk = resp
+                .chunk()
+                .await
+                .with_context(|| format!("read body of GET {url}"))?;
+            let Some(chunk) = chunk else { break };
+            body.extend_from_slice(&chunk);
+        }
+        body.truncate(max);
+        Ok(body)
+    })
     .await
+}
+
+/// Sends the GET, with the token when there is one; anything but 200 is an
+/// [`HttpStatusError`].
+async fn send_ok(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+) -> Result<reqwest::Response> {
+    let mut req = client.get(url);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+    let status = resp.status();
+    if status != reqwest::StatusCode::OK {
+        let headers = resp.headers().clone();
+        return Err(HttpStatusError::new(format!("GET {url}"), status.as_u16(), &headers).into());
+    }
+    Ok(resp)
 }
 
 /// The subset of `GET /api/models/{owner}/{repo}` this needs — mirrors
