@@ -6,16 +6,16 @@ fetched from the network — and talks to the daemon over the same HTTP API
 every other client uses, so anything it shows is something `llmman`'s
 CLI or an Ollama/OpenAI client could ask for too.
 
-The page has two modes, toggled at the top:
+The page has two modes, toggled at the top, and a Models page in the
+sidebar:
 
 - **Chat** — a conversation with any model the daemon can reach. The
   model picker lists the local store (`/v1/models`, with which ones are
   loaded) and every hosted provider the daemon holds a usable key for
   (`/llmman/providers`; see [providers.md](providers.md)). Replies stream
   over `/v1/chat/completions`; a model's reasoning, when it emits any,
-  is shown collapsed above the answer. *Pull a model…* accepts any
-  reference `llmman pull` does — an OCI image, `hf.co/…`, `ms://…`,
-  `ngc://…`, `s3://…`, `gs://…` — and streams `/api/pull`'s progress.
+  is shown collapsed above the answer. *Pull a model…* opens the
+  Models page.
 
   Diffusion models (`/api/show` capabilities `image`, `video` or `audio`
   rather than `completion`) are listed under *Generate* in the same
@@ -29,6 +29,19 @@ The page has two modes, toggled at the top:
   that names the file as `run` does. Each prompt stands alone: a
   diffusion model has no conversation. *Stop* abandons the request; a
   video or audio generation already running finishes on the daemon.
+- **Models** (`#/models`) — what this machine has pulled, and a search
+  of Docker Hub and Hugging Face (`/llmman/search`, the rows `llmman
+  search` prints). Selecting a model opens its card
+  (`/llmman/search/model`): each tag or quantization with its size, a
+  rough fit against this machine's model memory (`/llmman/node`; weights
+  only, not context), and *Pull*, which streams `/api/pull`'s progress.
+  A model already here can be chatted with, unloaded or deleted from
+  its card. The search box also takes any reference `llmman pull` does
+  — an OCI image, `hf.co/…`, `ms://…`, `ngc://…`, `s3://…`, `gs://…` —
+  and pulls it on Enter. Owners' pictures load from Hugging Face and
+  Gravatar through `/llmman/search/avatar`, the one thing the page
+  fetches from outside the daemon; without one, or with an API key the
+  browser cannot attach to an image request, the row shows initials.
 - **Shell** — a terminal on the machine running `llmman serve`, as the
   user running it: the login shell in a pty, bridged over a WebSocket at
   `/llmman/shell`. `llmman` itself is on `PATH` there, so `llmman launch

@@ -30,8 +30,9 @@ the notification's *Stop* ends it. If the daemon exits, the service restarts
 it with backoff and the UI reloads. A failure shows the daemon's log in the
 app.
 
-Everything the web UI can do on a desktop works here: *Pull a model…* with
-any reference `llmman pull` takes (`docker.io/ai/…`, `hf.co/…`, …), chat
+Everything the web UI can do on a desktop works here: the *Models* page's
+search, and pulling any reference `llmman pull` takes (`docker.io/ai/…`,
+`hf.co/…`, …), chat
 with streaming replies, the model picker, Export chats (into Downloads;
 on Android 9 a file picker asks where), and the *Shell* tab — a `/system/bin/sh` in the app's sandbox, with
 `llmman` on `PATH`. Diffusion models are not supported: the mediagen

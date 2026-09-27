@@ -45,9 +45,9 @@
       <a class="nav-item" href="#/" data-nav="chat">
         <svg viewBox="0 0 24 24"><use href="#i-chat"/></svg><span>Chats</span>
       </a>
-      <button class="nav-item" id="nav-models" type="button">
+      <a class="nav-item" href="#/models" data-nav="models">
         <svg viewBox="0 0 24 24"><use href="#i-cube"/></svg><span>Models</span>
-      </button>
+      </a>
     </nav>
 
     <div class="recents">
@@ -188,6 +188,26 @@
     </section>
 
     <!-- Shell -->
+    <!-- Models -->
+    <section class="view view-models hidden" id="view-models" role="tabpanel">
+      <div class="browser" id="mb">
+        <aside class="browser-list">
+          <div class="browser-search">
+            <svg viewBox="0 0 24 24" class="browser-search-icon"><use href="#i-search"/></svg>
+            <input id="mb-query" placeholder="Search Docker Hub and Hugging Face" autocomplete="off" spellcheck="false">
+            <select id="mb-filter" aria-label="Show">
+              <option value="all">All</option>
+              <option value="local">On this machine</option>
+              <option value="docker">Docker Hub</option>
+              <option value="hf">Hugging Face</option>
+            </select>
+          </div>
+          <div class="browser-rows" id="mb-list" role="listbox" aria-label="Models"></div>
+        </aside>
+        <section class="browser-card" id="mb-card"></section>
+      </div>
+    </section>
+
     <section class="view view-shell hidden" id="view-shell" role="tabpanel">
       <div class="terminal-host">
         <div class="terminal-pane" id="terminal-pane"></div>
@@ -201,42 +221,6 @@
       </div>
     </section>
   </main>
-
-  <!-- Pull a model -->
-  <dialog class="dialog" id="pull-dialog">
-    <form method="dialog" class="dialog-body" id="pull-form">
-      <h2>Pull a model</h2>
-      <p class="muted">
-        Any reference llmman can pull: an OCI image (<code>ghcr.io/org/model:tag</code>),
-        HuggingFace (<code>hf.co/org/repo</code>, <code>hf.co/org/repo:Q4_K_M</code>),
-        ModelScope (<code>ms://org/repo</code>), NGC (<code>ngc://…</code>), S3 or GCS.
-      </p>
-      <input class="input" id="pull-ref" placeholder="hf.co/unsloth/Qwen3.5-0.8B-GGUF" autocomplete="off" spellcheck="false">
-      <div class="pull-progress hidden" id="pull-progress">
-        <div class="pull-status" id="pull-status"></div>
-        <div class="bar"><div class="bar-fill" id="pull-bar"></div></div>
-        <div class="pull-detail muted" id="pull-detail"></div>
-      </div>
-      <div class="dialog-actions">
-        <button class="btn" type="button" id="pull-cancel">Cancel</button>
-        <button class="btn primary" value="pull" id="pull-go">Pull</button>
-      </div>
-    </form>
-  </dialog>
-
-  <!-- Models -->
-  <dialog class="dialog dialog-wide" id="models-dialog">
-    <div class="dialog-body">
-      <div class="dialog-head">
-        <h2>Models</h2>
-        <button class="icon-btn" id="models-close" aria-label="Close"><svg viewBox="0 0 24 24"><use href="#i-x"/></svg></button>
-      </div>
-      <div id="models-dialog-body" class="models-table"></div>
-      <div class="dialog-actions">
-        <button class="btn" id="models-dialog-pull">Pull a model…</button>
-      </div>
-    </div>
-  </dialog>
 
   <!-- Settings -->
   <dialog class="dialog" id="settings-dialog">
@@ -302,6 +286,9 @@
     <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m16 16 4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 20s-7.5-4.4-7.5-10A4.3 4.3 0 0 1 12 7.6 4.3 4.3 0 0 1 19.5 10c0 5.6-7.5 10-7.5 10Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 5 8 12l7 7" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7 10.5 12 15.5l5-5M4 19h16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>

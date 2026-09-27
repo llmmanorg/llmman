@@ -20,8 +20,7 @@ async function boot() {
   chat.init();
   shell.init();
   models.initPicker();
-  models.initPullDialog();
-  models.initModelsDialog();
+  models.initModelsPage();
   initFrame();
   initSettingsDialog();
 
@@ -68,6 +67,10 @@ async function route() {
     setMode("shell");
     return;
   }
+  if (hash === "/models") {
+    setMode("models");
+    return;
+  }
   setMode("chat");
   if (hash === "/new") {
     chat.newConversation();
@@ -98,10 +101,12 @@ function setMode(next) {
   $$(".nav-item[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === next));
   $("#app").classList.toggle("mode-shell", next === "shell");
   $("#view-chat").classList.toggle("hidden", next !== "chat");
+  $("#view-models").classList.toggle("hidden", next !== "models");
   $("#view-shell").classList.toggle("hidden", next !== "shell");
+  if (next === "models") models.showModelsPage();
   if (next === "shell") shell.show().catch((e) => toast(`Shell: ${e.message}`, "error"));
   else shell.hide();
-  document.title = next === "shell" ? "Shell · llmman" : "llmman";
+  document.title = next === "shell" ? "Shell · llmman" : next === "models" ? "Models · llmman" : "llmman";
 }
 
 // ---- Frame ------------------------------------------------------------
