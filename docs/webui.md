@@ -36,7 +36,9 @@ sidebar:
   tab for what this machine already has. Selecting a model opens its card
   (`/llmman/search/model`): each tag or quantization with its size, a
   rough fit against this machine's model memory (`/llmman/node`; weights
-  only, not context), and *Pull*, which streams `/api/pull`'s progress.
+  only, not context), *Pull*, which streams `/api/pull`'s progress, and
+  the repo's README. The README's HTML is reduced to its links, headings
+  and text, and its images are left out, so it renders like a reply.
   A model already here can be chatted with, unloaded or deleted from
   its card. The search box also takes any reference `llmman pull` does
   — an OCI image, `hf.co/…`, `ms://…`, `ngc://…`, `s3://…`, `gs://…` —

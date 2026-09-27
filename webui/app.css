@@ -1037,6 +1037,16 @@ code, pre, kbd { font-family: var(--font-mono); }
 .local-line .icon-btn { width: 1.75rem; height: 1.75rem; }
 .local-line .icon-btn svg { width: 1rem; height: 1rem; }
 .chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.readme {
+  font-size: 0.9rem;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  border-top: 1px solid var(--border);
+  padding-top: 0.25rem;
+}
+.readme h1 { font-size: 1.25rem; }
+.readme h2 { font-size: 1.1rem; }
+.readme h3, .readme h4 { font-size: 1rem; text-transform: none; letter-spacing: 0; color: var(--text-head); }
 
 /* A phone shows one pane at a time: the list, or the card over it. */
 @media (max-width: 760px) {

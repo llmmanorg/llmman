@@ -318,6 +318,25 @@ pub struct ModelCard {
     /// Hugging Face's tags, minus the `license:`/`region:` bookkeeping.
     pub tags: Vec<String>,
     pub variants: Vec<Variant>,
+    /// The repo's README as its registry serves it (Markdown, often with
+    /// HTML in it), cut at [`README_MAX`].
+    pub readme: Option<String>,
+}
+
+/// Bytes of README kept: model cards run long, and the page shows the top.
+const README_MAX: usize = 64 * 1024;
+
+/// `text` cut at [`README_MAX`] bytes, on a character boundary.
+fn cap_readme(mut text: String) -> String {
+    if text.len() > README_MAX {
+        let mut end = README_MAX;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n\n…");
+    }
+    text
 }
 
 /// One pullable tag of a repo.
@@ -388,15 +407,26 @@ async fn hugging_face_card(client: &reqwest::Client, name: &str, repo: &str) -> 
     let token = hf::token();
     let info =
         hf::api::fetch_model_info(client, &endpoint, owner, repo_name, token.as_deref()).await?;
-    let files = hf::api::fetch_files(
-        client,
-        &endpoint,
-        owner,
-        repo_name,
-        info.commit(),
-        token.as_deref(),
-    )
-    .await?;
+    let readme_url = format!(
+        "{endpoint}{owner}/{repo_name}/raw/{}/README.md",
+        info.commit()
+    );
+    let (files, readme) = tokio::join!(
+        hf::api::fetch_files(
+            client,
+            &endpoint,
+            owner,
+            repo_name,
+            info.commit(),
+            token.as_deref()
+        ),
+        hf::api::get_bytes(client, &readme_url, token.as_deref()),
+    );
+    let files = files?;
+    // A repo without a README (404), or one that failed to load, still has a card.
+    let readme = readme
+        .ok()
+        .map(|b| cap_readme(String::from_utf8_lossy(&b).into_owned()));
     Ok(ModelCard {
         name: name.to_owned(),
         page: format!("https://huggingface.co/{repo}"),
@@ -413,6 +443,7 @@ async fn hugging_face_card(client: &reqwest::Client, name: &str, repo: &str) -> 
             .cloned()
             .collect(),
         variants: hugging_face_variants(name, &files),
+        readme,
     })
 }
 
@@ -515,6 +546,9 @@ struct HubTag {
 
 #[derive(Debug, Deserialize)]
 struct HubRepo {
+    /// The repo's overview page, in Markdown.
+    #[serde(default)]
+    full_description: Option<String>,
     #[serde(default)]
     pull_count: Option<u64>,
     #[serde(default)]
@@ -559,6 +593,10 @@ async fn docker_hub_card(client: &reqwest::Client, name: &str, repo: &str) -> Re
                 tag: t.name,
             })
             .collect(),
+        readme: info
+            .full_description
+            .filter(|d| !d.trim().is_empty())
+            .map(cap_readme),
     })
 }
 
@@ -730,6 +768,15 @@ mod tests {
         );
         assert_eq!(hits[1].pulls, Some(0));
         assert_eq!(hits[1].updated, None);
+    }
+
+    #[test]
+    fn a_long_readme_is_cut_on_a_character_boundary() {
+        assert_eq!(cap_readme("short".into()), "short");
+        let long = "é".repeat(README_MAX); // two bytes each
+        let cut = cap_readme(long);
+        assert!(cut.len() <= README_MAX + "\n\n…".len());
+        assert!(cut.ends_with("\n\n…"));
     }
 
     #[test]

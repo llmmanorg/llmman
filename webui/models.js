@@ -5,6 +5,7 @@
 import * as api from "./api.js";
 import * as settings from "./settings.js";
 import { toast, formatBytes, $, icon, iconButton, debounce } from "./util.js";
+import { render as renderMarkdown } from "./markdown.js";
 
 const state = {
   local: [], // [{id, loaded, capabilities: [..] | null}]
@@ -854,7 +855,49 @@ function cardView(name, info) {
     for (const t of tags) box.appendChild(pill(t));
     wrap.appendChild(box);
   }
+
+  if (info.readme) {
+    wrap.appendChild(sectionTitle("README"));
+    const readme = document.createElement("div");
+    readme.className = "readme content";
+    readme.appendChild(renderMarkdown(readmeMarkdown(info.readme, registryOf(name) === "hf" ? info.page : "")));
+    wrap.appendChild(readme);
+  }
   return wrap;
+}
+
+/**
+ * A registry README as Markdown for the page's renderer: front matter and
+ * comments dropped, and outside code blocks the HTML model cards are full
+ * of reduced to what it says (links, headings, line breaks, text). Images
+ * go: most are badges, and the page fetches nothing a README asks for.
+ * The renderer still treats all of it as untrusted text. Relative links
+ * point into the repo at `page`, when given.
+ */
+function readmeMarkdown(text, page) {
+  const body = text.replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
+  const entities = { amp: "&", lt: "<", gt: ">", quot: '"', "#39": "'", nbsp: " " };
+  const flat = (t) => t.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+  // Split on fenced code blocks; odd pieces are code and stay as written.
+  const pieces = body.split(/(^```[\s\S]*?^```[^\n]*$)/m);
+  const out = pieces.map((piece, i) => {
+    if (i % 2) return piece;
+    let s = piece.replace(/<!--[\s\S]*?-->/g, "");
+    s = s.replace(/<img\b[^>]*>/gi, "");
+    s = s.replace(/<br\s*\/?>/gi, "\n");
+    s = s.replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi, (_, n, t) => `\n\n${"#".repeat(+n)} ${flat(t)}\n\n`);
+    s = s.replace(/<a\b[^>]*?href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, (_, href, t) =>
+      flat(t) ? `[${flat(t)}](${href})` : "",
+    );
+    s = s.replace(/<\/?(p|div|center|table|thead|tbody|tr|details|summary|ul|ol|li)\b[^>]*>/gi, "\n");
+    s = s.replace(/<\/?[a-z][^>\n]*>/gi, "");
+    s = s.replace(/&(amp|lt|gt|quot|#39|nbsp);/g, (_, e) => entities[e]);
+    if (page) {
+      s = s.replace(/\]\((?!https?:|mailto:|#)([^)\s]+)\)/g, (_, path) => `](${page}/blob/main/${path.replace(/^\.?\//, "")})`);
+    }
+    return s.replace(/\n{3,}/g, "\n\n");
+  });
+  return out.join("").trim();
 }
 
 function sectionTitle(text) {

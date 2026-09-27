@@ -156,8 +156,9 @@ Hub's most pulled models, then Hugging Face's most downloaded GGUF
 text-generation repos.
 `/llmman/search/model?name=<a row's name>` expands one row: every tag
 `pull` can take for it with its size (`variants`, the one a tagless
-`pull` takes marked `default`), plus the repo's pulls, likes, license
-and tags. For a GGUF repo on Hugging Face the variants are its
+`pull` takes marked `default`), plus the repo's pulls, likes, license,
+tags and README (Hugging Face's `README.md`, Docker Hub's overview; the
+first 64 KiB). For a GGUF repo on Hugging Face the variants are its
 quantizations, each one that resolves to its own file the way `pull`
 picks one. `/llmman/search/avatar?name=` redirects to the repo owner's
 picture on Hugging Face or Gravatar, or is a `404` when it has none.
