@@ -3502,6 +3502,7 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .route("/llmman/providers/:id", get(handle_llmman_provider))
         .route("/llmman/node", get(aggregation::handle_node))
         .route("/llmman/search", get(search::handle_search))
+        .route("/llmman/search/popular", get(search::handle_popular))
         .route("/llmman/search/model", get(search::handle_model))
         .route("/llmman/search/avatar", get(search::handle_avatar))
         .route("/llmman/shell", get(shell::handle_shell))

@@ -195,12 +195,12 @@
           <div class="browser-search">
             <svg viewBox="0 0 24 24" class="browser-search-icon"><use href="#i-search"/></svg>
             <input id="mb-query" placeholder="Search Docker Hub and Hugging Face" autocomplete="off" spellcheck="false">
-            <select id="mb-filter" aria-label="Show">
-              <option value="all">All</option>
-              <option value="local">On this machine</option>
-              <option value="docker">Docker Hub</option>
-              <option value="hf">Hugging Face</option>
-            </select>
+          </div>
+          <div class="browser-tabs" id="mb-tabs" role="tablist" aria-label="Show">
+            <button role="tab" data-filter="all" class="active" aria-selected="true">All</button>
+            <button role="tab" data-filter="docker" aria-selected="false">Docker Hub</button>
+            <button role="tab" data-filter="hf" aria-selected="false">Hugging Face</button>
+            <button role="tab" data-filter="local" aria-selected="false">Pulled</button>
           </div>
           <div class="browser-rows" id="mb-list" role="listbox" aria-label="Models"></div>
         </aside>

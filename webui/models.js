@@ -437,6 +437,7 @@ const mb = {
   query: "",
   filter: "all",
   hits: null, // search results, or null for "no search yet"
+  popular: null, // what to show before a search: rows, "loading" or an Error
   selected: null, // a repo name, e.g. hf.co/unsloth/Qwen3.5-0.8B-GGUF
   cards: new Map(), // repo → ModelCard | Error
   memory: 0, // bytes of model memory on this machine, 0 if unknown
@@ -458,10 +459,16 @@ export function initModelsPage() {
     if (isReference(text)) mbPull(text);
     else mbSearch(text);
   });
-  $("#mb-filter").addEventListener("change", (e) => {
-    mb.filter = e.target.value;
-    renderBrowserList();
-  });
+  for (const tab of document.querySelectorAll("#mb-tabs [data-filter]")) {
+    tab.addEventListener("click", () => {
+      mb.filter = tab.dataset.filter;
+      for (const t of document.querySelectorAll("#mb-tabs [data-filter]")) {
+        t.classList.toggle("active", t === tab);
+        t.setAttribute("aria-selected", String(t === tab));
+      }
+      renderBrowserList();
+    });
+  }
 }
 
 export async function showModelsPage() {
@@ -473,8 +480,21 @@ export async function showModelsPage() {
       renderCard();
     })
     .catch(() => {});
+  loadPopular();
   await reloadLocal();
   $("#mb-query").focus();
+}
+
+/** Once per page load: the registries' most popular models change slowly. */
+async function loadPopular() {
+  if (mb.popular && !(mb.popular instanceof Error)) return;
+  mb.popular = "loading";
+  try {
+    mb.popular = await api.popular({ limit: SEARCH_LIMIT });
+  } catch (e) {
+    mb.popular = e;
+  }
+  renderBrowserList();
 }
 
 /** The store changed (or may have): re-read it and redraw. */
@@ -551,16 +571,33 @@ function renderBrowserList() {
   const list = $("#mb-list");
   list.replaceChildren();
   const filter = mb.filter;
-  if (filter === "local" || mb.hits === null) {
+  const shown = (rows) => rows.filter((h) => filter === "all" || registryOf(h.name) === filter);
+  if (filter === "local") {
     const repos = localRepos();
-    list.appendChild(listHeading(filter === "local" || !mb.query ? "On this machine" : ""));
+    list.appendChild(listHeading("On this machine"));
     if (!repos.length) list.appendChild(emptyRow("Nothing pulled yet. Search above to find a model."));
     for (const r of repos) list.appendChild(browserRow({ name: r.name }));
     return;
   }
+  if (mb.hits === null) {
+    // No search yet: the popular models, by registry.
+    if (mb.popular === "loading" || mb.popular === null) return list.appendChild(emptyRow("Loading popular models…"));
+    if (mb.popular instanceof Error) return list.appendChild(emptyRow(mb.popular.message));
+    const rows = shown(mb.popular);
+    for (const [registry, heading] of [
+      ["docker", "Featured on Docker Hub"],
+      ["hf", "Popular GGUF on Hugging Face"],
+    ]) {
+      const group = rows.filter((h) => registryOf(h.name) === registry);
+      if (!group.length) continue;
+      list.appendChild(listHeading(heading));
+      for (const hit of group) list.appendChild(browserRow(hit));
+    }
+    return;
+  }
   if (mb.hits === "loading") return list.appendChild(emptyRow("Searching…"));
   if (mb.hits instanceof Error) return list.appendChild(emptyRow(mb.hits.message));
-  const hits = mb.hits.filter((h) => filter === "all" || registryOf(h.name) === filter);
+  const hits = shown(mb.hits);
   list.appendChild(listHeading(`Results for “${mb.query}”`));
   if (!hits.length) list.appendChild(emptyRow("No models found."));
   for (const hit of hits) list.appendChild(browserRow(hit));

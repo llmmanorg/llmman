@@ -9,7 +9,7 @@ Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
 | Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/pull`, `/api/push`, `/api/copy`, `/api/create`, `/api/blobs/{digest}`, `/api/ps`, `/api/delete`, `/api/version` |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`) |
 | Anthropic | `/v1/messages` |
-| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/avatar`, `/llmman/shell` |
+| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/shell` |
 | Web UI | `/` and `/ui/*` — see [webui.md](webui.md) |
 | llama.cpp | `/props` |
 | Prometheus | `/metrics` (off unless `LLMMAN_METRICS` is `1`, `true`, `yes` or `on`) |
@@ -151,6 +151,9 @@ is what aggregation peers ask each other. See [aggregation.md](aggregation.md).
 Hub and Hugging Face rows in the same order, as `{"models": [{name,
 pulls, likes, updated}]}`, each `name` ready for `/api/pull`. `limit`
 caps the rows per registry as `--limit` does (default 25, at most 64).
+`/llmman/search/popular` has the same shape and needs no query: Docker
+Hub's most pulled models, then Hugging Face's most downloaded GGUF
+text-generation repos.
 `/llmman/search/model?name=<a row's name>` expands one row: every tag
 `pull` can take for it with its size (`variants`, the one a tagless
 `pull` takes marked `default`), plus the repo's pulls, likes, license

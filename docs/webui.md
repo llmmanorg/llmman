@@ -29,9 +29,11 @@ sidebar:
   that names the file as `run` does. Each prompt stands alone: a
   diffusion model has no conversation. *Stop* abandons the request; a
   video or audio generation already running finishes on the daemon.
-- **Models** (`#/models`) — what this machine has pulled, and a search
-  of Docker Hub and Hugging Face (`/llmman/search`, the rows `llmman
-  search` prints). Selecting a model opens its card
+- **Models** (`#/models`) — opens on popular models
+  (`/llmman/search/popular`: Docker Hub's most pulled, then Hugging
+  Face's most downloaded GGUF), searches Docker Hub and Hugging Face
+  (`/llmman/search`, the rows `llmman search` prints), and has a *Pulled*
+  tab for what this machine already has. Selecting a model opens its card
   (`/llmman/search/model`): each tag or quantization with its size, a
   rough fit against this machine's model memory (`/llmman/node`; weights
   only, not context), and *Pull*, which streams `/api/pull`'s progress.

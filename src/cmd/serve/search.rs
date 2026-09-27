@@ -47,6 +47,23 @@ pub(super) async fn handle_search(
 }
 
 #[derive(Deserialize)]
+pub(super) struct PopularParams {
+    limit: Option<u32>,
+}
+
+/// `GET /llmman/search/popular[?limit=<n>]`: what to show before a search,
+/// the same row shape as `/llmman/search`.
+pub(super) async fn handle_popular(
+    Query(params): Query<PopularParams>,
+) -> Result<Json<SearchResponse>, AppError> {
+    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let models = search::popular(limit)
+        .await
+        .map_err(|e| AppError(e, StatusCode::BAD_GATEWAY))?;
+    Ok(Json(SearchResponse { models }))
+}
+
+#[derive(Deserialize)]
 pub(super) struct NameParam {
     #[serde(default)]
     name: String,

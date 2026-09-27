@@ -105,28 +105,43 @@ pub async fn search(query: &str, limit: u32, registry: Option<Registry>) -> Resu
                 search_docker_hub(&client, query, limit),
                 search_hugging_face(&client, query, limit),
             );
-            match (docker, hugging_face) {
-                (Ok(mut hits), Ok(more)) => {
-                    hits.extend(more);
-                    Ok(hits)
-                }
-                (Ok(hits), Err(e)) => {
-                    eprintln!(
-                        "[llmman] Hugging Face search failed, showing Docker Hub only: {e:#}"
-                    );
-                    Ok(hits)
-                }
-                (Err(e), Ok(hits)) => {
-                    eprintln!(
-                        "[llmman] Docker Hub search failed, showing Hugging Face only: {e:#}"
-                    );
-                    Ok(hits)
-                }
-                (Err(docker), Err(hugging_face)) => Err(docker
-                    .context(format!("Hugging Face: {hugging_face:#}"))
-                    .context("search failed on both registries")),
-            }
+            both(docker, hugging_face)
         }
+    }
+}
+
+/// What `llmman serve`'s Models page lists before any search: Docker
+/// Hub's most pulled models, which Docker's own `ai/` ones lead, then
+/// Hugging Face's most downloaded GGUF text-generation repos, the kind
+/// llama.cpp serves.
+pub async fn popular(limit: u32) -> Result<Vec<Hit>> {
+    let client = hf::api_client()?;
+    let (docker, hugging_face) = tokio::join!(
+        search_docker_hub(&client, "", limit),
+        popular_hugging_face(&client, limit),
+    );
+    both(docker, hugging_face)
+}
+
+/// Docker Hub's rows, then Hugging Face's; one registry failing is a
+/// warning, both an error.
+fn both(docker: Result<Vec<Hit>>, hugging_face: Result<Vec<Hit>>) -> Result<Vec<Hit>> {
+    match (docker, hugging_face) {
+        (Ok(mut hits), Ok(more)) => {
+            hits.extend(more);
+            Ok(hits)
+        }
+        (Ok(hits), Err(e)) => {
+            eprintln!("[llmman] Hugging Face search failed, showing Docker Hub only: {e:#}");
+            Ok(hits)
+        }
+        (Err(e), Ok(hits)) => {
+            eprintln!("[llmman] Docker Hub search failed, showing Hugging Face only: {e:#}");
+            Ok(hits)
+        }
+        (Err(docker), Err(hugging_face)) => Err(docker
+            .context(format!("Hugging Face: {hugging_face:#}"))
+            .context("search failed on both registries")),
     }
 }
 
@@ -245,6 +260,30 @@ async fn search_hugging_face(
     let endpoint = hf::hf_endpoint("hf.co");
     let token = hf::token();
     let models = hf::api::search_models(client, &endpoint, query, limit, token.as_deref()).await?;
+    Ok(models.into_iter().map(hugging_face_hit).collect())
+}
+
+async fn popular_hugging_face(client: &reqwest::Client, limit: u32) -> Result<Vec<Hit>> {
+    let endpoint = hf::hf_endpoint("hf.co");
+    let token = hf::token();
+    let limit = limit.to_string();
+    let url = reqwest::Url::parse_with_params(
+        &format!("{endpoint}api/models"),
+        [
+            ("filter", "gguf"),
+            ("pipeline_tag", "text-generation"),
+            ("limit", limit.as_str()),
+            ("sort", "downloads"),
+            ("direction", "-1"),
+            ("expand[]", "lastModified"),
+            ("expand[]", "downloads"),
+            ("expand[]", "likes"),
+        ],
+    )
+    .context("build HF popular-models URL")?;
+    let models: Vec<hf::api::SearchHit> = hf::api::get_json(client, url.as_str(), token.as_deref())
+        .await
+        .context("HF popular models")?;
     Ok(models.into_iter().map(hugging_face_hit).collect())
 }
 

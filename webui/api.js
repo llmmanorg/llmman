@@ -146,6 +146,12 @@ export async function search(query, { limit, signal } = {}) {
   return body.models || [];
 }
 
+/** `GET /llmman/search/popular`: what to show before a search, in `search`'s row shape. */
+export async function popular({ limit } = {}) {
+  const body = await getJson(`llmman/search/popular${limit ? `?limit=${limit}` : ""}`);
+  return body.models || [];
+}
+
 /** `GET /llmman/search/model`: a search row's tags with sizes, and its repo's facts. */
 export function modelCard(name) {
   return getJson(`llmman/search/model?name=${encodeURIComponent(name)}`);
