@@ -191,7 +191,7 @@ fn walk_value(value: &Value, prefix: &str, out: &mut Vec<(String, String)>) {
 
 /// Append one key to a dotted path, quoted if TOML would quote it.
 fn join(prefix: &str, key: &str) -> String {
-    let key = Key::new(key).display_repr().into_owned();
+    let key = crate::config::toml_key(key);
     if prefix.is_empty() {
         key
     } else {

@@ -16,8 +16,8 @@
 //! [providers.openrouter]               # crate::providers
 //! api_key = "sk-or-..."
 //!
-//! [providers.gpubox]                   # a provider models.dev does not list
-//! base_url = "http://gpubox:8000/v1"
+//! [providers.inferencebox]                   # a provider models.dev does not list
+//! base_url = "http://inferencebox:8000/v1"
 //! wire     = "openai"                  # default; or "anthropic"
 //!
 //! [verify]                             # crate::verify
@@ -408,11 +408,10 @@ pub fn system_path() -> PathBuf {
     system_dir().join(FILE)
 }
 
-/// [`user_path`] for printing, falling back to the bare file name.
-pub fn user_path_display() -> String {
-    user_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| FILE.to_string())
+/// `key` as one part of a dotted TOML key, quoted unless it is bare: an
+/// id like `wafer.ai` would otherwise name two nested tables.
+pub fn toml_key(key: &str) -> String {
+    toml_edit::Key::new(key).display_repr().into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,8 +1054,8 @@ mod tests {
     fn a_base_url_turns_a_provider_table_into_a_definition() {
         let files = [file(
             r#"
-            [providers.gpubox]
-            base_url = "http://gpubox:8000/v1/"
+            [providers.inferencebox]
+            base_url = "http://inferencebox:8000/v1/"
 
             [providers.relay]
             base_url    = "https://relay.example/v1"
@@ -1074,10 +1073,10 @@ mod tests {
             configured,
             vec![
                 ConfiguredProvider {
-                    id: "gpubox".into(),
-                    name: "gpubox".into(),
+                    id: "inferencebox".into(),
+                    name: "inferencebox".into(),
                     // Trailing slash gone: a route appends its own.
-                    base_url: "http://gpubox:8000/v1".into(),
+                    base_url: "http://inferencebox:8000/v1".into(),
                     wire: crate::providers::Wire::OpenAi,
                     key_env: None,
                 },
@@ -1107,11 +1106,11 @@ mod tests {
     #[test]
     fn a_later_definition_overrides_field_by_field() {
         let system = file(
-            "[providers.gpubox]\nbase_url = \"http://gpubox:8000/v1\"\nname = \"Shared box\"\n\
+            "[providers.inferencebox]\nbase_url = \"http://inferencebox:8000/v1\"\nname = \"Shared box\"\n\
              api_key_env = \"SHARED_KEY\"",
         );
         let user = file(
-            "[providers.gpubox]\nbase_url = \"http://10.0.0.5:8000/v1\"\nwire = \"anthropic\"\n\
+            "[providers.inferencebox]\nbase_url = \"http://10.0.0.5:8000/v1\"\nwire = \"anthropic\"\n\
              api_key_env = \"\"",
         );
         let merged = configured_from(&[system, user]);
@@ -1129,17 +1128,17 @@ mod tests {
     /// defines nothing, a `wire` llmman does not speak.
     #[test]
     fn a_bad_provider_definition_is_a_parse_error() {
-        let bad = |body: &str| parse(&format!("[providers.gpubox]\n{body}")).expect_err(body);
+        let bad = |body: &str| parse(&format!("[providers.inferencebox]\n{body}")).expect_err(body);
 
-        assert!(bad("base_url = \"gpubox:8000\"").contains("base_url"));
-        assert!(bad("base_url = \"gpubox:8000/v1\"").contains("base_url"));
-        assert!(bad("base_url = \"ftp://gpubox/v1\"").contains("http or https"));
+        assert!(bad("base_url = \"inferencebox:8000\"").contains("base_url"));
+        assert!(bad("base_url = \"inferencebox:8000/v1\"").contains("base_url"));
+        assert!(bad("base_url = \"ftp://inferencebox/v1\"").contains("http or https"));
         assert!(bad("base_url = \"http://\"").contains("base_url"));
-        assert!(bad("base_url = \"http://gpubox/v1?x=1\"").contains("query"));
+        assert!(bad("base_url = \"http://inferencebox/v1?x=1\"").contains("query"));
         assert!(bad("base_url = \"\"").contains("base_url"));
         // The URL is reported by the daemon's API; a secret does not go in it.
-        assert!(bad("base_url = \"https://user:pw@gpubox/v1\"").contains("api_key"));
-        assert!(bad("base_url = \"https://user@gpubox/v1\"").contains("api_key"));
+        assert!(bad("base_url = \"https://user:pw@inferencebox/v1\"").contains("api_key"));
+        assert!(bad("base_url = \"https://user@inferencebox/v1\"").contains("api_key"));
         // A slash in the id would never survive `split_remote_ref`.
         assert!(
             parse("[providers.\"team/gpu\"]\nbase_url = \"http://g/v1\"")
@@ -1160,9 +1159,12 @@ mod tests {
         // The good shapes parse, and come out normalized: lowercase
         // scheme and host, no trailing slash.
         for (url, want) in [
-            ("http://gpubox:8000/v1", "http://gpubox:8000/v1"),
-            ("http://gpubox", "http://gpubox"),
-            ("HTTP://GPUBox:8000/v1/", "http://gpubox:8000/v1"),
+            ("http://inferencebox:8000/v1", "http://inferencebox:8000/v1"),
+            ("http://inferencebox", "http://inferencebox"),
+            (
+                "HTTP://InferenceBox:8000/v1/",
+                "http://inferencebox:8000/v1",
+            ),
             ("http://127.0.0.1:11434/v1", "http://127.0.0.1:11434/v1"),
             ("http://[::1]:8000/v1", "http://[::1]:8000/v1"),
             (
@@ -1171,7 +1173,7 @@ mod tests {
             ),
         ] {
             assert_eq!(base_url_of(url).expect(url), want);
-            parse(&format!("[providers.gpubox]\nbase_url = {url:?}")).expect(url);
+            parse(&format!("[providers.inferencebox]\nbase_url = {url:?}")).expect(url);
         }
     }
 
@@ -1179,10 +1181,10 @@ mod tests {
     #[test]
     fn debug_output_shows_a_definition_but_never_a_key() {
         let c = conf(
-            "[providers.gpubox]\nbase_url = \"http://gpubox:8000/v1\"\napi_key = \"sk-secret-value\"",
+            "[providers.inferencebox]\nbase_url = \"http://inferencebox:8000/v1\"\napi_key = \"sk-secret-value\"",
         );
         let rendered = format!("{c:?}");
-        assert!(rendered.contains("gpubox:8000"), "{rendered}");
+        assert!(rendered.contains("inferencebox:8000"), "{rendered}");
         assert!(!rendered.contains("sk-secret-value"), "{rendered}");
     }
 

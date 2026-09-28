@@ -2055,18 +2055,18 @@ fn provider_responses_carry_no_api_key() {
 #[test]
 fn a_configured_provider_reports_its_key_as_optional() {
     let catalog = fixture_catalog().with_configured(&[crate::config::ConfiguredProvider {
-        id: "gpubox".into(),
-        name: "GPU box".into(),
-        base_url: "http://gpubox:8000/v1".into(),
+        id: "inferencebox".into(),
+        name: "Inference box".into(),
+        base_url: "http://inferencebox:8000/v1".into(),
         wire: Wire::OpenAi,
         key_env: None,
     }]);
-    let provider = catalog.get("gpubox").unwrap();
+    let provider = catalog.get("inferencebox").unwrap();
     let json = serde_json::to_value(ProviderSummary::new(&test_state(), provider)).unwrap();
     assert_eq!(json["key_optional"], true);
     assert_eq!(json["key_set"], false);
     assert!(json.get("key_env").is_none(), "{json}");
-    assert_eq!(json["base_url"], "http://gpubox:8000/v1");
+    assert_eq!(json["base_url"], "http://inferencebox:8000/v1");
     // The catalog entry is untouched, and still demands its key.
     let json = serde_json::to_value(ProviderSummary::new(
         &test_state(),
@@ -2084,8 +2084,8 @@ fn a_keyless_remote_target_sends_no_credential_header() {
     let client = Client::new();
     let keyless = |wire: Wire| {
         Target::Remote(Arc::new(RemoteTarget {
-            provider: "gpubox".into(),
-            base_url: "http://gpubox:8000/v1".into(),
+            provider: "inferencebox".into(),
+            base_url: "http://inferencebox:8000/v1".into(),
             wire,
             model: "m".into(),
             max_output: None,
@@ -2095,7 +2095,7 @@ fn a_keyless_remote_target_sends_no_credential_header() {
     };
     let headers = |target: &Target| {
         target
-            .authorize(client.post("http://gpubox:8000/v1/x"))
+            .authorize(client.post("http://inferencebox:8000/v1/x"))
             .build()
             .unwrap()
             .headers()
@@ -2113,7 +2113,10 @@ fn a_keyless_remote_target_sends_no_credential_header() {
         anthropic::VERSION
     );
     // And with a key, the header is back.
-    let keyed = headers(&remote_target_on("http://gpubox:8000/v1", Wire::OpenAi));
+    let keyed = headers(&remote_target_on(
+        "http://inferencebox:8000/v1",
+        Wire::OpenAi,
+    ));
     assert_eq!(
         keyed.get(reqwest::header::AUTHORIZATION).unwrap(),
         "Bearer sk-test"
@@ -2121,7 +2124,7 @@ fn a_keyless_remote_target_sends_no_credential_header() {
 }
 
 /// The models of a configured provider come from its own `/models`,
-/// so `list --provider gpubox` shows what the box actually serves; a
+/// so `list --provider inferencebox` shows what the box actually serves; a
 /// box that is down or lacks the route costs an empty list, never an
 /// error, since requests can still go to it.
 #[tokio::test]
@@ -2150,8 +2153,8 @@ async fn a_configured_providers_models_are_asked_of_its_endpoint() {
 
     let provider =
         crate::providers::Provider::from_configured(&crate::config::ConfiguredProvider {
-            id: "gpubox".into(),
-            name: "gpubox".into(),
+            id: "inferencebox".into(),
+            name: "inferencebox".into(),
             base_url: base.clone(),
             wire: Wire::OpenAi,
             key_env: None,

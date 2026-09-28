@@ -67,16 +67,16 @@ is defined in `llmman.conf` by giving a `[providers.<id>]` a
 `base_url`:
 
 ```toml
-[providers.gpubox]
-base_url = "http://gpubox:8000/v1"
+[providers.inferencebox]
+base_url = "http://inferencebox:8000/v1"
 ```
 
 ```console
-$ llmman config set providers.gpubox.base_url http://gpubox:8000/v1
-$ llmman providers | grep gpubox
-gpubox      gpubox    -          none needed    -
-$ llmman list --provider gpubox                # asks the box's own /models
-$ llmman launch opencode --provider gpubox --model qwen3-coder
+$ llmman config set providers.inferencebox.base_url http://inferencebox:8000/v1
+$ llmman providers | grep inferencebox
+inferencebox    inferencebox    -          none needed    -
+$ llmman list --provider inferencebox          # asks the box's own /models
+$ llmman launch opencode --provider inferencebox --model qwen3-coder
 ```
 
 From there it is a provider like any other: `run`, `list`, `launch` and

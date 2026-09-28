@@ -37,8 +37,8 @@ gemma4 = "docker.io/ai/gemma4"
 [providers.openrouter]
 api_key = "sk-or-..."
 
-[providers.gpubox]                 # an endpoint models.dev does not list
-base_url = "http://gpubox:8000/v1"
+[providers.inferencebox]           # an endpoint models.dev does not list
+base_url = "http://inferencebox:8000/v1"
 
 [verify]
 default = "off"
@@ -194,12 +194,12 @@ than keying a catalog one — an inference server at some host or URL
 models.dev does not list, or a replacement URL for one it does:
 
 ```toml
-[providers.gpubox]
-base_url    = "http://gpubox:8000/v1"   # required; http or https
-wire        = "openai"                  # default; or "anthropic"
-api_key     = "..."                     # optional: most local servers take none
-api_key_env = "GPUBOX_API_KEY"          # optional: a variable to read it from
-name        = "GPU box"                 # optional: for listings
+[providers.inferencebox]
+base_url    = "http://inferencebox:8000/v1"   # required; http or https
+wire        = "openai"                        # default; or "anthropic"
+api_key     = "..."                           # optional: most local servers take none
+api_key_env = "INFERENCEBOX_API_KEY"          # optional: a variable to read it from
+name        = "Inference box"                 # optional: for listings
 ```
 
 `wire`, `api_key_env` and `name` only mean something on a definition, so

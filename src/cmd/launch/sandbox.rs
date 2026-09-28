@@ -1307,8 +1307,8 @@ mod tests {
         );
         // A daemon elsewhere is reached as it is.
         assert_eq!(
-            agent_server_for("https://gpubox:443", alias).unwrap(),
-            "https://gpubox:443"
+            agent_server_for("https://inferencebox:443", alias).unwrap(),
+            "https://inferencebox:443"
         );
         // Its certificate would not name the alias.
         assert!(agent_server_for("https://127.0.0.1:17434", alias).is_err());
@@ -2248,7 +2248,10 @@ mod tests {
             "host.openshell.internal:17434"
         );
         // A daemon elsewhere keeps its own name, so policy must name it.
-        assert_eq!(openshell_endpoint("https://gpubox").unwrap(), "gpubox:443");
+        assert_eq!(
+            openshell_endpoint("https://inferencebox").unwrap(),
+            "inferencebox:443"
+        );
         // `host_str` keeps an IPv6 address bracketed.
         assert_eq!(
             openshell_endpoint("http://[2001:db8::1]:17434").unwrap(),

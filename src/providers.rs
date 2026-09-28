@@ -416,39 +416,31 @@ fn key_from_env(var: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Both places llmman looks, named, for an error that fires because it
-/// found neither. One string so every such message agrees: a user told
-/// only about the variable would never learn the file exists.
+/// What to do about a missing key, for every error that reports one.
+/// `config set` rather than a hand edit: it rejects a misspelt key and
+/// makes the file owner-only, without which the key is ignored.
 pub fn key_hint(id: &str, var: Option<&str>) -> String {
+    let key = shell_word(&format!(
+        "providers.{}.api_key",
+        crate::config::toml_key(id)
+    ));
+    let set = format!("run `llmman config set {key} <key>`");
     match var {
-        Some(var) => format!(
-            "set {var} in the environment, or add a [providers.{}] api_key to {}",
-            toml_key(id),
-            crate::config::user_path_display()
-        ),
-        None => format!(
-            "add an api_key to [providers.{}] in {}",
-            toml_key(id),
-            crate::config::user_path_display()
-        ),
+        Some(var) => format!("set {var} in the environment, or {set}"),
+        None => set,
     }
 }
 
-/// `id` as a TOML key, quoted when it is not a bare one.
-///
-/// models.dev has ids with a dot in them (`wafer.ai`), and
-/// `[providers.wafer.ai]` is two nested tables, not the key `wafer.ai` —
-/// so an unquoted hint tells the user to write something that silently
-/// does not configure the provider they asked about.
-fn toml_key(id: &str) -> String {
-    let bare = !id.is_empty()
-        && id
+/// `word` as one POSIX shell word, single-quoted unless it is plain.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if bare {
-        id.to_string()
+            .all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c));
+    if plain {
+        word.to_string()
     } else {
-        format!("{id:?}")
+        format!("'{}'", word.replace('\'', r"'\''"))
     }
 }
 
@@ -1775,19 +1767,18 @@ mod tests {
         assert_eq!(resolve_key(None, Some("")), None);
     }
 
-    /// Both places, in one message.
     #[test]
-    fn key_hint_names_the_variable_and_the_config_file() {
-        let hint = key_hint("openrouter", Some("OPENROUTER_API_KEY"));
-        assert!(hint.contains("OPENROUTER_API_KEY"), "{hint}");
-        assert!(hint.contains("[providers.openrouter]"), "{hint}");
-        assert!(hint.contains("llmman.conf"), "{hint}");
-
-        // No variable to name: the file alone, and no dangling "or".
-        let hint = key_hint("gpubox", None);
-        assert!(hint.contains("[providers.gpubox]"), "{hint}");
-        assert!(hint.contains("llmman.conf"), "{hint}");
-        assert!(!hint.contains("environment"), "{hint}");
+    fn key_hint_names_the_variable_and_the_command() {
+        assert_eq!(
+            key_hint("openrouter", Some("OPENROUTER_API_KEY")),
+            "set OPENROUTER_API_KEY in the environment, or run \
+             `llmman config set providers.openrouter.api_key <key>`"
+        );
+        // No variable to name: the command alone, and no dangling "or".
+        assert_eq!(
+            key_hint("inferencebox", None),
+            "run `llmman config set providers.inferencebox.api_key <key>`"
+        );
     }
 
     fn configured(id: &str, base_url: &str, wire: Wire) -> crate::config::ConfiguredProvider {
@@ -1817,7 +1808,7 @@ mod tests {
             }"#,
         )
         .with_configured(&[
-            configured("gpubox", "http://gpubox:8000/v1", Wire::OpenAi),
+            configured("inferencebox", "http://inferencebox:8000/v1", Wire::OpenAi),
             crate::config::ConfiguredProvider {
                 id: "relay".into(),
                 name: "Claude relay".into(),
@@ -1830,19 +1821,19 @@ mod tests {
         assert_eq!(catalog.len(), 3);
         assert_eq!(
             catalog.ids().collect::<Vec<_>>(),
-            ["gpubox", "openrouter", "relay"]
+            ["inferencebox", "openrouter", "relay"]
         );
 
-        let gpubox = catalog.get("gpubox").unwrap();
-        assert_eq!(gpubox.base_url, "http://gpubox:8000/v1");
-        assert_eq!(gpubox.wire, Wire::OpenAi);
-        assert!(gpubox.key_optional);
-        assert_eq!(gpubox.key_env, None);
-        assert!(gpubox.models.is_empty());
-        assert_eq!(gpubox.api_key(), None);
+        let inferencebox = catalog.get("inferencebox").unwrap();
+        assert_eq!(inferencebox.base_url, "http://inferencebox:8000/v1");
+        assert_eq!(inferencebox.wire, Wire::OpenAi);
+        assert!(inferencebox.key_optional);
+        assert_eq!(inferencebox.key_env, None);
+        assert!(inferencebox.models.is_empty());
+        assert_eq!(inferencebox.api_key(), None);
         assert_eq!(
-            gpubox.url("/v1/chat/completions"),
-            "http://gpubox:8000/v1/chat/completions"
+            inferencebox.url("/v1/chat/completions"),
+            "http://inferencebox:8000/v1/chat/completions"
         );
 
         let relay = catalog.get("relay").unwrap();
@@ -1892,12 +1883,12 @@ mod tests {
     #[test]
     fn configured_providers_stand_alone_without_the_catalog() {
         let catalog = Catalog::from_configured(&[configured(
-            "gpubox",
-            "http://gpubox:8000/v1",
+            "inferencebox",
+            "http://inferencebox:8000/v1",
             Wire::OpenAi,
         )]);
         assert_eq!(catalog.len(), 1);
-        assert!(catalog.get("gpubox").is_some());
+        assert!(catalog.get("inferencebox").is_some());
         assert!(Catalog::from_configured(&[]).is_empty());
     }
 
@@ -1919,19 +1910,24 @@ mod tests {
         }
     }
 
-    /// models.dev ships `wafer.ai`, and `[providers.wafer.ai]` is two
-    /// nested tables rather than that key — a hint saying so would not
-    /// configure the provider it names.
+    /// models.dev ships `wafer.ai`; `providers.wafer.ai` is two nested
+    /// tables, so the key is TOML-quoted and then shell-quoted.
     #[test]
-    fn key_hint_quotes_a_provider_id_that_is_not_a_bare_toml_key() {
-        assert!(
-            key_hint("wafer.ai", Some("WAFER_API_KEY")).contains(r#"[providers."wafer.ai"]"#),
-            "{}",
-            key_hint("wafer.ai", Some("WAFER_API_KEY"))
+    fn key_hint_quotes_an_id_that_is_not_a_bare_toml_key() {
+        assert_eq!(
+            key_hint("wafer.ai", None),
+            r#"run `llmman config set 'providers."wafer.ai".api_key' <key>`"#
         );
-        assert_eq!(toml_key("openrouter"), "openrouter");
-        assert_eq!(toml_key("z-ai"), "z-ai");
-        assert_eq!(toml_key("wafer.ai"), r#""wafer.ai""#);
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word(""), "''");
+
+        // Quoted or not, the key parses back to exactly the id.
+        for id in ["z-ai", "wafer.ai", "it's", "a\"b"] {
+            let key = format!("providers.{}.api_key", crate::config::toml_key(id));
+            let parts = toml_edit::Key::parse(&key).expect("a valid dotted key");
+            let parts: Vec<&str> = parts.iter().map(toml_edit::Key::get).collect();
+            assert_eq!(parts, ["providers", id, "api_key"], "{key}");
+        }
     }
 
     /// The listing has to stay short enough to read in an error message

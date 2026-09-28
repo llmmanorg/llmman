@@ -133,7 +133,7 @@ mod tests {
 
         // A provider that takes no key is not "unset": there is nothing
         // to set. One that has a key anyway reports it as any other.
-        let mut p = summary("gpubox", "GPU box");
+        let mut p = summary("inferencebox", "Inference box");
         p.key_env = None;
         p.key_optional = true;
         assert_eq!(key_status(&p), "none needed");
