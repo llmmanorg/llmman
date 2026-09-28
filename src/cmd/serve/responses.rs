@@ -20,8 +20,9 @@
 //! - Ollama's server-side `web_search`/`tool_search` tools are dropped.
 //! - `tool_choice` and `text.format` are forwarded (`/api/chat` has no
 //!   `tool_choice`).
-//! - `namespace` members flatten to `namespace_member`, not
-//!   `namespace.member`: providers enforce `^[a-zA-Z0-9_-]{1,128}$`.
+//! - `namespace` members flatten to reversibly escaped
+//!   `namespace_member`, not `namespace.member`: providers enforce
+//!   `^[a-zA-Z0-9_-]{1,128}$`.
 //!
 //! The request and stream conversion is pure — a JSON request in, SSE
 //! text out — and is tested with no network. The routes at the end of
@@ -50,14 +51,18 @@ use super::sched::ActivityGuard;
 use super::{remote_status, send_chat_completion, AppError, AppState, Target};
 
 /// Whether a provider's answer on `/v1/responses` means "retry as a chat
-/// completion": 404/405/501 (no such route) or any 5xx (`opencode` 500s
-/// the route for every non-OpenAI model). Any other 4xx is the provider's
-/// answer about the caller's key or request, and a retry would bury it.
+/// completion": 404/405/501 (no such route). opencode also 500s the
+/// route for every non-OpenAI model, so keep its compatibility fallback
+/// without treating every provider's transient 5xx as no route support.
 pub(super) fn falls_back(status: StatusCode) -> bool {
     matches!(
         status,
         StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
-    ) || status.is_server_error()
+    )
+}
+
+fn falls_back_for(target: &Target, status: StatusCode) -> bool {
+    falls_back(status) || (target.is_provider("opencode") && status.is_server_error())
 }
 
 // ---------------------------------------------------------------------------
@@ -112,8 +117,9 @@ pub(super) fn from_responses_request(req: &Value) -> anyhow::Result<Value> {
     });
 
     let mut tools: Vec<Value> = Vec::new();
+    let mut tool_names = BTreeMap::new();
     for tool in &available_tools {
-        convert_tools(tool, &mut tools);
+        convert_tools(tool, &mut tools, &mut tool_names)?;
     }
     if !tools.is_empty() {
         chat["tools"] = Value::Array(tools);
@@ -315,11 +321,30 @@ fn append_response_tool_call(messages: &mut Vec<Value>, call: Value) {
 
 /// Ollama's `convertTools`: a `namespace` tool becomes each of its
 /// members under a qualified name; non-function tools are dropped.
-fn convert_tools(tool: &Value, out: &mut Vec<Value>) {
+fn convert_tools(
+    tool: &Value,
+    out: &mut Vec<Value>,
+    names: &mut BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    convert_tools_in(tool, &[], out, names)
+}
+
+fn convert_tools_in(
+    tool: &Value,
+    namespace: &[String],
+    out: &mut Vec<Value>,
+    names: &mut BTreeMap<String, String>,
+) -> anyhow::Result<()> {
     match tool.get("type").and_then(Value::as_str) {
-        Some("function") => out.push(convert_tool(tool, "")),
+        Some("function") => {
+            let converted = convert_tool_in_namespace(tool, namespace);
+            remember_tool_name(tool, namespace, &converted, names)?;
+            out.push(converted);
+        }
         Some("namespace") => {
-            let namespace = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            let mut namespace = namespace.to_vec();
+            namespace.push(name.to_string());
             for member in tool
                 .get("tools")
                 .and_then(Value::as_array)
@@ -327,16 +352,13 @@ fn convert_tools(tool: &Value, out: &mut Vec<Value>) {
                 .flatten()
             {
                 match member.get("type").and_then(Value::as_str) {
-                    Some("function") => out.push(convert_tool(member, namespace)),
+                    Some("function") => {
+                        let converted = convert_tool_in_namespace(member, &namespace);
+                        remember_tool_name(member, &namespace, &converted, names)?;
+                        out.push(converted);
+                    }
                     Some("namespace") => {
-                        let mut inner = Vec::new();
-                        convert_tools(member, &mut inner);
-                        for mut t in inner {
-                            let name = t["function"]["name"].as_str().unwrap_or("").to_string();
-                            t["function"]["name"] =
-                                Value::String(qualify_namespace_tool_name(namespace, &name));
-                            out.push(t);
-                        }
+                        convert_tools_in(member, &namespace, out, names)?;
                     }
                     _ => {}
                 }
@@ -344,12 +366,51 @@ fn convert_tools(tool: &Value, out: &mut Vec<Value>) {
         }
         _ => {}
     }
+    Ok(())
 }
 
-/// Ollama's `convertTool`, plus `strict`, which chat completions has too.
-fn convert_tool(tool: &Value, namespace: &str) -> Value {
+fn remember_tool_name(
+    tool: &Value,
+    namespace: &[String],
+    converted: &Value,
+    names: &mut BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let Some(native) = converted
+        .pointer("/function/name")
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())
+    else {
+        return Ok(());
+    };
+    let raw_name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+    let raw_namespace = raw_namespace_path(namespace);
+    let raw = if raw_namespace.is_empty() {
+        format!("function:{raw_name}")
+    } else {
+        format!("namespace:{raw_namespace}/function:{raw_name}")
+    };
+    if let Some(previous) = names.insert(native.to_string(), raw.clone()) {
+        if previous != raw {
+            anyhow::bail!(
+                "Responses tools {previous:?} and {raw:?} both encode to Chat Completions function name {native:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn convert_tool_in_namespace(tool: &Value, namespace: &[String]) -> Value {
     let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-    let mut function = json!({ "name": qualify_namespace_tool_name(namespace, name) });
+    let native = if namespace.is_empty() {
+        encode_tool_name_segment(name)
+    } else {
+        format!(
+            "{}_{}",
+            encode_namespace_segments(namespace.iter().map(String::as_str)),
+            encode_tool_name_segment(name)
+        )
+    };
+    let mut function = json!({ "name": native });
     for key in ["description", "parameters", "strict"] {
         if let Some(v) = tool.get(key).filter(|v| !v.is_null()) {
             function[key] = v.clone();
@@ -358,59 +419,133 @@ fn convert_tool(tool: &Value, namespace: &str) -> Value {
     json!({ "type": "function", "function": function })
 }
 
-/// Ollama's `qualifyNamespaceToolName`, with `_` wherever Ollama has `.`:
+fn raw_namespace_path(segments: &[String]) -> String {
+    segments.join("_")
+}
+
+/// Ollama's `qualifyNamespaceToolName`, with a reversible segment escape:
 /// providers enforce `^[a-zA-Z0-9_-]{1,128}$` on function names (Anthropic
 /// rejects Codex's `multi_agent_v1.spawn_agent`).
 fn qualify_namespace_tool_name(namespace: &str, member: &str) -> String {
     if namespace.is_empty() || member.is_empty() {
-        return member.to_string();
+        return encode_tool_name_segment(member);
     }
     if let Some(rest) = member.strip_prefix(&format!("{namespace}.")) {
-        return format!("{namespace}_{rest}");
+        return format!(
+            "{}_{}",
+            encode_namespace_path(namespace),
+            encode_tool_name_segment(rest)
+        );
     }
     if member.starts_with(&format!("{namespace}_")) {
-        return member.to_string();
+        return encode_namespace_path(member);
     }
     if member.starts_with('_') {
-        return format!("{namespace}{member}");
+        return format!(
+            "{}_{}",
+            encode_namespace_path(namespace),
+            encode_tool_name_segment(member)
+        );
     }
-    format!("{namespace}_{member}")
+    format!(
+        "{}_{}",
+        encode_namespace_path(namespace),
+        encode_tool_name_segment(member)
+    )
+}
+
+fn raw_namespace_child(namespace: &str, child: &str) -> String {
+    if namespace.is_empty() {
+        child.to_string()
+    } else {
+        format!("{namespace}_{child}")
+    }
+}
+
+/// Encodes a raw namespace path. Existing callers spell nested paths with
+/// `_`, so this preserves that compatibility while escaping literal
+/// underscores inside each segment.
+fn encode_namespace_path(namespace: &str) -> String {
+    encode_namespace_segments(namespace.split('_').filter(|segment| !segment.is_empty()))
+}
+
+/// Encodes namespace structure from explicit segments, using `_` only as the
+/// separator this bridge introduces.
+fn encode_namespace_segments<'a>(segments: impl IntoIterator<Item = &'a str>) -> String {
+    segments
+        .into_iter()
+        .map(encode_tool_name_segment)
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+/// Escapes one namespace or member-name segment into the Chat Completions
+/// function-name alphabet without losing dotted member names.
+fn encode_tool_name_segment(segment: &str) -> String {
+    let mut out = String::new();
+    for byte in segment.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => out.push(byte as char),
+            b'_' => out.push_str("-u-"),
+            b'-' => out.push_str("--"),
+            b'.' => out.push_str("-d-"),
+            b':' => out.push_str("-c-"),
+            other => out.push_str(&format!("_x{other:02X}")),
+        }
+    }
+    out
 }
 
 /// Ollama's `responsesToolCallName`: `(namespace, name)` for a qualified
 /// member of one of the request's `namespace` tools, else `("", qualified)`.
 fn responses_tool_call_name(tools: &[Value], qualified: &str) -> (String, String) {
     for tool in tools {
-        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
-            continue;
-        }
-        let Some(namespace) = tool
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|n| !n.is_empty())
-        else {
-            continue;
-        };
-        for member in tool
-            .get("tools")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if member.get("type").and_then(Value::as_str) == Some("namespace") {
-                continue;
-            }
-            let name = member.get("name").and_then(Value::as_str).unwrap_or("");
-            let native = qualify_namespace_tool_name(namespace, name);
-            if qualified == native
-                || qualified == format!("{namespace}.{name}")
-                || qualified == format!("{namespace}:{name}")
-            {
-                return (namespace.to_string(), name.to_string());
-            }
+        if let Some(found) = responses_tool_call_name_in(tool, "", qualified) {
+            return found;
         }
     }
     (String::new(), qualified.to_string())
+}
+
+fn responses_tool_call_name_in(
+    tool: &Value,
+    parent_namespace: &str,
+    qualified: &str,
+) -> Option<(String, String)> {
+    if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+        return None;
+    }
+    let name = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())?;
+    let namespace = raw_namespace_child(parent_namespace, name);
+    for member in tool
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match member.get("type").and_then(Value::as_str) {
+            Some("function") => {
+                let name = member.get("name").and_then(Value::as_str).unwrap_or("");
+                let native = qualify_namespace_tool_name(&namespace, name);
+                if qualified == native
+                    || qualified == format!("{namespace}.{name}")
+                    || qualified == format!("{namespace}:{name}")
+                {
+                    return Some((namespace, name.to_string()));
+                }
+            }
+            Some("namespace") => {
+                if let Some(found) = responses_tool_call_name_in(member, &namespace, qualified) {
+                    return Some(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Ollama's `convertResponsesContent`: a bare string when all text (every
@@ -1138,6 +1273,18 @@ pub(super) async fn handle_openai_responses(
 /// The generating Responses route, the one Codex talks to.
 pub(super) const RESPONSES_ROUTE: &str = "/v1/responses";
 
+pub(super) const MUSE_RESPONSES_ROUTE: &str = "/muse-code/v1/responses";
+
+/// Muse needs the complete Responses event envelopes and its namespaced
+/// tools preserved, rather than llama-server's native Responses subset.
+pub(super) async fn handle_muse_responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    proxy_openai_generation(&state, &headers, body, MUSE_RESPONSES_ROUTE).await
+}
+
 /// `/v1/responses` for a remote provider: natively when the provider has
 /// it, as a translated chat completion when it doesn't.
 ///
@@ -1181,7 +1328,7 @@ pub(super) async fn remote_responses(
                 relay_rewriting_model(resp, activity, &canonical_model).await
             };
         }
-        if !falls_back(status) {
+        if !falls_back_for(target, status) {
             return Ok(relay(resp, activity));
         }
         eprintln!(
@@ -1190,8 +1337,26 @@ pub(super) async fn remote_responses(
         );
     }
 
-    let chat_req =
+    translated_responses(client, target, req, activity, canonical_model).await
+}
+
+/// Shared Responses-to-chat bridge for providers without native support
+/// and clients requiring a fuller protocol than a local backend exposes.
+pub(super) async fn translated_responses(
+    client: &Client,
+    target: &Target,
+    req: Value,
+    activity: ActivityGuard,
+    canonical_model: String,
+) -> Result<Response, AppError> {
+    let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut chat_req =
         from_responses_request(&req).map_err(|e| AppError(e, StatusCode::BAD_REQUEST))?;
+    if !target.is_remote() {
+        super::openai::apply_default_repeat_penalty(&mut chat_req);
+        super::openai::apply_reasoning_effort(&mut chat_req);
+        super::openai::consolidate_chat_system_messages(&mut chat_req);
+    }
     let upstream = send_chat_completion(client, target, &chat_req, &canonical_model).await?;
     let status = upstream.status;
     if status.is_client_error() {
@@ -1210,6 +1375,8 @@ pub(super) async fn remote_responses(
     Ok(convert_upstream(upstream.body, activity, converter, streaming).await)
 }
 
+/// Proxies the non-generating Responses token-count route without applying
+/// generation-only request rewrites.
 pub(super) async fn handle_openai_responses_input_tokens(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1550,7 +1717,7 @@ mod tests {
     }
 
     /// Ollama's namespace handling: a `namespace` tool is flattened into
-    /// `namespace.member` functions on the way out, a `function_call`
+    /// `namespace_member` functions on the way out, a `function_call`
     /// naming a member is qualified the same way on the way back in
     /// (whether it carries `namespace` or a dotted/colon name), and the
     /// model's call to one is reported under its namespace.
@@ -1576,7 +1743,7 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["agents_spawn", "agents_wait", "shell"]);
+        assert_eq!(names, ["agents_spawn", "agents_-u-wait", "shell"]);
         for name in names {
             assert!(
                 name.chars()
@@ -1586,7 +1753,7 @@ mod tests {
         }
         let calls = chat["messages"][1]["tool_calls"].as_array().unwrap();
         assert_eq!(calls[0]["function"]["name"], "agents_spawn");
-        assert_eq!(calls[1]["function"]["name"], "agents_wait");
+        assert_eq!(calls[1]["function"]["name"], "agents_-u-wait");
         assert_eq!(calls[2]["function"]["name"], "shell");
 
         let lines = [
@@ -1601,6 +1768,197 @@ mod tests {
             .unwrap()["item"];
         assert_eq!(item["namespace"], "agents");
         assert_eq!(item["name"], "spawn");
+    }
+
+    #[test]
+    fn nested_namespace_tools_round_trip_through_the_flattened_name() {
+        let tools = json!([
+            { "type": "namespace", "name": "agents", "tools": [
+                { "type": "namespace", "name": "files", "tools": [
+                    { "type": "function", "name": "read" }
+                ]}
+            ]}
+        ]);
+        let req = json!({ "model": "m", "tools": tools, "tool_choice": {
+            "type": "function", "name": "agents_files.read"
+        }, "input": [
+            { "type": "function_call", "call_id": "c1", "name": "agents_files:read", "arguments": "{}" }
+        ]});
+        let chat = from_responses_request(&req).unwrap();
+        assert_eq!(chat["tools"][0]["function"]["name"], "agents_files_read");
+        assert_eq!(chat["tool_choice"]["function"]["name"], "agents_files_read");
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["name"],
+            "agents_files_read"
+        );
+
+        let lines = [
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"agents_files_read","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ];
+        let (_, events) = run(json!({ "tools": tools }), &lines);
+        let item = &events
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .unwrap()["item"];
+        assert_eq!(item["namespace"], "agents_files");
+        assert_eq!(item["name"], "read");
+    }
+
+    #[test]
+    fn dotted_namespace_member_names_round_trip_through_encoded_chat_names() {
+        let tools = json!([
+            { "type": "namespace", "name": "agents", "tools": [
+                { "type": "function", "name": "files.read" }
+            ]}
+        ]);
+        let req = json!({ "model": "m", "tools": tools, "tool_choice": {
+            "type": "function", "namespace": "agents", "name": "files.read"
+        }, "input": [
+            { "type": "function_call", "call_id": "c1", "namespace": "agents", "name": "files.read", "arguments": "{}" }
+        ]});
+        let chat = from_responses_request(&req).unwrap();
+        assert_eq!(chat["tools"][0]["function"]["name"], "agents_files-d-read");
+        assert_eq!(
+            chat["tool_choice"]["function"]["name"],
+            "agents_files-d-read"
+        );
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["name"],
+            "agents_files-d-read"
+        );
+
+        let lines = [
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"agents_files-d-read","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ];
+        let (_, events) = run(json!({ "tools": tools }), &lines);
+        let item = &events
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .unwrap()["item"];
+        assert_eq!(item["namespace"], "agents");
+        assert_eq!(item["name"], "files.read");
+    }
+
+    #[test]
+    fn punctuation_namespace_names_round_trip_without_double_encoding() {
+        let tools = json!([
+            { "type": "namespace", "name": "my-tools", "tools": [
+                { "type": "namespace", "name": "files.v1", "tools": [
+                    { "type": "function", "name": "read" }
+                ]}
+            ]}
+        ]);
+        let req = json!({ "model": "m", "tools": tools, "tool_choice": {
+            "type": "function", "namespace": "my-tools_files.v1", "name": "read"
+        }, "input": [
+            { "type": "function_call", "call_id": "c1", "namespace": "my-tools_files.v1", "name": "read", "arguments": "{}" }
+        ]});
+        let chat = from_responses_request(&req).unwrap();
+        assert_eq!(
+            chat["tools"][0]["function"]["name"],
+            "my--tools_files-d-v1_read"
+        );
+        assert_eq!(
+            chat["tool_choice"]["function"]["name"],
+            "my--tools_files-d-v1_read"
+        );
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["name"],
+            "my--tools_files-d-v1_read"
+        );
+
+        let lines = [
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"my--tools_files-d-v1_read","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ];
+        let (_, events) = run(json!({ "tools": tools }), &lines);
+        let item = &events
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .unwrap()["item"];
+        assert_eq!(item["namespace"], "my-tools_files.v1");
+        assert_eq!(item["name"], "read");
+    }
+
+    #[test]
+    fn flattened_tool_names_with_literal_underscores_stay_distinct() {
+        let chat = from_responses_request(&json!({
+            "model": "m",
+            "input": "go",
+            "tools": [
+                { "type": "function", "name": "agents_spawn" },
+                { "type": "namespace", "name": "agents", "tools": [
+                    { "type": "function", "name": "spawn" }
+                ]}
+            ]
+        }))
+        .unwrap();
+        let names: Vec<&str> = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["agents-u-spawn", "agents_spawn"]);
+    }
+
+    #[test]
+    fn escape_looking_tool_names_stay_distinct_from_escaped_bytes() {
+        let chat = from_responses_request(&json!({
+            "model": "m",
+            "input": "go",
+            "tools": [
+                { "type": "namespace", "name": "agents", "tools": [
+                    { "type": "function", "name": "é" },
+                    { "type": "function", "name": "_xC3_xA9" }
+                ]}
+            ]
+        }))
+        .unwrap();
+        let names: Vec<&str> = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["agents__xC3_xA9", "agents_-u-xC3-u-xA9"]);
+    }
+
+    #[test]
+    fn namespace_underscores_are_escaped_inside_each_segment() {
+        let chat = from_responses_request(&json!({
+            "model": "m",
+            "input": "go",
+            "tools": [
+                { "type": "namespace", "name": "a__b", "tools": [
+                    { "type": "function", "name": "x" }
+                ]},
+                { "type": "namespace", "name": "a", "tools": [
+                    { "type": "namespace", "name": "b", "tools": [
+                        { "type": "function", "name": "x" }
+                    ]}
+                ]},
+                { "type": "namespace", "name": "_ns", "tools": [
+                    { "type": "function", "name": "x" }
+                ]},
+                { "type": "namespace", "name": "ns_", "tools": [
+                    { "type": "function", "name": "x" }
+                ]}
+            ]
+        }))
+        .unwrap();
+        let names: Vec<&str> = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["a-u--u-b_x", "a_b_x", "-u-ns_x", "ns-u-_x"]);
     }
 
     #[test]
@@ -2304,7 +2662,11 @@ mod tests {
         assert_eq!(qualify_namespace_tool_name("ns", "f"), "ns_f");
         assert_eq!(qualify_namespace_tool_name("ns", "ns.f"), "ns_f");
         assert_eq!(qualify_namespace_tool_name("ns", "ns_f"), "ns_f");
-        assert_eq!(qualify_namespace_tool_name("ns", "_f"), "ns_f");
+        assert_eq!(qualify_namespace_tool_name("ns", "_f"), "ns_-u-f");
+        assert_eq!(
+            qualify_namespace_tool_name("ns", "files.read"),
+            "ns_files-d-read"
+        );
     }
 
     // -- fallback policy ----------------------------------------------------
@@ -2315,9 +2677,6 @@ mod tests {
             StatusCode::NOT_FOUND,
             StatusCode::METHOD_NOT_ALLOWED,
             StatusCode::NOT_IMPLEMENTED,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            StatusCode::BAD_GATEWAY,
-            StatusCode::SERVICE_UNAVAILABLE,
         ] {
             assert!(falls_back(status), "{status}");
         }
@@ -2329,6 +2688,9 @@ mod tests {
             StatusCode::PAYMENT_REQUIRED,
             StatusCode::TOO_MANY_REQUESTS,
             StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
         ] {
             assert!(!falls_back(status), "{status}");
         }

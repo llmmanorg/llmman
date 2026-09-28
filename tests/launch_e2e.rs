@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `cline`, `grok`, `qwen`,
+//! (`claude`, `agy`, `muse`, `opencode`, `pi`, `omp`, `codex`, `cline`, `grok`, `qwen`,
 //! `hermes`,
 //! `openclaw`, `dsh`, `goose`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
@@ -735,9 +735,9 @@ fn launch_and_assert(integration: &str, extra_args: &[&str]) {
 }
 
 /// [`launch_and_assert`], but a *completed* run that never said `pong`
-/// is a test failure, and a timeout is one unless the daemon still
-/// answers afterwards. Used where the integration is expected to be
-/// deterministic enough that a zero exit without inference is not success.
+/// is a test failure, as is a timeout. Used where the integration is
+/// expected to be deterministic enough that the test needs a completed
+/// CLI inference, not only a still-healthy daemon.
 fn launch_and_assert_strict(integration: &str, extra_args: &[&str]) {
     launch_and_assert_with(
         integration,
@@ -834,8 +834,7 @@ fn reply_contains_pong(stdout: &str) -> bool {
 /// The shared body: `nonzero_disposition` rejects, retries, or conditionally
 /// accepts a nonzero exit, `reject_stdout` narrows what a zero exit may be,
 /// `accept_stdout` defines a successful model reply, and `strict` makes
-/// exhausting the sampling attempts a test failure — for a timeout, only
-/// when the daemon has stopped answering (see [`launch_and_assert`]).
+/// exhausting the sampling attempts a test failure.
 fn launch_and_assert_with(
     integration: &str,
     extra_args: &[&str],
@@ -928,9 +927,7 @@ fn launch_and_assert_with(
     } else {
         "an unexpected model reply (or a known non-llmman-caused failure)"
     };
-    // A strict timeout is tolerated only once the daemon is shown to be
-    // fine: then the CLI, not llmman, was the slow party.
-    let tolerated = !strict || (timed_out && daemon_still_answers(integration));
+    let tolerated = !strict && (!timed_out || daemon_still_answers(integration));
     assert!(
         tolerated,
         "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` gave up via {why}\n\
@@ -997,6 +994,34 @@ fn launch_agy_with_model() {
             "--print-timeout",
             &print_timeout,
             "--disable-slash-commands",
+        ],
+    );
+}
+
+#[test]
+fn launch_muse_with_model() {
+    let _guard = lock_serial();
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("muse") {
+        eprintln!("skipping: muse not on PATH — https://dev.meta.ai/docs/muse-code");
+        return;
+    }
+    launch_and_assert_strict(
+        "muse",
+        &[
+            "exec",
+            "--no-session-log",
+            "--disable-shell",
+            "--disable-write",
+            "--disable-web-tools",
+            "--reasoning-effort",
+            "minimal",
+            "--max-model-steps",
+            "4",
+            PROMPT,
         ],
     );
 }

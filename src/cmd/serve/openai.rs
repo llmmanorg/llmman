@@ -353,7 +353,7 @@ pub(super) async fn proxy_openai_generation(
 }
 
 /// [`proxy_openai_generation`] against one resolved target.
-async fn proxy_openai_generation_to(
+pub(super) async fn proxy_openai_generation_to(
     state: &AppState,
     headers: &HeaderMap,
     req: serde_json::Value,
@@ -364,6 +364,23 @@ async fn proxy_openai_generation_to(
 ) -> Result<Response, AppError> {
     let (mut req, target, activity, response_model_override) =
         prepare_openai_request(state, req, model, target, guard).await?;
+    if llama_path == super::responses::MUSE_RESPONSES_ROUTE {
+        let canonical = response_model_override
+            .unwrap_or_else(|| req["model"].as_str().unwrap_or_default().to_string());
+        if target.is_remote() {
+            strip_llama_fields(&mut req);
+            return remote_responses(&state.0.client, &target, headers, req, activity, canonical)
+                .await;
+        }
+        return super::responses::translated_responses(
+            &state.0.client,
+            &target,
+            req,
+            activity,
+            canonical,
+        )
+        .await;
+    }
     if let Some(refusal) = unsupported_on_wire(&target, llama_path) {
         drop(activity);
         return Ok(refusal);

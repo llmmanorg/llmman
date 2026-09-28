@@ -660,7 +660,7 @@ jobs:
 
   # --------------------------------------------------------------------------
   # E2E: `llmman launch
-  # <claude|agy|opencode|pi|omp|codex|cline|grok|qwen|hermes|openclaw|dsh|
+  # <claude|agy|muse|opencode|pi|omp|codex|cline|grok|qwen|hermes|openclaw|dsh|
   # goose|docker-agent> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
@@ -692,7 +692,7 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/agy/opencode/pi/omp/codex/cline/grok/qwen/hermes/openclaw/dsh/goose/docker-agent, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/agy/muse/opencode/pi/omp/codex/cline/grok/qwen/hermes/openclaw/dsh/goose/docker-agent, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
@@ -1151,6 +1151,60 @@ jobs:
           done
           echo "::error::docker-agent never produced a working binary on ${{ runner.os }} ${{ runner.arch }} after $max_attempts attempts"
           exit 1
+
+      # Pinned native Muse binaries from the official release manifest.
+      - name: Install muse (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          MUSE_VERSION: 1.4.0-R4302.1
+          MUSE_PLATFORM: ${{ runner.os }}-${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          case "$MUSE_PLATFORM" in
+            Linux-X64) artifact=muse-x86-linux; checksum=ad21c22965f8600b4473b4ab8354ff7cc483d4cb681b46f2952561d855c8ed86 ;;
+            Linux-ARM64) artifact=muse-aarch64-linux; checksum=79cfba1b9e417b370bdb9154a546c524b7f32a34026e6164b6f3f122f0ea3386 ;;
+            macOS-X64) artifact=muse-x86-macos; checksum=648d8f8b7d7f944e11dda116b1833e9a4ce2e753c8d48db57f0c0200b12e7213 ;;
+            macOS-ARM64) artifact=muse-aarch64-macos; checksum=b7e1ebdf6b5c7e67ddb8ff4b917461f555758545c7db25076b3696d84018d752 ;;
+            *) echo "Unsupported Muse platform: $MUSE_PLATFORM" >&2; exit 1 ;;
+          esac
+          install_dir="$RUNNER_TEMP/muse"
+          mkdir -p "$install_dir"
+          curl --fail --location --retry 3 "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse&version=$MUSE_VERSION&file=$artifact" -o "$install_dir/muse"
+          cd "$install_dir"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "$checksum  muse" | sha256sum -c -
+          else
+            echo "$checksum  muse" | shasum -a 256 -c -
+          fi
+          chmod +x muse
+          ./muse --version
+          echo "$install_dir" >> "$GITHUB_PATH"
+
+      - name: Install muse (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          MUSE_VERSION: 1.4.0-R4302.1
+          MUSE_ARCH: ${{ runner.arch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          switch ($env:MUSE_ARCH) {
+            'X64' { $artifact = 'muse-x86-windows.exe'; $checksum = '61dbb475cb454e89d6e8c6d2e4a22332cd5437437c31654b3591abc72c6b14ac' }
+            'ARM64' { $artifact = 'muse-aarch64-windows.exe'; $checksum = '90416263b95cbee5bcb82a5389537c6965e7c2b36094b09b01c6792b609b71ef' }
+            default { throw "Unsupported Muse architecture: $env:MUSE_ARCH" }
+          }
+          $installDir = Join-Path $env:RUNNER_TEMP 'muse'
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+          $binaryPath = Join-Path $installDir 'muse.exe'
+          curl.exe --fail --location --retry 3 "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse&version=$env:MUSE_VERSION&file=$artifact" -o $binaryPath
+          if ($LASTEXITCODE -ne 0) { throw 'Muse download failed' }
+          if ((Get-FileHash $binaryPath -Algorithm SHA256).Hash -ne $checksum) {
+            throw 'Muse binary checksum mismatch'
+          }
+          & $binaryPath --version
+          if ($LASTEXITCODE -ne 0) { throw 'Muse version check failed' }
+          $installDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       # Pinned official AGY release; verify each runner's archive before installing.
       - name: Install AGY (Unix)

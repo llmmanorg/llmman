@@ -1546,6 +1546,10 @@ impl Target {
         self.wire() == Some(Wire::Anthropic)
     }
 
+    fn is_provider(&self, provider: &str) -> bool {
+        matches!(self, Self::Remote(remote) if remote.provider == provider)
+    }
+
     /// Names this target for an error message. "inference backend" is
     /// what every failure here said before providers existed, and is
     /// still right for a local one; naming the provider is the whole
@@ -3594,6 +3598,12 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .merge(ollama_router())
         // OpenAI API
         .route("/v1/models", get(handle_openai_models))
+        // Muse discovers its catalog before using its Responses adapter.
+        .route("/muse-code/models", get(handle_openai_models))
+        .route(
+            responses::MUSE_RESPONSES_ROUTE,
+            post(responses::handle_muse_responses),
+        )
         .route("/v1/chat/completions", post(handle_openai_chat))
         .route("/v1/completions", post(handle_openai_completions))
         .route("/v1/embeddings", post(handle_openai_embeddings))
