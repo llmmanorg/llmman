@@ -981,15 +981,13 @@ fn launch(
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let name = name.to_lowercase();
+    // Unknown levels are a guess: add the one asked for, don't refuse it.
+    let widened = variant
+        .filter(|_| thinking.is_none())
+        .map(unknown_levels_with);
+    let thinking = widened.as_ref().or(thinking);
     if let Some(variant) = variant {
-        let choices = thinking_choices(thinking);
-        let shown = if model.is_empty() { "the model" } else { model };
-        anyhow::ensure!(!choices.is_empty(), "{shown} does not think");
-        anyhow::ensure!(
-            choices.contains(&variant),
-            "{shown} has no variant {variant}; it has {}",
-            choices.join(", ")
-        );
+        check_variant(model, thinking, variant)?;
     }
     let effort = variant.map(|v| spell_variant(&name, v)).transpose()?;
     let listed = effort.map(|default| Effort {
@@ -1040,6 +1038,19 @@ fn launch(
         "docker-agent" => launch_docker_agent(model, api_key, extra_args),
         other => Err(unknown_integration(other)),
     }
+}
+
+/// Refuses a `--variant` the model is known not to have.
+fn check_variant(model: &str, thinking: Option<&Thinking>, variant: &str) -> anyhow::Result<()> {
+    let choices = thinking_choices(thinking);
+    let shown = if model.is_empty() { "the model" } else { model };
+    anyhow::ensure!(!choices.is_empty(), "{shown} does not think");
+    anyhow::ensure!(
+        choices.contains(&variant),
+        "{shown} has no variant {variant}; it has {}",
+        choices.join(", ")
+    );
+    Ok(())
 }
 
 fn unknown_integration(name: &str) -> anyhow::Error {
@@ -1214,6 +1225,19 @@ fn thinking_choices(thinking: Option<&Thinking>) -> Vec<&str> {
         Some(thinking) => thinking.choices(),
         None => PORTABLE_THINKING_LEVELS.to_vec(),
     }
+}
+
+/// The guessed levels plus `variant`, for a model whose levels are
+/// unknown: a provider can serve a level before models.dev lists it, and
+/// an integration must find its starting level among those it is given.
+/// `thinking` is a template switch, not a level, so it stays refused.
+fn unknown_levels_with(variant: &str) -> Thinking {
+    let levels = std::iter::once("none")
+        .chain(EFFORT_LEVELS.iter().copied())
+        .filter(|l| PORTABLE_THINKING_LEVELS.contains(l) || *l == variant)
+        .map(String::from)
+        .collect();
+    Thinking::Listed(levels)
 }
 
 /// opencode's `variants` for the model, in cycle order (`variant_cycle`,
@@ -6185,6 +6209,44 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
     }
 
     // -- --variant ---------------------------------------------------------
+
+    /// A model with unknown levels (`None`) takes any effort level, and
+    /// opencode finds it among its variants; one with known levels still
+    /// refuses what it lacks.
+    #[test]
+    fn a_variant_is_refused_only_for_a_model_with_known_levels() {
+        let check = |thinking: Option<&Thinking>, variant: &str| {
+            check_variant("m", thinking, variant).map_err(|e| e.to_string())
+        };
+        assert!(check(None, "xhigh").is_err(), "the guess refuses");
+        for variant in ["none", "minimal", "low", "high", "xhigh", "max"] {
+            let widened = unknown_levels_with(variant);
+            check(Some(&widened), variant).unwrap();
+        }
+        let thinking = unknown_levels_with("thinking");
+        assert!(check(Some(&thinking), "thinking").is_err());
+
+        let widened = unknown_levels_with("xhigh");
+        let variants = opencode_variants(Some(&widened));
+        let names: Vec<_> = variants.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["none", "low", "medium", "high", "xhigh"]);
+        assert_eq!(
+            variants[4].1,
+            serde_json::json!({ "reasoningEffort": "xhigh" })
+        );
+
+        let listed = Thinking::Listed(["low", "high"].map(String::from).to_vec());
+        assert!(check(Some(&listed), "high").is_ok());
+        let err = check(Some(&listed), "xhigh").unwrap_err();
+        assert!(
+            err.contains("m has no variant xhigh; it has low, high"),
+            "{err}"
+        );
+        let none = Thinking::Listed(Vec::new());
+        assert!(check(Some(&none), "low")
+            .unwrap_err()
+            .contains("does not think"));
+    }
 
     #[test]
     fn spell_variant_uses_each_integrations_own_words() {

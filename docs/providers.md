@@ -229,7 +229,7 @@ the model's default.
   gets the levels models.dev's `reasoning_options` list, as opencode
   does (Claude Opus 5.5: `low` to `max`; an Anthropic `budget_tokens`
   model: `high`, `max`); none where models.dev says it does not reason;
-  else `none`, `low`, `medium`, `high`.
+  else `none`, `low`, `medium`, `high`, plus the `--variant` asked for.
 - `claude`: Claude Code's `/effort <low|medium|high|xhigh|max>`, sent as
   spelled; a level the template rejects is a 400.
 - `codex`: `model_reasoning_effort`, e.g. `-- -c
@@ -239,7 +239,8 @@ the model's default.
 `--variant`, as on opencode's `run`, picks one of those up front:
 `llmman run qwen3.8 --variant xhigh` sends it as is; `llmman launch`
 first checks the model has it, then hands it over in the integration's
-own form, still changeable from inside:
+own form, still changeable from inside. A model with no known levels,
+such as one models.dev does not list yet, takes any effort level.
 
 | Integration | As | Takes |
 |---|---|---|
