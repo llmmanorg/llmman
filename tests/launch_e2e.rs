@@ -663,7 +663,10 @@ fn run_launch(
         // AGY's background updater replaces its binary in place (seen
         // within a minute of a first run), so without this a retry would
         // run a different AGY than the one CI installed and checksummed.
-        .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+        .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
+        // Cline likewise reinstalls itself as `latest` (CI's pinned 2.18.0
+        // became 3.0.x within ~20s), so a retry ran a different Cline.
+        .env("CLINE_NO_AUTO_UPDATE", "1");
 
     try_spawn_with_timeout(
         cmd,
@@ -813,18 +816,26 @@ fn launch_and_assert_tolerating(
     launch_and_assert_with(
         integration,
         extra_args,
-        |_stdout, stderr| {
-            if tolerate_stderr(stderr) {
-                NonzeroDisposition::Retry
-            } else {
-                NonzeroDisposition::Reject
-            }
-        },
+        retry_on_stderr(tolerate_stderr),
         |_stdout| false,
         reply_contains_pong,
         false,
         |_home| {},
     );
+}
+
+/// A nonzero-exit disposition that retries when `tolerate_stderr` matches
+/// and rejects anything else.
+fn retry_on_stderr(
+    tolerate_stderr: impl Fn(&str) -> bool,
+) -> impl Fn(&str, &str) -> NonzeroDisposition {
+    move |_stdout, stderr| {
+        if tolerate_stderr(stderr) {
+            NonzeroDisposition::Retry
+        } else {
+            NonzeroDisposition::Reject
+        }
+    }
 }
 
 fn reply_contains_pong(stdout: &str) -> bool {
@@ -1308,15 +1319,38 @@ fn launch_docker_agent_with_model() {
     // passes, so a tolerated miss would skip the config checks below
     // and leave the test asserting nothing. A timeout is still
     // forgiven when the daemon is shown to be alive.
+    //
+    // Only docker-agent's own loop guard is retried; any other nonzero
+    // exit still fails at once.
     launch_and_assert_with(
         "docker-agent",
         &["--exec", PROMPT],
-        |_stdout, _stderr| NonzeroDisposition::Reject,
+        retry_on_stderr(docker_agent_stopped_a_degenerate_loop),
         |_stdout| false,
         docker_agent_reply_is_pong,
         true,
         docker_agent_left_the_users_own_config_alone,
     );
+}
+
+/// Whether docker-agent's own loop guard ended the run (`Error: Agent
+/// terminated: detected 5 consecutive identical calls to write_file. This
+/// indicates a degenerate loop where the model is not making progress.`):
+/// model sampling variance, not an llmman failure.
+fn docker_agent_stopped_a_degenerate_loop(stderr: &str) -> bool {
+    stderr.contains("degenerate loop where the model is not making progress")
+}
+
+#[test]
+fn docker_agent_retries_only_its_own_degenerate_loop_guard() {
+    assert!(docker_agent_stopped_a_degenerate_loop(
+        "Error: Agent terminated: detected 5 consecutive identical calls to write_file. \
+         This indicates a degenerate loop where the model is not making progress.\n"
+    ));
+    assert!(!docker_agent_stopped_a_degenerate_loop(
+        "Error: failed to create runtime: connection refused\n"
+    ));
+    assert!(!docker_agent_stopped_a_degenerate_loop(""));
 }
 
 /// Whether the model's *reply* was "pong", ignoring the reasoning
