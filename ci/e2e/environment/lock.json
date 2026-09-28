@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "description": "Concrete e2e environment artifacts consumed by CI. Update digest fields only after the environment build workflow has published and smoke-tested the artifact.",
+  "linux_oci_manifest_list": {
+    "image": "ghcr.io/llmmanorg/llmman-e2e-env",
+    "tag": "2026-09-28",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "platforms": [
+      {"platform": "linux/amd64", "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"},
+      {"platform": "linux/arm64", "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+    ]
+  },
+  "native_bundles": [
+    {"os": "macos", "arch": "arm64", "artifact": "e2e-env-macos-arm64-2026-09-28.tar.zst", "sha256": "TBD"},
+    {"os": "windows", "arch": "x64", "artifact": "e2e-env-windows-x64-2026-09-28.zip", "sha256": "TBD"},
+    {"os": "windows", "arch": "arm64", "artifact": "e2e-env-windows-arm64-2026-09-28.zip", "sha256": "TBD"}
+  ]
+}

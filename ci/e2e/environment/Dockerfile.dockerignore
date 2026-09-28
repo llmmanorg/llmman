@@ -1,0 +1,5 @@
+**
+!.mise.toml
+!ci/e2e/environment/manifest.json
+!ci/e2e/environment/install-npm-tools.js
+!ci/e2e/environment/smoke.sh

@@ -1,0 +1,67 @@
+name: E2E Environment
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - ".mise.toml"
+      - "ci/e2e/environment/**"
+      - "LLAMA_CPP_RELEASE"
+      - "MLX_LM_RELEASE"
+      - "PYTHON_RELEASE"
+      - ".github/workflows/e2e-environment.yml"
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  validate:
+    name: Validate manifest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Validate e2e environment manifest
+        run: python3 ci/e2e/environment/validate.py
+
+  linux:
+    name: Build Linux OCI manifest list
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build and push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: ci/e2e/environment/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          sbom: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/llmman-e2e-env:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/llmman-e2e-env:2026-09-28
+
+      - name: Inspect manifest list
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/llmman-e2e-env
+          ENVIRONMENT_TAG: "2026-09-28"
+        run: docker buildx imagetools inspect "$IMAGE:$ENVIRONMENT_TAG"

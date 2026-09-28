@@ -694,6 +694,7 @@ jobs:
   e2e:
     name: E2E (launch claude/agy/opencode/pi/omp/codex/cline/grok/qwen/hermes/openclaw/dsh/goose/docker-agent, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
     # push event that leads to a release: a push to main — see the
@@ -743,6 +744,8 @@ jobs:
           # ── Linux x86_64 (docker backend) ────────────────────────────────
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
+            container: ghcr.io/llmmanorg/llmman-e2e-env:2026-09-28@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            prebaked_env: true
             go-os: linux
             llama-asset: ubuntu-x64.tar.gz
             backend: docker
@@ -751,6 +754,8 @@ jobs:
           # ── Linux aarch64 (docker backend) ───────────────────────────────
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            container: ghcr.io/llmmanorg/llmman-e2e-env:2026-09-28@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            prebaked_env: true
             go-os: linux
             llama-asset: ubuntu-arm64.tar.gz
             backend: docker
@@ -766,6 +771,8 @@ jobs:
           # the `build` job only compiles this backend, it doesn't run it.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
+            container: ghcr.io/llmmanorg/llmman-e2e-env:2026-09-28@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            prebaked_env: true
             go-os: linux
             llama-asset: ubuntu-x64.tar.gz
             backend: podman
@@ -774,6 +781,8 @@ jobs:
           # ── Linux aarch64 (podman backend) ───────────────────────────────
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            container: ghcr.io/llmmanorg/llmman-e2e-env:2026-09-28@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            prebaked_env: true
             go-os: linux
             llama-asset: ubuntu-arm64.tar.gz
             backend: podman
@@ -782,6 +791,8 @@ jobs:
           # ── macOS aarch64 (Apple Silicon, docker backend) ────────────────
           - target: aarch64-apple-darwin
             runner: macos-15
+            container: null
+            prebaked_env: false
             go-os: darwin
             llama-asset: macos-arm64.tar.gz
             backend: docker
@@ -793,6 +804,8 @@ jobs:
           # previously ran it against a real registry there.
           - target: aarch64-apple-darwin
             runner: macos-15
+            container: null
+            prebaked_env: false
             go-os: darwin
             llama-asset: macos-arm64.tar.gz
             backend: podman
@@ -804,6 +817,8 @@ jobs:
           # containers/image has no Windows support.
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
+            container: null
+            prebaked_env: false
             go-os: windows
             llama-asset: win-cpu-x64.zip
             msvc-arch: amd64
@@ -815,6 +830,8 @@ jobs:
           # rustflags empty; ARM64 keeps its unwind data — see `build`.
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
+            container: null
+            prebaked_env: false
             go-os: windows
             llama-asset: win-cpu-arm64.zip
             msvc-arch: arm64
@@ -823,10 +840,11 @@ jobs:
             feature-flags: ""
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: ${{ !matrix.prebaked_env }}
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version: "1.25"
           cache-dependency-path: go-shim/go.sum
@@ -835,12 +853,13 @@ jobs:
       # there for genuinely cross-compiled targets, harmless here where
       # every target is actually native.
       - name: Set up Rust
+        if: ${{ !matrix.prebaked_env }}
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache Rust build artefacts
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           # backend, not just target: the docker/podman entries sharing a
           # target build with different --features, and Cargo's target dir
@@ -856,7 +875,7 @@ jobs:
       # comment on its identical msvc-arch matrix field).
       - name: Set up MSVC (Windows)
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c # v1.13.0
         with:
           arch: ${{ matrix.msvc-arch }}
 
@@ -867,12 +886,13 @@ jobs:
       # are fully self-contained (verified via `strings`/load-command
       # inspection — no external libomp/libcurl reference either way).
       - name: Install build dependencies (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.prebaked_env
         run: sudo apt-get update && sudo apt-get install -y gcc libgomp1 libcurl4
 
       # ── Node.js (for the claude/opencode/codex CLIs under test) ────────────
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: ${{ !matrix.prebaked_env }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 
@@ -894,11 +914,13 @@ jobs:
       # a registry blip, instead of failing the install), just not
       # detectable by a mere on_path/PATH check. Retrying rides that out.
       - name: Set up Bun for OMP
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        if: ${{ !matrix.prebaked_env }}
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.3.14
 
       - name: Install OMP
+        if: ${{ !matrix.prebaked_env }}
         shell: bash
         run: |
           # Pinned with the minimum Bun version its package declares. The E2E
@@ -907,6 +929,7 @@ jobs:
           omp --version
 
       - name: Install integration CLIs (claude, opencode, pi, codex, cline, qwen, openclaw, dsh)
+        if: ${{ !matrix.prebaked_env }}
         shell: bash
         run: |
           failed_clis=()
@@ -1519,7 +1542,7 @@ jobs:
       # PYTHON_RELEASE's value (`with:` cannot read a file); keep in step.
       - name: Set up Python (mlx e2e)
         if: matrix.target == 'aarch64-apple-darwin'
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
 
@@ -1547,7 +1570,7 @@ jobs:
       # is actually discoverable by the vllm process.
       - name: Set up Python (vllm-plugin e2e)
         if: runner.os == 'Linux' || runner.os == 'macOS'
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
