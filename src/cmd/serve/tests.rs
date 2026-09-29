@@ -331,12 +331,251 @@ async fn call_remote_responses(base_url: &str, stream: bool) -> (StatusCode, Hea
     (status, headers, String::from_utf8_lossy(&body).into_owned())
 }
 
+async fn call_remote_responses_target(
+    target: Target,
+    stream: bool,
+) -> (StatusCode, HeaderMap, String) {
+    let state = test_state();
+    let req = serde_json::json!({ "model": "mock-model", "input": "hi", "stream": stream });
+    let resp = remote_responses(
+        &state.0.client,
+        &target,
+        &HeaderMap::new(),
+        req,
+        ActivityGuard::new(&state, "m"),
+        "llmman.provider/mockprov/mock-model".to_string(),
+    )
+    .await
+    .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, headers, String::from_utf8_lossy(&body).into_owned())
+}
+
+async fn call_muse_remote_responses(
+    base_url: &str,
+    req: serde_json::Value,
+) -> (StatusCode, HeaderMap, String) {
+    let state = test_state();
+    let canonical = "llmman.provider/mockprov/mock-model";
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", "application/json".parse().unwrap());
+    let resp = openai::proxy_openai_generation_to(
+        &state,
+        &headers,
+        req,
+        responses::MUSE_RESPONSES_ROUTE,
+        canonical.to_string(),
+        remote_target(base_url),
+        ActivityGuard::new(&state, canonical),
+    )
+    .await
+    .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, headers, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
+async fn muse_remote_responses_try_native_before_translation() {
+    let seen = Arc::new(tokio::sync::Mutex::new(serde_json::Value::Null));
+    let capture = seen.clone();
+    let app = Router::new()
+        .route(
+            "/v1/responses",
+            post(move |Json(body): Json<serde_json::Value>| async move {
+                *capture.lock().await = body;
+                (
+                    [("content-type", "application/json")],
+                    r#"{"id":"resp_1","object":"response","model":"mock-model","status":"completed","output":[]}"#,
+                )
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(|| async { (StatusCode::IM_A_TEAPOT, "translation was not expected") }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (status, _, body) = call_muse_remote_responses(
+        &format!("http://127.0.0.1:{}/v1", addr.port()),
+        serde_json::json!({
+            "model": "llmman.provider/mockprov/mock-model",
+            "input": "hi",
+            "stream": false,
+            "tools": [
+                {"type": "web_search"},
+                {"type": "namespace", "name": "muse", "tools": [
+                    {"type": "function", "name": "read_file", "parameters": {"type": "object"}}
+                ]}
+            ],
+            "repeat_penalty": 1.1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let request = seen.lock().await;
+    assert_eq!(request["model"], "mock-model");
+    assert_eq!(request["tools"][0]["type"], "web_search");
+    assert_eq!(request["tools"][1]["type"], "namespace");
+    assert_eq!(request["tools"][1]["tools"][0]["name"], "read_file");
+    assert!(request.get("repeat_penalty").is_none(), "{request}");
+    assert!(
+        body.contains("\"model\":\"llmman.provider/mockprov/mock-model\""),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn muse_remote_responses_fall_back_when_native_is_missing() {
+    let seen = Arc::new(tokio::sync::Mutex::new(serde_json::Value::Null));
+    let capture = seen.clone();
+    let app = Router::new()
+        .route("/v1/responses", post(|| async { StatusCode::NOT_FOUND }))
+        .route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| async move {
+                *capture.lock().await = body;
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n\
+                     data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                     data: [DONE]\n\n",
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (status, headers, body) = call_muse_remote_responses(
+        &format!("http://127.0.0.1:{}/v1", addr.port()),
+        serde_json::json!({
+            "model": "llmman.provider/mockprov/mock-model",
+            "input": "hi",
+            "stream": true,
+            "tools": [
+                {"type": "web_search"},
+                {"type": "namespace", "name": "muse", "tools": [
+                    {"type": "function", "name": "read_file", "parameters": {"type": "object"}}
+                ]}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(headers["content-type"], "text/event-stream");
+    assert!(body.contains("event: response.created"), "{body}");
+    assert!(body.contains("\"delta\":\"OK\""), "{body}");
+    let request = seen.lock().await;
+    assert_eq!(request["model"], "mock-model");
+    assert_eq!(request["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(request["tools"][0]["function"]["name"], "muse_read_file");
+}
+
+#[tokio::test]
+async fn muse_remote_responses_relays_transient_native_failures() {
+    let app = Router::new()
+        .route(
+            "/v1/responses",
+            post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("x-provider", "native")],
+                    r#"{"error":{"message":"temporarily unavailable"}}"#,
+                )
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(|| async { (StatusCode::IM_A_TEAPOT, "translation was not expected") }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (status, headers, body) = call_muse_remote_responses(
+        &format!("http://127.0.0.1:{}/v1", addr.port()),
+        serde_json::json!({
+            "model": "llmman.provider/mockprov/mock-model",
+            "input": "hi",
+            "stream": false,
+            "tools": [{"type": "web_search"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(headers.contains_key("x-provider"));
+    assert!(body.contains("temporarily unavailable"), "{body}");
+}
+
+#[tokio::test]
+async fn muse_local_responses_preserve_tools_and_normalize_system_messages() {
+    let seen = Arc::new(tokio::sync::Mutex::new(serde_json::Value::Null));
+    let capture = seen.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<serde_json::Value>| async move {
+            *capture.lock().await = body;
+            (
+                [("content-type", "text/event-stream")],
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"},\"finish_reason\":null}]}\n\n\
+                 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                 data: [DONE]\n\n",
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let state = test_state();
+    let response = responses::translated_responses(
+        &state.0.client,
+        &Target::Local(port),
+        serde_json::json!({
+            "model": "local-model", "stream": true, "instructions": "first",
+            "input": [
+                {"role": "user", "content": "pong"},
+                {"role": "developer", "content": "second"}
+            ],
+            "tools": [{"type": "namespace", "name": "muse", "tools": [
+                {"type": "function", "name": "read_file", "parameters": {"type": "object"}}
+            ]}]
+        }),
+        ActivityGuard::new(&state, "local-model"),
+        "local-model".into(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("event: response.completed"), "{body}");
+    assert!(body.contains("\"sequence_number\":0"), "{body}");
+    assert!(body.contains("\"delta\":\"pong\""), "{body}");
+    let request = seen.lock().await;
+    assert_eq!(request["messages"][0]["content"], "first\n\nsecond");
+    assert_eq!(request["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(request["tools"][0]["function"]["name"], "muse_read_file");
+    task.abort();
+}
+
 /// The provider's own answer on `/v1/responses` decides: a missing or
 /// broken route falls back to a chat completion translated both ways,
 /// anything else is relayed as it came.
 #[tokio::test]
 async fn remote_responses_falls_back_only_on_a_missing_or_broken_route() {
-    for native in [StatusCode::NOT_FOUND, StatusCode::INTERNAL_SERVER_ERROR] {
+    for native in [StatusCode::NOT_FOUND] {
         let base = fake_provider(native).await;
         let (status, headers, body) = call_remote_responses(&base, true).await;
         assert_eq!(status, StatusCode::OK, "{native}");
@@ -358,10 +597,30 @@ async fn remote_responses_falls_back_only_on_a_missing_or_broken_route() {
         assert_eq!(response["usage"]["total_tokens"], 4);
     }
 
+    for native in [StatusCode::INTERNAL_SERVER_ERROR, StatusCode::BAD_GATEWAY] {
+        let base = fake_provider(native).await;
+        let target = Target::Remote(Arc::new(RemoteTarget {
+            provider: "opencode".into(),
+            base_url: base,
+            wire: Wire::OpenAi,
+            model: "mock-model".into(),
+            max_output: None,
+            cost: None,
+            api_key: Some("sk-test".into()),
+        }));
+        let (status, headers, body) = call_remote_responses_target(target, true).await;
+        assert_eq!(status, StatusCode::OK, "{native}");
+        assert_eq!(headers["content-type"], "text/event-stream");
+        assert!(body.contains("event: response.completed"), "{body}");
+    }
+
     for native in [
         StatusCode::OK,
         StatusCode::UNAUTHORIZED,
         StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::BAD_GATEWAY,
+        StatusCode::SERVICE_UNAVAILABLE,
     ] {
         let base = fake_provider(native).await;
         let (status, headers, body) = call_remote_responses(&base, true).await;
@@ -5597,6 +5856,37 @@ fn keyed_state(keys: &[&str]) -> AppState {
     AppState(Arc::new(inner))
 }
 
+#[tokio::test]
+async fn muse_catalog_lists_the_same_models_as_openai() {
+    let state = state_with_peers(vec![], 0);
+    let store_path = state.0.store_path.clone();
+    let url = serve_router_with(state, false).await;
+    let client = Client::new();
+    let openai: serde_json::Value = client
+        .get(format!("{url}/v1/models"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let muse: serde_json::Value = client
+        .get(format!("{url}/muse-code/models"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(muse, openai);
+    assert_eq!(muse["data"][0]["id"], "docker.io/ai/m:latest");
+    std::fs::remove_dir_all(store_path).unwrap();
+}
+
 /// Every route but the UI's own files wants the key, in either header
 /// spelling; a wrong or missing one is a 401 with a challenge.
 #[tokio::test]
@@ -5607,6 +5897,7 @@ async fn a_keyed_daemon_refuses_everything_but_its_own_page_without_the_key() {
     for path in [
         "/api/version",
         "/v1/models",
+        "/muse-code/models",
         "/llmman/node",
         "/llmman/search?q=qwen",
         "/llmman/search/popular",

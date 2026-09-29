@@ -611,6 +611,11 @@ struct Integration {
 
 const INTEGRATIONS: &[Integration] = &[
     Integration {
+        name: "muse",
+        description: "Meta Muse Code",
+        binary: "muse",
+    },
+    Integration {
         name: "claude",
         description: "Claude Code",
         binary: "claude",
@@ -867,6 +872,8 @@ const LOW_TO_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// levels it takes for an unknown model without clamping (pi, omp and
 /// Cline clamp the rest). opencode takes llmman's own variants.
 const VARIANT_SPELLINGS: &[(&str, Option<&str>, &[&str])] = &[
+    // The Meta provider rejects `none`, despite advertising it in --help.
+    ("muse", None, EFFORT_LEVELS),
     ("claude", None, LOW_TO_MAX),
     ("codex", Some("none"), EFFORT_LEVELS),
     ("pi", Some("off"), &["minimal", "low", "medium", "high"]),
@@ -928,6 +935,7 @@ struct Effort<'a> {
 /// dsh take it in their configuration instead.
 fn effort_args(integration: &str, effort: &str) -> Vec<String> {
     let flags: &[&str] = match integration {
+        "muse" => &["--reasoning-effort"],
         "claude" | "copilot" | "copilot-cli" | "grok" => &["--effort"],
         "pi" | "omp" | "cline" => &["--thinking"],
         "hermes" => &["--reasoning"],
@@ -996,7 +1004,13 @@ fn launch(
             .filter_map(|c| spell_variant(&name, c).ok())
             .collect(),
     });
+    // Muse dispatches headless mode only when `exec` is the first argument.
+    // Keep it ahead of the effort flags as well as the launcher defaults.
+    let command_len =
+        usize::from(name == "muse" && extra_args.first().is_some_and(|arg| arg == "exec"));
+    let (command, extra_args) = extra_args.split_at(command_len);
     let extra_args = &[
+        command.to_vec(),
         effort.map_or_else(Vec::new, |e| effort_args(&name, e)),
         extra_args.to_vec(),
     ]
@@ -1008,6 +1022,7 @@ fn launch(
             .and_then(Thinking::template)
             .is_some_and(|t| t.thinks);
     match name.as_str() {
+        "muse" => launch_muse(model, api_key, extra_args),
         "claude" => launch_claude(model, api_key, extra_args),
         "opencode" => launch_opencode(
             model,
@@ -1086,6 +1101,11 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
     let data = xdg("XDG_DATA_HOME", ".local/share");
     let state = xdg("XDG_STATE_HOME", ".local/state");
     Ok(match name {
+        "muse" => vec![
+            Dir(config.join("muse")),
+            Dir(data.join("muse")),
+            Dir(home.join(".muse")),
+        ],
         "claude" => match env_dir("CLAUDE_CONFIG_DIR") {
             Some(dir) => vec![Dir(dir)],
             None => vec![Dir(home.join(".claude")), Files(home.join(".claude.json"))],
@@ -1130,6 +1150,36 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
 // ---------------------------------------------------------------------------
 // Per-integration launchers
 // ---------------------------------------------------------------------------
+
+fn muse_args(model: &str, base_url: &str, extra_args: &[String]) -> Vec<String> {
+    let mut args = Vec::new();
+    // Muse's headless parser requires `exec` before its options; putting
+    // --model/--base-url before it selects the interactive parser instead.
+    let extra_args = if extra_args.first().is_some_and(|arg| arg == "exec") {
+        args.push("exec".to_string());
+        &extra_args[1..]
+    } else {
+        extra_args
+    };
+    args.extend(["--provider".to_string(), "meta".to_string()]);
+    args.extend(["--base-url".to_string(), base_url.to_string()]);
+    if !model.is_empty() {
+        args.extend(["--model".to_string(), model.to_string()]);
+    }
+    args.extend_from_slice(extra_args);
+    args
+}
+
+/// Muse's Meta provider accepts a custom Responses API endpoint.
+fn launch_muse(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_on_path("muse").ok_or_else(|| anyhow::anyhow!("muse is not installed"))?;
+    let args = muse_args(model, &format!("{}/muse-code/v1", server()), extra_args);
+    exec_with_env(
+        &bin,
+        &args,
+        &[("META_API_KEY", api_key), ("MUSE_NO_AUTO_UPDATE", "1")],
+    )
+}
 
 /// claude: set ANTHROPIC_BASE_URL and a dummy ANTHROPIC_API_KEY so it talks to
 /// our server's Anthropic-compatible API.
@@ -3725,6 +3775,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn muse_is_listed_as_an_integration() {
+        let muse = INTEGRATIONS.iter().find(|i| i.name == "muse").unwrap();
+        assert_eq!(muse.binary, "muse");
+        assert!(!MODEL_REQUIRED.contains(&"muse"));
+        assert!(!CONFIGURED_BY_FILE.contains(&"muse"));
+    }
+
+    #[test]
+    fn muse_options_follow_the_headless_subcommand() {
+        let extra = ["exec", "--max-model-steps", "1", "reply pong"].map(String::from);
+        assert_eq!(
+            muse_args("local-model", "http://localhost:1234/v1", &extra),
+            [
+                "exec",
+                "--provider",
+                "meta",
+                "--base-url",
+                "http://localhost:1234/v1",
+                "--model",
+                "local-model",
+                "--max-model-steps",
+                "1",
+                "reply pong"
+            ]
+        );
+    }
+
+    #[test]
+    fn muse_interactive_args_preserve_the_default_model_and_prompt() {
+        assert_eq!(
+            muse_args("", "http://localhost:1234/v1", &["hello".into()]),
+            [
+                "--provider",
+                "meta",
+                "--base-url",
+                "http://localhost:1234/v1",
+                "hello"
+            ]
+        );
+    }
+
+    #[test]
     fn agy_settings_are_written_to_the_llmman_owned_directory() {
         let dir = std::env::temp_dir().join(format!(
             "llmman-agy-settings-{}-{}",
@@ -6252,6 +6344,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         let ok = |name, variant| spell_variant(name, variant).unwrap();
         assert_eq!(ok("opencode", "thinking"), "thinking");
         assert_eq!(ok("codex", "none"), "none");
+        assert_eq!(ok("muse", "minimal"), "minimal");
         assert_eq!(ok("pi", "none"), "off");
         assert_eq!(ok("dsh", "none"), "off");
         assert_eq!(ok("claude", "max"), "max");
@@ -6273,6 +6366,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert!(err("pi", "xhigh").contains("none, minimal"));
         assert!(err("cline", "minimal").contains("cline cannot start"));
         assert!(err("kimi", "high").contains("--variant does not work with kimi"));
+        assert!(err("muse", "none").contains("muse cannot start"));
         assert!(err("nope", "high").contains("unknown integration"));
     }
 
@@ -6296,6 +6390,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
     #[test]
     fn effort_args_lead_with_each_integrations_flag() {
         let args = |name| effort_args(name, "high");
+        assert_eq!(args("muse"), ["--reasoning-effort", "high"]);
         assert_eq!(args("claude"), ["--effort", "high"]);
         assert_eq!(args("pi"), ["--thinking", "high"]);
         assert_eq!(args("hermes"), ["--reasoning", "high"]);
