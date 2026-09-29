@@ -580,6 +580,14 @@ impl Catalog {
         self.providers.get(id)
     }
 
+    /// Whether `provider` is a models.dev entry that does not list `model`,
+    /// the one case a newer catalog might fix. A configured provider has no
+    /// list here (its endpoint is asked), and an unknown id is another error.
+    pub fn lacks_model(&self, provider: &str, model: &str) -> bool {
+        self.get(provider)
+            .is_some_and(|p| !p.key_optional && !p.models.iter().any(|m| m.id == model))
+    }
+
     /// Every routable provider, ordered by id.
     pub fn iter(&self) -> impl Iterator<Item = &Provider> {
         self.providers.values()
@@ -907,6 +915,82 @@ fn base_url_of(api: &str) -> String {
 /// reach models.dev would pay [`FETCH_TIMEOUT`] again.
 const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// The soonest [`catalog_listing`] re-fetches after any fetch, so a model
+/// models.dev never lists (a typo) costs one download, not one per request.
+const MISS_REFRESH_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+static GATE: Gate = Gate::new(MISS_REFRESH_COOLDOWN);
+
+/// Serializes catalog downloads (the background refresh and
+/// [`catalog_listing`] share one) and remembers when the last one ran, so
+/// a queued download that another already covered is skipped.
+struct Gate {
+    cooldown: Duration,
+    turn: Mutex<()>,
+    last: Mutex<Option<Instant>>,
+}
+
+impl Gate {
+    /// A gate whose downloads are `cooldown` apart at the soonest.
+    const fn new(cooldown: Duration) -> Self {
+        Self {
+            cooldown,
+            turn: Mutex::new(()),
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Notes that models.dev was just asked, whatever came of it.
+    fn record(&self) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+
+    /// When models.dev was last asked.
+    fn last(&self) -> Option<Instant> {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Runs the background `load` in its turn, unless a download finished
+    /// while it queued: that one already answered.
+    fn background(&self, load: impl FnOnce()) {
+        self.background_since(Instant::now(), load);
+    }
+
+    /// [`Gate::background`] for a `load` queued at `queued`.
+    fn background_since(&self, queued: Instant, load: impl FnOnce()) {
+        let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        if self.last().is_none_or(|at| at < queued) {
+            load();
+        }
+    }
+
+    /// `held()`, replaced by `fetch()` when it lacks `model` and no download
+    /// ran within the cooldown. A failed fetch keeps the held catalog.
+    fn listing(
+        &self,
+        provider: &str,
+        model: &str,
+        held: impl Fn() -> anyhow::Result<Arc<Catalog>>,
+        fetch: impl FnOnce() -> anyhow::Result<Arc<Catalog>>,
+    ) -> anyhow::Result<Arc<Catalog>> {
+        let current = held()?;
+        if !current.lacks_model(provider, model) {
+            return Ok(current);
+        }
+        let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        // A download that ran while this waited may already list it.
+        let current = held()?;
+        let cooling = self.last().is_some_and(|at| at.elapsed() < self.cooldown);
+        if !current.lacks_model(provider, model) || cooling {
+            return Ok(current);
+        }
+        fetch().or_else(|e| {
+            eprintln!("[llmman] could not refresh the provider list ({e:#})");
+            Ok(current)
+        })
+    }
+}
+
 /// The last [`load`], when it happened, and how long it is good for. The
 /// error is kept as a message rather than an `anyhow::Error`, which is
 /// not cloneable.
@@ -947,8 +1031,10 @@ pub fn catalog() -> anyhow::Result<Arc<Catalog>> {
                         }
                     }
                     let _done = Done;
-                    let entry = load_entry();
-                    *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(entry);
+                    GATE.background(|| {
+                        let entry = load_entry();
+                        *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(entry);
+                    });
                 });
             }
             Ok(stale)
@@ -960,6 +1046,20 @@ pub fn catalog() -> anyhow::Result<Arc<Catalog>> {
             result
         }
     }
+}
+
+/// [`catalog`], re-fetched first if `provider` is a models.dev entry that
+/// does not list `model`: the snapshot may predate the model. Waits out a
+/// background refresh rather than duplicating it, re-fetches at most once
+/// per [`MISS_REFRESH_COOLDOWN`], and keeps the held catalog if the fetch
+/// fails. Blocking, like [`catalog`].
+pub fn catalog_listing(provider: &str, model: &str) -> anyhow::Result<Arc<Catalog>> {
+    GATE.listing(provider, model, catalog, || {
+        let fresh = entry(Instant::now(), refresh(cache_path().as_deref())?, CACHE_TTL);
+        let result = result_of(&fresh.2);
+        *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(fresh);
+        result
+    })
 }
 
 fn result_of(result: &Result<Arc<Catalog>, String>) -> anyhow::Result<Arc<Catalog>> {
@@ -975,11 +1075,10 @@ fn load_entry() -> Cached {
     let configured = crate::config::configured_providers();
     let now = Instant::now();
     match load() {
-        Ok(loaded) => (
-            now,
-            loaded.good_for(),
-            Ok(Arc::new(loaded.into_catalog().with_configured(configured))),
-        ),
+        Ok(loaded) => {
+            let good_for = loaded.good_for();
+            entry(now, loaded.into_catalog(), good_for)
+        }
         Err(e) if !configured.is_empty() => {
             eprintln!(
                 "[llmman] using only the {} provider(s) defined in llmman.conf ({e:#})",
@@ -993,6 +1092,17 @@ fn load_entry() -> Cached {
         }
         Err(e) => (now, RETRY_COOLDOWN, Err(format!("{e:#}"))),
     }
+}
+
+/// `catalog` with `llmman.conf`'s providers merged in, as [`catalog`]
+/// caches it.
+fn entry(at: Instant, catalog: Catalog, good_for: Duration) -> Cached {
+    let configured = crate::config::configured_providers();
+    (
+        at,
+        good_for,
+        Ok(Arc::new(catalog.with_configured(configured))),
+    )
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -1054,24 +1164,8 @@ fn load() -> anyhow::Result<Loaded> {
         }
     }
 
-    crate::debug_log!("provider catalog: fetching {CATALOG_URL}");
-    // Parse is part of the refresh, not a separate step after it: a 200
-    // carrying a truncated body or a captive portal's HTML is a failed
-    // refresh, and must reach the stale cache below like any other.
-    let refreshed = fetch(CATALOG_URL).and_then(|raw| {
-        let catalog = Catalog::from_json(&raw)?;
-        Ok((catalog, raw))
-    });
-
-    match refreshed {
-        Ok((catalog, raw)) => {
-            // Best-effort: an unwritable cache costs a fetch next time,
-            // nothing more, so it must not fail the load.
-            if let Some(path) = &path {
-                let _ = write_cache(path, &raw);
-            }
-            Ok(Loaded::Fresh(catalog))
-        }
+    match refresh(path.as_deref()) {
+        Ok(catalog) => Ok(Loaded::Fresh(catalog)),
         Err(err) => {
             let stale = path
                 .as_deref()
@@ -1089,6 +1183,23 @@ fn load() -> anyhow::Result<Loaded> {
             }
         }
     }
+}
+
+/// Fetches models.dev whatever the cache says, and caches what it sent.
+/// Parsing is part of it: a truncated body or a captive portal's HTML is a
+/// failed refresh, which [`load`] answers from the stale cache.
+fn refresh(path: Option<&std::path::Path>) -> anyhow::Result<Catalog> {
+    crate::debug_log!("provider catalog: fetching {CATALOG_URL}");
+    let fetched = fetch(CATALOG_URL);
+    GATE.record();
+    let raw = fetched?;
+    let catalog = Catalog::from_json(&raw)?;
+    // Best-effort: an unwritable cache costs a fetch next time, nothing
+    // more, so it must not fail the load.
+    if let Some(path) = path {
+        let _ = write_cache(path, &raw);
+    }
+    Ok(catalog)
 }
 
 /// Writes the cache atomically (`fsutil::write_atomic`), as opencode does
@@ -1187,6 +1298,159 @@ mod tests {
 
     fn catalog_from(json: &str) -> Catalog {
         Catalog::from_json(json.as_bytes()).expect("fixture parses")
+    }
+
+    /// An `anthropic` catalog listing exactly `models`.
+    fn anthropic_with(models: &[&str]) -> Catalog {
+        let models: Vec<String> = models.iter().map(|m| format!("{m:?}: {{}}")).collect();
+        catalog_from(&format!(
+            r#"{{"anthropic": {{
+                "id": "anthropic", "name": "Anthropic",
+                "npm": "@ai-sdk/anthropic", "env": ["ANTHROPIC_API_KEY"],
+                "models": {{ {} }}
+            }}}}"#,
+            models.join(", ")
+        ))
+    }
+
+    /// Only a catalog entry missing the model lacks it: not a listed model,
+    /// an unknown provider, or a configured one (its endpoint is asked).
+    #[test]
+    fn only_a_catalog_entry_missing_the_model_lacks_it() {
+        let catalog = anthropic_with(&["claude-sonnet-5"]);
+        assert!(!catalog.lacks_model("anthropic", "claude-sonnet-5"));
+        assert!(catalog.lacks_model("anthropic", "claude-sonnet-5-5"));
+        assert!(!catalog.lacks_model("nope", "claude-sonnet-5-5"));
+
+        let configured = Catalog::from_configured(&[configured(
+            "inferencebox",
+            "http://10.0.0.5:8000/v1",
+            Wire::OpenAi,
+        )]);
+        assert!(!configured.lacks_model("inferencebox", "anything"));
+    }
+
+    /// A [`Gate`] over a catalog held in a cell, with a scripted models.dev.
+    struct Fake {
+        gate: Gate,
+        held: std::cell::RefCell<Arc<Catalog>>,
+        fetches: std::cell::Cell<u32>,
+    }
+
+    impl Fake {
+        fn new(cooldown: Duration, models: &[&str]) -> Self {
+            Self {
+                gate: Gate::new(cooldown),
+                held: std::cell::RefCell::new(Arc::new(anthropic_with(models))),
+                fetches: std::cell::Cell::new(0),
+            }
+        }
+
+        /// One `catalog_listing`; models.dev lists `upstream`, or is down.
+        fn listing(&self, model: &str, upstream: Option<&[&str]>) -> Arc<Catalog> {
+            self.gate
+                .listing(
+                    "anthropic",
+                    model,
+                    || Ok(self.held.borrow().clone()),
+                    || {
+                        self.fetches.set(self.fetches.get() + 1);
+                        self.gate.record();
+                        let models = upstream.ok_or_else(|| anyhow::anyhow!("offline"))?;
+                        let fresh = Arc::new(anthropic_with(models));
+                        *self.held.borrow_mut() = fresh.clone();
+                        Ok(fresh)
+                    },
+                )
+                .unwrap()
+        }
+    }
+
+    const OLD: &[&str] = &["claude-sonnet-5"];
+    const NEW: &[&str] = &["claude-sonnet-5", "claude-sonnet-5-5"];
+
+    /// The reported bug: a model newer than the snapshot is found by
+    /// fetching, once, and the fresh catalog is what is held afterwards.
+    #[test]
+    fn a_model_newer_than_the_snapshot_is_found_by_fetching() {
+        let fake = Fake::new(Duration::from_secs(60), OLD);
+
+        let got = fake.listing("claude-sonnet-5-5", Some(NEW));
+
+        assert!(!got.lacks_model("anthropic", "claude-sonnet-5-5"));
+        assert!(!fake
+            .held
+            .borrow()
+            .lacks_model("anthropic", "claude-sonnet-5-5"));
+        assert_eq!(fake.fetches.get(), 1);
+    }
+
+    /// A listed model never fetches.
+    #[test]
+    fn a_listed_model_does_not_fetch() {
+        let fake = Fake::new(Duration::from_secs(60), OLD);
+        fake.listing("claude-sonnet-5", Some(&[]));
+        assert_eq!(fake.fetches.get(), 0);
+    }
+
+    /// A model models.dev never lists stays unlisted, and is asked about
+    /// once per cooldown, not once per launch.
+    #[test]
+    fn a_persistent_miss_fetches_once_per_cooldown() {
+        let fake = Fake::new(Duration::from_secs(3600), OLD);
+        for _ in 0..3 {
+            assert!(fake
+                .listing("typo", Some(OLD))
+                .lacks_model("anthropic", "typo"));
+        }
+        assert_eq!(fake.fetches.get(), 1);
+
+        let fake = Fake::new(Duration::ZERO, OLD);
+        fake.listing("typo", Some(OLD));
+        fake.listing("typo", Some(OLD));
+        assert_eq!(fake.fetches.get(), 2);
+    }
+
+    /// A models.dev that is down keeps the catalog held, and still counts
+    /// toward the cooldown so an offline machine does not retry per request.
+    #[test]
+    fn a_failed_fetch_keeps_the_held_catalog() {
+        let fake = Fake::new(Duration::from_secs(3600), OLD);
+        for _ in 0..2 {
+            let got = fake.listing("claude-sonnet-5-5", None);
+            assert!(got.lacks_model("anthropic", "claude-sonnet-5-5"));
+            assert!(!got.lacks_model("anthropic", "claude-sonnet-5"));
+        }
+        assert_eq!(fake.fetches.get(), 1);
+    }
+
+    /// An unknown provider is the daemon's error to give, not a download.
+    #[test]
+    fn an_unknown_provider_does_not_fetch() {
+        let gate = Gate::new(Duration::ZERO);
+        let held = Arc::new(anthropic_with(OLD));
+        gate.listing("nope", "x", || Ok(held.clone()), || panic!("fetched"))
+            .unwrap();
+    }
+
+    /// A background refresh queued behind a download that already ran (even
+    /// a failed one) does not download again; one queued after it does.
+    #[test]
+    fn a_queued_background_refresh_yields_to_a_download_that_ran() {
+        let gate = Gate::new(Duration::ZERO);
+        let ran = std::cell::Cell::new(0);
+        let run = || ran.set(ran.get() + 1);
+
+        gate.background_since(Instant::now(), run);
+        assert_eq!(ran.get(), 1);
+
+        let queued = Instant::now();
+        gate.record();
+        gate.background_since(queued, run);
+        assert_eq!(ran.get(), 1, "queued before the download that ran");
+
+        gate.background_since(Instant::now() + Duration::from_secs(1), run);
+        assert_eq!(ran.get(), 2, "queued after it");
     }
 
     /// The base case: an `@ai-sdk/openai-compatible` provider with one

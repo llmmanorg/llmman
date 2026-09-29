@@ -11,7 +11,9 @@ use base64::Engine as _;
 // `HttpBody` is axum's re-export of the `http_body::Body` trait, in
 // scope only for `size_hint` in `track_metrics`.
 use axum::body::{Body, Bytes, HttpBody as _};
-use axum::extract::{DefaultBodyLimit, FromRequest, MatchedPath, Path as UrlPath, Request, State};
+use axum::extract::{
+    DefaultBodyLimit, FromRequest, MatchedPath, Path as UrlPath, Query, Request, State,
+};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -1641,7 +1643,24 @@ fn daemon_key_spendable(state: &AppState, headers: Option<&HeaderMap>) -> bool {
 /// later one is memoized, and a 502 when that fetch fails — the failure
 /// is upstream's, not the caller's.
 async fn provider_catalog() -> Result<Arc<crate::providers::Catalog>, AppError> {
-    tokio::task::spawn_blocking(crate::providers::catalog)
+    catalog_blocking(crate::providers::catalog).await
+}
+
+/// [`provider_catalog`], re-fetched first if `provider` does not list
+/// `model` (see [`crate::providers::catalog_listing`]).
+async fn provider_catalog_listing(
+    provider: &str,
+    model: &str,
+) -> Result<Arc<crate::providers::Catalog>, AppError> {
+    let (provider, model) = (provider.to_string(), model.to_string());
+    catalog_blocking(move || crate::providers::catalog_listing(&provider, &model)).await
+}
+
+/// Runs a blocking catalog `load` off the runtime.
+async fn catalog_blocking(
+    load: impl FnOnce() -> anyhow::Result<Arc<crate::providers::Catalog>> + Send + 'static,
+) -> Result<Arc<crate::providers::Catalog>, AppError> {
+    tokio::task::spawn_blocking(load)
         .await
         .context("provider catalog task panicked")?
         .map_err(|e| AppError(e, StatusCode::BAD_GATEWAY))
@@ -3015,6 +3034,25 @@ impl ProviderResponse {
     }
 }
 
+/// The query of `GET /llmman/providers/:id`.
+#[derive(Deserialize)]
+struct ProviderQuery {
+    /// The model the caller is about to use. Not a filter: it makes a
+    /// catalog that lacks it be re-fetched before it is reported.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+impl ProviderQuery {
+    /// The hint, unless blank: a blank one would spend a download on nothing.
+    fn model(&self) -> Option<&str> {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+    }
+}
+
 /// `GET /llmman/providers` — every provider `--provider` accepts.
 async fn handle_llmman_providers(
     State(state): State<AppState>,
@@ -3036,8 +3074,12 @@ async fn handle_llmman_providers(
 async fn handle_llmman_provider(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
+    Query(query): Query<ProviderQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let catalog = provider_catalog().await?;
+    let catalog = match query.model() {
+        Some(model) => provider_catalog_listing(&id, model).await?,
+        None => provider_catalog().await?,
+    };
     let provider = catalog.get(&id).ok_or_else(|| {
         AppError(
             crate::providers::unknown_provider_error(&id, &catalog),

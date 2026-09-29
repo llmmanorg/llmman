@@ -406,8 +406,8 @@ fn provider_model(provider: &str, model: &str) -> anyhow::Result<(String, Option
         crate::daemon::server()
     );
 
-    let entry = daemon::provider(provider)?;
     let model = model.trim();
+    let entry = daemon::provider(provider, Some(model).filter(|m| !m.is_empty()))?;
     anyhow::ensure!(
         !model.is_empty(),
         "--provider {provider} also needs a model\n\n{}",

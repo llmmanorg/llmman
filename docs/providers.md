@@ -26,6 +26,10 @@ The provider list comes from [models.dev](https://models.dev), the
 catalog `opencode` uses, so a new provider needs no llmman release. It
 is cached for 24 hours and a stale copy is used when the fetch fails.
 
+When `--model` names a model the cached catalog lacks, the daemon re-fetches
+once (at most every five minutes) before warning that the provider does not list
+it. If that fetch is skipped or fails, the warning reflects the cached catalog.
+
 All four commands read it from the daemon over
 [`/llmman/providers`](api.md#llmmans-own-api), so the cache outlives any
 one command and the key status reported is the daemon's.

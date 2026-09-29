@@ -134,7 +134,9 @@ this daemon can route to, each with its API-key variable, whether the
 daemon has that key, and how many models it serves;
 `/llmman/providers/{id}` adds those models and what each costs in US
 dollars per million tokens (absent, not zero, where models.dev publishes
-no price), including `cache_read`/`cache_write`/`reasoning` where it publishes those. `llmman providers`, `list --provider`, `run --provider` and
+no price), including `cache_read`/`cache_write`/`reasoning` where it publishes those.
+`?model=<id>` filters nothing; a catalog that lacks it is re-fetched first
+(at most every five minutes). `llmman providers`, `list --provider`, `run --provider` and
 `launch --provider` are all clients of it, so the catalog is fetched and
 cached in one process: the one that forwards the request upstream.
 

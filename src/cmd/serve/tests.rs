@@ -6226,3 +6226,22 @@ async fn the_usage_ledger_prices_a_provider_reply_and_skips_the_rest() {
     assert!((entry.cost.unwrap() - want).abs() < 1e-12, "{entry:?}");
     assert_eq!(entry.rate.unwrap().cache_read, 0.3);
 }
+
+/// A blank `?model=` names nothing, so it must not trigger a catalog fetch.
+#[test]
+fn a_blank_model_hint_is_no_hint() {
+    let hint = |model: Option<&str>| {
+        super::ProviderQuery {
+            model: model.map(str::to_string),
+        }
+        .model()
+        .map(str::to_string)
+    };
+    assert_eq!(hint(None), None);
+    assert_eq!(hint(Some("")), None);
+    assert_eq!(hint(Some("  \t")), None);
+    assert_eq!(
+        hint(Some(" claude-sonnet-5-5 ")),
+        Some("claude-sonnet-5-5".into())
+    );
+}

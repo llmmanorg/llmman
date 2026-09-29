@@ -520,17 +520,16 @@ fn resolve_provider_model(
     // Asked of the daemon, not models.dev: it routes the request, so it
     // is the authority on whether this provider exists — and on whether
     // *it* has the key, which this shell cannot see.
-    let entry = daemon::provider(provider)?;
+    let model = model.map(str::trim).filter(|m| !m.is_empty());
+    // Sent so a catalog that predates the model is refreshed, not warned about.
+    let entry = daemon::provider(provider, model)?;
 
-    let model = model
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "--provider {provider} also needs --model\n\n{}",
-                providers::example_models(&entry.name, &entry.model_ids())
-            )
-        })?;
+    let model = model.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--provider {provider} also needs --model\n\n{}",
+            providers::example_models(&entry.name, &entry.model_ids())
+        )
+    })?;
 
     entry.warn_unlisted(model);
 

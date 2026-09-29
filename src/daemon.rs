@@ -1554,14 +1554,26 @@ impl ProviderDetail {
 /// Looks one provider up in the daemon's catalog. An unknown id comes
 /// back as the daemon's own error, near-matches included (see
 /// `crate::providers::unknown_provider_error`).
-pub fn provider(id: &str) -> anyhow::Result<ProviderDetail> {
-    get_json(&format!("/llmman/providers/{}", encode_path_segment(id)))
+///
+/// `model` is the one the caller is about to use, if any: a daemon whose
+/// catalog lacks it re-fetches before answering. Older daemons ignore it.
+pub fn provider(id: &str, model: Option<&str>) -> anyhow::Result<ProviderDetail> {
+    get_json(&provider_path(id, model))
+}
+
+/// The route for [`provider`], `model` as one encoded query value.
+fn provider_path(id: &str, model: Option<&str>) -> String {
+    let query = model
+        .map(|m| format!("?model={}", encode_path_segment(m)))
+        .unwrap_or_default();
+    format!("/llmman/providers/{}{query}", encode_path_segment(id))
 }
 
 /// Percent-encodes everything outside the unreserved set, so a typo'd id
 /// stays one path segment: `a/b` would otherwise miss the daemon's
 /// single-segment route (an empty 404 from axum's router instead of
-/// llmman's "unknown provider"), and `../` would address another.
+/// llmman's "unknown provider"), and `../` would address another. Also
+/// right for a query value, where `&` and `#` would end it.
 fn encode_path_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
@@ -1645,6 +1657,23 @@ mod tests {
 
     /// A typo'd id has to stay one segment, or the daemon's "unknown
     /// provider" answer never gets printed.
+    /// The model stays one query value, whatever `/`, `&` or `#` it holds.
+    #[test]
+    fn provider_path_carries_the_model_as_one_query_value() {
+        assert_eq!(
+            provider_path("anthropic", None),
+            "/llmman/providers/anthropic"
+        );
+        assert_eq!(
+            provider_path("anthropic", Some("claude-sonnet-5-5")),
+            "/llmman/providers/anthropic?model=claude-sonnet-5-5"
+        );
+        assert_eq!(
+            provider_path("openrouter", Some("anthropic/claude-sonnet-5.5&x=1#f")),
+            "/llmman/providers/openrouter?model=anthropic%2Fclaude-sonnet-5.5%26x%3D1%23f"
+        );
+    }
+
     #[test]
     fn encode_path_segment_keeps_a_typo_inside_one_segment() {
         assert_eq!(encode_path_segment("openrouter"), "openrouter");
