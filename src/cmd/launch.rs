@@ -129,11 +129,14 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         let id = name.to_lowercase();
         let carries_key =
             provider.is_some() || overflow.is_some() || crate::auth::client_key().is_some();
+        // A --variant goes into opencode's state (`write_opencode_variant`).
+        let configured_by_file =
+            CONFIGURED_BY_FILE.contains(&id.as_str()) || (id == "opencode" && variant.is_some());
         sandbox::prepare(
             kind,
             &id,
             sandbox_state(&id)?,
-            CONFIGURED_BY_FILE.contains(&id.as_str()),
+            configured_by_file,
             carries_key,
         )?;
     }
@@ -1108,7 +1111,7 @@ const CONFIGURED_BY_FILE: &[&str] = &[
 fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
     use sandbox::State::{Dir, Files};
     let home = dirs::home_dir().context("no home directory")?;
-    let xdg = |var: &str, default: &str| env_dir(var).unwrap_or_else(|| home.join(default));
+    let xdg = |var: &str, default: &str| xdg_dir(&home, var, default);
     let config = xdg("XDG_CONFIG_HOME", ".config");
     let data = xdg("XDG_DATA_HOME", ".local/share");
     let state = xdg("XDG_STATE_HOME", ".local/state");
@@ -1120,7 +1123,7 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
         "opencode" => vec![
             Dir(config.join("opencode")),
             Dir(data.join("opencode")),
-            Dir(state.join("opencode")),
+            Dir(opencode_state_dir()?),
             Dir(xdg("XDG_CACHE_HOME", ".cache").join("opencode")),
         ],
         "codex" => vec![Dir(codex_dir()?)],
@@ -1202,7 +1205,7 @@ fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
 /// opencode: a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
 /// /v1 endpoint, with the model's thinking variants, its window and, for
 /// a vision model, image input. `--variant` becomes the model's default
-/// options.
+/// options and its selection in opencode's state.
 #[allow(clippy::too_many_arguments)]
 fn launch_opencode(
     model: &str,
@@ -1229,8 +1232,41 @@ fn launch_opencode(
         context_window,
         max_output,
     );
+    if let Some(variant) = variant {
+        write_opencode_variant(&opencode_state_dir()?, effective_model, variant)?;
+    }
 
     exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
+}
+
+/// opencode's state directory, where its `xdg-basedir` puts it.
+fn opencode_state_dir() -> anyhow::Result<PathBuf> {
+    let home = crate::config::home_dir().context("no home directory")?;
+    Ok(xdg_dir(&home, "XDG_STATE_HOME", ".local/state").join("opencode"))
+}
+
+/// `$var`, else `default` under `home`.
+fn xdg_dir(home: &Path, var: &str, default: &str) -> PathBuf {
+    env_dir(var).unwrap_or_else(|| home.join(default))
+}
+
+/// How opencode names `model` on llmman's provider.
+fn opencode_model_ref(model: &str) -> String {
+    format!("ollama/{model}")
+}
+
+/// Selects `variant` for `model` in opencode's `model.json`, as ctrl+t
+/// does. Its UI sends that selection, which outranks the model's
+/// `options`; only `opencode run` sends those alone.
+fn write_opencode_variant(state_dir: &Path, model: &str, variant: &str) -> anyhow::Result<()> {
+    write_json_merged(&state_dir.join("model.json"), "opencode", |existing| {
+        let mut merged = existing.clone();
+        if !merged["variant"].is_object() {
+            merged["variant"] = serde_json::json!({});
+        }
+        merged["variant"][opencode_model_ref(model)] = variant.into();
+        merged
+    })
 }
 
 /// The thinking choices a model offers an integration, in cycle order.
@@ -1490,7 +1526,7 @@ fn opencode_config(
                 )],
             },
         },
-        model: format!("ollama/{model}"),
+        model: opencode_model_ref(model),
     };
     serde_json::to_string(&config).expect("opencode config serializes")
 }
@@ -4465,6 +4501,7 @@ mod tests {
             );
         };
         covers("codex", codex_dir().unwrap());
+        covers("opencode", opencode_state_dir().unwrap().join("model.json"));
         covers("pi", pi_agent_dir().unwrap());
         covers("omp", omp_agent_dir().unwrap());
         covers("cline", cline_data_dir().unwrap());
@@ -6355,8 +6392,8 @@ model = \"gpt-5\"
         assert!(!bare.contains("variants"), "{bare}");
     }
 
-    /// `--variant` makes its options the model's own, which requests carry
-    /// until a cycled-to variant overrides them.
+    /// `--variant` makes its options the model's own, which requests that
+    /// name no variant (all of `opencode run`'s) carry.
     #[test]
     fn opencode_config_starts_the_model_at_the_variant() {
         let variants = opencode_variants(None);
@@ -6381,6 +6418,53 @@ model = \"gpt-5\"
         let text = opencode_config("http://h", "m", "k", &variants, None, false, None, None);
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert!(config["provider"]["ollama"]["models"]["m"]["options"].is_null());
+    }
+
+    #[test]
+    fn write_opencode_variant_selects_the_model_and_keeps_the_rest() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-opencode-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("state").join("opencode").join("model.json");
+        let state = path.parent().unwrap();
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        };
+
+        // No file yet.
+        write_opencode_variant(state, "m", "xhigh").unwrap();
+        assert_eq!(
+            read(),
+            serde_json::json!({ "variant": { "ollama/m": "xhigh" } })
+        );
+
+        // Another model's selection and the rest of the state stay.
+        std::fs::write(
+            &path,
+            r#"{"recent":[{"modelID":"o"}],"variant":{"ollama/m":"medium","ollama/o":"low"}}"#,
+        )
+        .unwrap();
+        write_opencode_variant(state, "m", "xhigh").unwrap();
+        let written = read();
+        assert_eq!(written["variant"]["ollama/m"], "xhigh");
+        assert_eq!(written["variant"]["ollama/o"], "low");
+        assert_eq!(written["recent"][0]["modelID"], "o");
+
+        // A `variant` that is not an object is replaced; a file that is not
+        // a JSON object is left alone, as opencode resets it itself.
+        std::fs::write(&path, r#"{"variant":"high"}"#).unwrap();
+        write_opencode_variant(state, "m", "low").unwrap();
+        assert_eq!(read()["variant"], serde_json::json!({ "ollama/m": "low" }));
+        std::fs::write(&path, "[1, 2").unwrap();
+        write_opencode_variant(state, "m", "low").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[1, 2");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -7530,6 +7614,30 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         .args;
         let err = run(&args).unwrap_err().to_string();
         assert!(err.contains("not after --"), "{err}");
+    }
+
+    /// OpenShell gets none of the host's files, including the state a
+    /// `--variant` is written to.
+    #[cfg(not(windows))]
+    #[test]
+    fn opencode_variant_is_refused_where_the_sandbox_gets_no_files() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: LaunchArgs,
+        }
+        let args = <Cli as clap::Parser>::try_parse_from([
+            "l",
+            "opencode",
+            "--sandbox",
+            "openshell",
+            "--variant",
+            "high",
+        ])
+        .unwrap()
+        .args;
+        let err = run(&args).unwrap_err().to_string();
+        assert!(err.contains("openshell cannot run opencode"), "{err}");
     }
 
     #[test]

@@ -65,10 +65,10 @@ as `CLAUDE_CONFIG_DIR`) that contains your home directory is refused.
   exits. The sandbox is kept until you delete it. OpenShell cannot see
   files in your home directory, so the integrations llmman configures
   through files there (codex, pi, omp, cline, qwen, hermes, openclaw, agy,
-  dsh, grok, docker-agent) are refused. `host.openshell.internal` is the
-  gateway's machine, so a loopback daemon needs the gateway running on
-  this machine. Otherwise, point `LLMMAN_HOST` at a daemon the gateway can
-  reach.
+  dsh, grok, docker-agent, and opencode with `--variant`) are refused.
+  `host.openshell.internal` is the gateway's machine, so a loopback
+  daemon needs the gateway running on this machine. Otherwise, point
+  `LLMMAN_HOST` at a daemon the gateway can reach.
 
 ## Images
 

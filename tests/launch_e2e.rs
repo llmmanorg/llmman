@@ -91,7 +91,7 @@
 //!     `cmd::serve::responses::consolidate_responses_instructions`.
 
 use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, Once};
@@ -627,22 +627,21 @@ fn daemon_still_answers(integration: &str) -> bool {
     }
 }
 
-/// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
-/// with `home` as its `HOME`, returning `Err(TimedOut)` (rather than
-/// panicking) if it had to be killed at `TIMEOUT` — see `warm_model`,
-/// `try_spawn_with_timeout`, and `launch_and_assert` for who retries
-/// that and why.
-fn run_launch(
+/// `llmman launch <integration> --model qwen3.5:0.8b <launch_flags> --
+/// <extra_args>` with `home` as its `HOME`, and every directory an
+/// integration keeps its state in under it.
+fn launch_command(
     home: &Path,
     integration: &str,
+    launch_flags: &[&str],
     extra_args: &[&str],
-) -> Result<std::process::Output, TimedOut> {
-    eprintln!("[run_launch] {integration}: calling warm_model()");
-    warm_model();
-    eprintln!("[run_launch] {integration}: warm_model() returned, spawning launch");
-
+) -> Command {
     let mut cmd = Command::new(llmman_bin());
-    cmd.arg("launch").arg(integration).arg("--model").arg(MODEL);
+    cmd.arg("launch")
+        .arg(integration)
+        .arg("--model")
+        .arg(MODEL)
+        .args(launch_flags);
     if !extra_args.is_empty() {
         cmd.arg("--").args(extra_args);
     }
@@ -650,6 +649,7 @@ fn run_launch(
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
         // Set, not cleared: a `QWEN_HOME` (or `GROK_HOME`, `CLINE_DIR`) in
         // the developer's shell would send the settings a launch writes
         // past this `HOME`, and on Windows `dirs::home_dir` reads neither
@@ -669,9 +669,25 @@ fn run_launch(
         // Cline likewise reinstalls itself as `latest` (CI's pinned 2.18.0
         // became 3.0.x within ~20s), so a retry ran a different Cline.
         .env("CLINE_NO_AUTO_UPDATE", "1");
+    cmd
+}
+
+/// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
+/// with `home` as its `HOME`, returning `Err(TimedOut)` (rather than
+/// panicking) if it had to be killed at `TIMEOUT` — see `warm_model`,
+/// `try_spawn_with_timeout`, and `launch_and_assert` for who retries
+/// that and why.
+fn run_launch(
+    home: &Path,
+    integration: &str,
+    extra_args: &[&str],
+) -> Result<std::process::Output, TimedOut> {
+    eprintln!("[run_launch] {integration}: calling warm_model()");
+    warm_model();
+    eprintln!("[run_launch] {integration}: warm_model() returned, spawning launch");
 
     try_spawn_with_timeout(
-        cmd,
+        launch_command(home, integration, &[], extra_args),
         TIMEOUT,
         &format!("`llmman launch {integration} --model {MODEL} -- {extra_args:?}`"),
     )
@@ -1118,6 +1134,212 @@ fn launch_codex_in_a_container_sandbox() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `--variant`
+// ---------------------------------------------------------------------------
+
+/// `MODEL` offers `none` and `thinking`; claude and codex take `thinking`
+/// as `medium`.
+const VARIANT: &str = "thinking";
+const SPELLED: &str = "medium";
+/// An effort the tool saved itself, for the launch to outrank. Its
+/// background requests (claude's session title) send it regardless, so
+/// only that the variant's effort is sent can be checked.
+const SAVED: &str = "high";
+
+/// A TCP relay in front of the daemon, keeping what clients send: the
+/// tools don't print their effort, so their requests are where to look.
+struct Relay {
+    addr: String,
+    sent: Arc<Mutex<Vec<u8>>>,
+}
+
+fn relay_to_daemon() -> Relay {
+    let upstream = llmman::daemon::server()
+        .trim_start_matches("http://")
+        .to_string();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the relay");
+    let addr = listener.local_addr().expect("relay address").to_string();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&sent);
+    std::thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            let Ok(server) = std::net::TcpStream::connect(&upstream) else {
+                continue;
+            };
+            let (Ok(from_client), Ok(to_server)) = (client.try_clone(), server.try_clone()) else {
+                continue;
+            };
+            let record = Arc::clone(&record);
+            std::thread::spawn(move || relay_bytes(from_client, to_server, Some(record)));
+            std::thread::spawn(move || relay_bytes(server, client, None));
+        }
+    });
+    Relay { addr, sent }
+}
+
+/// Copies `from` to `to` until either ends, keeping a copy in `record`.
+fn relay_bytes(
+    mut from: std::net::TcpStream,
+    mut to: std::net::TcpStream,
+    record: Option<Arc<Mutex<Vec<u8>>>>,
+) {
+    let mut buf = [0u8; 16 * 1024];
+    while let Ok(n) = from.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        if let Some(record) = &record {
+            record.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+        if to.write_all(&buf[..n]).is_err() {
+            break;
+        }
+    }
+    let _ = to.shutdown(std::net::Shutdown::Write);
+}
+
+/// What a real integration sent the daemon when launched at [`VARIANT`].
+struct VariantLaunch {
+    home: PathBuf,
+    sent: String,
+    output: String,
+}
+
+impl VariantLaunch {
+    /// The values of the string field `key` in what was sent.
+    fn sent_values(&self, key: &str) -> Vec<&str> {
+        let needle = format!("\"{key}\":\"");
+        self.sent
+            .match_indices(&needle)
+            .map(|(at, _)| {
+                let rest = &self.sent[at + needle.len()..];
+                &rest[..rest.find('"').unwrap_or(rest.len())]
+            })
+            .collect()
+    }
+}
+
+/// Launches `integration` at [`VARIANT`] behind a [`Relay`], after `saved`
+/// has set up its fresh `HOME`. The request is what is checked, not the
+/// reply, and a run killed at `TIMEOUT` has sent it already.
+fn launch_at_variant(
+    integration: &str,
+    extra_args: &[&str],
+    saved: impl FnOnce(&Path),
+) -> VariantLaunch {
+    warm_model();
+    let home = fresh_home(integration);
+    saved(&home);
+    let relay = relay_to_daemon();
+    let mut cmd = launch_command(&home, integration, &["--variant", VARIANT], extra_args);
+    cmd.env("LLMMAN_HOST", &relay.addr);
+    let description =
+        format!("`llmman launch {integration} --variant {VARIANT} -- {extra_args:?}`");
+    let output = match try_spawn_with_timeout(cmd, TIMEOUT, &description) {
+        Ok(output) => format!(
+            "--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(timed_out) => timed_out.message,
+    };
+    let sent = String::from_utf8_lossy(&relay.sent.lock().unwrap()).into_owned();
+    VariantLaunch { home, sent, output }
+}
+
+fn write_saved(home: &Path, file: &str, contents: &str) {
+    let path = home.join(file);
+    std::fs::create_dir_all(path.parent().unwrap()).expect("create the saved file's directory");
+    std::fs::write(path, contents).expect("write the saved file");
+}
+
+/// False, with a note, unless llama-server and `tool` are installed.
+fn installed(tool: &str, hint: &str) -> bool {
+    let found = on_path("llama-server") && on_path(tool);
+    if !found {
+        eprintln!("skipping: needs llama-server and {tool} on PATH ({hint})");
+    }
+    found
+}
+
+/// claude and codex send the launch's effort, not the one in their own
+/// settings (`saved_file`).
+fn variant_outranks_saved_effort(
+    tool: &str,
+    hint: &str,
+    args: &[&str],
+    saved_file: &str,
+    saved: &str,
+) {
+    let _guard = lock_serial();
+    if !installed(tool, hint) {
+        return;
+    }
+    let launch = launch_at_variant(tool, args, |home| write_saved(home, saved_file, saved));
+    let sent = launch.sent_values("effort");
+    assert!(
+        sent.contains(&SPELLED),
+        "{tool} should send effort {SPELLED:?}, not just its saved {SAVED:?}; it sent {sent:?}\n{}",
+        launch.output
+    );
+}
+
+#[test]
+fn launch_claude_variant_outranks_the_saved_effort() {
+    variant_outranks_saved_effort(
+        "claude",
+        "https://code.claude.com/docs/en/quickstart",
+        &["-p", PROMPT],
+        ".claude/settings.json",
+        &format!(r#"{{"effortLevel":"{SAVED}"}}"#),
+    );
+}
+
+#[test]
+fn launch_codex_variant_outranks_the_saved_effort() {
+    variant_outranks_saved_effort(
+        "codex",
+        "npm install -g @openai/codex",
+        &["exec", PROMPT],
+        ".codex/config.toml",
+        &format!("model_reasoning_effort = \"{SAVED}\"\n"),
+    );
+}
+
+/// `opencode run` sends the model's options; its UI sends the selection
+/// in `model.json`, which the launch has to replace.
+#[test]
+fn launch_opencode_variant_outranks_the_saved_selection() {
+    let _guard = lock_serial();
+    if !installed("opencode", "https://opencode.ai") {
+        return;
+    }
+    let model = format!(
+        "ollama/{}",
+        llmman::shortnames::resolve_ollama_api(MODEL).expect("MODEL resolves")
+    );
+    let state = ".local/state/opencode/model.json";
+    let launch = launch_at_variant("opencode", &["run", PROMPT], |home| {
+        let saved = serde_json::json!({ "variant": { &model: "none" } });
+        write_saved(home, state, &saved.to_string());
+    });
+
+    let sent = launch.sent_values("reasoning_effort");
+    assert!(
+        sent.contains(&SPELLED) && launch.sent.contains(r#""enable_thinking":true"#),
+        "opencode should send effort {SPELLED:?} with thinking on; it sent {sent:?}\n{}",
+        launch.output
+    );
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(launch.home.join(state)).unwrap()).unwrap();
+    assert_eq!(
+        saved["variant"][&model], VARIANT,
+        "opencode's saved selection: {saved}\n{}",
+        launch.output
+    );
+}
+
 #[test]
 fn launch_pi_with_model() {
     eprintln!("[test] launch_pi_with_model: acquiring SERIAL");
@@ -1240,6 +1462,7 @@ fn cline_nonzero_is_only_missing_completion_tool(stdout: &str, stderr: &str) -> 
                     event["type"] == "error"
                         && event["message"].as_str().is_some_and(|message| {
                             message.contains("Too many consecutive mistakes")
+                                || message.contains("attempt_completion without value")
                         })
                 })
         })
@@ -1261,6 +1484,10 @@ fn cline_json_reply_requires_the_final_result_to_be_exactly_pong() {
     ));
     assert!(cline_nonzero_is_only_missing_completion_tool(
         "{\"type\":\"error\",\"message\":\"[YOLO MODE] Task failed: Too many consecutive mistakes (3).\"}\n",
+        ""
+    ));
+    assert!(cline_nonzero_is_only_missing_completion_tool(
+        "{\"type\":\"error\",\"message\":\"Cline tried to use attempt_completion without value for required parameter 'result'. Retrying...\"}\n",
         ""
     ));
     assert!(!cline_nonzero_is_only_missing_completion_tool(
