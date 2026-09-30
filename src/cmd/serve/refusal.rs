@@ -19,15 +19,10 @@ use crate::providers::Wire;
 /// a round trip that could only 404.
 pub(super) fn unsupported_on_wire(target: &Target, route: &str) -> Option<Response> {
     let message = wire_refusal(target, route)?;
-    Some(refuse(StatusCode::NOT_IMPLEMENTED, message))
-}
-
-/// A request turned down, in OpenAI's error envelope.
-pub(super) fn refuse(status: StatusCode, message: impl Into<String>) -> Response {
     let body = serde_json::json!({
-        "error": { "message": message.into(), "type": "invalid_request_error" }
+        "error": { "message": message, "type": "invalid_request_error" }
     });
-    (status, Json(body)).into_response()
+    Some((StatusCode::NOT_IMPLEMENTED, Json(body)).into_response())
 }
 
 /// The message behind [`unsupported_on_wire`], for the Ollama embedding

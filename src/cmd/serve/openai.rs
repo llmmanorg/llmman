@@ -15,7 +15,7 @@ use tokio::time::{sleep, Duration, Instant};
 use super::backend::would_use_mlx;
 use super::hybrid::{request_pin, send_with_hybrid_fallback};
 use super::messages::content_text;
-use super::refusal::{explain_missing_route, refuse, unsupported_on_wire};
+use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::relay::{
     proxy, proxy_rewriting_model, relay, relay_chat_upstream, stream_rewriting_model,
 };
@@ -589,14 +589,17 @@ pub(super) async fn forward_openai_request(
 /// `Engine::Mlx` backend — see that function's own doc comment on why
 /// that request could never succeed there anyway.
 pub(super) fn mlx_embeddings_unsupported_response(canonical_model: &str) -> Response {
-    refuse(
-        StatusCode::NOT_IMPLEMENTED,
-        format!(
-            "{canonical_model} is served by mlx_lm.server, which llmman never starts with \
-             --embedding-model — /v1/embeddings isn't supported for it; use a GGUF or \
-             vllm-served model for embeddings instead"
-        ),
-    )
+    let body = serde_json::json!({
+        "error": {
+            "message": format!(
+                "{canonical_model} is served by mlx_lm.server, which llmman never starts with \
+                 --embedding-model — /v1/embeddings isn't supported for it; use a GGUF or \
+                 vllm-served model for embeddings instead"
+            ),
+            "type": "invalid_request_error",
+        }
+    });
+    (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()
 }
 
 pub(super) async fn handle_openai_chat(
@@ -666,7 +669,7 @@ async fn handle_openai_media(
 
 /// The engine behind a [`Target::Local`]; `None` for anything else, or a
 /// backend unloaded since `ensure_model` (the request then fails on its own).
-pub(super) async fn local_engine(state: &AppState, target: &Target) -> Option<Engine> {
+async fn local_engine(state: &AppState, target: &Target) -> Option<Engine> {
     let Target::Local(port) = target else {
         return None;
     };
