@@ -367,15 +367,15 @@ mod tests {
     use super::*;
 
     /// Regression test guarding against exactly the leak CodeRabbit
-    /// flagged on this PR: an `Engine::Mlx` backend is addressed by its
+    /// flagged in review: an `Engine::Mlx` backend is addressed by its
     /// real on-disk directory path (see `backend_wire_model`), and
     /// `mlx_lm.server` echoes whatever `"model"` value it received
     /// straight back into its own response — so a plain byte-for-byte
     /// relay would leak that internal path back to the client instead of
     /// the name it actually asked for. `set_response_model` is the one
     /// place both `rewrite_json_response_model` and
-    /// `rewrite_sse_line_model` below delegate the actual field
-    /// substitution to.
+    /// `rewrite_sse_line_model` delegate the actual field substitution
+    /// to.
     #[test]
     fn set_response_model_overwrites_an_existing_model_field_and_leaves_a_missing_one_alone() {
         let mut with_model = serde_json::json!({"model": "/abs/path/to/model", "id": "x"});
