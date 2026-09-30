@@ -483,16 +483,149 @@ pub fn pull_image(
     engine: ContainerEngine,
     version: Option<&str>,
 ) -> Result<()> {
+    use std::io::Write;
+
     let image = image_for(engine, version)?;
-    eprintln!("[llmman] {}: pulling {image}...", ociman.binary());
-    let status = std::process::Command::new(ociman.binary())
-        .args(["pull", &image])
-        .status()
-        .with_context(|| format!("run {} pull {image}", ociman.binary()))?;
-    if !status.success() {
-        anyhow::bail!("{} pull {image} failed", ociman.binary());
+    let cli = ociman.binary();
+    let header = format!("[llmman] {cli}: pulling {image}...");
+    eprintln!("{header}");
+    let (success, reason) = match pull_progress_sink() {
+        Some((mut sink, cols)) => {
+            let _ = write!(sink, "{header}\r\n");
+            let run = run_on_pty(cli, &["pull", &image], cols, &mut sink)?;
+            (run.success, run.last_line)
+        }
+        None => {
+            let status = std::process::Command::new(cli)
+                .args(["pull", &image])
+                .status()
+                .with_context(|| format!("run {cli} pull {image}"))?;
+            (status.success(), None)
+        }
+    };
+    if !success {
+        anyhow::bail!(
+            "{cli} pull {image} failed{}",
+            reason.map(|l| format!(": {l}")).unwrap_or_default()
+        );
     }
     Ok(())
+}
+
+/// The download marker's status while [`pull_image`] runs; the client
+/// keys on it to show the pull's output.
+pub const PULL_STATUS: &str = "pulling the llama.cpp container image";
+
+/// Set by `daemon::ensure_server` on the daemon it spawns for a terminal:
+/// a file the client replays to its terminal, and that terminal's width.
+/// The daemon's stdio is a log file, where `docker pull`/`podman pull`
+/// print no progress, so [`pull_image`] runs them on a pty of that width
+/// and appends what they draw to the file.
+pub const PULL_PROGRESS_FILE_ENV: &str = "LLMMAN_PULL_PROGRESS_FILE";
+pub const PULL_PROGRESS_COLS_ENV: &str = "LLMMAN_PULL_PROGRESS_COLS";
+
+/// The file and width from those variables. `None` (pull on inherited
+/// stdio) if unset or the file is gone: the client removes it when it
+/// stops listening, so a later pull, like a lazy retry, goes to the log.
+fn pull_progress_sink() -> Option<(std::fs::File, u16)> {
+    let path = std::env::var_os(PULL_PROGRESS_FILE_ENV)?;
+    let cols = std::env::var(PULL_PROGRESS_COLS_ENV)
+        .ok()?
+        .parse::<u16>()
+        .ok()
+        .filter(|c| *c > 0)?;
+    // Append-only across pulls, so the client's offset stays valid.
+    let file = std::fs::OpenOptions::new().append(true).open(path).ok()?;
+    Some((file, cols))
+}
+
+struct PtyRun {
+    success: bool,
+    /// See [`last_output_line`].
+    last_line: Option<String>,
+}
+
+/// Runs `program` on a pty of `cols` columns, writing what it draws to
+/// `sink`. Sink errors are ignored: the pty must still be drained or the
+/// program would block.
+fn run_on_pty(
+    program: &str,
+    args: &[&str],
+    cols: u16,
+    sink: &mut dyn std::io::Write,
+) -> Result<PtyRun> {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::Read;
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("open a pty")?;
+    let mut cmd = CommandBuilder::new(program);
+    cmd.args(args);
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .with_context(|| format!("run {program}"))?;
+    // Held open, the slave would keep the reader from seeing EOF.
+    drop(pair.slave);
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .context("read from the pty")?;
+    const TAIL: usize = 4096;
+    let mut tail = Vec::new();
+    let mut buf = [0u8; 8192];
+    // Ends when the program exits: Linux reports the closed slave as an
+    // error after handing over what was buffered.
+    while let Ok(n @ 1..) = reader.read(&mut buf) {
+        let _ = sink.write_all(&buf[..n]);
+        tail.extend_from_slice(&buf[..n]);
+        if tail.len() > TAIL {
+            tail.drain(..tail.len() - TAIL);
+        }
+    }
+    let status = child.wait().with_context(|| format!("wait on {program}"))?;
+    // The master stays open until here: closing it hangs the program up.
+    drop(pair.master);
+    Ok(PtyRun {
+        success: status.success(),
+        last_line: last_output_line(&tail),
+    })
+}
+
+/// The last non-empty line of terminal output, control sequences removed:
+/// a failed pull's reason, for the error (and so the daemon's log).
+fn last_output_line(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut plain = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // CSI: parameter bytes, then one final byte in `@`..=`~`.
+            '\x1b' => {
+                if chars.next() == Some('[') {
+                    for n in chars.by_ref() {
+                        if ('@'..='~').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+            }
+            '\r' | '\n' => plain.push('\n'),
+            c if c.is_control() => {}
+            c => plain.push(c),
+        }
+    }
+    plain
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(str::to_owned)
 }
 
 /// How long [`verify_llama_server_runs`] waits for its container.
@@ -1022,6 +1155,55 @@ pub fn stop(_pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_output_line_drops_control_sequences_and_redraws() {
+        let out = b"Pulling\r\n\x1b[1A\x1b[2K\rabc: Downloading  1MB/3MB\r\x1b[1B\x1b[1A\x1b[2K\rError response from daemon: denied \r\n\r\n";
+        assert_eq!(
+            last_output_line(out).as_deref(),
+            Some("Error response from daemon: denied")
+        );
+        assert_eq!(last_output_line(b"\x1b[2K\r\n"), None);
+        assert_eq!(last_output_line(b""), None);
+    }
+
+    /// A pty is a terminal to the program on it, of the width asked for,
+    /// and everything it prints reaches the sink, carriage returns and all.
+    #[cfg(unix)]
+    #[test]
+    fn run_on_pty_gives_the_program_a_terminal_and_relays_its_output() {
+        let mut sink = Vec::new();
+        let run = run_on_pty(
+            "sh",
+            &[
+                "-c",
+                "test -t 1 && stty size; printf 'half\\rdone\\n'; echo 'boom: nope' >&2; exit 3",
+            ],
+            97,
+            &mut sink,
+        )
+        .unwrap();
+        let text = String::from_utf8_lossy(&sink);
+        assert!(text.contains("24 97"), "got: {text:?}");
+        assert!(text.contains("half\rdone"), "got: {text:?}");
+        assert!(!run.success);
+        assert_eq!(run.last_line.as_deref(), Some("boom: nope"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_on_pty_reports_success() {
+        let mut sink = Vec::new();
+        let run = run_on_pty("sh", &["-c", "echo ok"], 80, &mut sink).unwrap();
+        assert!(run.success);
+        assert_eq!(run.last_line.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn run_on_pty_reports_a_missing_program() {
+        let err = run_on_pty("llmman-no-such-program", &[], 80, &mut Vec::new());
+        assert!(err.is_err());
+    }
 
     #[test]
     fn cuda_major_12_picks_cuda12_image() {

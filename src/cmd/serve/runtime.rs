@@ -359,7 +359,7 @@ fn try_one(
 /// startup budget, as it does for the release download.
 fn with_download_marker<T>(pull: impl FnOnce() -> T) -> T {
     let marker = crate::llama_release::DownloadMarker::create();
-    marker.set_status("pulling the llama.cpp container image");
+    marker.set_status(crate::container::PULL_STATUS);
     marker.keep_alive_during(pull)
 }
 

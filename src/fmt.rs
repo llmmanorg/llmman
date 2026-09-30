@@ -20,6 +20,22 @@ pub fn braille_spinner(template: &str) -> ProgressBar {
     pb
 }
 
+/// Columns of the terminal on file descriptor `fd`; `None` if it is not
+/// a terminal or reports no width (and always off Unix).
+pub fn terminal_cols(fd: i32) -> Option<u16> {
+    #[cfg(unix)]
+    {
+        // SAFETY: TIOCGWINSZ only writes into the `winsize` it is given.
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
+            return Some(ws.ws_col);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = fd;
+    None
+}
+
 /// First 12 hex chars of a `sha256:...` digest, matching `docker images`'s
 /// convention (and Ollama's `ollama ps`/`ollama list`, which truncate to 12
 /// as well).

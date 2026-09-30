@@ -611,7 +611,7 @@ impl Drop for DownloadMarker {
 /// download onto an arbitrary path. Retries once after unlinking a
 /// pre-existing entry (a stale file from an earlier run, or an attacker's
 /// symlink — either way, safe to remove and recreate).
-fn create_new_file(dest: &Path) -> Result<std::fs::File> {
+pub(crate) fn create_new_file(dest: &Path) -> Result<std::fs::File> {
     let open = || {
         std::fs::OpenOptions::new()
             .write(true)

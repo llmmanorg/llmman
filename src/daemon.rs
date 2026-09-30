@@ -483,6 +483,20 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
         cmd.arg(preload_model);
     }
     cmd.stdin(Stdio::null());
+    let pull_relay = log_path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .and_then(PullRelay::new);
+    // Internal: never inherited from our own environment.
+    cmd.env_remove(crate::container::PULL_PROGRESS_FILE_ENV)
+        .env_remove(crate::container::PULL_PROGRESS_COLS_ENV);
+    if let Some(relay) = &pull_relay {
+        cmd.env(crate::container::PULL_PROGRESS_FILE_ENV, &relay.path)
+            .env(
+                crate::container::PULL_PROGRESS_COLS_ENV,
+                relay.cols.to_string(),
+            );
+    }
     // Silently redirect the daemon's stdio to its log file (or /dev/null if
     // that file can't be opened) — no "starting serve" status line here:
     // every caller of ensure_server (run/pull/push/launch) wants to look
@@ -514,7 +528,7 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     // fetching, and restarts after each fetch so the daemon gets a full
     // budget to bind afterwards.
     let mut idle_since = std::time::Instant::now();
-    let mut fetch_notice = FetchNotice::default();
+    let mut fetch_notice = FetchNotice::new(pull_relay);
     loop {
         std::thread::sleep(Duration::from_millis(500));
         if server_alive() {
@@ -584,18 +598,61 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
 /// neither listening nor reporting a live backend fetch.
 const STARTUP_BUDGET: Duration = Duration::from_secs(60);
 
+/// How long a pull keeps the spinner before its output takes over: a
+/// cached image answers in about a second, and "up to date" after every
+/// daemon start would be noise.
+const PULL_RELAY_DELAY: Duration = Duration::from_secs(2);
+
 /// What [`ensure_server`] shows while its daemon is still fetching
 /// backends: a spinner line with the daemon's latest progress text on a
-/// terminal, else one plain notice the first time. Cleared on drop.
-#[derive(Default)]
+/// terminal, else one plain notice the first time. A lasting container
+/// image pull shows its own output instead ([`PullRelay`]). Cleared on drop.
 struct FetchNotice {
     spinner: Option<ProgressBar>,
     announced: bool,
+    relay: Option<PullRelay>,
+    /// When a pull was first seen, until a different status is.
+    pulling_since: Option<std::time::Instant>,
+    /// Whether the last [`update`](Self::update) showed the relay.
+    relaying: bool,
 }
 
 impl FetchNotice {
+    fn new(relay: Option<PullRelay>) -> FetchNotice {
+        FetchNotice {
+            spinner: None,
+            announced: false,
+            relay,
+            pulling_since: None,
+            relaying: false,
+        }
+    }
+
     /// `status` is the marker text, `""` for a fetch that never set one.
     fn update(&mut self, status: &str) {
+        if status == crate::container::PULL_STATUS {
+            let pulling_for = self
+                .pulling_since
+                .get_or_insert_with(std::time::Instant::now)
+                .elapsed();
+            let relaying = self.relaying;
+            if let Some(relay) = self
+                .relay
+                .as_mut()
+                .filter(|_| relaying || pulling_for >= PULL_RELAY_DELAY)
+            {
+                // The pull's cursor movement would fight the spinner.
+                if let Some(pb) = self.spinner.take() {
+                    pb.finish_and_clear();
+                }
+                relay.drain();
+                self.relaying = true;
+                return;
+            }
+        } else {
+            self.pulling_since = None;
+        }
+        self.finish_relay();
         let message = fetch_message(status);
         if !std::io::stderr().is_terminal() {
             if !self.announced {
@@ -608,13 +665,102 @@ impl FetchNotice {
             .get_or_insert_with(|| crate::fmt::braille_spinner("{spinner} {msg}"))
             .set_message(message);
     }
+
+    /// The marker can vanish before the last poll; show what it missed.
+    fn finish_relay(&mut self) {
+        if std::mem::take(&mut self.relaying) {
+            if let Some(relay) = self.relay.as_mut() {
+                relay.drain();
+            }
+        }
+    }
 }
 
 impl Drop for FetchNotice {
     fn drop(&mut self) {
+        self.finish_relay();
         if let Some(pb) = self.spinner.take() {
             pb.finish_and_clear();
         }
+    }
+}
+
+/// Replays a spawned daemon's container image pull on this terminal. The
+/// daemon runs the pull on a pty and appends what it draws to a file that
+/// [`drain`](Self::drain) copies to stderr as it grows (see
+/// `container::PULL_PROGRESS_FILE_ENV`). The file exists only while this
+/// does, which is how the daemon knows someone is watching.
+struct PullRelay {
+    path: std::path::PathBuf,
+    /// Terminal width for the daemon's pty.
+    cols: u16,
+    /// How much of the file has been shown.
+    offset: u64,
+}
+
+/// One file per client process, so concurrent clients stay apart.
+const PULL_PROGRESS_PREFIX: &str = "pull-progress-";
+
+/// Older than this, another client's progress file is one a killed
+/// client left behind.
+const PULL_PROGRESS_STALE: Duration = Duration::from_secs(24 * 60 * 60);
+
+impl PullRelay {
+    /// `None` unless stderr is a terminal of known width.
+    fn new(dir: &std::path::Path) -> Option<PullRelay> {
+        Self::at(dir, crate::fmt::terminal_cols(2)?)
+    }
+
+    fn at(dir: &std::path::Path, cols: u16) -> Option<PullRelay> {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let stale = entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(PULL_PROGRESS_PREFIX)
+                    && entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > PULL_PROGRESS_STALE));
+                if stale {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        let path = dir.join(format!("{PULL_PROGRESS_PREFIX}{}", std::process::id()));
+        crate::llama_release::create_new_file(&path).ok()?;
+        Some(PullRelay {
+            path,
+            cols,
+            offset: 0,
+        })
+    }
+
+    /// Copies what the file has gained to stderr.
+    fn drain(&mut self) {
+        self.drain_to(&mut std::io::stderr());
+    }
+
+    fn drain_to(&mut self, out: &mut dyn std::io::Write) {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
+            return;
+        };
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return;
+        }
+        let mut chunk = Vec::new();
+        if file.read_to_end(&mut chunk).is_ok() && !chunk.is_empty() {
+            self.offset += chunk.len() as u64;
+            let _ = out.write_all(&chunk);
+            let _ = out.flush();
+        }
+    }
+}
+
+impl Drop for PullRelay {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -1893,6 +2039,79 @@ mod tests {
             with.ends_with(": downloading llama.tar.gz: 12 MB / 40 MB (30%)"),
             "got: {with}"
         );
+    }
+
+    /// The relay shows each byte once, creates its own file (clearing
+    /// only stale ones of a killed client), and removes it when dropped.
+    #[test]
+    fn pull_relay_shows_what_the_file_gains() {
+        let dir = std::env::temp_dir().join(format!("llmman-pull-relay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join(format!("{PULL_PROGRESS_PREFIX}1"));
+        let other = dir.join(format!("{PULL_PROGRESS_PREFIX}2"));
+        for p in [&old, &other] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - PULL_PROGRESS_STALE * 2)
+            .unwrap();
+
+        let mut relay = PullRelay::at(&dir, 80).unwrap();
+        assert!(!old.exists(), "a dead client's file is swept");
+        assert!(other.exists(), "a recent one may be live");
+        assert_eq!(relay.cols, 80);
+
+        let mut shown = Vec::new();
+        relay.drain_to(&mut shown);
+        assert!(shown.is_empty());
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&relay.path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"one\r\n").unwrap();
+        relay.drain_to(&mut shown);
+        relay.drain_to(&mut shown);
+        std::io::Write::write_all(&mut file, b"two\r\n").unwrap();
+        relay.drain_to(&mut shown);
+        assert_eq!(shown, b"one\r\ntwo\r\n");
+
+        let path = relay.path.clone();
+        drop(relay);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pull shows its own output only once it has outlasted
+    /// PULL_RELAY_DELAY, stops when the status moves on, and without a
+    /// relay (a pipe, not a terminal) never does.
+    #[test]
+    fn fetch_notice_relays_only_a_lasting_pull() {
+        // Never created: nothing is drained from it here.
+        let relay = PullRelay {
+            path: std::env::temp_dir().join("llmman-no-such-pull-progress"),
+            cols: 80,
+            offset: 0,
+        };
+        let pull = crate::container::PULL_STATUS;
+        let mut notice = FetchNotice::new(Some(relay));
+
+        notice.update(pull);
+        assert!(!notice.relaying, "a fresh pull keeps the spinner");
+        notice.pulling_since = Some(std::time::Instant::now() - PULL_RELAY_DELAY);
+        notice.update(pull);
+        assert!(notice.relaying);
+        notice.update("downloading llama.tar.gz: 12 MB / 40 MB (30%)");
+        assert!(!notice.relaying);
+        assert!(notice.pulling_since.is_none());
+
+        let mut bare = FetchNotice::new(None);
+        bare.update(pull);
+        bare.pulling_since = Some(std::time::Instant::now() - PULL_RELAY_DELAY);
+        bare.update(pull);
+        assert!(!bare.relaying);
     }
 
     #[test]
