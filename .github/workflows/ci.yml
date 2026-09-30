@@ -32,6 +32,17 @@ env:
   # VLLM_METAL_VERSION below: a vllm-metal release names the vLLM
   # release it was built against in its `.github/vllm-release-tag.commit`.
   VLLM_VERSION: "0.30.0"
+  # torchcodec CPU build ("+cpu", from PyTorch's CPU index) the Linux
+  # "Install vLLM (e2e)" step pins. vLLM's wheel only asks for
+  # torchcodec>=0.14, and pip takes the highest version across PyPI and
+  # that index. PyPI's is a CUDA build: its libtorchcodec_image.so needs
+  # libnvrtc.so.13, so `import vllm` dies on a CPU runner. Whenever the
+  # index's listing trails PyPI, pip picks PyPI's: it did for 0.17.0
+  # (PyPI 2026-09-30 12:52Z; the listing still lacked 0.17.0+cpu at
+  # 13:08Z), failing serve_vllm_safetensors_model on the Linux e2e jobs.
+  # 0.16.0 is what the last green run used with VLLM_VERSION above. Bump
+  # deliberately, with VLLM_VERSION.
+  TORCHCODEC_CPU_VERSION: "0.16.0"
   # vllm-metal (github.com/vllm-project/vllm-metal), macOS's Metal-GPU
   # vLLM platform below. A stable release, cut from its `releases/vX.Y.Z`
   # branch and numbered after the vLLM release it pairs with — never a
@@ -1602,6 +1613,7 @@ jobs:
             wheel="vllm-${VLLM_VERSION}+cpu-cp38-abi3-manylinux_2_39_${arch}.whl"
             "$venv/bin/pip" install \
               "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/$wheel" \
+              "torchcodec==${TORCHCODEC_CPU_VERSION}+cpu" \
               --extra-index-url https://download.pytorch.org/whl/cpu
 
             if [ "$arch" = "x86_64" ]; then
