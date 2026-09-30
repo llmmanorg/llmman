@@ -2,13 +2,14 @@
 
 `llmman serve` listens on `127.0.0.1:17434` by default (`LLMMAN_HOST`
 changes it; see [configuration.md](configuration.md)) and speaks the
-Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
+Ollama, OpenAI, Anthropic and System One wire formats, plus a small API of its own.
 
 | API | Endpoints |
 |-----|-----------|
 | Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/pull`, `/api/push`, `/api/copy`, `/api/create`, `/api/blobs/{digest}`, `/api/ps`, `/api/delete`, `/api/version` |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`) |
 | Anthropic | `/v1/messages` |
+| System One | `/v1/systemone` |
 | llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/shell` |
 | Web UI | `/` and `/ui/*` — see [webui.md](webui.md) |
 | llama.cpp | `/props` |
@@ -124,6 +125,67 @@ breakpoints and `anthropic-beta` headers have no chat-completion form
 and are dropped; a `tool_choice` naming a server tool is a 400. A
 provider on the `anthropic` wire gets the request relayed as sent (see
 [wire formats](providers.md#wire-formats)).
+
+## System One API notes
+
+`/v1/systemone` is the System One decision API: a `state` and up to 64 typed
+questions in, one answer each out, with a probability per candidate. llama.cpp
+has no such endpoint, so llmman answers it on ggml, like
+[media generation](backends.md): a backend process per model loads the GGUF on
+the `libggml`/`libllama` of the llama.cpp `--runtime` picks and reads the
+model's next-token probabilities. Nothing is generated. Wording, labels,
+refusals and formulas follow sglang's `/v1/systemone`.
+
+```sh
+curl localhost:17434/v1/systemone -d '{
+  "state": "I have tried to connect Stripe for 3 days and the integration keeps failing.",
+  "model": "qwen3.5:0.8b",
+  "questions": {
+    "team":   { "type": "choice", "instructions": "Which team should handle this?",
+                "criteria": { "billing": null, "technical": "Bugs or integration problems", "sales": null } },
+    "urgent": { "type": "noul", "instructions": "The customer needs an answer today." },
+    "mood":   { "type": "score", "instructions": "How upset is the customer?",
+                "criteria": ["Calm", "Annoyed", "Furious"] }
+  }
+}'
+```
+
+A `choice` answer has the most probable option, its `confidence` and
+`probabilities` in the order sent (the first option is labelled `A`, so order
+is part of the question); `noul` is the probability of yes; `score` the
+probability-weighted mean level, with the levels as `legend`. `usage` counts
+every question's prompt, so the state is counted once per question.
+
+Each question is one user turn through the model's own chat template (Jinja,
+as llama-server renders it) with `enable_thinking: false`, and the model is
+read where it would start to answer: its probability of each label (`A`..`Z`,
+a level digit, `yes`/`no`), renormalised over the labels. `x_label_mass` is
+the probability it put on the labels at all; low means it wanted to say
+something else. Any model with a chat template works (tested on Qwen3.5 and
+Gemma 4), and:
+
+- `noul` counts `yes` and `Yes` together, and `no` and `No`: Gemma 4 capitalises.
+- Options past 26 are labelled with two letters, as far as the tokenizer gives
+  each one token; a choice takes up to 255.
+- The KV cache is kept between questions and requests, so a shared state is
+  decoded once. A hybrid model (Qwen3.5) cannot roll back and decodes again.
+- The context starts at 2048 tokens and doubles as prompts need it, up to
+  `LLMMAN_CONTEXT_LENGTH` or the model's trained context. A longer prompt is a 400.
+
+The backend starts on the first request and is a model like any other:
+`keep_alive`, `LLMMAN_MAX_LOADED_MODELS` and eviction apply, and `llmman ps`
+lists it as `<model>#systemone`. It is separate from the model's `llama-server`
+(llama-server cannot give the probability of a token it did not sample), so a
+model in use for chat is loaded twice. Only a local GGUF with a chat template
+can be read: a provider's model, a hybrid pair and a safetensors model are a 400.
+
+An invalid request is a 422 with FastAPI's `detail` list (one entry per problem,
+with its `loc`); any other refusal is a 400 in OpenAI's error shape. Refused too:
+`chat_template_kwargs` turning `enable_thinking` on, a template that leaves a
+`<think>` block open at the answer position, and a label that is not one
+distinct token there. Unknown top-level fields are ignored; unknown keys in a
+question are refused. Probabilities are the model's own and not calibrated:
+validate a threshold on your own labelled data.
 
 ## llmman's own API
 

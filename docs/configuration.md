@@ -356,6 +356,7 @@ setting may not behave identically.
 | `llama-server` | Passed as `--ctx-size` as-is for generation models (llama-server allocates the KV cache at that size and caps each request slot to the model's trained context). Embedding models are always capped to their trained context, and `0` means that context. | `--ctx-size 262144` (256k), or the model's trained context if smaller. If the load then fails with an out-of-memory error, llmman retries with the context halved (down to a 16384 floor) before giving up. |
 | `vLLM` | Positive values are passed as `--max-model-len`; oversized values are rejected by vLLM. `0` is not forwarded. | Uses vLLM's model-derived default. |
 | `vllm serve --omni` | Not forwarded: a diffusion pipeline has no context window. | — |
+| System One (`/v1/systemone`) | The most the context may grow to (it starts at 2048 tokens and doubles as prompts need it), capped to the model's trained context. | The model's trained context. |
 | `sglang` | Positive values are passed as `--context-length`, the same rule as vLLM's; oversized values are rejected by SGLang. `0` is not forwarded. | Uses the model's `config.json`. |
 | `mlx_lm.server` | Not currently forwarded. | Uses `mlx_lm.server` defaults. |
 

@@ -45,6 +45,9 @@ pub const GGML_BACKEND_BUFFER_USAGE_WEIGHTS: c_int = 1;
 pub const GGML_PREC_F32: c_int = 10;
 pub const GGML_SCALE_MODE_NEAREST: u32 = 0;
 pub const GGML_STATUS_SUCCESS: c_int = 0;
+/// `enum llama_token_attr` bits: tokens the tokenizer splits text at.
+pub const LLAMA_TOKEN_ATTR_CONTROL: c_int = 1 << 3;
+pub const LLAMA_TOKEN_ATTR_USER_DEFINED: c_int = 1 << 4;
 pub const LLAMA_POOLING_TYPE_NONE: c_int = 0;
 pub const LLAMA_FLASH_ATTN_TYPE_AUTO: c_int = -1;
 pub const LLAMA_FLASH_ATTN_TYPE_DISABLED: c_int = 0;
@@ -308,16 +311,25 @@ api! {
     fn llama_model_n_layer(model: *const LlamaModel) -> i32;
     fn llama_model_n_embd(model: *const LlamaModel) -> i32;
     fn llama_model_chat_template(model: *const LlamaModel, name: *const c_char) -> *const c_char;
+    fn llama_model_n_ctx_train(model: *const LlamaModel) -> i32;
     fn llama_context_default_params() -> ParamBlob;
     fn llama_init_from_model(model: *mut LlamaModel, params: ParamBlob) -> *mut LlamaContextT;
     fn llama_free(ctx: *mut LlamaContextT);
     fn llama_get_memory(ctx: *const LlamaContextT) -> LlamaMemory;
     fn llama_memory_clear(mem: LlamaMemory, data: bool);
+    fn llama_memory_seq_rm(mem: LlamaMemory, seq_id: i32, p0: i32, p1: i32) -> bool;
     fn llama_set_embeddings(ctx: *mut LlamaContextT, embeddings: bool);
     fn llama_batch_init(n_tokens: i32, embd: i32, n_seq_max: i32) -> LlamaBatch;
     fn llama_batch_free(batch: LlamaBatch);
     fn llama_decode(ctx: *mut LlamaContextT, batch: LlamaBatch) -> i32;
     fn llama_get_embeddings_ith(ctx: *mut LlamaContextT, i: i32) -> *mut f32;
+    fn llama_get_logits_ith(ctx: *mut LlamaContextT, i: i32) -> *mut f32;
+    fn llama_vocab_n_tokens(vocab: *const LlamaVocab) -> i32;
+    fn llama_vocab_bos(vocab: *const LlamaVocab) -> LlamaToken;
+    fn llama_vocab_eos(vocab: *const LlamaVocab) -> LlamaToken;
+    fn llama_vocab_get_add_bos(vocab: *const LlamaVocab) -> bool;
+    fn llama_vocab_get_text(vocab: *const LlamaVocab, token: LlamaToken) -> *const c_char;
+    fn llama_vocab_get_attr(vocab: *const LlamaVocab, token: LlamaToken) -> c_int;
     fn llama_tokenize(vocab: *const LlamaVocab, text: *const c_char, text_len: i32, tokens: *mut LlamaToken, n_max: i32, add_special: bool, parse_special: bool) -> i32;
     fn llama_token_to_piece(vocab: *const LlamaVocab, token: LlamaToken, buf: *mut c_char, len: i32, lstrip: i32, special: bool) -> i32;
     fn llama_vocab_is_eog(vocab: *const LlamaVocab, token: LlamaToken) -> bool;
@@ -444,6 +456,83 @@ impl Api {
             check_context_params(cp.view_mut::<LlamaContextParams>())?;
         }
         Ok(())
+    }
+
+    /// Loads a GGUF, offloading `n_gpu_layers` layers.
+    pub fn load_model(&self, path: &str, n_gpu_layers: i32) -> Result<*mut LlamaModel> {
+        let cpath = std::ffi::CString::new(path)?;
+        unsafe {
+            let mut mp = (self.llama_model_default_params)();
+            {
+                let p = mp.view_mut::<LlamaModelParams>();
+                check_model_params(p)?;
+                p.n_gpu_layers = n_gpu_layers;
+            }
+            let model = (self.llama_model_load_from_file)(cpath.as_ptr(), mp);
+            if model.is_null() {
+                anyhow::bail!("failed to load {path}");
+            }
+            Ok(model)
+        }
+    }
+
+    /// `llama_tokenize`; the length is passed, so NUL bytes are text.
+    pub fn tokenize(
+        &self,
+        vocab: *const LlamaVocab,
+        text: &str,
+        add_special: bool,
+        parse_special: bool,
+    ) -> Result<Vec<LlamaToken>> {
+        let mut tokens = vec![0; text.len() + 16];
+        for _ in 0..2 {
+            let n = unsafe {
+                (self.llama_tokenize)(
+                    vocab,
+                    text.as_ptr().cast(),
+                    text.len() as i32,
+                    tokens.as_mut_ptr(),
+                    tokens.len() as i32,
+                    add_special,
+                    parse_special,
+                )
+            };
+            if n >= 0 {
+                tokens.truncate(n as usize);
+                return Ok(tokens);
+            }
+            // minus the size it needs
+            tokens.resize((-n) as usize, 0);
+        }
+        anyhow::bail!("failed to tokenize")
+    }
+
+    /// Decodes `tokens` into sequence 0 at positions `from..`, with logits
+    /// for every token or only the last.
+    pub fn decode(
+        &self,
+        ctx: *mut LlamaContextT,
+        tokens: &[LlamaToken],
+        from: usize,
+        all_logits: bool,
+    ) -> Result<()> {
+        unsafe {
+            let mut batch = (self.llama_batch_init)(tokens.len() as i32, 0, 1);
+            for (i, &t) in tokens.iter().enumerate() {
+                *batch.token.add(i) = t;
+                *batch.pos.add(i) = (from + i) as i32;
+                *batch.n_seq_id.add(i) = 1;
+                **batch.seq_id.add(i) = 0;
+                *batch.logits.add(i) = (all_logits || i + 1 == tokens.len()) as i8;
+            }
+            batch.n_tokens = tokens.len() as i32;
+            let status = (self.llama_decode)(ctx, batch);
+            (self.llama_batch_free)(batch);
+            if status != 0 {
+                anyhow::bail!("llama_decode failed with {status}");
+            }
+            Ok(())
+        }
     }
 
     pub fn set_n_threads(&self, backend: GgmlBackend, n: i32) {

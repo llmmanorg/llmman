@@ -84,6 +84,11 @@ multer     = "3"
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 # conditioning images for image-to-video and action runs
 image      = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# System One renders every question through the model's own Jinja chat
+# template, as llama-server does. libllama only knows a fixed list of legacy
+# templates, and neither Qwen3.5's nor Gemma 4's is on it.
+minijinja         = { version = "2", features = ["json", "loop_controls"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 # Real Xet-protocol downloads for HuggingFace files too large for the
 # plain-HTTP path to reliably serve — see src/xet_fetch.rs. Its

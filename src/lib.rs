@@ -27,6 +27,7 @@ pub mod providers;
 pub mod shortnames;
 pub mod sources;
 pub mod storage;
+pub mod systemone;
 pub mod thinking;
 pub mod usage;
 pub mod verify;

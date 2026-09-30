@@ -14,6 +14,7 @@ already exists for the model format it finds, and runs it unmodified.
 | safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | macOS: llmman's own `uv`-installed copy, installed when the daemon starts, or the one on your `PATH` — per `--runtime`, as for `llama-server`; preferred over `vllm` |
 | GGUF diffusion (LTX-2) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
 | Diffusers safetensors (Qwen-Image 2.1) | llmman itself, on ggml | The same libraries; see [below](#qwen-image-21) |
+| GGUF, for [`/v1/systemone`](api.md#system-one-api-notes) | llmman itself, on ggml | The same libraries; reads the model's token probabilities |
 | Diffusers safetensors | [`vllm serve --omni`](https://github.com/vllm-project/vllm-omni) | Your `PATH`'s `vllm` with the `vllm-omni` package installed |
 | Diffusers safetensors | `vllm serve --omni` in a container | `--runtime docker` / `podman` (Linux only): the `vllm/vllm-omni` image (CUDA only) |
 
