@@ -38,7 +38,8 @@
 //! engine on `PATH`; for mlx, Apple Silicon macOS too) isn't met. The
 //! vllm and sglang ones run a daemon of their own on a fresh port (the
 //! engine choice is daemon-wide environment) — see
-//! `serve_safetensors_with_engine`.
+//! `serve_safetensors_with_engine`. So does [`serve_systemone_reads_a_local_model`],
+//! for `POST /v1/systemone` against the real `qwen3.5:0.8b`.
 //!
 //! `llmman serve` is a process-wide singleton bound to a single loopback
 //! port (127.0.0.1:17434 by default, or wherever `LLMMAN_HOST` points —
@@ -2508,6 +2509,117 @@ fn serve_sglang_safetensors_model() {
         return;
     }
     serve_safetensors_with_engine("sglang", SGLANG_MODEL, &[("LLMMAN_CONTEXT_LENGTH", "1024")]);
+}
+
+/// `POST /v1/systemone` end to end: a daemon of the test's own on a fresh
+/// port, the real `qwen3.5:0.8b` behind a real `llama-server`, read at its
+/// first token. Only what a 0.8B model is decisive about is asserted as an
+/// answer: where an unambiguous ticket goes, and that a furious customer
+/// reads angrier than a grateful one. The rest is the shapes, the
+/// probabilities adding up, and nothing being generated.
+#[cfg(unix)]
+#[test]
+fn serve_systemone_reads_a_local_model() {
+    eprintln!("[test] serve_systemone_reads_a_local_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] serve_systemone_reads_a_local_model: acquired SERIAL");
+
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH");
+        return;
+    }
+    let host = format!("127.0.0.1:{}", free_loopback_port());
+    // Not the shared daemon's 256k context: nothing here needs more.
+    let mut daemon = spawn_test_daemon(&host, &[("LLMMAN_CONTEXT_LENGTH", "4096")]);
+
+    let result = std::panic::catch_unwind(|| {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(TIMEOUT)
+            .build()
+            .expect("build an HTTP client");
+        let ask = |state: &str| -> serde_json::Value {
+            let body = serde_json::json!({
+                "state": state,
+                "model": MODEL,
+                "questions": {
+                    "team": {
+                        "type": "choice",
+                        "instructions": "Which team should handle this ticket?",
+                        "criteria": {
+                            "billing": "Payment or subscription issues",
+                            "technical": "Bugs or integration problems",
+                            "sales": "Pricing or account questions",
+                        },
+                    },
+                    "angry": { "type": "noul", "instructions": "The customer is angry." },
+                    "mood": { "type": "score", "instructions": "How upset is the customer?",
+                              "criteria": ["Calm", "Annoyed", "Furious"] },
+                },
+            });
+            let resp = client
+                .post(format!("http://{host}/v1/systemone"))
+                .json(&body)
+                .send()
+                .expect("POST /v1/systemone");
+            let status = resp.status();
+            let text = resp.text().expect("read the reply");
+            assert!(status.is_success(), "{status}: {text}");
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
+        };
+
+        let billing = ask("I was charged twice for my subscription this month, please refund the duplicate payment.");
+        let technical = ask("The API returns a 500 error every time I call the webhook endpoint.");
+        assert_eq!(billing["answers"]["team"]["choice"], "billing", "{billing}");
+        assert_eq!(
+            technical["answers"]["team"]["choice"], "technical",
+            "{technical}"
+        );
+
+        for reply in [&billing, &technical] {
+            assert_eq!(reply["model"], "docker.io/ai/qwen3.5:0.8b");
+            let answers = reply["answers"].as_object().unwrap();
+            assert_eq!(answers.len(), 3);
+            for (id, answer) in answers {
+                assert_eq!(answer["x_source"], "logprobs", "{id}");
+                let mass = answer["x_label_mass"].as_f64().unwrap();
+                assert!(0.5 < mass && mass <= 1.0 + 1e-6, "{id}: mass {mass}");
+            }
+            for id in ["team", "mood"] {
+                let total: f64 = answers[id]["probabilities"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .map(|p| p.as_f64().unwrap())
+                    .sum();
+                assert!((total - 1.0).abs() < 1e-3, "{id} adds up to {total}");
+            }
+            // Nothing is generated; every question's prompt is counted.
+            assert_eq!(reply["usage"]["output_tokens"], 0);
+            assert!(reply["usage"]["input_tokens"].as_u64().unwrap() > 100);
+        }
+
+        let grateful = ask("Thanks so much, this was a wonderful experience!");
+        let furious = ask(
+            "This is UNACCEPTABLE. I am FURIOUS. Fix this NOW or I will cancel and tell everyone!!!",
+        );
+        let angry = |r: &serde_json::Value| r["answers"]["angry"]["noul"].as_f64().unwrap();
+        assert!(
+            angry(&furious) > angry(&grateful),
+            "furious {} vs grateful {}",
+            angry(&furious),
+            angry(&grateful)
+        );
+        eprintln!(
+            "[test] systemone: furious {:.2} vs grateful {:.2}",
+            angry(&furious),
+            angry(&grateful)
+        );
+    });
+
+    terminate_daemon(&mut daemon);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 /// llmman never links against llama.cpp: `mediagen::ffi` dlopens the

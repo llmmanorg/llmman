@@ -51,6 +51,7 @@ mod sched;
 mod search;
 mod shell;
 mod stream;
+mod systemone;
 mod types;
 mod usage;
 mod webui;
@@ -3665,7 +3666,9 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         // to the model chosen by `llmman launch agy`.
         .route("/gemini/:model/*gemini_path", post(handle_pinned_gemini))
         // Anthropic API
-        .route("/v1/messages", post(anthropic::handle_anthropic_messages));
+        .route("/v1/messages", post(anthropic::handle_anthropic_messages))
+        // System One decision API
+        .route("/v1/systemone", post(systemone::handle_systemone));
 
     // Applied only when the operator asked for metrics. Nothing can read
     // the store while the endpoint is absent — enabling it needs a

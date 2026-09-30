@@ -2,13 +2,14 @@
 
 `llmman serve` listens on `127.0.0.1:17434` by default (`LLMMAN_HOST`
 changes it; see [configuration.md](configuration.md)) and speaks the
-Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
+Ollama, OpenAI, Anthropic and System One wire formats, plus a small API of its own.
 
 | API | Endpoints |
 |-----|-----------|
 | Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/pull`, `/api/push`, `/api/copy`, `/api/create`, `/api/blobs/{digest}`, `/api/ps`, `/api/delete`, `/api/version` |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`) |
 | Anthropic | `/v1/messages` |
+| System One | `/v1/systemone` |
 | llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/shell` |
 | Web UI | `/` and `/ui/*` — see [webui.md](webui.md) |
 | llama.cpp | `/props` |
@@ -124,6 +125,85 @@ breakpoints and `anthropic-beta` headers have no chat-completion form
 and are dropped; a `tool_choice` naming a server tool is a 400. A
 provider on the `anthropic` wire gets the request relayed as sent (see
 [wire formats](providers.md#wire-formats)).
+
+## System One API notes
+
+`/v1/systemone` is the System One decision API: a `state` and up to 64 typed
+questions in, one answer each out, with a probability per candidate. Clients
+written for it (the TypeSafe SDKs) work by pointing their base URL here, with
+`model` naming a model llmman serves. Wording, labels, refusals and formulas
+follow sglang's `/v1/systemone`.
+
+```sh
+curl localhost:17434/v1/systemone -d '{
+  "state": "I have tried to connect Stripe for 3 days and the integration keeps failing.",
+  "model": "qwen3.5:0.8b",
+  "questions": {
+    "team":   { "type": "choice", "instructions": "Which team should handle this?",
+                "criteria": { "billing": null, "technical": "Bugs or integration problems", "sales": null } },
+    "urgent": { "type": "noul", "instructions": "The customer needs an answer today." },
+    "mood":   { "type": "score", "instructions": "How upset is the customer?",
+                "criteria": ["Calm", "Annoyed", "Furious"] }
+  }
+}'
+```
+
+A `choice` answer has the most probable option, its `confidence` and
+`probabilities` in the order the options were sent (the first is labelled
+`A`, so order is part of the question); `noul` is the probability of yes;
+`score` the probability-weighted mean level, with the levels as `legend`.
+`usage` counts every question's prompt, so the state is counted once per
+question, with cache and reasoning counts when a provider reports them;
+hosted calls appear in `llmman usage`.
+
+Each answer's `x_source` says where its probabilities come from:
+
+- **A local model is read** (`logprobs`): one user turn per question, rendered
+  with the model's chat template, thinking off, and the model's own
+  next-token probability of each label (`A`..`Z`, a level digit, `yes`/`no`),
+  renormalised over the labels. Nothing is generated. `x_label_mass` is the
+  probability the model put on the labels at all; low means it wanted to say
+  something else. This needs `llama-server` (read through `/apply-template`,
+  `/tokenize` and `/completion`); other engines get a 501. A label that is not
+  one token at the answer position, a template that leaves a `<think>` block
+  open, a model putting no probability on the labels, and a prompt past the
+  context are each a 400. `chat_template_kwargs` is accepted, over
+  `enable_thinking: false`.
+- **A hosted model is asked** (`elicited`), for any provider and wire
+  (`llmman.provider/<provider>/<model>`): hosted APIs show no token
+  probabilities (Anthropic's has no logprobs), so the model states its
+  probabilities as JSON, one request per question, four at a time. No
+  `x_label_mass`.
+
+A hosted model's variant is the `reasoning_effort` it thinks at: `none`,
+`minimal`, `low`, `medium`, `high`, `xhigh` or `max`, in each provider's own
+form. Name it as a `reasoning_effort` field or as a last segment of `model`,
+which is all an SDK can set; these are one request:
+
+```
+"model": "llmman.provider/anthropic/claude-sonnet-5-5/xhigh"
+"model": "anthropic/claude-sonnet-5-5/xhigh"
+"model": "llmman.provider/anthropic/claude-sonnet-5-5", "reasoning_effort": "xhigh"
+```
+
+The bare form needs a known provider and an effort level; a bare
+`<org>/<repo>` stays a Hugging Face repository, as on every other route. With
+no variant the model's own default applies. A local model is read before it
+thinks, so a variant on one is a 400, as is a `model` and `reasoning_effort`
+that disagree.
+
+Stated probabilities are the model's account of its own uncertainty, not a
+measurement of it, and a small model's can be far worse than its token
+probabilities for the same question. Neither source is a calibrated
+probability of being right, and a threshold tuned on one does not carry to the
+other; validate it on your own labelled data.
+
+An invalid request is a 422 with FastAPI's `detail` list, one entry per
+problem with its `loc`; any other refusal is a 400 in OpenAI's error shape,
+and a provider's refusal of the caller (a bad key, a rate limit) keeps its
+status. A choice takes 1 to 26 options (the schema allows 255; sglang labels
+the rest with two-letter tokens, llmman does not) and a score 1 to 10 levels.
+Unknown top-level fields are ignored; unknown keys in a question are refused.
 
 ## llmman's own API
 
