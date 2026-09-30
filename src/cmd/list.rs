@@ -94,7 +94,7 @@ pub fn run(args: &ListArgs) -> anyhow::Result<()> {
 /// SIZE/MODIFIED, which mean nothing for someone else's weights.
 fn list_provider_models(provider: &str) -> anyhow::Result<()> {
     crate::daemon::ensure_server("")?;
-    let entry = crate::daemon::provider(provider)?;
+    let entry = crate::daemon::provider(provider, None)?;
     if entry.models.is_empty() {
         // As for an empty local store: nothing to tabulate. The provider
         // exists — an unknown one is an error from the daemon.

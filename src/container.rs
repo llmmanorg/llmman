@@ -17,10 +17,10 @@
 //! several installed backend libraries, pick the best one for this
 //! machine at runtime — except there's no shared library to load and
 //! score here, just one container image to run, so detection below is a
-//! fixed priority order (CUDA > ROCm > Vulkan > CPU) rather than a
+//! fixed container-image priority order (CUDA > ROCm > Vulkan > CPU) rather than a
 //! numeric score.
 //!
-//! Host GPU detection itself (the real CUDA Driver/HIP runtime/Vulkan API
+//! Host GPU detection itself (the real CUDA Driver/HIP runtime/OpenCL/Vulkan API
 //! probing) is entirely [`crate::hostgpu::detect`]'s job, shared with the
 //! local (non-container) `llama-server` binary path in
 //! `crate::llama_release` — this module only adds the mapping from that
@@ -147,12 +147,14 @@ fn nvidia_toolkit_present(ociman: ContainerManager) -> bool {
     false
 }
 
-/// GPU backends this module can detect and run a matching
+/// Container GPU backends this module can run with a matching
 /// `ghcr.io/ggml-org/llama.cpp:server-*` image for. Deliberately a subset
 /// of every tag llama.cpp publishes (musa/intel/openvino are skipped): as
 /// of writing, rocm/vulkan images are amd64-only upstream and cuda/vulkan
 /// support arm64 too — see docs/docker.md for the authoritative list if
-/// more get added here later.
+/// more get added here later. OpenCL is intentionally absent: llama.cpp's
+/// OpenCL release is a Windows ARM64 Adreno binary, not a published Linux
+/// container image, and this module is used only for Linux containers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GpuBackend {
     Cpu,
@@ -224,7 +226,7 @@ impl GpuBackend {
 }
 
 /// Detects the best available GPU backend by delegating to
-/// [`crate::hostgpu::detect`] (real CUDA Driver/HIP runtime/Vulkan API
+/// [`crate::hostgpu::detect`] (real CUDA Driver/HIP/OpenCL/Vulkan API
 /// probing — see that module) and mapping its result onto which
 /// `ghcr.io/ggml-org/llama.cpp` image to run. This doesn't verify the
 /// container engine itself is configured to pass a GPU through: for an
@@ -236,22 +238,23 @@ fn detect_backend() -> GpuBackend {
     backend_from_hostgpu(hostgpu::detect())
 }
 
-/// Pure mapping from [`HostGpu`] to [`GpuBackend`], split out from
+/// Pure mapping from [`HostGpu`] to the available container [`GpuBackend`], split out from
 /// [`detect_backend`] so the CUDA 12-vs-13 image split (llama.cpp's own
 /// CUDA Dockerfile split between the `cuda`/`cuda12` tag, built against
-/// CUDA_VERSION 12.8.1, and `cuda13`, 13.3.0 — see docs/docker.md) can be
+/// CUDA_VERSION 12.8.1, and `cuda13`, 13.4.1 — see docs/docker.md) can be
 /// tested directly without needing real GPU hardware. `HostGpu::Metal`
 /// has no container image (Docker/Podman GPU passthrough isn't a macOS
 /// concept, and container runtimes are rejected on non-Linux before this is ever
-/// called — see `cmd::serve::serve_async`) and falls back to CPU here
-/// only so this match stays exhaustive.
+/// called — see `cmd::serve::serve_async`). `HostGpu::Opencl` also falls back
+/// to CPU here because there is no OpenCL container image; it remains a real
+/// backend in [`crate::llama_release`] for the local Windows ARM64 binary.
 fn backend_from_hostgpu(gpu: HostGpu) -> GpuBackend {
     match gpu {
         HostGpu::Cuda { major } if major >= 13 => GpuBackend::Cuda13,
         HostGpu::Cuda { .. } => GpuBackend::Cuda12,
         HostGpu::Rocm => GpuBackend::Rocm,
         HostGpu::Vulkan => GpuBackend::Vulkan,
-        HostGpu::Metal | HostGpu::None => GpuBackend::Cpu,
+        HostGpu::Metal | HostGpu::None | HostGpu::Opencl => GpuBackend::Cpu,
     }
 }
 
@@ -490,6 +493,62 @@ pub fn pull_image(
         anyhow::bail!("{} pull {image} failed", ociman.binary());
     }
     Ok(())
+}
+
+/// How long [`verify_llama_server_runs`] waits for its container.
+const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Runs `llama-server --version` in the llama.cpp image [`spawn`] would
+/// run, with the same GPU passthrough: `<cli> info` answering does not
+/// mean the engine can start a container (rootless podman without a
+/// reachable systemd fails every `run` in crun), and `--runtime auto`
+/// must not settle on an engine every model load would then fail on.
+/// The engine's own error goes to stderr, like [`pull_image`]'s progress.
+pub fn verify_llama_server_runs(ociman: ContainerManager, version: Option<&str>) -> Result<()> {
+    let cli = ociman.binary();
+    let name = format!(
+        "llmman-verify-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
+    let mut cmd = std::process::Command::new(cli);
+    cmd.args(verify_args(detect_backend(), version, &name))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    match run_with_timeout(cmd, VERIFY_TIMEOUT).with_context(|| format!("run {cli} run"))? {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => anyhow::bail!("{cli} could not start a llama.cpp container ({status})"),
+        None => {
+            // Killing the attached CLI leaves its container running; --rm
+            // only acts once the container exits.
+            let mut rm = std::process::Command::new(cli);
+            rm.args(["rm", "-f", &name])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let _ = run_with_timeout(rm, PROBE_TIMEOUT);
+            anyhow::bail!("{cli} did not start a llama.cpp container within {VERIFY_TIMEOUT:?}")
+        }
+    }
+}
+
+/// The GPU passthrough and GPU-visibility environment match what [`spawn`]
+/// serves with.
+fn verify_args(backend: GpuBackend, version: Option<&str>, name: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "--init".into(),
+        "--name".into(),
+        name.into(),
+    ];
+    args.extend(backend.engine_args());
+    args.extend(forwarded_env_args(&[]));
+    args.push(backend.image_ref(version));
+    args.push("--version".into());
+    args
 }
 
 /// Every `llama-server` knob `cmd::serve` resolves once per load and
@@ -740,16 +799,19 @@ fn run_args(
         args.push(n.to_string());
     }
     args.extend(engine_args);
-    for var in crate::cmd::serve::GPU_VISIBLE_DEVICE_VARS
+    args.extend(forwarded_env_args(passthrough_vars));
+    args
+}
+
+/// `-e NAME` for each GPU-visibility variable and each of
+/// `passthrough_vars` set in our environment.
+fn forwarded_env_args(passthrough_vars: &[&str]) -> Vec<String> {
+    crate::cmd::serve::GPU_VISIBLE_DEVICE_VARS
         .iter()
         .chain(passthrough_vars)
-    {
-        if std::env::var_os(var).is_some() {
-            args.push("-e".into());
-            args.push(var.to_string());
-        }
-    }
-    args
+        .filter(|var| std::env::var_os(var).is_some())
+        .flat_map(|var| ["-e".to_string(), var.to_string()])
+        .collect()
 }
 
 impl ContainerEngine {
@@ -993,6 +1055,7 @@ mod tests {
     #[test]
     fn non_cuda_hostgpu_variants_map_to_their_matching_backend() {
         assert_eq!(backend_from_hostgpu(HostGpu::Rocm), GpuBackend::Rocm);
+        assert_eq!(backend_from_hostgpu(HostGpu::Opencl), GpuBackend::Cpu);
         assert_eq!(backend_from_hostgpu(HostGpu::Vulkan), GpuBackend::Vulkan);
         assert_eq!(backend_from_hostgpu(HostGpu::None), GpuBackend::Cpu);
         assert_eq!(backend_from_hostgpu(HostGpu::Metal), GpuBackend::Cpu);
@@ -1405,6 +1468,28 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-e", VAR]), "{args:?}");
         // The value stays out of argv (it may be a secret).
         assert!(!args.iter().any(|a| a.starts_with(&format!("{VAR}="))));
+    }
+
+    #[test]
+    fn verify_runs_the_served_image_with_its_gpu_passthrough() {
+        for (backend, image) in [
+            (GpuBackend::Cpu, "ghcr.io/ggml-org/llama.cpp:server-b9994"),
+            (
+                GpuBackend::Cuda13,
+                "ghcr.io/ggml-org/llama.cpp:server-cuda13-b9994",
+            ),
+        ] {
+            let args = verify_args(backend, Some("b9994"), "llmman-verify-1");
+            assert_eq!(
+                &args[..5],
+                ["run", "--rm", "--init", "--name", "llmman-verify-1"]
+            );
+            let at = args.iter().position(|a| a == image).expect("image present");
+            let mut between = backend.engine_args();
+            between.extend(forwarded_env_args(&[]));
+            assert_eq!(&args[5..at], between.as_slice(), "{backend:?}");
+            assert_eq!(&args[at + 1..], ["--version"]);
+        }
     }
 
     #[test]

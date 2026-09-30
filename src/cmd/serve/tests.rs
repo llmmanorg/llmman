@@ -1,20 +1,29 @@
 use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
+use super::hybrid::{request_pin, resolve_hybrid_side, with_hybrid_fallback};
 use super::ollama::{
-    embed_inputs, empty_chat_chunk, evict_if_retagged, normalize_in_place, options_to_oai,
-    progress_line, staged_blob_path, staged_file, OllamaPullRequest, OllamaPushRequest,
-    PushOutcome, StreamedOutcome,
+    embed_inputs, empty_chat_chunk, evict_if_retagged, model_info_json, normalize_in_place,
+    opt_f64, opt_num_thread, opt_u32, options_to_oai, progress_line, staged_blob_path, staged_file,
+    OllamaPullRequest, OllamaPushRequest, PushOutcome, StreamedOutcome,
 };
 use super::openai::{
-    apply_default_repeat_penalty, apply_reasoning_effort, mlx_embeddings_unsupported_response,
-    multipart_form, multipart_text_field, omni_image_request, omni_video_fields,
+    apply_default_repeat_penalty, apply_reasoning_effort, consolidate_chat_system_messages,
+    mlx_embeddings_unsupported_response, multipart_form, multipart_text_field, omni_image_request,
+    omni_video_fields,
 };
+use super::refusal::{explain_missing_route, unsupported_on_wire};
+use super::relay::{rewrite_json_response_model, rewrite_sse_line_model, set_response_model};
 use super::responses::{
     consolidate_responses_instructions, filter_non_function_tools, remote_responses,
     responses_input_item_text, RESPONSES_ROUTE,
 };
-use super::sched::{reap_idle_models_once, resolve_keep_alive, DEFAULT_KEEP_ALIVE};
+use super::sched::{reap_idle_models_once, DEFAULT_KEEP_ALIVE};
 use super::stream::{fold_ollama_lines, stream_ollama};
+use super::test_support::{
+    headers_with, mock_peer, node, remote_target, remote_target_on, rendered_registry,
+    running_model_fixture, running_model_fixture_with_engine, serve_router, serve_router_with,
+    test_inner, test_state, test_state_at, test_state_with_budget, ws_upgrade, HOSTED, PAIR,
+};
 use super::*;
 
 // -- pull/push progress relay -------------------------------------------
@@ -78,21 +87,6 @@ fn progress_line_reports_status_only_snapshots_and_clamps_completed() {
 }
 
 // -- request targets (local backend vs remote provider) -----------------
-
-pub(super) fn remote_target(base_url: &str) -> Target {
-    remote_target_on(base_url, Wire::OpenAi)
-}
-
-fn remote_target_on(base_url: &str, wire: Wire) -> Target {
-    Target::Remote(Arc::new(RemoteTarget {
-        provider: "mockprov".into(),
-        base_url: base_url.into(),
-        wire,
-        model: "mock-model".into(),
-        max_output: None,
-        api_key: Some("sk-test".into()),
-    }))
-}
 
 /// A local target must keep producing byte-for-byte the same loopback
 /// URLs the `format!("http://127.0.0.1:{port}{path}")` calls this
@@ -641,6 +635,104 @@ async fn a_non_streaming_request_to_an_anthropic_provider_is_folded() {
     assert_eq!(seen.lock().await[0].2["stream"], true);
 }
 
+/// `max_tokens` is clamped to the catalog's ceiling; without one it
+/// passes as asked.
+#[tokio::test]
+async fn max_tokens_is_clamped_to_the_catalogs_ceiling_for_an_anthropic_provider() {
+    let (base, seen) = mock_anthropic(MOCK_MESSAGES_STREAM).await;
+    let capped = Target::Remote(Arc::new(RemoteTarget {
+        provider: "mockprov".into(),
+        base_url: base.clone(),
+        wire: Wire::Anthropic,
+        model: "mock-model".into(),
+        max_output: Some(64_000),
+        cost: None,
+        api_key: Some("sk-test".into()),
+    }));
+    let send = |target: &Target, req: serde_json::Value| {
+        let target = target.clone();
+        async move {
+            send_chat_completion(&Client::new(), &target, &req, "m")
+                .await
+                .unwrap()
+        }
+    };
+    let ask = |max_tokens: u64| {
+        serde_json::json!({
+            "model": "mock-model",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "max_tokens": max_tokens
+        })
+    };
+    send(&capped, ask(65_535)).await;
+    send(&capped, ask(1_000)).await;
+    send(&remote_target_on(&base, Wire::Anthropic), ask(65_535)).await;
+    let calls = seen.lock().await;
+    assert_eq!(calls[0].2["max_tokens"], 64_000);
+    assert_eq!(calls[1].2["max_tokens"], 1_000);
+    assert_eq!(calls[2].2["max_tokens"], 65_535);
+}
+
+/// `reasoning_effort` reaches Sonnet 5 as adaptive thinking and effort
+/// without a beta, and an older Claude as the budget with it.
+#[tokio::test]
+async fn a_thinking_level_reaches_each_claude_in_its_own_form() {
+    let (base, seen) = mock_anthropic(MOCK_MESSAGES_STREAM).await;
+    for (model, effort) in [
+        ("claude-sonnet-5", "high"),
+        ("claude-sonnet-5", "none"),
+        ("claude-sonnet-4-5", "high"),
+    ] {
+        let target = Target::Remote(Arc::new(RemoteTarget {
+            provider: "anthropic".into(),
+            base_url: base.clone(),
+            wire: Wire::Anthropic,
+            model: model.into(),
+            max_output: Some(64_000),
+            cost: None,
+            api_key: Some("sk-test".into()),
+        }));
+        let req = serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "reasoning_effort": effort, "max_tokens": 64_000, "temperature": 0.2
+        });
+        let upstream = send_chat_completion(&Client::new(), &target, &req, "m")
+            .await
+            .unwrap();
+        assert_eq!(upstream.status, StatusCode::OK, "{model} {effort}");
+    }
+    let calls = seen.lock().await;
+
+    let (_, headers, sent) = &calls[0];
+    assert_eq!(
+        sent["thinking"],
+        serde_json::json!({ "type": "adaptive", "display": "summarized" })
+    );
+    assert_eq!(
+        sent["output_config"],
+        serde_json::json!({ "effort": "high" })
+    );
+    assert!(sent.get("temperature").is_none(), "{sent}");
+    assert!(headers.get("anthropic-beta").is_none(), "{headers:?}");
+
+    let (_, headers, sent) = &calls[1];
+    assert_eq!(sent["thinking"], serde_json::json!({ "type": "disabled" }));
+    assert!(sent.get("output_config").is_none(), "{sent}");
+    assert!(headers.get("anthropic-beta").is_none());
+
+    let (_, headers, sent) = &calls[2];
+    assert_eq!(
+        sent["thinking"],
+        serde_json::json!({ "type": "enabled", "budget_tokens": 16_384 })
+    );
+    assert!(sent.get("output_config").is_none(), "{sent}");
+    assert_eq!(
+        headers["anthropic-beta"],
+        anthropic::INTERLEAVED_THINKING_BETA
+    );
+}
+
 /// `/v1/messages` is relayed whole, `model` rewritten, the client's
 /// `anthropic-beta` forwarded and its credential not.
 #[tokio::test]
@@ -744,6 +836,7 @@ fn remote(provider: &str, model: &str, wire: Wire) -> RemoteTarget {
         wire,
         model: model.into(),
         max_output: None,
+        cost: None,
         api_key: Some("k".into()),
     }
 }
@@ -872,6 +965,55 @@ fn provider_compat_applies_openais_reasoning_model_rules() {
     }
 }
 
+/// Claude on the Anthropic wire loses `top_p` beside `temperature`, and
+/// both after Opus 4.6 (bar `temperature` 1.0); other wires and vendors
+/// keep theirs.
+#[test]
+fn provider_compat_drops_claudes_rejected_sampling_parameters() {
+    let both =
+        serde_json::json!({ "model": "m", "temperature": 0.2, "top_p": 0.9, "max_tokens": 5 });
+    let with = |provider: &str, model: &str, wire: Wire, req: &serde_json::Value| {
+        let mut req = req.clone();
+        provider_compat(&remote(provider, model, wire), &mut req);
+        req
+    };
+    // agy: sonnet-5 with both set, which is what 400'd.
+    assert_eq!(
+        with("anthropic", "claude-sonnet-5", Wire::Anthropic, &both),
+        serde_json::json!({ "model": "m", "max_tokens": 5 })
+    );
+    let one = serde_json::json!({ "model": "m", "temperature": 1.0, "top_p": 0.9 });
+    assert_eq!(
+        with("anthropic", "claude-opus-4-7", Wire::Anthropic, &one),
+        serde_json::json!({ "model": "m", "temperature": 1.0 })
+    );
+    // Up to Opus 4.6: temperature wins over top_p; top_p alone stays.
+    assert_eq!(
+        with(
+            "anthropic",
+            "claude-sonnet-4-5-20250929",
+            Wire::Anthropic,
+            &both
+        ),
+        serde_json::json!({ "model": "m", "temperature": 0.2, "max_tokens": 5 })
+    );
+    let nucleus = serde_json::json!({ "model": "m", "top_p": 0.9, "temperature": null });
+    assert_eq!(
+        with("anthropic", "claude-opus-4-6", Wire::Anthropic, &nucleus),
+        nucleus
+    );
+    assert_eq!(
+        with(
+            "openrouter",
+            "anthropic/claude-sonnet-5",
+            Wire::OpenAi,
+            &both
+        ),
+        both
+    );
+    assert_eq!(with("minimax", "MiniMax-M2", Wire::Anthropic, &both), both);
+}
+
 // -- aggregation (peer daemons) ------------------------------------------
 
 #[test]
@@ -893,35 +1035,14 @@ fn a_peer_target_is_a_local_backend_in_all_but_address() {
     }
 }
 
-/// `/llmman/node` answers `node`; every other route records its call.
-async fn mock_peer(
-    node: aggregation::Node,
-) -> (
-    String,
-    Arc<tokio::sync::Mutex<Vec<(String, HeaderMap, Bytes)>>>,
-) {
-    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let captured = seen.clone();
-    let app = Router::new()
-        .route("/llmman/node", get(move || async move { Json(node) }))
-        .fallback(move |req: Request| async move {
-            let (parts, body) = req.into_parts();
-            let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-            captured
-                .lock()
-                .await
-                .push((parts.uri.path().to_string(), parts.headers, body));
-            ([("content-type", "application/json")], "{}")
-        });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (origin, seen)
-}
-
 /// Store tags `docker.io/ai/m:latest` with no blobs, so a local load
 /// fails offline instead of pulling.
 fn state_with_peers(peers: Vec<String>, memory: u64) -> AppState {
+    AppState(Arc::new(inner_with_peers(peers, memory)))
+}
+
+/// [`state_with_peers`]'s `Inner`, for a test that sets more.
+fn inner_with_peers(peers: Vec<String>, memory: u64) -> Inner {
     let dir = std::env::temp_dir().join(format!(
         "llmman-aggregation-{}-{}",
         std::process::id(),
@@ -943,16 +1064,7 @@ fn state_with_peers(peers: Vec<String>, memory: u64) -> AppState {
     let mut inner = test_inner(dir);
     inner.peers = peers;
     inner.memory = memory;
-    AppState(Arc::new(inner))
-}
-
-fn node(memory: u64, loaded: &[&str], stored: &[&str]) -> aggregation::Node {
-    let map = |names: &[&str]| names.iter().map(|n| (n.to_string(), 1 << 30)).collect();
-    aggregation::Node {
-        memory,
-        loaded: map(loaded),
-        stored: map(stored),
-    }
+    inner
 }
 
 /// A peer gets llmman's own dialect, the hop marker, no credential.
@@ -1220,30 +1332,18 @@ async fn an_unload_is_forwarded_to_every_peer() {
 
 // -- hybrid pairs (one reference, a local and a hosted half) -------------
 
-pub(super) fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    for (name, value) in pairs {
-        headers.insert(
-            reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
-            value.parse().unwrap(),
-        );
-    }
-    headers
-}
-
 fn pair(reference: &'static str) -> crate::hybrid::Pair<'static> {
     crate::hybrid::split_ref(reference).expect("test reference must be a pair")
 }
 
-pub(super) const PAIR: &str = "llmman.hybrid/gemma4,anthropic/claude-sonnet-4-5";
-pub(super) const HOSTED: &str = "llmman.provider/anthropic/claude-sonnet-4-5";
-
 /// What comes back is one half's own ordinary reference, with
 /// nothing left for anything downstream to special-case.
-#[test]
-fn a_pair_resolves_to_an_ordinary_reference_for_the_half_it_picks() {
+#[tokio::test]
+async fn a_pair_resolves_to_an_ordinary_reference_for_the_half_it_picks() {
     let state = test_state();
-    let local = resolve_hybrid_side(&state, &pair(PAIR), Some(&headers_with(&[]))).unwrap();
+    let local = resolve_hybrid_side(&state, &pair(PAIR), Some(&headers_with(&[])))
+        .await
+        .unwrap();
     assert_eq!(local, "gemma4");
 
     let cloud = resolve_hybrid_side(
@@ -1251,45 +1351,54 @@ fn a_pair_resolves_to_an_ordinary_reference_for_the_half_it_picks() {
         &pair(PAIR),
         Some(&headers_with(&[("x-llmman-route", "cloud")])),
     )
+    .await
     .unwrap();
     assert_eq!(cloud, HOSTED);
     assert!(crate::providers::is_remote_ref(&cloud));
 }
 
 /// A surface with no headers to offer keeps a pair local.
-#[test]
-fn a_pair_without_headers_stays_local() {
+#[tokio::test]
+async fn a_pair_without_headers_stays_local() {
     let state = test_state();
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), None).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), None)
+            .await
+            .unwrap(),
         "gemma4"
     );
 }
 
 /// The one automatic rule that sends data off the machine, wired to
 /// a real `Content-Length` and a real budget.
-#[test]
-fn a_request_too_large_for_this_host_goes_to_the_hosted_half() {
+#[tokio::test]
+async fn a_request_too_large_for_this_host_goes_to_the_hosted_half() {
     let state = test_state_with_budget(262_144);
     let fits = headers_with(&[("content-length", "262144")]);
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), Some(&fits)).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&fits))
+            .await
+            .unwrap(),
         "gemma4"
     );
     let does_not = headers_with(&[("content-length", "262145")]);
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), Some(&does_not)).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&does_not))
+            .await
+            .unwrap(),
         HOSTED
     );
 }
 
 /// `LLMMAN_HYBRID_LOCAL_BYTES=0`: size alone never routes away.
-#[test]
-fn without_a_budget_size_never_routes_a_pair_away() {
+#[tokio::test]
+async fn without_a_budget_size_never_routes_a_pair_away() {
     let state = test_state();
     let huge = headers_with(&[("content-length", "999999999")]);
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), Some(&huge)).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&huge))
+            .await
+            .unwrap(),
         "gemma4"
     );
 }
@@ -1297,12 +1406,14 @@ fn without_a_budget_size_never_routes_a_pair_away() {
 /// `/v1/audio/transcriptions` relays multipart bytes it cannot
 /// rewrite, so a pair takes its local half regardless of size there,
 /// consulting the pin only.
-#[test]
-fn a_transcription_pair_takes_its_local_half_whatever_its_size() {
+#[tokio::test]
+async fn a_transcription_pair_takes_its_local_half_whatever_its_size() {
     let state = test_state_with_budget(1);
     let huge = headers_with(&[("content-length", "99999999")]);
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), Some(&huge)).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&huge))
+            .await
+            .unwrap(),
         HOSTED,
         "the generic path still routes on size"
     );
@@ -1316,13 +1427,195 @@ fn a_transcription_pair_takes_its_local_half_whatever_its_size() {
 }
 
 /// An unreadable pin is a 400, not a guess. See `hybrid::parse_pin`.
-#[test]
-fn an_unreadable_route_header_is_rejected_rather_than_guessed() {
+#[tokio::test]
+async fn an_unreadable_route_header_is_rejected_rather_than_guessed() {
     let state = test_state();
     let headers = headers_with(&[("x-llmman-route", "on-device")]);
     let err = resolve_hybrid_side(&state, &pair(PAIR), Some(&headers))
+        .await
         .expect_err("an unknown side must not be guessed at");
     assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+}
+
+/// `LLMMAN_CONTEXT_LENGTH=0` means the model's trained context, not
+/// "no window": recording `None` for it would leave a hybrid pair with
+/// no budget at all and the size rule silently off.
+#[test]
+fn a_zero_context_length_records_the_trained_context_it_stands_for() {
+    assert_eq!(
+        loaded_context_window(Engine::LlamaServer, Some(0), Some(32_768), None, true),
+        Some(32_768)
+    );
+    // --ctx-size 0 cannot be scaled up, so llama-server splits the
+    // trained context across the slots and a request gets one slot's.
+    assert_eq!(
+        loaded_context_window(Engine::LlamaServer, Some(0), Some(32_768), Some(4), true),
+        Some(8_192)
+    );
+    // Nothing to stand in for: a GGUF whose header names no context.
+    assert_eq!(
+        loaded_context_window(Engine::LlamaServer, Some(0), None, None, true),
+        None
+    );
+}
+
+/// Each engine reports the window it was handed, and `None` where it
+/// was left to choose.
+#[test]
+fn a_loads_window_is_the_one_its_own_engine_was_given() {
+    // The ordinary case: the clamped, possibly shrunk --ctx-size.
+    assert_eq!(
+        loaded_context_window(Engine::LlamaServer, Some(32_768), Some(32_768), None, false),
+        Some(32_768)
+    );
+    // vLLM only gets --max-model-len for an explicit length; left to
+    // its own, the daemon does not know what it chose.
+    assert_eq!(
+        loaded_context_window(Engine::Vllm, Some(8_192), None, None, true),
+        Some(8_192)
+    );
+    assert_eq!(
+        loaded_context_window(Engine::Vllm, Some(8_192), None, None, false),
+        None
+    );
+    // MLX takes no window at all.
+    assert_eq!(
+        loaded_context_window(Engine::Mlx, Some(8_192), Some(8_192), None, true),
+        None
+    );
+}
+
+/// The loaded window, not the daemon-wide default, is what a pair is
+/// routed against: a half loaded with 32k tokens holds 128 KiB, so a
+/// 200 KB body leaves the machine even though the daemon started with
+/// a 256k default.
+#[tokio::test]
+async fn a_pair_routes_against_the_window_its_local_half_actually_loaded_with() {
+    // The default budget: DEFAULT_CTX_SIZE tokens' worth.
+    let state = test_state_with_budget(262_144 * 4);
+    let big = headers_with(&[("content-length", "200000")]);
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&big))
+            .await
+            .unwrap(),
+        "gemma4",
+        "nothing is loaded yet, so the daemon-wide budget stands"
+    );
+
+    let mut loaded = running_model_fixture(None, Duration::ZERO, 0);
+    loaded.context_window = Some(32_768);
+    let key = running_key(&state, "gemma4");
+    state.0.manager.lock().await.running.insert(key, loaded);
+
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&big))
+            .await
+            .unwrap(),
+        HOSTED,
+        "past the 32k this half loaded with, whatever the daemon's default"
+    );
+    let fits = headers_with(&[("content-length", "131072")]);
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&fits))
+            .await
+            .unwrap(),
+        "gemma4"
+    );
+    // A chunked request declares no size, so there is nothing to
+    // compare a budget against and none is resolved.
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&headers_with(&[])))
+            .await
+            .unwrap(),
+        "gemma4"
+    );
+}
+
+/// vLLM and MLX expose no `/props`, so there is no live `n_ctx` to
+/// report: `/api/ps` falls back to the window this daemon gave the
+/// load.
+#[tokio::test]
+async fn ps_reports_the_configured_window_when_the_backend_exposes_none() {
+    let state = test_state();
+    let mut loaded = running_model_fixture(None, Duration::ZERO, 0);
+    // Port 0 answers nothing, standing in for a backend with no /props.
+    loaded.port = 0;
+    loaded.context_window = Some(32_768);
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .insert("m:latest".into(), loaded);
+
+    let resp = handle_ps(State(state.clone()), HeaderMap::new())
+        .await
+        .into_response();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let ps: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(ps["models"][0]["context_length"], 32_768);
+}
+
+/// A crashed runner keeps its entry until the next `check_running`
+/// reaps it, but not its window: routing on a dead process's figure
+/// sends every large request away, so nothing ever notices it died.
+#[tokio::test]
+async fn a_dead_local_half_is_budgeted_as_if_it_were_not_loaded() {
+    let state = test_state_with_budget(262_144 * 4);
+    let big = headers_with(&[("content-length", "200000")]);
+
+    let mut dead = running_model_fixture(None, Duration::ZERO, 0);
+    dead.context_window = Some(32_768);
+    match &mut dead.process {
+        ModelProcess::Local(_, child, _) | ModelProcess::Container(_, _, child) => {
+            child.kill().await.expect("kill the placeholder process")
+        }
+    }
+    let key = running_key(&state, "gemma4");
+    state.0.manager.lock().await.running.insert(key, dead);
+
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&big))
+            .await
+            .unwrap(),
+        "gemma4",
+        "the daemon-wide budget stands, so ensure_model still reloads it"
+    );
+    // And it is that budget, not no budget: past it, the pair still
+    // routes away.
+    let past_the_daemons_own = headers_with(&[("content-length", "2000000")]);
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&past_the_daemons_own))
+            .await
+            .unwrap(),
+        HOSTED
+    );
+}
+
+/// An explicit `LLMMAN_HYBRID_LOCAL_BYTES` is not replaced by a load,
+/// however small the window that load ended up with.
+#[tokio::test]
+async fn a_stated_budget_is_not_overridden_by_the_loaded_window() {
+    let mut inner = test_inner(std::env::temp_dir());
+    inner.hybrid_local_bytes = Some(1_000_000);
+    inner.hybrid_local_bytes_explicit = true;
+    let state = AppState(Arc::new(inner));
+
+    let mut loaded = running_model_fixture(None, Duration::ZERO, 0);
+    loaded.context_window = Some(4_096);
+    let key = running_key(&state, "gemma4");
+    state.0.manager.lock().await.running.insert(key, loaded);
+
+    let big = headers_with(&[("content-length", "999999")]);
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&big))
+            .await
+            .unwrap(),
+        "gemma4"
+    );
 }
 
 /// An invalid local half is rejected exactly as a bare one is (see
@@ -1387,26 +1680,6 @@ fn a_local_context_refusal_is_recognised_in_every_shape_it_arrives_in() {
     }
 }
 
-/// Only a pair falls back, and never one the caller pinned local:
-/// that pin is the promise the data stays on this machine.
-#[test]
-fn only_an_unpinned_pair_has_a_hosted_half_to_fall_back_to() {
-    assert_eq!(
-        hybrid_fallback(PAIR, Some(&headers_with(&[]))).unwrap(),
-        Some(HOSTED.to_string())
-    );
-    assert_eq!(
-        hybrid_fallback(PAIR, None).unwrap(),
-        Some(HOSTED.to_string())
-    );
-    assert_eq!(
-        hybrid_fallback(PAIR, Some(&headers_with(&[("x-llmman-route", "local")]))).unwrap(),
-        None
-    );
-    assert_eq!(hybrid_fallback("gemma4", None).unwrap(), None);
-    assert_eq!(hybrid_fallback(HOSTED, None).unwrap(), None);
-}
-
 /// Two pins is no pin: the header decides where data goes, so it is
 /// never resolved by header order.
 #[test]
@@ -1437,6 +1710,7 @@ async fn a_local_refusal_is_retried_on_the_hosted_half_unless_pinned() {
                     wire: Wire::OpenAi,
                     model: "claude".into(),
                     max_output: None,
+                    cost: None,
                     api_key: Some("k".into()),
                 }))
             } else {
@@ -1519,83 +1793,6 @@ async fn a_local_refusal_is_retried_on_the_hosted_half_unless_pinned() {
     assert_eq!(
         run(Local::Relayed, pinned).await,
         (Ok(StatusCode::BAD_REQUEST), 1, 0)
-    );
-}
-
-/// A relayed 400 is inspected and either taken as the refusal or
-/// handed back intact; nothing else is touched.
-#[tokio::test]
-async fn a_relayed_response_is_only_intercepted_when_it_is_the_refusal() {
-    let llama = r#"{"error":{"code":400,"message":"request (9 tokens) exceeds the available context size (8 tokens), try increasing it","type":"exceed_context_size_error"}}"#;
-    // No Content-Length: proxy_rewriting_model strips it.
-    let resp = |status: StatusCode, body: &'static str| {
-        Response::builder()
-            .status(status)
-            .body(Body::from(body))
-            .unwrap()
-    };
-    let refusal = local_context_overflow(resp(StatusCode::BAD_REQUEST, llama))
-        .await
-        .expect_err("the refusal must be intercepted");
-    assert!(
-        refusal.contains("exceeds the available context size"),
-        "{refusal}"
-    );
-
-    let other = r#"{"error":{"code":400,"message":"invalid grammar"}}"#;
-    let passed = local_context_overflow(resp(StatusCode::BAD_REQUEST, other))
-        .await
-        .expect("another 400 passes through");
-    assert_eq!(passed.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(passed.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(body, other.as_bytes(), "body reattached intact");
-
-    let ok = local_context_overflow(resp(StatusCode::OK, "data: {}"))
-        .await
-        .expect("a success is never read");
-    assert_eq!(ok.status(), StatusCode::OK);
-
-    // Past the read limit: not classified, and nothing lost.
-    let big: &'static str = String::from_utf8(vec![b'x'; OVERFLOW_BODY_LIMIT + 10])
-        .unwrap()
-        .leak();
-    let passed = local_context_overflow(resp(StatusCode::BAD_REQUEST, big))
-        .await
-        .expect("an oversized 400 passes through");
-    let body = axum::body::to_bytes(passed.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(body.len(), big.len());
-}
-
-// -- keep_alive parsing / resolution (idle-timeout auto-unload) ---------
-
-/// Regression test for `handle_ollama_generate`'s unload-sentinel
-/// check: it must reuse `resolve_keep_alive` (as asserted here) rather
-/// than a bare `keep_alive.as_i64() == Some(0)` check, since the
-/// latter misses every non-integer zero form `resolve_keep_alive`
-/// itself accepts — a string `"0"`, `"0s"`, or a float `0.0` — leaving
-/// a client that sends one of those loaded until the next idle-reaper
-/// tick instead of unloading immediately as requested.
-#[test]
-fn resolve_keep_alive_treats_every_zero_form_as_the_unload_sentinel() {
-    assert_eq!(
-        resolve_keep_alive(&Some(serde_json::json!(0))),
-        Some(Duration::ZERO)
-    );
-    assert_eq!(
-        resolve_keep_alive(&Some(serde_json::json!("0"))),
-        Some(Duration::ZERO)
-    );
-    assert_eq!(
-        resolve_keep_alive(&Some(serde_json::json!("0s"))),
-        Some(Duration::ZERO)
-    );
-    assert_eq!(
-        resolve_keep_alive(&Some(serde_json::json!(0.0))),
-        Some(Duration::ZERO)
     );
 }
 
@@ -1858,18 +2055,18 @@ fn provider_responses_carry_no_api_key() {
 #[test]
 fn a_configured_provider_reports_its_key_as_optional() {
     let catalog = fixture_catalog().with_configured(&[crate::config::ConfiguredProvider {
-        id: "gpubox".into(),
-        name: "GPU box".into(),
-        base_url: "http://gpubox:8000/v1".into(),
+        id: "inferencebox".into(),
+        name: "Inference box".into(),
+        base_url: "http://inferencebox:8000/v1".into(),
         wire: Wire::OpenAi,
         key_env: None,
     }]);
-    let provider = catalog.get("gpubox").unwrap();
+    let provider = catalog.get("inferencebox").unwrap();
     let json = serde_json::to_value(ProviderSummary::new(&test_state(), provider)).unwrap();
     assert_eq!(json["key_optional"], true);
     assert_eq!(json["key_set"], false);
     assert!(json.get("key_env").is_none(), "{json}");
-    assert_eq!(json["base_url"], "http://gpubox:8000/v1");
+    assert_eq!(json["base_url"], "http://inferencebox:8000/v1");
     // The catalog entry is untouched, and still demands its key.
     let json = serde_json::to_value(ProviderSummary::new(
         &test_state(),
@@ -1887,17 +2084,18 @@ fn a_keyless_remote_target_sends_no_credential_header() {
     let client = Client::new();
     let keyless = |wire: Wire| {
         Target::Remote(Arc::new(RemoteTarget {
-            provider: "gpubox".into(),
-            base_url: "http://gpubox:8000/v1".into(),
+            provider: "inferencebox".into(),
+            base_url: "http://inferencebox:8000/v1".into(),
             wire,
             model: "m".into(),
             max_output: None,
+            cost: None,
             api_key: None,
         }))
     };
     let headers = |target: &Target| {
         target
-            .authorize(client.post("http://gpubox:8000/v1/x"))
+            .authorize(client.post("http://inferencebox:8000/v1/x"))
             .build()
             .unwrap()
             .headers()
@@ -1915,7 +2113,10 @@ fn a_keyless_remote_target_sends_no_credential_header() {
         anthropic::VERSION
     );
     // And with a key, the header is back.
-    let keyed = headers(&remote_target_on("http://gpubox:8000/v1", Wire::OpenAi));
+    let keyed = headers(&remote_target_on(
+        "http://inferencebox:8000/v1",
+        Wire::OpenAi,
+    ));
     assert_eq!(
         keyed.get(reqwest::header::AUTHORIZATION).unwrap(),
         "Bearer sk-test"
@@ -1923,7 +2124,7 @@ fn a_keyless_remote_target_sends_no_credential_header() {
 }
 
 /// The models of a configured provider come from its own `/models`,
-/// so `list --provider gpubox` shows what the box actually serves; a
+/// so `list --provider inferencebox` shows what the box actually serves; a
 /// box that is down or lacks the route costs an empty list, never an
 /// error, since requests can still go to it.
 #[tokio::test]
@@ -1952,8 +2153,8 @@ async fn a_configured_providers_models_are_asked_of_its_endpoint() {
 
     let provider =
         crate::providers::Provider::from_configured(&crate::config::ConfiguredProvider {
-            id: "gpubox".into(),
-            name: "gpubox".into(),
+            id: "inferencebox".into(),
+            name: "inferencebox".into(),
             base_url: base.clone(),
             wire: Wire::OpenAi,
             key_env: None,
@@ -1987,142 +2188,6 @@ async fn a_configured_providers_models_are_asked_of_its_endpoint() {
 }
 
 // -- Idle-timeout auto-unload reaper --------------------------------------
-
-pub(super) fn test_state() -> AppState {
-    test_state_at(std::env::temp_dir())
-}
-
-/// `test_state` with a real store directory, for the few tests that
-/// need `canonical_ref` to actually resolve something.
-fn test_state_at(store_path: PathBuf) -> AppState {
-    AppState(Arc::new(test_inner(store_path)))
-}
-
-/// `test_state` with a hybrid byte budget (every other test has none).
-fn test_state_with_budget(hybrid_local_bytes: u64) -> AppState {
-    let mut inner = test_inner(std::env::temp_dir());
-    inner.hybrid_local_bytes = Some(hybrid_local_bytes);
-    AppState(Arc::new(inner))
-}
-
-/// `test_state_at`'s `Inner`, for tests that set one field differently.
-fn test_inner(store_path: PathBuf) -> Inner {
-    Inner {
-        manager: Mutex::new(ModelManager {
-            running: HashMap::new(),
-            pending_loads: 0,
-        }),
-        exe: None,
-        // `path`, so a resolve could never download.
-        runtime: runtime::Lazy::new(Runtime::Path, None, None),
-        llama_cpp_version: None,
-        vllm_version: None,
-        sglang_version: None,
-        ctx_size: None,
-        ctx_size_explicit: false,
-        hybrid_local_bytes: None,
-        flash_attention: None,
-        kv_cache_type: None,
-        split_mode: None,
-        num_parallel: None,
-        threads: None,
-        cpu_limit: None,
-        // usize::MAX, not 0 — 0 now means "admit almost nothing"
-        // (see try_admit_against's doc comment), and no test here
-        // calls ensure_model (the only caller of try_admit) directly
-        // anyway.
-        max_queue: usize::MAX,
-        max_loaded_models: 0,
-        peers: Vec::new(),
-        memory: 0,
-        store_path,
-        cache_path: std::env::temp_dir(),
-        prompt_log: None,
-        shell: shell::Policy {
-            disabled: None,
-            origins: default_allowed_origins(),
-            command: Vec::new(),
-        },
-        auth: auth::Policy::default(),
-        peer_key: None,
-        client: Client::new(),
-    }
-}
-
-/// A long-lived, harmless real child process to back a test
-/// `RunningModel` — `ModelProcess::is_alive`/`Drop` both need a real
-/// `tokio::process::Child`, not a mock. `sleep` isn't on `PATH` on
-/// Windows (which this project does target — see the `#[cfg(windows)]`
-/// branches elsewhere in this module), so it's spawned differently per
-/// platform rather than assuming a Unix-only test environment.
-///
-/// Its own process group (matching `spawn_vllm_server`'s own real
-/// spawn — see its doc comment), not just the bare default: a
-/// fixture backing an `Engine::Vllm` `RunningModel` hits
-/// `ModelProcess::Drop`'s process-group-SIGKILL arm, which needs
-/// this to actually *be* one, or that kill fails and prints a
-/// spurious "SIGKILL to vllm process group ... failed" warning on
-/// every test run that uses one — confirmed live via CodeRabbit
-/// review on this repo's own git history.
-#[cfg(unix)]
-fn spawn_placeholder_process() -> tokio::process::Child {
-    tokio::process::Command::new("sleep")
-        .arg("60")
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn placeholder `sleep` process")
-}
-
-#[cfg(windows)]
-fn spawn_placeholder_process() -> tokio::process::Child {
-    tokio::process::Command::new("cmd")
-        .args(["/C", "timeout", "/T", "60", "/NOBREAK"])
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn placeholder `cmd /C timeout` process")
-}
-
-fn running_model_fixture(
-    keep_alive: Option<Duration>,
-    idle_for: Duration,
-    in_flight: u32,
-) -> RunningModel {
-    RunningModel {
-        process: ModelProcess::Local(Engine::LlamaServer, spawn_placeholder_process(), None),
-        port: 0,
-        digest: String::new(),
-        size: 0,
-        started_at: now_rfc3339(),
-        last_active: Instant::now() - idle_for,
-        last_active_wall: chrono::Utc::now(),
-        backend_model_path: None,
-        keep_alive,
-        in_flight,
-    }
-}
-
-/// Like `running_model_fixture`, but with a caller-chosen `Engine`
-/// and `backend_model_path` — used by `backend_wire_model`'s own
-/// tests below, which need to distinguish an `Engine::Mlx` backend
-/// from every other one, and by the `engine_label` test.
-fn running_model_fixture_with_engine(
-    engine: Engine,
-    backend_model_path: Option<&str>,
-) -> RunningModel {
-    RunningModel {
-        process: ModelProcess::Local(engine, spawn_placeholder_process(), None),
-        port: 0,
-        digest: String::new(),
-        size: 0,
-        started_at: now_rfc3339(),
-        last_active: Instant::now(),
-        last_active_wall: chrono::Utc::now(),
-        backend_model_path: backend_model_path.map(|s| s.to_string()),
-        keep_alive: None,
-        in_flight: 0,
-    }
-}
 
 /// The container arm reports the engine it runs, not the runtime that
 /// runs it. `tokio::test` because the fixture spawns a real child.
@@ -3901,6 +3966,264 @@ fn consolidate_responses_instructions_is_a_no_op_without_developer_or_system_ite
     assert_eq!(req, before);
 }
 
+/// An agent runner sends one `system` message per toolset, which a
+/// strict template refuses past the first.
+#[test]
+fn consolidate_chat_system_messages_merges_them_into_one_leading_message() {
+    let mut req = serde_json::json!({
+        "model": "docker.io/ai/qwen3.5:0.8b",
+        "messages": [
+            {"role": "system", "content": "you are a helpful assistant"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "## Shell Tools"},
+            {"role": "developer", "content": [{"type": "text", "text": "## Filesystem Tools"}]}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"],
+        serde_json::json!([
+            {"role": "system", "content":
+                "you are a helpful assistant\n\n## Shell Tools\n\n## Filesystem Tools"},
+            {"role": "user", "content": "hi"}
+        ])
+    );
+}
+
+/// The common shape, and the one every ordinary request pays for:
+/// already-leading system message, returned byte for byte.
+#[test]
+fn consolidate_chat_system_messages_leaves_a_single_leading_one_alone() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": "you are a helpful assistant"},
+            {"role": "user", "content": "hi"}
+        ]
+    });
+    let before = req.clone();
+    consolidate_chat_system_messages(&mut req);
+    assert_eq!(req, before);
+}
+
+/// Rebuilding a conforming request would flatten its content to text
+/// and drop every block that isn't.
+#[test]
+fn consolidate_chat_system_messages_keeps_block_content_when_conforming() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "be terse"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+            ]},
+            {"role": "user", "content": "hi"}
+        ]
+    });
+    let before = req.clone();
+    consolidate_chat_system_messages(&mut req);
+    assert_eq!(req, before);
+}
+
+/// Folding content to text drops every block that isn't text, which
+/// forwards a truncated prompt with no error.
+#[test]
+fn consolidate_chat_system_messages_keeps_non_text_blocks_while_merging() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "be terse"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+            ]},
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "and cite sources"}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"],
+        serde_json::json!([
+            {"role": "system", "content": [
+                {"type": "text", "text": "be terse"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                {"type": "text", "text": "and cite sources"}
+            ]},
+            {"role": "user", "content": "hi"}
+        ])
+    );
+}
+
+/// The blank line separates messages, so one message's own parts must
+/// not use it too — two parts would read as two instructions.
+#[test]
+fn consolidate_chat_system_messages_keep_a_messages_own_parts_off_the_blank_line() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "part one"},
+                {"type": "text", "text": "part two"}
+            ]},
+            {"role": "user", "content": "hi"},
+            // Without this the request conforms and is returned as written.
+            {"role": "developer", "content": "developer instruction"}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"][0]["content"],
+        "part one\npart two\n\ndeveloper instruction"
+    );
+}
+
+/// A non-text block ends the run it interrupts: parts before it stay one
+/// instruction, parts after it start another. The image is the object
+/// shape an OpenAI client sends, asserted back whole — `push` clones a
+/// non-text block rather than reading it, so its shape does not matter.
+#[test]
+fn consolidate_chat_system_messages_let_a_non_text_block_end_the_run() {
+    let image = serde_json::json!({
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}
+    });
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "before one"},
+                {"type": "text", "text": "before two"},
+                image,
+                {"type": "text", "text": "after"}
+            ]},
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "and cite sources"}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"][0]["content"],
+        serde_json::json!([
+            {"type": "text", "text": "before one\nbefore two"},
+            {"type": "image_url",
+             "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}},
+            {"type": "text", "text": "after\n\nand cite sources"}
+        ])
+    );
+    // Non-instruction turns are left alone.
+    assert_eq!(
+        req["messages"][1],
+        serde_json::json!({"role": "user", "content": "hi"})
+    );
+    assert_eq!(req["messages"].as_array().map(Vec::len), Some(2));
+}
+
+/// An empty part is dropped, not joined: it would otherwise leave a
+/// stray newline at either end of the run, or a blank line mid-message.
+#[test]
+fn consolidate_chat_system_messages_drop_empty_parts_from_the_run() {
+    let cases = [
+        // Leading, trailing and lone empties leave no trace.
+        (
+            serde_json::json!([{"type": "text", "text": "a"},
+                            {"type": "text", "text": ""}]),
+            "a\n\ndev",
+        ),
+        (
+            serde_json::json!([{"type": "text", "text": ""},
+                            {"type": "text", "text": "b"}]),
+            "b\n\ndev",
+        ),
+        (
+            serde_json::json!([{"type": "text", "text": ""},
+                            {"type": "text", "text": ""}]),
+            "dev",
+        ),
+        // One between two real parts does not split them.
+        (
+            serde_json::json!([{"type": "text", "text": "a"},
+                            {"type": "text", "text": ""},
+                            {"type": "text", "text": "b"}]),
+            "a\nb\n\ndev",
+        ),
+    ];
+    for (content, want) in cases {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": content},
+                {"role": "user", "content": "hi"},
+                {"role": "developer", "content": "dev"}
+            ]
+        });
+        consolidate_chat_system_messages(&mut req);
+        assert_eq!(req["messages"][0]["content"], want);
+    }
+}
+
+/// A late system turn is the shape templates reject, so it moves — and
+/// reorders relative to the user turn before it, as `/v1/messages` does.
+#[test]
+fn consolidate_chat_system_messages_moves_a_late_lone_system_turn_to_the_front() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "a mid-conversation reminder"}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"],
+        serde_json::json!([
+            {"role": "system", "content": "a mid-conversation reminder"},
+            {"role": "user", "content": "hi"}
+        ])
+    );
+}
+
+/// A request with no system message must not gain one.
+#[test]
+fn consolidate_chat_system_messages_is_a_no_op_without_any() {
+    let mut req = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let before = req.clone();
+    consolidate_chat_system_messages(&mut req);
+    assert_eq!(req, before);
+
+    // An embeddings-shaped body has no `messages` at all.
+    let mut input_only = serde_json::json!({"input": "hi"});
+    let before = input_only.clone();
+    consolidate_chat_system_messages(&mut input_only);
+    assert_eq!(input_only, before);
+}
+
+/// An empty system message must not join a blank line into the merge.
+#[test]
+fn consolidate_chat_system_messages_drops_empty_ones() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "the only real instruction"}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"],
+        serde_json::json!([
+            {"role": "system", "content": "the only real instruction"},
+            {"role": "user", "content": "hi"}
+        ])
+    );
+}
+
 // -- Tests ported from ollama ---------------------------------------------
 //
 // The tests below are ported from ollama's own unit-test suites for the
@@ -4289,6 +4612,180 @@ async fn handle_delete_rejects_an_invalid_ref_with_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// ollama sends every GGUF metadata key verbatim, drops two of them, and
+/// carries an array whole unless it is longer than its own ceiling.
+#[test]
+fn model_info_json_sends_scalars_and_short_arrays_verbatim() {
+    use crate::gguf::Value;
+    let mut info = crate::gguf::Info::default();
+    for (k, v) in [
+        ("general.architecture", Value::String("llama".into())),
+        ("llama.context_length", Value::U32(4096)),
+        ("tokenizer.ggml.add_eos_token", Value::Bool(false)),
+        (
+            "tokenizer.ggml.token_type",
+            Value::Array(vec![Value::I32(1), Value::I32(3)]),
+        ),
+        (
+            "tokenizer.ggml.precompiled_charsmap",
+            Value::Array(vec![Value::U8(1), Value::U8(2), Value::U8(3)]),
+        ),
+        ("llama.vision.indexes", Value::Array(Vec::new())),
+        ("general.name", Value::String("Qwen3.5 0.8B".into())),
+        (
+            "tokenizer.chat_template",
+            Value::String("{{ bulk }}".into()),
+        ),
+    ] {
+        info.metadata.insert(k.to_string(), v);
+    }
+    let json = model_info_json(&info);
+    assert_eq!(json["general.architecture"], serde_json::json!("llama"));
+    assert_eq!(json["llama.context_length"], serde_json::json!(4096));
+    assert_eq!(
+        json["tokenizer.ggml.add_eos_token"],
+        serde_json::json!(false)
+    );
+    // A UINT8 array is Go's []byte, which encoding/json writes as a
+    // base64 string — "AQID" is [1, 2, 3].
+    assert_eq!(
+        json["tokenizer.ggml.precompiled_charsmap"],
+        serde_json::json!("AQID")
+    );
+    // A short array is the value itself, not a placeholder for one.
+    assert_eq!(json["tokenizer.ggml.token_type"], serde_json::json!([1, 3]));
+    assert_eq!(json["llama.vision.indexes"], serde_json::json!([]));
+    // Both keys ollama's GetModelInfo deletes. The template has its own
+    // field on this response.
+    assert_eq!(json.get("general.name"), None);
+    assert_eq!(json.get("tokenizer.chat_template"), None);
+}
+
+/// The ceiling is ollama's: an array of exactly 1024 elements is still
+/// sent, and a longer one is elided as `[]` rather than `null`, which a
+/// client would read as "this key has no value" instead of "not carried".
+#[test]
+fn model_info_json_elides_only_arrays_past_the_ceiling() {
+    use crate::gguf::Value;
+    let array = |n: usize| Value::Array(vec![Value::U32(7); n]);
+    let mut info = crate::gguf::Info::default();
+    info.metadata.insert("at.ceiling".into(), array(1024));
+    info.metadata.insert("past.ceiling".into(), array(1025));
+    let json = model_info_json(&info);
+    assert_eq!(json["at.ceiling"].as_array().map(Vec::len), Some(1024));
+    assert_eq!(json["past.ceiling"], serde_json::json!([]));
+}
+
+/// The `/api/show` body for a store holding one model whose single
+/// layer is `(media_type, filepath, blob)`. The two cases below differ
+/// only in that layer, and in what they then assert.
+async fn show_one_model(
+    name: &str,
+    media_type: &str,
+    filepath: &str,
+    blob: &[u8],
+) -> serde_json::Value {
+    let dir = std::env::temp_dir().join(format!(
+        "llmman-show-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let state = test_state_at(dir.clone());
+    let store = OciStore::open(&dir).unwrap();
+
+    let mut layer = store.write_blob(media_type, blob).unwrap();
+    layer.annotations = Some(HashMap::from([(
+        "org.cncf.model.filepath".to_string(),
+        filepath.to_string(),
+    )]));
+    let config = store
+        .write_blob("application/vnd.cncf.model.config.v1+json", b"{}")
+        .unwrap();
+    let manifest = crate::storage::oci::Manifest {
+        schema_version: 2,
+        media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+        artifact_type: None,
+        config,
+        layers: vec![layer],
+        annotations: None,
+    };
+    let mdesc = store
+        .write_blob(
+            "application/vnd.oci.image.manifest.v1+json",
+            &serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    store
+        .tag(mdesc, &format!("docker.io/ai/{name}:latest"))
+        .unwrap();
+
+    let req = OllamaShowRequest {
+        model: format!("docker.io/ai/{name}"),
+        name: None,
+    };
+    let resp = handle_show(State(state), Json(req)).await.into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// The whole `/api/show` wiring over a stored GGUF: the fields below are
+/// public API, and a handler that read the architecture into the wrong
+/// one would still pass the unit tests for the pieces.
+#[tokio::test]
+async fn handle_show_reports_the_stored_ggufs_own_metadata() {
+    // file_type 15 is Q4_K_M while the fixture's lone tensor is Q4_K, so
+    // the assertion below says which of the two sources won.
+    let path = crate::gguf::write_test_gguf_with(&[("general.file_type", 15)]);
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let v = show_one_model(
+        "showmeta",
+        "application/vnd.docker.ai.gguf.v3",
+        "model.gguf",
+        &bytes,
+    )
+    .await;
+
+    // write_test_gguf_with's header: llama, 4096, one 2-D Q4_K tensor.
+    assert_eq!(v["details"]["format"], "gguf");
+    assert_eq!(v["details"]["family"], "llama");
+    assert_eq!(v["details"]["families"], serde_json::json!(["llama"]));
+    assert_eq!(v["details"]["quantization_level"], "Q4_K_M");
+    assert_eq!(v["model_info"]["general.architecture"], "llama");
+    assert_eq!(v["model_info"]["llama.context_length"], 4096);
+    // The old stub keys are gone.
+    assert_eq!(v["model_info"].get("digest"), None);
+    assert_eq!(v["model_info"].get("size"), None);
+}
+
+/// The other half: a checkout-layout model has no GGUF header, so the
+/// format must be its own rather than the `"gguf"` this handler used to
+/// hardcode, and the metadata fields stay empty rather than guessing.
+#[tokio::test]
+async fn handle_show_reports_a_safetensors_model_as_safetensors() {
+    let v = show_one_model(
+        "showst",
+        "application/vnd.cncf.model.weight.v1.tar",
+        "model.safetensors",
+        b"weights",
+    )
+    .await;
+
+    assert_eq!(v["details"]["format"], "safetensors");
+    assert_eq!(v["details"]["family"], "");
+    assert_eq!(v["details"]["families"], serde_json::json!([]));
+    assert_eq!(v["model_info"], serde_json::json!({}));
+    assert_eq!(v["template"], serde_json::Value::Null);
+}
+
 /// /api/show resolves (and so validates) the client ref before it ever
 /// opens the store: an invalid ref returns a 400 and touches nothing.
 #[tokio::test]
@@ -4383,83 +4880,6 @@ fn ollama_push_request_accepts_a_name_only_body() {
             .expect("a name-only body must still deserialize");
     assert_eq!(req.model, "");
     assert_eq!(req.name, "docker.io/ai/gemma4:E2B");
-}
-
-// -- multipart_text_field (/v1/audio/transcriptions) ----------------------
-
-/// Builds a `multipart/form-data` body + matching `content-type`
-/// header out of `fields` (name, value) pairs — a hand-rolled encoder
-/// rather than a dependency, just enough to exercise
-/// `multipart_text_field` against real (if minimal) multipart wire
-/// format.
-fn multipart_body(fields: &[(&str, &str)]) -> (Bytes, HeaderMap) {
-    let boundary = "llmman-test-boundary";
-    let mut body = String::new();
-    for (name, value) in fields {
-        body.push_str(&format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
-        ));
-    }
-    body.push_str(&format!("--{boundary}--\r\n"));
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "content-type",
-        format!("multipart/form-data; boundary={boundary}")
-            .parse()
-            .unwrap(),
-    );
-    (Bytes::from(body), headers)
-}
-
-#[tokio::test]
-async fn multipart_text_field_finds_a_named_field_among_several() {
-    let (body, headers) = multipart_body(&[
-        ("language", "en"),
-        ("model", "docker.io/ai/whisper:latest"),
-        ("response_format", "json"),
-    ]);
-    assert_eq!(
-        multipart_text_field(&body, &headers, "model").await,
-        Some("docker.io/ai/whisper:latest".to_string())
-    );
-    assert_eq!(
-        multipart_text_field(&body, &headers, "language").await,
-        Some("en".to_string())
-    );
-}
-
-#[tokio::test]
-async fn multipart_text_field_leaves_the_original_body_untouched() {
-    // Regression: multipart_text_field parses a *clone* of the body
-    // for the field it wants — the original `Bytes` handed to
-    // `proxy` afterward must still be the exact, complete multipart
-    // payload (file bytes included), not something already partially
-    // consumed by this lookup.
-    let (body, headers) = multipart_body(&[("model", "m"), ("prompt", "hello")]);
-    let before = body.clone();
-    let _ = multipart_text_field(&body, &headers, "model").await;
-    assert_eq!(body, before);
-}
-
-#[tokio::test]
-async fn multipart_text_field_is_none_for_a_missing_field_or_non_multipart_body() {
-    let (body, headers) = multipart_body(&[("language", "en")]);
-    assert_eq!(multipart_text_field(&body, &headers, "model").await, None);
-
-    let plain_body = Bytes::from_static(b"{\"model\":\"m\"}");
-    let mut json_headers = HeaderMap::new();
-    json_headers.insert("content-type", "application/json".parse().unwrap());
-    assert_eq!(
-        multipart_text_field(&plain_body, &json_headers, "model").await,
-        None
-    );
-
-    // No content-type header at all.
-    assert_eq!(
-        multipart_text_field(&plain_body, &HeaderMap::new(), "model").await,
-        None
-    );
 }
 
 // -- stream_ollama over a mock SSE backend --------------------------------
@@ -4559,19 +4979,6 @@ async fn stream_ollama_true_returns_ndjson_chunks() {
     assert_eq!(done.len(), 1);
     assert_eq!(done[0]["eval_count"], 3);
     assert!(chunks[0].get("eval_count").is_none());
-}
-
-/// The process-wide registry against placeholder gauges.
-fn rendered_registry() -> String {
-    metrics::render(&metrics::Snapshot {
-        version: "test".into(),
-        start_time_seconds: 0,
-        scheduling_requests_in_flight: 0,
-        scheduling_capacity: 1,
-        models_loaded: 0,
-        models_loading: 0,
-        models: Vec::new(),
-    })
 }
 
 /// One model's unload counter from the process-wide registry; `0`
@@ -4790,135 +5197,12 @@ async fn the_scrape_endpoint_is_absent_unless_the_operator_enabled_it() {
     );
 }
 
-// -- web UI ---------------------------------------------------------
-
-/// Binds `build_router(state, false)` on a free loopback port.
-async fn serve_router(state: AppState) -> String {
-    serve_router_with(state, false).await
-}
-
-async fn serve_router_with(state: AppState, metrics: bool) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = build_router(state, metrics);
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://127.0.0.1:{}", addr.port())
-}
-
-/// `/` is the page only for a client that asks for HTML; everything
-/// else gets the liveness line scripts have always seen.
-#[tokio::test]
-async fn the_root_is_the_web_ui_for_browsers_and_a_liveness_line_for_the_rest() {
-    let url = serve_router(test_state()).await;
-    let curl = Client::new().get(&url).send().await.unwrap();
-    assert_eq!(curl.status(), StatusCode::OK);
-    assert_eq!(curl.text().await.unwrap(), "llmman is running");
-
-    let browser = Client::new()
-        .get(&url)
-        .header("accept", "text/html,application/xhtml+xml")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(browser.status(), StatusCode::OK);
-    assert_eq!(
-        browser.headers()["content-type"],
-        "text/html; charset=utf-8"
-    );
-    assert_eq!(browser.headers()["content-encoding"], "gzip");
-    let mut html = String::new();
-    std::io::Read::read_to_string(
-        &mut flate2::read::GzDecoder::new(&browser.bytes().await.unwrap()[..]),
-        &mut html,
-    )
-    .unwrap();
-    // The page must reference its own assets under ui/ relatively, so
-    // a gateway prefix works (docs/compose.md).
-    assert!(html.contains("<!doctype html>"), "{html}");
-    assert!(html.contains("ui/app.js"), "{html}");
-    assert!(
-        !html.contains("\"/ui/"),
-        "asset paths must be relative: {html}"
-    );
-}
-
-/// Assets come gzipped with a content ETag; a matching `If-None-Match`
-/// is a 304, and no `max-age` keeps an old UI alive past an upgrade.
-#[tokio::test]
-async fn web_ui_assets_are_gzipped_and_revalidate_by_etag() {
-    let url = serve_router(test_state()).await;
-    let client = Client::builder().no_gzip().build().unwrap();
-    let first = client
-        .get(format!("{url}/ui/app.css"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(first.status(), StatusCode::OK);
-    assert_eq!(first.headers()["content-encoding"], "gzip");
-    assert_eq!(first.headers()["content-type"], "text/css; charset=utf-8");
-    assert_eq!(first.headers()["cache-control"], "no-cache");
-    let etag = first.headers()["etag"].to_str().unwrap().to_string();
-    assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
-    let body = first.bytes().await.unwrap();
-    assert_eq!(&body[..2], &[0x1f, 0x8b], "not gzip");
-
-    for tag in [etag.clone(), format!("W/{etag}"), "*".to_string()] {
-        let again = client
-            .get(format!("{url}/ui/app.css"))
-            .header("if-none-match", &tag)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(again.status(), StatusCode::NOT_MODIFIED, "{tag}");
-    }
-
-    // The page is unframeable however it is reached.
-    for path in ["/", "/ui/index.html"] {
-        let page = client
-            .get(format!("{url}{path}"))
-            .header("accept", "text/html")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(page.headers()["x-frame-options"], "DENY", "{path}");
-        assert_eq!(
-            page.headers()["content-security-policy"],
-            "frame-ancestors 'none'",
-            "{path}"
-        );
-    }
-    let css = client
-        .get(format!("{url}/ui/app.css"))
-        .send()
-        .await
-        .unwrap();
-    assert!(!css.headers().contains_key("x-frame-options"));
-
-    for missing in ["/ui/nope.js", "/ui/../Cargo.toml", "/ui/vendor"] {
-        let r = client.get(format!("{url}{missing}")).send().await.unwrap();
-        assert_eq!(r.status(), StatusCode::NOT_FOUND, "{missing}");
-    }
-}
-
 // -- /llmman/shell ------------------------------------------------------
 
 fn shell_state(policy: shell::Policy) -> AppState {
     let mut inner = test_inner(std::env::temp_dir());
     inner.shell = policy;
     AppState(Arc::new(inner))
-}
-
-fn ws_upgrade(client: &Client, url: &str, origin: Option<&str>) -> reqwest::RequestBuilder {
-    let mut req = client
-        .get(url)
-        .header("connection", "upgrade")
-        .header("upgrade", "websocket")
-        .header("sec-websocket-version", "13")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
-    if let Some(origin) = origin {
-        req = req.header("origin", origin);
-    }
-    req
 }
 
 /// A plain GET reports the policy; an upgrade under a disabled policy
@@ -5324,6 +5608,10 @@ async fn a_keyed_daemon_refuses_everything_but_its_own_page_without_the_key() {
         "/api/version",
         "/v1/models",
         "/llmman/node",
+        "/llmman/search?q=qwen",
+        "/llmman/search/popular",
+        "/llmman/search/model?name=hf.co/o/r",
+        "/llmman/search/avatar?name=hf.co/o/r",
         "/llmman/shell",
         "/metrics",
     ] {
@@ -5645,5 +5933,315 @@ async fn an_unenforced_policy_strips_its_keys_without_refusing_anyone() {
     assert_eq!(
         client_api_key(Some(&seen[1])).as_deref(),
         Some("sk-provider")
+    );
+}
+
+// -- usage ledger ------------------------------------------------------------
+
+fn temp_log(label: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "llmman-{label}-{}-{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+/// The ledger once it holds `n` entries: a stream's is written when hyper
+/// drops the body, which can be after the client read the last byte.
+async fn ledger_of(path: &std::path::Path, n: usize) -> Vec<crate::usage::Entry> {
+    for _ in 0..100 {
+        let entries = crate::usage::read(path).unwrap();
+        if entries.len() >= n {
+            return entries;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    crate::usage::read(path).unwrap()
+}
+
+/// A peer with `docker.io/ai/m:latest` loaded that streams as llama-server
+/// does: `timings` on the finish chunk, or with `include_usage` on the
+/// usage chunk after it. Records each request body.
+async fn usage_peer() -> (String, Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>) {
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let node = node(8 << 30, &["docker.io/ai/m:latest"], &[]);
+    let app = Router::new()
+        .route("/llmman/node", get(move || async move { Json(node) }))
+        .route(
+            "/v1/chat/completions",
+            post(move |Json(req): Json<serde_json::Value>| async move {
+                captured.lock().await.push(req.clone());
+                let usage = serde_json::json!({
+                    "prompt_tokens": 120, "completion_tokens": 7,
+                    "prompt_tokens_details": { "cached_tokens": 100 }
+                });
+                if req["stream"] != true {
+                    let body = serde_json::json!({
+                        "choices": [{ "message": { "content": "hi" } }],
+                        "usage": usage,
+                    });
+                    return ([("content-type", "application/json")], body.to_string());
+                }
+                let timings =
+                    serde_json::json!({ "prompt_n": 20, "cache_n": 100, "predicted_n": 7 });
+                let finish =
+                    serde_json::json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] });
+                let mut sse =
+                    String::from("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
+                if req["stream_options"]["include_usage"] == true {
+                    let last =
+                        serde_json::json!({ "choices": [], "usage": usage, "timings": timings });
+                    sse.push_str(&format!("data: {finish}\n\ndata: {last}\n\n"));
+                } else {
+                    let mut finish = finish;
+                    finish["timings"] = timings;
+                    sse.push_str(&format!("data: {finish}\n\n"));
+                }
+                sse.push_str("data: [DONE]\n\n");
+                ([("content-type", "text/event-stream")], sse)
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (origin, seen)
+}
+
+/// A local stream is not asked for usage (its `timings` report it), so the
+/// client's stream is untouched; each request is one ledger line, joined
+/// to the prompt log.
+#[tokio::test]
+async fn the_usage_ledger_records_each_reply_and_leaves_the_stream_as_asked() {
+    let (origin, seen) = usage_peer().await;
+    let usage_log = temp_log("usage");
+    let prompt_log = temp_log("prompts");
+    let mut inner = inner_with_peers(vec![origin], 0);
+    inner.usage_log = Some(usage_log.clone());
+    inner.prompt_log = Some(prompt_log.clone());
+    let base = serve_router(AppState(Arc::new(inner))).await;
+
+    let chat = |extra: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "model": "docker.io/ai/m",
+            "messages": [{ "role": "user", "content": "hello" }],
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let url = format!("{base}/v1/chat/completions");
+        async move {
+            let resp = Client::new()
+                .post(url)
+                .header("user-agent", "test-agent/1")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp.text().await.unwrap()
+        }
+    };
+
+    let unasked = chat(serde_json::json!({ "stream": true })).await;
+    assert!(unasked.ends_with("data: [DONE]\n\n"), "{unasked}");
+    assert!(!unasked.contains("usage"), "not asked for: {unasked}");
+    assert!(unasked.contains("\"timings\""), "{unasked}");
+    assert!(seen.lock().await[0].get("stream_options").is_none());
+
+    let asked = chat(serde_json::json!({
+        "stream": true, "stream_options": { "include_usage": true }
+    }))
+    .await;
+    assert!(asked.contains("\"prompt_tokens\":120"), "{asked}");
+
+    let whole = chat(serde_json::json!({})).await;
+    assert!(whole.contains("\"usage\""), "{whole}");
+    assert!(
+        seen.lock().await[2].get("stream_options").is_none(),
+        "an unstreamed request is left alone"
+    );
+
+    let entries = ledger_of(&usage_log, 3).await;
+    let prompts = crate::promptlog::read(&prompt_log).unwrap();
+    let _ = std::fs::remove_file(&usage_log);
+    let _ = std::fs::remove_file(&prompt_log);
+    assert_eq!(entries.len(), 3, "{entries:?}");
+    assert_eq!(prompts.len(), 3, "{prompts:?}");
+    for (entry, prompt) in entries.iter().zip(&prompts) {
+        assert_eq!(entry.id, prompt.id, "the two logs join");
+        assert_eq!(entry.route, "/v1/chat/completions");
+        assert_eq!(entry.model, "docker.io/ai/m:latest");
+        assert_eq!(entry.provider, None, "a peer is not a provider");
+        assert_eq!(entry.client.as_deref(), Some("test-agent/1"));
+        assert_eq!(entry.tokens, crate::usage::Tokens::new(120, 100, 0, 7));
+        assert_eq!((entry.rate, entry.cost), (None, None), "no price, not free");
+    }
+}
+
+/// A provider's reply is priced and keeps its `Content-Length`, even under
+/// a (client-settable) hop header; a provider stream is asked for usage,
+/// which the client then doesn't see. No target, a failure, or a local
+/// reply to a hop records nothing.
+#[tokio::test]
+async fn the_usage_ledger_prices_a_provider_reply_and_skips_the_rest() {
+    let usage_log = temp_log("usage-priced");
+    let mut inner = test_inner(std::env::temp_dir());
+    inner.usage_log = Some(usage_log.clone());
+    let state = AppState(Arc::new(inner));
+
+    fn routed() {
+        let cost = crate::providers::Cost {
+            cache_read: Some(0.3),
+            cache_write: Some(3.75),
+            ..crate::providers::Cost::flat(3.0, 15.0)
+        };
+        let target = Target::Remote(Arc::new(RemoteTarget {
+            provider: "openrouter".into(),
+            base_url: "https://openrouter.invalid/api/v1".into(),
+            wire: Wire::OpenAi,
+            model: "anthropic/claude-sonnet-4".into(),
+            max_output: None,
+            cost: Some(cost),
+            api_key: None,
+        }));
+        usage::note_target(
+            "llmman.provider/openrouter/anthropic/claude-sonnet-4",
+            &target,
+        );
+    }
+    let messages = r#"{"type":"message","usage":{"input_tokens":130,"cache_read_input_tokens":17010,"cache_creation_input_tokens":1000,"output_tokens":412}}"#;
+    let app = Router::new()
+        .route(
+            "/v1/messages",
+            post(move || async move {
+                routed();
+                ([("content-type", "application/json")], messages)
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(|| async {
+                // No target: an error before resolution, say.
+                r#"{"usage":{"prompt_tokens":5,"completion_tokens":5}}"#
+            }),
+        )
+        .route(
+            "/v1/completions",
+            post(|| async {
+                let mut req = serde_json::json!({ "stream": true });
+                usage::ask_for_stream_usage(&mut req);
+                assert_eq!(req["stream_options"]["include_usage"], true);
+                routed();
+                let sse = "data: {\"choices\":[{\"text\":\"hi\",\"finish_reason\":\"stop\"}]}\n\n\
+                    data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n\
+                    data: [DONE]\n\n";
+                let body = futures::stream::iter(sse.as_bytes().chunks(7).map(|c| {
+                    Ok::<_, std::convert::Infallible>(Bytes::copy_from_slice(c))
+                }));
+                ([("content-type", "text/event-stream")], Body::from_stream(body))
+            }),
+        )
+        .route(
+            "/api/generate",
+            post(|| async {
+                usage::note_target("m", &Target::Local(1));
+                r#"{"done":true,"prompt_eval_count":5,"eval_count":5}"#
+            }),
+        )
+        .route(
+            "/api/chat",
+            post(|| async {
+                routed();
+                (
+                    StatusCode::BAD_GATEWAY,
+                    r#"{"prompt_eval_count":5,"eval_count":5}"#,
+                )
+            }),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            usage::record_usage,
+        ))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = Client::new();
+    let resp = client
+        .post(format!("{base}/v1/messages"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers().get("content-length").map(|v| v.as_bytes()),
+        Some(messages.len().to_string().as_bytes()),
+        "an in-memory reply stays unchunked"
+    );
+    assert_eq!(resp.text().await.unwrap(), messages);
+    let stream = client
+        .post(format!("{base}/v1/completions"))
+        .send()
+        .await
+        .unwrap();
+    assert!(!stream.text().await.unwrap().contains("usage"));
+    for route in ["/v1/chat/completions", "/api/chat"] {
+        client.post(format!("{base}{route}")).send().await.unwrap();
+    }
+    for route in ["/api/generate", "/v1/messages"] {
+        client
+            .post(format!("{base}{route}"))
+            .header(aggregation::HOP, "1")
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let mut entries = ledger_of(&usage_log, 3).await;
+    let _ = std::fs::remove_file(&usage_log);
+    assert_eq!(entries.len(), 3, "{entries:?}");
+    let streamed = entries
+        .iter()
+        .position(|e| e.route == "/v1/completions")
+        .unwrap();
+    assert_eq!(
+        entries.remove(streamed).tokens,
+        crate::usage::Tokens::new(10, 0, 0, 1)
+    );
+    assert_eq!(entries[0].tokens, entries[1].tokens);
+    let entry = &entries[0];
+    assert_eq!(entry.id.len(), 40);
+    assert_eq!(entry.provider.as_deref(), Some("openrouter"));
+    assert_eq!(
+        entry.tokens,
+        crate::usage::Tokens::new(18_140, 17_010, 1_000, 412)
+    );
+    let want = (130.0 * 3.0 + 17_010.0 * 0.3 + 1_000.0 * 3.75 + 412.0 * 15.0) / 1e6;
+    assert!((entry.cost.unwrap() - want).abs() < 1e-12, "{entry:?}");
+    assert_eq!(entry.rate.unwrap().cache_read, 0.3);
+}
+
+/// A blank `?model=` names nothing, so it must not trigger a catalog fetch.
+#[test]
+fn a_blank_model_hint_is_no_hint() {
+    let hint = |model: Option<&str>| {
+        super::ProviderQuery {
+            model: model.map(str::to_string),
+        }
+        .model()
+        .map(str::to_string)
+    };
+    assert_eq!(hint(None), None);
+    assert_eq!(hint(Some("")), None);
+    assert_eq!(hint(Some("  \t")), None);
+    assert_eq!(
+        hint(Some(" claude-sonnet-5-5 ")),
+        Some("claude-sonnet-5-5".into())
     );
 }

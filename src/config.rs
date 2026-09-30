@@ -7,7 +7,7 @@
 //!
 //! The same paths on every platform, with no llmman-specific variable
 //! to move them: one documented answer to "where does this go". (`~` is
-//! `$HOME` as usual.)
+//! `$HOME`, or `%USERPROFILE%` on Windows.)
 //!
 //! ```toml
 //! [aliases]                            # crate::shortnames
@@ -16,8 +16,8 @@
 //! [providers.openrouter]               # crate::providers
 //! api_key = "sk-or-..."
 //!
-//! [providers.gpubox]                   # a provider models.dev does not list
-//! base_url = "http://gpubox:8000/v1"
+//! [providers.inferencebox]                   # a provider models.dev does not list
+//! base_url = "http://inferencebox:8000/v1"
 //! wire     = "openai"                  # default; or "anthropic"
 //!
 //! [verify]                             # crate::verify
@@ -78,6 +78,9 @@ pub struct Conf {
     /// Private, like `providers`: reached through [`auth_api_keys`] only.
     #[serde(default)]
     auth: AuthConf,
+    /// Native OAuth forwarding on the daemon's TLS listener.
+    #[serde(default)]
+    pub managed: ManagedConf,
     /// `[registries."<host>"]` tables, keyed by the registry host a
     /// reference names — see [`registry_mirrors`].
     #[serde(default)]
@@ -114,6 +117,59 @@ struct AuthConf {
     /// — a string so `llmman config set auth.api_keys a,b` can write it.
     #[serde(default)]
     api_keys: Option<String>,
+}
+
+/// The `[managed]` section. Strings work with `llmman config set`.
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedConf {
+    /// Explicit opt-in; absent means disabled.
+    #[serde(default)]
+    pub enabled: Option<String>,
+    /// Optional upstream idle-read limit; absent or zero means no limit.
+    #[serde(default)]
+    pub read_timeout_seconds: Option<String>,
+}
+
+/// Validated forwarding settings. No provider credentials are stored here.
+#[derive(Default, Debug, Clone)]
+pub struct Managed {
+    /// Whether the daemon mounts the forwarding routes.
+    pub enabled: bool,
+    /// Maximum wait for each upstream read; no total request deadline.
+    pub read_timeout: Option<std::time::Duration>,
+}
+
+/// Loads managed settings using the normal configuration precedence.
+pub fn managed() -> Result<Managed, String> {
+    managed_from_files(files()?)
+}
+
+fn managed_from_files(files: &[File]) -> Result<Managed, String> {
+    let mut managed = Managed::default();
+    for file in files {
+        managed.apply(&file.conf.managed)?;
+    }
+    Ok(managed)
+}
+
+impl Managed {
+    /// Shared by parse-time validation and field-by-field configuration merging.
+    fn apply(&mut self, conf: &ManagedConf) -> Result<(), String> {
+        if let Some(enabled) = &conf.enabled {
+            self.enabled = enabled
+                .parse()
+                .map_err(|_| "managed.enabled must be \"true\" or \"false\"".to_string())?;
+        }
+        if let Some(seconds) = &conf.read_timeout_seconds {
+            let seconds: u32 = seconds.parse().map_err(|_| {
+                "managed.read_timeout_seconds must be an unsigned 32-bit integer".to_string()
+            })?;
+            self.read_timeout =
+                (seconds != 0).then(|| std::time::Duration::from_secs(seconds.into()));
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for AuthConf {
@@ -296,9 +352,47 @@ fn system_dir() -> PathBuf {
 }
 
 /// `~/.config/llmman`, on every platform. No llmman-specific override;
-/// `~` is `$HOME` as usual.
+/// `~` is the home directory below.
 fn user_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".config").join("llmman"))
+    home_dir().map(|h| h.join(".config").join("llmman"))
+}
+
+/// The home directory `~` names, here and for the integrations
+/// `cmd::launch` configures. The environment comes first because
+/// `dirs::home_dir` reads the Windows known-folder API, which ignores
+/// the home a session set for every other program in it — node's
+/// `os.homedir()` included, which is what Cline and pi resolve through.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    env_home().or_else(dirs::home_dir)
+}
+
+/// The variables that name the home directory. `%USERPROFILE%` is what
+/// a Windows session sets and what node's `os.homedir()` reads; `HOME`
+/// is not consulted there, because a POSIX shell exports it in a form
+/// Windows reads as drive-relative.
+const HOME_KEYS: &[&str] = if cfg!(windows) {
+    &["USERPROFILE"]
+} else {
+    &["HOME"]
+};
+
+/// The first of [`HOME_KEYS`] that names an absolute path. A relative
+/// or empty one would anchor the config on the current drive rather
+/// than at a home directory.
+fn env_home() -> Option<PathBuf> {
+    env_home_from(HOME_KEYS, |key| std::env::var_os(key))
+}
+
+/// Split from [`env_home`] so the rule can be asserted without changing
+/// the process environment.
+fn env_home_from(
+    keys: &[&str],
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    keys.iter()
+        .filter_map(|key| lookup(key))
+        .map(PathBuf::from)
+        .find(|value| value.is_absolute())
 }
 
 /// Where a user's own config belongs, for a message that has to name
@@ -314,11 +408,10 @@ pub fn system_path() -> PathBuf {
     system_dir().join(FILE)
 }
 
-/// [`user_path`] for printing, falling back to the bare file name.
-pub fn user_path_display() -> String {
-    user_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| FILE.to_string())
+/// `key` as one part of a dotted TOML key, quoted unless it is bare: an
+/// id like `wafer.ai` would otherwise name two nested tables.
+pub fn toml_key(key: &str) -> String {
+    toml_edit::Key::new(key).display_repr().into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +477,7 @@ pub(crate) fn parse(text: &str) -> Result<Conf, String> {
 /// What the TOML shape alone cannot say, checked at parse time so
 /// `llmman config set` refuses it on the spot.
 fn validate(conf: &Conf) -> Result<(), String> {
+    Managed::default().apply(&conf.managed)?;
     let mut seen: HashMap<String, &str> = HashMap::new();
     for (host, r) in &conf.registries {
         let canonical = canonical_registry_host(host).ok_or_else(|| {
@@ -789,6 +883,38 @@ mod tests {
         parse(text).expect("valid conf")
     }
 
+    /// `$HOME` is what `dirs::home_dir` reads on Unix anyway, so this
+    /// pins the Windows half: `%USERPROFILE%`, which it ignores.
+    #[test]
+    fn a_home_comes_from_the_environment_when_it_is_absolute() {
+        let expected: &[&str] = if cfg!(windows) {
+            &["USERPROFILE"]
+        } else {
+            &["HOME"]
+        };
+        assert_eq!(HOME_KEYS, expected);
+
+        let take = |value: &str| {
+            let value = value.to_string();
+            env_home_from(HOME_KEYS, move |_| {
+                Some(std::ffi::OsString::from(value.clone()))
+            })
+        };
+        let home = if cfg!(windows) {
+            "C:\\Users\\u"
+        } else {
+            "/home/u"
+        };
+        assert_eq!(take(home), Some(PathBuf::from(home)));
+        assert_eq!(take(""), None);
+        assert_eq!(take("relative/home"), None);
+        // What a POSIX shell exports to a Windows binary: rooted, but
+        // not absolute, so it would follow the current drive.
+        #[cfg(windows)]
+        assert_eq!(take("/c/Users/u"), None);
+        assert_eq!(env_home_from(HOME_KEYS, |_| None), None);
+    }
+
     /// A key must not reach a log through the derived `Debug` of the
     /// public `Conf`/`File`.
     #[test]
@@ -928,8 +1054,8 @@ mod tests {
     fn a_base_url_turns_a_provider_table_into_a_definition() {
         let files = [file(
             r#"
-            [providers.gpubox]
-            base_url = "http://gpubox:8000/v1/"
+            [providers.inferencebox]
+            base_url = "http://inferencebox:8000/v1/"
 
             [providers.relay]
             base_url    = "https://relay.example/v1"
@@ -947,10 +1073,10 @@ mod tests {
             configured,
             vec![
                 ConfiguredProvider {
-                    id: "gpubox".into(),
-                    name: "gpubox".into(),
+                    id: "inferencebox".into(),
+                    name: "inferencebox".into(),
                     // Trailing slash gone: a route appends its own.
-                    base_url: "http://gpubox:8000/v1".into(),
+                    base_url: "http://inferencebox:8000/v1".into(),
                     wire: crate::providers::Wire::OpenAi,
                     key_env: None,
                 },
@@ -980,11 +1106,11 @@ mod tests {
     #[test]
     fn a_later_definition_overrides_field_by_field() {
         let system = file(
-            "[providers.gpubox]\nbase_url = \"http://gpubox:8000/v1\"\nname = \"Shared box\"\n\
+            "[providers.inferencebox]\nbase_url = \"http://inferencebox:8000/v1\"\nname = \"Shared box\"\n\
              api_key_env = \"SHARED_KEY\"",
         );
         let user = file(
-            "[providers.gpubox]\nbase_url = \"http://10.0.0.5:8000/v1\"\nwire = \"anthropic\"\n\
+            "[providers.inferencebox]\nbase_url = \"http://10.0.0.5:8000/v1\"\nwire = \"anthropic\"\n\
              api_key_env = \"\"",
         );
         let merged = configured_from(&[system, user]);
@@ -1002,17 +1128,17 @@ mod tests {
     /// defines nothing, a `wire` llmman does not speak.
     #[test]
     fn a_bad_provider_definition_is_a_parse_error() {
-        let bad = |body: &str| parse(&format!("[providers.gpubox]\n{body}")).expect_err(body);
+        let bad = |body: &str| parse(&format!("[providers.inferencebox]\n{body}")).expect_err(body);
 
-        assert!(bad("base_url = \"gpubox:8000\"").contains("base_url"));
-        assert!(bad("base_url = \"gpubox:8000/v1\"").contains("base_url"));
-        assert!(bad("base_url = \"ftp://gpubox/v1\"").contains("http or https"));
+        assert!(bad("base_url = \"inferencebox:8000\"").contains("base_url"));
+        assert!(bad("base_url = \"inferencebox:8000/v1\"").contains("base_url"));
+        assert!(bad("base_url = \"ftp://inferencebox/v1\"").contains("http or https"));
         assert!(bad("base_url = \"http://\"").contains("base_url"));
-        assert!(bad("base_url = \"http://gpubox/v1?x=1\"").contains("query"));
+        assert!(bad("base_url = \"http://inferencebox/v1?x=1\"").contains("query"));
         assert!(bad("base_url = \"\"").contains("base_url"));
         // The URL is reported by the daemon's API; a secret does not go in it.
-        assert!(bad("base_url = \"https://user:pw@gpubox/v1\"").contains("api_key"));
-        assert!(bad("base_url = \"https://user@gpubox/v1\"").contains("api_key"));
+        assert!(bad("base_url = \"https://user:pw@inferencebox/v1\"").contains("api_key"));
+        assert!(bad("base_url = \"https://user@inferencebox/v1\"").contains("api_key"));
         // A slash in the id would never survive `split_remote_ref`.
         assert!(
             parse("[providers.\"team/gpu\"]\nbase_url = \"http://g/v1\"")
@@ -1033,9 +1159,12 @@ mod tests {
         // The good shapes parse, and come out normalized: lowercase
         // scheme and host, no trailing slash.
         for (url, want) in [
-            ("http://gpubox:8000/v1", "http://gpubox:8000/v1"),
-            ("http://gpubox", "http://gpubox"),
-            ("HTTP://GPUBox:8000/v1/", "http://gpubox:8000/v1"),
+            ("http://inferencebox:8000/v1", "http://inferencebox:8000/v1"),
+            ("http://inferencebox", "http://inferencebox"),
+            (
+                "HTTP://InferenceBox:8000/v1/",
+                "http://inferencebox:8000/v1",
+            ),
             ("http://127.0.0.1:11434/v1", "http://127.0.0.1:11434/v1"),
             ("http://[::1]:8000/v1", "http://[::1]:8000/v1"),
             (
@@ -1044,7 +1173,7 @@ mod tests {
             ),
         ] {
             assert_eq!(base_url_of(url).expect(url), want);
-            parse(&format!("[providers.gpubox]\nbase_url = {url:?}")).expect(url);
+            parse(&format!("[providers.inferencebox]\nbase_url = {url:?}")).expect(url);
         }
     }
 
@@ -1052,11 +1181,37 @@ mod tests {
     #[test]
     fn debug_output_shows_a_definition_but_never_a_key() {
         let c = conf(
-            "[providers.gpubox]\nbase_url = \"http://gpubox:8000/v1\"\napi_key = \"sk-secret-value\"",
+            "[providers.inferencebox]\nbase_url = \"http://inferencebox:8000/v1\"\napi_key = \"sk-secret-value\"",
         );
         let rendered = format!("{c:?}");
-        assert!(rendered.contains("gpubox:8000"), "{rendered}");
+        assert!(rendered.contains("inferencebox:8000"), "{rendered}");
         assert!(!rendered.contains("sk-secret-value"), "{rendered}");
+    }
+
+    #[test]
+    fn managed_configuration_is_opt_in_strict_and_uses_field_precedence() {
+        assert!(!managed_from_files(&[]).unwrap().enabled);
+        let base = file("[managed]\nenabled = \"true\"\nread_timeout_seconds = \"600\"");
+        let override_file = file("[managed]\nread_timeout_seconds = \"0\"");
+        let settings = managed_from_files(&[base, override_file]).unwrap();
+        assert!(settings.enabled);
+        assert!(settings.read_timeout.is_none());
+        let settings =
+            managed_from_files(&[file("[managed]\nread_timeout_seconds = \"300\"")]).unwrap();
+        assert_eq!(
+            settings.read_timeout,
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert!(!settings.enabled);
+        for text in [
+            "[managed]\nenabled = \"yes\"",
+            "[managed]\nread_timeout_seconds = \"-1\"",
+            "[managed]\nread_timeout_seconds = \"4294967296\"",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+        assert!(parse("[managed]\nenabled = true").is_err());
+        assert!(parse("[managed]\nenabeld = \"true\"").is_err());
     }
 
     // -- aggregation peers ---------------------------------------------------

@@ -37,15 +37,17 @@ pub struct Server {
     model_path: String,
     videos: Mutex<VecDeque<Video>>,
     counter: AtomicU32,
+    supports_image: bool,
     supports_video: bool,
     supports_audio: bool,
     /// Frame counts are `stride * k + 1`.
     temporal_stride: i64,
-    /// `"ltx"` or `"cosmos3"`.
+    /// `"ltx"`, `"cosmos3"` or `"qwen-image"`.
     family: &'static str,
     /// The model's own defaults when a request leaves them out.
     default_steps: i32,
     default_cfg: f32,
+    default_size: (i64, i64),
 }
 
 type Shared = Arc<Server>;
@@ -125,10 +127,10 @@ fn get_str(body: &Value, k: &str) -> String {
 }
 
 /// Fields shared by all three endpoints; (width, height) come from `size` unless overridden.
-fn common_params(body: &Value) -> Result<GenParams, Error> {
+fn common_params(body: &Value, default_size: (i64, i64)) -> Result<GenParams, Error> {
     let mut p = GenParams::default();
     let size = get_str(body, "size");
-    let (mut w, mut h) = (p.width, p.height);
+    let (mut w, mut h) = default_size;
     if !size.is_empty() && size != "auto" {
         (w, h) = parse_size(&size)
             .ok_or_else(|| Error::Invalid("invalid \"size\", expected WIDTHxHEIGHT".into()))?;
@@ -263,8 +265,11 @@ fn parse_body(body: &[u8]) -> Result<Value, Error> {
 
 fn caps(s: &Server) -> Vec<&'static str> {
     let mut c = Vec::new();
+    if s.supports_image {
+        c.push("image");
+    }
     if s.supports_video {
-        c.extend(["image", "video"]);
+        c.push("video");
     }
     if s.supports_audio {
         c.push("audio");
@@ -296,9 +301,9 @@ async fn props(State(s): State<Shared>) -> Json<Value> {
         "model_path": s.model_path,
         "modalities": {
             "vision": false, "video": false, "audio": false,
-            "image_generation": s.supports_video, "video_generation": s.supports_video, "audio_generation": s.supports_audio,
+            "image_generation": s.supports_image, "video_generation": s.supports_video, "audio_generation": s.supports_audio,
         },
-        "default_generation_settings": {"width": 768, "height": 512, "fps": 24.0, "steps": s.default_steps, "cfg_scale": s.default_cfg},
+        "default_generation_settings": {"width": s.default_size.0, "height": s.default_size.1, "fps": 24.0, "steps": s.default_steps, "cfg_scale": s.default_cfg},
         "build_info": format!("llmman {}", env!("CARGO_PKG_VERSION")),
     }))
 }
@@ -330,6 +335,11 @@ async fn generate(
 
 /// POST /v1/images/generations: OpenAI fields plus negative_prompt, seed, steps, cfg_scale, width, height.
 async fn images(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Response, Error> {
+    if !s.supports_image {
+        return Err(Error::Invalid(
+            "the loaded model does not support image generation".into(),
+        ));
+    }
     let body = parse_body(&body)?;
     let prompt = get_str(&body, "prompt");
     if prompt.is_empty() {
@@ -347,7 +357,7 @@ async fn images(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
             "only response_format=b64_json is supported".into(),
         ));
     }
-    let mut p = common_params(&body)?;
+    let mut p = common_params(&body, s.default_size)?;
     p.prompt = prompt;
     p.n_frames = 1;
     check_pixels(&p)?;
@@ -356,7 +366,7 @@ async fn images(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
 
     if !stream {
         let out = generate(s, p, None, cancelled).await?;
-        let png = encode::png(out.frame(0), out.width, out.height)
+        let png = encode::png(out.frame(0), out.frame_alpha(0), out.width, out.height)
             .map_err(|e| Error::Failed(e.to_string()))?;
         return Ok(Json(json!({
             "created": now(),
@@ -379,13 +389,20 @@ async fn images(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
             }
         }
         let ev = match gen.await {
-            Ok(Ok(out)) => match encode::png(out.frame(0), out.width, out.height) {
-                Ok(png) => {
-                    json!({"type": "image_generation.completed", "b64_json": b64(&png), "revised_prompt": out.revised_prompt, "created_at": now()})
+            Ok(Ok(out)) => {
+                match encode::png(out.frame(0), out.frame_alpha(0), out.width, out.height) {
+                    Ok(png) => {
+                        json!({"type": "image_generation.completed", "b64_json": b64(&png), "revised_prompt": out.revised_prompt, "created_at": now()})
+                    }
+                    Err(e) => json!({"type": "error", "error": {"message": e.to_string()}}),
                 }
-                Err(e) => json!({"type": "error", "error": {"message": e.to_string()}}),
-            },
-            Ok(Err(_)) | Err(_) => {
+            }
+            Ok(Err(
+                Error::Invalid(m) | Error::Failed(m) | Error::NotFound(m) | Error::NotSupported(m),
+            )) => {
+                json!({"type": "error", "error": {"message": m}})
+            }
+            Err(_) => {
                 json!({"type": "error", "error": {"message": "image generation failed"}})
             }
         };
@@ -406,12 +423,17 @@ fn tokio_stream_from<T>(rx: mpsc::UnboundedReceiver<T>) -> impl futures::Stream<
 /// POST /v1/videos: synchronous, returns the completed job; the mp4 is served by /v1/videos/:id/content
 /// (frames and audio are inlined with response_format "frames" or without ffmpeg).
 async fn videos(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Response, Error> {
+    if !s.supports_video {
+        return Err(Error::Invalid(
+            "the loaded model does not support video generation".into(),
+        ));
+    }
     let body = parse_body(&body)?;
     let prompt = get_str(&body, "prompt");
     if prompt.is_empty() {
         return Err(Error::Invalid("\"prompt\" is required".into()));
     }
-    let mut p = common_params(&body)?;
+    let mut p = common_params(&body, s.default_size)?;
     p.prompt = prompt.clone();
     p.fps = get_f64(&body, "fps", 24.0) as f32;
     if !(1.0..=120.0).contains(&p.fps) {
@@ -478,7 +500,7 @@ async fn videos(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
     if response_format == "frames" || mp4.is_empty() {
         let mut frames = Vec::with_capacity(out.n_frames as usize);
         for f in 0..out.n_frames as usize {
-            let png = encode::png(out.frame(f), out.width, out.height)
+            let png = encode::png(out.frame(f), out.frame_alpha(f), out.width, out.height)
                 .map_err(|e| Error::Failed(e.to_string()))?;
             frames.push(b64(&png));
         }
@@ -557,7 +579,7 @@ async fn speech(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
             "only response_format=wav is supported".into(),
         ));
     }
-    let mut p = common_params(&body)?;
+    let mut p = common_params(&body, s.default_size)?;
     let seconds = get_f64(&body, "seconds", 4.0);
     let max_seconds = MAX_FRAMES as f64 / p.fps as f64;
     if !(seconds > 0.0 && seconds <= max_seconds) {
@@ -585,12 +607,14 @@ async fn speech(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
 
 pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
     let s = Arc::new(Server {
+        supports_image: ctx.supports_image(),
         supports_video: ctx.supports_video(),
         supports_audio: ctx.supports_audio(),
         temporal_stride: ctx.temporal_stride(),
         family: ctx.family(),
         default_steps: ctx.default_steps(),
         default_cfg: ctx.default_cfg(),
+        default_size: ctx.default_size(),
         ctx: Mutex::new(ctx),
         model_name,
         model_path,

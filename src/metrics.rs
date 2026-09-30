@@ -16,6 +16,10 @@
 //! `ollama_eval_total` belong in the process that produced them; llmman
 //! is not that process.
 //!
+//! Per-provider tokens and cost are in `crate::usage`'s ledger instead: a
+//! bill is asked of history, which counters reset by a restart can't
+//! answer.
+//!
 //! No new dependency: a `prometheus` client crate would bring a registry,
 //! a descriptor system and a protobuf encoder to emit the text below,
 //! none of which this surface needs.

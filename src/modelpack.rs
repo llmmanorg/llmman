@@ -35,7 +35,8 @@ pub enum ModelPath {
     /// A latent diffusion model (image / video / audio generation) —
     /// served in-process by `crate::mediagen` from the transformer GGUF
     /// plus the sidecars pulled next to it (see
-    /// `crate::hf::oci::ANNOTATION_ROLE`).
+    /// `crate::hf::oci::ANNOTATION_ROLE`), or from a Diffusers pack whose
+    /// pipeline it runs (`crate::mediagen::is_native_pipeline`).
     Diffusion(DiffusionPaths),
     /// A Diffusers-layout safetensors directory (a root `model_index.json`,
     /// weights in `transformer/`, `vae/`, ...) such as `nvidia/Cosmos3-Edge`
@@ -49,7 +50,8 @@ pub const DIFFUSERS_MODEL_INDEX: &str = "model_index.json";
 /// The files of a resolved [`ModelPath::Diffusion`] model.
 #[derive(Debug, Clone, Default)]
 pub struct DiffusionPaths {
-    /// The diffusion transformer GGUF (`--model`).
+    /// The diffusion transformer GGUF (`--model`), or a Diffusers pack's
+    /// `model_index.json` (its components are in `files`).
     pub model: PathBuf,
     /// Video VAE (`--vae`).
     pub vae: Option<PathBuf>,
@@ -266,7 +268,7 @@ fn raw_blob_path(
     Ok(p)
 }
 
-/// A raw layer's blob under its original file name, as a symlink
+/// A raw layer's blob under its original file name as
 /// `<cache>/<digest>/<filename>`: the name carries the variant
 /// (`distilled` selects the sampling schedule).
 fn named_blob_path(
@@ -278,21 +280,9 @@ fn named_blob_path(
     let Some(name) = layer_filepath(layer).and_then(|p| Path::new(p).file_name()) else {
         return Ok(blob);
     };
-    // absolute: LLMMAN_MODELS may be relative
-    let blob = dunce::canonicalize(&blob)?;
     let dir = cache_path.join(digest_hex(&layer.digest)?);
-    std::fs::create_dir_all(&dir)?;
     let link = dir.join(name);
-    if !link.exists() {
-        // a link left dangling by blob GC
-        let _ = std::fs::remove_file(&link);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&blob, &link)
-            .with_context(|| format!("link {} -> {}", link.display(), blob.display()))?;
-        #[cfg(not(unix))]
-        std::fs::hard_link(&blob, &link)
-            .with_context(|| format!("link {} -> {}", link.display(), blob.display()))?;
-    }
+    cache_layer_file(&blob, &link, layer.size)?;
     Ok(link)
 }
 
@@ -362,6 +352,43 @@ pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) 
     caps
 }
 
+/// How many primary GGUF layers the manifest holds. More than one is a
+/// `gguf-split` set, whose tensors are spread across the shards, so no
+/// single header's tensor list describes the whole model.
+pub fn gguf_shard_count(manifest: &crate::storage::oci::Manifest) -> usize {
+    let layers: Vec<_> = manifest
+        .layers
+        .iter()
+        .filter(|l| is_gguf_layer(l) && layer_role(l).is_none())
+        .collect();
+    let weights = layers.iter().filter(|l| !is_mmproj_layer(l)).count();
+    if weights > 0 {
+        return weights;
+    }
+    // [`gguf_layers`] falls back to the first layer when every one looks
+    // like mmproj, so a lone one is the model and its header describes
+    // it. Several, and which is the model is a guess — stay plural, so
+    // the caller reports nothing rather than one of them.
+    layers.len()
+}
+
+/// The model's parsed GGUF header: the blob as stored, or a tar layer
+/// already extracted. Like [`chat_template`] it extracts nothing itself,
+/// so a read-only caller never copies a checkout into the cache. `None`
+/// for a checkout-layout model, or a header that will not parse.
+pub fn gguf_info(
+    store_path: &Path,
+    cache_path: &Path,
+    manifest: &crate::storage::oci::Manifest,
+) -> Option<crate::gguf::Info> {
+    let (primary, _) = gguf_layers(manifest)?;
+    let path = raw_blob_path(store_path, primary)
+        .ok()
+        .filter(|p| blob_is_gguf(p))
+        .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))?;
+    crate::gguf::read_info(&path).ok()
+}
+
 /// Ollama's `api.ShowResponse.Template`: the model's chat template, read
 /// without extracting anything (a read-only `/api/show` must not copy a
 /// checkout into the cache). A GGUF's `tokenizer.chat_template`, from
@@ -374,13 +401,8 @@ pub fn chat_template(
     cache_path: &Path,
     manifest: &crate::storage::oci::Manifest,
 ) -> Option<String> {
-    if let Some((primary, _)) = gguf_layers(manifest) {
-        let path = raw_blob_path(store_path, primary)
-            .ok()
-            .filter(|p| blob_is_gguf(p))
-            .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))?;
-        return crate::gguf::read_info(&path)
-            .ok()?
+    if gguf_layers(manifest).is_some() {
+        return gguf_info(store_path, cache_path, manifest)?
             .str("tokenizer.chat_template")
             .map(str::to_string);
     }
@@ -484,9 +506,21 @@ pub enum ModelFormat {
     Omni,
 }
 
+impl ModelFormat {
+    /// The same vocabulary [`ModelPath::format`] reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelFormat::Gguf => "gguf",
+            ModelFormat::SafeTensors => "safetensors",
+            ModelFormat::Diffusion => "diffusion",
+            ModelFormat::Omni => "omni",
+        }
+    }
+}
+
 /// [`resolve_model`]'s classification: diffusion > GGUF > Diffusers
 /// (omni) > safetensors, `None` for "no servable model layer".
-fn manifest_format(manifest: &crate::storage::oci::Manifest) -> Option<ModelFormat> {
+pub fn manifest_format(manifest: &crate::storage::oci::Manifest) -> Option<ModelFormat> {
     if manifest.layers.iter().any(|l| layer_role(l).is_some()) {
         Some(ModelFormat::Diffusion)
     } else if gguf_layers(manifest).is_some() {
@@ -497,6 +531,36 @@ fn manifest_format(manifest: &crate::storage::oci::Manifest) -> Option<ModelForm
         Some(ModelFormat::SafeTensors)
     } else {
         None
+    }
+}
+
+/// A Diffusers pack whose pipeline `crate::mediagen` runs itself.
+fn is_native_diffusers(store: &OciStore, manifest: &crate::storage::oci::Manifest) -> bool {
+    manifest
+        .layers
+        .iter()
+        .find(|l| is_diffusers_index_layer(l))
+        .and_then(|l| store.read_blob(&l.digest).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| {
+            v.get("_class_name")?
+                .as_str()
+                .map(crate::mediagen::is_native_pipeline)
+        })
+        .unwrap_or(false)
+}
+
+/// [`manifest_format`], but a Diffusers pack whose pipeline `crate::mediagen`
+/// runs is [`ModelFormat::Diffusion`] rather than [`ModelFormat::Omni`].
+pub fn stored_manifest_format(
+    store: &OciStore,
+    manifest: &crate::storage::oci::Manifest,
+) -> Option<ModelFormat> {
+    match manifest_format(manifest) {
+        Some(ModelFormat::Omni) if is_native_diffusers(store, manifest) => {
+            Some(ModelFormat::Diffusion)
+        }
+        f => f,
     }
 }
 
@@ -527,7 +591,7 @@ pub fn stored_format(store_path: &Path, model_ref: &str) -> anyhow::Result<Model
         .find(model_ref)
         .with_context(|| format!("model not found in store: {model_ref}"))?;
     let manifest = store.read_manifest(&desc.digest)?;
-    manifest_format(&manifest).ok_or_else(|| no_servable_layer(model_ref, &manifest))
+    stored_manifest_format(&store, &manifest).ok_or_else(|| no_servable_layer(model_ref, &manifest))
 }
 
 /// Resolve `model_ref` (already present in the `OciStore` at `store_path`)
@@ -544,9 +608,31 @@ pub fn resolve_model(
         .with_context(|| format!("model not found in store: {model_ref}"))?;
     let manifest = store.read_manifest(&desc.digest)?;
 
-    let Some(format) = manifest_format(&manifest) else {
+    let Some(format) = stored_manifest_format(&store, &manifest) else {
         return Err(no_servable_layer(model_ref, &manifest));
     };
+
+    // ── Diffusers pipeline → crate::mediagen ──────────────────────────────
+    if format == ModelFormat::Diffusion && manifest_format(&manifest) == Some(ModelFormat::Omni) {
+        extract_safetensors_dir(store_path, cache_path, &desc.digest, &manifest)?;
+        let root = cache_path.join(digest_hex(&desc.digest)?);
+        let files: std::collections::BTreeMap<String, PathBuf> = manifest
+            .layers
+            .iter()
+            .filter_map(layer_filepath)
+            .filter(|p| crate::sources::is_safe_relative_path(p) && root.join(p).is_file())
+            .map(|p| (p.to_string(), root.join(p)))
+            .collect();
+        let model = files
+            .get(DIFFUSERS_MODEL_INDEX)
+            .cloned()
+            .ok_or_else(|| anyhow!("{model_ref}: {DIFFUSERS_MODEL_INDEX} was not extracted"))?;
+        return Ok(ModelPath::Diffusion(DiffusionPaths {
+            model,
+            files,
+            ..Default::default()
+        }));
+    }
 
     // ── diffusion → crate::mediagen ───────────────────────────────────────
     if format == ModelFormat::Diffusion {
@@ -681,14 +767,8 @@ fn extract_safetensors_dir(
             continue;
         }
 
-        std::fs::create_dir_all(dest.parent().context("no parent")?)?;
-        match std::fs::remove_file(&dest) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("remove {}", dest.display())),
-        }
         let blob = raw_blob_path(store_path, layer)?;
-        link_or_copy_file(&blob, &dest, layer.size)
+        cache_layer_file(&blob, &dest, layer.size)
             .with_context(|| format!("cache {rel_path} from blob store"))?;
         eprintln!("[llmman] cached {rel_path}");
     }
@@ -703,29 +783,48 @@ fn extract_safetensors_dir(
 }
 
 fn cached_layer_file_matches(dest: &Path, layer_size: u64) -> bool {
-    dest.metadata()
+    dest.symlink_metadata()
         .map(|m| m.is_file() && m.len() == layer_size)
         .unwrap_or(false)
 }
 
-fn link_or_copy_file(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        match std::fs::hard_link(src, dest) {
-            Ok(()) => Ok(()),
-            Err(_) if cached_layer_file_matches(dest, layer_size) => Ok(()),
-            Err(hardlink_error) => copy_file_atomic(src, dest, layer_size).with_context(|| {
-                format!(
-                    "hardlink {} to {} failed: {hardlink_error}; copy failed",
-                    src.display(),
-                    dest.display()
-                )
-            }),
-        }
+fn cache_layer_file(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result<()> {
+    if cached_layer_file_matches(dest, layer_size) {
+        return Ok(());
     }
-    #[cfg(not(unix))]
-    {
-        copy_file_atomic(src, dest, layer_size)
+    std::fs::create_dir_all(dest.parent().context("no parent")?)?;
+    match std::fs::remove_file(dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("remove {}", dest.display())),
+    }
+    link_or_copy_file(src, dest, layer_size)
+}
+
+fn link_or_copy_file(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result<()> {
+    match std::fs::hard_link(src, dest) {
+        Ok(()) if cached_layer_file_matches(dest, layer_size) => Ok(()),
+        Ok(()) => {
+            let actual_size = dest
+                .symlink_metadata()
+                .with_context(|| format!("inspect hardlink {}", dest.display()))
+                .map(|meta| meta.len());
+            std::fs::remove_file(dest)
+                .with_context(|| format!("remove invalid hardlink {}", dest.display()))?;
+            let actual_size = actual_size?;
+            anyhow::bail!(
+                "blob {} is {actual_size} bytes, expected {layer_size}",
+                src.display()
+            );
+        }
+        Err(_) if cached_layer_file_matches(dest, layer_size) => Ok(()),
+        Err(hardlink_error) => copy_file_atomic(src, dest, layer_size).with_context(|| {
+            format!(
+                "hardlink {} to {} failed: {hardlink_error}; copy failed",
+                src.display(),
+                dest.display()
+            )
+        }),
     }
 }
 
@@ -886,6 +985,30 @@ mod tests {
     }
 
     #[test]
+    fn gguf_info_reads_the_header_of_the_stored_primary_layer() {
+        let path = crate::gguf::write_test_gguf_with(&[]);
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let (store, mut m) = manifest_with(vec![]);
+        let mut d = store.write_blob(HF_GGUF_MEDIA_TYPE, &bytes).unwrap();
+        d.annotations.get_or_insert_with(Default::default).insert(
+            "org.cncf.model.filepath".to_string(),
+            "model.gguf".to_string(),
+        );
+        m.layers = vec![d];
+        let info = gguf_info(store.root(), Path::new("/nonexistent"), &m).expect("header");
+        assert_eq!(info.architecture(), Some("llama"));
+        assert_eq!(info.context_length(), Some(4096));
+    }
+
+    /// A checkout-layout model has no GGUF layer to read.
+    #[test]
+    fn gguf_info_is_none_without_a_gguf_layer() {
+        let (store, m) = manifest_with(vec![descriptor("sha256:a", "model.safetensors")]);
+        assert!(gguf_info(store.root(), Path::new("/nonexistent"), &m).is_none());
+    }
+
+    #[test]
     fn capabilities_honours_cncf_config_input_types_image() {
         // The exact shape hf::oci::build_cncf_manifest writes.
         let (store, mut m) = manifest_with(vec![descriptor("sha256:a", "model.gguf")]);
@@ -962,6 +1085,40 @@ mod tests {
         assert_eq!(manifest_format(&m), None);
     }
 
+    #[test]
+    fn gguf_shard_count_counts_only_the_primary_weights() {
+        let (_, m) = manifest_with(vec![
+            descriptor("sha256:a", "model-00001-of-00003.gguf"),
+            descriptor("sha256:b", "model-00002-of-00003.gguf"),
+            descriptor("sha256:c", "model-00003-of-00003.gguf"),
+            descriptor("sha256:d", "mmproj-F16.gguf"),
+        ]);
+        assert_eq!(gguf_shard_count(&m), 3);
+        let (_, m) = manifest_with(vec![
+            descriptor("sha256:a", "model.Q4_K_M.gguf"),
+            descriptor("sha256:b", "mmproj-F16.gguf"),
+        ]);
+        assert_eq!(gguf_shard_count(&m), 1);
+        // A lone mmproj-named GGUF is the model here (see gguf_layers).
+        let (_, m) = manifest_with(vec![descriptor("sha256:a", "mmproj-F16.gguf")]);
+        assert_eq!(gguf_shard_count(&m), 1);
+        // Several, and which one is the model is a guess.
+        let (_, m) = manifest_with(vec![
+            descriptor("sha256:a", "mmproj-F16.gguf"),
+            descriptor("sha256:b", "mmproj-Q8.gguf"),
+        ]);
+        assert_eq!(gguf_shard_count(&m), 2);
+    }
+
+    /// `/api/show` reports these strings, so they are the wire contract.
+    #[test]
+    fn model_format_as_str_matches_model_paths_vocabulary() {
+        assert_eq!(ModelFormat::Gguf.as_str(), "gguf");
+        assert_eq!(ModelFormat::SafeTensors.as_str(), "safetensors");
+        assert_eq!(ModelFormat::Diffusion.as_str(), "diffusion");
+        assert_eq!(ModelFormat::Omni.as_str(), "omni");
+    }
+
     /// The layers `llmman pull nvidia/Cosmos3-Edge` records (the
     /// Diffusers layout: a root pipeline index, per-component subdirs).
     fn cosmos3_layers() -> Vec<crate::storage::oci::Descriptor> {
@@ -995,6 +1152,29 @@ mod tests {
         layers.push(vae);
         let (_, m) = manifest_with(layers);
         assert_eq!(manifest_format(&m), Some(ModelFormat::Diffusion));
+    }
+
+    #[test]
+    fn a_pipeline_mediagen_runs_is_diffusion_not_omni() {
+        let with_index = |class: &str| {
+            let (store, mut m) = manifest_with(cosmos3_layers());
+            let index = store
+                .write_blob(
+                    "application/vnd.cncf.model.weight.config.v1.raw",
+                    format!(r#"{{"_class_name": "{class}"}}"#).as_bytes(),
+                )
+                .unwrap();
+            m.layers[1].digest = index.digest;
+            stored_manifest_format(&store, &m)
+        };
+        assert_eq!(
+            with_index("QwenImage21Pipeline"),
+            Some(ModelFormat::Diffusion)
+        );
+        assert_eq!(with_index("Cosmos3OmniPipeline"), Some(ModelFormat::Omni));
+        // an index missing from the store leaves it to vLLM-Omni
+        let (store, m) = manifest_with(cosmos3_layers());
+        assert_eq!(stored_manifest_format(&store, &m), Some(ModelFormat::Omni));
     }
 
     #[test]
@@ -1138,6 +1318,41 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn named_blob_path_replaces_symlink_with_hardlink() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        let weights = b"complete-weights-bytes";
+        let layer_hex = "aa".repeat(32);
+        let mut layer = descriptor(&format!("sha256:{layer_hex}"), "model.safetensors");
+        layer.media_type = "application/vnd.cncf.model.weight.v1.raw".into();
+        layer.size = weights.len() as u64;
+        let (store, _) = manifest_with(vec![layer.clone()]);
+
+        let blob = store.root().join("blobs").join("sha256").join(&layer_hex);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, weights).unwrap();
+
+        let cache = store.root().join("cache");
+        let dest = cache.join(&layer_hex).join("model.safetensors");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        symlink(&blob, &dest).unwrap();
+
+        assert_eq!(named_blob_path(store.root(), &cache, &layer).unwrap(), dest);
+        assert!(!std::fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let dest_meta = std::fs::metadata(&dest).unwrap();
+        let blob_meta = std::fs::metadata(&blob).unwrap();
+        assert_eq!(
+            (dest_meta.dev(), dest_meta.ino()),
+            (blob_meta.dev(), blob_meta.ino())
+        );
+    }
+
     #[test]
     fn copy_file_atomic_replaces_dest_through_temp_file() {
         let dir = std::env::temp_dir().join(format!(
@@ -1162,6 +1377,27 @@ mod tests {
                 .all(|e| !e.file_name().to_string_lossy().contains(".tmp")),
             "copy temp file should not remain"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn link_or_copy_file_rejects_a_short_blob() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-modelpack-short-blob-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("blob");
+        let dest = dir.join("model.safetensors");
+        std::fs::write(&src, b"short").unwrap();
+
+        let error = link_or_copy_file(&src, &dest, 22).unwrap_err();
+        assert!(
+            error.to_string().contains("is 5 bytes, expected 22"),
+            "{error:#}"
+        );
+        assert!(!dest.exists(), "short linked dest should be removed");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

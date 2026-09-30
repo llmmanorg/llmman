@@ -1,0 +1,30 @@
+name: Upload artifact (with retry)
+description: >-
+  actions/upload-artifact with one retry. The final FinalizeArtifact call
+  gets a transient 403 now and then after every byte is up. The half-made
+  artifact then holds the name for this run (CreateArtifact: 409) but is
+  listed nowhere, so `overwrite: true` cannot remove it; the retry goes
+  under `<name>-retry` and consumers download the pattern `<name>*`.
+inputs:
+  name:
+    description: Artifact name (the retry is `<name>-retry`)
+    required: true
+  path:
+    description: File(s) to upload
+    required: true
+runs:
+  using: composite
+  steps:
+    - id: first
+      continue-on-error: true
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        if-no-files-found: error
+    - if: steps.first.outcome == 'failure'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: ${{ inputs.name }}-retry
+        path: ${{ inputs.path }}
+        if-no-files-found: error

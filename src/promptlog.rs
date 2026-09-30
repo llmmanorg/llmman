@@ -7,11 +7,18 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const FILE: &str = "prompts.jsonl";
+
+/// A logged prompt's [`Entry::id`], left in the request's extensions for
+/// `crate::usage`'s entry for the same request to carry.
+#[derive(Clone, Debug)]
+pub struct PromptId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
@@ -29,8 +36,13 @@ pub struct Entry {
 
 /// `<store>/../prompts.jsonl`, honoring `LLMMAN_MODELS` like `serve.log`.
 pub fn path() -> anyhow::Result<PathBuf> {
+    beside_store(FILE)
+}
+
+/// `<store>/../<file>`: where the daemon's own logs live.
+pub fn beside_store(file: &str) -> anyhow::Result<PathBuf> {
     let store = crate::default_store()?;
-    Ok(store.parent().unwrap_or(&store).join(FILE))
+    Ok(store.parent().unwrap_or(&store).join(file))
 }
 
 /// Off under `LLMMAN_NOHISTORY` (as ollama's `OLLAMA_NOHISTORY`).
@@ -59,8 +71,21 @@ pub fn entry(route: &str, body: &[u8], client: Option<&str>, time: String) -> Op
     if prompt.is_empty() {
         return None;
     }
-    // Nanoseconds too, so identical requests within the same displayed
-    // second still get distinct ids.
+    Some(Entry {
+        id: new_id(&time, route, body),
+        time,
+        route: route.to_string(),
+        model: req["model"].as_str().unwrap_or("").to_string(),
+        client: client.map(str::to_string),
+        prompt,
+    })
+}
+
+/// A fresh 40-hex-char id for a request at `time`. Nanoseconds and a
+/// counter too, so identical requests within the same displayed second
+/// (or the same clock tick) still get distinct ids.
+pub fn new_id(time: &str, route: &str, body: &[u8]) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -68,17 +93,10 @@ pub fn entry(route: &str, body: &[u8], client: Option<&str>, time: String) -> Op
     let mut hasher = Sha256::new();
     hasher.update(time.as_bytes());
     hasher.update(nanos.to_le_bytes());
+    hasher.update(COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
     hasher.update(route.as_bytes());
     hasher.update(body);
-    let id = hex::encode(hasher.finalize())[..40].to_string();
-    Some(Entry {
-        id,
-        time,
-        route: route.to_string(),
-        model: req["model"].as_str().unwrap_or("").to_string(),
-        client: client.map(str::to_string),
-        prompt,
-    })
+    hex::encode(hasher.finalize())[..40].to_string()
 }
 
 /// The last user turn's text from `messages` (Ollama, OpenAI, Anthropic)
@@ -129,10 +147,20 @@ fn text_of(content: &serde_json::Value) -> String {
     }
 }
 
-/// Appends one entry as one line, to a file only its owner can read. A
-/// tail left unterminated by a crash mid-write gets its newline first,
-/// so it costs only itself.
+/// Appends one entry as one line; see [`append_line`].
 pub fn append(path: &Path, entry: &Entry) -> std::io::Result<()> {
+    append_line(path, entry)
+}
+
+/// Every entry, oldest first; see [`read_lines`].
+pub fn read(path: &Path) -> std::io::Result<Vec<Entry>> {
+    read_lines(path)
+}
+
+/// Appends one JSON value (this log's entry or `crate::usage`'s) as one
+/// line, to a file only its owner can read. A tail left unterminated by
+/// a crash mid-write gets its newline first, so it costs only itself.
+pub fn append_line<T: Serialize>(path: &Path, entry: &T) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -155,9 +183,9 @@ pub fn append(path: &Path, entry: &Entry) -> std::io::Result<()> {
     file.write_all(&line)
 }
 
-/// Every entry, oldest first. A missing file is an empty log; a line
+/// Every line, oldest first. A missing file is an empty log; a line
 /// that doesn't parse (a torn write, a hand edit) is skipped.
-pub fn read(path: &Path) -> std::io::Result<Vec<Entry>> {
+pub fn read_lines<T: DeserializeOwned>(path: &Path) -> std::io::Result<Vec<T>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

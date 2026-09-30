@@ -67,8 +67,8 @@ pub fn run(args: &RmArgs) -> anyhow::Result<()> {
         let live = gc::referenced_digests(&store)?;
         let cache_path = crate::default_cache()?;
         let grace = gc::GC_GRACE_PERIOD;
-        let blob_stats = gc::prune_blobs(&store_root, &live, grace)?;
-        let cache_stats = gc::prune_cache(&cache_path, &live, grace)?;
+        let (blob_stats, cache_stats) =
+            gc::prune_blobs_and_cache(&store_root, &cache_path, &live, grace)?;
         if blob_stats.count > 0 || cache_stats.count > 0 {
             println!(
                 "Freed {} ({} blobs, {} cache entries)",

@@ -463,4 +463,30 @@ mod tests {
              to keep the model, not whether to keep it"
         );
     }
+
+    /// Every zero form `parse_keep_alive_value` accepts resolves to a
+    /// zero duration, not only the JSON number: a client spelling `"0"`,
+    /// `"0s"` or `0.0` is asking for the same immediate unload as one
+    /// spelling `0`. Whether a request is an unload at all is
+    /// [`is_explicit_unload`]'s question, for the reason its own doc
+    /// comment gives.
+    #[test]
+    fn resolve_keep_alive_treats_every_zero_form_as_the_unload_sentinel() {
+        assert_eq!(
+            resolve_keep_alive(&Some(serde_json::json!(0))),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            resolve_keep_alive(&Some(serde_json::json!("0"))),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            resolve_keep_alive(&Some(serde_json::json!("0s"))),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            resolve_keep_alive(&Some(serde_json::json!(0.0))),
+            Some(Duration::ZERO)
+        );
+    }
 }

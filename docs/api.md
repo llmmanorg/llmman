@@ -9,7 +9,7 @@ Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
 | Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/pull`, `/api/push`, `/api/copy`, `/api/create`, `/api/blobs/{digest}`, `/api/ps`, `/api/delete`, `/api/version` |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`) |
 | Anthropic | `/v1/messages` |
-| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node`, `/llmman/shell` |
+| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/shell` |
 | Web UI | `/` and `/ui/*` — see [webui.md](webui.md) |
 | llama.cpp | `/props` |
 | Prometheus | `/metrics` (off unless `LLMMAN_METRICS` is `1`, `true`, `yes` or `on`) |
@@ -96,6 +96,12 @@ A local `/v1/chat/completions` with `reasoning_effort` also gets the
 `reasoning_effort`), so it works on llama-server builds that do not read
 `reasoning_effort` themselves. The caller's own kwargs are kept.
 
+A streamed `/v1/chat/completions` or `/v1/completions` to an `openai`-wire
+provider (Cohere aside) or a non-llama.cpp backend goes upstream with
+`stream_options.include_usage` for [`llmman usage`](commands.md); a
+client that did not ask gets the usage chunk stripped back out.
+llama-server's `timings` need no asking.
+
 `/v1/audio/transcriptions` is likewise a pass-through. The model needs
 audio support (an `--mmproj` projector, supplied when the model image
 carries one). Bodies up to 200 MiB are accepted.
@@ -128,7 +134,9 @@ this daemon can route to, each with its API-key variable, whether the
 daemon has that key, and how many models it serves;
 `/llmman/providers/{id}` adds those models and what each costs in US
 dollars per million tokens (absent, not zero, where models.dev publishes
-no price). `llmman providers`, `list --provider`, `run --provider` and
+no price), including `cache_read`/`cache_write`/`reasoning` where it publishes those.
+`?model=<id>` filters nothing; a catalog that lacks it is re-fetched first
+(at most every five minutes). `llmman providers`, `list --provider`, `run --provider` and
 `launch --provider` are all clients of it, so the catalog is fetched and
 cached in one process: the one that forwards the request upstream.
 
@@ -140,6 +148,24 @@ reports, unpriced.
 
 `/llmman/node` reports this node's memory and loaded/stored models; it
 is what aggregation peers ask each other. See [aggregation.md](aggregation.md).
+
+`/llmman/search?q=<query>` is `llmman search` over HTTP: the same Docker
+Hub and Hugging Face rows in the same order, as `{"models": [{name,
+pulls, likes, updated}]}`, each `name` ready for `/api/pull`. `limit`
+caps the rows per registry as `--limit` does (default 25, at most 64).
+`/llmman/search/popular` has the same shape and needs no query: Docker
+Hub's most pulled models, then Hugging Face's most downloaded GGUF
+text-generation repos.
+`/llmman/search/model?name=<a row's name>` expands one row: every tag
+`pull` can take for it with its size (`variants`, the one a tagless
+`pull` takes marked `default`), plus the repo's pulls, likes, license,
+tags and README (Hugging Face's `README.md`, Docker Hub's overview; the
+first 64 KiB). For a GGUF repo on Hugging Face the variants are its
+quantizations, each one that resolves to its own file the way `pull`
+picks one. `/llmman/search/avatar?name=` redirects to the repo owner's
+picture on Hugging Face or Gravatar, or is a `404` when it has none.
+These ask the registries live; a registry that cannot be reached is a
+`502`.
 
 ## Authentication
 

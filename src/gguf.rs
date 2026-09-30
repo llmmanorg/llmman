@@ -326,6 +326,59 @@ pub fn read_info(path: &Path) -> anyhow::Result<Info> {
     })
 }
 
+/// `general.file_type`'s name — llama.cpp's `llama_ftype`, transcribed
+/// from `include/llama.h` at the pinned `LLAMA_CPP_RELEASE`. The file
+/// type keeps the mixed-quant variant that [`dominant_quantization`]
+/// cannot see: `Q4_K_M` and `Q4_K_S` are both modal `Q4_K` by tensor
+/// type, and differ only in which tensors got the larger one. `None` for
+/// a value this llama.cpp has no name for, including the removed ones
+/// and `LLAMA_FTYPE_GUESSED`. New quantizations land in that enum (39-41
+/// are recent), so this table goes stale silently — which is why callers
+/// fall back to [`dominant_quantization`] rather than treating a `None`
+/// as "unquantized": a stale entry costs the `_M`/`_S` variant, not the
+/// answer.
+pub fn file_type_name(ftype: u64) -> Option<&'static str> {
+    Some(match ftype {
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        7 => "Q8_0",
+        8 => "Q5_0",
+        9 => "Q5_1",
+        10 => "Q2_K",
+        11 => "Q3_K_S",
+        12 => "Q3_K_M",
+        13 => "Q3_K_L",
+        14 => "Q4_K_S",
+        15 => "Q4_K_M",
+        16 => "Q5_K_S",
+        17 => "Q5_K_M",
+        18 => "Q6_K",
+        19 => "IQ2_XXS",
+        20 => "IQ2_XS",
+        21 => "Q2_K_S",
+        22 => "IQ3_XS",
+        23 => "IQ3_XXS",
+        24 => "IQ1_S",
+        25 => "IQ4_NL",
+        26 => "IQ3_S",
+        27 => "IQ3_M",
+        28 => "IQ2_S",
+        29 => "IQ2_M",
+        30 => "IQ4_XS",
+        31 => "IQ1_M",
+        32 => "BF16",
+        36 => "TQ1_0",
+        37 => "TQ2_0",
+        38 => "MXFP4_MOE",
+        39 => "NVFP4",
+        40 => "Q1_0",
+        41 => "Q2_0",
+        _ => return None,
+    })
+}
+
 /// The `ggml_type` name most representative of a model's actual
 /// quantization — the modal type (by total element count, not tensor
 /// count, so a handful of huge matrices outweigh many tiny ones) among
@@ -520,6 +573,19 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(info.parameter_count, u64::MAX);
         assert_eq!(info.quantization, Some("F32".to_string()));
+    }
+
+    /// The variant the modal tensor type cannot see: both are Q4_K by
+    /// tensor type and differ only in the file type.
+    #[test]
+    fn file_type_name_keeps_the_mixed_quant_variant() {
+        assert_eq!(file_type_name(14), Some("Q4_K_S"));
+        assert_eq!(file_type_name(15), Some("Q4_K_M"));
+        assert_eq!(file_type_name(0), Some("F32"));
+        assert_eq!(file_type_name(32), Some("BF16"));
+        // Removed from gguf files, and "not specified in the model file".
+        assert_eq!(file_type_name(33), None);
+        assert_eq!(file_type_name(1024), None);
     }
 
     #[test]

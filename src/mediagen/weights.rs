@@ -314,17 +314,31 @@ impl Weights {
         buft: GgmlBackendBuft,
         opts: &LoadOpts,
     ) -> Result<Weights> {
-        let idx = read_index(path)?;
+        Self::load_files(api, &[path], buft, opts)
+    }
+
+    /// The tensors of every file (the shards of one checkpoint) in one buffer.
+    pub fn load_files(
+        api: &'static Api,
+        paths: &[&Path],
+        buft: GgmlBackendBuft,
+        opts: &LoadOpts,
+    ) -> Result<Weights> {
         struct Item {
             dst: Tensor,
             src: TensorDesc,
+            file: usize,
             tap: i32,
             name: String,
         }
-        let mut plan: Vec<Item> = Vec::new();
-        let n_planned: usize = idx
-            .tensors
+        let idxs = paths
             .iter()
+            .map(|p| read_index(p))
+            .collect::<Result<Vec<_>>>()?;
+        let mut plan: Vec<Item> = Vec::new();
+        let n_planned: usize = idxs
+            .iter()
+            .flat_map(|i| &i.tensors)
             .map(|d| {
                 if d.ne.len() == 5 {
                     d.ne[2].max(1) as usize
@@ -339,7 +353,11 @@ impl Weights {
             true,
         )?;
         let mut tensors = HashMap::new();
-        for d in &idx.tensors {
+        for (file, d) in idxs
+            .iter()
+            .enumerate()
+            .flat_map(|(i, idx)| idx.tensors.iter().map(move |d| (i, d)))
+        {
             let name = match &opts.rename {
                 Some(f) => match f(&d.name) {
                     Some(n) => n,
@@ -365,6 +383,7 @@ impl Weights {
                     plan.push(Item {
                         dst: t,
                         src: d.clone(),
+                        file,
                         tap: k as i32,
                         name: tname,
                     });
@@ -380,13 +399,17 @@ impl Weights {
             plan.push(Item {
                 dst: t,
                 src: d.clone(),
+                file,
                 tap: -1,
                 name,
             });
         }
+        let what = paths
+            .first()
+            .map_or_else(String::new, |p| p.display().to_string());
         let buf = unsafe { (api.ggml_backend_alloc_ctx_tensors_from_buft)(ctx.raw, buft) };
         if buf.is_null() {
-            bail!("failed to allocate a buffer for {}", path.display());
+            bail!("failed to allocate a buffer for {what}");
         }
         unsafe { (api.ggml_backend_buffer_set_usage)(buf, ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS) };
         let w = Weights {
@@ -396,12 +419,19 @@ impl Weights {
             tensors,
         };
 
-        let mut f = File::open(path)?;
-        let file_len = f.metadata()?.len();
+        let mut files = paths
+            .iter()
+            .map(|p| {
+                let f = File::open(p).with_context(|| format!("open {}", p.display()))?;
+                let len = f.metadata()?.len();
+                Ok((f, len))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut read_buf = Vec::new();
         let mut conv_buf = Vec::new();
         for item in &plan {
             let d = &item.src;
+            let (f, file_len) = &mut files[item.file];
             let elems =
                 d.ne.iter()
                     .try_fold(1i64, |a, &b| a.checked_mul(b))
@@ -417,7 +447,7 @@ impl Weights {
             }
             if d.offset
                 .checked_add(src_bytes as u64)
-                .is_none_or(|end| end > file_len)
+                .is_none_or(|end| end > *file_len)
             {
                 bail!("tensor {}: data past the end of the file", d.name);
             }
@@ -472,10 +502,14 @@ impl Weights {
             };
         }
         eprintln!(
-            "[llmman] mediagen: loaded {} tensors ({:.1} MiB) from {}",
+            "[llmman] mediagen: loaded {} tensors ({:.1} MiB) from {what}{}",
             plan.len(),
             w.size() as f64 / 1024.0 / 1024.0,
-            path.display()
+            if paths.len() > 1 {
+                format!(" and {} more", paths.len() - 1)
+            } else {
+                String::new()
+            }
         );
         Ok(w)
     }
@@ -511,14 +545,20 @@ fn convert(api: &Api, from: u32, to: u32, src: &[u8], n: i64) -> Result<Option<V
         }
     }
     match to {
-        ffi::ty::F32 => Ok(Some(f32s.iter().flat_map(|v| v.to_le_bytes()).collect())),
+        ffi::ty::F32 => Ok(Some(le_bytes(&f32s))),
         ffi::ty::F16 => {
             let mut h = vec![0u16; n as usize];
             unsafe { (api.ggml_fp32_to_fp16_row)(f32s.as_ptr(), h.as_mut_ptr(), n) };
-            Ok(Some(h.iter().flat_map(|v| v.to_le_bytes()).collect()))
+            Ok(Some(le_bytes(&h)))
         }
         other => bail!("cannot convert to ggml type {other}"),
     }
+}
+
+/// The in-memory bytes of `v` (little-endian on every target ggml runs on).
+fn le_bytes<T: Copy>(v: &[T]) -> Vec<u8> {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+        .to_vec()
 }
 
 /// One tensor of a safetensors file as stored: dtype name, torch-order shape, raw bytes.

@@ -219,6 +219,9 @@ pub(super) struct OllamaMetrics {
     pub(super) prompt_eval_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) prompt_eval_cached_count: Option<u64>,
+    /// llmman's too: of `prompt_eval_count`, written to a provider's cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) prompt_eval_cache_write_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) prompt_eval_duration: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -245,8 +248,15 @@ pub(super) struct OllamaModelInfo {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct OllamaModelDetails {
+    /// Always empty: llmman has no equivalent of ollama's `FROM <model>`
+    /// derivation, but clients read the field.
+    #[serde(default)]
+    pub(super) parent_model: String,
     pub(super) format: String,
     pub(super) family: String,
+    /// `family` in a list, as ollama reports it.
+    #[serde(default)]
+    pub(super) families: Vec<String>,
     pub(super) parameter_size: String,
     pub(super) quantization_level: String,
 }
@@ -673,12 +683,22 @@ pub(super) struct OAIUsage {
     pub(super) total_tokens: u64,
     #[serde(default)]
     pub(super) prompt_tokens_details: OAIPromptTokensDetails,
+    #[serde(default)]
+    pub(super) completion_tokens_details: OAICompletionTokensDetails,
+}
+
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+pub(super) struct OAICompletionTokensDetails {
+    #[serde(default)]
+    pub(super) reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy)]
 pub(super) struct OAIPromptTokensDetails {
     #[serde(default)]
     pub(super) cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub(super) cache_write_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy)]
@@ -720,7 +740,11 @@ pub(super) struct OAIChunkDelta {
 /// incrementally as a partial JSON string; see `ToolCallAccumulator`.
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct OAIToolCallDelta {
-    pub(super) index: usize,
+    /// Absent from Gemini's OpenAI-compatible endpoint, which sends each
+    /// call whole; the call's position in the delta stands in for it, as
+    /// in `responses` and `messages`.
+    #[serde(default)]
+    pub(super) index: Option<usize>,
     #[serde(default)]
     pub(super) id: Option<String>,
     #[serde(default)]
@@ -774,8 +798,8 @@ pub(super) fn accumulate_tool_call_deltas(
         return;
     }
     let mut acc = acc.borrow_mut();
-    for delta in deltas {
-        let entry = acc.entry(delta.index).or_default();
+    for (position, delta) in deltas.into_iter().enumerate() {
+        let entry = acc.entry(delta.index.unwrap_or(position)).or_default();
         if let Some(id) = delta.id.filter(|id| !id.is_empty()) {
             if entry.id.is_empty() {
                 entry.id = id;

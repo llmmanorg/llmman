@@ -123,7 +123,7 @@ pub fn timestep_embedding(t: f32) -> Vec<f32> {
 }
 
 /// Rotate-half RoPE on `x: [n_heads * hd, T]` with a `[hd/2, T]` table shared by all heads.
-fn rope(g: &Ctx, x: Tensor, cos: Tensor, sin: Tensor, n_heads: i64) -> Tensor {
+pub fn rope(g: &Ctx, x: Tensor, cos: Tensor, sin: Tensor, n_heads: i64) -> Tensor {
     let [dim, t, ..] = ffi::shape(x);
     let hd = dim / n_heads;
     let x4 = g.reshape_4d(g.cont(x), hd / 2, 2, n_heads, t);
@@ -138,7 +138,7 @@ fn rope(g: &Ctx, x: Tensor, cos: Tensor, sin: Tensor, n_heads: i64) -> Tensor {
 }
 
 /// RMSNorm over each head of `x: [n_heads * head_dim, T]` with a `[head_dim]` weight.
-fn head_rms(g: &Ctx, x: Tensor, hd: i64, eps: f32, w: Option<Tensor>) -> Tensor {
+pub fn head_rms(g: &Ctx, x: Tensor, hd: i64, eps: f32, w: Option<Tensor>) -> Tensor {
     let [dim, t, ..] = ffi::shape(x);
     let x3 = g.reshape_3d(g.cont(x), hd, dim / hd, t);
     let y = rms(g, x3, eps, w);
@@ -146,7 +146,7 @@ fn head_rms(g: &Ctx, x: Tensor, hd: i64, eps: f32, w: Option<Tensor>) -> Tensor 
 }
 
 /// Grouped-query attention: q `[n_heads*hd, Tq]`, k/v `[n_kv*hd, Tk]` -> `[n_heads*hd, Tq]`.
-fn sdpa_gqa(
+pub fn sdpa_gqa(
     g: &Ctx,
     q: Tensor,
     k: Tensor,
@@ -190,34 +190,32 @@ fn mlp(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, relu2: bool) -> Result<Ten
     Ok(g.linear(h, w.get(&format!("{prefix}.down_proj.weight"))?, None))
 }
 
-/// The understanding stream over the prompt tokens.
-pub fn und_forward(hp: &Hparams, w: &Weights, be: &Backend, ids: &[u32]) -> Result<UndCache> {
+/// The Qwen3-VL text decoder over `ids`, calling `on_layer(graph, k, v)` with
+/// every layer's keys (normed for the generation stream, roped) and values;
+/// returns the last layer's output, before the final norm.
+fn text_decoder(
+    hp: &Hparams,
+    w: &Weights,
+    gr: &mut Graph,
+    ids: &[u32],
+    mut on_layer: impl FnMut(&Graph, Tensor, Tensor),
+) -> Result<Tensor> {
     let n = ids.len() as i64;
     if n == 0 || n > MAX_PROMPT_TOKENS {
         bail!("the prompt must be 1 to {MAX_PROMPT_TOKENS} tokens, got {n}");
     }
-    let mut gr = Graph::new(be.api, 4 * 1024 + hp.n_layers as usize * 96)?;
     let ids_i32: Vec<i32> = ids.iter().map(|&i| i as i32).collect();
     let ids_t = gr.input_i32(&[n], &ids_i32, "ids");
     let (cos, sin) = mrope_tables(hp, &text_positions(n));
     let half = hp.head_dim / 2;
     let cos_t = gr.input_f32(&[half, n], &cos, "cos");
     let sin_t = gr.input_f32(&[half, n], &sin, "sin");
-    // causal mask [Tk, Tq]: -inf where the key follows the query
-    let mut mask = vec![0f32; (n * n) as usize];
-    for q in 0..n as usize {
-        for k in q + 1..n as usize {
-            mask[q * n as usize + k] = f32::NEG_INFINITY;
-        }
-    }
-    let mask_t = gr.input_f32(&[n, n], &mask, "mask");
+    let mask_t = gr.input_f32(&[n, n], &causal_mask(n), "mask");
 
     let g = &gr.ctx;
     let eps = hp.rms_eps;
     let hd = hp.head_dim;
     let mut x = g.get_rows(w.get("embed_tokens.weight")?, ids_t);
-    let mut ks = Vec::with_capacity(hp.n_layers as usize);
-    let mut vs = Vec::with_capacity(hp.n_layers as usize);
     for l in 0..hp.n_layers {
         let p = format!("layers.{l}");
         let h = rms(
@@ -252,6 +250,7 @@ pub fn und_forward(hp: &Hparams, w: &Weights, be: &Backend, ids: &[u32]) -> Resu
         q = rope(g, q, cos_t, sin_t, hp.n_heads);
         k = rope(g, k, cos_t, sin_t, hp.n_kv_heads);
         k_gen = rope(g, k_gen, cos_t, sin_t, hp.n_kv_heads);
+        on_layer(gr, k_gen, v);
         let attn = sdpa_gqa(g, q, k, v, hp.n_heads, hp.n_kv_heads, Some(mask_t), false);
         x = g.add(
             x,
@@ -264,19 +263,51 @@ pub fn und_forward(hp: &Hparams, w: &Weights, be: &Backend, ids: &[u32]) -> Resu
             Some(w.get(&format!("{p}.post_attention_layernorm.weight"))?),
         );
         x = g.add(x, mlp(g, w, &format!("{p}.mlp"), h2, hp.relu2)?);
-        let k_out = g.cont(k_gen);
-        let v_out = g.cont(v);
-        gr.mark_output(k_out);
-        gr.mark_output(v_out);
-        ks.push(k_out);
-        vs.push(v_out);
     }
+    Ok(x)
+}
+
+/// `[Tk, Tq]`: -inf where the key follows the query.
+pub fn causal_mask(n: i64) -> Vec<f32> {
+    let n = n as usize;
+    let mut mask = vec![0f32; n * n];
+    for q in 0..n {
+        mask[q * n + q + 1..(q + 1) * n].fill(f32::NEG_INFINITY);
+    }
+    mask
+}
+
+fn text_graph(be: &Backend, hp: &Hparams) -> Result<Graph> {
+    Graph::new(be.api, 4 * 1024 + hp.n_layers as usize * 96)
+}
+
+/// The understanding stream over the prompt tokens.
+pub fn und_forward(hp: &Hparams, w: &Weights, be: &Backend, ids: &[u32]) -> Result<UndCache> {
+    let mut gr = text_graph(be, hp)?;
+    let (mut ks, mut vs) = (Vec::new(), Vec::new());
+    text_decoder(hp, w, &mut gr, ids, |gr, k, v| {
+        let (k, v) = (gr.ctx.cont(k), gr.ctx.cont(v));
+        gr.mark_output(k);
+        gr.mark_output(v);
+        ks.push(k);
+        vs.push(v);
+    })?;
     gr.compute(be)?;
     Ok(UndCache {
-        n_tokens: n,
+        n_tokens: ids.len() as i64,
         k: ks.iter().map(|&t| gr.output_f32(t)).collect(),
         v: vs.iter().map(|&t| gr.output_f32(t)).collect(),
     })
+}
+
+/// A Qwen3-VL text model's last hidden states `[n][hidden]`, before the final norm.
+pub fn text_hidden(hp: &Hparams, w: &Weights, be: &Backend, ids: &[u32]) -> Result<Vec<f32>> {
+    let mut gr = text_graph(be, hp)?;
+    let x = text_decoder(hp, w, &mut gr, ids, |_, _, _| {})?;
+    let x = gr.ctx.cont(x);
+    gr.mark_output(x);
+    gr.compute(be)?;
+    Ok(gr.output_f32(x))
 }
 
 /// One modality's tokens of the generation stream for a denoising step.

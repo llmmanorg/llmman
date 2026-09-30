@@ -7,13 +7,14 @@
 //! twice.
 //!
 //! Detection calls the real vendor APIs — the CUDA Driver API, the HIP
-//! runtime API, and the Vulkan API — the same libraries and entry points
+//! runtime API, the OpenCL API, and the Vulkan API — the same libraries and entry points
 //! [ggml-org/llama-install.sh](https://github.com/ggml-org/llama-install.sh)'s
 //! own `cuda/probe.c`, `rocm/probe.cc`, and `vulkan/probe.c` call, just
 //! reached here via runtime dynamic loading ([`libloading`]) instead of
 //! being separately compiled probe binaries downloaded and executed by
 //! `install.sh`/`install.ps1`: `libcuda`/`nvcuda.dll` (CUDA), `libamdhip64`/
-//! `amdhip64.dll` (HIP/ROCm), and `libvulkan`/`vulkan-1.dll` (Vulkan) are
+//! `amdhip64.dll` (HIP/ROCm), `OpenCL.dll` (OpenCL), and `libvulkan`/
+//! `vulkan-1.dll` (Vulkan) are
 //! all loader/runtime libraries that ship with the vendor's driver or
 //! runtime install itself, so a successful load and a real, successful
 //! API call against them is as strong a signal of "this backend actually
@@ -22,7 +23,7 @@
 //! for a `/dev` node or a same-named DLL sitting on `PATH`, none of which
 //! confirm the runtime itself can actually initialize).
 //!
-//! Priority order (CUDA > ROCm > Vulkan > CPU, plus Metal on macOS)
+//! Priority order (CUDA > ROCm > OpenCL > Vulkan > CPU, plus Metal on macOS)
 //! matches `install.sh`'s own `main()` probing order.
 
 /// What kind of GPU acceleration, if any, was detected on the local host.
@@ -37,13 +38,14 @@ pub enum HostGpu {
         major: u32,
     },
     Rocm,
+    Opencl,
     Vulkan,
     /// macOS (Apple Silicon) only.
     Metal,
 }
 
 /// Detects the best available accelerator on this host, in priority order
-/// CUDA > ROCm > Vulkan > CPU on Linux/Windows, or Metal > CPU on macOS.
+/// CUDA > ROCm > OpenCL > Vulkan > CPU on Linux/Windows, or Metal > CPU on macOS.
 ///
 /// A non-empty `LLMMAN_LLM_LIBRARY` (mirrors Ollama's
 /// `OLLAMA_LLM_LIBRARY`) bypasses every probe below — see
@@ -74,7 +76,7 @@ pub fn detect() -> HostGpu {
 }
 
 /// [`detect`]'s `LLMMAN_LLM_LIBRARY` override. Accepts (case-insensitive)
-/// `cpu`, `cuda`/`cuda12`, `cuda13`, `rocm`, `vulkan`, `metal`. Unset,
+/// `cpu`, `cuda`/`cuda12`, `cuda13`, `rocm`, `opencl`, `vulkan`, `metal`. Unset,
 /// blank, or unrecognized falls through to real autodetection.
 fn llm_library_override() -> Option<HostGpu> {
     parse_llm_library(std::env::var("LLMMAN_LLM_LIBRARY").ok().as_deref())
@@ -90,6 +92,7 @@ fn parse_llm_library(value: Option<&str>) -> Option<HostGpu> {
         "cuda" | "cuda12" | "cuda_v12" => Some(HostGpu::Cuda { major: 12 }),
         "cuda13" | "cuda_v13" => Some(HostGpu::Cuda { major: 13 }),
         "rocm" => Some(HostGpu::Rocm),
+        "opencl" => Some(HostGpu::Opencl),
         "vulkan" => Some(HostGpu::Vulkan),
         "metal" => Some(HostGpu::Metal),
         _ => None,
@@ -119,7 +122,7 @@ pub fn memory_bytes(vram_bytes: u64) -> u64 {
     if vram_bytes > 0 {
         return vram_bytes;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         std::fs::read_to_string("/proc/meminfo")
             .ok()
@@ -134,7 +137,12 @@ pub fn memory_bytes(vram_bytes: u64) -> u64 {
     {
         windows_memory_bytes().unwrap_or(0)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )))]
     {
         0
     }
@@ -174,7 +182,7 @@ fn windows_memory_bytes() -> Option<u64> {
 }
 
 /// `MemTotal:       16384000 kB` -> bytes.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn parse_meminfo_total(meminfo: &str) -> Option<u64> {
     let kib = meminfo
         .lines()
@@ -252,7 +260,7 @@ fn parse_probe_output_with_vram(stdout: &str) -> Option<(HostGpu, u64)> {
 }
 
 /// Parses [`probe_subprocess_main`]'s first output line (`"none"`,
-/// `"rocm"`, `"vulkan"`, or `"cuda:<major>"`) into a [`HostGpu`] — split
+/// `"rocm"`, `"opencl"`, `"vulkan"`, or `"cuda:<major>"`) into a [`HostGpu`] — split
 /// out so parsing is unit-testable without spawning a process. Ignores
 /// any second (VRAM) line; see [`spawn_probe_subprocess_with_vram`] for
 /// that.
@@ -266,6 +274,7 @@ fn parse_probe_output(stdout: &str) -> Option<HostGpu> {
     }
     match line {
         "rocm" => Some(HostGpu::Rocm),
+        "opencl" => Some(HostGpu::Opencl),
         "vulkan" => Some(HostGpu::Vulkan),
         "none" => Some(HostGpu::None),
         _ => None,
@@ -275,7 +284,7 @@ fn parse_probe_output(stdout: &str) -> Option<HostGpu> {
 /// [`main()`]'s hidden re-exec target (see [`PROBE_SUBPROCESS_ARG`]) —
 /// runs [`detect_gpu_api_uncontained`] in what is, from the caller's
 /// point of view, a disposable child process, and reports the result as
-/// two stdout lines: kind (`"none"`/`"rocm"`/`"vulkan"`/`"cuda:<major>"`)
+/// two stdout lines: kind (`"none"`/`"rocm"`/`"opencl"`/`"vulkan"`/`"cuda:<major>"`)
 /// then total VRAM bytes. Never returns: always exits successfully,
 /// regardless of what was detected — only a real crash should produce a
 /// non-zero/abnormal exit here.
@@ -286,6 +295,7 @@ pub fn probe_subprocess_main() -> ! {
         HostGpu::None => "none".to_string(),
         HostGpu::Cuda { major } => format!("cuda:{major}"),
         HostGpu::Rocm => "rocm".to_string(),
+        HostGpu::Opencl => "opencl".to_string(),
         HostGpu::Vulkan => "vulkan".to_string(),
         // Unreachable: this subprocess only runs on Linux/Windows.
         HostGpu::Metal => "none".to_string(),
@@ -374,20 +384,23 @@ fn detect_gpu_api_uncontained() -> (HostGpu, u64) {
     if let Some(vram) = detect_rocm() {
         return (HostGpu::Rocm, vram);
     }
+    if let Some(vram) = detect_opencl() {
+        return (HostGpu::Opencl, vram);
+    }
     if let Some(vram) = detect_vulkan() {
         return (HostGpu::Vulkan, vram);
     }
     (HostGpu::None, 0)
 }
 
-/// One `#[cfg]` for the whole file: none of those three runtimes exists
+/// One `#[cfg]` for the whole file: none of those four runtimes exists
 /// on macOS, where compiling them is not just wasted work but ~22
 /// `dead_code` warnings — see the module's own doc comment.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod vendor;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-use vendor::{detect_cuda, detect_rocm, detect_vulkan};
+use vendor::{detect_cuda, detect_opencl, detect_rocm, detect_vulkan};
 
 #[cfg(test)]
 mod tests {
@@ -426,6 +439,7 @@ mod tests {
             Some(HostGpu::Cuda { major: 13 })
         );
         assert_eq!(parse_llm_library(Some("rocm")), Some(HostGpu::Rocm));
+        assert_eq!(parse_llm_library(Some("OpenCL")), Some(HostGpu::Opencl));
         assert_eq!(parse_llm_library(Some("Vulkan")), Some(HostGpu::Vulkan));
         assert_eq!(parse_llm_library(Some("metal")), Some(HostGpu::Metal));
     }
@@ -457,6 +471,7 @@ mod tests {
     fn parse_probe_output_round_trips_every_variant() {
         assert_eq!(parse_probe_output("none\n"), Some(HostGpu::None));
         assert_eq!(parse_probe_output("rocm\n"), Some(HostGpu::Rocm));
+        assert_eq!(parse_probe_output("opencl\n"), Some(HostGpu::Opencl));
         assert_eq!(parse_probe_output("vulkan\n"), Some(HostGpu::Vulkan));
         assert_eq!(
             parse_probe_output("cuda:12\n"),

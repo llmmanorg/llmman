@@ -55,16 +55,6 @@ landing in your local store.
   them runs on whichever node has the model loaded or the most room for
   it. A laptop, a workstation and a Spark look like one endpoint.
 
-| | llmman | Ollama |
-|---|---|---|
-| Model registry | Hugging Face directly, or any OCI registry (Docker Hub, GHCR, quay, Harbor, self-hosted) | ollama.com library, own registry protocol |
-| Model format on disk | Unmodified GGUF / safetensors in a standard OCI Image Layout | GGUF and safetensors imported via `Modelfile` into Ollama's blob layout |
-| Inference engine | Upstream `llama.cpp` release, or your own `llama-server`; `vllm`; `sglang`; `mlx-lm` | Bundled `llama.cpp`/ggml fork plus Ollama's own engine |
-| Hosted models | Any provider via `--provider` | Ollama Cloud |
-| Registry-to-registry transfer | `llmman transfer hf.co/... docker.io/...` in one step, nothing added to your local store | Pull, write a `Modelfile`, `create`, push to ollama.com |
-| Signing and verification | cosign-format signatures; `verify` command and per-repo pull-time trust policy | None |
-| Multiple machines | Aggregation: daemons pool hardware, any node answers for all | One host per endpoint |
-
 ## Install
 
 **Linux, macOS:**
@@ -85,10 +75,11 @@ irm https://llmmanorg.github.io/install.ps1 | iex
 brew install llmmanorg/tap/llmman
 ```
 
-**winget:**
+**Scoop:**
 
 ```powershell
-winget install llmmanorg.llmman
+scoop bucket add llmman https://github.com/llmmanorg/scoop-bucket
+scoop install llmman
 ```
 
 **Cargo:**
@@ -97,6 +88,9 @@ winget install llmmanorg.llmman
 cargo binstall llmman   # prebuilt binary
 cargo install llmman    # build from source; needs Go 1.25+ (and LLVM on Windows) as well as Rust
 ```
+
+**Android** (the web UI over an on-device daemon, see [docs/android.md](docs/android.md)):
+`llmman-aarch64-linux-android.apk` from the [latest release](https://github.com/llmmanorg/llmman/releases/latest).
 
 **Container** (llmman in the llama.cpp server image, see [docs/backends.md](docs/backends.md#in-a-container)):
 
@@ -134,42 +128,29 @@ Without a prompt it opens a `>>> ` loop where `/set width|height|steps|seed|cfg|
 adjusts the settings. The same model answers `/v1/images/generations`, `/v1/videos` and
 `/v1/audio/speech` on `llmman serve`.
 
-Diffusion repositories published as Diffusers-layout safetensors (a root `model_index.json`)
-are instead served by [vLLM-Omni](https://github.com/vllm-project/vllm-omni) (`vllm serve
---omni`; install `vllm-omni` next to `vllm`, or use `--runtime docker` for the `vllm/vllm-omni` image).
+Qwen-Image 2.1 runs from its Diffusers-layout safetensors the same way:
+
+```sh
+llmman run qwen-image-2.1 "A manatee in a sunlit lagoon"               # an RGBA png
+```
+
+Other Diffusers-layout repositories (a root `model_index.json`) are served by
+[vLLM-Omni](https://github.com/vllm-project/vllm-omni) (`vllm serve --omni`; install
+`vllm-omni` next to `vllm`, or use `--runtime docker` for the `vllm/vllm-omni` image).
 See [docs/backends.md](docs/backends.md#vllm-omni-diffusers-pipelines).
 
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `serve`   | Start an inference server (Ollama / OpenAI / Anthropic APIs) |
-| `launch`  | Launch an integration (Claude Code, OpenCode, …) |
-| `run`     | Run a model interactively or with a one-shot prompt |
-| `pull`    | Pull a model from a registry or HuggingFace |
-| `search`  | Search for models on Docker Hub and Hugging Face (Docker Hub results first) |
-| `list` (`ls`) | List locally stored models, or a hosted provider's (`--provider`) models |
-| `ps`      | List models currently loaded |
-| `log`     | Show the prompts `serve` has seen, newest first, like `git log` |
-| `providers` | List the hosted providers `--provider` can route to |
-| `stop`    | Stop (unload) a running model |
-| `build`   | Package model files into a local OCI image |
-| `push`    | Push a local image to a registry |
-| `transfer` | Transfer an image directly from one location to another (e.g. HuggingFace to an OCI registry) |
-| `cp`      | Copy a local image to a new reference |
-| `rm`      | Remove a local image |
-| `show`    | Show a local model's architecture, parameters, license, and template |
-| `verify`  | Check a registry model's signatures against trusted public keys |
-| `login`   | Log in to a container registry or HuggingFace |
-| `logout`  | Log out from a container registry or HuggingFace |
-| `config`  | Read and write `llmman.conf` settings (aliases, API keys, trust policy, aggregation peers) |
-
-## Models are OCI artifacts
+## OCI-native models
 
 Models are packaged as standard OCI artifacts and stored in any compatible
-registry: Docker Hub, GHCR, quay, self-hosted. There is no curated library and
-no gatekeeper: push a model anywhere you can push a container image, and anyone
-can `llmman run` it straight from there.
+registry: Docker Hub, GHCR, quay, Harbor, self-hosted. There is no curated
+library and no gatekeeper: push a model anywhere you can push a container
+image, and anyone can `llmman run` it straight from there.
+
+That means the registry, mirroring, access control, retention and
+signing infrastructure you already run for containers works for models
+too. Pull from the registry you already trust, `transfer` a model from
+Hugging Face into your own registry without it ever touching a laptop,
+and sign it with cosign so `pull` can refuse anything unsigned.
 
 ### Pull a model
 
@@ -205,6 +186,22 @@ A `[verify]` trust policy turns that into an automatic check on every
 `pull`, warning or refusing outright per repository. Off by default —
 there is nothing to check against until you have said whom you trust.
 See [docs/verification.md](docs/verification.md).
+
+### Compared with Ollama
+
+Ollama stores models in its own blob layout behind its own registry
+protocol; llmman uses the OCI standard end to end, so the model
+supply chain looks like the container supply chain:
+
+| | llmman | Ollama |
+|---|---|---|
+| Model registry | Hugging Face directly, or any OCI registry (Docker Hub, GHCR, quay, Harbor, self-hosted) | ollama.com library, own registry protocol |
+| Model format on disk | Unmodified GGUF / safetensors in a standard OCI Image Layout | GGUF and safetensors imported via `Modelfile` into Ollama's blob layout |
+| Registry-to-registry transfer | `llmman transfer hf.co/... docker.io/...` in one step, nothing added to your local store | Pull, write a `Modelfile`, `create`, push to ollama.com |
+| Signing and verification | cosign-format signatures; `verify` command and per-repo pull-time trust policy | None |
+| Inference engine | Upstream `llama.cpp` release, or your own `llama-server`; `vllm`; `sglang`; `mlx-lm` | Bundled `llama.cpp`/ggml fork plus Ollama's own engine |
+| Hosted models | Any provider via `--provider` | Ollama Cloud |
+| Multiple machines | Aggregation: daemons pool hardware, any node answers for all | One host per endpoint |
 
 ## Serve
 
@@ -280,19 +277,52 @@ integration:
 
 ```
 llmman launch claude --model qwen3.8
+llmman launch omp --model qwen3.8 -- -p "Explain this repository"
 llmman launch agy --model qwen3.8 -- -p "Explain this repository"
+llmman launch cline --model qwen3.8 -- --json "Explain this repository"
+llmman launch grok --model qwen3.8 -- -p "Explain this repository"
 ```
 
 Run `llmman launch` with no arguments to list the supported integrations
-(Claude Code, OpenCode, Codex, Aider, Qwen Code, Gemini CLI, AGY, DeepSeek
-Harness, ...) and whether each is installed. `dsh` runs under `npx` when
-it isn't installed globally. Any extra arguments after `--` are forwarded to
-the integration's own CLI. Short names work wherever a model reference is
-accepted.
+(Claude Code, OpenCode, Codex, Pi, OMP, Cline, Aider, Qwen Code,
+Gemini CLI, Grok Build, AGY, DeepSeek Harness, Docker Agent, goose,
+goose Desktop, ...) and whether
+each is installed. Installing an
+integration is up to you; llmman only execs what is already on your
+machine, except that a missing Cline can be installed with npm after an
+interactive confirmation. `dsh` runs under `npx` when it isn't installed
+globally. Any extra arguments after `--` are forwarded to the integration's
+own CLI. Short names work wherever a model reference is accepted.
 
 AGY requires version 1.1.13 or newer for Gemini API-key and custom-endpoint
 support. llmman writes Gemini mode to its own stable settings directory at
 `~/.gemini/llmman/`; your AGY settings stay untouched.
+
+Cline merges the Ollama provider into `~/.cline/data/settings/providers.json`
+and `globalState.json`, honouring `CLINE_DIR` like Cline does.
+
+`goose` launches the goose CLI and `goose-desktop` the desktop app, both
+with the same endpoint, model and key. Each is configured entirely through
+the environment goose reads in preference to its own config, so neither
+writes to `~/.config/goose` and your `goose configure` provider survives
+the launch. `goose-desktop` is found on `PATH` as `goose-desktop` or
+`goose-gui`, otherwise in `/Applications` on macOS and, on Linux,
+`/usr/lib/goose` from the .deb or `/usr/lib/Goose` from the .rpm — the two
+packages differ in that capital alone. Windows ships as a zip with no
+installer: add the unpacked folder to `PATH` and its `Goose.exe` is found
+there, told apart from the `goose` CLI — the same name to Windows — by the
+Electron files beside it.
+
+Docker Agent is found on `PATH` or in `~/.docker/cli-plugins`, where Docker
+Desktop and `brew install docker-agent` put it. llmman generates its own
+agent file under `~/.config/llmman/launch/docker-agent/` and passes it to
+`docker-agent run`; `~/.config/cagent` stays untouched. With more than one
+Docker Agent installed, the one on `PATH` wins.
+
+The generated agent gets the `shell` and `filesystem` toolsets. Docker
+Agent asks before each tool call unless you pass `--yolo`. To run an
+agent of your own instead, point its model at the daemon and run
+`docker-agent` directly.
 
 ### Hosted providers
 
@@ -305,6 +335,7 @@ llmman providers                                    # which providers, and is th
 llmman list --provider openrouter                   # its models, and $/Mtok in and out
 llmman run --provider openrouter qwen/qwen3-coder   # chat with one directly
 llmman launch opencode --provider openrouter --model qwen/qwen3-coder
+llmman usage --since yesterday                      # what that session cost, per model
 ```
 
 The provider list comes from [models.dev](https://models.dev), the same
@@ -336,15 +367,37 @@ one ordinary model name, `llmman.hybrid/gemma4,anthropic/claude-sonnet-5`,
 so it works from any client on every inference endpoint. Details in
 [docs/providers.md](docs/providers.md#hybrid-model-pairs).
 
+### Sandboxes
+
+`--sandbox` runs the integration inside a sandbox. It can write to the
+current Git work tree and to its own settings, but not to the rest of your
+files. Under seatbelt it can also write to the temporary and cache
+directories.
+
+```sh
+llmman launch claude --model qwen3.8 --sandbox docker
+llmman launch opencode --model qwen3.8 --sandbox seatbelt
+```
+
+The choices are `sbx` (Docker Sandboxes), `seatbelt` (macOS
+`sandbox-exec`), `docker`, `podman`, `apple-container`, `microsandbox`
+and `openshell`. The image-based sandboxes default to Docker Sandboxes'
+agent images, so the integration does not need to be installed on your
+machine. What each sandbox shares, and how it reaches `llmman serve`, is
+in [docs/sandbox.md](docs/sandbox.md).
+
 ## Documentation
 
 | | |
 |---|---|
+| [docs/commands.md](docs/commands.md) | Every subcommand, one line each |
 | [docs/api.md](docs/api.md) | Every HTTP endpoint, and per-API notes |
 | [docs/aggregation.md](docs/aggregation.md) | Pooling several machines into one endpoint |
+| [docs/android.md](docs/android.md) | The Android app: install, what runs on the phone, building the APK |
 | [docs/backends.md](docs/backends.md) | llama.cpp, vLLM, SGLang, MLX, containers, and building from source |
 | [docs/compose.md](docs/compose.md) | Compose deployment behind a gateway, with persistent model storage |
 | [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, registry mirrors, environment variables, store layout |
 | [docs/providers.md](docs/providers.md) | Hosted providers, API keys, and which integrations can use them |
+| [docs/sandbox.md](docs/sandbox.md) | `launch --sandbox`: what each sandbox shares and how it reaches the daemon |
 | [docs/verification.md](docs/verification.md) | Signing models and pull-time trust policy |
 | [docs/metrics.md](docs/metrics.md) | The Prometheus `/metrics` families |

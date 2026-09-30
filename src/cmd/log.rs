@@ -71,23 +71,11 @@ pub fn run(args: &LogArgs) -> anyhow::Result<()> {
     let mut entries = crate::promptlog::read(&path)
         .with_context(|| format!("read prompt log {}", path.display()))?;
 
-    let now = Utc::now();
-    let since = args
-        .since
-        .as_deref()
-        .map(|s| parse_date(s, now))
-        .transpose()?;
-    let until = args
-        .until
-        .as_deref()
-        .map(|s| parse_date(s, now))
-        .transpose()?;
+    let in_window = window(args.since.as_deref(), args.until.as_deref(), Utc::now())?;
     let model = patterns(&args.model, args.ignore_case)?;
     let grep = patterns(&args.grep, args.ignore_case)?;
     entries.retain(|e| {
-        let time = DateTime::parse_from_rfc3339(&e.time).ok();
-        since.is_none_or(|s| time.is_some_and(|t| t >= s))
-            && until.is_none_or(|u| time.is_some_and(|t| t <= u))
+        in_window(&e.time)
             && model.as_ref().is_none_or(|m| m.is_match(&e.model))
             && grep.as_ref().is_none_or(|g| g.is_match(&e.prompt))
     });
@@ -123,8 +111,26 @@ fn select(entries: &[Entry], skip: usize, max: Option<usize>, reverse: bool) -> 
     shown
 }
 
+/// Whether an RFC 3339 time is within `--since`/`--until`.
+pub(super) fn window(
+    since: Option<&str>,
+    until: Option<&str>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<impl Fn(&str) -> bool> {
+    let since = since.map(|s| parse_date(s, now)).transpose()?;
+    let until = until.map(|s| parse_date(s, now)).transpose()?;
+    Ok(move |time: &str| {
+        let time = DateTime::parse_from_rfc3339(time).ok();
+        since.is_none_or(|s| time.is_some_and(|t| t >= s))
+            && until.is_none_or(|u| time.is_some_and(|t| t <= u))
+    })
+}
+
 /// Several patterns match when any does, as in git; none is no filter.
-fn patterns(patterns: &[String], ignore_case: bool) -> anyhow::Result<Option<regex::RegexSet>> {
+pub(super) fn patterns(
+    patterns: &[String],
+    ignore_case: bool,
+) -> anyhow::Result<Option<regex::RegexSet>> {
     if patterns.is_empty() {
         return Ok(None);
     }
@@ -194,7 +200,7 @@ fn paint(text: &str, color: bool) -> String {
 /// Request-supplied text with control characters (tab aside) dropped:
 /// no driving the terminal — `less -R` passes escapes through — and no
 /// forged header lines from a newline in a model name.
-fn clean(s: &str) -> String {
+pub(super) fn clean(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control() || *c == '\t')
         .collect()
@@ -238,7 +244,7 @@ fn git_date(rfc3339: &str) -> String {
 /// Through the pager when stdout is a terminal, as git: `$LLMMAN_PAGER`,
 /// else `$PAGER`, else `less`, via the shell; empty or `cat` means none.
 /// `LESS=FRX` is git's default too.
-fn emit(text: &str, pager: bool) -> anyhow::Result<()> {
+pub(super) fn emit(text: &str, pager: bool) -> anyhow::Result<()> {
     if pager && io::stdout().is_terminal() {
         if let Some(mut child) = pager_command().and_then(|cmd| spawn_pager(&cmd).ok()) {
             if let Some(mut stdin) = child.stdin.take() {

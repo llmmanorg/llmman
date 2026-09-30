@@ -1,10 +1,11 @@
-// The model picker (local store + hosted providers with a usable key),
-// the Pull dialog and the Models dialog. Nothing here knows a model name;
+// The model picker (local store + hosted providers with a usable key)
+// and the Models page. Nothing here knows a model name;
 // everything comes from the daemon.
 
 import * as api from "./api.js";
 import * as settings from "./settings.js";
-import { toast, formatBytes, $, icon, iconButton } from "./util.js";
+import { toast, formatBytes, $, icon, iconButton, debounce } from "./util.js";
+import { render as renderMarkdown } from "./markdown.js";
 
 const state = {
   local: [], // [{id, loaded, capabilities: [..] | null}]
@@ -153,11 +154,6 @@ export function mediaCapabilities(ref) {
   return m && generative(m) ? mediaOf(m) : [];
 }
 
-/** Capabilities that are not chat, for a label: "image", "video", ... */
-function otherCapabilities(m) {
-  return (m.capabilities || []).filter((c) => c !== "completion" && c !== "vision" && c !== "tools").join(" · ");
-}
-
 function knownRef(ref) {
   if (api.splitRemoteRef(ref)) return true; // provider models are checked lazily
   return state.local.some((m) => m.id === ref && usable(m));
@@ -213,7 +209,7 @@ export function initPicker() {
   });
   $("#pull-open").addEventListener("click", () => {
     closeMenu();
-    openPullDialog();
+    location.hash = "#/models";
   });
   window.addEventListener("resize", () => menuOpen && positionMenu());
 }
@@ -400,187 +396,666 @@ async function unload(ref) {
   }
 }
 
-// ---- Pull dialog ------------------------------------------------------
+// ---- Search helpers ---------------------------------------------------
 
-let pullAbort = null;
+/**
+ * A pasted reference (a scheme, or a registry host before the first `/`)
+ * is pulled as typed; anything else is a search.
+ */
+function isReference(text) {
+  return text.includes("://") || /^[\w-]+(\.[\w-]+)+(:\d+)?\//.test(text);
+}
 
-export function initPullDialog() {
-  const dialog = $("#pull-dialog");
-  const form = $("#pull-form");
-  form.addEventListener("submit", (e) => {
-    if (e.submitter?.value === "pull") {
-      e.preventDefault();
-      startPull();
-    }
-  });
-  $("#pull-cancel").addEventListener("click", () => dialog.close());
-  dialog.addEventListener("close", () => {
-    pullAbort?.abort();
-    pullAbort = null;
-  });
-  $("#models-dialog-pull").addEventListener("click", () => {
-    $("#models-dialog").close();
-    openPullDialog();
+/** Whether any tag of repository `name` is already in the local store. */
+function isPulled(name) {
+  const repo = name.toLowerCase();
+  return state.local.some((m) => {
+    const id = m.id.toLowerCase();
+    return id === repo || id.startsWith(`${repo}:`);
   });
 }
 
-export function openPullDialog(prefill = "") {
-  const dialog = $("#pull-dialog");
-  $("#pull-ref").value = prefill;
-  $("#pull-ref").disabled = false;
-  $("#pull-go").disabled = false;
-  $("#pull-progress").classList.add("hidden");
-  $("#pull-bar").style.width = "0";
-  $("#pull-bar").classList.remove("indeterminate");
-  $("#pull-status").textContent = "";
-  $("#pull-detail").textContent = "";
-  dialog.showModal();
-  $("#pull-ref").focus();
+function formatCount(n) {
+  return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(n);
 }
 
-async function startPull() {
-  const ref = $("#pull-ref").value.trim();
-  if (!ref) return;
-  $("#pull-ref").disabled = true;
-  $("#pull-go").disabled = true;
-  $("#pull-progress").classList.remove("hidden");
-  $("#pull-status").textContent = `Pulling ${ref}`;
-  $("#pull-bar").classList.add("indeterminate");
+function relativeTime(iso) {
+  const days = Math.round((Date.parse(iso) - Date.now()) / 86_400_000);
+  if (!Number.isFinite(days)) return "";
+  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  if (Math.abs(days) < 31) return rtf.format(days, "day");
+  if (Math.abs(days) < 365) return rtf.format(Math.round(days / 30), "month");
+  return rtf.format(Math.round(days / 365), "year");
+}
+
+// ---- Models page (#/models) -------------------------------------------
+//
+// A list on the left (this machine's models, or search results) and a
+// card on the right for the selected one: its tags with sizes and whether
+// each fits this machine, and Pull / Use / Delete.
+
+const mb = {
+  query: "",
+  filter: "all",
+  hits: null, // search results, or null for "no search yet"
+  popular: null, // what to show before a search: rows, "loading" or an Error
+  selected: null, // a repo name, e.g. hf.co/unsloth/Qwen3.5-0.8B-GGUF
+  cards: new Map(), // repo → ModelCard | Error
+  memory: 0, // bytes of model memory on this machine, 0 if unknown
+  choice: new Map(), // repo → the variant name picked on its card
+  details: new Map(), // local id (lowercase) → its `/api/tags` row
+  searchAbort: null,
+  pull: null, // {ref, abort, done, total, status}
+};
+
+/** Search rows per registry: a page's worth without scrolling forever. */
+const SEARCH_LIMIT = 20;
+
+export function initModelsPage() {
+  const query = $("#mb-query");
+  query.addEventListener("input", () => mbSearchSoon(query.value.trim()));
+  query.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    const text = query.value.trim();
+    if (isReference(text)) mbPull(text);
+    else mbSearch(text);
+  });
+  for (const tab of document.querySelectorAll("#mb-tabs [data-filter]")) {
+    tab.addEventListener("click", () => {
+      mb.filter = tab.dataset.filter;
+      for (const t of document.querySelectorAll("#mb-tabs [data-filter]")) {
+        t.classList.toggle("active", t === tab);
+        t.setAttribute("aria-pressed", String(t === tab));
+      }
+      renderBrowserList();
+    });
+  }
+}
+
+export async function showModelsPage() {
+  $("#mb").classList.remove("show-card");
+  api
+    .nodeInfo()
+    .then((n) => {
+      mb.memory = n.memory || 0;
+      renderCard();
+    })
+    .catch(() => {});
+  loadPopular();
+  await reloadLocal();
+  $("#mb-query").focus();
+}
+
+/** Once per page load: the registries' most popular models change slowly. */
+async function loadPopular() {
+  if (mb.popular && !(mb.popular instanceof Error)) return;
+  mb.popular = "loading";
+  try {
+    mb.popular = await api.popular({ limit: SEARCH_LIMIT });
+  } catch (e) {
+    mb.popular = e;
+  }
+  renderBrowserList();
+}
+
+/** The store changed (or may have): re-read it and redraw. */
+async function reloadLocal() {
+  await refresh({ quiet: true });
+  const tags = await api.listLocalDetailed().catch(() => []);
+  mb.details = new Map(tags.map((t) => [t.name.toLowerCase(), t]));
+  renderBrowserList();
+  renderCard();
+}
+
+/** Whether the store holds variant `v`: exactly, or as the `:latest` a tagless pull is stored under. */
+function holds(v) {
+  const want = v.name.toLowerCase();
+  const latest = `${repoOf(want)}:latest`;
+  return state.local.some((m) => {
+    const id = m.id.toLowerCase();
+    return id === want || (v.default && id === latest);
+  });
+}
+
+/** `docker.io/ai/qwen3.5:0.8b` → `docker.io/ai/qwen3.5`. */
+function repoOf(ref) {
+  const slash = ref.lastIndexOf("/");
+  const colon = ref.lastIndexOf(":");
+  return colon > slash ? ref.slice(0, colon) : ref;
+}
+
+function registryOf(name) {
+  if (name.startsWith("hf.co/")) return "hf";
+  if (name.startsWith("docker.io/")) return "docker";
+  return "other";
+}
+
+const mbSearchSoon = debounce((query) => {
+  if (query.length < 2 || isReference(query)) {
+    mb.searchAbort?.abort();
+    mb.query = "";
+    mb.hits = null;
+    return renderBrowserList();
+  }
+  mbSearch(query);
+}, 300);
+
+async function mbSearch(query) {
+  if (!query) return;
+  mb.searchAbort?.abort();
   const abort = new AbortController();
-  pullAbort = abort;
-  const before = new Set(state.local.map((m) => m.id));
-  const layers = new Map(); // digest → {total, completed}
+  mb.searchAbort = abort;
+  mb.query = query;
+  mb.hits = "loading";
+  renderBrowserList();
+  try {
+    mb.hits = await api.search(query, { limit: SEARCH_LIMIT, signal: abort.signal });
+  } catch (e) {
+    if (e.name === "AbortError") return;
+    mb.hits = e;
+  }
+  if (!abort.signal.aborted) renderBrowserList();
+}
+
+/** Local models, one row per repo, with the tags this machine holds. */
+function localRepos() {
+  const byRepo = new Map();
+  for (const m of state.local) {
+    const repo = repoOf(m.id);
+    if (!byRepo.has(repo)) byRepo.set(repo, { name: repo, local: [] });
+    byRepo.get(repo).local.push(m);
+  }
+  return [...byRepo.values()];
+}
+
+function renderBrowserList() {
+  const list = $("#mb-list");
+  list.replaceChildren();
+  const filter = mb.filter;
+  const shown = (rows) => rows.filter((h) => filter === "all" || registryOf(h.name) === filter);
+  if (filter === "local") {
+    const repos = localRepos();
+    list.appendChild(listHeading("On this machine"));
+    if (!repos.length) list.appendChild(emptyRow("Nothing pulled yet. Search above to find a model."));
+    for (const r of repos) list.appendChild(browserRow({ name: r.name }));
+    return;
+  }
+  if (mb.hits === null) {
+    // No search yet: the popular models, by registry.
+    if (mb.popular === "loading" || mb.popular === null) return list.appendChild(emptyRow("Loading popular models…"));
+    if (mb.popular instanceof Error) return list.appendChild(emptyRow(mb.popular.message));
+    const rows = shown(mb.popular);
+    if (!rows.length) return list.appendChild(emptyRow("No popular models from this registry right now. Search above."));
+    for (const [registry, heading] of [
+      ["docker", "Featured on Docker Hub"],
+      ["hf", "Popular GGUF on Hugging Face"],
+    ]) {
+      const group = rows.filter((h) => registryOf(h.name) === registry);
+      if (!group.length) continue;
+      list.appendChild(listHeading(heading));
+      for (const hit of group) list.appendChild(browserRow(hit));
+    }
+    return;
+  }
+  if (mb.hits === "loading") return list.appendChild(emptyRow("Searching…"));
+  if (mb.hits instanceof Error) return list.appendChild(emptyRow(mb.hits.message));
+  const hits = shown(mb.hits);
+  list.appendChild(listHeading(`Results for “${mb.query}”`));
+  if (!hits.length) list.appendChild(emptyRow("No models found."));
+  for (const hit of hits) list.appendChild(browserRow(hit));
+}
+
+function listHeading(text) {
+  const h = document.createElement("div");
+  h.className = "browser-heading";
+  h.textContent = text;
+  return h;
+}
+
+/** A 28px avatar: the owner's picture, or its initials when it has none. */
+function avatar(name, size = 28) {
+  const box = document.createElement("span");
+  box.className = "avatar";
+  box.style.setProperty("--size", `${size}px`);
+  const owner = name.split("/").at(-2) || "?";
+  box.textContent = owner.slice(0, 2).toUpperCase();
+  // A stable colour per owner, for the initials.
+  box.style.setProperty("--hue", String([...owner].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7)));
+  const img = document.createElement("img");
+  img.alt = "";
+  img.loading = "lazy";
+  img.src = `llmman/search/avatar?name=${encodeURIComponent(repoOf(name))}`;
+  img.addEventListener("load", () => box.classList.add("has-img"));
+  img.addEventListener("error", () => img.remove());
+  box.appendChild(img);
+  return box;
+}
+
+function registryBadge(name) {
+  const r = registryOf(name);
+  const b = document.createElement("span");
+  b.className = `registry ${r}`;
+  b.textContent = r === "hf" ? "HF" : r === "docker" ? "Hub" : "";
+  return b;
+}
+
+function browserRow(hit) {
+  const name = hit.name;
+  const row = document.createElement("button");
+  row.type = "button";
+  row.className = "browser-row" + (mb.selected === name ? " selected" : "");
+  row.setAttribute("role", "option");
+  row.setAttribute("aria-selected", String(mb.selected === name));
+  row.appendChild(avatar(name));
+  const text = document.createElement("span");
+  text.className = "browser-row-text";
+  const title = document.createElement("span");
+  title.className = "browser-row-title";
+  const label = document.createElement("span");
+  label.className = "label";
+  label.textContent = name.split("/").at(-1);
+  title.appendChild(label);
+  if (isPulled(name)) {
+    const tag = document.createElement("span");
+    tag.className = "tag";
+    tag.textContent = "pulled";
+    title.appendChild(tag);
+  }
+  text.appendChild(title);
+  const sub = document.createElement("span");
+  sub.className = "browser-row-sub";
+  sub.appendChild(registryBadge(name));
+  sub.append(name.split("/").at(-2) || "");
+  if (hit.pulls != null) sub.append(stat("i-download", formatCount(hit.pulls)));
+  if (hit.likes != null) sub.append(stat("i-heart", formatCount(hit.likes)));
+  text.appendChild(sub);
+  row.appendChild(text);
+  row.addEventListener("click", () => {
+    mb.selected = name;
+    $("#mb").classList.add("show-card");
+    renderBrowserList();
+    renderCard();
+  });
+  return row;
+}
+
+function stat(iconId, text) {
+  const s = document.createElement("span");
+  s.className = "stat";
+  s.append(icon(iconId), text);
+  return s;
+}
+
+// ---- The card ---------------------------------------------------------
+
+async function renderCard() {
+  const card = $("#mb-card");
+  const name = mb.selected;
+  if (!name) {
+    card.replaceChildren(placeholder());
+    return;
+  }
+  if (registryOf(name) === "other") return card.replaceChildren(cardView(name, null));
+  let info = mb.cards.get(name);
+  if (!info) {
+    card.replaceChildren(cardView(name, "loading"));
+    try {
+      info = await api.modelCard(name);
+      mb.cards.set(name, info);
+    } catch (e) {
+      info = e; // not kept: selecting the row again retries
+    }
+    if (mb.selected !== name) return;
+  }
+  card.replaceChildren(cardView(name, info));
+}
+
+function placeholder() {
+  const p = document.createElement("div");
+  p.className = "card-empty";
+  p.append(icon("i-cube"));
+  const h = document.createElement("h2");
+  h.textContent = "Select a model";
+  const t = document.createElement("p");
+  t.className = "muted";
+  t.textContent = "Pick one to see its tags and sizes, whether it fits this machine, and pull it.";
+  p.append(h, t);
+  return p;
+}
+
+function cardView(name, info) {
+  const wrap = document.createElement("div");
+  wrap.className = "card";
+
+  const back = iconButton("i-back", "Back to the list", () => $("#mb").classList.remove("show-card"));
+  back.classList.add("card-back");
+  wrap.appendChild(back);
+
+  const head = document.createElement("div");
+  head.className = "card-head";
+  head.appendChild(avatar(name, 48));
+  const titles = document.createElement("div");
+  const h = document.createElement("h2");
+  if (info && !(info instanceof Error) && info !== "loading") {
+    const a = document.createElement("a");
+    a.href = info.page;
+    a.target = "_blank";
+    a.rel = "noopener";
+    a.textContent = name.split("/").slice(-2).join("/");
+    h.appendChild(a);
+  } else h.textContent = name.split("/").slice(-2).join("/");
+  titles.appendChild(h);
+  const sub = document.createElement("div");
+  sub.className = "card-stats";
+  sub.appendChild(registryBadge(name));
+  if (info && typeof info === "object" && !(info instanceof Error)) {
+    if (info.pulls != null) sub.append(stat("i-download", `${formatCount(info.pulls)} ${info.pulls === 1 ? "pull" : "pulls"}`));
+    if (info.likes != null) sub.append(stat("i-heart", formatCount(info.likes)));
+    if (info.updated) sub.append(pill(`updated ${relativeTime(info.updated)}`));
+    if (info.license) sub.append(pill(info.license));
+    if (info.task) sub.append(pill(info.task));
+    if (info.gated) sub.append(pill("gated: needs an HF token"));
+  }
+  titles.appendChild(sub);
+  head.appendChild(titles);
+  wrap.appendChild(head);
+
+  // What this machine already has of it.
+  const local = state.local.filter((m) => repoOf(m.id).toLowerCase() === name.toLowerCase());
+  if (local.length) {
+    wrap.appendChild(sectionTitle("On this machine"));
+    const box = document.createElement("div");
+    box.className = "card-local";
+    for (const m of local) box.appendChild(localLine(m));
+    wrap.appendChild(box);
+  }
+
+  // A pull of this repo, from its card or typed as a reference.
+  const pulling = mb.pull && repoOf(mb.pull.ref).toLowerCase() === name.toLowerCase();
+  if (pulling) wrap.appendChild(pullProgress());
+
+  if (info === "loading") {
+    wrap.appendChild(emptyRow("Loading…"));
+    return wrap;
+  }
+  if (info instanceof Error) {
+    wrap.appendChild(emptyRow(info.message));
+    return wrap;
+  }
+  if (!info) return wrap;
+
+  // Tags to pull, with sizes and fit.
+  if (!info.variants.length) {
+    wrap.appendChild(emptyRow("Nothing in this repository that llmman can pull."));
+  } else {
+    wrap.appendChild(sectionTitle(info.variants.length > 1 ? `Pick a version · ${info.variants.length}` : "Download"));
+    const list = document.createElement("div");
+    list.className = "variants";
+    const chosen =
+      info.variants.find((v) => v.name === mb.choice.get(name)) ||
+      info.variants.find((v) => v.default) ||
+      info.variants[0];
+    for (const v of info.variants) {
+      const row = document.createElement("label");
+      row.className = "variant" + (v === chosen ? " chosen" : "");
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "variant";
+      radio.checked = v === chosen;
+      radio.addEventListener("change", () => {
+        mb.choice.set(name, v.name);
+        renderCard();
+      });
+      row.appendChild(radio);
+      const tag = document.createElement("span");
+      tag.className = "variant-tag";
+      tag.textContent = v.tag;
+      row.appendChild(tag);
+      if (v.default) row.appendChild(pill("default"));
+      if (holds(v)) {
+        const t = document.createElement("span");
+        t.className = "tag";
+        t.textContent = "pulled";
+        row.appendChild(t);
+      }
+      const size = document.createElement("span");
+      size.className = "variant-size";
+      size.textContent = v.size ? formatBytes(v.size) : "";
+      row.appendChild(size);
+      row.appendChild(fitDot(v.size));
+      list.appendChild(row);
+    }
+    wrap.appendChild(list);
+    // The default is rarely first (rows go by size); show it without moving the page.
+    requestAnimationFrame(() => {
+      const row = list.querySelector(".variant.chosen");
+      if (row) list.scrollTop = row.offsetTop - (list.clientHeight - row.offsetHeight) / 2;
+    });
+
+    wrap.appendChild(fitLine(chosen));
+
+    const actions = document.createElement("div");
+    actions.className = "card-actions";
+    if (!pulling) {
+      const have = holds(chosen);
+      const go = document.createElement("button");
+      go.className = "btn primary";
+      if (have) go.append(icon("i-check"), ` ${chosen.tag} is on this machine`);
+      else go.append(icon("i-download"), ` Pull ${chosen.tag}${chosen.size ? ` · ${formatBytes(chosen.size)}` : ""}`);
+      go.disabled = have || !!mb.pull;
+      go.title = mb.pull ? `Pulling ${mb.pull.ref}` : chosen.name;
+      go.addEventListener("click", () => mbPull(chosen.name));
+      actions.appendChild(go);
+    }
+    wrap.appendChild(actions);
+  }
+
+  const tags = (info.tags || []).filter((t) => !t.startsWith("base_model:") && !t.startsWith("dataset:")).slice(0, 14);
+  if (tags.length) {
+    wrap.appendChild(sectionTitle("Tags"));
+    const box = document.createElement("div");
+    box.className = "chips";
+    for (const t of tags) box.appendChild(pill(t));
+    wrap.appendChild(box);
+  }
+
+  if (info.readme) {
+    wrap.appendChild(sectionTitle("README"));
+    const readme = document.createElement("div");
+    readme.className = "readme content";
+    readme.appendChild(renderMarkdown(readmeMarkdown(info.readme, registryOf(name) === "hf" ? info.page : "")));
+    wrap.appendChild(readme);
+  }
+  return wrap;
+}
+
+/**
+ * A registry README as Markdown for the page's renderer: front matter and
+ * comments dropped, and outside code blocks the HTML model cards are full
+ * of reduced to what it says (links, headings, line breaks, text). Images
+ * go: most are badges, and the page fetches nothing a README asks for.
+ * The renderer still treats all of it as untrusted text. Relative links
+ * point into the repo at `page`, when given.
+ */
+function readmeMarkdown(text, page) {
+  const body = text.replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
+  const entities = { amp: "&", lt: "<", gt: ">", quot: '"', "#39": "'", nbsp: " " };
+  const flat = (t) => t.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+  // Split on fenced code blocks; odd pieces are code and stay as written.
+  const pieces = body.split(/(^```[\s\S]*?^```[^\n]*$)/m);
+  const out = pieces.map((piece, i) => {
+    if (i % 2) return piece;
+    let s = piece.replace(/<!--[\s\S]*?-->/g, "");
+    s = s.replace(/<img\b[^>]*>/gi, "");
+    s = s.replace(/<br\s*\/?>/gi, "\n");
+    s = s.replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi, (_, n, t) => `\n\n${"#".repeat(+n)} ${flat(t)}\n\n`);
+    s = s.replace(/<a\b[^>]*?href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, (_, href, t) =>
+      flat(t) ? `[${flat(t)}](${href})` : "",
+    );
+    s = s.replace(/<\/?(p|div|center|table|thead|tbody|tr|details|summary|ul|ol|li)\b[^>]*>/gi, "\n");
+    s = s.replace(/<\/?[a-z][^>\n]*>/gi, "");
+    s = s.replace(/&(amp|lt|gt|quot|#39|nbsp);/g, (_, e) => entities[e]);
+    if (page) {
+      s = s.replace(/\]\((?!https?:|mailto:|#)([^)\s]+)\)/g, (_, path) => `](${page}/blob/main/${path.replace(/^\.?\//, "")})`);
+    }
+    return s.replace(/\n{3,}/g, "\n\n");
+  });
+  return out.join("").trim();
+}
+
+function sectionTitle(text) {
+  const h = document.createElement("h3");
+  h.textContent = text;
+  return h;
+}
+
+function pill(text) {
+  const p = document.createElement("span");
+  p.className = "pill";
+  p.textContent = text;
+  return p;
+}
+
+/** ok / tight / too big, against this machine's model memory. */
+function fitOf(size) {
+  if (!size || !mb.memory) return null;
+  const share = size / mb.memory;
+  return share <= 0.6 ? "ok" : share <= 0.9 ? "warn" : "bad";
+}
+
+function fitDot(size) {
+  const d = document.createElement("span");
+  const fit = fitOf(size);
+  d.className = "dot " + (fit || "");
+  d.title = fit ? { ok: "Fits this machine", warn: "Tight on this machine", bad: "Too big for this machine" }[fit] : "";
+  return d;
+}
+
+function fitLine(v) {
+  const line = document.createElement("div");
+  line.className = "fit-line";
+  const fit = fitOf(v.size);
+  if (!fit) {
+    line.textContent = v.size ? "" : "Size unknown until pulled.";
+    return line;
+  }
+  line.appendChild(fitDot(v.size));
+  const words = { ok: "Fits this machine", warn: "Tight on this machine", bad: "Too big for this machine" }[fit];
+  line.append(` ${words}: ${formatBytes(v.size)} of weights, ${formatBytes(mb.memory)} of model memory here (context and runtime need more).`);
+  return line;
+}
+
+function localLine(m) {
+  const row = document.createElement("div");
+  row.className = "local-line";
+  const dot = document.createElement("span");
+  dot.className = "dot " + (m.loaded ? "ok" : "");
+  dot.title = m.loaded ? "loaded" : "not loaded";
+  row.appendChild(dot);
+  const name = document.createElement("span");
+  name.className = "name";
+  name.textContent = m.id.split(":").length > 1 && m.id.lastIndexOf(":") > m.id.lastIndexOf("/") ? m.id.slice(m.id.lastIndexOf(":") + 1) : m.id;
+  name.title = m.id;
+  row.appendChild(name);
+  const d = mb.details.get(m.id.toLowerCase());
+  if (d) {
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    const x = d.details || {};
+    meta.textContent = [x.format, x.parameter_size, x.quantization_level, d.size && formatBytes(d.size)]
+      .filter(Boolean)
+      .join(" · ");
+    row.appendChild(meta);
+  }
+  const acts = document.createElement("span");
+  acts.className = "actions";
+  if (usable(m)) {
+    const use = document.createElement("button");
+    use.className = "btn";
+    use.textContent = generative(m) ? "Generate" : "Chat";
+    use.addEventListener("click", () => {
+      select(m.id);
+      location.hash = "#/";
+    });
+    acts.appendChild(use);
+  }
+  if (m.loaded) acts.appendChild(iconButton("i-eject", "Unload", () => unload(m.id).then(reloadLocal)));
+  acts.appendChild(
+    iconButton("i-trash", "Delete from this machine", async () => {
+      if (!confirm(`Delete ${m.id} from the local store?`)) return;
+      try {
+        await api.deleteModel(m.id);
+        toast(`Deleted ${m.id}`);
+      } catch (e) {
+        toast(e.message, "error");
+      }
+      await reloadLocal();
+    }),
+  );
+  row.appendChild(acts);
+  return row;
+}
+
+// ---- Pull, from the card ---------------------------------------------
+
+function pullProgress() {
+  const box = document.createElement("div");
+  box.className = "pull-progress card-pull";
+  const p = mb.pull;
+  const status = document.createElement("div");
+  status.className = "pull-status";
+  status.textContent = p.status || `Pulling ${p.ref}`;
+  const bar = document.createElement("div");
+  bar.className = "bar";
+  const fill = document.createElement("div");
+  fill.className = "bar-fill" + (p.total ? "" : " indeterminate");
+  if (p.total) fill.style.width = `${Math.min(100, (100 * p.done) / p.total).toFixed(1)}%`;
+  bar.appendChild(fill);
+  const detail = document.createElement("div");
+  detail.className = "pull-detail muted";
+  detail.textContent = p.total ? `${formatBytes(p.done)} of ${formatBytes(p.total)}` : "";
+  const cancel = document.createElement("button");
+  cancel.className = "btn";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => p.abort.abort());
+  box.append(status, bar, detail, cancel);
+  return box;
+}
+
+async function mbPull(ref) {
+  if (mb.pull) return toast(`Already pulling ${mb.pull.ref}`, "error");
+  const abort = new AbortController();
+  mb.pull = { ref, abort, done: 0, total: 0, status: "" };
+  mb.selected = repoOf(ref);
+  $("#mb").classList.add("show-card");
+  renderBrowserList();
+  renderCard();
+  const layers = new Map();
+  let frame = 0;
   try {
     await api.pull(
       ref,
       (ev) => {
-        if (ev.status) $("#pull-status").textContent = ev.status;
+        if (ev.status) mb.pull.status = ev.status;
         if (ev.total) {
           layers.set(ev.digest || ev.status || "_", { total: ev.total, completed: ev.completed || 0 });
-          let total = 0, done = 0;
-          for (const l of layers.values()) (total += l.total), (done += l.completed);
-          if (total > 0) {
-            $("#pull-bar").classList.remove("indeterminate");
-            $("#pull-bar").style.width = `${Math.min(100, (100 * done) / total).toFixed(1)}%`;
-            $("#pull-detail").textContent = `${formatBytes(done)} of ${formatBytes(total)}`;
-          }
+          mb.pull.total = mb.pull.done = 0;
+          for (const l of layers.values()) (mb.pull.total += l.total), (mb.pull.done += l.completed);
         }
+        cancelAnimationFrame(frame);
+        frame = requestAnimationFrame(() => {
+          const box = $("#mb-card .card-pull");
+          if (box) box.replaceWith(pullProgress());
+        });
       },
       abort.signal,
     );
-    $("#pull-bar").classList.remove("indeterminate");
-    $("#pull-bar").style.width = "100%";
-    $("#pull-status").textContent = "Done";
     toast(`Pulled ${ref}`);
-    await refresh({ quiet: true });
-    // What appeared is what was pulled; if it was already there, match
-    // the reference as the daemon canonicalizes it.
-    const local =
-      state.local.find((m) => !before.has(m.id) && usable(m)) ||
-      state.local.find((m) => sameModel(m.id, ref));
-    if (local) select(local.id);
-    $("#pull-dialog").close();
   } catch (e) {
-    if (e.name === "AbortError") return;
-    $("#pull-bar").classList.remove("indeterminate");
-    $("#pull-status").textContent = "Pull failed";
-    $("#pull-detail").textContent = e.message;
-    $("#pull-ref").disabled = false;
-    $("#pull-go").disabled = false;
+    if (e.name !== "AbortError") toast(`Pull failed: ${e.message}`, "error");
   } finally {
-    if (pullAbort === abort) pullAbort = null;
-  }
-}
-
-/**
- * Whether stored `id` is `ref` as the daemon canonicalized it: a registry
- * host and/or a default tag added, never a longer name (`myfoo` for `foo`).
- */
-function sameModel(id, ref) {
-  const forms = [ref, `${ref}:latest`];
-  return forms.some((f) => id === f || id.endsWith(`/${f}`));
-}
-
-// ---- Models dialog ----------------------------------------------------
-
-export function initModelsDialog() {
-  $("#nav-models").addEventListener("click", openModelsDialog);
-  $("#models-close").addEventListener("click", () => $("#models-dialog").close());
-}
-
-async function openModelsDialog() {
-  const dialog = $("#models-dialog");
-  const body = $("#models-dialog-body");
-  body.replaceChildren(emptyRow("Loading…"));
-  dialog.showModal();
-  await renderModelsDialog();
-}
-
-async function renderModelsDialog() {
-  const body = $("#models-dialog-body");
-  let tags, running;
-  try {
-    [tags, running] = await Promise.all([api.listLocalDetailed(), api.listRunning().catch(() => [])]);
-  } catch (e) {
-    body.replaceChildren(emptyRow(e.message));
-    return;
-  }
-  const loaded = new Set(running.map((m) => m.name || m.model));
-  body.replaceChildren();
-  if (!tags.length) {
-    body.appendChild(emptyRow("No local models. Pull one to get started."));
-  }
-  for (const m of tags.sort((a, b) => a.name.localeCompare(b.name))) {
-    const row = document.createElement("div");
-    row.className = "models-row";
-    const dot = document.createElement("span");
-    dot.className = "dot " + (loaded.has(m.name) ? "ok" : "");
-    dot.title = loaded.has(m.name) ? "loaded" : "not loaded";
-    row.appendChild(dot);
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = m.name;
-    name.title = m.digest || "";
-    row.appendChild(name);
-    const fmt = document.createElement("span");
-    fmt.className = "meta";
-    const d = m.details || {};
-    const known = state.local.find((l) => l.id === m.name);
-    const caps = known ? otherCapabilities(known) : "";
-    fmt.textContent = [caps, d.format, d.parameter_size, d.quantization_level].filter(Boolean).join(" · ");
-    row.appendChild(fmt);
-    const size = document.createElement("span");
-    size.className = "meta";
-    size.textContent = formatBytes(m.size || 0);
-    row.appendChild(size);
-    const actions = document.createElement("span");
-    actions.className = "actions";
-    if (!known || usable(known)) {
-      const use = known && generative(known) ? `Use to generate ${mediaOf(known).join("/")}` : "Use in chat";
-      actions.appendChild(
-        iconButton("i-check", use, () => {
-          select(m.name);
-          $("#models-dialog").close();
-        }),
-      );
-    }
-    if (loaded.has(m.name)) {
-      actions.appendChild(iconButton("i-eject", "Unload", () => unload(m.name).then(renderModelsDialog)));
-    }
-    actions.appendChild(
-      iconButton("i-trash", "Delete from this machine", async () => {
-        if (!confirm(`Delete ${m.name} from the local store?`)) return;
-        try {
-          await api.deleteModel(m.name);
-          toast(`Deleted ${m.name}`);
-          await refresh({ quiet: true });
-        } catch (e) {
-          toast(e.message, "error");
-        }
-        renderModelsDialog();
-      }),
-    );
-    row.appendChild(actions);
-    body.appendChild(row);
+    cancelAnimationFrame(frame);
+    mb.pull = null;
+    await reloadLocal();
   }
 }

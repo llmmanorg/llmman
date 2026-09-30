@@ -119,12 +119,6 @@ export async function listLocalDetailed() {
   return body.models || [];
 }
 
-/** `GET /api/ps`: what is loaded right now. */
-export async function listRunning() {
-  const body = await getJson("api/ps");
-  return body.models || [];
-}
-
 /**
  * Providers the daemon knows, from `GET /llmman/providers`. `key_usable`
  * is the one that matters for the UI: whether a request from this page
@@ -139,6 +133,33 @@ export async function listProviders() {
 export async function providerModels(id) {
   const body = await getJson(`llmman/providers/${encodeURIComponent(id)}`);
   return body.models || [];
+}
+
+/**
+ * `GET /llmman/search`: models on Docker Hub and Hugging Face matching
+ * `query`, as `llmman search` lists them, each `name` pullable as is.
+ */
+export async function search(query, { limit, signal } = {}) {
+  const params = new URLSearchParams({ q: query });
+  if (limit) params.set("limit", String(limit));
+  const body = await getJson(`llmman/search?${params}`, { signal });
+  return body.models || [];
+}
+
+/** `GET /llmman/search/popular`: what to show before a search, in `search`'s row shape. */
+export async function popular({ limit } = {}) {
+  const body = await getJson(`llmman/search/popular${limit ? `?limit=${limit}` : ""}`);
+  return body.models || [];
+}
+
+/** `GET /llmman/search/model`: a search row's tags with sizes, and its repo's facts. */
+export function modelCard(name) {
+  return getJson(`llmman/search/model?name=${encodeURIComponent(name)}`);
+}
+
+/** `GET /llmman/node`: this daemon's model memory, and what it has loaded and stored. */
+export function nodeInfo() {
+  return getJson("llmman/node");
 }
 
 /** Load a model without generating (Ollama's empty-prompt convention). */

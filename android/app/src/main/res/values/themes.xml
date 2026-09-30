@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Colours mirror the bg/fg custom properties in webui/app.css so the
+         system-bar padding around the WebView reads as part of the page. -->
+    <color name="bg">#F6F7FB</color>
+    <color name="fg">#1B2130</color>
+    <color name="accent">#3B7DDD</color>
+    <color name="ic_launcher_background">#0B0E14</color>
+
+    <style name="Theme.Llmman" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:colorBackground">@color/bg</item>
+        <item name="android:textColorPrimary">@color/fg</item>
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>

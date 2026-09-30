@@ -42,11 +42,12 @@ use reqwest::Client;
 use serde_json::{json, Value};
 
 use super::openai::{proxy_openai_generation, proxy_openai_passthrough};
-use super::sched::ActivityGuard;
-use super::{
+use super::relay::{
     convert_upstream, relay, relay_chat_upstream, relay_rewriting_model,
-    relay_stream_rewriting_model, remote_status, send_chat_completion, AppError, AppState, Target,
+    relay_stream_rewriting_model,
 };
+use super::sched::ActivityGuard;
+use super::{remote_status, send_chat_completion, AppError, AppState, Target};
 
 /// Whether a provider's answer on `/v1/responses` means "retry as a chat
 /// completion": 404/405/501 (no such route) or any 5xx (`opencode` 500s
@@ -1085,7 +1086,7 @@ fn usage_of(usage: &Value) -> Value {
     let n = |v: Option<&Value>| v.and_then(Value::as_u64).unwrap_or(0);
     let input = n(usage.get("prompt_tokens"));
     let output = n(usage.get("completion_tokens"));
-    json!({
+    let mut out = json!({
         "input_tokens": input,
         "output_tokens": output,
         "total_tokens": input + output,
@@ -1095,7 +1096,13 @@ fn usage_of(usage: &Value) -> Value {
         "output_tokens_details": {
             "reasoning_tokens": n(usage.pointer("/completion_tokens_details/reasoning_tokens")),
         },
-    })
+    });
+    // Not OpenAI's field, but cache writes are billed above input.
+    let written = n(usage.pointer("/prompt_tokens_details/cache_write_tokens"));
+    if written > 0 {
+        out["input_tokens_details"]["cache_write_tokens"] = written.into();
+    }
+    out
 }
 
 fn now_unix() -> u64 {
@@ -1335,6 +1342,19 @@ pub(super) fn responses_input_item_text(item: &serde_json::Value) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cache_write_survives_the_translation() {
+        let usage = json!({"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 3}});
+        assert_eq!(
+            usage_of(&usage)["input_tokens_details"],
+            json!({"cached_tokens": 4, "cache_write_tokens": 3})
+        );
+        let plain = usage_of(&json!({"prompt_tokens": 10}));
+        assert!(plain["input_tokens_details"]
+            .get("cache_write_tokens")
+            .is_none());
+    }
 
     /// Parses every `data:` line of an SSE text back into JSON events.
     fn events(sse: &str) -> Vec<Value> {

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status-bar icons are alpha-only; same bubble as the launcher. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M4,3 h16 a2,2 0 0 1 2,2 v10 a2,2 0 0 1 -2,2 h-10 l-5,4 v-4 h-1 a2,2 0 0 1 -2,-2 v-10 a2,2 0 0 1 2,-2 z M7,8 l3,3 l-3,3 l-1,-1 l2,-2 l-2,-2 z M12,13 h6 v1.5 h-6 z" />
+</vector>

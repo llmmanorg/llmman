@@ -5,14 +5,14 @@
 #   packaging/version.sh --apply    # also write it into Cargo.toml + Cargo.lock
 #
 # Every commit on main is a release, published to GitHub Releases,
-# crates.io, Homebrew and winget at once, so the version is
+# crates.io, Homebrew and scoop at once, so the version is
 #
 #     <MAJOR>.<MINOR>.<number of commits reachable from HEAD>
 #
 # MAJOR.MINOR come from Cargo.toml's [package] version (its PATCH is a
 # placeholder; keep it 0). The commit count is the old b<N> build number,
 # now in a shape that is valid semver for crates.io and sorts correctly
-# for Homebrew and winget. Bump MAJOR or MINOR in Cargo.toml to start a
+# for Homebrew and scoop. Bump MAJOR or MINOR in Cargo.toml to start a
 # new series; the count only grows, so versions stay strictly increasing.
 #
 # Needs a full clone (fetch-depth: 0): a shallow one miscounts.

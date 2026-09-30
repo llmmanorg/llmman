@@ -191,7 +191,7 @@ fn walk_value(value: &Value, prefix: &str, out: &mut Vec<(String, String)>) {
 
 /// Append one key to a dotted path, quoted if TOML would quote it.
 fn join(prefix: &str, key: &str) -> String {
-    let key = Key::new(key).display_repr().into_owned();
+    let key = crate::config::toml_key(key);
     if prefix.is_empty() {
         key
     } else {
@@ -677,6 +677,32 @@ mod tests {
         let mut d = doc("");
         set_in(&mut d, "alias.gemma4", "docker.io/ai/gemma4").expect("toml accepts it");
         assert!(crate::config::parse(&d.to_string()).is_err(), "{d}");
+    }
+
+    #[test]
+    fn invalid_managed_values_never_replace_the_saved_configuration() {
+        let dir = scratch("managed-validation");
+        let path = dir.join("llmman.conf");
+        let original = "[managed]\nenabled = \"true\"\nread_timeout_seconds = \"300\"\n";
+        std::fs::write(&path, original).unwrap();
+        for (key, value) in [
+            ("managed.enabled", "yes"),
+            ("managed.enabled", ""),
+            ("managed.read_timeout_seconds", "-1"),
+            ("managed.read_timeout_seconds", "1.5"),
+            ("managed.read_timeout_seconds", "4294967296"),
+        ] {
+            let mut edited = read(&path).unwrap();
+            set_in(&mut edited, key, value).unwrap();
+            assert!(save(&path, &edited).is_err(), "{key}={value}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+        let mut edited = read(&path).unwrap();
+        set_in(&mut edited, "managed.enabled", "false").unwrap();
+        set_in(&mut edited, "managed.read_timeout_seconds", "0").unwrap();
+        save(&path, &edited).unwrap();
+        crate::config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A success that quietly did nothing reports a credential removed

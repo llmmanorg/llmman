@@ -5,8 +5,11 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `agy`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`,
-//! `talos`, `dsh`, `goose`) — not mocks.
+//! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `cline`, `grok`, `qwen`,
+//! `hermes`,
+//! `openclaw`, `talos`, `dsh`, `goose`) — not mocks. The one exception is
+//! [`launch_goose_desktop_env`]: Goose Desktop is a GUI with no headless
+//! mode, so it stubs its binary.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -565,15 +568,8 @@ fn try_spawn_with_timeout(
 fn warm_model() {
     WARM.call_once(|| {
         eprintln!("[warm_model] starting");
-        let mut cmd = Command::new(llmman_bin());
-        cmd.arg("run")
-            .arg(MODEL)
-            .arg("--think")
-            .arg("false")
-            .arg("--num-predict")
-            .arg("64")
-            .arg(PROMPT);
-        let output = spawn_with_timeout(cmd, TIMEOUT, "llmman run (model warm-up)");
+        let output = run_model_prompt(TIMEOUT, "llmman run (model warm-up)")
+            .unwrap_or_else(|timed_out| panic!("{}", timed_out.message));
         eprintln!("[warm_model] done, status={:?}", output.status);
         assert!(
             output.status.success(),
@@ -584,6 +580,51 @@ fn warm_model() {
             String::from_utf8_lossy(&output.stderr),
         );
     });
+}
+
+/// `llmman run MODEL PROMPT` with `warm_model`'s guard flags, bounded by
+/// `timeout`. Shared by `warm_model` and `daemon_still_answers`.
+fn run_model_prompt(
+    timeout: Duration,
+    description: &str,
+) -> Result<std::process::Output, TimedOut> {
+    let mut cmd = Command::new(llmman_bin());
+    cmd.arg("run")
+        .arg(MODEL)
+        .arg("--think")
+        .arg("false")
+        .arg("--num-predict")
+        .arg("64")
+        .arg(PROMPT);
+    try_spawn_with_timeout(cmd, timeout, description)
+}
+
+/// After a launch was killed at `TIMEOUT`: does the daemon still answer
+/// our own client? Yes means the third-party CLI was the slow party (a
+/// slow runner or a degenerate sampling loop); no means a daemon stall,
+/// which a strict test must report.
+fn daemon_still_answers(integration: &str) -> bool {
+    match run_model_prompt(
+        Duration::from_secs(180),
+        &format!("llmman run (daemon probe after {integration} timed out)"),
+    ) {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            eprintln!(
+                "[test] {integration}: daemon probe failed (status: {:?})\n--- stderr ---\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            false
+        }
+        Err(timed_out) => {
+            eprintln!(
+                "[test] {integration}: daemon probe hung\n{}",
+                timed_out.message
+            );
+            false
+        }
+    }
 }
 
 /// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
@@ -610,10 +651,14 @@ fn run_launch(
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
-        // Set, not cleared: a `QWEN_HOME` in the developer's shell would
-        // send the settings `launch qwen` writes past this `HOME`, and on
-        // Windows `dirs::home_dir` reads neither `HOME` nor `USERPROFILE`.
+        // Set, not cleared: a `QWEN_HOME` (or `GROK_HOME`, `CLINE_DIR`) in
+        // the developer's shell would send the settings a launch writes
+        // past this `HOME`, and on Windows `dirs::home_dir` reads neither
+        // `HOME` nor `USERPROFILE`.
         .env("QWEN_HOME", home.join(".qwen"))
+        .env("GROK_HOME", home.join(".grok"))
+        .env("CLINE_DIR", home.join(".cline"))
+        .env("PI_CODING_AGENT_DIR", home.join(".pi").join("agent"))
         // goose asks before each tool call otherwise, and a headless run
         // has nobody to answer. Granted here, not by `launch goose`:
         // auto-approving an agent's writes is the user's call.
@@ -621,10 +666,12 @@ fn run_launch(
         // AGY's background updater replaces its binary in place (seen
         // within a minute of a first run), so without this a retry would
         // run a different AGY than the one CI installed and checksummed.
-        .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+        .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
+        // Cline likewise reinstalls itself as `latest` (CI's pinned 2.18.0
+        // became 3.0.x within ~20s), so a retry ran a different Cline.
+        .env("CLINE_NO_AUTO_UPDATE", "1");
     // On top of the fresh HOME, for an integration that needs more than
-    // a home directory to find itself or its operator (see
-    // `launch_talos_with_model`).
+    // a home directory to find itself or its operator.
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -658,10 +705,14 @@ const MAX_ATTEMPTS: u32 = 3;
 ///     real chance of a different, correct answer.
 ///   - killed at `TIMEOUT` — an endless agent loop (small-model sampling
 ///     degenerating under real concurrent batching, observed decoding
-///     thousands of tokens at ~14 t/s on a CPU-only runner). NOT
-///     retried: a fresh `HOME` doesn't fix a slow runner or the model's
-///     own sampling, and CI run 32633829292 already showed retrying this
-///     shape doesn't reliably help — only costs more CI time.
+///     thousands of tokens at ~14 t/s on a CPU-only runner), or a slow
+///     runner: aarch64 Linux prefills the same ~10k-token system prompt
+///     at ~44 t/s where x86_64 does ~200 t/s (CI run 35602511987), so a
+///     CLI needing several such requests per answer can't fit in
+///     `TIMEOUT` there. NOT retried: a fresh `HOME` doesn't fix a slow
+///     runner or the model's own sampling, and CI run 32633829292
+///     already showed retrying this shape doesn't reliably help — only
+///     costs more CI time.
 ///
 /// A real regression (non-zero exit: a crash, a rejected request, a 500)
 /// is never retried — it panics immediately via the `assert!` below, on
@@ -671,14 +722,72 @@ const MAX_ATTEMPTS: u32 = 3;
 /// Exhausting attempts via only the two shapes above (never the
 /// `assert!`) is logged loudly but does not panic: it's the model's own
 /// sampling variance, not an llmman regression, so it must not turn CI
-/// red on its own.
+/// red on its own. The `strict` variants fail on the first shape (a CLI
+/// that *completed* without saying "pong"); on a timeout they fail only
+/// if `daemon_still_answers` finds the daemon stalled. CI run
+/// 35602511987 went red on all six E2E targets through the two strict
+/// tests timing out on these very shapes (cline on five, grok on one).
+enum NonzeroDisposition {
+    Reject,
+    Retry,
+    Accept,
+}
+
 fn launch_and_assert(integration: &str, extra_args: &[&str]) {
     launch_and_assert_with(
         integration,
         extra_args,
         &[],
-        |_stderr| false,
+        |_stdout, _stderr| NonzeroDisposition::Reject,
         |_stdout| false,
+        reply_contains_pong,
+        false,
+        |_home| {},
+    );
+}
+
+/// [`launch_and_assert`], but a *completed* run that never said `pong`
+/// is a test failure, and a timeout is one unless the daemon still
+/// answers afterwards. Used where the integration is expected to be
+/// deterministic enough that a zero exit without inference is not success.
+fn launch_and_assert_strict(integration: &str, extra_args: &[&str]) {
+    launch_and_assert_with(
+        integration,
+        extra_args,
+        &[],
+        |_stdout, _stderr| NonzeroDisposition::Reject,
+        |_stdout| false,
+        reply_contains_pong,
+        true,
+        |_home| {},
+    );
+}
+
+/// Strict inference plus assertions over the fresh HOME after the real CLI
+/// exits. This catches launchers that infer correctly but leak credentials or
+/// mutate user-owned state while doing it.
+fn launch_and_assert_strict_inspecting(
+    integration: &str,
+    extra_args: &[&str],
+    accept_nonzero: impl Fn(&str, &str) -> bool,
+    accept_stdout: impl Fn(&str) -> bool,
+    inspect_home: impl Fn(&Path),
+) {
+    launch_and_assert_with(
+        integration,
+        extra_args,
+        &[],
+        |stdout, stderr| {
+            if accept_nonzero(stdout, stderr) {
+                NonzeroDisposition::Accept
+            } else {
+                NonzeroDisposition::Reject
+            }
+        },
+        |_stdout| false,
+        accept_stdout,
+        true,
+        inspect_home,
     );
 }
 
@@ -690,7 +799,16 @@ fn launch_and_assert_rejecting(
     extra_args: &[&str],
     reject_stdout: impl Fn(&str) -> bool,
 ) {
-    launch_and_assert_with(integration, extra_args, &[], |_stderr| false, reject_stdout);
+    launch_and_assert_with(
+        integration,
+        extra_args,
+        &[],
+        |_stdout, _stderr| NonzeroDisposition::Reject,
+        reject_stdout,
+        reply_contains_pong,
+        false,
+        |_home| {},
+    );
 }
 
 /// [`launch_and_assert`], generalized with an extra tolerated failure
@@ -712,19 +830,62 @@ fn launch_and_assert_tolerating(
         integration,
         extra_args,
         extra_env,
-        tolerate_stderr,
+        retry_on_stderr(tolerate_stderr),
         |_stdout| false,
+        reply_contains_pong,
+        false,
+        |_home| {},
     );
 }
 
-/// The shared body: `tolerate_stderr` widens what a nonzero exit may be,
-/// `reject_stdout` narrows what a zero exit may be.
+/// A nonzero-exit disposition that retries when `tolerate_stderr` matches
+/// and rejects anything else.
+fn retry_on_stderr(
+    tolerate_stderr: impl Fn(&str) -> bool,
+) -> impl Fn(&str, &str) -> NonzeroDisposition {
+    move |_stdout, stderr| {
+        if tolerate_stderr(stderr) {
+            NonzeroDisposition::Retry
+        } else {
+            NonzeroDisposition::Reject
+        }
+    }
+}
+
+fn reply_contains_pong(stdout: &str) -> bool {
+    stdout.to_lowercase().contains("pong")
+}
+
+/// Whether exhausting all attempts without an accepted reply may remain a
+/// warning. A strict completed run is never success; only a timed-out CLI may
+/// be forgiven when the daemon is independently shown to remain healthy.
+fn exhausted_attempts_are_tolerated(strict: bool, timed_out: bool, daemon_healthy: bool) -> bool {
+    !strict || (timed_out && daemon_healthy)
+}
+
+#[test]
+fn strict_completed_run_without_the_expected_reply_is_not_tolerated() {
+    assert!(!exhausted_attempts_are_tolerated(true, false, true));
+    assert!(!exhausted_attempts_are_tolerated(true, false, false));
+    assert!(exhausted_attempts_are_tolerated(true, true, true));
+    assert!(!exhausted_attempts_are_tolerated(true, true, false));
+}
+
+/// The shared body: `nonzero_disposition` rejects, retries, or conditionally
+/// accepts a nonzero exit, `reject_stdout` narrows what a zero exit may be,
+/// `accept_stdout` defines a successful model reply, and `strict` makes
+/// exhausting the sampling attempts a test failure — for a timeout, only
+/// when the daemon has stopped answering (see [`launch_and_assert`]).
+#[allow(clippy::too_many_arguments)]
 fn launch_and_assert_with(
     integration: &str,
     extra_args: &[&str],
     extra_env: &[(&str, String)],
-    tolerate_stderr: impl Fn(&str) -> bool,
+    nonzero_disposition: impl Fn(&str, &str) -> NonzeroDisposition,
     reject_stdout: impl Fn(&str) -> bool,
+    accept_stdout: impl Fn(&str) -> bool,
+    strict: bool,
+    inspect_home: impl Fn(&Path),
 ) {
     let mut last_failure = None;
     // Set when the loop gives up on a timeout (not retried) rather than
@@ -749,12 +910,18 @@ fn launch_and_assert_with(
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() {
-            assert!(
-                tolerate_stderr(&stderr),
-                "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` failed \
-                 (status: {:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-                output.status
-            );
+            match nonzero_disposition(&stdout, &stderr) {
+                NonzeroDisposition::Accept if accept_stdout(&stdout) => {
+                    inspect_home(&home);
+                    return;
+                }
+                NonzeroDisposition::Accept | NonzeroDisposition::Retry => {}
+                NonzeroDisposition::Reject => panic!(
+                    "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` failed \
+                     (status: {:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                    output.status
+                ),
+            }
             eprintln!(
                 "[test] {integration}: attempt {attempt}/{MAX_ATTEMPTS} failed via its own \
                  known non-llmman-caused failure shape; {}",
@@ -778,12 +945,13 @@ fn launch_and_assert_with(
             "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` exited 0 but \
              reported a failure of its own\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
         );
-        if stdout.to_lowercase().contains("pong") {
+        if accept_stdout(&stdout) {
+            inspect_home(&home);
             return;
         }
         eprintln!(
             "[test] {integration}: attempt {attempt}/{MAX_ATTEMPTS} succeeded but the reply \
-             didn't contain \"pong\"; {}",
+             didn't satisfy the output assertion; {}",
             if attempt < MAX_ATTEMPTS {
                 "retrying with a fresh HOME"
             } else {
@@ -791,16 +959,26 @@ fn launch_and_assert_with(
             }
         );
         last_failure = Some(format!(
-            "expected {integration}'s reply to contain \"pong\"\n\
+            "expected {integration}'s reply to satisfy its output assertion\n\
              --- stdout (last attempt) ---\n{stdout}\n--- stderr (last attempt) ---\n{stderr}"
         ));
     }
     let last_failure = last_failure.expect("loop runs at least once, so this is always set");
-    let why = if gave_up_after_timeout.is_some() {
+    let timed_out = gave_up_after_timeout.is_some();
+    let why = if timed_out {
         "a timeout"
     } else {
-        "a missing \"pong\" (or a known non-llmman-caused failure)"
+        "an unexpected model reply (or a known non-llmman-caused failure)"
     };
+    // A strict timeout is tolerated only once the daemon is shown to be
+    // fine: then the CLI, not llmman, was the slow party.
+    let daemon_healthy = strict && timed_out && daemon_still_answers(integration);
+    let tolerated = exhausted_attempts_are_tolerated(strict, timed_out, daemon_healthy);
+    assert!(
+        tolerated,
+        "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` gave up via {why}\n\
+         {last_failure}"
+    );
     eprintln!(
         "[test] {integration}: WARNING — gave up via {why} only (sampling variance, not an \
          llmman regression — see launch_and_assert's doc comment); does not fail this test. \
@@ -910,6 +1088,390 @@ fn launch_codex_with_model() {
 
     // `exec <prompt>`: codex's non-interactive one-shot mode.
     launch_and_assert("codex", &["exec", PROMPT]);
+}
+
+/// `launch codex --sandbox docker|podman`: codex from Docker Sandboxes'
+/// image, reading the profile the launcher wrote on the host. That needs
+/// both halves of the container plumbing: the state directory mounted at
+/// its host path, and the daemon reachable from inside. codex need not be
+/// installed here. Opt-in, since it pulls a multi-GB image:
+///
+///   LLMMAN_E2E_SANDBOX=docker cargo test --release --test launch_e2e \
+///     launch_codex_in_a_container_sandbox -- --nocapture
+#[test]
+fn launch_codex_in_a_container_sandbox() {
+    let _guard = lock_serial();
+    let Some(engine) = std::env::var("LLMMAN_E2E_SANDBOX")
+        .ok()
+        .filter(|e| e == "docker" || e == "podman")
+    else {
+        eprintln!("skipping: set LLMMAN_E2E_SANDBOX=docker or podman (pulls a multi-GB image)");
+        return;
+    };
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path(&engine) {
+        eprintln!("skipping: {engine} not on PATH");
+        return;
+    }
+    warm_model();
+
+    let home = fresh_home("codex-sandbox");
+    let mut cmd = Command::new(llmman_bin());
+    cmd.args(["launch", "codex", "--model", MODEL, "--sandbox", &engine])
+        .args(["--", "exec", "--skip-git-repo-check", PROMPT])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"));
+    let output = spawn_with_timeout(cmd, TIMEOUT, "`llmman launch codex --sandbox`");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "`llmman launch codex --sandbox {engine}` failed (status: {:?})\n\
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        output.status
+    );
+    // The sandbox's home is llmman's own, under this HOME, not HOME itself.
+    assert!(
+        home.join(".local/share/llmman/sandbox/codex").is_dir(),
+        "no sandbox home under {}",
+        home.display()
+    );
+    if !reply_contains_pong(&stdout) {
+        eprintln!(
+            "[test] codex --sandbox: WARNING — exited 0 without saying pong (sampling \
+             variance, see launch_and_assert)\n--- stdout ---\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn launch_pi_with_model() {
+    eprintln!("[test] launch_pi_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_pi_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("pi") {
+        eprintln!("skipping: pi not on PATH — npm install -g @earendil-works/pi-coding-agent");
+        return;
+    }
+
+    // `-p <prompt>`: pi's own print-and-exit mode. `run_launch` gives it a
+    // fresh HOME and PI_CODING_AGENT_DIR, so this exercises writing
+    // models.json and settings.json from nothing as well as the request.
+    launch_and_assert("pi", &["-p", PROMPT]);
+}
+
+#[test]
+fn launch_omp_with_model() {
+    eprintln!("[test] launch_omp_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_omp_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("omp") {
+        eprintln!("skipping: omp not on PATH — https://omp.sh/");
+        return;
+    }
+
+    // `-p <prompt>` is OMP's print-and-exit mode. The launcher selects
+    // `ollama/<model>` while run_launch's fresh HOME ensures the test does
+    // not succeed because of a developer's pre-existing OMP configuration.
+    launch_and_assert_strict("omp", &["-p", PROMPT]);
+}
+
+#[test]
+fn launch_cline_with_model() {
+    eprintln!("[test] launch_cline_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_cline_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("cline") {
+        eprintln!("skipping: cline not on PATH — npm install -g cline");
+        return;
+    }
+
+    // `--json` selects NDJSON output and `--yolo` prevents interactive tool
+    // approval. Parse only the final assistant text so an echoed prompt or a
+    // question containing "pong" cannot satisfy the assertion. qwen3.5:0.8b
+    // may answer correctly without wrapping it in Cline's completion tool;
+    // accept that one known nonzero shape only after this exact reply check.
+    launch_and_assert_strict_inspecting(
+        "cline",
+        &["--json", "--yolo", PROMPT],
+        cline_nonzero_is_only_missing_completion_tool,
+        cline_json_reply_is_exact_pong,
+        |home| {
+            let path = home.join(".cline/data/settings/providers.json");
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let settings: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+            let provider = &settings["providers"]["ollama"]["settings"];
+            assert_eq!(settings["lastUsedProvider"], "ollama");
+            assert_eq!(provider["provider"], "ollama");
+            assert_eq!(provider["model"], "docker.io/ai/qwen3.5:0.8b");
+            assert_eq!(
+                provider["baseUrl"],
+                format!("{}/v1", llmman::daemon::server())
+            );
+            // See CLINE_RESPONSE_START_TIMEOUT_MS in launch.rs.
+            assert!(
+                provider["timeout"].as_u64().is_some_and(|ms| ms > 300_000),
+                "expected `llmman launch cline` to raise Cline's response-start timeout: {text}"
+            );
+            assert!(
+                provider.get("apiKey").is_none(),
+                "Cline persisted the launch credential in {}: {text}",
+                path.display()
+            );
+
+            let global_path = home.join(".cline/data/globalState.json");
+            let global_text = std::fs::read_to_string(&global_path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", global_path.display()));
+            let global: serde_json::Value = serde_json::from_str(&global_text)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", global_path.display()));
+            assert_eq!(global["actModeApiProvider"], "ollama");
+            assert_eq!(global["planModeApiProvider"], "ollama");
+            assert_eq!(global["actModeOllamaModelId"], "docker.io/ai/qwen3.5:0.8b");
+            assert_eq!(global["planModeOllamaModelId"], "docker.io/ai/qwen3.5:0.8b");
+            assert_eq!(global["welcomeViewCompleted"], true);
+        },
+    );
+}
+
+fn cline_json_reply_is_exact_pong(stdout: &str) -> bool {
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["type"] == "say" && event["say"] == "text")
+        .filter_map(|event| event["text"].as_str().map(str::to_owned))
+        .next_back()
+        .is_some_and(|text| text.trim() == "pong")
+}
+
+fn cline_nonzero_is_only_missing_completion_tool(stdout: &str, stderr: &str) -> bool {
+    stderr.trim().is_empty()
+        && stdout.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|event| {
+                    event["type"] == "error"
+                        && event["message"].as_str().is_some_and(|message| {
+                            message.contains("Too many consecutive mistakes")
+                        })
+                })
+        })
+}
+
+#[test]
+fn cline_json_reply_requires_the_final_result_to_be_exactly_pong() {
+    assert!(cline_json_reply_is_exact_pong(
+        "{\"type\":\"say\",\"say\":\"task\",\"text\":\"Reply with exactly the single word: pong\"}\n\
+         {\"type\":\"say\",\"say\":\"text\",\"text\":\"  pong\\n\"}\n"
+    ));
+    assert!(!cline_json_reply_is_exact_pong(
+        "{\"type\":\"say\",\"say\":\"task\",\"text\":\"Reply with exactly the single word: pong\"}\n\
+         {\"type\":\"ask\",\"ask\":\"followup\",\"text\":\"Which teammate should I play in the pong game?\"}\n"
+    ));
+    assert!(!cline_json_reply_is_exact_pong(
+        "{\"type\":\"say\",\"say\":\"text\",\"text\":\"pong\"}\n\
+         {\"type\":\"say\",\"say\":\"text\",\"text\":\"not pong\"}\n"
+    ));
+    assert!(cline_nonzero_is_only_missing_completion_tool(
+        "{\"type\":\"error\",\"message\":\"[YOLO MODE] Task failed: Too many consecutive mistakes (3).\"}\n",
+        ""
+    ));
+    assert!(!cline_nonzero_is_only_missing_completion_tool(
+        "{\"type\":\"error\",\"message\":\"connection refused\"}\n",
+        ""
+    ));
+}
+
+#[test]
+fn launch_grok_with_model() {
+    eprintln!("[test] launch_grok_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_grok_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("grok") {
+        eprintln!("skipping: grok not on PATH — https://x.ai/cli");
+        return;
+    }
+
+    // `-p <prompt>` is Grok Build's headless, single-turn mode. This
+    // exercises its real model-catalog fetch and Chat Completions request
+    // against llmman's `/v1` endpoint, using the model table llmman writes
+    // into Grok's config.
+    launch_and_assert_strict("grok", &["-p", PROMPT]);
+}
+
+#[test]
+fn launch_docker_agent_with_model() {
+    eprintln!("[test] launch_docker_agent_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_docker_agent_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    // `on_path` alone, though `find_docker_agent` also looks in
+    // `~/.docker/cli-plugins`: `run_launch` replaces `HOME` with a fresh
+    // temp directory, so that fallback can never fire under this
+    // harness. CI installs the binary onto `PATH` for that reason.
+    if !on_path("docker-agent") {
+        eprintln!(
+            "skipping: docker-agent not on PATH — https://github.com/docker/docker-agent/releases"
+        );
+        return;
+    }
+
+    // These arguments land after the `run <agent file>` that
+    // `docker_agent_args` prepends, which is why neither appears here.
+    // `--exec` is docker-agent's non-interactive mode. No `--yolo`,
+    // though the generated agent carries the shell and filesystem
+    // toolsets: a one-word reply calls neither, and granting an agent's
+    // writes stays the caller's decision.
+    //
+    // Strict: `inspect_home` runs only after the reply assertion
+    // passes, so a tolerated miss would skip the config checks below
+    // and leave the test asserting nothing. A timeout is still
+    // forgiven when the daemon is shown to be alive.
+    //
+    // Only docker-agent's own loop guard is retried; any other nonzero
+    // exit still fails at once.
+    launch_and_assert_with(
+        "docker-agent",
+        &["--exec", PROMPT],
+        &[],
+        retry_on_stderr(docker_agent_stopped_a_degenerate_loop),
+        |_stdout| false,
+        docker_agent_reply_is_pong,
+        true,
+        docker_agent_left_the_users_own_config_alone,
+    );
+}
+
+/// Whether docker-agent's own loop guard ended the run (`Error: Agent
+/// terminated: detected 5 consecutive identical calls to write_file. This
+/// indicates a degenerate loop where the model is not making progress.`):
+/// model sampling variance, not an llmman failure.
+fn docker_agent_stopped_a_degenerate_loop(stderr: &str) -> bool {
+    stderr.contains("degenerate loop where the model is not making progress")
+}
+
+#[test]
+fn docker_agent_retries_only_its_own_degenerate_loop_guard() {
+    assert!(docker_agent_stopped_a_degenerate_loop(
+        "Error: Agent terminated: detected 5 consecutive identical calls to write_file. \
+         This indicates a degenerate loop where the model is not making progress.\n"
+    ));
+    assert!(!docker_agent_stopped_a_degenerate_loop(
+        "Error: failed to create runtime: connection refused\n"
+    ));
+    assert!(!docker_agent_stopped_a_degenerate_loop(""));
+}
+
+/// Whether the model's *reply* was "pong", ignoring the reasoning
+/// docker-agent prints above it.
+///
+/// A thinking model reasons about the prompt, so the word appears in its
+/// reasoning whether or not it ever answers — `stdout.contains("pong")`
+/// passes on a run that produced no reply. The reply is the last
+/// non-empty line.
+fn docker_agent_reply_is_pong(stdout: &str) -> bool {
+    stdout
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| !line.is_empty())
+        .is_some_and(|reply| {
+            reply
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .eq_ignore_ascii_case("pong")
+        })
+}
+
+/// Checks what `launch_docker_agent` promises: it writes its own agent
+/// file under `~/.config/llmman`, and puts nothing in docker-agent's own
+/// `~/.config/cagent`. The second is asserted as "no llmman settings in
+/// that file" rather than "that directory is absent", because
+/// docker-agent creates it itself on first run.
+///
+/// Runs on every platform: `docker_agent_config_dir` hangs off
+/// `llmman.conf`'s directory, which resolves `~` through
+/// `HOME`/`USERPROFILE`, so Windows writes into this temp home too.
+fn docker_agent_left_the_users_own_config_alone(home: &Path) {
+    let generated = docker_agent_generated_file(home);
+    let text = std::fs::read_to_string(&generated)
+        .unwrap_or_else(|error| panic!("read {}: {error}", generated.display()));
+    assert!(
+        text.contains(&format!("base_url: \"{}/v1\"", llmman::daemon::server())),
+        "generated agent does not route at the daemon: {text}"
+    );
+    assert!(
+        // MODEL as `launch` resolves it before the launcher sees it,
+        // spelled out the way `launch_cline_with_model` does.
+        text.contains("model: \"docker.io/ai/qwen3.5:0.8b\""),
+        "generated agent does not name the resolved model: {text}"
+    );
+    // The key is named, not written, so a `--provider` launch cannot
+    // leave a real credential in this file.
+    assert!(
+        text.contains("token_key: LLMMAN_API_KEY"),
+        "generated agent does not read its key from the environment: {text}"
+    );
+    assert!(
+        !text.contains("api_key"),
+        "generated agent persisted a credential: {text}"
+    );
+
+    let theirs = home.join(".config/cagent/config.yaml");
+    if let Ok(text) = std::fs::read_to_string(&theirs) {
+        assert!(
+            !text.contains("llmman"),
+            "llmman wrote into docker-agent's own config at {}: {text}",
+            theirs.display()
+        );
+    }
+}
+
+/// The agent file the launch wrote, matched rather than spelled out
+/// because `launch_docker_agent` names it after the model. One file is
+/// also the assertion that a launch leaves nothing else behind.
+fn docker_agent_generated_file(home: &Path) -> PathBuf {
+    let dir = home.join(".config/llmman/launch/docker-agent");
+    let mut written: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+        .map(|entry| entry.expect("read directory entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("agent-") && name.ends_with(".yaml"))
+        })
+        .collect();
+    written.sort();
+    assert_eq!(
+        written.len(),
+        1,
+        "expected one generated agent file in {}, found {written:?}",
+        dir.display()
+    );
+    written.remove(0)
 }
 
 #[test]
@@ -1023,7 +1585,7 @@ fn launch_talos_with_model() {
     // `ask`: Talos's one-turn command, answer on stdout — `chat` counts
     // a terminal as attended only when stdin and stdout both are one,
     // and there is no terminal here.
-    launch_and_assert_tolerating(
+    launch_and_assert_with(
         "talos",
         &["ask", PROMPT],
         &[
@@ -1033,7 +1595,11 @@ fn launch_talos_with_model() {
             ("TALOS_MODEL", String::new()),
             ("TALOS_ALLOWED_PRINCIPALS", String::new()),
         ],
-        |_stderr| false,
+        |_stdout, _stderr| NonzeroDisposition::Reject,
+        |_stdout| false,
+        reply_contains_pong,
+        true,
+        |_home| {},
     );
     let written = std::fs::read_to_string(&secrets).unwrap();
     let model = llmman::shortnames::resolve_ollama_api(MODEL).unwrap();
@@ -1161,6 +1727,187 @@ fn launch_goose_with_model() {
 fn goose_request_failed(stdout: &str) -> bool {
     stdout.contains("Network error:") || stdout.contains("Ran into this error:")
 }
+
+/// `launch goose-desktop` hands the desktop app the same endpoint, model
+/// and key as the CLI, and leaves the user's goose config alone.
+///
+/// The one test here that stubs its binary: Goose Desktop is a GUI with
+/// no headless mode, so a real launch could only ever skip on a CI
+/// runner. The shim records the environment it was given, which is what
+/// the desktop path actually risks getting wrong.
+#[test]
+fn launch_goose_desktop_env() {
+    let _guard = lock_serial();
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    warm_model();
+
+    let home = fresh_home("goose-desktop");
+    let shim_dir = home.join("shim");
+    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+    let dump = home.join("env.txt");
+
+    // Only the variables under test are recorded, never the whole
+    // environment: this inherits the runner's, and a failing assertion
+    // below prints what it read. The dump path is hardcoded into the
+    // script, so the shim needs nothing from the environment it records.
+    let shim = if cfg!(windows) {
+        let path = shim_dir.join("goose-desktop.cmd");
+        let d = dump.display();
+        std::fs::write(
+            &path,
+            format!(
+                "@echo off\r\n\
+                 set GOOSE_ > \"{d}\" 2>nul\r\n\
+                 set OPENAI_ >> \"{d}\" 2>nul\r\n\
+                 set OLLAMA_HOST >> \"{d}\" 2>nul\r\n\
+                 exit /b 0\r\n"
+            ),
+        )
+        .expect("write shim");
+        path
+    } else {
+        let path = shim_dir.join("goose-desktop");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 env | grep -E '^(GOOSE_|OPENAI_|OLLAMA_HOST=)' > '{}'\n\
+                 exit 0\n",
+                dump.display()
+            ),
+        )
+        .expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+        path
+    };
+    assert!(shim.is_file());
+
+    // A configuration the user already has. Seeded rather than left
+    // absent: an empty home only proves nothing was created, not that an
+    // existing provider survives, which is what this target promises.
+    let goose_config = home.join(".config").join("goose");
+    std::fs::create_dir_all(&goose_config).expect("create goose config dir");
+    std::fs::write(goose_config.join("config.yaml"), GOOSE_CONFIG_SENTINEL)
+        .expect("seed goose config");
+
+    // Prepended, so `find_on_path("goose-desktop")` reaches the shim
+    // before any real install on this machine.
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs = vec![shim_dir.clone()];
+    dirs.extend(std::env::split_paths(&path_var));
+    let new_path = std::env::join_paths(dirs).expect("join PATH");
+
+    let mut cmd = Command::new(llmman_bin());
+    cmd.arg("launch")
+        .arg("goose-desktop")
+        .arg("--model")
+        .arg(MODEL)
+        .env("PATH", new_path)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"));
+    let output = try_spawn_with_timeout(
+        cmd,
+        TIMEOUT,
+        &format!("`llmman launch goose-desktop --model {MODEL}`"),
+    )
+    .unwrap_or_else(|timed_out| panic!("{}", timed_out.message));
+    assert!(
+        output.status.success(),
+        "launch goose-desktop failed (status: {:?})\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let dumped = std::fs::read_to_string(&dump).expect("shim did not record its environment");
+    // Read before the assertions, so a failing one cannot leave the
+    // recorded values on disk.
+    let config_after = std::fs::read_to_string(goose_config.join("config.yaml")).ok();
+    let mut left_in_config: Vec<String> = std::fs::read_dir(&goose_config)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    left_in_config.sort();
+    let _ = std::fs::remove_dir_all(&home);
+
+    let get = |key: &str| {
+        dumped
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}=")))
+            .map(str::trim)
+    };
+    // What a failure is allowed to print: the key's value is llmman's to
+    // hand out, not this log's to carry.
+    let shown = dumped
+        .lines()
+        .map(|l| match l.split_once('=') {
+            Some((k, _)) if k.ends_with("API_KEY") => format!("{k}=<redacted>"),
+            _ => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(get("GOOSE_PROVIDER"), Some("openai"));
+    assert_eq!(get("OPENAI_BASE_PATH"), Some("v1/chat/completions"));
+    assert!(
+        get("OPENAI_API_KEY").is_some_and(|k| !k.is_empty()),
+        "no OPENAI_API_KEY in:\n{shown}"
+    );
+    // llmman resolves the short name before launching (see
+    // `shortnames::resolve_ollama_api`), so this is the resolved
+    // reference, not necessarily MODEL verbatim.
+    assert!(
+        get("GOOSE_MODEL").is_some_and(|m| m.contains(MODEL)),
+        "GOOSE_MODEL does not name {MODEL} in:\n{shown}"
+    );
+    // Scheme and authority only: goose appends OPENAI_BASE_PATH, so a
+    // `/v1` here would request `/v1/v1/chat/completions`, and any other
+    // path, query or fragment lands somewhere the daemon does not serve.
+    // Checked structurally — rejecting `/v1` alone lets the rest past.
+    let host = get("OPENAI_HOST").expect("no OPENAI_HOST");
+    let authority = host
+        .strip_prefix("http://")
+        .or_else(|| host.strip_prefix("https://"))
+        .unwrap_or_else(|| panic!("OPENAI_HOST is not an http(s) URL: {host}"));
+    assert!(
+        // A lone trailing slash still names the origin; anything after
+        // it does not.
+        !authority.trim_end_matches('/').contains(['/', '?', '#']),
+        "OPENAI_HOST is not a bare origin: {host}"
+    );
+
+    // Byte-identical, and alone: a launch that rewrote, replaced or
+    // deleted the provider the user configured — or left a `.bak` beside
+    // it, as the file-configured targets do — fails here.
+    assert_eq!(
+        config_after.as_deref(),
+        Some(GOOSE_CONFIG_SENTINEL),
+        "launch goose-desktop changed the user's config.yaml"
+    );
+    assert_eq!(
+        left_in_config,
+        ["config.yaml"],
+        "launch goose-desktop left files in ~/.config/goose"
+    );
+}
+
+/// Seeded into the test's `~/.config/goose/config.yaml`: a provider that
+/// is not llmman, so a launch that honored the file instead of the
+/// environment would also be visible in `GOOSE_PROVIDER`.
+const GOOSE_CONFIG_SENTINEL: &str = "GOOSE_PROVIDER: anthropic\nGOOSE_MODEL: claude-sonnet-4\n";
 
 /// Verifies `daemon::ensure_server`'s fast-fail path end to end: when the
 /// auto-spawned `llmman serve` dies during startup, the client command

@@ -17,6 +17,8 @@ always use whichever store the daemon was started with; set `LLMMAN_MODELS`
 before `llmman serve` to change it for all of them. `transfer`, `login`, and
 `logout` never touch a local store at all.
 
+If `LLMMAN_MODELS` puts the store on a different filesystem from its sibling cache (`<store>/../cache`), llmman copies cached model files instead of hardlinking them.
+
 The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), readable by `docker` and `podman`.
 
 ## llmman.conf
@@ -35,8 +37,8 @@ gemma4 = "docker.io/ai/gemma4"
 [providers.openrouter]
 api_key = "sk-or-..."
 
-[providers.gpubox]                 # an endpoint models.dev does not list
-base_url = "http://gpubox:8000/v1"
+[providers.inferencebox]           # an endpoint models.dev does not list
+base_url = "http://inferencebox:8000/v1"
 
 [verify]
 default = "off"
@@ -71,6 +73,41 @@ Unknown sections and keys are rejected rather than ignored: a misspelled
 `[verify]` or `api_kye` that parsed happily would be a policy or a
 credential that silently never takes effect, and the symptom would show up
 somewhere else entirely.
+
+### Managed OAuth forwarding
+
+Native Codex/Claude OAuth forwarding is explicitly enabled in the same file:
+
+```toml
+[auth]
+api_keys = "a-strong-daemon-key"
+
+[managed]
+enabled = "true"
+# Optional upstream idle-read timeout, in seconds; absent or "0" is unbounded.
+# read_timeout_seconds = "600"
+```
+
+Use `llmman config set managed.enabled true` and, if desired,
+`llmman config set managed.read_timeout_seconds 600`. Values are strings,
+matching the other sections. Invalid booleans or timeout values are rejected
+before `config set` saves the file, and also when the daemon reads it.
+Later files override individual fields. No additional configuration file is used.
+
+Managed forwarding requires the existing `LLMMAN_TLS_CERT` and `LLMMAN_TLS_KEY`
+settings and a matching HTTPS `LLMMAN_HOST`. The TLS private key must pass the
+existing owner-only file permission check, as must configuration files supplying
+daemon API keys. Missing keys, plaintext HTTP,
+or `LLMMAN_AUTH=off` prevent startup when managed forwarding is enabled.
+Managed forwarding is currently supported only on Unix platforms. On Windows
+and other non-Unix platforms, enabling it fails startup because owner-only key
+ACLs cannot yet be verified. Ordinary daemon operation remains available.
+
+Only loopback peers can use the forwarding routes, even when the daemon also
+serves ordinary routes on a network interface. The client sends its daemon key
+as `X-Api-Key`, leaving `Authorization` for its provider OAuth bearer. See
+[providers.md](providers.md#oauth-credential-forwarding) for routes, capability
+checks, network-policy IP pinning, and header handling.
 
 ### llmman config
 
@@ -157,12 +194,12 @@ than keying a catalog one — an inference server at some host or URL
 models.dev does not list, or a replacement URL for one it does:
 
 ```toml
-[providers.gpubox]
-base_url    = "http://gpubox:8000/v1"   # required; http or https
-wire        = "openai"                  # default; or "anthropic"
-api_key     = "..."                     # optional: most local servers take none
-api_key_env = "GPUBOX_API_KEY"          # optional: a variable to read it from
-name        = "GPU box"                 # optional: for listings
+[providers.inferencebox]
+base_url    = "http://inferencebox:8000/v1"   # required; http or https
+wire        = "openai"                        # default; or "anthropic"
+api_key     = "..."                           # optional: most local servers take none
+api_key_env = "INFERENCEBOX_API_KEY"          # optional: a variable to read it from
+name        = "Inference box"                 # optional: for listings
 ```
 
 `wire`, `api_key_env` and `name` only mean something on a definition, so
@@ -278,7 +315,7 @@ setting may not behave identically.
 | `LLMMAN_TLS_CERT` / `LLMMAN_TLS_KEY` | PEM certificate chain and private key; set both and `llmman serve` terminates TLS itself (rustls). Set `LLMMAN_HOST=https://...` too, so the CLI in the same environment connects accordingly. |
 | `LLMMAN_TLS_CA` | A PEM bundle of extra roots to trust, for a private CA: the daemon uses it to reach peers, and the CLI to reach the daemon. |
 | `LLMMAN_CONTEXT_LENGTH` | Context size for llama-server/vLLM/SGLang when set. Defaults to `262144` (256k) for llama-server, capped to each model's trained context; backend-specific forwarding is below. |
-| `LLMMAN_HYBRID_LOCAL_BYTES` | Largest request body, in bytes, that a [hybrid model pair](providers.md#hybrid-model-pairs) serves locally; anything larger goes to the hosted half. `0` disables the size rule; a request the local half then refuses as over its context is still retried on the hosted half. Defaults to four bytes per token of the context size. |
+| `LLMMAN_HYBRID_LOCAL_BYTES` | Largest request body, in bytes, that a [hybrid model pair](providers.md#hybrid-model-pairs) serves locally; anything larger goes to the hosted half. `0` disables the size rule; a request the local half then refuses as over its context is still retried on the hosted half. Set, it is never overridden by a load; unset, the budget is four bytes per token of the window the local half loaded with, falling back to the daemon's context size until then. |
 | `LLMMAN_KEEP_ALIVE` | The daemon-wide default `keep_alive` (how long an idle, unused model stays loaded before being unloaded). Defaults to 5 minutes. Overridden per-request by `/api/chat`/`/api/generate`'s own `keep_alive` field. |
 | `LLMMAN_MAX_LOADED_MODELS` | Caps how many models this daemon keeps loaded at once, as one flat daemon-wide total (llmman has no per-model memory estimate to size an automatic per-GPU figure against). Once at the cap, the least-recently-used idle model is evicted to make room; if every loaded model is busy, the request gets a `503` instead. Defaults to `0` (unbounded, today's behavior, unchanged). |
 | `LLMMAN_MAX_QUEUE` | Caps how many requests `llmman serve` admits into scheduling at once; anything beyond that gets an immediate `503` (`server busy, please try again.  maximum pending requests exceeded`, two spaces included). Defaults to `512`. |
@@ -295,11 +332,12 @@ setting may not behave identically.
 | `LLMMAN_ORIGINS` | A comma-separated list of extra allowed CORS origins for the HTTP API. A single `*` anywhere in an entry matches any substring (`http://host:*` for any port, `https://*.example.com` for any subdomain, a bare `*` for everything), same as Ollama. Always includes every scheme/port on `localhost`/`127.0.0.1`/`0.0.0.0`/`[::1]` regardless of this variable. |
 | `LLMMAN_SHELL` | The web UI's Shell tab (`/llmman/shell`, a terminal on the daemon's machine as the daemon's user). `0`/`false`/`no`/`off` removes it; unset (or `1`/`true`/`yes`/`on`) runs the login shell; any other value is the command to run instead, split on whitespace (`tmux new -A -s llmman`). Regardless of this variable the shell is off whenever `LLMMAN_HOST` binds beyond loopback, requires the daemon's API key when it has one, and a browser page may only open one from an origin `LLMMAN_ORIGINS` allows. See [webui.md](webui.md). |
 | `LLMMAN_WEBUI_DIR` | Serves the web UI from this directory instead of the copy built into the binary, uncompressed and uncached, for working on it (`LLMMAN_WEBUI_DIR=webui llmman serve`). Development only. |
+| `LLMMAN_SANDBOX_IMAGE` | The image `llmman launch --sandbox` runs the integration from, for `docker`, `podman`, `apple-container`, `microsandbox` and `openshell`. Defaults to Docker Sandboxes' image for the agent (`docker.io/docker/sandbox-templates:<tag>`) where one exists. Other integrations need this set. `seatbelt` runs the installed integration rather than an image. `sbx` ignores this variable and uses its own agent image. See [sandbox.md](sandbox.md#images). |
 | `LLMMAN_SCHED_SPREAD` | Truthy forwards `--split-mode layer` (spread a model across every GPU, already llama-server's own default); falsey forwards `--split-mode none` (restrict to one GPU). |
 | `LLMMAN_FLASH_ATTENTION` | Flash Attention mode (`--flash-attn`): `on`, `off`, or `auto` (llama-server's own default). Also accepts `1`/`0`/`true`/`false`. |
 | `LLMMAN_KV_CACHE_TYPE` | KV-cache quantization (`--cache-type-k`/`--cache-type-v`), e.g. `f16` (default), `q8_0`, `q4_0`. Trades output quality for memory at long context lengths. |
 | `LLMMAN_RUNTIME` | Where `llmman serve` gets its inference engine: `auto` (default), `docker`, `podman`, `bin` or `path` — the same setting as `serve --runtime`, as an environment variable so it also reaches the daemon `llmman run`/`launch` start for you. See [backends.md](backends.md#choosing-a-runtime). |
-| `LLMMAN_LLM_LIBRARY` | Forces which GPU backend `llmman serve`/`run` picks (`cpu`, `cuda`/`cuda12`/`cuda_v12`, `cuda13`/`cuda_v13`, `rocm`, `vulkan`, or macOS-only `metal`), bypassing autodetection. Has no effect under `--runtime path` (that binary's backend is fixed), or on macOS's local-binary download (one asset per architecture, no separate choice to make). |
+| `LLMMAN_LLM_LIBRARY` | Forces which GPU backend `llmman serve`/`run` picks (`cpu`, `cuda`/`cuda12`/`cuda_v12`, `cuda13`/`cuda_v13`, `rocm`, `opencl`, `vulkan`, or macOS-only `metal`), bypassing autodetection. Has no effect under `--runtime path` (that binary's backend is fixed), or on macOS's local-binary download (one asset per architecture, no separate choice to make). |
 | `LLMMAN_IGPU_ENABLE` | Counts integrated GPUs (Vulkan only) when probing for an accelerator. Defaults to disabled, since an integrated GPU is usually a worse choice than the discrete/CPU fallback it would otherwise be skipped in favor of. |
 | `LLMMAN_LOAD_TIMEOUT` | How long to allow a model load to stall before giving up. Zero or negative means wait forever. Defaults to 10 minutes (`vllm` and `sglang` can take several minutes to load a large safetensors model). Also passed to vLLM-Omni as `--init-timeout` (a day when unbounded). |
 | `LLMMAN_VLLM_OMNI_GUARDRAILS` | When set (`1`/`true`/`yes`/`on`), a Diffusers-layout model served by vLLM-Omni keeps its safety guardrails on; llmman otherwise passes `--no-guardrails`. See [backends.md](backends.md#vllm-omni-diffusers-pipelines). |
@@ -307,6 +345,7 @@ setting may not behave identically.
 | `LLMMAN_VERIFY` | Overrides the signature-verification mode (`off`, `warn`, or `enforce`) for every reference, ignoring what `[verify]` selected. Does *not* supply trusted keys — those still come from `llmman.conf`, so `enforce` with no configured keys fails every check rather than passing them. Intended for CI, which can demand `enforce` without editing config files. See [verification.md](verification.md). |
 | `LLMMAN_SIGN_PASSWORD` | Passphrase for the `--sign-key` private key used by `push`/`transfer`, when it is an encrypted PEM. Falls back to `COSIGN_PASSWORD`. Read by the CLI process, which does the signing itself; neither key nor passphrase reaches the daemon. |
 | `LLMMAN_NOHISTORY` | When set (to anything other than `0`/`false`/`no`/`off`), `llmman serve` stops recording prompts for `llmman log`. Otherwise each request to a generation route (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`) appends its time, route, model, `User-Agent` and the last user message's text — not the transcript or the reply — to `prompts.jsonl` beside the store (`~/.local/share/llmman/prompts.jsonl` by default), readable only by its owner. Delete the file to clear the history. |
+| `LLMMAN_NOUSAGE` | When set (to anything other than `0`/`false`/`no`/`off`), `llmman serve` stops recording token usage for `llmman usage`. Otherwise each reply that reports usage appends its time, route, serving model and provider, `User-Agent`, token counts and, for a priced provider model, the rate and cost in US dollars to `usage.jsonl` beside the store, readable only by its owner. No prompt text, so independent of `LLMMAN_NOHISTORY`; the `id` matches the `prompts.jsonl` entry when there is one. |
 | `LLMMAN_NOPRUNE` | When set (to anything other than `0`/`false`/`no`/`off`), skips the garbage-collection sweep that `llmman rm` and `llmman serve` startup otherwise run to delete blobs and extracted-cache entries no longer referenced by any local model. Note this is broader than skipping the daemon-startup catch-all: it also stops `llmman rm` itself from ever freeing disk space, so a removed model's (possibly multi-GB) weights stay on disk until a later sweep runs without this set. Useful for a shared/read-mostly store, or scripts that `rm` in a loop and prune once at the end. |
 | `LLAMA_ARG_FIT` / `LLAMA_ARG_FIT_TARGET` / `LLAMA_ARG_THREADS` | llama.cpp's own env-configurable `--fit`/`--fit-target`/`--threads` options. Not something llmman parses itself, just forwarded through to every `llama-server` (local or container) it spawns, same as `CUDA_VISIBLE_DEVICES`/etc. below. |
 

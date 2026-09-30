@@ -31,16 +31,25 @@ fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&crc.to_be_bytes());
 }
 
-/// 8-bit RGB PNG, unfiltered scanlines.
-pub fn png(rgb: &[u8], width: i64, height: i64) -> Result<Vec<u8>> {
+/// 8-bit RGB PNG (RGBA with `alpha`, `[h][w]`), unfiltered scanlines.
+pub fn png(rgb: &[u8], alpha: Option<&[u8]>, width: i64, height: i64) -> Result<Vec<u8>> {
     let (w, h) = (width as usize, height as usize);
-    if rgb.len() != w * h * 3 {
-        bail!("rgb buffer of {} bytes does not match {w}x{h}", rgb.len());
+    if rgb.len() != w * h * 3 || alpha.is_some_and(|a| a.len() != w * h) {
+        bail!("pixel buffer of {} bytes does not match {w}x{h}", rgb.len());
     }
-    let mut raw = Vec::with_capacity((w * 3 + 1) * h);
-    for row in rgb.chunks(w * 3) {
+    let nc = if alpha.is_some() { 4 } else { 3 };
+    let mut raw = Vec::with_capacity((w * nc + 1) * h);
+    for (y, row) in rgb.chunks(w * 3).enumerate() {
         raw.push(0);
-        raw.extend_from_slice(row);
+        match alpha {
+            None => raw.extend_from_slice(row),
+            Some(a) => {
+                for (px, &a) in row.chunks(3).zip(&a[y * w..(y + 1) * w]) {
+                    raw.extend_from_slice(px);
+                    raw.push(a);
+                }
+            }
+        }
     }
     let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
     enc.write_all(&raw)?;
@@ -49,7 +58,8 @@ pub fn png(rgb: &[u8], width: i64, height: i64) -> Result<Vec<u8>> {
     let mut ihdr = Vec::with_capacity(13);
     ihdr.extend_from_slice(&(w as u32).to_be_bytes());
     ihdr.extend_from_slice(&(h as u32).to_be_bytes());
-    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    // color type 2: RGB, 6: RGBA
+    ihdr.extend_from_slice(&[8, if alpha.is_some() { 6 } else { 2 }, 0, 0, 0]);
     png_chunk(&mut out, b"IHDR", &ihdr);
     png_chunk(&mut out, b"IDAT", &idat);
     png_chunk(&mut out, b"IEND", &[]);
@@ -245,14 +255,19 @@ mod tests {
 
     #[test]
     fn png_has_valid_signature_and_chunks() {
-        let p = png(&[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255], 2, 2).unwrap();
+        let rgb = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255];
+        let p = png(&rgb, None, 2, 2).unwrap();
         assert_eq!(
             &p[..8],
             &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']
         );
         assert_eq!(&p[12..16], b"IHDR");
+        assert_eq!(p[25], 2); // RGB
         assert_eq!(&p[p.len() - 8..p.len() - 4], b"IEND");
         assert_eq!(crc32(b"IEND"), 0xae42_6082);
+        let p = png(&rgb, Some(&[255, 0, 128, 255]), 2, 2).unwrap();
+        assert_eq!(p[25], 6); // RGBA
+        assert!(png(&rgb, Some(&[255]), 2, 2).is_err());
     }
 
     #[test]

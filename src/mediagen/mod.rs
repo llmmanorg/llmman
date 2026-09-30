@@ -10,7 +10,9 @@ pub mod cosmos3;
 pub mod encode;
 pub mod ffi;
 pub mod ltx;
+pub mod qwen_image;
 pub mod server;
+pub mod wan_vae;
 pub mod weights;
 
 use std::collections::BTreeMap;
@@ -26,6 +28,7 @@ use weights::{LoadOpts, Weights};
 
 /// Model files of one diffusion model.
 pub struct ContextParams {
+    /// The transformer GGUF, or a Diffusers pack's `model_index.json`.
     pub model: PathBuf,
     pub vae: Option<PathBuf>,
     pub audio_vae: Option<PathBuf>,
@@ -157,6 +160,8 @@ pub struct Output {
     pub n_frames: i64,
     pub fps: f32,
     pub rgb: Vec<u8>,
+    /// `[f][h][w]` bytes when the model generates transparency, else empty.
+    pub alpha: Vec<u8>,
     pub sample_rate: i32,
     pub n_channels: i32,
     pub pcm: Vec<f32>,
@@ -171,12 +176,18 @@ impl Output {
         let n = (self.width * self.height * 3) as usize;
         &self.rgb[i * n..(i + 1) * n]
     }
+
+    pub fn frame_alpha(&self, i: usize) -> Option<&[u8]> {
+        let n = (self.width * self.height) as usize;
+        self.alpha.get(i * n..(i + 1) * n)
+    }
 }
 
 /// The loaded model of one of the supported architectures.
 enum Inner {
     Ltx(Box<LtxCtx>),
     Cosmos3(Box<cosmos3::Model>),
+    QwenImage(Box<qwen_image::Model>),
 }
 
 pub struct Context {
@@ -210,8 +221,17 @@ pub fn is_diffusion_model(path: &Path) -> bool {
         .is_some_and(|a| is_ltx(&a) || cosmos3::is_cosmos3(&a))
 }
 
-/// Does this architecture run without a separate text encoder GGUF?
+/// Does this Diffusers `_class_name` run here (rather than on vLLM-Omni)?
+pub fn is_native_pipeline(class: &str) -> bool {
+    class == qwen_image::PIPELINE
+}
+
+/// Does this model need a separate text encoder GGUF (role `text_encoder`)?
+/// Cosmos3 has its own; a Diffusers pack carries it among its files.
 pub fn needs_text_encoder(path: &Path) -> bool {
+    if qwen_image::is_pipeline_index(path) {
+        return false;
+    }
     weights::read_index(path)
         .ok()
         .and_then(|i| i.metadata.get("general.architecture").cloned())
@@ -296,6 +316,15 @@ impl Mt19937 {
 
 impl Context {
     pub fn init(api: &'static Api, p: &ContextParams) -> Result<Context> {
+        if qwen_image::is_pipeline_index(&p.model) {
+            let mut be = Backend::new(api, p.use_gpu, p.n_threads, 64 * 1024)?;
+            let m = qwen_image::Model::load(api, &be, &p.files, p.flash_attn)?;
+            be.release_compute()?;
+            return Ok(Context {
+                inner: Inner::QwenImage(Box::new(m)),
+                be,
+            });
+        }
         let idx = weights::read_index(&p.model)?;
         let arch = idx
             .metadata
@@ -323,10 +352,18 @@ impl Context {
         Ok(Context { inner, be })
     }
 
+    pub fn supports_image(&self) -> bool {
+        match &self.inner {
+            Inner::Ltx(l) => l.has_video_vae,
+            Inner::Cosmos3(_) | Inner::QwenImage(_) => true,
+        }
+    }
+
     pub fn supports_video(&self) -> bool {
         match &self.inner {
             Inner::Ltx(l) => l.has_video_vae,
             Inner::Cosmos3(_) => true,
+            Inner::QwenImage(_) => false,
         }
     }
 
@@ -334,6 +371,7 @@ impl Context {
         match &self.inner {
             Inner::Ltx(l) => l.ltx.hp.has_audio && l.has_audio_vae,
             Inner::Cosmos3(m) => m.sound.is_some(),
+            Inner::QwenImage(_) => false,
         }
     }
 
@@ -341,6 +379,7 @@ impl Context {
         match &self.inner {
             Inner::Ltx(_) => "ltx",
             Inner::Cosmos3(_) => "cosmos3",
+            Inner::QwenImage(_) => "qwen-image",
         }
     }
 
@@ -349,13 +388,22 @@ impl Context {
         match &self.inner {
             Inner::Ltx(_) => 0,
             Inner::Cosmos3(_) => cosmos3::DEFAULT_STEPS,
+            Inner::QwenImage(_) => qwen_image::DEFAULT_STEPS,
         }
     }
 
     pub fn default_cfg(&self) -> f32 {
         match &self.inner {
-            Inner::Ltx(_) => 1.0,
+            Inner::Ltx(_) | Inner::QwenImage(_) => 1.0,
             Inner::Cosmos3(_) => cosmos3::DEFAULT_CFG,
+        }
+    }
+
+    /// `(width, height)` when a request does not say.
+    pub fn default_size(&self) -> (i64, i64) {
+        match &self.inner {
+            Inner::Ltx(_) | Inner::Cosmos3(_) => (768, 512),
+            Inner::QwenImage(_) => (qwen_image::DEFAULT_SIZE, qwen_image::DEFAULT_SIZE),
         }
     }
 
@@ -364,6 +412,7 @@ impl Context {
         match &self.inner {
             Inner::Ltx(l) => l.ltx.hp.vae_scale_t,
             Inner::Cosmos3(m) => m.hp.vae_scale_t,
+            Inner::QwenImage(_) => 1,
         }
     }
 
@@ -376,6 +425,7 @@ impl Context {
         let out = match &mut self.inner {
             Inner::Ltx(l) => l.generate_inner(&mut self.be, p, progress),
             Inner::Cosmos3(m) => m.generate(&mut self.be, p, progress),
+            Inner::QwenImage(m) => m.generate(&mut self.be, p, progress),
         };
         // frees the compute buffers; recreates the GPU backend after a failure
         self.be.release_compute()?;

@@ -50,6 +50,8 @@ enum Commands {
     Ps(cmd::ps::PsArgs),
     /// Show the prompts `llmman serve` has seen, newest first (like `git log`)
     Log(cmd::log::LogArgs),
+    /// Show the tokens and cost of what `llmman serve` has served, per model
+    Usage(cmd::usage::UsageArgs),
     /// List the hosted providers `--provider` can route to
     Providers(cmd::providers::ProvidersArgs),
     /// Read and write llmman.conf settings
@@ -107,7 +109,8 @@ fn main() {
 
     let cli = Cli::parse_from(cmd::log::expand_count_shorthand(std::env::args_os()));
     // A bare `llmman` is a request for help, not a usage error: print it
-    // and exit 0 rather than clap's 2 (which winget's validator flags).
+    // and exit 0 rather than clap's 2 (package validators flag a non-zero
+    // exit from a bare invocation as a broken install).
     let Some(command) = &cli.command else {
         Cli::command()
             .print_help()
@@ -129,6 +132,7 @@ fn main() {
         Commands::List(a) => cmd::list::run(a),
         Commands::Ps(a) => cmd::ps::run(a),
         Commands::Log(a) => cmd::log::run(a),
+        Commands::Usage(a) => cmd::usage::run(a),
         Commands::Providers(a) => cmd::providers::run(a),
         Commands::Config(a) => cmd::config::run(a),
         Commands::Cp(a) => cmd::cp::run(a),

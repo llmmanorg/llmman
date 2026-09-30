@@ -4,7 +4,7 @@ go 1.25.7
 
 require (
 	// Docker backend — containerd's OCI registry resolver (same transport moby uses)
-	github.com/containerd/containerd/v2 v2.0.12
+	github.com/containerd/containerd/v2 v2.0.13
 	github.com/containerd/errdefs v1.0.0
 	github.com/docker/cli v29.4.1+incompatible
 

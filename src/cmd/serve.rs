@@ -11,7 +11,9 @@ use base64::Engine as _;
 // `HttpBody` is axum's re-export of the `http_body::Body` trait, in
 // scope only for `size_hint` in `track_metrics`.
 use axum::body::{Body, Bytes, HttpBody as _};
-use axum::extract::{DefaultBodyLimit, FromRequest, MatchedPath, Path as UrlPath, Request, State};
+use axum::extract::{
+    DefaultBodyLimit, FromRequest, MatchedPath, Path as UrlPath, Query, Request, State,
+};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -36,15 +38,21 @@ mod auth;
 mod backend;
 mod config;
 mod gemini;
+mod hybrid;
+mod managed;
 mod messages;
 mod ollama;
 mod openai;
+mod refusal;
+mod relay;
 mod responses;
 pub mod runtime;
 mod sched;
+mod search;
 mod shell;
 mod stream;
 mod types;
+mod usage;
 mod webui;
 
 use backend::{
@@ -55,16 +63,16 @@ use backend::{
     OutputTail, SafetensorsEngine, POLL_INTERVAL,
 };
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
-pub use config::DEFAULT_CTX_SIZE;
 use config::{
-    backend_ctx_size, container_cpu_limit, context_length_from_env, effective_num_parallel,
-    embedding_model_ctx, flash_attention_from_env, gguf_trained_ctx, initial_ctx_size,
-    kv_cache_type_from_env, looks_like_oom, max_loaded_models_from_env, max_queue_from_env,
-    metrics_enabled_from_env, next_ctx_size_after_oom, num_parallel_from_env,
-    sched_spread_from_env, supports_context_shift, threads_from_env_or_host, tls_from_env,
-    MAX_CTX_SHRINK_ATTEMPTS,
+    backend_ctx_size, container_cpu_limit, effective_num_parallel, embedding_model_ctx,
+    flash_attention_from_env, gguf_trained_ctx, initial_ctx_size, kv_cache_type_from_env,
+    looks_like_oom, max_loaded_models_from_env, max_queue_from_env, metrics_enabled_from_env,
+    next_ctx_size_after_oom, num_parallel_from_env, sched_spread_from_env, supports_context_shift,
+    threads_from_env_or_host, tls_from_env, MAX_CTX_SHRINK_ATTEMPTS,
 };
+pub use config::{context_length_from_env, DEFAULT_CTX_SIZE};
 use gemini::{gemini_method, handle_pinned_gemini};
+use hybrid::resolve_hybrid_side;
 use ollama::{
     handle_blob_head, handle_blob_upload, handle_copy, handle_create, handle_delete, handle_embed,
     handle_embeddings, handle_ollama_chat, handle_ollama_generate, handle_ps, handle_pull,
@@ -75,6 +83,7 @@ use openai::{
     handle_openai_models, handle_openai_speech, handle_openai_transcriptions,
     handle_openai_video_get, handle_openai_videos, TRANSCRIPTION_BODY_LIMIT_BYTES,
 };
+use relay::proxy;
 pub use runtime::Runtime;
 use sched::{
     begin_activity, default_keep_alive, reap_idle_models, refresh_activity, ActivityGuard,
@@ -114,6 +123,7 @@ Environment Variables:
       LLMMAN_VLLM_ARGS               Extra whitespace-separated arguments appended to every `vllm serve` (e.g. \"--dtype bfloat16 --tp 2\")
       LLMMAN_SGLANG_ARGS             Extra whitespace-separated arguments appended to every sglang launch (e.g. \"--disable-cuda-graph\")
       LLMMAN_NOHISTORY               Do not record prompts for `llmman log`
+      LLMMAN_NOUSAGE                 Do not record token usage and cost for `llmman usage`
       LLMMAN_NOPRUNE                 Do not prune model blobs on startup
       LLMMAN_ORIGINS                 A comma separated list of allowed CORS origins
       LLMMAN_PEERS                   A comma separated list of peer daemons ([scheme://]host[:port]) to pool hardware with (overrides [aggregation] in llmman.conf)
@@ -122,7 +132,7 @@ Environment Variables:
       LLMMAN_FLASH_ATTENTION         Enable flash attention
       LLMMAN_KV_CACHE_TYPE           Quantization type for the K/V cache (default: f16)
       LLMMAN_RUNTIME                 Where the inference engine comes from: auto (default), docker, podman, bin or path — same as --runtime
-      LLMMAN_LLM_LIBRARY             Set backend (cpu/cuda/cuda13/rocm/vulkan/metal) to bypass GPU autodetection
+      LLMMAN_LLM_LIBRARY             Set backend (cpu/cuda/cuda13/rocm/opencl/vulkan/metal) to bypass GPU autodetection
       LLMMAN_IGPU_ENABLE             Enable integrated GPUs
       LLMMAN_LOAD_TIMEOUT            How long to allow model loads to stall before giving up (default \"10m\")
       LLMMAN_VLLM_OMNI_GUARDRAILS    Keep a Diffusers-layout model's vLLM-Omni safety guardrails on (default: off)
@@ -230,8 +240,15 @@ struct Inner {
     // user's explicit choice isn't silently overridden.
     ctx_size_explicit: bool,
     // Largest request a hybrid pair serves locally (see
-    // crate::hybrid::local_budget_bytes). Resolved once at startup.
+    // crate::hybrid::local_budget_bytes). Resolved once at startup, so
+    // it is only the fallback for a pair whose local half is not loaded
+    // yet — see `local_budget` in the hybrid module.
     hybrid_local_bytes: Option<u64>,
+    // True if `hybrid_local_bytes` came from an explicit
+    // LLMMAN_HYBRID_LOCAL_BYTES rather than being derived from
+    // `ctx_size`. A stated budget is the user's, so no loaded model's
+    // own window replaces it (mirrors `ctx_size_explicit`).
+    hybrid_local_bytes_explicit: bool,
     // See flash_attention_from_env's doc comment — forwarded verbatim to
     // every spawn_llama_server/container::spawn call, local or
     // containerized.
@@ -267,6 +284,8 @@ struct Inner {
     cache_path: PathBuf,
     // `record_prompt`'s file; None under LLMMAN_NOHISTORY (and in tests).
     prompt_log: Option<PathBuf>,
+    // `usage::record_usage`'s file; None under LLMMAN_NOUSAGE (and in tests).
+    usage_log: Option<PathBuf>,
     // Who may open the web UI's terminal — see the `shell` module.
     shell: shell::Policy,
     // Who may call this daemon — see the `auth` module.
@@ -328,6 +347,16 @@ struct RunningModel {
     /// `Some(sglang_served_model_name(..))` for `Engine::Sglang` (`:` is
     /// its LoRA separator), `None` otherwise.
     backend_model_path: Option<String>,
+    /// The per-request context window this load ended up with — see
+    /// [`loaded_context_window`], which resolves it per engine. `None`
+    /// only where the backend was left to pick its own (`Engine::Mlx`,
+    /// a vLLM with no explicit length, a GGUF whose header names no
+    /// trained context).
+    ///
+    /// Read by `hybrid::local_budget`, which would otherwise budget a
+    /// pair against the daemon-wide default — many times this window
+    /// for a model whose trained context clamped the load.
+    context_window: Option<u32>,
 }
 
 /// Which engine is actually serving requests for a [`RunningModel`] — surfaced
@@ -865,6 +894,19 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
         .and_then(|a| a.get("org.opencontainers.image.ref.name"))
         .cloned()
         .unwrap_or_else(|| model_ref.to_owned())
+}
+
+/// The key `running` holds `model_ref` under, resolved the way
+/// [`ensure_model`] resolves one before its own `running.insert`. For
+/// reading an already-loaded model's entry; starting one goes through
+/// [`ensure_model`] and its load lock.
+///
+/// Best-effort: a spelling that does not resolve is returned unchanged,
+/// so the lookup finds nothing rather than the wrong model.
+fn running_key(state: &AppState, model_ref: &str) -> String {
+    let resolved =
+        crate::shortnames::resolve_ollama_api(model_ref).unwrap_or_else(|_| model_ref.to_string());
+    canonical_ref(&state.0.store_path, &crate::storage::default_tag(&resolved))
 }
 
 /// The load-lock key for `model`: one string for every spelling of the
@@ -1419,10 +1461,19 @@ struct RemoteTarget {
     /// The catalog's output ceiling, for a wire that requires
     /// `max_tokens` (see [`anthropic::DEFAULT_MAX_TOKENS`]).
     max_output: Option<u32>,
+    /// The catalog's price, for the usage ledger.
+    cost: Option<crate::providers::Cost>,
     /// API key for this request, or `None` for a provider that takes
     /// none (see `Provider::key_optional`). See [`resolve_remote_target`]
     /// for where it comes from.
     api_key: Option<String>,
+}
+
+impl RemoteTarget {
+    /// Cohere's compatibility API rejects `stream_options`.
+    fn refuses_stream_options(&self) -> bool {
+        self.provider == "cohere"
+    }
 }
 
 impl std::fmt::Debug for RemoteTarget {
@@ -1592,7 +1643,24 @@ fn daemon_key_spendable(state: &AppState, headers: Option<&HeaderMap>) -> bool {
 /// later one is memoized, and a 502 when that fetch fails — the failure
 /// is upstream's, not the caller's.
 async fn provider_catalog() -> Result<Arc<crate::providers::Catalog>, AppError> {
-    tokio::task::spawn_blocking(crate::providers::catalog)
+    catalog_blocking(crate::providers::catalog).await
+}
+
+/// [`provider_catalog`], re-fetched first if `provider` does not list
+/// `model` (see [`crate::providers::catalog_listing`]).
+async fn provider_catalog_listing(
+    provider: &str,
+    model: &str,
+) -> Result<Arc<crate::providers::Catalog>, AppError> {
+    let (provider, model) = (provider.to_string(), model.to_string());
+    catalog_blocking(move || crate::providers::catalog_listing(&provider, &model)).await
+}
+
+/// Runs a blocking catalog `load` off the runtime.
+async fn catalog_blocking(
+    load: impl FnOnce() -> anyhow::Result<Arc<crate::providers::Catalog>> + Send + 'static,
+) -> Result<Arc<crate::providers::Catalog>, AppError> {
+    tokio::task::spawn_blocking(load)
         .await
         .context("provider catalog task panicked")?
         .map_err(|e| AppError(e, StatusCode::BAD_GATEWAY))
@@ -1660,15 +1728,13 @@ async fn resolve_remote_target(
         }
     };
 
+    let listed = provider.models.iter().find(|m| m.id == model);
     let target = RemoteTarget {
         provider: provider_id,
         base_url: provider.base_url.clone(),
         wire: provider.wire,
-        max_output: provider
-            .models
-            .iter()
-            .find(|m| m.id == model)
-            .and_then(|m| m.max_output),
+        max_output: listed.and_then(|m| m.max_output),
+        cost: listed.and_then(|m| m.cost.clone()),
         model,
         api_key,
     };
@@ -1682,178 +1748,6 @@ async fn resolve_remote_target(
         target.wire.as_str()
     );
     Ok(Some(Target::Remote(Arc::new(target))))
-}
-
-/// Picks which half of a hybrid pair serves this request and returns
-/// that half's own ordinary reference (see [`crate::hybrid`]).
-/// Substitution rather than a third [`Target`] variant, so the rest of
-/// [`ensure_model`] and every proxy past it serve a pair unchanged. Does
-/// no I/O.
-fn resolve_hybrid_side(
-    state: &AppState,
-    pair: &crate::hybrid::Pair<'_>,
-    headers: Option<&HeaderMap>,
-) -> Result<String, AppError> {
-    let pin = request_pin(headers)?;
-    // The declared length is all that is knowable before the body is
-    // parsed. A chunked request declares none and stays local.
-    let request_bytes = headers
-        .and_then(|h| h.get(reqwest::header::CONTENT_LENGTH))
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok());
-    let decision = crate::hybrid::route(pin, request_bytes, state.0.hybrid_local_bytes);
-
-    let why = match decision.reason {
-        crate::hybrid::Reason::Pinned => format!("pinned by {}", crate::hybrid::ROUTE_HEADER),
-        crate::hybrid::Reason::Overflow { bytes, budget } => format!(
-            "{} request exceeds the {} this host serves locally",
-            crate::fmt::human_size(bytes),
-            crate::fmt::human_size(budget)
-        ),
-        crate::hybrid::Reason::LocalFirst => "no reason to leave this machine".to_string(),
-    };
-    // The sides differ in cost and in where the data goes, so every
-    // request says which way it went. `{:?}`, as the request logs do:
-    // both names come straight from the request.
-    eprintln!(
-        "[llmman] hybrid {:?} + {:?} -> {} ({why})",
-        pair.local,
-        pair.remote_ref(),
-        decision.side.as_str()
-    );
-    Ok(pair.side_ref(decision.side))
-}
-
-/// The side a request pinned itself to, if any; a 400 when unreadable.
-/// Raw bytes reach [`crate::hybrid::parse_pin`] so a non-UTF-8 value is
-/// rejected rather than read as absent.
-fn request_pin(headers: Option<&HeaderMap>) -> Result<Option<crate::hybrid::Side>, AppError> {
-    let mut values = headers
-        .map(|h| h.get_all(crate::hybrid::ROUTE_HEADER).iter())
-        .into_iter()
-        .flatten();
-    let value = values.next();
-    // Two values is not a pin, whichever came first.
-    if values.next().is_some() {
-        return Err(AppError::status(
-            StatusCode::BAD_REQUEST,
-            format!("{} given more than once", crate::hybrid::ROUTE_HEADER),
-        ));
-    }
-    crate::hybrid::parse_pin(value.map(|v| v.as_bytes()))
-        .map_err(|e| AppError(e, StatusCode::BAD_REQUEST))
-}
-
-/// The hosted half a hybrid pair falls back to when its local half
-/// refuses a request as too large: `None` for anything but a pair, and
-/// for a pair pinned local, whose pin is never overridden.
-fn hybrid_fallback(
-    model_ref: &str,
-    headers: Option<&HeaderMap>,
-) -> Result<Option<String>, AppError> {
-    let Some(pair) = crate::hybrid::split_ref(model_ref) else {
-        return Ok(None);
-    };
-    Ok((request_pin(headers)? != Some(crate::hybrid::Side::Local)).then(|| pair.remote_ref()))
-}
-
-/// Serves a generating request through `send` against the target
-/// [`ensure_model`] picks, retrying once on a hybrid pair's hosted half
-/// when the local half refuses the request as over its context. The
-/// byte budget is an estimate; the refusal is exact and arrives before
-/// any output. Without the retry an agent sees the context error,
-/// compacts its history and stays local.
-///
-/// The refusal is [`post_chat`]'s [`ContextOverflow`] or, for a raw
-/// relay, the backend's own 400, read only when a fallback exists so a
-/// plain local model's error passes through untouched.
-async fn send_with_hybrid_fallback<F, Fut>(
-    state: &AppState,
-    model_ref: &str,
-    headers: Option<&HeaderMap>,
-    request_threads: Option<u32>,
-    send: F,
-) -> Result<Response, AppError>
-where
-    F: Fn(String, Target, ActivityGuard) -> Fut,
-    Fut: std::future::Future<Output = Result<Response, AppError>>,
-{
-    let resolve =
-        |m: String| async move { ensure_model(state, &m, headers, request_threads).await };
-    with_hybrid_fallback(model_ref, headers, resolve, send).await
-}
-
-/// [`send_with_hybrid_fallback`] with `ensure_model` abstracted, so the
-/// retry itself is testable.
-async fn with_hybrid_fallback<R, RFut, F, Fut>(
-    model_ref: &str,
-    headers: Option<&HeaderMap>,
-    resolve: R,
-    send: F,
-) -> Result<Response, AppError>
-where
-    R: Fn(String) -> RFut,
-    RFut: std::future::Future<Output = Result<(String, Target, ActivityGuard), AppError>>,
-    F: Fn(String, Target, ActivityGuard) -> Fut,
-    Fut: std::future::Future<Output = Result<Response, AppError>>,
-{
-    let (model, target, guard) = resolve(model_ref.to_string()).await?;
-    let fallback = match target {
-        Target::Local(_) => hybrid_fallback(model_ref, headers)?,
-        _ => None,
-    };
-    let Some(cloud) = fallback else {
-        return send(model, target, guard).await;
-    };
-    let refusal = match send(model, target, guard).await {
-        Ok(resp) => match local_context_overflow(resp).await {
-            Ok(resp) => return Ok(resp),
-            Err(refusal) => refusal,
-        },
-        Err(err) => match err.0.downcast_ref::<ContextOverflow>() {
-            Some(overflow) => overflow.refusal.clone(),
-            None => return Err(err),
-        },
-    };
-    eprintln!("[llmman] hybrid {model_ref:?} -> cloud ({refusal})");
-    let (model, target, guard) = resolve(cloud).await?;
-    send(model, target, guard).await
-}
-
-/// Largest 400 body [`local_context_overflow`] reads to classify it.
-/// llama-server's is one short JSON object.
-const OVERFLOW_BODY_LIMIT: usize = 64 * 1024;
-
-/// Splits a relayed response into the backend's context refusal (`Err`,
-/// with its message) or anything else (`Ok`, the response intact). Only
-/// a 400 is read, up to [`OVERFLOW_BODY_LIMIT`]; whatever was read is
-/// put back in front of the rest when it is some other error.
-async fn local_context_overflow(resp: Response) -> Result<Response, String> {
-    if resp.status() != StatusCode::BAD_REQUEST {
-        return Ok(resp);
-    }
-    let (parts, body) = resp.into_parts();
-    let mut rest = body.into_data_stream();
-    let mut head = Vec::new();
-    while head.len() <= OVERFLOW_BODY_LIMIT {
-        match rest.next().await {
-            Some(Ok(chunk)) => head.extend_from_slice(&chunk),
-            // A read error is the client's to see, as it would have been.
-            Some(Err(_)) | None => break,
-        }
-    }
-    if head.len() <= OVERFLOW_BODY_LIMIT {
-        if let Some(refusal) =
-            context_overflow_message(parts.status, &String::from_utf8_lossy(&head))
-        {
-            return Err(refusal);
-        }
-    }
-    let head = futures::stream::once(futures::future::ready(Ok(Bytes::from(head))));
-    Ok(Response::from_parts(
-        parts,
-        Body::from_stream(head.chain(rest)),
-    ))
 }
 
 /// Ensures `model_ref` is loaded and returns `(canonical_ref, port,
@@ -1876,11 +1770,11 @@ async fn local_context_overflow(resp: Response) -> Result<Response, String> {
 ///
 /// `headers` are the incoming request's, used to pick up a caller-
 /// supplied provider API key (see [`resolve_remote_target`]) and, for a
-/// hybrid pair, which half to use (see [`resolve_hybrid_side`]); `None`
+/// hybrid pair, which half to use (see [`hybrid::resolve_hybrid_side`]); `None`
 /// from a surface that has none to offer, which keeps a pair local.
 ///
 /// `request_threads` is the caller's Ollama `options.num_thread` (see
-/// [`opt_num_thread`]); `None` from every surface without an Ollama
+/// [`ollama::opt_num_thread`]); `None` from every surface without an Ollama
 /// options blob (OpenAI-compat, Anthropic, embeddings, preload).
 /// Precedence for the thread count a local llama-server ends up with:
 /// request option > `LLAMA_ARG_THREADS` > the derived `state.threads`
@@ -1901,11 +1795,26 @@ async fn ensure_model(
     headers: Option<&HeaderMap>,
     request_threads: Option<u32>,
 ) -> Result<(String, Target, ActivityGuard), AppError> {
+    let resolved = resolve_target(state, model_ref, headers, request_threads).await?;
+    // Every surface resolves here, so the usage ledger learns the target
+    // here; a hybrid retry's overwrites the first.
+    usage::note_target(&resolved.0, &resolved.1);
+    Ok(resolved)
+}
+
+/// [`ensure_model`], before the usage ledger is told the outcome.
+async fn resolve_target(
+    state: &AppState,
+    model_ref: &str,
+    headers: Option<&HeaderMap>,
+    request_threads: Option<u32>,
+) -> Result<(String, Target, ActivityGuard), AppError> {
     // First, so everything below sees one half rather than the pair. A
     // half is never itself a pair, so this cannot recurse.
-    let hybrid_side = crate::hybrid::split_ref(model_ref)
-        .map(|pair| resolve_hybrid_side(state, &pair, headers))
-        .transpose()?;
+    let hybrid_side = match crate::hybrid::split_ref(model_ref) {
+        Some(pair) => Some(resolve_hybrid_side(state, &pair, headers).await?),
+        None => None,
+    };
     let model_ref = hybrid_side.as_deref().unwrap_or(model_ref);
 
     // Before `resolve_ollama_api`, deliberately: a provider-routed
@@ -2334,6 +2243,14 @@ async fn ensure_model(
         Engine::Sglang => Some(sglang_served_model_name(model_ref)),
         Engine::LlamaServer | Engine::Vllm | Engine::VllmOmni => None,
     };
+    // `ctx_size` carries any shrink the retry loop above applied.
+    let context_window = loaded_context_window(
+        process.engine(),
+        ctx_size,
+        trained_ctx,
+        num_parallel,
+        state.0.ctx_size_explicit,
+    );
 
     let mut mgr = state.0.manager.lock().await;
     mgr.running.insert(
@@ -2347,6 +2264,7 @@ async fn ensure_model(
             last_active: Instant::now(),
             last_active_wall: chrono::Utc::now(),
             backend_model_path,
+            context_window,
             keep_alive: default_keep_alive(),
             // 1, not 0 — see this function's own doc comment.
             in_flight: 1,
@@ -2362,6 +2280,35 @@ async fn ensure_model(
         Target::Local(port),
         ActivityGuard::new(state, model_ref),
     ))
+}
+
+/// The per-request context window a finished load ended up serving, for
+/// [`RunningModel::context_window`]: whichever window this engine was
+/// actually given, `None` where it was left to pick its own.
+///
+/// `ctx_size` is the value the load settled on, after any clamp to
+/// `trained_ctx` and any OOM shrink. A zero is not "no window": it is
+/// `LLMMAN_CONTEXT_LENGTH=0` asking llama.cpp for the model's trained
+/// context, which `backend_ctx_size` cannot scale up, so llama-server
+/// splits that one across the `--parallel` slots.
+fn loaded_context_window(
+    engine: Engine,
+    ctx_size: Option<u32>,
+    trained_ctx: Option<u32>,
+    num_parallel: Option<u32>,
+    ctx_size_explicit: bool,
+) -> Option<u32> {
+    match engine {
+        Engine::LlamaServer if ctx_size == Some(0) => {
+            trained_ctx.map(|trained| trained / num_parallel.unwrap_or(1))
+        }
+        Engine::LlamaServer => ctx_size,
+        Engine::Vllm | Engine::Sglang => vllm_max_model_len(ctx_size, ctx_size_explicit),
+        // `vllm_omni_serve_args` passes no `--max-model-len` at all, so
+        // the Omni engine's window is its own, like MLX's.
+        Engine::VllmOmni | Engine::Mlx => None,
+    }
+    .filter(|n| *n > 0)
 }
 
 /// The `"model"` value to actually put in the JSON request body sent to
@@ -2394,265 +2341,6 @@ async fn backend_wire_model(state: &AppState, target: &Target, canonical_model: 
         .get(canonical_model)
         .and_then(|r| r.backend_model_path.clone())
         .unwrap_or_else(|| canonical_model.to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Proxy helper – forward raw bytes to llama-server and stream back
-// ---------------------------------------------------------------------------
-
-async fn proxy(
-    client: &Client,
-    target: &Target,
-    route: &str,
-    headers: &HeaderMap,
-    body: Bytes,
-    activity: ActivityGuard,
-) -> Result<Response, AppError> {
-    // `Bytes` clones are refcounted, not copies — passing `body` straight
-    // through (reqwest::Body: From<Bytes>) avoids an extra full-size
-    // allocation that `body.to_vec()` would add on top of it, which
-    // matters most for large multipart audio uploads.
-    let mut req = target.authorize(client.post(target.url(route)).body(body));
-    if let Some(ct) = headers.get("content-type") {
-        req = req.header("content-type", ct);
-    }
-    let resp = req
-        .send()
-        .await
-        .with_context(|| format!("proxy request to {}", target.describe()))?;
-    Ok(relay(resp, activity))
-}
-
-/// The relay half of [`proxy`], split out so `remote_responses` can
-/// inspect the status before deciding to relay.
-fn relay(resp: reqwest::Response, activity: ActivityGuard) -> Response {
-    let status = resp.status();
-    let resp_headers = resp.headers().clone();
-
-    // Moved into the stream below (see ActivityGuard's doc comment) so it
-    // isn't dropped — resetting this model's idle clock — until the whole
-    // response body has actually been relayed.
-    let stream = resp.bytes_stream().map(move |item| {
-        let _activity = &activity;
-        item.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-    });
-
-    let mut builder = Response::builder().status(status.as_u16());
-    for (k, v) in &resp_headers {
-        builder = builder.header(k, v);
-    }
-    builder.body(Body::from_stream(stream)).unwrap()
-}
-
-// ---------------------------------------------------------------------------
-// Proxy helpers – like `proxy` above, but for a request whose backend
-// needed a *different* "model" name than the client itself asked for
-// (see `backend_wire_model`'s own doc comment — only ever true for an
-// `Engine::Mlx` backend, addressed by its real on-disk directory path
-// rather than a human-readable name). `mlx_lm.server` echoes whatever
-// "model" value it received straight back into every response it sends
-// — the one non-streamed JSON body for `stream: false`, and *every*
-// individual `data: {...}` SSE chunk for `stream: true` — so a plain
-// byte-for-byte relay like `proxy` would leak that internal directory
-// path back to the client instead of the name it actually asked for.
-// These two rewrite just that one field back to the canonical name
-// before any of it reaches the client; every other field, and (for the
-// streaming variant) the SSE framing itself, passes through unchanged.
-// ---------------------------------------------------------------------------
-
-/// Sets `value["model"]` to `canonical_model` if that key is present at
-/// all — shared by both helpers below so a response shape that happens
-/// not to carry one (an error body, a future backend response this
-/// doesn't recognize) is left alone rather than gaining a field it
-/// never had.
-fn set_response_model(value: &mut serde_json::Value, canonical_model: &str) {
-    if value.get("model").is_some() {
-        value["model"] = serde_json::Value::String(canonical_model.to_string());
-    }
-    // A Responses API event nests it: `response.created`'s `response`.
-    // So does a Messages API stream: `message_start`'s `message`.
-    for key in ["response", "message"] {
-        if let Some(nested) = value.get_mut(key) {
-            if nested.get("model").is_some() {
-                nested["model"] = serde_json::Value::String(canonical_model.to_string());
-            }
-        }
-    }
-}
-
-/// [`proxy_rewriting_model`]'s actual rewrite, split out as a pure
-/// `bytes -> bytes` function so it's directly unit-testable without any
-/// networking at all. Parses `raw` as JSON, rewrites its `"model"` field
-/// (see [`set_response_model`]), and re-serializes — or returns `raw`
-/// completely unchanged if it isn't valid JSON at all (an error body's
-/// own shape, or a future backend response this doesn't recognize)
-/// rather than mangling or dropping it.
-fn rewrite_json_response_model(raw: &Bytes, canonical_model: &str) -> Bytes {
-    match serde_json::from_slice::<serde_json::Value>(raw) {
-        Ok(mut value) => {
-            set_response_model(&mut value, canonical_model);
-            serde_json::to_vec(&value)
-                .map(Bytes::from)
-                .unwrap_or_else(|_| raw.clone())
-        }
-        Err(_) => raw.clone(),
-    }
-}
-
-/// [`stream_rewriting_model`]'s actual per-line rewrite, split out as a
-/// pure `&str -> String` function so it's directly unit-testable without
-/// any networking at all. `line` is one already-decoded logical line
-/// from [`bytes_to_lines`] (its own line ending already stripped, not
-/// yet restored here — the caller does that once, uniformly, since
-/// every branch below needs it regardless of which one fires): a
-/// `data: {...}` line whose payload parses as JSON gets its `"model"`
-/// field rewritten (see [`set_response_model`]); `data: [DONE]`, a
-/// blank SSE event-separator line, or a `data: ` line whose payload
-/// *doesn't* parse as JSON all pass through byte-for-byte unchanged.
-fn rewrite_sse_line_model(line: &str, canonical_model: &str) -> String {
-    match line.strip_prefix("data: ") {
-        Some(payload) if payload != "[DONE]" => match serde_json::from_str(payload) {
-            Ok(mut value) => {
-                set_response_model(&mut value, canonical_model);
-                format!(
-                    "data: {}",
-                    serde_json::to_string(&value).unwrap_or_else(|_| payload.to_string())
-                )
-            }
-            Err(_) => line.to_string(),
-        },
-        _ => line.to_string(),
-    }
-}
-
-/// The non-streaming (`stream: false`, or no `stream` concept at all —
-/// embeddings, the Responses API's token-counting endpoint) case:
-/// buffers the whole response body (unlike `proxy`, which never does)
-/// so its `"model"` field can be parsed, rewritten, and re-serialized
-/// before forwarding it on. Every route that can reach this returns one
-/// complete JSON object either way (never anything token-streamed a
-/// client would notice the added latency of buffering first), so this
-/// costs nothing a real client could observe.
-///
-/// `Content-Length`, if the backend sent one, is dropped rather than
-/// forwarded: the rewritten body is a different size than the original
-/// one that header described, and hyper/axum fill in the correct value
-/// for a fixed (`Body::from(Bytes)`, not streamed) body on their own
-/// when none is set explicitly.
-async fn proxy_rewriting_model(
-    client: &Client,
-    target: &Target,
-    route: &str,
-    headers: &HeaderMap,
-    body: Bytes,
-    activity: ActivityGuard,
-    canonical_model: &str,
-) -> Result<Response, AppError> {
-    let mut req = target.authorize(client.post(target.url(route)).body(body));
-    if let Some(ct) = headers.get("content-type") {
-        req = req.header("content-type", ct);
-    }
-    let resp = req
-        .send()
-        .await
-        .with_context(|| format!("proxy request to {}", target.describe()))?;
-    relay_rewriting_model(resp, activity, canonical_model).await
-}
-
-/// The relay half of [`proxy_rewriting_model`]; see [`relay`].
-async fn relay_rewriting_model(
-    resp: reqwest::Response,
-    activity: ActivityGuard,
-    canonical_model: &str,
-) -> Result<Response, AppError> {
-    let status = resp.status();
-    let resp_headers = resp.headers().clone();
-    let raw = resp
-        .bytes()
-        .await
-        .context("read inference backend response")?;
-    // The whole body is already collected by this point, so there's no
-    // partial relay left for keeping this alive any longer to protect —
-    // see `proxy`'s own comment on why it instead holds this open across
-    // its whole (streamed) relay.
-    drop(activity);
-
-    let rewritten = rewrite_json_response_model(&raw, canonical_model);
-
-    let mut builder = Response::builder().status(status.as_u16());
-    for (k, v) in &resp_headers {
-        if k == reqwest::header::CONTENT_LENGTH {
-            continue;
-        }
-        builder = builder.header(k, v);
-    }
-    Ok(builder.body(Body::from(rewritten)).unwrap())
-}
-
-/// The streaming (`stream: true`) case: like `stream_ollama`/
-/// `anthropic_messages_to`, uses `bytes_to_lines` so a `data: {...}` SSE line
-/// split across two TCP reads is never parsed as JSON prematurely — but
-/// unlike those two (which convert into a completely different wire
-/// format, ndjson/Anthropic SSE, and so don't need to preserve the
-/// original SSE framing at all), this must reproduce the exact original
-/// OpenAI SSE shape byte-for-byte except for the one field being
-/// rewritten: every blank line (an SSE event separator) and the
-/// trailing `data: [DONE]` sentinel pass through completely unchanged;
-/// only a `data: {...}` line whose payload actually parses as a JSON
-/// object carrying a `model` field gets rewritten.
-async fn stream_rewriting_model(
-    client: &Client,
-    target: &Target,
-    route: &str,
-    headers: &HeaderMap,
-    body: Bytes,
-    activity: ActivityGuard,
-    canonical_model: String,
-) -> Result<Response, AppError> {
-    let mut req = target.authorize(client.post(target.url(route)).body(body));
-    if let Some(ct) = headers.get("content-type") {
-        req = req.header("content-type", ct);
-    }
-    let resp = req
-        .send()
-        .await
-        .with_context(|| format!("proxy request to {}", target.describe()))?;
-    Ok(relay_stream_rewriting_model(
-        resp,
-        activity,
-        canonical_model,
-    ))
-}
-
-/// The relay half of [`stream_rewriting_model`]; see [`relay`].
-fn relay_stream_rewriting_model(
-    resp: reqwest::Response,
-    activity: ActivityGuard,
-    canonical_model: String,
-) -> Response {
-    let status = resp.status();
-    // Every header but the ones describing a body about to be rewritten
-    // line by line: a provider's `request-id`, rate limits and
-    // `Retry-After` matter to the client.
-    let mut resp_headers = resp.headers().clone();
-    resp_headers.remove(reqwest::header::CONTENT_LENGTH);
-    resp_headers.remove(reqwest::header::TRANSFER_ENCODING);
-
-    let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
-        // See `proxy`'s own comment on this same pattern.
-        let _activity = &activity;
-        // bytes_to_lines strips the original line ending; restored here,
-        // uniformly, regardless of which of rewrite_sse_line_model's own
-        // branches actually fired.
-        let out = rewrite_sse_line_model(&line, &canonical_model) + "\n";
-        Ok::<_, std::convert::Infallible>(Bytes::from(out))
-    });
-
-    let mut builder = Response::builder().status(status.as_u16());
-    for (k, v) in &resp_headers {
-        builder = builder.header(k, v);
-    }
-    builder.body(Body::from_stream(stream)).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -2753,7 +2441,8 @@ fn strip_llama_fields(req: &mut serde_json::Value) {
 /// wire, which has a budget to turn on or off, since an OpenAI provider
 /// 400s `reasoning_effort` on a model that does not reason. OpenAI's
 /// reasoning models then take `max_completion_tokens`, not `max_tokens`,
-/// and reject sampling overrides (litellm's o-series and gpt-5 rules).
+/// and reject sampling overrides (litellm's o-series and gpt-5 rules);
+/// so do the newer Claude models ([`anthropic::sampling_compat`]).
 fn provider_compat(remote: &RemoteTarget, req: &mut serde_json::Value) {
     let Some(o) = req.as_object_mut() else {
         return;
@@ -2775,9 +2464,11 @@ fn provider_compat(remote: &RemoteTarget, req: &mut serde_json::Value) {
     for field in LLAMA_FIELDS {
         o.remove(*field);
     }
-    // Cohere's compatibility API rejects `stream_options`.
-    if remote.provider == "cohere" {
+    if remote.refuses_stream_options() {
         o.remove("stream_options");
+    }
+    if remote.wire == Wire::Anthropic {
+        anthropic::sampling_compat(&remote.model, o);
     }
     if remote.provider != "openai" {
         return;
@@ -2916,15 +2607,24 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
         .get("stream")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let default_max_tokens = match target {
-        Target::Remote(remote) => remote.max_output,
-        _ => None,
+    // The API 400s a `max_tokens` above the model's ceiling; agents ask
+    // every model for the same large number.
+    if let Some(ceiling) = remote.max_output {
+        for key in ["max_tokens", "max_completion_tokens"] {
+            if req
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|n| n > u64::from(ceiling))
+            {
+                req[key] = serde_json::json!(ceiling);
+            }
+        }
     }
-    .unwrap_or(anthropic::DEFAULT_MAX_TOKENS);
+    let default_max_tokens = remote.max_output.unwrap_or(anthropic::DEFAULT_MAX_TOKENS);
     let messages_req = anthropic::from_chat_request(&req, default_max_tokens)
         .map_err(|e| AppError(e, StatusCode::BAD_REQUEST))?;
     let mut upstream = target.authorize(client.post(target.url(anthropic::MESSAGES_ROUTE)));
-    if anthropic::thinks(&messages_req) {
+    if anthropic::manual_thinking(&messages_req) {
         upstream = upstream.header("anthropic-beta", anthropic::INTERLEAVED_THINKING_BETA);
     }
     let resp = upstream
@@ -2988,20 +2688,6 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
         headers,
         body,
     })
-}
-
-/// [`relay`] for a [`ChatUpstream`]: `activity` lives until the whole
-/// body has been relayed (see `ActivityGuard`).
-fn relay_chat_upstream(upstream: ChatUpstream, activity: ActivityGuard) -> Response {
-    let stream = upstream.body.map(move |item| {
-        let _activity = &activity;
-        item.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-    });
-    let mut builder = Response::builder().status(upstream.status.as_u16());
-    for (k, v) in &upstream.headers {
-        builder = builder.header(k, v);
-    }
-    builder.body(Body::from_stream(stream)).unwrap()
 }
 
 /// POSTs oai_req to url and returns the still-streaming, OpenAI-shaped
@@ -3289,6 +2975,17 @@ struct ProviderModelResponse {
     /// "unknown" as "free" lies about someone's bill.
     #[serde(skip_serializing_if = "Option::is_none")]
     cost: Option<ProviderCostResponse>,
+    /// See [`crate::providers::Model::thinking`]; absent is not empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Vec<String>>,
+    /// See [`crate::providers::Model::max_context`]; absent where the
+    /// catalog names no window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<u64>,
+    /// See [`crate::providers::Model::max_output`]; absent where the
+    /// catalog names no ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<u32>,
 }
 
 /// US dollars per million tokens, models.dev's own unit (see
@@ -3297,6 +2994,12 @@ struct ProviderModelResponse {
 struct ProviderCostResponse {
     input: f64,
     output: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_read: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_write: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<f64>,
 }
 
 impl ProviderResponse {
@@ -3315,13 +3018,38 @@ impl ProviderResponse {
                 .iter()
                 .map(|m| ProviderModelResponse {
                     id: m.id.clone(),
-                    cost: m.cost.map(|c| ProviderCostResponse {
+                    cost: m.cost.as_ref().map(|c| ProviderCostResponse {
                         input: c.input,
                         output: c.output,
+                        cache_read: c.cache_read,
+                        cache_write: c.cache_write,
+                        reasoning: c.reasoning,
                     }),
+                    thinking: m.thinking.clone(),
+                    context: m.max_context,
+                    output: m.max_output,
                 })
                 .collect(),
         }
+    }
+}
+
+/// The query of `GET /llmman/providers/:id`.
+#[derive(Deserialize)]
+struct ProviderQuery {
+    /// The model the caller is about to use. Not a filter: it makes a
+    /// catalog that lacks it be re-fetched before it is reported.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+impl ProviderQuery {
+    /// The hint, unless blank: a blank one would spend a download on nothing.
+    fn model(&self) -> Option<&str> {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
     }
 }
 
@@ -3346,8 +3074,12 @@ async fn handle_llmman_providers(
 async fn handle_llmman_provider(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
+    Query(query): Query<ProviderQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let catalog = provider_catalog().await?;
+    let catalog = match query.model() {
+        Some(model) => provider_catalog_listing(&id, model).await?,
+        None => provider_catalog().await?,
+    };
     let provider = catalog.get(&id).ok_or_else(|| {
         AppError(
             crate::providers::unknown_provider_error(&id, &catalog),
@@ -3359,7 +3091,16 @@ async fn handle_llmman_provider(
         response.models = configured_provider_models(&state, provider)
             .await
             .into_iter()
-            .map(|id| ProviderModelResponse { id, cost: None })
+            // A provider defined in llmman.conf: its models come from
+            // the endpoint's own /v1/models, which names no window and
+            // no output ceiling.
+            .map(|id| ProviderModelResponse {
+                id,
+                cost: None,
+                thinking: None,
+                context: None,
+                output: None,
+            })
             .collect();
     }
     Ok(Json(response))
@@ -3416,167 +3157,6 @@ async fn configured_provider_models(
             Vec::new()
         }
     }
-}
-
-// -- Upstream SSE conversion -------------------------------------------------
-
-/// A converter of one upstream SSE stream into another, line by line:
-/// `responses::StreamConverter` and `messages::StreamConverter`.
-trait SseConverter: Send + 'static {
-    fn line(&mut self, line: &str) -> String;
-    fn finish(&mut self) -> String;
-    fn failed(&self) -> bool;
-    fn fold(&mut self, lines: Vec<String>) -> serde_json::Value;
-}
-
-macro_rules! sse_converter {
-    ($($t:ty),*) => {$(
-        impl SseConverter for $t {
-            fn line(&mut self, line: &str) -> String {
-                Self::line(self, line)
-            }
-            fn finish(&mut self) -> String {
-                Self::finish(self)
-            }
-            fn failed(&self) -> bool {
-                Self::failed(self)
-            }
-            fn fold(&mut self, lines: Vec<String>) -> serde_json::Value {
-                Self::fold(self, lines)
-            }
-        }
-    )*};
-}
-sse_converter!(responses::StreamConverter, messages::StreamConverter);
-
-/// `body` translated by `converter`: streamed as SSE, with a trailing
-/// `None` so the converter can close a stream ended without `[DONE]`, or
-/// folded into one JSON object (502 when the converter failed).
-async fn convert_upstream(
-    body: ChatBody,
-    activity: ActivityGuard,
-    mut converter: impl SseConverter,
-    streaming: bool,
-) -> Response {
-    if !streaming {
-        let lines: Vec<String> = bytes_to_lines(body).collect().await;
-        drop(activity);
-        let response = converter.fold(lines);
-        let status = if converter.failed() {
-            StatusCode::BAD_GATEWAY
-        } else {
-            StatusCode::OK
-        };
-        return (status, Json(response)).into_response();
-    }
-    let sse_stream = bytes_to_lines(body)
-        .map(Some)
-        .chain(futures::stream::once(futures::future::ready(None)))
-        .map(move |line| {
-            let _activity = &activity;
-            let out = match line {
-                Some(line) => converter.line(&line),
-                None => converter.finish(),
-            };
-            Ok::<_, std::convert::Infallible>(Bytes::from(out))
-        });
-    Response::builder()
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(Body::from_stream(sse_stream))
-        .unwrap()
-}
-
-// -- Routes a target has no equivalent of ------------------------------------
-
-/// Routes the Messages API has no equivalent of (legacy completions,
-/// embeddings, Responses token counting), refused with a 501 instead of
-/// a round trip that could only 404.
-fn unsupported_on_wire(target: &Target, route: &str) -> Option<Response> {
-    let message = wire_refusal(target, route)?;
-    let body = serde_json::json!({
-        "error": { "message": message, "type": "invalid_request_error" }
-    });
-    Some((StatusCode::NOT_IMPLEMENTED, Json(body)).into_response())
-}
-
-/// The message behind [`unsupported_on_wire`], for the Ollama embedding
-/// routes.
-fn wire_refusal(target: &Target, route: &str) -> Option<String> {
-    let Target::Remote(remote) = target else {
-        return None;
-    };
-    if remote.wire != Wire::Anthropic
-        || matches!(route, CHAT_COMPLETIONS_ROUTE | responses::RESPONSES_ROUTE)
-    {
-        return None;
-    }
-    Some(format!(
-        "provider {} speaks the Anthropic Messages API, which has no equivalent of {route}; \
-         only chat completions, /v1/responses and /v1/messages reach it",
-        remote.provider
-    ))
-}
-
-/// Explains a provider's bare 404 on the Responses API.
-///
-/// Being OpenAI-wire-format does not mean implementing every OpenAI
-/// route: `openai`, `groq` and `openrouter` answer `/v1/responses*`,
-/// `mistral` 404s. Generation is bridged by
-/// [`responses::remote_responses`], so this only fires for
-/// `/v1/responses/input_tokens`, which has no chat-completions
-/// equivalent. It reports the 404 actually received rather than
-/// predicting one from a list that would go stale.
-fn explain_missing_route(target: &Target, route: &str, resp: Response) -> Response {
-    if resp.status() != StatusCode::NOT_FOUND || !responses::is_responses_route(route) {
-        return resp;
-    }
-    // A 404 on any other route means something else entirely — an
-    // unknown model on `/v1/chat/completions`, most often — and claiming
-    // a missing Responses API for it would be a worse answer than the
-    // provider's own.
-    let Target::Remote(remote) = target else {
-        return resp;
-    };
-    let body = serde_json::json!({
-        "error": {
-            "message": format!(
-                "provider {} has no {route} — it is OpenAI-compatible but does not \
-                 implement the Responses API's token counting. Generation on \
-                 /v1/responses is bridged; this route cannot be.",
-                remote.provider
-            ),
-            "type": "invalid_request_error",
-        }
-    });
-    (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()
-}
-
-// ---------------------------------------------------------------------------
-// Option extractors from Ollama options blob
-// ---------------------------------------------------------------------------
-
-fn opt_f64(opts: &Option<serde_json::Value>, key: &str) -> Option<f32> {
-    opts.as_ref()?.get(key)?.as_f64().map(|f| f as f32)
-}
-
-fn opt_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32> {
-    opts.as_ref()?.get(key)?.as_u64().map(|n| n as u32)
-}
-
-/// `num_thread` from the Ollama options blob: the per-request
-/// `--threads <n>` for a fresh local llama-server load (see
-/// `ensure_model`'s `request_threads` parameter for the full precedence
-/// chain and the reuse/container caveats). Zero, negative, fractional,
-/// or above-u32 numbers are dropped, falling back down that chain, the
-/// same way `parse_num_parallel` rejects zero for `--parallel`. Unlike
-/// that env-string parser this value arrives as a JSON number (Ollama's
-/// `num_thread` is an int field), so `as_u64` does the type filtering;
-/// not built on [`opt_u32`], whose `as u32` truncation is harmless for
-/// `num_predict` but would turn e.g. 2^32+1 into `--threads 1` here.
-fn opt_num_thread(opts: &Option<serde_json::Value>) -> Option<u32> {
-    let n = opts.as_ref()?.get("num_thread")?.as_u64()?;
-    u32::try_from(n).ok().filter(|&n| n != 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -3792,8 +3372,13 @@ async fn record_prompt(State(state): State<AppState>, req: Request, next: Next) 
         if let Some(model) = selected_model {
             entry.model = model;
         }
-        if let Err(e) = crate::promptlog::append(log, &entry) {
-            eprintln!("[llmman] warning: prompt log {}: {e}", log.display());
+        match crate::promptlog::append(log, &entry) {
+            Ok(()) => {
+                parts
+                    .extensions
+                    .insert(crate::promptlog::PromptId(entry.id));
+            }
+            Err(e) => eprintln!("[llmman] warning: prompt log {}: {e}", log.display()),
         }
     }
     next.run(Request::from_parts(parts, Body::from(body))).await
@@ -4042,6 +3627,10 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .route("/llmman/providers", get(handle_llmman_providers))
         .route("/llmman/providers/:id", get(handle_llmman_provider))
         .route("/llmman/node", get(aggregation::handle_node))
+        .route("/llmman/search", get(search::handle_search))
+        .route("/llmman/search/popular", get(search::handle_popular))
+        .route("/llmman/search/model", get(search::handle_model))
+        .route("/llmman/search/avatar", get(search::handle_avatar))
         .route("/llmman/shell", get(shell::handle_shell))
         // Ollama API
         .merge(ollama_router())
@@ -4092,10 +3681,16 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
     // daemon did any work for.
     // Innermost, so `track_metrics` times its body read as the handler's
     // and CORS answers preflights before it.
-    let app = app.layer(middleware::from_fn_with_state(
-        app_state.clone(),
-        record_prompt,
-    ));
+    // `record_usage` inside `record_prompt`, to read the prompt's id.
+    let app = app
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            usage::record_usage,
+        ))
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            record_prompt,
+        ));
 
     let app = if metrics_enabled {
         app.layer(middleware::from_fn(track_metrics))
@@ -4290,11 +3885,13 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         if let Ok(store) = OciStore::open(&store_path) {
             if let Ok(live) = crate::storage::gc::referenced_digests(&store) {
                 let grace = crate::storage::gc::GC_GRACE_PERIOD;
-                if let Err(e) = crate::storage::gc::prune_blobs(&store_path, &live, grace) {
-                    eprintln!("[llmman] blob GC sweep failed: {e:#}");
-                }
-                if let Err(e) = crate::storage::gc::prune_cache(&cache_path, &live, grace) {
-                    eprintln!("[llmman] cache GC sweep failed: {e:#}");
+                if let Err(e) = crate::storage::gc::prune_blobs_and_cache(
+                    &store_path,
+                    &cache_path,
+                    &live,
+                    grace,
+                ) {
+                    eprintln!("[llmman] GC sweep failed: {e:#}");
                 }
             }
         }
@@ -4318,6 +3915,9 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         0
     };
     let ctx_size = ctx_size_explicit.or(Some(DEFAULT_CTX_SIZE));
+    // Read once so the budget and the flag below cannot disagree about
+    // what the environment said.
+    let hybrid_local_bytes_env = std::env::var("LLMMAN_HYBRID_LOCAL_BYTES").ok();
     let memory = crate::hostgpu::memory_bytes(vram);
     if !peers.is_empty() {
         eprintln!(
@@ -4364,6 +3964,15 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         );
     }
     let tls = tls_from_env()?;
+    let managed_config = crate::config::managed().map_err(anyhow::Error::msg)?;
+    if managed_config.enabled {
+        if let Some((_, key)) = &tls {
+            crate::config::owner_readable_only(key)
+                .map_err(anyhow::Error::msg)
+                .context("managed TLS private key permissions")?;
+        }
+    }
+    let managed_routes = managed::routes(managed_config, auth.clone(), tls.is_some())?;
     anyhow::ensure!(
         tls.is_some() == crate::daemon::tls_scheme(),
         "LLMMAN_HOST and LLMMAN_TLS_CERT/LLMMAN_TLS_KEY disagree: an https:// host needs the \
@@ -4393,7 +4002,14 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         sglang_version: _args.sglang_version.clone(),
         ctx_size,
         ctx_size_explicit: ctx_size_explicit.is_some(),
-        hybrid_local_bytes: crate::hybrid::local_budget_bytes_from_env(ctx_size),
+        hybrid_local_bytes: crate::hybrid::local_budget_bytes(
+            ctx_size,
+            hybrid_local_bytes_env.as_deref(),
+        ),
+        hybrid_local_bytes_explicit: crate::hybrid::local_budget_override(
+            hybrid_local_bytes_env.as_deref(),
+        )
+        .is_some(),
         flash_attention: flash_attention_from_env(),
         kv_cache_type: kv_cache_type_from_env(),
         split_mode: sched_spread_from_env(),
@@ -4409,13 +4025,18 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         prompt_log: crate::promptlog::enabled_from_env()
             .then(crate::promptlog::path)
             .transpose()?,
+        usage_log: crate::usage::enabled_from_env()
+            .then(crate::usage::path)
+            .transpose()?,
         shell: shell::Policy::from_env(),
         auth,
         peer_key: crate::auth::peer_key(),
         client,
     }));
 
-    let app = build_router(state.clone(), metrics_enabled_from_env());
+    // Managed routes have their own mandatory auth and bypass prompt logging
+    // and the usage ledger.
+    let app = build_router(state.clone(), metrics_enabled_from_env()).merge(managed_routes);
 
     // Before the listener binds, so uptime counts from the daemon coming
     // up rather than from whenever something first scraped it.
@@ -4478,9 +4099,12 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
 
     match tls {
         None => {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await?
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?
         }
         Some((cert, key)) => {
             // Both rustls providers are compiled in (reqwest's, the AWS
@@ -4505,7 +4129,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             });
             axum_server::from_tcp_rustls(listener.into_std()?, config)?
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?
         }
     }
@@ -4551,6 +4175,9 @@ async fn shutdown_signal() {
     }
     eprintln!("llmman serve shutting down");
 }
+
+#[cfg(test)]
+mod test_support;
 
 #[cfg(test)]
 mod tests;

@@ -269,19 +269,34 @@ const BYTES_PER_TOKEN: u64 = 4;
 /// unparseable is treated as unset, like the daemon's other numeric
 /// variables.
 pub fn local_budget_bytes(ctx_size: Option<u32>, env: Option<&str>) -> Option<u64> {
-    match env.map(str::trim).filter(|v| !v.is_empty()) {
-        Some(v) => match v.parse::<u64>() {
-            Ok(0) => None,
-            Ok(bytes) => Some(bytes),
-            Err(_) => ctx_size.and_then(budget_for_ctx),
-        },
-        None => ctx_size.and_then(budget_for_ctx),
+    match local_budget_override(env) {
+        Some(bytes) => bytes,
+        None => ctx_size.and_then(budget_bytes_for_ctx),
     }
 }
 
-/// `None` for a zero context size, which `LLMMAN_CONTEXT_LENGTH=0` uses
-/// to mean the model's trained context.
-fn budget_for_ctx(ctx_size: u32) -> Option<u64> {
+/// The budget `env` (`LLMMAN_HYBRID_LOCAL_BYTES`) states outright:
+/// `Some(Some(bytes))`, or `Some(None)` for the `0` that disables the
+/// overflow rule. `None` when it states none — unset, blank, or
+/// unparseable — leaving the budget to be derived from a context size.
+///
+/// Kept apart from the derived budget so `local_budget` (see
+/// cmd::serve::hybrid) can tell them apart: it replaces a derived
+/// budget with the local half's real window once loaded, and leaves a
+/// stated one alone.
+pub fn local_budget_override(env: Option<&str>) -> Option<Option<u64>> {
+    let value = env.map(str::trim).filter(|v| !v.is_empty())?;
+    match value.parse::<u64>() {
+        Ok(0) => Some(None),
+        Ok(bytes) => Some(Some(bytes)),
+        Err(_) => None,
+    }
+}
+
+/// The budget a context window of `ctx_size` tokens is worth. `None`
+/// for a zero context size, which `LLMMAN_CONTEXT_LENGTH=0` uses to
+/// mean the model's trained context.
+pub fn budget_bytes_for_ctx(ctx_size: u32) -> Option<u64> {
     (ctx_size > 0).then(|| u64::from(ctx_size).saturating_mul(BYTES_PER_TOKEN))
 }
 
@@ -561,6 +576,27 @@ mod tests {
     fn zero_disables_the_overflow_rule_entirely() {
         assert_eq!(local_budget_bytes(Some(65536), Some("0")), None);
         assert_eq!(route(None, Some(u64::MAX), None).side, Side::Local);
+    }
+
+    /// The two halves the daemon composes at startup have to agree:
+    /// `local_budget_override` marks exactly the inputs on which
+    /// `local_budget_bytes` ignores the context size, since that flag is
+    /// what stops a loaded model's own window replacing a stated budget
+    /// (see `local_budget` in cmd::serve::hybrid).
+    #[test]
+    fn an_override_is_flagged_exactly_when_it_ignores_the_context_size() {
+        for env in [None, Some("1024"), Some("0"), Some("lots"), Some("  ")] {
+            let derived = local_budget_bytes(Some(4096), env);
+            let stated = local_budget_override(env);
+            assert_eq!(
+                stated.is_some(),
+                derived != Some(16_384),
+                "{env:?} is flagged as stated but derived {derived:?}"
+            );
+            if let Some(stated) = stated {
+                assert_eq!(stated, derived, "{env:?}");
+            }
+        }
     }
 
     #[test]

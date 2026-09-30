@@ -1,6 +1,6 @@
 name: CI
 
-# No `tags:` trigger: every commit on main is a release, and the `release`
+# No `tags:` trigger: every commit on main is a release, and the `tag`
 # job creates the v<version> tag itself (see packaging/version.sh).
 on:
   push:
@@ -12,11 +12,9 @@ on:
   # still requires a push to main.
   workflow_dispatch:
 
-# Workflow-wide default: read-only. Every job here only needs to check
-# out and build/test the repo except `release`, which needs to create a
-# GitHub Release — that one job overrides this with its own
-# `permissions: contents: write` (see the release job below) rather than
-# every job inheriting broad default repo permissions for no reason.
+# Workflow-wide default: read-only. Only `tag`, `release` and `untag`
+# write to the repo (the release tag and the GitHub Release); they set
+# their own `permissions: contents: write`.
 permissions:
   contents: read
 
@@ -33,7 +31,7 @@ env:
   # vllm-plugin/tests/test_e2e.py's real `vllm serve` test. Moves with
   # VLLM_METAL_VERSION below: a vllm-metal release names the vLLM
   # release it was built against in its `.github/vllm-release-tag.commit`.
-  VLLM_VERSION: "0.28.0"
+  VLLM_VERSION: "0.30.0"
   # vllm-metal (github.com/vllm-project/vllm-metal), macOS's Metal-GPU
   # vLLM platform below. A stable release, cut from its `releases/vX.Y.Z`
   # branch and numbered after the vLLM release it pairs with — never a
@@ -41,13 +39,28 @@ env:
   # and each one deletes the previous (vllm-metal#662), so a pinned one
   # 404s within hours. The 0.3.0.dev20260825040033 pinned here before
   # went that way and took every macOS e2e run with it. Bump deliberately.
-  VLLM_METAL_VERSION: "0.28.0"
+  VLLM_METAL_VERSION: "0.30.0"
   # SGLang git tag (`v` added at use) the e2e job installs from source
   # for tests/launch_e2e.rs's `serve_sglang_safetensors_model`: upstream's
   # PyPI wheel and `sglang-kernel` are CUDA builds, so the CPU engine
   # (Linux) and MLX runtime (macOS) come from the repo's own
   # pyproject_cpu.toml / pyproject_other.toml.
   SGLANG_VERSION: "0.5.19"
+  # Official Grok Build CLI used by launch_e2e's real `launch grok` test.
+  # Pinned because its command-line and custom-model contracts are what
+  # the test verifies; bump deliberately and rerun the launch suite.
+  GROK_CLI_VERSION: "1.0.34"
+  # Official Cline CLI used by launch_e2e's real `launch cline` test.
+  # Pinned because its provider-settings schema and CLI flags are the
+  # integration contract under test. The macOS GitHub runner kills 3.0.62;
+  # that failure is runner-specific, not a general macOS release failure.
+  CLINE_CLI_VERSION: "2.18.0"
+  # Docker Agent release used by launch_e2e's real `launch docker-agent`
+  # test. Pinned because the agent-file contract launch_docker_agent
+  # writes is what that test verifies; bump deliberately and rerun the
+  # launch suite. Not the v1.50.0 Docker Desktop ships: that build answers
+  # this test with a 600s timeout.
+  DOCKER_AGENT_VERSION: "1.142.0"
 
 jobs:
   # --------------------------------------------------------------------------
@@ -128,7 +141,7 @@ jobs:
 
       # Writes MAJOR.MINOR.<commit count> into Cargo.toml/Cargo.lock before
       # compiling, so `llmman --version`, the release tag, the crate and
-      # the brew/winget packages all carry the same version. Runs on PRs
+      # the brew/scoop packages all carry the same version. Runs on PRs
       # too, so a broken script fails before it can ship. That edit would
       # make build.rs's `git describe --dirty` report -dirty, so the commit
       # hash is passed explicitly instead.
@@ -264,36 +277,23 @@ jobs:
           }
 
       # ── Upload artefacts ──────────────────────────────────────────────────
-      # Two attempts: the upload's final "FinalizeArtifact" call gets a
-      # transient 403 from GitHub's blob store now and then, after every
-      # byte is up. The action has no retry of its own, so the second
-      # attempt overwrites whatever the first left behind.
       - name: Upload binary (docker)
-        id: upload
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: llmman-docker-${{ matrix.target }}
           path: dist-docker/${{ matrix.binary }}
-          if-no-files-found: error
-      - name: Upload binary (docker, retry)
-        if: steps.upload.outcome == 'failure'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: llmman-docker-${{ matrix.target }}
-          path: dist-docker/${{ matrix.binary }}
-          if-no-files-found: error
-          overwrite: true
 
       # ── Lint + unit tests ─────────────────────────────────────────────────
       - name: cargo fmt --check
         if: matrix.check-fmt
         run: cargo fmt --all -- --check
 
-      # `fuzzing` gates fuzz_check_parse_registry_ref in src/shortnames.rs,
+      # `fuzzing` gates the fuzz_check_* wrappers in src/shortnames.rs
+      # (parse_registry_ref, validate_reference, resolve_ollama_api),
       # which only the fuzz/ crate calls; without this a rename there
       # compiles clean everywhere and only breaks the fuzz harness. This
-      # compiles the feature, it does not run cargo-fuzz (needs nightly).
+      # compiles the feature, it does not run cargo-fuzz (needs nightly;
+      # actual fuzzing runs nightly in fuzz-nightly.yml).
       - name: cargo clippy --features fuzzing
         if: matrix.check-fmt
         run: cargo clippy --features fuzzing --lib -- -D warnings
@@ -316,19 +316,143 @@ jobs:
         run: cargo test --release --target ${{ matrix.target }} --lib --bins
 
   # --------------------------------------------------------------------------
+  # Android app (android/, docs/android.md): the web UI in a WebView over
+  # an embedded `llmman serve`, cross-compiled for aarch64-linux-android
+  # and bundled with llama.cpp's own Android release (the LLAMA_CPP_RELEASE
+  # pin). Gradle drives both (`cargo ndk`, the tarball fetch), so this is
+  # one `assembleRelease`. Runs on PRs so a broken NDK cross-compile or
+  # Gradle project fails before release; the APK is a release asset.
+  #
+  # Signing: with the LLMMAN_ANDROID_* secrets the APK is release-signed;
+  # without them (PRs from forks, local builds) it is debug-signed, which
+  # still installs by sideload but not over a release-signed install.
+  # --------------------------------------------------------------------------
+  android:
+    name: Build Android app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ANDROID_NDK_VERSION: "27.2.12479018"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Same version as the other binaries; app/build.gradle.kts reads it
+      # from Cargo.toml.
+      - name: Set release version
+        shell: bash
+        run: |
+          packaging/version.sh --apply
+          echo "LLMMAN_GIT_DESCRIBE=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: go-shim/go.sum
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: aarch64-linux-android
+          cache-bin: true
+
+      # cargo-ndk sets CC_<triple>/CFLAGS_<triple>; build.rs takes GOOS,
+      # GOARCH and the Go CC wrapper from those.
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Set up JDK
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+
+      # The runner image ships the SDK and cmdline-tools; the NDK version
+      # is the one app/build.gradle.kts names (AGP uses it to strip the
+      # staged .so files, not to compile anything).
+      - name: Install Android NDK
+        run: |
+          set -euo pipefail
+          yes 2>/dev/null | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ANDROID_NDK_VERSION" "platforms;android-35" "build-tools;35.0.0"
+
+      # The signing key reaches only the push-to-main run that releases:
+      # a same-repository PR runs the PR's own Gradle scripts, which would
+      # otherwise see it. Everything else builds debug-signed.
+      - name: Build APK
+        working-directory: android
+        env:
+          LLMMAN_ANDROID_KEYSTORE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.LLMMAN_ANDROID_KEYSTORE || '' }}
+          LLMMAN_ANDROID_KEYSTORE_PASSWORD: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.LLMMAN_ANDROID_KEYSTORE_PASSWORD || '' }}
+          LLMMAN_ANDROID_KEY_ALIAS: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.LLMMAN_ANDROID_KEY_ALIAS || '' }}
+          LLMMAN_ANDROID_KEY_PASSWORD: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.LLMMAN_ANDROID_KEY_PASSWORD || '' }}
+        run: ./gradlew --no-daemon assembleRelease
+
+      # The APK must carry this commit's version and the full native
+      # payload: the daemon, its shim, and llama-server with its libraries.
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          aapt2="$(ls -d "$ANDROID_HOME"/build-tools/35.0.0)/aapt2"
+          version="$(packaging/version.sh)"
+          badging="$("$aapt2" dump badging "$apk")"
+          echo "$badging" | grep -E "^package:|^native-code:"
+          case "$badging" in
+          *"versionName='$version'"*) ;;
+          *) echo "::error::APK versionName is not $version"; exit 1 ;;
+          esac
+          for lib in libllmman.so libllmman_shim.so libllama-server.so libllama-server-impl.so libllama.so libggml.so libggml-base.so libmtmd.so libllama-common.so; do
+            unzip -l "$apk" "lib/arm64-v8a/$lib" >/dev/null || { echo "::error::$lib missing from APK"; exit 1; }
+          done
+          unzip -l "$apk" | grep -q "lib/arm64-v8a/libggml-cpu-android_" || { echo "::error::no ggml-cpu variants in APK"; exit 1; }
+          # A release must be signed with the release key: the debug key is
+          # generated per runner, so a debug-signed release could never be
+          # installed over the previous one.
+          signer="$("$(dirname "$aapt2")/apksigner" verify --print-certs "$apk" | grep 'certificate DN')"
+          echo "$signer"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            case "$signer" in
+            *"CN=Android Debug"*)
+              echo "::error::release APK is debug-signed; set the LLMMAN_ANDROID_KEYSTORE, LLMMAN_ANDROID_KEYSTORE_PASSWORD, LLMMAN_ANDROID_KEY_ALIAS and LLMMAN_ANDROID_KEY_PASSWORD secrets"
+              exit 1 ;;
+            esac
+          fi
+          mkdir -p dist-android
+          cp "$apk" dist-android/llmman-aarch64-linux-android.apk
+
+      - name: Upload APK
+        uses: ./.github/actions/upload-artifact-retry
+        with:
+          name: llmman-android-aarch64-linux-android
+          path: dist-android/llmman-aarch64-linux-android.apk
+
+  # --------------------------------------------------------------------------
   # Lint + packaging: cheap Linux-only checks, ~2 min total and off the
   # critical path, so they share one runner. `release` gates on this.
   #
   # Packaging (first, the faster half): version.sh and render.sh output
-  # (Homebrew formula, winget manifests, crate) is checked on every PR so a
-  # broken template fails here, not after it reaches the tap or winget-pkgs.
+  # (Homebrew formula, scoop manifest, crate) is checked on every PR so a
+  # broken template fails here, not after it reaches the tap or bucket.
   #
   # Lint: go-shim/ static analysis; linters live in go-shim/.golangci.yml.
   # Linux view only: Go drops OS-tagged files (push_stream_windows.go)
   # before analysis, and cross-GOOS linting would need a cross C toolchain.
   # --------------------------------------------------------------------------
   lint-packaging:
-    name: Lint (go-shim) + Packaging (version, brew/winget templates, crate)
+    name: Lint (go-shim) + Packaging (version, brew/scoop templates, crate)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -345,7 +469,7 @@ jobs:
 
       # ── Packaging ────────────────────────────────────────────────────────
       - name: shellcheck
-        run: shellcheck packaging/version.sh packaging/render.sh
+        run: shellcheck packaging/version.sh packaging/render.sh packaging/release-tag.sh
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -372,7 +496,7 @@ jobs:
 
       # Synthetic checksums: this checks rendering, not hashes. Everything
       # goes to $RUNNER_TEMP so `cargo package` below sees a clean tree.
-      - name: Render formula and manifests
+      - name: Render formula and manifest
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -406,7 +530,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          f="$RUNNER_TEMP/out/Formula/llmman.rb"
+          f="$RUNNER_TEMP/out/homebrew/Formula/llmman.rb"
           ruby -c "$f"
           grep -q '^class Llmman < Formula$' "$f" || { echo "::error::$f does not declare 'class Llmman'"; exit 1; }
           grep -q "^  version \"$VERSION\"$" "$f" || { echo "::error::$f does not declare version $VERSION"; exit 1; }
@@ -417,57 +541,41 @@ jobs:
           if grep -q '^ *url ".*x86_64-apple-darwin' "$f"; then
             echo "::error::$f has a url for x86_64-apple-darwin, which llmman does not publish"; exit 1
           fi
-          test -f "$RUNNER_TEMP/out/README.md"
+          test -f "$RUNNER_TEMP/out/homebrew/README.md"
           echo "OK: $f"
 
-      # Against the real 1.12.0 manifest schemas. The timestamp override
-      # keeps ReleaseDate a string, as winget's YAML parser does.
-      - name: Check winget manifests
+      # Against scoop's real manifest schema.
+      - name: Check scoop manifest
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet pyyaml jsonschema
-          dir="$RUNNER_TEMP/out/manifests/l/llmmanorg/llmman/$VERSION"
-          for t in version installer defaultLocale; do
-            curl -fsSL --retry 3 -o "$RUNNER_TEMP/schema-$t.json" \
-              "https://raw.githubusercontent.com/microsoft/winget-cli/master/schemas/JSON/manifests/v1.12.0/manifest.$t.1.12.0.json"
-          done
-          "$RUNNER_TEMP/venv/bin/python" - "$dir" "$VERSION" "$RUNNER_TEMP" <<'PY'
-          import json, sys, yaml, jsonschema
-          d, version, tmp = sys.argv[1], sys.argv[2], sys.argv[3]
-          class L(yaml.SafeLoader): pass
-          L.add_constructor('tag:yaml.org,2002:timestamp', lambda l, n: l.construct_scalar(n))
-          files = {
-              "version": "llmmanorg.llmman.yaml",
-              "installer": "llmmanorg.llmman.installer.yaml",
-              "defaultLocale": "llmmanorg.llmman.locale.en-US.yaml",
-          }
-          docs = {}
-          for t, name in files.items():
-              with open(f"{d}/{name}") as fh:
-                  doc = yaml.load(fh, Loader=L)
-              jsonschema.validate(doc, json.load(open(f"{tmp}/schema-{t}.json")), format_checker=jsonschema.FormatChecker())
-              assert doc["PackageIdentifier"] == "llmmanorg.llmman", name
-              assert doc["PackageVersion"] == version, (name, doc["PackageVersion"])
-              docs[t] = doc
-              print(f"OK {name}: valid against manifest.{t}.1.12.0")
-          inst = docs["installer"]
-          assert inst["InstallerType"] == "portable", inst["InstallerType"]
-          assert inst.get("Commands") == ["llmman"], inst.get("Commands")  # names the PATH symlink
-          arches = {i["Architecture"]: i for i in inst["Installers"]}
-          assert set(arches) == {"x64", "arm64"}, sorted(arches)
-          for arch, triple in (("x64", "x86_64-pc-windows-msvc"), ("arm64", "aarch64-pc-windows-msvc")):
-              i = arches[arch]
-              assert i["InstallerUrl"] == f"https://github.com/llmmanorg/llmman/releases/download/v{version}/llmman-{triple}.exe", i["InstallerUrl"]
-              assert len(i["InstallerSha256"]) == 64 and i["InstallerSha256"] == i["InstallerSha256"].upper(), i["InstallerSha256"]
-              deps = [d["PackageIdentifier"] for d in i["Dependencies"]["PackageDependencies"]]
-              assert deps == [f"Microsoft.VCRedist.2015+.{arch}"], (arch, deps)  # binaries import VCRUNTIME140.dll
-          loc = docs["defaultLocale"]
-          for key in ("Publisher", "PackageName", "License", "LicenseUrl", "ShortDescription", "Description", "Moniker", "ReleaseNotesUrl"):
-              assert loc.get(key), f"locale manifest lacks {key}"
-          print(f"OK: x64 and arm64 portable installers for v{version}")
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet jsonschema
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/scoop-schema.json" \
+            https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json
+          "$RUNNER_TEMP/venv/bin/python" - "$RUNNER_TEMP/out/scoop/bucket/llmman.json" "$VERSION" "$RUNNER_TEMP/scoop-schema.json" <<'PY'
+          import json, sys, jsonschema
+          path, version, schema = sys.argv[1], sys.argv[2], sys.argv[3]
+          with open(path) as fh:
+              doc = json.load(fh)
+          jsonschema.validate(doc, json.load(open(schema)), format_checker=jsonschema.FormatChecker())
+          print(f"OK {path}: valid against scoop schema.json")
+          assert doc["version"] == version, doc["version"]
+          assert doc["bin"] == "llmman.exe", doc["bin"]  # the PATH shim's name
+          for key in ("description", "homepage", "license", "checkver", "autoupdate"):
+              assert doc.get(key), f"manifest lacks {key}"
+          arches = doc["architecture"]
+          assert set(arches) == {"64bit", "arm64"}, sorted(arches)
+          base = f"https://github.com/llmmanorg/llmman/releases/download/v{version}"
+          for arch, triple in (("64bit", "x86_64-pc-windows-msvc"), ("arm64", "aarch64-pc-windows-msvc")):
+              a = arches[arch]
+              assert a["url"] == f"{base}/llmman-{triple}.exe#/llmman.exe", a["url"]  # fragment names the exe for `bin`
+              assert len(a["hash"]) == 64 and a["hash"] == a["hash"].lower(), a["hash"]
+              assert doc["autoupdate"]["architecture"][arch]["url"] == a["url"].replace(f"v{version}", "v$version"), arch
+          # scoop strips the fragment for $baseurl and looks the hash up by the asset's real name.
+          assert doc["autoupdate"]["hash"]["url"] == "$baseurl/checksums.txt", doc["autoupdate"]["hash"]
+          print(f"OK: 64bit and arm64 portable exes for v{version}")
           PY
 
       # `build` already compiles this source on all five targets; this
@@ -552,10 +660,13 @@ jobs:
 
   # --------------------------------------------------------------------------
   # E2E: `llmman launch
-  # <claude|agy|opencode|codex|qwen|hermes|openclaw|talos|dsh|goose> --model
+  # <claude|agy|opencode|pi|omp|codex|cline|grok|qwen|hermes|openclaw|dsh|
+  # talos|goose|goose-desktop|docker-agent> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
-  # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
+  # — not mocks, except goose-desktop, a GUI whose test supplies its own
+  # stub binary (see `launch_goose_desktop_env`) and so installs nothing
+  # here. Mirrors the `build` job's own 5-target matrix exactly
   # (same runners, same msvc-arch/rustflags choices), so the launch/env/
   # config plumbing this actually exercises gets checked on every
   # platform/architecture llmman ships a binary for, not just a subset.
@@ -583,7 +694,7 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/agy/opencode/codex/qwen/hermes/openclaw/talos/dsh/goose, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/agy/opencode/pi/omp/codex/cline/grok/qwen/hermes/openclaw/talos/dsh/goose/goose-desktop/docker-agent, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
@@ -592,34 +703,38 @@ jobs:
     # that reason, and its own identical `if:` condition below — or when
     # dispatched by hand on a branch (see `workflow_dispatch` above).
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
-    # 9 tests run serialized (--test-threads=1 + lock_serial()), so the
-    # worst case sums all 9's own retry budgets: MAX_ATTEMPTS * TIMEOUT
+    # 14 tests run serialized (--test-threads=1 + lock_serial()), so the
+    # worst case sums all 14's own retry budgets: MAX_ATTEMPTS * TIMEOUT
     # (3 * 600s = 30 min) each — a timeout itself never retries (see
     # launch_and_assert's own doc comment), so 30 min/test is only hit if
     # every attempt fails via a missing "pong" instead. Plus warm_model()'s
     # own separate TIMEOUT budget (10 min), paid at most once across all
-    # tests (guarded by WARM's own Once). 10*30 + 10 = 310 min. Exhausting
+    # tests (guarded by WARM's own Once). 15*30 + 10 = 460 min.
+    # `launch_goose_desktop_env` runs serialized with them but multiplies
+    # by nothing: its shim exits at once, so it carries a single TIMEOUT
+    # budget like the safetensors tests below rather than a retry one.
+    # Exhausting
     # every attempt doesn't fail this job either way (see
     # launch_and_assert's own doc comment) — a run can still legitimately
     # take this long in wall-clock time before giving up.
     #
-    # +90 (400) for the vllm-plugin steps' own per-step budgets below: up
+    # +90 (550) for the vllm-plugin steps' own per-step budgets below: up
     # to 60 min for "Install vLLM (e2e)" (wheel downloads, but a
     # slow/retried one on a bad connection) plus up to 30 min for
     # "pytest -m e2e (vllm-plugin)".
     #
-    # +10 (410) for `serve_mlx_safetensors_model`'s own single TIMEOUT
+    # +10 (560) for `serve_mlx_safetensors_model`'s own single TIMEOUT
     # budget (10 min, same 600s as warm_model's) — it doesn't go through
     # launch_and_assert's retry loop at all (a real failure there is
     # always a deterministic llmman bug worth failing loudly on, not
-    # small-model sampling variance), so unlike the 10 launch tests above
+    # small-model sampling variance), so unlike the 15 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
     #
     # +60 more for `serve_vllm_safetensors_model` and
     # `serve_sglang_safetensors_model` (20 min each, no retries, like the
     # mlx test) and "Install SGLang (e2e)"'s 40-minute budget.
     #
-    # 470 in total, but 360 is GitHub's own hard limit for a hosted-runner
+    # 620 in total, but 360 is GitHub's own hard limit for a hosted-runner
     # job and kills a run past it regardless, so the number here stays at
     # 400 rather than chasing a budget neither it nor GitHub can grant.
     timeout-minutes: 400
@@ -771,7 +886,7 @@ jobs:
       # multi-line/array syntax; ubuntu/macOS already default to bash.
       #
       # Unlike hermes/mlx_lm.server (legitimately missing on some
-      # platforms), these six are plain npm packages expected to work
+      # platforms), these eight are plain npm packages expected to work
       # everywhere — so install_cli fails the job, rather than letting
       # tests/launch_e2e.rs's on_path check silently skip, when one never
       # becomes a working binary.
@@ -784,7 +899,20 @@ jobs:
       # designed (npm tolerates one failed platform-tarball fetch, here
       # a registry blip, instead of failing the install), just not
       # detectable by a mere on_path/PATH check. Retrying rides that out.
-      - name: Install integration CLIs (claude, opencode, codex, qwen, openclaw, dsh)
+      - name: Set up Bun for OMP
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install OMP
+        shell: bash
+        run: |
+          # Pinned with the minimum Bun version its package declares. The E2E
+          # invocation and models.yml schema are verified against this pair.
+          bun install -g @oh-my-pi/pi-coding-agent@18.2.11
+          omp --version
+
+      - name: Install integration CLIs (claude, opencode, pi, codex, cline, qwen, openclaw, dsh)
         shell: bash
         run: |
           failed_clis=()
@@ -802,9 +930,10 @@ jobs:
               [ "$attempt" -eq "$max_attempts" ] && next="giving up"
               if ! npm install -g "$install_spec"; then
                 echo "::warning::$pkg_name install failed on ${{ runner.os }} (attempt $attempt/$max_attempts); $next"
-              elif version_output=$("$bin" --version 2>&1); then
-                return 0
               else
+                if version_output=$("$bin" --version 2>&1); then
+                  return 0
+                fi
                 echo "::warning::$pkg_name installed but \"$bin --version\" failed on ${{ runner.os }} (attempt $attempt/$max_attempts); $next — output: $version_output"
               fi
               # Exponential backoff: 1s, 2s, 4s, 8s, 16s.
@@ -819,6 +948,14 @@ jobs:
           install_cli "@anthropic-ai/claude-code" "@anthropic-ai/claude-code" "claude"
           install_cli "opencode-ai" "opencode-ai" "opencode"
           install_cli "@openai/codex" "@openai/codex" "codex"
+          # Pinned: launch_cline depends on this release's provider-settings
+          # schema and headless JSON/yolo flags.
+          install_cli "cline@${CLINE_CLI_VERSION}" "cline" "cline"
+          # Pinned (not @latest): pi is pre-1.0 and tests/launch_e2e.rs's
+          # own invocation (-p) plus the models.json/settings.json shapes
+          # `launch pi` writes were verified against this exact release;
+          # an unpinned upgrade could change either with no warning here.
+          install_cli "@earendil-works/pi-coding-agent@0.86.1" "@earendil-works/pi-coding-agent" "pi"
           # Pinned (not @latest): tests/launch_e2e.rs's qwen test relies on
           # this release's tool set under --safe-mode and on the
           # report_findings schema it excludes by name; a newer release can
@@ -964,6 +1101,106 @@ jobs:
             fi
           done
           echo "::error::goose never produced a working binary on ${{ runner.os }} ${{ runner.arch }} after $max_attempts attempts"
+          exit 1
+
+      # Grok Build's official installer supports every E2E target and puts
+      # the binary in GROK_BIN_DIR. No login is needed: launch_grok supplies
+      # the local endpoint and placeholder/API key for each test process.
+      - name: Install Grok Build (e2e)
+        shell: bash
+        run: |
+          set -o pipefail
+          bin_dir="$HOME/.grok/bin"
+          bin="$bin_dir/grok"
+          [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
+
+          max_attempts=6
+          for attempt in $(seq 1 "$max_attempts"); do
+            next="retrying"
+            [ "$attempt" -eq "$max_attempts" ] && next="giving up"
+            if ! curl -fsSL https://x.ai/cli/install.sh \
+              | GROK_BIN_DIR="$bin_dir" bash -s "$GROK_CLI_VERSION"; then
+              echo "::warning::grok install failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next"
+            elif version_output=$("$bin" --version 2>&1); then
+              if command -v cygpath >/dev/null 2>&1; then
+                cygpath -w "$bin_dir" >> "$GITHUB_PATH"
+              else
+                echo "$bin_dir" >> "$GITHUB_PATH"
+              fi
+              exit 0
+            else
+              echo "::warning::grok installed but \"grok --version\" failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next — output: $version_output"
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              sleep "$((2 ** (attempt - 1)))"
+            fi
+          done
+          echo "::error::grok never produced a working binary on ${{ runner.os }} ${{ runner.arch }} after $max_attempts attempts"
+          exit 1
+
+      # One static binary per platform, covering every E2E target. Onto
+      # PATH rather than ~/.docker/cli-plugins, which run_launch's fresh
+      # HOME puts out of reach. No login needed: the generated agent file
+      # carries the endpoint, and the key arrives in LLMMAN_API_KEY.
+      - name: Install Docker Agent (e2e)
+        shell: bash
+        run: |
+          set -o pipefail
+          # A digest per asset, checked before the binary is made
+          # executable: HTTPS authenticates the host, not the bytes, and a
+          # release asset can be replaced under the same tag. Recompute
+          # these when DOCKER_AGENT_VERSION moves (`curl -sL <url> | shasum
+          # -a 256`), as the AGY step below does for its archives.
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)     asset=docker-agent-linux-amd64;       digest=3337bb2c6cd83f23e44a2f9a76f8ceaf05c242db50c2b9b783a2d6eb014d2c20 ;;
+            Linux-ARM64)   asset=docker-agent-linux-arm64;       digest=bf3ba6a4def17427cae3ed283ee3d0eef90290300fbec4ea2ecda4ea452462d8 ;;
+            macOS-X64)     asset=docker-agent-darwin-amd64;      digest=f9102143f5d96d951263d8bf9614603b328a2f51b3e824dcb56013b766f331a4 ;;
+            macOS-ARM64)   asset=docker-agent-darwin-arm64;      digest=33a3d04855f22fc65bb1d1ed02da59d5b32d761d501debbf11b92d26cb740a15 ;;
+            Windows-X64)   asset=docker-agent-windows-amd64.exe; digest=d522a46babc8ea5d1704c66b35b6a32a5ba119807c1d4a4ef88c7862d9b9a6f5 ;;
+            Windows-ARM64) asset=docker-agent-windows-arm64.exe; digest=2862312b878518fc11a2b8b7cf8c9dc5d74d7c51b22ed1cf72387cbdce966977 ;;
+            *) echo "::warning::no Docker Agent build for ${{ runner.os }}-${{ runner.arch }}; launch_docker_agent_with_model will skip"; exit 0 ;;
+          esac
+          bin_dir="$HOME/.docker-agent/bin"
+          bin="$bin_dir/docker-agent"
+          [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
+          mkdir -p "$bin_dir"
+
+          max_attempts=6
+          for attempt in $(seq 1 "$max_attempts"); do
+            next="retrying"
+            [ "$attempt" -eq "$max_attempts" ] && next="giving up"
+            # `--speed-time`/`--speed-limit` rather than a flat
+            # `--max-time`: a stalled transfer has to end for the retry
+            # below to mean anything, but a slow one that is still making
+            # progress should be allowed to finish.
+            if ! curl -fsSL --connect-timeout 20 --speed-time 60 --speed-limit 1000 -o "$bin" \
+              "https://github.com/docker/docker-agent/releases/download/v$DOCKER_AGENT_VERSION/$asset"; then
+              echo "::warning::docker-agent download failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next"
+            elif ! (cd "$bin_dir" && if command -v sha256sum >/dev/null 2>&1; then
+                      echo "$digest  $(basename "$bin")" | sha256sum -c -
+                    else
+                      echo "$digest  $(basename "$bin")" | shasum -a 256 -c -
+                    fi); then
+              echo "::error::docker-agent $asset did not match its pinned SHA-256"
+              exit 1
+            else
+              chmod +x "$bin"
+              # `version`, not `--version`: docker-agent rejects the flag.
+              if version_output=$("$bin" version 2>&1); then
+                if command -v cygpath >/dev/null 2>&1; then
+                  cygpath -w "$bin_dir" >> "$GITHUB_PATH"
+                else
+                  echo "$bin_dir" >> "$GITHUB_PATH"
+                fi
+                exit 0
+              fi
+              echo "::warning::docker-agent installed but \"docker-agent version\" failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next — output: $version_output"
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              sleep "$((2 ** (attempt - 1)))"
+            fi
+          done
+          echo "::error::docker-agent never produced a working binary on ${{ runner.os }} ${{ runner.arch }} after $max_attempts attempts"
           exit 1
 
       # Pinned official AGY release; verify each runner's archive before installing.
@@ -1407,7 +1644,7 @@ jobs:
               aarch64-*) arch=aarch64 ;;
               *) echo "unhandled target for vLLM CPU wheel: ${{ matrix.target }}" >&2; exit 1 ;;
             esac
-            wheel="vllm-${VLLM_VERSION}+cpu-cp38-abi3-manylinux_2_34_${arch}.whl"
+            wheel="vllm-${VLLM_VERSION}+cpu-cp38-abi3-manylinux_2_39_${arch}.whl"
             "$venv/bin/pip" install \
               "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/$wheel" \
               --extra-index-url https://download.pytorch.org/whl/cpu
@@ -1437,10 +1674,15 @@ jobs:
       # Only the `sglang` console script goes on PATH, via a symlink dir:
       # the venv's bin/ also has a python3 and pytest, and $GITHUB_PATH
       # prepends, so it would shadow the vllm-plugin venv's pytest.
+      # UV_HTTP_RETRIES: uv's default of 3 exponential-backoff retries spans
+      # ~10s, shorter than a PyPI 503 blip; a real run failed on exactly
+      # that ("Request failed after 3 retries in 10.1s"). 8 spans minutes.
       - name: Install SGLang (e2e)
         if: runner.os == 'Linux' || runner.os == 'macOS'
         timeout-minutes: 40
         shell: bash
+        env:
+          UV_HTTP_RETRIES: "8"
         run: |
           set -euo pipefail
           src="$RUNNER_TEMP/sglang-src"
@@ -1484,10 +1726,8 @@ jobs:
           set -euo pipefail
           if [ "${{ runner.os }}" = "macOS" ]; then
             {
-              echo "LLMMAN_VLLM_ARGS=--max-num-seqs 1"
+              echo "LLMMAN_VLLM_ARGS=--max-num-seqs 1 --gpu-memory-utilization 0.8"
               echo "GLOO_SOCKET_IFNAME=lo0"
-              echo "VLLM_METAL_USE_PAGED_ATTENTION=1"
-              echo "VLLM_METAL_MEMORY_FRACTION=0.8"
               echo "SGLANG_USE_MLX=1"
               echo "LLMMAN_SGLANG_ARGS=--disable-cuda-graph"
             } >> "$GITHUB_ENV"
@@ -1495,7 +1735,7 @@ jobs:
             {
               echo "LLMMAN_VLLM_ARGS=--dtype bfloat16 --enforce-eager"
               # vLLM CPU's KV-cache arena, in GiB — a demand, not a cap
-              # (see test_e2e.py); unset, vLLM 0.28 asks for 0.9 of RAM.
+              # (see test_e2e.py); unset, vLLM asks for 0.9 of RAM.
               echo "VLLM_CPU_KVCACHE_SPACE=1"
               echo "SGLANG_USE_CPU_ENGINE=1"
             } >> "$GITHUB_ENV"
@@ -1627,6 +1867,43 @@ jobs:
           fi
 
   # --------------------------------------------------------------------------
+  # Tag: v<version> on this commit, as soon as the run starts. GITHUB_TOKEN
+  # can only create a ref whose .github/workflows/ matches main's tip (see
+  # packaging/release-tag.sh), so when `release` did this an hour after
+  # the push, any merge touching ci.yml in between failed it with a 403
+  # (v0.1.389, .396, .409-.411). Now the commit is the tip, bar a merge
+  # landing before this job gets a runner. `untag` removes the tag if the
+  # release never happens.
+  # --------------------------------------------------------------------------
+  tag:
+    name: Tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+
+    outputs:
+      tag_name: ${{ steps.version.outputs.tag_name }}
+
+    steps:
+      # fetch-depth: 0 for the commit count.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine version and tag
+        id: version
+        run: echo "tag_name=v$(packaging/version.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag_name }}
+        run: packaging/release-tag.sh ensure "$TAG" "$GITHUB_SHA"
+
+  # --------------------------------------------------------------------------
   # Release: a GitHub Release per commit on main, tagged v<version> where
   # version = packaging/version.sh's MAJOR.MINOR.<commit count>. The build
   # job compiled with that version in Cargo.toml, so the binaries report
@@ -1639,7 +1916,7 @@ jobs:
     name: Release
     # Everything must be green first. e2e only runs on the same push event
     # this job fires on, so this never waits on a run that will not happen.
-    needs: [build, lint-packaging, e2e]
+    needs: [tag, build, android, lint-packaging, e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -1668,19 +1945,39 @@ jobs:
           echo "tag_name=v$version" >> "$GITHUB_OUTPUT"
           echo "Releasing llmman $version as tag v$version"
 
+      # The tag job made this; check it is still here and at this commit
+      # before the Releases API would try to create it itself. Recreating
+      # it (after `untag` ran and the failed jobs were re-run) works only
+      # while ci.yml is unchanged on main.
+      - name: Verify release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag_name }}
+        run: packaging/release-tag.sh ensure "$TAG" "$GITHUB_SHA"
+
+      # Patterns: a retried upload is `<name>-retry` (upload-artifact-retry).
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           pattern: llmman-docker-*
           merge-multiple: false
 
+      # The APK is already named for release (llmman-<triple>.apk).
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: llmman-android-aarch64-linux-android*
+          merge-multiple: true
+
       - name: Rename binaries for release
         shell: bash
         run: |
+          set -euo pipefail
           cd dist
-          for dir in */; do
-            target="${dir%/}"          # e.g. llmman-docker-x86_64-unknown-linux-gnu
+          for dir in llmman-docker-*/; do
+            target="${dir%/}"          # e.g. llmman-docker-x86_64-unknown-linux-gnu[-retry]
             triple="${target#llmman-docker-}"
+            triple="${triple%-retry}"
             if [ -f "${dir}llmman.exe" ]; then
               cp "${dir}llmman.exe" "llmman-${triple}.exe"
             else
@@ -1688,7 +1985,7 @@ jobs:
             fi
           done
 
-      # All five assets, by name, before anything is published, and the
+      # All six assets, by name, before anything is published, and the
       # one binary this runner can execute must report this version.
       - name: Verify release assets
         shell: bash
@@ -1702,7 +1999,8 @@ jobs:
             llmman-aarch64-unknown-linux-gnu \
             llmman-aarch64-apple-darwin \
             llmman-x86_64-pc-windows-msvc.exe \
-            llmman-aarch64-pc-windows-msvc.exe; do
+            llmman-aarch64-pc-windows-msvc.exe \
+            llmman-aarch64-linux-android.apk; do
             [ -s "$asset" ] || { echo "::error::release asset $asset is missing or empty"; exit 1; }
           done
           chmod +x llmman-x86_64-unknown-linux-gnu
@@ -1717,8 +2015,8 @@ jobs:
           esac
 
       # checksums.txt: a release asset for users, and (as an artifact) the
-      # hashes publish-homebrew/publish-winget embed, so what brew/winget
-      # enforce is the hash of the bytes uploaded here. Run from dist/ so
+      # hashes publish-packages embeds, so what brew/scoop enforce is the
+      # hash of the bytes uploaded here. Run from dist/ so
       # names are bare basenames, which render.sh expects.
       - name: Generate checksums
         shell: bash
@@ -1730,23 +2028,11 @@ jobs:
             | xargs -0 sha256sum > checksums.txt
           cat checksums.txt
 
-      # Two attempts, as for the binaries above.
       - name: Upload checksums artifact
-        id: upload_checksums
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: release-checksums
           path: dist/checksums.txt
-          if-no-files-found: error
-      - name: Upload checksums artifact (retry)
-        if: steps.upload_checksums.outcome == 'failure'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-checksums
-          path: dist/checksums.txt
-          if-no-files-found: error
-          overwrite: true
 
       - name: Build release notes
         id: notes
@@ -1767,17 +2053,50 @@ jobs:
               ' > release-notes.md
           cat release-notes.md
 
+      # The tag exists (verified above), so this creates no ref. It must
+      # not send target_commitish either: GITHUB_TOKEN's workflows check
+      # (see packaging/release-tag.sh) runs on that field whenever it is
+      # present, tag or no tag, and 403'd v0.1.438/.439 once a later
+      # ci.yml merge was main's tip. Probed here: the same POST fails with
+      # it and succeeds without; asset upload and the draft-publishing
+      # PATCH succeed too. Unset, the action omits the field.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.version.outputs.tag_name }}
           name: ${{ steps.version.outputs.tag_name }}
           body_path: release-notes.md
-          target_commitish: ${{ github.sha }}
           prerelease: false
           files: |
             dist/llmman-*
             dist/checksums.txt
+
+  # --------------------------------------------------------------------------
+  # No release, no tag: a failed or cancelled run must not leave
+  # v<version> on an unreleased commit. Leaves a tag that has a release
+  # (an upload failure is fixed by re-running). Deleting a ref is not
+  # subject to the workflows restriction.
+  # --------------------------------------------------------------------------
+  untag:
+    name: Remove unreleased tag
+    needs: [tag, release]
+    # always(): also after a cancellation. Skipped unless `tag` made one.
+    if: always() && needs.tag.result == 'success' && needs.release.result != 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Delete tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.tag.outputs.tag_name }}
+        run: packaging/release-tag.sh remove "$TAG" "$GITHUB_SHA"
 
   # --------------------------------------------------------------------------
   # docker.io/ai/llmman: each ghcr.io/ggml-org/llama.cpp server image
@@ -1813,16 +2132,21 @@ jobs:
         with:
           persist-credentials: false
 
+      # Trailing `*`: a retried upload is `<name>-retry` (upload-artifact-retry).
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
-          pattern: llmman-docker-*-unknown-linux-gnu
+          pattern: llmman-docker-*-unknown-linux-gnu*
 
       # Artifacts drop the executable bit; COPY keeps the context's mode.
+      # An unmatched glob stays literal, so a missing binary fails install.
       - name: Lay out the build context
         run: |
-          install -m 755 dist/llmman-docker-x86_64-unknown-linux-gnu/llmman packaging/llmman-amd64
-          install -m 755 dist/llmman-docker-aarch64-unknown-linux-gnu/llmman packaging/llmman-arm64
+          set -euo pipefail
+          for pair in x86_64:amd64 aarch64:arm64; do
+            src=(dist/llmman-docker-"${pair%%:*}"-unknown-linux-gnu*/llmman)
+            install -m 755 "${src[0]}" "packaging/llmman-${pair##*:}"
+          done
 
       - name: Log in to Docker Hub
         env:
@@ -1931,33 +2255,53 @@ jobs:
         run: cargo publish --locked --allow-dirty
 
   # --------------------------------------------------------------------------
-  # Homebrew (#385): macOS arm64, Linux x86_64/aarch64. Pushes the rendered
-  # Formula/llmman.rb to llmmanorg/homebrew-tap, which needs
-  # secrets.TAP_GITHUB_TOKEN (contents:write there). Users run
-  # `brew install llmmanorg/tap/llmman`.
+  # Package repos, one matrix entry each. render.sh lays rendered/<id> out
+  # as the target repo, so the job body is shared:
+  #   Homebrew (#385): macOS arm64, Linux x86_64/aarch64 -> homebrew-tap
+  #                    (`brew install llmmanorg/tap/llmman`)
+  #   scoop (#390):    Windows x64/arm64 -> scoop-bucket
+  #                    (`scoop bucket add llmman <url>; scoop install llmman`)
+  # Pushes use secrets.TAP_GITHUB_TOKEN (contents:write on both repos).
   # --------------------------------------------------------------------------
-  publish-homebrew:
-    name: Publish Homebrew formula
+  publish-packages:
+    name: Publish ${{ matrix.name }}
     needs: [release, publish-images]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # Queue, never cancel: two close merges must not interleave their tap
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Homebrew formula
+            id: homebrew
+            repo: llmmanorg/homebrew-tap
+            # file carries the version; version_sed reads it.
+            file: Formula/llmman.rb
+            version_sed: 's/^  version "\(.*\)"$/\1/p'
+          - name: scoop manifest
+            id: scoop
+            repo: llmmanorg/scoop-bucket
+            file: bucket/llmman.json
+            version_sed: 's/^    "version": "\(.*\)",$/\1/p'
+    # Queue, never cancel: two close merges must not interleave their
     # pushes, and cancelling would drop an already-released version.
     concurrency:
-      group: publish-homebrew
+      group: publish-${{ matrix.id }}
       cancel-in-progress: false
     steps:
-      # persist-credentials: false -- only the tap checkout needs a token.
+      # persist-credentials: false -- only the target repo checkout needs a token.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
 
+      # Pattern: a retried upload is `<name>-retry` (upload-artifact-retry).
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: release-checksums
+          pattern: release-checksums*
+          merge-multiple: true
 
-      - name: Render formula
+      - name: Render
         env:
           VERSION: ${{ needs.release.outputs.version }}
         run: |
@@ -1966,19 +2310,23 @@ jobs:
             --checksums checksums.txt \
             --out-dir rendered
 
-      - name: Check out the tap
+      - name: Check out ${{ matrix.repo }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          repository: llmmanorg/homebrew-tap
+          repository: ${{ matrix.repo }}
           token: ${{ secrets.TAP_GITHUB_TOKEN }}
-          path: tap
+          path: target-repo
 
       - name: Commit and push
-        working-directory: tap
+        working-directory: target-repo
         env:
           VERSION: ${{ needs.release.outputs.version }}
           TAG: ${{ needs.release.outputs.tag_name }}
           SRC: ${{ github.sha }}
+          PKG: ${{ matrix.id }}
+          REPO: ${{ matrix.repo }}
+          FILE: ${{ matrix.file }}
+          VERSION_SED: ${{ matrix.version_sed }}
         run: |
           set -euo pipefail
           git config user.name "llmman-ci"
@@ -1990,30 +2338,27 @@ jobs:
           fi
           echo "Target branch: $branch"
 
-          # The formula is generated output, so on a rejected push just
-          # re-sync and regenerate on top rather than rebase.
+          # Generated output: on a rejected push, re-sync and regenerate
+          # on top rather than rebase.
           for attempt in 1 2 3 4 5; do
             git fetch --quiet origin "$branch"
             git reset --quiet --hard FETCH_HEAD
 
-            # Never move the tap backwards: two main pushes can finish out
-            # of order, and a downgrade would hit every `brew upgrade`.
-            if [ -f Formula/llmman.rb ]; then
-              have="$(sed -n 's/^  version "\(.*\)"$/\1/p' Formula/llmman.rb | head -n1)"
+            # Never downgrade: two main pushes can finish out of order.
+            if [ -f "$FILE" ]; then
+              have="$(sed -n "$VERSION_SED" "$FILE" | head -n1)"
               if [ -n "$have" ] && [ "$have" != "$VERSION" ] \
                  && [ "$(printf '%s\n%s\n' "$have" "$VERSION" | sort -V | tail -n1)" = "$have" ]; then
-                echo "::notice::tap already has llmman $have, newer than $VERSION; leaving it"
+                echo "::notice::$REPO already has llmman $have, newer than $VERSION; leaving it"
                 exit 0
               fi
             fi
 
-            mkdir -p Formula
-            cp ../rendered/Formula/llmman.rb Formula/llmman.rb
-            cp ../rendered/README.md README.md
-            git add Formula README.md
+            cp -R "../rendered/$PKG/." .
+            git add -A .
 
             if git diff --cached --quiet; then
-              echo "::notice::tap already up to date for $TAG"
+              echo "::notice::$REPO already up to date for $TAG"
               exit 0
             fi
 
@@ -2021,104 +2366,11 @@ jobs:
               -m "Generated from llmmanorg/llmman@$SRC by packaging/render.sh."
 
             if git push --quiet origin "HEAD:$branch"; then
-              echo "Pushed llmman $VERSION to the tap"
+              echo "Pushed llmman $VERSION to $REPO"
               exit 0
             fi
-            echo "::warning::push to homebrew-tap rejected (attempt $attempt/5); re-syncing"
+            echo "::warning::push to $REPO rejected (attempt $attempt/5); re-syncing"
             sleep "$((attempt * 3))"
           done
-          echo "::error::could not push llmman $VERSION to homebrew-tap after 5 attempts"
+          echo "::error::could not push llmman $VERSION to $REPO after 5 attempts"
           exit 1
-
-  # --------------------------------------------------------------------------
-  # winget (#390): Windows x64/arm64. Every version is a PR against
-  # microsoft/winget-pkgs, opened with Microsoft's wingetcreate (Windows
-  # only) using secrets.WINGET_GITHUB_TOKEN, a PAT for an account that can
-  # fork winget-pkgs. Their bot validates, a moderator merges. Users run
-  # `winget install llmmanorg.llmman`.
-  # --------------------------------------------------------------------------
-  publish-winget:
-    name: Publish winget manifest
-    needs: [release, publish-images]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: windows-2025
-    timeout-minutes: 20
-    concurrency:
-      group: publish-winget
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-checksums
-
-      - name: Render manifests
-        shell: bash
-        env:
-          VERSION: ${{ needs.release.outputs.version }}
-        run: |
-          packaging/render.sh \
-            --version "$VERSION" \
-            --checksums checksums.txt \
-            --out-dir rendered
-
-      # Re-runs must not open a duplicate PR moderators have to close:
-      # skip if the version is already merged or already has an open PR.
-      - name: Skip if this version is already in winget-pkgs
-        id: exists
-        shell: bash
-        env:
-          VERSION: ${{ needs.release.outputs.version }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if gh api "repos/microsoft/winget-pkgs/contents/manifests/l/llmmanorg/llmman/$VERSION" >/dev/null 2>&1; then
-            echo "::notice::winget-pkgs already has llmman $VERSION; skipping"
-            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          open="$(gh api "search/issues?q=repo:microsoft/winget-pkgs+is:pr+is:open+in:title+%22llmmanorg.llmman+version+$VERSION%22" --jq .total_count)"
-          if [ "$open" != "0" ]; then
-            echo "::notice::an open winget-pkgs PR for llmman $VERSION already exists; skipping"
-            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-
-      # Pinned release + checksum, not aka.ms/wingetcreate/latest: this
-      # binary runs with a PAT in its environment.
-      - name: Install wingetcreate
-        if: steps.exists.outputs.skip != 'true'
-        shell: pwsh
-        env:
-          WINGETCREATE_VERSION: v1.12.13.0
-          WINGETCREATE_SHA256: 24042BD37915805615E6CF969AC57C6439124C3FE85823327F5F3FB24BD9FFEA
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $url = "https://github.com/microsoft/winget-create/releases/download/$env:WINGETCREATE_VERSION/wingetcreate.exe"
-          Invoke-WebRequest -Uri $url -OutFile wingetcreate.exe
-          $got = (Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash
-          if ($got -ne $env:WINGETCREATE_SHA256) { throw "wingetcreate.exe sha256 $got != $env:WINGETCREATE_SHA256" }
-          # Smoke test. `info` is the only real "print the version" command:
-          # `version` and `help` are listed in the help text by
-          # CommandLineParser but are not registered verbs, so they (like
-          # `--version`) print help and exit 1. `info` also skips the GitHub
-          # client, so it needs no token or network.
-          .\wingetcreate.exe info
-          if ($LASTEXITCODE -ne 0) { throw "wingetcreate info failed with exit code $LASTEXITCODE" }
-
-      # WINGET_CREATE_GITHUB_TOKEN is wingetcreate's env var for CI
-      # (https://aka.ms/winget-create-token); --token may be logged.
-      - name: Submit to microsoft/winget-pkgs
-        if: steps.exists.outputs.skip != 'true'
-        shell: pwsh
-        env:
-          VERSION: ${{ needs.release.outputs.version }}
-          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $dir = "rendered/manifests/l/llmmanorg/llmman/$env:VERSION"
-          Get-ChildItem $dir
-          .\wingetcreate.exe submit $dir
-          if ($LASTEXITCODE -ne 0) { throw "wingetcreate submit failed with exit code $LASTEXITCODE" }

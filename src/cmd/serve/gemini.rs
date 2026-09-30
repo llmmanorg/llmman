@@ -9,12 +9,13 @@ use base64::Engine as _;
 use futures::StreamExt;
 use serde::Deserialize;
 
+use super::hybrid::send_with_hybrid_fallback;
 use super::sched::{begin_activity, ActivityGuard};
 use super::stream::{bytes_to_lines, oai_chunk_to_content};
 use super::types::{OAIChatRequest, OAIChunk, OAIMessage, OAIToolCall, OAIToolCallFunction};
 use super::{
-    accumulate_tool_call_deltas, backend_wire_model, collect_body, post_chat,
-    send_with_hybrid_fallback, AppError, AppState, Target, ToolCallAccumulator,
+    accumulate_tool_call_deltas, backend_wire_model, collect_body, post_chat, AppError, AppState,
+    Target, ToolCallAccumulator,
 };
 
 // ---------------------------------------------------------------------------
@@ -501,17 +502,31 @@ where
 }
 
 /// Extracts OpenAI token usage into Gemini's usage metadata field names.
+/// A cached prefix is `cachedContentTokenCount`, inside `promptTokenCount`;
+/// reasoning is `thoughtsTokenCount`, outside `candidatesTokenCount`.
 fn gemini_usage_metadata(payload: &str) -> Option<serde_json::Value> {
     let usage = serde_json::from_str::<OAIChunk>(payload).ok()?.usage?;
-    Some(serde_json::json!({
+    let thoughts = usage
+        .completion_tokens_details
+        .reasoning_tokens
+        .unwrap_or(0)
+        .min(usage.completion_tokens);
+    let mut metadata = serde_json::json!({
         "promptTokenCount": usage.prompt_tokens,
-        "candidatesTokenCount": usage.completion_tokens,
+        "candidatesTokenCount": usage.completion_tokens - thoughts,
         "totalTokenCount": if usage.total_tokens == 0 {
             usage.prompt_tokens + usage.completion_tokens
         } else {
             usage.total_tokens
         },
-    }))
+    });
+    if let Some(cached) = usage.prompt_tokens_details.cached_tokens.filter(|&n| n > 0) {
+        metadata["cachedContentTokenCount"] = cached.into();
+    }
+    if thoughts > 0 {
+        metadata["thoughtsTokenCount"] = thoughts.into();
+    }
+    Some(metadata)
 }
 
 /// The Gemini API methods the pinned route serves: `v1beta/models/<model>:<method>`.
@@ -735,9 +750,31 @@ fn gemini_oai_request(model: String, req: &GeminiRequest) -> Result<OAIChatReque
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{headers_with, remote_target, test_state, HOSTED, PAIR};
-    use super::super::{with_hybrid_fallback, ContextOverflow};
+    use super::super::hybrid::with_hybrid_fallback;
+    use super::super::test_support::{headers_with, remote_target, test_state, HOSTED, PAIR};
+    use super::super::ContextOverflow;
     use super::*;
+
+    #[test]
+    fn a_cached_prefix_reaches_the_usage_metadata() {
+        let cached = gemini_usage_metadata(
+            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":6}}}"#,
+        )
+        .unwrap();
+        assert_eq!(cached["promptTokenCount"], 10);
+        assert_eq!(cached["cachedContentTokenCount"], 6);
+        let thinking = gemini_usage_metadata(
+            r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":9,"completion_tokens_details":{"reasoning_tokens":7}}}"#,
+        )
+        .unwrap();
+        assert_eq!(thinking["candidatesTokenCount"], 2);
+        assert_eq!(thinking["thoughtsTokenCount"], 7);
+        let plain = gemini_usage_metadata(
+            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
+        )
+        .unwrap();
+        assert!(plain.get("cachedContentTokenCount").is_none());
+    }
     use axum::{response::IntoResponse, routing::post, Router};
     use std::sync::Arc;
     #[test]
@@ -1119,6 +1156,22 @@ mod tests {
         assert!(GeminiMethod::Stream.generates());
         assert!(GeminiMethod::Generate.generates());
         assert!(!GeminiMethod::CountTokens.generates());
+    }
+
+    /// The `google` provider's OpenAI endpoint sends a whole tool call,
+    /// with no `index`, on its finish chunk.
+    #[test]
+    fn folding_a_stream_keeps_a_call_sent_without_an_index() {
+        let response = fold_gemini_stream([
+            r#"data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"0","type":"function","function":{"name":"lookup","arguments":"{\"id\":1}"}}]},"finish_reason":"tool_calls","index":0}]}"#,
+            "data: [DONE]",
+        ])
+        .expect("complete stream");
+
+        assert_eq!(
+            response["candidates"][0]["content"]["parts"],
+            serde_json::json!([{"functionCall": {"id": "0", "name": "lookup", "args": {"id": 1}}}])
+        );
     }
 
     #[test]

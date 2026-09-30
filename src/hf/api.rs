@@ -30,19 +30,9 @@ pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
     token: Option<&str>,
 ) -> Result<T> {
     let body = super::client::probe(&format!("GET {url}"), || async {
-        let mut req = client.get(url);
-        if let Some(t) = token {
-            req = req.bearer_auth(t);
-        }
-        let resp = req.send().await.with_context(|| format!("GET {url}"))?;
-        let status = resp.status();
-        if status != reqwest::StatusCode::OK {
-            let headers = resp.headers().clone();
-            return Err(
-                HttpStatusError::new(format!("GET {url}"), status.as_u16(), &headers).into(),
-            );
-        }
-        resp.bytes()
+        send_ok(client, url, token)
+            .await?
+            .bytes()
             .await
             .with_context(|| format!("read body of GET {url}"))
     })
@@ -50,15 +40,74 @@ pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&body).with_context(|| format!("decode JSON from {url}"))
 }
 
-/// The subset of `GET /api/models/{owner}/{repo}` this needs — mirrors `hfModelInfo`.
+/// [`get_json`]'s authenticated GET for a body that isn't JSON, reading at
+/// most `max` bytes of it: for a caller that keeps only the start of what
+/// could be a large file.
+pub(crate) async fn get_prefix(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+    max: usize,
+) -> Result<Vec<u8>> {
+    super::client::probe(&format!("GET {url}"), || async {
+        let mut resp = send_ok(client, url, token).await?;
+        let mut body = Vec::new();
+        while body.len() < max {
+            let chunk = resp
+                .chunk()
+                .await
+                .with_context(|| format!("read body of GET {url}"))?;
+            let Some(chunk) = chunk else { break };
+            body.extend_from_slice(&chunk);
+        }
+        body.truncate(max);
+        Ok(body)
+    })
+    .await
+}
+
+/// Sends the GET, with the token when there is one; anything but 200 is an
+/// [`HttpStatusError`].
+async fn send_ok(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+) -> Result<reqwest::Response> {
+    let mut req = client.get(url);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+    let status = resp.status();
+    if status != reqwest::StatusCode::OK {
+        let headers = resp.headers().clone();
+        return Err(HttpStatusError::new(format!("GET {url}"), status.as_u16(), &headers).into());
+    }
+    Ok(resp)
+}
+
+/// The subset of `GET /api/models/{owner}/{repo}` this needs — mirrors
+/// `hfModelInfo`, plus what `llmman serve`'s `/llmman/search/model` shows.
 #[derive(Debug, Deserialize, Default)]
 pub struct ModelInfo {
     #[serde(default)]
     sha: String,
     #[serde(default)]
-    tags: Vec<String>,
+    pub tags: Vec<String>,
     #[serde(default, rename = "cardData")]
     card_data: CardData,
+    #[serde(default)]
+    pub downloads: Option<u64>,
+    #[serde(default)]
+    pub likes: Option<u64>,
+    #[serde(default, rename = "lastModified")]
+    pub last_modified: Option<String>,
+    /// The Hub's task tag (`text-generation`, ...).
+    #[serde(default)]
+    pub pipeline_tag: Option<String>,
+    /// `false`, or the gating mode (`"auto"`, `"manual"`).
+    #[serde(default)]
+    gated: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -68,6 +117,14 @@ struct CardData {
 }
 
 impl ModelInfo {
+    /// Whether downloading needs an accepted license and a token.
+    pub fn gated(&self) -> bool {
+        !matches!(
+            self.gated,
+            serde_json::Value::Null | serde_json::Value::Bool(false)
+        )
+    }
+
     /// The commit SHA to pin resolve URLs to, falling back to "main".
     pub fn commit(&self) -> &str {
         if self.sha.is_empty() {

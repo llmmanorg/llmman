@@ -234,12 +234,14 @@ api! {
     fn ggml_sub(ctx: *mut GgmlContext, a: Tensor, b: Tensor) -> Tensor;
     fn ggml_mul(ctx: *mut GgmlContext, a: Tensor, b: Tensor) -> Tensor;
     fn ggml_scale(ctx: *mut GgmlContext, a: Tensor, s: f32) -> Tensor;
+    fn ggml_scale_bias(ctx: *mut GgmlContext, a: Tensor, s: f32, b: f32) -> Tensor;
     fn ggml_mul_mat(ctx: *mut GgmlContext, a: Tensor, b: Tensor) -> Tensor;
     fn ggml_rms_norm(ctx: *mut GgmlContext, a: Tensor, eps: f32) -> Tensor;
     fn ggml_norm(ctx: *mut GgmlContext, a: Tensor, eps: f32) -> Tensor;
     fn ggml_silu(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
     fn ggml_gelu(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
     fn ggml_sigmoid(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
+    fn ggml_tanh(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
     fn ggml_sin(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
     fn ggml_sqr(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
     fn ggml_sqrt(ctx: *mut GgmlContext, a: Tensor) -> Tensor;

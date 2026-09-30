@@ -304,14 +304,52 @@ pub struct Model {
     /// models.dev's `limit.output`, the default `max_tokens` for a wire
     /// that requires one. `None` where the catalog has none.
     pub max_output: Option<u32>,
+    /// models.dev's `limit.context`, the window this model can hold —
+    /// what a hybrid pair's ceiling is measured against (see
+    /// `cmd::launch`'s `pair_context_window`). `None` where the catalog
+    /// has none, and for a provider defined in `llmman.conf`, which has
+    /// no catalog entry at all.
+    pub max_context: Option<u64>,
+    /// The `reasoning_effort` levels opencode offers, in cycle order (see
+    /// [`thinking_levels_of`]). Empty for a model that does not reason;
+    /// `None` where the catalog does not say.
+    pub thinking: Option<Vec<String>>,
 }
 
 /// US dollars per million tokens — models.dev's own unit, unconverted so
 /// a printed figure matches the provider's pricing page.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Cost {
     pub input: f64,
     pub output: f64,
+    /// `None` where models.dev publishes none, which is not free.
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+    pub reasoning: Option<f64>,
+    /// Rates for a prompt past a context size, ascending by `above`.
+    pub tiers: Vec<Tier>,
+}
+
+impl Cost {
+    /// A price with no cache rates or tiers.
+    pub fn flat(input: f64, output: f64) -> Self {
+        Self {
+            input,
+            output,
+            cache_read: None,
+            cache_write: None,
+            reasoning: None,
+            tiers: Vec::new(),
+        }
+    }
+}
+
+/// The price, itself without tiers, of a prompt longer than `above`
+/// tokens.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tier {
+    pub above: u64,
+    pub price: Cost,
 }
 
 impl Provider {
@@ -378,39 +416,31 @@ fn key_from_env(var: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Both places llmman looks, named, for an error that fires because it
-/// found neither. One string so every such message agrees: a user told
-/// only about the variable would never learn the file exists.
+/// What to do about a missing key, for every error that reports one.
+/// `config set` rather than a hand edit: it rejects a misspelt key and
+/// makes the file owner-only, without which the key is ignored.
 pub fn key_hint(id: &str, var: Option<&str>) -> String {
+    let key = shell_word(&format!(
+        "providers.{}.api_key",
+        crate::config::toml_key(id)
+    ));
+    let set = format!("run `llmman config set {key} <key>`");
     match var {
-        Some(var) => format!(
-            "set {var} in the environment, or add a [providers.{}] api_key to {}",
-            toml_key(id),
-            crate::config::user_path_display()
-        ),
-        None => format!(
-            "add an api_key to [providers.{}] in {}",
-            toml_key(id),
-            crate::config::user_path_display()
-        ),
+        Some(var) => format!("set {var} in the environment, or {set}"),
+        None => set,
     }
 }
 
-/// `id` as a TOML key, quoted when it is not a bare one.
-///
-/// models.dev has ids with a dot in them (`wafer.ai`), and
-/// `[providers.wafer.ai]` is two nested tables, not the key `wafer.ai` —
-/// so an unquoted hint tells the user to write something that silently
-/// does not configure the provider they asked about.
-fn toml_key(id: &str) -> String {
-    let bare = !id.is_empty()
-        && id
+/// `word` as one POSIX shell word, single-quoted unless it is plain.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if bare {
-        id.to_string()
+            .all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c));
+    if plain {
+        word.to_string()
     } else {
-        format!("{id:?}")
+        format!("'{}'", word.replace('\'', r"'\''"))
     }
 }
 
@@ -550,6 +580,14 @@ impl Catalog {
         self.providers.get(id)
     }
 
+    /// Whether `provider` is a models.dev entry that does not list `model`,
+    /// the one case a newer catalog might fix. A configured provider has no
+    /// list here (its endpoint is asked), and an unknown id is another error.
+    pub fn lacks_model(&self, provider: &str, model: &str) -> bool {
+        self.get(provider)
+            .is_some_and(|p| !p.key_optional && !p.models.iter().any(|m| m.id == model))
+    }
+
     /// Every routable provider, ordered by id.
     pub fn iter(&self) -> impl Iterator<Item = &Provider> {
         self.providers.values()
@@ -649,8 +687,7 @@ struct RawProvider {
     models: BTreeMap<String, RawModel>,
 }
 
-/// A models.dev model entry — the id is the map key, so only the price
-/// and the output ceiling are read out of the value.
+/// A models.dev model entry; the id is the map key.
 #[derive(Debug, Deserialize)]
 struct RawModel {
     /// Untyped on purpose: a typed `{input, output}` would let an
@@ -658,9 +695,16 @@ struct RawModel {
     /// and a listing column is not worth `--provider x` breaking over.
     #[serde(default)]
     cost: Option<serde_json::Value>,
-    /// Untyped for the same reason; only `output` is read.
+    /// Untyped for the same reason; `output` and `context` are read.
     #[serde(default)]
     limit: Option<serde_json::Value>,
+    /// Untyped for the same reason.
+    #[serde(default)]
+    reasoning: Option<serde_json::Value>,
+    /// Untyped for the same reason, e.g.
+    /// `[{"type": "effort", "values": ["low", "high"]}]`.
+    #[serde(default)]
+    reasoning_options: Option<serde_json::Value>,
 }
 
 /// A models.dev `limit.output` as a token count, or `None` unless it is
@@ -670,17 +714,94 @@ fn max_output_of(raw: &serde_json::Value) -> Option<u32> {
     u32::try_from(n).ok().filter(|&n| n > 0)
 }
 
-/// A models.dev `cost` object as a [`Cost`], or `None` unless *both*
-/// figures are there and sane — half a price misleads worse than none.
+/// [`max_output_of`]'s sibling for `limit.context`.
+fn max_context_of(raw: &serde_json::Value) -> Option<u64> {
+    raw.get("context")?.as_u64().filter(|&n| n > 0)
+}
+
+/// The levels opencode derives from a models.dev entry
+/// (`ProviderTransform.reasoningVariants`, which also reads the options
+/// before `reasoning`):
+///
+/// - an `effort` option: its `values`, `null` spelled `none`;
+/// - else `budget_tokens` on the Anthropic wire: `high` and `max`;
+/// - an empty list, or `reasoning: false` with nothing usable: none;
+/// - anything else: `None`; opencode's per-model heuristics are not copied.
+fn thinking_levels_of(raw: &RawModel, wire: Wire, max_output: Option<u32>) -> Option<Vec<String>> {
+    let options = raw
+        .reasoning_options
+        .as_ref()
+        .and_then(serde_json::Value::as_array);
+    let of_type = |kind: &str| options?.iter().find(|o| o["type"] == kind);
+    if options.is_some_and(Vec::is_empty) {
+        return Some(Vec::new());
+    }
+    if let Some(effort) = of_type("effort") {
+        let mut levels: Vec<String> = Vec::new();
+        for value in effort["values"].as_array().into_iter().flatten() {
+            let level = match value {
+                serde_json::Value::Null => "none",
+                serde_json::Value::String(s) => s.trim(),
+                _ => continue,
+            };
+            if !level.is_empty() && !levels.iter().any(|l| l == level) {
+                levels.push(level.to_string());
+            }
+        }
+        return Some(levels);
+    }
+    // opencode caps the budget at `limit.output - 1`.
+    if wire == Wire::Anthropic
+        && of_type("budget_tokens").is_some()
+        && max_output.is_some_and(|n| n > 1)
+    {
+        return Some(vec!["high".to_string(), "max".to_string()]);
+    }
+    (raw.reasoning.as_ref().and_then(serde_json::Value::as_bool) == Some(false)).then(Vec::new)
+}
+
+/// A models.dev `cost` object as a [`Cost`], or `None` unless both
+/// `input` and `output` are there and sane — half a price misleads worse
+/// than none. Tiers come from `tiers` (which names the real size, e.g.
+/// OpenAI's 272k), else `context_over_200k`.
 fn cost_of(raw: &serde_json::Value) -> Option<Cost> {
+    let tier = |above: u64, raw: &serde_json::Value| {
+        Some(Tier {
+            above,
+            price: flat_cost_of(raw)?,
+        })
+    };
+    let mut tiers: Vec<Tier> = raw
+        .get("tiers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|t| t["tier"]["type"] == "context")
+        .filter_map(|t| tier(t["tier"]["size"].as_u64()?, t))
+        .collect();
+    if tiers.is_empty() {
+        tiers.extend(raw.get("context_over_200k").and_then(|t| tier(200_000, t)));
+    }
+    tiers.sort_by_key(|t| t.above);
+    tiers.dedup_by_key(|t| t.above);
+    Some(Cost {
+        tiers,
+        ..flat_cost_of(raw)?
+    })
+}
+
+/// One rate set, without tiers.
+fn flat_cost_of(raw: &serde_json::Value) -> Option<Cost> {
     let field = |name: &str| -> Option<f64> {
         raw.get(name)?
             .as_f64()
             .filter(|v| v.is_finite() && *v >= 0.0)
     };
     Some(Cost {
-        input: field("input")?,
-        output: field("output")?,
+        cache_read: field("cache_read"),
+        cache_write: field("cache_write"),
+        reasoning: field("reasoning"),
+        ..Cost::flat(field("input")?, field("output")?)
     })
 }
 
@@ -753,10 +874,15 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
         models: raw
             .models
             .into_iter()
-            .map(|(id, model)| Model {
-                id,
-                cost: model.cost.as_ref().and_then(cost_of),
-                max_output: model.limit.as_ref().and_then(max_output_of),
+            .map(|(id, model)| {
+                let max_output = model.limit.as_ref().and_then(max_output_of);
+                Model {
+                    cost: model.cost.as_ref().and_then(cost_of),
+                    thinking: thinking_levels_of(&model, wire, max_output),
+                    max_context: model.limit.as_ref().and_then(max_context_of),
+                    max_output,
+                    id,
+                }
             })
             .collect(),
     })
@@ -788,6 +914,82 @@ fn base_url_of(api: &str) -> String {
 /// produced it — but not zero, or every request on a machine that cannot
 /// reach models.dev would pay [`FETCH_TIMEOUT`] again.
 const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// The soonest [`catalog_listing`] re-fetches after any fetch, so a model
+/// models.dev never lists (a typo) costs one download, not one per request.
+const MISS_REFRESH_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+static GATE: Gate = Gate::new(MISS_REFRESH_COOLDOWN);
+
+/// Serializes catalog downloads (the background refresh and
+/// [`catalog_listing`] share one) and remembers when the last one ran, so
+/// a queued download that another already covered is skipped.
+struct Gate {
+    cooldown: Duration,
+    turn: Mutex<()>,
+    last: Mutex<Option<Instant>>,
+}
+
+impl Gate {
+    /// A gate whose downloads are `cooldown` apart at the soonest.
+    const fn new(cooldown: Duration) -> Self {
+        Self {
+            cooldown,
+            turn: Mutex::new(()),
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Notes that models.dev was just asked, whatever came of it.
+    fn record(&self) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+
+    /// When models.dev was last asked.
+    fn last(&self) -> Option<Instant> {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Runs the background `load` in its turn, unless a download finished
+    /// while it queued: that one already answered.
+    fn background(&self, load: impl FnOnce()) {
+        self.background_since(Instant::now(), load);
+    }
+
+    /// [`Gate::background`] for a `load` queued at `queued`.
+    fn background_since(&self, queued: Instant, load: impl FnOnce()) {
+        let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        if self.last().is_none_or(|at| at < queued) {
+            load();
+        }
+    }
+
+    /// `held()`, replaced by `fetch()` when it lacks `model` and no download
+    /// ran within the cooldown. A failed fetch keeps the held catalog.
+    fn listing(
+        &self,
+        provider: &str,
+        model: &str,
+        held: impl Fn() -> anyhow::Result<Arc<Catalog>>,
+        fetch: impl FnOnce() -> anyhow::Result<Arc<Catalog>>,
+    ) -> anyhow::Result<Arc<Catalog>> {
+        let current = held()?;
+        if !current.lacks_model(provider, model) {
+            return Ok(current);
+        }
+        let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        // A download that ran while this waited may already list it.
+        let current = held()?;
+        let cooling = self.last().is_some_and(|at| at.elapsed() < self.cooldown);
+        if !current.lacks_model(provider, model) || cooling {
+            return Ok(current);
+        }
+        fetch().or_else(|e| {
+            eprintln!("[llmman] could not refresh the provider list ({e:#})");
+            Ok(current)
+        })
+    }
+}
 
 /// The last [`load`], when it happened, and how long it is good for. The
 /// error is kept as a message rather than an `anyhow::Error`, which is
@@ -829,8 +1031,10 @@ pub fn catalog() -> anyhow::Result<Arc<Catalog>> {
                         }
                     }
                     let _done = Done;
-                    let entry = load_entry();
-                    *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(entry);
+                    GATE.background(|| {
+                        let entry = load_entry();
+                        *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(entry);
+                    });
                 });
             }
             Ok(stale)
@@ -842,6 +1046,20 @@ pub fn catalog() -> anyhow::Result<Arc<Catalog>> {
             result
         }
     }
+}
+
+/// [`catalog`], re-fetched first if `provider` is a models.dev entry that
+/// does not list `model`: the snapshot may predate the model. Waits out a
+/// background refresh rather than duplicating it, re-fetches at most once
+/// per [`MISS_REFRESH_COOLDOWN`], and keeps the held catalog if the fetch
+/// fails. Blocking, like [`catalog`].
+pub fn catalog_listing(provider: &str, model: &str) -> anyhow::Result<Arc<Catalog>> {
+    GATE.listing(provider, model, catalog, || {
+        let fresh = entry(Instant::now(), refresh(cache_path().as_deref())?, CACHE_TTL);
+        let result = result_of(&fresh.2);
+        *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(fresh);
+        result
+    })
 }
 
 fn result_of(result: &Result<Arc<Catalog>, String>) -> anyhow::Result<Arc<Catalog>> {
@@ -857,11 +1075,10 @@ fn load_entry() -> Cached {
     let configured = crate::config::configured_providers();
     let now = Instant::now();
     match load() {
-        Ok(loaded) => (
-            now,
-            loaded.good_for(),
-            Ok(Arc::new(loaded.into_catalog().with_configured(configured))),
-        ),
+        Ok(loaded) => {
+            let good_for = loaded.good_for();
+            entry(now, loaded.into_catalog(), good_for)
+        }
         Err(e) if !configured.is_empty() => {
             eprintln!(
                 "[llmman] using only the {} provider(s) defined in llmman.conf ({e:#})",
@@ -875,6 +1092,17 @@ fn load_entry() -> Cached {
         }
         Err(e) => (now, RETRY_COOLDOWN, Err(format!("{e:#}"))),
     }
+}
+
+/// `catalog` with `llmman.conf`'s providers merged in, as [`catalog`]
+/// caches it.
+fn entry(at: Instant, catalog: Catalog, good_for: Duration) -> Cached {
+    let configured = crate::config::configured_providers();
+    (
+        at,
+        good_for,
+        Ok(Arc::new(catalog.with_configured(configured))),
+    )
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -936,24 +1164,8 @@ fn load() -> anyhow::Result<Loaded> {
         }
     }
 
-    crate::debug_log!("provider catalog: fetching {CATALOG_URL}");
-    // Parse is part of the refresh, not a separate step after it: a 200
-    // carrying a truncated body or a captive portal's HTML is a failed
-    // refresh, and must reach the stale cache below like any other.
-    let refreshed = fetch(CATALOG_URL).and_then(|raw| {
-        let catalog = Catalog::from_json(&raw)?;
-        Ok((catalog, raw))
-    });
-
-    match refreshed {
-        Ok((catalog, raw)) => {
-            // Best-effort: an unwritable cache costs a fetch next time,
-            // nothing more, so it must not fail the load.
-            if let Some(path) = &path {
-                let _ = write_cache(path, &raw);
-            }
-            Ok(Loaded::Fresh(catalog))
-        }
+    match refresh(path.as_deref()) {
+        Ok(catalog) => Ok(Loaded::Fresh(catalog)),
         Err(err) => {
             let stale = path
                 .as_deref()
@@ -971,6 +1183,23 @@ fn load() -> anyhow::Result<Loaded> {
             }
         }
     }
+}
+
+/// Fetches models.dev whatever the cache says, and caches what it sent.
+/// Parsing is part of it: a truncated body or a captive portal's HTML is a
+/// failed refresh, which [`load`] answers from the stale cache.
+fn refresh(path: Option<&std::path::Path>) -> anyhow::Result<Catalog> {
+    crate::debug_log!("provider catalog: fetching {CATALOG_URL}");
+    let fetched = fetch(CATALOG_URL);
+    GATE.record();
+    let raw = fetched?;
+    let catalog = Catalog::from_json(&raw)?;
+    // Best-effort: an unwritable cache costs a fetch next time, nothing
+    // more, so it must not fail the load.
+    if let Some(path) = path {
+        let _ = write_cache(path, &raw);
+    }
+    Ok(catalog)
 }
 
 /// Writes the cache atomically (`fsutil::write_atomic`), as opencode does
@@ -1071,6 +1300,159 @@ mod tests {
         Catalog::from_json(json.as_bytes()).expect("fixture parses")
     }
 
+    /// An `anthropic` catalog listing exactly `models`.
+    fn anthropic_with(models: &[&str]) -> Catalog {
+        let models: Vec<String> = models.iter().map(|m| format!("{m:?}: {{}}")).collect();
+        catalog_from(&format!(
+            r#"{{"anthropic": {{
+                "id": "anthropic", "name": "Anthropic",
+                "npm": "@ai-sdk/anthropic", "env": ["ANTHROPIC_API_KEY"],
+                "models": {{ {} }}
+            }}}}"#,
+            models.join(", ")
+        ))
+    }
+
+    /// Only a catalog entry missing the model lacks it: not a listed model,
+    /// an unknown provider, or a configured one (its endpoint is asked).
+    #[test]
+    fn only_a_catalog_entry_missing_the_model_lacks_it() {
+        let catalog = anthropic_with(&["claude-sonnet-5"]);
+        assert!(!catalog.lacks_model("anthropic", "claude-sonnet-5"));
+        assert!(catalog.lacks_model("anthropic", "claude-sonnet-5-5"));
+        assert!(!catalog.lacks_model("nope", "claude-sonnet-5-5"));
+
+        let configured = Catalog::from_configured(&[configured(
+            "inferencebox",
+            "http://10.0.0.5:8000/v1",
+            Wire::OpenAi,
+        )]);
+        assert!(!configured.lacks_model("inferencebox", "anything"));
+    }
+
+    /// A [`Gate`] over a catalog held in a cell, with a scripted models.dev.
+    struct Fake {
+        gate: Gate,
+        held: std::cell::RefCell<Arc<Catalog>>,
+        fetches: std::cell::Cell<u32>,
+    }
+
+    impl Fake {
+        fn new(cooldown: Duration, models: &[&str]) -> Self {
+            Self {
+                gate: Gate::new(cooldown),
+                held: std::cell::RefCell::new(Arc::new(anthropic_with(models))),
+                fetches: std::cell::Cell::new(0),
+            }
+        }
+
+        /// One `catalog_listing`; models.dev lists `upstream`, or is down.
+        fn listing(&self, model: &str, upstream: Option<&[&str]>) -> Arc<Catalog> {
+            self.gate
+                .listing(
+                    "anthropic",
+                    model,
+                    || Ok(self.held.borrow().clone()),
+                    || {
+                        self.fetches.set(self.fetches.get() + 1);
+                        self.gate.record();
+                        let models = upstream.ok_or_else(|| anyhow::anyhow!("offline"))?;
+                        let fresh = Arc::new(anthropic_with(models));
+                        *self.held.borrow_mut() = fresh.clone();
+                        Ok(fresh)
+                    },
+                )
+                .unwrap()
+        }
+    }
+
+    const OLD: &[&str] = &["claude-sonnet-5"];
+    const NEW: &[&str] = &["claude-sonnet-5", "claude-sonnet-5-5"];
+
+    /// The reported bug: a model newer than the snapshot is found by
+    /// fetching, once, and the fresh catalog is what is held afterwards.
+    #[test]
+    fn a_model_newer_than_the_snapshot_is_found_by_fetching() {
+        let fake = Fake::new(Duration::from_secs(60), OLD);
+
+        let got = fake.listing("claude-sonnet-5-5", Some(NEW));
+
+        assert!(!got.lacks_model("anthropic", "claude-sonnet-5-5"));
+        assert!(!fake
+            .held
+            .borrow()
+            .lacks_model("anthropic", "claude-sonnet-5-5"));
+        assert_eq!(fake.fetches.get(), 1);
+    }
+
+    /// A listed model never fetches.
+    #[test]
+    fn a_listed_model_does_not_fetch() {
+        let fake = Fake::new(Duration::from_secs(60), OLD);
+        fake.listing("claude-sonnet-5", Some(&[]));
+        assert_eq!(fake.fetches.get(), 0);
+    }
+
+    /// A model models.dev never lists stays unlisted, and is asked about
+    /// once per cooldown, not once per launch.
+    #[test]
+    fn a_persistent_miss_fetches_once_per_cooldown() {
+        let fake = Fake::new(Duration::from_secs(3600), OLD);
+        for _ in 0..3 {
+            assert!(fake
+                .listing("typo", Some(OLD))
+                .lacks_model("anthropic", "typo"));
+        }
+        assert_eq!(fake.fetches.get(), 1);
+
+        let fake = Fake::new(Duration::ZERO, OLD);
+        fake.listing("typo", Some(OLD));
+        fake.listing("typo", Some(OLD));
+        assert_eq!(fake.fetches.get(), 2);
+    }
+
+    /// A models.dev that is down keeps the catalog held, and still counts
+    /// toward the cooldown so an offline machine does not retry per request.
+    #[test]
+    fn a_failed_fetch_keeps_the_held_catalog() {
+        let fake = Fake::new(Duration::from_secs(3600), OLD);
+        for _ in 0..2 {
+            let got = fake.listing("claude-sonnet-5-5", None);
+            assert!(got.lacks_model("anthropic", "claude-sonnet-5-5"));
+            assert!(!got.lacks_model("anthropic", "claude-sonnet-5"));
+        }
+        assert_eq!(fake.fetches.get(), 1);
+    }
+
+    /// An unknown provider is the daemon's error to give, not a download.
+    #[test]
+    fn an_unknown_provider_does_not_fetch() {
+        let gate = Gate::new(Duration::ZERO);
+        let held = Arc::new(anthropic_with(OLD));
+        gate.listing("nope", "x", || Ok(held.clone()), || panic!("fetched"))
+            .unwrap();
+    }
+
+    /// A background refresh queued behind a download that already ran (even
+    /// a failed one) does not download again; one queued after it does.
+    #[test]
+    fn a_queued_background_refresh_yields_to_a_download_that_ran() {
+        let gate = Gate::new(Duration::ZERO);
+        let ran = std::cell::Cell::new(0);
+        let run = || ran.set(ran.get() + 1);
+
+        gate.background_since(Instant::now(), run);
+        assert_eq!(ran.get(), 1);
+
+        let queued = Instant::now();
+        gate.record();
+        gate.background_since(queued, run);
+        assert_eq!(ran.get(), 1, "queued before the download that ran");
+
+        gate.background_since(Instant::now() + Duration::from_secs(1), run);
+        assert_eq!(ran.get(), 2, "queued after it");
+    }
+
     /// The base case: an `@ai-sdk/openai-compatible` provider with one
     /// concrete URL and one key variable is taken straight from
     /// models.dev, builtins uninvolved.
@@ -1104,17 +1486,89 @@ mod tests {
                     id: "a-model".into(),
                     cost: None,
                     max_output: None,
+                    max_context: None,
+                    thinking: None,
                 },
                 Model {
                     id: "z-model".into(),
-                    cost: Some(Cost {
-                        input: 2.5,
-                        output: 10.0
-                    }),
+                    cost: Some(Cost::flat(2.5, 10.0)),
                     max_output: Some(32000),
+                    // The fixture's `limit.context`, now carried too.
+                    max_context: Some(200_000),
+                    thinking: None,
                 },
             ]
         );
+    }
+
+    /// The levels opencode's `reasoningVariants` offers for each entry.
+    #[test]
+    fn thinking_levels_follow_the_catalogs_reasoning_options() {
+        let catalog = catalog_from(
+            r#"{
+                "anthropic": {
+                    "id": "anthropic", "name": "Anthropic",
+                    "npm": "@ai-sdk/anthropic", "env": ["ANTHROPIC_API_KEY"],
+                    "models": {
+                        "claude-opus-5-5": { "reasoning": true, "limit": { "output": 128000 },
+                            "reasoning_options": [{ "type": "effort", "values": ["low", "medium", "high", "xhigh", "max"] }] },
+                        "claude-sonnet-5": { "reasoning": true, "limit": { "output": 128000 },
+                            "reasoning_options": [{ "type": "toggle" }, { "type": "effort", "values": ["low", "high"] }] },
+                        "claude-haiku-4-5": { "reasoning": true, "limit": { "output": 64000 },
+                            "reasoning_options": [{ "type": "budget_tokens", "min": 1024 }] },
+                        "claude-no-ceiling": { "reasoning": true,
+                            "reasoning_options": [{ "type": "budget_tokens", "min": 1024 }] },
+                        "claude-3-haiku": { "reasoning": false, "limit": { "output": 4096 } }
+                    }
+                },
+                "cheap": {
+                    "id": "cheap", "name": "Cheap", "api": "https://cheap.example/v1",
+                    "npm": "@ai-sdk/openai-compatible", "env": ["CHEAP_API_KEY"],
+                    "models": {
+                        "gpt-x": { "reasoning": true,
+                            "reasoning_options": [{ "type": "effort", "values": [null, "low", "low", 3, "", "xhigh"] }] },
+                        "qwen-budget": { "reasoning": true, "limit": { "output": 32000 },
+                            "reasoning_options": [{ "type": "toggle" }, { "type": "budget_tokens", "max": 32768 }] },
+                        "no-reasoning": { "reasoning": false,
+                            "reasoning_options": [{ "type": "toggle" }] },
+                        "switch-off": { "reasoning": true, "reasoning_options": [] },
+                        "unsaid": { "reasoning": true },
+                        "odd": { "reasoning": "yes", "reasoning_options": { "type": "effort" } }
+                    }
+                }
+            }"#,
+        );
+        let levels = |provider: &str, model: &str| {
+            catalog
+                .get(provider)
+                .and_then(|p| p.models.iter().find(|m| m.id == model))
+                .unwrap_or_else(|| panic!("{provider}/{model}"))
+                .thinking
+                .clone()
+        };
+        let some = |levels: &[&str]| Some(levels.iter().map(|l| l.to_string()).collect());
+
+        assert_eq!(
+            levels("anthropic", "claude-opus-5-5"),
+            some(&["low", "medium", "high", "xhigh", "max"])
+        );
+        assert_eq!(
+            levels("anthropic", "claude-sonnet-5"),
+            some(&["low", "high"])
+        );
+        assert_eq!(
+            levels("anthropic", "claude-haiku-4-5"),
+            some(&["high", "max"])
+        );
+        assert_eq!(levels("anthropic", "claude-no-ceiling"), None);
+        assert_eq!(levels("anthropic", "claude-3-haiku"), some(&[]));
+
+        assert_eq!(levels("cheap", "gpt-x"), some(&["none", "low", "xhigh"]));
+        assert_eq!(levels("cheap", "qwen-budget"), None);
+        assert_eq!(levels("cheap", "no-reasoning"), some(&[]));
+        assert_eq!(levels("cheap", "switch-off"), some(&[]));
+        assert_eq!(levels("cheap", "unsaid"), None);
+        assert_eq!(levels("cheap", "odd"), None);
     }
 
     /// models.dev leaves `api` unset for providers whose SDK hardcodes
@@ -1577,19 +2031,18 @@ mod tests {
         assert_eq!(resolve_key(None, Some("")), None);
     }
 
-    /// Both places, in one message.
     #[test]
-    fn key_hint_names_the_variable_and_the_config_file() {
-        let hint = key_hint("openrouter", Some("OPENROUTER_API_KEY"));
-        assert!(hint.contains("OPENROUTER_API_KEY"), "{hint}");
-        assert!(hint.contains("[providers.openrouter]"), "{hint}");
-        assert!(hint.contains("llmman.conf"), "{hint}");
-
-        // No variable to name: the file alone, and no dangling "or".
-        let hint = key_hint("gpubox", None);
-        assert!(hint.contains("[providers.gpubox]"), "{hint}");
-        assert!(hint.contains("llmman.conf"), "{hint}");
-        assert!(!hint.contains("environment"), "{hint}");
+    fn key_hint_names_the_variable_and_the_command() {
+        assert_eq!(
+            key_hint("openrouter", Some("OPENROUTER_API_KEY")),
+            "set OPENROUTER_API_KEY in the environment, or run \
+             `llmman config set providers.openrouter.api_key <key>`"
+        );
+        // No variable to name: the command alone, and no dangling "or".
+        assert_eq!(
+            key_hint("inferencebox", None),
+            "run `llmman config set providers.inferencebox.api_key <key>`"
+        );
     }
 
     fn configured(id: &str, base_url: &str, wire: Wire) -> crate::config::ConfiguredProvider {
@@ -1619,7 +2072,7 @@ mod tests {
             }"#,
         )
         .with_configured(&[
-            configured("gpubox", "http://gpubox:8000/v1", Wire::OpenAi),
+            configured("inferencebox", "http://inferencebox:8000/v1", Wire::OpenAi),
             crate::config::ConfiguredProvider {
                 id: "relay".into(),
                 name: "Claude relay".into(),
@@ -1632,19 +2085,19 @@ mod tests {
         assert_eq!(catalog.len(), 3);
         assert_eq!(
             catalog.ids().collect::<Vec<_>>(),
-            ["gpubox", "openrouter", "relay"]
+            ["inferencebox", "openrouter", "relay"]
         );
 
-        let gpubox = catalog.get("gpubox").unwrap();
-        assert_eq!(gpubox.base_url, "http://gpubox:8000/v1");
-        assert_eq!(gpubox.wire, Wire::OpenAi);
-        assert!(gpubox.key_optional);
-        assert_eq!(gpubox.key_env, None);
-        assert!(gpubox.models.is_empty());
-        assert_eq!(gpubox.api_key(), None);
+        let inferencebox = catalog.get("inferencebox").unwrap();
+        assert_eq!(inferencebox.base_url, "http://inferencebox:8000/v1");
+        assert_eq!(inferencebox.wire, Wire::OpenAi);
+        assert!(inferencebox.key_optional);
+        assert_eq!(inferencebox.key_env, None);
+        assert!(inferencebox.models.is_empty());
+        assert_eq!(inferencebox.api_key(), None);
         assert_eq!(
-            gpubox.url("/v1/chat/completions"),
-            "http://gpubox:8000/v1/chat/completions"
+            inferencebox.url("/v1/chat/completions"),
+            "http://inferencebox:8000/v1/chat/completions"
         );
 
         let relay = catalog.get("relay").unwrap();
@@ -1694,12 +2147,12 @@ mod tests {
     #[test]
     fn configured_providers_stand_alone_without_the_catalog() {
         let catalog = Catalog::from_configured(&[configured(
-            "gpubox",
-            "http://gpubox:8000/v1",
+            "inferencebox",
+            "http://inferencebox:8000/v1",
             Wire::OpenAi,
         )]);
         assert_eq!(catalog.len(), 1);
-        assert!(catalog.get("gpubox").is_some());
+        assert!(catalog.get("inferencebox").is_some());
         assert!(Catalog::from_configured(&[]).is_empty());
     }
 
@@ -1721,19 +2174,24 @@ mod tests {
         }
     }
 
-    /// models.dev ships `wafer.ai`, and `[providers.wafer.ai]` is two
-    /// nested tables rather than that key — a hint saying so would not
-    /// configure the provider it names.
+    /// models.dev ships `wafer.ai`; `providers.wafer.ai` is two nested
+    /// tables, so the key is TOML-quoted and then shell-quoted.
     #[test]
-    fn key_hint_quotes_a_provider_id_that_is_not_a_bare_toml_key() {
-        assert!(
-            key_hint("wafer.ai", Some("WAFER_API_KEY")).contains(r#"[providers."wafer.ai"]"#),
-            "{}",
-            key_hint("wafer.ai", Some("WAFER_API_KEY"))
+    fn key_hint_quotes_an_id_that_is_not_a_bare_toml_key() {
+        assert_eq!(
+            key_hint("wafer.ai", None),
+            r#"run `llmman config set 'providers."wafer.ai".api_key' <key>`"#
         );
-        assert_eq!(toml_key("openrouter"), "openrouter");
-        assert_eq!(toml_key("z-ai"), "z-ai");
-        assert_eq!(toml_key("wafer.ai"), r#""wafer.ai""#);
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word(""), "''");
+
+        // Quoted or not, the key parses back to exactly the id.
+        for id in ["z-ai", "wafer.ai", "it's", "a\"b"] {
+            let key = format!("providers.{}.api_key", crate::config::toml_key(id));
+            let parts = toml_edit::Key::parse(&key).expect("a valid dotted key");
+            let parts: Vec<&str> = parts.iter().map(toml_edit::Key::get).collect();
+            assert_eq!(parts, ["providers", id, "api_key"], "{key}");
+        }
     }
 
     /// The listing has to stay short enough to read in an error message
@@ -1769,25 +2227,78 @@ mod tests {
         let cost = |json: &str| cost_of(&serde_json::from_str(json).unwrap());
         assert_eq!(
             cost(r#"{"input": 2.5, "output": 10}"#),
-            Some(Cost {
-                input: 2.5,
-                output: 10.0
-            })
+            Some(Cost::flat(2.5, 10.0))
         );
         // A genuinely free model is a price, not a missing one.
         assert_eq!(
-            cost(r#"{"input": 0, "output": 0, "cache_read": 1}"#),
-            Some(Cost {
-                input: 0.0,
-                output: 0.0
-            })
+            cost(r#"{"input": 0, "output": 0}"#),
+            Some(Cost::flat(0.0, 0.0))
         );
         // Half a price, no price, and a shape llmman doesn't recognize.
         assert_eq!(cost(r#"{"input": 2.5}"#), None);
+        assert_eq!(cost(r#"{"cache_read": 1}"#), None);
         assert_eq!(cost(r#"{}"#), None);
         assert_eq!(cost(r#"{"input": "2.5", "output": "10"}"#), None);
         assert_eq!(cost(r#"{"input": -1, "output": 10}"#), None);
         assert_eq!(cost(r#"[]"#), None);
+    }
+
+    /// Cache and reasoning rates are kept when published, `None` (not
+    /// zero) when not.
+    #[test]
+    fn cost_of_keeps_the_cache_rates() {
+        let cost = |json: &str| cost_of(&serde_json::from_str(json).unwrap()).unwrap();
+        let sonnet = cost(
+            r#"{"input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75, "reasoning": 20}"#,
+        );
+        assert_eq!(sonnet.cache_read, Some(0.3));
+        assert_eq!(sonnet.cache_write, Some(3.75));
+        assert_eq!(sonnet.reasoning, Some(20.0));
+        let partial = cost(r#"{"input": 2.5, "output": 10, "cache_read": "0.25"}"#);
+        assert_eq!(partial, Cost::flat(2.5, 10.0));
+    }
+
+    /// `tiers` wins over `context_over_200k`, the fallback when it has
+    /// nothing usable.
+    #[test]
+    fn cost_of_reads_context_tiers() {
+        let cost = |json: &str| cost_of(&serde_json::from_str(json).unwrap()).unwrap();
+        let gpt = cost(
+            r#"{"input": 2.5, "output": 15, "cache_read": 0.25,
+                "tiers": [{"input": 5, "output": 22.5, "cache_read": 0.5, "tier": {"type": "context", "size": 272000}}],
+                "context_over_200k": {"input": 5, "output": 22.5, "cache_read": 0.5}}"#,
+        );
+        assert_eq!(
+            gpt.tiers,
+            vec![Tier {
+                above: 272_000,
+                price: Cost {
+                    cache_read: Some(0.5),
+                    ..Cost::flat(5.0, 22.5)
+                },
+            }]
+        );
+        let legacy = cost(
+            r#"{"input": 3, "output": 15, "context_over_200k": {"input": 6, "output": 22.5}}"#,
+        );
+        assert_eq!(legacy.tiers.len(), 1);
+        assert_eq!(legacy.tiers[0].above, 200_000);
+        // Sorted, deduplicated, and a tier llmman can't read is skipped.
+        let many = cost(
+            r#"{"input": 1, "output": 2, "tiers": [
+                {"input": 4, "output": 8, "tier": {"type": "context", "size": 128000}},
+                {"input": 2, "output": 4, "tier": {"type": "context", "size": 32000}},
+                {"input": 9, "output": 9, "tier": {"type": "context", "size": 32000}},
+                {"input": 3, "output": 6, "tier": {"type": "time_of_day", "size": 64000}},
+                {"input": 3, "tier": {"type": "context", "size": 64000}}]}"#,
+        );
+        let above: Vec<u64> = many.tiers.iter().map(|t| t.above).collect();
+        assert_eq!(above, [32_000, 128_000]);
+        let unusable = cost(
+            r#"{"input": 3, "output": 15, "tiers": [{"input": 6, "tier": {"type": "context", "size": 1}}],
+                "context_over_200k": {"input": 6, "output": 22.5}}"#,
+        );
+        assert_eq!(unusable.tiers[0].above, 200_000);
     }
 
     /// The reason `cost` is untyped: a shape llmman doesn't know costs

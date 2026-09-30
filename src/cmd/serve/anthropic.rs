@@ -25,12 +25,13 @@ use axum::response::Response;
 use reqwest::Client;
 use serde_json::{json, Value};
 
+use super::hybrid::send_with_hybrid_fallback;
 use super::openai::apply_default_repeat_penalty;
+use super::relay::{convert_upstream, relay_rewriting_model, relay_stream_rewriting_model};
 use super::sched::{begin_activity, ActivityGuard};
 use super::{
-    backend_wire_model, chat_body, convert_upstream, messages, relay_rewriting_model,
-    relay_stream_rewriting_model, repeat_penalty_applies, send_chat_completion,
-    send_with_hybrid_fallback, AppError, AppState, Target,
+    backend_wire_model, chat_body, messages, repeat_penalty_applies, send_chat_completion,
+    AppError, AppState, Target,
 };
 
 /// The generating Messages route, appended to a provider's base URL.
@@ -46,8 +47,8 @@ pub(super) const VERSION: &str = "2023-06-01";
 pub(super) const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// Thinking budgets per `reasoning_effort` level (every one of
-/// `crate::chat_template::EFFORT_LEVELS`, in its order). The Messages
-/// API has only a token budget, spent from `max_tokens`.
+/// `crate::chat_template::EFFORT_LEVELS`, in its order) for a model that
+/// thinks on a budget spent from `max_tokens`; see [`adaptive_thinker`].
 const THINKING_BUDGETS: [(&str, u32); 6] = [
     ("minimal", 1024),
     ("low", 2048),
@@ -67,8 +68,8 @@ pub(super) fn portable_efforts() -> &'static [(&'static str, u32)] {
 /// The smallest budget the API accepts.
 const MIN_THINKING_BUDGET: u32 = 1024;
 
-/// The beta that lets a model think between tool calls, not only before
-/// the first; sent whenever thinking is enabled.
+/// The beta that lets a budgeted model think between tool calls too;
+/// sent whenever [`manual_thinking`]. Adaptive thinking needs none.
 pub(super) const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 
 /// The forced tool a `response_format` JSON schema becomes (the API has
@@ -209,21 +210,35 @@ pub(super) fn from_chat_request(req: &Value, default_max_tokens: u32) -> anyhow:
         out["tool_choice"] = choice;
     }
 
-    // With thinking on, a final assistant turn holding a tool call must
-    // start with its signed thinking block, which no OpenAI client can
-    // hand back. A tool loop's continuation runs without thinking.
-    let awaiting_tool = out["messages"]
-        .as_array()
-        .and_then(|m| m.iter().rev().find(|m| m["role"] == "assistant"))
-        .is_some_and(|m| has_block(m, "tool_use"));
-    // Nor with a forced tool, which is the caller's output contract.
-    let forced = matches!(
-        out.pointer("/tool_choice/type").and_then(Value::as_str),
-        Some("any" | "tool")
-    );
-    if let Some(budget) = thinking_budget(req, max_tokens).filter(|_| !awaiting_tool && !forced) {
-        out["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
-        // Thinking forbids sampling overrides.
+    let model = req.get("model").and_then(Value::as_str).unwrap_or("");
+    let effort = req.get("reasoning_effort").and_then(Value::as_str);
+    if adaptive_thinker(model) {
+        if let Some(effort) = effort {
+            adaptive_thinking(model, effort, &mut out);
+        }
+    } else {
+        // A budgeted final assistant turn holding a tool call must start
+        // with its signed thinking block, which no OpenAI client can hand
+        // back; a forced tool is the caller's output contract. Neither
+        // thinks.
+        let awaiting_tool = out["messages"]
+            .as_array()
+            .and_then(|m| m.iter().rev().find(|m| m["role"] == "assistant"))
+            .is_some_and(|m| has_block(m, "tool_use"));
+        let forced = matches!(
+            out.pointer("/tool_choice/type").and_then(Value::as_str),
+            Some("any" | "tool")
+        );
+        if let Some(budget) = thinking_budget(req, max_tokens).filter(|_| !awaiting_tool && !forced)
+        {
+            out["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        }
+    }
+    // Thinking forbids sampling overrides.
+    if out
+        .pointer("/thinking/type")
+        .is_some_and(|t| t != "disabled")
+    {
         if let Some(o) = out.as_object_mut() {
             o.remove("temperature");
             o.remove("top_p");
@@ -234,10 +249,81 @@ pub(super) fn from_chat_request(req: &Value, default_max_tokens: u32) -> anyhow:
     Ok(out)
 }
 
-/// Whether thinking is on in a translated request; the caller adds
-/// [`INTERLEAVED_THINKING_BETA`] for it.
-pub(super) fn thinks(messages_req: &Value) -> bool {
-    messages_req.get("thinking").is_some()
+/// Whether `model` thinks adaptively, steered by `output_config.effort`:
+/// a Claude from 4.6 (where a budget is deprecated; from 4.7 a 400) or
+/// unversioned. Older Claudes and other vendors take a budget.
+fn adaptive_thinker(model: &str) -> bool {
+    claude(model) && claude_version(model).is_none_or(|v| v >= (4, 6))
+}
+
+/// Adaptive thinking at `effort`, with the summarized text 4.7+ omit by
+/// default. `minimal` is `low`; `xhigh` is `high` on 4.6, which lacks it;
+/// an unknown level is the model's default. `none` is `disabled`, or
+/// `low` on Fable and Mythos, which always think.
+fn adaptive_thinking(model: &str, effort: &str, out: &mut Value) {
+    let lower = model.to_ascii_lowercase();
+    let always_thinks = lower.contains("fable") || lower.contains("mythos");
+    if effort == "none" && !always_thinks {
+        out["thinking"] = json!({ "type": "disabled" });
+        return;
+    }
+    out["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
+    let effort = match effort {
+        "none" | "minimal" => "low",
+        "xhigh" if claude_version(model) == Some((4, 6)) => "high",
+        "low" | "medium" | "high" | "xhigh" | "max" => effort,
+        _ => return,
+    };
+    out["output_config"] = json!({ "effort": effort });
+}
+
+fn claude(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("claude")
+}
+
+/// Drops the sampling overrides Claude 400s. `top_p` is deprecated:
+/// from Opus 4.1/Sonnet 4.5 it cannot join `temperature`, and a model
+/// after Opus 4.6 rejects any non-default value of either, so `top_p`
+/// yields to `temperature`, and both go on a later model bar a
+/// `temperature` of 1.0. Other vendors' models keep theirs.
+pub(super) fn sampling_compat(model: &str, req: &mut serde_json::Map<String, Value>) {
+    if !claude(model) {
+        return;
+    }
+    let fixed = fixed_sampling(model);
+    let temperature = req.get("temperature").and_then(Value::as_f64);
+    if fixed || temperature.is_some() {
+        req.remove("top_p");
+    }
+    if fixed && temperature != Some(1.0) {
+        req.remove("temperature");
+    }
+}
+
+/// Whether a Claude is newer than Opus 4.6: versioned above it, or
+/// unversioned (a preview).
+fn fixed_sampling(model: &str) -> bool {
+    claude_version(model).is_none_or(|v| v > (4, 6))
+}
+
+/// The version in a Claude model name: `claude-sonnet-4-5-20250929` and
+/// `claude-3-5-sonnet-20241022` are (4, 5) and (3, 5), `claude-sonnet-5`
+/// is (5, 0). A date or build suffix is not a version segment.
+fn claude_version(model: &str) -> Option<(u32, u32)> {
+    let is_version = |s: &&str| (1..=2).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit());
+    let mut numbers = model
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .skip_while(|s| !is_version(s))
+        .take_while(is_version)
+        .filter_map(|s| s.parse::<u32>().ok());
+    let major = numbers.next()?;
+    Some((major, numbers.next().unwrap_or(0)))
+}
+
+/// Whether a translated request thinks on a budget; the caller adds
+/// [`INTERLEAVED_THINKING_BETA`] for it. Adaptive thinking needs no beta.
+pub(super) fn manual_thinking(messages_req: &Value) -> bool {
+    messages_req.pointer("/thinking/type") == Some(&json!("enabled"))
 }
 
 /// The name [`from_chat_request`] injects a schema tool under, or `None`
@@ -718,6 +804,7 @@ pub(super) struct StreamConverter {
     finish_reason: Option<&'static str>,
     prompt_tokens: u64,
     cached_tokens: u64,
+    cache_write_tokens: u64,
     completion_tokens: u64,
     error: Option<Value>,
 }
@@ -751,6 +838,7 @@ impl StreamConverter {
             finish_reason: None,
             prompt_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             completion_tokens: 0,
             error: None,
         }
@@ -1043,7 +1131,8 @@ impl StreamConverter {
 
     /// `message_start` carries input usage, `message_delta` output usage.
     /// Cache reads and writes are billed input, so they count into
-    /// `prompt_tokens` as OpenAI counts them.
+    /// `prompt_tokens` as OpenAI counts them; writes are also given as
+    /// OpenRouter's `cache_write_tokens`, billed above input.
     fn read_usage(&mut self, usage: Option<&Value>) {
         let Some(usage) = usage else {
             return;
@@ -1054,6 +1143,7 @@ impl StreamConverter {
             let written = n("cache_creation_input_tokens").unwrap_or(0);
             self.prompt_tokens = input + read + written;
             self.cached_tokens = read;
+            self.cache_write_tokens = written;
         }
         if let Some(output) = n("output_tokens") {
             self.completion_tokens = output;
@@ -1065,7 +1155,10 @@ impl StreamConverter {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.prompt_tokens + self.completion_tokens,
-            "prompt_tokens_details": { "cached_tokens": self.cached_tokens },
+            "prompt_tokens_details": {
+                "cached_tokens": self.cached_tokens,
+                "cache_write_tokens": self.cache_write_tokens,
+            },
         })
     }
 }
@@ -1619,7 +1712,7 @@ mod tests {
             "reasoning_effort": "high", "max_tokens": 64000
         }));
         assert!(out.get("thinking").is_none(), "{out}");
-        assert!(!thinks(&out));
+        assert!(!manual_thinking(&out));
 
         let fresh = convert(json!({
             "messages": [
@@ -1632,7 +1725,7 @@ mod tests {
             "tools": [{ "type": "function", "function": { "name": "f" } }],
             "reasoning_effort": "high", "max_tokens": 64000
         }));
-        assert!(thinks(&fresh), "{fresh}");
+        assert!(manual_thinking(&fresh), "{fresh}");
     }
 
     /// Images in a tool result are carried as image blocks.
@@ -1677,6 +1770,40 @@ mod tests {
         assert_eq!(fallback["metadata"], json!({ "user_id": "s1" }));
         // No Messages equivalent: dropped rather than sent to be 400'd.
         assert!(out.get("frequency_penalty").is_none());
+    }
+
+    /// The version is read from either side of the family name, never
+    /// from a date; above 4.6 or absent means fixed sampling, from 4.6
+    /// or absent adaptive thinking.
+    #[test]
+    fn claude_versions_tell_fixed_sampling_and_adaptive_thinking_apart() {
+        for (model, version, fixed, adaptive) in [
+            ("claude-sonnet-5", Some((5, 0)), true, true),
+            ("claude-fable-5-1", Some((5, 1)), true, true),
+            ("claude-opus-4-7", Some((4, 7)), true, true),
+            ("claude-mythos-preview", None, true, true),
+            ("claude", None, true, true),
+            ("claude-opus-4-6", Some((4, 6)), false, true),
+            ("claude-sonnet-4-6", Some((4, 6)), false, true),
+            ("claude-haiku-4-5-20251001", Some((4, 5)), false, false),
+            ("claude-sonnet-4-20250514", Some((4, 0)), false, false),
+            ("claude-opus-4-1@20250805", Some((4, 1)), false, false),
+            (
+                "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                Some((3, 5)),
+                false,
+                false,
+            ),
+            ("claude-2.1", Some((2, 1)), false, false),
+            ("Claude-3-7-Sonnet-Latest", Some((3, 7)), false, false),
+        ] {
+            assert_eq!(claude_version(model), version, "{model}");
+            assert_eq!(fixed_sampling(model), fixed, "{model}");
+            assert_eq!(adaptive_thinker(model), adaptive, "{model}");
+        }
+        assert_eq!(claude_version("MiniMax-M2"), None);
+        assert!(!adaptive_thinker("MiniMax-M2"));
+        assert!(!adaptive_thinker(""));
     }
 
     /// Calls become `tool_use` blocks with decoded arguments, and every
@@ -1848,6 +1975,88 @@ mod tests {
         assert_eq!(none["temperature"], Value::Null);
     }
 
+    /// On a Claude from 4.6, `reasoning_effort` is adaptive thinking with
+    /// the level as `output_config.effort`, never a budget; `none` turns
+    /// thinking off where the model allows. No beta, sampling still goes.
+    #[test]
+    fn reasoning_effort_steers_an_adaptive_claude_by_effort() {
+        let with = |model: &str, effort: &str| {
+            convert(json!({
+                "model": model,
+                "messages": [{ "role": "user", "content": "hi" }],
+                "reasoning_effort": effort, "max_tokens": 1500, "temperature": 0.1
+            }))
+        };
+        let out = with("claude-sonnet-5", "high");
+        assert_eq!(
+            out["thinking"],
+            json!({ "type": "adaptive", "display": "summarized" })
+        );
+        assert_eq!(out["output_config"], json!({ "effort": "high" }));
+        assert!(out.get("temperature").is_none(), "{out}");
+        assert!(!manual_thinking(&out));
+
+        for (model, level, effort) in [
+            ("claude-sonnet-5", "minimal", "low"),
+            ("claude-sonnet-5", "xhigh", "xhigh"),
+            ("claude-sonnet-5", "max", "max"),
+            ("claude-opus-4-6", "xhigh", "high"),
+        ] {
+            assert_eq!(
+                with(model, level)["output_config"]["effort"],
+                effort,
+                "{level}"
+            );
+        }
+        let unknown = with("claude-sonnet-5", "verbose");
+        assert_eq!(unknown["thinking"]["type"], "adaptive");
+        assert!(unknown.get("output_config").is_none(), "{unknown}");
+
+        let off = with("claude-sonnet-5", "none");
+        assert_eq!(off["thinking"], json!({ "type": "disabled" }));
+        assert_eq!(off["temperature"], 0.1);
+        for model in ["claude-fable-5-1", "claude-mythos-preview"] {
+            let least = with(model, "none");
+            assert_eq!(least["thinking"]["type"], "adaptive", "{model}");
+            assert_eq!(least["output_config"]["effort"], "low", "{model}");
+        }
+
+        let unset = convert(json!({
+            "model": "claude-sonnet-5",
+            "messages": [{ "role": "user", "content": "hi" }]
+        }));
+        assert!(unset.get("thinking").is_none());
+    }
+
+    /// Adaptive thinking needs no signed block ahead of a tool call and
+    /// allows a forced tool, so neither turns it off as they do a budget.
+    #[test]
+    fn adaptive_thinking_stays_on_through_tool_calls() {
+        let tool = json!({ "type": "function", "function": { "name": "f" } });
+        let continuation = convert(json!({
+            "model": "claude-sonnet-5",
+            "messages": [
+                { "role": "user", "content": "go" },
+                { "role": "assistant", "tool_calls": [{ "id": "a", "type": "function", "function": { "name": "f", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "a", "content": "ok" }
+            ],
+            "tools": [tool], "reasoning_effort": "high"
+        }));
+        assert_eq!(
+            continuation["thinking"]["type"], "adaptive",
+            "{continuation}"
+        );
+        assert_eq!(continuation["output_config"]["effort"], "high");
+
+        let forced = convert(json!({
+            "model": "claude-sonnet-5",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [tool], "tool_choice": "required", "reasoning_effort": "high"
+        }));
+        assert_eq!(forced["tool_choice"], json!({ "type": "any" }));
+        assert_eq!(forced["thinking"]["type"], "adaptive", "{forced}");
+    }
+
     /// A `tool` message without an id cannot be matched to its call.
     #[test]
     fn a_tool_result_without_an_id_is_an_error() {
@@ -1910,7 +2119,7 @@ mod tests {
             ev[3]["usage"],
             json!({
                 "prompt_tokens": 35, "completion_tokens": 4, "total_tokens": 39,
-                "prompt_tokens_details": { "cached_tokens": 10 }
+                "prompt_tokens_details": { "cached_tokens": 10, "cache_write_tokens": 0 }
             })
         );
         assert_eq!(ev[4], "[DONE]");

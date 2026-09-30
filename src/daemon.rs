@@ -1116,9 +1116,23 @@ pub struct ShowResponse {
     /// The model's chat template, if any (see `crate::modelpack::chat_template`).
     #[serde(default)]
     pub template: Option<String>,
+    /// The GGUF header's metadata keys. Untyped so that any shape an
+    /// older daemon sends decodes.
+    #[serde(default)]
+    pub model_info: serde_json::Value,
 }
 
 impl ShowResponse {
+    /// The trained context, `{general.architecture}.context_length`;
+    /// `None` when absent or zero.
+    pub fn context_length(&self) -> Option<u64> {
+        let arch = self.model_info.get("general.architecture")?.as_str()?;
+        self.model_info
+            .get(format!("{arch}.context_length"))?
+            .as_u64()
+            .filter(|n| *n > 0)
+    }
+
     /// The template's thinking controls; `None` without a template.
     pub fn thinking_controls(&self) -> Option<crate::chat_template::ThinkingControls> {
         self.template
@@ -1222,6 +1236,72 @@ pub fn unload(reference: &str) -> anyhow::Result<bool> {
         return Ok(false);
     }
     anyhow::bail!("stop {reference}: server returned {status}: {body}");
+}
+
+/// Loads `reference` and reports the context window the runner actually
+/// got, from `/api/ps` — the post-load `n_ctx`, not the trained context
+/// `/api/show` reports. `None` when the daemon does not report one: a
+/// vLLM- or MLX-backed model, or a load that failed.
+///
+/// The load is the point. `ensure_model_pulled` only pulls, and
+/// `ensure_server` preloads only when it spawns, so on a reused daemon
+/// the model is usually still cold — and an OOM retry halves `--ctx-size`
+/// during that load, which is exactly the value a caller needs to read
+/// back rather than predict.
+pub fn loaded_context_length(reference: &str) -> Option<u64> {
+    // Ollama's load sentinel: no prompt, and no `keep_alive` of its
+    // own, so the daemon's default decides how long the model stays
+    // (an absent field never reads as an unload — see
+    // `is_explicit_unload` in cmd::serve). This only asks for the load,
+    // so `/api/ps` has something to report.
+    client()
+        .ok()?
+        .post(format!("{}/api/generate", server()))
+        .json(&serde_json::json!({"model": reference}))
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    let ps: PsWindows = get_json("/api/ps").ok()?;
+    ps_window(ps.models, reference)
+}
+
+/// `reference`'s window among the models `/api/ps` reports loaded.
+///
+/// The tag is defaulted on both sides: `/api/ps` answers under the
+/// reference `ensure_model` loaded the model as, which it ran through
+/// `default_tag` first, while a caller's own spelling is untagged
+/// (`resolve_ollama_api` leaves `gemma4` as `docker.io/ai/gemma4`). An
+/// exact match therefore finds nothing and reports no window at all.
+fn ps_window(models: Vec<PsWindow>, reference: &str) -> Option<u64> {
+    let local = crate::storage::default_tag(crate::hybrid::local_half(reference));
+    models
+        .into_iter()
+        .find(|m| crate::storage::default_tag(&m.name) == local)
+        .and_then(|m| m.context_length)
+}
+
+/// The two `/api/ps` fields [`loaded_context_length`] needs; the CLI's
+/// own `cmd::ps` parses the rest for display.
+#[derive(serde::Deserialize)]
+struct PsWindows {
+    models: Vec<PsWindow>,
+}
+
+#[derive(serde::Deserialize)]
+struct PsWindow {
+    name: String,
+    context_length: Option<u64>,
+}
+
+#[cfg(test)]
+impl PsWindow {
+    fn new(name: &str, context_length: Option<u64>) -> Self {
+        Self {
+            name: name.to_string(),
+            context_length,
+        }
+    }
 }
 
 /// The `{"error":"model '<name>' not found"}` this daemon sends for
@@ -1347,6 +1427,18 @@ pub struct ProviderModel {
     /// `None` where models.dev publishes no price, which is not free.
     #[serde(default)]
     pub cost: Option<ModelCost>,
+    /// See `crate::providers::Model::thinking`; `None` from an older daemon too.
+    #[serde(default)]
+    pub thinking: Option<Vec<String>>,
+    /// The window this model can hold (models.dev `limit.context`).
+    /// `None` from an older daemon, and for a provider defined in
+    /// `llmman.conf`, which has no catalog entry.
+    #[serde(default)]
+    pub context: Option<u64>,
+    /// The most this model will emit in one reply (models.dev
+    /// `limit.output`), `None` on the same terms as `context`.
+    #[serde(default)]
+    pub output: Option<u32>,
 }
 
 /// US dollars per million tokens (see [`crate::providers::Cost`]).
@@ -1354,6 +1446,13 @@ pub struct ProviderModel {
 pub struct ModelCost {
     pub input: f64,
     pub output: f64,
+    /// `None` where models.dev publishes none, or from an older daemon.
+    #[serde(default)]
+    pub cache_read: Option<f64>,
+    #[serde(default)]
+    pub cache_write: Option<f64>,
+    #[serde(default)]
+    pub reasoning: Option<f64>,
 }
 
 impl ProviderDetail {
@@ -1374,6 +1473,36 @@ impl ProviderDetail {
     /// `crate::providers::example_models`).
     pub fn model_ids(&self) -> Vec<&str> {
         self.models.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    /// The catalog's thinking levels for `model`, if it lists any.
+    pub fn thinking_levels(&self, model: &str) -> Option<Vec<String>> {
+        self.models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.thinking.clone())
+    }
+
+    /// The catalog's window for `model` (models.dev `limit.context`).
+    /// `None` from an older daemon, and for a provider defined in
+    /// `llmman.conf`.
+    pub fn context_window(&self, model: &str) -> Option<u64> {
+        self.models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.context)
+    }
+
+    /// The catalog's output ceiling for `model` (models.dev
+    /// `limit.output`), on the same terms as [`Self::context_window`].
+    /// What the provider will actually accept as a max-output request,
+    /// which is not derivable from the window: a 128k-context model may
+    /// still refuse to be asked for more than 8k of reply.
+    pub fn max_output(&self, model: &str) -> Option<u32> {
+        self.models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.output)
     }
 
     /// Where a key for this provider would go (see
@@ -1425,14 +1554,26 @@ impl ProviderDetail {
 /// Looks one provider up in the daemon's catalog. An unknown id comes
 /// back as the daemon's own error, near-matches included (see
 /// `crate::providers::unknown_provider_error`).
-pub fn provider(id: &str) -> anyhow::Result<ProviderDetail> {
-    get_json(&format!("/llmman/providers/{}", encode_path_segment(id)))
+///
+/// `model` is the one the caller is about to use, if any: a daemon whose
+/// catalog lacks it re-fetches before answering. Older daemons ignore it.
+pub fn provider(id: &str, model: Option<&str>) -> anyhow::Result<ProviderDetail> {
+    get_json(&provider_path(id, model))
+}
+
+/// The route for [`provider`], `model` as one encoded query value.
+fn provider_path(id: &str, model: Option<&str>) -> String {
+    let query = model
+        .map(|m| format!("?model={}", encode_path_segment(m)))
+        .unwrap_or_default();
+    format!("/llmman/providers/{}{query}", encode_path_segment(id))
 }
 
 /// Percent-encodes everything outside the unreserved set, so a typo'd id
 /// stays one path segment: `a/b` would otherwise miss the daemon's
 /// single-segment route (an empty 404 from axum's router instead of
-/// llmman's "unknown provider"), and `../` would address another.
+/// llmman's "unknown provider"), and `../` would address another. Also
+/// right for a query value, where `&` and `#` would end it.
 fn encode_path_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
@@ -1449,6 +1590,45 @@ fn encode_path_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn show_response(body: serde_json::Value) -> ShowResponse {
+        serde_json::from_value(body).expect("a ShowResponse")
+    }
+
+    #[test]
+    fn context_length_is_read_under_the_declared_architecture() {
+        let info = show_response(serde_json::json!({
+            "model_info": {
+                "general.architecture": "qwen35",
+                "qwen35.context_length": 32768,
+                "llama.context_length": 4096,
+            }
+        }));
+        assert_eq!(info.context_length(), Some(32768));
+    }
+
+    #[test]
+    fn context_length_is_none_without_a_usable_header() {
+        assert_eq!(show_response(serde_json::json!({})).context_length(), None);
+        for model_info in [
+            // What a daemon older than #512 sends.
+            serde_json::json!({ "digest": "sha256:a", "size": 1 }),
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({ "llama.context_length": 4096 }),
+            serde_json::json!({
+                "general.architecture": "llama",
+                "llama.context_length": "4096",
+            }),
+            serde_json::json!({
+                "general.architecture": "llama",
+                "llama.context_length": 0,
+            }),
+        ] {
+            let info = show_response(serde_json::json!({ "model_info": model_info.clone() }));
+            assert_eq!(info.context_length(), None, "{model_info}");
+        }
+    }
 
     /// The two locality questions differ on exactly one host, and it is
     /// the one that matters: a wildcard bind is reached over loopback
@@ -1477,6 +1657,23 @@ mod tests {
 
     /// A typo'd id has to stay one segment, or the daemon's "unknown
     /// provider" answer never gets printed.
+    /// The model stays one query value, whatever `/`, `&` or `#` it holds.
+    #[test]
+    fn provider_path_carries_the_model_as_one_query_value() {
+        assert_eq!(
+            provider_path("anthropic", None),
+            "/llmman/providers/anthropic"
+        );
+        assert_eq!(
+            provider_path("anthropic", Some("claude-sonnet-5-5")),
+            "/llmman/providers/anthropic?model=claude-sonnet-5-5"
+        );
+        assert_eq!(
+            provider_path("openrouter", Some("anthropic/claude-sonnet-5.5&x=1#f")),
+            "/llmman/providers/openrouter?model=anthropic%2Fclaude-sonnet-5.5%26x%3D1%23f"
+        );
+    }
+
     #[test]
     fn encode_path_segment_keeps_a_typo_inside_one_segment() {
         assert_eq!(encode_path_segment("openrouter"), "openrouter");
@@ -1820,5 +2017,41 @@ mod tests {
             r#"{"message":"model 'docker.io/ai/m' not found"}"#,
             m
         ));
+    }
+
+    /// The window is found under the caller's own spelling, not only
+    /// the one the daemon loaded the model under. The untagged form
+    /// `resolve_ollama_api` hands `llmman launch` is the common case.
+    #[test]
+    fn a_loaded_window_is_found_however_its_reference_is_tagged() {
+        let loaded = || {
+            vec![
+                PsWindow::new("docker.io/ai/other:latest", Some(4096)),
+                PsWindow::new("docker.io/ai/gemma4:latest", Some(32_768)),
+            ]
+        };
+        assert_eq!(ps_window(loaded(), "docker.io/ai/gemma4"), Some(32_768));
+        assert_eq!(
+            ps_window(loaded(), "docker.io/ai/gemma4:latest"),
+            Some(32_768)
+        );
+        // A pair is read back on its local half, the only loaded one.
+        assert_eq!(
+            ps_window(
+                loaded(),
+                "llmman.hybrid/docker.io/ai/gemma4,anthropic/claude-sonnet-4-5"
+            ),
+            Some(32_768)
+        );
+        // Another tag is another model, and a backend that reports no
+        // window of its own reports none.
+        assert_eq!(ps_window(loaded(), "docker.io/ai/gemma4:8b"), None);
+        assert_eq!(
+            ps_window(
+                vec![PsWindow::new("docker.io/ai/gemma4:latest", None)],
+                "docker.io/ai/gemma4"
+            ),
+            None
+        );
     }
 }
