@@ -154,7 +154,8 @@ A `choice` answer has the most probable option, its `confidence` and
 `score` the probability-weighted mean level, with the levels as `legend`.
 `usage` counts every question's prompt, so the state is counted once per
 question, with cache and reasoning counts when a provider reports them;
-hosted calls appear in `llmman usage`.
+hosted calls appear in `llmman usage`, including those answered beside a
+question that failed.
 
 Each answer's `x_source` says where its probabilities come from:
 
@@ -167,8 +168,8 @@ Each answer's `x_source` says where its probabilities come from:
   `/tokenize` and `/completion`); other engines get a 501. A label that is not
   one token at the answer position, a template that leaves a `<think>` block
   open, a model putting no probability on the labels, and a prompt past the
-  context are each a 400. `chat_template_kwargs` is accepted, over
-  `enable_thinking: false`.
+  context are each a 400. `chat_template_kwargs`, if given, is an object,
+  accepted over `enable_thinking: false`.
 - **A hosted model is asked** (`elicited`), for any provider and wire
   (`llmman.provider/<provider>/<model>`): hosted APIs show no token
   probabilities (Anthropic's has no logprobs), so the model states its
@@ -203,7 +204,9 @@ problem with its `loc`; any other refusal is a 400 in OpenAI's error shape,
 and a provider's refusal of the caller (a bad key, a rate limit) keeps its
 status. A choice takes 1 to 26 options (the schema allows 255; sglang labels
 the rest with two-letter tokens, llmman does not) and a score 1 to 10 levels.
-Unknown top-level fields are ignored; unknown keys in a question are refused.
+Unknown top-level fields are ignored, except `temperature`,
+`prompt_format_version` and `return_prompt_token_ids`, which are refused unless
+`null`, as sglang refuses them; unknown keys in a question are refused.
 
 ## llmman's own API
 

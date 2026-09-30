@@ -30,6 +30,7 @@ use super::openai::local_engine;
 use super::refusal::refuse;
 use super::relay::proxy;
 use super::sched::begin_activity;
+use super::usage::note_spent;
 use super::{
     ensure_model, provider_catalog, send_chat_completion, AppError, AppState, Engine, RemoteTarget,
     Target,
@@ -182,6 +183,14 @@ struct Request {
     /// The variant: how hard a hosted model thinks (an llmman extension).
     reasoning_effort: Option<String>,
 }
+
+/// `/v1/decisions` fields that would change an answer whether honored or
+/// ignored: sglang refuses any that is not `null`, and so does this.
+const REFUSED_FIELDS: [&str; 3] = [
+    "temperature",
+    "prompt_format_version",
+    "return_prompt_token_ids",
+];
 
 /// A variant level: `none` or any effort level.
 fn is_effort(level: &str) -> bool {
@@ -446,7 +455,8 @@ impl Request {
         let Some(fields) = parser.object(root, &body) else {
             return Err(parser.errors);
         };
-        // Unknown top-level fields are ignored, as the published schema allows.
+        // Unknown top-level fields are ignored, as the published schema allows,
+        // bar those in `REFUSED_FIELDS`.
         let state = match fields.get("state") {
             Some(state) => parser
                 .text(state, &at(&body, "state"))
@@ -471,8 +481,9 @@ impl Request {
                 None
             }
         };
+        // Only an absent field defaults: a present `null` is not a dictionary.
         let template_kwargs = match fields.get("chat_template_kwargs") {
-            None | Some(Node::Null) => Default::default(),
+            None => Default::default(),
             Some(kwargs @ Node::Object(_)) => match serde_json::to_value(kwargs) {
                 Ok(serde_json::Value::Object(map)) => map,
                 _ => Default::default(),
@@ -496,6 +507,12 @@ impl Request {
                 None
             }
         };
+        for field in REFUSED_FIELDS {
+            if !matches!(fields.get(field), None | Some(Node::Null)) {
+                let msg = format!("Value error, {field} is not part of this API");
+                parser.fail("value_error", &at(&body, field), msg);
+            }
+        }
         let path = at(&body, "questions");
         let questions = match fields.get("questions") {
             Some(Node::Object(map)) => {
@@ -1102,16 +1119,45 @@ impl Hosted<'_> {
         })
     }
 
-    async fn ask_all(&self, state: &str, questions: &[Question]) -> Result<Vec<Scored>, Failure> {
+    /// Every question, a few at a time. One failing does not cancel or
+    /// discard the others in its batch: they were billed, so they are counted
+    /// in [`Abandoned::spent`], and no further batch is sent.
+    async fn ask_all(&self, state: &str, questions: &[Question]) -> Result<Vec<Scored>, Abandoned> {
         let mut scored = Vec::new();
         for chunk in questions.chunks(HOSTED_CONCURRENCY) {
             let chunk = chunk.iter().map(|q| async move {
                 self.ask(state, q).await.map_err(|f| f.for_question(&q.id))
             });
-            scored.extend(futures::future::try_join_all(chunk).await?);
+            let mut failure = None;
+            // In question order, so the same failure is the one reported.
+            for result in futures::future::join_all(chunk).await {
+                match result {
+                    Ok(one) => scored.push(one),
+                    Err(f) => {
+                        failure.get_or_insert(f);
+                    }
+                }
+            }
+            if let Some(failure) = failure {
+                let spent = total_tokens(&scored);
+                return Err(Abandoned { failure, spent });
+            }
         }
         Ok(scored)
     }
+}
+
+/// Why hosted questions stopped, and what the ones answered used.
+#[derive(Debug)]
+struct Abandoned {
+    failure: Failure,
+    spent: Tokens,
+}
+
+fn total_tokens(scored: &[Scored]) -> Tokens {
+    let mut tokens = Tokens::default();
+    scored.iter().for_each(|s| tokens.add(&s.tokens));
+    tokens
 }
 
 // -- The answers -------------------------------------------------------------
@@ -1389,13 +1435,16 @@ pub(super) async fn handle_systemone(
             };
             match hosted.ask_all(&state_text, &request.questions).await {
                 Ok(scored) => scored,
-                Err(failure) => return failure.respond(),
+                Err(Abandoned { failure, spent }) => {
+                    // The failed reply reports none of it, but it was billed.
+                    note_spent(spent);
+                    return failure.respond();
+                }
             }
         }
     };
 
-    let mut tokens = Tokens::default();
-    scored.iter().for_each(|s| tokens.add(&s.tokens));
+    let tokens = total_tokens(&scored);
     let answers = request
         .questions
         .iter()
@@ -1663,6 +1712,58 @@ mod tests {
         // Allowed: an empty state, an empty id, a blank description, unknown top-level fields.
         let lenient = r#"{"state":"","model":"m","images":[],"questions":{"":{"type":"choice","criteria":{"a":"  "}}}}"#;
         assert!(parse(lenient).is_ok());
+    }
+
+    /// sglang refuses the `/v1/decisions` fields an ignored field would leave
+    /// silently changing the answers, unless `null`; and only an absent
+    /// `chat_template_kwargs` is an empty one.
+    #[test]
+    fn decisions_fields_and_a_null_kwargs_are_refused_as_sglang_does() {
+        let with = |extra: &str| {
+            format!(
+                r#"{{"state":"s","model":"m",{extra}"questions":{{"q":{{"type":"noul","instructions":"x"}}}}}}"#
+            )
+        };
+        for (field, value) in [
+            ("temperature", "0.7"),
+            ("temperature", "0"),
+            ("prompt_format_version", r#""2""#),
+            ("return_prompt_token_ids", "false"),
+        ] {
+            let text = with(&format!(r#""{field}":{value},"#));
+            assert_eq!(problems(&text), [format!("value_error body.{field}")]);
+            assert_eq!(
+                parse(&text).unwrap_err()[0].msg,
+                format!("Value error, {field} is not part of this API")
+            );
+        }
+        // Every one is reported, not just the first.
+        let all =
+            with(r#""temperature":1,"prompt_format_version":1,"return_prompt_token_ids":true,"#);
+        assert_eq!(
+            problems(&all),
+            [
+                "value_error body.temperature",
+                "value_error body.prompt_format_version",
+                "value_error body.return_prompt_token_ids"
+            ]
+        );
+        // `null` is not given, as in sglang; other unknown fields stay ignored.
+        let nulls = with(
+            r#""temperature":null,"prompt_format_version":null,"return_prompt_token_ids":null,"images":[],"#,
+        );
+        assert!(parse(&nulls).is_ok());
+
+        assert!(parse(&with("")).unwrap().template_kwargs.is_empty());
+        let kwargs = parse(&with(r#""chat_template_kwargs":{"a":1},"#)).unwrap();
+        assert_eq!(kwargs.template_kwargs["a"], 1);
+        for bad in ["null", "[]", r#""x""#] {
+            assert_eq!(
+                problems(&with(&format!(r#""chat_template_kwargs":{bad},"#))),
+                ["dict_type body.chat_template_kwargs"],
+                "{bad}"
+            );
+        }
     }
 
     /// Valid for the schema, but the alphabet is the most a choice is labelled with.
@@ -2621,14 +2722,42 @@ mod tests {
         let target = hosted_target(&flaky.base, Wire::OpenAi, "mock-model");
         let mut named = vec![choice_question(2), choice_question(3)];
         named[1].id = "third".into();
-        let failure = hosted(&client, &target, None)
+        let abandoned = hosted(&client, &target, None)
             .ask_all(STATE, &named)
             .await
             .unwrap_err();
         assert!(
-            matches!(&failure, Failure::Provider(_, m) if m.starts_with("question \"third\": ")),
-            "{failure:?}"
+            matches!(&abandoned.failure, Failure::Provider(_, m) if m.starts_with("question \"third\": ")),
+            "{abandoned:?}"
         );
+        // The first question was answered, and billed.
+        assert_eq!(abandoned.spent, Tokens::new(7, 3, 0, 5).with_reasoning(2));
+    }
+
+    /// One question failing does not lose the replies beside it: they were
+    /// billed, so they are counted, and the next batch is not sent.
+    #[tokio::test]
+    async fn the_replies_beside_a_failed_question_are_still_counted() {
+        let flaky = fake_gated_openai(
+            |system| match asked_labels(system).len() {
+                3 => (StatusCode::OK, "no idea".into()),
+                _ => last_label(system),
+            },
+            HOSTED_CONCURRENCY,
+        )
+        .await;
+        let target = hosted_target(&flaky.base, Wire::OpenAi, "mock-model");
+        // Widths 2 to 5 go out together, 6 and 7 after them.
+        let questions: Vec<_> = (2..8).map(choice_question).collect();
+        let abandoned = hosted(&Client::new(), &target, None)
+            .ask_all(STATE, &questions)
+            .await
+            .unwrap_err();
+        assert!(matches!(abandoned.failure, Failure::Provider(..)));
+        let mut answered = Tokens::default();
+        (0..3).for_each(|_| answered.add(&Tokens::new(7, 3, 0, 5).with_reasoning(2)));
+        assert_eq!(abandoned.spent, answered, "the three that answered");
+        assert_eq!(flaky.seen.lock().await.len(), HOSTED_CONCURRENCY);
     }
 
     /// However a hosted model words its probabilities.

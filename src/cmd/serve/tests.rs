@@ -6084,6 +6084,28 @@ async fn the_usage_ledger_records_each_reply_and_leaves_the_stream_as_asked() {
     }
 }
 
+/// Notes that the current request went to a priced provider model.
+fn routed() {
+    let cost = crate::providers::Cost {
+        cache_read: Some(0.3),
+        cache_write: Some(3.75),
+        ..crate::providers::Cost::flat(3.0, 15.0)
+    };
+    let target = Target::Remote(Arc::new(RemoteTarget {
+        provider: "openrouter".into(),
+        base_url: "https://openrouter.invalid/api/v1".into(),
+        wire: Wire::OpenAi,
+        model: "anthropic/claude-sonnet-4".into(),
+        max_output: None,
+        cost: Some(cost),
+        api_key: None,
+    }));
+    usage::note_target(
+        "llmman.provider/openrouter/anthropic/claude-sonnet-4",
+        &target,
+    );
+}
+
 /// A provider's reply is priced and keeps its `Content-Length`, even under
 /// a (client-settable) hop header; a provider stream is asked for usage,
 /// which the client then doesn't see. No target, a failure, or a local
@@ -6095,26 +6117,6 @@ async fn the_usage_ledger_prices_a_provider_reply_and_skips_the_rest() {
     inner.usage_log = Some(usage_log.clone());
     let state = AppState(Arc::new(inner));
 
-    fn routed() {
-        let cost = crate::providers::Cost {
-            cache_read: Some(0.3),
-            cache_write: Some(3.75),
-            ..crate::providers::Cost::flat(3.0, 15.0)
-        };
-        let target = Target::Remote(Arc::new(RemoteTarget {
-            provider: "openrouter".into(),
-            base_url: "https://openrouter.invalid/api/v1".into(),
-            wire: Wire::OpenAi,
-            model: "anthropic/claude-sonnet-4".into(),
-            max_output: None,
-            cost: Some(cost),
-            api_key: None,
-        }));
-        usage::note_target(
-            "llmman.provider/openrouter/anthropic/claude-sonnet-4",
-            &target,
-        );
-    }
     let messages = r#"{"type":"message","usage":{"input_tokens":130,"cache_read_input_tokens":17010,"cache_creation_input_tokens":1000,"output_tokens":412}}"#;
     let app = Router::new()
         .route(
@@ -6225,6 +6227,59 @@ async fn the_usage_ledger_prices_a_provider_reply_and_skips_the_rest() {
     let want = (130.0 * 3.0 + 17_010.0 * 0.3 + 1_000.0 * 3.75 + 412.0 * 15.0) / 1e6;
     assert!((entry.cost.unwrap() - want).abs() < 1e-12, "{entry:?}");
     assert_eq!(entry.rate.unwrap().cache_read, 0.3);
+}
+
+/// A failed reply is not recorded, but what its request noted as spent
+/// before failing is, priced: the provider billed it. Noting nothing spent
+/// records nothing.
+#[tokio::test]
+async fn the_usage_ledger_records_what_a_failed_request_spent() {
+    let usage_log = temp_log("usage-spent");
+    let mut inner = test_inner(std::env::temp_dir());
+    inner.usage_log = Some(usage_log.clone());
+    let state = AppState(Arc::new(inner));
+
+    let app = Router::new()
+        .route(
+            "/v1/systemone",
+            post(|| async {
+                routed();
+                usage::note_spent(crate::usage::Tokens::new(300, 200, 0, 40));
+                (StatusCode::BAD_GATEWAY, "a question failed")
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(|| async {
+                routed();
+                usage::note_spent(crate::usage::Tokens::default());
+                (StatusCode::BAD_GATEWAY, "nothing was spent")
+            }),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            usage::record_usage,
+        ))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = Client::new();
+    for route in ["/v1/chat/completions", "/v1/systemone"] {
+        let resp = client.post(format!("{base}{route}")).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "still a failure");
+    }
+
+    let entries = ledger_of(&usage_log, 2).await;
+    let _ = std::fs::remove_file(&usage_log);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let entry = &entries[0];
+    assert_eq!(entry.route, "/v1/systemone");
+    assert_eq!(entry.provider.as_deref(), Some("openrouter"));
+    assert_eq!(entry.tokens, crate::usage::Tokens::new(300, 200, 0, 40));
+    let want = (100.0 * 3.0 + 200.0 * 0.3 + 40.0 * 15.0) / 1e6;
+    assert!((entry.cost.unwrap() - want).abs() < 1e-12, "{entry:?}");
 }
 
 /// A blank `?model=` names nothing, so it must not trigger a catalog fetch.

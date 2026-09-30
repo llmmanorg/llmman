@@ -15,7 +15,7 @@ use futures::StreamExt;
 use serde_json::Value;
 
 use crate::providers::Cost;
-use crate::usage::{Decoder, Dialect, Entry};
+use crate::usage::{Decoder, Dialect, Entry, Tokens};
 
 use super::{aggregation, now_rfc3339, AppState, Target};
 
@@ -28,6 +28,8 @@ struct Capture {
     routed: Option<Routed>,
     /// [`ask_for_stream_usage`] asked for a chunk the client did not.
     strip_usage_chunk: bool,
+    /// What a request used before it failed, see [`note_spent`].
+    spent: Option<Tokens>,
 }
 
 struct Routed {
@@ -53,6 +55,16 @@ pub(super) fn note_target(model: &str, target: &Target) {
             provider,
             cost,
         });
+    });
+}
+
+/// Records what the current request used at its provider before it failed,
+/// which its reply cannot report. A failed reply is not recorded, but the
+/// provider billed that work; the last call wins, and nothing used is
+/// nothing recorded. A no-op outside [`record_usage`].
+pub(super) fn note_spent(tokens: Tokens) {
+    let _ = CAPTURE.try_with(|capture| {
+        lock(capture).spent = (tokens != Tokens::default()).then_some(tokens);
     });
 }
 
@@ -84,9 +96,10 @@ pub(super) fn ask_for_stream_usage(req: &mut Value) {
 }
 
 /// Appends each successful, routed generation reply's usage to the
-/// ledger. A local reply to a peer's hop ([`aggregation::HOP`]) is the
-/// forwarding daemon's to record; the header is the client's to set, so
-/// a provider-routed one is recorded regardless.
+/// ledger, and what a failed one [`note_spent`]. A local reply to a peer's
+/// hop ([`aggregation::HOP`]) is the forwarding daemon's to record; the
+/// header is the client's to set, so a provider-routed one is recorded
+/// regardless.
 pub(super) async fn record_usage(
     State(state): State<AppState>,
     req: Request,
@@ -123,9 +136,11 @@ pub(super) async fn record_usage(
     let Capture {
         routed,
         strip_usage_chunk,
+        spent,
     } = std::mem::take(&mut *lock(&capture));
+    let succeeded = response.status().is_success();
     let routed =
-        routed.filter(|r| response.status().is_success() && !(hopped && r.provider.is_none()));
+        routed.filter(|r| (succeeded || spent.is_some()) && !(hopped && r.provider.is_none()));
     let Some(routed) = routed else {
         return response;
     };
@@ -142,6 +157,13 @@ pub(super) async fn record_usage(
         routed,
         decoder: Decoder::new(dialect, content_type, strip_usage_chunk),
     };
+    if !succeeded {
+        // The reply reports none of it; what was noted is all there is.
+        if let Some(tokens) = spent {
+            pending.record(tokens);
+        }
+        return response;
+    }
 
     let (mut parts, body) = response.into_parts();
     if strip_usage_chunk {
@@ -202,12 +224,8 @@ struct Pending {
     decoder: Decoder,
 }
 
-impl Drop for Pending {
-    fn drop(&mut self) {
-        self.decoder.finish();
-        let Some(tokens) = self.decoder.tokens() else {
-            return;
-        };
+impl Pending {
+    fn record(&mut self, tokens: Tokens) {
         let id = self
             .id
             .take()
@@ -228,6 +246,15 @@ impl Drop for Pending {
         }
         if let Err(e) = crate::usage::append(&self.log, &entry) {
             eprintln!("[llmman] warning: usage ledger {}: {e}", self.log.display());
+        }
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.decoder.finish();
+        if let Some(tokens) = self.decoder.tokens() {
+            self.record(tokens);
         }
     }
 }
