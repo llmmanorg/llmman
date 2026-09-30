@@ -160,8 +160,8 @@ Each answer's `x_source` says where its probabilities come from:
 
 - **A local model is read** (`logprobs`): one user turn per question, rendered
   with the model's chat template, thinking off, and the model's own
-  next-token probability of each label (`A`..`Z`, a level digit, `yes`/`no`
-  counting `Yes`/`No` too, as Gemma 4 capitalises), renormalised over the labels. Nothing is generated. `x_label_mass` is the
+  next-token probability of each label (`A`..`Z`, a level digit, `yes`/`no`),
+  renormalised over the labels. Nothing is generated. `x_label_mass` is the
   probability the model put on the labels at all; low means it wanted to say
   something else. This needs `llama-server` (read through `/apply-template`,
   `/tokenize` and `/completion`); other engines get a 501. A label that is not

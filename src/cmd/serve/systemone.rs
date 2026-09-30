@@ -170,18 +170,6 @@ impl Question {
             Kind::Noul | Kind::Score => self.names.clone(),
         }
     }
-
-    /// Every way the model may write each label. A model answers yes or no
-    /// with a capital as often as not (Gemma 4 always does), so a `noul`
-    /// candidate is `yes` and `Yes` together.
-    fn forms(&self) -> Vec<Vec<String>> {
-        let capitalised = |label: &str| label[..1].to_uppercase() + &label[1..];
-        let forms = |label: String| match self.kind {
-            Kind::Noul => vec![label.clone(), capitalised(&label)],
-            _ => vec![label],
-        };
-        self.labels().into_iter().map(forms).collect()
-    }
 }
 
 #[derive(Debug)]
@@ -902,15 +890,8 @@ impl Backend<'_> {
             ));
         }
         let ids = self.tokenize(&prompt).await?;
-        let forms = question.forms();
-        let label_ids = self.label_ids(&prompt, &ids, &forms.concat()).await?;
-        let (shares, mass) = self.label_probabilities(&ids, &label_ids).await?;
-        // A candidate is the sum of its forms.
-        let mut shares = shares.into_iter();
-        let probabilities: Vec<f64> = forms
-            .iter()
-            .map(|forms| shares.by_ref().take(forms.len()).sum())
-            .collect();
+        let label_ids = self.label_ids(&prompt, &ids, &labels).await?;
+        let (probabilities, mass) = self.label_probabilities(&ids, &label_ids).await?;
         if !probabilities.iter().chain([&mass]).all(|v| v.is_finite()) {
             return Err(Failure::Backend("scored non-finite values".into()));
         }
@@ -1526,18 +1507,6 @@ mod tests {
         assert_eq!(request.questions[1].labels(), strings(&["0", "1"]));
     }
 
-    /// A yes or no is written `yes` or `Yes`, and either is that answer.
-    #[test]
-    fn a_noul_candidate_is_both_capitalisations() {
-        let noul = question(r#"{"type":"noul","instructions":"x"}"#);
-        assert_eq!(
-            noul.forms(),
-            [strings(&["yes", "Yes"]), strings(&["no", "No"])]
-        );
-        let choice = question(r#"{"type":"choice","criteria":{"a":null,"b":null}}"#);
-        assert_eq!(choice.forms(), [strings(&["A"]), strings(&["B"])]);
-    }
-
     /// Objects render as compact JSON in the order sent, escapes written out.
     #[test]
     fn structured_text_renders_as_written() {
@@ -1902,9 +1871,9 @@ mod tests {
         port
     }
 
-    /// A token per character, except a `yes`, `no`, `Yes` or `No` after a newline: one each.
+    /// A token per character, except a `yes` or `no` after a newline: one each.
     fn fake_tokens(text: &str) -> Vec<i64> {
-        for (word, id) in [("yes", 1001), ("no", 1002), ("Yes", 1003), ("No", 1004)] {
+        for (word, id) in [("yes", 1001), ("no", 1002)] {
             if let Some(head) = text.strip_suffix(word).filter(|h| h.ends_with('\n')) {
                 return [fake_tokens(head), vec![id]].concat();
             }
@@ -2057,8 +2026,6 @@ mod tests {
             (50, 0.30), // 0 1 2
             (1001, 0.30),
             (1002, 0.10), // yes no
-            (1003, 0.20),
-            (1004, 0.05), // Yes No
         ]);
         let (port, seen) = fake_llama(CLOSED, dist, Flaws::default()).await;
         let url = serve_model(port, Engine::LlamaServer).await;
@@ -2100,14 +2067,10 @@ mod tests {
         near(team["probabilities"]["sales"].as_f64().unwrap(), 0.2 / 0.9);
         near(team["x_label_mass"].as_f64().unwrap(), 0.9);
         assert_eq!(team["x_source"], "logprobs");
-        // `yes` and `Yes` against `no` and `No`.
-        near(
-            body["answers"]["urgent"]["noul"].as_f64().unwrap(),
-            0.5 / 0.65,
-        );
+        near(body["answers"]["urgent"]["noul"].as_f64().unwrap(), 0.75);
         near(
             body["answers"]["urgent"]["x_label_mass"].as_f64().unwrap(),
-            0.65,
+            0.4,
         );
         let mood = &body["answers"]["mood"];
         near(mood["score"].as_f64().unwrap(), 0.3 + 2.0 * 0.6);
@@ -2160,30 +2123,6 @@ mod tests {
             (&check["add_special"], &check["parse_special"]),
             (&json!(true), &json!(true))
         );
-    }
-
-    /// Gemma 4 answers `Yes` and never `yes`: that is its answer, and it is read from the boosted read.
-    #[tokio::test]
-    async fn a_model_that_capitalises_yes_and_no_is_still_read() {
-        let dist = distribution(&[(1003, 0.90), (1004, 0.05), (1001, 1e-7), (1002, 1e-7)]);
-        let (port, seen) = fake_llama(CLOSED, dist, Flaws::default()).await;
-        let url = serve_model(port, Engine::LlamaServer).await;
-        let noul = json!({ "q": { "type": "noul", "instructions": "x" } });
-        let (status, text) = ask(&url, request(noul)).await;
-        assert_eq!(status, StatusCode::OK, "{text}");
-        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let q = &body["answers"]["q"];
-        assert!(
-            (q["noul"].as_f64().unwrap() - 0.9 / 0.95).abs() < 1e-6,
-            "{q}"
-        );
-        assert!(
-            (q["x_label_mass"].as_f64().unwrap() - 0.95).abs() < 1e-6,
-            "{q}"
-        );
-        // All four forms were boosted together.
-        let boost = &completions(&seen).await[1];
-        assert_eq!(boost["logit_bias"].as_array().unwrap().len(), 4);
     }
 
     /// A label below the top is invisible to `n_probs`, so it is read with every label boosted.
