@@ -91,7 +91,7 @@ pub(super) fn relay(resp: reqwest::Response, activity: ActivityGuard) -> Respons
 /// not to carry one (an error body, a future backend response this
 /// doesn't recognize) is left alone rather than gaining a field it
 /// never had.
-pub(super) fn set_response_model(value: &mut serde_json::Value, canonical_model: &str) {
+fn set_response_model(value: &mut serde_json::Value, canonical_model: &str) {
     if value.get("model").is_some() {
         value["model"] = serde_json::Value::String(canonical_model.to_string());
     }
@@ -113,7 +113,7 @@ pub(super) fn set_response_model(value: &mut serde_json::Value, canonical_model:
 /// completely unchanged if it isn't valid JSON at all (an error body's
 /// own shape, or a future backend response this doesn't recognize)
 /// rather than mangling or dropping it.
-pub(super) fn rewrite_json_response_model(raw: &Bytes, canonical_model: &str) -> Bytes {
+fn rewrite_json_response_model(raw: &Bytes, canonical_model: &str) -> Bytes {
     match serde_json::from_slice::<serde_json::Value>(raw) {
         Ok(mut value) => {
             set_response_model(&mut value, canonical_model);
@@ -135,7 +135,7 @@ pub(super) fn rewrite_json_response_model(raw: &Bytes, canonical_model: &str) ->
 /// field rewritten (see [`set_response_model`]); `data: [DONE]`, a
 /// blank SSE event-separator line, or a `data: ` line whose payload
 /// *doesn't* parse as JSON all pass through byte-for-byte unchanged.
-pub(super) fn rewrite_sse_line_model(line: &str, canonical_model: &str) -> String {
+fn rewrite_sse_line_model(line: &str, canonical_model: &str) -> String {
     match line.strip_prefix("data: ") {
         Some(payload) if payload != "[DONE]" => match serde_json::from_str(payload) {
             Ok(mut value) => {
