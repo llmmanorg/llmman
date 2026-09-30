@@ -1398,12 +1398,13 @@ fn launch_cline_with_model() {
     // `--json` selects NDJSON output and `--yolo` prevents interactive tool
     // approval. Parse only the final assistant text so an echoed prompt or a
     // question containing "pong" cannot satisfy the assertion. qwen3.5:0.8b
-    // may answer correctly without wrapping it in Cline's completion tool;
-    // accept that one known nonzero shape only after this exact reply check.
+    // may answer correctly but never make a well-formed tool call, which
+    // Cline requires to finish; accept that one known nonzero shape only
+    // after this exact reply check.
     launch_and_assert_strict_inspecting(
         "cline",
         &["--json", "--yolo", PROMPT],
-        cline_nonzero_is_only_missing_completion_tool,
+        cline_nonzero_is_a_malformed_tool_call,
         cline_json_reply_is_exact_pong,
         |home| {
             let path = home.join(".cline/data/settings/providers.json");
@@ -1454,7 +1455,13 @@ fn cline_json_reply_is_exact_pong(stdout: &str) -> bool {
         .is_some_and(|text| text.trim() == "pong")
 }
 
-fn cline_nonzero_is_only_missing_completion_tool(stdout: &str, stderr: &str) -> bool {
+/// Cline ends a `--yolo` run with exit 1 when the model's tool call is
+/// malformed: it gives up after "Too many consecutive mistakes", or reports
+/// "Cline tried to use <tool> without value for required parameter '<name>'".
+/// Cline takes its tool calls from the model's text, so this is the model's
+/// sampling and not llmman. qwen3.5:0.8b has hit it on `attempt_completion`
+/// and `ask_followup_question`, so match the shape and not the tool name.
+fn cline_nonzero_is_a_malformed_tool_call(stdout: &str, stderr: &str) -> bool {
     stderr.trim().is_empty()
         && stdout.lines().any(|line| {
             serde_json::from_str::<serde_json::Value>(line)
@@ -1463,7 +1470,8 @@ fn cline_nonzero_is_only_missing_completion_tool(stdout: &str, stderr: &str) -> 
                     event["type"] == "error"
                         && event["message"].as_str().is_some_and(|message| {
                             message.contains("Too many consecutive mistakes")
-                                || message.contains("attempt_completion without value")
+                                || (message.starts_with("Cline tried to use ")
+                                    && message.contains(" without value for required parameter "))
                         })
                 })
         })
@@ -1483,16 +1491,40 @@ fn cline_json_reply_requires_the_final_result_to_be_exactly_pong() {
         "{\"type\":\"say\",\"say\":\"text\",\"text\":\"pong\"}\n\
          {\"type\":\"say\",\"say\":\"text\",\"text\":\"not pong\"}\n"
     ));
-    assert!(cline_nonzero_is_only_missing_completion_tool(
+    assert!(cline_nonzero_is_a_malformed_tool_call(
         "{\"type\":\"error\",\"message\":\"[YOLO MODE] Task failed: Too many consecutive mistakes (3).\"}\n",
         ""
     ));
-    assert!(cline_nonzero_is_only_missing_completion_tool(
+    // The same failure on whichever tool the model botched (CI run
+    // 36698710059 was `attempt_completion`, 36712104327 this one).
+    assert!(cline_nonzero_is_a_malformed_tool_call(
         "{\"type\":\"error\",\"message\":\"Cline tried to use attempt_completion without value for required parameter 'result'. Retrying...\"}\n",
         ""
     ));
-    assert!(!cline_nonzero_is_only_missing_completion_tool(
+    assert!(cline_nonzero_is_a_malformed_tool_call(
+        "{\"type\":\"error\",\"message\":\"Cline tried to use ask_followup_question without value for required parameter 'question'. Retrying...\"}\n",
+        ""
+    ));
+    // CI run 36712104327, condensed: the model said `pong` as plain text
+    // each turn, never made a valid tool call, and Cline exited 1.
+    let botched = "{\"type\":\"say\",\"say\":\"task\",\"text\":\"Reply with exactly the single word: pong\"}\n\
+         {\"type\":\"say\",\"say\":\"text\",\"text\":\"pong\",\"partial\":false}\n\
+         {\"type\":\"say\",\"say\":\"text\",\"text\":\"pong\",\"partial\":false}\n\
+         {\"type\":\"say\",\"say\":\"error\",\"text\":\"Cline tried to use ask_followup_question without value for required parameter 'question'. Retrying...\"}\n\
+         {\"type\":\"error\",\"message\":\"Cline tried to use ask_followup_question without value for required parameter 'question'. Retrying...\"}\n";
+    assert!(cline_nonzero_is_a_malformed_tool_call(botched, ""));
+    assert!(cline_json_reply_is_exact_pong(botched));
+    // Anything else, or anything on stderr, is not the model's tool call.
+    assert!(!cline_nonzero_is_a_malformed_tool_call(
         "{\"type\":\"error\",\"message\":\"connection refused\"}\n",
+        ""
+    ));
+    assert!(!cline_nonzero_is_a_malformed_tool_call(
+        "{\"type\":\"error\",\"message\":\"Cline tried to use ask_followup_question without value for required parameter 'question'. Retrying...\"}\n",
+        "Error: cline is not installed\n"
+    ));
+    assert!(!cline_nonzero_is_a_malformed_tool_call(
+        "{\"type\":\"say\",\"say\":\"text\",\"text\":\"Cline tried to use x without value for required parameter 'y'\"}\n",
         ""
     ));
 }
