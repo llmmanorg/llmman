@@ -4102,8 +4102,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("bind {addr}"))?;
     eprintln!(
-        "llmman serve listening on {addr}{}",
-        if tls.is_some() { " (TLS)" } else { "" }
+        "llmman serve listening on http{}://{addr}",
+        if tls.is_some() { "s" } else { "" }
     );
 
     // Background idle-unload reaper — see reap_idle_models's doc comment.
