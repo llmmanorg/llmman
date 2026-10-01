@@ -223,7 +223,7 @@ fn parse_registry_ref(reference: &str) -> Result<ParsedRef<'_>, InvalidReference
 
     let (rest, digest) = match rest.split_once('@') {
         Some((rest, digest)) => {
-            check_digest(digest).map_err(&fail)?;
+            check_digest(digest).map_err(fail)?;
             (rest, Some(digest))
         }
         None => (rest, None),
@@ -240,7 +240,7 @@ fn parse_registry_ref(reference: &str) -> Result<ParsedRef<'_>, InvalidReference
         None => (rest, None),
     };
     if let Some(tag) = tag {
-        check_part(tag, "tag", true, MAX_PART_LEN).map_err(&fail)?;
+        check_part(tag, "tag", true, MAX_PART_LEN).map_err(fail)?;
     }
 
     let components: Vec<&str> = name.split('/').collect();
@@ -249,15 +249,15 @@ fn parse_registry_ref(reference: &str) -> Result<ParsedRef<'_>, InvalidReference
         _ => (None, components.as_slice()),
     };
     if let Some(host) = host {
-        check_host(host).map_err(&fail)?;
+        check_host(host).map_err(fail)?;
     }
     // `path` is non-empty: `components` has at least one element (split of a
     // non-empty string), and the host branch only fires when more follow it.
     let (model, namespace) = path.split_last().expect("path has at least the model");
     for component in namespace {
-        check_part(component, "namespace component", false, MAX_PART_LEN).map_err(&fail)?;
+        check_part(component, "namespace component", false, MAX_PART_LEN).map_err(fail)?;
     }
-    check_part(model, "model", true, MAX_PART_LEN).map_err(&fail)?;
+    check_part(model, "model", true, MAX_PART_LEN).map_err(fail)?;
 
     let parsed = ParsedRef {
         scheme,

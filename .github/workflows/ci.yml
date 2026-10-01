@@ -753,6 +753,8 @@ jobs:
       # These tests are about the llama-server "Install llama-server" puts
       # on PATH, which `--runtime auto` would try docker before.
       LLMMAN_RUNTIME: path
+      # pip's 15s default kills stalled downloads.
+      PIP_DEFAULT_TIMEOUT: "120"
     strategy:
       fail-fast: false
       matrix:
@@ -1573,7 +1575,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m venv "$RUNNER_TEMP/vllm-plugin-venv"
+          # New pip resumes cut-off downloads.
+          python3 -m venv --upgrade-deps "$RUNNER_TEMP/vllm-plugin-venv"
           "$RUNNER_TEMP/vllm-plugin-venv/bin/pip" install -e ./vllm-plugin pytest
           echo "$RUNNER_TEMP/vllm-plugin-venv/bin" >> "$GITHUB_PATH"
 
