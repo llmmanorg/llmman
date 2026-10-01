@@ -27,6 +27,7 @@ use crate::chat_template::{ThinkingControls, EFFORT_LEVELS};
 use crate::daemon;
 use crate::providers;
 
+mod gemini;
 mod goose;
 mod goose_desktop;
 mod sandbox;
@@ -1057,7 +1058,7 @@ fn launch(
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
         "kimi" => launch_simple("kimi", model, extra_args),
-        "gemini" => launch_gemini(model, api_key, extra_args),
+        "gemini" => gemini::launch_gemini(model, api_key, extra_args),
         "agy" => launch_agy(model, api_key, extra_args),
         "hermes" => launch_hermes(model, vision, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
@@ -2190,27 +2191,6 @@ fn launch_copilot(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     args.extend_from_slice(extra_args);
 
     exec_with_env(&bin, &args, &[("COPILOT_PROVIDER_BASE_URL", &base_url)])
-}
-
-/// gemini: set GOOGLE_GENAI_BASE_URL pointing at our Anthropic-compatible endpoint.
-fn launch_gemini(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("gemini").ok_or_else(|| anyhow::anyhow!("gemini is not installed"))?;
-
-    let mut args: Vec<String> = Vec::new();
-    if !model.is_empty() {
-        args.extend(["--model".to_string(), model.to_string()]);
-    }
-    args.extend_from_slice(extra_args);
-
-    let base_url = format!("{}/v1", server());
-    exec_with_env(
-        &bin,
-        &args,
-        &[
-            ("GEMINI_BASE_URL", base_url.as_str()),
-            ("GEMINI_API_KEY", api_key),
-        ],
-    )
 }
 
 /// AGY speaks Gemini's native generation protocol. The encoded model in the
