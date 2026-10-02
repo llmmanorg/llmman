@@ -38,7 +38,8 @@
 //! engine on `PATH`; for mlx, Apple Silicon macOS too) isn't met. The
 //! vllm and sglang ones run a daemon of their own on a fresh port (the
 //! engine choice is daemon-wide environment) — see
-//! `serve_safetensors_with_engine`.
+//! `serve_safetensors_with_engine`. So does [`serve_systemone_reads_a_local_model`]
+//! (`POST /v1/systemone` on `qwen3.5:0.8b`; `gemma4` with `--ignored`).
 //!
 //! `llmman serve` is a process-wide singleton bound to a single loopback
 //! port (127.0.0.1:17434 by default, or wherever `LLMMAN_HOST` points —
@@ -73,7 +74,7 @@
 //!     request 500'd and Claude Code retried in a loop until giving up —
 //!     fixed in `cmd::serve::anthropic::handle_anthropic_messages` by
 //!     folding every system-role turn into one leading message.
-//!   - `codex`: the config `write_codex_config` wrote (a `[profiles.llmman]`
+//!   - `codex`: the config `codex::write_codex_config` wrote (a `[profiles.llmman]`
 //!     table in `config.toml`) is a format current codex (0.134+) refuses
 //!     to load at all — fixed by writing the sibling
 //!     `~/.codex/llmman.config.toml` overlay codex now expects instead.
@@ -91,7 +92,7 @@
 //!     `cmd::serve::responses::consolidate_responses_instructions`.
 
 use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, Once};
@@ -627,23 +628,21 @@ fn daemon_still_answers(integration: &str) -> bool {
     }
 }
 
-/// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
-/// with `home` as its `HOME`, returning `Err(TimedOut)` (rather than
-/// panicking) if it had to be killed at `TIMEOUT` — see `warm_model`,
-/// `try_spawn_with_timeout`, and `launch_and_assert` for who retries
-/// that and why.
-fn run_launch(
+/// `llmman launch <integration> --model qwen3.5:0.8b <launch_flags> --
+/// <extra_args>` with `home` as its `HOME`, and every directory an
+/// integration keeps its state in under it.
+fn launch_command(
     home: &Path,
     integration: &str,
+    launch_flags: &[&str],
     extra_args: &[&str],
-    extra_env: &[(&str, String)],
-) -> Result<std::process::Output, TimedOut> {
-    eprintln!("[run_launch] {integration}: calling warm_model()");
-    warm_model();
-    eprintln!("[run_launch] {integration}: warm_model() returned, spawning launch");
-
+) -> Command {
     let mut cmd = Command::new(llmman_bin());
-    cmd.arg("launch").arg(integration).arg("--model").arg(MODEL);
+    cmd.arg("launch")
+        .arg(integration)
+        .arg("--model")
+        .arg(MODEL)
+        .args(launch_flags);
     if !extra_args.is_empty() {
         cmd.arg("--").args(extra_args);
     }
@@ -651,6 +650,7 @@ fn run_launch(
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
         // Set, not cleared: a `QWEN_HOME` (or `GROK_HOME`, `CLINE_DIR`) in
         // the developer's shell would send the settings a launch writes
         // past this `HOME`, and on Windows `dirs::home_dir` reads neither
@@ -670,6 +670,25 @@ fn run_launch(
         // Cline likewise reinstalls itself as `latest` (CI's pinned 2.18.0
         // became 3.0.x within ~20s), so a retry ran a different Cline.
         .env("CLINE_NO_AUTO_UPDATE", "1");
+    cmd
+}
+
+/// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
+/// with `home` as its `HOME`, returning `Err(TimedOut)` (rather than
+/// panicking) if it had to be killed at `TIMEOUT` — see `warm_model`,
+/// `try_spawn_with_timeout`, and `launch_and_assert` for who retries
+/// that and why.
+fn run_launch(
+    home: &Path,
+    integration: &str,
+    extra_args: &[&str],
+    extra_env: &[(&str, String)],
+) -> Result<std::process::Output, TimedOut> {
+    eprintln!("[run_launch] {integration}: calling warm_model()");
+    warm_model();
+    eprintln!("[run_launch] {integration}: warm_model() returned, spawning launch");
+
+    let mut cmd = launch_command(home, integration, &[], extra_args);
     // On top of the fresh HOME, for an integration that needs more than
     // a home directory to find itself or its operator.
     for (key, value) in extra_env {
@@ -1060,7 +1079,7 @@ fn launch_opencode_with_model() {
 
     // `run <message>`: opencode's non-interactive one-shot mode.
     // --print-logs --log-level DEBUG: opencode's provider (configured via
-    // OPENCODE_CONFIG_CONTENT's "npm" field — see launch::opencode_config)
+    // OPENCODE_CONFIG_CONTENT's "npm" field — see launch::opencode::opencode_config)
     // is installed on demand into ~/.config/opencode/node_modules the
     // first time a fresh HOME uses it, which showed up as a slow/hanging
     // step in one environment during development; keep this on so a CI
@@ -1148,6 +1167,212 @@ fn launch_codex_in_a_container_sandbox() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `--variant`
+// ---------------------------------------------------------------------------
+
+/// `MODEL` offers `none` and `thinking`; claude and codex take `thinking`
+/// as `medium`.
+const VARIANT: &str = "thinking";
+const SPELLED: &str = "medium";
+/// An effort the tool saved itself, for the launch to outrank. Its
+/// background requests (claude's session title) send it regardless, so
+/// only that the variant's effort is sent can be checked.
+const SAVED: &str = "high";
+
+/// A TCP relay in front of the daemon, keeping what clients send: the
+/// tools don't print their effort, so their requests are where to look.
+struct Relay {
+    addr: String,
+    sent: Arc<Mutex<Vec<u8>>>,
+}
+
+fn relay_to_daemon() -> Relay {
+    let upstream = llmman::daemon::server()
+        .trim_start_matches("http://")
+        .to_string();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the relay");
+    let addr = listener.local_addr().expect("relay address").to_string();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&sent);
+    std::thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            let Ok(server) = std::net::TcpStream::connect(&upstream) else {
+                continue;
+            };
+            let (Ok(from_client), Ok(to_server)) = (client.try_clone(), server.try_clone()) else {
+                continue;
+            };
+            let record = Arc::clone(&record);
+            std::thread::spawn(move || relay_bytes(from_client, to_server, Some(record)));
+            std::thread::spawn(move || relay_bytes(server, client, None));
+        }
+    });
+    Relay { addr, sent }
+}
+
+/// Copies `from` to `to` until either ends, keeping a copy in `record`.
+fn relay_bytes(
+    mut from: std::net::TcpStream,
+    mut to: std::net::TcpStream,
+    record: Option<Arc<Mutex<Vec<u8>>>>,
+) {
+    let mut buf = [0u8; 16 * 1024];
+    while let Ok(n) = from.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        if let Some(record) = &record {
+            record.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+        if to.write_all(&buf[..n]).is_err() {
+            break;
+        }
+    }
+    let _ = to.shutdown(std::net::Shutdown::Write);
+}
+
+/// What a real integration sent the daemon when launched at [`VARIANT`].
+struct VariantLaunch {
+    home: PathBuf,
+    sent: String,
+    output: String,
+}
+
+impl VariantLaunch {
+    /// The values of the string field `key` in what was sent.
+    fn sent_values(&self, key: &str) -> Vec<&str> {
+        let needle = format!("\"{key}\":\"");
+        self.sent
+            .match_indices(&needle)
+            .map(|(at, _)| {
+                let rest = &self.sent[at + needle.len()..];
+                &rest[..rest.find('"').unwrap_or(rest.len())]
+            })
+            .collect()
+    }
+}
+
+/// Launches `integration` at [`VARIANT`] behind a [`Relay`], after `saved`
+/// has set up its fresh `HOME`. The request is what is checked, not the
+/// reply, and a run killed at `TIMEOUT` has sent it already.
+fn launch_at_variant(
+    integration: &str,
+    extra_args: &[&str],
+    saved: impl FnOnce(&Path),
+) -> VariantLaunch {
+    warm_model();
+    let home = fresh_home(integration);
+    saved(&home);
+    let relay = relay_to_daemon();
+    let mut cmd = launch_command(&home, integration, &["--variant", VARIANT], extra_args);
+    cmd.env("LLMMAN_HOST", &relay.addr);
+    let description =
+        format!("`llmman launch {integration} --variant {VARIANT} -- {extra_args:?}`");
+    let output = match try_spawn_with_timeout(cmd, TIMEOUT, &description) {
+        Ok(output) => format!(
+            "--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(timed_out) => timed_out.message,
+    };
+    let sent = String::from_utf8_lossy(&relay.sent.lock().unwrap()).into_owned();
+    VariantLaunch { home, sent, output }
+}
+
+fn write_saved(home: &Path, file: &str, contents: &str) {
+    let path = home.join(file);
+    std::fs::create_dir_all(path.parent().unwrap()).expect("create the saved file's directory");
+    std::fs::write(path, contents).expect("write the saved file");
+}
+
+/// False, with a note, unless llama-server and `tool` are installed.
+fn installed(tool: &str, hint: &str) -> bool {
+    let found = on_path("llama-server") && on_path(tool);
+    if !found {
+        eprintln!("skipping: needs llama-server and {tool} on PATH ({hint})");
+    }
+    found
+}
+
+/// claude and codex send the launch's effort, not the one in their own
+/// settings (`saved_file`).
+fn variant_outranks_saved_effort(
+    tool: &str,
+    hint: &str,
+    args: &[&str],
+    saved_file: &str,
+    saved: &str,
+) {
+    let _guard = lock_serial();
+    if !installed(tool, hint) {
+        return;
+    }
+    let launch = launch_at_variant(tool, args, |home| write_saved(home, saved_file, saved));
+    let sent = launch.sent_values("effort");
+    assert!(
+        sent.contains(&SPELLED),
+        "{tool} should send effort {SPELLED:?}, not just its saved {SAVED:?}; it sent {sent:?}\n{}",
+        launch.output
+    );
+}
+
+#[test]
+fn launch_claude_variant_outranks_the_saved_effort() {
+    variant_outranks_saved_effort(
+        "claude",
+        "https://code.claude.com/docs/en/quickstart",
+        &["-p", PROMPT],
+        ".claude/settings.json",
+        &format!(r#"{{"effortLevel":"{SAVED}"}}"#),
+    );
+}
+
+#[test]
+fn launch_codex_variant_outranks_the_saved_effort() {
+    variant_outranks_saved_effort(
+        "codex",
+        "npm install -g @openai/codex",
+        &["exec", PROMPT],
+        ".codex/config.toml",
+        &format!("model_reasoning_effort = \"{SAVED}\"\n"),
+    );
+}
+
+/// `opencode run` sends the model's options; its UI sends the selection
+/// in `model.json`, which the launch has to replace.
+#[test]
+fn launch_opencode_variant_outranks_the_saved_selection() {
+    let _guard = lock_serial();
+    if !installed("opencode", "https://opencode.ai") {
+        return;
+    }
+    let model = format!(
+        "ollama/{}",
+        llmman::shortnames::resolve_ollama_api(MODEL).expect("MODEL resolves")
+    );
+    let state = ".local/state/opencode/model.json";
+    let launch = launch_at_variant("opencode", &["run", PROMPT], |home| {
+        let saved = serde_json::json!({ "variant": { &model: "none" } });
+        write_saved(home, state, &saved.to_string());
+    });
+
+    let sent = launch.sent_values("reasoning_effort");
+    assert!(
+        sent.contains(&SPELLED) && launch.sent.contains(r#""enable_thinking":true"#),
+        "opencode should send effort {SPELLED:?} with thinking on; it sent {sent:?}\n{}",
+        launch.output
+    );
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(launch.home.join(state)).unwrap()).unwrap();
+    assert_eq!(
+        saved["variant"][&model], VARIANT,
+        "opencode's saved selection: {saved}\n{}",
+        launch.output
+    );
+}
+
 #[test]
 fn launch_pi_with_model() {
     eprintln!("[test] launch_pi_with_model: acquiring SERIAL");
@@ -1185,7 +1410,14 @@ fn launch_omp_with_model() {
     // `-p <prompt>` is OMP's print-and-exit mode. The launcher selects
     // `ollama/<model>` while run_launch's fresh HOME ensures the test does
     // not succeed because of a developer's pre-existing OMP configuration.
-    launch_and_assert_strict("omp", &["-p", PROMPT]);
+    // The 0.8B model can say any word ("Rust" x3 in run 36833820219): any reply counts.
+    launch_and_assert_strict_inspecting(
+        "omp",
+        &["-p", PROMPT],
+        |_stdout, _stderr| false,
+        |stdout| !stdout.trim().is_empty(),
+        |_home| {},
+    );
 }
 
 #[test]
@@ -1205,12 +1437,13 @@ fn launch_cline_with_model() {
     // `--json` selects NDJSON output and `--yolo` prevents interactive tool
     // approval. Parse only the final assistant text so an echoed prompt or a
     // question containing "pong" cannot satisfy the assertion. qwen3.5:0.8b
-    // may answer correctly without wrapping it in Cline's completion tool;
-    // accept that one known nonzero shape only after this exact reply check.
+    // may answer correctly but never make a well-formed tool call, which
+    // Cline requires to finish; accept that one known nonzero shape only
+    // after this exact reply check.
     launch_and_assert_strict_inspecting(
         "cline",
         &["--json", "--yolo", PROMPT],
-        cline_nonzero_is_only_missing_completion_tool,
+        cline_nonzero_is_a_malformed_tool_call,
         cline_json_reply_is_exact_pong,
         |home| {
             let path = home.join(".cline/data/settings/providers.json");
@@ -1261,7 +1494,13 @@ fn cline_json_reply_is_exact_pong(stdout: &str) -> bool {
         .is_some_and(|text| text.trim() == "pong")
 }
 
-fn cline_nonzero_is_only_missing_completion_tool(stdout: &str, stderr: &str) -> bool {
+/// Cline ends a `--yolo` run with exit 1 when the model's tool call is
+/// malformed: it gives up after "Too many consecutive mistakes", or reports
+/// "Cline tried to use <tool> without value for required parameter '<name>'".
+/// Cline takes its tool calls from the model's text, so this is the model's
+/// sampling and not llmman. qwen3.5:0.8b has hit it on `attempt_completion`
+/// and `ask_followup_question`, so match the shape and not the tool name.
+fn cline_nonzero_is_a_malformed_tool_call(stdout: &str, stderr: &str) -> bool {
     stderr.trim().is_empty()
         && stdout.lines().any(|line| {
             serde_json::from_str::<serde_json::Value>(line)
@@ -1270,6 +1509,8 @@ fn cline_nonzero_is_only_missing_completion_tool(stdout: &str, stderr: &str) -> 
                     event["type"] == "error"
                         && event["message"].as_str().is_some_and(|message| {
                             message.contains("Too many consecutive mistakes")
+                                || (message.starts_with("Cline tried to use ")
+                                    && message.contains(" without value for required parameter "))
                         })
                 })
         })
@@ -1289,12 +1530,40 @@ fn cline_json_reply_requires_the_final_result_to_be_exactly_pong() {
         "{\"type\":\"say\",\"say\":\"text\",\"text\":\"pong\"}\n\
          {\"type\":\"say\",\"say\":\"text\",\"text\":\"not pong\"}\n"
     ));
-    assert!(cline_nonzero_is_only_missing_completion_tool(
+    assert!(cline_nonzero_is_a_malformed_tool_call(
         "{\"type\":\"error\",\"message\":\"[YOLO MODE] Task failed: Too many consecutive mistakes (3).\"}\n",
         ""
     ));
-    assert!(!cline_nonzero_is_only_missing_completion_tool(
+    // The same failure on whichever tool the model botched (CI run
+    // 36698710059 was `attempt_completion`, 36712104327 this one).
+    assert!(cline_nonzero_is_a_malformed_tool_call(
+        "{\"type\":\"error\",\"message\":\"Cline tried to use attempt_completion without value for required parameter 'result'. Retrying...\"}\n",
+        ""
+    ));
+    assert!(cline_nonzero_is_a_malformed_tool_call(
+        "{\"type\":\"error\",\"message\":\"Cline tried to use ask_followup_question without value for required parameter 'question'. Retrying...\"}\n",
+        ""
+    ));
+    // CI run 36712104327, condensed: the model said `pong` as plain text
+    // each turn, never made a valid tool call, and Cline exited 1.
+    let botched = "{\"type\":\"say\",\"say\":\"task\",\"text\":\"Reply with exactly the single word: pong\"}\n\
+         {\"type\":\"say\",\"say\":\"text\",\"text\":\"pong\",\"partial\":false}\n\
+         {\"type\":\"say\",\"say\":\"text\",\"text\":\"pong\",\"partial\":false}\n\
+         {\"type\":\"say\",\"say\":\"error\",\"text\":\"Cline tried to use ask_followup_question without value for required parameter 'question'. Retrying...\"}\n\
+         {\"type\":\"error\",\"message\":\"Cline tried to use ask_followup_question without value for required parameter 'question'. Retrying...\"}\n";
+    assert!(cline_nonzero_is_a_malformed_tool_call(botched, ""));
+    assert!(cline_json_reply_is_exact_pong(botched));
+    // Anything else, or anything on stderr, is not the model's tool call.
+    assert!(!cline_nonzero_is_a_malformed_tool_call(
         "{\"type\":\"error\",\"message\":\"connection refused\"}\n",
+        ""
+    ));
+    assert!(!cline_nonzero_is_a_malformed_tool_call(
+        "{\"type\":\"error\",\"message\":\"Cline tried to use ask_followup_question without value for required parameter 'question'. Retrying...\"}\n",
+        "Error: cline is not installed\n"
+    ));
+    assert!(!cline_nonzero_is_a_malformed_tool_call(
+        "{\"type\":\"say\",\"say\":\"text\",\"text\":\"Cline tried to use x without value for required parameter 'y'\"}\n",
         ""
     ));
 }
@@ -2422,6 +2691,164 @@ fn serve_sglang_safetensors_model() {
         return;
     }
     serve_safetensors_with_engine("sglang", SGLANG_MODEL, &[("LLMMAN_CONTEXT_LENGTH", "1024")]);
+}
+
+/// `POST /v1/systemone` end to end, on a daemon of the test's own and the
+/// ggml libraries of the `llama-server` on `PATH`. Answers are asserted only
+/// where a small model is decisive (an unambiguous ticket, furious vs
+/// grateful); the rest is shapes, sums, no generation, the same answers
+/// from a warm KV cache, and the refusals.
+#[cfg(unix)]
+fn systemone_reads(model: &str, canonical: &str) {
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH");
+        return;
+    }
+    let host = format!("127.0.0.1:{}", free_loopback_port());
+    // Not the shared daemon's 256k context: nothing here needs more.
+    let mut daemon = spawn_test_daemon(&host, &[("LLMMAN_CONTEXT_LENGTH", "4096")]);
+
+    let result = std::panic::catch_unwind(|| {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(TIMEOUT)
+            .build()
+            .expect("build an HTTP client");
+        let post = |body: &serde_json::Value| {
+            let resp = client
+                .post(format!("http://{host}/v1/systemone"))
+                .json(body)
+                .send()
+                .expect("POST /v1/systemone");
+            let status = resp.status();
+            let text = resp.text().expect("read the reply");
+            let json = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+            (status, json)
+        };
+        let ask = |state: &str| -> serde_json::Value {
+            let (status, reply) = post(&serde_json::json!({
+                "state": state,
+                "model": model,
+                "questions": {
+                    "team": {
+                        "type": "choice",
+                        "instructions": "Which team should handle this ticket?",
+                        "criteria": {
+                            "billing": "Payment or subscription issues",
+                            "technical": "Bugs or integration problems",
+                            "sales": "Pricing or account questions",
+                        },
+                    },
+                    "angry": { "type": "noul", "instructions": "The customer is angry." },
+                    "mood": { "type": "score", "instructions": "How upset is the customer?",
+                              "criteria": ["Calm", "Annoyed", "Furious"] },
+                },
+            }));
+            assert!(status.is_success(), "{status}: {reply}");
+            reply
+        };
+
+        let billing = ask("I was charged twice for my subscription this month, please refund the duplicate payment.");
+        let technical = ask("The API returns a 500 error every time I call the webhook endpoint.");
+        assert_eq!(billing["answers"]["team"]["choice"], "billing", "{billing}");
+        assert_eq!(
+            technical["answers"]["team"]["choice"], "technical",
+            "{technical}"
+        );
+
+        for reply in [&billing, &technical] {
+            assert_eq!(reply["model"], canonical);
+            let answers = reply["answers"].as_object().unwrap();
+            assert_eq!(answers.len(), 3);
+            for (id, answer) in answers {
+                // thinking is off: the model answers with a label at once
+                let mass = answer["x_label_mass"].as_f64().unwrap();
+                assert!(0.5 < mass && mass <= 1.0 + 1e-6, "{id}: mass {mass}");
+            }
+            for id in ["team", "mood"] {
+                let total: f64 = answers[id]["probabilities"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .map(|p| p.as_f64().unwrap())
+                    .sum();
+                assert!((total - 1.0).abs() < 1e-3, "{id} adds up to {total}");
+            }
+            // nothing is generated; every question's prompt is counted
+            assert_eq!(reply["usage"]["output_tokens"], 0);
+            assert!(reply["usage"]["input_tokens"].as_u64().unwrap() > 100);
+        }
+
+        // asked again, the state is in the KV cache: the same answers
+        let again = ask("The API returns a 500 error every time I call the webhook endpoint.");
+        for id in ["team", "angry", "mood"] {
+            for field in ["choice", "noul", "score"] {
+                let (a, b) = (
+                    &technical["answers"][id][field],
+                    &again["answers"][id][field],
+                );
+                match (a.as_f64(), b.as_f64()) {
+                    (Some(a), Some(b)) => assert!((a - b).abs() < 2e-3, "{id}.{field}: {a} vs {b}"),
+                    _ => assert_eq!(a, b, "{id}.{field}"),
+                }
+            }
+        }
+
+        let grateful = ask("Thanks so much, this was a wonderful experience!");
+        let furious = ask(
+            "This is UNACCEPTABLE. I am FURIOUS. Fix this NOW or I will cancel and tell everyone!!!",
+        );
+        let angry = |r: &serde_json::Value| r["answers"]["angry"]["noul"].as_f64().unwrap();
+        assert!(
+            angry(&furious) > angry(&grateful),
+            "furious {} vs grateful {}",
+            angry(&furious),
+            angry(&grateful)
+        );
+        eprintln!(
+            "[test] systemone {model}: furious {:.2} vs grateful {:.2}",
+            angry(&furious),
+            angry(&grateful)
+        );
+
+        // an invalid request is a 422; thinking cannot be switched on
+        let (status, reply) = post(&serde_json::json!({
+            "state": "s", "model": model, "questions": {"q": {"type": "choice"}}
+        }));
+        assert_eq!(status, 422, "{reply}");
+        assert_eq!(reply["detail"][0]["loc"][3], "criteria", "{reply}");
+        let (status, reply) = post(&serde_json::json!({
+            "state": "s", "model": model, "chat_template_kwargs": {"enable_thinking": true},
+            "questions": {"q": {"type": "noul", "instructions": "i"}}
+        }));
+        assert_eq!(status, 400, "{reply}");
+        assert_eq!(reply["error"]["type"], "invalid_request_error");
+    });
+
+    terminate_daemon(&mut daemon);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_systemone_reads_a_local_model() {
+    eprintln!("[test] serve_systemone_reads_a_local_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] serve_systemone_reads_a_local_model: acquired SERIAL");
+    systemone_reads(MODEL, "docker.io/ai/qwen3.5:0.8b");
+}
+
+/// [`serve_systemone_reads_a_local_model`] on Gemma 4: another template,
+/// tokenizer and KV cache. `cargo test --test launch_e2e -- --ignored`.
+#[cfg(unix)]
+#[test]
+#[ignore = "pulls gemma4, about 7 GB"]
+fn serve_systemone_reads_gemma4() {
+    eprintln!("[test] serve_systemone_reads_gemma4: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] serve_systemone_reads_gemma4: acquired SERIAL");
+    systemone_reads("gemma4", "docker.io/ai/gemma4:latest");
 }
 
 /// llmman never links against llama.cpp: `mediagen::ffi` dlopens the

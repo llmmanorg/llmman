@@ -91,7 +91,7 @@ pub(super) fn relay(resp: reqwest::Response, activity: ActivityGuard) -> Respons
 /// not to carry one (an error body, a future backend response this
 /// doesn't recognize) is left alone rather than gaining a field it
 /// never had.
-pub(super) fn set_response_model(value: &mut serde_json::Value, canonical_model: &str) {
+fn set_response_model(value: &mut serde_json::Value, canonical_model: &str) {
     if value.get("model").is_some() {
         value["model"] = serde_json::Value::String(canonical_model.to_string());
     }
@@ -113,7 +113,7 @@ pub(super) fn set_response_model(value: &mut serde_json::Value, canonical_model:
 /// completely unchanged if it isn't valid JSON at all (an error body's
 /// own shape, or a future backend response this doesn't recognize)
 /// rather than mangling or dropping it.
-pub(super) fn rewrite_json_response_model(raw: &Bytes, canonical_model: &str) -> Bytes {
+fn rewrite_json_response_model(raw: &Bytes, canonical_model: &str) -> Bytes {
     match serde_json::from_slice::<serde_json::Value>(raw) {
         Ok(mut value) => {
             set_response_model(&mut value, canonical_model);
@@ -135,7 +135,7 @@ pub(super) fn rewrite_json_response_model(raw: &Bytes, canonical_model: &str) ->
 /// field rewritten (see [`set_response_model`]); `data: [DONE]`, a
 /// blank SSE event-separator line, or a `data: ` line whose payload
 /// *doesn't* parse as JSON all pass through byte-for-byte unchanged.
-pub(super) fn rewrite_sse_line_model(line: &str, canonical_model: &str) -> String {
+fn rewrite_sse_line_model(line: &str, canonical_model: &str) -> String {
     match line.strip_prefix("data: ") {
         Some(payload) if payload != "[DONE]" => match serde_json::from_str(payload) {
             Ok(mut value) => {
@@ -360,4 +360,103 @@ pub(super) async fn convert_upstream(
         .header("cache-control", "no-cache")
         .body(Body::from_stream(sse_stream))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test guarding against exactly the leak CodeRabbit
+    /// flagged in review: an `Engine::Mlx` backend is addressed by its
+    /// real on-disk directory path (see `backend_wire_model`), and
+    /// `mlx_lm.server` echoes whatever `"model"` value it received
+    /// straight back into its own response — so a plain byte-for-byte
+    /// relay would leak that internal path back to the client instead of
+    /// the name it actually asked for. `set_response_model` is the one
+    /// place both `rewrite_json_response_model` and
+    /// `rewrite_sse_line_model` delegate the actual field substitution
+    /// to.
+    #[test]
+    fn set_response_model_overwrites_an_existing_model_field_and_leaves_a_missing_one_alone() {
+        let mut with_model = serde_json::json!({"model": "/abs/path/to/model", "id": "x"});
+        set_response_model(&mut with_model, "gemma4:latest");
+        assert_eq!(
+            with_model,
+            serde_json::json!({"model": "gemma4:latest", "id": "x"})
+        );
+
+        let mut without_model = serde_json::json!({"id": "x"});
+        set_response_model(&mut without_model, "gemma4:latest");
+        assert_eq!(without_model, serde_json::json!({"id": "x"}));
+
+        // A Responses event carries it nested.
+        let mut event =
+            serde_json::json!({"type": "response.created", "response": {"model": "wire"}});
+        set_response_model(&mut event, "canonical");
+        assert_eq!(event["response"]["model"], "canonical");
+    }
+
+    #[test]
+    fn rewrite_json_response_model_rewrites_a_json_body_and_leaves_every_other_field_alone() {
+        let raw = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "id": "chatcmpl-1",
+                "model": "/home/user/.local/share/llmman/cache/abcd/model-dir",
+                "choices": [{"message": {"content": "hi"}}]
+            }))
+            .unwrap(),
+        );
+        let rewritten = rewrite_json_response_model(&raw, "gemma4:latest");
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(value["model"], "gemma4:latest");
+        assert_eq!(value["id"], "chatcmpl-1");
+        assert_eq!(value["choices"][0]["message"]["content"], "hi");
+    }
+
+    #[test]
+    fn rewrite_json_response_model_passes_non_json_bodies_through_unchanged() {
+        // An error body, or any other shape this doesn't recognize —
+        // must never be mangled or dropped just because it isn't JSON.
+        let raw = Bytes::from_static(b"not json at all");
+        assert_eq!(rewrite_json_response_model(&raw, "gemma4:latest"), raw);
+    }
+
+    #[test]
+    fn rewrite_sse_line_model_rewrites_only_the_model_field_of_a_data_line() {
+        let line = r#"data: {"id":"1","model":"/abs/path","choices":[{"delta":{"content":"h"}}]}"#;
+        let rewritten = rewrite_sse_line_model(line, "gemma4:latest");
+        let payload = rewritten.strip_prefix("data: ").expect("data: prefix");
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(value["model"], "gemma4:latest");
+        assert_eq!(value["id"], "1");
+        assert_eq!(value["choices"][0]["delta"]["content"], "h");
+    }
+
+    #[test]
+    fn rewrite_sse_line_model_leaves_the_done_sentinel_and_blank_separators_untouched() {
+        assert_eq!(
+            rewrite_sse_line_model("data: [DONE]", "gemma4:latest"),
+            "data: [DONE]"
+        );
+        assert_eq!(rewrite_sse_line_model("", "gemma4:latest"), "");
+    }
+
+    #[test]
+    fn rewrite_sse_line_model_passes_a_non_json_data_line_through_unchanged() {
+        assert_eq!(
+            rewrite_sse_line_model("data: not json", "gemma4:latest"),
+            "data: not json"
+        );
+    }
+
+    /// `message_start` nests the model one level down.
+    #[test]
+    fn set_response_model_reaches_a_messages_stream_event() {
+        let mut event = serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-x" }
+        });
+        set_response_model(&mut event, "mine");
+        assert_eq!(event["message"]["model"], "mine");
+    }
 }

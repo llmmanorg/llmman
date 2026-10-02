@@ -27,6 +27,13 @@ use crate::chat_template::{ThinkingControls, EFFORT_LEVELS};
 use crate::daemon;
 use crate::providers;
 
+mod claude;
+mod codex;
+mod common;
+mod copilot;
+mod goose;
+mod goose_desktop;
+mod opencode;
 mod sandbox;
 
 pub use sandbox::Sandbox;
@@ -134,11 +141,14 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         );
         let carries_key =
             provider.is_some() || overflow.is_some() || crate::auth::client_key().is_some();
+        // A --variant goes into opencode's state (`write_opencode_variant`).
+        let configured_by_file =
+            CONFIGURED_BY_FILE.contains(&id.as_str()) || (id == "opencode" && variant.is_some());
         sandbox::prepare(
             kind,
             &id,
             sandbox_state(&id)?,
-            CONFIGURED_BY_FILE.contains(&id.as_str()),
+            configured_by_file,
             carries_key,
         )?;
     }
@@ -805,13 +815,13 @@ fn env_dir(key: &str) -> Option<PathBuf> {
 /// prefix-local installs that have only a venv (see [`talos_command`]).
 fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
-        "opencode" => find_opencode(),
+        "opencode" => opencode::find_opencode(),
         "omp" => find_omp(),
         "qwen" => find_qwen(),
         "talos" => find_talos(),
         "dsh" => find_dsh().map(|(bin, _)| bin),
-        "goose" => find_goose(),
-        "goose-desktop" => find_goose_desktop(),
+        "goose" => goose::find_goose(),
+        "goose-desktop" => goose_desktop::find_goose_desktop(),
         "grok" => find_grok(),
         "docker-agent" => find_docker_agent(),
         _ => find_on_path(i.binary),
@@ -1005,7 +1015,7 @@ fn effort_args(integration: &str, effort: &str) -> Vec<String> {
 /// (see [`local_context_window`]), a `--provider` model's catalog one,
 /// or a pair's larger half (see [`pair_context_window`]); `None` when
 /// none of them is known. codex alone substitutes
-/// [`CODEX_FALLBACK_CONTEXT_WINDOW`] for a `None`, because its catalog
+/// [`codex::CODEX_FALLBACK_CONTEXT_WINDOW`] for a `None`, because its catalog
 /// cannot omit the field.
 #[allow(clippy::too_many_arguments)]
 fn launch(
@@ -1048,8 +1058,8 @@ fn launch(
             .and_then(Thinking::template)
             .is_some_and(|t| t.thinks);
     match name.as_str() {
-        "claude" => launch_claude(model, api_key, extra_args),
-        "opencode" => launch_opencode(
+        "claude" => claude::launch_claude(model, api_key, extra_args),
+        "opencode" => opencode::launch_opencode(
             model,
             api_key,
             thinking,
@@ -1059,12 +1069,12 @@ fn launch(
             max_output,
             extra_args,
         ),
-        "codex" => launch_codex(model, api_key, vision, context_window, extra_args),
+        "codex" => codex::launch_codex(model, api_key, vision, context_window, extra_args),
         "pi" => launch_pi(model, reasons, vision, context_window, extra_args),
         "omp" => launch_omp(model, reasons, vision, context_window, extra_args),
         "cline" => launch_cline(model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
-        "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
+        "copilot" | "copilot-cli" => copilot::launch_copilot(model, extra_args),
         "kimi" => launch_simple("kimi", model, extra_args),
         "gemini" => launch_gemini(model, api_key, extra_args),
         "agy" => launch_agy(model, api_key, extra_args),
@@ -1073,8 +1083,8 @@ fn launch(
         "talos" => launch_talos(model, extra_args),
         "qwen" => launch_qwen(model, api_key, vision, listed.as_ref(), extra_args),
         "dsh" => launch_dsh(model, api_key, vision, listed.as_ref(), extra_args),
-        "goose" => launch_goose(model, api_key, extra_args),
-        "goose-desktop" => launch_goose_desktop(model, api_key, extra_args),
+        "goose" => goose::launch_goose(model, api_key, extra_args),
+        "goose-desktop" => goose_desktop::launch_goose_desktop(model, api_key, extra_args),
         "grok" => launch_grok(model, api_key, listed.as_ref(), extra_args),
         "docker-agent" => launch_docker_agent(model, api_key, extra_args),
         other => Err(unknown_integration(other)),
@@ -1124,7 +1134,7 @@ const CONFIGURED_BY_FILE: &[&str] = &[
 fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
     use sandbox::State::{Dir, Files};
     let home = dirs::home_dir().context("no home directory")?;
-    let xdg = |var: &str, default: &str| env_dir(var).unwrap_or_else(|| home.join(default));
+    let xdg = |var: &str, default: &str| xdg_dir(&home, var, default);
     let config = xdg("XDG_CONFIG_HOME", ".config");
     let data = xdg("XDG_DATA_HOME", ".local/share");
     let state = xdg("XDG_STATE_HOME", ".local/state");
@@ -1136,10 +1146,10 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
         "opencode" => vec![
             Dir(config.join("opencode")),
             Dir(data.join("opencode")),
-            Dir(state.join("opencode")),
+            Dir(opencode::opencode_state_dir()?),
             Dir(xdg("XDG_CACHE_HOME", ".cache").join("opencode")),
         ],
-        "codex" => vec![Dir(codex_dir()?)],
+        "codex" => vec![Dir(codex::codex_dir()?)],
         "pi" => vec![Dir(pi_agent_dir()?)],
         "omp" => vec![Dir(omp_agent_dir()?)],
         "cline" => vec![Dir(cline_dir()?)],
@@ -1176,7 +1186,7 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
                 Dir(state.join("goose")),
             ];
             if name == "goose-desktop" {
-                dirs.push(Dir(goose_desktop_user_data(&home, &config)));
+                dirs.push(Dir(goose_desktop::goose_desktop_user_data(&home, &config)));
                 // macOS keeps the app's preferences outside `userData`,
                 // under the bundle id `Goose.app` 1.52.0 declares.
                 if cfg!(target_os = "macos") {
@@ -1199,60 +1209,9 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
 // Per-integration launchers
 // ---------------------------------------------------------------------------
 
-/// claude: set ANTHROPIC_BASE_URL and a dummy ANTHROPIC_API_KEY so it talks to
-/// our server's Anthropic-compatible API.
-fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("claude").ok_or_else(|| anyhow::anyhow!("claude is not installed"))?;
-
-    let mut args: Vec<String> = Vec::new();
-    if !model.is_empty() {
-        args.extend(["--model".to_string(), model.to_string()]);
-    }
-    args.extend_from_slice(extra_args);
-
-    let server = server();
-    exec_with_env(
-        &bin,
-        &args,
-        &[
-            ("ANTHROPIC_BASE_URL", server.as_str()),
-            ("ANTHROPIC_API_KEY", api_key),
-        ],
-    )
-}
-
-/// opencode: a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
-/// /v1 endpoint, with the model's thinking variants, its window and, for
-/// a vision model, image input. `--variant` becomes the model's default
-/// options.
-#[allow(clippy::too_many_arguments)]
-fn launch_opencode(
-    model: &str,
-    api_key: &str,
-    thinking: Option<&Thinking>,
-    variant: Option<&str>,
-    vision: bool,
-    context_window: Option<u64>,
-    max_output: Option<u32>,
-    extra_args: &[String],
-) -> anyhow::Result<()> {
-    let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
-
-    let effective_model = if model.is_empty() { "default" } else { model };
-    let variants = opencode_variants(thinking);
-    let options = variant.and_then(|v| variants.iter().find(|(name, _)| *name == v));
-    let config = opencode_config(
-        &server(),
-        effective_model,
-        api_key,
-        &variants,
-        options.map(|(_, options)| options),
-        vision,
-        context_window,
-        max_output,
-    );
-
-    exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
+/// `$var`, else `default` under `home`.
+fn xdg_dir(home: &Path, var: &str, default: &str) -> PathBuf {
+    env_dir(var).unwrap_or_else(|| home.join(default))
 }
 
 /// The thinking choices a model offers an integration, in cycle order.
@@ -1305,216 +1264,6 @@ fn unknown_levels_with(variant: &str) -> Thinking {
         .map(String::from)
         .collect();
     Thinking::Listed(levels)
-}
-
-/// opencode's `variants` for the model, in cycle order (`variant_cycle`,
-/// ctrl+t by default): [`thinking_choices`]. Each variant is the request
-/// options `@ai-sdk/openai-compatible` sends: `reasoningEffort` as
-/// `reasoning_effort`, other keys verbatim. opencode derives variants
-/// only for models it knows from models.dev, so without these a model
-/// has nothing to cycle.
-/// A switch-only model's two variants set both keys, so either overrides
-/// the other when `--variant` put it in the model's options.
-fn opencode_variants(thinking: Option<&Thinking>) -> Vec<(&str, serde_json::Value)> {
-    let choices = thinking_choices(thinking);
-    let switch = choices.contains(&"thinking");
-    choices
-        .into_iter()
-        .map(|choice| {
-            let options = match choice {
-                "none" if switch => serde_json::json!({
-                    "reasoningEffort": "none",
-                    "chat_template_kwargs": { "enable_thinking": false },
-                }),
-                "thinking" => serde_json::json!({
-                    "reasoningEffort": "medium",
-                    "chat_template_kwargs": { "enable_thinking": true },
-                }),
-                level => serde_json::json!({ "reasoningEffort": level }),
-            };
-            (choice, options)
-        })
-        .collect()
-}
-
-/// Finds opencode on `PATH`, then where its installers put it. The second
-/// check finds a fresh install that this process's `PATH` doesn't include
-/// yet.
-fn find_opencode() -> Option<PathBuf> {
-    find_on_path("opencode").or_else(|| opencode_fallback_paths().into_iter().find(|p| p.is_file()))
-}
-
-/// Where opencode's installers put it: `~/.opencode/bin` (install script)
-/// and, on Windows, `%APPDATA%\npm` (`npm install -g`).
-fn opencode_fallback_paths() -> Vec<PathBuf> {
-    let home = dirs::home_dir();
-    if cfg!(windows) {
-        let mut paths: Vec<PathBuf> = home
-            .iter()
-            .map(|h| h.join(".opencode").join("bin").join("opencode.exe"))
-            .collect();
-        // Treat an empty APPDATA as unset.
-        let roaming = std::env::var_os("APPDATA")
-            .filter(|d| !d.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| home.as_ref().map(|h| h.join("AppData").join("Roaming")));
-        if let Some(npm) = roaming.map(|d| d.join("npm")) {
-            paths.extend(
-                WINDOWS_PATH_EXTS
-                    .iter()
-                    .map(|ext| npm.join(format!("opencode.{ext}"))),
-            );
-        }
-        return paths;
-    }
-    home.iter()
-        .map(|h| h.join(".opencode").join("bin").join("opencode"))
-        .collect()
-}
-
-/// opencode's own `OUTPUT_TOKEN_MAX` (`provider/transform.ts`), the cap
-/// it applies to `limit.output` and the value it substitutes for a 0.
-const OPENCODE_OUTPUT_TOKEN_MAX: u64 = 32_000;
-
-/// `limit.output` for a window of `context` when the catalog names no
-/// real ceiling: a quarter, capped at [`OPENCODE_OUTPUT_TOKEN_MAX`],
-/// never 0.
-///
-/// opencode spends this field twice — the `maxOutputTokens` it sends
-/// and the headroom it keeps before compacting — capping both at its
-/// own [`OPENCODE_OUTPUT_TOKEN_MAX`], which is what makes a catalog
-/// ceiling of any size safe to pass. A quarter is the guess where
-/// there is none: longer than one turn produces, short enough to leave
-/// the window mostly usable.
-fn opencode_output_reserve(context: u64) -> u64 {
-    (context / 4).clamp(1, OPENCODE_OUTPUT_TOKEN_MAX)
-}
-
-/// The `OPENCODE_CONFIG_CONTENT` for `model` at `server`. Structs rather
-/// than `json!`, whose map sorts keys: opencode cycles variants in the
-/// order listed. No variants leaves the key out.
-#[allow(clippy::too_many_arguments)]
-fn opencode_config(
-    server: &str,
-    model: &str,
-    api_key: &str,
-    variants: &[(&str, serde_json::Value)],
-    options: Option<&serde_json::Value>,
-    vision: bool,
-    context_window: Option<u64>,
-    max_output: Option<u32>,
-) -> String {
-    use serde::ser::{SerializeMap, Serializer};
-
-    /// An object with runtime keys, in the order given.
-    fn entries<S: Serializer, V: serde::Serialize>(
-        entries: &[(&str, V)],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(entries.len()))?;
-        for (key, value) in entries {
-            map.serialize_entry(key, value)?;
-        }
-        map.end()
-    }
-
-    #[derive(serde::Serialize)]
-    struct Config<'a> {
-        #[serde(rename = "$schema")]
-        schema: &'static str,
-        provider: Providers<'a>,
-        model: String,
-    }
-    #[derive(serde::Serialize)]
-    struct Providers<'a> {
-        ollama: Provider<'a>,
-    }
-    #[derive(serde::Serialize)]
-    struct Provider<'a> {
-        npm: &'static str,
-        name: &'static str,
-        options: Options<'a>,
-        #[serde(serialize_with = "entries")]
-        models: [(&'a str, Model<'a>); 1],
-    }
-    #[derive(serde::Serialize)]
-    struct Options<'a> {
-        #[serde(rename = "baseURL")]
-        base_url: String,
-        #[serde(rename = "apiKey")]
-        api_key: &'a str,
-    }
-    #[derive(serde::Serialize)]
-    struct Model<'a> {
-        name: &'a str,
-        #[serde(serialize_with = "entries", skip_serializing_if = "<[_]>::is_empty")]
-        variants: &'a [(&'a str, serde_json::Value)],
-        #[serde(skip_serializing_if = "Option::is_none")]
-        options: Option<&'a serde_json::Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        modalities: Option<Modalities>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        attachment: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        limit: Option<Limit>,
-    }
-    #[derive(serde::Serialize)]
-    struct Modalities {
-        input: &'static [&'static str],
-        output: &'static [&'static str],
-    }
-    /// opencode's schema requires both fields once `limit` is present.
-    #[derive(serde::Serialize)]
-    struct Limit {
-        context: u64,
-        output: u64,
-    }
-
-    // Declare image input for a vision model so opencode will attach
-    // images; a text-only model gets neither key.
-    let modalities = vision.then_some(Modalities {
-        input: &["text", "image"],
-        output: &["text"],
-    });
-
-    // Without `limit`, opencode normalizes a config-defined model to
-    // `{context: 0, output: 0}` and then skips overflow detection
-    // entirely for a 0 context (`session/overflow.ts`, `isOverflow`), so
-    // a session never auto-compacts. Declared only when llmman knows the
-    // window; otherwise the key stays out rather than assert a guess.
-    let limit = context_window.map(|context| Limit {
-        context,
-        // The catalog's own ceiling wherever there is one; derived
-        // only for a local model, which has no catalog to name one.
-        output: max_output.map_or_else(|| opencode_output_reserve(context), u64::from),
-    });
-
-    let config = Config {
-        schema: "https://opencode.ai/config.json",
-        provider: Providers {
-            ollama: Provider {
-                npm: "@ai-sdk/openai-compatible",
-                name: "Ollama",
-                options: Options {
-                    base_url: format!("{server}/v1"),
-                    api_key,
-                },
-                models: [(
-                    model,
-                    Model {
-                        name: model,
-                        variants,
-                        options,
-                        modalities,
-                        attachment: vision.then_some(true),
-                        limit,
-                    },
-                )],
-            },
-        },
-        model: format!("ollama/{model}"),
-    };
-    serde_json::to_string(&config).expect("opencode config serializes")
 }
 
 /// pi: register llmman as an OpenAI-compatible provider in `models.json`
@@ -1638,7 +1387,7 @@ fn write_omp_config_in_dir(
         context_window,
         server,
     )?;
-    write_yaml_merged(&dir.join("config.yml"), "omp", omp_config_merged)
+    common::write_yaml_merged(&dir.join("config.yml"), "omp", omp_config_merged)
 }
 
 fn omp_config_merged(existing: &serde_json::Value) -> serde_json::Value {
@@ -1663,7 +1412,7 @@ fn write_omp_models_config_at(
     server: &str,
 ) -> anyhow::Result<()> {
     let entry = pi_model_entry(model, reasons, vision, context_window);
-    write_yaml_merged(path, "omp", |existing| {
+    common::write_yaml_merged(path, "omp", |existing| {
         omp_models_merged(existing, server, &entry)
     })
 }
@@ -1691,29 +1440,6 @@ fn omp_models_merged(
         provider.insert("authHeader".into(), serde_json::json!(true));
         provider.insert("discovery".into(), serde_json::json!({ "type": "ollama" }));
     })
-}
-
-fn write_yaml_merged(
-    path: &Path,
-    label: &str,
-    merge: impl FnOnce(&serde_json::Value) -> serde_json::Value,
-) -> anyhow::Result<()> {
-    write_structured_merged(
-        path,
-        label,
-        ("YAML", "yml.bak"),
-        |text| Ok(yaml_serde::from_str(text)?),
-        |value| Ok(yaml_serde::to_string(value)?),
-        |raw, backup| {
-            if !backup.exists() {
-                return true;
-            }
-            yaml_serde::from_str::<serde_json::Value>(raw)
-                .and_then(|value| yaml_serde::to_string(&value))
-                .is_ok_and(|canonical| canonical != raw)
-        },
-        merge,
-    )
 }
 
 /// Select llmman's model through OMP's Ollama provider unless the caller
@@ -1745,7 +1471,7 @@ fn configured_pi_agent_dir() -> anyhow::Result<Option<PathBuf>> {
         return Ok(Some(PathBuf::from(dir)));
     }
     let home = crate::config::home_dir().context("no home directory")?;
-    Ok(Some(expand_tilde(dir, &home)))
+    Ok(Some(common::expand_tilde(dir, &home)))
 }
 
 /// pi's config directory: `PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
@@ -1774,10 +1500,10 @@ fn write_pi_config(
 ) -> anyhow::Result<()> {
     let dir = pi_agent_dir()?;
     let entry = pi_model_entry(model, reasons, vision, context_window);
-    write_json_merged(&dir.join("models.json"), "pi", |existing| {
+    common::write_json_merged(&dir.join("models.json"), "pi", |existing| {
         pi_models_merged(existing, &server(), &entry)
     })?;
-    write_json_merged(&dir.join("settings.json"), "pi", |existing| {
+    common::write_json_merged(&dir.join("settings.json"), "pi", |existing| {
         pi_settings_merged(existing, model)
     })
 }
@@ -1826,7 +1552,7 @@ fn provider_models_merged(
     let Some(root_map) = root.as_object_mut() else {
         return serde_json::json!({});
     };
-    let provider = object_under(object_under(root_map, "providers"), provider_name);
+    let provider = common::object_under(common::object_under(root_map, "providers"), provider_name);
     let old_models = provider
         .get("models")
         .and_then(serde_json::Value::as_array)
@@ -1899,112 +1625,6 @@ fn pi_settings_merged(existing: &serde_json::Value, model: &str) -> serde_json::
     root
 }
 
-/// codex: set OPENAI_API_KEY=llmman and write ~/.codex/config.toml with the
-/// ollama provider pointing at our /v1 endpoint.
-fn launch_codex(
-    model: &str,
-    api_key: &str,
-    vision: bool,
-    context_window: Option<u64>,
-    extra_args: &[String],
-) -> anyhow::Result<()> {
-    // Write codex config
-    write_codex_config(model, vision, context_window)?;
-
-    // Regression: this used to pass a bare PathBuf::from("codex") straight
-    // to exec_with_env instead of resolving it via find_on_path like every
-    // other integration here does. That happened to work on Unix (bare
-    // relative names go through $PATH search via execvp with no extension
-    // needed), but on Windows, Command::status() calls CreateProcess
-    // directly (not cmd.exe), which — unlike a shell — does not consult
-    // PATHEXT to try .cmd/.bat alternatives for an extensionless name: it
-    // only ever auto-appends a single ".exe". Since `npm install -g
-    // @openai/codex` installs a "codex.cmd" shim on Windows, not a
-    // "codex.exe", every real Windows codex launch failed with "program
-    // not found" — a real E2E-verified failure, not a theoretical one.
-    let bin = find_on_path("codex").ok_or_else(|| anyhow::anyhow!("codex is not installed"))?;
-
-    let mut args: Vec<String> = Vec::new();
-    if !model.is_empty() {
-        args.extend(["--model".to_string(), model.to_string()]);
-    }
-    // codex profile flag
-    args.extend(["--profile".to_string(), "llmman".to_string()]);
-    args.extend_from_slice(extra_args);
-
-    exec_with_env(&bin, &args, &[("OPENAI_API_KEY", api_key)])
-}
-
-/// Writes codex's `llmman` profile.
-///
-/// Codex 0.134+ dropped support for `--profile <name>` reading a
-/// `[profiles.<name>]` table out of `config.toml`: it now only overlays a
-/// sibling `~/.codex/<name>.config.toml`, using top-level keys instead of a
-/// `[profiles.<name>]` wrapper (see
-/// <https://developers.openai.com/codex/config-advanced#profiles>). An
-/// older llmman wrote the now-unsupported `[profiles.llmman]` form directly
-/// into `config.toml`, which current codex refuses to start with at all
-/// ("cannot be used while config.toml contains legacy ... table") — so any
-/// leftover copy of that table is stripped from `config.toml` first, then
-/// the real settings are (re)written to the profile overlay file codex
-/// actually reads.
-fn write_codex_config(
-    model: &str,
-    vision: bool,
-    context_window: Option<u64>,
-) -> anyhow::Result<()> {
-    let config_dir = codex_dir()?;
-    std::fs::create_dir_all(&config_dir)?;
-
-    let config_path = config_dir.join("config.toml");
-    if let Ok(existing) = std::fs::read_to_string(&config_path) {
-        if existing.contains("[profiles.llmman]") {
-            std::fs::write(&config_path, strip_legacy_llmman_profile(&existing))?;
-        }
-    }
-
-    // Without a model there is nothing to describe; codex keeps its defaults.
-    let catalog_path = config_dir.join("llmman-model.json");
-    let catalog = (!model.is_empty()).then(|| {
-        let context_window = codex_context_window(context_window);
-        write_codex_file(
-            &catalog_path,
-            &codex_model_catalog(model, vision, context_window),
-        )
-        .map(|()| catalog_path.clone())
-    });
-    let catalog = catalog.transpose()?;
-
-    let profile_path = config_dir.join("llmman.config.toml");
-    write_codex_file(&profile_path, &codex_profile(&server(), catalog.as_deref()))
-}
-
-fn codex_dir() -> anyhow::Result<PathBuf> {
-    Ok(dirs::home_dir()
-        .context("no home directory")?
-        .join(".codex"))
-}
-
-/// Writes `contents` to `path` unless it already holds exactly that.
-fn write_codex_file(path: &Path, contents: &str) -> anyhow::Result<()> {
-    if std::fs::read_to_string(path).ok().as_deref() == Some(contents) {
-        return Ok(());
-    }
-    std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))
-}
-
-/// The catalog's `context_window` where `launch` resolved none at all;
-/// ollama's fallback too.
-const CODEX_FALLBACK_CONTEXT_WINDOW: u64 = 128_000;
-
-/// What codex compacts against: the window `launch` resolved — live from
-/// the loaded runner, and a hybrid pair's larger half — else
-/// [`CODEX_FALLBACK_CONTEXT_WINDOW`]. codex's catalog cannot omit the
-/// field, so it guesses where every other integration stays quiet.
-fn codex_context_window(window: Option<u64>) -> u64 {
-    window.unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
-}
-
 /// The window the daemon serves for `model`, read back from the loaded
 /// runner rather than predicted: an OOM retry halves `--ctx-size` during
 /// the load, and a reused daemon keeps whatever it was started with.
@@ -2058,89 +1678,6 @@ fn served_context_window(env: Option<u32>, trained: Option<u64>) -> Option<u64> 
     }
 }
 
-/// The `model_catalog_json` for `model`, declaring its image input in
-/// `input_modalities`. The other fields are ones codex requires, valued
-/// as ollama's `buildCodexModelEntry` does.
-fn codex_model_catalog(model: &str, vision: bool, context_window: u64) -> String {
-    let input: &[&str] = if vision {
-        &["text", "image"]
-    } else {
-        &["text"]
-    };
-    let entry = serde_json::json!({
-        "slug": model,
-        "display_name": model,
-        "context_window": context_window,
-        "shell_type": "default",
-        "visibility": "list",
-        "supported_in_api": true,
-        "priority": 0,
-        "truncation_policy": { "mode": "bytes", "limit": 10000 },
-        "input_modalities": input,
-        "base_instructions": "",
-        "support_verbosity": true,
-        "default_verbosity": "low",
-        "supports_parallel_tool_calls": false,
-        "supports_reasoning_summaries": false,
-        "supported_reasoning_levels": [],
-        "experimental_supported_tools": [],
-    });
-    let catalog = serde_json::json!({ "models": [entry] });
-    serde_json::to_string_pretty(&catalog).expect("codex catalog serializes") + "\n"
-}
-
-/// The contents of `~/.codex/llmman.config.toml`: a provider of llmman's
-/// own rather than `openai_base_url` on codex's built-in one, which codex
-/// treats as WebSocket-capable and so opened every session with five
-/// failed `ws://` attempts (~6s of "Reconnecting...") before HTTP.
-fn codex_profile(server: &str, catalog: Option<&Path>) -> String {
-    // A JSON string is also a valid TOML string.
-    let catalog = catalog
-        .map(|p| {
-            let quoted = serde_json::Value::from(p.display().to_string());
-            format!("model_catalog_json = {quoted}\n")
-        })
-        .unwrap_or_default();
-    format!(
-        "# Written by `llmman launch codex`; edits are overwritten.\n\
-         model_provider = \"llmman\"\n\
-         {catalog}\
-         \n\
-         [model_providers.llmman]\n\
-         name = \"llmman\"\n\
-         base_url = \"{server}/v1\"\n\
-         env_key = \"OPENAI_API_KEY\"\n\
-         wire_api = \"responses\"\n\
-         supports_websockets = false\n"
-    )
-}
-
-/// Removes a `[profiles.llmman]` table (and everything up to the next
-/// top-level `[...]` header or end of file) from `config.toml`'s text —
-/// the shape an older llmman wrote there, now rejected by current codex.
-/// Line-based rather than a real TOML parser: this only ever needs to
-/// undo llmman's own prior output, not handle arbitrary user TOML.
-fn strip_legacy_llmman_profile(existing: &str) -> String {
-    let mut out = String::new();
-    let mut skipping = false;
-    for line in existing.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[profiles.llmman]" {
-            skipping = true;
-            continue;
-        }
-        if skipping && trimmed.starts_with('[') {
-            skipping = false;
-        }
-        if skipping {
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
-}
-
 /// aider: set OPENAI_API_KEY and OPENAI_BASE_URL.
 fn launch_aider(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let base_url = format!("{}/v1", server());
@@ -2159,21 +1696,6 @@ fn launch_aider(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Re
             ("OPENAI_BASE_URL", base_url.as_str()),
         ],
     )
-}
-
-/// copilot: passes COPILOT_PROVIDER_BASE_URL via env.
-fn launch_copilot(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin =
-        find_on_path("gh").ok_or_else(|| anyhow::anyhow!("gh (GitHub CLI) is not installed"))?;
-
-    let base_url = format!("{}/v1", server());
-    let mut args = vec!["copilot".to_string()];
-    if !model.is_empty() {
-        args.extend(["--model".to_string(), model.to_string()]);
-    }
-    args.extend_from_slice(extra_args);
-
-    exec_with_env(&bin, &args, &[("COPILOT_PROVIDER_BASE_URL", &base_url)])
 }
 
 /// gemini: set GOOGLE_GENAI_BASE_URL pointing at our Anthropic-compatible endpoint.
@@ -2289,7 +1811,7 @@ fn hermes_home() -> anyhow::Result<PathBuf> {
 /// Only overwrites the `model:`/`providers:` top-level blocks this
 /// itself writes — everything else in an existing `config.yaml` (other
 /// providers, toolsets, etc.) is preserved, the same way
-/// `write_codex_config`/`strip_legacy_llmman_profile` avoid clobbering
+/// `codex::write_codex_config`/`codex::strip_legacy_llmman_profile` avoid clobbering
 /// unrelated `config.toml` content.
 fn write_hermes_config(model: &str, vision: bool) -> anyhow::Result<()> {
     let config_dir = hermes_home()?;
@@ -2312,8 +1834,8 @@ fn hermes_config_blocks(model: &str, base_url: &str, vision: bool) -> String {
     // Double-quoted (not bare) so a model name that happens to be a YAML
     // keyword (`null`, `true`, ...) or contain metacharacters (`:`, `#`,
     // ...) still parses back as the literal string it is.
-    let model = yaml_quote(model);
-    let base_url = yaml_quote(base_url);
+    let model = common::yaml_quote(model);
+    let base_url = common::yaml_quote(base_url);
     let vision = if vision {
         "  supports_vision: true\n"
     } else {
@@ -2325,17 +1847,9 @@ fn hermes_config_blocks(model: &str, base_url: &str, vision: bool) -> String {
     )
 }
 
-/// Renders `s` as a double-quoted YAML scalar, escaping backslashes and
-/// double quotes — enough to keep any value we generate (a model name, a
-/// URL) a literal string regardless of YAML keywords or metacharacters
-/// it might contain.
-fn yaml_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
 /// Removes a top-level YAML key (`<key>:` at column 0) and every line
 /// indented under it, up to the next column-0 line or EOF — the YAML
-/// (indentation-block) equivalent of `strip_legacy_llmman_profile`'s
+/// (indentation-block) equivalent of `codex::strip_legacy_llmman_profile`'s
 /// TOML `[...]`-header block removal. Only ever needs to undo llmman's
 /// own prior writes below, not handle arbitrary user YAML.
 fn strip_yaml_top_level_key(existing: &str, key: &str) -> String {
@@ -2478,7 +1992,7 @@ fn qwen_model_and_vision<'a>(
     vision: bool,
     extra_args: &'a [String],
 ) -> (&'a str, bool) {
-    let forwarded = forwarded_model(extra_args);
+    let forwarded = common::forwarded_model(extra_args);
     let same = forwarded.is_none_or(|f| {
         crate::shortnames::resolve_ollama_api(f).is_ok_and(|resolved| resolved == model)
     });
@@ -2501,24 +2015,6 @@ fn path_with_dir_prepended(
     }
     components.insert(0, dir.to_path_buf());
     std::env::join_paths(components).ok()
-}
-
-/// The value of the last `--model`/`-m` after `--`, as a word or
-/// `=`-joined, the forms `has_flag` takes; yargs keeps the last too.
-fn forwarded_model(extra_args: &[String]) -> Option<&str> {
-    let mut found = None;
-    let mut args = extra_args.iter().map(String::as_str);
-    while let Some(a) = args.next() {
-        match a {
-            "--model" | "-m" => found = args.next().or(found),
-            _ => {
-                if let Some(v) = a.strip_prefix("--model=").or_else(|| a.strip_prefix("-m=")) {
-                    found = Some(v);
-                }
-            }
-        }
-    }
-    found.filter(|v| !v.is_empty())
 }
 
 /// `--auth-type openai --model <model>` ahead of the caller's own
@@ -3110,24 +2606,13 @@ fn qwen_home() -> anyhow::Result<PathBuf> {
     let home = || dirs::home_dir().context("no home directory");
     match std::env::var("QWEN_HOME").ok().filter(|d| !d.is_empty()) {
         Some(dir) if !dir.starts_with('~') => Ok(PathBuf::from(dir)),
-        Some(dir) => Ok(expand_tilde(&dir, &home()?)),
+        Some(dir) => Ok(common::expand_tilde(&dir, &home()?)),
         None => Ok(home()?.join(".qwen")),
     }
 }
 
-/// A leading `~` is `home`, as Qwen Code's `Storage.resolvePath` reads
-/// it; a quoted export leaves it for the program to expand.
-fn expand_tilde(dir: &str, home: &Path) -> PathBuf {
-    match dir.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => {
-            home.join(rest.trim_start_matches(['/', '\\']))
-        }
-        _ => PathBuf::from(dir),
-    }
-}
-
 /// Records llmman as the `openai` provider for `model` in Qwen Code's
-/// `settings.json`, as `write_codex_config` and `write_hermes_config` do
+/// `settings.json`, as `codex::write_codex_config` and `write_hermes_config` do
 /// for theirs. See `qwen_settings_merged` for what goes in.
 fn write_qwen_settings(model: &str, vision: bool, effort: Option<&Effort>) -> anyhow::Result<()> {
     write_qwen_settings_at(
@@ -3152,140 +2637,9 @@ fn write_qwen_settings_at(
     vision: bool,
     effort: Option<&Effort>,
 ) -> anyhow::Result<()> {
-    write_json_merged(&dir.join("settings.json"), "qwen", |existing| {
+    common::write_json_merged(&dir.join("settings.json"), "qwen", |existing| {
         qwen_settings_merged(existing, model, base_url, vision, effort)
     })
-}
-
-/// Rewrites the JSON object at `path` through `merge`, leaving a file it
-/// does not understand alone and saying so under `label`.
-///
-/// The settings files these integrations read are the user's as much as
-/// llmman's, so: comments survive a parse (`strip_json_comments`) and the
-/// text carrying them is kept as `.bak` before the first rewrite that
-/// would drop them; a rendering that already matches is not written at
-/// all; and the write is atomic, since a half-written settings file is
-/// worse than a stale one. A leading BOM is stripped because a
-/// node-based reader tolerates one and `serde_json` does not.
-fn write_json_merged(
-    path: &Path,
-    label: &str,
-    merge: impl FnOnce(&serde_json::Value) -> serde_json::Value,
-) -> anyhow::Result<()> {
-    write_structured_merged(
-        path,
-        label,
-        ("JSON", "json.bak"),
-        |text| {
-            let text = text.trim_start_matches('\u{feff}').trim();
-            Ok(serde_json::from_str(&strip_json_comments(text))?)
-        },
-        |value| {
-            let mut out = serde_json::to_string_pretty(value)?;
-            out.push('\n');
-            Ok(out)
-        },
-        |raw, backup| !backup.exists() || strip_json_comments(raw) != raw,
-        merge,
-    )
-}
-
-/// Parse, merge, back up, and atomically rewrite a user-owned structured
-/// settings file. Format-specific parsing and rendering stay at the call site.
-fn write_structured_merged(
-    path: &Path,
-    label: &str,
-    format: (&str, &str),
-    parse: impl FnOnce(&str) -> anyhow::Result<serde_json::Value>,
-    serialize: impl FnOnce(&serde_json::Value) -> anyhow::Result<String>,
-    should_backup: impl FnOnce(&str, &Path) -> bool,
-    merge: impl FnOnce(&serde_json::Value) -> serde_json::Value,
-) -> anyhow::Result<()> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => Some(raw),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
-    let existing = match raw.as_deref().map(str::trim) {
-        None | Some("") => serde_json::json!({}),
-        Some(text) => match parse(text) {
-            Ok(value) if value.is_object() => value,
-            _ => {
-                eprintln!(
-                    "[llmman] {label}: {} is not a {} object; leaving it alone",
-                    path.display(),
-                    format.0
-                );
-                return Ok(());
-            }
-        },
-    };
-    let merged = merge(&existing);
-    if merged == existing {
-        return Ok(());
-    }
-    let dir = path.parent().context("settings path has no directory")?;
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    if let Some(raw) = &raw {
-        let backup = path.with_extension(format.1);
-        if should_backup(raw, &backup) {
-            std::fs::copy(path, &backup)
-                .with_context(|| format!("back up {} to {}", path.display(), backup.display()))?;
-        }
-    }
-    let out = serialize(&merged)?;
-    crate::fsutil::write_atomic(path, out.as_bytes())
-        .with_context(|| format!("write {}", path.display()))
-}
-
-/// `//` and `/* */` comments outside strings replaced by spaces, so a
-/// parse error still points at the right place; what `strip-json-comments`
-/// does for Qwen Code before `JSON.parse`.
-fn strip_json_comments(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-    while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                in_string = true;
-                out.push(c);
-            }
-            '/' if chars.peek() == Some(&'/') => {
-                out.push(' ');
-                while chars.peek().is_some_and(|&n| n != '\n') {
-                    chars.next();
-                    out.push(' ');
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                out.push_str("  ");
-                let mut prev = ' ';
-                for n in chars.by_ref() {
-                    out.push(if n == '\n' { '\n' } else { ' ' });
-                    if prev == '*' && n == '/' {
-                        break;
-                    }
-                    prev = n;
-                }
-            }
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 /// The variable llmman's entry names as its key, and what marks the entry
@@ -3342,7 +2696,7 @@ fn qwen_settings_merged(
         };
         ours["capabilities"] = serde_json::json!({ "reasoning": reasoning });
     }
-    let openai = object_under(&mut doc, "modelProviders")
+    let openai = common::object_under(&mut doc, "modelProviders")
         .entry("openai")
         .or_insert_with(|| serde_json::json!([]));
     let unwrapped = openai.get("models").is_some_and(|m| m.is_array());
@@ -3360,28 +2714,16 @@ fn qwen_settings_merged(
     if unwrapped {
         doc.insert("$version".into(), 4.into());
     }
-    let auth = object_under(object_under(&mut doc, "security"), "auth");
+    let auth = common::object_under(common::object_under(&mut doc, "security"), "auth");
     auth.insert("selectedType".into(), "openai".into());
     auth.insert("baseUrl".into(), base_url.into());
-    let model_cfg = object_under(&mut doc, "model");
+    let model_cfg = common::object_under(&mut doc, "model");
     model_cfg.insert("name".into(), model.into());
     model_cfg.insert("baseUrl".into(), base_url.into());
     if effort.is_some() {
         model_cfg.remove("reasoningEffort");
     }
     serde_json::Value::Object(doc)
-}
-
-/// The object at `key` in `parent`, put there if absent or not an object.
-fn object_under<'a>(
-    parent: &'a mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> &'a mut serde_json::Map<String, serde_json::Value> {
-    let slot = parent.entry(key).or_insert_with(|| serde_json::json!({}));
-    if !slot.is_object() {
-        *slot = serde_json::json!({});
-    }
-    slot.as_object_mut().expect("set to an object just above")
 }
 
 /// An entry llmman wrote: `QWEN_ENV_KEY` as its key, at this daemon's
@@ -3393,663 +2735,6 @@ fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
     field("envKey") == Some(QWEN_ENV_KEY)
         && field("baseUrl")
             .is_some_and(|u| u.trim_end_matches('/') == base_url.trim_end_matches('/'))
-}
-
-/// goose: configured entirely through the environment, which goose reads
-/// in preference to its own `config.yaml` — so unlike hermes and qwen
-/// nothing is written to disk and no key is persisted. `OPENAI_HOST` is
-/// the bare origin, not a `/v1` base URL: goose joins it with
-/// `OPENAI_BASE_PATH` itself. Verified against goose 1.50.0 with no
-/// config file and no `goose configure`.
-fn launch_goose(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_goose().ok_or_else(|| anyhow::anyhow!("goose is not installed"))?;
-    let host = server();
-    exec_with_env(&bin, extra_args, &goose_env(model, api_key, &host))
-}
-
-/// Split out so a test can assert what goose is handed: [`exec_with_env`]
-/// never returns, so calling [`launch_goose`] would take the test runner
-/// with it.
-fn goose_env<'a>(model: &'a str, api_key: &'a str, host: &'a str) -> Vec<(&'a str, &'a str)> {
-    let mut env = vec![
-        ("GOOSE_PROVIDER", "openai"),
-        ("OPENAI_API_KEY", api_key),
-        ("OPENAI_HOST", host),
-        ("OPENAI_BASE_PATH", "v1/chat/completions"),
-    ];
-    // Absent, not empty: goose reads "" as a model actually named "".
-    if !model.is_empty() {
-        env.push(("GOOSE_MODEL", model));
-    }
-    env
-}
-
-/// The CLI, never the desktop app standing in for it: the unpacked zip's
-/// executable answers to this name too — exactly on Linux, by case
-/// elsewhere — and handing the GUI `goose run`'s arguments is
-/// block/goose#4079 the other way round.
-fn find_goose() -> Option<PathBuf> {
-    find_on_path_unless("goose", is_electron_bundle).or_else(|| goose_fallback(&dirs::home_dir()?))
-}
-
-/// goose's own installer target: `download_cli.sh` writes to
-/// `$GOOSE_BIN_DIR` without putting it on `PATH`. Its default is
-/// `$USERPROFILE/goose` on Windows (what `dirs::home_dir` returns there)
-/// and `~/.local/bin` elsewhere; Windows probes both, since goose's
-/// install instructions and this repo's CI pass the latter (v1.50.0).
-fn goose_fallback(home: &Path) -> Option<PathBuf> {
-    let bin = if cfg!(windows) { "goose.exe" } else { "goose" };
-    let mut candidates = Vec::new();
-    if cfg!(windows) {
-        candidates.push(home.join("goose").join(bin));
-    }
-    candidates.push(home.join(".local").join("bin").join(bin));
-    // is_file, not exists: a directory of that name would be reported as
-    // installed and then fail to spawn. Not the desktop app either: a
-    // zip can be unpacked into the installer's own directory, and these
-    // names match its executable — exactly on Linux, by case elsewhere.
-    candidates
-        .into_iter()
-        .find(|p| p.is_file() && !is_electron_bundle(p))
-}
-
-/// goose-desktop: [`launch_goose`]'s environment, pointed at the desktop
-/// app. Configured through the environment alone, so nothing is written
-/// and a `goose configure` provider survives the launch.
-///
-/// Verified against Goose Desktop 1.52.0: the launched process carries
-/// these variables, a prompt typed into it reaches the daemon, and
-/// neither the launch nor the conversation touches `~/.config/goose`.
-///
-/// On macOS that is all of it: 1.52.0 takes no single-instance lock
-/// there, so two launches make two processes, each with the environment
-/// it was given. Elsewhere it does take one, and hands this launch to the
-/// copy already running, which keeps its own provider — read out of
-/// 1.52.0's `app.asar`, not run.
-///
-/// So the launch is refused when [`goose_desktop_instance`] finds a
-/// holder, and warned about when it cannot tell. Nothing is inferred
-/// afterwards from the exit code or from how long the app ran: a second
-/// instance quitting and a user quitting look identical from here, and
-/// guessing between them cried wolf on every quick exit.
-fn launch_goose_desktop(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_goose_desktop().ok_or_else(|| {
-        anyhow::anyhow!(
-            "goose-desktop is not installed\n\
-             Install Goose Desktop from https://github.com/aaif-goose/goose, \
-             or run 'llmman launch goose' for the CLI."
-        )
-    })?;
-    // Before the launch, because afterwards there is nothing to tell a
-    // handover from an ordinary quick exit: both are an exit 0.
-    //
-    // Not on macOS, which takes no lock, so there is no handover to find.
-    // Not under a sandbox either: that launch has its own profile and
-    // process table, so no window on this machine can be handed it.
-    if !cfg!(target_os = "macos") && !sandbox::active() {
-        match dirs::home_dir() {
-            Some(home) => {
-                let config = env_dir("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
-                match goose_desktop_instance(&bin, &home, &config) {
-                    GooseInstance::Confirmed(pid) => {
-                        offer_to_quit_goose_desktop(pid, &bin, &home, &config)?
-                    }
-                    GooseInstance::Held => anyhow::bail!(goose_desktop_lock_held(
-                        &goose_desktop_user_data(&home, &config)
-                    )),
-                    GooseInstance::Unknown => eprintln!("{}", goose_desktop_unknown_warning()),
-                    GooseInstance::Free => {}
-                }
-            }
-            // Without a home directory there is no profile to read the
-            // lock from, which is the same not-knowing.
-            None => eprintln!("{}", goose_desktop_unknown_warning()),
-        }
-    }
-    let host = server();
-    exec_with_env(&bin, extra_args, &goose_env(model, api_key, &host))
-}
-
-/// What a probe for a running Goose Desktop found.
-///
-/// Two questions, and they take different evidence. Whether this launch
-/// will be handed over: anything alive holding the single-instance lock
-/// does that, whatever binary it is, because that is what Chromium keys
-/// on. Whether the holder may be signalled: only a pid confirmed to be
-/// `bin`, or a `SIGTERM` lands on a stranger whose pid was reused. One
-/// bar for both would either miss handovers or signal blind.
-#[derive(Debug, PartialEq, Eq)]
-enum GooseInstance {
-    /// A live instance of the binary this launch resolved: this launch
-    /// would be handed to it, and its pid is ours to signal.
-    Confirmed(u32),
-    /// Something live holds the lock, but not confirmably that binary —
-    /// another build, a process this user cannot read, or a pid reused
-    /// after a crash. The launch is refused, since a holder is what causes
-    /// the handover, and nothing is signalled on this much.
-    Held,
-    /// The probe reached no answer — it could not run, or could not read
-    /// what it needed. Nothing is known either way.
-    Unknown,
-    /// Nothing holds the lock.
-    Free,
-}
-
-/// Electron's `userData`, named for the bundle rather than the CLI.
-/// Shared with [`sandbox_state`] so the directory a sandbox mounts and
-/// the one the lock is read from cannot drift apart.
-fn goose_desktop_user_data(home: &Path, config: &Path) -> PathBuf {
-    if cfg!(target_os = "macos") {
-        home.join("Library")
-            .join("Application Support")
-            .join("Goose")
-    } else if cfg!(windows) {
-        env_dir("APPDATA")
-            .unwrap_or_else(|| home.join("AppData").join("Roaming"))
-            .join("Goose")
-    } else {
-        config.join("Goose")
-    }
-}
-
-/// Who holds Chromium's single-instance lock in `user_data`.
-///
-/// `SingletonLock` is Chromium's own lock, which Electron takes through
-/// it: a symlink whose target is `<hostname>-<pid>`. Chromium breaks a
-/// lock whose holder is gone and becomes the primary itself, so a stale
-/// one is [`GooseInstance::Free`] here too — it must not stand in the way
-/// of a launch that would have worked.
-///
-/// Not on Windows, which keeps this lock in a named mutex with nothing on
-/// disk to read — see [`goose_desktop_running_windows`].
-#[cfg(not(windows))]
-fn single_instance_lock_holder(user_data: &Path, bin: &Path) -> GooseInstance {
-    let target = match std::fs::read_link(user_data.join("SingletonLock")) {
-        Ok(target) => target,
-        // Conclusively no holder: no lock (`NotFound`), or something
-        // there that Chromium did not write, since it always writes a
-        // symlink and reading any other file type gives `EINVAL`.
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
-            ) =>
-        {
-            return GooseInstance::Free;
-        }
-        // Anything else — an unreadable profile directory, most likely —
-        // is not evidence that nothing is running.
-        Err(_) => return GooseInstance::Unknown,
-    };
-    // A target that does not end in a number names no holder.
-    let Some(pid) = target
-        .to_str()
-        .and_then(|t| t.rsplit_once('-'))
-        .and_then(|(_, pid)| pid.parse::<u32>().ok())
-    else {
-        return GooseInstance::Free;
-    };
-    // `kill` and `/proc` take a signed pid. A number too large to be one
-    // is not a pid Chromium wrote, and `pid_alive` rejects zero.
-    let Ok(signed) = i32::try_from(pid) else {
-        return GooseInstance::Free;
-    };
-    if !pid_alive(signed) {
-        return GooseInstance::Free;
-    }
-    if process_is(signed, bin) {
-        GooseInstance::Confirmed(pid)
-    } else {
-        GooseInstance::Held
-    }
-}
-
-/// Whether `pid` exists, without signalling it: `kill(pid, 0)` performs
-/// the permission and existence checks and delivers nothing. `EPERM` is a
-/// live process this user may not signal, which counts as alive — the
-/// caller only needs to know the lock has a holder.
-///
-/// Zero and negatives are rejected first, because to `kill` they address
-/// process *groups*, this process's own among them.
-#[cfg(not(windows))]
-fn pid_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    // SAFETY: kill(2) with signal 0 sends nothing; it only reports
-    // whether the process exists and could be signalled.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Whether `pid` is running `bin`, by the executable `/proc/<pid>/exe`
-/// resolves to — what the Windows side matches as `ExecutablePath`.
-///
-/// This is the bar for *signalling*, not for refusing. `SingletonLock`
-/// outlives an app that was hard-killed, and its pid may since have been
-/// reused by something unrelated, which [`quit_goose_desktop`] would
-/// otherwise SIGTERM after a prompt naming Goose Desktop. The same goes
-/// for a lock written on another machine over a shared home directory,
-/// whose pid means nothing here.
-///
-/// Only Linux has `/proc/<pid>/exe`; an unreadable one — another user's
-/// process, or any other unix — counts as not it. The launch is still
-/// refused in that case, as [`GooseInstance::Held`]; it is only the
-/// SIGTERM that is withheld. That costs macOS nothing, since
-/// [`goose_desktop_instance`] never reads a lock there.
-#[cfg(not(windows))]
-fn process_is(pid: i32, bin: &Path) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
-        return false;
-    };
-    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    canonical(&exe) == canonical(bin)
-}
-
-/// Whether a Goose Desktop already holds the single-instance lock. `bin`
-/// is the executable this launch resolved. Windows has no lock file, so
-/// the process is what is looked for — see
-/// [`goose_desktop_running_windows`].
-#[cfg(windows)]
-fn goose_desktop_instance(bin: &Path, _home: &Path, _config: &Path) -> GooseInstance {
-    goose_desktop_running_windows(bin)
-}
-
-/// Whether a Goose Desktop already holds the single-instance lock.
-///
-/// macOS never takes it — `app.asar` guards the whole branch with
-/// `process.platform !== 'darwin'` — so this is always
-/// [`GooseInstance::Free`] there, and a `SingletonLock` left behind by
-/// something else cannot refuse a launch that would have worked.
-#[cfg(not(windows))]
-fn goose_desktop_instance(bin: &Path, home: &Path, config: &Path) -> GooseInstance {
-    if cfg!(target_os = "macos") {
-        return GooseInstance::Free;
-    }
-    single_instance_lock_holder(&goose_desktop_user_data(home, config), bin)
-}
-
-/// A running Goose Desktop on Windows, where Chromium keeps the lock in a
-/// named mutex with nothing on disk to read, so the process is what there
-/// is to find. `Get-CimInstance` the way [`crate::daemon`]'s own stop path
-/// finds a process by name.
-///
-/// A probe that cannot run reports [`GooseInstance::Unknown`] rather than
-/// guessing either way: a machine without `powershell` is not a machine
-/// without Goose Desktop, and the caller warns instead of refusing.
-#[cfg(windows)]
-fn goose_desktop_running_windows(bin: &Path) -> GooseInstance {
-    let out = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_Process -Filter \"Name='Goose.exe'\" | \
-             ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)|$($_.CommandLine)\" }",
-        ])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success());
-    match out {
-        Some(out) => goose_exe_pid(
-            &String::from_utf8_lossy(&out.stdout),
-            bin,
-            is_electron_bundle,
-        ),
-        None => GooseInstance::Unknown,
-    }
-}
-
-/// Reads `Get-CimInstance`'s `<pid>|<path>|<command>` lines. Split from the
-/// shell-out, and given `is_bundle` rather than calling
-/// [`is_electron_bundle`] itself, so it can be tested off Windows where
-/// neither would work.
-///
-/// [`GooseInstance::Confirmed`] needs the main process — matched on the
-/// path, so an unrelated `Goose.exe` is not taken for the app this launch
-/// resolved, and on the absence of `--type=`, which every process Electron
-/// spawns off the main one carries. A renderer holds no lock, and
-/// `taskkill` without `/F` would not close one anyway.
-///
-/// Another Electron `Goose.exe` is [`GooseInstance::Held`] — a build
-/// installed elsewhere, or a child, which implies a main process holding
-/// the lock even when that row is not listed. Windows exposes nothing
-/// profile-scoped to read, so a running process is all there is to go on:
-/// one sharing this profile takes the launch, one with a profile of its own
-/// would not, and refusing on it is the cost of not being able to tell.
-///
-/// `is_bundle` is what keeps the `goose` CLI out of that: Windows reads its
-/// `goose.exe` and the app's `Goose.exe` as one name, and `Name=` in WQL is
-/// case-insensitive, so a CLI session would otherwise refuse every desktop
-/// launch.
-///
-/// A blank `ExecutablePath` — a process this user cannot open — is
-/// [`GooseInstance::Unknown`]: it cannot be told from the CLI either, and a
-/// refusal on it would block the launch on nothing. An app whose directory
-/// cannot be read also fails the bundle check, so it is missed rather than
-/// refused — though such a process rarely lists an `ExecutablePath` at all,
-/// and lands here instead.
-#[cfg(any(windows, test))]
-fn goose_exe_pid(listing: &str, bin: &Path, is_bundle: impl Fn(&Path) -> bool) -> GooseInstance {
-    let mut held = false;
-    let mut unreadable = false;
-    for line in listing.lines() {
-        let mut fields = line.trim().splitn(3, '|');
-        let Some(pid) = fields.next() else { continue };
-        let Some(path) = fields.next() else { continue };
-        // The command line keeps any `|` of its own: it is last, and
-        // `splitn` leaves the remainder whole.
-        let command = fields.next().unwrap_or_default();
-        if path.trim().is_empty() {
-            unreadable = true;
-            continue;
-        }
-        if !is_bundle(Path::new(path.trim())) {
-            // The CLI under its other name, which holds no lock.
-            continue;
-        }
-        held = true;
-        if command.contains("--type=") || !same_windows_path(path, bin) {
-            continue;
-        }
-        if let Ok(pid) = pid.trim().parse() {
-            return GooseInstance::Confirmed(pid);
-        }
-    }
-    // A holder outranks not knowing: one is evidence, the other is its absence.
-    if held {
-        GooseInstance::Held
-    } else if unreadable {
-        GooseInstance::Unknown
-    } else {
-        GooseInstance::Free
-    }
-}
-
-/// Whether two Windows paths name one file, comparing case-insensitively
-/// and treating `/` as `\`. An empty path never matches:
-/// `ExecutablePath` is blank for a process this user cannot open.
-#[cfg(any(windows, test))]
-fn same_windows_path(a: &str, b: &Path) -> bool {
-    let normalize = |s: &str| s.trim().replace('/', "\\").to_ascii_lowercase();
-    let a = normalize(a);
-    !a.is_empty() && a == normalize(&b.to_string_lossy())
-}
-
-/// Asks the app to quit, the way [`crate::daemon`]'s own stop path does:
-/// `SIGTERM` rather than `SIGKILL`, `taskkill` without `/F`, so it closes
-/// its session rather than losing it. Best-effort — whether it went is
-/// [`wait_for_goose_desktop_to_quit`]'s to say.
-fn quit_goose_desktop(pid: u32) {
-    #[cfg(unix)]
-    if let Ok(pid) = i32::try_from(pid) {
-        // SAFETY: kill(2) with SIGTERM only asks that process to exit.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-    }
-    #[cfg(windows)]
-    {
-        // Nulled like `daemon`'s: taskkill reports a missing pid loudly,
-        // and the poll below is what decides either way.
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-    }
-}
-
-/// Polls until nothing holds the lock, for as long as
-/// [`QUIT_TIMEOUT`]. Bounded by the clock rather than by a count of
-/// tries, unlike `daemon`'s `wait_for_port_free`: on Windows each probe
-/// shells out to `powershell`, so a fixed number of tries would wait for
-/// however long that costs on top of the sleeps.
-fn wait_for_goose_desktop_to_quit(bin: &Path, home: &Path, config: &Path) -> bool {
-    let deadline = std::time::Instant::now() + QUIT_TIMEOUT;
-    loop {
-        // `Free` only: `Held` is still a holder, and `Unknown` is a probe
-        // that stopped working, which is no evidence that it quit.
-        if goose_desktop_instance(bin, home, config) == GooseInstance::Free {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-
-/// How long a quitting Goose Desktop is given to release the lock.
-const QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// What a launch is told when the running instance would take it. A
-/// function rather than a literal so a test can assert on it without
-/// going through the prompt, which would block on stdin.
-fn goose_desktop_refusal(pid: u32) -> String {
-    format!(
-        "Goose Desktop is already running (pid {pid}), and holds the lock that \
-         makes a second launch hand over to it — with the provider and model it \
-         already had, not llmman's.\n\
-         Quit it and run this again."
-    )
-}
-
-/// The refusal for a holder that could not be confirmed to be the binary
-/// this launch resolved, so there is no pid llmman will offer to signal.
-///
-/// Off Windows this is also how a lock left by a crash whose pid has since
-/// been reused presents itself, and deleting the file clears it — so the
-/// path is named. Windows holds the lock in a kernel mutex with no file to
-/// remove, hence nothing to point at there.
-fn goose_desktop_lock_held(user_data: &Path) -> String {
-    let mut message = "Something is already holding Goose Desktop's single-instance lock, so \
-         this launch would be handed to it and keep that instance's provider \
-         and model, not llmman's.\n\
-         Quit Goose Desktop and run this again."
-        .to_string();
-    if !cfg!(windows) {
-        message.push_str(&format!(
-            " If it is not running, the lock is stale and can be removed:\n  {}",
-            user_data.join("SingletonLock").display()
-        ));
-    }
-    message
-}
-
-/// What a launch is told when llmman could not determine whether an
-/// instance is running. Printed, not refused: the launch may well be the
-/// only instance, and refusing on no evidence would block a working setup.
-fn goose_desktop_unknown_warning() -> String {
-    "[llmman] could not determine whether Goose Desktop is already running. \
-     If it is, this launch is handed to it and keeps that instance's provider \
-     and model instead of the ones llmman resolved."
-        .to_string()
-}
-
-/// What to do about a quit the user approved, given what the lock says by
-/// the time they answered.
-#[derive(Debug, PartialEq, Eq)]
-enum QuitDecision {
-    /// Still the same confirmed instance: signal it.
-    Signal,
-    /// It quit while the prompt waited, so the launch can proceed.
-    AlreadyGone,
-    /// Something else holds the lock now, or it can no longer be read.
-    /// Signal nothing.
-    Changed,
-}
-
-/// Only an unchanged, still-confirmed pid may be signalled. Split from
-/// [`offer_to_quit_goose_desktop`], which blocks on a prompt, so that rule
-/// can be tested.
-fn quit_decision(probe: &GooseInstance, approved: u32) -> QuitDecision {
-    match probe {
-        GooseInstance::Confirmed(pid) if *pid == approved => QuitDecision::Signal,
-        GooseInstance::Free => QuitDecision::AlreadyGone,
-        // A different pid, an unconfirmable holder, or no answer at all.
-        _ => QuitDecision::Changed,
-    }
-}
-
-/// Refuses a launch the running instance would take, or quits that
-/// instance when there is a terminal to answer for it.
-///
-/// Follows [`ensure_cline_installed`]: a pipe or a CI job is told, never
-/// asked, so nothing here can hang waiting on a stdin that will not
-/// answer.
-fn offer_to_quit_goose_desktop(
-    pid: u32,
-    bin: &Path,
-    home: &Path,
-    config: &Path,
-) -> anyhow::Result<()> {
-    use std::io::{BufRead, IsTerminal, Write};
-
-    let refusal = goose_desktop_refusal(pid);
-    anyhow::ensure!(
-        std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
-        "{refusal}"
-    );
-
-    eprint!("Goose Desktop is already running (pid {pid}) and would take this launch with its own provider and model. Quit it? [y/N] ");
-    std::io::stderr().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
-    anyhow::ensure!(accepts_prompt(&answer), "{refusal}");
-
-    // Re-probed after the prompt, which waits as long as the user does: by
-    // then `pid` may name something else entirely — the app quit and the
-    // number was reused — and this is the call that would SIGTERM it.
-    match quit_decision(&goose_desktop_instance(bin, home, config), pid) {
-        QuitDecision::Signal => {
-            eprintln!("[llmman] asking Goose Desktop to quit...");
-            quit_goose_desktop(pid);
-        }
-        // It quit while the prompt waited, so the launch can go ahead.
-        QuitDecision::AlreadyGone => {
-            eprintln!("[llmman] Goose Desktop already quit; nothing to signal.");
-            return Ok(());
-        }
-        QuitDecision::Changed => anyhow::bail!(
-            "Goose Desktop (pid {pid}) is no longer the instance llmman \
-             confirmed, so nothing was signalled. Run this again."
-        ),
-    }
-    anyhow::ensure!(
-        wait_for_goose_desktop_to_quit(bin, home, config),
-        "Goose Desktop (pid {pid}) did not quit, so this launch would still go \
-         to it. Quit it and run this again."
-    );
-    Ok(())
-}
-
-/// `goose-desktop` is the name this integration is specified against;
-/// `goose-gui` is the symlink `BUILDING_LINUX.md` installs. Never a bare
-/// `Goose`: on a case-insensitive filesystem it resolves to the `goose`
-/// CLI — as it does on macOS — and launching the CLI in place of the app
-/// is the mistake upstream's own desktop entry made (block/goose#4079).
-fn find_goose_desktop() -> Option<PathBuf> {
-    find_on_path("goose-desktop")
-        .or_else(|| find_on_path("goose-gui"))
-        .or_else(goose_exe_on_path)
-        .or_else(|| goose_desktop_fallback(&dirs::home_dir()?))
-}
-
-/// The Windows zip unpacks to `Goose.exe` and upstream ships no
-/// installer, so a directory on `PATH` is the only way to reach it.
-/// Windows reads that name and the CLI's `goose.exe` as one, so a match
-/// counts only where the Electron bundle sits beside it.
-fn goose_exe_on_path() -> Option<PathBuf> {
-    if !cfg!(windows) {
-        return None;
-    }
-    find_on_path_unless("Goose", |exe| !is_electron_bundle(exe))
-}
-
-/// Whether `exe` is the unpacked Electron app rather than a same-named
-/// binary, in either layout the packager produces: `resources/app.asar`
-/// beside the executable on Windows and Linux, `Contents/Resources` a
-/// level up from `Contents/MacOS` in a macOS `.app`.
-///
-/// Beside the target, not the link: `BUILDING_LINUX.md` installs the app
-/// by symlinking it into a `bin` directory, where nothing sits beside
-/// the link. A path that will not resolve falls back to its literal
-/// parent, which is where a bundle reached directly keeps these anyway.
-///
-/// Keyed on `app.asar`, which every packaging so far produces. A build
-/// with asar off keeps `resources/app/` instead, and would read as the
-/// CLI here — check for both if upstream ever ships one.
-fn is_electron_bundle(exe: &Path) -> bool {
-    let resolved = std::fs::canonicalize(exe);
-    let Some(dir) = resolved.as_deref().unwrap_or(exe).parent() else {
-        return false;
-    };
-    if dir.join("resources").join("app.asar").is_file() {
-        return true;
-    }
-    // Only where the layout really is a `.app`: otherwise any executable
-    // two levels below a `Resources` counts, and a case-insensitive
-    // filesystem matches the flat `resources` above as one.
-    dir.file_name() == Some(std::ffi::OsStr::new("MacOS"))
-        && dir
-            .parent()
-            .is_some_and(|contents| contents.join("Resources").join("app.asar").is_file())
-}
-
-/// Where Goose Desktop lands when it is not on `PATH`: a macOS `.app`
-/// bundle never is, and `~/.local/bin` is not always.
-///
-/// The bundle is verified against 1.52.0, whose `CFBundleExecutable` is
-/// `Goose`; the Linux path is the `.deb`'s. `is_file` keeps a wrong one
-/// harmless, falling through to "not installed" rather than naming
-/// something that fails to spawn.
-///
-/// Windows has no path to probe: upstream ships a zip with no
-/// installer, so an install is wherever it was unpacked, and
-/// [`goose_exe_on_path`] is what finds it there.
-fn goose_desktop_fallback(home: &Path) -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if cfg!(target_os = "macos") {
-        for root in [PathBuf::from("/Applications"), home.join("Applications")] {
-            candidates.push(
-                root.join("Goose.app")
-                    .join("Contents")
-                    .join("MacOS")
-                    .join("Goose"),
-            );
-        }
-    }
-    if !cfg!(windows) {
-        // `goose-gui` as well: that is the name `BUILDING_LINUX.md`
-        // symlinks, and a `PATH` without `~/.local/bin` never sees it.
-        for name in ["goose-desktop", "goose-gui"] {
-            candidates.push(home.join(".local").join("bin").join(name));
-        }
-    }
-    if cfg!(target_os = "linux") {
-        // The packaged GUI binary, capital G beside the lowercase CLI. Both
-        // spellings, because 1.52.0's Electron Forge makers give the deb and
-        // the rpm their own desktop templates, and those differ in the case
-        // of the directory alone: `Exec=/usr/lib/goose/Goose` in
-        // `forge.deb.desktop`, `Exec=/usr/lib/Goose/Goose` in
-        // `forge.rpm.desktop`. Linux tells the two apart; neither is on
-        // `PATH`.
-        //
-        // Not the manual `/opt/goose` unpack: its executable is spelled
-        // `goose`, so a CLI left there would be launched in place of the
-        // app, and that install's own `goose-gui` symlink is on `PATH`.
-        candidates.push(PathBuf::from("/usr/lib/goose/Goose"));
-        candidates.push(PathBuf::from("/usr/lib/Goose/Goose"));
-    }
-    candidates.into_iter().find(|p| p.is_file())
 }
 
 // ---------------------------------------------------------------------------
@@ -4279,7 +2964,7 @@ fn launch_grok(
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_grok().ok_or_else(|| anyhow::anyhow!("grok is not installed"))?;
-    let effective_model = forwarded_model(extra_args).unwrap_or(model);
+    let effective_model = common::forwarded_model(extra_args).unwrap_or(model);
     let base_url = format!("{}/v1", server());
     let models_url = format!("{base_url}/models");
     // Never edit the user's config.toml. This child is wholly llmman-owned,
@@ -4557,8 +3242,8 @@ fn write_dsh_settings(
     vision: bool,
     effort: Option<&Effort>,
 ) -> anyhow::Result<()> {
-    let quoted_model = yaml_quote(model);
-    let base_url = yaml_quote(&format!("{}/v1", server()));
+    let quoted_model = common::yaml_quote(model);
+    let base_url = common::yaml_quote(&format!("{}/v1", server()));
     // Claiming image input a text-only model can't serve would have dsh
     // attach what the daemon then rejects.
     let input = if vision { "[text, image]" } else { "[text]" };
@@ -4592,7 +3277,7 @@ fn write_dsh_patch(path: &Path, settings_path: &Path) -> anyhow::Result<()> {
 /// path on any platform: `yaml_quote` escapes the `\` separators, and
 /// forgetting that is what once turned the Windows leg red.
 fn dsh_patch_document(settings_path: &Path) -> String {
-    let quoted_settings_path = yaml_quote(&settings_path.to_string_lossy());
+    let quoted_settings_path = common::yaml_quote(&settings_path.to_string_lossy());
     format!(
         "# Written by `llmman launch dsh`; edits are overwritten.\n\
          - id: settings\n  config:\n    path: {quoted_settings_path}\n"
@@ -4769,8 +3454,8 @@ fn write_docker_agent_file(path: &Path, model: &str, base_url: &str) -> anyhow::
 /// agent that reaches the model carries one leading system message
 /// whatever the template accepts.
 fn docker_agent_document(model: &str, base_url: &str) -> String {
-    let quoted_model = yaml_quote(model);
-    let quoted_base_url = yaml_quote(base_url);
+    let quoted_model = common::yaml_quote(model);
+    let quoted_base_url = common::yaml_quote(base_url);
     format!(
         "# Written by `llmman launch docker-agent`; edits are overwritten.\n\
          version: \"2\"\n\
@@ -4989,7 +3674,11 @@ mod tests {
                 written.display()
             );
         };
-        covers("codex", codex_dir().unwrap());
+        covers("codex", codex::codex_dir().unwrap());
+        covers(
+            "opencode",
+            opencode::opencode_state_dir().unwrap().join("model.json"),
+        );
         covers("pi", pi_agent_dir().unwrap());
         covers("omp", omp_agent_dir().unwrap());
         covers("cline", cline_data_dir().unwrap());
@@ -5005,20 +3694,6 @@ mod tests {
                 .unwrap()
                 .join(".openclaw")
                 .join("openclaw.json"),
-        );
-    }
-
-    /// Regression test for a real CodeRabbit finding: an unquoted model
-    /// value in generated YAML could be misparsed as a non-string
-    /// (`null`, `true`, ...) or broken outright by metacharacters.
-    #[test]
-    fn yaml_quote_escapes_keywords_and_metacharacters() {
-        assert_eq!(yaml_quote("qwen3.5:0.8b"), "\"qwen3.5:0.8b\"");
-        assert_eq!(yaml_quote("null"), "\"null\"");
-        assert_eq!(yaml_quote("true"), "\"true\"");
-        assert_eq!(
-            yaml_quote(r#"a "quoted" \ value"#),
-            r#""a \"quoted\" \\ value""#
         );
     }
 
@@ -5316,24 +3991,6 @@ defaults:
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The only configuration goose gets: a wrong or missing one sends
-    /// the session to api.openai.com instead of the daemon. `OPENAI_HOST`
-    /// is the bare origin — goose appends `OPENAI_BASE_PATH` itself, so a
-    /// `/v1` here would request `/v1/v1/chat/completions`.
-    #[test]
-    fn goose_env_points_at_the_daemon_and_carries_the_key() {
-        let env = goose_env("m", "k", "http://127.0.0.1:17434");
-        let get = |k| env.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
-        assert_eq!(get("GOOSE_PROVIDER"), Some("openai"));
-        assert_eq!(get("GOOSE_MODEL"), Some("m"));
-        assert_eq!(get("OPENAI_API_KEY"), Some("k"));
-        assert_eq!(get("OPENAI_HOST"), Some("http://127.0.0.1:17434"));
-        assert_eq!(get("OPENAI_BASE_PATH"), Some("v1/chat/completions"));
-
-        let env = goose_env("", "k", "http://127.0.0.1:17434");
-        assert!(!env.iter().any(|(n, _)| *n == "GOOSE_MODEL"));
-    }
-
     /// goose carries the key in its own environment, so `--provider`
     /// needs neither a refusal nor the daemon holding the key.
     #[test]
@@ -5341,139 +3998,6 @@ defaults:
         assert!(INTEGRATIONS.iter().any(|i| i.name == "goose"));
         assert!(check_provider_supported("goose").is_ok());
         assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"goose"));
-    }
-
-    /// `download_cli.sh`'s target is off `PATH` on a fresh shell, so this
-    /// fallback is the one that fires for most installs — at every
-    /// directory that installer writes to, Windows included.
-    #[test]
-    fn goose_fallback_finds_the_installers_target() {
-        let name = if cfg!(windows) { "goose.exe" } else { "goose" };
-        let dirs: &[&[&str]] = if cfg!(windows) {
-            &[&["goose"], &[".local", "bin"]]
-        } else {
-            &[&[".local", "bin"]]
-        };
-        for (i, parts) in dirs.iter().enumerate() {
-            let home = std::env::temp_dir().join(format!(
-                "llmman-goose-{}-{}-{i}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let bin = parts.iter().fold(home.clone(), |p, part| p.join(part));
-            std::fs::create_dir_all(&bin).unwrap();
-            assert_eq!(goose_fallback(&home), None);
-            let goose = bin.join(name);
-            // A directory of that name is not the binary: returning it
-            // would report goose as installed and then fail to spawn.
-            std::fs::create_dir(&goose).unwrap();
-            assert_eq!(goose_fallback(&home), None);
-            std::fs::remove_dir(&goose).unwrap();
-            std::fs::write(&goose, "").unwrap();
-            assert_eq!(goose_fallback(&home), Some(goose));
-            assert_eq!(goose_fallback(&home.join("nowhere")), None);
-            let _ = std::fs::remove_dir_all(&home);
-        }
-    }
-
-    /// The environment the desktop target hands over. Both launchers call
-    /// `goose_env`, so this pins that its result is still right for the
-    /// desktop app: a `/v1` on the host or a missing key breaks it there
-    /// exactly as it breaks the CLI.
-    #[test]
-    fn goose_desktop_shares_the_cli_environment() {
-        let host = "http://127.0.0.1:17434";
-        let env = goose_env("m", "k", host);
-        let get = |k| env.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
-        assert_eq!(get("GOOSE_PROVIDER"), Some("openai"));
-        assert_eq!(get("GOOSE_MODEL"), Some("m"));
-        assert_eq!(get("OPENAI_API_KEY"), Some("k"));
-        // The bare origin: goose joins OPENAI_BASE_PATH onto it itself,
-        // so a `/v1` here would request /v1/v1/chat/completions.
-        assert_eq!(get("OPENAI_HOST"), Some(host));
-        assert_eq!(get("OPENAI_BASE_PATH"), Some("v1/chat/completions"));
-    }
-
-    /// `Goose.exe` and the CLI's `goose.exe` are one name to Windows, so
-    /// the bundle beside it is what tells them apart. Get this wrong and
-    /// `launch goose-desktop` starts the CLI — block/goose#4079 again.
-    #[test]
-    fn only_an_electron_bundle_counts_as_the_desktop_app() {
-        let dir = std::env::temp_dir().join(format!(
-            "llmman-goose-bundle-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("Goose.exe");
-        std::fs::write(&exe, "").unwrap();
-        // A bare executable is the CLI as far as this can tell.
-        assert!(!is_electron_bundle(&exe));
-        let resources = dir.join("resources");
-        std::fs::create_dir(&resources).unwrap();
-        // The directory alone is not the bundle either.
-        assert!(!is_electron_bundle(&exe));
-        std::fs::write(resources.join("app.asar"), "").unwrap();
-        assert!(is_electron_bundle(&exe));
-        // Through a symlink too: the documented Linux install is a link
-        // into a bin directory, and nothing sits beside the link. Unix
-        // only — `std::os::unix` is what makes one without a privilege
-        // Windows asks for.
-        #[cfg(unix)]
-        {
-            let link_dir = dir.join("bin");
-            std::fs::create_dir(&link_dir).unwrap();
-            let link = link_dir.join("goose");
-            std::os::unix::fs::symlink(&exe, &link).unwrap();
-            assert!(is_electron_bundle(&link));
-
-            // A link to an ordinary file is still not the app.
-            let target = link_dir.join("target");
-            let plain = link_dir.join("plain");
-            std::fs::write(&target, "").unwrap();
-            std::os::unix::fs::symlink(&target, &plain).unwrap();
-            assert!(!is_electron_bundle(&plain));
-        }
-
-        // The macOS `.app`, whose `app.asar` is a level up from the
-        // executable rather than beside it.
-        let macos = dir.join("Goose.app").join("Contents").join("MacOS");
-        std::fs::create_dir_all(&macos).unwrap();
-        let app = macos.join("Goose");
-        std::fs::write(&app, "").unwrap();
-        assert!(!is_electron_bundle(&app));
-        let res = dir.join("Goose.app").join("Contents").join("Resources");
-        std::fs::create_dir(&res).unwrap();
-        std::fs::write(res.join("app.asar"), "").unwrap();
-        assert!(is_electron_bundle(&app));
-
-        // `goose_fallback` refuses it too, or the installer's own
-        // directory becomes a way past the guard.
-        let fallback_home = dir.join("home");
-        let unpacked = if cfg!(windows) {
-            fallback_home.join("goose")
-        } else {
-            fallback_home.join(".local").join("bin")
-        };
-        std::fs::create_dir_all(unpacked.join("resources")).unwrap();
-        let bin = unpacked.join(if cfg!(windows) { "goose.exe" } else { "goose" });
-        std::fs::write(&bin, "").unwrap();
-        assert_eq!(goose_fallback(&fallback_home), Some(bin));
-        std::fs::write(unpacked.join("resources").join("app.asar"), "").unwrap();
-        assert_eq!(goose_fallback(&fallback_home), None);
-
-        // Never consulted off Windows, where the CLI owns the name.
-        if !cfg!(windows) {
-            assert_eq!(goose_exe_on_path(), None);
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The predicate has to be able to veto, or `find_goose`'s refusal of
@@ -5507,309 +4031,6 @@ defaults:
             find_on_path_unless("llmman-no-such-binary-xyz", |_| false),
             None
         );
-    }
-
-    /// The refusal has to name the pid and say what to do about it —
-    /// without that, all the user sees is a launch that did not happen.
-    #[test]
-    fn the_refusal_names_the_instance_and_what_to_do() {
-        let refusal = goose_desktop_refusal(4242);
-        assert!(refusal.contains("4242"), "{refusal}");
-        assert!(refusal.contains("Quit it and run this again"), "{refusal}");
-        // Says whose provider wins, which is the part a user acts on.
-        assert!(refusal.contains("not llmman's"), "{refusal}");
-    }
-
-    /// The pid reused while the prompt waited is the one this must never
-    /// SIGTERM, so every outcome but an unchanged match refuses to signal.
-    #[test]
-    fn only_the_same_confirmed_instance_is_signalled_after_the_prompt() {
-        use GooseInstance::{Confirmed, Free, Held, Unknown};
-        assert_eq!(quit_decision(&Confirmed(4242), 4242), QuitDecision::Signal);
-        // Reused while the prompt waited: a stranger wearing that number.
-        assert_eq!(quit_decision(&Confirmed(99), 4242), QuitDecision::Changed);
-        // Quit while the prompt waited, so there is nothing to signal.
-        assert_eq!(quit_decision(&Free, 4242), QuitDecision::AlreadyGone);
-        // A holder llmman cannot identify is not one it may signal, and a
-        // probe that stopped answering is no licence either.
-        assert_eq!(quit_decision(&Held, 4242), QuitDecision::Changed);
-        assert_eq!(quit_decision(&Unknown, 4242), QuitDecision::Changed);
-    }
-
-    /// An unconfirmable holder is refused without a pid to offer, so off
-    /// Windows the message names the lock file instead — the only way out
-    /// when the lock is stale and its pid has been reused. Windows has no
-    /// such file, and must not be told to delete one.
-    #[test]
-    fn the_held_refusal_names_the_lock_to_remove() {
-        let user_data = Path::new("/home/me/.config/Goose");
-        let held = goose_desktop_lock_held(user_data);
-        assert!(held.contains("not llmman's"), "{held}");
-        assert!(held.contains("Quit Goose Desktop"), "{held}");
-        // No pid is claimed: none was confirmed.
-        assert!(!held.contains("pid"), "{held}");
-        if cfg!(windows) {
-            assert!(!held.contains("SingletonLock"), "{held}");
-            assert!(!held.contains("stale"), "{held}");
-        } else {
-            assert!(
-                held.contains("/home/me/.config/Goose/SingletonLock"),
-                "{held}"
-            );
-        }
-    }
-
-    /// Not knowing is said out loud rather than refused — a launch that
-    /// would have worked must not be blocked on absent evidence.
-    #[test]
-    fn the_unknown_warning_says_what_it_could_not_determine() {
-        let warning = goose_desktop_unknown_warning();
-        assert!(warning.starts_with("[llmman]"), "{warning}");
-        assert!(warning.contains("could not determine"), "{warning}");
-        assert!(warning.contains("provider"), "{warning}");
-    }
-
-    /// macOS takes no single-instance lock, so a `SingletonLock` sitting
-    /// in its profile must not refuse a launch that would have worked
-    /// there. Everywhere else the same file is the lock, and does.
-    #[test]
-    #[cfg(unix)]
-    fn goose_desktop_instance_reads_the_lock_only_where_it_is_taken() {
-        let home = std::env::temp_dir().join(format!(
-            "llmman-goose-instance-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let config = home.join(".config");
-        let user_data = goose_desktop_user_data(&home, &config);
-        std::fs::create_dir_all(&user_data).unwrap();
-        // A path nothing resolves to: only the lock is under test, so a
-        // holder can never be `Confirmed` here.
-        let bin = Path::new("/nonexistent/Goose");
-        assert_eq!(
-            goose_desktop_instance(bin, &home, &config),
-            GooseInstance::Free
-        );
-
-        let me = std::process::id();
-        std::os::unix::fs::symlink(format!("host-{me}"), user_data.join("SingletonLock")).unwrap();
-        let found = goose_desktop_instance(bin, &home, &config);
-        if cfg!(target_os = "macos") {
-            assert_eq!(found, GooseInstance::Free, "macOS never takes the lock");
-        } else {
-            // This test's own pid is alive, so the lock has a holder —
-            // `Held`, not `Confirmed`, because it is not running `bin`.
-            assert_eq!(found, GooseInstance::Held);
-        }
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// The `<pid>|<path>|<command>` lines `Get-CimInstance` prints. Only
-    /// the main process is `Confirmed` — matched on the path, and on the
-    /// absence of `--type=`, so an Electron renderer is not signalled as
-    /// the lock holder. Another Electron `Goose.exe` is still `Held`: it
-    /// takes the launch whatever its path.
-    ///
-    /// Every path here is an Electron bundle unless a case says otherwise;
-    /// the real probe asks the filesystem, which these paths are not on.
-    #[test]
-    fn goose_exe_pid_finds_the_main_process_only() {
-        use GooseInstance::{Confirmed, Free, Held, Unknown};
-        let bin = Path::new(r"C:\Users\me\Goose\Goose.exe");
-        let exe = r"C:\Users\me\Goose\Goose.exe";
-        let bundle = |_: &Path| true;
-        // As Windows really lists it: the children come first, and they
-        // share their parent's executable.
-        let listing = format!(
-            "1001|{exe}|\"{exe}\" --type=gpu-process --field-trial-handle=1\r\n\
-             1002|{exe}|\"{exe}\" --type=renderer --lang=en-GB\r\n\
-             1003|{exe}|\"{exe}\"\r\n"
-        );
-        assert_eq!(goose_exe_pid(&listing, bin, bundle), Confirmed(1003));
-
-        // A child with no main process listed is not ours to signal, but
-        // the app it belongs to still holds the lock.
-        assert_eq!(
-            goose_exe_pid(
-                &format!("1002|{exe}|\"{exe}\" --type=renderer"),
-                bin,
-                bundle
-            ),
-            Held
-        );
-        // Neither case nor separator tells two Windows paths apart.
-        assert_eq!(
-            goose_exe_pid("9|c:/users/me/goose/GOOSE.EXE|x", bin, bundle),
-            Confirmed(9)
-        );
-        // A command line of its own may hold `|`; it is last and stays whole.
-        assert_eq!(
-            goose_exe_pid(&format!("9|{exe}|\"{exe}\" --logfile a|b"), bin, bundle),
-            Confirmed(9)
-        );
-        // A blank ExecutablePath cannot be told from the CLI, so it is not
-        // grounds to refuse — only to say so.
-        assert_eq!(goose_exe_pid("9||x", bin, bundle), Unknown);
-        assert_eq!(goose_exe_pid("9|   |x", bin, bundle), Unknown);
-        // A build installed elsewhere shares the profile and the mutex.
-        assert_eq!(
-            goose_exe_pid("9|C:\\elsewhere\\Goose.exe|x", bin, bundle),
-            Held
-        );
-        // Only an empty listing means nothing is running.
-        assert_eq!(goose_exe_pid("", bin, bundle), Free);
-        // One field is not a row `Get-CimInstance` can produce.
-        assert_eq!(goose_exe_pid("nonsense", bin, bundle), Free);
-
-        // The `goose` CLI, which this listing picks up under the app's name
-        // and which holds no lock.
-        let cli = r"C:\Users\me\.local\bin\goose.exe";
-        let not_a_bundle = |p: &Path| p != Path::new(cli);
-        assert_eq!(
-            goose_exe_pid(&format!("2001|{cli}|\"{cli}\" session"), bin, not_a_bundle),
-            Free
-        );
-        // Nor does it mask a real instance listed beside it.
-        assert_eq!(
-            goose_exe_pid(
-                &format!("2001|{cli}|\"{cli}\" session\r\n1003|{exe}|\"{exe}\"\r\n"),
-                bin,
-                not_a_bundle
-            ),
-            Confirmed(1003)
-        );
-    }
-
-    /// A lock counts only while the pid in it is *this app*. Liveness
-    /// alone would let a stale lock whose number has been reused name an
-    /// unrelated process — which the prompt would call Goose Desktop and
-    /// `quit_goose_desktop` would then SIGTERM.
-    #[test]
-    #[cfg(not(windows))]
-    fn a_single_instance_lock_counts_only_for_the_app_that_holds_it() {
-        let user_data = std::env::temp_dir().join(format!(
-            "llmman-goose-lock-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&user_data).unwrap();
-        let lock = user_data.join("SingletonLock");
-        // This test is a live process running a real executable, so it
-        // stands in for the app; anything else stands in for a pid that
-        // was reused after the app died.
-        let me = std::process::id() as i32;
-        let this_exe = std::env::current_exe().unwrap();
-        let elsewhere = Path::new("/nonexistent/Goose");
-
-        // No lock at all: nothing to hand a launch to.
-        assert_eq!(
-            single_instance_lock_holder(&user_data, &this_exe),
-            GooseInstance::Free
-        );
-
-        std::os::unix::fs::symlink(format!("somehost-{me}"), &lock).unwrap();
-        // A live pid running something else still holds the lock, so the
-        // launch is refused — but as `Held`, which is never signalled.
-        // This is the reused-pid case that used to SIGTERM a stranger.
-        assert_eq!(
-            single_instance_lock_holder(&user_data, elsewhere),
-            GooseInstance::Held
-        );
-        // `/proc/<pid>/exe` is what confirms the binary, and only Linux
-        // has it. Elsewhere the holder is real but unconfirmable, which
-        // costs macOS nothing since it never takes the lock.
-        let confirmed = single_instance_lock_holder(&user_data, &this_exe);
-        if cfg!(target_os = "linux") {
-            assert_eq!(confirmed, GooseInstance::Confirmed(me as u32));
-        } else {
-            assert_eq!(confirmed, GooseInstance::Held);
-        }
-
-        // A pid nothing answers to is a lock Chromium would break itself,
-        // so it must not stand in the way of a launch. Malformed targets
-        // and a plain file name no holder at all.
-        for target in ["somehost-2147483646", "somehost-notapid", "nodash"] {
-            std::fs::remove_file(&lock).unwrap();
-            std::os::unix::fs::symlink(target, &lock).unwrap();
-            assert_eq!(
-                single_instance_lock_holder(&user_data, &this_exe),
-                GooseInstance::Free,
-                "{target}"
-            );
-        }
-        std::fs::remove_file(&lock).unwrap();
-        std::fs::write(&lock, "").unwrap();
-        assert_eq!(
-            single_instance_lock_holder(&user_data, &this_exe),
-            GooseInstance::Free
-        );
-
-        let _ = std::fs::remove_dir_all(&user_data);
-    }
-
-    /// A profile llmman cannot read is not a profile with nothing in it.
-    /// Reporting `Free` there would launch into a silent handover, which
-    /// is the whole failure this guard exists to prevent, so it reports
-    /// `Unknown` and the caller warns instead.
-    #[test]
-    #[cfg(unix)]
-    fn an_unreadable_profile_is_unknown_rather_than_free() {
-        use std::os::unix::fs::PermissionsExt;
-        let user_data = std::env::temp_dir().join(format!(
-            "llmman-goose-perm-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&user_data).unwrap();
-        let me = std::process::id();
-        std::os::unix::fs::symlink(format!("somehost-{me}"), user_data.join("SingletonLock"))
-            .unwrap();
-        std::fs::set_permissions(&user_data, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        let bin = std::env::current_exe().unwrap();
-        let found = single_instance_lock_holder(&user_data, &bin);
-        // Restored before asserting: a failing assertion would otherwise
-        // leave a directory nothing can delete.
-        std::fs::set_permissions(&user_data, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&user_data);
-        if unsafe { libc::geteuid() } == 0 {
-            // root reads it regardless of the mode, so a holder is found —
-            // `Confirmed` only where `/proc` can back that up.
-            assert!(
-                matches!(found, GooseInstance::Confirmed(p) if p == me)
-                    || found == GooseInstance::Held,
-                "{found:?}"
-            );
-        } else {
-            assert_eq!(found, GooseInstance::Unknown);
-        }
-    }
-
-    /// `kill(pid, 0)` asks without signalling. This process is alive; pid
-    /// 0 and negatives address process *groups*, which must never be
-    /// mistaken for a holder, and a freshly reaped child is gone.
-    #[test]
-    #[cfg(not(windows))]
-    fn pid_alive_sees_this_process_and_not_a_group_or_a_corpse() {
-        assert!(pid_alive(std::process::id() as i32));
-        assert!(!pid_alive(0));
-        assert!(!pid_alive(-1));
-        assert!(!pid_alive(-(std::process::id() as i32)));
-
-        let mut child = Command::new("true").spawn().expect("spawn true");
-        let pid = child.id() as i32;
-        child.wait().expect("wait");
-        // Reaped, so the pid is free rather than a zombie still answering.
-        assert!(!pid_alive(pid));
     }
 
     /// The desktop app keeps Electron state the CLI has none of, and
@@ -5853,65 +4074,6 @@ defaults:
         // It has no --model of its own to yield to.
         assert!(!MODEL_FLAG_FORWARDED.contains(&"goose-desktop"));
         assert!(MODEL_REQUIRED.contains(&"goose-desktop"));
-    }
-
-    /// A GUI install is the one never on `PATH`, so the fallback is what
-    /// finds it: the real app when this machine has one, a fake home
-    /// otherwise, since a fake home cannot outrank an install the
-    /// machine really has at an absolute path.
-    #[test]
-    fn goose_desktop_fallback_finds_the_installers_target() {
-        // A real install is the better test: assert the fallback finds
-        // it rather than skip. Every machine-absolute candidate counts,
-        // not just the macOS one.
-        let installed = [
-            "/Applications/Goose.app/Contents/MacOS/Goose",
-            "/usr/lib/goose/Goose",
-            "/usr/lib/Goose/Goose",
-        ]
-        .into_iter()
-        .map(Path::new)
-        .find(|p| p.is_file());
-        if let Some(installed) = installed {
-            assert_eq!(
-                goose_desktop_fallback(Path::new("/nonexistent")),
-                Some(installed.to_path_buf())
-            );
-            return;
-        }
-        // Windows has no installer and so no candidate to exercise: an
-        // unpacked zip is found on `PATH` or not at all.
-        if cfg!(windows) {
-            assert_eq!(goose_desktop_fallback(Path::new("/nonexistent")), None);
-            return;
-        }
-        let (parts, name): (&[&str], &str) = if cfg!(target_os = "macos") {
-            (&["Applications", "Goose.app", "Contents", "MacOS"], "Goose")
-        } else {
-            (&[".local", "bin"], "goose-desktop")
-        };
-        let home = std::env::temp_dir().join(format!(
-            "llmman-goose-desktop-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let dir = parts.iter().fold(home.clone(), |p, part| p.join(part));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(goose_desktop_fallback(&home), None);
-        let bin = dir.join(name);
-        // A directory of that name is not the app: returning it would
-        // report Goose Desktop as installed and then fail to spawn.
-        std::fs::create_dir(&bin).unwrap();
-        assert_eq!(goose_desktop_fallback(&home), None);
-        std::fs::remove_dir(&bin).unwrap();
-        std::fs::write(&bin, "").unwrap();
-        assert_eq!(goose_desktop_fallback(&home), Some(bin));
-        assert_eq!(goose_desktop_fallback(&home.join("nowhere")), None);
-
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -6293,18 +4455,6 @@ defaults:
         );
     }
 
-    /// The last forwarded model wins, in either spelling; none is none.
-    #[test]
-    fn forwarded_model_takes_the_last_spelling() {
-        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(forwarded_model(&args(&["--model", "b"])), Some("b"));
-        assert_eq!(forwarded_model(&args(&["-m=b", "--model", "c"])), Some("c"));
-        assert_eq!(forwarded_model(&args(&["--model=b", "-m", "c"])), Some("c"));
-        assert_eq!(forwarded_model(&args(&["-p", "x"])), None);
-        assert_eq!(forwarded_model(&args(&["--model"])), None);
-        assert_eq!(forwarded_model(&args(&["--model="])), None);
-    }
-
     /// A word or `=`-joined, and nothing looser: `-sm` is not `-m`.
     #[test]
     fn has_flag_takes_the_exact_and_joined_forms_only() {
@@ -6563,21 +4713,6 @@ defaults:
         ));
     }
 
-    /// Comments go, as `strip-json-comments` takes them out for Qwen Code,
-    /// and nothing else moves: not a `//` inside a string, not a column.
-    #[test]
-    fn strip_json_comments_keeps_strings_and_columns() {
-        let raw =
-            "{\n  // note\n  \"url\": \"http://h//v1\", /* block\n  */ \"q\": \"a\\\"//b\"\n}\n";
-        let stripped = strip_json_comments(raw);
-        assert_eq!(stripped.chars().count(), raw.chars().count());
-        assert_eq!(stripped.lines().count(), raw.lines().count());
-        let v: serde_json::Value = serde_json::from_str(&stripped).unwrap();
-        assert_eq!(v["url"], "http://h//v1");
-        assert_eq!(v["q"], "a\"//b");
-        assert_eq!(strip_json_comments("{\"a\": 1}"), "{\"a\": 1}");
-    }
-
     /// pi is node, so its home half is the one node reads — the same
     /// `cline_dir` resolves, and the reason #535 stopped using
     /// `dirs::home_dir` alone. `config::home_dir` reads `%USERPROFILE%`
@@ -6725,16 +4860,6 @@ defaults:
         assert_eq!(merged["defaultModel"], "qwen3.5:0.8b");
     }
 
-    /// A leading `~` is the home directory; anything else is as given.
-    #[test]
-    fn expand_tilde_reads_the_forms_qwen_code_reads() {
-        let home = Path::new("/h");
-        assert_eq!(expand_tilde("~/alt", home), PathBuf::from("/h/alt"));
-        assert_eq!(expand_tilde("~", home), PathBuf::from("/h"));
-        assert_eq!(expand_tilde("/abs", home), PathBuf::from("/abs"));
-        assert_eq!(expand_tilde("~user/x", home), PathBuf::from("~user/x"));
-    }
-
     /// The reading and writing half over a directory of its own: a fresh
     /// one gets the file, a correct file is not touched, a commented one
     /// merges with its text kept as `.bak`, a later rewrite of llmman's
@@ -6800,165 +4925,6 @@ defaults:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Regression test for the codex config bug described on
-    /// `write_codex_config`'s own doc comment: an older llmman's
-    /// `[profiles.llmman]` table (a format current codex refuses to load
-    /// at all) must be fully removed, leaving everything else in
-    /// `config.toml` untouched.
-    #[test]
-    fn strip_legacy_llmman_profile_removes_only_that_table() {
-        let existing = "\
-[some_other_setting]
-foo = \"bar\"
-
-[profiles.llmman]
-openai_base_url = \"http://127.0.0.1:17434/v1\"
-
-[profiles.other]
-model = \"gpt-5\"
-";
-        let cleaned = strip_legacy_llmman_profile(existing);
-        assert!(!cleaned.contains("[profiles.llmman]"));
-        assert!(!cleaned.contains("openai_base_url"));
-        assert!(cleaned.contains("[some_other_setting]"));
-        assert!(cleaned.contains("foo = \"bar\""));
-        assert!(cleaned.contains("[profiles.other]"));
-        assert!(cleaned.contains("model = \"gpt-5\""));
-    }
-
-    #[test]
-    fn strip_legacy_llmman_profile_is_a_no_op_without_the_legacy_table() {
-        let existing = "[profiles.other]\nmodel = \"gpt-5\"\n";
-        assert_eq!(strip_legacy_llmman_profile(existing), existing);
-    }
-
-    #[test]
-    fn strip_legacy_llmman_profile_handles_the_table_at_end_of_file() {
-        let existing = "[profiles.llmman]\nopenai_base_url = \"http://127.0.0.1:17434/v1\"\n";
-        assert_eq!(strip_legacy_llmman_profile(existing), "");
-    }
-
-    /// The config points at the daemon's `/v1` and lists the variants in
-    /// the order given (a parsed `Value` would re-sort them).
-    #[test]
-    fn opencode_config_lists_the_variants_in_order() {
-        let variants = opencode_variants(None);
-        let text = opencode_config(
-            "http://127.0.0.1:17434",
-            "qwen3.5:0.8b",
-            "k",
-            &variants,
-            None,
-            false,
-            None,
-            None,
-        );
-        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-        assert_eq!(config["$schema"], "https://opencode.ai/config.json");
-        assert_eq!(config["model"], "ollama/qwen3.5:0.8b");
-        let provider = &config["provider"]["ollama"];
-        assert_eq!(provider["npm"], "@ai-sdk/openai-compatible");
-        assert_eq!(provider["name"], "Ollama");
-        assert_eq!(provider["options"]["baseURL"], "http://127.0.0.1:17434/v1");
-        assert_eq!(provider["options"]["apiKey"], "k");
-        assert_eq!(provider["models"].as_object().map(|m| m.len()), Some(1));
-
-        let model = &provider["models"]["qwen3.5:0.8b"];
-        assert_eq!(model["name"], "qwen3.5:0.8b");
-        let written = model["variants"].as_object().expect("variants object");
-        assert_eq!(written.len(), variants.len());
-        for (name, options) in &variants {
-            assert_eq!(&written[*name], options, "variant {name}");
-        }
-        let positions: Vec<usize> = variants
-            .iter()
-            .map(|(name, _)| text.find(&format!("\"{name}\"")).expect(name))
-            .collect();
-        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
-
-        let bare = opencode_config("http://h", "m", "k", &[], None, false, None, None);
-        assert!(!bare.contains("variants"), "{bare}");
-    }
-
-    /// `--variant` makes its options the model's own, which requests carry
-    /// until a cycled-to variant overrides them.
-    #[test]
-    fn opencode_config_starts_the_model_at_the_variant() {
-        let variants = opencode_variants(None);
-        let high = variants.iter().find(|(name, _)| *name == "high").unwrap();
-        let text = opencode_config(
-            "http://h",
-            "m",
-            "k",
-            &variants,
-            Some(&high.1),
-            false,
-            None,
-            None,
-        );
-        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-        let model = &config["provider"]["ollama"]["models"]["m"];
-        assert_eq!(
-            model["options"],
-            serde_json::json!({ "reasoningEffort": "high" })
-        );
-
-        let text = opencode_config("http://h", "m", "k", &variants, None, false, None, None);
-        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-        assert!(config["provider"]["ollama"]["models"]["m"]["options"].is_null());
-    }
-
-    #[test]
-    fn opencode_config_declares_image_input_only_for_a_vision_model() {
-        let text = opencode_config("http://h", "m", "k", &[], None, true, None, None);
-        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-        let model = &config["provider"]["ollama"]["models"]["m"];
-        assert_eq!(
-            model["modalities"],
-            serde_json::json!({ "input": ["text", "image"], "output": ["text"] })
-        );
-        assert_eq!(model["attachment"], true);
-
-        let text_only = opencode_config("http://h", "m", "k", &[], None, false, None, None);
-        assert!(!text_only.contains("modalities"), "{text_only}");
-        assert!(!text_only.contains("attachment"), "{text_only}");
-    }
-
-    /// The reserve scales with the window, so a small one keeps a
-    /// usable budget.
-    #[test]
-    fn opencode_output_reserve_scales_with_the_window_and_is_never_zero() {
-        let cases = [
-            (4096, 1024),
-            (32768, 8192),
-            (131072, 32000),
-            // Capped however large the window.
-            (1 << 20, OPENCODE_OUTPUT_TOKEN_MAX),
-            // Never 0, which opencode would replace with its own max.
-            (1, 1),
-            (3, 1),
-        ];
-        for (context, want) in cases {
-            assert_eq!(opencode_output_reserve(context), want, "context={context}");
-        }
-    }
-
-    /// Without `limit` opencode never auto-compacts, so the window has
-    /// to travel.
-    #[test]
-    fn opencode_config_declares_the_window_only_when_it_is_known() {
-        let text = opencode_config("http://h", "m", "k", &[], None, false, Some(8192), None);
-        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-        let limit = &config["provider"]["ollama"]["models"]["m"]["limit"];
-        assert_eq!(limit["context"], 8192);
-        // Both keys are required once `limit` is present.
-        assert_eq!(limit["output"], 2048);
-
-        // No window: the key stays out and opencode keeps its defaults.
-        let unknown = opencode_config("http://h", "m", "k", &[], None, false, None, None);
-        assert!(!unknown.contains("limit"), "{unknown}");
-    }
-
     /// Only the integrations that put a window somewhere pay for the
     /// load that reads the live one back. Every launcher in [`launch`]
     /// that takes `context_window` must be listed, or it silently gets
@@ -6975,210 +4941,6 @@ model = \"gpt-5\"
         assert!(declares_context_window("omp"));
         assert!(!declares_context_window("claude"));
         assert!(!declares_context_window("aider"));
-    }
-
-    /// opencode sends `limit.output` as the request's max output, so a
-    /// hosted model's own ceiling has to travel: deriving one from the
-    /// window advertises more than the provider will accept.
-    #[test]
-    fn opencode_config_prefers_the_catalogs_output_ceiling_to_a_derived_one() {
-        let hosted = opencode_config(
-            "http://h",
-            "m",
-            "k",
-            &[],
-            None,
-            false,
-            Some(128_000),
-            Some(8_192),
-        );
-        let config: serde_json::Value = serde_json::from_str(&hosted).expect("valid JSON");
-        let limit = &config["provider"]["ollama"]["models"]["m"]["limit"];
-        assert_eq!(limit["context"], 128_000);
-        assert_eq!(
-            limit["output"], 8_192,
-            "the catalog's ceiling, not a quarter of the window"
-        );
-
-        // A local model has no catalog and no ceiling of its own, so the
-        // derived reserve still stands.
-        let local = opencode_config("http://h", "m", "k", &[], None, false, Some(128_000), None);
-        let config: serde_json::Value = serde_json::from_str(&local).expect("valid JSON");
-        assert_eq!(
-            config["provider"]["ollama"]["models"]["m"]["limit"]["output"],
-            OPENCODE_OUTPUT_TOKEN_MAX
-        );
-    }
-
-    #[test]
-    fn opencode_config_escapes_the_model_name() {
-        let model = "we\"ird/mo\\del";
-        let config: serde_json::Value = serde_json::from_str(&opencode_config(
-            "http://h",
-            model,
-            "k",
-            &[],
-            None,
-            false,
-            None,
-            None,
-        ))
-        .expect("valid JSON");
-        assert_eq!(config["model"], format!("ollama/{model}"));
-        assert_eq!(config["provider"]["ollama"]["models"][model]["name"], model);
-    }
-
-    /// Each choice becomes the options that select it; no template means
-    /// the portable set, no thinking means no variants.
-    #[test]
-    fn opencode_variants_follow_the_templates_controls() {
-        let gemma4 = ThinkingControls {
-            thinks: true,
-            enable_thinking: true,
-            efforts: vec![],
-        };
-        assert_eq!(
-            opencode_variants(Some(&Thinking::Template(gemma4.clone()))),
-            [
-                (
-                    "none",
-                    serde_json::json!({
-                        "reasoningEffort": "none",
-                        "chat_template_kwargs": { "enable_thinking": false },
-                    })
-                ),
-                (
-                    "thinking",
-                    serde_json::json!({
-                        "reasoningEffort": "medium",
-                        "chat_template_kwargs": { "enable_thinking": true },
-                    })
-                ),
-            ]
-        );
-        let qwen3_8 = ThinkingControls {
-            efforts: vec!["low", "medium", "xhigh"],
-            ..gemma4
-        };
-        assert_eq!(
-            opencode_variants(Some(&Thinking::Template(qwen3_8))),
-            [
-                ("none", serde_json::json!({ "reasoningEffort": "none" })),
-                ("low", serde_json::json!({ "reasoningEffort": "low" })),
-                ("medium", serde_json::json!({ "reasoningEffort": "medium" })),
-                ("xhigh", serde_json::json!({ "reasoningEffort": "xhigh" })),
-            ]
-        );
-        let plain = Thinking::Template(ThinkingControls::default());
-        assert!(opencode_variants(Some(&plain)).is_empty());
-        let fallback = opencode_variants(None);
-        assert_eq!(fallback.len(), PORTABLE_THINKING_LEVELS.len());
-        assert_eq!(fallback[0].0, "none");
-    }
-
-    /// A provider's model cycles exactly the catalog's levels, with no
-    /// added `none`; an empty list means no variants, not the portable set.
-    #[test]
-    fn opencode_variants_follow_the_catalogs_levels() {
-        let claude = Thinking::Listed(
-            ["low", "medium", "high", "xhigh", "max"]
-                .map(String::from)
-                .to_vec(),
-        );
-        let variants = opencode_variants(Some(&claude));
-        assert_eq!(
-            variants.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
-            ["low", "medium", "high", "xhigh", "max"]
-        );
-        assert_eq!(
-            variants[4].1,
-            serde_json::json!({ "reasoningEffort": "max" })
-        );
-        assert!(opencode_variants(Some(&Thinking::Listed(Vec::new()))).is_empty());
-        assert!(claude.template().is_none());
-    }
-
-    #[test]
-    fn codex_profile_is_a_websocket_free_provider_at_the_daemon() {
-        let profile: toml::Value = codex_profile("http://127.0.0.1:17434", None)
-            .parse()
-            .expect("valid TOML");
-        assert_eq!(profile["model_provider"].as_str(), Some("llmman"));
-        let provider = &profile["model_providers"]["llmman"];
-        assert_eq!(
-            provider["base_url"].as_str(),
-            Some("http://127.0.0.1:17434/v1")
-        );
-        assert_eq!(provider["env_key"].as_str(), Some("OPENAI_API_KEY"));
-        assert_eq!(provider["wire_api"].as_str(), Some("responses"));
-        assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
-        assert!(
-            profile.get("openai_base_url").is_none(),
-            "the built-in openai provider is not the one in use"
-        );
-        assert!(
-            profile.get("model_catalog_json").is_none(),
-            "no model, no catalog to point at"
-        );
-    }
-
-    #[test]
-    fn codex_profile_names_the_catalog_it_was_given() {
-        let path = PathBuf::from("/home/we\"ird/.codex/llmman-model.json");
-        let profile: toml::Value = codex_profile("http://h", Some(&path))
-            .parse()
-            .expect("valid TOML");
-        assert_eq!(
-            profile["model_catalog_json"].as_str(),
-            Some(path.to_str().unwrap())
-        );
-    }
-
-    #[test]
-    fn codex_model_catalog_declares_image_input_only_for_a_vision_model() {
-        let catalog: serde_json::Value =
-            serde_json::from_str(&codex_model_catalog("m", true, 32768)).expect("valid JSON");
-        let entry = &catalog["models"][0];
-        assert_eq!(
-            entry["input_modalities"],
-            serde_json::json!(["text", "image"])
-        );
-        assert_eq!(entry["slug"], "m");
-        assert_eq!(entry["display_name"], "m");
-        assert_eq!(entry["context_window"], 32768);
-        // Fields codex requires of an entry.
-        for key in [
-            "context_window",
-            "shell_type",
-            "visibility",
-            "supported_in_api",
-            "priority",
-            "truncation_policy",
-            "support_verbosity",
-            "supported_reasoning_levels",
-            "experimental_supported_tools",
-        ] {
-            assert!(entry.get(key).is_some(), "missing {key}");
-        }
-
-        let text_only: serde_json::Value =
-            serde_json::from_str(&codex_model_catalog("m", false, 32768)).expect("valid JSON");
-        assert_eq!(
-            text_only["models"][0]["input_modalities"],
-            serde_json::json!(["text"])
-        );
-    }
-
-    /// codex takes the window `launch` resolved, like every other
-    /// integration; it differs only in having to name one when there is
-    /// none. What that window is made of — live, env, trained, a pair's
-    /// larger half — is `served_context_window`'s and
-    /// `pair_context_window`'s own business, tested there.
-    #[test]
-    fn codex_context_window_falls_back_only_when_there_is_no_window() {
-        assert_eq!(codex_context_window(Some(16384)), 16384);
-        assert_eq!(codex_context_window(Some(1 << 20)), 1 << 20);
-        assert_eq!(codex_context_window(None), CODEX_FALLBACK_CONTEXT_WINDOW);
     }
 
     /// Requests above the local budget route to the hosted half, so the
@@ -7335,7 +5097,7 @@ model = \"gpt-5\"
         // never matches (a real red Windows CI leg).
         assert!(contents.contains(&format!(
             "path: {}",
-            yaml_quote(&settings_path.to_string_lossy())
+            common::yaml_quote(&settings_path.to_string_lossy())
         )));
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -8523,7 +6285,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert!(check(Some(&thinking), "thinking").is_err());
 
         let widened = unknown_levels_with("xhigh");
-        let variants = opencode_variants(Some(&widened));
+        let variants = opencode::opencode_variants(Some(&widened));
         let names: Vec<_> = variants.iter().map(|(name, _)| *name).collect();
         assert_eq!(names, ["none", "low", "medium", "high", "xhigh"]);
         assert_eq!(
@@ -8639,6 +6401,30 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         .args;
         let err = run(&args).unwrap_err().to_string();
         assert!(err.contains("not after --"), "{err}");
+    }
+
+    /// OpenShell gets none of the host's files, including the state a
+    /// `--variant` is written to.
+    #[cfg(not(windows))]
+    #[test]
+    fn opencode_variant_is_refused_where_the_sandbox_gets_no_files() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: LaunchArgs,
+        }
+        let args = <Cli as clap::Parser>::try_parse_from([
+            "l",
+            "opencode",
+            "--sandbox",
+            "openshell",
+            "--variant",
+            "high",
+        ])
+        .unwrap()
+        .args;
+        let err = run(&args).unwrap_err().to_string();
+        assert!(err.contains("openshell cannot run opencode"), "{err}");
     }
 
     #[test]

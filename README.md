@@ -209,13 +209,14 @@ supply chain looks like the container supply chain:
 llmman serve
 ```
 
-One endpoint on `127.0.0.1:17434` that speaks Ollama, OpenAI and Anthropic:
+One endpoint on `127.0.0.1:17434` that speaks Ollama, OpenAI, Anthropic and System One:
 
 | API | Endpoints |
 |-----|-----------|
 | Ollama | `/api/chat`, `/api/generate`, `/api/embed`, `/api/tags`, `/api/ps`, `/api/pull`, `/api/push`, `/api/create`, ... |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/audio/transcriptions` |
 | Anthropic | `/v1/messages` |
+| System One | `/v1/systemone`, answered from a GGUF model's own token probabilities on ggml ([details](docs/api.md#system-one-api-notes)) |
 
 So any existing client works unchanged:
 

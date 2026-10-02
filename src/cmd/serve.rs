@@ -51,6 +51,7 @@ mod sched;
 mod search;
 mod shell;
 mod stream;
+mod systemone;
 mod types;
 mod usage;
 mod webui;
@@ -196,8 +197,7 @@ pub struct ServeArgs {
     #[arg(long)]
     pub pull_only: bool,
 
-    /// Run as the media backend for MODEL on this port, the way
-    /// `llama-server --port` is for a GGUF; see `mediagen_backend`.
+    /// Run as the ggml backend for MODEL on this port; see `ggml_backend`.
     #[arg(long, hide = true, requires = "model")]
     pub port: Option<u16>,
 
@@ -1363,7 +1363,7 @@ impl Drop for QueueGuard {
 /// consumer goroutine rather than rejecting every single one outright
 /// — a one-in-flight-at-a-time cap is the closest llmman gets to that
 /// same direct handoff, having no consumer-goroutine equivalent of its
-/// own. Not "unbounded" either way. `fetch_update` (not a plain
+/// own. Not "unbounded" either way. `try_update` (not a plain
 /// increment-then-check) so rejected callers never inflate the counter.
 fn try_admit_against(
     counter: &'static std::sync::atomic::AtomicUsize,
@@ -1371,7 +1371,7 @@ fn try_admit_against(
 ) -> Result<QueueGuard, AppError> {
     let cap = max_queue.max(1);
     let admitted = counter
-        .fetch_update(
+        .try_update(
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
             |n| (n < cap).then_some(n + 1),
@@ -1750,6 +1750,43 @@ async fn resolve_remote_target(
     Ok(Some(Target::Remote(Arc::new(target))))
 }
 
+/// The manifest digest and layer-size sum of `model_ref` in the store;
+/// empty and zero if it cannot be read.
+fn manifest_digest_and_size(store_path: &std::path::Path, model_ref: &str) -> (String, u64) {
+    OciStore::open(store_path)
+        .and_then(|s| {
+            s.find(model_ref).map(|d| {
+                let size = s.total_size(&d);
+                (d.digest, size)
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Pulls `model_ref` if the store lacks it. `pull_serialized` runs even
+/// when it is present, so a model on disk is still subject to the
+/// signature policy (it returns at once when none applies). No progress
+/// stream reaches the client on this path, so the daemon log is the only
+/// place to say what it did.
+async fn pull_if_missing(state: &AppState, model_ref: &str) -> Result<(), AppError> {
+    let present = OciStore::open(&state.0.store_path)
+        .and_then(|s| s.find(model_ref))
+        .is_ok();
+    if !present {
+        eprintln!("[llmman] {model_ref} not in store — pulling");
+    }
+    let store_path = state.0.store_path.clone();
+    let model_ref = model_ref.to_owned();
+    let notices = tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_ref))
+        .await
+        .context("pull task panicked")?
+        .context("pull failed")?;
+    for notice in notices {
+        eprintln!("[llmman] {notice}");
+    }
+    Ok(())
+}
+
 /// Ensures `model_ref` is loaded and returns `(canonical_ref, port,
 /// guard)`. The canonical name is what it's actually registered under
 /// with its backend (`--served-model-name`), which can differ from a
@@ -1892,30 +1929,7 @@ async fn resolve_target(
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
-    // Pull if missing — and run pull_serialized even when present, so a
-    // model already on disk is still subject to the signature policy
-    // (it returns immediately when no policy applies). See verify_stored.
-    {
-        let present = crate::storage::OciStore::open(&state.0.store_path)
-            .and_then(|s| s.find(model_ref))
-            .is_ok();
-        if !present {
-            eprintln!("[llmman] {model_ref} not in store — pulling");
-        }
-        let store_path = state.0.store_path.clone();
-        let model_ref_owned = model_ref.to_owned();
-        let notices =
-            tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_ref_owned))
-                .await
-                .context("pull task panicked")?
-                .context("pull failed")?;
-        // No progress stream to relay over on this path — an inference
-        // request triggered it, not `llmman pull` — so the daemon log is
-        // the only place left. Better there than nowhere.
-        for notice in notices {
-            eprintln!("[llmman] {notice}");
-        }
-    }
+    pull_if_missing(state, model_ref).await?;
 
     // Re-canonicalise after the pull: default_tag already fixed the lock
     // key, so this only refines to a more specific stored form.
@@ -1932,14 +1946,7 @@ async fn resolve_target(
     // the model exists, so a failure here (e.g. a race with a concurrent
     // `rm`) just means those columns show as empty/zero rather than
     // failing the whole request.
-    let (digest, size) = OciStore::open(&state.0.store_path)
-        .and_then(|s| {
-            s.find(model_ref).map(|d| {
-                let size = s.total_size(&d);
-                (d.digest, size)
-            })
-        })
-        .unwrap_or_default();
+    let (digest, size) = manifest_digest_and_size(&state.0.store_path, model_ref);
     // The content may be running already under a key this spelling does
     // not resolve to; see `check_running_by_digest`'s doc comment for the
     // order that produces one.
@@ -2049,26 +2056,12 @@ async fn resolve_target(
                 oom_retryable = true;
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }
-            // diffusion models run in this binary (see mediagen_backend)
-            (ModelPath::Diffusion(_), Some(ociman)) => {
-                let mut child = crate::container::spawn_mediagen(
-                    ociman,
-                    model_ref,
-                    &state.0.store_path,
-                    &state.0.cache_path,
-                    state.0.llama_cpp_version.as_deref(),
-                    port,
-                    state.0.cpu_limit,
-                )?;
-                stderr_tail = Some(tail_child_output(&mut child));
-                oom_retryable = true;
-                ModelProcess::Container(ociman, Engine::LlamaServer, child)
-            }
-            (ModelPath::Diffusion(_), None) => {
-                let (child, tail) = spawn_mediagen_backend(model_ref, port, state).await?;
+            // diffusion models run in this binary (see ggml_backend)
+            (ModelPath::Diffusion(_), ociman) => {
+                let (spawned, tail) = spawn_ggml(state, ociman, model_ref, port).await?;
                 stderr_tail = Some(tail);
                 oom_retryable = true;
-                ModelProcess::Local(Engine::LlamaServer, child, None)
+                spawned
             }
             // Container runtimes are Linux-only and mlx macOS-only, so
             // this never competes with the mlx arm. vllm unless
@@ -3233,8 +3226,13 @@ fn cors_layer() -> tower_http::cors::CorsLayer {
 // llama-server binary resolution
 // ---------------------------------------------------------------------------
 
-/// `crate::mediagen`'s debugging knobs, forwarded to the backend it spawns.
-pub const MEDIAGEN_ENV_PASSTHROUGH_VARS: &[&str] = &["MEDIAGEN_DUMP", "MEDIAGEN_VAE_TILE"];
+/// What the ggml backends read beyond llama.cpp's own variables.
+pub const GGML_ENV_PASSTHROUGH_VARS: &[&str] = &[
+    "LLMMAN_CONTEXT_LENGTH",
+    "LLMMAN_FLASH_ATTENTION",
+    "MEDIAGEN_DUMP",
+    "MEDIAGEN_VAE_TILE",
+];
 
 // ---------------------------------------------------------------------------
 // Metrics
@@ -3503,7 +3501,7 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
 
 pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     if let (Some(port), Some(model)) = (args.port, &args.model) {
-        return tokio::runtime::Runtime::new()?.block_on(mediagen_backend(model, port, args));
+        return tokio::runtime::Runtime::new()?.block_on(ggml_backend(model, port, args));
     }
     tokio::runtime::Runtime::new()?.block_on(serve_async(args))
 }
@@ -3521,16 +3519,15 @@ pub fn llama_lib_dir(runtime: Runtime, pinned_version: Option<&str>) -> anyhow::
     })
 }
 
-/// `llmman serve MODEL --port PORT`: the media backend the daemon spawns
-/// for a diffusion model; same endpoints and `/health` as llama-server.
-async fn mediagen_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyhow::Result<()> {
+/// `llmman serve MODEL --port PORT`: what the daemon spawns to run a model
+/// on ggml itself: a diffusion model's media backend, or a GGUF's System One
+/// backend. Both answer `/health` like llama-server.
+async fn ggml_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyhow::Result<()> {
     let store_path = default_store()?;
     let cache_path = crate::default_cache()?;
-    let ModelPath::Diffusion(paths) = resolve_model(&store_path, &cache_path, model_ref)? else {
-        anyhow::bail!("{model_ref} is not a diffusion model");
-    };
-    if paths.text_encoder.is_none() && crate::mediagen::needs_text_encoder(&paths.model) {
-        anyhow::bail!("{model_ref}: no text encoder in the model pack");
+    let model = resolve_model(&store_path, &cache_path, model_ref)?;
+    if !matches!(model, ModelPath::Diffusion(_) | ModelPath::Gguf(..)) {
+        anyhow::bail!("{model_ref} is neither a diffusion model nor a GGUF");
     }
     let pinned = runtime::llama_cpp_pin(args.llama_cpp_version.as_deref());
     let runtime = args.runtime;
@@ -3539,49 +3536,96 @@ async fn mediagen_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyho
     // the graph builders hold `&'static Api`
     let api: &'static crate::mediagen::ffi::Api =
         Box::leak(Box::new(crate::mediagen::ffi::Api::load(&lib_dir)?));
-    let params = crate::mediagen::ContextParams {
-        model: paths.model.clone(),
-        vae: paths.vae.clone(),
-        audio_vae: paths.audio_vae.clone(),
-        text_proj: paths.text_proj.clone(),
-        text_model: paths.text_encoder.clone(),
-        files: paths.files.clone(),
-        use_gpu: true,
-        // llama.cpp's own env var for -ngl
-        text_gpu_layers: std::env::var("LLAMA_ARG_N_GPU_LAYERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(999),
-        n_threads: std::env::var("LLAMA_ARG_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or_else(|| threads_from_env_or_host().map(|n| n as i32))
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() as i32)),
-        flash_attn: flash_attention_from_env().as_deref() != Some("off"),
+    let loading = |e: anyhow::Error| {
+        e.context(format!(
+            "loading the model with the llama.cpp libraries in {} (an old build? \
+             remove it from PATH or pass --llama-cpp-version to use a release)",
+            lib_dir.display()
+        ))
     };
-    let ctx = tokio::task::spawn_blocking(move || crate::mediagen::Context::init(api, &params))
-        .await?
-        .with_context(|| {
-            format!(
-                "loading the model with the llama.cpp libraries in {} (an old build? \
-                 remove it from PATH or pass --llama-cpp-version to use a release)",
-                lib_dir.display()
-            )
-        })?;
-    let router = crate::mediagen::server::router(
-        ctx,
-        model_ref.to_string(),
-        paths.model.to_string_lossy().into_owned(),
-    );
-    crate::mediagen::server::serve(router, (args.host, port).into()).await
+    // llama.cpp's own env var for -ngl
+    let gpu_layers = std::env::var("LLAMA_ARG_N_GPU_LAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(999);
+    let n_threads = std::env::var("LLAMA_ARG_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| threads_from_env_or_host().map(|n| n as i32))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() as i32));
+    let flash_attn = flash_attention_from_env().as_deref() != Some("off");
+    let addr = (args.host, port).into();
+    match model {
+        ModelPath::Diffusion(paths) => {
+            if paths.text_encoder.is_none() && crate::mediagen::needs_text_encoder(&paths.model) {
+                anyhow::bail!("{model_ref}: no text encoder in the model pack");
+            }
+            let params = crate::mediagen::ContextParams {
+                model: paths.model.clone(),
+                vae: paths.vae.clone(),
+                audio_vae: paths.audio_vae.clone(),
+                text_proj: paths.text_proj.clone(),
+                text_model: paths.text_encoder.clone(),
+                files: paths.files.clone(),
+                use_gpu: true,
+                text_gpu_layers: gpu_layers,
+                n_threads,
+                flash_attn,
+            };
+            let ctx =
+                tokio::task::spawn_blocking(move || crate::mediagen::Context::init(api, &params))
+                    .await?
+                    .map_err(loading)?;
+            let router = crate::mediagen::server::router(
+                ctx,
+                model_ref.to_string(),
+                paths.model.to_string_lossy().into_owned(),
+            );
+            crate::mediagen::server::serve(router, addr, "mediagen").await
+        }
+        ModelPath::Gguf(path, _) => {
+            let opts = crate::systemone::engine::Options {
+                n_gpu_layers: gpu_layers,
+                n_threads,
+                flash_attn,
+                max_ctx: context_length_from_env(),
+            };
+            let engine = tokio::task::spawn_blocking(move || {
+                crate::systemone::engine::Engine::load(api, &path, opts)
+            })
+            .await?
+            .map_err(loading)?;
+            let router = crate::systemone::server::router(engine, model_ref.to_string());
+            crate::mediagen::server::serve(router, addr, "systemone").await
+        }
+        _ => unreachable!("checked above"),
+    }
 }
 
-/// Spawns this binary as a [`mediagen_backend`].
-async fn spawn_mediagen_backend(
+/// Starts the [`ggml_backend`] of `model_ref`: this binary, or in a
+/// container runtime the same binary in the llama.cpp image.
+async fn spawn_ggml(
+    state: &AppState,
+    ociman: Option<crate::container::ContainerManager>,
     model_ref: &str,
     port: u16,
-    state: &AppState,
-) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
+) -> anyhow::Result<(ModelProcess, OutputTail)> {
+    if let Some(ociman) = ociman {
+        let mut child = crate::container::spawn_mediagen(
+            ociman,
+            model_ref,
+            &state.0.store_path,
+            &state.0.cache_path,
+            state.0.llama_cpp_version.as_deref(),
+            port,
+            state.0.cpu_limit,
+        )?;
+        let tail = tail_child_output(&mut child);
+        return Ok((
+            ModelProcess::Container(ociman, Engine::LlamaServer, child),
+            tail,
+        ));
+    }
     let exe = std::env::current_exe().context("locating the llmman binary")?;
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.args(["serve", model_ref, "--port", &port.to_string()]);
@@ -3596,7 +3640,7 @@ async fn spawn_mediagen_backend(
     for var in GPU_VISIBLE_DEVICE_VARS
         .iter()
         .chain(LLAMA_CPP_ENV_PASSTHROUGH_VARS)
-        .chain(MEDIAGEN_ENV_PASSTHROUGH_VARS)
+        .chain(GGML_ENV_PASSTHROUGH_VARS)
     {
         if let Ok(val) = std::env::var(var) {
             cmd.env(var, val);
@@ -3608,9 +3652,9 @@ async fn spawn_mediagen_backend(
     let mut child = cmd
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("spawn media generation backend from {}", exe.display()))?;
+        .with_context(|| format!("spawn the ggml backend from {}", exe.display()))?;
     let tail = tail_child_output(&mut child);
-    Ok((child, tail))
+    Ok((ModelProcess::Local(Engine::LlamaServer, child, None), tail))
 }
 
 /// The daemon's routes and the layers over them, split out of
@@ -3665,7 +3709,13 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         // to the model chosen by `llmman launch agy`.
         .route("/gemini/:model/*gemini_path", post(handle_pinned_gemini))
         // Anthropic API
-        .route("/v1/messages", post(anthropic::handle_anthropic_messages));
+        .route("/v1/messages", post(anthropic::handle_anthropic_messages))
+        // System One decision API (crate::systemone)
+        .route(
+            "/v1/systemone",
+            post(systemone::handle_systemone)
+                .layer(DefaultBodyLimit::max(crate::systemone::server::BODY_LIMIT)),
+        );
 
     // Applied only when the operator asked for metrics. Nothing can read
     // the store while the endpoint is absent — enabling it needs a
@@ -4052,8 +4102,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("bind {addr}"))?;
     eprintln!(
-        "llmman serve listening on {addr}{}",
-        if tls.is_some() { " (TLS)" } else { "" }
+        "llmman serve listening on http{}://{addr}",
+        if tls.is_some() { "s" } else { "" }
     );
 
     // Background idle-unload reaper — see reap_idle_models's doc comment.

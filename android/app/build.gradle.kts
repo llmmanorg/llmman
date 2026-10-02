@@ -114,7 +114,7 @@ val fetchLlamaCpp by tasks.registering(Exec::class) {
     onlyIf { !out.exists() }
     doFirst { out.parentFile.mkdirs() }
     commandLine(
-        "curl", "-fsSL", "--retry", "3", "-o", out.path,
+        "curl", "-fsSL", "--retry", "8", "-o", out.path,
         "https://github.com/ggml-org/llama.cpp/releases/download/$llamaCppRelease/$llamaCppTarballName",
     )
 }

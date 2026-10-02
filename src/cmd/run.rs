@@ -717,14 +717,7 @@ struct WrapState {
 /// Terminal width, falling back to 80 like ollama's `displayResponse`
 /// does when `term.GetSize` fails (e.g. not a real terminal).
 fn term_width() -> usize {
-    #[cfg(unix)]
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-            return ws.ws_col as usize;
-        }
-    }
-    80
+    crate::fmt::terminal_cols(1).map_or(80, usize::from)
 }
 
 /// Pure computation half of `wrap_write`, split out so it's testable

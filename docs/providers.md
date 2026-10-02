@@ -250,7 +250,7 @@ such as one models.dev does not list yet, takes any effort level.
 
 | Integration | As | Takes |
 |---|---|---|
-| `opencode` | the model's default options | every variant |
+| `opencode` | the model's default options and its saved variant | every variant |
 | `claude`, `copilot` | `--effort` | `low` to `max` |
 | `codex` | `-c model_reasoning_effort=` | all |
 | `pi`, `omp` | `--thinking` | `none`, `minimal` to `high` (omp: `xhigh`) |

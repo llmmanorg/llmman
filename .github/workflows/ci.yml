@@ -32,6 +32,17 @@ env:
   # VLLM_METAL_VERSION below: a vllm-metal release names the vLLM
   # release it was built against in its `.github/vllm-release-tag.commit`.
   VLLM_VERSION: "0.30.0"
+  # torchcodec CPU build ("+cpu", from PyTorch's CPU index) the Linux
+  # "Install vLLM (e2e)" step pins. vLLM's wheel only asks for
+  # torchcodec>=0.14, and pip takes the highest version across PyPI and
+  # that index. PyPI's is a CUDA build: its libtorchcodec_image.so needs
+  # libnvrtc.so.13, so `import vllm` dies on a CPU runner. Whenever the
+  # index's listing trails PyPI, pip picks PyPI's: it did for 0.17.0
+  # (PyPI 2026-09-30 12:52Z; the listing still lacked 0.17.0+cpu at
+  # 13:08Z), failing serve_vllm_safetensors_model on the Linux e2e jobs.
+  # 0.16.0 is what the last green run used with VLLM_VERSION above. Bump
+  # deliberately, with VLLM_VERSION.
+  TORCHCODEC_CPU_VERSION: "0.16.0"
   # vllm-metal (github.com/vllm-project/vllm-metal), macOS's Metal-GPU
   # vLLM platform below. A stable release, cut from its `releases/vX.Y.Z`
   # branch and numbered after the vLLM release it pairs with — never a
@@ -742,6 +753,8 @@ jobs:
       # These tests are about the llama-server "Install llama-server" puts
       # on PATH, which `--runtime auto` would try docker before.
       LLMMAN_RUNTIME: path
+      # pip's 15s default kills stalled downloads.
+      PIP_DEFAULT_TIMEOUT: "120"
     strategy:
       fail-fast: false
       matrix:
@@ -1016,8 +1029,8 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         env:
-          TALOS_VERSION: 0.18.0-alpha
-          TALOS_SHA256: 05b4e3345a0027474b7c479a62fdb16681a9ca0f9f277f1b5c872eb45cee9d33
+          TALOS_VERSION: 0.20.0-beta.2
+          TALOS_SHA256: aaf05f8233d7bf6483daf33ef7de8750b97d42701d93bb711401fc7615fd9219
         run: |
           set -euo pipefail
           tarball="talos-${TALOS_VERSION}.tar.gz"
@@ -1607,7 +1620,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m venv "$RUNNER_TEMP/vllm-plugin-venv"
+          # New pip resumes cut-off downloads.
+          python3 -m venv --upgrade-deps "$RUNNER_TEMP/vllm-plugin-venv"
           "$RUNNER_TEMP/vllm-plugin-venv/bin/pip" install -e ./vllm-plugin pytest
           echo "$RUNNER_TEMP/vllm-plugin-venv/bin" >> "$GITHUB_PATH"
 
@@ -1647,6 +1661,7 @@ jobs:
             wheel="vllm-${VLLM_VERSION}+cpu-cp38-abi3-manylinux_2_39_${arch}.whl"
             "$venv/bin/pip" install \
               "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/$wheel" \
+              "torchcodec==${TORCHCODEC_CPU_VERSION}+cpu" \
               --extra-index-url https://download.pytorch.org/whl/cpu
 
             if [ "$arch" = "x86_64" ]; then

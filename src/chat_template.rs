@@ -5,7 +5,7 @@
 //! else; gpt-oss reads `reasoning_effort` but names only its default;
 //! Qwen3.5 and Gemma 4 have just the switch; Llama 3 has none.
 //! `llmman launch` offers an integration exactly these (see
-//! `cmd::launch::opencode_variants`), never a level the model rejects.
+//! `cmd::launch::opencode::opencode_variants`), never a level the model rejects.
 
 use std::ops::Range;
 
