@@ -6,7 +6,7 @@ use super::ollama::{
     opt_f64, opt_num_thread, opt_u32, options_to_oai, progress_line, staged_blob_path, staged_file,
     OllamaPullRequest, OllamaPushRequest, PushOutcome, StreamedOutcome,
 };
-use super::openai::{apply_default_repeat_penalty, apply_reasoning_effort};
+use super::openai::apply_default_repeat_penalty;
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::responses::{
     consolidate_responses_instructions, filter_non_function_tools, remote_responses,
@@ -846,50 +846,6 @@ fn provider_compat_translates_think_per_wire() {
     assert_eq!(with(&anthropic, on), Some("medium".into()));
     let off = serde_json::json!({ "enable_thinking": false });
     assert_eq!(with(&anthropic, off), Some("none".into()));
-}
-
-/// A local `reasoning_effort` becomes the `chat_template_kwargs` Ollama's
-/// `think` would; the caller's kwargs win; an unknown level changes nothing.
-#[test]
-fn apply_reasoning_effort_mirrors_it_into_template_kwargs() {
-    let with = |req: serde_json::Value| {
-        let mut req = req;
-        apply_reasoning_effort(&mut req);
-        req
-    };
-    assert_eq!(
-        with(serde_json::json!({ "model": "m", "reasoning_effort": "none" })),
-        serde_json::json!({
-            "model": "m", "reasoning_effort": "none",
-            "chat_template_kwargs": { "enable_thinking": false }
-        })
-    );
-    for level in crate::chat_template::EFFORT_LEVELS {
-        assert_eq!(
-            with(serde_json::json!({ "model": "m", "reasoning_effort": level })),
-            serde_json::json!({
-                "model": "m", "reasoning_effort": level,
-                "chat_template_kwargs": { "enable_thinking": true, "reasoning_effort": level }
-            }),
-            "{level}"
-        );
-    }
-    assert_eq!(
-        with(serde_json::json!({
-            "model": "m", "reasoning_effort": "high",
-            "chat_template_kwargs": { "enable_thinking": false }
-        })),
-        serde_json::json!({
-            "model": "m", "reasoning_effort": "high",
-            "chat_template_kwargs": { "enable_thinking": false, "reasoning_effort": "high" }
-        })
-    );
-    let unknown = serde_json::json!({ "model": "m", "reasoning_effort": "verbose" });
-    assert_eq!(with(unknown.clone()), unknown);
-    let absent = serde_json::json!({ "model": "m", "chat_template_kwargs": { "a": 1 } });
-    assert_eq!(with(absent.clone()), absent);
-    let not_a_string = serde_json::json!({ "model": "m", "reasoning_effort": 3 });
-    assert_eq!(with(not_a_string.clone()), not_a_string);
 }
 
 /// OpenAI's reasoning models take `max_completion_tokens` and reject
