@@ -278,6 +278,7 @@ integration:
 
 ```
 llmman launch claude --model qwen3.8
+llmman launch copilot --model qwen3.8 -- -p "Explain this repository"
 llmman launch omp --model qwen3.8 -- -p "Explain this repository"
 llmman launch agy --model qwen3.8 -- -p "Explain this repository"
 llmman launch cline --model qwen3.8 -- --json "Explain this repository"
@@ -285,7 +286,7 @@ llmman launch grok --model qwen3.8 -- -p "Explain this repository"
 ```
 
 Run `llmman launch` with no arguments to list the supported integrations
-(Claude Code, OpenCode, Codex, Pi, OMP, Cline, Aider, Qwen Code,
+(Claude Code, OpenCode, Codex, GitHub Copilot CLI, Pi, OMP, Cline, Aider, Qwen Code,
 Gemini CLI, Grok Build, AGY, DeepSeek Harness, Docker Agent, goose,
 goose Desktop, ...) and whether
 each is installed. Installing an
@@ -294,6 +295,10 @@ machine, except that a missing Cline can be installed with npm after an
 interactive confirmation. `dsh` runs under `npx` when it isn't installed
 globally. Any extra arguments after `--` are forwarded to the integration's
 own CLI. Short names work wherever a model reference is accepted.
+
+GitHub Copilot uses the standalone `copilot` CLI (`npm install -g
+@github/copilot`) in offline BYOK mode, so a local-model launch does not
+require a GitHub login.
 
 AGY requires version 1.1.13 or newer for Gemini API-key and custom-endpoint
 support. llmman writes Gemini mode to its own stable settings directory at
