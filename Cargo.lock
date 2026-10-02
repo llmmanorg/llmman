@@ -2387,6 +2387,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "console",
  "dirs 5.0.1",
  "dunce",
  "flate2",

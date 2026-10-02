@@ -215,6 +215,8 @@ is what aggregation peers ask each other. See [aggregation.md](aggregation.md).
 Hub and Hugging Face rows in the same order, as `{"models": [{name,
 pulls, likes, updated}]}`, each `name` ready for `/api/pull`. `limit`
 caps the rows per registry as `--limit` does (default 25, at most 64).
+It leaves out the FIT column `llmman search` adds, which costs a
+registry request per row; the web UI shows fit on a model's card.
 `/llmman/search/popular` has the same shape and needs no query: Docker
 Hub's most pulled models, then Hugging Face's most downloaded GGUF
 text-generation repos.

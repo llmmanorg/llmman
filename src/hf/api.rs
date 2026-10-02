@@ -40,6 +40,17 @@ pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&body).with_context(|| format!("decode JSON from {url}"))
 }
 
+/// [`get_json`] for a lookup that may fail (no such tag, a gated repo):
+/// one try, no log line, `None` on any error.
+pub(crate) async fn get_json_quiet<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+) -> Option<T> {
+    let body = send_ok(client, url, token).await.ok()?.bytes().await.ok()?;
+    serde_json::from_slice(&body).ok()
+}
+
 /// [`get_json`]'s authenticated GET for a body that isn't JSON, reading at
 /// most `max` bytes of it: for a caller that keeps only the start of what
 /// could be a large file.
@@ -199,8 +210,13 @@ pub async fn fetch_files(
     commit: &str,
     token: Option<&str>,
 ) -> Result<Vec<HfFile>> {
-    let url = format!("{endpoint}api/models/{owner}/{repo}/tree/{commit}?recursive=true");
+    let url = files_url(endpoint, owner, repo, commit);
     get_json(client, &url, token).await.context("HF file list")
+}
+
+/// Where [`fetch_files`] lists a repo's files at `commit`.
+pub(crate) fn files_url(endpoint: &str, owner: &str, repo: &str, commit: &str) -> String {
+    format!("{endpoint}api/models/{owner}/{repo}/tree/{commit}?recursive=true")
 }
 
 /// One row of `GET /api/models?search=...`, only what `llmman search`

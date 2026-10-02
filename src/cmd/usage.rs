@@ -236,30 +236,7 @@ fn table(rows: &[Row], by: Option<By>) -> String {
         line.push(dollars(row));
         lines.push(line);
     }
-    let widths: Vec<usize> = (0..lines[0].len())
-        .map(|i| {
-            lines
-                .iter()
-                .map(|l| l[i].chars().count())
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
-    let mut out = String::new();
-    for line in lines {
-        let last = line.len() - 1;
-        for (i, cell) in line.iter().enumerate() {
-            if i == last {
-                out.push_str(cell);
-            } else {
-                out.push_str(cell);
-                let pad = widths[i] - cell.chars().count() + 4;
-                out.extend(std::iter::repeat_n(' ', pad));
-            }
-        }
-        out.push('\n');
-    }
-    out
+    crate::fmt::columns(&lines)
 }
 
 /// `-` for no price, not free (`$0.00`); `+` when only some had one.

@@ -9,7 +9,7 @@ reference; this is the one-line summary of each subcommand.
 | `launch`  | Launch an integration (Claude Code, OpenCode, …) |
 | `run`     | Run a model interactively or with a one-shot prompt |
 | `pull`    | Pull a model from a registry or HuggingFace |
-| `search`  | Search for models on Docker Hub and Hugging Face (Docker Hub results first) |
+| `search`  | Search for models on Docker Hub and Hugging Face (Docker Hub results first), with a `FIT` column: how much of this machine's model memory each default download takes |
 | `list` (`ls`) | List locally stored models, or a hosted provider's (`--provider`) models |
 | `ps`      | List models currently loaded |
 | `log`     | Show the prompts `serve` has seen, newest first, like `git log` |

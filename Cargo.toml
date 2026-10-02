@@ -75,6 +75,7 @@ reqwest    = { version = "0.12", default-features = false, features = ["json", "
 futures    = "0.3"
 bytes      = "1"
 indicatif  = "0.18"
+console    = { version = "0.16", default-features = false, features = ["std"] }
 flate2     = "1"
 zip        = { version = "2", default-features = false, features = ["deflate"] }
 libloading = "0.8"

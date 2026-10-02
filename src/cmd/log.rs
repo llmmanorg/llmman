@@ -186,15 +186,8 @@ fn local_to_utc(t: chrono::NaiveDateTime) -> anyhow::Result<DateTime<Utc>> {
         .ok_or_else(|| anyhow::anyhow!("not a valid local time: {t}"))
 }
 
-const YELLOW: &str = "\x1b[33m";
-const RESET: &str = "\x1b[0m";
-
 fn paint(text: &str, color: bool) -> String {
-    if color {
-        format!("{YELLOW}{text}{RESET}")
-    } else {
-        text.to_string()
-    }
+    crate::fmt::paint(text, crate::fmt::YELLOW, color)
 }
 
 /// Request-supplied text with control characters (tab aside) dropped:

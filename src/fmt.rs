@@ -36,6 +36,49 @@ pub fn terminal_cols(fd: i32) -> Option<u16> {
     None
 }
 
+pub const GREEN: &str = "\x1b[32m";
+pub const YELLOW: &str = "\x1b[33m";
+pub const RED: &str = "\x1b[31m";
+
+/// Whether stdout takes ANSI colors: a terminal that is not `dumb` and
+/// has no `NO_COLOR`; on Windows it also turns VT processing on.
+pub fn stdout_color() -> bool {
+    console::Term::stdout().features().colors_supported()
+}
+
+/// `text` in the ANSI color `code` when `color`, else as it is.
+pub fn paint(text: &str, code: &str, color: bool) -> String {
+    if color {
+        format!("{code}{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Rows (header first) as `list`-style columns: each cell but a row's
+/// last is padded to its column's widest, plus a 4-space gutter. The last
+/// is never padded, so it may carry color.
+pub fn columns(rows: &[Vec<String>]) -> String {
+    let cols = rows.first().map_or(0, Vec::len);
+    let widths: Vec<usize> = (0..cols)
+        .map(|i| {
+            let cell = |r: &Vec<String>| r.get(i).map_or(0, |c| c.chars().count());
+            rows.iter().map(cell).max().unwrap_or(0)
+        })
+        .collect();
+    let mut out = String::new();
+    for row in rows {
+        if let Some((last, rest)) = row.split_last() {
+            for (cell, width) in rest.iter().zip(&widths) {
+                out.push_str(&format!("{cell:<width$}    "));
+            }
+            out.push_str(last);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// First 12 hex chars of a `sha256:...` digest, matching `docker images`'s
 /// convention (and Ollama's `ollama ps`/`ollama list`, which truncate to 12
 /// as well).
@@ -157,6 +200,17 @@ pub fn until_rfc3339(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn columns_pad_all_but_the_last_cell() {
+        let rows = [["NAME", "SIZE", "FIT"], ["a", "10", "\x1b[32m5%\x1b[0m"]]
+            .map(|r| r.map(String::from).to_vec());
+        assert_eq!(
+            columns(&rows),
+            "NAME    SIZE    FIT\na       10      \x1b[32m5%\x1b[0m\n"
+        );
+        assert_eq!(columns(&[]), "");
+    }
 
     #[test]
     fn short_id_truncates_to_12_hex_chars() {

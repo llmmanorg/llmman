@@ -13,13 +13,21 @@
 //! (`application/vnd.docker.ai.model.config.v0.1+json`) are left out.
 //! Hugging Face goes through `hf::api::search_models`, with the user's
 //! token when configured.
+//!
+//! The CLI adds a FIT column; it costs a request per row, so
+//! `/llmman/search` does not.
+
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
+use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::fmt::{human_count, relative_time_rfc3339};
-use crate::hf;
+use crate::fmt::{
+    columns, human_count, paint, relative_time_rfc3339, stdout_color, GREEN, RED, YELLOW,
+};
+use crate::{hf, hostgpu};
 
 /// Docker Hub's website search API; not part of the OCI registry
 /// protocol, so it doesn't go through the Go shim.
@@ -34,7 +42,21 @@ pub const DEFAULT_LIMIT: u32 = 25;
 /// The manifest media type of a CNCF ModelPack artifact.
 const MODELPACK_MANIFEST: &str = "application/vnd.cncf.model.manifest.v1+json";
 
+const FIT_HELP: &str = "\
+FIT is the percent of this machine's model memory (GPU, else RAM) that a \
+row's default download takes, weights only. Green is up to 60%, yellow up \
+to 90%, red above; `-` is unknown. Colors show only on a terminal, and not \
+with NO_COLOR set.";
+
+/// Size lookups in flight at once for FIT.
+const SIZE_LOOKUPS: usize = 16;
+
+/// All of FIT's lookups and the memory probe get this long; rows still
+/// unanswered show `-`.
+const FIT_BUDGET: Duration = Duration::from_secs(10);
+
 #[derive(Args, Debug)]
+#[command(after_help = FIT_HELP)]
 pub struct SearchArgs {
     /// Text to match against model names and descriptions
     #[arg(value_name = "QUERY")]
@@ -81,14 +103,16 @@ pub fn run(args: &SearchArgs) -> Result<()> {
     let query = args.query.trim();
     anyhow::ensure!(!query.is_empty(), "search query must not be empty");
 
-    let hits = tokio::runtime::Runtime::new()
-        .context("start tokio runtime")?
-        .block_on(search(query, args.limit, args.registry))?;
+    let runtime = tokio::runtime::Runtime::new().context("start tokio runtime")?;
+    let hits = runtime.block_on(search(query, args.limit, args.registry))?;
 
     if hits.is_empty() {
         anyhow::bail!("no models found for {query:?}");
     }
-    print!("{}", render(&hits));
+    let fits = runtime.block_on(fits(&hits));
+    print!("{}", render(&hits, &fits, stdout_color()));
+    // Not `drop`, which would wait out a hung memory probe.
+    runtime.shutdown_background();
     Ok(())
 }
 
@@ -502,6 +526,11 @@ fn hugging_face_variants(name: &str, files: &[hf::api::HfFile]) -> Vec<Variant> 
     variants
 }
 
+/// The Hub API's URL for one repo; `/tags` and `/tags/<tag>` hang off it.
+fn docker_hub_repo_url(namespace: &str, repo_name: &str) -> String {
+    format!("https://hub.docker.com/v2/namespaces/{namespace}/repositories/{repo_name}")
+}
+
 async fn docker_hub_tags(client: &reqwest::Client, base: &str) -> Result<Vec<HubTag>> {
     let mut url = Some(format!("{base}/tags?page_size=100"));
     let mut tags = Vec::new();
@@ -570,7 +599,7 @@ async fn docker_hub_card(client: &reqwest::Client, name: &str, repo: &str) -> Re
     let (namespace, repo_name) = repo
         .split_once('/')
         .with_context(|| format!("{name:?}: expected docker.io/<namespace>/<repo>"))?;
-    let base = format!("https://hub.docker.com/v2/namespaces/{namespace}/repositories/{repo_name}");
+    let base = docker_hub_repo_url(namespace, repo_name);
     let (info, tags) = tokio::join!(
         hf::api::get_json::<HubRepo>(client, &base, None),
         docker_hub_tags(client, &base),
@@ -610,57 +639,120 @@ async fn docker_hub_card(client: &reqwest::Client, name: &str, repo: &str) -> Re
 }
 
 // ---------------------------------------------------------------------------
+// Fit
+// ---------------------------------------------------------------------------
+
+/// Up to this percent of model memory is green, up to the next yellow,
+/// above red: `fitOf` in `webui/models.js`.
+const FIT_OK_MAX: u64 = 60;
+const FIT_TIGHT_MAX: u64 = 90;
+
+/// Percent of `memory` that `size` bytes take, rounded up so it never
+/// reads under a tier edge it has crossed. `None` if either is unknown.
+fn fit_percent(size: u64, memory: u64) -> Option<u64> {
+    if size == 0 || memory == 0 {
+        return None;
+    }
+    let percent = (size as u128 * 100).div_ceil(memory as u128);
+    Some(u64::try_from(percent).unwrap_or(u64::MAX))
+}
+
+fn fit_color(percent: u64) -> &'static str {
+    match percent {
+        p if p <= FIT_OK_MAX => GREEN,
+        p if p <= FIT_TIGHT_MAX => YELLOW,
+        _ => RED,
+    }
+}
+
+/// Each hit's [`fit_percent`] for its default download, in order; `None`
+/// where a lookup failed or timed out. Failures are silent.
+async fn fits(hits: &[Hit]) -> Vec<Option<u64>> {
+    let Ok(client) = hf::api_client() else {
+        return vec![None; hits.len()];
+    };
+    let endpoint = hf::hf_endpoint("hf.co");
+    let token = hf::token();
+    let (client, endpoint, token) = (&client, &endpoint, token.as_deref());
+    let deadline = tokio::time::Instant::now() + FIT_BUDGET;
+    // A subprocess on Linux/Windows, so it runs alongside the lookups.
+    let probe =
+        tokio::task::spawn_blocking(|| hostgpu::memory_bytes(hostgpu::detect_with_vram().1));
+    // Unordered, so a stalled lookup does not hold up the rest.
+    let found: Vec<(usize, Option<u64>)> = stream::iter(hits.iter().enumerate())
+        .map(|(i, hit)| async move {
+            let size = default_size(client, endpoint, token, &hit.name);
+            (
+                i,
+                tokio::time::timeout_at(deadline, size).await.ok().flatten(),
+            )
+        })
+        .buffer_unordered(SIZE_LOOKUPS)
+        .collect()
+        .await;
+    let mut sizes = vec![None; hits.len()];
+    for (i, size) in found {
+        sizes[i] = size;
+    }
+    // A probe that hangs or fails leaves system RAM.
+    let memory = match tokio::time::timeout_at(deadline, probe).await {
+        Ok(Ok(bytes)) => bytes,
+        _ => hostgpu::memory_bytes(0),
+    };
+    sizes
+        .into_iter()
+        .map(|size| fit_percent(size?, memory))
+        .collect()
+}
+
+/// Bytes `pull` downloads for `name` with no tag: the default variant of
+/// its web UI card.
+async fn default_size(
+    client: &reqwest::Client,
+    endpoint: &str,
+    token: Option<&str>,
+    name: &str,
+) -> Option<u64> {
+    if let Some(repo) = name.strip_prefix("hf.co/") {
+        let (owner, repo_name) = repo.split_once('/')?;
+        let url = hf::api::files_url(endpoint, owner, repo_name, "main");
+        let files: Vec<hf::api::HfFile> = hf::api::get_json_quiet(client, &url, token).await?;
+        hugging_face_variants(name, &files)
+            .into_iter()
+            .find(|v| v.default)?
+            .size
+    } else {
+        let (namespace, repo_name) = name.strip_prefix("docker.io/")?.split_once('/')?;
+        let url = format!("{}/tags/latest", docker_hub_repo_url(namespace, repo_name));
+        let tag: HubTag = hf::api::get_json_quiet(client, &url, None).await?;
+        tag.full_size
+            .filter(|_| tag.media_type == MODELPACK_MANIFEST)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Output
 // ---------------------------------------------------------------------------
 
-/// Same shape as `list`/`ps`: uppercase headers, 4-space gutters, columns
-/// as wide as their widest cell, last column unpadded, nothing after the
-/// final row.
-fn render(hits: &[Hit]) -> String {
+/// `list`-style columns; with `color`, each FIT is painted by its tier.
+/// `fits` runs alongside `hits`.
+fn render(hits: &[Hit], fits: &[Option<u64>], color: bool) -> String {
     let dash = || "-".to_string();
-    let rows: Vec<[String; 4]> = hits
-        .iter()
-        .map(|h| {
-            [
-                h.name.clone(),
-                h.pulls.map(human_count).unwrap_or_else(dash),
-                h.likes.map(|n| n.to_string()).unwrap_or_else(dash),
-                h.updated
-                    .as_deref()
-                    .map(relative_time_rfc3339)
-                    .unwrap_or_else(dash),
-            ]
-        })
-        .collect();
-
-    let headers = ["NAME", "PULLS", "LIKES", "UPDATED"];
-    let widths: Vec<usize> = (0..headers.len())
-        .map(|c| {
-            rows.iter()
-                .map(|r| r[c].len())
-                .max()
-                .unwrap_or(0)
-                .max(headers[c].len())
-        })
-        .collect();
-
-    let line = |cells: [&str; 4]| {
-        format!(
-            "{:<w0$}    {:<w1$}    {:<w2$}    {}\n",
-            cells[0],
-            cells[1],
-            cells[2],
-            cells[3],
-            w0 = widths[0],
-            w1 = widths[1],
-            w2 = widths[2],
-        )
-    };
-    let mut out = line(headers);
-    for r in &rows {
-        out.push_str(&line([&r[0], &r[1], &r[2], &r[3]]));
+    let header = ["NAME", "PULLS", "LIKES", "UPDATED", "FIT"].map(String::from);
+    let mut rows = vec![header.to_vec()];
+    for (h, fit) in hits.iter().zip(fits) {
+        rows.push(vec![
+            h.name.clone(),
+            h.pulls.map(human_count).unwrap_or_else(dash),
+            h.likes.map(|n| n.to_string()).unwrap_or_else(dash),
+            h.updated
+                .as_deref()
+                .map(relative_time_rfc3339)
+                .unwrap_or_else(dash),
+            fit.map_or_else(dash, |p| paint(&format!("{p}%"), fit_color(p), color)),
+        ]);
     }
-    out
+    columns(&rows)
 }
 
 #[cfg(test)]
@@ -856,28 +948,82 @@ mod tests {
         assert!(only[0].default);
     }
 
+    fn hit(name: &str, pulls: u64, likes: u64) -> Hit {
+        Hit {
+            name: name.into(),
+            pulls: Some(pulls),
+            likes: Some(likes),
+            updated: None,
+        }
+    }
+
     #[test]
     fn render_aligns_columns_and_dashes_missing_values() {
         let hits = vec![
-            Hit {
-                name: "docker.io/ai/qwen3".into(),
-                pulls: Some(614_283),
-                likes: Some(210),
-                updated: None,
-            },
-            Hit {
-                name: "hf.co/unsloth/Qwen3-8B-GGUF".into(),
-                pulls: Some(12_853_002),
-                likes: Some(989),
-                updated: None,
-            },
+            hit("docker.io/ai/qwen3", 614_283, 210),
+            hit("hf.co/unsloth/Qwen3-8B-GGUF", 12_853_002, 989),
         ];
-        let out = render(&hits);
+        let out = render(&hits, &[Some(42), None], false);
         assert_eq!(
             out,
-            "NAME                           PULLS     LIKES    UPDATED\n\
-             docker.io/ai/qwen3             614.3K    210      -\n\
-             hf.co/unsloth/Qwen3-8B-GGUF    12.9M     989      -\n"
+            "NAME                           PULLS     LIKES    UPDATED    FIT\n\
+             docker.io/ai/qwen3             614.3K    210      -          42%\n\
+             hf.co/unsloth/Qwen3-8B-GGUF    12.9M     989      -          -\n"
         );
+    }
+
+    /// The web UI's tiers: 60% exactly is still green, 90% still yellow.
+    #[test]
+    fn fit_percent_rounds_up_so_it_never_reads_under_a_tier_it_has_left() {
+        let memory = 1_000;
+        let at = |size| fit_percent(size, memory).unwrap();
+        assert_eq!(at(600), 60);
+        assert_eq!(at(601), 61);
+        assert_eq!(at(900), 90);
+        assert_eq!(at(901), 91);
+        assert_eq!(at(1), 1);
+        assert_eq!(at(3_720), 372);
+
+        let color = |size| fit_color(at(size));
+        assert_eq!(color(600), GREEN);
+        assert_eq!(color(601), YELLOW);
+        assert_eq!(color(900), YELLOW);
+        assert_eq!(color(901), RED);
+        assert_eq!(color(3_720), RED);
+    }
+
+    #[test]
+    fn fit_is_unknown_without_a_size_or_memory() {
+        assert_eq!(fit_percent(0, 16_000_000_000), None);
+        assert_eq!(fit_percent(5_000_000_000, 0), None);
+        assert_eq!(fit_percent(u64::MAX, 1), Some(u64::MAX));
+    }
+
+    /// Color wraps only the last cell, so the columns line up as uncolored.
+    #[test]
+    fn render_paints_fit_by_tier_and_leaves_the_rest_alone() {
+        let hits = vec![
+            hit("docker.io/ai/a", 1, 1),
+            hit("docker.io/ai/b", 1, 1),
+            hit("docker.io/ai/c", 1, 1),
+            hit("docker.io/ai/d", 1, 1),
+        ];
+        let fits = [Some(30), Some(75), Some(140), None];
+        let plain = render(&hits, &fits, false);
+        let colored = render(&hits, &fits, true);
+        assert_eq!(
+            colored,
+            "NAME              PULLS    LIKES    UPDATED    FIT\n\
+             docker.io/ai/a    1        1        -          \x1b[32m30%\x1b[0m\n\
+             docker.io/ai/b    1        1        -          \x1b[33m75%\x1b[0m\n\
+             docker.io/ai/c    1        1        -          \x1b[31m140%\x1b[0m\n\
+             docker.io/ai/d    1        1        -          -\n"
+        );
+        let stripped = colored
+            .replace(GREEN, "")
+            .replace(YELLOW, "")
+            .replace(RED, "")
+            .replace("\x1b[0m", "");
+        assert_eq!(stripped, plain);
     }
 }
