@@ -7,7 +7,7 @@
 //! `llama-server` backing it, and the real third-party CLI under test
 //! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `cline`, `grok`, `qwen`,
 //! `hermes`,
-//! `openclaw`, `dsh`, `goose`) — not mocks. The one exception is
+//! `openclaw`, `talos`, `dsh`, `goose`) — not mocks. The one exception is
 //! [`launch_goose_desktop_env`]: Goose Desktop is a GUI with no headless
 //! mode, so it stubs its binary.
 //! That's the only way this actually verifies anything: every one of the
@@ -682,13 +682,21 @@ fn run_launch(
     home: &Path,
     integration: &str,
     extra_args: &[&str],
+    extra_env: &[(&str, String)],
 ) -> Result<std::process::Output, TimedOut> {
     eprintln!("[run_launch] {integration}: calling warm_model()");
     warm_model();
     eprintln!("[run_launch] {integration}: warm_model() returned, spawning launch");
 
+    let mut cmd = launch_command(home, integration, &[], extra_args);
+    // On top of the fresh HOME, for an integration that needs more than
+    // a home directory to find itself or its operator.
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+
     try_spawn_with_timeout(
-        launch_command(home, integration, &[], extra_args),
+        cmd,
         TIMEOUT,
         &format!("`llmman launch {integration} --model {MODEL} -- {extra_args:?}`"),
     )
@@ -748,6 +756,7 @@ fn launch_and_assert(integration: &str, extra_args: &[&str]) {
     launch_and_assert_with(
         integration,
         extra_args,
+        &[],
         |_stdout, _stderr| NonzeroDisposition::Reject,
         |_stdout| false,
         reply_contains_pong,
@@ -764,6 +773,7 @@ fn launch_and_assert_strict(integration: &str, extra_args: &[&str]) {
     launch_and_assert_with(
         integration,
         extra_args,
+        &[],
         |_stdout, _stderr| NonzeroDisposition::Reject,
         |_stdout| false,
         reply_contains_pong,
@@ -785,6 +795,7 @@ fn launch_and_assert_strict_inspecting(
     launch_and_assert_with(
         integration,
         extra_args,
+        &[],
         |stdout, stderr| {
             if accept_nonzero(stdout, stderr) {
                 NonzeroDisposition::Accept
@@ -810,6 +821,7 @@ fn launch_and_assert_rejecting(
     launch_and_assert_with(
         integration,
         extra_args,
+        &[],
         |_stdout, _stderr| NonzeroDisposition::Reject,
         reject_stdout,
         reply_contains_pong,
@@ -830,11 +842,13 @@ fn launch_and_assert_rejecting(
 fn launch_and_assert_tolerating(
     integration: &str,
     extra_args: &[&str],
+    extra_env: &[(&str, String)],
     tolerate_stderr: impl Fn(&str) -> bool,
 ) {
     launch_and_assert_with(
         integration,
         extra_args,
+        extra_env,
         retry_on_stderr(tolerate_stderr),
         |_stdout| false,
         reply_contains_pong,
@@ -861,14 +875,31 @@ fn reply_contains_pong(stdout: &str) -> bool {
     stdout.to_lowercase().contains("pong")
 }
 
+/// Whether exhausting all attempts without an accepted reply may remain a
+/// warning. A strict completed run is never success; only a timed-out CLI may
+/// be forgiven when the daemon is independently shown to remain healthy.
+fn exhausted_attempts_are_tolerated(strict: bool, timed_out: bool, daemon_healthy: bool) -> bool {
+    !strict || (timed_out && daemon_healthy)
+}
+
+#[test]
+fn strict_completed_run_without_the_expected_reply_is_not_tolerated() {
+    assert!(!exhausted_attempts_are_tolerated(true, false, true));
+    assert!(!exhausted_attempts_are_tolerated(true, false, false));
+    assert!(exhausted_attempts_are_tolerated(true, true, true));
+    assert!(!exhausted_attempts_are_tolerated(true, true, false));
+}
+
 /// The shared body: `nonzero_disposition` rejects, retries, or conditionally
 /// accepts a nonzero exit, `reject_stdout` narrows what a zero exit may be,
 /// `accept_stdout` defines a successful model reply, and `strict` makes
 /// exhausting the sampling attempts a test failure — for a timeout, only
 /// when the daemon has stopped answering (see [`launch_and_assert`]).
+#[allow(clippy::too_many_arguments)]
 fn launch_and_assert_with(
     integration: &str,
     extra_args: &[&str],
+    extra_env: &[(&str, String)],
     nonzero_disposition: impl Fn(&str, &str) -> NonzeroDisposition,
     reject_stdout: impl Fn(&str) -> bool,
     accept_stdout: impl Fn(&str) -> bool,
@@ -882,7 +913,7 @@ fn launch_and_assert_with(
     let mut gave_up_after_timeout = None;
     for attempt in 1..=MAX_ATTEMPTS {
         let home = fresh_home(integration);
-        let output = match run_launch(&home, integration, extra_args) {
+        let output = match run_launch(&home, integration, extra_args, extra_env) {
             Ok(output) => output,
             Err(timed_out) => {
                 eprintln!(
@@ -960,7 +991,8 @@ fn launch_and_assert_with(
     };
     // A strict timeout is tolerated only once the daemon is shown to be
     // fine: then the CLI, not llmman, was the slow party.
-    let tolerated = !strict || (timed_out && daemon_still_answers(integration));
+    let daemon_healthy = strict && timed_out && daemon_still_answers(integration);
+    let tolerated = exhausted_attempts_are_tolerated(strict, timed_out, daemon_healthy);
     assert!(
         tolerated,
         "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` gave up via {why}\n\
@@ -1594,6 +1626,7 @@ fn launch_docker_agent_with_model() {
     launch_and_assert_with(
         "docker-agent",
         &["--exec", PROMPT],
+        &[],
         retry_on_stderr(docker_agent_stopped_a_degenerate_loop),
         |_stdout| false,
         docker_agent_reply_is_pong,
@@ -1755,6 +1788,7 @@ fn launch_openclaw_with_model() {
     launch_and_assert_tolerating(
         "openclaw",
         &["agent", "--local", "--message", PROMPT, "--agent", "main"],
+        &[],
         openclaw_pull_registry_flake,
     );
 }
@@ -1782,8 +1816,117 @@ fn launch_qwen_with_model() {
     launch_and_assert_tolerating(
         "qwen",
         &[PROMPT, "--safe-mode", "--exclude-tools", "report_findings"],
+        &[],
         qwen_loop_detection,
     );
+}
+
+// Unix only, like `launch_talos` itself (it bails on Windows): the helpers
+// below ask the OS for a uid, which the Windows test binary must not even
+// have to compile.
+#[cfg(unix)]
+#[test]
+fn launch_talos_with_model() {
+    eprintln!("[test] launch_talos_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_talos_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    // Resolve the real installation before run_launch supplies a fresh HOME.
+    // The official wrapper may be on PATH, while CI also supports the venv
+    // layout; either way this stable prefix must survive that HOME change.
+    let Some(prefix) = talos_prefix() else {
+        eprintln!("skipping: talos not installed — https://talos-agent.ch/install.sh");
+        return;
+    };
+    // Talos only talks to a terminal it knows: `cli:<uid>` has to be in
+    // TALOS_ALLOWED_PRINCIPALS, a policy key `launch_talos` deliberately
+    // does not write (the kernel decides who may talk to it, not the
+    // launcher). The e2e grants it the way an operator would — in a
+    // secrets env file of its own, which Talos reads on top of its env
+    // file — so the launcher under test stays exactly what a user runs.
+    let secrets = talos_secrets_env(&prefix);
+    // Empty overrides neutralize the runner's private configuration while
+    // forcing Talos to read the provider/model and allowlist from the file.
+    // Supplying the expected model here would mask a broken file handoff.
+    // `ask`: Talos's one-turn command, answer on stdout — `chat` counts
+    // a terminal as attended only when stdin and stdout both are one,
+    // and there is no terminal here.
+    launch_and_assert_with(
+        "talos",
+        &["ask", PROMPT],
+        &[
+            ("TALOS_PREFIX", prefix.to_string_lossy().into_owned()),
+            ("TALOS_SECRETS_ENV", secrets.to_string_lossy().into_owned()),
+            ("TALOS_MODEL_PROVIDER", String::new()),
+            ("TALOS_MODEL", String::new()),
+            ("TALOS_ALLOWED_PRINCIPALS", String::new()),
+        ],
+        |_stdout, _stderr| NonzeroDisposition::Reject,
+        |_stdout| false,
+        reply_contains_pong,
+        true,
+        |_home| {},
+    );
+    let written = std::fs::read_to_string(&secrets).unwrap();
+    let model = llmman::shortnames::resolve_ollama_api(MODEL).unwrap();
+    let uid = unsafe { libc::getuid() };
+    for expected in [
+        "TALOS_MODEL_PROVIDER=ollama".to_string(),
+        format!("TALOS_MODEL={model}"),
+        format!("TALOS_ALLOWED_PRINCIPALS=cli:{uid}"),
+    ] {
+        assert!(
+            written.lines().any(|line| line == expected),
+            "missing {expected}"
+        );
+    }
+    std::fs::remove_file(secrets).unwrap();
+}
+
+/// Where `launch_talos` would find Talos: `$TALOS_PREFIX`, else `~/talos`
+/// under the *real* home — checked for the venv interpreter the
+/// installer creates, which is the invocation both use.
+#[cfg(unix)]
+fn talos_prefix() -> Option<PathBuf> {
+    let prefix = std::env::var("TALOS_PREFIX")
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("talos")))?;
+    prefix
+        .join(".venv")
+        .join("bin")
+        .join("python")
+        .is_file()
+        .then_some(prefix)
+}
+
+/// A secrets env file allowing this uid's terminal, next to nothing else
+/// of Talos's — written once per test binary run, mode 600 like Talos
+/// writes its own.
+#[cfg(unix)]
+fn talos_secrets_env(prefix: &Path) -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    let path = std::env::temp_dir().join(format!(
+        "llmman-e2e-talos-{}-{}.env",
+        std::process::id(),
+        uid
+    ));
+    std::fs::write(&path, format!("TALOS_ALLOWED_PRINCIPALS=cli:{uid}\n")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    eprintln!(
+        "[test] launch_talos_with_model: prefix {} · secrets env {}",
+        prefix.display(),
+        path.display()
+    );
+    path
 }
 
 /// Qwen Code's own loop detector stops a run and exits 1 when a small

@@ -1015,6 +1015,7 @@ async fn serve_tls(app: Router, name: &str) -> (Server, reqwest::Certificate, u1
     let listener = listener.into_std().unwrap();
     let task = tokio::spawn(async move {
         axum_server::from_tcp_rustls(listener, tls)
+            .unwrap()
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .unwrap();
