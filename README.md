@@ -297,7 +297,7 @@ globally. Any extra arguments after `--` are forwarded to the integration's
 own CLI. Short names work wherever a model reference is accepted.
 
 GitHub Copilot uses the standalone `copilot` CLI (`npm install -g
-@github/copilot`) in offline BYOK mode, so a local-model launch does not
+@github/copilot`) in BYOK mode, so a local-model launch does not
 require a GitHub login.
 
 AGY requires version 1.1.13 or newer for Gemini API-key and custom-endpoint

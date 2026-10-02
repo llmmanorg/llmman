@@ -1092,7 +1092,7 @@ fn launch_copilot_with_model() {
     }
 
     // `-p` is Copilot CLI's non-interactive prompt mode. run_launch's
-    // fresh HOME proves BYOK offline mode does not depend on a prior GitHub
+    // fresh HOME proves BYOK mode does not depend on a prior GitHub
     // login or Copilot configuration. `--silent` leaves only the model's
     // reply on stdout, and the strict assertion prevents Copilot's unusual
     // zero-exit "Failed to get response" path from passing this test.
