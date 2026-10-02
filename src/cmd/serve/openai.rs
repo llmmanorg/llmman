@@ -1343,4 +1343,262 @@ mod tests {
             Some("m".to_string())
         );
     }
+
+    /// An agent runner sends one `system` message per toolset, which a
+    /// strict template refuses past the first.
+    #[test]
+    fn consolidate_chat_system_messages_merges_them_into_one_leading_message() {
+        let mut req = serde_json::json!({
+            "model": "docker.io/ai/qwen3.5:0.8b",
+            "messages": [
+                {"role": "system", "content": "you are a helpful assistant"},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "## Shell Tools"},
+                {"role": "developer", "content": [{"type": "text", "text": "## Filesystem Tools"}]}
+            ]
+        });
+
+        consolidate_chat_system_messages(&mut req);
+
+        assert_eq!(
+            req["messages"],
+            serde_json::json!([
+                {"role": "system", "content":
+                    "you are a helpful assistant\n\n## Shell Tools\n\n## Filesystem Tools"},
+                {"role": "user", "content": "hi"}
+            ])
+        );
+    }
+
+    /// The common shape, and the one every ordinary request pays for:
+    /// already-leading system message, returned byte for byte.
+    #[test]
+    fn consolidate_chat_system_messages_leaves_a_single_leading_one_alone() {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "you are a helpful assistant"},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let before = req.clone();
+        consolidate_chat_system_messages(&mut req);
+        assert_eq!(req, before);
+    }
+
+    /// Rebuilding a conforming request would flatten its content to text
+    /// and drop every block that isn't.
+    #[test]
+    fn consolidate_chat_system_messages_keeps_block_content_when_conforming() {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "be terse"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+                ]},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let before = req.clone();
+        consolidate_chat_system_messages(&mut req);
+        assert_eq!(req, before);
+    }
+
+    /// Folding content to text drops every block that isn't text, which
+    /// forwards a truncated prompt with no error.
+    #[test]
+    fn consolidate_chat_system_messages_keeps_non_text_blocks_while_merging() {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "be terse"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "developer", "content": "and cite sources"}
+            ]
+        });
+
+        consolidate_chat_system_messages(&mut req);
+
+        assert_eq!(
+            req["messages"],
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "be terse"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                    {"type": "text", "text": "and cite sources"}
+                ]},
+                {"role": "user", "content": "hi"}
+            ])
+        );
+    }
+
+    /// The blank line separates messages, so one message's own parts must
+    /// not use it too — two parts would read as two instructions.
+    #[test]
+    fn consolidate_chat_system_messages_keep_a_messages_own_parts_off_the_blank_line() {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "part one"},
+                    {"type": "text", "text": "part two"}
+                ]},
+                {"role": "user", "content": "hi"},
+                // Without this the request conforms and is returned as written.
+                {"role": "developer", "content": "developer instruction"}
+            ]
+        });
+
+        consolidate_chat_system_messages(&mut req);
+
+        assert_eq!(
+            req["messages"][0]["content"],
+            "part one\npart two\n\ndeveloper instruction"
+        );
+    }
+
+    /// A non-text block ends the run it interrupts: parts before it stay one
+    /// instruction, parts after it start another. The image is the object
+    /// shape an OpenAI client sends, asserted back whole — `push` clones a
+    /// non-text block rather than reading it, so its shape does not matter.
+    #[test]
+    fn consolidate_chat_system_messages_let_a_non_text_block_end_the_run() {
+        let image = serde_json::json!({
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}
+        });
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "before one"},
+                    {"type": "text", "text": "before two"},
+                    image,
+                    {"type": "text", "text": "after"}
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "developer", "content": "and cite sources"}
+            ]
+        });
+
+        consolidate_chat_system_messages(&mut req);
+
+        assert_eq!(
+            req["messages"][0]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "before one\nbefore two"},
+                {"type": "image_url",
+                 "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}},
+                {"type": "text", "text": "after\n\nand cite sources"}
+            ])
+        );
+        // Non-instruction turns are left alone.
+        assert_eq!(
+            req["messages"][1],
+            serde_json::json!({"role": "user", "content": "hi"})
+        );
+        assert_eq!(req["messages"].as_array().map(Vec::len), Some(2));
+    }
+
+    /// An empty part is dropped, not joined: it would otherwise leave a
+    /// stray newline at either end of the run, or a blank line mid-message.
+    #[test]
+    fn consolidate_chat_system_messages_drop_empty_parts_from_the_run() {
+        let cases = [
+            // Leading, trailing and lone empties leave no trace.
+            (
+                serde_json::json!([{"type": "text", "text": "a"},
+                                {"type": "text", "text": ""}]),
+                "a\n\ndev",
+            ),
+            (
+                serde_json::json!([{"type": "text", "text": ""},
+                                {"type": "text", "text": "b"}]),
+                "b\n\ndev",
+            ),
+            (
+                serde_json::json!([{"type": "text", "text": ""},
+                                {"type": "text", "text": ""}]),
+                "dev",
+            ),
+            // One between two real parts does not split them.
+            (
+                serde_json::json!([{"type": "text", "text": "a"},
+                                {"type": "text", "text": ""},
+                                {"type": "text", "text": "b"}]),
+                "a\nb\n\ndev",
+            ),
+        ];
+        for (content, want) in cases {
+            let mut req = serde_json::json!({
+                "messages": [
+                    {"role": "system", "content": content},
+                    {"role": "user", "content": "hi"},
+                    {"role": "developer", "content": "dev"}
+                ]
+            });
+            consolidate_chat_system_messages(&mut req);
+            assert_eq!(req["messages"][0]["content"], want);
+        }
+    }
+
+    /// A late system turn is the shape templates reject, so it moves — and
+    /// reorders relative to the user turn before it, as `/v1/messages` does.
+    #[test]
+    fn consolidate_chat_system_messages_moves_a_late_lone_system_turn_to_the_front() {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "a mid-conversation reminder"}
+            ]
+        });
+
+        consolidate_chat_system_messages(&mut req);
+
+        assert_eq!(
+            req["messages"],
+            serde_json::json!([
+                {"role": "system", "content": "a mid-conversation reminder"},
+                {"role": "user", "content": "hi"}
+            ])
+        );
+    }
+
+    /// A request with no system message must not gain one.
+    #[test]
+    fn consolidate_chat_system_messages_is_a_no_op_without_any() {
+        let mut req = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let before = req.clone();
+        consolidate_chat_system_messages(&mut req);
+        assert_eq!(req, before);
+
+        // An embeddings-shaped body has no `messages` at all.
+        let mut input_only = serde_json::json!({"input": "hi"});
+        let before = input_only.clone();
+        consolidate_chat_system_messages(&mut input_only);
+        assert_eq!(input_only, before);
+    }
+
+    /// An empty system message must not join a blank line into the merge.
+    #[test]
+    fn consolidate_chat_system_messages_drops_empty_ones() {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": ""},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "the only real instruction"}
+            ]
+        });
+
+        consolidate_chat_system_messages(&mut req);
+
+        assert_eq!(
+            req["messages"],
+            serde_json::json!([
+                {"role": "system", "content": "the only real instruction"},
+                {"role": "user", "content": "hi"}
+            ])
+        );
+    }
 }
