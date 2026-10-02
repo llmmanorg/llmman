@@ -2213,7 +2213,7 @@ async fn backend_wire_model_strips_the_routing_prefix_for_a_remote_target() {
     );
 }
 
-/// Regression test for the CodeRabbit nitpick this PR addresses:
+/// Regression test for a CodeRabbit nitpick in review:
 /// `proxy_openai_passthrough`'s `/v1/embeddings` guard must be able
 /// to answer "would this already-running model be served by
 /// Engine::Mlx" from a plain map lookup — no backend spawn, no
