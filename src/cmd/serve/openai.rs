@@ -1172,4 +1172,24 @@ mod tests {
             None
         );
     }
+
+    /// Regression test for the second CodeRabbit finding in review:
+    /// `/v1/embeddings` against an `Engine::Mlx` backend must
+    /// fail fast with a clear reason (not a bare, unexplained 404 from
+    /// forwarding to `mlx_lm.server`, which never gets a
+    /// `--embedding-model` from `spawn_mlx_server` — see
+    /// `proxy_openai_passthrough`'s own doc comment).
+    #[tokio::test]
+    async fn mlx_embeddings_unsupported_response_explains_why_and_names_the_model() {
+        let resp = mlx_embeddings_unsupported_response("gemma4:latest");
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("gemma4:latest"));
+        assert!(message.contains("mlx_lm.server"));
+        assert!(message.contains("/v1/embeddings"));
+    }
 }

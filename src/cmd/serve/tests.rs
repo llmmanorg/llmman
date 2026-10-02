@@ -8,8 +8,7 @@ use super::ollama::{
 };
 use super::openai::{
     apply_default_repeat_penalty, apply_reasoning_effort, consolidate_chat_system_messages,
-    mlx_embeddings_unsupported_response, multipart_form, multipart_text_field, omni_image_request,
-    omni_video_fields,
+    multipart_form, multipart_text_field, omni_image_request, omni_video_fields,
 };
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::responses::{
@@ -4218,26 +4217,6 @@ fn consolidate_chat_system_messages_drops_empty_ones() {
 // equivalent conversion logic — file references point at ollama/ollama's
 // test files — adapted to llmman's own (narrower) semantics where the two
 // differ; each test's doc comment calls out any such adaptation.
-
-/// Regression test for the other CodeRabbit finding this PR
-/// addresses: `/v1/embeddings` against an `Engine::Mlx` backend must
-/// fail fast with a clear reason (not a bare, unexplained 404 from
-/// forwarding to `mlx_lm.server`, which never gets a
-/// `--embedding-model` from `spawn_mlx_server` — see
-/// `proxy_openai_passthrough`'s own doc comment).
-#[tokio::test]
-async fn mlx_embeddings_unsupported_response_explains_why_and_names_the_model() {
-    let resp = mlx_embeddings_unsupported_response("gemma4:latest");
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let message = value["error"]["message"].as_str().unwrap();
-    assert!(message.contains("gemma4:latest"));
-    assert!(message.contains("mlx_lm.server"));
-    assert!(message.contains("/v1/embeddings"));
-}
 
 /// Ported from ollama's openai/responses_test.go polymorphic-input
 /// cases: a Responses-API input item's `content` is either a bare
