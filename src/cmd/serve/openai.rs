@@ -220,7 +220,7 @@ impl MergedInstructions {
 /// llama-server reads `reasoning_effort` itself; older builds and vLLM
 /// read only the kwargs. The caller's own kwargs win key by key.
 /// [`provider_compat`] is the reverse, for a provider.
-pub(super) fn apply_reasoning_effort(req: &mut serde_json::Value) {
+fn apply_reasoning_effort(req: &mut serde_json::Value) {
     let Some(effort) = req.get("reasoning_effort").and_then(|v| v.as_str()) else {
         return;
     };
@@ -525,7 +525,7 @@ pub(super) async fn proxy_openai_passthrough(
 
 /// [`proxy_openai_passthrough`] after the model is loaded: wire checks,
 /// then the proxy. Split out for [`handle_openai_media`].
-pub(super) async fn forward_openai_request(
+async fn forward_openai_request(
     state: &AppState,
     headers: &HeaderMap,
     mut req: serde_json::Value,
@@ -588,7 +588,7 @@ pub(super) async fn forward_openai_request(
 /// instead of forwarding a `/v1/embeddings` request on to an
 /// `Engine::Mlx` backend — see that function's own doc comment on why
 /// that request could never succeed there anyway.
-pub(super) fn mlx_embeddings_unsupported_response(canonical_model: &str) -> Response {
+fn mlx_embeddings_unsupported_response(canonical_model: &str) -> Response {
     let body = serde_json::json!({
         "error": {
             "message": format!(
@@ -693,9 +693,7 @@ async fn local_engine(state: &AppState, target: &Target) -> Option<Engine> {
 /// returned (vLLM-Omni's text-to-image does not stream). `Err` names a
 /// request that cannot be expressed: one dimension without the other
 /// (llama-server fills in a default; vLLM-Omni's `size` needs both).
-pub(super) fn omni_image_request(
-    mut req: serde_json::Value,
-) -> Result<(serde_json::Value, bool), String> {
+fn omni_image_request(mut req: serde_json::Value) -> Result<(serde_json::Value, bool), String> {
     let stream = req["stream"].as_bool().unwrap_or(false);
     let Some(obj) = req.as_object_mut() else {
         return Ok((req, stream));
@@ -785,7 +783,7 @@ async fn omni_images(
 /// names renamed (`steps`, `cfg_scale`, `frames`, `audio`), fractional
 /// `seconds` rounded to the whole seconds it takes, everything else by
 /// name (objects as JSON text, which is how it reads `extra_params`).
-pub(super) fn omni_video_fields(req: &serde_json::Value) -> Vec<(String, String)> {
+fn omni_video_fields(req: &serde_json::Value) -> Vec<(String, String)> {
     let Some(obj) = req.as_object() else {
         return Vec::new();
     };
@@ -839,7 +837,7 @@ pub(super) fn omni_video_fields(req: &serde_json::Value) -> Vec<(String, String)
 /// Both come from the caller: a name that is not a plain identifier is
 /// dropped (it would be written into a header), and the boundary is
 /// re-salted until no value contains it.
-pub(super) fn multipart_form(fields: &[(String, String)]) -> (Vec<u8>, String) {
+fn multipart_form(fields: &[(String, String)]) -> (Vec<u8>, String) {
     let fields: Vec<&(String, String)> = fields
         .iter()
         .filter(|(name, _)| {
@@ -1012,7 +1010,7 @@ pub(super) const TRANSCRIPTION_BODY_LIMIT_BYTES: usize = 200 * 1024 * 1024;
 /// Extracts a top-level form field's text value from a
 /// `multipart/form-data` body, or `None` if not multipart / no boundary /
 /// field not found.
-pub(super) async fn multipart_text_field(
+async fn multipart_text_field(
     body: &Bytes,
     headers: &HeaderMap,
     field_name: &str,
