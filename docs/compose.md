@@ -49,8 +49,9 @@ service's cgroup and llmman can derive its thread count from that limit.
 
 With `--runtime docker` or `--runtime podman` the backend runs in a separate
 container, a sibling of the service. The service's limit is forwarded to it as
-`--cpus`, with a matching `--threads` for `llama-server`; an unconstrained
-daemon starts an unconstrained container, and `LLAMA_ARG_THREADS` still wins.
+`--cpus`, and `llama-server` gets `--threads` from the same CPU count (half
+above 8); an unconstrained daemon starts a container without `--cpus`, and
+`LLAMA_ARG_THREADS` still wins.
 
 ## Customizing the gateway
 

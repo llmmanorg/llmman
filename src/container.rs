@@ -733,7 +733,7 @@ pub struct LlamaOptions<'a> {
     pub batch_size: Option<u32>,
 
     /// `--threads <n>`: a request's Ollama `options.num_thread`, else the
-    /// derived host-limit value (see `cmd::serve::ensure_model`'s
+    /// derived default, half the CPUs above 8 (see `cmd::serve::ensure_model`'s
     /// `request_threads` and `cmd::serve::config::threads_from_env_or_host`).
     /// Forwarded into the container too, since `cpus` gives it the same
     /// CPU budget the value was derived from. An explicit

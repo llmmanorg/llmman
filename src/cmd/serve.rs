@@ -140,7 +140,7 @@ Environment Variables:
       LLMMAN_TMPDIR                  Staging directory for llama-server release downloads
       LLAMA_ARG_FIT                  Enable llama.cpp automatic fit of unset memory options (default \"on\")
       LLAMA_ARG_FIT_TARGET           Target free VRAM margin per device for llama.cpp fit (MiB)
-      LLAMA_ARG_THREADS              Thread count for llama-server (default: llama-server autodetection, overridden by a binding CPU quota/affinity limit)
+      LLAMA_ARG_THREADS              Thread count for llama-server (default: half the available CPUs above 8, else all of them)
 ";
 
 #[derive(Args, Debug)]
@@ -3982,7 +3982,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let cpu_limit = container_cpu_limit();
     let threads = threads_from_env_or_host();
     if let Some(n) = threads {
-        eprintln!("[llmman] llama-server gets --threads {n} (CPU quota/affinity limit below the online CPU count)");
+        eprintln!("[llmman] llama-server gets --threads {n} (half the available CPUs above 8, else all of them)");
     } else if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         eprintln!("[llmman] LLAMA_ARG_THREADS set: leaving llama-server thread count to it");
     }

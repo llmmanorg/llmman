@@ -123,20 +123,34 @@ fn parse_num_parallel(value: Option<&str>) -> Option<u32> {
     (n != 0).then_some(n)
 }
 
-/// `--threads <n>` for every `llama-server` this daemon spawns, `Some`
-/// only when a CPU limit binds ([`host_cpu_limit`]). Unconstrained,
-/// llama-server's own autodetection (`cpu_get_num_math()`) already
-/// picks the math cores; the derived value only corrects what it
-/// cannot see: a cgroup quota or a narrowed affinity mask. Accepted
-/// tradeoff: a quota between the physical-core and SMT-thread counts
-/// (`--cpus=12` on 8c/16t) passes 12 where autodetection would pick 8.
+/// `--threads <n>` for every `llama-server` this daemon spawns:
+/// [`default_threads`] of `std::thread::available_parallelism`, which
+/// already reflects a cgroup quota or a narrowed affinity mask.
 /// `LLAMA_ARG_THREADS` set wins: `None` here, llama-server reads it
 /// itself (in a container, via `LLAMA_CPP_ENV_PASSTHROUGH_VARS`).
 pub(super) fn threads_from_env_or_host() -> Option<u32> {
     if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         return None;
     }
-    host_cpu_limit()
+    let available = std::thread::available_parallelism().ok()?.get();
+    Some(default_threads(
+        u32::try_from(available).unwrap_or(u32::MAX),
+    ))
+}
+
+/// Above this many available CPUs, [`default_threads`] uses half.
+const HALVE_THREADS_ABOVE: u32 = 8;
+
+/// Half the available CPUs when more than [`HALVE_THREADS_ABOVE`] are
+/// available, otherwise all of them. On SMT hosts half is roughly the
+/// physical core count; small boxes and quota-limited containers keep
+/// every CPU they were given.
+fn default_threads(available: u32) -> u32 {
+    if available > HALVE_THREADS_ABOVE {
+        available / 2
+    } else {
+        available
+    }
 }
 
 /// This daemon's effective CPU limit in whole CPUs, `Some(n)` only when
@@ -144,16 +158,12 @@ pub(super) fn threads_from_env_or_host() -> Option<u32> {
 /// cgroup quota), floored, at least 1; std walks the cgroup ancestor
 /// chain itself, v1 and v2 — below the online CPU count from
 /// /sys/devices/system/cpu/online. Any read failure is `None`: fail
-/// closed. Linux only.
-pub(super) fn host_cpu_limit() -> Option<u32> {
-    #[cfg(target_os = "linux")]
-    {
-        let allowed = std::thread::available_parallelism().ok()?.get() as u32;
-        let online = online_cpu_count()?;
-        (allowed < online).then_some(allowed)
-    }
-    #[cfg(not(target_os = "linux"))]
-    None
+/// closed.
+#[cfg(target_os = "linux")]
+fn host_cpu_limit() -> Option<u32> {
+    let allowed = std::thread::available_parallelism().ok()?.get() as u32;
+    let online = online_cpu_count()?;
+    (allowed < online).then_some(allowed)
 }
 
 /// The backend container's `--cpus`: this daemon's cgroup v2 quota as a
@@ -450,6 +460,16 @@ pub(super) fn looks_like_oom(detail: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_threads_halves_only_above_eight() {
+        assert_eq!(default_threads(1), 1);
+        assert_eq!(default_threads(2), 2);
+        assert_eq!(default_threads(8), 8);
+        assert_eq!(default_threads(9), 4);
+        assert_eq!(default_threads(16), 8);
+        assert_eq!(default_threads(128), 64);
+    }
 
     #[test]
     fn parse_max_queue_defaults_to_ollamas_own_512_on_anything_unparseable() {

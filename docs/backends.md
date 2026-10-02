@@ -90,10 +90,11 @@ for the host, suffixed with the pinned release.
 
 The container is a sibling of the daemon, not part of its cgroup, so a
 CPU limit on `llmman serve` is forwarded: when one binds (cgroup quota or
-affinity mask), the container gets `--cpus <n>` and `llama-server` the
-matching `--threads <n>` (a quota alone would leave it autodetecting a
-thread per host core and throttling). No limit, no flags. An explicit
-`LLAMA_ARG_THREADS` still wins. vLLM containers get the same `--cpus`.
+affinity mask), the container gets `--cpus <n>`. `llama-server` always gets
+`--threads <n>`: half the CPUs the daemon can use above 8, else all of them
+(a quota alone would leave it autodetecting a thread per host core and
+throttling). No limit, no `--cpus`. An explicit `LLAMA_ARG_THREADS` still
+wins. vLLM containers get the same `--cpus`.
 
 Each of those images is also published with llmman in it, as
 `docker.io/ai/llmman:<tag>` (`latest` is `server`) and `<tag>-<llmman
