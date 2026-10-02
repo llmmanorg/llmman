@@ -127,6 +127,7 @@ const PASSTHROUGH_ENV: &[&str] = &[
     "LC_ALL",
     "CLAUDE_CONFIG_DIR",
     "CLINE_DIR",
+    "COPILOT_HOME",
     "GH_CONFIG_DIR",
     "GROK_HOME",
     "HERMES_HOME",
@@ -2135,6 +2136,7 @@ mod tests {
     fn the_guest_env_is_home_the_passthrough_and_the_launchers_last_word() {
         let host = |name: &str| match name {
             "TERM" => Some("xterm-256color".to_string()),
+            "COPILOT_HOME" => Some("/home/me/copilot-state".to_string()),
             "PATH" => Some("/usr/bin".to_string()),
             _ => None,
         };
@@ -2152,6 +2154,7 @@ mod tests {
         .unwrap();
         assert_eq!(env["HOME"], "/home/me");
         assert_eq!(env["TERM"], "xterm-256color");
+        assert_eq!(env["COPILOT_HOME"], "/home/me/copilot-state");
         assert_eq!(env["OLLAMA_HOST"], "http://host.docker.internal:17434");
         // The host's PATH would name directories the image does not have.
         assert!(!env.contains_key("PATH"));

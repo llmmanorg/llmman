@@ -108,8 +108,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             "--variant does not work with --sandbox sbx"
         );
         anyhow::ensure!(
-            !(MODEL_FLAG_FORWARDED.contains(&name.to_lowercase().as_str())
-                && has_flag(&args.extra_args, "--model", Some("-m"))),
+            !has_forwarded_model_flag(name, &args.extra_args),
             "--variant needs the model as llmman's --model, not after --"
         );
         spell_variant(name, variant)?;
@@ -140,10 +139,8 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         let carries_key =
             provider.is_some() || overflow.is_some() || crate::auth::client_key().is_some();
         // A --variant goes into opencode's state (`write_opencode_variant`).
-        // copilot-cli is an alias of the file-configured copilot launcher.
-        let configured_by_file = CONFIGURED_BY_FILE.contains(&id.as_str())
-            || id == "copilot-cli"
-            || (id == "opencode" && variant.is_some());
+        let configured_by_file =
+            CONFIGURED_BY_FILE.contains(&id.as_str()) || (id == "opencode" && variant.is_some());
         sandbox::prepare(
             kind,
             &id,
@@ -381,13 +378,21 @@ fn check_model_flag(
         let with_provider = provider.map_or(String::new(), |p| format!(" --provider {p}"));
         anyhow::bail!("{name} needs a model: llmman launch {name}{with_provider} --model <model>");
     };
-    let short = (!matches!(name.as_str(), "copilot" | "copilot-cli")).then_some("-m");
-    if MODEL_FLAG_FORWARDED.contains(&name.as_str()) && has_flag(extra_args, "--model", short) {
+    if has_forwarded_model_flag(&name, extra_args) {
         eprintln!(
             "[llmman] {name}: the --model after -- wins over --model {model}, the one llmman resolved"
         );
     }
     Ok(())
+}
+
+/// Whether this integration accepts a forwarded model flag. Copilot's
+/// documented spelling is only `--model`; the other launchers also accept
+/// `-m`.
+fn has_forwarded_model_flag(integration: &str, extra_args: &[String]) -> bool {
+    let name = integration.to_lowercase();
+    let short = (!matches!(name.as_str(), "copilot" | "copilot-cli")).then_some("-m");
+    MODEL_FLAG_FORWARDED.contains(&name.as_str()) && has_flag(extra_args, "--model", short)
 }
 
 /// Whether `extra_args` spells `long` or `short`, as a word or `=`-joined.
@@ -1119,7 +1124,6 @@ const CONFIGURED_BY_FILE: &[&str] = &[
     "agy",
     "cline",
     "codex",
-    "copilot",
     "docker-agent",
     "dsh",
     "grok",
@@ -1157,7 +1161,7 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
         "cline" => vec![Dir(cline_dir()?)],
         "aider" => vec![Dir(home.join(".aider"))],
         "copilot" | "copilot-cli" => vec![
-            Dir(home.join(".copilot")),
+            Dir(env_dir("COPILOT_HOME").unwrap_or_else(|| home.join(".copilot"))),
             Dir(env_dir("GH_CONFIG_DIR").unwrap_or_else(|| config.join("gh"))),
         ],
         "kimi" => vec![Dir(home.join(".kimi"))],
@@ -2892,12 +2896,30 @@ fn docker_agent_fallback(home: &Path) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 fn exec_with_env(bin: &Path, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
-    std::process::exit(run_with_env(bin, args, extra_env)?);
+    exec_with_env_removing(bin, args, extra_env, &[])
+}
+
+fn exec_with_env_removing(
+    bin: &Path,
+    args: &[String],
+    extra_env: &[(&str, &str)],
+    remove_env: &[&str],
+) -> anyhow::Result<()> {
+    std::process::exit(run_with_env_removing(bin, args, extra_env, remove_env)?);
 }
 
 /// Runs the integration — in the `--sandbox`, when there is one — and
 /// returns its exit code.
 fn run_with_env(bin: &Path, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<i32> {
+    run_with_env_removing(bin, args, extra_env, &[])
+}
+
+fn run_with_env_removing(
+    bin: &Path,
+    args: &[String],
+    extra_env: &[(&str, &str)],
+    remove_env: &[&str],
+) -> anyhow::Result<i32> {
     // The inherited environment, overlaid with OLLAMA_HOST and the
     // integration's variables, later ones winning.
     let mut overlay = vec![("OLLAMA_HOST".to_string(), server())];
@@ -2916,6 +2938,9 @@ fn run_with_env(bin: &Path, args: &[String], extra_env: &[(&str, &str)]) -> anyh
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
     cmd.envs(overlay);
+    for name in remove_env {
+        cmd.env_remove(name);
+    }
 
     let status = cmd
         .status()
@@ -3014,13 +3039,6 @@ mod tests {
             );
         };
         covers("codex", codex::codex_dir().unwrap());
-        covers(
-            "copilot",
-            crate::config::home_dir()
-                .unwrap()
-                .join(".copilot")
-                .join("llmman-providers.json"),
-        );
         covers(
             "opencode",
             opencode::opencode_state_dir().unwrap().join("model.json"),
