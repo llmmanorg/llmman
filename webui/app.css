@@ -1133,12 +1133,21 @@ code, pre, kbd { font-family: var(--font-mono); }
 
 /* ---- Narrow screens ----------------------------------------------- */
 
+.sidebar-scrim { display: none; }
+
 @media (max-width: 760px) {
   .sidebar {
     position: absolute;
     z-index: 40;
     height: 100%;
     box-shadow: var(--shadow);
+  }
+  .app:not(.sidebar-collapsed) .sidebar-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 39;
+    background: rgba(0, 0, 0, 0.35);
   }
   .topbar-title { display: none; }
   .greeting h1 { font-size: 1.6rem; }

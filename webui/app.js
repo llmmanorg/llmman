@@ -11,11 +11,15 @@ import { $, $$, toast, icon, iconButton } from "./util.js";
 
 let mode = "chat";
 
+/** Phone width: the sidebar covers the page rather than sitting beside it. */
+const narrow = window.matchMedia("(max-width: 760px)");
+
 // ---- Boot -------------------------------------------------------------
 
 async function boot() {
   settings.applyTheme();
-  if (settings.get("sidebarCollapsed")) $("#app").classList.add("sidebar-collapsed");
+  // On a phone it starts closed: open, it covers the page.
+  if (settings.get("sidebarCollapsed") || narrow.matches) $("#app").classList.add("sidebar-collapsed");
 
   chat.init();
   shell.init();
@@ -136,6 +140,11 @@ function initFrame() {
   };
   $("#sidebar-close").addEventListener("click", () => collapse(true));
   $("#sidebar-open").addEventListener("click", () => collapse(false));
+  // Covering the page, it closes on a tap beside it or once it has taken you somewhere.
+  $("#sidebar-scrim").addEventListener("click", () => collapse(true));
+  const closeOnPhone = () => narrow.matches && collapse(true);
+  window.addEventListener("hashchange", closeOnPhone);
+  $("#new-chat").addEventListener("click", closeOnPhone);
 
   document.addEventListener("keydown", (e) => {
     const mod = e.metaKey || e.ctrlKey;
