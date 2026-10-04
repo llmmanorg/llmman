@@ -106,8 +106,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             "--variant does not work with --sandbox sbx"
         );
         anyhow::ensure!(
-            !(MODEL_FLAG_FORWARDED.contains(&name.to_lowercase().as_str())
-                && has_flag(&args.extra_args, "--model", Some("-m"))),
+            !has_forwarded_model_flag(name, &args.extra_args),
             "--variant needs the model as llmman's --model, not after --"
         );
         spell_variant(name, variant)?;
@@ -309,6 +308,7 @@ fn integration_key() -> String {
 /// explicit model the request never reaches llmman at all.
 /// OMP needs a model so the launcher can select the matching entry its
 /// Ollama discovery reads from llmman's `/api/tags`.
+/// Copilot's BYOK mode also requires an explicit model.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
 const MODEL_REQUIRED: &[&str] = &[
     "qwen",
@@ -320,6 +320,8 @@ const MODEL_REQUIRED: &[&str] = &[
     "cline",
     "pi",
     "omp",
+    "copilot",
+    "copilot-cli",
     "docker-agent",
 ];
 
@@ -332,6 +334,7 @@ const MODEL_REQUIRED: &[&str] = &[
 /// also wins over the provider selected in its settings.
 /// OMP's argument builder drops the generated Ollama model when the caller
 /// supplies one.
+/// Copilot's argument builder likewise yields to its own `--model`.
 /// Not docker-agent: its `--model` replaces the whole model entry
 /// `docker_agent_document` wrote, `base_url` included, so a forwarded one
 /// reaches api.openai.com. `check_docker_agent_args` refuses it rather
@@ -344,7 +347,15 @@ const MODEL_REQUIRED: &[&str] = &[
 /// `goose session`'s, and the desktop app has no documented equivalent,
 /// so promising the caller's wins would be false. Move it here if it
 /// turns out to take one.
-const MODEL_FLAG_FORWARDED: &[&str] = &["qwen", "goose", "grok", "cline", "omp"];
+const MODEL_FLAG_FORWARDED: &[&str] = &[
+    "qwen",
+    "goose",
+    "grok",
+    "cline",
+    "omp",
+    "copilot",
+    "copilot-cli",
+];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
 /// `--provider` too. A second `--model` after `--` is the caller's to
@@ -365,13 +376,21 @@ fn check_model_flag(
         let with_provider = provider.map_or(String::new(), |p| format!(" --provider {p}"));
         anyhow::bail!("{name} needs a model: llmman launch {name}{with_provider} --model <model>");
     };
-    if MODEL_FLAG_FORWARDED.contains(&name.as_str()) && has_flag(extra_args, "--model", Some("-m"))
-    {
+    if has_forwarded_model_flag(&name, extra_args) {
         eprintln!(
             "[llmman] {name}: the --model after -- wins over --model {model}, the one llmman resolved"
         );
     }
     Ok(())
+}
+
+/// Whether this integration accepts a forwarded model flag. Copilot's
+/// documented spelling is only `--model`; the other launchers also accept
+/// `-m`.
+fn has_forwarded_model_flag(integration: &str, extra_args: &[String]) -> bool {
+    let name = integration.to_lowercase();
+    let short = (!matches!(name.as_str(), "copilot" | "copilot-cli")).then_some("-m");
+    MODEL_FLAG_FORWARDED.contains(&name.as_str()) && has_flag(extra_args, "--model", short)
 }
 
 /// Whether `extra_args` spells `long` or `short`, as a word or `=`-joined.
@@ -391,7 +410,7 @@ fn has_flag(extra_args: &[String], long: &str, short: Option<&str>) -> bool {
 ///
 /// `launch_simple` only exports `OLLAMA_HOST`: it never passes a model,
 /// so Kimi picks its own and the provider-routed reference never reaches
-/// the daemon. `copilot` takes a model but has no way to carry a key.
+/// the daemon.
 /// Refusing is the same call the catalog filter makes — a
 /// combination llmman cannot actually drive is absent, not offered and
 /// then broken at the first request.
@@ -400,8 +419,6 @@ const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
         "kimi",
         "it selects its own model rather than taking one from llmman",
     ),
-    ("copilot", "it has no way to send a provider API key"),
-    ("copilot-cli", "it has no way to send a provider API key"),
     // Its key variable feeds a native Google client, and llmman has not
     // verified that GEMINI_BASE_URL still redirects it here. Getting that
     // wrong sends someone's OpenRouter key to Google, which is a worse
@@ -667,7 +684,7 @@ const INTEGRATIONS: &[Integration] = &[
     Integration {
         name: "copilot",
         description: "GitHub Copilot CLI",
-        binary: "gh",
+        binary: "copilot",
     },
     Integration {
         name: "kimi",
@@ -804,6 +821,7 @@ fn env_dir(key: &str) -> Option<PathBuf> {
 /// launcher knows.
 fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
+        "copilot" => copilot::find_copilot(),
         "opencode" => opencode::find_opencode(),
         "omp" => find_omp(),
         "qwen" => find_qwen(),
@@ -965,7 +983,8 @@ struct Effort<'a> {
 /// dsh take it in their configuration instead.
 fn effort_args(integration: &str, effort: &str) -> Vec<String> {
     let flags: &[&str] = match integration {
-        "claude" | "copilot" | "copilot-cli" | "grok" => &["--effort"],
+        "claude" | "grok" => &["--effort"],
+        "copilot" | "copilot-cli" => &["--reasoning-effort"],
         "pi" | "omp" | "cline" => &["--thinking"],
         "hermes" => &["--reasoning"],
         // Else aider drops the effort for a model it does not know.
@@ -1061,7 +1080,7 @@ fn launch(
         "omp" => launch_omp(model, reasons, vision, context_window, extra_args),
         "cline" => launch_cline(model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
-        "copilot" | "copilot-cli" => copilot::launch_copilot(model, extra_args),
+        "copilot" | "copilot-cli" => copilot::launch_copilot(model, api_key, extra_args),
         "kimi" => launch_simple("kimi", model, extra_args),
         "gemini" => launch_gemini(model, api_key, extra_args),
         "agy" => agy::launch_agy(model, api_key, extra_args),
@@ -1140,7 +1159,7 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
         "cline" => vec![Dir(cline_dir()?)],
         "aider" => vec![Dir(home.join(".aider"))],
         "copilot" | "copilot-cli" => vec![
-            Dir(home.join(".copilot")),
+            Dir(env_dir("COPILOT_HOME").unwrap_or_else(|| home.join(".copilot"))),
             Dir(env_dir("GH_CONFIG_DIR").unwrap_or_else(|| config.join("gh"))),
         ],
         "kimi" => vec![Dir(home.join(".kimi"))],
@@ -2916,12 +2935,30 @@ fn docker_agent_fallback(home: &Path) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 fn exec_with_env(bin: &Path, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
-    std::process::exit(run_with_env(bin, args, extra_env)?);
+    exec_with_env_removing(bin, args, extra_env, &[])
+}
+
+fn exec_with_env_removing(
+    bin: &Path,
+    args: &[String],
+    extra_env: &[(&str, &str)],
+    remove_env: &[&str],
+) -> anyhow::Result<()> {
+    std::process::exit(run_with_env_removing(bin, args, extra_env, remove_env)?);
 }
 
 /// Runs the integration — in the `--sandbox`, when there is one — and
 /// returns its exit code.
 fn run_with_env(bin: &Path, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<i32> {
+    run_with_env_removing(bin, args, extra_env, &[])
+}
+
+fn run_with_env_removing(
+    bin: &Path,
+    args: &[String],
+    extra_env: &[(&str, &str)],
+    remove_env: &[&str],
+) -> anyhow::Result<i32> {
     // The inherited environment, overlaid with OLLAMA_HOST and the
     // integration's variables, later ones winning.
     let mut overlay = vec![("OLLAMA_HOST".to_string(), server())];
@@ -2940,6 +2977,9 @@ fn run_with_env(bin: &Path, args: &[String], extra_env: &[(&str, &str)]) -> anyh
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
     cmd.envs(overlay);
+    for name in remove_env {
+        cmd.env_remove(name);
+    }
 
     let status = cmd
         .status()
@@ -2961,6 +3001,18 @@ mod tests {
     fn agy_is_listed_as_an_integration() {
         let agy = INTEGRATIONS.iter().find(|i| i.name == "agy").unwrap();
         assert_eq!(agy.binary, "agy");
+    }
+
+    #[test]
+    fn copilot_is_the_standalone_model_required_byok_integration() {
+        let copilot = INTEGRATIONS.iter().find(|i| i.name == "copilot").unwrap();
+        assert_eq!(copilot.binary, "copilot");
+        for id in ["copilot", "copilot-cli"] {
+            assert!(MODEL_REQUIRED.contains(&id));
+            assert!(MODEL_FLAG_FORWARDED.contains(&id));
+            assert!(!PROVIDER_UNSUPPORTED.iter().any(|(name, _)| *name == id));
+            assert_eq!(effort_args(id, "high"), ["--reasoning-effort", "high"]);
+        }
     }
 
     /// Every integration `--provider` refuses must be one `launch`
@@ -3086,7 +3138,7 @@ mod tests {
         let none: Vec<String> = vec![];
         for id in MODEL_REQUIRED {
             assert!(
-                INTEGRATIONS.iter().any(|i| i.name == *id),
+                INTEGRATIONS.iter().any(|i| i.name == *id) || *id == "copilot-cli",
                 "{id} is not an integration"
             );
             assert!(check_model_flag(id, None, None, &none).is_err());

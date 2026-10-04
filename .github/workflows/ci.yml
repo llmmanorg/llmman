@@ -705,7 +705,7 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/agy/opencode/pi/omp/codex/cline/grok/qwen/hermes/openclaw/dsh/goose/goose-desktop/docker-agent, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/agy/opencode/pi/omp/codex/copilot/cline/grok/qwen/hermes/openclaw/dsh/goose/goose-desktop/docker-agent, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
@@ -720,7 +720,7 @@ jobs:
     # launch_and_assert's own doc comment), so 30 min/test is only hit if
     # every attempt fails via a missing "pong" instead. Plus warm_model()'s
     # own separate TIMEOUT budget (10 min), paid at most once across all
-    # tests (guarded by WARM's own Once). 14*30 + 10 = 430 min.
+    # tests (guarded by WARM's own Once). 15*30 + 10 = 460 min.
     # `launch_goose_desktop_env` runs serialized with them but multiplies
     # by nothing: its shim exits at once, so it carries a single TIMEOUT
     # budget like the safetensors tests below rather than a retry one.
@@ -729,12 +729,12 @@ jobs:
     # launch_and_assert's own doc comment) — a run can still legitimately
     # take this long in wall-clock time before giving up.
     #
-    # +90 (520) for the vllm-plugin steps' own per-step budgets below: up
+    # +90 (550) for the vllm-plugin steps' own per-step budgets below: up
     # to 60 min for "Install vLLM (e2e)" (wheel downloads, but a
     # slow/retried one on a bad connection) plus up to 30 min for
     # "pytest -m e2e (vllm-plugin)".
     #
-    # +10 (530) for `serve_mlx_safetensors_model`'s own single TIMEOUT
+    # +10 (560) for `serve_mlx_safetensors_model`'s own single TIMEOUT
     # budget (10 min, same 600s as warm_model's) — it doesn't go through
     # launch_and_assert's retry loop at all (a real failure there is
     # always a deterministic llmman bug worth failing loudly on, not
@@ -745,7 +745,7 @@ jobs:
     # `serve_sglang_safetensors_model` (20 min each, no retries, like the
     # mlx test) and "Install SGLang (e2e)"'s 40-minute budget.
     #
-    # 590 in total, but 360 is GitHub's own hard limit for a hosted-runner
+    # 620 in total, but 360 is GitHub's own hard limit for a hosted-runner
     # job and kills a run past it regardless, so the number here stays at
     # 400 rather than chasing a budget neither it nor GitHub can grant.
     timeout-minutes: 400
@@ -899,7 +899,7 @@ jobs:
       # multi-line/array syntax; ubuntu/macOS already default to bash.
       #
       # Unlike hermes/mlx_lm.server (legitimately missing on some
-      # platforms), these eight are plain npm packages expected to work
+      # platforms), these nine are plain npm packages expected to work
       # everywhere — so install_cli fails the job, rather than letting
       # tests/launch_e2e.rs's on_path check silently skip, when one never
       # becomes a working binary.
@@ -925,7 +925,7 @@ jobs:
           bun install -g @oh-my-pi/pi-coding-agent@18.2.11
           omp --version
 
-      - name: Install integration CLIs (claude, opencode, pi, codex, cline, qwen, openclaw, dsh)
+      - name: Install integration CLIs (claude, opencode, pi, codex, copilot, cline, qwen, openclaw, dsh)
         shell: bash
         run: |
           failed_clis=()
@@ -961,6 +961,9 @@ jobs:
           install_cli "@anthropic-ai/claude-code" "@anthropic-ai/claude-code" "claude"
           install_cli "opencode-ai" "opencode-ai" "opencode"
           install_cli "@openai/codex" "@openai/codex" "codex"
+          # Pinned: the standalone CLI's BYOK environment and `-p` mode are
+          # exercised against this release by tests/launch_e2e.rs.
+          install_cli "@github/copilot@1.0.91" "@github/copilot" "copilot"
           # Pinned: launch_cline depends on this release's provider-settings
           # schema and headless JSON/yolo flags.
           install_cli "cline@${CLINE_CLI_VERSION}" "cline" "cline"
