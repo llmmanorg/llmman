@@ -44,6 +44,15 @@ export function iconButton(iconId, title, onClick, cls = "icon-btn") {
   return b;
 }
 
+/** An `<a>` that opens `href` in a new tab, without handing it `window.opener`. */
+export function externalLink(href) {
+  const a = document.createElement("a");
+  a.href = href;
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  return a;
+}
+
 /** Swap a copy button's icon to a check for a moment. */
 export function flashCopied(btn) {
   btn.replaceChildren(icon("i-check"));

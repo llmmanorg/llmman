@@ -9,6 +9,7 @@ const DEFAULTS = {
   systemPrompt: "",
   sendWith: "enter", // enter | mod-enter
   model: "", // last chosen model ref
+  webSearch: false, // ground each chat reply in a web search
   sidebarCollapsed: false,
 };
 

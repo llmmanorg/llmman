@@ -17,6 +17,7 @@ import android.util.Log
 import android.view.View
 import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
+import android.webkit.PermissionRequest
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -69,6 +70,32 @@ class MainActivity : ComponentActivity() {
 
     private val requestNotifications =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    /** The page's camera or microphone request waiting on the system dialog; one at a time. */
+    private var mediaRequest: PermissionRequest? = null
+
+    private val requestMedia =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            val request = mediaRequest ?: return@registerForActivityResult
+            mediaRequest = null
+            grantMedia(request)
+        }
+
+    /** The Android permission behind a WebView resource, for the two the page may ask for. */
+    private fun permissionFor(resource: String): String? = when (resource) {
+        PermissionRequest.RESOURCE_VIDEO_CAPTURE -> Manifest.permission.CAMERA
+        PermissionRequest.RESOURCE_AUDIO_CAPTURE -> Manifest.permission.RECORD_AUDIO
+        else -> null
+    }
+
+    private fun hasPermission(permission: String): Boolean =
+        ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+
+    /** Grants the page what Android has granted the app, and refuses the rest. */
+    private fun grantMedia(request: PermissionRequest) {
+        val allowed = request.resources.filter { r -> permissionFor(r)?.let { hasPermission(it) } == true }
+        if (allowed.isEmpty()) request.deny() else request.grant(allowed.toTypedArray())
+    }
 
     private class PendingSave(val name: String, val mimeType: String, val bytes: ByteArray)
 
@@ -235,6 +262,30 @@ class MainActivity : ComponentActivity() {
                 val types = params.acceptTypes.filter { it.isNotBlank() }
                 pickFiles.launch(if (types.size == 1) types[0] else "*/*")
                 return true
+            }
+
+            // getUserMedia, for the camera button and voice input: our own
+            // page only, camera and microphone only. The system asks the
+            // user the first time.
+            override fun onPermissionRequest(request: PermissionRequest) {
+                runOnUiThread {
+                    val needed = request.resources.mapNotNull { permissionFor(it) }
+                    if (!isOurOrigin(request.origin) || needed.isEmpty() || mediaRequest != null) {
+                        request.deny()
+                        return@runOnUiThread
+                    }
+                    val missing = needed.filterNot { hasPermission(it) }
+                    if (missing.isEmpty()) {
+                        grantMedia(request)
+                    } else {
+                        mediaRequest = request
+                        requestMedia.launch(missing.toTypedArray())
+                    }
+                }
+            }
+
+            override fun onPermissionRequestCanceled(request: PermissionRequest) {
+                if (mediaRequest === request) mediaRequest = null
             }
 
             override fun onConsoleMessage(message: ConsoleMessage): Boolean {

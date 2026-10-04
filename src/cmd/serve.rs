@@ -54,6 +54,7 @@ mod stream;
 mod systemone;
 mod types;
 mod usage;
+mod websearch;
 mod webui;
 
 use backend::{
@@ -3675,6 +3676,7 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .route("/llmman/search/popular", get(search::handle_popular))
         .route("/llmman/search/model", get(search::handle_model))
         .route("/llmman/search/avatar", get(search::handle_avatar))
+        .route("/llmman/websearch", get(websearch::handle_websearch))
         .route("/llmman/shell", get(shell::handle_shell))
         // Ollama API
         .merge(ollama_router())

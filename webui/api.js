@@ -139,11 +139,15 @@ export async function providerModels(id) {
  * `GET /llmman/search`: models on Docker Hub and Hugging Face matching
  * `query`, as `llmman search` lists them, each `name` pullable as is.
  */
-export async function search(query, { limit, signal } = {}) {
+export async function search(query, opts) {
+  return (await searchJson("llmman/search", query, opts)).models || [];
+}
+
+/** `GET <path>?q=<query>[&limit=<n>]`, the shape both searches share. */
+function searchJson(path, query, { limit, signal } = {}) {
   const params = new URLSearchParams({ q: query });
   if (limit) params.set("limit", String(limit));
-  const body = await getJson(`llmman/search?${params}`, { signal });
-  return body.models || [];
+  return getJson(`${path}?${params}`, { signal });
 }
 
 /** `GET /llmman/search/popular`: what to show before a search, in `search`'s row shape. */
@@ -265,15 +269,40 @@ export async function pull(model, onProgress, signal) {
 }
 
 /**
+ * `GET /llmman/websearch`: `[{title, url, published?, snippet}]`. Rejects
+ * with the daemon's words when search is not configured (503) or fails (502).
+ */
+export async function webSearch(query, opts) {
+  return (await searchJson("llmman/websearch", query, opts)).results || [];
+}
+
+/**
+ * `POST /v1/audio/transcriptions` for a wav (llama.cpp reads wav, mp3 and
+ * flac, not what a browser records). Resolves with the text; `model` has
+ * to take audio input.
+ */
+export async function transcribe({ model, audio, signal }) {
+  const form = new FormData();
+  form.append("file", audio, "speech.wav");
+  form.append("model", model);
+  // No content-type: the browser adds the multipart boundary.
+  const r = await request("v1/audio/transcriptions", { method: "POST", body: form, signal });
+  if (!r.ok) throw await errorFrom(r);
+  return String((await r.json()).text ?? "").trim();
+}
+
+/**
  * `POST /v1/chat/completions`, streaming. `onDelta` gets `{content,
  * reasoning}` per chunk (backends spell the reasoning field three ways).
+ * `reasoningEffort` is `none` or a level; left out, the model decides.
  * Resolves with `{finishReason}`; a stream that ends without `[DONE]` or
  * a finish reason is truncated and rejects, as the daemon itself treats it.
  */
-export async function chat({ model, messages, temperature, maxTokens, signal, onDelta }) {
+export async function chat({ model, messages, temperature, maxTokens, reasoningEffort, signal, onDelta }) {
   const body = { model, messages, stream: true };
   if (Number.isFinite(temperature)) body.temperature = temperature;
   if (Number.isFinite(maxTokens) && maxTokens > 0) body.max_tokens = maxTokens;
+  if (reasoningEffort) body.reasoning_effort = reasoningEffort;
 
   const r = await postJson("v1/chat/completions", body, { signal });
   let finishReason = null;

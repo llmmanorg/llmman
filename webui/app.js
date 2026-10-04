@@ -116,6 +116,7 @@ function setMode(next) {
   $("#view-chat").classList.toggle("hidden", next !== "chat");
   $("#view-models").classList.toggle("hidden", next !== "models");
   $("#view-shell").classList.toggle("hidden", next !== "shell");
+  if (next !== "chat") chat.leave();
   if (next === "models") models.showModelsPage();
   if (next === "shell") shell.show().catch((e) => toast(`Shell: ${e.message}`, "error"));
   else shell.hide();

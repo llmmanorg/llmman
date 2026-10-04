@@ -5,7 +5,7 @@
 // emphasis, links, autolinks); a single newline is a line break. Images
 // render as links: a model must not make the browser fetch a URL unasked.
 
-import { icon, iconButton, flashCopied } from "./util.js";
+import { icon, iconButton, flashCopied, externalLink } from "./util.js";
 
 const el = (tag, cls) => {
   const node = document.createElement(tag);
@@ -323,7 +323,7 @@ function renderCode(block, opts) {
 
 // ---- Inline -----------------------------------------------------------
 
-const SAFE_URL = /^(https?:|mailto:)/i;
+export const SAFE_URL = /^(https?:|mailto:)/i;
 const AUTOLINK = /^https?:\/\/[^\s<>()]+[^\s<>().,;:!?'"]/i;
 
 /** Append inline-parsed `text` to `parent`. */
@@ -409,10 +409,7 @@ export function appendInline(parent, text) {
       const m = AUTOLINK.exec(text.slice(i));
       if (m) {
         flush();
-        const a = el("a");
-        a.href = m[0];
-        a.target = "_blank";
-        a.rel = "noopener noreferrer";
+        const a = externalLink(m[0]);
         a.textContent = m[0];
         parent.appendChild(a);
         i += m[0].length;
@@ -451,10 +448,7 @@ function appendLink(parent, link, plainLabel) {
     appendInline(parent, link.label);
     return;
   }
-  const a = el("a");
-  a.href = link.url;
-  a.target = "_blank";
-  a.rel = "noopener noreferrer";
+  const a = externalLink(link.url);
   if (link.title) a.title = link.title;
   if (plainLabel !== null) a.textContent = plainLabel;
   else appendInline(a, link.label);

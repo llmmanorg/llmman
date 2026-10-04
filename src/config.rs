@@ -35,6 +35,9 @@
 //! [auth]                               # cmd::serve::auth
 //! api_keys = "k1,k2"                   # what a request to this daemon must present
 //!
+//! [websearch]                          # cmd::serve::websearch
+//! api_key = "..."                      # an Exa key, as EXA_API_KEY
+//!
 //! [registries."docker.io"]             # crate::ffi, go-shim
 //! mirrors = "https://mirror.gcr.io,registry-mirror.corp:5000"
 //! ```
@@ -78,6 +81,9 @@ pub struct Conf {
     /// Private, like `providers`: reached through [`auth_api_keys`] only.
     #[serde(default)]
     auth: AuthConf,
+    /// Private, like `auth`: reached through [`websearch_api_key`] only.
+    #[serde(default)]
+    websearch: WebsearchConf,
     /// Native OAuth forwarding on the daemon's TLS listener.
     #[serde(default)]
     pub managed: ManagedConf,
@@ -176,6 +182,23 @@ impl std::fmt::Debug for AuthConf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthConf")
             .field("api_keys", &self.api_keys.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// The `[websearch]` section — see `cmd::serve::websearch`.
+#[derive(Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+struct WebsearchConf {
+    /// As `EXA_API_KEY`.
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+impl std::fmt::Debug for WebsearchConf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebsearchConf")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -807,13 +830,35 @@ pub fn auth_api_keys() -> Vec<String> {
 /// The key presented to peers: `LLMMAN_PEER_API_KEY`, else the last file
 /// setting `aggregation.api_key` that passes the mode gate. `None` for blank.
 pub fn peer_api_key() -> Option<String> {
-    std::env::var("LLMMAN_PEER_API_KEY")
-        .ok()
-        .or_else(|| {
-            secret_from_files(files().unwrap_or_default(), "aggregation.api_key", |f| {
-                f.conf.aggregation.api_key.as_deref()
-            })
-        })
+    env_or_file_secret(
+        std::env::var("LLMMAN_PEER_API_KEY").ok(),
+        files().unwrap_or_default(),
+        "aggregation.api_key",
+        |f| f.conf.aggregation.api_key.as_deref(),
+    )
+}
+
+/// The Exa key `/llmman/websearch` spends: `EXA_API_KEY`, else the last
+/// file setting `websearch.api_key` that passes the mode gate. `None`
+/// for blank, which is how web search is off.
+pub fn websearch_api_key() -> Option<String> {
+    env_or_file_secret(
+        std::env::var("EXA_API_KEY").ok(),
+        files().unwrap_or_default(),
+        "websearch.api_key",
+        |f| f.conf.websearch.api_key.as_deref(),
+    )
+}
+
+/// `env`, else the last file's `field` (see [`secret_from_files`]),
+/// trimmed; `None` for blank.
+fn env_or_file_secret<'a>(
+    env: Option<String>,
+    files: &'a [File],
+    field: &str,
+    pick: impl Fn(&'a File) -> Option<&'a str>,
+) -> Option<String> {
+    env.or_else(|| secret_from_files(files, field, pick))
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty())
 }
@@ -1246,21 +1291,25 @@ mod tests {
         assert!(parse("[aggregation]\npeer = \"a\"").is_err());
     }
 
-    /// The daemon's own keys and the peer key are secrets: redacted in
-    /// `Debug`, and read from the last file that sets them — skipping,
-    /// with a warning, one that other users can read.
+    /// The daemon's own keys, the peer key and the Exa key are secrets:
+    /// redacted in `Debug`, and read from the last file that sets them,
+    /// skipping, with a warning, one that other users can read.
     #[cfg(unix)]
     #[test]
-    fn daemon_and_peer_keys_are_redacted_and_gated_on_the_file_mode() {
+    fn daemon_peer_and_search_keys_are_redacted_and_gated_on_the_file_mode() {
         use std::os::unix::fs::PermissionsExt;
 
-        let c = conf("[auth]\napi_keys = \"k-secret,k2\"\n[aggregation]\napi_key = \"p-secret\"");
+        let c = conf(
+            "[auth]\napi_keys = \"k-secret,k2\"\n[aggregation]\napi_key = \"p-secret\"\n\
+             [websearch]\napi_key = \"w-secret\"",
+        );
         let rendered = format!("{c:?}");
         assert!(!rendered.contains("secret"), "{rendered}");
         assert!(
             parse("[auth]\napi_key = \"k\"").is_err(),
             "the field is plural"
         );
+        assert!(parse("[websearch]\napikey = \"k\"").is_err());
 
         let dir = std::env::temp_dir().join(format!("llmman-auth-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -1271,17 +1320,19 @@ mod tests {
         };
         write(
             "system.conf",
-            "[auth]\napi_keys = \"a, b\"\n[aggregation]\napi_key = \"pa\"",
+            "[auth]\napi_keys = \"a, b\"\n[aggregation]\napi_key = \"pa\"\n\
+             [websearch]\napi_key = \" wa \"",
             0o600,
         );
         write(
             "loose.conf",
-            "[auth]\napi_keys = \"c\"\n[aggregation]\napi_key = \"pc\"",
+            "[auth]\napi_keys = \"c\"\n[aggregation]\napi_key = \"pc\"\n\
+             [websearch]\napi_key = \"wc\"",
             0o644,
         );
         write(
             "out.conf",
-            "[auth]\napi_keys = \"\"\n[aggregation]\napi_key = \"\"",
+            "[auth]\napi_keys = \"\"\n[aggregation]\napi_key = \"\"\n[websearch]\napi_key = \"\"",
             0o644,
         );
         let files = |names: &[&str]| -> Vec<File> {
@@ -1308,6 +1359,11 @@ mod tests {
                 f.conf.aggregation.api_key.as_deref()
             })
         };
+        let search = |env: Option<&str>, files: &[File]| {
+            env_or_file_secret(env.map(String::from), files, "websearch.api_key", |f| {
+                f.conf.websearch.api_key.as_deref()
+            })
+        };
         let ab = vec!["a".to_string(), "b".to_string()];
         assert_eq!(keys(&files(&["system.conf"])), ab);
         assert_eq!(peer(&files(&["system.conf"])).as_deref(), Some("pa"));
@@ -1324,6 +1380,23 @@ mod tests {
             Some("")
         );
         assert!(keys(&[]).is_empty());
+
+        // The Exa key: trimmed, the environment first, a blank switches it off.
+        assert_eq!(
+            search(None, &files(&["system.conf"])).as_deref(),
+            Some("wa")
+        );
+        assert_eq!(
+            search(None, &files(&["system.conf", "loose.conf"])).as_deref(),
+            Some("wa")
+        );
+        assert_eq!(
+            search(Some(" env "), &files(&["system.conf"])).as_deref(),
+            Some("env")
+        );
+        assert_eq!(search(Some(" "), &files(&["system.conf"])), None);
+        assert_eq!(search(None, &files(&["system.conf", "out.conf"])), None);
+        assert_eq!(search(None, &[]), None);
 
         std::fs::remove_dir_all(&dir).ok();
     }

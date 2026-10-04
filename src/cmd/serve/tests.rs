@@ -5043,6 +5043,7 @@ async fn a_keyed_daemon_refuses_everything_but_its_own_page_without_the_key() {
         "/llmman/search/popular",
         "/llmman/search/model?name=hf.co/o/r",
         "/llmman/search/avatar?name=hf.co/o/r",
+        "/llmman/websearch?q=qwen",
         "/llmman/shell",
         "/metrics",
     ] {

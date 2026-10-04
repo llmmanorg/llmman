@@ -1,10 +1,14 @@
 // Conversations in this browser's IndexedDB, one record each; the daemon
 // keeps none. A conversation:
 //   { id, title, model, createdAt, updatedAt, systemPrompt, temperature,
-//     maxTokens, media?, messages: [{ role, content, reasoning?, model?, at,
-//     generate?, prompt?, request?, media?: { kind, blob, ... } }] }
+//     maxTokens, thinking?, media?, messages: [{ role, content, reasoning?,
+//     model?, at, generate?, prompt?, request?, media?: { kind, blob, ... },
+//     images?: [{ blob, width, height }], sources?: [{ title, url,
+//     published?, snippet }] }] }
 // The conversation's `media` is its generation options; a message's is the
-// generated picture, clip or sound, a Blob IndexedDB stores as is.
+// generated picture, clip or sound, a Blob IndexedDB stores as is. `thinking`
+// is "", "none" or a reasoning effort; `images` are a user message's JPEGs
+// (Blobs); `sources` are the web results behind a reply.
 
 const DB_NAME = "llmman";
 const DB_VERSION = 1;

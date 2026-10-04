@@ -133,6 +133,12 @@ export function chattable(m) {
   return !m.capabilities || m.capabilities.includes("completion");
 }
 
+/** Whether `ref` takes images: `vision` for a local model, assumed for a hosted one or unknown. */
+export function acceptsImages(ref) {
+  const m = state.local.find((m) => m.id === ref);
+  return !m?.capabilities || m.capabilities.includes("vision");
+}
+
 /** The media a local model generates, in the composer's order; `[]` for a chat model. */
 function mediaOf(m) {
   return ["image", "video", "audio"].filter((k) => m.capabilities?.includes(k));

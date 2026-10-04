@@ -10,7 +10,7 @@ Ollama, OpenAI, Anthropic and System One wire formats, plus a small API of its o
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`) |
 | Anthropic | `/v1/messages` |
 | System One | `/v1/systemone` |
-| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/shell` |
+| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/websearch`, `/llmman/shell` |
 | Web UI | `/` and `/ui/*` — see [webui.md](webui.md) |
 | llama.cpp | `/props` |
 | Prometheus | `/metrics` (off unless `LLMMAN_METRICS` is `1`, `true`, `yes` or `on`) |
@@ -230,6 +230,16 @@ picks one. `/llmman/search/avatar?name=` redirects to the repo owner's
 picture on Hugging Face or Gravatar, or is a `404` when it has none.
 These ask the registries live; a registry that cannot be reached is a
 `502`.
+
+`/llmman/websearch?q=<query>[&limit=<n>]` is the web UI's *Search the web*:
+the daemon asks [Exa](https://exa.ai) and answers `{"results": [{title,
+url, published?, snippet}]}`, most relevant first (`limit` defaults to 5,
+at most 10; non-`http(s)` URLs are left out). It needs an Exa key
+([configuration.md](configuration.md#web-search)): without one it is a
+`503` saying how to set it, a failure at Exa a `502`. Like a provider's
+key, it is only spent for an authenticated caller, or on a loopback
+daemon for a request that is not cross-site (else `403`). The query is
+all that goes to Exa.
 
 ## Authentication
 
