@@ -56,6 +56,7 @@ fn copilot_args(model: &str, extra_args: &[String]) -> Vec<String> {
 fn copilot_env<'a>(model: &'a str, api_key: &'a str, base_url: &'a str) -> Vec<(&'a str, &'a str)> {
     vec![
         ("COPILOT_PROVIDER_BASE_URL", base_url),
+        ("COPILOT_PROVIDER_TYPE", "openai"),
         ("COPILOT_PROVIDER_API_KEY", api_key),
         ("COPILOT_MODEL", model),
         ("COPILOT_PROVIDER_WIRE_API", "responses"),
@@ -93,10 +94,11 @@ mod tests {
             get("COPILOT_PROVIDER_BASE_URL"),
             Some("http://127.0.0.1:17434/v1")
         );
+        assert_eq!(get("COPILOT_PROVIDER_TYPE"), Some("openai"));
         assert_eq!(get("COPILOT_PROVIDER_API_KEY"), Some("secret"));
         assert_eq!(get("COPILOT_MODEL"), Some("local/model"));
         assert_eq!(get("COPILOT_PROVIDER_WIRE_API"), Some("responses"));
-        assert_eq!(env.len(), 4, "only documented BYOK variables are set");
+        assert_eq!(env.len(), 5, "only documented BYOK variables are set");
         assert_eq!(
             COPILOT_ENV_TO_CLEAR,
             [
@@ -108,14 +110,7 @@ mod tests {
 
     #[test]
     fn fallback_finds_the_installers_target() {
-        let home = std::env::temp_dir().join(format!(
-            "llmman-copilot-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let home = super::super::test_temp_dir("copilot");
         let name = if cfg!(windows) {
             "copilot.exe"
         } else {

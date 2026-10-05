@@ -745,6 +745,17 @@ const INTEGRATIONS: &[Integration] = &[
     },
 ];
 
+/// The registry entry for a launch name, after resolving supported aliases.
+#[cfg(test)]
+fn integration(name: &str) -> Option<&'static Integration> {
+    let name = name.to_ascii_lowercase();
+    let canonical = match name.as_str() {
+        "copilot-cli" => "copilot",
+        other => other,
+    };
+    INTEGRATIONS.iter().find(|i| i.name == canonical)
+}
+
 fn print_integrations() {
     println!("Available integrations:\n");
     for i in INTEGRATIONS {
@@ -816,6 +827,20 @@ fn env_dir(key: &str) -> Option<PathBuf> {
     std::env::var_os(key)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+#[cfg(test)]
+fn test_temp_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "llmman-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 /// The binary `launch` will run for `i`, so the listing does not report
@@ -2929,7 +2954,7 @@ fn run_with_env_removing(
             .map(|(k, v)| (k.to_string(), v.to_string())),
     );
     if sandbox::active() {
-        return sandbox::run(bin, args, &overlay);
+        return sandbox::run(bin, args, &overlay, remove_env);
     }
 
     let mut cmd = Command::new(bin);
@@ -2982,10 +3007,7 @@ mod tests {
     #[test]
     fn every_provider_unsupported_integration_is_a_real_one() {
         for (id, why) in PROVIDER_UNSUPPORTED {
-            assert!(
-                INTEGRATIONS.iter().any(|i| i.name == *id) || *id == "copilot-cli",
-                "{id} is not an integration"
-            );
+            assert!(integration(id).is_some(), "{id} is not an integration");
             assert!(!why.is_empty(), "{id} has no reason");
             assert!(check_provider_supported(id).is_err(), "{id} was accepted");
             // Case-insensitively, the way `launch` dispatches.
@@ -3098,10 +3120,7 @@ mod tests {
     fn model_required_integrations_are_refused_without_a_model() {
         let none: Vec<String> = vec![];
         for id in MODEL_REQUIRED {
-            assert!(
-                INTEGRATIONS.iter().any(|i| i.name == *id) || *id == "copilot-cli",
-                "{id} is not an integration"
-            );
+            assert!(integration(id).is_some(), "{id} is not an integration");
             assert!(check_model_flag(id, None, None, &none).is_err());
             assert!(check_model_flag(id, Some(" "), None, &none).is_err());
             assert!(check_model_flag(&id.to_uppercase(), None, None, &none).is_err());
@@ -3216,14 +3235,7 @@ mod tests {
 
     #[test]
     fn omp_config_is_created_for_a_fresh_home_and_round_trips() {
-        let dir = std::env::temp_dir().join(format!(
-            "llmman-omp-models-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = test_temp_dir("omp-models");
         let models_path = dir.join("models.yml");
         write_omp_config_in_dir(
             &dir,
@@ -3257,15 +3269,7 @@ mod tests {
 
     #[test]
     fn omp_models_yml_backs_up_the_exact_commented_file_before_rewriting() {
-        let dir = std::env::temp_dir().join(format!(
-            "llmman-omp-models-backup-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_temp_dir("omp-models-backup");
         let path = dir.join("models.yml");
         let config_path = dir.join("config.yml");
         let original = r#"# my own notes, do not delete

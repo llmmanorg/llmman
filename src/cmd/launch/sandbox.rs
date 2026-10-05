@@ -248,8 +248,14 @@ pub fn prepare(
 }
 
 /// Runs the integration in the prepared sandbox; returns its exit code.
-/// `env` overlays the inherited environment, later entries winning.
-pub fn run(bin: &Path, args: &[String], env: &[(String, String)]) -> anyhow::Result<i32> {
+/// `env` overlays the inherited environment, later entries winning;
+/// `remove_env` is stripped from host-process sandboxes before launch.
+pub fn run(
+    bin: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    remove_env: &[&str],
+) -> anyhow::Result<i32> {
     let active = ACTIVE.get().context("no sandbox prepared")?;
     let filtered;
     let env = if active.sandbox.uses_image() {
@@ -260,7 +266,7 @@ pub fn run(bin: &Path, args: &[String], env: &[(String, String)]) -> anyhow::Res
     };
     match active.sandbox {
         Sandbox::Sbx => anyhow::bail!("--sandbox sbx is not prepared"),
-        Sandbox::Seatbelt => run_seatbelt(active, bin, args, env),
+        Sandbox::Seatbelt => run_seatbelt(active, bin, args, env, remove_env),
         Sandbox::Openshell => run_openshell(active, bin, args, env),
         sandbox => {
             let plan = plan(active, bin, args, env)?;
@@ -533,7 +539,19 @@ fn run_seatbelt(
     bin: &Path,
     args: &[String],
     env: &[(String, String)],
+    remove_env: &[&str],
 ) -> anyhow::Result<i32> {
+    let cmd = seatbelt_command(active, bin, args, env, remove_env)?;
+    status_code(cmd, SANDBOX_EXEC)
+}
+
+fn seatbelt_command(
+    active: &Active,
+    bin: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    remove_env: &[&str],
+) -> anyhow::Result<Command> {
     let (dirs, files) = seatbelt_writable(active);
     let workspace = real_path(&active.workspace);
     let mut cmd = Command::new(SANDBOX_EXEC);
@@ -542,7 +560,10 @@ fn run_seatbelt(
         .arg(bin)
         .args(args);
     cmd.envs(env.iter().map(|(k, v)| (k, v)));
-    status_code(cmd, SANDBOX_EXEC)
+    for name in remove_env {
+        cmd.env_remove(name);
+    }
+    Ok(cmd)
 }
 
 /// Real paths, which seatbelt matches (`/tmp` and `/var` are symlinks).
@@ -1261,11 +1282,11 @@ mod tests {
     /// hides that the real name is missing.
     #[test]
     fn every_integration_named_here_is_a_real_one() {
-        let known = |id: &str| {
-            id == "copilot-cli" || super::super::INTEGRATIONS.iter().any(|i| i.name == id)
-        };
         for (id, _) in SBX_AGENTS.iter().chain(DEFAULT_IMAGES) {
-            assert!(known(id), "{id} is not an integration");
+            assert!(
+                super::super::integration(id).is_some(),
+                "{id} is not an integration"
+            );
         }
     }
 
@@ -1984,6 +2005,44 @@ mod tests {
         assert!(profile.trim_end().ends_with(')'));
         // A quote would end the string early.
         assert!(seatbelt_profile(&[PathBuf::from("/tmp/a\"b")], &[], Path::new("/tmp")).is_err());
+    }
+
+    #[test]
+    fn seatbelt_removes_inherited_environment_before_launch() {
+        let root = temp_dir("seatbelt-env");
+        let active = Active {
+            sandbox: Sandbox::Seatbelt,
+            integration: "copilot".into(),
+            server: "http://127.0.0.1:17434".into(),
+            workspace: root.clone(),
+            home: root.join("home"),
+            image: None,
+            state: vec![],
+        };
+        let remove = [
+            "COPILOT_PROVIDER_API_KEY_COMMAND",
+            "COPILOT_PROVIDER_BEARER_TOKEN",
+        ];
+        let cmd = seatbelt_command(
+            &active,
+            Path::new("copilot"),
+            &[],
+            &[("COPILOT_PROVIDER_API_KEY".into(), "llmman".into())],
+            &remove,
+        )
+        .unwrap();
+        let env: Vec<_> = cmd.get_envs().collect();
+        assert!(env.iter().any(|(key, value)| {
+            *key == "COPILOT_PROVIDER_API_KEY" && value.is_some_and(|v| v == "llmman")
+        }));
+        for name in remove {
+            assert!(
+                env.iter()
+                    .any(|(key, value)| *key == name && value.is_none()),
+                "{name} was not removed: {env:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -658,6 +658,7 @@ fn launch_command(
         .env("QWEN_HOME", home.join(".qwen"))
         .env("GROK_HOME", home.join(".grok"))
         .env("CLINE_DIR", home.join(".cline"))
+        .env("COPILOT_HOME", home.join(".copilot"))
         .env("PI_CODING_AGENT_DIR", home.join(".pi").join("agent"))
         // goose asks before each tool call otherwise, and a headless run
         // has nobody to answer. Granted here, not by `launch goose`:
