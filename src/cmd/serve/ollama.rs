@@ -1742,3 +1742,133 @@ pub(super) fn opt_num_thread(opts: &Option<serde_json::Value>) -> Option<u32> {
     let n = opts.as_ref()?.get("num_thread")?.as_u64()?;
     u32::try_from(n).ok().filter(|&n| n != 0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::test_state;
+    use super::*;
+
+    /// The heartbeat must not come back once the bar is running: the
+    /// shim drops its entry when the transfer ends, while the task still
+    /// has its signature check to do, and a heartbeat there printed a
+    /// stray line under the finished bar.
+    #[test]
+    fn progress_line_stops_heartbeating_once_byte_counts_have_been_seen() {
+        let mut saw_bytes = false;
+        // Nothing known yet: the heartbeat is all there is to send.
+        assert_eq!(
+            progress_line("pull", "m", (String::new(), 0, 0), &mut saw_bytes),
+            Some(serde_json::json!({"status": "pulling m"}))
+        );
+        assert!(!saw_bytes);
+        // Real counts latch the flag and drive the bar.
+        assert_eq!(
+            progress_line("pull", "m", ("pulling".into(), 100, 40), &mut saw_bytes),
+            Some(serde_json::json!({"status": "pulling", "total": 100, "completed": 40}))
+        );
+        assert!(saw_bytes);
+        // Entry dropped, task still finishing: say nothing.
+        assert_eq!(
+            progress_line("pull", "m", (String::new(), 0, 0), &mut saw_bytes),
+            None
+        );
+    }
+
+    /// A status-only snapshot still reports; a blank status names the
+    /// model, and `completed` never exceeds `total`.
+    #[test]
+    fn progress_line_reports_status_only_snapshots_and_clamps_completed() {
+        let mut saw_bytes = false;
+        assert_eq!(
+            progress_line("pull", "m", ("verifying".into(), 0, 0), &mut saw_bytes),
+            Some(serde_json::json!({"status": "verifying"}))
+        );
+        assert!(!saw_bytes);
+        assert_eq!(
+            progress_line("push", "m", (String::new(), 100, 999), &mut saw_bytes),
+            Some(serde_json::json!({"status": "pushing m", "total": 100, "completed": 100}))
+        );
+    }
+
+    /// /api/push validates the client ref before resolving it: an invalid
+    /// ref returns a 400, matching /api/pull's early rejection.
+    #[tokio::test]
+    async fn handle_push_rejects_an_invalid_ref_with_400() {
+        let state = test_state();
+        let req = OllamaPushRequest {
+            model: "hf.co/../x".to_string(),
+            name: String::new(),
+        };
+        let resp = handle_push(State(state), Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// /api/push has no "fetch it first" fallback: a valid ref that isn't
+    /// already in the local store returns a 404 through AppError, not a
+    /// hand-built body.
+    #[tokio::test]
+    async fn handle_push_returns_404_for_a_model_not_in_the_store() {
+        let state = test_state();
+        let req = OllamaPushRequest {
+            model: "hf.co/does-not-exist/nowhere".to_string(),
+            name: String::new(),
+        };
+        let resp = handle_push(State(state), Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A push reports the digest it landed on, which is what
+    /// `cmd::push --sign-key` signs — the daemon deliberately does not
+    /// sign, so losing this line would silently disable signing.
+    #[test]
+    fn a_push_outcome_reports_its_digest_on_the_stream() {
+        let lines = PushOutcome {
+            digest: "sha256:abc".into(),
+        }
+        .into_lines();
+        assert_eq!(lines, vec![serde_json::json!({"digest": "sha256:abc"})]);
+    }
+
+    /// An Ollama client's push body has no signing fields at all, and
+    /// deserializing one must not require them.
+    #[test]
+    fn an_ollama_push_body_still_deserializes() {
+        let req: OllamaPushRequest =
+            serde_json::from_str(r#"{"model":"docker.io/org/model:v1"}"#).unwrap();
+        assert_eq!(req.model, "docker.io/org/model:v1");
+        // The deprecated `name` spelling real Ollama still accepts.
+        let req: OllamaPushRequest = serde_json::from_str(r#"{"name":"x"}"#).unwrap();
+        assert_eq!(req.name, "x");
+    }
+
+    /// Regression test for `OllamaPullRequest`'s `name` field: a body
+    /// carrying only `{"name": "..."}` used to fail Axum's `Json`
+    /// extraction outright — `model` was a required, non-default field —
+    /// before this handler's own name-falls-back-to-model logic ever ran.
+    #[test]
+    fn ollama_pull_request_accepts_a_name_only_body() {
+        let req: OllamaPullRequest =
+            serde_json::from_value(serde_json::json!({"name": "docker.io/ai/gemma4:E2B"}))
+                .expect("a name-only body must still deserialize");
+        assert_eq!(req.model, "");
+        assert_eq!(req.name, "docker.io/ai/gemma4:E2B");
+    }
+
+    #[test]
+    fn ollama_pull_request_accepts_a_model_only_body() {
+        let req: OllamaPullRequest =
+            serde_json::from_value(serde_json::json!({"model": "docker.io/ai/gemma4:E2B"}))
+                .expect("a model-only body must still deserialize");
+        assert_eq!(req.model, "docker.io/ai/gemma4:E2B");
+        assert_eq!(req.name, "");
+    }
+
+    #[test]
+    fn ollama_push_request_accepts_a_name_only_body() {
+        let req: OllamaPushRequest =
+            serde_json::from_value(serde_json::json!({"name": "docker.io/ai/gemma4:E2B"}))
+                .expect("a name-only body must still deserialize");
+        assert_eq!(req.model, "");
+        assert_eq!(req.name, "docker.io/ai/gemma4:E2B");
+    }
+}
