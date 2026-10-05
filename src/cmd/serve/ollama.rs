@@ -336,7 +336,7 @@ const MODEL_INFO_OMITTED: [&str; 2] = ["general.name", "tokenizer.chat_template"
 /// The GGUF header as ollama's `/api/show` reports it: every metadata key
 /// verbatim, minus [`MODEL_INFO_OMITTED`] and the bulk
 /// [`MODEL_INFO_MAX_ARRAY`] cuts.
-pub(super) fn model_info_json(info: &crate::gguf::Info) -> serde_json::Value {
+fn model_info_json(info: &crate::gguf::Info) -> serde_json::Value {
     info.metadata
         .iter()
         .filter(|(k, _)| !MODEL_INFO_OMITTED.contains(&k.as_str()))
@@ -544,15 +544,15 @@ async fn push_impl(
 
 /// What a completed push reports back, for `cmd::push --sign-key` to
 /// sign. See `push_impl` for why the daemon does not sign it.
-pub(super) struct PushOutcome {
-    pub(super) digest: String,
+struct PushOutcome {
+    digest: String,
 }
 
 /// Whatever a pull/push task needs to tell the client beyond "success",
 /// as NDJSON objects emitted ahead of the terminal line — a pull's
 /// verification notices, a push's digest. Both go out the one stream, so
 /// `stream_ffi_progress` serves either.
-pub(super) trait StreamedOutcome {
+trait StreamedOutcome {
     fn into_lines(self) -> Vec<serde_json::Value>;
 }
 
@@ -574,7 +574,7 @@ impl StreamedOutcome for PushOutcome {
 /// latches once real counts arrive: an empty snapshot after that means
 /// the transfer ended while the task finishes up, and heartbeating
 /// there printed a stray line under the finished bar.
-pub(super) fn progress_line(
+fn progress_line(
     verb: &str,
     model: &str,
     snap: (String, i64, i64),
@@ -743,7 +743,7 @@ pub(super) async fn handle_copy(
 /// Keys are compared tag-defaulted, since a runner may be keyed `m:latest`
 /// for a tag written as `m`. In-flight requests on the old content are
 /// cut, as an explicit `keep_alive: 0` unload cuts them.
-pub(super) async fn evict_if_retagged(state: &AppState, reference: &str, digest: &str) {
+async fn evict_if_retagged(state: &AppState, reference: &str, digest: &str) {
     let want = crate::storage::default_tag(reference);
     let mut mgr = state.0.manager.lock().await;
     let stale: Vec<String> = mgr
@@ -784,7 +784,7 @@ fn staging_temp_name(prefix: &str) -> String {
 
 /// The staging path for `digest`, or a 400 if it isn't `sha256:<64 hex>`
 /// — which is also what keeps the path inside the staging directory.
-pub(super) fn staged_blob_path(state: &AppState, digest: &str) -> Result<PathBuf, AppError> {
+fn staged_blob_path(state: &AppState, digest: &str) -> Result<PathBuf, AppError> {
     let hex = digest.strip_prefix("sha256:").unwrap_or_default();
     if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(AppError::status(
@@ -983,7 +983,7 @@ fn is_empty_json(v: &serde_json::Value) -> bool {
 
 /// One `files` entry, checked: a bare file name (`../` would escape the
 /// build directory), a well-formed digest, and an upload that has landed.
-pub(super) fn staged_file(state: &AppState, name: &str, digest: &str) -> Result<PathBuf, AppError> {
+fn staged_file(state: &AppState, name: &str, digest: &str) -> Result<PathBuf, AppError> {
     let bare = Path::new(name)
         .file_name()
         .and_then(|n| n.to_str())
@@ -1051,7 +1051,7 @@ fn create_from_staged_blobs(
 /// the rest of `OllamaMessage`, not explicit `None`s: every other field is
 /// `skip_serializing_if`, so this reaches the wire as the bare
 /// `{"role":"assistant","content":""}` ollama 0.32.6 sends.
-pub(super) fn empty_chat_chunk(model: String, done_reason: &str) -> OllamaChatChunk {
+fn empty_chat_chunk(model: String, done_reason: &str) -> OllamaChatChunk {
     OllamaChatChunk {
         model,
         created_at: now_rfc3339(),
@@ -1183,7 +1183,7 @@ async fn ollama_chat_to(
 /// sampling knobs Ollama documents that have no equivalent on a chat
 /// completion (`num_ctx`, `num_keep`, `repeat_last_n`, `typical_p`,
 /// `mirostat*`) are left out; `num_ctx` is `LLMMAN_CONTEXT_LENGTH`.
-pub(super) fn options_to_oai(options: &Option<serde_json::Value>) -> OAIChatRequest {
+fn options_to_oai(options: &Option<serde_json::Value>) -> OAIChatRequest {
     OAIChatRequest {
         temperature: opt_f64(options, "temperature"),
         top_p: opt_f64(options, "top_p"),
@@ -1376,7 +1376,7 @@ async fn ollama_generate_to(
 
 /// A string or an array of strings, as ollama accepts; an empty string or
 /// `null` is the load-only request.
-pub(super) fn embed_inputs(input: &serde_json::Value) -> Result<Vec<String>, AppError> {
+fn embed_inputs(input: &serde_json::Value) -> Result<Vec<String>, AppError> {
     let invalid = || AppError::status(StatusCode::BAD_REQUEST, "invalid input type");
     match input {
         serde_json::Value::Null => Ok(Vec::new()),
@@ -1632,7 +1632,7 @@ async fn truncate_to_tokens(
 
 /// Unit-length in place (a prefix of a unit vector isn't one); a zero
 /// vector is left alone, a non-finite one is an error, as on ollama.
-pub(super) fn normalize_in_place(v: &mut [f32]) -> Result<(), AppError> {
+fn normalize_in_place(v: &mut [f32]) -> Result<(), AppError> {
     if v.iter().any(|x| !x.is_finite()) {
         return Err(AppError::status(
             StatusCode::BAD_GATEWAY,
@@ -1720,11 +1720,11 @@ pub(super) async fn handle_embeddings(
 
 // -- Ollama options blob -----------------------------------------------------
 
-pub(super) fn opt_f64(opts: &Option<serde_json::Value>, key: &str) -> Option<f32> {
+fn opt_f64(opts: &Option<serde_json::Value>, key: &str) -> Option<f32> {
     opts.as_ref()?.get(key)?.as_f64().map(|f| f as f32)
 }
 
-pub(super) fn opt_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32> {
+fn opt_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32> {
     opts.as_ref()?.get(key)?.as_u64().map(|n| n as u32)
 }
 
@@ -1738,7 +1738,7 @@ pub(super) fn opt_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32
 /// `num_thread` is an int field), so `as_u64` does the type filtering;
 /// not built on [`opt_u32`], whose `as u32` truncation is harmless for
 /// `num_predict` but would turn e.g. 2^32+1 into `--threads 1` here.
-pub(super) fn opt_num_thread(opts: &Option<serde_json::Value>) -> Option<u32> {
+fn opt_num_thread(opts: &Option<serde_json::Value>) -> Option<u32> {
     let n = opts.as_ref()?.get("num_thread")?.as_u64()?;
     u32::try_from(n).ok().filter(|&n| n != 0)
 }
