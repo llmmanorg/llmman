@@ -266,6 +266,8 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         }
     };
 
+    check_integration_key_transport(&api_key)?;
+
     launch(
         name,
         &model,
@@ -284,6 +286,31 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
 /// tells serve the header is not a credential.
 fn integration_key() -> String {
     crate::auth::client_key().unwrap_or_else(|| providers::PLACEHOLDER_API_KEY.to_string())
+}
+
+/// Refuse to hand a real credential to an integration when it would send
+/// that key to a remote daemon over cleartext. The placeholder carries no
+/// secret, while loopback HTTP and remote HTTPS are safe (see
+/// [`crate::daemon::connects_securely`]).
+fn check_integration_key_transport(api_key: &str) -> anyhow::Result<()> {
+    check_integration_key_transport_to(
+        api_key,
+        crate::daemon::connects_securely(),
+        &crate::daemon::server(),
+    )
+}
+
+fn check_integration_key_transport_to(
+    api_key: &str,
+    connects_securely: bool,
+    server: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        api_key == providers::PLACEHOLDER_API_KEY || connects_securely,
+        "launch needs a local llmman serve, or one over TLS: LLMMAN_HOST points at {server}, \
+         and the API key would cross the network in cleartext."
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2999,6 +3026,26 @@ mod tests {
             assert!(!PROVIDER_UNSUPPORTED.iter().any(|(name, _)| *name == id));
             assert_eq!(effort_args(id, "high"), ["--reasoning-effort", "high"]);
         }
+    }
+
+    #[test]
+    fn a_real_integration_key_never_crosses_remote_cleartext() {
+        let remote_http = "http://192.0.2.1:17434";
+        let error = check_integration_key_transport_to("secret", false, remote_http)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(remote_http));
+        assert!(error.contains("cleartext"));
+
+        // No secret travels with the placeholder, and a real key remains
+        // valid over either loopback HTTP or authenticated HTTPS.
+        assert!(check_integration_key_transport_to(
+            providers::PLACEHOLDER_API_KEY,
+            false,
+            remote_http
+        )
+        .is_ok());
+        assert!(check_integration_key_transport_to("secret", true, remote_http).is_ok());
     }
 
     /// Every integration `--provider` refuses must be one `launch`
