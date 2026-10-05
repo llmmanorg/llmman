@@ -1226,7 +1226,11 @@ code, pre, kbd { font-family: var(--font-mono); }
   .topbar-title { display: none; }
   .greeting h1 { font-size: 1.6rem; }
   .msg-user .bubble { max-width: 95%; }
+  /* The row wraps once the left-hand buttons fill the width, and
+     `space-between` leaves a lone wrapped child at the start: keep the
+     model picker and Send where a thumb reaches for them. */
   .composer-row { flex-wrap: wrap; gap: 0.35rem; }
+  .composer-right { margin-left: auto; }
   .kind-toggle button span { display: none; }
   .kind-toggle button { padding: 0.3rem 0.55rem; }
   .model-btn { max-width: 11rem; }
