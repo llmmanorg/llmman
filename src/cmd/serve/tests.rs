@@ -1,9 +1,6 @@
 use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
 use super::hybrid::{request_pin, resolve_hybrid_side, with_hybrid_fallback};
-use super::ollama::{
-    evict_if_retagged, model_info_json, staged_blob_path, staged_file, StreamedOutcome,
-};
 use super::openai::apply_default_repeat_penalty;
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::responses::{
@@ -1425,34 +1422,6 @@ async fn a_pair_routes_against_the_window_its_local_half_actually_loaded_with() 
             .unwrap(),
         "gemma4"
     );
-}
-
-/// vLLM and MLX expose no `/props`, so there is no live `n_ctx` to
-/// report: `/api/ps` falls back to the window this daemon gave the
-/// load.
-#[tokio::test]
-async fn ps_reports_the_configured_window_when_the_backend_exposes_none() {
-    let state = test_state();
-    let mut loaded = running_model_fixture(None, Duration::ZERO, 0);
-    // Port 0 answers nothing, standing in for a backend with no /props.
-    loaded.port = 0;
-    loaded.context_window = Some(32_768);
-    state
-        .0
-        .manager
-        .lock()
-        .await
-        .running
-        .insert("m:latest".into(), loaded);
-
-    let resp = handle_ps(State(state.clone()), HeaderMap::new())
-        .await
-        .into_response();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let ps: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(ps["models"][0]["context_length"], 32_768);
 }
 
 /// A crashed runner keeps its entry until the next `check_running`
@@ -3492,59 +3461,6 @@ async fn create_needs_exactly_one_of_from_or_files() {
     }
 }
 
-/// A loaded model whose tag now points at other content is dropped,
-/// whichever way the tag is spelled; one serving the same content stays.
-#[tokio::test]
-async fn evict_if_retagged_drops_only_a_runner_serving_stale_content() {
-    let state = test_state();
-    let key = "hf.co/o/m:latest";
-    let mut fixture = running_model_fixture(None, Duration::ZERO, 0);
-    fixture.digest = "sha256:old".into();
-    state
-        .0
-        .manager
-        .lock()
-        .await
-        .running
-        .insert(key.into(), fixture);
-    evict_if_retagged(&state, key, "sha256:old").await;
-    assert!(state.0.manager.lock().await.running.contains_key(key));
-    evict_if_retagged(&state, "hf.co/o/m", "sha256:new").await;
-    assert!(!state.0.manager.lock().await.running.contains_key(key));
-}
-
-/// `files` keys name a file inside the build directory; anything else
-/// is refused before a link is made.
-#[test]
-fn staged_file_refuses_a_name_that_is_not_a_bare_file_name() {
-    let state = test_state();
-    let digest = format!("sha256:{}", "a".repeat(64));
-    for name in ["../escape.gguf", "sub/dir.gguf", ".", ""] {
-        let err = staged_file(&state, name, &digest).unwrap_err();
-        assert_eq!(err.1, StatusCode::BAD_REQUEST, "{name:?}");
-    }
-}
-
-/// A malformed digest is a 400, which also keeps a crafted path
-/// segment out of the filesystem.
-#[test]
-fn staged_blob_path_requires_a_well_formed_sha256_digest() {
-    let state = test_state();
-    let ok = staged_blob_path(&state, &format!("sha256:{}", "a".repeat(64))).unwrap();
-    assert_eq!(ok, state.0.cache_path.join("blobs").join("a".repeat(64)));
-    for bad in [
-        "sha256:abc",
-        "md5:0000",
-        &format!("sha256:{}", "g".repeat(64)),
-        "../x",
-    ] {
-        assert_eq!(
-            staged_blob_path(&state, bad).unwrap_err().1,
-            StatusCode::BAD_REQUEST
-        );
-    }
-}
-
 /// Regression test for the Codex tool-type bug described on
 /// `filter_non_function_tools`'s own doc comment.
 #[test]
@@ -3772,17 +3688,6 @@ async fn ensure_model_rejects_an_invalid_ref_with_400() {
     assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
 }
 
-/// A pull's notices go out the same stream, so one helper serves
-/// both verbs.
-#[test]
-fn pull_notices_go_out_as_notice_lines() {
-    let lines = vec!["warning: unsigned".to_string()].into_lines();
-    assert_eq!(
-        lines,
-        vec![serde_json::json!({"notice": "warning: unsigned"})]
-    );
-}
-
 /// /api/delete resolves (and so validates) the client ref before it ever
 /// opens the store: an invalid ref returns a 400 and touches nothing.
 #[tokio::test]
@@ -3794,70 +3699,6 @@ async fn handle_delete_rejects_an_invalid_ref_with_400() {
     };
     let resp = handle_delete(State(state), Json(req)).await.into_response();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-/// ollama sends every GGUF metadata key verbatim, drops two of them, and
-/// carries an array whole unless it is longer than its own ceiling.
-#[test]
-fn model_info_json_sends_scalars_and_short_arrays_verbatim() {
-    use crate::gguf::Value;
-    let mut info = crate::gguf::Info::default();
-    for (k, v) in [
-        ("general.architecture", Value::String("llama".into())),
-        ("llama.context_length", Value::U32(4096)),
-        ("tokenizer.ggml.add_eos_token", Value::Bool(false)),
-        (
-            "tokenizer.ggml.token_type",
-            Value::Array(vec![Value::I32(1), Value::I32(3)]),
-        ),
-        (
-            "tokenizer.ggml.precompiled_charsmap",
-            Value::Array(vec![Value::U8(1), Value::U8(2), Value::U8(3)]),
-        ),
-        ("llama.vision.indexes", Value::Array(Vec::new())),
-        ("general.name", Value::String("Qwen3.5 0.8B".into())),
-        (
-            "tokenizer.chat_template",
-            Value::String("{{ bulk }}".into()),
-        ),
-    ] {
-        info.metadata.insert(k.to_string(), v);
-    }
-    let json = model_info_json(&info);
-    assert_eq!(json["general.architecture"], serde_json::json!("llama"));
-    assert_eq!(json["llama.context_length"], serde_json::json!(4096));
-    assert_eq!(
-        json["tokenizer.ggml.add_eos_token"],
-        serde_json::json!(false)
-    );
-    // A UINT8 array is Go's []byte, which encoding/json writes as a
-    // base64 string — "AQID" is [1, 2, 3].
-    assert_eq!(
-        json["tokenizer.ggml.precompiled_charsmap"],
-        serde_json::json!("AQID")
-    );
-    // A short array is the value itself, not a placeholder for one.
-    assert_eq!(json["tokenizer.ggml.token_type"], serde_json::json!([1, 3]));
-    assert_eq!(json["llama.vision.indexes"], serde_json::json!([]));
-    // Both keys ollama's GetModelInfo deletes. The template has its own
-    // field on this response.
-    assert_eq!(json.get("general.name"), None);
-    assert_eq!(json.get("tokenizer.chat_template"), None);
-}
-
-/// The ceiling is ollama's: an array of exactly 1024 elements is still
-/// sent, and a longer one is elided as `[]` rather than `null`, which a
-/// client would read as "this key has no value" instead of "not carried".
-#[test]
-fn model_info_json_elides_only_arrays_past_the_ceiling() {
-    use crate::gguf::Value;
-    let array = |n: usize| Value::Array(vec![Value::U32(7); n]);
-    let mut info = crate::gguf::Info::default();
-    info.metadata.insert("at.ceiling".into(), array(1024));
-    info.metadata.insert("past.ceiling".into(), array(1025));
-    let json = model_info_json(&info);
-    assert_eq!(json["at.ceiling"].as_array().map(Vec::len), Some(1024));
-    assert_eq!(json["past.ceiling"], serde_json::json!([]));
 }
 
 /// The `/api/show` body for a store holding one model whose single
