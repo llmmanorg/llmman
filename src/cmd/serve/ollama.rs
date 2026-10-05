@@ -1871,4 +1871,156 @@ mod tests {
         assert_eq!(req.model, "");
         assert_eq!(req.name, "docker.io/ai/gemma4:E2B");
     }
+
+    /// Every Ollama option with a chat-completion spelling is mapped;
+    /// `num_predict: -1` (no limit) is no cap, and `stop` takes both forms.
+    #[test]
+    fn options_to_oai_maps_the_documented_sampling_options() {
+        let oai = options_to_oai(&Some(serde_json::json!({
+            "temperature": 0.5, "top_p": 0.9, "top_k": 40, "min_p": 0.05,
+            "seed": 42, "num_predict": -1, "repeat_penalty": 1.1,
+            "presence_penalty": 0.1, "frequency_penalty": 0.2,
+            "stop": ["a", "b"], "num_ctx": 8192
+        })));
+        assert_eq!(oai.temperature, Some(0.5));
+        assert_eq!(oai.top_k, Some(40));
+        assert_eq!(oai.min_p, Some(0.05));
+        assert_eq!(oai.seed, Some(42));
+        assert_eq!(oai.max_tokens, None);
+        assert_eq!(oai.presence_penalty, Some(0.1));
+        assert_eq!(oai.frequency_penalty, Some(0.2));
+        assert_eq!(
+            oai.stop.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
+        let one = options_to_oai(&Some(
+            serde_json::json!({ "stop": "END", "num_predict": 8 }),
+        ));
+        assert_eq!(one.stop.as_deref(), Some(&["END".to_string()][..]));
+        assert_eq!(one.max_tokens, Some(8));
+        assert_eq!(options_to_oai(&None).seed, None);
+    }
+
+    /// Pins the wire shape against ollama 0.32.6, which answers both
+    /// message-less forms with exactly this body. The `message` object must
+    /// carry `role` and `content` and nothing else — `thinking`, `images`,
+    /// `tool_calls` and `tool_name` are all `skip_serializing_if`, and a
+    /// client comparing against ollama's reply would see any extra key.
+    #[test]
+    fn empty_chat_chunk_matches_ollamas_message_less_reply() {
+        let value = serde_json::to_value(empty_chat_chunk("m:latest".into(), "load")).unwrap();
+
+        assert_eq!(value["model"], "m:latest");
+        assert_eq!(value["done"], true);
+        assert_eq!(value["done_reason"], "load");
+        assert_eq!(value["message"]["role"], "assistant");
+        assert_eq!(value["message"]["content"], "");
+        assert_eq!(
+            value["message"].as_object().unwrap().len(),
+            2,
+            "ollama's message-less reply carries only role and content"
+        );
+        assert!(value.get("created_at").is_some());
+    }
+
+    /// `/api/embed` takes a string or an array of strings, and nothing
+    /// else; an empty string and `null` both mean "no inputs".
+    #[test]
+    fn embed_inputs_accepts_a_string_or_string_array_only() {
+        assert_eq!(embed_inputs(&serde_json::json!("hi")).unwrap(), vec!["hi"]);
+        assert_eq!(
+            embed_inputs(&serde_json::json!(["a", "b"])).unwrap(),
+            vec!["a", "b"]
+        );
+        assert!(embed_inputs(&serde_json::Value::Null).unwrap().is_empty());
+        assert!(embed_inputs(&serde_json::json!("")).unwrap().is_empty());
+        for bad in [
+            serde_json::json!(1),
+            serde_json::json!(["a", 1]),
+            serde_json::json!({}),
+        ] {
+            let err = embed_inputs(&bad).unwrap_err();
+            assert_eq!(err.1, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn normalize_in_place_yields_a_unit_vector_and_rejects_non_finite() {
+        let mut v = vec![3.0f32, 4.0];
+        normalize_in_place(&mut v).unwrap();
+        assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
+        let mut zero = vec![0.0f32, 0.0];
+        normalize_in_place(&mut zero).unwrap();
+        assert_eq!(zero, vec![0.0, 0.0]);
+        assert!(normalize_in_place(&mut [1.0, f32::NAN]).is_err());
+        assert!(normalize_in_place(&mut [f32::INFINITY]).is_err());
+        let mut huge = vec![f32::MAX, f32::MAX];
+        normalize_in_place(&mut huge).unwrap();
+        assert!((huge[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        let mut tiny = vec![1e-20f32, 0.0];
+        normalize_in_place(&mut tiny).unwrap();
+        assert_eq!(tiny, vec![1.0, 0.0]);
+    }
+
+    /// Ported from ollama's server/routes_options_test.go concept
+    /// (api.Options blob -> typed option values): numeric options are
+    /// pulled out of the Ollama `options` blob by key, and missing keys,
+    /// wrong-typed values, or an absent blob all yield None instead of
+    /// erroring.
+    #[test]
+    fn option_extractors_ported_ollama_options_blob_cases() {
+        let opts = Some(serde_json::json!({
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "num_predict": 128,
+            "stop": ["### User:"]
+        }));
+        assert_eq!(opt_f64(&opts, "temperature"), Some(0.5));
+        assert_eq!(opt_f64(&opts, "top_p"), Some(0.9));
+        assert_eq!(opt_u32(&opts, "num_predict"), Some(128));
+        // Missing key.
+        assert_eq!(opt_f64(&opts, "repeat_penalty"), None);
+        // Wrong type for the extractor.
+        assert_eq!(opt_u32(&opts, "stop"), None);
+        // No options blob at all.
+        assert_eq!(opt_f64(&None, "temperature"), None);
+        assert_eq!(opt_u32(&None, "num_predict"), None);
+    }
+
+    #[test]
+    fn opt_num_thread_accepts_a_positive_integer() {
+        assert_eq!(
+            opt_num_thread(&Some(serde_json::json!({"num_thread": 4}))),
+            Some(4)
+        );
+        assert_eq!(
+            opt_num_thread(&Some(serde_json::json!({"num_thread": 1}))),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn opt_num_thread_rejects_zero_negative_and_non_integer_values() {
+        // (num_thread value in the options blob, why it must be dropped)
+        let cases = [
+            (
+                serde_json::json!(0),
+                "zero: llama-server rejects --threads 0",
+            ),
+            (serde_json::json!(-1), "negative"),
+            (serde_json::json!(2.5), "fractional"),
+            (serde_json::json!("4"), "string, not a JSON number"),
+            (
+                serde_json::json!(u64::from(u32::MAX) + 1),
+                "above u32: must not truncate to --threads 0",
+            ),
+        ];
+        for (value, why) in cases {
+            let opts = Some(serde_json::json!({ "num_thread": value }));
+            assert_eq!(opt_num_thread(&opts), None, "{why}");
+        }
+        // Missing key, and no options blob at all.
+        assert_eq!(opt_num_thread(&Some(serde_json::json!({}))), None);
+        assert_eq!(opt_num_thread(&None), None);
+    }
 }
