@@ -1029,8 +1029,8 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         env:
-          TALOS_VERSION: 0.20.0-beta.2
-          TALOS_SHA256: aaf05f8233d7bf6483daf33ef7de8750b97d42701d93bb711401fc7615fd9219
+          TALOS_VERSION: 0.20.0-beta.4
+          TALOS_SHA256: 5c9c07bdf98d1504aef66a91c6d60df14a111da2c130123251a72eb9535e7c05
         run: |
           set -euo pipefail
           tarball="talos-${TALOS_VERSION}.tar.gz"
