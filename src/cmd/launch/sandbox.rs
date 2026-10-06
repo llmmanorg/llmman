@@ -1209,6 +1209,7 @@ fn status_code(mut cmd: Command, what: &str) -> anyhow::Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_temp_dir;
     use super::*;
 
     fn strings(args: &[&str]) -> Vec<String> {
@@ -1362,22 +1363,9 @@ mod tests {
         }
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "llmman-sandbox-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn the_workspace_is_the_git_work_tree_but_never_the_home_directory() {
-        let root = temp_dir("workspace");
+        let root = test_temp_dir("sandbox-workspace");
         let home = root.join("home");
         let repo = home.join("src").join("repo");
         let sub = repo.join("crate");
@@ -1401,7 +1389,7 @@ mod tests {
 
     #[test]
     fn container_plan_mounts_linked_worktree_git_metadata_read_only() {
-        let root = temp_dir("linked-worktree");
+        let root = test_temp_dir("sandbox-linked-worktree");
         let repo = root.join("repo");
         let worktree = root.join("worktree");
         std::fs::create_dir_all(&repo).unwrap();
@@ -1507,7 +1495,7 @@ mod tests {
     fn container_plan_preserves_symlinked_git_metadata_guest_paths() {
         use std::os::unix::fs::symlink;
 
-        let root = temp_dir("linked-worktree-symlink");
+        let root = test_temp_dir("sandbox-linked-worktree-symlink");
         let repo = root.join("repo");
         let worktree = root.join("worktree");
         let git_dir_alias = root.join("gitdir-alias");
@@ -1618,7 +1606,7 @@ mod tests {
     fn container_plan_allows_shared_symlinked_ancestor_for_relative_commondir() {
         use std::os::unix::fs::symlink;
 
-        let root = temp_dir("linked-worktree-shared-ancestor-symlink");
+        let root = test_temp_dir("sandbox-linked-worktree-shared-ancestor-symlink");
         let repo = root.join("repo");
         let worktree = root.join("worktree");
         let root_alias = root.with_file_name(format!(
@@ -1739,7 +1727,7 @@ mod tests {
     fn container_plan_rejects_relative_commondir_through_symlinked_gitdir_ancestor() {
         use std::os::unix::fs::symlink;
 
-        let root = temp_dir("linked-worktree-ancestor-symlink");
+        let root = test_temp_dir("sandbox-linked-worktree-ancestor-symlink");
         let repo = root.join("repo");
         let worktree = root.join("worktree");
         let gitdir_parent_alias = root.join("gitdir-parent-alias");
@@ -1815,7 +1803,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn container_plan_rejects_a_git_pointer_to_host_ssh() {
-        let root = temp_dir("untrusted-git-pointer");
+        let root = test_temp_dir("sandbox-untrusted-git-pointer");
         let workspace = root.join("workspace");
         let home = root.join("home");
         let ssh = home.join(".ssh");
@@ -1849,7 +1837,7 @@ mod tests {
     fn container_plan_rejects_a_symlinked_git_directory_to_host_ssh() {
         use std::os::unix::fs::symlink;
 
-        let root = temp_dir("symlinked-git-directory");
+        let root = test_temp_dir("sandbox-symlinked-git-directory");
         let workspace = root.join("workspace");
         let home = root.join("home");
         let ssh = home.join(".ssh");
@@ -1878,7 +1866,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn container_plan_rejects_an_internal_gitdir_with_external_commondir() {
-        let root = temp_dir("untrusted-commondir");
+        let root = test_temp_dir("sandbox-untrusted-commondir");
         let workspace = root.join("workspace");
         let home = root.join("home");
         let ssh = home.join(".ssh");
@@ -1905,7 +1893,7 @@ mod tests {
 
     #[test]
     fn container_plan_rejects_external_gitdir_outside_worktrees_without_commondir() {
-        let root = temp_dir("external-gitdir-outside-worktrees");
+        let root = test_temp_dir("sandbox-external-gitdir-outside-worktrees");
         let workspace = root.join("workspace");
         let git_dir = root.join("host/metadata/arbitrary/gitdir");
         let dot_git = workspace.join(".git");
@@ -1927,7 +1915,7 @@ mod tests {
     fn container_plan_rejects_symlinked_final_component_of_relative_commondir() {
         use std::os::unix::fs::symlink;
 
-        let root = temp_dir("linked-worktree-final-commondir-symlink");
+        let root = test_temp_dir("sandbox-linked-worktree-final-commondir-symlink");
         let repo = root.join("repo");
         let worktree = root.join("worktree");
         std::fs::create_dir_all(&repo).unwrap();
@@ -2007,9 +1995,10 @@ mod tests {
         assert!(seatbelt_profile(&[PathBuf::from("/tmp/a\"b")], &[], Path::new("/tmp")).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn seatbelt_removes_inherited_environment_before_launch() {
-        let root = temp_dir("seatbelt-env");
+        let root = test_temp_dir("sandbox-seatbelt-env");
         let active = Active {
             sandbox: Sandbox::Seatbelt,
             integration: "copilot".into(),
@@ -2047,7 +2036,7 @@ mod tests {
 
     #[test]
     fn real_path_resolves_the_existing_part_of_a_missing_path() {
-        let root = temp_dir("realpath");
+        let root = test_temp_dir("sandbox-realpath");
         let missing = root.join("not").join("yet");
         assert_eq!(
             real_path(&missing),
