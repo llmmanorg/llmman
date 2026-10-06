@@ -52,19 +52,11 @@ pub struct Server {
 
 type Shared = Arc<Server>;
 
-pub enum Error {
+enum Error {
     Invalid(String),
     Failed(String),
     NotFound(String),
     NotSupported(String),
-    Unavailable(String),
-}
-
-/// What `?` on an internal failure comes to: a 500.
-impl<E: Into<anyhow::Error>> From<E> for Error {
-    fn from(e: E) -> Self {
-        Error::Failed(format!("{:#}", e.into()))
-    }
 }
 
 impl IntoResponse for Error {
@@ -74,7 +66,6 @@ impl IntoResponse for Error {
             Error::Failed(m) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error", m),
             Error::NotFound(m) => (StatusCode::NOT_FOUND, "not_found_error", m),
             Error::NotSupported(m) => (StatusCode::NOT_IMPLEMENTED, "not_supported_error", m),
-            Error::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, "server_error", m),
         };
         (
             status,
@@ -407,11 +398,7 @@ async fn images(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
                 }
             }
             Ok(Err(
-                Error::Invalid(m)
-                | Error::Failed(m)
-                | Error::NotFound(m)
-                | Error::NotSupported(m)
-                | Error::Unavailable(m),
+                Error::Invalid(m) | Error::Failed(m) | Error::NotFound(m) | Error::NotSupported(m),
             )) => {
                 json!({"type": "error", "error": {"message": m}})
             }
@@ -652,10 +639,10 @@ pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
 }
 
 /// Serves until the listener fails or the parent goes away.
-pub async fn serve(router: Router, addr: std::net::SocketAddr, what: &str) -> Result<()> {
+pub async fn serve(router: Router, addr: std::net::SocketAddr) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!(
-        "[llmman] {what}: listening on http://{}",
+        "[llmman] mediagen: listening on http://{}",
         listener.local_addr()?
     );
     axum::serve(listener, router).await?;

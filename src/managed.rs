@@ -198,15 +198,7 @@ mod tests {
             Err(std::fs::TryLockError::WouldBlock)
         ));
         drop(first);
-        // A child another test has forked holds a copy of the lock until it
-        // execs, so it may outlive the drop for a moment.
-        let released = (0..500).any(|_| {
-            probe.try_lock().is_ok() || {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                false
-            }
-        });
-        assert!(released, "lock still held 5s after the drop");
+        assert!(probe.try_lock().is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

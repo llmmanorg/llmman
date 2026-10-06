@@ -188,8 +188,7 @@ impl Dialect {
             "/api/chat" | "/api/generate" | "/api/embed" => Some(Self::Ollama),
             "/v1/chat/completions" | "/v1/completions" | "/v1/embeddings" => Some(Self::OpenAi),
             "/v1/messages" => Some(Self::Anthropic),
-            // System One's usage is in the Responses shape.
-            "/v1/responses" | "/v1/systemone" => Some(Self::Responses),
+            "/v1/responses" => Some(Self::Responses),
             "/gemini/:model/*gemini_path" => Some(Self::Gemini),
             _ => None,
         }
@@ -666,18 +665,6 @@ mod tests {
         assert_eq!(
             decode(Dialect::Anthropic, "application/json", json),
             Some(Tokens::new(8, 3, 0, 7))
-        );
-    }
-
-    /// System One's reply carries `usage` in the Responses shape, so a
-    /// `/v1/systemone` call is in the ledger like any other request.
-    #[test]
-    fn a_system_one_reply_is_read_as_a_responses_usage() {
-        assert_eq!(Dialect::of_route("/v1/systemone"), Some(Dialect::Responses));
-        let json = r#"{"model":"m","answers":{},"usage":{"input_tokens":333,"output_tokens":0}}"#;
-        assert_eq!(
-            decode(Dialect::Responses, "application/json", json),
-            Some(Tokens::new(333, 0, 0, 0))
         );
     }
 

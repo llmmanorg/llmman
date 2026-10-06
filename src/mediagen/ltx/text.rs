@@ -6,10 +6,10 @@
 use std::ffi::{c_void, CString};
 use std::ptr;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use super::super::backend::{Backend, Graph};
-use super::super::ffi::{self, Api, LlamaContextParams, LlamaModel, Tensor};
+use super::super::ffi::{self, Api, LlamaContextParams, LlamaModel, LlamaModelParams, Tensor};
 use super::{attention, feed_forward, rms, rope_tables, AttnWeights, Model, Rope, TextCond};
 
 /// The LTX-2 system prompt for prompt enhancement (Lightricks, Apache-2.0):
@@ -114,20 +114,30 @@ impl TextEncoder {
         n_threads: i32,
         flash: bool,
     ) -> Result<Box<TextEncoder>> {
-        let model = api
-            .load_model(path, n_gpu_layers)
-            .context("loading the text encoder")?;
-        let mut enc = Box::new(TextEncoder {
-            api,
-            model,
-            ctx: ptr::null_mut(),
-            n_ctx,
-            n_threads,
-            flash,
-            capture: ptr::null_mut(),
-        });
-        enc.ensure_context()?;
-        Ok(enc)
+        unsafe {
+            let mut mp = (api.llama_model_default_params)();
+            {
+                let p = mp.view_mut::<LlamaModelParams>();
+                ffi::check_model_params(p)?;
+                p.n_gpu_layers = n_gpu_layers;
+            }
+            let cpath = CString::new(path)?;
+            let model = (api.llama_model_load_from_file)(cpath.as_ptr(), mp);
+            if model.is_null() {
+                bail!("failed to load the text encoder {path}");
+            }
+            let mut enc = Box::new(TextEncoder {
+                api,
+                model,
+                ctx: ptr::null_mut(),
+                n_ctx,
+                n_threads,
+                flash,
+                capture: ptr::null_mut(),
+            });
+            enc.ensure_context()?;
+            Ok(enc)
+        }
     }
 
     /// Creates the llama context if there is none.
@@ -182,8 +192,38 @@ impl TextEncoder {
     }
 
     fn tokenize(&self, text: &str, add_special: bool, parse_special: bool) -> Result<Vec<i32>> {
-        self.api
-            .tokenize(self.vocab(), text, add_special, parse_special)
+        let ctext = CString::new(text)?;
+        let mut tokens = vec![0i32; text.len() + 16];
+        let mut n = unsafe {
+            (self.api.llama_tokenize)(
+                self.vocab(),
+                ctext.as_ptr(),
+                text.len() as i32,
+                tokens.as_mut_ptr(),
+                tokens.len() as i32,
+                add_special,
+                parse_special,
+            )
+        };
+        if n < 0 {
+            tokens.resize((-n) as usize, 0);
+            n = unsafe {
+                (self.api.llama_tokenize)(
+                    self.vocab(),
+                    ctext.as_ptr(),
+                    text.len() as i32,
+                    tokens.as_mut_ptr(),
+                    tokens.len() as i32,
+                    add_special,
+                    parse_special,
+                )
+            };
+        }
+        if n < 0 {
+            bail!("failed to tokenize");
+        }
+        tokens.truncate(n as usize);
+        Ok(tokens)
     }
 
     /// Runs the model and returns the packed, per-token RMS-normalized hidden
@@ -213,9 +253,22 @@ impl TextEncoder {
         unsafe {
             (self.api.llama_memory_clear)((self.api.llama_get_memory)(self.ctx), true);
             self.capture = &mut *cap;
-            let decoded = self.api.decode(self.ctx, &tokens, 0, true);
+            let batch = (self.api.llama_batch_init)(n as i32, 0, 1);
+            for (i, &tok) in tokens.iter().enumerate() {
+                *batch.token.add(i) = tok;
+                *batch.pos.add(i) = i as i32;
+                *batch.n_seq_id.add(i) = 1;
+                **batch.seq_id.add(i) = 0;
+                *batch.logits.add(i) = 1;
+            }
+            let mut batch = batch;
+            batch.n_tokens = n as i32;
+            let ret = (self.api.llama_decode)(self.ctx, batch);
             self.capture = ptr::null_mut();
-            decoded?;
+            (self.api.llama_batch_free)(batch);
+            if ret != 0 {
+                bail!("llama_decode failed with {ret}");
+            }
             // last hidden state: the final norm output, i.e. the per-token embeddings
             let h = if cap.n_hidden > 0 {
                 cap.n_hidden
@@ -307,8 +360,16 @@ impl TextEncoder {
             // same context as encode(), in logits mode
             (api.llama_set_embeddings)(self.ctx, false);
             (api.llama_memory_clear)((api.llama_get_memory)(self.ctx), true);
-            let mut ok = api.decode(self.ctx, &tokens, 0, false).is_ok();
-            let mut batch = (api.llama_batch_init)(1, 0, 1);
+            let mut batch = (api.llama_batch_init)(self.n_ctx as i32, 0, 1);
+            for (i, &tok) in tokens.iter().enumerate() {
+                *batch.token.add(i) = tok;
+                *batch.pos.add(i) = i as i32;
+                *batch.n_seq_id.add(i) = 1;
+                **batch.seq_id.add(i) = 0;
+                *batch.logits.add(i) = (i + 1 == tokens.len()) as i8;
+            }
+            batch.n_tokens = tokens.len() as i32;
+            let mut ok = (api.llama_decode)(self.ctx, batch) == 0;
             let smpl = (api.llama_sampler_chain_init)((api.llama_sampler_chain_default_params)());
             (api.llama_sampler_chain_add)(smpl, (api.llama_sampler_init_temp)(0.7));
             (api.llama_sampler_chain_add)(smpl, (api.llama_sampler_init_dist)(seed));

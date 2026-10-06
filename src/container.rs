@@ -1091,7 +1091,7 @@ pub fn spawn_mediagen(
     let (exe, store, cache) = (utf8(&exe)?, utf8(store_path)?, utf8(cache_path)?);
     let passthrough = [
         crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS,
-        crate::cmd::serve::GGML_ENV_PASSTHROUGH_VARS,
+        crate::cmd::serve::MEDIAGEN_ENV_PASSTHROUGH_VARS,
     ]
     .concat();
     let mut args = run_args(backend.engine_args(), port, &passthrough, cpus);
