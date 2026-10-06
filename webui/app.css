@@ -440,45 +440,6 @@ code, pre, kbd { font-family: var(--font-mono); }
   max-width: 14rem;
 }
 
-/* Pictures sent with a user message */
-.msg-images { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.4rem; margin-bottom: 0.4rem; }
-.msg-images img {
-  max-width: min(14rem, 45%);
-  max-height: 14rem;
-  border-radius: var(--radius);
-  border: 1px solid var(--border);
-  object-fit: cover;
-}
-
-/* The pages a reply was grounded in */
-.sources {
-  font-family: var(--font-sans);
-  margin-bottom: 0.75rem;
-  border-left: 2px solid var(--accent-soft);
-  padding-left: 0.75rem;
-}
-.sources summary {
-  cursor: pointer;
-  color: var(--text-muted);
-  font-size: 0.85rem;
-  list-style: none;
-  display: flex;
-  align-items: center;
-  gap: 0.35rem;
-  user-select: none;
-}
-.sources summary::-webkit-details-marker { display: none; }
-.sources summary svg { width: 0.95rem; height: 0.95rem; }
-.sources summary .chev { transition: transform 0.15s; width: 0.9rem; height: 0.9rem; }
-.sources[open] summary .chev { transform: rotate(180deg); }
-.sources ol { margin: 0.5rem 0 0; padding-left: 1.4rem; font-size: 0.9rem; }
-.sources li { margin: 0.25rem 0; overflow-wrap: anywhere; }
-.sources a { color: var(--accent); text-decoration: none; }
-.sources a:hover { text-decoration: underline; }
-.sources .source-meta { color: var(--text-muted); font-size: 0.8rem; margin-left: 0.35rem; }
-
-.msg-meta .icon-btn.speaking { color: var(--accent); }
-
 .thinking {
   font-family: var(--font-sans);
   margin-bottom: 0.75rem;
@@ -622,32 +583,6 @@ code, pre, kbd { font-family: var(--font-mono); }
   margin-top: 0.5rem;
 }
 .composer-left, .composer-right { display: flex; align-items: center; gap: 0.35rem; }
-
-/* Buttons that stay on once pressed: search, thinking, voice mode, the mic. */
-.composer .icon-btn[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); }
-.composer .icon-btn.listening svg { animation: pulse 1s ease-in-out infinite; }
-
-/* Pictures waiting to be sent */
-.attachments { display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0 0.25rem 0.6rem; }
-.thumb { position: relative; width: 3.6rem; height: 3.6rem; }
-.thumb img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-}
-.thumb .thumb-remove {
-  position: absolute;
-  top: -0.35rem;
-  right: -0.35rem;
-  width: 1.2rem;
-  height: 1.2rem;
-  border-radius: 50%;
-  background: var(--text-head);
-  color: var(--bg);
-}
-.thumb .thumb-remove svg { width: 0.7rem; height: 0.7rem; }
 
 /* Image / Video / Audio toggle */
 .kind-toggle {
@@ -899,14 +834,6 @@ code, pre, kbd { font-family: var(--font-mono); }
 .dialog h2 { font-weight: 600; font-size: 1.25rem; letter-spacing: -0.02em; color: var(--text-head); margin: 0; }
 .dialog p { margin: 0; font-size: 0.9rem; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.25rem; }
-.camera-dialog { width: min(34rem, calc(100vw - 2rem)); }
-.camera-dialog video {
-  width: 100%;
-  max-height: 65vh;
-  border-radius: var(--radius-sm);
-  background: #000;
-  object-fit: contain;
-}
 .about { border-top: 1px solid var(--border); padding-top: 0.75rem; }
 
 .pull-progress { display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.88rem; }
@@ -1201,7 +1128,6 @@ code, pre, kbd { font-family: var(--font-mono); }
   font-size: 0.88rem;
   box-shadow: var(--shadow);
   max-width: min(36rem, calc(100vw - 2rem));
-  pointer-events: none; /* it sits over the composer: never in the way of a click */
 }
 .toast.error { background: var(--danger); color: #fff; }
 

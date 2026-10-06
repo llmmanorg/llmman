@@ -8,12 +8,6 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- The page's camera button and voice input; asked for on first use. -->
-    <uses-permission android:name="android.permission.CAMERA" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <!-- Optional: a device without either still installs. -->
-    <uses-feature android:name="android.hardware.camera" android:required="false" />
-    <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
     <!-- Only arm64: that is the one Android build llama.cpp publishes. -->
     <supports-screens

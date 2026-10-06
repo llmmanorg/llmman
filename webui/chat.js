@@ -2,27 +2,20 @@
 // conversation (`current`) is open at a time and persisted after every
 // change; a streaming reply re-renders its markdown once per frame.
 // With a media generation model selected, each prompt becomes an image,
-// a video or an audio clip instead, shown inline as the reply. Otherwise
-// a prompt can carry pictures, be grounded in a web search or dictated,
-// and its reply read aloud.
+// a video or an audio clip instead, shown inline as the reply.
 
 import * as api from "./api.js";
-import * as attach from "./attach.js";
 import * as db from "./db.js";
 import * as models from "./models.js";
 import * as settings from "./settings.js";
-import * as voice from "./voice.js";
-import { groundedPrompt, hostOf } from "./websearch.js";
-import { IncrementalRenderer, SAFE_URL } from "./markdown.js";
-import { $, $$, toast, copyText, autosize, greeting, icon, iconButton, flashCopied, formatBytes, externalLink } from "./util.js";
+import { IncrementalRenderer } from "./markdown.js";
+import { $, $$, toast, copyText, autosize, greeting, icon, iconButton, flashCopied, formatBytes } from "./util.js";
 
 let current = null; // the open conversation, or null for a fresh one
 let streaming = null; // { abort: AbortController, node, message }
 const deleted = new Set(); // ids a still-finishing generate() must not write back
 const listeners = new Set();
 let stickToBottom = true;
-let pendingImages = []; // [{blob, width, height}] waiting to go with the next message
-let preparing = 0; // pictures being shrunk: sending waits, or they would join the next message
 
 /** Called with no arguments whenever the list of conversations may have changed. */
 export function onChange(fn) {
@@ -78,9 +71,6 @@ export function init() {
   });
   initPromptSettings();
   initKindToggle();
-  initAttachments();
-  initToggles();
-  initVoice();
   updateComposerMode();
   updateGreeting();
   setInterval(updateGreeting, 60_000);
@@ -104,7 +94,7 @@ function updateSendState() {
     send.disabled = false;
     return;
   }
-  send.disabled = preparing > 0 || !$("#prompt").value.trim() || !models.selected();
+  send.disabled = !$("#prompt").value.trim() || !models.selected();
 }
 
 // ---- Media generation mode ----------------------------------------------
@@ -164,10 +154,6 @@ function updateComposerMode() {
   btn.title = generating ? "Generation settings" : "Chat settings";
   btn.setAttribute("aria-label", btn.title);
   $("#settings-media").dataset.kind = opts.kind;
-  // Pictures, search, thinking and voice mode are for chat models.
-  if (generating && voiceMode) setVoiceMode(false); // not a loop that would send media prompts unseen
-  for (const el of $$(".chat-only")) el.classList.toggle("hidden", generating || (el.id === "voice-btn" && !voiceAvailable()));
-  updateToggles();
 }
 
 function initKindToggle() {
@@ -184,7 +170,6 @@ function initPromptSettings() {
   const sys = $("#system-prompt");
   const temp = $("#temperature");
   const max = $("#max-tokens");
-  const thinking = $("#thinking");
   const media = {
     width: $("#media-width"),
     height: $("#media-height"),
@@ -213,7 +198,6 @@ function initPromptSettings() {
     sys.value = current?.systemPrompt ?? settings.get("systemPrompt") ?? "";
     temp.value = current?.temperature ?? "";
     max.value = current?.maxTokens ?? "";
-    thinking.value = thinkingLevel();
     pop.classList.remove("hidden");
     position();
     (generating ? media.steps : sys).focus();
@@ -248,7 +232,6 @@ function initPromptSettings() {
     await saveSettings({ systemPrompt: sys.value, temperature: num(temp), maxTokens: num(max, true) });
   };
   for (const input of [sys, temp, max]) input.addEventListener("change", save);
-  thinking.addEventListener("change", () => setThinking(thinking.value));
 
   const saveMedia = async () => {
     // Some backends need both dimensions or neither.
@@ -270,286 +253,14 @@ function initPromptSettings() {
 
 let pendingSettings = null;
 
-// ---- Thinking and web search -------------------------------------------------
-
-/** The conversation's thinking: "" (the model decides), "none" or a reasoning effort. */
-function thinkingLevel() {
-  return current?.thinking ?? pendingSettings?.thinking ?? "";
-}
-
-const thinkingOn = () => !["", "none"].includes(thinkingLevel());
-
-async function setThinking(level) {
-  const saved = saveSettings({ thinking: level });
-  updateToggles();
-  await saved;
-}
-
-function initToggles() {
-  // Search is a way of asking, so a page preference rather than a conversation's.
-  $("#search-btn").addEventListener("click", () => {
-    settings.set({ webSearch: !settings.get("webSearch") });
-    updateToggles();
-  });
-  // On is "high"; the settings popover has the finer choices.
-  $("#think-btn").addEventListener("click", () => setThinking(thinkingOn() ? "" : "high"));
-}
-
-function updateToggles() {
-  const search = settings.get("webSearch");
-  const searchBtn = $("#search-btn");
-  searchBtn.setAttribute("aria-pressed", String(search));
-  searchBtn.title = search ? "Searching the web (click to turn off)" : "Search the web";
-  const level = thinkingLevel();
-  const thinkBtn = $("#think-btn");
-  thinkBtn.setAttribute("aria-pressed", String(thinkingOn()));
-  thinkBtn.title = thinkingOn()
-    ? `Deep thinking: ${level} (click for the model's default)`
-    : level === "none"
-      ? "Thinking is off (click to turn on deep thinking)"
-      : "Deep thinking";
-}
-
-// ---- Pictures ------------------------------------------------------------------
-
-function initAttachments() {
-  const input = $("#attach-input");
-  const cameraInput = $("#camera-input");
-  $("#attach-btn").addEventListener("click", () => input.click());
-  $("#camera-btn").addEventListener("click", takePhoto);
-  for (const el of [input, cameraInput]) {
-    el.addEventListener("change", () => {
-      const files = Array.from(el.files);
-      el.value = ""; // so choosing the same file again is a change
-      addImages(files);
-    });
-  }
-  $("#prompt").addEventListener("paste", (e) => {
-    const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith("image/"));
-    if (!files.length || mediaKinds().length) return;
-    e.preventDefault();
-    addImages(files);
-  });
-}
-
-async function takePhoto() {
-  if (!attach.canCapture()) {
-    $("#camera-input").click(); // not a secure context: the phone's camera app
-    return;
-  }
-  try {
-    const photo = await attach.capturePhoto();
-    if (photo) await addImages([photo]);
-  } catch (e) {
-    toast(attach.deviceError(e), "error");
-  }
-}
-
-/** Shrinks `files` and adds them to the next message, up to the limit. */
-async function addImages(files) {
-  const room = Math.max(0, attach.MAX_IMAGES - pendingImages.length);
-  if (files.length > room) toast(`At most ${attach.MAX_IMAGES} images go with a message`);
-  preparing++;
-  updateSendState();
-  try {
-    for (const file of files.slice(0, room)) {
-      try {
-        const image = await attach.prepare(file);
-        if (pendingImages.length < attach.MAX_IMAGES) pendingImages.push(image);
-      } catch (e) {
-        toast(e.message, "error");
-      }
-    }
-  } finally {
-    preparing--;
-    updateSendState();
-  }
-  renderAttachments();
-  const model = models.selected();
-  if (pendingImages.length && model && !models.acceptsImages(model)) {
-    toast(`${models.displayName(model)} cannot read images; pick a vision model before sending`);
-  }
-}
-
-function renderAttachments() {
-  const strip = $("#attachments");
-  strip.replaceChildren(
-    ...pendingImages.map((image) => {
-      const thumb = document.createElement("div");
-      thumb.className = "thumb";
-      const img = document.createElement("img");
-      img.src = urlFor(image.blob);
-      img.alt = "Attached image";
-      thumb.appendChild(img);
-      const remove = iconButton(
-        "i-x",
-        "Remove image",
-        () => {
-          pendingImages = pendingImages.filter((i) => i !== image);
-          renderAttachments();
-        },
-        "icon-btn thumb-remove",
-      );
-      thumb.appendChild(remove);
-      return thumb;
-    }),
-  );
-  strip.classList.toggle("hidden", !pendingImages.length);
-}
-
-// ---- Voice ---------------------------------------------------------------------
-//
-// The mic dictates into the composer. Voice mode is the hands-free loop:
-// what is heard is sent at the pause, the reply is read aloud, and the
-// microphone opens again.
-
-let listening = null; // the voice.listen() controller while the microphone is open
-let voiceMode = false;
-let reading = null; // the "Read aloud" button of the message being spoken
-
-const voiceAvailable = () => voice.canListen() && voice.canSpeak();
-
-function initVoice() {
-  const mic = $("#mic-btn");
-  mic.classList.toggle("hidden", !voice.canListen());
-  mic.addEventListener("click", () => (listening ? listening.stop() : startListening()));
-  $("#voice-btn").addEventListener("click", () => setVoiceMode(!voiceMode));
-}
-
-/** The chat view is no longer showing: stop listening and speaking. */
-export function leave() {
-  setVoiceMode(false);
-}
-
-function setVoiceMode(on) {
-  voiceMode = on && voiceAvailable();
-  const btn = $("#voice-btn");
-  btn.setAttribute("aria-pressed", String(voiceMode));
-  btn.title = voiceMode ? "Voice mode is on (click to stop)" : "Voice mode: speak, and hear the reply";
-  if (voiceMode) {
-    if (!streaming) startListening();
-  } else {
-    stopListening();
-    stopReading();
-  }
-}
-
-function setMic(on) {
-  const mic = $("#mic-btn");
-  mic.setAttribute("aria-pressed", String(on));
-  mic.classList.toggle("listening", on);
-  mic.title = on ? "Stop listening" : "Dictate";
-  const status = $("#composer-status");
-  if (!on && ["Listening…", "Transcribing…"].includes(status.textContent)) status.textContent = "";
-}
-
-function stopListening() {
-  if (!listening) return;
-  listening.cancel();
-  listening = null;
-  setMic(false);
-}
-
-/** Listens for one utterance, shown in the composer; in voice mode it is then sent. */
-function startListening() {
-  if (listening || streaming) return;
-  stopReading();
-  const prompt = $("#prompt");
-  const before = prompt.value.trim() ? `${prompt.value.trimEnd()} ` : "";
-  const startedAt = performance.now();
-  const show = (text) => {
-    prompt.value = before + text;
-    autosize(prompt);
-    updateSendState();
-  };
-  let over = false;
-  const finish = () => {
-    over = true;
-    listening = null;
-    setMic(false);
-  };
-  const model = models.selected();
-  setMic(true);
-  listening = voice.listen({
-    transcribe: (audio, signal) => api.transcribe({ model, audio, signal }),
-    onState: (state) => {
-      if (!over) $("#composer-status").textContent = state === "transcribing" ? "Transcribing…" : "Listening…";
-    },
-    onInterim: (text) => !over && show(text),
-    onDone: (text) => {
-      finish();
-      if (text) show(text);
-      if (!voiceMode) return;
-      if (text) {
-        submit();
-        if (!streaming) {
-          // Not sent (pictures still being prepared): the loop would be dead, so end it.
-          setVoiceMode(false);
-          toast("Voice mode stopped: the message was not sent", "error");
-        }
-      } else if (performance.now() - startedAt < 1500) {
-        // Silence takes seconds; an instant end is a failure that would loop.
-        setVoiceMode(false);
-        toast("Voice mode stopped: nothing could be heard", "error");
-      } else {
-        startListening();
-      }
-    },
-    onError: (message) => {
-      finish();
-      toast(message, "error");
-      setVoiceMode(false);
-    },
-  });
-}
-
-/** Says `message` aloud on behalf of `btn`; `then` runs if it was said to the end. */
-function readAloud(message, btn, then) {
-  stopReading();
-  reading = btn;
-  btn?.classList.add("speaking");
-  voice.speak(message.content, (error) => {
-    if (reading === btn) {
-      reading = null;
-      btn?.classList.remove("speaking");
-    }
-    if (error) {
-      toast(error, "error");
-      setVoiceMode(false);
-    } else {
-      then?.();
-    }
-  });
-}
-
-function stopReading() {
-  voice.stopSpeaking();
-  reading?.classList.remove("speaking");
-  reading = null;
-}
-
-/** Voice mode, after a reply: say it, then listen for the next question. */
-function continueVoice(conv, message, node) {
-  if (!voiceMode || conv !== current) return;
-  if (message.error) {
-    setVoiceMode(false);
-  } else if (message.stopped || !message.content) {
-    startListening(); // the speaker cut the reply short: their turn
-  } else {
-    readAloud(message, node.querySelector(".act-speak"), () => voiceMode && startListening());
-  }
-}
-
 // ---- Conversation lifecycle -------------------------------------------
 
 /** Start a fresh, unsaved conversation. */
 export function newConversation() {
   if (streaming) stop();
-  setVoiceMode(false); // leaving a conversation ends what is being heard or said
   current = null;
   pendingSettings = null;
   releaseObjectUrls();
-  renderAttachments(); // their object URLs were just released
   $("#messages").replaceChildren();
   $("#view-chat").classList.add("empty");
   $("#topbar-title").textContent = "";
@@ -570,7 +281,6 @@ export async function open(id, stillWanted = () => true) {
   if (!conv) return false;
   if (!stillWanted()) return true;
   if (streaming) stop();
-  setVoiceMode(false); // leaving a conversation ends what is being heard or said
   current = conv;
   pendingSettings = null;
   if (conv.model && conv.model !== models.selected()) {
@@ -630,7 +340,6 @@ function ensureConversation(firstText) {
     systemPrompt: pendingSettings?.systemPrompt ?? settings.get("systemPrompt") ?? "",
     temperature: pendingSettings?.temperature ?? null,
     maxTokens: pendingSettings?.maxTokens ?? null,
-    thinking: pendingSettings?.thinking ?? "",
     media: pendingSettings?.media ?? null,
     messages: [],
   };
@@ -649,32 +358,20 @@ function titleFrom(text) {
 async function submit() {
   const prompt = $("#prompt");
   const text = prompt.value.trim();
-  if (!text || streaming || preparing) return;
+  if (!text || streaming) return;
   const model = models.selected();
   if (!model) {
     toast("Choose a model first");
     $("#model-btn").click();
     return;
   }
-  // A media model takes no pictures; any waiting stay for a chat model.
-  const images = mediaKinds().length ? [] : pendingImages;
-  if (images.length && !models.acceptsImages(model)) {
-    toast(`${models.displayName(model)} cannot read images; pick a vision model or remove them`, "error");
-    return;
-  }
-  stopListening(); // sending ends any dictation still open
   prompt.value = "";
   autosize(prompt);
-  if (images.length) {
-    pendingImages = [];
-    renderAttachments();
-  }
   updateSendState();
 
   ensureConversation(text);
   current.model = model;
   const userMsg = { role: "user", content: text, at: Date.now() };
-  if (images.length) userMsg.images = images;
   current.messages.push(userMsg);
   $("#messages").appendChild(renderMessage(userMsg, current.messages.length - 1));
   stickToBottom = true;
@@ -702,8 +399,17 @@ async function generate() {
   const turn = beginTurn(conv, message);
   const { node, status, abort } = turn;
   const remote = api.splitRemoteRef(model);
-  const waiting = !remote && !models.isLoaded(model) ? `Loading ${model}…` : "Thinking…";
-  status.textContent = waiting;
+  status.textContent = !remote && !models.isLoaded(model) ? `Loading ${model}…` : "Thinking…";
+
+  const history = [];
+  if (conv.systemPrompt?.trim()) history.push({ role: "system", content: conv.systemPrompt.trim() });
+  for (const m of conv.messages.slice(0, turn.index)) {
+    // Media prompts and replies are not part of a chat.
+    if (m.generate || m.request) continue;
+    if (m.role === "user" || (m.role === "assistant" && m.content)) {
+      history.push({ role: m.role, content: m.content });
+    }
+  }
 
   // Tokens arrive in bursts; showing them at a steady rate reads better.
   // Each frame releases a slice of what is pending, so the display trails
@@ -729,26 +435,11 @@ async function generate() {
   };
 
   try {
-    if (settings.get("webSearch")) {
-      const question = conv.messages.findLast((m) => m.role === "user")?.content;
-      if (question) {
-        status.textContent = "Searching the web…";
-        try {
-          message.sources = await api.webSearch(question, { signal: abort.signal });
-          renderAssistantBody(node, message, true);
-        } catch (e) {
-          if (e.name === "AbortError") throw e;
-          toast(`Web search failed, answering without it: ${e.message}`, "error");
-        }
-        status.textContent = waiting;
-      }
-    }
     const result = await api.chat({
       model,
-      messages: await chatHistory(conv, turn.index, model, message.sources),
+      messages: history,
       temperature: conv.temperature ?? undefined,
       maxTokens: conv.maxTokens ?? undefined,
-      reasoningEffort: conv.thinking || undefined,
       signal: abort.signal,
       onDelta: ({ content, reasoning }) => {
         if (status.textContent) status.textContent = "";
@@ -768,44 +459,7 @@ async function generate() {
     const empty = !message.content && !message.reasoning;
     if (empty && !message.stopped && !message.error) message.error = "The model returned nothing.";
     await endTurn(turn, empty && message.stopped);
-    continueVoice(conv, message, node);
   }
-}
-
-/**
- * The chat request's messages for the first `end` of `conv`: its system
- * prompt, then each turn, the newest question led by `sources` if this
- * turn was searched. Pictures take what the text leaves of the request
- * budget, newest first, and only go to a model that reads them. A message
- * whose pictures were left out says so, so the model does not answer as
- * if it saw them.
- */
-async function chatHistory(conv, end, model, sources) {
-  const turns = conv.messages.slice(0, end);
-  const lastUser = turns.findLastIndex((m) => m.role === "user");
-  const entries = [];
-  if (conv.systemPrompt?.trim()) entries.push({ role: "system", text: conv.systemPrompt.trim() });
-  turns.forEach((m, i) => {
-    if (m.generate || m.request) return; // a media prompt or reply is not part of a chat
-    if (m.role === "user") {
-      const text = i === lastUser && sources?.length ? groundedPrompt(m.content, sources) : m.content;
-      entries.push({ role: "user", text, images: m.images ?? [] });
-    } else if (m.role === "assistant" && m.content) {
-      entries.push({ role: "assistant", text: m.content });
-    }
-  });
-  const textBytes = new Blob([JSON.stringify(entries.map(({ role, text }) => ({ role, content: text })))]).size;
-  const sent = models.acceptsImages(model) ? attach.imagesToSend(entries, attach.REQUEST_BUDGET - textBytes) : new Set();
-  return Promise.all(
-    entries.map(async ({ role, text, images }) => {
-      if (!images) return { role, content: text };
-      const shown = images.filter((image) => sent.has(image));
-      const left = images.length - shown.length;
-      const note = left ? `\n\n[${left} attached image${left > 1 ? "s were" : " was"} not included]` : "";
-      const urls = await Promise.all(shown.map((image) => attach.toDataUrl(image.blob)));
-      return { role, content: attach.contentParts(text + note, urls) };
-    }),
-  );
 }
 
 /**
@@ -950,8 +604,7 @@ async function editFrom(index) {
   autosize($("#prompt"));
   $("#prompt").focus();
   updateSendState();
-  pendingImages = msg.images ? [...msg.images] : [];
-  renderAll(); // also redraws the pictures waiting in the composer
+  renderAll();
   if (!current.messages.length) {
     deleted.add(current.id);
     await db.remove(current.id);
@@ -961,7 +614,6 @@ async function editFrom(index) {
       systemPrompt: keep.systemPrompt,
       temperature: keep.temperature,
       maxTokens: keep.maxTokens,
-      thinking: keep.thinking ?? "",
       media: keep.media ?? null,
     };
     $("#view-chat").classList.add("empty");
@@ -977,9 +629,7 @@ async function editFrom(index) {
 
 function renderAll() {
   const list = $("#messages");
-  stopReading(); // the Read aloud button being rebuilt is the only way to stop it
   releaseObjectUrls();
-  renderAttachments(); // their object URLs were just released
   list.replaceChildren();
   if (!current) return;
   current.messages.forEach((m, i) => list.appendChild(renderMessage(m, i)));
@@ -991,17 +641,6 @@ function renderMessage(message, index) {
   node.dataset.index = String(index);
 
   if (message.role === "user") {
-    if (message.images?.length) {
-      const pictures = document.createElement("div");
-      pictures.className = "msg-images";
-      for (const image of message.images) {
-        const img = document.createElement("img");
-        img.src = urlFor(image.blob);
-        img.alt = "Attached image";
-        pictures.appendChild(img);
-      }
-      node.appendChild(pictures);
-    }
     const bubble = document.createElement("div");
     bubble.className = "bubble";
     bubble.textContent = message.content;
@@ -1028,11 +667,6 @@ function renderMessage(message, index) {
   const save = iconButton("i-save", "Download", () => downloadMedia(message));
   save.classList.add("act-download", "hidden");
   meta.appendChild(save);
-  if (voice.canSpeak()) {
-    const speak = iconButton("i-speaker", "Read aloud", (btn) => (reading === btn ? stopReading() : readAloud(message, btn)));
-    speak.classList.add("act-speak");
-    meta.appendChild(speak);
-  }
   meta.appendChild(iconButton("i-retry", "Retry", () => regenerateFrom(index)));
   const label = document.createElement("span");
   label.className = "msg-model";
@@ -1063,14 +697,8 @@ function renderAssistantBody(node, message, live) {
       thinking: null,
       collapsed: false,
       media: null,
-      sources: null,
     };
     views.set(node, view);
-  }
-
-  if (message.sources?.length && !view.sources) {
-    view.sources = renderSources(message.sources);
-    view.body.insertBefore(view.sources, view.content);
   }
 
   if (message.media?.blob && !view.media) {
@@ -1112,8 +740,6 @@ function renderAssistantBody(node, message, live) {
   }
 
   view.renderer.update(message.content || "");
-  // Nothing to say for an error or a generated picture.
-  node.querySelector(".act-speak")?.classList.toggle("hidden", !message.content);
 
   view.trailer.className = "";
   view.trailer.textContent = "";
@@ -1124,31 +750,6 @@ function renderAssistantBody(node, message, live) {
     view.trailer.className = "msg-status";
     view.trailer.textContent = "Stopped";
   }
-}
-
-/** The pages a reply was grounded in, numbered as the reply cites them. */
-function renderSources(sources) {
-  const details = document.createElement("details");
-  details.className = "sources";
-  const summary = document.createElement("summary");
-  const count = `${sources.length} source${sources.length > 1 ? "s" : ""}`;
-  const chev = icon("i-chevron");
-  chev.classList.add("chev");
-  summary.append(icon("i-globe"), document.createTextNode(`Searched the web · ${count}`), chev);
-  const list = document.createElement("ol");
-  for (const source of sources) {
-    const item = document.createElement("li");
-    // These come from the open web: only http(s) becomes a link.
-    const label = SAFE_URL.test(source.url) ? externalLink(source.url) : document.createElement("span");
-    label.textContent = source.title;
-    const meta = document.createElement("span");
-    meta.className = "source-meta";
-    meta.textContent = [hostOf(source.url), source.published].filter(Boolean).join(" · ");
-    item.append(label, meta);
-    list.appendChild(item);
-  }
-  details.append(summary, list);
-  return details;
 }
 
 function copyButton(message) {

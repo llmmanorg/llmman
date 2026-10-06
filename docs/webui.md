@@ -29,41 +29,6 @@ sidebar:
   that names the file as `run` does. Each prompt stands alone: a
   diffusion model has no conversation. *Stop* abandons the request; a
   video or audio generation already running finishes on the daemon.
-
-  A chat model's composer also has:
-
-  - **Deep thinking.** The light bulb asks a reasoning model to think at
-    length; *Chat settings* has Off, Low, Medium and High. It is sent as
-    `reasoning_effort` ([api.md](api.md#openai-api-notes)), which a model
-    that does not reason ignores.
-  - **Pictures.** The paperclip attaches images (or paste them) and the
-    camera button takes a photo, up to four to a message. Each is shrunk
-    to a JPEG of at most 1280 pixels and sent as an `image_url` part, so
-    a local model needs `vision` in its `/api/show` capabilities (the page
-    says when it lacks it; a hosted model is assumed to). The daemon reads
-    at most 2 MiB of a chat request, so the newest pictures that fit
-    with the text go with it, and a message whose pictures were left out
-    says so to the model. All stay in the conversation.
-  - **Search the web.** The globe grounds each reply in a web search: the
-    daemon asks [Exa](https://exa.ai) (needs a key, see
-    [configuration.md](configuration.md#web-search)), the numbered results
-    go ahead of the question for that turn only, and the reply cites them
-    as `[1]`, `[2]` above a list of sources. If the search fails the
-    reply goes ahead without it. The question you typed goes to Exa, the
-    one thing a prompt sends off the machine. The results are untrusted
-    pages and the prompt says so, which makes an injected instruction
-    less likely to work, not impossible.
-  - **Voice.** The microphone dictates into the composer; *Voice mode*
-    (the headphones) is hands-free: what is heard is sent at the pause,
-    the reply is read aloud, and the microphone opens again. Every reply
-    has a *Read aloud* button. Listening uses the browser's speech
-    recognition where it has one (Chrome's goes to its vendor). Without
-    one, as in Firefox and the [Android app](android.md), the page
-    records and has the daemon transcribe over `/v1/audio/transcriptions`,
-    which needs the selected model to take audio input. The camera and
-    microphone need a secure context (`127.0.0.1` or HTTPS); over plain
-    HTTP on a LAN address the camera button opens the phone's camera app
-    and the microphone is unavailable.
 - **Models** (`#/models`) — opens on popular models
   (`/llmman/search/popular`: Docker Hub's most pulled, then Hugging
   Face's most downloaded GGUF), searches Docker Hub and Hugging Face
@@ -87,10 +52,9 @@ sidebar:
   claude --model …` or `llmman ps` work as they would in any terminal.
   Shift- or cmd/ctrl-click a URL in the output to open it in a new tab.
 
-Conversations, generated media and attached pictures are stored in the
-browser (IndexedDB), not by the daemon; *Settings* can export
-conversations as JSON (without media or pictures) or delete them. Theme
-follows the system unless set.
+Conversations and generated media are stored in the browser (IndexedDB),
+not by the daemon; *Settings* can export conversations as JSON (without
+the media) or delete them. Theme follows the system unless set.
 
 A daemon that requires an API key ([api.md](api.md#authentication))
 serves the page itself without one — it is only files — and the page

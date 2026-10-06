@@ -38,16 +38,6 @@ on Android 9 a file picker asks where), and the *Shell* tab — a `/system/bin/s
 `llmman` on `PATH`. Diffusion models are not supported: the mediagen
 backend needs GPU libraries the phone lacks.
 
-The camera button and microphone (photos, voice input) ask for the
-`CAMERA` and `RECORD_AUDIO` permissions on first use; refusing leaves the
-rest working, and only the app's own page is granted them. A WebView has
-no speech recognition, so voice input records the microphone and has the
-on-device daemon transcribe it, which needs a model that takes audio
-input ([webui.md](webui.md)). *Search the web* needs an
-[Exa key](configuration.md#web-search): set it from the *Shell* tab with
-`llmman config set websearch.api_key …`, then stop the daemon from the
-notification and reopen the app.
-
 The daemon binds loopback only, which keeps the network out but not other
 apps on the phone — Android's loopback is shared. So it runs with an API
 key ([api.md](api.md#authentication)) generated once per install into the
