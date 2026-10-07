@@ -394,7 +394,7 @@ impl Provider {
 pub fn key_for(id: &str, var: Option<&str>) -> Option<String> {
     resolve_key(
         var.and_then(key_from_env),
-        crate::config::provider_api_key(id),
+        crate::config::provider_api_key(id).as_deref(),
     )
 }
 

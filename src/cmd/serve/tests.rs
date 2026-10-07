@@ -4809,6 +4809,64 @@ fn an_authenticated_caller_may_spend_the_daemon_provider_key() {
     assert!(!daemon_key_spendable(&test_state(), Some(&cross_site)));
 }
 
+/// Setting a provider key follows the rule for spending one: a keyed
+/// daemon's caller may, an open daemon's page on another site may not.
+#[test]
+fn provider_keys_are_set_only_by_whoever_may_spend_them() {
+    let mut cross_site = HeaderMap::new();
+    cross_site.insert("sec-fetch-site", "cross-site".parse().unwrap());
+    let keyed = keyed_state(&["k"]);
+    assert_eq!(provider_key_write_refusal(&keyed, &cross_site), None);
+    assert_eq!(provider_key_write_refusal(&keyed, &HeaderMap::new()), None);
+    assert!(provider_key_write_refusal(&test_state(), &cross_site)
+        .is_some_and(|r| r.contains("another site")));
+}
+
+/// `PUT|DELETE /llmman/providers/:id/key` sit behind the daemon's key
+/// like every route, refuse an open daemon's cross-site page, and take
+/// one non-blank line; none of their answers carries a key.
+#[tokio::test]
+async fn the_provider_key_route_checks_before_it_writes() {
+    let mut inner = test_inner(std::env::temp_dir());
+    inner.auth = auth::Policy::with_keys(["k"]);
+    let keyed = serve_router(AppState(Arc::new(inner))).await;
+    let client = Client::new();
+    let route = format!("{keyed}/llmman/providers/anthropic/key");
+
+    let anonymous = client
+        .put(&route)
+        .json(&serde_json::json!({"api_key": "sk-secret"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    let anonymous = client.delete(&route).send().await.unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    for blank in ["", "  ", "sk-a\nsk-b"] {
+        let r = client
+            .put(&route)
+            .bearer_auth("k")
+            .json(&serde_json::json!({ "api_key": blank }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{blank:?}");
+        assert!(!r.text().await.unwrap().contains("sk-"), "{blank:?}");
+    }
+
+    let open = serve_router(test_state()).await;
+    let r = client
+        .put(format!("{open}/llmman/providers/anthropic/key"))
+        .header("sec-fetch-site", "cross-site")
+        .json(&serde_json::json!({"api_key": "sk-secret"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    assert!(!r.text().await.unwrap().contains("sk-secret"));
+}
+
 /// The browser cannot set a header on an upgrade, so the shell takes
 /// the key as a subprotocol and echoes it, as the handshake requires.
 #[tokio::test]

@@ -47,7 +47,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, PoisonError, RwLock};
 
 use serde::Deserialize;
 
@@ -339,10 +339,10 @@ impl Conf {
     ///
     /// A blank value is kept here rather than dropped, so a user file can
     /// blank out a key `/etc` set — otherwise there is no way to opt out
-    /// of a system-wide credential. [`load_provider_keys`] drops blanks
+    /// of a system-wide credential. [`provider_keys_in`] drops blanks
     /// after merging, since sending `Authorization: Bearer ` upstream
     /// would turn a clear "no API key" into someone else's 401.
-    fn provider_keys(&self) -> HashMap<String, String> {
+    pub(crate) fn provider_keys(&self) -> HashMap<String, String> {
         self.providers
             .iter()
             .filter_map(|(id, p)| Some((id.clone(), p.api_key.as_deref()?.trim().to_string())))
@@ -493,9 +493,14 @@ fn load() -> Result<Vec<File>, String> {
     if cfg!(test) {
         return Ok(Vec::new());
     }
+    load_from(search_paths())
+}
 
+/// The files among `paths` that exist, parsed. Split out from [`load`]
+/// so a test can point it at a temporary directory.
+fn load_from(paths: Vec<PathBuf>) -> Result<Vec<File>, String> {
     let mut files = Vec::new();
-    for path in search_paths() {
+    for path in paths {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             // Absence is the common case: most machines never have one.
@@ -760,19 +765,55 @@ fn configured_from(files: &[File]) -> Vec<ConfiguredProvider> {
 /// by the id `llmman providers` prints, not by the environment variable,
 /// which is models.dev's naming rather than llmman's.
 ///
-/// Borrowed from a process-lifetime cache, so a daemon serving requests
-/// is not stat'ing `/etc` per token.
-pub fn provider_api_key(provider_id: &str) -> Option<&'static str> {
-    static CACHE: OnceLock<HashMap<String, String>> = OnceLock::new();
-    CACHE
-        .get_or_init(load_provider_keys)
+/// From a process-lifetime cache, so a daemon serving requests is not
+/// stat'ing `/etc` per token; [`reload_provider_keys`] refreshes it after
+/// `PUT /llmman/providers/:id/key` writes one.
+pub fn provider_api_key(provider_id: &str) -> Option<String> {
+    if let Some(keys) = PROVIDER_KEYS
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+    {
+        return keys.get(provider_id).cloned();
+    }
+    PROVIDER_KEYS
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(|| provider_keys_in(files().unwrap_or_default()))
         .get(provider_id)
-        .map(String::as_str)
+        .cloned()
 }
 
-fn load_provider_keys() -> HashMap<String, String> {
+static PROVIDER_KEYS: RwLock<Option<HashMap<String, String>>> = RwLock::new(None);
+
+/// Re-reads the provider keys of every `llmman.conf`, so a key the daemon
+/// just wrote is spent from the next request on, without a restart. The
+/// other settings (aliases, providers, policy) keep their startup values.
+pub fn reload_provider_keys() {
+    let paths = if cfg!(test) {
+        Vec::new()
+    } else {
+        search_paths()
+    };
+    reload_provider_keys_from(paths);
+}
+
+fn reload_provider_keys_from(paths: Vec<PathBuf>) {
+    match load_from(paths) {
+        Ok(files) => {
+            *PROVIDER_KEYS
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = Some(provider_keys_in(&files));
+        }
+        // The keys in force stay: a file broken by a hand edit must not
+        // switch every provider off.
+        Err(e) => eprintln!("[llmman] warning: {e}; provider keys not reloaded"),
+    }
+}
+
+fn provider_keys_in(files: &[File]) -> HashMap<String, String> {
     let mut accepted = Vec::new();
-    for file in files().unwrap_or_default() {
+    for file in files {
         let keys = file.conf.provider_keys();
         // The mode gate is for a file that holds a secret. One that only
         // blanks a key out does not.
@@ -861,7 +902,7 @@ pub fn peer_api_key() -> Option<String> {
         .filter(|k| !k.is_empty())
 }
 
-/// The last file that sets a secret field, behind [`load_provider_keys`]'s
+/// The last file that sets a secret field, behind [`provider_keys_in`]'s
 /// mode gate: a loose file is skipped with a warning. A blank is returned
 /// as such — it is how a user file clears a system-wide value.
 fn secret_from_files<'a>(
@@ -921,6 +962,37 @@ pub(crate) fn owner_readable_only(_path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key written while the daemon runs is spent from the next
+    /// request on: the reload re-reads the files, behind the same mode
+    /// gate as at startup.
+    #[cfg(unix)]
+    #[test]
+    fn reloaded_provider_keys_take_effect_without_a_restart() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let id = "llmman-test-reload";
+        let dir = std::env::temp_dir().join(format!("llmman-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join(FILE);
+        std::fs::write(&path, format!("[providers.{id}]\napi_key = \"sk-new\"\n")).expect("write");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        reload_provider_keys_from(vec![path.clone()]);
+        assert_eq!(
+            provider_api_key(id),
+            None,
+            "a world-readable file's key is ignored"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        reload_provider_keys_from(vec![path.clone()]);
+        assert_eq!(provider_api_key(id).as_deref(), Some("sk-new"));
+
+        reload_provider_keys_from(Vec::new());
+        assert_eq!(provider_api_key(id), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn conf(text: &str) -> Conf {
         parse(text).expect("valid conf")

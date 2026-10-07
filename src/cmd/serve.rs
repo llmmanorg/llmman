@@ -17,7 +17,7 @@ use axum::extract::{
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use clap::Args;
 use futures::StreamExt;
@@ -3106,6 +3106,111 @@ async fn handle_llmman_provider(
     Ok(Json(response))
 }
 
+/// `PUT /llmman/providers/:id/key`.
+#[derive(Deserialize)]
+struct ProviderKeyBody {
+    api_key: String,
+}
+
+/// What `PUT|DELETE /llmman/providers/:id/key` answer: never the key.
+#[derive(Serialize)]
+struct ProviderKeyResponse {
+    id: String,
+    /// See [`ProviderSummary::key_usable`].
+    key_usable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_env: Option<String>,
+    /// The provider's environment variable is set in the daemon's
+    /// environment: it wins over the stored key (see
+    /// `crate::providers::key_for`).
+    env_override: bool,
+}
+
+/// `PUT /llmman/providers/:id/key`: stores the key in the per-user
+/// llmman.conf, as `llmman config set providers.<id>.api_key` does, and
+/// spends it from the next request on.
+async fn handle_set_provider_key(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+    Json(body): Json<ProviderKeyBody>,
+) -> Result<Json<ProviderKeyResponse>, AppError> {
+    let key = body.api_key.trim();
+    if key.is_empty() || key.contains(['\n', '\r']) {
+        return Err(AppError(
+            anyhow!("api_key must be one non-blank line"),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    store_provider_key(state, headers, id, Some(key.to_string())).await
+}
+
+/// `DELETE /llmman/providers/:id/key`: removes the per-user llmman.conf's
+/// key. One in `/etc/llmman/llmman.conf` or the environment still applies,
+/// which `key_usable` shows.
+async fn handle_delete_provider_key(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<ProviderKeyResponse>, AppError> {
+    store_provider_key(state, headers, id, None).await
+}
+
+async fn store_provider_key(
+    state: AppState,
+    headers: HeaderMap,
+    id: String,
+    key: Option<String>,
+) -> Result<Json<ProviderKeyResponse>, AppError> {
+    if let Some(reason) = provider_key_write_refusal(&state, &headers) {
+        return Err(AppError(anyhow!(reason), StatusCode::FORBIDDEN));
+    }
+    let catalog = provider_catalog().await?;
+    if catalog.get(&id).is_none() {
+        return Err(AppError(
+            crate::providers::unknown_provider_error(&id, &catalog),
+            StatusCode::NOT_FOUND,
+        ));
+    }
+    let path = crate::config::user_path()
+        .ok_or_else(|| anyhow!("no home directory to hold llmman.conf"))?;
+    let provider_id = id.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::cmd::config::write_provider_key(&path, &provider_id, key.as_deref())
+    })
+    .await
+    .map_err(|e| anyhow!("writing llmman.conf: {e}"))??;
+    let provider = catalog.get(&id).expect("looked up above");
+    let key_env = provider.key_env.clone();
+    let env_override = key_env
+        .as_deref()
+        .is_some_and(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()));
+    Ok(Json(ProviderKeyResponse {
+        key_usable: daemon_key_usable(&state, provider),
+        id,
+        key_env,
+        env_override,
+    }))
+}
+
+/// Why this request may not set a provider key, or `None` when it may:
+/// the same condition as spending one ([`daemon_key_spendable`]). A
+/// daemon others can reach without a key of its own must not let them
+/// plant one, nor may a page on another site acting through the
+/// operator's browser.
+fn provider_key_write_refusal(state: &AppState, headers: &HeaderMap) -> Option<&'static str> {
+    if daemon_key_spendable(state, Some(headers)) {
+        None
+    } else if is_cross_site(Some(headers)) {
+        Some("provider keys cannot be set from another site's page")
+    } else {
+        Some(
+            "llmman serve is reachable beyond loopback without LLMMAN_API_KEYS, \
+             so provider keys cannot be set over HTTP; use `llmman config set` on that computer",
+        )
+    }
+}
+
 /// How long a configured provider gets to answer `GET /models`. Short:
 /// this sits in front of `llmman launch`, and a box that is down should
 /// cost a moment, not a hang.
@@ -3626,6 +3731,10 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         // llmman's own API — see handle_llmman_providers
         .route("/llmman/providers", get(handle_llmman_providers))
         .route("/llmman/providers/:id", get(handle_llmman_provider))
+        .route(
+            "/llmman/providers/:id/key",
+            put(handle_set_provider_key).delete(handle_delete_provider_key),
+        )
         .route("/llmman/node", get(aggregation::handle_node))
         .route("/llmman/search", get(search::handle_search))
         .route("/llmman/search/popular", get(search::handle_popular))

@@ -314,6 +314,34 @@ fn unset(args: &ConfigArgs, opts: &UnsetArgs) -> Result<()> {
     save(&path, &doc)
 }
 
+/// Sets (`Some`) or removes (`None`) `providers.<id>.api_key` in the
+/// file at `path` — what `llmman config set|unset` do, for
+/// `PUT|DELETE /llmman/providers/:id/key` — then reloads the daemon's
+/// provider keys. `Ok(false)` when there was no key to remove.
+///
+/// One write at a time: two requests interleaving read → edit → save
+/// would each save the file without the other's key (and share the
+/// temporary file's name).
+pub(crate) fn write_provider_key(path: &Path, id: &str, key: Option<&str>) -> Result<bool> {
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = WRITING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let name = format!("providers.{}.api_key", crate::config::toml_key(id));
+    let mut doc = read(path)?;
+    match key {
+        Some(key) => set_in(&mut doc, &name, key)?,
+        None => {
+            if unset_in(&mut doc, &name).is_err() {
+                return Ok(false);
+            }
+        }
+    }
+    save(path, &doc)?;
+    crate::config::reload_provider_keys();
+    Ok(true)
+}
+
 /// Split out from [`set`] to be testable without a file, a home
 /// directory, or a particular umask.
 fn set_in(doc: &mut DocumentMut, name: &str, value: &str) -> Result<()> {
@@ -774,6 +802,67 @@ mod tests {
             assert_eq!(mode(&path), 0o600, "{key}");
         }
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two `PUT /llmman/providers/:id/key` at once: each one's key is in
+    /// the file afterwards, and the file still parses.
+    #[test]
+    fn concurrent_provider_key_writes_keep_both() {
+        let dir = scratch("provider-keys-race");
+        let path = dir.join("llmman.conf");
+        std::fs::remove_file(&path).ok();
+        let ids: Vec<String> = (0..8).map(|i| format!("p{i}")).collect();
+        std::thread::scope(|s| {
+            for id in &ids {
+                let path = &path;
+                s.spawn(move || {
+                    write_provider_key(path, id, Some(&format!("key-{id}"))).expect("write")
+                });
+            }
+        });
+        let conf =
+            crate::config::parse(&std::fs::read_to_string(&path).expect("read")).expect("parses");
+        let keys = conf.provider_keys();
+        for id in &ids {
+            assert_eq!(
+                keys.get(id).map(String::as_str),
+                Some(format!("key-{id}").as_str()),
+                "{id}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The per-user file a first `PUT` creates is 0600 from the start; a
+    /// stricter mode an existing file has is kept; `DELETE` removes only
+    /// the key, and reports when there was none.
+    #[cfg(unix)]
+    #[test]
+    fn provider_key_writes_keep_the_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("provider-keys-mode");
+        let path = dir.join("llmman.conf");
+        let mode = |p: &Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+        std::fs::remove_file(&path).ok();
+
+        assert!(write_provider_key(&path, "anthropic", Some("sk-a")).expect("set"));
+        assert_eq!(mode(&path), 0o600, "a new file holding a key");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).expect("chmod");
+        assert!(write_provider_key(&path, "openai", Some("sk-o")).expect("set"));
+        assert_eq!(mode(&path), 0o400, "a stricter mode is kept");
+
+        assert!(write_provider_key(&path, "anthropic", None).expect("unset"));
+        assert!(!write_provider_key(&path, "anthropic", None).expect("unset again"));
+        let conf =
+            crate::config::parse(&std::fs::read_to_string(&path).expect("read")).expect("parses");
+        assert_eq!(conf.provider_keys().get("anthropic"), None);
+        assert_eq!(
+            conf.provider_keys().get("openai").map(String::as_str),
+            Some("sk-o")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

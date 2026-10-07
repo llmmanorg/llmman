@@ -9,7 +9,7 @@ Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
 | Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/pull`, `/api/push`, `/api/copy`, `/api/create`, `/api/blobs/{digest}`, `/api/ps`, `/api/delete`, `/api/version` |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`) |
 | Anthropic | `/v1/messages` |
-| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/shell` |
+| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/providers/{id}/key`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/shell` |
 | Web UI | `/` and `/ui/*` — see [webui.md](webui.md) |
 | llama.cpp | `/props` |
 | Prometheus | `/metrics` (off unless `LLMMAN_METRICS` is `1`, `true`, `yes` or `on`) |
@@ -145,6 +145,19 @@ appears alongside the catalog ones with `key_optional: true`, no
 `key_env` unless the file names one, and — on `/llmman/providers/{id}`
 — for the `openai` wire, whatever model ids its own `GET /models`
 reports, unpriced.
+
+`PUT /llmman/providers/{id}/key` with `{"api_key": "..."}` stores a
+provider's key the way `llmman config set providers.<id>.api_key` does
+(the per-user `llmman.conf`, `chmod 600`), and the daemon spends it from
+the next request on, without a restart. `DELETE` removes that file's key;
+one in `/etc/llmman/llmman.conf` or the provider's variable still
+applies. Both answer `{id, key_usable, key_env, env_override}` and never
+the key; `env_override: true` means the variable is set in the daemon's
+environment and wins over the stored key. An id neither in the catalog
+nor configured is a 404, a blank or multi-line key a 400. They are
+refused (403) where the daemon would not spend its own provider key for
+the caller: a daemon reachable beyond loopback without `LLMMAN_API_KEYS`,
+or a page on another site (see [authentication](#authentication)).
 
 `/llmman/node` reports this node's memory and loaded/stored models; it
 is what aggregation peers ask each other. See [aggregation.md](aggregation.md).
