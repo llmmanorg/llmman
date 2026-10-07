@@ -5,8 +5,8 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `copilot`, `cline`, `grok`, `qwen`,
-//! `hermes`,
+//! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `copilot`, `cline`,
+//! `grok`, `qwen`, `hermes`,
 //! `openclaw`, `dsh`, `goose`) — not mocks. The one exception is
 //! [`launch_goose_desktop_env`]: Goose Desktop is a GUI with no headless
 //! mode, so it stubs its binary.
