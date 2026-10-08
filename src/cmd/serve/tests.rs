@@ -3701,27 +3701,9 @@ async fn handle_delete_rejects_an_invalid_ref_with_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-/// The `/api/show` body for a store holding one model whose single
-/// layer is `(media_type, filepath, blob)`. The two cases below differ
-/// only in that layer, and in what they then assert.
-async fn show_one_model(
-    name: &str,
-    media_type: &str,
-    filepath: &str,
-    blob: &[u8],
-) -> serde_json::Value {
-    let dir = std::env::temp_dir().join(format!(
-        "llmman-show-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    let state = test_state_at(dir.clone());
-    let store = OciStore::open(&dir).unwrap();
-
+/// Stores `docker.io/ai/{name}:latest` in `store` as one model whose
+/// single layer is `(media_type, filepath, blob)`.
+fn store_one_model(store: &OciStore, name: &str, media_type: &str, filepath: &str, blob: &[u8]) {
     let mut layer = store.write_blob(media_type, blob).unwrap();
     layer.annotations = Some(HashMap::from([(
         "org.cncf.model.filepath".to_string(),
@@ -3747,6 +3729,40 @@ async fn show_one_model(
     store
         .tag(mdesc, &format!("docker.io/ai/{name}:latest"))
         .unwrap();
+}
+
+/// A fresh store directory under the temp dir, unique per call.
+fn fresh_store_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "llmman-show-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// The `/api/show` body for a store holding one model whose single
+/// layer is `(media_type, filepath, blob)`. The two cases below differ
+/// only in that layer, and in what they then assert.
+async fn show_one_model(
+    name: &str,
+    media_type: &str,
+    filepath: &str,
+    blob: &[u8],
+) -> serde_json::Value {
+    let dir = fresh_store_dir(name);
+    let state = test_state_at(dir.clone());
+    store_one_model(
+        &OciStore::open(&dir).unwrap(),
+        name,
+        media_type,
+        filepath,
+        blob,
+    );
 
     let req = OllamaShowRequest {
         model: format!("docker.io/ai/{name}"),
@@ -3809,6 +3825,56 @@ async fn handle_show_reports_a_safetensors_model_as_safetensors() {
     assert_eq!(v["details"]["families"], serde_json::json!([]));
     assert_eq!(v["model_info"], serde_json::json!({}));
     assert_eq!(v["template"], serde_json::Value::Null);
+}
+
+/// `/api/tags` reads each model's format the way `/api/show` does,
+/// rather than calling everything `"gguf"`.
+#[tokio::test]
+async fn handle_tags_reports_each_models_own_format() {
+    let dir = fresh_store_dir("tags");
+    let state = test_state_at(dir.clone());
+    let store = OciStore::open(&dir).unwrap();
+    let path = crate::gguf::write_test_gguf_with(&[]);
+    let gguf = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    store_one_model(
+        &store,
+        "tagsgguf",
+        "application/vnd.docker.ai.gguf.v3",
+        "model.gguf",
+        &gguf,
+    );
+    store_one_model(
+        &store,
+        "tagsst",
+        "application/vnd.cncf.model.weight.v1.tar",
+        "model.safetensors",
+        b"weights",
+    );
+    store_one_model(&store, "tagsnone", "text/plain", "README.md", b"no weights");
+
+    let resp = handle_tags(State(state), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let format = |name: &str| {
+        v["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == format!("docker.io/ai/{name}:latest"))
+            .unwrap_or_else(|| panic!("{name} not listed: {v}"))["details"]["format"]
+            .clone()
+    };
+    assert_eq!(format("tagsgguf"), "gguf");
+    assert_eq!(format("tagsst"), "safetensors");
+    // Nothing servable: empty, not a guess.
+    assert_eq!(format("tagsnone"), "");
 }
 
 /// /api/show resolves (and so validates) the client ref before it ever
