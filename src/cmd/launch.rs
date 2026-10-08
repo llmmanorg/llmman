@@ -168,6 +168,10 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     if name.eq_ignore_ascii_case("docker-agent") {
         docker_agent::check_docker_agent_args(&args.extra_args)?;
     }
+    // Each launcher looks for its program only once it runs, which is
+    // after the daemon has started and the model has been pulled: a
+    // missing agent would otherwise cost a download first.
+    check_installed(name)?;
     // The model's thinking choices (see `opencode_variants`), from its
     // template or the catalog; whether it takes images (see
     // `dsh::write_dsh_settings`) and the trained context only a local model
@@ -755,7 +759,6 @@ const INTEGRATIONS: &[Integration] = &[
 ];
 
 /// The registry entry for a launch name, after resolving supported aliases.
-#[cfg(test)]
 fn integration(name: &str) -> Option<&'static Integration> {
     let name = name.to_ascii_lowercase();
     let canonical = match name.as_str() {
@@ -867,6 +870,26 @@ fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
         "grok" => grok::find_grok(),
         "docker-agent" => docker_agent::find_docker_agent(),
         _ => find_on_path(i.binary),
+    }
+}
+
+/// Fails, before anything is started or pulled, when `name`'s program is
+/// not there to run, looked up as its launcher will look for it (so an
+/// image-based `--sandbox`, prepared just before, counts as there). Cline
+/// installs itself on demand, and an unknown name is left to the
+/// launcher's own error.
+fn check_installed(name: &str) -> anyhow::Result<()> {
+    let Some(i) = integration(name) else {
+        return Ok(());
+    };
+    if i.name == "cline" || find_integration_binary(i).is_some() {
+        return Ok(());
+    }
+    match i.name {
+        "dsh" => anyhow::bail!("{}", dsh::DSH_MISSING),
+        "docker-agent" => Err(docker_agent::docker_agent_missing()),
+        "goose-desktop" => Err(goose_desktop::goose_desktop_missing()),
+        _ => anyhow::bail!("{} is not installed", i.binary),
     }
 }
 
@@ -2045,6 +2068,14 @@ fn server() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cline installs itself, and a name launch does not know is left to
+    /// its own error, so neither is refused here whatever is on PATH.
+    #[test]
+    fn check_installed_leaves_cline_and_unknown_names_alone() {
+        assert!(check_installed("cline").is_ok());
+        assert!(check_installed("not-an-integration").is_ok());
+    }
 
     #[test]
     fn agy_is_listed_as_an_integration() {

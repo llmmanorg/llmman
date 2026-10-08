@@ -11,6 +11,9 @@ use super::{exec_with_env, find_on_path, has_flag, server, Effort};
 /// key value is ever written to disk (same role as `QWEN_ENV_KEY`).
 const DSH_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 
+pub(super) const DSH_MISSING: &str =
+    "dsh is not installed, and there is no npx on PATH to run it with";
+
 /// dsh: unlike qwen, hermes and codex, nothing here merges into a file
 /// dsh reads by default. dsh's own `--patch` overlay mechanism lets both
 /// files live under llmman's own config dir and be rewritten in full on
@@ -45,9 +48,7 @@ pub(super) fn launch_dsh(
             if command == "web" { "web" } else { "<name>" }
         );
     }
-    let (bin, prefix) = find_dsh().ok_or_else(|| {
-        anyhow::anyhow!("dsh is not installed, and there is no npx on PATH to run it with")
-    })?;
+    let (bin, prefix) = find_dsh().ok_or_else(|| anyhow::anyhow!("{DSH_MISSING}"))?;
 
     let dir = dsh_config_dir()?;
     let settings_path = dir.join("settings.yaml");

@@ -37,13 +37,7 @@ pub(super) fn launch_goose_desktop(
     api_key: &str,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
-    let bin = find_goose_desktop().ok_or_else(|| {
-        anyhow::anyhow!(
-            "goose-desktop is not installed\n\
-             Install Goose Desktop from https://github.com/aaif-goose/goose, \
-             or run 'llmman launch goose' for the CLI."
-        )
-    })?;
+    let bin = find_goose_desktop().ok_or_else(goose_desktop_missing)?;
     // Before the launch, because afterwards there is nothing to tell a
     // handover from an ordinary quick exit: both are an exit 0.
     //
@@ -525,6 +519,14 @@ pub(super) fn find_goose_desktop() -> Option<PathBuf> {
         .or_else(|| find_on_path("goose-gui"))
         .or_else(goose_exe_on_path)
         .or_else(|| goose_desktop_fallback(&dirs::home_dir()?))
+}
+
+pub(super) fn goose_desktop_missing() -> anyhow::Error {
+    anyhow::anyhow!(
+        "goose-desktop is not installed\n\
+         Install Goose Desktop from https://github.com/aaif-goose/goose, \
+         or run 'llmman launch goose' for the CLI."
+    )
 }
 
 /// The Windows zip unpacks to `Goose.exe` and upstream ships no

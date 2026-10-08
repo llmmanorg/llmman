@@ -31,20 +31,22 @@ pub(super) fn launch_docker_agent(
     // `run` has already rejected these arguments before starting the
     // daemon; repeated so a direct call to `launch` rejects them too.
     check_docker_agent_args(extra_args)?;
-    let bin = find_docker_agent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "docker-agent is not installed\n\n\
-             llmman looks for it on PATH and in ~/.docker/cli-plugins, where Docker Desktop \
-             and `brew install docker-agent` put it.\n\
-             Releases: https://github.com/docker/docker-agent/releases"
-        )
-    })?;
+    let bin = find_docker_agent().ok_or_else(docker_agent_missing)?;
 
     let path = docker_agent_agent_file(&docker_agent_config_dir()?, model);
     write_docker_agent_file(&path, model, &format!("{}/v1", server()))?;
 
     let args = docker_agent_args(&path, extra_args);
     exec_with_env(&bin, &args, &[(DOCKER_AGENT_API_KEY_ENV, api_key)])
+}
+
+pub(super) fn docker_agent_missing() -> anyhow::Error {
+    anyhow::anyhow!(
+        "docker-agent is not installed\n\n\
+         llmman looks for it on PATH and in ~/.docker/cli-plugins, where Docker Desktop \
+         and `brew install docker-agent` put it.\n\
+         Releases: https://github.com/docker/docker-agent/releases"
+    )
 }
 
 /// Rejects the arguments after `--` that docker-agent cannot be launched

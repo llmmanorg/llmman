@@ -122,3 +122,29 @@ fn log_follow_filters_new_prompts_and_does_not_limit_them_to_max_count() {
     }
     reader.join().unwrap();
 }
+
+/// A launch whose agent is not installed fails on that, before it starts
+/// a daemon or pulls the model: nothing listens at LLMMAN_HOST, so any
+/// attempt to reach one would be a different error, and PATH is empty.
+#[test]
+fn launch_reports_a_missing_agent_before_starting_or_pulling_anything() {
+    let home = std::env::temp_dir().join(format!("llmman-cli-launch-{}", std::process::id()));
+    let empty_path = home.join("bin");
+    std::fs::create_dir_all(&empty_path).unwrap();
+    let out = llmman()
+        .args(["launch", "claude", "--model", "ai/smollm2"])
+        .env("PATH", &empty_path)
+        .env("HOME", &home)
+        .env("LLMMAN_HOST", "127.0.0.1:9")
+        .env_remove("LLMMAN_API_KEY")
+        .output()
+        .expect("spawn llmman");
+    let _ = std::fs::remove_dir_all(&home);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("claude is not installed"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("pull"), "stderr: {stderr}");
+}
