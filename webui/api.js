@@ -2,9 +2,10 @@
 // /llmman/shell. Paths are relative so a gateway prefix works.
 //
 // A keyed daemon (LLMMAN_API_KEYS) gets the key as a bearer on every
-// same-origin call; the first 401 asks the user for one. The shell's
-// WebSocket cannot carry a header, so it goes as a subprotocol
-// (`llmman.bearer.` + base64url key) the daemon echoes back.
+// same-origin call; the daemon's own first 401 asks the user for one (a
+// provider's 401, relayed, is just an error). The shell's WebSocket
+// cannot carry a header, so it goes as a subprotocol (`llmman.bearer.` +
+// base64url key) the daemon echoes back.
 
 /** A hosted model is addressed as `llmman.provider/<provider>/<model>`. */
 export const REMOTE_PREFIX = "llmman.provider/";
@@ -68,7 +69,16 @@ function askForKey() {
   return pending;
 }
 
-/** `fetch` with the key on same-origin URLs, asking on the first 401 and retrying once. */
+/**
+ * Whether `r` is the daemon refusing this page's key. A provider's or
+ * backend's 401 is relayed as is, without the daemon's realm: that is an
+ * error to show, not a key to ask for.
+ */
+function wantsKey(r) {
+  return r.status === 401 && /realm="llmman"/i.test(r.headers.get("www-authenticate") || "");
+}
+
+/** `fetch` with the key on same-origin URLs, asking on the daemon's first 401 and retrying once. */
 async function request(path, init = {}) {
   const sameOrigin = new URL(path, document.baseURI).origin === location.origin;
   const send = () => {
@@ -78,7 +88,7 @@ async function request(path, init = {}) {
   };
   const sent = apiKey();
   let r = await send();
-  if (r.status === 401 && sameOrigin && (apiKey() !== sent || (await askForKey()))) r = await send();
+  if (wantsKey(r) && sameOrigin && (apiKey() !== sent || (await askForKey()))) r = await send();
   return r;
 }
 
