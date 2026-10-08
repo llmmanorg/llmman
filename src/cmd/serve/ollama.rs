@@ -43,6 +43,15 @@ pub(super) async fn handle_version(State(state): State<AppState>) -> impl IntoRe
     }))
 }
 
+/// What `resolve_model` would serve `manifest` as, read off the manifest.
+/// Empty rather than a guess when no layer is servable at all.
+fn served_format(store: &OciStore, manifest: &crate::storage::oci::Manifest) -> String {
+    crate::modelpack::stored_manifest_format(store, manifest)
+        .map(crate::modelpack::ModelFormat::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 pub(super) async fn handle_tags(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -51,25 +60,32 @@ pub(super) async fn handle_tags(
     let list = store.list()?;
     let mut models: Vec<OllamaModelInfo> = list
         .into_iter()
-        .map(|img| OllamaModelInfo {
-            name: img.reference.clone(),
-            model: img.reference,
-            size: img.size,
-            digest: img.digest,
-            modified_at: img
-                .modified_at
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .and_then(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, 0))
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(now_rfc3339),
-            details: OllamaModelDetails {
-                parent_model: String::new(),
-                format: "gguf".into(),
-                family: String::new(),
-                families: Vec::new(),
-                parameter_size: String::new(),
-                quantization_level: String::new(),
-            },
+        .map(|img| {
+            // As handle_show reads it; none for a manifest that cannot be read.
+            let format = store
+                .read_manifest(&img.digest)
+                .map(|m| served_format(&store, &m))
+                .unwrap_or_default();
+            OllamaModelInfo {
+                name: img.reference.clone(),
+                model: img.reference,
+                size: img.size,
+                digest: img.digest,
+                modified_at: img
+                    .modified_at
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, 0))
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(now_rfc3339),
+                details: OllamaModelDetails {
+                    parent_model: String::new(),
+                    format,
+                    family: String::new(),
+                    families: Vec::new(),
+                    parameter_size: String::new(),
+                    quantization_level: String::new(),
+                },
+            }
         })
         .collect();
     // A peer's models are servable from here too, by forwarding.
@@ -278,13 +294,7 @@ pub(super) async fn handle_show(
             .map_or_else(|| serde_json::json!({}), model_info_json),
         details: OllamaModelDetails {
             parent_model: String::new(),
-            // What resolve_model would serve this as, read off the
-            // manifest. Empty rather than a guess when no layer is
-            // servable at all.
-            format: crate::modelpack::stored_manifest_format(&store, &manifest)
-                .map(crate::modelpack::ModelFormat::as_str)
-                .unwrap_or_default()
-                .to_string(),
+            format: served_format(&store, &manifest),
             family: arch.unwrap_or_default().to_string(),
             families: arch.map(|a| vec![a.to_string()]).unwrap_or_default(),
             // The header's own figure when it declares one. Otherwise
