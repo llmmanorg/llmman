@@ -10,7 +10,7 @@ use super::common;
 use super::{exec_with_env, find_on_path, has_flag, server};
 
 /// The env var the generated `token_key` names, so no key reaches disk
-/// (same role as `QWEN_ENV_KEY` and `dsh::DSH_API_KEY_ENV`).
+/// (same role as `qwen::QWEN_ENV_KEY` and `dsh::DSH_API_KEY_ENV`).
 const DOCKER_AGENT_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 
 /// The generated model entry's name, which its `root` agent selects it by.
@@ -289,7 +289,7 @@ mod tests {
     }
 
     /// The key is named, never written, so a `--provider` launch does
-    /// not persist a real credential — as `write_qwen_settings_at` and
+    /// not persist a real credential — as `qwen::write_qwen_settings_at` and
     /// `dsh::write_dsh_settings` also promise.
     #[test]
     fn docker_agent_document_names_the_key_variable_rather_than_a_key() {

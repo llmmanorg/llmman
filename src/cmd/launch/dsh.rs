@@ -8,7 +8,7 @@ use super::common;
 use super::{exec_with_env, find_on_path, has_flag, server, Effort};
 
 /// The env var dsh's generated provider entry reads its key from, so no
-/// key value is ever written to disk (same role as `QWEN_ENV_KEY`).
+/// key value is ever written to disk (same role as `qwen::QWEN_ENV_KEY`).
 const DSH_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 
 /// dsh: unlike qwen, hermes and codex, nothing here merges into a file
