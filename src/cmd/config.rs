@@ -317,7 +317,10 @@ fn unset(args: &ConfigArgs, opts: &UnsetArgs) -> Result<()> {
 /// Sets (`Some`) or removes (`None`) `providers.<id>.api_key` in the
 /// file at `path` — what `llmman config set|unset` do, for
 /// `PUT|DELETE /llmman/providers/:id/key` — then reloads the daemon's
-/// provider keys. `Ok(false)` when there was no key to remove.
+/// provider keys, also when there was nothing to remove, so `Ok` means
+/// the keys in force are what the files now say. `Ok(false)` when there
+/// was no key to remove. An `Err` can quote the file: log it, do not
+/// return it to a client.
 ///
 /// One write at a time: two requests interleaving read → edit → save
 /// would each save the file without the other's key (and share the
@@ -329,17 +332,18 @@ pub(crate) fn write_provider_key(path: &Path, id: &str, key: Option<&str>) -> Re
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let name = format!("providers.{}.api_key", crate::config::toml_key(id));
     let mut doc = read(path)?;
-    match key {
-        Some(key) => set_in(&mut doc, &name, key)?,
-        None => {
-            if unset_in(&mut doc, &name).is_err() {
-                return Ok(false);
-            }
+    let changed = match key {
+        Some(key) => {
+            set_in(&mut doc, &name, key)?;
+            true
         }
+        None => unset_in(&mut doc, &name).is_ok(),
+    };
+    if changed {
+        save(path, &doc)?;
     }
-    save(path, &doc)?;
-    crate::config::reload_provider_keys();
-    Ok(true)
+    crate::config::reload_provider_keys().map_err(|e| anyhow!(e))?;
+    Ok(changed)
 }
 
 /// Split out from [`set`] to be testable without a file, a home
@@ -809,6 +813,9 @@ mod tests {
     /// the file afterwards, and the file still parses.
     #[test]
     fn concurrent_provider_key_writes_keep_both() {
+        let _one = crate::config::PROVIDER_KEYS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch("provider-keys-race");
         let path = dir.join("llmman.conf");
         std::fs::remove_file(&path).ok();
@@ -842,6 +849,9 @@ mod tests {
     fn provider_key_writes_keep_the_file_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _one = crate::config::PROVIDER_KEYS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch("provider-keys-mode");
         let path = dir.join("llmman.conf");
         let mode = |p: &Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;

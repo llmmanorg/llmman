@@ -3172,19 +3172,32 @@ async fn store_provider_key(
             StatusCode::NOT_FOUND,
         ));
     }
-    let path = crate::config::user_path()
+    let path = crate::config::provider_key_file()
         .ok_or_else(|| anyhow!("no home directory to hold llmman.conf"))?;
     let provider_id = id.clone();
-    tokio::task::spawn_blocking(move || {
+    let written = tokio::task::spawn_blocking(move || {
         crate::cmd::config::write_provider_key(&path, &provider_id, key.as_deref())
     })
     .await
-    .map_err(|e| anyhow!("writing llmman.conf: {e}"))??;
+    .map_err(|e| anyhow!("writing llmman.conf: {e}"))?;
+    // A parse error quotes the offending line, which may be an
+    // `api_key = …`: the detail is for the daemon's log only.
+    if let Err(e) = written {
+        eprintln!("[llmman] provider key for {id} not updated: {e:#}");
+        return Err(AppError(
+            anyhow!(
+                "could not update the provider key in llmman.conf; \
+                 llmman serve's log says why"
+            ),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+    }
     let provider = catalog.get(&id).expect("looked up above");
     let key_env = provider.key_env.clone();
     let env_override = key_env
         .as_deref()
-        .is_some_and(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()));
+        .and_then(crate::providers::key_from_env)
+        .is_some();
     Ok(Json(ProviderKeyResponse {
         key_usable: daemon_key_usable(&state, provider),
         id,

@@ -48,8 +48,10 @@ api_key = "sk-or-..."
 or, equivalently, `llmman config set providers.openrouter.api_key sk-or-...`,
 or from a client over HTTP: `PUT /llmman/providers/openrouter/key`
 (what a client such as a phone app uses; see
-[api.md](api.md#llmmans-own-api)). A key set either way is spent by a
-running `llmman serve` from its next request, no restart needed.
+[api.md](api.md#llmmans-own-api)). A key set over HTTP is spent by the
+running `llmman serve` from its next request; one set with `llmman
+config set` or a hand edit reaches a running daemon when it restarts,
+like every other setting.
 
 Either way it travels per request; it is never written into an
 integration's config.

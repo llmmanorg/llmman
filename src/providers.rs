@@ -409,7 +409,7 @@ fn resolve_key(from_env: Option<String>, from_conf: Option<&str>) -> Option<Stri
 }
 
 /// An API key read out of `var`, or `None` when it is unset or blank.
-fn key_from_env(var: &str) -> Option<String> {
+pub(crate) fn key_from_env(var: &str) -> Option<String> {
     std::env::var(var)
         .ok()
         .map(|v| v.trim().to_string())
@@ -996,6 +996,18 @@ impl Gate {
 /// not cloneable.
 type Cached = (Instant, Duration, Result<Arc<Catalog>, String>);
 static CATALOG: Mutex<Option<Cached>> = Mutex::new(None);
+
+/// Holds `json` as the catalog for an hour, so a test of a route that
+/// looks a provider up does not reach models.dev.
+#[cfg(test)]
+pub(crate) fn hold_catalog_for_tests(json: &str) {
+    let catalog = Catalog::from_json(json.as_bytes()).expect("test catalog parses");
+    *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+        Instant::now(),
+        Duration::from_secs(3600),
+        Ok(Arc::new(catalog)),
+    ));
+}
 
 /// Whether a background refresh (see [`catalog`]) is in flight.
 static REFRESHING: AtomicBool = AtomicBool::new(false);

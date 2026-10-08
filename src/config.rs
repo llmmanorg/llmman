@@ -789,26 +789,61 @@ static PROVIDER_KEYS: RwLock<Option<HashMap<String, String>>> = RwLock::new(None
 /// Re-reads the provider keys of every `llmman.conf`, so a key the daemon
 /// just wrote is spent from the next request on, without a restart. The
 /// other settings (aliases, providers, policy) keep their startup values.
-pub fn reload_provider_keys() {
-    let paths = if cfg!(test) {
-        Vec::new()
-    } else {
-        search_paths()
-    };
-    reload_provider_keys_from(paths);
+///
+/// Only `PUT|DELETE /llmman/providers/:id/key` call this: a key written
+/// by `llmman config set` or a hand edit reaches a running daemon at its
+/// next start, as every other setting does.
+///
+/// `Err` leaves the keys in force: a file broken by a hand edit must not
+/// switch every provider off. The message can quote the file, keys and
+/// all, so it is for the daemon's log, not a client.
+pub fn reload_provider_keys() -> Result<(), String> {
+    reload_provider_keys_from(provider_key_paths())
 }
 
-fn reload_provider_keys_from(paths: Vec<PathBuf>) {
-    match load_from(paths) {
-        Ok(files) => {
-            *PROVIDER_KEYS
-                .write()
-                .unwrap_or_else(PoisonError::into_inner) = Some(provider_keys_in(&files));
-        }
-        // The keys in force stay: a file broken by a hand edit must not
-        // switch every provider off.
-        Err(e) => eprintln!("[llmman] warning: {e}; provider keys not reloaded"),
-    }
+#[cfg(not(test))]
+fn provider_key_paths() -> Vec<PathBuf> {
+    search_paths()
+}
+
+/// Tests read no real config: only the files a test names here.
+#[cfg(test)]
+fn provider_key_paths() -> Vec<PathBuf> {
+    TEST_PROVIDER_FILES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// The file `PUT|DELETE /llmman/providers/:id/key` writes: the per-user
+/// llmman.conf, as `llmman config set` does.
+#[cfg(not(test))]
+pub fn provider_key_file() -> Option<PathBuf> {
+    user_path()
+}
+
+#[cfg(test)]
+pub fn provider_key_file() -> Option<PathBuf> {
+    provider_key_paths().last().cloned()
+}
+
+/// The config files a test reads provider keys from, and writes them to.
+#[cfg(test)]
+pub(crate) static TEST_PROVIDER_FILES: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Held by every test that reloads or reads the provider-key cache:
+/// it is one process-wide value, and a reload in one test would
+/// otherwise change what another reads mid-assertion.
+#[cfg(test)]
+pub(crate) static PROVIDER_KEYS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn reload_provider_keys_from(paths: Vec<PathBuf>) -> Result<(), String> {
+    let files = load_from(paths)?;
+    *PROVIDER_KEYS
+        .write()
+        .unwrap_or_else(PoisonError::into_inner) = Some(provider_keys_in(&files));
+    Ok(())
 }
 
 fn provider_keys_in(files: &[File]) -> HashMap<String, String> {
@@ -971,6 +1006,9 @@ mod tests {
     fn reloaded_provider_keys_take_effect_without_a_restart() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _one = PROVIDER_KEYS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let id = "llmman-test-reload";
         let dir = std::env::temp_dir().join(format!("llmman-reload-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -978,7 +1016,7 @@ mod tests {
         std::fs::write(&path, format!("[providers.{id}]\napi_key = \"sk-new\"\n")).expect("write");
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-        reload_provider_keys_from(vec![path.clone()]);
+        reload_provider_keys_from(vec![path.clone()]).expect("reload");
         assert_eq!(
             provider_api_key(id),
             None,
@@ -986,10 +1024,15 @@ mod tests {
         );
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-        reload_provider_keys_from(vec![path.clone()]);
+        reload_provider_keys_from(vec![path.clone()]).expect("reload");
         assert_eq!(provider_api_key(id).as_deref(), Some("sk-new"));
 
-        reload_provider_keys_from(Vec::new());
+        // A file that no longer parses: the error, and the keys in force stay.
+        std::fs::write(&path, format!("[providers.{id}]\napi_key = \"sk-broken\n")).expect("write");
+        assert!(reload_provider_keys_from(vec![path.clone()]).is_err());
+        assert_eq!(provider_api_key(id).as_deref(), Some("sk-new"));
+
+        reload_provider_keys_from(Vec::new()).expect("reload");
         assert_eq!(provider_api_key(id), None);
         std::fs::remove_dir_all(&dir).ok();
     }

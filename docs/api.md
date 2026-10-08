@@ -151,9 +151,16 @@ provider's key the way `llmman config set providers.<id>.api_key` does
 (the per-user `llmman.conf`, `chmod 600`), and the daemon spends it from
 the next request on, without a restart. `DELETE` removes that file's key;
 one in `/etc/llmman/llmman.conf` or the provider's variable still
-applies. Both answer `{id, key_usable, key_env, env_override}` and never
-the key; `env_override: true` means the variable is set in the daemon's
-environment and wins over the stored key. An id neither in the catalog
+applies. Both re-read every `llmman.conf`'s provider keys before they
+answer (a `DELETE` with nothing to remove too), so a `200` means the
+keys in force are what the files now say; only these routes reload,
+and a key set with `llmman config set` or a hand edit waits for a
+restart. If the files cannot be read (a hand edit that broke one), the
+keys in force are kept and the answer is a `500` that points to the
+daemon's log, which has the detail. Both answer `{id, key_usable,
+key_env, env_override}` and never the key; `env_override: true` means
+the variable is set in the daemon's environment and wins over the
+stored key. An id neither in the catalog
 nor configured is a 404, a blank or multi-line key a 400. They are
 refused (403) where the daemon would not spend its own provider key for
 the caller: a daemon reachable beyond loopback without `LLMMAN_API_KEYS`,

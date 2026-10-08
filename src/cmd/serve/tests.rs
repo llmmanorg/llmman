@@ -4822,6 +4822,131 @@ fn provider_keys_are_set_only_by_whoever_may_spend_them() {
         .is_some_and(|r| r.contains("another site")));
 }
 
+/// A daemon whose provider keys live in one temporary llmman.conf, and
+/// a catalog that knows `anthropic` without asking models.dev. Holds the
+/// provider-key lock for as long as the guard lives.
+struct ProviderKeyFixture {
+    dir: std::path::PathBuf,
+    path: std::path::PathBuf,
+    _one: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ProviderKeyFixture {
+    fn new(name: &str) -> Self {
+        let one = crate::config::PROVIDER_KEYS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("llmman-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("llmman.conf");
+        *crate::config::TEST_PROVIDER_FILES.lock().unwrap() = vec![path.clone()];
+        crate::providers::hold_catalog_for_tests(
+            r#"{"anthropic": {"id": "anthropic", "name": "Anthropic",
+                "npm": "@ai-sdk/anthropic", "env": ["ANTHROPIC_API_KEY"],
+                "models": {"claude-sonnet-5": {}}}}"#,
+        );
+        Self {
+            dir,
+            path,
+            _one: one,
+        }
+    }
+}
+
+impl Drop for ProviderKeyFixture {
+    fn drop(&mut self) {
+        crate::config::TEST_PROVIDER_FILES.lock().unwrap().clear();
+        let _ = crate::config::reload_provider_keys();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// PUT then DELETE, end to end: the file holds the key (owner-only), no
+/// reply carries it, `env_override` matches the daemon's environment, and
+/// the very next request spends what the file now says.
+#[tokio::test]
+async fn a_provider_key_put_then_delete_takes_effect_at_once() {
+    let fx = ProviderKeyFixture::new("provider-key-e2e");
+    let url = serve_router(keyed_state(&["k"])).await;
+    let client = Client::new();
+    let route = format!("{url}/llmman/providers/anthropic/key");
+    let secret = "sk-e2e-0123456789";
+
+    let r = client
+        .put(&route)
+        .bearer_auth("k")
+        .json(&serde_json::json!({ "api_key": secret }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = r.text().await.unwrap();
+    assert!(!body.contains(secret), "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["id"], "anthropic");
+    assert_eq!(v["key_env"], "ANTHROPIC_API_KEY");
+    assert_eq!(
+        v["env_override"],
+        crate::providers::key_from_env("ANTHROPIC_API_KEY").is_some()
+    );
+    assert_eq!(v["key_usable"], true);
+    assert!(std::fs::read_to_string(&fx.path).unwrap().contains(secret));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&fx.path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    assert_eq!(
+        crate::config::provider_api_key("anthropic").as_deref(),
+        Some(secret),
+        "spent from the next request on"
+    );
+
+    let r = client.delete(&route).bearer_auth("k").send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(!std::fs::read_to_string(&fx.path).unwrap().contains(secret));
+    assert_eq!(crate::config::provider_api_key("anthropic"), None);
+
+    // Nothing left to remove still reloads, and still answers 200.
+    let r = client.delete(&route).bearer_auth("k").send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+/// A config file that no longer parses: the route fails without quoting
+/// it (a parse error echoes the line, here an `api_key`), and the keys in
+/// force stay as they were.
+#[tokio::test]
+async fn a_malformed_config_never_reaches_the_reply() {
+    let fx = ProviderKeyFixture::new("provider-key-redact");
+    let leaked = "sk-must-not-leak-42";
+    std::fs::write(
+        &fx.path,
+        format!("[providers.anthropic]\napi_key = \"{leaked}\n"),
+    )
+    .unwrap();
+    let url = serve_router(keyed_state(&["k"])).await;
+    let client = Client::new();
+    let route = format!("{url}/llmman/providers/anthropic/key");
+
+    let put = client
+        .put(&route)
+        .bearer_auth("k")
+        .json(&serde_json::json!({"api_key": "sk-new-one"}))
+        .send()
+        .await
+        .unwrap();
+    let delete = client.delete(&route).bearer_auth("k").send().await.unwrap();
+    for r in [put, delete] {
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = r.text().await.unwrap();
+        assert!(!body.contains(leaked), "{body}");
+        assert!(!body.contains("api_key ="), "{body}");
+        assert!(body.contains("log"), "{body}");
+    }
+}
+
 /// `PUT|DELETE /llmman/providers/:id/key` sit behind the daemon's key
 /// like every route, refuse an open daemon's cross-site page, and take
 /// one non-blank line; none of their answers carries a key.
