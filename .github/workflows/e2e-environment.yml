@@ -1,0 +1,164 @@
+name: E2E Environment
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - ".mise.toml"
+      - "ci/e2e/environment/**"
+      - "LLAMA_CPP_RELEASE"
+      - "MLX_LM_RELEASE"
+      - "PYTHON_RELEASE"
+      - ".github/workflows/e2e-environment.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - ".mise.toml"
+      - "ci/e2e/environment/**"
+      - "!ci/e2e/environment/lock.json"
+      - "LLAMA_CPP_RELEASE"
+      - "MLX_LM_RELEASE"
+      - "PYTHON_RELEASE"
+      - ".github/workflows/e2e-environment.yml"
+  schedule:
+    - cron: "17 3 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || (github.ref == 'refs/heads/main' && 'publish' || github.ref) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate manifest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Validate e2e environment manifest
+        run: python3 ci/e2e/environment/validate.py
+
+  linux:
+    name: Build Linux ${{ matrix.arch }}
+    needs: validate
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: ci/e2e/environment/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/llmman-e2e-env,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/llmman-e2e-env:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/llmman-e2e-env:buildcache-${{ matrix.arch }},mode=max
+          provenance: false
+          sbom: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Export image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "Invalid image digest: $DIGEST" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-env-digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  merge:
+    name: Publish Linux OCI manifest list
+    needs: linux
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download image digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: e2e-env-digests-*
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Create and inspect manifest list
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/llmman-e2e-env
+          REVISION: ${{ github.sha }}
+        run: |
+          environment_tag="$(date -u +%Y-%m-%d)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          shopt -s nullglob
+          digests=("$RUNNER_TEMP"/digests/*)
+          if [[ "${#digests[@]}" -ne 2 ]]; then
+            echo "Expected exactly two image digests" >&2
+            exit 1
+          fi
+          sources=()
+          for digest in "${digests[@]}"; do
+            hash="${digest##*/}"
+            if [[ ! -f "$digest" || ! "$hash" =~ ^[a-f0-9]{64}$ ]]; then
+              echo "Invalid image digest: $hash" >&2
+              exit 1
+            fi
+            sources+=("$IMAGE@sha256:$hash")
+          done
+          docker buildx imagetools create \
+            --tag "$IMAGE:$REVISION" \
+            --tag "$IMAGE:$environment_tag" \
+            "${sources[@]}"
+          docker buildx imagetools inspect "$IMAGE:$environment_tag"
+          docker buildx imagetools inspect --raw "$IMAGE:$environment_tag" | jq -e '
+            [.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]
+          '
+          printf 'Published `%s:%s`\n' "$IMAGE" "$environment_tag" | tee -a "$GITHUB_STEP_SUMMARY"

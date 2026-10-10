@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "description": "Pinned inputs for the pre-baked e2e environment.",
+  "base": {
+    "linux": {
+      "image": "ubuntu:24.04",
+      "platforms": ["linux/amd64", "linux/arm64"]
+    }
+  },
+  "toolchains": {"mise": "../../../.mise.toml"},
+  "release_files": {
+    "llama_cpp": "../../../LLAMA_CPP_RELEASE",
+    "mlx_lm": "../../../MLX_LM_RELEASE",
+    "python": "../../../PYTHON_RELEASE"
+  },
+  "deferred": {
+    "status": "not-installed",
+    "reason": "Native agents and inference engines remain outside the foundation image; existing CI installation steps still provide them where supported.",
+    "native_tools": {
+      "goose": {"version": "1.50.0", "source": "https://github.com/aaif-goose/goose/releases"},
+      "grok": {"version": "1.0.34", "source": "https://x.ai/cli/install.sh"},
+      "docker_agent": {"version": "1.142.0", "source": "https://github.com/docker/docker-agent/releases"},
+      "muse": {"version": "1.4.0-R4302.1", "source": "https://lookaside.facebook.com/lookaside/muse/download/"},
+      "agy": {"version": "1.2.2", "source": "https://github.com/google-antigravity/antigravity-cli/releases"},
+      "hermes": {"version": "v2026.9.21", "source": "https://github.com/NousResearch/hermes-agent/releases"}
+    },
+    "engines": {
+      "llama_cpp": {"version_file": "../../../LLAMA_CPP_RELEASE"},
+      "vllm": {"version": "0.30.0"},
+      "vllm_metal": {"version": "0.30.0"},
+      "sglang": {"version": "0.5.19"},
+      "mlx_lm": {"version_file": "../../../MLX_LM_RELEASE"}
+    }
+  }
+}
