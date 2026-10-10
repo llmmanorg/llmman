@@ -488,6 +488,17 @@ fn raw_namespace_path(segments: &[String]) -> String {
 /// Ollama's `qualifyNamespaceToolName`, replacing dots with underscores:
 /// providers enforce `^[a-zA-Z0-9_-]{1,128}$` on function names (Anthropic
 /// rejects Codex's `multi_agent_v1.spawn_agent`).
+///
+/// Compatibility: each segment is encoded via `encode_tool_name_segment`,
+/// which replaces `.` with `_` but keeps underscores and hyphens verbatim. A
+/// leading-underscore member therefore keeps its underscore: `("ns", "_f")`
+/// becomes `ns__f`. Before #563 this was `ns_f`, and dotted names such as
+/// `ns_files.read` were passed through unchanged and rejected by strict
+/// providers. Clients never see the encoded name: `responses_tool_call_name`
+/// decodes it back, and replayed history is re-encoded per-request alongside
+/// tool definitions, so stored sessions keep working. Only the upstream-visible
+/// name changed: expect one provider prompt-cache miss after upgrading, and
+/// different names in provider-side logs.
 fn qualify_namespace_tool_name(namespace: &str, member: &str) -> String {
     if namespace.is_empty() || member.is_empty() {
         return encode_tool_name_segment(member);
@@ -533,6 +544,8 @@ fn encode_namespace_segments<'a>(segments: impl IntoIterator<Item = &'a str>) ->
 }
 
 /// Preserve tool names, replacing only dots for Chat Completions providers.
+/// Leading/inner underscores and hyphens are kept verbatim; collapsing them
+/// would let distinct Responses identities collide (see `remember_tool_name`).
 fn encode_tool_name_segment(segment: &str) -> String {
     segment.replace('.', "_")
 }

@@ -72,6 +72,12 @@ fn settings(
 }
 
 fn write_settings(root: &Path, settings: &serde_json::Value) -> anyhow::Result<()> {
+    // `root` is passed to Muse as `XDG_CONFIG_HOME` (set in `launch_muse`), and
+    // Muse reads `$XDG_CONFIG_HOME/muse/settings.json`. The inner `muse/` is
+    // Muse's own XDG app subdirectory, not a duplicate of the outer
+    // `llmman/muse` directory: the full path is
+    // `.../llmman/muse/<sha256(model)>/muse/settings.json`. Removing it would
+    // silently break settings loading (launch_e2e tests assert this path).
     let path = root.join("muse/settings.json");
     std::fs::create_dir_all(path.parent().expect("settings file has a parent"))?;
     crate::fsutil::write_atomic(&path, &serde_json::to_vec_pretty(settings)?)

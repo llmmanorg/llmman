@@ -83,6 +83,10 @@ translates to and from `/v1/chat/completions` itself, and for a provider
 that speaks the Anthropic Messages API from there to `/v1/messages` (see
 [wire formats](providers.md#wire-formats)).
 
+When bridging Responses API requests, a `namespace` tool's members are sent upstream as `<namespace>_<member>`, with dots replaced by `_` and everything else kept verbatim.
+
+Since llmman #563, a member whose name starts with `_` keeps that underscore: `agents._wait` is sent upstream as `agents__wait`. Earlier versions sent `agents_wait`. Clients always receive the original member names, and replayed sessions re-encode names per-request alongside their tool definitions, so stored history is unaffected. Only provider-side logs and prompt caches see the new spelling.
+
 A request bound for a provider loses llama-server's own fields
 (`repeat_penalty`, `top_k`, `min_p`, `chat_template_kwargs`, ...), which
 a strict provider would reject the whole request over; OpenAI's reasoning
