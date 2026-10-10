@@ -40,6 +40,7 @@ mod goose;
 mod goose_desktop;
 mod grok;
 mod hermes;
+mod muse;
 mod openclaw;
 mod opencode;
 mod qwen;
@@ -485,7 +486,7 @@ const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes", "cline", "pi"];
 fn declares_context_window(integration: &str) -> bool {
     matches!(
         integration.to_lowercase().as_str(),
-        "opencode" | "codex" | "pi" | "omp"
+        "opencode" | "codex" | "pi" | "omp" | "muse"
     )
 }
 
@@ -662,6 +663,11 @@ struct Integration {
 }
 
 const INTEGRATIONS: &[Integration] = &[
+    Integration {
+        name: "muse",
+        description: "Meta Muse Code",
+        binary: "muse",
+    },
     Integration {
         name: "claude",
         description: "Claude Code",
@@ -921,6 +927,8 @@ const LOW_TO_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// levels it takes for an unknown model without clamping (pi, omp and
 /// Cline clamp the rest). opencode takes llmman's own variants.
 const VARIANT_SPELLINGS: &[(&str, Option<&str>, &[&str])] = &[
+    // The Meta provider rejects `none`, despite advertising it in --help.
+    ("muse", None, EFFORT_LEVELS),
     ("claude", None, LOW_TO_MAX),
     ("codex", Some("none"), EFFORT_LEVELS),
     ("pi", Some("off"), &["minimal", "low", "medium", "high"]),
@@ -978,10 +986,28 @@ struct Effort<'a> {
     levels: Vec<&'a str>,
 }
 
+/// Keep Muse subcommands ahead of generated effort options.
+fn launch_extra_args(name: &str, effort: Option<&str>, extra_args: &[String]) -> Vec<String> {
+    let command_len = usize::from(
+        name == "muse"
+            && extra_args
+                .first()
+                .is_some_and(|arg| muse::is_subcommand(arg)),
+    );
+    let (command, extra_args) = extra_args.split_at(command_len);
+    [
+        command.to_vec(),
+        effort.map_or_else(Vec::new, |e| effort_args(name, e)),
+        extra_args.to_vec(),
+    ]
+    .concat()
+}
+
 /// The flags that start `integration` at `effort`; opencode, qwen and
 /// dsh take it in their configuration instead.
 fn effort_args(integration: &str, effort: &str) -> Vec<String> {
     let flags: &[&str] = match integration {
+        "muse" => &["--reasoning-effort"],
         "claude" | "grok" => &["--effort"],
         "copilot" | "copilot-cli" => &["--reasoning-effort"],
         "pi" | "omp" | "cline" => &["--thinking"],
@@ -1051,11 +1077,7 @@ fn launch(
             .filter_map(|c| spell_variant(&name, c).ok())
             .collect(),
     });
-    let extra_args = &[
-        effort.map_or_else(Vec::new, |e| effort_args(&name, e)),
-        extra_args.to_vec(),
-    ]
-    .concat();
+    let extra_args = &launch_extra_args(&name, effort, extra_args);
     // pi and omp force thinking off for a model not marked as reasoning;
     // a model with the variant reasons.
     let reasons = variant.is_some()
@@ -1063,6 +1085,7 @@ fn launch(
             .and_then(Thinking::template)
             .is_some_and(|t| t.thinks);
     match name.as_str() {
+        "muse" => muse::launch_muse(model, api_key, context_window, max_output, extra_args),
         "claude" => claude::launch_claude(model, api_key, extra_args),
         "opencode" => opencode::launch_opencode(
             model,
@@ -1125,6 +1148,7 @@ const CONFIGURED_BY_FILE: &[&str] = &[
     "dsh",
     "grok",
     "hermes",
+    "muse",
     "omp",
     "openclaw",
     "pi",
@@ -1142,6 +1166,11 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
     let data = xdg("XDG_DATA_HOME", ".local/share");
     let state = xdg("XDG_STATE_HOME", ".local/state");
     Ok(match name {
+        "muse" => vec![
+            Dir(muse::settings_root()?),
+            Dir(data.join("muse")),
+            Dir(home.join(".muse")),
+        ],
         "claude" => match env_dir("CLAUDE_CONFIG_DIR") {
             Some(dir) => vec![Dir(dir)],
             None => vec![Dir(home.join(".claude")), Files(home.join(".claude.json"))],
@@ -2565,6 +2594,7 @@ defaults:
         let ok = |name, variant| spell_variant(name, variant).unwrap();
         assert_eq!(ok("opencode", "thinking"), "thinking");
         assert_eq!(ok("codex", "none"), "none");
+        assert_eq!(ok("muse", "minimal"), "minimal");
         assert_eq!(ok("pi", "none"), "off");
         assert_eq!(ok("dsh", "none"), "off");
         assert_eq!(ok("claude", "max"), "max");
@@ -2586,6 +2616,7 @@ defaults:
         assert!(err("pi", "xhigh").contains("none, minimal"));
         assert!(err("cline", "minimal").contains("cline cannot start"));
         assert!(err("kimi", "high").contains("--variant does not work with kimi"));
+        assert!(err("muse", "none").contains("muse cannot start"));
         assert!(err("nope", "high").contains("unknown integration"));
     }
 
@@ -2609,6 +2640,7 @@ defaults:
     #[test]
     fn effort_args_lead_with_each_integrations_flag() {
         let args = |name| effort_args(name, "high");
+        assert_eq!(args("muse"), ["--reasoning-effort", "high"]);
         assert_eq!(args("claude"), ["--effort", "high"]);
         assert_eq!(args("pi"), ["--thinking", "high"]);
         assert_eq!(args("hermes"), ["--reasoning", "high"]);

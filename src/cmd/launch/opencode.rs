@@ -150,7 +150,7 @@ const OPENCODE_OUTPUT_TOKEN_MAX: u64 = 32_000;
 /// ceiling of any size safe to pass. A quarter is the guess where
 /// there is none: longer than one turn produces, short enough to leave
 /// the window mostly usable.
-fn opencode_output_reserve(context: u64) -> u64 {
+pub(super) fn opencode_output_reserve(context: u64) -> u64 {
     (context / 4).clamp(1, OPENCODE_OUTPUT_TOKEN_MAX)
 }
 

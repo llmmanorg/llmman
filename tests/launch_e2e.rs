@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `copilot`, `cline`,
+//! (`claude`, `agy`, `muse`, `opencode`, `pi`, `omp`, `codex`, `copilot`, `cline`,
 //! `grok`, `qwen`, `hermes`,
 //! `openclaw`, `dsh`, `goose`) — not mocks. The one exception is
 //! [`launch_goose_desktop_env`]: Goose Desktop is a GUI with no headless
@@ -1032,6 +1032,34 @@ fn launch_agy_with_model() {
 }
 
 #[test]
+fn launch_muse_with_model() {
+    let _guard = lock_serial();
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("muse") {
+        eprintln!("skipping: muse not on PATH — https://dev.meta.ai/docs/muse-code");
+        return;
+    }
+    launch_and_assert_strict(
+        "muse",
+        &[
+            "exec",
+            "--no-session-log",
+            "--disable-shell",
+            "--disable-write",
+            "--disable-web-tools",
+            "--reasoning-effort",
+            "minimal",
+            "--max-model-steps",
+            "4",
+            PROMPT,
+        ],
+    );
+}
+
+#[test]
 fn launch_opencode_with_model() {
     eprintln!("[test] launch_opencode_with_model: acquiring SERIAL");
     let _guard = lock_serial();
@@ -1327,6 +1355,55 @@ fn launch_codex_variant_outranks_the_saved_effort() {
         &["exec", PROMPT],
         ".codex/config.toml",
         &format!("model_reasoning_effort = \"{SAVED}\"\n"),
+    );
+}
+
+#[test]
+fn launch_muse_variant_forwards_model_effort() {
+    let _guard = lock_serial();
+    if !installed("muse", "https://dev.meta.ai/docs/muse-code") {
+        return;
+    }
+    let launch = launch_at_variant(
+        "muse",
+        &[
+            "exec",
+            "--no-session-log",
+            "--disable-shell",
+            "--disable-write",
+            "--disable-web-tools",
+            "--max-model-steps",
+            "1",
+            PROMPT,
+        ],
+        |_| {},
+    );
+    let home = &launch.home;
+
+    let root = home.join(".config/llmman/muse");
+    let generated = std::fs::read_dir(root)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("muse/settings.json");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(generated).unwrap()).unwrap();
+    let row = &config["model_catalog"][0];
+    assert!(row["context_limit"].as_u64().unwrap() > 0);
+    assert!(row["output_limit"].as_u64().unwrap() > 0);
+    assert_eq!(row["profile_id"], "tbh");
+    assert_eq!(config["endpoint_transport"]["auth"], "none");
+    assert!(config["endpoint_transport"]["base_url"]
+        .as_str()
+        .unwrap()
+        .ends_with("/muse-code/v1"));
+    assert!(!home.join(".config/muse/settings.json").exists());
+    assert!(
+        launch.sent_values("effort").contains(&SPELLED),
+        "Muse should send effort {SPELLED} from --variant {VARIANT}; {}",
+        launch.output
     );
 }
 
