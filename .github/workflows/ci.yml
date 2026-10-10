@@ -1745,18 +1745,49 @@ jobs:
       # 256k default --ctx-size — several GiB nothing below needs (`llmman
       # resolve` never talks to the daemon). On a real aarch64 run that
       # left `vllm serve` only 3.3 of 15.6 GiB, under the KV arena it
-      # demands up front (see test_e2e.py's VLLM_CPU_KVCACHE_SPACE).
+      # demands up front (see test_e2e.py's VLLM_CPU_KVCACHE_SPACE). On
+      # Windows, where nothing below needs the RAM, a run left with them
+      # failed the next steps with bash unable to start (0xC0000142), and
+      # the runner killed llmman and llama-server as orphans at the end.
       #
       # Signals the daemon's process group, which its llama-server shares,
       # the same way daemon::kill_daemon does: pid from /api/version,
-      # `pkill -f` fallback. Never fails the job: a daemon that never
-      # started (every launch_e2e test skipped) is fine here.
-      - name: Stop the launch_e2e daemon (free RAM for vllm-plugin e2e)
-        if: runner.os == 'Linux' || runner.os == 'macOS'
+      # `pkill -f` fallback; on Windows `taskkill /T`, as kill_daemon does
+      # there. Never fails the job: a daemon that never started (every
+      # launch_e2e test skipped) is fine here.
+      - name: Stop the launch_e2e daemon
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -uo pipefail
           host="${LLMMAN_HOST:-127.0.0.1:17434}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # Git Bash would turn taskkill's /switches into paths.
+            export MSYS_NO_PATHCONV=1
+            pid=$(curl -fsS --max-time 5 "http://$host/api/version" 2>/dev/null \
+              | sed -n 's/.*"pid": *\([0-9][0-9]*\).*/\1/p') || pid=""
+            if [ -n "$pid" ] && tasklist /FI "PID eq $pid" /NH 2>/dev/null | grep -qi 'llmman'; then
+              echo "stopping llmman serve (pid $pid) and its children"
+              taskkill /PID "$pid" /T /F || true
+            else
+              echo "no llmman serve daemon at $host"
+            fi
+            # A killed process still holds its memory until it has exited.
+            for _ in $(seq 1 30); do
+              tasklist /NH 2>/dev/null | grep -qi -E '^(llmman|llama-server)\.exe' || break
+              sleep 1
+            done
+            if tasklist /NH 2>/dev/null | grep -qi -E '^(llmman|llama-server)\.exe'; then
+              echo "::warning::llmman serve/llama-server still alive 30s after taskkill; killing by name"
+              taskkill /IM llama-server.exe /F || true
+              # Only `llmman serve`, as kill_daemon matches it, not other llmman commands.
+              powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='llmman.exe'\" | Where-Object { \$_.CommandLine -match ' serve' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force }" || true
+              sleep 2
+            fi
+            tasklist /NH 2>/dev/null | grep -i -E '^(llmman|llama-server)\.exe' \
+              || echo "no llmman or llama-server left"
+            exit 0
+          fi
           pid=$(curl -fsS --max-time 5 "http://$host/api/version" 2>/dev/null \
             | python3 -c 'import json, sys; print(json.load(sys.stdin).get("pid") or "")' 2>/dev/null) || pid=""
           # Only signal a pid that is numeric and still an llmman process.
