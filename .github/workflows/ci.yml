@@ -1756,6 +1756,7 @@ jobs:
       # there. Never fails the job: a daemon that never started (every
       # launch_e2e test skipped) is fine here.
       - name: Stop the launch_e2e daemon
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -uo pipefail
@@ -1779,6 +1780,8 @@ jobs:
             if tasklist /NH 2>/dev/null | grep -qi -E '^(llmman|llama-server)\.exe'; then
               echo "::warning::llmman serve/llama-server still alive 30s after taskkill; killing by name"
               taskkill /IM llama-server.exe /F || true
+              # Only `llmman serve`, as kill_daemon matches it, not other llmman commands.
+              powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='llmman.exe'\" | Where-Object { \$_.CommandLine -match ' serve' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force }" || true
               sleep 2
             fi
             tasklist /NH 2>/dev/null | grep -i -E '^(llmman|llama-server)\.exe' \
