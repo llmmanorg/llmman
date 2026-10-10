@@ -1548,6 +1548,10 @@ impl Target {
         self.wire() == Some(Wire::Anthropic)
     }
 
+    fn is_provider(&self, provider: &str) -> bool {
+        matches!(self, Self::Remote(remote) if remote.provider == provider)
+    }
+
     /// Names this target for an error message. "inference backend" is
     /// what every failure here said before providers existed, and is
     /// still right for a local one; naming the provider is the whole
