@@ -219,10 +219,10 @@ machine prefer an integration that sends its own key.
 
 `codex` speaks only OpenAI's Responses API, which most providers lack
 (`mistral` 404s it, `opencode` 500s it for non-OpenAI models). The
-daemon tries the provider first and, on a 404/405/501 or 5xx, translates
-the request to a chat completion and the reply back, tool calls included.
-Providers that have the API (`openai`, `groq`, `openrouter`) are used
-natively; any other 4xx is relayed as-is.
+daemon tries the provider first and, on a 404/405/501 (or any 5xx from
+`opencode`), translates the request to a chat completion and the reply
+back, tool calls included. Providers that have the API (`openai`, `groq`,
+`openrouter`) are used natively; any other error is relayed as-is.
 
 ### Thinking
 
