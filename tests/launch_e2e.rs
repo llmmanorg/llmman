@@ -733,11 +733,8 @@ const MAX_ATTEMPTS: u32 = 3;
 /// Exhausting attempts via only the two shapes above (never the
 /// `assert!`) is logged loudly but does not panic: it's the model's own
 /// sampling variance, not an llmman regression, so it must not turn CI
-/// red on its own. The `strict` variants fail on the first shape (a CLI
-/// that *completed* without saying "pong"); on a timeout they fail only
-/// if `daemon_still_answers` finds the daemon stalled. CI run
-/// 35602511987 went red on all six E2E targets through the two strict
-/// tests timing out on these very shapes (cline on five, grok on one).
+/// red on its own. The `strict` variants fail both when a completed CLI
+/// never says "pong" and when it times out, even if the daemon still answers.
 enum NonzeroDisposition {
     Reject,
     Retry,
@@ -757,9 +754,9 @@ fn launch_and_assert(integration: &str, extra_args: &[&str]) {
 }
 
 /// [`launch_and_assert`], but a *completed* run that never said `pong`
-/// is a test failure, and a timeout is one unless the daemon still
-/// answers afterwards. Used where the integration is expected to be
-/// deterministic enough that a zero exit without inference is not success.
+/// is a test failure, as is a timeout. Used where the integration is
+/// expected to be deterministic enough that the test needs a completed
+/// CLI inference, not only a still-healthy daemon.
 fn launch_and_assert_strict(integration: &str, extra_args: &[&str]) {
     launch_and_assert_with(
         integration,
@@ -864,8 +861,7 @@ fn reply_contains_pong(stdout: &str) -> bool {
 /// The shared body: `nonzero_disposition` rejects, retries, or conditionally
 /// accepts a nonzero exit, `reject_stdout` narrows what a zero exit may be,
 /// `accept_stdout` defines a successful model reply, and `strict` makes
-/// exhausting the sampling attempts a test failure — for a timeout, only
-/// when the daemon has stopped answering (see [`launch_and_assert`]).
+/// exhausting the sampling attempts a test failure.
 fn launch_and_assert_with(
     integration: &str,
     extra_args: &[&str],
@@ -958,9 +954,7 @@ fn launch_and_assert_with(
     } else {
         "an unexpected model reply (or a known non-llmman-caused failure)"
     };
-    // A strict timeout is tolerated only once the daemon is shown to be
-    // fine: then the CLI, not llmman, was the slow party.
-    let tolerated = !strict || (timed_out && daemon_still_answers(integration));
+    let tolerated = !strict && (!timed_out || daemon_still_answers(integration));
     assert!(
         tolerated,
         "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` gave up via {why}\n\
