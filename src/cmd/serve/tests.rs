@@ -258,6 +258,30 @@ async fn fake_provider(native: StatusCode) -> String {
     format!("http://{addr}/v1")
 }
 
+async fn call_remote_responses_target(
+    target: Target,
+    stream: bool,
+) -> (StatusCode, HeaderMap, String) {
+    let state = test_state();
+    let req = serde_json::json!({ "model": "mock-model", "input": "hi", "stream": stream });
+    let resp = remote_responses(
+        &state.0.client,
+        &target,
+        &HeaderMap::new(),
+        req,
+        ActivityGuard::new(&state, "m"),
+        "llmman.provider/mockprov/mock-model".to_string(),
+    )
+    .await
+    .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, headers, String::from_utf8_lossy(&body).into_owned())
+}
+
 async fn call_remote_responses(base_url: &str, stream: bool) -> (StatusCode, HeaderMap, String) {
     let state = test_state();
     let req = serde_json::json!({ "model": "mock-model", "input": "hi", "stream": stream });
@@ -284,7 +308,7 @@ async fn call_remote_responses(base_url: &str, stream: bool) -> (StatusCode, Hea
 /// anything else is relayed as it came.
 #[tokio::test]
 async fn remote_responses_falls_back_only_on_a_missing_or_broken_route() {
-    for native in [StatusCode::NOT_FOUND, StatusCode::INTERNAL_SERVER_ERROR] {
+    for native in [StatusCode::NOT_FOUND] {
         let base = fake_provider(native).await;
         let (status, headers, body) = call_remote_responses(&base, true).await;
         assert_eq!(status, StatusCode::OK, "{native}");
@@ -306,10 +330,30 @@ async fn remote_responses_falls_back_only_on_a_missing_or_broken_route() {
         assert_eq!(response["usage"]["total_tokens"], 4);
     }
 
+    for native in [StatusCode::INTERNAL_SERVER_ERROR, StatusCode::BAD_GATEWAY] {
+        let base = fake_provider(native).await;
+        let target = Target::Remote(Arc::new(RemoteTarget {
+            provider: "opencode".into(),
+            base_url: base,
+            wire: Wire::OpenAi,
+            model: "mock-model".into(),
+            max_output: None,
+            cost: None,
+            api_key: Some("sk-test".into()),
+        }));
+        let (status, headers, body) = call_remote_responses_target(target, true).await;
+        assert_eq!(status, StatusCode::OK, "{native}");
+        assert_eq!(headers["content-type"], "text/event-stream");
+        assert!(body.contains("event: response.completed"), "{body}");
+    }
+
     for native in [
         StatusCode::OK,
         StatusCode::UNAUTHORIZED,
         StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::BAD_GATEWAY,
+        StatusCode::SERVICE_UNAVAILABLE,
     ] {
         let base = fake_provider(native).await;
         let (status, headers, body) = call_remote_responses(&base, true).await;

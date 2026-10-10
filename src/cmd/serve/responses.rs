@@ -50,14 +50,18 @@ use super::sched::ActivityGuard;
 use super::{remote_status, send_chat_completion, AppError, AppState, Target};
 
 /// Whether a provider's answer on `/v1/responses` means "retry as a chat
-/// completion": 404/405/501 (no such route) or any 5xx (`opencode` 500s
-/// the route for every non-OpenAI model). Any other 4xx is the provider's
-/// answer about the caller's key or request, and a retry would bury it.
+/// completion": 404/405/501 (no such route). opencode also 500s the
+/// route for every non-OpenAI model, so keep its compatibility fallback
+/// without treating every provider's transient 5xx as no route support.
 pub(super) fn falls_back(status: StatusCode) -> bool {
     matches!(
         status,
         StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
-    ) || status.is_server_error()
+    )
+}
+
+fn falls_back_for(target: &Target, status: StatusCode) -> bool {
+    falls_back(status) || (target.is_provider("opencode") && status.is_server_error())
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,7 +1185,7 @@ pub(super) async fn remote_responses(
                 relay_rewriting_model(resp, activity, &canonical_model).await
             };
         }
-        if !falls_back(status) {
+        if !falls_back_for(target, status) {
             return Ok(relay(resp, activity));
         }
         eprintln!(
@@ -2315,9 +2319,6 @@ mod tests {
             StatusCode::NOT_FOUND,
             StatusCode::METHOD_NOT_ALLOWED,
             StatusCode::NOT_IMPLEMENTED,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            StatusCode::BAD_GATEWAY,
-            StatusCode::SERVICE_UNAVAILABLE,
         ] {
             assert!(falls_back(status), "{status}");
         }
@@ -2329,6 +2330,9 @@ mod tests {
             StatusCode::PAYMENT_REQUIRED,
             StatusCode::TOO_MANY_REQUESTS,
             StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
         ] {
             assert!(!falls_back(status), "{status}");
         }
