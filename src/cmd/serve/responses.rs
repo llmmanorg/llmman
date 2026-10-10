@@ -20,8 +20,9 @@
 //! - Ollama's server-side `web_search`/`tool_search` tools are dropped.
 //! - `tool_choice` and `text.format` are forwarded (`/api/chat` has no
 //!   `tool_choice`).
-//! - `namespace` members flatten to `namespace_member`, not
-//!   `namespace.member`: providers enforce `^[a-zA-Z0-9_-]{1,128}$`.
+//! - `namespace` members flatten to dot-normalized
+//!   `namespace_member`, not `namespace.member`: providers enforce
+//!   `^[a-zA-Z0-9_-]{1,128}$`.
 //!
 //! The request and stream conversion is pure — a JSON request in, SSE
 //! text out — and is tested with no network. The routes at the end of
@@ -112,8 +113,9 @@ pub(super) fn from_responses_request(req: &Value) -> anyhow::Result<Value> {
     });
 
     let mut tools: Vec<Value> = Vec::new();
+    let mut tool_names = ToolNames::default();
     for tool in &available_tools {
-        convert_tools(tool, &mut tools);
+        convert_tools(tool, &mut tools, &mut tool_names)?;
     }
     if !tools.is_empty() {
         chat["tools"] = Value::Array(tools);
@@ -164,6 +166,19 @@ pub(super) fn from_responses_request(req: &Value) -> anyhow::Result<Value> {
             }
         }
     }
+    for message in chat["messages"].as_array().into_iter().flatten() {
+        for call in message["tool_calls"].as_array().into_iter().flatten() {
+            if let Some(native) = call.pointer("/function/name").and_then(Value::as_str) {
+                validate_tool_name(native)?;
+            }
+        }
+    }
+    if let Some(native) = chat
+        .pointer("/tool_choice/function/name")
+        .and_then(Value::as_str)
+    {
+        validate_tool_name(native)?;
+    }
     Ok(chat)
 }
 
@@ -183,7 +198,7 @@ fn tool_choice(choice: &Value, tools: &[Value]) -> Value {
         Some(ns) if !ns.is_empty() => (ns.to_string(), name.to_string()),
         _ => responses_tool_call_name(tools, name),
     };
-    json!({ "type": "function", "function": { "name": qualify_namespace_tool_name(&namespace, &name) } })
+    json!({ "type": "function", "function": { "name": request_tool_name(tools, &namespace, &name) } })
 }
 
 /// Appends the chat message(s) one `input` item stands for; `next` is the
@@ -230,7 +245,7 @@ fn push_input_item(
                 "id": item.get("call_id").cloned().unwrap_or(Value::Null),
                 "type": "function",
                 "function": {
-                    "name": qualify_namespace_tool_name(&namespace, &name),
+                    "name": request_tool_name(tools, &namespace, &name),
                     "arguments": arguments,
                 },
             });
@@ -313,13 +328,34 @@ fn append_response_tool_call(messages: &mut Vec<Value>, call: Value) {
     messages.push(json!({ "role": "assistant", "tool_calls": [call] }));
 }
 
+/// Reject different Responses identities that flatten to the same tool name.
+#[derive(Default)]
+struct ToolNames {
+    native_to_raw: BTreeMap<String, String>,
+}
+
 /// Ollama's `convertTools`: a `namespace` tool becomes each of its
 /// members under a qualified name; non-function tools are dropped.
-fn convert_tools(tool: &Value, out: &mut Vec<Value>) {
+fn convert_tools(tool: &Value, out: &mut Vec<Value>, names: &mut ToolNames) -> anyhow::Result<()> {
+    convert_tools_in(tool, &[], out, names)
+}
+
+fn convert_tools_in(
+    tool: &Value,
+    namespace: &[String],
+    out: &mut Vec<Value>,
+    names: &mut ToolNames,
+) -> anyhow::Result<()> {
     match tool.get("type").and_then(Value::as_str) {
-        Some("function") => out.push(convert_tool(tool, "")),
+        Some("function") => {
+            let converted = convert_tool_in_namespace(tool, namespace);
+            remember_tool_name(tool, namespace, &converted, names)?;
+            out.push(converted);
+        }
         Some("namespace") => {
-            let namespace = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            let mut namespace = namespace.to_vec();
+            namespace.push(name.to_string());
             for member in tool
                 .get("tools")
                 .and_then(Value::as_array)
@@ -327,16 +363,13 @@ fn convert_tools(tool: &Value, out: &mut Vec<Value>) {
                 .flatten()
             {
                 match member.get("type").and_then(Value::as_str) {
-                    Some("function") => out.push(convert_tool(member, namespace)),
+                    Some("function") => {
+                        let converted = convert_tool_in_namespace(member, &namespace);
+                        remember_tool_name(member, &namespace, &converted, names)?;
+                        out.push(converted);
+                    }
                     Some("namespace") => {
-                        let mut inner = Vec::new();
-                        convert_tools(member, &mut inner);
-                        for mut t in inner {
-                            let name = t["function"]["name"].as_str().unwrap_or("").to_string();
-                            t["function"]["name"] =
-                                Value::String(qualify_namespace_tool_name(namespace, &name));
-                            out.push(t);
-                        }
+                        convert_tools_in(member, &namespace, out, names)?;
                     }
                     _ => {}
                 }
@@ -344,12 +377,58 @@ fn convert_tools(tool: &Value, out: &mut Vec<Value>) {
         }
         _ => {}
     }
+    Ok(())
 }
 
-/// Ollama's `convertTool`, plus `strict`, which chat completions has too.
-fn convert_tool(tool: &Value, namespace: &str) -> Value {
+fn validate_tool_name(native: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !native.is_empty() && native.len() <= 128,
+        "encoded Chat Completions function name must contain 1 to 128 characters (got {}): {native:?}",
+        native.len()
+    );
+    anyhow::ensure!(
+        native
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+        "Chat Completions function name contains unsupported characters: {native:?}"
+    );
+    Ok(())
+}
+
+fn remember_tool_name(
+    tool: &Value,
+    namespace: &[String],
+    converted: &Value,
+    names: &mut ToolNames,
+) -> anyhow::Result<()> {
+    let Some(native) = converted.pointer("/function/name").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    validate_tool_name(native)?;
+    let raw_name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+    let raw = serde_json::to_string(&(namespace, raw_name))?;
+    if let Some(previous) = names.native_to_raw.insert(native.to_string(), raw.clone()) {
+        if previous != raw {
+            anyhow::bail!(
+                "Responses tools {previous:?} and {raw:?} both encode to Chat Completions function name {native:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn convert_tool_in_namespace(tool: &Value, namespace: &[String]) -> Value {
     let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-    let mut function = json!({ "name": qualify_namespace_tool_name(namespace, name) });
+    let native = if namespace.is_empty() {
+        encode_tool_name_segment(name)
+    } else {
+        format!(
+            "{}_{}",
+            encode_namespace_segments(namespace.iter().map(String::as_str)),
+            encode_tool_name_segment(name)
+        )
+    };
+    let mut function = json!({ "name": native });
     for key in ["description", "parameters", "strict"] {
         if let Some(v) = tool.get(key).filter(|v| !v.is_null()) {
             function[key] = v.clone();
@@ -358,59 +437,172 @@ fn convert_tool(tool: &Value, namespace: &str) -> Value {
     json!({ "type": "function", "function": function })
 }
 
-/// Ollama's `qualifyNamespaceToolName`, with `_` wherever Ollama has `.`:
+/// Resolve a raw namespace against the request's original structure before
+/// encoding it; underscores inside a segment are not path separators.
+fn request_tool_name(tools: &[Value], namespace: &str, name: &str) -> String {
+    fn find(tools: &[Value], parent: &[String], namespace: &str, name: &str) -> Option<String> {
+        for tool in tools {
+            if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+                continue;
+            }
+            let mut path = parent.to_vec();
+            path.push(
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            let members = tool
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if raw_namespace_path(&path) == namespace {
+                for member in members {
+                    if member.get("type").and_then(Value::as_str) == Some("function")
+                        && member.get("name").and_then(Value::as_str) == Some(name)
+                    {
+                        return Some(
+                            convert_tool_in_namespace(member, &path)["function"]["name"]
+                                .as_str()
+                                .unwrap()
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            if let Some(native) = find(members, &path, namespace, name) {
+                return Some(native);
+            }
+        }
+        None
+    }
+    find(tools, &[], namespace, name)
+        .unwrap_or_else(|| qualify_namespace_tool_name(namespace, name))
+}
+
+fn raw_namespace_path(segments: &[String]) -> String {
+    segments.join("_")
+}
+
+/// Ollama's `qualifyNamespaceToolName`, replacing dots with underscores:
 /// providers enforce `^[a-zA-Z0-9_-]{1,128}$` on function names (Anthropic
 /// rejects Codex's `multi_agent_v1.spawn_agent`).
+///
+/// Compatibility: each segment is encoded via `encode_tool_name_segment`,
+/// which replaces `.` with `_` but keeps underscores and hyphens verbatim. A
+/// leading-underscore member therefore keeps its underscore: `("ns", "_f")`
+/// becomes `ns__f`. Before #563 this was `ns_f`, and dotted names such as
+/// `ns_files.read` were passed through unchanged and rejected by strict
+/// providers. Clients never see the encoded name: `responses_tool_call_name`
+/// decodes it back, and replayed history is re-encoded per-request alongside
+/// tool definitions, so stored sessions keep working. Only the upstream-visible
+/// name changed: expect one provider prompt-cache miss after upgrading, and
+/// different names in provider-side logs.
 fn qualify_namespace_tool_name(namespace: &str, member: &str) -> String {
     if namespace.is_empty() || member.is_empty() {
-        return member.to_string();
+        return encode_tool_name_segment(member);
     }
     if let Some(rest) = member.strip_prefix(&format!("{namespace}.")) {
-        return format!("{namespace}_{rest}");
+        return format!(
+            "{}_{}",
+            encode_namespace_path(namespace),
+            encode_tool_name_segment(rest)
+        );
     }
     if member.starts_with(&format!("{namespace}_")) {
-        return member.to_string();
+        return encode_namespace_path(member);
     }
     if member.starts_with('_') {
-        return format!("{namespace}{member}");
+        return format!(
+            "{}_{}",
+            encode_namespace_path(namespace),
+            encode_tool_name_segment(member)
+        );
     }
-    format!("{namespace}_{member}")
+    format!(
+        "{}_{}",
+        encode_namespace_path(namespace),
+        encode_tool_name_segment(member)
+    )
+}
+
+/// Encodes a raw namespace path. Existing callers spell nested paths with
+/// `_`; preserve existing underscores and hyphens.
+fn encode_namespace_path(namespace: &str) -> String {
+    encode_tool_name_segment(namespace)
+}
+
+/// Encodes namespace structure from explicit segments, using `_` only as the
+/// separator this bridge introduces.
+fn encode_namespace_segments<'a>(segments: impl IntoIterator<Item = &'a str>) -> String {
+    segments
+        .into_iter()
+        .map(encode_tool_name_segment)
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+/// Preserve tool names, replacing only dots for Chat Completions providers.
+/// Leading/inner underscores and hyphens are kept verbatim; collapsing them
+/// would let distinct Responses identities collide (see `remember_tool_name`).
+fn encode_tool_name_segment(segment: &str) -> String {
+    segment.replace('.', "_")
 }
 
 /// Ollama's `responsesToolCallName`: `(namespace, name)` for a qualified
 /// member of one of the request's `namespace` tools, else `("", qualified)`.
 fn responses_tool_call_name(tools: &[Value], qualified: &str) -> (String, String) {
     for tool in tools {
-        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
-            continue;
-        }
-        let Some(namespace) = tool
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|n| !n.is_empty())
-        else {
-            continue;
-        };
-        for member in tool
-            .get("tools")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if member.get("type").and_then(Value::as_str) == Some("namespace") {
-                continue;
-            }
-            let name = member.get("name").and_then(Value::as_str).unwrap_or("");
-            let native = qualify_namespace_tool_name(namespace, name);
-            if qualified == native
-                || qualified == format!("{namespace}.{name}")
-                || qualified == format!("{namespace}:{name}")
-            {
-                return (namespace.to_string(), name.to_string());
-            }
+        if let Some(found) = responses_tool_call_name_in(tool, &[], qualified) {
+            return found;
         }
     }
     (String::new(), qualified.to_string())
+}
+
+fn responses_tool_call_name_in(
+    tool: &Value,
+    parent_namespace: &[String],
+    qualified: &str,
+) -> Option<(String, String)> {
+    if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+        return None;
+    }
+    let name = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())?;
+    let mut path = parent_namespace.to_vec();
+    path.push(name.to_string());
+    let namespace = raw_namespace_path(&path);
+    for member in tool
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match member.get("type").and_then(Value::as_str) {
+            Some("function") => {
+                let name = member.get("name").and_then(Value::as_str).unwrap_or("");
+                let converted = convert_tool_in_namespace(member, &path);
+                let native = converted["function"]["name"].as_str().unwrap();
+                if qualified == native
+                    || qualified == format!("{namespace}.{name}")
+                    || qualified == format!("{namespace}:{name}")
+                {
+                    return Some((namespace, name.to_string()));
+                }
+            }
+            Some("namespace") => {
+                if let Some(found) = responses_tool_call_name_in(member, &path, qualified) {
+                    return Some(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Ollama's `convertResponsesContent`: a bare string when all text (every
@@ -1138,6 +1330,18 @@ pub(super) async fn handle_openai_responses(
 /// The generating Responses route, the one Codex talks to.
 pub(super) const RESPONSES_ROUTE: &str = "/v1/responses";
 
+pub(super) const MUSE_RESPONSES_ROUTE: &str = "/muse-code/v1/responses";
+
+/// Muse needs the complete Responses event envelopes and its namespaced
+/// tools preserved, rather than llama-server's native Responses subset.
+pub(super) async fn handle_muse_responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    proxy_openai_generation(&state, &headers, body, MUSE_RESPONSES_ROUTE).await
+}
+
 /// `/v1/responses` for a remote provider: natively when the provider has
 /// it, as a translated chat completion when it doesn't.
 ///
@@ -1190,8 +1394,26 @@ pub(super) async fn remote_responses(
         );
     }
 
-    let chat_req =
+    translated_responses(client, target, req, activity, canonical_model).await
+}
+
+/// Shared Responses-to-chat bridge for providers without native support
+/// and clients requiring a fuller protocol than a local backend exposes.
+pub(super) async fn translated_responses(
+    client: &Client,
+    target: &Target,
+    req: Value,
+    activity: ActivityGuard,
+    canonical_model: String,
+) -> Result<Response, AppError> {
+    let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut chat_req =
         from_responses_request(&req).map_err(|e| AppError(e, StatusCode::BAD_REQUEST))?;
+    if !target.is_remote() {
+        super::openai::apply_default_repeat_penalty(&mut chat_req);
+        super::openai::apply_reasoning_effort(&mut chat_req);
+        super::openai::consolidate_chat_system_messages(&mut chat_req);
+    }
     let upstream = send_chat_completion(client, target, &chat_req, &canonical_model).await?;
     let status = upstream.status;
     if status.is_client_error() {
@@ -1210,6 +1432,8 @@ pub(super) async fn remote_responses(
     Ok(convert_upstream(upstream.body, activity, converter, streaming).await)
 }
 
+/// Proxies the non-generating Responses token-count route without applying
+/// generation-only request rewrites.
 pub(super) async fn handle_openai_responses_input_tokens(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1550,7 +1774,7 @@ mod tests {
     }
 
     /// Ollama's namespace handling: a `namespace` tool is flattened into
-    /// `namespace.member` functions on the way out, a `function_call`
+    /// `namespace_member` functions on the way out, a `function_call`
     /// naming a member is qualified the same way on the way back in
     /// (whether it carries `namespace` or a dotted/colon name), and the
     /// model's call to one is reported under its namespace.
@@ -1576,7 +1800,7 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["agents_spawn", "agents_wait", "shell"]);
+        assert_eq!(names, ["agents_spawn", "agents__wait", "shell"]);
         for name in names {
             assert!(
                 name.chars()
@@ -1586,7 +1810,7 @@ mod tests {
         }
         let calls = chat["messages"][1]["tool_calls"].as_array().unwrap();
         assert_eq!(calls[0]["function"]["name"], "agents_spawn");
-        assert_eq!(calls[1]["function"]["name"], "agents_wait");
+        assert_eq!(calls[1]["function"]["name"], "agents__wait");
         assert_eq!(calls[2]["function"]["name"], "shell");
 
         let lines = [
@@ -1601,6 +1825,255 @@ mod tests {
             .unwrap()["item"];
         assert_eq!(item["namespace"], "agents");
         assert_eq!(item["name"], "spawn");
+    }
+
+    #[test]
+    fn nested_namespace_tools_round_trip_through_the_flattened_name() {
+        let tools = json!([
+            { "type": "namespace", "name": "agents", "tools": [
+                { "type": "namespace", "name": "files", "tools": [
+                    { "type": "function", "name": "read" }
+                ]}
+            ]}
+        ]);
+        let req = json!({ "model": "m", "tools": tools, "tool_choice": {
+            "type": "function", "name": "agents_files.read"
+        }, "input": [
+            { "type": "function_call", "call_id": "c1", "name": "agents_files:read", "arguments": "{}" }
+        ]});
+        let chat = from_responses_request(&req).unwrap();
+        assert_eq!(chat["tools"][0]["function"]["name"], "agents_files_read");
+        assert_eq!(chat["tool_choice"]["function"]["name"], "agents_files_read");
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["name"],
+            "agents_files_read"
+        );
+
+        let lines = [
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"agents_files_read","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ];
+        let (_, events) = run(json!({ "tools": tools }), &lines);
+        let item = &events
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .unwrap()["item"];
+        assert_eq!(item["namespace"], "agents_files");
+        assert_eq!(item["name"], "read");
+    }
+
+    #[test]
+    fn dotted_namespace_member_names_round_trip_through_encoded_chat_names() {
+        let tools = json!([
+            { "type": "namespace", "name": "agents", "tools": [
+                { "type": "function", "name": "files.read" }
+            ]}
+        ]);
+        let req = json!({ "model": "m", "tools": tools, "tool_choice": {
+            "type": "function", "namespace": "agents", "name": "files.read"
+        }, "input": [
+            { "type": "function_call", "call_id": "c1", "namespace": "agents", "name": "files.read", "arguments": "{}" }
+        ]});
+        let chat = from_responses_request(&req).unwrap();
+        assert_eq!(chat["tools"][0]["function"]["name"], "agents_files_read");
+        assert_eq!(chat["tool_choice"]["function"]["name"], "agents_files_read");
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["name"],
+            "agents_files_read"
+        );
+
+        let lines = [
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"agents_files_read","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ];
+        let (_, events) = run(json!({ "tools": tools }), &lines);
+        let item = &events
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .unwrap()["item"];
+        assert_eq!(item["namespace"], "agents");
+        assert_eq!(item["name"], "files.read");
+    }
+
+    #[test]
+    fn punctuation_namespace_names_round_trip_without_double_encoding() {
+        let tools = json!([
+            { "type": "namespace", "name": "my-tools", "tools": [
+                { "type": "namespace", "name": "files.v1", "tools": [
+                    { "type": "function", "name": "read" }
+                ]}
+            ]}
+        ]);
+        let req = json!({ "model": "m", "tools": tools, "tool_choice": {
+            "type": "function", "namespace": "my-tools_files.v1", "name": "read"
+        }, "input": [
+            { "type": "function_call", "call_id": "c1", "namespace": "my-tools_files.v1", "name": "read", "arguments": "{}" }
+        ]});
+        let chat = from_responses_request(&req).unwrap();
+        assert_eq!(
+            chat["tools"][0]["function"]["name"],
+            "my-tools_files_v1_read"
+        );
+        assert_eq!(
+            chat["tool_choice"]["function"]["name"],
+            "my-tools_files_v1_read"
+        );
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["name"],
+            "my-tools_files_v1_read"
+        );
+
+        let lines = [
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"my-tools_files_v1_read","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ];
+        let (_, events) = run(json!({ "tools": tools }), &lines);
+        let item = &events
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .unwrap()["item"];
+        assert_eq!(item["namespace"], "my-tools_files.v1");
+        assert_eq!(item["name"], "read");
+    }
+
+    #[test]
+    fn flattened_tool_name_collisions_are_rejected() {
+        for tools in [
+            json!([{"type":"function","name":"agents_spawn"},
+                {"type":"namespace","name":"agents","tools":[{"type":"function","name":"spawn"}]}]),
+            json!([{"type":"function","name":"files.read"}, {"type":"function","name":"files_read"}]),
+        ] {
+            let error = from_responses_request(&json!({"model":"m","input":"go","tools":tools}))
+                .unwrap_err();
+            assert!(error.to_string().contains("both encode"), "{error}");
+        }
+    }
+
+    #[test]
+    fn ordinary_tool_names_are_preserved() {
+        for name in ["apply_patch", "read-file", "_xC3_xA9"] {
+            let chat = from_responses_request(
+                &json!({"model":"m","input":"go","tools":[{"type":"function","name":name}]}),
+            )
+            .unwrap();
+            assert_eq!(chat["tools"][0]["function"]["name"], name);
+        }
+    }
+
+    #[test]
+    fn ambiguous_raw_namespace_identities_are_rejected_in_either_order() {
+        let literal = json!({"type": "namespace", "name": "a_b", "tools": [
+            {"type": "function", "name": "x"}
+        ]});
+        let nested = json!({"type": "namespace", "name": "a", "tools": [
+            {"type": "namespace", "name": "b", "tools": [
+                {"type": "function", "name": "x"}
+            ]}
+        ]});
+        for tools in [json!([literal, nested]), json!([nested, literal])] {
+            let error =
+                from_responses_request(&json!({"model": "m", "input": "go", "tools": tools}))
+                    .unwrap_err();
+            assert!(error.to_string().contains("both encode"), "{error}");
+        }
+    }
+
+    #[test]
+    fn encoded_function_names_must_fit_the_provider_limit() {
+        for (tool, valid) in [
+            (json!({"type": "function", "name": "a".repeat(128)}), true),
+            (json!({"type": "function", "name": "a".repeat(129)}), false),
+            (json!({"type": "function", "name": "-".repeat(128)}), true),
+            (json!({"type": "function", "name": ".".repeat(43)}), true),
+            (
+                json!({"type": "namespace", "name": "a".repeat(64), "tools": [
+                    {"type": "function", "name": "b".repeat(64)}
+                ]}),
+                false,
+            ),
+        ] {
+            let result =
+                from_responses_request(&json!({"model": "m", "input": "go", "tools": [tool]}));
+            if valid {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("1 to 128 characters"));
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_replayed_function_names_are_rejected_without_definitions() {
+        let error = from_responses_request(&json!({"model": "m", "input": [
+            {"type": "function_call", "name": "a".repeat(129), "call_id": "c", "arguments": "{}"}
+        ]}))
+        .unwrap_err();
+        assert!(error.to_string().contains("1 to 128 characters"));
+    }
+
+    #[test]
+    fn namespace_underscores_are_preserved_inside_each_segment() {
+        let req = json!({
+            "model": "m",
+            "input": "go",
+            "tools": [
+                { "type": "namespace", "name": "a__b", "tools": [
+                    { "type": "function", "name": "x" }
+                ]},
+                { "type": "namespace", "name": "a", "tools": [
+                    { "type": "namespace", "name": "b", "tools": [
+                        { "type": "function", "name": "x" }
+                    ]}
+                ]},
+                { "type": "namespace", "name": "_ns", "tools": [
+                    { "type": "function", "name": "x" }
+                ]},
+                { "type": "namespace", "name": "ns_", "tools": [
+                    { "type": "function", "name": "x" }
+                ]}
+            ]
+        });
+        let chat = from_responses_request(&req).unwrap();
+        let names: Vec<&str> = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["a__b_x", "a_b_x", "_ns_x", "ns__x"]);
+        let tools = &req["tools"];
+        for (namespace, native) in [
+            ("a__b", "a__b_x"),
+            ("a_b", "a_b_x"),
+            ("_ns", "_ns_x"),
+            ("ns_", "ns__x"),
+        ] {
+            assert_eq!(
+                responses_tool_call_name(tools.as_array().unwrap(), native),
+                (namespace.to_string(), "x".to_string())
+            );
+            for call in [
+                json!({"type": "function_call", "namespace": namespace, "name": "x", "call_id": "c", "arguments": "{}"}),
+                json!({"type": "function_call", "name": native, "call_id": "c", "arguments": "{}"}),
+            ] {
+                let chat = from_responses_request(&json!({
+                    "model": "m", "tools": tools, "input": [call],
+                    "tool_choice": {"type": "function", "namespace": namespace, "name": "x"}
+                }))
+                .unwrap();
+                assert_eq!(chat["tool_choice"]["function"]["name"], native);
+                assert_eq!(
+                    chat["messages"][0]["tool_calls"][0]["function"]["name"],
+                    native
+                );
+            }
+        }
     }
 
     #[test]
@@ -2304,7 +2777,11 @@ mod tests {
         assert_eq!(qualify_namespace_tool_name("ns", "f"), "ns_f");
         assert_eq!(qualify_namespace_tool_name("ns", "ns.f"), "ns_f");
         assert_eq!(qualify_namespace_tool_name("ns", "ns_f"), "ns_f");
-        assert_eq!(qualify_namespace_tool_name("ns", "_f"), "ns_f");
+        assert_eq!(qualify_namespace_tool_name("ns", "_f"), "ns__f");
+        assert_eq!(
+            qualify_namespace_tool_name("ns", "files.read"),
+            "ns_files_read"
+        );
     }
 
     // -- fallback policy ----------------------------------------------------

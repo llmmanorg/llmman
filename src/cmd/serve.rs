@@ -3758,6 +3758,12 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .merge(ollama_router())
         // OpenAI API
         .route("/v1/models", get(handle_openai_models))
+        // Muse discovers its catalog before using its Responses adapter.
+        .route("/muse-code/models", get(handle_openai_models))
+        .route(
+            responses::MUSE_RESPONSES_ROUTE,
+            post(responses::handle_muse_responses),
+        )
         .route("/v1/chat/completions", post(handle_openai_chat))
         .route("/v1/completions", post(handle_openai_completions))
         .route("/v1/embeddings", post(handle_openai_embeddings))
