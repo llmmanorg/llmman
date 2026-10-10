@@ -58,6 +58,7 @@ pub fn is_generation_route(route: &str) -> bool {
             | "/v1/chat/completions"
             | "/v1/completions"
             | "/v1/responses"
+            | "/muse-code/v1/responses"
             | "/v1/messages"
             | "/gemini/:model/*gemini_path"
     )
@@ -365,6 +366,7 @@ mod tests {
             "/v1/chat/completions",
             "/v1/completions",
             "/v1/responses",
+            "/muse-code/v1/responses",
             "/v1/messages",
             "/gemini/:model/*gemini_path",
         ] {
