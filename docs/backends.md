@@ -190,6 +190,14 @@ llmman run qwen-image-2.1 "A manatee in a sunlit lagoon"
 Text to image only: 1024x1024, 40 steps, RGBA PNG. The text encoder and the
 transformer load on first use and take turns when both do not fit.
 
+The E2E suite checks the Metal image against the CPU's on a tiny synthetic
+pack (`mediagen_qwen_image_metal_matches_cpu`). When bumping the llama.cpp
+release, also run the real model, which needs ~33 GB of weights:
+
+```sh
+LLMMAN_E2E_IMAGE_MODEL=qwen-image-2.1 cargo test --release --test launch_e2e generate_image_with_a_real_diffusion_model -- --nocapture
+```
+
 ### `vllm serve` from llmman's store
 
 The inverse: the [`vllm-llmman`](https://pypi.org/project/vllm-llmman/)
