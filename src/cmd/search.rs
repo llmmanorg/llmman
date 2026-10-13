@@ -906,6 +906,7 @@ mod tests {
             path: path.into(),
             size,
             kind: "file".into(),
+            lfs: None,
         }
     }
 

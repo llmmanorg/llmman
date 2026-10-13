@@ -165,6 +165,25 @@ async fn pull_into(reference: &str, target: &Target<'_>) -> Result<()> {
     anyhow::bail!("{reference}: not a source reference this module handles")
 }
 
+/// Fails before anything is fetched when files of `sizes` won't fit on
+/// the disk `target` writes to. A source names no content digests up
+/// front, so every file counts, even one already stored.
+fn ensure_room(
+    reference: &str,
+    target: &Target<'_>,
+    sizes: impl IntoIterator<Item = i64>,
+) -> Result<()> {
+    let needed = sizes
+        .into_iter()
+        .fold(0u64, |total, size| total.saturating_add(size.max(0) as u64));
+    crate::fsutil::ensure_room(
+        reference,
+        target.layout_dir,
+        needed,
+        crate::fsutil::available_space(target.layout_dir),
+    )
+}
+
 fn strip_any_prefix<'a>(s: &'a str, prefixes: &[&str]) -> Option<&'a str> {
     prefixes.iter().find_map(|p| s.strip_prefix(p))
 }

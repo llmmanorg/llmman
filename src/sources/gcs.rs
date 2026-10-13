@@ -65,6 +65,21 @@ pub(crate) async fn pull(reference: &str, rest: &str, target: &Target<'_>) -> Re
     if objects.is_empty() {
         anyhow::bail!("no objects found at gs://{bucket}/{prefix}");
     }
+    super::ensure_room(
+        reference,
+        target,
+        objects
+            .iter()
+            .filter(|obj| {
+                super::relative_to_prefix(&obj.name, prefix).is_some_and(super::should_pack)
+            })
+            .map(|obj| {
+                obj.size
+                    .as_deref()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0)
+            }),
+    )?;
 
     let dl = crate::hf::download_client()?;
     let mut packed = Vec::new();

@@ -665,6 +665,9 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	if _, err := writeBlob(layoutDir, manifest.Config.MediaType, configData); err != nil {
 		return fmt.Errorf("write config blob: %w", err)
 	}
+	if err := ensureRoom(progressKey, layoutDir, layersMissing(layoutDir, manifest.Layers)); err != nil {
+		return err
+	}
 
 	// Fetch layers in parallel — up to 6 concurrent downloads, matching podman's
 	// default maxParallelDownloads.  All bars share one mpb.Progress; OnComplete

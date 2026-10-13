@@ -55,6 +55,15 @@ pub(crate) async fn pull(reference: &str, rest: &str, target: &Target<'_>) -> Re
     if keys.is_empty() {
         anyhow::bail!("no objects found at s3://{bucket}/{prefix}");
     }
+    super::ensure_room(
+        reference,
+        target,
+        keys.iter()
+            .filter(|(key, _)| {
+                super::relative_to_prefix(key, prefix).is_some_and(super::should_pack)
+            })
+            .map(|(_, size)| *size),
+    )?;
 
     let mut packed = Vec::new();
     for (key, size) in &keys {

@@ -85,6 +85,16 @@ pub(crate) async fn pull(reference: &str, ms_ref: &str, target: &Target<'_>) -> 
         anyhow::bail!("ModelScope list: HTTP {}", status.as_u16());
     }
     let listing: MsListing = resp.json().await.context("ModelScope list decode")?;
+    super::ensure_room(
+        reference,
+        target,
+        listing
+            .data
+            .files
+            .iter()
+            .filter(|f| !f.is_dir() && super::should_pack(&f.path))
+            .map(|f| f.size),
+    )?;
 
     let dl = crate::hf::download_client()?;
     let mut packed = Vec::new();

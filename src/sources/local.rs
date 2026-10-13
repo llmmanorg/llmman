@@ -71,6 +71,14 @@ pub(crate) fn pull(local_path: &str, target: &Target<'_>) -> Result<()> {
     if packed.is_empty() {
         anyhow::bail!("no model files found in {local_path}");
     }
+    // Imported by copying, so the files need room in the store too.
+    super::ensure_room(
+        local_path,
+        target,
+        packed.iter().map(|f| {
+            std::fs::metadata(&f.local_path).map_or(0, |m| m.len().min(i64::MAX as u64) as i64)
+        }),
+    )?;
     eprintln!("Importing {} files from {local_path}", packed.len());
     // No download progress to show the work happening, so announce each
     // file as it is stored instead.

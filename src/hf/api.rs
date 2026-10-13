@@ -20,6 +20,16 @@ pub struct HfFile {
     pub size: i64,
     #[serde(default, rename = "type")]
     pub kind: String, // "file" or "directory"
+    /// Set for an LFS file, whose `oid` is its sha256: the name of the
+    /// blob it is stored as.
+    #[serde(default)]
+    pub lfs: Option<HfLfs>,
+}
+
+/// The `lfs` object of an [`HfFile`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct HfLfs {
+    pub oid: String,
 }
 
 /// Issues an authenticated GET and decodes JSON; see `client::probe` for
@@ -719,6 +729,7 @@ mod tests {
             path: path.to_string(),
             size,
             kind: "file".to_string(),
+            lfs: None,
         }
     }
 

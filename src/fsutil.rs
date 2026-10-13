@@ -1,4 +1,5 @@
-//! Whole-file writes a reader never sees half done.
+//! Whole-file writes a reader never sees half done, and the free space a
+//! download needs.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -43,6 +44,87 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })
 }
 
+/// Fails when `needed` bytes will not fit in the `available` bytes free
+/// at `dir`, before `what` is pulled there. Free space that could not be
+/// read passes: running out still fails the write, as it always has.
+pub fn ensure_room(
+    what: &str,
+    dir: &Path,
+    needed: u64,
+    available: Option<u64>,
+) -> anyhow::Result<()> {
+    match available {
+        Some(free) if needed > free => anyhow::bail!(
+            "not enough disk space to pull {what}: it needs {}, and {} is free at {}; \
+             free some space (llmman rm) or set LLMMAN_MODELS to a store on a bigger disk",
+            crate::fmt::human_size(needed),
+            crate::fmt::human_size(free),
+            dir.display()
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// The bytes this user may still write to the filesystem holding `dir`,
+/// or `None` where that can't be read (or a filesystem reports no size,
+/// as some FUSE ones do).
+pub fn available_space(dir: &Path) -> Option<u64> {
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `path` is NUL-terminated and `st` is written by the call.
+        if unsafe { libc::statvfs(path.as_ptr(), st.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: statvfs returned 0, so it filled `st`.
+        let st = unsafe { st.assume_init() };
+        #[allow(clippy::unnecessary_cast)]
+        return (st.f_blocks > 0).then(|| st.f_bavail as u64 * st.f_frsize as u64);
+    }
+    // statfs, not statvfs: Apple's statvfs has 32-bit block counts.
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `path` is NUL-terminated and `st` is written by the call.
+        if unsafe { libc::statfs(path.as_ptr(), st.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: statfs returned 0, so it filled `st`.
+        let st = unsafe { st.assume_init() };
+        return (st.f_blocks > 0).then(|| st.f_bavail * u64::from(st.f_bsize));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetDiskFreeSpaceExW(
+                directory: *const u16,
+                free_to_caller: *mut u64,
+                total: *mut u64,
+                total_free: *mut u64,
+            ) -> i32;
+        }
+        let path: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+        let (mut free, mut total) = (0u64, 0u64);
+        // SAFETY: `path` is NUL-terminated; the outputs are plain u64s and
+        // the last one may be null.
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(path.as_ptr(), &mut free, &mut total, std::ptr::null_mut())
+        };
+        return (ok != 0 && total > 0).then_some(free);
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = dir;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,6 +140,28 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn ensure_room_refuses_only_what_does_not_fit() {
+        let dir = Path::new("/models");
+        assert!(ensure_room("m", dir, 10, Some(10)).is_ok());
+        assert!(
+            ensure_room("m", dir, 11, None).is_ok(),
+            "unknown free space passes"
+        );
+        let err = ensure_room("org/m", dir, 3 << 30, Some(1 << 30))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("org/m"), "{err}");
+        assert!(err.contains(&crate::fmt::human_size(3 << 30)), "{err}");
+        assert!(err.contains(&crate::fmt::human_size(1 << 30)), "{err}");
+        assert!(err.contains("/models"), "{err}");
+    }
+
+    #[test]
+    fn available_space_reads_the_temp_dirs_filesystem() {
+        assert!(available_space(&std::env::temp_dir()).is_some_and(|free| free > 0));
     }
 
     #[test]

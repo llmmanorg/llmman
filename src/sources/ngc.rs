@@ -62,6 +62,16 @@ pub(crate) async fn pull(reference: &str, rest: &str, target: &Target<'_>) -> Re
     }
     let listing: NgcListing = resp.json().await.context("NGC list decode")?;
 
+    super::ensure_room(
+        reference,
+        target,
+        listing
+            .model_files
+            .iter()
+            .filter(|f| super::should_pack(&f.name))
+            .map(|f| f.size),
+    )?;
+
     let dl = crate::hf::download_client()?;
     let mut packed = Vec::new();
     for f in &listing.model_files {

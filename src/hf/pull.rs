@@ -72,6 +72,20 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
             } else {
                 String::new()
             };
+            let plan = diffusion.then(|| api::diffusion_plan(&files, &shards[0].path));
+            let mmproj = if diffusion {
+                None
+            } else {
+                api::select_mmproj(&files)
+            };
+            let license = api::select_license_file(&files);
+            let wanted: Vec<&HfFile> = shards
+                .iter()
+                .chain(plan.iter().flat_map(|p| p.sidecars.iter().map(|(_, f)| f)))
+                .chain(mmproj.iter())
+                .chain(license.iter())
+                .collect();
+            ensure_room(reference, layout_dir, &wanted)?;
 
             let mut layers = Vec::new();
             for f in &shards {
@@ -91,8 +105,7 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
                     .await?,
                 );
             }
-            if diffusion {
-                let plan = api::diffusion_plan(&files, &shards[0].path);
+            if let Some(plan) = plan {
                 meta.diffusion_outputs = plan.outputs;
                 for (role, file) in &plan.sidecars {
                     let d = download_layer(
@@ -127,7 +140,7 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
                         .insert(oci::ANNOTATION_ROLE.to_string(), "text_encoder".to_string());
                     layers.push(d);
                 }
-            } else if let Some(mmproj) = api::select_mmproj(&files) {
+            } else if let Some(mmproj) = mmproj {
                 layers.push(
                     download_layer(
                         &dl_client,
@@ -145,7 +158,7 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
                 );
                 meta.vision = true;
             }
-            if let Some(lic) = api::select_license_file(&files) {
+            if let Some(lic) = license {
                 let mut d = download_layer(
                     &dl_client,
                     &head_client,
@@ -180,6 +193,11 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
             if to_download.is_empty() {
                 anyhow::bail!("no model files found in repository {owner}/{repo}");
             }
+            ensure_room(
+                reference,
+                layout_dir,
+                &to_download.iter().collect::<Vec<_>>(),
+            )?;
             // Concurrent, bounded by LLMMAN_MAX_TRANSFER_STREAMS (the
             // GGUF branch above stays sequential). Indexed so `layers`'
             // order doesn't depend on finish order.
@@ -234,6 +252,40 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
     oci::write_manifest_ref(layout_dir, reference, manifest_desc)
 }
 
+/// Fails before anything downloads when `files` won't fit on the store's
+/// disk; see [`bytes_missing`].
+fn ensure_room(reference: &str, layout_dir: &Path, files: &[&HfFile]) -> Result<()> {
+    let needed = bytes_missing(layout_dir, files);
+    crate::fsutil::ensure_room(
+        reference,
+        layout_dir,
+        needed,
+        crate::fsutil::available_space(layout_dir),
+    )
+}
+
+/// The bytes `files` still need in `layout_dir`. An LFS file already
+/// stored as its blob (its `lfs.oid` is the sha256 that names it, and
+/// `download_layer` reuses it) needs none, nor does a second file with
+/// the same content. Each download lands in `blobs/tmp` and is renamed
+/// into place on the same disk, so this is also the most it ever holds.
+fn bytes_missing(layout_dir: &Path, files: &[&HfFile]) -> u64 {
+    let blobs = layout_dir.join("blobs").join("sha256");
+    let mut seen = std::collections::HashSet::new();
+    let mut needed = 0u64;
+    for f in files {
+        let stored = f.lfs.as_ref().is_some_and(|lfs| {
+            !seen.insert(lfs.oid.as_str())
+                || std::fs::metadata(blobs.join(&lfs.oid))
+                    .is_ok_and(|m| m.is_file() && m.len() as i64 == f.size)
+        });
+        if !stored {
+            needed = needed.saturating_add(f.size.max(0) as u64);
+        }
+    }
+    needed
+}
+
 fn basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
@@ -266,6 +318,7 @@ async fn pull_text_encoder(
     if shards.len() != 1 {
         anyhow::bail!("text encoder {reference}: split GGUFs are not supported");
     }
+    ensure_room(reference, layout_dir, &[&shards[0]])?;
     let mut d = download_layer(
         dl_client,
         head_client,
@@ -568,6 +621,50 @@ impl Write for HashingProgressWriter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lfs_file(path: &str, size: i64, oid: Option<&str>) -> HfFile {
+        HfFile {
+            path: path.to_string(),
+            size,
+            kind: "file".to_string(),
+            lfs: oid.map(|oid| api::HfLfs {
+                oid: oid.to_string(),
+            }),
+        }
+    }
+
+    /// Only what isn't already a blob of the right size counts, and a
+    /// file whose content another one already brings counts once.
+    #[test]
+    fn bytes_missing_skips_stored_blobs_and_repeated_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = dir.path().join("blobs").join("sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join("aa"), [0u8; 100]).unwrap();
+        std::fs::write(blobs.join("bb"), [0u8; 5]).unwrap();
+        let stored = lfs_file("stored.gguf", 100, Some("aa"));
+        let truncated = lfs_file("truncated.gguf", 200, Some("bb"));
+        let absent = lfs_file("absent.gguf", 300, Some("cc"));
+        let again = lfs_file("copy/absent.gguf", 300, Some("cc"));
+        let config = lfs_file("config.json", 7, None);
+        assert_eq!(
+            bytes_missing(dir.path(), &[&stored, &truncated, &absent, &again, &config]),
+            200 + 300 + 7
+        );
+    }
+
+    /// Sizes come from the repository, so a sum that wraps must not read
+    /// as small.
+    #[test]
+    fn bytes_missing_saturates_on_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<HfFile> = ["a", "b", "c"]
+            .iter()
+            .map(|oid| lfs_file(oid, i64::MAX, Some(oid)))
+            .collect();
+        let files: Vec<&HfFile> = files.iter().collect();
+        assert_eq!(bytes_missing(dir.path(), &files), u64::MAX);
+    }
 
     #[test]
     fn tmp_file_guard_removes_the_file_on_drop_by_default() {

@@ -282,6 +282,18 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	}
 	defer pctx.Destroy()
 
+	// copy.Image never shows the layers before fetching them, so the
+	// manifest is read once more for their sizes. An index (or anything
+	// unreadable) is left to copy.Image unchecked.
+	if raw, err := fetchManifestRaw(ctx, ref); err == nil {
+		var m ocispec.Manifest
+		if json.Unmarshal(raw, &m) == nil && len(m.Layers) > 0 {
+			if err := ensureRoom(progressKey, layoutDir, layersMissing(layoutDir, m.Layers)); err != nil {
+				return err
+			}
+		}
+	}
+
 	progressSetStatus(progressKey, "pulling")
 	manifestData, err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pulling", "Pulled", &copy.Options{
 		MaxParallelDownloads: 6,
