@@ -37,6 +37,11 @@
 //!
 //! [registries."docker.io"]             # crate::ffi, go-shim
 //! mirrors = "https://mirror.gcr.io,registry-mirror.corp:5000"
+//!
+//! [launch.opencode]                    # cmd::launch: flags to use when none are typed
+//! provider = "anthropic"
+//! model    = "claude-sonnet-5-5"
+//! variant  = "xhigh"
 //! ```
 //!
 //! Parsing happens once, in [`files`]; what a *failed* parse means is
@@ -89,6 +94,9 @@ pub struct Conf {
     /// reference names — see [`registry_mirrors`].
     #[serde(default)]
     pub registries: HashMap<String, RegistryConf>,
+    /// `[launch.<integration>]` tables, see [`launch_defaults`].
+    #[serde(default)]
+    pub launch: HashMap<String, LaunchConf>,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]
@@ -241,6 +249,22 @@ pub struct RegistryConf {
     /// `llmman config set` can write it.
     #[serde(default)]
     pub mirrors: Option<String>,
+}
+
+/// One `[launch.<integration>]` table: the flags `llmman launch` uses when
+/// none are typed. A blank value clears one that an earlier file set.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchConf {
+    /// As `--provider`.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// As `--model`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// As `--variant`.
+    #[serde(default)]
+    pub variant: Option<String>,
 }
 
 /// One `[providers.<id>]` table. Without `base_url` it keys a catalog
@@ -551,6 +575,7 @@ fn validate(conf: &Conf) -> Result<(), String> {
             mirror_url_of(&mirror).map_err(|e| format!("[registries.{host:?}] mirrors: {e}"))?;
         }
     }
+    validate_launch(&conf.launch)?;
     for (id, p) in &conf.providers {
         // `<provider>/<model>` is how a reference travels (see
         // `crate::providers::split_remote_ref`), so a slash in the id
@@ -577,6 +602,40 @@ fn validate(conf: &Conf) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Each table must name an integration (once) and hold a variant that
+/// `--variant` takes; a misspelling would silently never apply.
+fn validate_launch(launch: &HashMap<String, LaunchConf>) -> Result<(), String> {
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    for (name, l) in launch {
+        let canonical = crate::cmd::launch::canonical_integration(name).ok_or_else(|| {
+            format!(
+                "[launch.{name:?}]: not an integration `llmman launch` knows; \
+                 run `llmman launch` to list them"
+            )
+        })?;
+        // `copilot` and its alias `copilot-cli` are one integration.
+        if let Some(other) = seen.insert(canonical, name) {
+            return Err(format!(
+                "[launch.{name:?}] and [launch.{other:?}] name the same integration"
+            ));
+        }
+        if let Some(variant) = set_value(l.variant.as_deref()) {
+            if !crate::cmd::run::variants().any(|v| v == variant) {
+                return Err(format!(
+                    "[launch.{name}] variant: {variant:?} is not one of {}",
+                    crate::cmd::run::variants().collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `value` trimmed, `None` when absent or blank.
+fn set_value(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
 }
 
 /// Parses an `http`/`https` URL with a host and no userinfo, query or
@@ -716,6 +775,57 @@ fn registry_mirrors_from(env: Option<&str>, files: &[File]) -> BTreeMap<String, 
     }
     by_host.retain(|_, mirrors| !mirrors.is_empty());
     by_host
+}
+
+// ---------------------------------------------------------------------------
+// Launch defaults
+// ---------------------------------------------------------------------------
+
+/// The `[launch.<integration>]` defaults for `integration` (any case, or
+/// an alias), merged one key at a time with later files overriding.
+///
+/// `Err` when a file does not parse: the defaults cannot be known, and
+/// running without them would silently launch another model.
+pub fn launch_defaults(integration: &str) -> Result<LaunchConf, &'static str> {
+    Ok(launch_defaults_from(files()?, integration))
+}
+
+fn launch_defaults_from(files: &[File], integration: &str) -> LaunchConf {
+    let wanted = crate::cmd::launch::canonical_integration(integration);
+    let mut merged = LaunchConf::default();
+    for conf in files.iter().filter_map(|file| {
+        // At most one table per integration: see `validate_launch`.
+        file.conf
+            .launch
+            .iter()
+            .find(|(name, _)| crate::cmd::launch::canonical_integration(name) == wanted)
+            .map(|(_, conf)| conf)
+    }) {
+        for (field, value) in [
+            (&mut merged.provider, &conf.provider),
+            (&mut merged.model, &conf.model),
+            (&mut merged.variant, &conf.variant),
+        ] {
+            if value.is_some() {
+                *field = set_value(value.as_deref()).map(str::to_string);
+            }
+        }
+    }
+    merged
+}
+
+#[cfg(test)]
+pub(crate) fn launch_conf(
+    provider: Option<&str>,
+    model: Option<&str>,
+    variant: Option<&str>,
+) -> LaunchConf {
+    let own = |v: Option<&str>| v.map(str::to_string);
+    LaunchConf {
+        provider: own(provider),
+        model: own(model),
+        variant: own(variant),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1693,6 +1803,84 @@ ps = "off""#,
         assert!(!registry_mirrors_from(Some(""), &[system()]).contains_key("docker.io"));
         assert!(registry_mirrors_from(Some("ftp://nope"), &[]).is_empty());
         assert!(registry_mirrors_from(None, &[]).is_empty());
+    }
+
+    // -- launch defaults -----------------------------------------------------
+
+    #[test]
+    fn launch_defaults_come_from_the_integrations_own_table() {
+        let f = [file(
+            "[launch.opencode]\nprovider = \"anthropic\"\nmodel = \"claude-sonnet-5-5\"\n\
+             variant = \"xhigh\"\n[launch.claude]\nmodel = \"qwen3.8\"",
+        )];
+        assert_eq!(
+            launch_defaults_from(&f, "opencode"),
+            launch_conf(Some("anthropic"), Some("claude-sonnet-5-5"), Some("xhigh"))
+        );
+        assert_eq!(
+            launch_defaults_from(&f, "claude"),
+            launch_conf(None, Some("qwen3.8"), None)
+        );
+        for other in ["codex", "nonesuch"] {
+            assert_eq!(
+                launch_defaults_from(&f, other),
+                LaunchConf::default(),
+                "{other}"
+            );
+        }
+        assert_eq!(launch_defaults_from(&[], "opencode"), LaunchConf::default());
+    }
+
+    /// `launch` takes any case, and `copilot-cli` for `copilot`.
+    #[test]
+    fn launch_defaults_are_found_through_case_and_alias() {
+        let f = [file(
+            "[launch.OpenCode]\nmodel = \"m\"\n[launch.copilot-cli]\nmodel = \"c\"",
+        )];
+        assert_eq!(
+            launch_defaults_from(&f, "OPENCODE").model.as_deref(),
+            Some("m")
+        );
+        for name in ["copilot", "copilot-cli", "Copilot"] {
+            assert_eq!(
+                launch_defaults_from(&f, name).model.as_deref(),
+                Some("c"),
+                "{name}"
+            );
+        }
+    }
+
+    /// One key at a time; a blank (or whitespace) value clears one.
+    #[test]
+    fn a_later_file_overrides_launch_defaults_one_key_at_a_time() {
+        let system = file(
+            "[launch.opencode]\nprovider = \"anthropic\"\nmodel = \"sys\"\nvariant = \"high\"",
+        );
+        let user = file("[launch.opencode]\nmodel = \"mine\"\nvariant = \"\"");
+        assert_eq!(
+            launch_defaults_from(&[system, user], "opencode"),
+            launch_conf(Some("anthropic"), Some("mine"), None)
+        );
+        let blank = file("[launch.opencode]\nprovider = \"  \"\nmodel = \" m \"");
+        assert_eq!(
+            launch_defaults_from(&[blank], "opencode"),
+            launch_conf(None, Some("m"), None)
+        );
+    }
+
+    #[test]
+    fn a_launch_table_must_name_an_integration_a_key_and_a_variant() {
+        let err = |text: &str| parse(text).expect_err("must not parse");
+        assert!(err("[launch.opencod]\nmodel = \"m\"").contains("opencod"));
+        assert!(err("[launch.opencode]\nmodle = \"m\"").contains("modle"));
+        assert!(err("[launch.opencode]\nvariant = \"turbo\"").contains("turbo"));
+        assert!(err("[launch.opencode]\nvariant = 3").contains("string"));
+        assert!(err("[launch]\nmodel = \"m\"").contains("model"));
+        let both = "[launch.copilot]\nmodel = \"a\"\n[launch.copilot-cli]\nmodel = \"b\"";
+        assert!(err(both).contains("same integration"));
+        for variant in crate::cmd::run::variants().chain(["", "  "]) {
+            parse(&format!("[launch.opencode]\nvariant = {variant:?}")).expect(variant);
+        }
     }
 
     // -- search paths --------------------------------------------------------

@@ -295,6 +295,10 @@ interactive confirmation. `dsh` runs under `npx` when it isn't installed
 globally. Any extra arguments after `--` are forwarded to the integration's
 own CLI. Short names work wherever a model reference is accepted.
 
+To stop retyping flags, set them once, e.g. `llmman config set
+launch.opencode.model claude-sonnet-5-5` (also `.provider`, `.variant`);
+flags you type still win. See [launch defaults](docs/configuration.md#launch-defaults).
+
 GitHub Copilot uses the standalone `copilot` CLI (`npm install -g
 @github/copilot`) in BYOK mode, so a local-model launch does not
 require a GitHub login.

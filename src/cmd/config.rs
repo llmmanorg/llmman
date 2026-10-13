@@ -711,6 +711,38 @@ mod tests {
         assert!(crate::config::parse(&d.to_string()).is_err(), "{d}");
     }
 
+    /// `launch.<integration>.<flag>` can be set; a typo is refused.
+    #[test]
+    fn launch_defaults_are_settable_and_checked_before_they_are_written() {
+        let mut d = doc("");
+        for (key, value) in [
+            ("launch.opencode.provider", "anthropic"),
+            ("launch.opencode.model", "claude-sonnet-5-5"),
+            ("launch.opencode.variant", "xhigh"),
+        ] {
+            set_in(&mut d, key, value).unwrap();
+        }
+        crate::config::parse(&d.to_string()).expect("a valid launch table");
+        assert_eq!(
+            keys(&d.to_string()),
+            [
+                "launch.opencode.provider=anthropic",
+                "launch.opencode.model=claude-sonnet-5-5",
+                "launch.opencode.variant=xhigh"
+            ]
+        );
+
+        for (key, value) in [
+            ("launch.opencod.model", "m"),
+            ("launch.opencode.variant", "turbo"),
+            ("launch.opencode.modle", "m"),
+        ] {
+            let mut d = doc("");
+            set_in(&mut d, key, value).unwrap();
+            assert!(crate::config::parse(&d.to_string()).is_err(), "{key}");
+        }
+    }
+
     #[test]
     fn invalid_managed_values_never_replace_the_saved_configuration() {
         let dir = scratch("managed-validation");

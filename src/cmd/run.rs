@@ -171,10 +171,15 @@ pub struct RunArgs {
     pub prompt: Vec<String>,
 }
 
+/// Every word `--variant` takes, here and on `launch`.
+pub(crate) fn variants() -> impl Iterator<Item = &'static str> {
+    let levels = crate::chat_template::EFFORT_LEVELS.iter().copied();
+    ["none", "thinking"].into_iter().chain(levels)
+}
+
 /// Every `--variant`, here and on `launch`.
 pub(crate) fn variant_parser() -> clap::builder::PossibleValuesParser {
-    let levels = crate::chat_template::EFFORT_LEVELS.iter().copied();
-    clap::builder::PossibleValuesParser::new(["none", "thinking"].into_iter().chain(levels))
+    clap::builder::PossibleValuesParser::new(variants())
 }
 
 /// Ollama's `think`: a switch or a reasoning level.

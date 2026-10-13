@@ -52,7 +52,7 @@ pub use sandbox::Sandbox;
 // CLI
 // ---------------------------------------------------------------------------
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct LaunchArgs {
     /// Integration to launch (claude, opencode, codex, cline, aider, …)
     /// Omit to list available integrations.
@@ -94,6 +94,23 @@ pub struct LaunchArgs {
 }
 
 pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
+    let configured;
+    let args = match args.integration.as_deref() {
+        Some(name) => {
+            let (with_defaults, applied) =
+                apply_defaults(args, name, || crate::config::launch_defaults(name))?;
+            if !applied.is_empty() {
+                // So a refusal of a flag that was not typed makes sense.
+                eprintln!(
+                    "[llmman] {name}: llmman.conf supplies {}",
+                    applied.join(" ")
+                );
+            }
+            configured = with_defaults;
+            &configured
+        }
+        None => args,
+    };
     let provider = providers::provider_flag(args.provider.as_deref())?;
     let overflow = crate::hybrid::overflow_flags(
         args.overflow_provider.as_deref(),
@@ -291,6 +308,46 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         max_output,
         &args.extra_args,
     )
+}
+
+/// `args` with `[launch.<name>]` from llmman.conf filled in for the flags
+/// left out, and those fills as the flags they stand for.
+///
+/// Typing `--provider`, `--model` or an overflow flag chooses a model, so
+/// none of the configured provider, model or variant applies: the
+/// provider would route the typed model to the wrong host, and the
+/// variant belongs to the old one. `--variant` alone keeps the configured
+/// model. A `--model` after `--` wins over the configured one, so the
+/// configured variant is dropped too. `load` runs only when needed.
+fn apply_defaults(
+    args: &LaunchArgs,
+    name: &str,
+    load: impl FnOnce() -> Result<crate::config::LaunchConf, &'static str>,
+) -> anyhow::Result<(LaunchArgs, Vec<String>)> {
+    let mut effective = args.clone();
+    let mut applied = Vec::new();
+    if args.provider.is_some()
+        || args.model.is_some()
+        || args.overflow_provider.is_some()
+        || args.overflow_model.is_some()
+    {
+        return Ok((effective, applied));
+    }
+    let mut defaults = load().map_err(|e| anyhow::anyhow!("cannot read launch defaults: {e}"))?;
+    if has_forwarded_model_flag(name, &args.extra_args) {
+        defaults.variant = None;
+    }
+    for (slot, configured, flag) in [
+        (&mut effective.provider, defaults.provider, "--provider"),
+        (&mut effective.model, defaults.model, "--model"),
+        (&mut effective.variant, defaults.variant, "--variant"),
+    ] {
+        if let (None, Some(value)) = (&*slot, configured) {
+            applied.push(format!("{flag} {value}"));
+            *slot = Some(value);
+        }
+    }
+    Ok((effective, applied))
 }
 
 /// What an integration authenticates with when no provider key travels:
@@ -776,6 +833,12 @@ const INTEGRATIONS: &[Integration] = &[
         binary: "docker-agent",
     },
 ];
+
+/// The registered name for a launch name (any case, or an alias): what
+/// `[launch.<name>]` in llmman.conf is matched on.
+pub(crate) fn canonical_integration(name: &str) -> Option<&'static str> {
+    integration(name).map(|i| i.name)
+}
 
 /// The registry entry for a launch name, after resolving supported aliases.
 fn integration(name: &str) -> Option<&'static Integration> {
@@ -2388,5 +2451,137 @@ defaults:
         .args;
         let err = run(&args).unwrap_err().to_string();
         assert!(err.contains("openshell cannot run opencode"), "{err}");
+    }
+
+    /// `llmman launch <argv...>` as the command line parses it.
+    fn launch_args(argv: &[&str]) -> LaunchArgs {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: LaunchArgs,
+        }
+        <Cli as clap::Parser>::try_parse_from(["l"].into_iter().chain(argv.iter().copied()))
+            .unwrap()
+            .args
+    }
+
+    /// `apply_defaults` for `argv` against `[launch.<integration>]`.
+    fn applied(argv: &[&str], conf: &crate::config::LaunchConf) -> (LaunchArgs, Vec<String>) {
+        let args = launch_args(argv);
+        let name = args.integration.clone().unwrap();
+        apply_defaults(&args, &name, || Ok(conf.clone())).unwrap()
+    }
+
+    fn sonnet() -> crate::config::LaunchConf {
+        crate::config::launch_conf(Some("anthropic"), Some("claude-sonnet-5-5"), Some("xhigh"))
+    }
+
+    /// `launch opencode` alone is the full invocation, and says which
+    /// flags it stands for.
+    #[test]
+    fn configured_defaults_fill_every_flag_the_command_line_left_out() {
+        let (args, applied) = applied(&["opencode"], &sonnet());
+        assert_eq!(args.provider.as_deref(), Some("anthropic"));
+        assert_eq!(args.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(args.variant.as_deref(), Some("xhigh"));
+        assert_eq!(
+            applied,
+            [
+                "--provider anthropic",
+                "--model claude-sonnet-5-5",
+                "--variant xhigh"
+            ]
+        );
+
+        // Arguments for the integration itself are not a choice of model.
+        let (args, _) = self::applied(
+            &["opencode", "--sandbox", "docker", "--", "run", "hi"],
+            &sonnet(),
+        );
+        assert_eq!(args.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(args.extra_args, ["run", "hi"]);
+    }
+
+    #[test]
+    fn nothing_configured_changes_nothing() {
+        let none = crate::config::LaunchConf::default();
+        let (args, applied) = applied(&["opencode", "-m", "qwen3.8", "--variant", "low"], &none);
+        assert!(applied.is_empty());
+        assert_eq!(args.model.as_deref(), Some("qwen3.8"));
+        assert_eq!(args.variant.as_deref(), Some("low"));
+        assert_eq!(args.provider, None);
+    }
+
+    /// `--variant` is the one flag that keeps the configured model.
+    #[test]
+    fn a_typed_variant_replaces_only_the_configured_variant() {
+        let (args, applied) = applied(&["opencode", "--variant", "low"], &sonnet());
+        assert_eq!(args.provider.as_deref(), Some("anthropic"));
+        assert_eq!(args.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(args.variant.as_deref(), Some("low"));
+        assert_eq!(
+            applied,
+            ["--provider anthropic", "--model claude-sonnet-5-5"]
+        );
+    }
+
+    #[test]
+    fn a_typed_model_choice_turns_the_configured_set_off() {
+        for argv in [
+            &["opencode", "--model", "qwen3.8"][..],
+            &["opencode", "-m", "qwen3.8"],
+            &["opencode", "--provider", "openai"],
+            &["opencode", "-p", "openai", "--model", "gpt-5"],
+            &["opencode", "--overflow-provider", "openai"],
+            &["opencode", "--overflow-model", "gpt-5"],
+        ] {
+            let typed = launch_args(argv);
+            let (args, applied) = applied(argv, &sonnet());
+            assert!(applied.is_empty(), "{argv:?}: {applied:?}");
+            assert_eq!(args.provider, typed.provider, "{argv:?}");
+            assert_eq!(args.model, typed.model, "{argv:?}");
+            assert_eq!(args.variant, None, "{argv:?}");
+        }
+    }
+
+    /// A `--model` after `--` wins over the configured one, as it does
+    /// over a typed one, but the configured model is still there for the
+    /// integrations that need one; its variant is not.
+    #[test]
+    fn a_forwarded_model_keeps_the_configured_model_but_not_its_variant() {
+        let (args, applied) = applied(&["qwen", "--", "--model", "b"], &sonnet());
+        assert_eq!(args.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(args.variant, None);
+        assert_eq!(
+            applied,
+            ["--provider anthropic", "--model claude-sonnet-5-5"]
+        );
+
+        // opencode has no such flag, so there it is a prompt's word.
+        let (args, _) = self::applied(&["opencode", "--", "--model", "x"], &sonnet());
+        assert_eq!(args.variant.as_deref(), Some("xhigh"));
+    }
+
+    /// Defaults that cannot be read are an error, but only where they
+    /// would have been used.
+    #[test]
+    fn unreadable_defaults_fail_only_a_launch_that_needs_them() {
+        let args = launch_args(&["opencode"]);
+        let err = apply_defaults(&args, "opencode", || Err("bad file")).unwrap_err();
+        assert!(err.to_string().contains("bad file"), "{err}");
+        for argv in [&["opencode", "-m", "x"][..], &["opencode", "-p", "x"]] {
+            let args = launch_args(argv);
+            apply_defaults(&args, "opencode", || Err("bad file")).expect("not consulted");
+        }
+    }
+
+    #[test]
+    fn canonical_integration_resolves_case_and_aliases() {
+        assert_eq!(canonical_integration("OpenCode"), Some("opencode"));
+        assert_eq!(canonical_integration("copilot-cli"), Some("copilot"));
+        assert_eq!(canonical_integration("nonesuch"), None);
+        for i in INTEGRATIONS {
+            assert_eq!(canonical_integration(i.name), Some(i.name));
+        }
     }
 }

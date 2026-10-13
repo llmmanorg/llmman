@@ -26,7 +26,7 @@ The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/b
 Everything that needs a file rather than an environment variable lives in
 one place: short-name aliases, provider API keys and endpoints, the
 signature trust policy, the peers of an aggregation, the daemon's own
-API keys, and registry mirrors.
+API keys, registry mirrors, and the defaults for `llmman launch`.
 
 ```toml
 # ~/.config/llmman/llmman.conf
@@ -56,6 +56,11 @@ api_keys = "k1, k2"                # what a request to this daemon must present
 
 [registries."docker.io"]
 mirrors = "https://mirror.gcr.io, registry-mirror.corp:5000"
+
+[launch.opencode]                  # what `llmman launch opencode` means with no flags
+provider = "anthropic"
+model    = "claude-sonnet-5-5"
+variant  = "xhigh"
 ```
 
 Read from two locations, later overriding earlier:
@@ -73,6 +78,44 @@ Unknown sections and keys are rejected rather than ignored: a misspelled
 `[verify]` or `api_kye` that parsed happily would be a policy or a
 credential that silently never takes effect, and the symptom would show up
 somewhere else entirely.
+
+### Launch defaults
+
+A `[launch.<integration>]` table holds the flags `llmman launch
+<integration>` uses when you leave them out:
+
+```console
+$ llmman config set launch.opencode.provider anthropic
+$ llmman config set launch.opencode.model claude-sonnet-5-5
+$ llmman config set launch.opencode.variant xhigh
+$ llmman launch opencode
+[llmman] opencode: llmman.conf supplies --provider anthropic --model claude-sonnet-5-5 --variant xhigh
+```
+
+`provider`, `model` and `variant` are `--provider`, `--model` and
+`--variant`, all optional and checked as if typed. The table is named for
+an integration as `llmman launch` lists it (any case, and `copilot-cli`
+for `copilot`).
+
+Flags you type win. `provider`, `model` and `variant` choose a model
+together, so typing `--provider`, `--model`, `--overflow-provider` or
+`--overflow-model` turns all three off: a configured provider would send
+your model to the wrong host, and the variant belongs to the old model.
+`--variant` alone replaces only the variant. A `--model` after `--` wins
+over the configured model and drops the configured variant. With the table
+above:
+
+| Command | Runs |
+|---------|------|
+| `llmman launch opencode` | `anthropic`, `claude-sonnet-5-5`, `xhigh` |
+| `llmman launch opencode --variant high` | `anthropic`, `claude-sonnet-5-5`, `high` |
+| `llmman launch opencode --model qwen3.8` | local `qwen3.8`, no variant |
+
+The two files merge one key at a time, later over earlier, and a blank
+value (`variant = ""`) clears one that the system file set. A misspelled
+integration, key or variant is rejected. If a file does not parse, a
+launch that needs the defaults fails; naming a model with `--model` does
+not read them.
 
 ### Managed OAuth forwarding
 
