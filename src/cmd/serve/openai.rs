@@ -22,7 +22,8 @@ use super::relay::{
     stream_rewriting_model,
 };
 use super::responses::{
-    is_responses_route, remote_responses, sanitize_responses_request, RESPONSES_ROUTE,
+    falls_back, is_responses_route, remote_responses, route_missing, sanitize_responses_request,
+    RESPONSES_ROUTE,
 };
 use super::sched::{begin_activity, ActivityGuard};
 use super::types::*;
@@ -372,8 +373,16 @@ pub(super) async fn proxy_openai_generation_to(
             .unwrap_or_else(|| req["model"].as_str().unwrap_or_default().to_string());
         if target.is_remote() {
             strip_llama_fields(&mut req);
-            return remote_responses(&state.0.client, &target, headers, req, activity, canonical)
-                .await;
+            return remote_responses(
+                &state.0.client,
+                &target,
+                headers,
+                req,
+                activity,
+                canonical,
+                route_missing,
+            )
+            .await;
         }
         return super::responses::translated_responses(
             &state.0.client,
@@ -390,13 +399,17 @@ pub(super) async fn proxy_openai_generation_to(
     }
     if llama_path == RESPONSES_ROUTE && target.is_remote() {
         strip_llama_fields(&mut req);
+        // A remote target always has an override (see backend_wire_model).
+        let canonical = response_model_override
+            .unwrap_or_else(|| req["model"].as_str().unwrap_or_default().to_string());
         return remote_responses(
             &state.0.client,
             &target,
             headers,
             req,
             activity,
-            reply_model,
+            canonical,
+            falls_back,
         )
         .await;
     }

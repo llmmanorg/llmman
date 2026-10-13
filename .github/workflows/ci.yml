@@ -1224,7 +1224,7 @@ jobs:
           $binaryPath = Join-Path $installDir 'muse.exe'
           curl.exe --fail --location --retry 3 --retry-all-errors "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse&version=$env:MUSE_VERSION&file=$artifact" -o $binaryPath
           if ($LASTEXITCODE -ne 0) { throw 'Muse download failed' }
-          if ((Get-FileHash $binaryPath -Algorithm SHA256).Hash -ne $checksum) {
+          if ((Get-FileHash $binaryPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $checksum) {
             throw 'Muse binary checksum mismatch'
           }
           & $binaryPath --version

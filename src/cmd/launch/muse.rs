@@ -4,7 +4,7 @@ use anyhow::Context;
 use sha2::Digest;
 use std::path::{Path, PathBuf};
 
-use super::{exec_with_env, find_on_path, server};
+use super::{exec_with_env_removing, find_on_path, server};
 
 pub(super) fn is_subcommand(arg: &str) -> bool {
     matches!(arg, "exec" | "resume")
@@ -72,6 +72,12 @@ fn settings(
 }
 
 fn write_settings(root: &Path, settings: &serde_json::Value) -> anyhow::Result<()> {
+    // `root` is passed to Muse as `XDG_CONFIG_HOME` (set in `launch_muse`), and
+    // Muse reads `$XDG_CONFIG_HOME/muse/settings.json`. The inner `muse/` is
+    // Muse's own XDG app subdirectory, not a duplicate of the outer
+    // `llmman/muse` directory: the full path is
+    // `.../llmman/muse/<sha256(model)>/muse/settings.json`. Removing it would
+    // silently break settings loading (launch_e2e tests assert this path).
     let path = root.join("muse/settings.json");
     std::fs::create_dir_all(path.parent().expect("settings file has a parent"))?;
     crate::fsutil::write_atomic(&path, &serde_json::to_vec_pretty(settings)?)
@@ -98,15 +104,25 @@ pub(super) fn launch_muse(
         .to_str()
         .context("Muse configuration path is not UTF-8")?;
     let args = muse_args(model, extra_args);
-    exec_with_env(
-        &bin,
-        &args,
-        &[
-            ("XDG_CONFIG_HOME", root),
-            ("META_API_KEY", if authenticated { api_key } else { "" }),
-            ("MUSE_NO_AUTO_UPDATE", "1"),
-        ],
-    )
+    let (env, remove) = muse_env(root, api_key, authenticated);
+    exec_with_env_removing(&bin, &args, &env, remove)
+}
+
+/// Muse reads the real Meta key only when authenticated. Otherwise the key is
+/// removed from the inherited environment so a shell-level key never reaches
+/// the local daemon.
+fn muse_env<'a>(
+    root: &'a str,
+    api_key: &'a str,
+    authenticated: bool,
+) -> (Vec<(&'a str, &'a str)>, &'static [&'static str]) {
+    let mut env = vec![("XDG_CONFIG_HOME", root), ("MUSE_NO_AUTO_UPDATE", "1")];
+    if authenticated {
+        env.push(("META_API_KEY", api_key));
+        (env, &[])
+    } else {
+        (env, &["META_API_KEY"])
+    }
 }
 
 #[cfg(test)]
@@ -130,6 +146,25 @@ mod tests {
         let config = settings("", "http://localhost/v1", None, None, true);
         assert_eq!(config["model_catalog"], serde_json::json!([]));
         assert_eq!(config["endpoint_transport"]["auth"], "bearer");
+    }
+
+    #[test]
+    fn muse_env_sets_the_key_only_when_authenticated() {
+        let (env, remove) = muse_env("/r", "llmman", false);
+        assert!(!env.iter().any(|(name, _)| *name == "META_API_KEY"));
+        assert_eq!(remove, ["META_API_KEY"]);
+
+        let (env, remove) = muse_env("/r", "secret", true);
+        assert!(env.contains(&("META_API_KEY", "secret")));
+        assert!(remove.is_empty());
+
+        for (env, _) in [
+            muse_env("/r", "llmman", false),
+            muse_env("/r", "secret", true),
+        ] {
+            assert!(env.contains(&("XDG_CONFIG_HOME", "/r")));
+            assert!(env.contains(&("MUSE_NO_AUTO_UPDATE", "1")));
+        }
     }
 
     #[test]

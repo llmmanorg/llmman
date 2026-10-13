@@ -268,6 +268,7 @@ async fn call_remote_responses(base_url: &str, stream: bool) -> (StatusCode, Hea
         req,
         ActivityGuard::new(&state, "m"),
         "llmman.provider/mockprov/mock-model".to_string(),
+        responses::falls_back,
     )
     .await
     .unwrap();
@@ -403,6 +404,49 @@ async fn muse_remote_responses_fall_back_when_native_is_missing() {
     assert_eq!(request["model"], "mock-model");
     assert_eq!(request["tools"].as_array().unwrap().len(), 1);
     assert_eq!(request["tools"][0]["function"]["name"], "muse_read_file");
+}
+
+#[tokio::test]
+async fn muse_remote_responses_relay_server_errors_without_a_second_generation() {
+    for native in [
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::BAD_GATEWAY,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        // A retry as a chat completion would answer 418 here, so a relayed
+        // 5xx proves the request was not generated a second time.
+        let app = Router::new()
+            .route("/v1/responses", post(move || async move { native }))
+            .route(
+                "/v1/chat/completions",
+                post(|| async { (StatusCode::IM_A_TEAPOT, "retried as chat completion") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (status, _, body) = call_muse_remote_responses(
+            &format!("http://127.0.0.1:{}/v1", addr.port()),
+            serde_json::json!({
+                "model": "llmman.provider/mockprov/mock-model",
+                "input": "hi",
+                "stream": false
+            }),
+        )
+        .await;
+        assert_eq!(status, native, "{body}");
+
+        let (status, _, body) = call_muse_remote_responses(
+            &format!("http://127.0.0.1:{}/v1", addr.port()),
+            serde_json::json!({
+                "model": "llmman.provider/mockprov/mock-model",
+                "input": "hi",
+                "stream": true
+            }),
+        )
+        .await;
+        assert_eq!(status, native, "{body}");
+    }
 }
 
 #[tokio::test]
@@ -4967,14 +5011,16 @@ async fn a_keyed_daemon_refuses_everything_but_its_own_page_without_the_key() {
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED, "{path}");
     }
 
-    // A POST route too, with a body that would otherwise be a 400.
-    let r = client
-        .post(format!("{url}/api/show"))
-        .body("{}")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    // POST routes too, with a body that would otherwise be a 400.
+    for path in ["/api/show", "/muse-code/v1/responses"] {
+        let r = client
+            .post(format!("{url}{path}"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
 
     // Either spelling, either key.
     let bearer = client

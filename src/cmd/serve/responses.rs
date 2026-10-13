@@ -61,6 +61,15 @@ pub(super) fn falls_back(status: StatusCode) -> bool {
     ) || status.is_server_error()
 }
 
+/// The provider has no `/v1/responses` route; nothing was generated,
+/// so a retry cannot duplicate inference.
+pub(super) fn route_missing(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Request: Responses -> chat completions (Ollama's FromResponsesRequest)
 // ---------------------------------------------------------------------------
@@ -353,7 +362,13 @@ fn convert_tools_in(
             out.push(converted);
         }
         Some("namespace") => {
-            let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("namespace tool requires a non-empty string name")
+                })?;
             let mut namespace = namespace.to_vec();
             namespace.push(name.to_string());
             for member in tool
@@ -488,6 +503,17 @@ fn raw_namespace_path(segments: &[String]) -> String {
 /// Ollama's `qualifyNamespaceToolName`, replacing dots with underscores:
 /// providers enforce `^[a-zA-Z0-9_-]{1,128}$` on function names (Anthropic
 /// rejects Codex's `multi_agent_v1.spawn_agent`).
+///
+/// Compatibility: each segment is encoded via `encode_tool_name_segment`,
+/// which replaces `.` with `_` but keeps underscores and hyphens verbatim. A
+/// leading-underscore member therefore keeps its underscore: `("ns", "_f")`
+/// becomes `ns__f`. Before #563 this was `ns_f`, and dotted names such as
+/// `ns_files.read` were passed through unchanged and rejected by strict
+/// providers. Clients never see the encoded name: `responses_tool_call_name`
+/// decodes it back, and replayed history is re-encoded per-request alongside
+/// tool definitions, so stored sessions keep working. Only the upstream-visible
+/// name changed: expect one provider prompt-cache miss after upgrading, and
+/// different names in provider-side logs.
 fn qualify_namespace_tool_name(namespace: &str, member: &str) -> String {
     if namespace.is_empty() || member.is_empty() {
         return encode_tool_name_segment(member);
@@ -495,31 +521,18 @@ fn qualify_namespace_tool_name(namespace: &str, member: &str) -> String {
     if let Some(rest) = member.strip_prefix(&format!("{namespace}.")) {
         return format!(
             "{}_{}",
-            encode_namespace_path(namespace),
+            encode_tool_name_segment(namespace),
             encode_tool_name_segment(rest)
         );
     }
     if member.starts_with(&format!("{namespace}_")) {
-        return encode_namespace_path(member);
-    }
-    if member.starts_with('_') {
-        return format!(
-            "{}_{}",
-            encode_namespace_path(namespace),
-            encode_tool_name_segment(member)
-        );
+        return encode_tool_name_segment(member);
     }
     format!(
         "{}_{}",
-        encode_namespace_path(namespace),
+        encode_tool_name_segment(namespace),
         encode_tool_name_segment(member)
     )
-}
-
-/// Encodes a raw namespace path. Existing callers spell nested paths with
-/// `_`; preserve existing underscores and hyphens.
-fn encode_namespace_path(namespace: &str) -> String {
-    encode_tool_name_segment(namespace)
 }
 
 /// Encodes namespace structure from explicit segments, using `_` only as the
@@ -533,14 +546,26 @@ fn encode_namespace_segments<'a>(segments: impl IntoIterator<Item = &'a str>) ->
 }
 
 /// Preserve tool names, replacing only dots for Chat Completions providers.
+/// Leading/inner underscores and hyphens are kept verbatim; collapsing them
+/// would let distinct Responses identities collide (see `remember_tool_name`).
 fn encode_tool_name_segment(segment: &str) -> String {
     segment.replace('.', "_")
 }
 
 /// Ollama's `responsesToolCallName`: `(namespace, name)` for a qualified
-/// member of one of the request's `namespace` tools, else `("", qualified)`.
+/// member of one of the request's `namespace` tools, `("", name)` for a
+/// top-level function whose encoded name matches `qualified`, else
+/// `("", qualified)`.
 fn responses_tool_call_name(tools: &[Value], qualified: &str) -> (String, String) {
     for tool in tools {
+        if tool.get("type").and_then(Value::as_str) == Some("function") {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            if !name.is_empty()
+                && convert_tool_in_namespace(tool, &[])["function"]["name"] == qualified
+            {
+                return (String::new(), name.to_string());
+            }
+        }
         if let Some(found) = responses_tool_call_name_in(tool, &[], qualified) {
             return found;
         }
@@ -1339,6 +1364,10 @@ pub(super) async fn handle_muse_responses(
 /// models) is retried as a chat completion; any other failure is the
 /// provider's own answer about the caller's key or request, relayed
 /// untouched. The retry happens before any body has been relayed.
+///
+/// `fallback` decides which statuses are retried: [`falls_back`] for the
+/// general case, [`route_missing`] where a 5xx must be relayed rather than
+/// regenerated.
 pub(super) async fn remote_responses(
     client: &Client,
     target: &Target,
@@ -1346,6 +1375,7 @@ pub(super) async fn remote_responses(
     req: serde_json::Value,
     activity: ActivityGuard,
     canonical_model: String,
+    fallback: fn(StatusCode) -> bool,
 ) -> Result<Response, AppError> {
     let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     // The Messages API has no Responses route; skip the 404 round trip.
@@ -1372,7 +1402,7 @@ pub(super) async fn remote_responses(
                 relay_rewriting_model(resp, activity, &canonical_model).await
             };
         }
-        if !falls_back(status) {
+        if !fallback(status) {
             return Ok(relay(resp, activity));
         }
         eprintln!(
@@ -1882,6 +1912,16 @@ mod tests {
             .unwrap()["item"];
         assert_eq!(item["namespace"], "agents");
         assert_eq!(item["name"], "files.read");
+    }
+
+    #[test]
+    fn top_level_dotted_function_names_round_trip_through_encoded_chat_names() {
+        let tools = vec![json!({"type":"function","name":"files.read"})];
+        assert_eq!(
+            responses_tool_call_name(&tools, "files_read"),
+            ("".to_string(), "files.read".to_string())
+        );
+        assert_eq!(qualify_namespace_tool_name("", "files.read"), "files_read");
     }
 
     #[test]
@@ -2769,6 +2809,24 @@ mod tests {
             qualify_namespace_tool_name("ns", "files.read"),
             "ns_files_read"
         );
+    }
+
+    #[test]
+    fn namespace_tools_require_a_non_empty_string_name() {
+        let member = json!({"type":"function","name":"x","description":"","parameters":{}});
+        for tool in [
+            json!({"type":"namespace","name":"","tools":[member]}),
+            json!({"type":"namespace","tools":[member]}),
+        ] {
+            let error = from_responses_request(&json!({"model":"m","input":"go","tools":[tool]}))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("non-empty string name"),
+                "{error}"
+            );
+        }
+        let valid = json!({"type":"namespace","name":"a","tools":[member]});
+        assert!(from_responses_request(&json!({"model":"m","input":"go","tools":[valid]})).is_ok());
     }
 
     // -- fallback policy ----------------------------------------------------
