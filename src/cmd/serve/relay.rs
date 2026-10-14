@@ -26,14 +26,15 @@ use super::sched::ActivityGuard;
 use super::stream::bytes_to_lines;
 use super::{messages, responses, AppError, ChatBody, ChatUpstream, Target};
 
-pub(super) async fn proxy(
+/// POSTs `body` to `route` on `target` with the caller's `content-type`;
+/// the request half of every `proxy*` helper.
+async fn send_proxied(
     client: &Client,
     target: &Target,
     route: &str,
     headers: &HeaderMap,
     body: Bytes,
-    activity: ActivityGuard,
-) -> Result<Response, AppError> {
+) -> Result<reqwest::Response, AppError> {
     // `Bytes` clones are refcounted, not copies — passing `body` straight
     // through (reqwest::Body: From<Bytes>) avoids an extra full-size
     // allocation that `body.to_vec()` would add on top of it, which
@@ -42,10 +43,21 @@ pub(super) async fn proxy(
     if let Some(ct) = headers.get("content-type") {
         req = req.header("content-type", ct);
     }
-    let resp = req
+    Ok(req
         .send()
         .await
-        .with_context(|| format!("proxy request to {}", target.describe()))?;
+        .with_context(|| format!("proxy request to {}", target.describe()))?)
+}
+
+pub(super) async fn proxy(
+    client: &Client,
+    target: &Target,
+    route: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    activity: ActivityGuard,
+) -> Result<Response, AppError> {
+    let resp = send_proxied(client, target, route, headers, body).await?;
     Ok(relay(resp, activity))
 }
 
@@ -174,15 +186,24 @@ pub(super) async fn proxy_rewriting_model(
     activity: ActivityGuard,
     canonical_model: &str,
 ) -> Result<Response, AppError> {
-    let mut req = target.authorize(client.post(target.url(route)).body(body));
-    if let Some(ct) = headers.get("content-type") {
-        req = req.header("content-type", ct);
-    }
-    let resp = req
-        .send()
-        .await
-        .with_context(|| format!("proxy request to {}", target.describe()))?;
+    let resp = send_proxied(client, target, route, headers, body).await?;
     relay_rewriting_model(resp, activity, canonical_model).await
+}
+
+/// [`proxy`] for a route whose reply is one JSON object that `rewrite`
+/// changes on the way out. The body is read whole, as in
+/// [`proxy_rewriting_model`]; an `Err` from `rewrite` is the reply.
+pub(super) async fn proxy_buffered(
+    client: &Client,
+    target: &Target,
+    route: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    activity: ActivityGuard,
+    rewrite: impl FnOnce(&Bytes) -> Result<Bytes, AppError>,
+) -> Result<Response, AppError> {
+    let resp = send_proxied(client, target, route, headers, body).await?;
+    relay_buffered(resp, activity, rewrite).await
 }
 
 /// The relay half of [`proxy_rewriting_model`]; see [`relay`].
@@ -190,6 +211,18 @@ pub(super) async fn relay_rewriting_model(
     resp: reqwest::Response,
     activity: ActivityGuard,
     canonical_model: &str,
+) -> Result<Response, AppError> {
+    relay_buffered(resp, activity, |raw| {
+        Ok(rewrite_json_response_model(raw, canonical_model))
+    })
+    .await
+}
+
+/// The relay half of [`proxy_buffered`]; see [`relay`].
+async fn relay_buffered(
+    resp: reqwest::Response,
+    activity: ActivityGuard,
+    rewrite: impl FnOnce(&Bytes) -> Result<Bytes, AppError>,
 ) -> Result<Response, AppError> {
     let status = resp.status();
     let resp_headers = resp.headers().clone();
@@ -203,7 +236,7 @@ pub(super) async fn relay_rewriting_model(
     // its whole (streamed) relay.
     drop(activity);
 
-    let rewritten = rewrite_json_response_model(&raw, canonical_model);
+    let rewritten = rewrite(&raw)?;
 
     let mut builder = Response::builder().status(status.as_u16());
     for (k, v) in &resp_headers {
@@ -235,14 +268,7 @@ pub(super) async fn stream_rewriting_model(
     activity: ActivityGuard,
     canonical_model: String,
 ) -> Result<Response, AppError> {
-    let mut req = target.authorize(client.post(target.url(route)).body(body));
-    if let Some(ct) = headers.get("content-type") {
-        req = req.header("content-type", ct);
-    }
-    let resp = req
-        .send()
-        .await
-        .with_context(|| format!("proxy request to {}", target.describe()))?;
+    let resp = send_proxied(client, target, route, headers, body).await?;
     Ok(relay_stream_rewriting_model(
         resp,
         activity,
@@ -264,21 +290,36 @@ pub(super) fn relay_stream_rewriting_model(
     resp_headers.remove(reqwest::header::CONTENT_LENGTH);
     resp_headers.remove(reqwest::header::TRANSFER_ENCODING);
 
-    let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
+    // `bytes_to_lines` reads a transport error as EOF: hold it back and
+    // send it after the last line, so a dying backend aborts the stream.
+    let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let record = failure.clone();
+    let upstream = resp.bytes_stream().map(move |item| {
+        item.or_else(|e| {
+            *record.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+            Ok(Bytes::new())
+        })
+    });
+    let lines = bytes_to_lines(upstream).map(move |line| {
         // See `proxy`'s own comment on this same pattern.
         let _activity = &activity;
         // bytes_to_lines strips the original line ending; restored here,
         // uniformly, regardless of which of rewrite_sse_line_model's own
         // branches actually fired.
         let out = rewrite_sse_line_model(&line, &canonical_model) + "\n";
-        Ok::<_, std::convert::Infallible>(Bytes::from(out))
+        Ok::<_, reqwest::Error>(Bytes::from(out))
     });
+    let error =
+        futures::stream::once(
+            async move { failure.lock().unwrap_or_else(|e| e.into_inner()).take() },
+        )
+        .filter_map(|e| async move { e.map(Err) });
 
     let mut builder = Response::builder().status(status.as_u16());
     for (k, v) in &resp_headers {
         builder = builder.header(k, v);
     }
-    builder.body(Body::from_stream(stream)).unwrap()
+    builder.body(Body::from_stream(lines.chain(error))).unwrap()
 }
 
 /// [`relay`] for a [`ChatUpstream`]: `activity` lives until the whole

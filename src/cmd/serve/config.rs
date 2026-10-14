@@ -381,13 +381,10 @@ pub(super) fn gguf_trained_ctx(info: &crate::gguf::Info) -> Option<u32> {
         .filter(|n| *n > 0)
 }
 
-/// `Some(trained context)` if the GGUF is an embedding model — one with
-/// an `{arch}.pooling_type` key, ollama's own test (`llm/llama_server.go`)
-/// — else `None`.
+/// `Some(trained context)` if the GGUF is an embedding model (see
+/// [`crate::gguf::Info::is_embedding`]), else `None`.
 pub(super) fn embedding_model_ctx(info: &crate::gguf::Info) -> Option<Option<u32>> {
-    let arch = info.architecture()?;
-    info.u64(&format!("{arch}.pooling_type"))?;
-    Some(gguf_trained_ctx(info))
+    info.is_embedding().then(|| gguf_trained_ctx(info))
 }
 
 /// The `--ctx-size` a load starts from: `configured` capped to `trained`

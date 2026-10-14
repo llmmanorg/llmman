@@ -125,6 +125,13 @@ impl Info {
         self.u64(&format!("{arch}.embedding_length"))
     }
 
+    /// Whether this is an embedding model: it has `{architecture}.pooling_type`,
+    /// ollama's own test.
+    pub fn is_embedding(&self) -> bool {
+        self.architecture()
+            .is_some_and(|arch| self.u64(&format!("{arch}.pooling_type")).is_some())
+    }
+
     /// `{architecture}.block_count` (i.e. number of transformer layers).
     pub fn block_count(&self) -> Option<u64> {
         let arch = self.architecture()?;
@@ -452,6 +459,15 @@ fn ggml_type_name(ty: u32) -> &'static str {
 /// extra `UINT32` keys, and one 2-D Q4_K tensor. The caller removes it.
 #[cfg(test)]
 pub(crate) fn write_test_gguf_with(extra_u32: &[(&str, u32)]) -> std::path::PathBuf {
+    write_test_gguf_with_strings(extra_u32, &[])
+}
+
+/// [`write_test_gguf_with`] plus `STRING` keys.
+#[cfg(test)]
+pub(crate) fn write_test_gguf_with_strings(
+    extra_u32: &[(&str, u32)],
+    extra_str: &[(&str, &str)],
+) -> std::path::PathBuf {
     use std::io::Write;
 
     fn write_string(buf: &mut Vec<u8>, s: &str) {
@@ -463,7 +479,8 @@ pub(crate) fn write_test_gguf_with(extra_u32: &[(&str, u32)]) -> std::path::Path
     buf.extend_from_slice(b"GGUF");
     buf.extend_from_slice(&3u32.to_le_bytes()); // version
     buf.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
-    buf.extend_from_slice(&(2 + extra_u32.len() as u64).to_le_bytes()); // metadata_kv_count
+    let kv_count = 2 + extra_u32.len() + extra_str.len();
+    buf.extend_from_slice(&(kv_count as u64).to_le_bytes()); // metadata_kv_count
 
     // general.architecture = "llama"
     write_string(&mut buf, "general.architecture");
@@ -479,6 +496,12 @@ pub(crate) fn write_test_gguf_with(extra_u32: &[(&str, u32)]) -> std::path::Path
         write_string(&mut buf, key);
         buf.extend_from_slice(&4u32.to_le_bytes()); // UINT32
         buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    for (key, value) in extra_str {
+        write_string(&mut buf, key);
+        buf.extend_from_slice(&8u32.to_le_bytes()); // STRING
+        write_string(&mut buf, value);
     }
 
     // one tensor: "blk.0.weight", 2 dims [4, 8], type Q4_K (12)

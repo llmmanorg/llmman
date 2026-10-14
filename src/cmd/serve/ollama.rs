@@ -287,6 +287,8 @@ pub(super) async fn handle_show(
             &manifest,
         ),
     };
+    let capabilities =
+        crate::modelpack::model_capabilities(capabilities, gguf.as_ref(), template.as_deref());
     let arch = gguf.as_ref().and_then(|i| i.architecture());
     Ok(Json(OllamaShowResponse {
         model_info: gguf
@@ -1660,6 +1662,16 @@ fn normalize_in_place(v: &mut [f32]) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Cuts `v` to `dims` values and re-normalises it, as `dimensions` asks
+/// of `/api/embed` and `/v1/embeddings`. A `dims` past its length is a no-op.
+pub(super) fn truncate_embedding(v: &mut Vec<f32>, dims: usize) -> Result<(), AppError> {
+    if dims < v.len() {
+        v.truncate(dims);
+        normalize_in_place(v)?;
+    }
+    Ok(())
+}
+
 /// Mirrors `ollama.EmbedHandler`; durations are nanoseconds, as there.
 pub(super) async fn handle_embed(
     State(state): State<AppState>,
@@ -1684,10 +1696,7 @@ pub(super) async fn handle_embed(
     .await?;
     if let Some(dims) = req.dimensions.filter(|d| *d > 0) {
         for v in &mut embeddings {
-            if dims < v.len() {
-                v.truncate(dims);
-                normalize_in_place(v)?;
-            }
+            truncate_embedding(v, dims)?;
         }
     }
     Ok(Json(OllamaEmbedResponse {

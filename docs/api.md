@@ -59,12 +59,15 @@ chunk carries Ollama's counts and durations (`prompt_eval_count`,
 `/api/embed` and `/api/embeddings` work with any GGUF embedding model
 (one with a pooling type, e.g. `embeddinggemma`, `nomic-embed-text`):
 `llama-server` is started with `--embeddings` for it, so `/v1/embeddings`
-works too.
+works too. `/api/embed` and `/v1/embeddings` honour `dimensions`: each vector
+is cut to that many values and re-normalised.
 
 `think` is `true`/`false` or a level (`minimal`, `low`, `medium`,
 `high`, `xhigh`, `max`), forwarded as llama-server's
 `chat_template_kwargs`. `/api/show` returns `capabilities` and, for a
-local model with one, `template`.
+local model with one, `template`. They are `completion` (`embedding` for a
+pooling model), `vision` with a projector, `tools` when the chat template
+renders a request's `tools`, and `thinking` when it handles reasoning.
 
 `/api/create` supports `from` (alias a model) and `files` (GGUFs uploaded
 via `/api/blobs/{digest}`, as `ollama create` does). Modelfile fields such
@@ -82,6 +85,10 @@ work. For a [provider](providers.md) without the route, the daemon
 translates to and from `/v1/chat/completions` itself, and for a provider
 that speaks the Anthropic Messages API from there to `/v1/messages` (see
 [wire formats](providers.md#wire-formats)).
+
+The `model` in a `/v1/chat/completions`, `/v1/completions` or `/v1/responses`
+reply (every streamed chunk too) is the one the client asked for, not the
+path llama-server loaded the weights from.
 
 A request bound for a provider loses llama-server's own fields
 (`repeat_penalty`, `top_k`, `min_p`, `chat_template_kwargs`, ...), which

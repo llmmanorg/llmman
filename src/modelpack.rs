@@ -290,6 +290,12 @@ fn named_blob_path(
 /// `capabilities` array (`ollama run` reads them to set `opts.MultiModal`).
 pub const CAPABILITY_COMPLETION: &str = "completion";
 pub const CAPABILITY_VISION: &str = "vision";
+/// Produces embeddings instead of text; such a model has no `"completion"`.
+pub const CAPABILITY_EMBEDDING: &str = "embedding";
+/// The chat template renders a request's `tools`.
+pub const CAPABILITY_TOOLS: &str = "tools";
+/// The chat template handles reasoning.
+pub const CAPABILITY_THINKING: &str = "thinking";
 /// Generates images (a latent diffusion model) — ollama's
 /// `CapabilityImage`. Such a model has no `"completion"`.
 pub const CAPABILITY_IMAGE: &str = "image";
@@ -348,6 +354,35 @@ pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) 
 
     if has_mmproj || config_says_image {
         caps.push(CAPABILITY_VISION.to_string());
+    }
+    caps
+}
+
+/// `caps` (from [`capabilities`]) plus what only the GGUF header and chat
+/// template say, in ollama's order: `"embedding"` for a pooling model in
+/// place of `"completion"`, then `"tools"` and `"thinking"` from the
+/// template. Agents choose features by these. A media or embedding model
+/// has no chat to equip and keeps what it has.
+pub fn model_capabilities(
+    mut caps: Vec<String>,
+    gguf: Option<&crate::gguf::Info>,
+    template: Option<&str>,
+) -> Vec<String> {
+    let Some(completion) = caps.iter().position(|c| c == CAPABILITY_COMPLETION) else {
+        return caps;
+    };
+    if gguf.is_some_and(|info| info.is_embedding()) {
+        caps[completion] = CAPABILITY_EMBEDDING.to_string();
+        return caps;
+    }
+    let Some(template) = template else {
+        return caps;
+    };
+    if crate::chat_template::handles_tools(template) {
+        caps.push(CAPABILITY_TOOLS.to_string());
+    }
+    if crate::chat_template::thinking_controls(template).thinks {
+        caps.push(CAPABILITY_THINKING.to_string());
     }
     caps
 }
@@ -956,6 +991,84 @@ mod tests {
     fn capabilities_is_completion_only_without_a_projector() {
         let (store, m) = manifest_with(vec![descriptor("sha256:a", "model.Q4_K_M.gguf")]);
         assert_eq!(capabilities(&store, &m), vec!["completion"]);
+    }
+
+    /// A GGUF header, with `pooling_type` for an embedding model.
+    fn gguf_header(pooling: bool) -> crate::gguf::Info {
+        use crate::gguf::Value;
+        let mut info = crate::gguf::Info::default();
+        info.metadata.insert(
+            "general.architecture".into(),
+            Value::String("gemma3".into()),
+        );
+        if pooling {
+            info.metadata
+                .insert("gemma3.pooling_type".into(), Value::U32(1));
+        }
+        info
+    }
+
+    const TOOLS_AND_THINKING: &str =
+        "{%- if tools %}{{ tools | tojson }}{%- endif %}{%- if enable_thinking %}<think>{%- endif %}";
+
+    /// `tools` and `thinking` follow `vision`, as in ollama.
+    #[test]
+    fn model_capabilities_adds_what_the_template_handles() {
+        let caps = |template: Option<&str>| {
+            model_capabilities(
+                vec!["completion".into(), "vision".into()],
+                Some(&gguf_header(false)),
+                template,
+            )
+        };
+        assert_eq!(
+            caps(Some(TOOLS_AND_THINKING)),
+            ["completion", "vision", "tools", "thinking"]
+        );
+        assert_eq!(
+            caps(Some("{%- if tools %}{{ tools }}{%- endif %}")),
+            ["completion", "vision", "tools"]
+        );
+        assert_eq!(
+            caps(Some("{%- if enable_thinking %}<think>{%- endif %}")),
+            ["completion", "vision", "thinking"]
+        );
+        assert_eq!(
+            caps(Some("{{ messages[0].content }}")),
+            ["completion", "vision"]
+        );
+        // No template: what the manifest said.
+        assert_eq!(caps(None), ["completion", "vision"]);
+        // No GGUF header (a checkout): the template still counts.
+        assert_eq!(
+            model_capabilities(vec!["completion".into()], None, Some(TOOLS_AND_THINKING)),
+            ["completion", "tools", "thinking"]
+        );
+    }
+
+    /// A pooling model embeds instead of completing, template or not.
+    #[test]
+    fn model_capabilities_reports_a_pooling_model_as_embedding() {
+        assert_eq!(
+            model_capabilities(
+                vec!["completion".into()],
+                Some(&gguf_header(true)),
+                Some(TOOLS_AND_THINKING)
+            ),
+            ["embedding"]
+        );
+        assert!(gguf_header(true).is_embedding());
+        assert!(!gguf_header(false).is_embedding());
+    }
+
+    /// A media model's capabilities are what it generates.
+    #[test]
+    fn model_capabilities_leaves_a_media_model_alone() {
+        let media = vec!["image".to_string(), "video".to_string()];
+        assert_eq!(
+            model_capabilities(media.clone(), None, Some(TOOLS_AND_THINKING)),
+            media
+        );
     }
 
     #[test]

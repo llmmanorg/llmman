@@ -516,6 +516,10 @@ pub fn pull_image(
 /// keys on it to show the pull's output.
 pub const PULL_STATUS: &str = "pulling the llama.cpp container image";
 
+/// The download marker's status while [`verify_llama_server_runs`] starts
+/// the pulled image (up to `VERIFY_TIMEOUT`).
+pub const VERIFY_STATUS: &str = "checking that the llama.cpp container starts";
+
 /// Set by `daemon::ensure_server` on the daemon it spawns for a terminal:
 /// a file the client replays to its terminal, and that terminal's width.
 /// The daemon's stdio is a log file, where `docker pull`/`podman pull`

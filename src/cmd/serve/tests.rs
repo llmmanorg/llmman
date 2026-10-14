@@ -1,7 +1,7 @@
 use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
 use super::hybrid::{request_pin, resolve_hybrid_side, with_hybrid_fallback};
-use super::openai::apply_default_repeat_penalty;
+use super::openai::{apply_default_repeat_penalty, decode_f32s, encode_f32s};
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::responses::{
     consolidate_responses_instructions, filter_non_function_tools, remote_responses,
@@ -3827,6 +3827,42 @@ async fn handle_show_reports_a_safetensors_model_as_safetensors() {
     assert_eq!(v["template"], serde_json::Value::Null);
 }
 
+/// `tools` and `thinking` come off the GGUF's chat template, `embedding`
+/// off its pooling key.
+#[tokio::test]
+async fn handle_show_reports_what_the_chat_template_handles() {
+    let capabilities = |name: &'static str, u32s: &[(&str, u32)], template: &str| {
+        let path = crate::gguf::write_test_gguf_with_strings(
+            u32s,
+            &[("tokenizer.chat_template", template)],
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        async move {
+            let v = show_one_model(
+                name,
+                "application/vnd.docker.ai.gguf.v3",
+                "model.gguf",
+                &bytes,
+            )
+            .await;
+            (v["capabilities"].clone(), v["template"].clone())
+        }
+    };
+    let template = "{%- if tools %}{{- tools | tojson }}{%- endif %}\
+                    {%- if enable_thinking %}<think>{%- endif %}";
+
+    let (caps, shown) = capabilities("showtools", &[], template).await;
+    assert_eq!(caps, serde_json::json!(["completion", "tools", "thinking"]));
+    assert_eq!(shown, template);
+
+    let (caps, _) = capabilities("showplain", &[], "{{ messages[0].content }}").await;
+    assert_eq!(caps, serde_json::json!(["completion"]));
+
+    let (caps, _) = capabilities("showembed", &[("llama.pooling_type", 1)], template).await;
+    assert_eq!(caps, serde_json::json!(["embedding"]));
+}
+
 /// `/api/tags` reads each model's format the way `/api/show` does,
 /// rather than calling everything `"gguf"`.
 #[tokio::test]
@@ -5487,4 +5523,251 @@ fn a_blank_model_hint_is_no_hint() {
         hint(Some(" claude-sonnet-5-5 ")),
         Some("claude-sonnet-5-5".into())
     );
+}
+
+// -- /v1 replies from a llama-server that answers under its own path ----
+
+/// The `model` llama-server puts in every reply: its own weights path.
+const BACKEND_MODEL_PATH: &str =
+    "/models/bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517";
+
+/// A llama-server stand-in answering every `/v1` route under that path.
+fn llama_server_standin() -> Router {
+    let completion = || {
+        Json(serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": BACKEND_MODEL_PATH,
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Hello" },
+                "finish_reason": "stop"
+            }],
+        }))
+    };
+    let sse = |body: String| ([("content-type", "text/event-stream")], body).into_response();
+    Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |Json(req): Json<serde_json::Value>| async move {
+                if req["stream"] != true {
+                    return completion().into_response();
+                }
+                let chunk = |content: &str| {
+                    let chunk = serde_json::json!({
+                        "id": "chatcmpl-1",
+                        "object": "chat.completion.chunk",
+                        "model": BACKEND_MODEL_PATH,
+                        "choices": [{ "index": 0, "delta": { "content": content } }],
+                    });
+                    format!("data: {chunk}\n\n")
+                };
+                sse(format!("{}{}data: [DONE]\n\n", chunk("Hel"), chunk("lo")))
+            }),
+        )
+        .route("/v1/completions", post(move || async move { completion() }))
+        .route(
+            "/v1/responses",
+            post(move |Json(req): Json<serde_json::Value>| async move {
+                let response = serde_json::json!({
+                    "id": "resp_1", "object": "response",
+                    "model": BACKEND_MODEL_PATH, "status": "completed",
+                });
+                if req["stream"] != true {
+                    return Json(response).into_response();
+                }
+                // The model rides inside `response`, as Codex reads it.
+                let created =
+                    serde_json::json!({ "type": "response.created", "response": response });
+                sse(format!(
+                    "event: response.created\ndata: {created}\n\n\
+                     event: response.output_text.delta\ndata: {{\"delta\":\"Hi\"}}\n\n"
+                ))
+            }),
+        )
+        .route(
+            "/v1/embeddings",
+            post(|Json(req): Json<serde_json::Value>| async move {
+                let embedding = if req["encoding_format"] == "base64" {
+                    serde_json::json!(encode_f32s(&[3.0, 4.0, 12.0]))
+                } else {
+                    serde_json::json!([3.0, 4.0, 12.0])
+                };
+                Json(serde_json::json!({
+                    "object": "list",
+                    "model": BACKEND_MODEL_PATH,
+                    "data": [{ "object": "embedding", "index": 0, "embedding": embedding }],
+                    "usage": { "prompt_tokens": 2, "total_tokens": 2 },
+                }))
+            }),
+        )
+}
+
+/// The daemon's router, with `model` loaded as a local backend served by
+/// `backend`.
+async fn serve_over(model: &str, backend: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut loaded = running_model_fixture(None, Duration::ZERO, 0);
+    loaded.port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    let state = test_state();
+    let key = running_key(&state, model);
+    state.0.manager.lock().await.running.insert(key, loaded);
+    serve_router(state).await
+}
+
+/// POSTs `body` with the fields of `extra` added.
+async fn post_with(
+    base: &str,
+    route: &str,
+    mut body: serde_json::Value,
+    extra: serde_json::Value,
+) -> reqwest::Response {
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let resp = Client::new()
+        .post(format!("{base}{route}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{route}");
+    resp
+}
+
+/// The `data:` payloads of an SSE body, `[DONE]` excluded.
+fn sse_payloads(stream: &str) -> Vec<serde_json::Value> {
+    stream
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .map(|payload| serde_json::from_str(payload).unwrap())
+        .collect()
+}
+
+/// Replies name the client's model, not llama-server's own path.
+#[tokio::test(flavor = "multi_thread")]
+async fn openai_replies_name_the_model_the_client_asked_for() {
+    let base = serve_over("qwen3.5:0.8b", llama_server_standin()).await;
+    let ask = |route: &'static str, extra: serde_json::Value| {
+        let body = serde_json::json!({
+            "model": "qwen3.5:0.8b",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "prompt": "hi",
+            "input": "hi",
+            "max_tokens": 8,
+        });
+        let base = base.clone();
+        async move { post_with(&base, route, body, extra).await }
+    };
+    let stream = serde_json::json!({ "stream": true });
+
+    for route in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+        let body: serde_json::Value = ask(route, serde_json::json!({}))
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["model"], "qwen3.5:0.8b", "{route}");
+    }
+
+    let text = ask("/v1/chat/completions", stream.clone())
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !text.contains("/models/") && text.ends_with("data: [DONE]\n\n"),
+        "{text}"
+    );
+    let chunks = sse_payloads(&text);
+    assert_eq!(chunks.len(), 2, "{text}");
+    for chunk in &chunks {
+        assert_eq!(chunk["model"], "qwen3.5:0.8b");
+        assert_eq!(chunk["id"], "chatcmpl-1");
+    }
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "lo");
+
+    // The Responses API nests the model inside `response`; `event:` lines stay.
+    let text = ask("/v1/responses", stream).await.text().await.unwrap();
+    assert!(!text.contains("/models/"), "{text}");
+    assert_eq!(sse_payloads(&text)[0]["response"]["model"], "qwen3.5:0.8b");
+    assert!(
+        text.contains("event: response.output_text.delta\n"),
+        "{text}"
+    );
+}
+
+/// A backend dying mid-reply aborts the client's stream rather than
+/// ending it cleanly.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backend_dying_mid_stream_aborts_the_clients_stream() {
+    use futures::StreamExt as _;
+    let dying = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let first = futures::stream::once(async {
+                Ok::<_, std::io::Error>(Bytes::from("data: {\"model\":\"x\"}\n\n"))
+            });
+            let then = futures::stream::once(async {
+                sleep(Duration::from_millis(50)).await;
+                Err(std::io::Error::other("backend died"))
+            });
+            (
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from_stream(first.chain(then)),
+            )
+        }),
+    );
+    let base = serve_over("qwen3.5:0.8b", dying).await;
+    let body = serde_json::json!({
+        "model": "qwen3.5:0.8b", "messages": [{ "role": "user", "content": "hi" }],
+    });
+    let resp = post_with(
+        &base,
+        "/v1/chat/completions",
+        body,
+        serde_json::json!({ "stream": true }),
+    )
+    .await;
+    assert!(
+        resp.text().await.is_err(),
+        "a truncated reply must not look complete"
+    );
+}
+
+/// llama-server ignores `dimensions`; the vectors are cut on the way back.
+#[tokio::test(flavor = "multi_thread")]
+async fn openai_embeddings_honour_dimensions() {
+    let base = serve_over("embeddinggemma", llama_server_standin()).await;
+    let ask = |extra: serde_json::Value| {
+        let body = serde_json::json!({ "model": "embeddinggemma", "input": "hello" });
+        let base = base.clone();
+        async move {
+            let resp = post_with(&base, "/v1/embeddings", body, extra).await;
+            resp.json::<serde_json::Value>().await.unwrap()
+        }
+    };
+
+    let cut = ask(serde_json::json!({ "dimensions": 2 })).await;
+    assert_eq!(cut["data"][0]["embedding"], serde_json::json!([0.6, 0.8]));
+    assert_eq!(cut["usage"]["prompt_tokens"], 2);
+    assert_eq!(cut["data"][0]["index"], 0);
+
+    // Not asked for, or not fewer values than it has: as llama-server sent it.
+    for extra in [
+        serde_json::json!({}),
+        serde_json::json!({ "dimensions": 3 }),
+        serde_json::json!({ "dimensions": 768 }),
+        serde_json::json!({ "dimensions": 0 }),
+    ] {
+        let whole = ask(extra.clone()).await;
+        let want = serde_json::json!([3.0, 4.0, 12.0]);
+        assert_eq!(whole["data"][0]["embedding"], want, "{extra}");
+    }
+
+    let cut = ask(serde_json::json!({ "dimensions": 2, "encoding_format": "base64" })).await;
+    let encoded = cut["data"][0]["embedding"].as_str().unwrap();
+    assert_eq!(decode_f32s(encoded).unwrap(), [0.6, 0.8]);
 }

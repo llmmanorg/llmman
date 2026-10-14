@@ -6,6 +6,7 @@
 //! Qwen3.5 and Gemma 4 have just the switch; Llama 3 has none.
 //! `llmman launch` offers an integration exactly these (see
 //! `cmd::launch::opencode::opencode_variants`), never a level the model rejects.
+//! Also whether it renders a request's `tools` ([`handles_tools`]).
 
 use std::ops::Range;
 
@@ -107,6 +108,50 @@ pub fn thinking_controls(template: &str) -> ThinkingControls {
         enable_thinking,
         efforts,
     }
+}
+
+/// Whether `template` renders a request's tools: it names the variable
+/// `tools` in a block, as ollama's own `tools` capability test does for
+/// Go templates. One that only handles `tool_calls` has nowhere to put
+/// the definitions, so is not one.
+pub fn handles_tools(template: &str) -> bool {
+    blocks(&strip_comments(template)).any(|block| names_variable(block, "tools"))
+}
+
+/// Whether `block` uses the variable `name`: the whole word, outside a
+/// string, and not an attribute (`message.tools`).
+fn names_variable(block: &str, name: &str) -> bool {
+    let bytes = block.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let (mut at, mut previous) = (0, None::<u8>);
+    while at < bytes.len() {
+        let c = bytes[at];
+        if c == b'\'' || c == b'"' {
+            // To the closing quote; a backslash escapes the next byte.
+            at += 1;
+            while at < bytes.len() && bytes[at] != c {
+                at += if bytes[at] == b'\\' { 2 } else { 1 };
+            }
+            at += 1;
+            previous = Some(c);
+        } else if is_word(c) {
+            let end = bytes[at..]
+                .iter()
+                .position(|b| !is_word(*b))
+                .map_or(bytes.len(), |n| at + n);
+            if &block[at..end] == name && previous != Some(b'.') {
+                return true;
+            }
+            at = end;
+            previous = Some(b'a');
+        } else {
+            if !c.is_ascii_whitespace() {
+                previous = Some(c);
+            }
+            at += 1;
+        }
+    }
+    false
 }
 
 /// `template` without its `{# ... #}` comments.
@@ -338,6 +383,46 @@ mod tests {
         let t = r#"{%- if reasoning_effort == "max" or reasoning_effort == "low" or reasoning_effort == "none" %}
 {%- if reasoning_effort == 'low' %}{%- set unrelated = 'high' %}"#;
         assert_eq!(thinking_controls(t).efforts, vec!["low", "max"]);
+    }
+
+    /// Qwen3.5, Llama 3.1, gpt-oss, a macro taking them.
+    #[test]
+    fn a_template_that_reads_tools_handles_them() {
+        let qwen = r##"{%- if tools %}{{- '<|im_start|>system\n' }}{{- "# Tools\n\n<tools>" }}
+{%- for tool in tools %}{{- "\n" }}{{- tool | tojson }}{%- endfor %}{%- endif %}"##;
+        let llama = "{%- if not tools is defined %}{%- set tools = none %}{%- endif %}";
+        let gpt_oss = "{{- tools | tojson(indent=2) -}}";
+        let macro_ = "{%- macro render_tools(tools) -%}{{ tools|length }}{%- endmacro -%}";
+        let one_line = "{%-if tools%}x{%-endif%}";
+        for template in [qwen, llama, gpt_oss, macro_, one_line] {
+            assert!(handles_tools(template), "{template}");
+        }
+        // An escaped quote does not end the string.
+        assert!(handles_tools(r"{{ 'it\'s' ~ tools }}"));
+    }
+
+    /// Gemma 3, and mentions that are not the variable.
+    #[test]
+    fn a_template_that_never_reads_tools_does_not() {
+        let gemma3 = "{{ bos_token }}{%- for message in messages -%}\
+                      {{ '<start_of_turn>' + message['role'] + '\\n' }}{%- endfor -%}";
+        assert!(!handles_tools(gemma3));
+        for template in [
+            // Neighbouring names.
+            "{%- if tool_calls %}{{ custom_tools }}{{ tools_in_user_message }}{%- endif %}",
+            "{%- for tool in message.tool_calls %}{%- endfor %}",
+            // An attribute, a key and the argument of a filter.
+            "{{ message.tools }}",
+            "{{ message['tools'] }}",
+            "{{ messages | map(attribute='tools') }}",
+            // A string, a comment, text between blocks.
+            r#"{{- "You may use tools." }}"#,
+            "{# tools #}{{ x }}",
+            "You may use tools. {{ x }}",
+            "",
+        ] {
+            assert!(!handles_tools(template), "{template}");
+        }
     }
 
     #[test]

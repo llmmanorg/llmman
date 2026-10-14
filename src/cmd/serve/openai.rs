@@ -15,9 +15,11 @@ use tokio::time::{sleep, Duration, Instant};
 use super::backend::would_use_mlx;
 use super::hybrid::{request_pin, send_with_hybrid_fallback};
 use super::messages::content_text;
+use super::ollama::truncate_embedding;
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::relay::{
-    proxy, proxy_rewriting_model, relay, relay_chat_upstream, stream_rewriting_model,
+    proxy, proxy_buffered, proxy_rewriting_model, relay, relay_chat_upstream,
+    stream_rewriting_model,
 };
 use super::responses::{
     is_responses_route, remote_responses, sanitize_responses_request, RESPONSES_ROUTE,
@@ -315,15 +317,9 @@ async fn prepare_openai_request(
 /// below for the two non-generation routes), not an easily-mis-set
 /// argument at the call site.
 ///
-/// Picks which of the three proxy helpers actually relays the response
-/// based on `resolve_openai_request`'s `response_model_override`: plain
-/// `proxy` (untouched byte relay) when it's `None` — every engine
-/// except `Engine::Mlx`, unchanged from before that engine existed —
-/// otherwise `stream_rewriting_model`/`proxy_rewriting_model` depending
-/// on whether this request itself asked for a streamed response, both
-/// of which rewrite the response's own `"model"` field back to the
-/// canonical name before it reaches the client (see either's own doc
-/// comment for why that's needed at all).
+/// Relays the reply through `stream_rewriting_model` or
+/// `proxy_rewriting_model`, so its `"model"` is always the client's own,
+/// never an MLX path, a provider's id or llama-server's `/models/<digest>`.
 pub(super) async fn proxy_openai_generation(
     state: &AppState,
     headers: &HeaderMap,
@@ -343,6 +339,7 @@ pub(super) async fn proxy_openai_generation(
                 headers,
                 req.clone(),
                 llama_path,
+                &model_ref,
                 model,
                 target,
                 guard,
@@ -352,17 +349,23 @@ pub(super) async fn proxy_openai_generation(
     .await
 }
 
-/// [`proxy_openai_generation`] against one resolved target.
+/// [`proxy_openai_generation`] against one resolved target; the reply
+/// names `model_ref`, the model as the client wrote it.
+#[allow(clippy::too_many_arguments)]
 async fn proxy_openai_generation_to(
     state: &AppState,
     headers: &HeaderMap,
     req: serde_json::Value,
     llama_path: &str,
+    model_ref: &str,
     model: String,
     target: Target,
     guard: ActivityGuard,
 ) -> Result<Response, AppError> {
-    let (mut req, target, activity, response_model_override) =
+    // OpenClaw reads any difference as a reroute; llama-server answers
+    // with its own model path.
+    let reply_model = model_ref.to_string();
+    let (mut req, target, activity, _) =
         prepare_openai_request(state, req, model, target, guard).await?;
     if let Some(refusal) = unsupported_on_wire(&target, llama_path) {
         drop(activity);
@@ -370,16 +373,19 @@ async fn proxy_openai_generation_to(
     }
     if llama_path == RESPONSES_ROUTE && target.is_remote() {
         strip_llama_fields(&mut req);
-        // A remote target always has an override (see backend_wire_model).
-        let canonical = response_model_override
-            .unwrap_or_else(|| req["model"].as_str().unwrap_or_default().to_string());
-        return remote_responses(&state.0.client, &target, headers, req, activity, canonical).await;
+        return remote_responses(
+            &state.0.client,
+            &target,
+            headers,
+            req,
+            activity,
+            reply_model,
+        )
+        .await;
     }
     if llama_path == CHAT_COMPLETIONS_ROUTE && target.is_anthropic() {
-        let canonical = response_model_override
-            .unwrap_or_else(|| req["model"].as_str().unwrap_or_default().to_string());
-        // The translated reply already names the canonical model.
-        let upstream = send_chat_completion(&state.0.client, &target, &req, &canonical).await?;
+        // The translated reply names the model it is given.
+        let upstream = send_chat_completion(&state.0.client, &target, &req, &reply_model).await?;
         return Ok(relay_chat_upstream(upstream, activity));
     }
     if is_responses_route(llama_path) && !target.is_remote() {
@@ -405,42 +411,28 @@ async fn proxy_openai_generation_to(
     }
     let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
-    let resp = match response_model_override {
-        Some(canonical) if streaming => {
-            stream_rewriting_model(
-                &state.0.client,
-                &target,
-                llama_path,
-                headers,
-                body,
-                activity,
-                canonical,
-            )
-            .await
-        }
-        Some(canonical) => {
-            proxy_rewriting_model(
-                &state.0.client,
-                &target,
-                llama_path,
-                headers,
-                body,
-                activity,
-                &canonical,
-            )
-            .await
-        }
-        None => {
-            proxy(
-                &state.0.client,
-                &target,
-                llama_path,
-                headers,
-                body,
-                activity,
-            )
-            .await
-        }
+    let resp = if streaming {
+        stream_rewriting_model(
+            &state.0.client,
+            &target,
+            llama_path,
+            headers,
+            body,
+            activity,
+            reply_model,
+        )
+        .await
+    } else {
+        proxy_rewriting_model(
+            &state.0.client,
+            &target,
+            llama_path,
+            headers,
+            body,
+            activity,
+            &reply_model,
+        )
+        .await
     }?;
     Ok(explain_missing_route(&target, llama_path, resp))
 }
@@ -553,9 +545,28 @@ async fn forward_openai_request(
             return Ok(mlx_embeddings_unsupported_response(canonical));
         }
     }
+    // A provider handles `dimensions` itself; llama-server (and maybe an
+    // older peer) ignores it, so those vectors are cut here.
+    let dimensions = (embeddings && !target.is_remote())
+        .then(|| requested_dimensions(&req))
+        .flatten();
     let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
-    let resp = match response_model_override {
-        Some(canonical) => {
+    let resp = match (response_model_override, dimensions) {
+        // Never remote, and a non-remote override was refused above (MLX),
+        // so there is no model name to put back here.
+        (_, Some(dims)) => {
+            proxy_buffered(
+                &state.0.client,
+                &target,
+                llama_path,
+                headers,
+                body,
+                activity,
+                |raw| apply_embedding_dimensions(raw, dims),
+            )
+            .await
+        }
+        (Some(canonical), None) => {
             proxy_rewriting_model(
                 &state.0.client,
                 &target,
@@ -567,7 +578,7 @@ async fn forward_openai_request(
             )
             .await
         }
-        None => {
+        (None, None) => {
             proxy(
                 &state.0.client,
                 &target,
@@ -582,6 +593,100 @@ async fn forward_openai_request(
     // `/v1/responses/input_tokens` comes through here, and a provider
     // without the Responses API 404s it just the same.
     Ok(explain_missing_route(&target, llama_path, resp))
+}
+
+/// `dimensions` of an OpenAI embeddings request; absent, zero or not a
+/// whole number is no request, as for `/api/embed`.
+fn requested_dimensions(req: &serde_json::Value) -> Option<usize> {
+    let dims = req.get("dimensions")?.as_u64().filter(|d| *d > 0)?;
+    usize::try_from(dims).ok()
+}
+
+/// A `/v1/embeddings` response read only as far as its vectors. Typed
+/// rather than `serde_json::Value` so a re-serialized `f32` keeps its
+/// short form (`0.1`, not `0.10000000149011612`).
+#[derive(serde::Deserialize, serde::Serialize)]
+struct EmbeddingsBody {
+    data: Vec<EmbeddingItem>,
+    #[serde(flatten)]
+    rest: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct EmbeddingItem {
+    embedding: EmbeddingVector,
+    #[serde(flatten)]
+    rest: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A list of numbers, or with `encoding_format: "base64"` (the OpenAI
+/// SDKs' default) the same values as little-endian `f32` bytes.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+enum EmbeddingVector {
+    Floats(Vec<f32>),
+    Base64(String),
+}
+
+impl EmbeddingVector {
+    /// Cuts the vector to `dims` values ([`truncate_embedding`]); whether
+    /// it changed. A shorter vector, or base64 that is not whole `f32`s,
+    /// is left alone.
+    fn truncate(&mut self, dims: usize) -> Result<bool, AppError> {
+        match self {
+            EmbeddingVector::Floats(v) if v.len() > dims => {
+                truncate_embedding(v, dims)?;
+                Ok(true)
+            }
+            EmbeddingVector::Floats(_) => Ok(false),
+            EmbeddingVector::Base64(encoded) => {
+                let Some(mut v) = decode_f32s(encoded).filter(|v| v.len() > dims) else {
+                    return Ok(false);
+                };
+                truncate_embedding(&mut v, dims)?;
+                *encoded = encode_f32s(&v);
+                Ok(true)
+            }
+        }
+    }
+}
+
+/// `values` as base64 of their little-endian bytes.
+pub(super) fn encode_f32s(values: &[f32]) -> String {
+    use base64::Engine as _;
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// [`encode_f32s`] undone; `None` unless base64 of whole `f32`s.
+pub(super) fn decode_f32s(encoded: &str) -> Option<Vec<f32>> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let (chunks, rest) = bytes.as_chunks::<4>();
+    rest.is_empty()
+        .then(|| chunks.iter().map(|c| f32::from_le_bytes(*c)).collect())
+}
+
+/// `raw`, a `/v1/embeddings` response, with every vector cut to `dims`
+/// and re-normalised, as `/api/embed` does. Anything that is not such a
+/// response, or has no longer vector, goes back untouched; a non-finite
+/// value is a 502, as there.
+fn apply_embedding_dimensions(raw: &Bytes, dims: usize) -> Result<Bytes, AppError> {
+    let Ok(mut body) = serde_json::from_slice::<EmbeddingsBody>(raw) else {
+        return Ok(raw.clone());
+    };
+    let mut changed = false;
+    for item in &mut body.data {
+        changed |= item.embedding.truncate(dims)?;
+    }
+    if !changed {
+        return Ok(raw.clone());
+    }
+    Ok(Bytes::from(
+        serde_json::to_vec(&body).context("re-serialize embeddings response")?,
+    ))
 }
 
 /// The clear, specific error [`proxy_openai_passthrough`] returns
@@ -1095,6 +1200,100 @@ pub(super) async fn handle_openai_transcriptions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn embeddings_response(embedding: serde_json::Value) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "object": "list",
+                "model": "/models/abc",
+                "data": [{ "object": "embedding", "index": 0, "embedding": embedding }],
+                "usage": { "prompt_tokens": 2, "total_tokens": 2 },
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// `[3, 4, 12]` cut to two is `[0.6, 0.8]`; the rest of the body is
+    /// untouched and the floats keep their short spelling.
+    #[test]
+    fn dimensions_cut_each_vector_and_renormalise_it() {
+        let raw = embeddings_response(serde_json::json!([3.0, 4.0, 12.0]));
+        let out = apply_embedding_dimensions(&raw, 2).unwrap();
+        let text = std::str::from_utf8(&out).unwrap();
+        assert!(text.contains("[0.6,0.8]"), "{text}");
+        let body: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(body["data"][0]["embedding"], serde_json::json!([0.6, 0.8]));
+        assert_eq!(body["data"][0]["index"], 0);
+        assert_eq!(body["data"][0]["object"], "embedding");
+        assert_eq!(body["usage"]["prompt_tokens"], 2);
+        assert_eq!(body["object"], "list");
+        assert_eq!(body["model"], "/models/abc");
+    }
+
+    /// The OpenAI SDKs ask for base64 unless told otherwise.
+    #[test]
+    fn dimensions_cut_a_base64_vector_too() {
+        let raw = embeddings_response(serde_json::json!(encode_f32s(&[3.0, 4.0, 12.0])));
+        let out = apply_embedding_dimensions(&raw, 2).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let encoded = body["data"][0]["embedding"].as_str().unwrap();
+        assert_eq!(decode_f32s(encoded).unwrap(), [0.6, 0.8]);
+    }
+
+    /// Nothing to cut, or not an embeddings response: bytes unchanged.
+    #[test]
+    fn dimensions_leave_everything_else_untouched() {
+        let raw = embeddings_response(serde_json::json!([3.0, 4.0, 12.0]));
+        for dims in [3, 4, 768] {
+            assert_eq!(apply_embedding_dimensions(&raw, dims).unwrap(), raw);
+        }
+        let short = embeddings_response(serde_json::json!(encode_f32s(&[3.0, 4.0])));
+        assert_eq!(apply_embedding_dimensions(&short, 2).unwrap(), short);
+        // Five bytes are not whole `f32`s.
+        let not_f32s = embeddings_response(serde_json::json!("AAAAAAA="));
+        assert_eq!(apply_embedding_dimensions(&not_f32s, 1).unwrap(), not_f32s);
+        let not_base64 = embeddings_response(serde_json::json!("%%%"));
+        assert_eq!(
+            apply_embedding_dimensions(&not_base64, 1).unwrap(),
+            not_base64
+        );
+        for body in [
+            Bytes::from_static(br#"{"error":{"message":"input too large"}}"#),
+            Bytes::from_static(b"not json"),
+            Bytes::new(),
+        ] {
+            assert_eq!(apply_embedding_dimensions(&body, 2).unwrap(), body);
+        }
+    }
+
+    /// A NaN cannot be normalised: a 502, as for `/api/embed`.
+    #[test]
+    fn dimensions_refuse_a_vector_that_is_not_finite() {
+        let raw = embeddings_response(serde_json::json!(encode_f32s(&[f32::NAN, 4.0, 12.0])));
+        let err = apply_embedding_dimensions(&raw, 2).unwrap_err();
+        assert_eq!(err.1, StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn dimensions_are_a_positive_whole_number() {
+        let asked = |dimensions: serde_json::Value| {
+            requested_dimensions(&serde_json::json!({ "model": "m", "dimensions": dimensions }))
+        };
+        assert_eq!(asked(serde_json::json!(256)), Some(256));
+        for not_a_request in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(256.5),
+            serde_json::json!("256"),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(asked(not_a_request.clone()), None, "{not_a_request}");
+        }
+        assert_eq!(
+            requested_dimensions(&serde_json::json!({ "model": "m" })),
+            None
+        );
+    }
 
     /// Builds a `multipart/form-data` body + matching `content-type`
     /// header out of `fields` (name, value) pairs — a hand-rolled encoder

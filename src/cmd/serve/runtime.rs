@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 
 use crate::container::{ContainerEngine, ContainerManager};
+use crate::llama_release::DownloadMarker;
 
 /// `--runtime` / `LLMMAN_RUNTIME`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -322,16 +323,21 @@ fn try_one(
             if !explicit {
                 ociman.probe()?;
             }
-            with_download_marker(|| {
-                crate::container::pull_image(
-                    ociman,
-                    ContainerEngine::LlamaServer,
-                    llama_cpp_version,
+            with_download_marker(|marker| {
+                prepare_container(
+                    marker,
+                    || {
+                        crate::container::pull_image(
+                            ociman,
+                            ContainerEngine::LlamaServer,
+                            llama_cpp_version,
+                        )
+                    },
+                    (!explicit).then_some(|| {
+                        crate::container::verify_llama_server_runs(ociman, llama_cpp_version)
+                    }),
                 )
             })?;
-            if !explicit {
-                crate::container::verify_llama_server_runs(ociman, llama_cpp_version)?;
-            }
             Ok(Resolved::Container(ociman))
         }
         Runtime::Bin => {
@@ -353,14 +359,30 @@ fn try_one(
     }
 }
 
-/// Runs `pull` (a `docker pull`, possibly minutes) holding
-/// `crate::llama_release`'s download marker with its heartbeat, so
-/// `daemon::ensure_server` leaves a daemon still pulling alive past its
-/// startup budget, as it does for the release download.
-fn with_download_marker<T>(pull: impl FnOnce() -> T) -> T {
-    let marker = crate::llama_release::DownloadMarker::create();
+/// Runs `setup` (a `docker pull` and the check after it, possibly
+/// minutes) holding the download marker with its heartbeat, so
+/// `daemon::ensure_server` leaves a daemon still setting up alive.
+fn with_download_marker<T>(setup: impl FnOnce(&DownloadMarker) -> T) -> T {
+    let marker = DownloadMarker::create();
+    marker.keep_alive_during(|| setup(&marker))
+}
+
+/// A container runtime's setup: `pull` the image, then (`--runtime auto`
+/// only) `verify` it starts. Each step names itself on `marker`, held
+/// throughout: the client's 60s budget counts time with no live marker,
+/// and `verify` may itself run for `container::VERIFY_TIMEOUT` (60s).
+fn prepare_container(
+    marker: &DownloadMarker,
+    pull: impl FnOnce() -> Result<()>,
+    verify: Option<impl FnOnce() -> Result<()>>,
+) -> Result<()> {
     marker.set_status(crate::container::PULL_STATUS);
-    marker.keep_alive_during(pull)
+    pull()?;
+    if let Some(verify) = verify {
+        marker.set_status(crate::container::VERIFY_STATUS);
+        verify()?;
+    }
+    Ok(())
 }
 
 /// `--llama-cpp-version` as a pin: unset is
@@ -407,6 +429,57 @@ mod tests {
         assert_eq!(llama_cpp_pin(None).as_deref(), Some(default));
         assert_eq!(llama_cpp_pin(Some("latest")), None);
         assert_eq!(llama_cpp_pin(Some("b9994")).as_deref(), Some("b9994"));
+    }
+
+    /// The marker file the client polls, at a path of this test's own.
+    fn marker_at_temp_path(name: &str) -> (DownloadMarker, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "llmman-runtime-marker-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        (DownloadMarker::create_at(path.clone()), path)
+    }
+
+    /// The marker is live, and says what it waits on, through both steps.
+    #[test]
+    fn the_marker_is_live_and_says_what_it_is_waiting_on_through_pull_and_verify() {
+        let (marker, path) = marker_at_temp_path("verify");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let note = || {
+            seen.borrow_mut()
+                .push(std::fs::read_to_string(&path).expect("the marker exists"));
+            Ok(())
+        };
+        prepare_container(&marker, note, Some(note)).unwrap();
+        assert_eq!(
+            *seen.borrow(),
+            [
+                crate::container::PULL_STATUS,
+                crate::container::VERIFY_STATUS
+            ]
+        );
+    }
+
+    /// An explicit runtime skips the check; a failed pull never reaches it.
+    #[test]
+    fn verify_is_skipped_for_an_explicit_runtime_and_after_a_failed_pull() {
+        let (marker, _path) = marker_at_temp_path("skip");
+        let verified = std::cell::Cell::new(false);
+        let verify = || {
+            verified.set(true);
+            Ok(())
+        };
+        prepare_container(&marker, || Ok(()), None::<fn() -> Result<()>>).unwrap();
+        assert!(!verified.get());
+        let err = prepare_container(&marker, || anyhow::bail!("pull failed"), Some(verify))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "pull failed");
+        assert!(!verified.get());
     }
 
     #[test]

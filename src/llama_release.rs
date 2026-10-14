@@ -525,7 +525,7 @@ impl DownloadMarker {
 
     /// The path-taking constructor behind [`DownloadMarker::create`], so
     /// tests can run the guard's lifecycle against a temp path.
-    fn create_at(path: PathBuf) -> DownloadMarker {
+    pub(crate) fn create_at(path: PathBuf) -> DownloadMarker {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
