@@ -1,0 +1,16 @@
+[tools]
+"npm:cline" = "2.18.0"
+"npm:@deepseek-ai/dsh" = "0.1.2-rc.1"
+"npm:@anthropic-ai/claude-code" = "2.1.300"
+"npm:opencode-ai" = "1.19.0"
+"npm:@openai/codex" = "0.162.1"
+"npm:@github/copilot" = "1.0.91"
+"npm:droid" = "0.242.0"
+"npm:@earendil-works/pi-coding-agent" = "0.86.1"
+"npm:@qwen-code/qwen-code" = "0.22.3"
+"npm:openclaw" = "2026.7.1-2"
+
+[settings]
+# claude-code's postinstall (node install.cjs) prepares its native binary;
+# mise skips build scripts by default, so approve it explicitly.
+allow_builds = ["npm:@anthropic-ai/claude-code"]

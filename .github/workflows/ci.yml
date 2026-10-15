@@ -67,11 +67,6 @@ env:
   # Pinned because its command-line and custom-model contracts are what
   # the test verifies; bump deliberately and rerun the launch suite.
   GROK_CLI_VERSION: "1.0.34"
-  # Official Cline CLI used by launch_e2e's real `launch cline` test.
-  # Pinned because its provider-settings schema and CLI flags are the
-  # integration contract under test. The macOS GitHub runner kills 3.0.62;
-  # that failure is runner-specific, not a general macOS release failure.
-  CLINE_CLI_VERSION: "2.18.0"
   # Docker Agent release used by launch_e2e's real `launch docker-agent`
   # test. Pinned because the agent-file contract launch_docker_agent
   # writes is what that test verifies; bump deliberately and rerun the
@@ -953,7 +948,7 @@ jobs:
       # multi-line/array syntax; ubuntu/macOS already default to bash.
       #
       # Unlike hermes/mlx_lm.server (legitimately missing on some
-      # platforms), these ten are plain npm packages expected to work
+      # platforms), these eight are plain npm packages expected to work
       # everywhere — so install_cli fails the job, rather than letting
       # tests/launch_e2e.rs's on_path check silently skip, when one never
       # becomes a working binary.
@@ -979,79 +974,34 @@ jobs:
           bun install -g @oh-my-pi/pi-coding-agent@18.2.11
           omp --version
 
-      - name: Install integration CLIs (claude, opencode, pi, codex, copilot, droid, cline, qwen, openclaw, dsh)
+      # mise-action uses `unzip` to extract its own installer on a cache miss.
+      # Windows runners ship 7-Zip but not unzip; Git for Windows provides one.
+      # Copy only the binary to System32 so the entire Git usr/bin directory is
+      # not prepended to PATH (which would shadow MSVC's link.exe).
+      - name: Add unzip to PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item "C:\Program Files\Git\usr\bin\unzip.exe" "$env:SystemRoot\System32\unzip.exe"
+
+      - name: Install mise tools (cline, dsh, claude, opencode, codex, copilot, droid, pi, qwen, openclaw)
+        uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
+        with:
+          version: "2026.10.11"
+          # Prevent the action from exporting the job token into the environment
+          # where third-party CLIs (smoke-check, E2E) would inherit it.
+          github_token: ""
+
+      - name: Smoke-check mise tools
         shell: bash
         run: |
-          failed_clis=()
-
-          install_cli() {
-            local install_spec="$1" pkg_name="$2" bin="$3"
-            local max_attempts=6
-            for attempt in $(seq 1 "$max_attempts"); do
-              if [ "$attempt" -gt 1 ]; then
-                # Clear npm's cache so a corrupted/incomplete cached
-                # response from the last attempt can't repeat itself.
-                npm cache clean --force >/dev/null 2>&1 || true
-              fi
-              local next="retrying"
-              [ "$attempt" -eq "$max_attempts" ] && next="giving up"
-              if ! npm install -g "$install_spec"; then
-                echo "::warning::$pkg_name install failed on ${{ runner.os }} (attempt $attempt/$max_attempts); $next"
-              else
-                if version_output=$("$bin" --version 2>&1); then
-                  return 0
-                fi
-                echo "::warning::$pkg_name installed but \"$bin --version\" failed on ${{ runner.os }} (attempt $attempt/$max_attempts); $next — output: $version_output"
-              fi
-              # Exponential backoff: 1s, 2s, 4s, 8s, 16s.
-              if [ "$attempt" -lt "$max_attempts" ]; then
-                sleep "$((2 ** (attempt - 1)))"
-              fi
-            done
-            echo "::error::$pkg_name never produced a working \"$bin\" on ${{ runner.os }} after $max_attempts attempts"
-            failed_clis+=("$pkg_name")
-          }
-
-          install_cli "@anthropic-ai/claude-code" "@anthropic-ai/claude-code" "claude"
-          install_cli "opencode-ai" "opencode-ai" "opencode"
-          install_cli "@openai/codex" "@openai/codex" "codex"
-          # Pinned: the standalone CLI's BYOK environment and `-p` mode are
-          # exercised against this release by tests/launch_e2e.rs.
-          install_cli "@github/copilot@1.0.91" "@github/copilot" "copilot"
-          # Pinned: tests/launch_e2e.rs verifies this release's custom-model
-          # settings schema, model id, and non-interactive `exec` interface.
-          install_cli "droid@0.242.0" "droid" "droid"
-          # Pinned: launch_cline depends on this release's provider-settings
-          # schema and headless JSON/yolo flags.
-          install_cli "cline@${CLINE_CLI_VERSION}" "cline" "cline"
-          # Pinned (not @latest): pi is pre-1.0 and tests/launch_e2e.rs's
-          # own invocation (-p) plus the models.json/settings.json shapes
-          # `launch pi` writes were verified against this exact release;
-          # an unpinned upgrade could change either with no warning here.
-          install_cli "@earendil-works/pi-coding-agent@0.86.1" "@earendil-works/pi-coding-agent" "pi"
-          # Pinned (not @latest): tests/launch_e2e.rs's qwen test relies on
-          # this release's tool set under --safe-mode and on the
-          # report_findings schema it excludes by name; a newer release can
-          # change either. Bump deliberately, re-running that test.
-          install_cli "@qwen-code/qwen-code@0.22.3" "@qwen-code/qwen-code" "qwen"
-          # Pinned (not @latest): tests/launch_e2e.rs's own openclaw
-          # invocation was verified against this exact release — its
-          # docs describe CLI commands/flags this build doesn't actually
-          # have (see launch_and_assert_tolerating's own doc comment),
-          # so an unpinned upgrade could silently break the same way
-          # again with no warning here.
-          install_cli "openclaw@2026.7.1-2" "openclaw" "openclaw"
-          # Pinned (not @latest): dsh is pre-1.0 (0.1.2-rc.1) and
-          # tests/launch_e2e.rs's own invocation (--profile headless) was
-          # verified against this exact release; an unpinned upgrade
-          # could silently change that profile's flags or behavior with
-          # no warning here.
-          install_cli "@deepseek-ai/dsh@0.1.2-rc.1" "@deepseek-ai/dsh" "dsh"
-
-          if [ "${#failed_clis[@]}" -gt 0 ]; then
-            echo "::error::the following integration CLIs never became installable on ${{ runner.os }} after retries: ${failed_clis[*]}"
-            exit 1
-          fi
+          for bin in cline dsh claude opencode codex copilot droid pi qwen openclaw; do
+            if output=$("$bin" --version 2>&1); then
+              echo "$bin: $output"
+            else
+              echo "::error::$bin --version failed (exit $?): $output"
+              exit 1
+            fi
+          done
 
       # hermes has no npm package (install.sh/install.ps1 only, like
       # llmman's own install scripts) — --skip-setup skips its
