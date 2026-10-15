@@ -417,7 +417,7 @@ class MainActivity : ComponentActivity() {
     private companion object {
         /**
          * Runs before any page script: stores the daemon's API key where
-         * webui/api.js reads it (the same localStorage key it would write
+         * the web UI reads it (the same localStorage key it would write
          * after asking the user), then [DOWNLOAD_NAME_SCRIPT].
          */
         fun startScript(apiKey: String): String = """

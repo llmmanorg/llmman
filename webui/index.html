@@ -1,319 +1,39 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light dark">
-  <title>llmman</title>
-  <link rel="icon" href="ui/manatee.png" type="image/png">
-  <link rel="stylesheet" href="ui/vendor/xterm.css">
-  <link rel="stylesheet" href="ui/app.css">
-  <script>
-    // Before first paint, so a dark theme never flashes light: the same
-    // key settings.js writes.
-    try {
-      var t = JSON.parse(localStorage.getItem("llmman.settings") || "{}").theme;
-      if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
-    } catch (e) {}
-  </script>
-</head>
-<body>
-<div class="app" id="app">
+  <head>
+    <meta charset="utf-8" />
+    <script>(function(){var d=location.pathname.split("/").slice(1,-1),r=["c","connect","models","providers","server","servers","settings"];for(var i=0;i<d.length;i++)if(r.indexOf(d[i])>=0){d=d.slice(0,i);break}var h=document.head,b=document.createElement("base"),p="/"+d.map(function(s){return s+"/"}).join("");b.href=p;h.appendChild(b);["ui/_expo/static/css/xterm-8a7c4e0dca731c11dbe6bdff98fb667c.css"].forEach(function(s){var l=document.createElement("link");l.rel="stylesheet";l.href=s;h.appendChild(l)})})()</script>
+    <meta httpEquiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <title>llmman</title>
+    <!-- The `react-native-web` recommended style reset: https://necolas.github.io/react-native-web/docs/setup/#root-element -->
+    <style id="expo-reset">
+      /* These styles make the body full-height */
+      html,
+      body {
+        height: 100%;
+      }
+      /* These styles disable body scrolling if you are using <ScrollView> */
+      body {
+        overflow: hidden;
+      }
+      /* These styles make the root element full-height */
+      #root {
+        display: flex;
+        height: 100%;
+        flex: 1;
+      }
+    </style>
+  <meta name="theme-color" content="#E8F5F1">
+<link rel="icon" href="ui/manatee.png" type="image/png"></head>
 
-  <aside class="sidebar" id="sidebar" aria-label="Sidebar">
-    <div class="sidebar-head">
-      <a class="wordmark" href="#/" title="llmman">
-        <img class="wordmark-mark" src="ui/manatee.png" alt="" aria-hidden="true">
-        <span>llmman</span>
-      </a>
-      <button class="icon-btn" id="sidebar-close" title="Close sidebar" aria-label="Close sidebar">
-        <svg viewBox="0 0 24 24"><use href="#i-panel"/></svg>
-      </button>
-    </div>
-
-    <div class="mode-toggle" role="tablist" aria-label="Mode">
-      <button role="tab" data-mode="chat" class="active" id="mode-chat" aria-selected="true" aria-controls="view-chat">Chat</button>
-      <button role="tab" data-mode="shell" id="mode-shell" aria-selected="false" aria-controls="view-shell">Shell</button>
-    </div>
-
-    <button class="new-chat" id="new-chat">
-      <span class="new-chat-plus"><svg viewBox="0 0 24 24"><use href="#i-plus"/></svg></span>
-      <span>New chat</span>
-    </button>
-
-    <nav class="sidebar-nav">
-      <a class="nav-item" href="#/" data-nav="chat">
-        <svg viewBox="0 0 24 24"><use href="#i-chat"/></svg><span>Chats</span>
-      </a>
-      <a class="nav-item" href="#/models" data-nav="models">
-        <svg viewBox="0 0 24 24"><use href="#i-cube"/></svg><span>Models</span>
-      </a>
-    </nav>
-
-    <div class="recents">
-      <div class="recents-label">Recents</div>
-      <ul class="recent-list" id="recent-list"></ul>
-      <div class="recents-empty" id="recents-empty">Your conversations will show up here.</div>
-    </div>
-
-    <div class="sidebar-foot">
-      <button class="nav-item" id="settings-btn" type="button">
-        <svg viewBox="0 0 24 24"><use href="#i-gear"/></svg><span>Settings</span>
-      </button>
-      <div class="daemon-line" id="daemon-line" title="The llmman serve this page is talking to">
-        <span class="dot" id="daemon-dot"></span>
-        <span id="daemon-text">connecting…</span>
-      </div>
-    </div>
-  </aside>
-  <div class="sidebar-scrim" id="sidebar-scrim" aria-hidden="true"></div>
-
-  <main class="main">
-    <header class="topbar">
-      <button class="icon-btn" id="sidebar-open" title="Open sidebar" aria-label="Open sidebar">
-        <svg viewBox="0 0 24 24"><use href="#i-panel"/></svg>
-      </button>
-      <div class="topbar-title" id="topbar-title"></div>
-    </header>
-
-    <!-- Chat -->
-    <section class="view view-chat empty" id="view-chat" role="tabpanel">
-      <div class="chat-scroll" id="chat-scroll">
-        <div class="chat-column">
-          <div class="greeting" id="greeting">
-            <img class="greeting-mark" src="ui/manatee.png" alt="" aria-hidden="true">
-            <h1 id="greeting-text">How can I help you today?</h1>
-          </div>
-          <div class="messages" id="messages"></div>
-          <div class="scroll-anchor" id="scroll-anchor"></div>
-        </div>
-      </div>
-
-      <div class="composer-wrap">
-        <div class="composer" id="composer">
-          <textarea id="prompt" rows="1" placeholder="How can I help you today?" aria-label="Message" autocomplete="off" spellcheck="true"></textarea>
-          <div class="composer-row">
-            <div class="composer-left">
-              <button class="icon-btn" id="prompt-settings-btn" title="Chat settings" aria-label="Chat settings">
-                <svg viewBox="0 0 24 24"><use href="#i-sliders"/></svg>
-              </button>
-              <!-- With a media generation model: what the prompt becomes. -->
-              <div class="kind-toggle hidden" id="media-kind" role="group" aria-label="Output">
-                <button type="button" data-kind="image" aria-pressed="false" title="Generate an image">
-                  <svg viewBox="0 0 24 24"><use href="#i-image"/></svg><span>Image</span>
-                </button>
-                <button type="button" data-kind="video" aria-pressed="false" title="Generate a video">
-                  <svg viewBox="0 0 24 24"><use href="#i-video"/></svg><span>Video</span>
-                </button>
-                <button type="button" data-kind="audio" aria-pressed="false" title="Generate audio">
-                  <svg viewBox="0 0 24 24"><use href="#i-audio"/></svg><span>Audio</span>
-                </button>
-              </div>
-            </div>
-            <div class="composer-right">
-              <button class="model-btn" id="model-btn" aria-haspopup="menu" aria-expanded="false">
-                <span class="model-btn-name" id="model-btn-name">Choose a model</span>
-                <svg viewBox="0 0 24 24" class="chev"><use href="#i-chevron"/></svg>
-              </button>
-              <button class="send-btn" id="send-btn" title="Send (Enter)" aria-label="Send" disabled>
-                <svg viewBox="0 0 24 24" class="send-icon"><use href="#i-arrow-up"/></svg>
-                <svg viewBox="0 0 24 24" class="stop-icon"><use href="#i-stop"/></svg>
-              </button>
-            </div>
-          </div>
-        </div>
-        <div class="composer-status" id="composer-status"></div>
-      </div>
-
-      <!-- Model picker popover -->
-      <div class="popover model-menu hidden" id="model-menu" role="menu">
-        <input class="menu-search" id="model-search" placeholder="Search models" autocomplete="off">
-        <div class="menu-body" id="model-menu-body"></div>
-        <div class="menu-foot">
-          <button class="menu-foot-btn" id="pull-open">
-            <svg viewBox="0 0 24 24"><use href="#i-download"/></svg><span>Pull a model…</span>
-          </button>
-          <button class="menu-foot-btn" id="models-refresh" title="Refresh">
-            <svg viewBox="0 0 24 24"><use href="#i-refresh"/></svg><span>Refresh</span>
-          </button>
-        </div>
-      </div>
-
-      <!-- Chat settings popover; media fields with a generation model. -->
-      <div class="popover prompt-settings hidden" id="prompt-settings">
-        <div class="settings-chat" id="settings-chat">
-          <label class="field">
-            <span>System prompt</span>
-            <textarea id="system-prompt" rows="4" placeholder="Optional instructions sent with every message in this conversation"></textarea>
-          </label>
-          <label class="field field-row">
-            <span>Temperature</span>
-            <input type="number" id="temperature" min="0" max="2" step="0.1" placeholder="model default">
-          </label>
-          <label class="field field-row">
-            <span>Max tokens</span>
-            <input type="number" id="max-tokens" min="1" step="1" placeholder="unlimited">
-          </label>
-        </div>
-        <div class="settings-media hidden" id="settings-media">
-          <div class="field field-row media-visual" role="group" aria-labelledby="media-size-label">
-            <span id="media-size-label">Size</span>
-            <span class="size-pair">
-              <input type="number" id="media-width" min="32" max="4096" step="32" placeholder="768" aria-label="Width">
-              <span class="muted">×</span>
-              <input type="number" id="media-height" min="32" max="4096" step="32" placeholder="512" aria-label="Height">
-            </span>
-          </div>
-          <label class="field field-row media-timed">
-            <span>Seconds</span>
-            <input type="number" id="media-seconds" min="0.5" max="42" step="0.5" placeholder="model default">
-          </label>
-          <label class="field field-row">
-            <span>Steps</span>
-            <input type="number" id="media-steps" min="1" max="200" step="1" placeholder="model default">
-          </label>
-          <label class="field field-row">
-            <span>Seed</span>
-            <input type="number" id="media-seed" min="0" max="4294967295" step="1" placeholder="random">
-          </label>
-          <label class="field field-row">
-            <span>Guidance</span>
-            <input type="number" id="media-cfg" min="0" max="30" step="0.5" placeholder="model default">
-          </label>
-          <label class="field">
-            <span>Negative prompt</span>
-            <textarea id="media-negative" rows="2" placeholder="What to keep out (guidance above 1 applies it)"></textarea>
-          </label>
-        </div>
-      </div>
-    </section>
-
-    <!-- Shell -->
-    <!-- Models -->
-    <section class="view view-models hidden" id="view-models" role="tabpanel">
-      <div class="browser" id="mb">
-        <aside class="browser-list">
-          <div class="browser-search">
-            <svg viewBox="0 0 24 24" class="browser-search-icon"><use href="#i-search"/></svg>
-            <input id="mb-query" placeholder="Search Docker Hub and Hugging Face" autocomplete="off" spellcheck="false">
-          </div>
-          <div class="browser-tabs" id="mb-tabs" role="group" aria-label="Show">
-            <button type="button" data-filter="all" class="active" aria-pressed="true">All</button>
-            <button type="button" data-filter="docker" aria-pressed="false">Docker Hub</button>
-            <button type="button" data-filter="hf" aria-pressed="false">Hugging Face</button>
-            <button type="button" data-filter="local" aria-pressed="false">Pulled</button>
-          </div>
-          <div class="browser-rows" id="mb-list" role="listbox" aria-label="Models"></div>
-        </aside>
-        <section class="browser-card" id="mb-card"></section>
-      </div>
-    </section>
-
-    <section class="view view-shell hidden" id="view-shell" role="tabpanel">
-      <div class="terminal-host">
-        <div class="terminal-pane" id="terminal-pane"></div>
-      </div>
-      <div class="shell-overlay hidden" id="shell-overlay">
-        <div class="shell-overlay-card">
-          <svg viewBox="0 0 24 24" class="shell-overlay-icon"><use href="#i-terminal"/></svg>
-          <div class="shell-overlay-text" id="shell-overlay-text"></div>
-          <button class="btn primary" id="shell-restart">Open a new shell</button>
-        </div>
-      </div>
-    </section>
-  </main>
-
-  <!-- Settings -->
-  <dialog class="dialog" id="settings-dialog">
-    <div class="dialog-body">
-      <div class="dialog-head">
-        <h2>Settings</h2>
-        <button class="icon-btn" id="settings-close" aria-label="Close"><svg viewBox="0 0 24 24"><use href="#i-x"/></svg></button>
-      </div>
-      <label class="field field-row">
-        <span>Appearance</span>
-        <select id="setting-theme">
-          <option value="system">System</option>
-          <option value="light">Light</option>
-          <option value="dark">Dark</option>
-        </select>
-      </label>
-      <label class="field field-row">
-        <span>Your name</span>
-        <input class="input" id="setting-name" placeholder="for the greeting">
-      </label>
-      <label class="field">
-        <span>Default system prompt</span>
-        <textarea id="setting-system" rows="3" placeholder="Used by new conversations"></textarea>
-      </label>
-      <label class="field field-row">
-        <span>Send with</span>
-        <select id="setting-enter">
-          <option value="enter">Enter (Shift+Enter for a newline)</option>
-          <option value="mod-enter">⌘/Ctrl+Enter</option>
-        </select>
-      </label>
-      <label class="field field-row">
-        <span>API key</span>
-        <input class="input" id="setting-api-key" type="password" autocomplete="off" placeholder="only if llmman serve requires one">
-      </label>
-      <div class="field">
-        <span>Data</span>
-        <div class="row gap">
-          <button class="btn" id="export-chats">Export chats</button>
-          <button class="btn danger" id="clear-chats">Delete all chats</button>
-        </div>
-        <p class="muted small">Conversations are stored in this browser only; the daemon keeps none.</p>
-      </div>
-      <div class="about muted small" id="about-line"></div>
-    </div>
-  </dialog>
-
-  <div class="toast hidden" id="toast" role="status"></div>
-</div>
-
-<!-- Icons -->
-<svg width="0" height="0" style="position:absolute" aria-hidden="true">
-  <defs>
-    <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 4v16" stroke="currentColor" stroke-width="1.8"/></symbol>
-    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
-    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M4 6a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v8a3 3 0 0 1-3 3H9l-5 4V6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
-    <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M7 9l3 3-3 3M12 15h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
-    <symbol id="i-cube" viewBox="0 0 24 24"><path d="M12 2.5 21 7v10l-9 4.5L3 17V7l9-4.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M3 7l9 4.5L21 7M12 11.5V21.5" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
-    <symbol id="i-gear" viewBox="0 0 24 24"><path d="M10.02 5.18 10.55 2.81H13.45L13.98 5.18 15.42 5.78 17.47 4.48 19.52 6.53 18.22 8.58 18.82 10.02 21.19 10.55V13.45L18.82 13.98 18.22 15.42 19.52 17.47 17.47 19.52 15.42 18.22 13.98 18.82 13.45 21.19H10.55L10.02 18.82 8.58 18.22 6.53 19.52 4.48 17.47 5.78 15.42 5.18 13.98 2.81 13.45V10.55L5.18 10.02 5.78 8.58 4.48 6.53 6.53 4.48 8.58 5.78Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="12" cy="12" r="2.8" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
-    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
-    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.5v2.5M12 19v2.5M21.5 12H19M5 12H2.5M18.7 5.3l-1.8 1.8M7.1 16.9l-1.8 1.8M18.7 18.7l-1.8-1.8M7.1 7.1 5.3 5.3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
-    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="16" cy="7" r="2.2" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="10" cy="17" r="2.2" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
-    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
-    <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
-    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor"/></symbol>
-    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m16 16 4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
-    <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 20s-7.5-4.4-7.5-10A4.3 4.3 0 0 1 12 7.6 4.3 4.3 0 0 1 19.5 10c0 5.6-7.5 10-7.5 10Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
-    <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 5 8 12l7 7" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
-    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7 10.5 12 15.5l5-5M4 19h16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
-    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
-    <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
-    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M5 15V6a2 2 0 0 1 2-2h9" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
-    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
-    <symbol id="i-retry" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.7M4 4v5h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
-    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M5 7h14M9 7V4.5h6V7M7 7l1 13h8l1-13M10 11v6M14 11v6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
-    <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M4 20h4l11-11-4-4L4 16v4zM13 7l4 4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
-    <symbol id="i-eject" viewBox="0 0 24 24"><path d="M12 5l7 9H5l7-9zM5 18h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></symbol>
-    <symbol id="i-dots" viewBox="0 0 24 24"><circle cx="6" cy="12" r="1.7" fill="currentColor"/><circle cx="12" cy="12" r="1.7" fill="currentColor"/><circle cx="18" cy="12" r="1.7" fill="currentColor"/></symbol>
-    <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M7 18a4 4 0 0 1-.5-8A6 6 0 0 1 18 9a4.5 4.5 0 0 1-.5 9H7z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
-    <symbol id="i-chip" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 2.5v3M15 2.5v3M9 18.5v3M15 18.5v3M2.5 9h3M2.5 15h3M18.5 9h3M18.5 15h3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
-    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="9" cy="9.5" r="1.6" fill="currentColor"/><path d="M4.5 17.5l5-5 3.5 3.5 2.5-2.5 4 4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></symbol>
-    <symbol id="i-video" viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M16 10.5l5-3v9l-5-3z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
-    <symbol id="i-audio" viewBox="0 0 24 24"><path d="M4 10v4M8 7v10M12 4v16M16 8v8M20 10.5v3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
-    <symbol id="i-save" viewBox="0 0 24 24"><path d="M12 4v10M8 10.5l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
-  </defs>
-</svg>
-
-<script src="ui/vendor/xterm.js"></script>
-<script src="ui/vendor/addon-fit.js"></script>
-<script src="ui/vendor/addon-webgl.js"></script>
-<script src="ui/vendor/addon-unicode11.js"></script>
-<script src="ui/vendor/addon-web-links.js"></script>
-<script type="module" src="ui/app.js"></script>
+  <body>
+    <!-- Use static rendering with Expo Router to support running without JavaScript. -->
+    <noscript>
+      You need to enable JavaScript to run this app.
+    </noscript>
+    <!-- The root element for your Expo app. -->
+    <div id="root"></div>
+  <script>["ui/_expo/static/js/web/__expo-metro-runtime-1f8f5d3ca6b7f58204d51e14506d73fb.js","ui/_expo/static/js/web/__common-249e12273673b0eddc4dbd7fe81db251.js","ui/_expo/static/js/web/entry-eadbc20420af9d93095d073b0a57afbd.js"].forEach(function(s){var e=document.createElement("script");e.src=s;e.async=false;document.body.appendChild(e)})</script>
 </body>
 </html>

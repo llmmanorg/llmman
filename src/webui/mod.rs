@@ -70,11 +70,12 @@ mod tests {
             "../index.html",
             "index.html/",
             "INDEX.HTML",
-            "vendor",
+            "_expo",
+            "_expo/",
         ] {
             assert!(asset(bad).is_none(), "{bad:?}");
         }
-        assert!(asset("vendor/xterm.js").is_some());
+        assert!(ASSETS.iter().any(|(p, ..)| p.starts_with("_expo/")));
     }
 
     #[test]

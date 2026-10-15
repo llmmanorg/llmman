@@ -12,16 +12,15 @@ same page, so a UI route can be reloaded or linked to. The API prefixes
 `/metrics`) never get it: an unknown path there is a `404`, as it is for
 any client that does not ask for HTML.
 
-The page has two modes, toggled at the top, and a Models page in the
-sidebar:
+The sidebar lists past chats and opens the other pages:
 
 - **Chat** — a conversation with any model the daemon can reach. The
   model picker lists the local store (`/v1/models`, with which ones are
   loaded) and every hosted provider the daemon holds a usable key for
   (`/llmman/providers`; see [providers.md](providers.md)). Replies stream
   over `/v1/chat/completions`; a model's reasoning, when it emits any,
-  is shown collapsed above the answer. *Pull a model…* opens the
-  Models page.
+  is shown collapsed above the answer. Images can be attached to a
+  message: chosen, pasted or dropped.
 
   Diffusion models (`/api/show` capabilities `image`, `video` or `audio`
   rather than `completion`) are listed under *Generate* in the same
@@ -35,7 +34,7 @@ sidebar:
   that names the file as `run` does. Each prompt stands alone: a
   diffusion model has no conversation. *Stop* abandons the request; a
   video or audio generation already running finishes on the daemon.
-- **Models** (`#/models`) — opens on popular models
+- **Models** (`/models`) — opens on popular models
   (`/llmman/search/popular`: Docker Hub's most pulled, then Hugging
   Face's most downloaded GGUF), searches Docker Hub and Hugging Face
   (`/llmman/search`, the rows `llmman search` prints), and has a *Pulled*
@@ -43,31 +42,54 @@ sidebar:
   (`/llmman/search/model`): each tag or quantization with its size, a
   rough fit against this machine's model memory (`/llmman/node`; weights
   only, not context), *Pull*, which streams `/api/pull`'s progress, and
-  the repo's README. The README's HTML is reduced to its links, headings
-  and text, and its images are left out, so it renders like a reply.
-  A model already here can be chatted with, unloaded or deleted from
-  its card. The search box also takes a full reference, with its registry
-  or scheme — an OCI image, `hf.co/…`, `ms://…`, `ngc://…`, `s3://…`,
-  `gs://…` — and pulls it on Enter; anything shorter is a search. Owners' pictures load from Hugging Face and
-  Gravatar through `/llmman/search/avatar`, the one thing the page
-  fetches from outside the daemon; without one, or with an API key the
-  browser cannot attach to an image request, the row shows initials.
-- **Shell** — a terminal on the machine running `llmman serve`, as the
-  user running it: the login shell in a pty, bridged over a WebSocket at
-  `/llmman/shell`. `llmman` itself is on `PATH` there, so `llmman launch
-  claude --model …` or `llmman ps` work as they would in any terminal.
-  Shift- or cmd/ctrl-click a URL in the output to open it in a new tab.
+  the repo's README. *Stop watching* only stops following a pull: the
+  daemon finishes the download. The README's HTML is reduced to its
+  links, headings and text, and its images are left out, so it renders
+  like a reply. A model already here can be chatted with, loaded,
+  unloaded or deleted. The search box also takes a full reference, with
+  its registry or scheme — an OCI image, `hf.co/…`, `ms://…`, `ngc://…`,
+  `s3://…`, `gs://…` — and pulls it. Owners' pictures load from Hugging
+  Face and Gravatar through `/llmman/search/avatar`, the one thing the
+  page fetches from outside the daemon; without one, or with an API key
+  the browser cannot attach to an image request, the row shows initials.
+- **Shell** (`/shell`) — a terminal on the machine running `llmman
+  serve`, as the user running it: the login shell in a pty, bridged over
+  a WebSocket at `/llmman/shell`. `llmman` itself is on `PATH` there, so
+  `llmman launch claude --model …` or `llmman ps` work as they would in
+  any terminal. Shift- or cmd/ctrl-click a URL in the output to open it
+  in a new tab.
+- **Providers** — the hosted providers the daemon knows, which of them
+  have a usable key, and a way to set or remove one. The key is sent to
+  the daemon once (`PUT`/`DELETE /llmman/providers/:id/key`), which keeps
+  it in the per-user `llmman.conf`; the browser does not keep it.
+- **Settings** — theme (the system's unless set), the name the greeting
+  uses, whether Enter or Cmd/Ctrl+Enter sends, this daemon's API key, and
+  the conversations: export as JSON (without generated media) or delete.
+  *About* names the daemon's version and executable.
+- **Servers** — the daemon that served the page, and any other `llmman
+  serve` added by address and key; the page talks to the one selected.
+  That daemon's CORS has to allow the page's origin: localhost is allowed
+  by default, anything else through `LLMMAN_ORIGINS`
+  ([configuration.md](configuration.md)).
+
+Every page is a path, so it can be reloaded or linked to; old `#/models`
+and `#/c/<id>` links still land where they did. Cmd/Ctrl+Shift+O starts a
+new chat, `Cmd/Ctrl+\` shows or hides the sidebar, and Escape closes a
+sheet.
 
 Conversations and generated media are stored in the browser (IndexedDB),
-not by the daemon; *Settings* can export conversations as JSON (without
-the media) or delete them. Theme follows the system unless set.
+not by the daemon. Chats kept by the earlier built-in UI on the same
+origin are imported once, and its theme and settings carry over.
 
 A daemon that requires an API key ([api.md](api.md#authentication))
 serves the page itself without one — it is only files — and the page
-asks for the key on its first `401`, keeps it in the browser's local
-storage, and sends it on every call thereafter; *Settings* shows and
-changes it. The shell's WebSocket carries it as a subprotocol, since a
-browser cannot set a header on an upgrade.
+asks for the key on its first `401` from llmman, keeps it in the
+browser's local storage (scoped to the page's path, so two daemons behind
+one gateway never share one), and sends it on every call thereafter; a
+`401` relayed from a hosted provider is shown as that provider's error,
+not as a wrong key. *Settings* shows and changes it. The shell's WebSocket
+carries it as a subprotocol, since a browser cannot set a header on an
+upgrade.
 
 ## The shell's guard rails
 
@@ -77,7 +99,7 @@ way:
 
 1. **Loopback only.** When `LLMMAN_HOST` binds beyond loopback
    (`0.0.0.0`, a LAN address), the shell is off: a WebSocket upgrade gets
-   `403` and the UI greys out the tab with the reason. Inference over the
+   `403` and the UI greys out *Shell* with the reason. Inference over the
    network behind an API key is a choice an operator can make; a shell
    is not, even behind one. On loopback, a daemon with keys requires one
    for the shell as for every other route.
@@ -110,23 +132,38 @@ the program.
 
 ## Working on it
 
-The UI is plain ES modules and CSS under `webui/` with no build step —
-`cargo build` gzips them into the binary (`build.rs`, `src/webui/`). The
-only third-party code is xterm.js (with its fit, WebGL, Unicode 11 and
-web-links addons), vendored under `webui/vendor/` with its versions recorded in
-`webui/vendor/VERSIONS`. No binaries live in the repository: the manatee
-mark is downloaded by `build.rs` from the `docs-assets` GitHub release,
-pinned by SHA-256 (`FETCHED_ASSETS`); an offline build warns and ships a
-blank image in its place.
-
-To iterate without rebuilding, point the daemon at the directory:
+The page is a React Native app (Expo, with Expo Router), whose source is
+under `app/`; the iOS and Android apps are built from the same source.
+What `cargo build` embeds is its web export, committed under `webui/`, so
+building llmman needs no Node.js: `build.rs` gzips every file there into
+the binary (`src/webui/`). CI checks that `webui/` is the export of
+`app/`, so a change to `app/` is committed with a fresh export:
 
 ```
-LLMMAN_WEBUI_DIR=webui cargo run -- serve
+cd app
+npm ci
+npm run check
+npm run export-web -- ../webui
+```
+
+The export has no absolute paths, so the page works under a gateway's
+path prefix ([compose.md](compose.md)), and no binaries: the manatee
+mark is downloaded by `build.rs` from the `docs-assets` GitHub release,
+pinned by SHA-256 (`FETCHED_ASSETS`), and served as `ui/manatee.png`; an
+offline build warns and ships a blank image in its place. `npm ci`
+downloads the same file for the app's icons.
+
+To iterate without rebuilding llmman, run the export into any directory
+and point the daemon at it:
+
+```
+LLMMAN_WEBUI_DIR=/tmp/webui cargo run -- serve
 ```
 
 Files are then read from disk on every request, uncompressed and
-uncached, so a save and a reload is the whole loop. Markdown from models
-is rendered by `webui/markdown.js`, which builds DOM nodes directly and
-never sets `innerHTML` — with a shell on the same origin, an HTML
-injection in a model's reply would be a remote shell.
+uncached, so an export and a reload is the whole loop; `npm start` and
+`w` also serve the page from Expo's development server, which reaches
+the daemon as another server would. Markdown from models is rendered by
+`app/lib/markdown.ts` into plain components, never as HTML — with a shell
+on the same origin, an HTML injection in a model's reply would be a
+remote shell.

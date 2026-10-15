@@ -646,7 +646,7 @@ async fn docker_hub_card(client: &reqwest::Client, name: &str, repo: &str) -> Re
 // ---------------------------------------------------------------------------
 
 /// Up to this percent of model memory is green, up to the next yellow,
-/// above red: `fitOf` in `webui/models.js`.
+/// above red: `fitOf` in `app/components/models/logic.ts`.
 const FIT_OK_MAX: u64 = 60;
 const FIT_TIGHT_MAX: u64 = 90;
 

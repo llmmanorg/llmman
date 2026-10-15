@@ -11,7 +11,7 @@ From the repository root:
 docker compose -f examples/compose/compose.yaml up
 ```
 
-Open <http://localhost:8080/> for the web UI. Its Shell tab is unavailable
+Open <http://localhost:8080/> for the web UI. Its Shell is unavailable
 here: the daemon binds `0.0.0.0` inside the container, and the shell is
 only offered by a daemon bound to loopback (see [webui.md](webui.md)).
 Clients can use the same address as their API base URL. For example:

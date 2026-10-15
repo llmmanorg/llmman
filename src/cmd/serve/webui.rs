@@ -257,9 +257,9 @@ mod tests {
         // The page must reference its own assets under ui/ relatively, so
         // a gateway prefix works (docs/compose.md).
         assert!(html.contains("<!doctype html>"), "{html}");
-        assert!(html.contains("ui/app.js"), "{html}");
+        assert!(html.contains("\"ui/_expo/static/js/"), "{html}");
         assert!(
-            !html.contains("\"/ui/"),
+            !html.contains("\"/ui/") && !html.contains("src=\"/") && !html.contains("href=\"/"),
             "asset paths must be relative: {html}"
         );
     }
@@ -328,17 +328,39 @@ mod tests {
         assert_eq!(json.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Every embedded file is served at its own path, the export's route
+    /// chunks (`[id]-<hash>.js`) included: a browser sends the brackets
+    /// as they are.
+    #[tokio::test]
+    async fn every_web_ui_file_is_served_at_its_path() {
+        let url = serve_router(test_state()).await;
+        let client = Client::builder().no_gzip().build().unwrap();
+        assert!(webui::ASSETS.iter().any(|(p, ..)| p.contains('[')));
+        for (path, content_type, etag, _) in webui::ASSETS {
+            let r = client.get(format!("{url}/ui/{path}")).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{path}");
+            assert_eq!(r.headers()["content-type"], *content_type, "{path}");
+            assert_eq!(r.headers()["etag"], *etag, "{path}");
+        }
+    }
+
+    /// The export's file names are hashed, so tests find theirs by kind.
+    fn asset_path(suffix: &str) -> String {
+        let (path, ..) = webui::ASSETS
+            .iter()
+            .find(|(p, ..)| p.ends_with(suffix))
+            .unwrap_or_else(|| panic!("no web UI file ends with {suffix}"));
+        format!("/ui/{path}")
+    }
+
     /// Assets come gzipped with a content ETag; a matching `If-None-Match`
     /// is a 304, and no `max-age` keeps an old UI alive past an upgrade.
     #[tokio::test]
     async fn web_ui_assets_are_gzipped_and_revalidate_by_etag() {
         let url = serve_router(test_state()).await;
         let client = Client::builder().no_gzip().build().unwrap();
-        let first = client
-            .get(format!("{url}/ui/app.css"))
-            .send()
-            .await
-            .unwrap();
+        let css = asset_path(".css");
+        let first = client.get(format!("{url}{css}")).send().await.unwrap();
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(first.headers()["content-encoding"], "gzip");
         assert_eq!(first.headers()["content-type"], "text/css; charset=utf-8");
@@ -350,7 +372,7 @@ mod tests {
 
         for tag in [etag.clone(), format!("W/{etag}"), "*".to_string()] {
             let again = client
-                .get(format!("{url}/ui/app.css"))
+                .get(format!("{url}{css}"))
                 .header("if-none-match", &tag)
                 .send()
                 .await
@@ -373,14 +395,10 @@ mod tests {
                 "{path}"
             );
         }
-        let css = client
-            .get(format!("{url}/ui/app.css"))
-            .send()
-            .await
-            .unwrap();
+        let css = client.get(format!("{url}{css}")).send().await.unwrap();
         assert!(!css.headers().contains_key("x-frame-options"));
 
-        for missing in ["/ui/nope.js", "/ui/../Cargo.toml", "/ui/vendor"] {
+        for missing in ["/ui/nope.js", "/ui/../Cargo.toml", "/ui/_expo"] {
             let r = client.get(format!("{url}{missing}")).send().await.unwrap();
             assert_eq!(r.status(), StatusCode::NOT_FOUND, "{missing}");
         }

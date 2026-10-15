@@ -4370,7 +4370,7 @@ async fn the_scrape_endpoint_is_absent_unless_the_operator_enabled_it() {
     // test requests it, so the series exists only if this disabled
     // router wrote it, whatever status the handler returned.
     Client::new()
-        .get(format!("{url}/ui/app.css"))
+        .get(format!("{url}/ui/index.html"))
         .send()
         .await
         .expect("request reaches the test router");
@@ -4860,7 +4860,7 @@ async fn a_keyed_daemon_refuses_everything_but_its_own_page_without_the_key() {
     // The page loads, so it can ask for the key. Metrics off: another test
     // asserts the process-wide registry never sees `/ui/*path`.
     let url = serve_router(keyed_state(&["k1"])).await;
-    for path in ["/", "/ui/app.js"] {
+    for path in ["/", "/ui/index.html"] {
         let r = client.get(format!("{url}{path}")).send().await.unwrap();
         assert_eq!(r.status(), StatusCode::OK, "{path}");
     }

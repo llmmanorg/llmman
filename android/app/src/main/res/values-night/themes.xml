@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="bg">#0B0E14</color>
-    <color name="fg">#E6E9F0</color>
+    <color name="bg">#171717</color>
+    <color name="fg">#ECECEC</color>
 
     <style name="Theme.Llmman" parent="android:Theme.Material.NoActionBar">
         <item name="android:windowBackground">@color/bg</item>

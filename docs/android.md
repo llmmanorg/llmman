@@ -34,7 +34,7 @@ Everything the web UI can do on a desktop works here: the *Models* page's
 search, and pulling any reference `llmman pull` takes (`docker.io/ai/…`,
 `hf.co/…`, …), chat
 with streaming replies, the model picker, Export chats (into Downloads;
-on Android 9 a file picker asks where), and the *Shell* tab — a `/system/bin/sh` in the app's sandbox, with
+on Android 9 a file picker asks where), and *Shell* — a `/system/bin/sh` in the app's sandbox, with
 `llmman` on `PATH`. Diffusion models are not supported: the mediagen
 backend needs GPU libraries the phone lacks.
 
@@ -42,7 +42,7 @@ The daemon binds loopback only, which keeps the network out but not other
 apps on the phone — Android's loopback is shared. So it runs with an API
 key ([api.md](api.md#authentication)) generated once per install into the
 app's private files: the WebView is handed it before the page loads, the
-Shell tab's `llmman` has it as `LLMMAN_API_KEY`, and any other app that
+Shell's `llmman` has it as `LLMMAN_API_KEY`, and any other app that
 connects to `127.0.0.1:17434` gets a `401`. There is no setting to expose
 the API or change the bind address.
 
