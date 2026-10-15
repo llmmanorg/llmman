@@ -680,6 +680,50 @@ jobs:
         run: go test -tags "$PODMAN_TAGS" ./...
 
   # --------------------------------------------------------------------------
+  # Web UI: webui/ is the committed web export of app/ (docs/webui.md), so
+  # `cargo build` needs no Node.js. This checks the app (typecheck, lint,
+  # format, tests) and that webui/ is exactly what its export makes. The
+  # export is reproducible, so a difference means app/ changed without a
+  # fresh export, or webui/ was edited by hand.
+  # --------------------------------------------------------------------------
+  webui:
+    name: Web UI (app/ checks, webui/ is its export)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      # react-native and metro ask for ^20.19.4 || ^22.13.0 || ^24.3.0.
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      # Its prepare script also downloads the mark and makes the icons.
+      - name: npm ci
+        run: npm ci
+
+      - name: npm run check
+        run: npm run check
+
+      # `git add` first so a new file counts as a difference too.
+      - name: webui/ is the export of app/
+        run: |
+          npm run export-web -- ../webui
+          git add -A ../webui
+          if ! git diff --cached --exit-code --stat -- ../webui; then
+            echo "::error::webui/ is not the web export of app/. Run \`cd app && npm ci && npm run export-web -- ../webui\` and commit webui/."
+            exit 1
+          fi
+
+  # --------------------------------------------------------------------------
   # E2E: `llmman launch
   # <claude|agy|opencode|pi|omp|codex|copilot|droid|cline|grok|qwen|hermes|openclaw|dsh|
   # goose|goose-desktop|docker-agent> --model
@@ -1959,7 +2003,7 @@ jobs:
     name: Release
     # Everything must be green first. e2e only runs on the same push event
     # this job fires on, so this never waits on a run that will not happen.
-    needs: [tag, build, android, lint-packaging, e2e]
+    needs: [tag, build, android, lint-packaging, webui, e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
