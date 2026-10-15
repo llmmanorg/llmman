@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Context;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::Deserialize;
 
 /// Default bind host/port when `LLMMAN_HOST` is unset/blank.
@@ -1073,12 +1073,23 @@ struct ProgressLine {
 /// started yet (see stream_progress), so repeating it here as the bar's
 /// own label just showed "pulling" twice in a row, stacked directly on
 /// top of each other, for no added information.
+///
+/// `wide_bar` fills whatever width the terminal has left (a fixed 32-cell
+/// bar made the line 90 columns, which wrapped at 80), and the label is
+/// truncated (`!`) so a long reference can't push the line past the edge.
 fn progress_bar_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{msg:<20} [{bar:32.cyan/blue}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12}",
+        "{msg:<20!} [{wide_bar:.cyan/blue}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12}",
     )
     .unwrap_or_else(|_| ProgressStyle::default_bar())
     .progress_chars("=> ")
+}
+
+fn new_pull_bar(total: u64, reference: &str, target: ProgressDrawTarget) -> ProgressBar {
+    let pb = ProgressBar::with_draw_target(Some(total), target);
+    pb.set_style(progress_bar_style());
+    pb.set_message(reference.to_string());
+    pb
 }
 
 /// POSTs `{"model": reference}` to `path` (e.g. "/api/pull" or "/api/push")
@@ -1220,10 +1231,7 @@ pub fn stream_progress_with(path: &str, reference: &str) -> anyhow::Result<Optio
             // A byte-level progress line: render/update the bar instead of
             // printing a new line for every update.
             let pb = bar.get_or_insert_with(|| {
-                let pb = ProgressBar::new(total);
-                pb.set_style(progress_bar_style());
-                pb.set_message(reference.to_string());
-                pb
+                new_pull_bar(total, reference, ProgressDrawTarget::stderr())
             });
             pb.set_length(total);
             pb.set_position(completed);
@@ -2272,5 +2280,78 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// A fixed-width terminal that records what indicatif writes to it.
+    #[derive(Debug)]
+    struct FixedWidthTerm {
+        width: u16,
+        written: std::sync::Arc<std::sync::Mutex<String>>,
+    }
+
+    impl indicatif::TermLike for FixedWidthTerm {
+        fn width(&self) -> u16 {
+            self.width
+        }
+        fn move_cursor_up(&self, _: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_down(&self, _: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_right(&self, _: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_left(&self, _: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn write_line(&self, s: &str) -> std::io::Result<()> {
+            self.write_str(&format!("{s}\n"))
+        }
+        fn write_str(&self, s: &str) -> std::io::Result<()> {
+            self.written.lock().unwrap().push_str(s);
+            Ok(())
+        }
+        fn clear_line(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The pull bar must fill, and never exceed, the terminal width.
+    #[test]
+    fn pull_bar_fits_the_terminal_width() {
+        const MIB: u64 = 1024 * 1024;
+        for reference in [
+            "qwen3.5:0.8b",
+            "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M",
+        ] {
+            for width in [60u16, 80, 100, 120, 200] {
+                let written = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+                let term = FixedWidthTerm {
+                    width,
+                    written: written.clone(),
+                };
+                let pb = new_pull_bar(
+                    703 * MIB,
+                    reference,
+                    ProgressDrawTarget::term_like(Box::new(term)),
+                );
+                written.lock().unwrap().clear();
+                pb.set_position(16 * MIB);
+
+                let frame = written.lock().unwrap().clone();
+                let frame = console::strip_ansi_codes(&frame);
+                let line = frame.trim_end();
+                assert!(!line.contains('\n'), "{reference} at {width}: {line:?}");
+                assert_eq!(
+                    console::measure_text_width(line),
+                    usize::from(width),
+                    "{reference} at {width}: {line:?}"
+                );
+            }
+        }
     }
 }
