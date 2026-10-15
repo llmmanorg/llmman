@@ -154,11 +154,11 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
 
     // Before either arm starts the daemon; see `check_model_flag`.
     check_model_flag(name, args.model.as_deref(), provider, &args.extra_args)?;
-    if name.eq_ignore_ascii_case("copilot") || name.eq_ignore_ascii_case("copilot-cli") {
-        copilot::check_daemon_key_transport()?;
-    }
-    if name.eq_ignore_ascii_case("droid") {
-        droid::check_daemon_key_transport()?;
+    if name.eq_ignore_ascii_case("copilot")
+        || name.eq_ignore_ascii_case("copilot-cli")
+        || name.eq_ignore_ascii_case("droid")
+    {
+        common::check_daemon_key_transport(name)?;
     }
     anyhow::ensure!(
         overflow.is_none() || args.model.as_deref().is_some_and(|m| !m.trim().is_empty()),
@@ -415,7 +415,8 @@ const MODEL_REQUIRED: &[&str] = &[
 /// OMP's argument builder drops the generated Ollama model when the caller
 /// supplies one.
 /// Copilot's argument builder likewise yields to its own `--model`.
-/// Droid's argument builder does the same for its custom model id.
+/// Droid's `exec` argument builder does the same for its custom model id;
+/// interactive Droid reads the generated session default instead.
 /// claude: `claude::claude_args` likewise drops the generated `--model`.
 /// Not docker-agent: its `--model` replaces the whole model entry
 /// `docker_agent::docker_agent_document` wrote, `base_url` included, so

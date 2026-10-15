@@ -2,19 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{common, exec_with_env_removing, find_on_path, has_forwarded_model_flag, server};
+use super::{exec_with_env_removing, find_on_path, has_forwarded_model_flag, server};
 
 const COPILOT_ENV_TO_CLEAR: &[&str] = &[
     "COPILOT_PROVIDER_API_KEY_COMMAND",
     "COPILOT_PROVIDER_BEARER_TOKEN",
 ];
-
-/// Copilot receives the daemon's real client key through its environment.
-/// Reject remote cleartext before `run` probes or starts the daemon; loopback
-/// HTTP and remote HTTPS remain valid.
-pub(super) fn check_daemon_key_transport() -> anyhow::Result<()> {
-    common::check_daemon_key_transport("copilot")
-}
 
 /// GitHub Copilot CLI's OpenAI-compatible BYOK mode, pointed at llmman.
 /// A local-model launch does not require GitHub login or mutate the user's

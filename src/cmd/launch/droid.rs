@@ -12,18 +12,12 @@ use super::{exec_with_env, find_on_path, has_forwarded_model_flag, server};
 /// environment, so a real daemon/provider credential is never persisted.
 const DROID_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 const DROID_API_KEY_REF: &str = "${LLMMAN_API_KEY}";
-
-/// Droid receives the daemon's real client key through its environment.
-/// Reject remote cleartext before `run` probes or starts the daemon; loopback
-/// HTTP and remote HTTPS remain valid.
-pub(super) fn check_daemon_key_transport() -> anyhow::Result<()> {
-    common::check_daemon_key_transport("droid")
-}
+const DROID_REASONING_EFFORTS: &[&str] = &["high", "medium", "low", "none"];
 
 /// Factory Droid's OpenAI-compatible custom-model mode, pointed at llmman's
-/// chat-completions endpoint. Droid resolves custom `--model` values by their
-/// generated `custom:<display>-<index>` id, not the wire model name, so the
-/// merge returns the id handed to [`droid_args`].
+/// chat-completions endpoint. Droid resolves custom models by their generated
+/// `custom:<display>-<index>` id, not the wire model name, so the merge writes
+/// that id as the interactive default and returns it for `droid exec`.
 pub(super) fn launch_droid(
     model: &str,
     api_key: &str,
@@ -106,57 +100,78 @@ fn droid_settings_merged(
     let root = root
         .as_object_mut()
         .expect("write_json_merged passes an object");
-    let slot = root
-        .entry("customModels")
-        .or_insert_with(|| serde_json::json!([]));
-    if !slot.is_array() {
-        *slot = serde_json::json!([]);
-    }
-    let models = slot.as_array_mut().expect("set to an array just above");
-    let index = models
-        .iter()
-        .position(|entry| {
-            entry.get("model").and_then(serde_json::Value::as_str) == Some(model)
-                && entry.get("apiKey").and_then(serde_json::Value::as_str)
-                    == Some(DROID_API_KEY_REF)
-        })
-        .unwrap_or(models.len());
+    let id = {
+        let slot = root
+            .entry("customModels")
+            .or_insert_with(|| serde_json::json!([]));
+        if !slot.is_array() {
+            *slot = serde_json::json!([]);
+        }
+        let models = slot.as_array_mut().expect("set to an array just above");
+        let index = models
+            .iter()
+            .position(|entry| {
+                entry.get("model").and_then(serde_json::Value::as_str) == Some(model)
+                    && entry.get("apiKey").and_then(serde_json::Value::as_str)
+                        == Some(DROID_API_KEY_REF)
+            })
+            .unwrap_or(models.len());
 
-    let mut entry = models
-        .get(index)
-        .and_then(serde_json::Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let display = entry
-        .get("displayName")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{model} [llmman]"));
-    let id = entry
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| droid_model_id(&display, index));
-    entry.insert("model".into(), serde_json::json!(model));
-    entry.insert("displayName".into(), serde_json::json!(display));
-    entry.insert("baseUrl".into(), serde_json::json!(base_url));
-    entry.insert("apiKey".into(), serde_json::json!(DROID_API_KEY_REF));
-    entry.insert(
-        "provider".into(),
-        serde_json::json!("generic-chat-completion-api"),
-    );
-    entry.insert("supportsImages".into(), serde_json::json!(vision));
-    entry.insert("id".into(), serde_json::json!(id));
-    entry.insert("index".into(), serde_json::json!(index));
-    if let Some(max_output) = max_output {
-        entry.insert("maxOutputTokens".into(), serde_json::json!(max_output));
-    }
+        let mut entry = models
+            .get(index)
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let display = entry
+            .get("displayName")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{model} [llmman]"));
+        let id = entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| droid_model_id(&display, index));
+        entry.insert("model".into(), serde_json::json!(model));
+        entry.insert("displayName".into(), serde_json::json!(display));
+        entry.insert("baseUrl".into(), serde_json::json!(base_url));
+        entry.insert("apiKey".into(), serde_json::json!(DROID_API_KEY_REF));
+        entry.insert(
+            "provider".into(),
+            serde_json::json!("generic-chat-completion-api"),
+        );
+        entry.insert("supportsImages".into(), serde_json::json!(vision));
+        entry.insert("id".into(), serde_json::json!(id));
+        entry.insert("index".into(), serde_json::json!(index));
+        if let Some(max_output) = max_output {
+            entry.insert("maxOutputTokens".into(), serde_json::json!(max_output));
+        }
 
-    let entry = serde_json::Value::Object(entry);
-    if index == models.len() {
-        models.push(entry);
-    } else {
-        models[index] = entry;
+        let entry = serde_json::Value::Object(entry);
+        if index == models.len() {
+            models.push(entry);
+        } else {
+            models[index] = entry;
+        }
+        id
+    };
+
+    let session = root
+        .entry("sessionDefaultSettings")
+        .or_insert_with(|| serde_json::json!({}));
+    if !session.is_object() {
+        *session = serde_json::json!({});
+    }
+    let session = session
+        .as_object_mut()
+        .expect("set to an object just above");
+    session.insert("model".into(), serde_json::json!(id));
+    let valid_effort = session
+        .get("reasoningEffort")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|effort| DROID_REASONING_EFFORTS.contains(&effort));
+    if !valid_effort {
+        session.insert("reasoningEffort".into(), serde_json::json!("none"));
     }
     (root.clone().into(), id)
 }
@@ -165,16 +180,16 @@ fn droid_model_id(display_name: &str, index: usize) -> String {
     format!("custom:{}-{index}", display_name.replace(' ', "-"))
 }
 
-/// Droid accepts `--model` globally and on `droid exec`. Keep it after the
-/// `exec` command in that mode, matching Droid's documented spelling. A model
-/// supplied by the caller wins and is passed through unchanged.
+/// Only `droid exec` accepts `--model`; interactive Droid reads the generated
+/// id from `sessionDefaultSettings`. A model supplied to `exec` by the caller
+/// wins and is passed through unchanged.
 fn droid_args(model_id: &str, extra_args: &[String]) -> Vec<String> {
     let mut args = extra_args.to_vec();
-    if has_forwarded_model_flag("droid", extra_args) {
+    if args.first().is_none_or(|arg| arg != "exec") || has_forwarded_model_flag("droid", extra_args)
+    {
         return args;
     }
-    let at = usize::from(args.first().is_some_and(|arg| arg == "exec"));
-    args.splice(at..at, ["--model".to_string(), model_id.to_string()]);
+    args.splice(1..1, ["--model".to_string(), model_id.to_string()]);
     args
 }
 
@@ -188,9 +203,10 @@ mod tests {
             droid_args("custom:local-model-0", &["exec".into(), "hello".into()]),
             ["exec", "--model", "custom:local-model-0", "hello"]
         );
+        assert!(droid_args("custom:local-model-0", &[]).is_empty());
         assert_eq!(
-            droid_args("custom:local-model-0", &["hello".into()]),
-            ["--model", "custom:local-model-0", "hello"]
+            droid_args("custom:local-model-0", &["--help".into()]),
+            ["--help"]
         );
         assert_eq!(
             droid_args(
@@ -207,9 +223,35 @@ mod tests {
     }
 
     #[test]
+    fn settings_merge_keeps_a_valid_reasoning_effort() {
+        let existing = serde_json::json!({
+            "sessionDefaultSettings": {
+                "model": "old-default",
+                "reasoningEffort": "high",
+                "autonomyLevel": "low"
+            }
+        });
+        let (merged, id) = droid_settings_merged(
+            &existing,
+            "local/model",
+            "http://127.0.0.1:17434/v1",
+            false,
+            None,
+        );
+        assert_eq!(merged["sessionDefaultSettings"]["model"], id);
+        assert_eq!(merged["sessionDefaultSettings"]["reasoningEffort"], "high");
+        assert_eq!(merged["sessionDefaultSettings"]["autonomyLevel"], "low");
+    }
+
+    #[test]
     fn settings_merge_preserves_user_models_and_fields() {
         let existing = serde_json::json!({
             "theme": "dark",
+            "sessionDefaultSettings": {
+                "model": "old-default",
+                "reasoningEffort": "invalid",
+                "autonomyLevel": "low"
+            },
             "customModels": [
                 {
                     "model": "user/model",
@@ -240,6 +282,9 @@ mod tests {
         );
         assert_eq!(id, "custom:My-local-name-1");
         assert_eq!(merged["theme"], "dark");
+        assert_eq!(merged["sessionDefaultSettings"]["model"], id);
+        assert_eq!(merged["sessionDefaultSettings"]["reasoningEffort"], "none");
+        assert_eq!(merged["sessionDefaultSettings"]["autonomyLevel"], "low");
         assert_eq!(merged["customModels"][0], existing["customModels"][0]);
         let ours = &merged["customModels"][1];
         assert_eq!(ours["displayName"], "My local name");
@@ -274,6 +319,8 @@ mod tests {
         assert_eq!(written["theme"], "dark");
         assert_eq!(written["customModels"][0]["maxOutputTokens"], 8192);
         assert_eq!(written["customModels"][0]["supportsImages"], false);
+        assert_eq!(written["sessionDefaultSettings"]["model"], id);
+        assert_eq!(written["sessionDefaultSettings"]["reasoningEffort"], "none");
 
         // Idempotent writes do not replace the original commented backup.
         write_droid_settings_at(

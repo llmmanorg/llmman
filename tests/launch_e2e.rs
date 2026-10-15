@@ -1314,6 +1314,11 @@ fn launch_droid_with_model() {
             assert_eq!(entry["provider"], "generic-chat-completion-api");
             assert_eq!(entry["id"], format!("custom:{model}-[llmman]-0"));
             assert_eq!(entry["index"], 0);
+            assert_eq!(settings["sessionDefaultSettings"]["model"], entry["id"]);
+            assert_eq!(
+                settings["sessionDefaultSettings"]["reasoningEffort"],
+                "none"
+            );
         },
     );
 }
