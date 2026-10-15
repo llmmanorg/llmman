@@ -139,6 +139,23 @@ Other Diffusers-layout repositories (a root `model_index.json`) are served by
 `vllm-omni` next to `vllm`, or use `--runtime docker` for the `vllm/vllm-omni` image).
 See [docs/backends.md](docs/backends.md#vllm-omni-diffusers-pipelines).
 
+### Answer questions about text and images
+
+A decision model (Clef, Clef Flash) doesn't chat: it answers typed questions about a text or image,
+with a probability for each answer. `--ask` is a question, yes/no unless `--choice` labels or `--level`
+scale follow it. The text is the words after the model, or stdin:
+
+```sh
+llmman run clef-flash --ask "Is a refund being requested?" < ticket.txt
+llmman run clef-flash --ask "Which team?" --choice billing="Payments" --choice technical < ticket.txt
+llmman run clef-flash --ask "How urgent?" --level Routine --level Soon --level Immediate < ticket.txt
+llmman run clef-flash --ask "Is this a receipt?" ./receipt.png
+```
+
+`--format json` prints the whole response and `--verbose` what it cost. Without `--ask` it opens a
+`> ` loop: your first message is the text, and each line after it a yes/no question. It is served on
+`/v1/systemone`; see [docs/api.md](docs/api.md).
+
 ## OCI-native models
 
 Models are packaged as standard OCI artifacts and stored in any compatible

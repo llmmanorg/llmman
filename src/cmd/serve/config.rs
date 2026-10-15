@@ -387,6 +387,43 @@ pub(super) fn embedding_model_ctx(info: &crate::gguf::Info) -> Option<Option<u32
     info.is_embedding().then(|| gguf_trained_ctx(info))
 }
 
+/// A decision model's default prompt limit, in tokens. llama-server reads
+/// its whole prompt in one ubatch, and the compute buffer grows with it
+/// (about 2 GiB here, 8.7 GiB at 32768, for a 9B model), so the 256k default
+/// context is no size to allocate.
+pub(super) const DECISION_DEFAULT_BATCH: u32 = 8192;
+
+/// The `-b`/`-ub` for a model whose whole input must fit one ubatch, else
+/// `None`. An embedding model gets its context. A decision model too, as
+/// ollama sizes it by `num_ctx`, but only an `explicit`
+/// `LLMMAN_CONTEXT_LENGTH` takes it past [`DECISION_DEFAULT_BATCH`], and
+/// never past the `trained` context (which is what `0` asks for).
+pub(super) fn whole_prompt_batch(
+    embedding: bool,
+    decision: bool,
+    ctx_size: Option<u32>,
+    explicit: bool,
+    trained: Option<u32>,
+) -> Option<u32> {
+    if embedding {
+        return ctx_size.filter(|n| *n > 0);
+    }
+    if !decision {
+        return None;
+    }
+    if !explicit {
+        let wanted = ctx_size.filter(|n| *n > 0);
+        return Some(wanted.map_or(DECISION_DEFAULT_BATCH, |n| n.min(DECISION_DEFAULT_BATCH)));
+    }
+    // An explicit 0 is the trained context, if known.
+    let trained = trained.filter(|n| *n > 0);
+    match (ctx_size.unwrap_or(0), trained) {
+        (0, trained) => trained,
+        (n, Some(trained)) => Some(n.min(trained)),
+        (n, None) => Some(n),
+    }
+}
+
 /// The `--ctx-size` a load starts from: `configured` capped to `trained`
 /// unless it's an `explicit` user value for a non-`embedding` model.
 /// llama-server allocates the KV cache at `--ctx-size` and only caps
@@ -679,6 +716,44 @@ mod tests {
         assert_eq!(embedding_model_ctx(&embed_info), Some(Some(4096)));
         assert_eq!(gguf_trained_ctx(&chat_info), Some(4096));
         assert_eq!(gguf_trained_ctx(&embed_info), Some(4096));
+    }
+
+    #[test]
+    fn whole_prompt_batch_sizes_the_ubatch_for_a_model_that_reads_its_input_at_once() {
+        let embed = |ctx| whole_prompt_batch(true, false, ctx, false, Some(4096));
+        // An embedding model takes its whole context, whatever that is.
+        assert_eq!(embed(Some(32768)), Some(32768));
+        assert_eq!(embed(Some(0)), None);
+        assert_eq!(embed(None), None);
+        // Anything else keeps llama-server's own batch.
+        assert_eq!(
+            whole_prompt_batch(false, false, Some(4096), true, None),
+            None
+        );
+    }
+
+    #[test]
+    fn whole_prompt_batch_gives_a_decision_model_its_context_up_to_what_memory_allows() {
+        let default = |ctx, trained| whole_prompt_batch(false, true, ctx, false, trained);
+        // Not asked for: the context, but never past the default batch.
+        assert_eq!(default(Some(4096), Some(262144)), Some(4096));
+        assert_eq!(
+            default(Some(262144), Some(262144)),
+            Some(DECISION_DEFAULT_BATCH)
+        );
+        assert_eq!(default(None, None), Some(DECISION_DEFAULT_BATCH));
+        assert_eq!(default(Some(0), Some(262144)), Some(DECISION_DEFAULT_BATCH));
+
+        let explicit = |ctx, trained| whole_prompt_batch(false, true, ctx, true, trained);
+        // Asked for: all of it, up to the trained context.
+        assert_eq!(explicit(Some(65536), Some(262144)), Some(65536));
+        assert_eq!(explicit(Some(1 << 20), Some(262144)), Some(262144));
+        assert_eq!(explicit(Some(2048), Some(262144)), Some(2048));
+        assert_eq!(explicit(Some(65536), None), Some(65536));
+        // 0 is the trained context.
+        assert_eq!(explicit(Some(0), Some(262144)), Some(262144));
+        assert_eq!(explicit(None, Some(262144)), Some(262144));
+        assert_eq!(explicit(Some(0), None), None);
     }
 
     #[test]

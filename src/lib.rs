@@ -22,6 +22,7 @@ pub mod metrics;
 pub mod mlx_release;
 pub mod modelpack;
 pub mod oauth;
+pub mod ordered;
 pub(crate) mod pager;
 pub mod promptlog;
 pub mod providers;

@@ -45,11 +45,13 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::daemon;
 
+mod decide;
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct RunArgs {
     #[arg(value_name = "MODEL")]
     pub model: String,
@@ -163,6 +165,20 @@ pub struct RunArgs {
     /// Cosmos3: scheduler flow shift (the reference action runs use 10).
     #[arg(long, hide = true)]
     pub flow_shift: Option<f32>,
+    /// How long the model stays loaded after the last request, as a
+    /// duration (`5m`) or seconds: `0` unloads it at once, a negative value
+    /// keeps it loaded. Defaults to the daemon's `LLMMAN_KEEP_ALIVE`.
+    #[arg(long, value_name = "DURATION", allow_hyphen_values = true)]
+    pub keepalive: Option<String>,
+    /// Decision models only: `--ask`, with `--choice` and `--level`.
+    #[command(flatten)]
+    pub ask: decide::Asked,
+    /// Decision models only: `json` prints the whole response.
+    #[arg(long, value_name = "FORMAT", value_parser = ["json"])]
+    pub format: Option<String>,
+    /// Decision models only: show what the answers cost.
+    #[arg(long)]
+    pub verbose: bool,
     #[arg(
         value_name = "PROMPT",
         trailing_var_arg = true,
@@ -217,6 +233,8 @@ struct ChatOptions<'a> {
     /// Ollama's `runOptions.MultiModal`, from `/api/show`'s capabilities:
     /// only then is a prompt scanned for image paths.
     multimodal: bool,
+    /// `--keepalive`.
+    keep_alive: Option<&'a str>,
 }
 
 impl Default for ChatOptions<'_> {
@@ -227,6 +245,7 @@ impl Default for ChatOptions<'_> {
             word_wrap: true,
             api_key: None,
             multimodal: false,
+            keep_alive: None,
         }
     }
 }
@@ -239,6 +258,7 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
         provider,
     )?;
     let prompt = args.prompt.join(" ");
+    check_keepalive(args.keepalive.as_deref())?;
 
     // resolve_ollama_api, not resolve: `llmman run` is an /api/chat client
     // (see chat_submit/run_interactive_tty below), so a bare name must
@@ -275,8 +295,14 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
     // validates against, and it forwards the chat upstream.
     crate::daemon::ensure_server("")?;
 
+    // Mirrors ollama's RunHandler: interactive needs *both* ends of the
+    // terminal, not just stdin — otherwise a redirected stdout still gets
+    // raw-moded and starts emitting ANSI escapes into it.
+    let interactive = prompt.is_empty() && io::stdin().is_terminal() && io::stdout().is_terminal();
+
     let (model, api_key, multimodal) = match route {
         Route::Provider(provider) => {
+            decide::reject_questions(args)?;
             let (model, key) = provider_model(provider, &args.model)?;
             // /api/show has no capabilities for a provider-routed model.
             (model, key, false)
@@ -290,12 +316,15 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
             // well after the `> ` prompt had already been shown and read
             // from. The same Show also answers ollama's `opts.MultiModal`.
             let info = crate::daemon::ensure_model_pulled(&model)?;
+            // A decision model answers questions instead of chatting.
+            if info.decision() {
+                return decide::run(&model, args, info.multimodal(), interactive);
+            }
+            decide::reject_questions(args)?;
             // An image generation model has no chat at all: every prompt
             // is a picture (ollama's `CapabilityImage` branch of
             // RunHandler, before it dropped image generation).
             if info.image() {
-                let interactive =
-                    prompt.is_empty() && io::stdin().is_terminal() && io::stdout().is_terminal();
                 let opts = crate::imagegen::ImageOptions {
                     media: if args.video {
                         crate::imagegen::Media::Video
@@ -348,20 +377,17 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
         }
     };
 
-    // Mirrors ollama's RunHandler: interactive needs *both* ends of the
-    // terminal, not just stdin — otherwise a redirected stdout still gets
-    // raw-moded and starts emitting ANSI escapes into it.
-    let interactive = prompt.is_empty() && io::stdin().is_terminal() && io::stdout().is_terminal();
     let opts = ChatOptions {
         think: Think::from_args(args),
         num_predict: args.num_predict,
         word_wrap: !args.nowordwrap,
         api_key: api_key.as_deref(),
         multimodal,
+        keep_alive: args.keepalive.as_deref(),
     };
 
     if interactive {
-        run_interactive_tty(&model, opts)
+        run_interactive_tty(&mut Chat::new(&model, opts)?)
     } else {
         let p = if prompt.is_empty() {
             let mut s = String::new();
@@ -381,6 +407,18 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
         }
         Ok(())
     }
+}
+
+/// Fails on a `--keepalive` the daemon could not read; it would quietly
+/// take its default.
+fn check_keepalive(keepalive: Option<&str>) -> anyhow::Result<()> {
+    if let Some(keepalive) = keepalive {
+        anyhow::ensure!(
+            crate::cmd::serve::parse_keep_alive_str(keepalive).is_some(),
+            "invalid --keepalive {keepalive:?}: want a duration such as 5m, or seconds"
+        );
+    }
+    Ok(())
 }
 
 /// Where this chat goes: a local reference, already resolved (see `run`),
@@ -493,6 +531,8 @@ struct ChatReq<'a> {
     messages: &'a [Msg],
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    keep_alive: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     think: Option<Think<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<ChatReqOptions>,
@@ -570,8 +610,22 @@ fn extract_file_names(input: &str) -> Vec<&str> {
 /// quotes) from the text. A missing path is left in place; an existing
 /// file of an unsupported type is an error.
 fn extract_file_data(input: &str) -> anyhow::Result<(String, Vec<String>)> {
+    let (text, files) = extract_files(input)?;
+    let engine = base64::engine::general_purpose::STANDARD;
+    Ok((text, files.iter().map(|f| engine.encode(&f.data)).collect()))
+}
+
+/// A file [`extract_files`] read: its sniffed MIME type and bytes.
+struct MediaFile {
+    content_type: &'static str,
+    data: Vec<u8>,
+}
+
+/// [`extract_file_data`] before the encoding: a decision model also wants
+/// the type, for a data URL.
+fn extract_files(input: &str) -> anyhow::Result<(String, Vec<MediaFile>)> {
     let mut out = input.to_string();
-    let mut imgs = Vec::new();
+    let mut files = Vec::new();
 
     for fp in extract_file_names(input) {
         let nfp = normalize_file_path(fp);
@@ -595,9 +649,12 @@ fn extract_file_data(input: &str) -> anyhow::Result<(String, Vec<String>)> {
         out = out.replace(&format!("'{nfp}'"), "");
         out = out.replace(&format!("'{fp}'"), "");
         out = out.replace(fp, "");
-        imgs.push(base64::engine::general_purpose::STANDARD.encode(&data));
+        files.push(MediaFile {
+            content_type: detect_content_type(&data),
+            data,
+        });
     }
-    Ok((out.trim().to_string(), imgs))
+    Ok((out.trim().to_string(), files))
 }
 
 /// Ollama's `getImageData`: sniff the first 512 bytes, cap at 100MB, then
@@ -816,15 +873,73 @@ impl Drop for SpinnerGuard {
 // Interactive — TTY path
 // ---------------------------------------------------------------------------
 
-fn run_interactive_tty(model: &str, opts: ChatOptions<'_>) -> anyhow::Result<()> {
+/// What the interactive loop does with what is typed: a chat turn, or for a
+/// decision model (see [`decide`]) a text or questions about it. The loop
+/// owns reading, paste handling, `"""` blocks and `/` commands.
+trait Turns {
+    /// Whether an image path is a file to attach, not an unknown `/` command.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn multimodal(&self) -> bool;
+    /// One submitted message, with the terminal out of raw mode so Ctrl-C
+    /// reaches the request.
+    fn submit(&mut self, content: String) -> anyhow::Result<()>;
+    /// `/clear`.
+    fn clear(&mut self);
+}
+
+/// A conversation with a chat model over `/api/chat`.
+struct Chat<'a> {
+    // One runtime for every turn; see `chat_submit`.
+    rt: tokio::runtime::Runtime,
+    client: Client,
+    model: &'a str,
+    messages: Vec<Msg>,
+    opts: ChatOptions<'a>,
+}
+
+impl<'a> Chat<'a> {
+    fn new(model: &'a str, opts: ChatOptions<'a>) -> anyhow::Result<Self> {
+        Ok(Self {
+            rt: tokio::runtime::Runtime::new().context("start tokio runtime")?,
+            client: chat_client(opts.api_key)?,
+            model,
+            messages: Vec::new(),
+            opts,
+        })
+    }
+}
+
+impl Turns for Chat<'_> {
+    fn multimodal(&self) -> bool {
+        self.opts.multimodal
+    }
+
+    fn submit(&mut self, content: String) -> anyhow::Result<()> {
+        chat_submit(
+            &self.rt,
+            &self.client,
+            self.model,
+            &mut self.messages,
+            content,
+            self.opts,
+        )
+    }
+
+    fn clear(&mut self) {
+        self.messages.clear();
+        eprintln!("Conversation cleared.");
+    }
+}
+
+fn run_interactive_tty(turns: &mut dyn Turns) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
-        run_interactive_unix(model, opts)
+        run_interactive_unix(turns)
     }
     #[cfg(not(unix))]
     {
         // Windows fallback: basic cooked-mode loop
-        run_interactive_cooked(model, opts)
+        run_interactive_cooked(turns)
     }
 }
 
@@ -833,14 +948,9 @@ fn run_interactive_tty(model: &str, opts: ChatOptions<'_>) -> anyhow::Result<()>
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-fn run_interactive_unix(model: &str, opts: ChatOptions<'_>) -> anyhow::Result<()> {
+fn run_interactive_unix(turns: &mut dyn Turns) -> anyhow::Result<()> {
     use unix_readline::Readline;
 
-    // One tokio runtime, reused across every turn's `block_on` — see
-    // `chat_submit`'s doc comment for why this needs async reqwest.
-    let rt = tokio::runtime::Runtime::new().context("start tokio runtime")?;
-    let client = chat_client(opts.api_key)?;
-    let mut messages: Vec<Msg> = Vec::new();
     let mut rl = Readline::new()?;
     let mut multiline: Option<String> = None; // Some while inside """
                                               // Accumulates lines while rl.pasting, mirrors ollama's `sb`.
@@ -894,7 +1004,7 @@ fn run_interactive_unix(model: &str, opts: ChatOptions<'_>) -> anyhow::Result<()
                 let full = std::mem::take(buf).trim_end_matches('\n').to_string();
                 multiline = None;
                 if !full.trim().is_empty() {
-                    submit_turn(&rt, &client, model, &mut rl, &mut messages, full, opts)?;
+                    submit_turn(&mut rl, turns, full)?;
                 }
             } else {
                 buf.push_str(&line);
@@ -908,15 +1018,14 @@ fn run_interactive_unix(model: &str, opts: ChatOptions<'_>) -> anyhow::Result<()
             "" => continue,
             "/bye" | "/exit" => break,
             "/clear" => {
-                messages.clear();
-                eprintln!("Conversation cleared.");
+                turns.clear();
                 continue;
             }
             s if s.starts_with('/') => {
                 // Ollama: a line starting with an image path is a prompt,
                 // not an unknown command, when the model is multimodal.
                 let first_word = s.split_whitespace().next().unwrap_or(s);
-                let is_file = opts.multimodal
+                let is_file = turns.multimodal()
                     && extract_file_names(s)
                         .iter()
                         .any(|f| f.starts_with(first_word));
@@ -935,7 +1044,7 @@ fn run_interactive_unix(model: &str, opts: ChatOptions<'_>) -> anyhow::Result<()
             if let Some(closed) = inner.strip_suffix("\"\"\"") {
                 let content = closed.to_string();
                 if !content.trim().is_empty() {
-                    submit_turn(&rt, &client, model, &mut rl, &mut messages, content, opts)?;
+                    submit_turn(&mut rl, turns, content)?;
                 }
             } else {
                 multiline = Some(inner.to_string() + "\n");
@@ -944,7 +1053,7 @@ fn run_interactive_unix(model: &str, opts: ChatOptions<'_>) -> anyhow::Result<()
         }
 
         if !line.trim().is_empty() {
-            submit_turn(&rt, &client, model, &mut rl, &mut messages, line, opts)?;
+            submit_turn(&mut rl, turns, line)?;
         }
     }
 
@@ -959,16 +1068,12 @@ fn run_interactive_unix(model: &str, opts: ChatOptions<'_>) -> anyhow::Result<()
 /// until the next `rl.readline()` call instead of interrupting now.
 #[cfg(unix)]
 fn submit_turn(
-    rt: &tokio::runtime::Runtime,
-    client: &Client,
-    model: &str,
     rl: &mut unix_readline::Readline,
-    messages: &mut Vec<Msg>,
+    turns: &mut dyn Turns,
     content: String,
-    opts: ChatOptions<'_>,
 ) -> anyhow::Result<()> {
     rl.leave_raw();
-    let result = chat_submit(rt, client, model, messages, content, opts);
+    let result = turns.submit(content);
     rl.enter_raw();
     result
 }
@@ -1033,6 +1138,7 @@ async fn chat_submit_async(
             model,
             messages,
             stream: true,
+            keep_alive: opts.keep_alive,
             think: opts.think,
             options: opts.num_predict.map(|n| ChatReqOptions {
                 num_predict: Some(n),
@@ -1410,10 +1516,7 @@ mod unix_readline {
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-fn run_interactive_cooked(model: &str, opts: ChatOptions<'_>) -> anyhow::Result<()> {
-    let rt = tokio::runtime::Runtime::new().context("start tokio runtime")?;
-    let client = chat_client(opts.api_key)?;
-    let mut messages: Vec<Msg> = Vec::new();
+fn run_interactive_cooked(turns: &mut dyn Turns) -> anyhow::Result<()> {
     use std::io::BufRead;
     let stdin = std::io::stdin();
     let mut reader = std::io::BufReader::new(stdin.lock());
@@ -1433,13 +1536,13 @@ fn run_interactive_cooked(model: &str, opts: ChatOptions<'_>) -> anyhow::Result<
             "" => continue,
             "/bye" | "/exit" => break,
             "/clear" => {
-                messages.clear();
+                turns.clear();
                 continue;
             }
             _ => {}
         }
         if !line.trim().is_empty() {
-            chat_submit(&rt, &client, model, &mut messages, line, opts)?;
+            turns.submit(line)?;
         }
     }
     Ok(())
@@ -1479,6 +1582,53 @@ mod tests {
         assert_eq!(think_json(&["--variant", "thinking"]), true);
         assert_eq!(think_json(&["--variant", "xhigh"]), "xhigh");
         assert_eq!(think_json(&["--think", "false"]), false);
+    }
+
+    /// For clap the prompt takes everything from its first word on, flags
+    /// included; a decision model re-parses it (see `decide::reparse`).
+    #[test]
+    fn ask_flags_come_before_the_prompt() {
+        let args = parse(&[
+            "--ask",
+            "Is it spam?",
+            "--format",
+            "json",
+            "Win",
+            "a",
+            "cruise",
+        ])
+        .unwrap();
+        assert!(!args.ask.is_empty());
+        assert_eq!(args.format.as_deref(), Some("json"));
+        assert_eq!(args.prompt, ["Win", "a", "cruise"]);
+
+        let args = parse(&["Win a cruise", "--ask", "Is it spam?"]).unwrap();
+        assert!(args.ask.is_empty());
+        assert_eq!(args.prompt, ["Win a cruise", "--ask", "Is it spam?"]);
+
+        assert!(parse(&["--format", "xml"]).is_err());
+    }
+
+    /// `--keepalive` rides on the chat request, and takes negative values.
+    #[test]
+    fn keepalive_rides_on_the_chat_request() {
+        let body = |keep_alive| {
+            serde_json::to_value(ChatReq {
+                model: "m",
+                messages: &[],
+                stream: true,
+                keep_alive,
+                think: None,
+                options: None,
+            })
+            .unwrap()
+        };
+        assert_eq!(body(Some("5m"))["keep_alive"], "5m");
+        assert!(body(None).get("keep_alive").is_none());
+        for value in ["1h30m", "-1", "-5m"] {
+            let args = parse(&["--keepalive", value]).unwrap();
+            assert_eq!(args.keepalive.as_deref(), Some(value));
+        }
     }
 
     #[test]

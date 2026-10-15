@@ -396,7 +396,7 @@ setting may not behave identically.
 
 | Backend | When `LLMMAN_CONTEXT_LENGTH` is set | When unset or invalid |
 |---------|-------------------------------------|-----------------------|
-| `llama-server` | Passed as `--ctx-size` as-is for generation models (llama-server allocates the KV cache at that size and caps each request slot to the model's trained context). Embedding models are always capped to their trained context, and `0` means that context. | `--ctx-size 262144` (256k), or the model's trained context if smaller. If the load then fails with an out-of-memory error, llmman retries with the context halved (down to a 16384 floor) before giving up. |
+| `llama-server` | Passed as `--ctx-size` as-is for generation models (llama-server allocates the KV cache at that size and caps each request slot to the model's trained context). Embedding models are always capped to their trained context, and `0` means that context. A decision model reads its whole prompt in one batch of this size (up to the trained context), costing memory in proportion, so unset it is `8192` tokens at most. | `--ctx-size 262144` (256k), or the model's trained context if smaller. If the load then fails with an out-of-memory error, llmman retries with the context halved (down to a 16384 floor) before giving up. |
 | `vLLM` | Positive values are passed as `--max-model-len`; oversized values are rejected by vLLM. `0` is not forwarded. | Uses vLLM's model-derived default. |
 | `vllm serve --omni` | Not forwarded: a diffusion pipeline has no context window. | — |
 | `sglang` | Positive values are passed as `--context-length`, the same rule as vLLM's; oversized values are rejected by SGLang. `0` is not forwarded. | Uses the model's `config.json`. |

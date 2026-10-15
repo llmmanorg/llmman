@@ -292,6 +292,9 @@ pub const CAPABILITY_COMPLETION: &str = "completion";
 pub const CAPABILITY_VISION: &str = "vision";
 /// Produces embeddings instead of text; such a model has no `"completion"`.
 pub const CAPABILITY_EMBEDDING: &str = "embedding";
+/// Answers typed questions instead of generating text (ollama's
+/// `CapabilityDecision`); such a model has no `"completion"`.
+pub const CAPABILITY_DECISION: &str = "decision";
 /// The chat template renders a request's `tools`.
 pub const CAPABILITY_TOOLS: &str = "tools";
 /// The chat template handles reasoning.
@@ -359,10 +362,10 @@ pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) 
 }
 
 /// `caps` (from [`capabilities`]) plus what only the GGUF header and chat
-/// template say, in ollama's order: `"embedding"` for a pooling model in
-/// place of `"completion"`, then `"tools"` and `"thinking"` from the
-/// template. Agents choose features by these. A media or embedding model
-/// has no chat to equip and keeps what it has.
+/// template say, in ollama's order: `"embedding"` for a pooling model or
+/// `"decision"` for a decision model, in place of `"completion"`, then
+/// `"tools"` and `"thinking"` from the template. A media, embedding or
+/// decision model has no chat to equip and keeps what it has.
 pub fn model_capabilities(
     mut caps: Vec<String>,
     gguf: Option<&crate::gguf::Info>,
@@ -373,6 +376,10 @@ pub fn model_capabilities(
     };
     if gguf.is_some_and(|info| info.is_embedding()) {
         caps[completion] = CAPABILITY_EMBEDDING.to_string();
+        return caps;
+    }
+    if gguf.is_some_and(|info| info.is_decision()) {
+        caps[completion] = CAPABILITY_DECISION.to_string();
         return caps;
     }
     let Some(template) = template else {
@@ -1059,6 +1066,26 @@ mod tests {
         );
         assert!(gguf_header(true).is_embedding());
         assert!(!gguf_header(false).is_embedding());
+    }
+
+    /// A decision model keeps its projector's vision.
+    #[test]
+    fn model_capabilities_reports_a_decision_model_as_decision() {
+        use crate::gguf::Value;
+        let mut header = gguf_header(false);
+        header
+            .metadata
+            .insert("gemma3.decision.type".into(), Value::String("clef".into()));
+        assert_eq!(
+            model_capabilities(
+                vec!["completion".into(), "vision".into()],
+                Some(&header),
+                Some(TOOLS_AND_THINKING)
+            ),
+            ["decision", "vision"]
+        );
+        assert!(header.is_decision());
+        assert!(!gguf_header(false).is_decision());
     }
 
     /// A media model's capabilities are what it generates.

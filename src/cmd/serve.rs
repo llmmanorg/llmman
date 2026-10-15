@@ -48,6 +48,7 @@ mod relay;
 mod responses;
 pub mod runtime;
 mod sched;
+pub(crate) use sched::parse_keep_alive_str;
 mod search;
 mod shell;
 mod stream;
@@ -68,7 +69,7 @@ use config::{
     flash_attention_from_env, gguf_trained_ctx, initial_ctx_size, kv_cache_type_from_env,
     looks_like_oom, max_loaded_models_from_env, max_queue_from_env, metrics_enabled_from_env,
     next_ctx_size_after_oom, num_parallel_from_env, sched_spread_from_env, supports_context_shift,
-    threads_from_env_or_host, tls_from_env, MAX_CTX_SHRINK_ATTEMPTS,
+    threads_from_env_or_host, tls_from_env, whole_prompt_batch, MAX_CTX_SHRINK_ATTEMPTS,
 };
 pub use config::{context_length_from_env, DEFAULT_CTX_SIZE};
 use gemini::{gemini_method, handle_pinned_gemini};
@@ -80,8 +81,9 @@ use ollama::{
 };
 use openai::{
     handle_openai_chat, handle_openai_completions, handle_openai_embeddings, handle_openai_images,
-    handle_openai_models, handle_openai_speech, handle_openai_transcriptions,
-    handle_openai_video_get, handle_openai_videos, TRANSCRIPTION_BODY_LIMIT_BYTES,
+    handle_openai_models, handle_openai_speech, handle_openai_systemone,
+    handle_openai_transcriptions, handle_openai_video_get, handle_openai_videos,
+    SYSTEMONE_BODY_LIMIT_BYTES, TRANSCRIPTION_BODY_LIMIT_BYTES,
 };
 use relay::proxy;
 pub use runtime::Runtime;
@@ -357,6 +359,8 @@ struct RunningModel {
     /// pair against the daemon-wide default — many times this window
     /// for a model whose trained context clamped the load.
     context_window: Option<u32>,
+    /// A decision model: refuses what [`Task::refuse_decision`] says.
+    decision: bool,
 }
 
 /// Which engine is actually serving requests for a [`RunningModel`] — surfaced
@@ -1799,19 +1803,73 @@ async fn ensure_model(
     headers: Option<&HeaderMap>,
     request_threads: Option<u32>,
 ) -> Result<(String, Target, ActivityGuard), AppError> {
-    let resolved = resolve_target(state, model_ref, headers, request_threads).await?;
-    // Every surface resolves here, so the usage ledger learns the target
-    // here; a hybrid retry's overwrites the first.
-    usage::note_target(&resolved.0, &resolved.1);
-    Ok(resolved)
+    ensure_model_for(state, model_ref, headers, request_threads, Task::Other).await
 }
 
-/// [`ensure_model`], before the usage ledger is told the outcome.
+/// What a request does with its model, so a decision model (see
+/// `Info::is_decision`) can turn away what it can't do with a 400, as
+/// ollama's capability check does, instead of llama-server's 500.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Task {
+    /// Chat, completions, responses, messages: anything that generates text.
+    Generate,
+    Embed,
+    /// Anything else, `/v1/systemone` included: the backend judges.
+    Other,
+}
+
+impl Task {
+    /// The 400 for sending this task to the decision model `model`.
+    fn refuse_decision(self, model: &str) -> Option<AppError> {
+        let message = match self {
+            Self::Generate => format!(
+                "{model} is a decision model: it answers questions through /v1/systemone \
+                 (llmman run {model} --ask ...) and does not generate text"
+            ),
+            Self::Embed => {
+                format!("{model} is a decision model, which does not support embeddings")
+            }
+            Self::Other => return None,
+        };
+        Some(AppError::status(StatusCode::BAD_REQUEST, message))
+    }
+}
+
+/// [`ensure_model`] for a request that says what it will do with the model.
+async fn ensure_model_for(
+    state: &AppState,
+    model_ref: &str,
+    headers: Option<&HeaderMap>,
+    request_threads: Option<u32>,
+    task: Task,
+) -> Result<(String, Target, ActivityGuard), AppError> {
+    let (model, target, guard) =
+        resolve_target(state, model_ref, headers, request_threads, task).await?;
+    // A cold load was refused in resolve_target; this is a model already
+    // loaded. A peer or provider judges for itself.
+    if task != Task::Other && matches!(target, Target::Local(_)) {
+        let decision = {
+            let mgr = state.0.manager.lock().await;
+            mgr.running.get(&model).is_some_and(|m| m.decision)
+        };
+        if let Some(refusal) = decision.then(|| task.refuse_decision(&model)).flatten() {
+            guard.release_idle();
+            return Err(refusal);
+        }
+    }
+    // Every surface resolves here, so the usage ledger learns the target
+    // here; a hybrid retry's overwrites the first.
+    usage::note_target(&model, &target);
+    Ok((model, target, guard))
+}
+
+/// [`ensure_model_for`], before the usage ledger is told the outcome.
 async fn resolve_target(
     state: &AppState,
     model_ref: &str,
     headers: Option<&HeaderMap>,
     request_threads: Option<u32>,
+    task: Task,
 ) -> Result<(String, Target, ActivityGuard), AppError> {
     // First, so everything below sees one half rather than the pair. A
     // half is never itself a pair, so this cannot recurse.
@@ -1955,9 +2013,9 @@ async fn resolve_target(
     let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
         .with_context(|| format!("resolve model {model_ref}"))?;
     let context_shift = supports_context_shift(model_ref);
-    // One header read feeds both initial_ctx_size and embedding_model_ctx;
-    // unreadable means "generation model, unknown trained context" and
-    // llama-server reports the real problem.
+    // One header read feeds initial_ctx_size, embedding_model_ctx and
+    // is_decision; unreadable means "generation model, unknown trained
+    // context" and llama-server reports the real problem.
     let gguf_info = match &model_path {
         ModelPath::Gguf(path, _) => crate::gguf::read_info(path).ok(),
         _ => None,
@@ -1965,6 +2023,13 @@ async fn resolve_target(
     let trained_ctx = gguf_info.as_ref().and_then(gguf_trained_ctx);
     // `Some` marks an embedding model; see embedding_model_ctx.
     let embedding_ctx = gguf_info.as_ref().and_then(embedding_model_ctx);
+    // Refused before anything is evicted or spawned.
+    let decision = gguf_info.as_ref().is_some_and(|info| info.is_decision());
+    if decision {
+        if let Some(refusal) = task.refuse_decision(model_ref) {
+            return Err(refusal);
+        }
+    }
     // See enforce_max_loaded_models's doc comment — held for the rest
     // of this function.
     let mut pending_load_guard =
@@ -2015,8 +2080,13 @@ async fn resolve_target(
             split_mode,
             num_parallel,
             embeddings: embedding_ctx.is_some(),
-            // `.filter`: a 0 here is "trained context", not a batch size.
-            batch_size: embedding_ctx.and(ctx_size).filter(|n| *n > 0),
+            batch_size: whole_prompt_batch(
+                embedding_ctx.is_some(),
+                decision,
+                ctx_size,
+                state.0.ctx_size_explicit,
+                trained_ctx,
+            ),
             // See ensure_model's `request_threads` doc comment for the
             // full precedence chain this `.or` implements.
             threads: request_threads.or(state.0.threads),
@@ -2272,6 +2342,7 @@ async fn resolve_target(
             keep_alive: default_keep_alive(),
             // 1, not 0 — see this function's own doc comment.
             in_flight: 1,
+            decision,
         },
     );
     // Same locked step as the insert, so this load is never both in
@@ -3765,6 +3836,10 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .route("/v1/chat/completions", post(handle_openai_chat))
         .route("/v1/completions", post(handle_openai_completions))
         .route("/v1/embeddings", post(handle_openai_embeddings))
+        .route(
+            "/v1/systemone",
+            post(handle_openai_systemone).layer(DefaultBodyLimit::max(SYSTEMONE_BODY_LIMIT_BYTES)),
+        )
         .route(
             "/v1/audio/transcriptions",
             post(handle_openai_transcriptions)

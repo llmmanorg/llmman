@@ -55,24 +55,26 @@ pub fn paint(text: &str, code: &str, color: bool) -> String {
     }
 }
 
-/// Rows (header first) as `list`-style columns: each cell but a row's
-/// last is padded to its column's widest, plus a 4-space gutter. The last
-/// is never padded, so it may carry color.
-pub fn columns(rows: &[Vec<String>]) -> String {
-    let cols = rows.first().map_or(0, Vec::len);
-    let widths: Vec<usize> = (0..cols)
-        .map(|i| {
-            let cell = |r: &Vec<String>| r.get(i).map_or(0, |c| c.chars().count());
-            rows.iter().map(cell).max().unwrap_or(0)
-        })
-        .collect();
+/// Rows as columns: each cell but a row's last is padded to the widest in
+/// its column, plus `gap` spaces (as `text/tabwriter` does, a row's last
+/// cell is not part of its column). The last is never padded, so it may
+/// carry color.
+pub fn columns(rows: &[Vec<String>], gap: usize) -> String {
+    let width = |column: usize| {
+        rows.iter()
+            .filter(|row| column + 1 < row.len())
+            .map(|row| row[column].chars().count())
+            .max()
+            .unwrap_or(0)
+    };
     let mut out = String::new();
     for row in rows {
-        if let Some((last, rest)) = row.split_last() {
-            for (cell, width) in rest.iter().zip(&widths) {
-                out.push_str(&format!("{cell:<width$}    "));
+        for (column, cell) in row.iter().enumerate() {
+            if column + 1 < row.len() {
+                out.push_str(&format!("{cell:<w$}{:gap$}", "", w = width(column)));
+            } else {
+                out.push_str(cell);
             }
-            out.push_str(last);
         }
         out.push('\n');
     }
@@ -206,10 +208,14 @@ mod tests {
         let rows = [["NAME", "SIZE", "FIT"], ["a", "10", "\x1b[32m5%\x1b[0m"]]
             .map(|r| r.map(String::from).to_vec());
         assert_eq!(
-            columns(&rows),
+            columns(&rows, 4),
             "NAME    SIZE    FIT\na       10      \x1b[32m5%\x1b[0m\n"
         );
-        assert_eq!(columns(&[]), "");
+        assert_eq!(columns(&[], 4), "");
+        // Rows of different lengths: a last cell is not part of its column.
+        let rows = [vec!["a", "yes", "100%"], vec!["b", "Soon", "64%", "1.2"]]
+            .map(|r| r.into_iter().map(String::from).collect::<Vec<_>>());
+        assert_eq!(columns(&rows, 2), "a  yes   100%\nb  Soon  64%  1.2\n");
     }
 
     #[test]

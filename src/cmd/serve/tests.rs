@@ -3859,7 +3859,7 @@ async fn handle_show_reports_a_safetensors_model_as_safetensors() {
 }
 
 /// `tools` and `thinking` come off the GGUF's chat template, `embedding`
-/// off its pooling key.
+/// off its pooling key and `decision` off its decision type.
 #[tokio::test]
 async fn handle_show_reports_what_the_chat_template_handles() {
     let capabilities = |name: &'static str, u32s: &[(&str, u32)], template: &str| {
@@ -3892,6 +3892,24 @@ async fn handle_show_reports_what_the_chat_template_handles() {
 
     let (caps, _) = capabilities("showembed", &[("llama.pooling_type", 1)], template).await;
     assert_eq!(caps, serde_json::json!(["embedding"]));
+
+    let path = crate::gguf::write_test_gguf_with_strings(
+        &[],
+        &[
+            ("tokenizer.chat_template", template),
+            ("llama.decision.type", "clef"),
+        ],
+    );
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let v = show_one_model(
+        "showdecision",
+        "application/vnd.docker.ai.gguf.v3",
+        "model.gguf",
+        &bytes,
+    )
+    .await;
+    assert_eq!(v["capabilities"], serde_json::json!(["decision"]));
 }
 
 /// `/api/tags` reads each model's format the way `/api/show` does,
@@ -5634,17 +5652,44 @@ fn llama_server_standin() -> Router {
         )
 }
 
+/// A decision model's llama-server stand-in: answers `/v1/systemone` with
+/// the request's raw text as `received`, so nothing here can sort it.
+fn decision_server_standin() -> Router {
+    Router::new().route(
+        "/v1/systemone",
+        post(|body: String| async move {
+            let received = serde_json::to_string(&body).unwrap();
+            let usage = r#"{"input_tokens":3,"output_tokens":0}"#;
+            // Out of alphabetical order on purpose.
+            (
+                [("content-type", "application/json")],
+                format!(
+                    r#"{{"model":"{BACKEND_MODEL_PATH}","answers":{{"zebra?":{{"type":"noul","noul":0.9}},"apple?":{{"type":"noul","noul":0.1}}}},"usage":{usage},"received":{received}}}"#
+                ),
+            )
+        })
+        // No limit of its own: what is under test is the daemon's.
+        .layer(DefaultBodyLimit::disable()),
+    )
+}
+
 /// The daemon's router, with `model` loaded as a local backend served by
 /// `backend`.
 async fn serve_over(model: &str, backend: Router) -> String {
+    serve_over_state(model, backend, false).await.0
+}
+
+/// [`serve_over`], returning the state too, the model a decision model if `decision`.
+async fn serve_over_state(model: &str, backend: Router, decision: bool) -> (String, AppState) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut loaded = running_model_fixture(None, Duration::ZERO, 0);
     loaded.port = listener.local_addr().unwrap().port();
+    loaded.decision = decision;
     tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
     let state = test_state();
     let key = running_key(&state, model);
     state.0.manager.lock().await.running.insert(key, loaded);
-    serve_router(state).await
+    (serve_router(state.clone()).await, state)
 }
 
 /// POSTs `body` with the fields of `extra` added.
@@ -5801,4 +5846,328 @@ async fn openai_embeddings_honour_dimensions() {
     let cut = ask(serde_json::json!({ "dimensions": 2, "encoding_format": "base64" })).await;
     let encoded = cut["data"][0]["embedding"].as_str().unwrap();
     assert_eq!(decode_f32s(encoded).unwrap(), [0.6, 0.8]);
+}
+
+async fn systemone(base: &str, body: serde_json::Value) -> reqwest::Response {
+    Client::new()
+        .post(format!("{base}/v1/systemone"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// The request as the stand-in received it.
+fn received(reply: &str) -> String {
+    let reply: serde_json::Value = serde_json::from_str(reply).unwrap();
+    reply["received"].as_str().unwrap().to_string()
+}
+
+/// Questions reach the backend, and answers return, in the order written.
+#[tokio::test(flavor = "multi_thread")]
+async fn systemone_keeps_the_order_of_questions_and_answers() {
+    let (base, _) = serve_over_state("clef-flash", decision_server_standin(), true).await;
+    let text = r#"{"model":"clef-flash","state":"Win a cruise","questions":{"zebra?":{"type":"noul","instructions":"zebra?"},"apple?":{"type":"noul","instructions":"apple?"}}}"#;
+    let resp = Client::new()
+        .post(format!("{base}/v1/systemone"))
+        .header("content-type", "application/json")
+        .body(text)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reply = resp.text().await.unwrap();
+
+    let got = received(&reply);
+    assert!(
+        got.find("zebra?").unwrap() < got.find("apple?").unwrap(),
+        "{got}"
+    );
+    assert!(reply.find("\"zebra?\":{\"type").unwrap() < reply.find("\"apple?\":{\"type").unwrap());
+    let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(v["usage"]["input_tokens"], 3);
+}
+
+/// Bare base64 `images` become data URLs; the reply names the client's model.
+#[tokio::test(flavor = "multi_thread")]
+async fn systemone_speaks_ollamas_images_and_names_the_clients_model() {
+    let (base, _) = serve_over_state("clef-flash", decision_server_standin(), true).await;
+    let resp = systemone(
+        &base,
+        serde_json::json!({
+            "model": "clef-flash",
+            "state": "Win a cruise",
+            "images": ["AAAA", "data:image/jpeg;base64,BBBB"],
+            "keep_alive": "30m",
+            "questions": { "q": { "type": "noul", "instructions": "q" } },
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reply = resp.text().await.unwrap();
+
+    let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(v["model"], "clef-flash");
+    assert!(!reply.contains(BACKEND_MODEL_PATH), "{reply}");
+    let got: serde_json::Value = serde_json::from_str(&received(&reply)).unwrap();
+    assert_eq!(
+        got["images"],
+        serde_json::json!(["data:image/png;base64,AAAA", "data:image/jpeg;base64,BBBB"])
+    );
+    assert!(got.get("keep_alive").is_none(), "{got}");
+    assert_eq!(got["model"], "docker.io/ai/clef-flash:latest");
+}
+
+/// `keep_alive` sets the model's, and is not sent to llama-server.
+#[tokio::test(flavor = "multi_thread")]
+async fn systemone_applies_keep_alive_to_the_model() {
+    let (base, state) = serve_over_state("clef-flash", decision_server_standin(), true).await;
+    let kept = |state: &AppState| {
+        let state = state.clone();
+        async move {
+            let mgr = state.0.manager.lock().await;
+            mgr.running.values().next().unwrap().keep_alive
+        }
+    };
+    for (keep_alive, want) in [
+        (serde_json::json!("30m"), Some(Duration::from_secs(1800))),
+        (serde_json::json!(-1), None),
+        (serde_json::json!(90), Some(Duration::from_secs(90))),
+    ] {
+        let resp = systemone(
+            &base,
+            serde_json::json!({
+                "model": "clef-flash", "state": "x", "keep_alive": keep_alive,
+                "questions": { "q": { "type": "noul", "instructions": "q" } },
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(kept(&state).await, want, "{keep_alive}");
+    }
+}
+
+/// A peer gets `keep_alive`: only it can apply it.
+#[tokio::test]
+async fn systemone_leaves_keep_alive_for_a_peer() {
+    let (origin, seen) = mock_peer(node(8 << 30, &["docker.io/ai/m:latest"], &[])).await;
+    let state = state_with_peers(vec![origin], 0);
+    let body = serde_json::json!({
+        "model": "docker.io/ai/m", "state": "x", "keep_alive": "1h",
+        "questions": { "q": { "type": "noul", "instructions": "q" } },
+    });
+    let resp = handle_openai_systemone(
+        State(state),
+        HeaderMap::new(),
+        Bytes::from(serde_json::to_vec(&body).unwrap()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let calls = seen.lock().await;
+    let (path, headers, body) = &calls[0];
+    assert_eq!(path, "/v1/systemone");
+    assert_eq!(headers[aggregation::HOP], "1");
+    let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+    assert_eq!(body["keep_alive"], "1h");
+    assert_eq!(body["model"], "docker.io/ai/m:latest");
+}
+
+/// Bodies past axum's 2 MiB default are accepted (base64 images).
+#[tokio::test(flavor = "multi_thread")]
+async fn systemone_takes_a_body_larger_than_axums_default_limit() {
+    let (base, _) = serve_over_state("clef-flash", decision_server_standin(), true).await;
+    let resp = systemone(
+        &base,
+        serde_json::json!({
+            "model": "clef-flash",
+            "state": "x".repeat(3 * 1024 * 1024),
+            "questions": { "q": { "type": "noul", "instructions": "q" } },
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(received(&resp.text().await.unwrap()).len() > 3 * 1024 * 1024);
+}
+
+/// A text past one batch is a 400 naming the limit; other failures pass through.
+#[tokio::test(flavor = "multi_thread")]
+async fn systemone_explains_a_text_that_does_not_fit_one_batch() {
+    let body = serde_json::json!({
+        "model": "clef-flash", "state": "x",
+        "questions": { "q": { "type": "noul", "instructions": "q" } },
+    });
+    let failing = |message: &'static str| {
+        Router::new().route(
+            "/v1/systemone",
+            post(move || async move {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": { "code": 500, "message": message, "type": "server_error" }
+                    })),
+                )
+            }),
+        )
+    };
+
+    let (base, _) = serve_over_state(
+        "clef-flash",
+        failing(
+            "input (9143 tokens) is too large to process. increase the physical batch size \
+             (current batch size: 8192)",
+        ),
+        true,
+    )
+    .await;
+    let resp = systemone(&base, body.clone()).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let error = resp.json::<serde_json::Value>().await.unwrap()["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("longer than the 8192 tokens"), "{error}");
+    assert!(error.contains("LLMMAN_CONTEXT_LENGTH"), "{error}");
+
+    let (base, _) = serve_over_state("clef-flash", failing("something else"), true).await;
+    let resp = systemone(&base, body).await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let v = resp.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(v["error"]["message"], "something else");
+}
+
+/// A decision model refuses generating and embedding with a 400, as ollama does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decision_model_refuses_to_generate_or_embed() {
+    let (base, state) = serve_over_state("clef-flash", decision_server_standin(), true).await;
+    let long_ago = Instant::now() - Duration::from_secs(3600);
+    for m in state.0.manager.lock().await.running.values_mut() {
+        m.last_active = long_ago;
+    }
+    let chat = serde_json::json!({
+        "model": "clef-flash", "messages": [{ "role": "user", "content": "Hello" }],
+    });
+    let generate = serde_json::json!({ "model": "clef-flash", "prompt": "Hello" });
+    let embed = serde_json::json!({ "model": "clef-flash", "input": "Hello" });
+    let responses = serde_json::json!({ "model": "clef-flash", "input": "Hello" });
+    let messages = serde_json::json!({
+        "model": "clef-flash", "max_tokens": 8,
+        "messages": [{ "role": "user", "content": "Hello" }],
+    });
+    for (route, body, says) in [
+        ("/api/chat", &chat, "does not generate text"),
+        ("/api/generate", &generate, "does not generate text"),
+        ("/v1/chat/completions", &chat, "does not generate text"),
+        ("/v1/completions", &generate, "does not generate text"),
+        ("/v1/responses", &responses, "does not generate text"),
+        ("/v1/messages", &messages, "does not generate text"),
+        ("/api/embed", &embed, "does not support embeddings"),
+        (
+            "/api/embeddings",
+            &serde_json::json!({ "model": "clef-flash", "prompt": "Hello" }),
+            "does not support embeddings",
+        ),
+        ("/v1/embeddings", &embed, "does not support embeddings"),
+    ] {
+        let resp = Client::new()
+            .post(format!("{base}{route}"))
+            .json(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{route}");
+        let text = resp.text().await.unwrap();
+        assert!(
+            text.contains("decision model") && text.contains(says),
+            "{route}: {text}"
+        );
+    }
+
+    // Refusals are not activity: retrying one must not defer the idle unload.
+    for _ in 0..50 {
+        if state
+            .0
+            .manager
+            .lock()
+            .await
+            .running
+            .values()
+            .all(|m| m.in_flight == 0)
+        {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    let mgr = state.0.manager.lock().await;
+    let m = mgr.running.values().next().unwrap();
+    assert_eq!(m.in_flight, 0);
+    assert_eq!(m.last_active, long_ago, "a refusal is not activity");
+    drop(mgr);
+
+    // Its own route works, and other models are unaffected.
+    let ok = systemone(
+        &base,
+        serde_json::json!({
+            "model": "clef-flash", "state": "x",
+            "questions": { "q": { "type": "noul", "instructions": "q" } },
+        }),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let base = serve_over("qwen3.5:0.8b", llama_server_standin()).await;
+    let resp = post_with(
+        &base,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "model": "qwen3.5:0.8b", "messages": [{ "role": "user", "content": "Hi" }],
+        }),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// A cold decision model is refused before anything is evicted or spawned.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decision_model_is_refused_before_it_loads() {
+    let dir = fresh_store_dir("decision-cold");
+    let state = test_state_at(dir.clone());
+    let path = crate::gguf::write_test_gguf_with_strings(&[], &[("llama.decision.type", "clef")]);
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    store_one_model(
+        &OciStore::open(&dir).unwrap(),
+        "decisioncold",
+        "application/vnd.docker.ai.gguf.v3",
+        "model.gguf",
+        &bytes,
+    );
+    // A running model that a load would evict.
+    let key = running_key(&state, "docker.io/ai/bystander");
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .insert(key.clone(), running_model_fixture(None, Duration::ZERO, 0));
+
+    for task in [Task::Generate, Task::Embed] {
+        let Err(err) =
+            ensure_model_for(&state, "docker.io/ai/decisioncold", None, None, task).await
+        else {
+            panic!("a decision model cannot do {task:?}");
+        };
+        assert_eq!(err.1, StatusCode::BAD_REQUEST);
+        assert!(
+            format!("{:#}", err.0).contains("is a decision model"),
+            "{:#}",
+            err.0
+        );
+    }
+    let running = state.0.manager.lock().await;
+    assert_eq!(running.running.len(), 1, "nothing was loaded");
+    assert!(running.running.contains_key(&key), "nothing was evicted");
+    let _ = std::fs::remove_dir_all(&dir);
 }

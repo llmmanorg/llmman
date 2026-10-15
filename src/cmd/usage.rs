@@ -236,7 +236,7 @@ fn table(rows: &[Row], by: Option<By>) -> String {
         line.push(dollars(row));
         lines.push(line);
     }
-    crate::fmt::columns(&lines)
+    crate::fmt::columns(&lines, 4)
 }
 
 /// `-` for no price, not free (`$0.00`); `+` when only some had one.

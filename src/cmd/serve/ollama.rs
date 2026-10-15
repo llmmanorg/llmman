@@ -23,9 +23,9 @@ use super::sched::*;
 use super::stream::*;
 use super::types::*;
 use super::{
-    aggregation, backend_wire_model, ensure_model, forward_ollama, model_lock, now_rfc3339,
+    aggregation, backend_wire_model, ensure_model_for, forward_ollama, model_lock, now_rfc3339,
     pull_serialized, release_model_lock, remote_status, unload_everywhere, AppError, AppState,
-    Target,
+    Target, Task,
 };
 use crate::metrics::{self, UnloadReason};
 use crate::storage::OciStore;
@@ -1432,7 +1432,8 @@ async fn embed_via_backend(
     let started = Instant::now();
     // No `request_threads`: OllamaEmbedRequest carries no `options`
     // blob here, so there is no num_thread to forward.
-    let (model, target, guard) = ensure_model(state, model_ref, Some(headers), None).await?;
+    let (model, target, guard) =
+        ensure_model_for(state, model_ref, Some(headers), None, Task::Embed).await?;
     let loaded = started.elapsed();
     if !target.is_remote() && would_use_mlx(state, &model).await.is_some() {
         return Err(mlx_unsupported(&model));

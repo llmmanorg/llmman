@@ -132,6 +132,16 @@ impl Info {
             .is_some_and(|arch| self.u64(&format!("{arch}.pooling_type")).is_some())
     }
 
+    /// Whether this is a decision model (`{architecture}.decision.type`, as
+    /// llama.cpp and ollama test it): it answers typed questions through
+    /// `/v1/systemone` and generates no text.
+    pub fn is_decision(&self) -> bool {
+        self.architecture().is_some_and(|arch| {
+            self.str(&format!("{arch}.decision.type"))
+                .is_some_and(|kind| !kind.is_empty())
+        })
+    }
+
     /// `{architecture}.block_count` (i.e. number of transformer layers).
     pub fn block_count(&self) -> Option<u64> {
         let arch = self.architecture()?;
@@ -550,6 +560,21 @@ mod tests {
         assert_eq!(info.tensor_count, 1);
         assert_eq!(info.parameter_count, 32); // 4 * 8
         assert_eq!(info.quantization, Some("Q4_K".to_string()));
+    }
+
+    #[test]
+    fn is_decision_needs_a_decision_type_under_the_architecture() {
+        let info = |strings: &[(&str, &str)]| {
+            let path = write_test_gguf_with_strings(&[], strings);
+            let info = read_info(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            info
+        };
+        assert!(info(&[("llama.decision.type", "clef")]).is_decision());
+        assert!(!info(&[]).is_decision());
+        assert!(!info(&[("llama.decision.type", "")]).is_decision());
+        // Another architecture's key says nothing about this one.
+        assert!(!info(&[("clef.decision.type", "clef")]).is_decision());
     }
 
     /// Regression test: two tensors whose declared dimensions each

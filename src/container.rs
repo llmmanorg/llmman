@@ -731,9 +731,9 @@ pub struct LlamaOptions<'a> {
     /// without it.
     pub embeddings: bool,
 
-    /// `-b`/`-ub`. Set only for an embedding model, to its per-slot
-    /// context (not the `num_parallel`-scaled `ctx_size`): llama-server
-    /// needs a whole input in one ubatch.
+    /// `-b`/`-ub`, for an embedding or decision model (see
+    /// `cmd::serve::config::whole_prompt_batch`): llama-server needs a whole
+    /// input in one ubatch. Per-slot, not the `num_parallel`-scaled `ctx_size`.
     pub batch_size: Option<u32>,
 
     /// `--threads <n>`: a request's Ollama `options.num_thread`, else the

@@ -24,12 +24,14 @@ use super::relay::{
 use super::responses::{
     is_responses_route, remote_responses, sanitize_responses_request, RESPONSES_ROUTE,
 };
-use super::sched::{begin_activity, ActivityGuard};
+use super::sched::{begin_activity, resolve_keep_alive, ActivityGuard};
 use super::types::*;
 use super::{
-    aggregation, backend_wire_model, ensure_model, provider_compat, send_chat_completion,
-    strip_llama_fields, AppError, AppState, Engine, Target, CHAT_COMPLETIONS_ROUTE,
+    aggregation, backend_wire_model, ensure_model, ensure_model_for, provider_compat,
+    send_chat_completion, strip_llama_fields, AppError, AppState, Engine, Target, Task,
+    CHAT_COMPLETIONS_ROUTE,
 };
+use crate::ordered::Ordered;
 use crate::storage::OciStore;
 
 pub(super) async fn handle_openai_models(
@@ -270,12 +272,13 @@ pub(super) async fn resolve_openai_request(
     state: &AppState,
     headers: &HeaderMap,
     body: Bytes,
+    task: Task,
 ) -> Result<(serde_json::Value, Target, ActivityGuard, Option<String>), AppError> {
     let req = parse_openai_request(&body)?;
     let model = req["model"].as_str().unwrap_or("").to_string();
     // No `request_threads`: the OpenAI-compatible surface has no Ollama
     // options blob, so there is no num_thread to forward.
-    let (model, target, guard) = ensure_model(state, &model, Some(headers), None).await?;
+    let (model, target, guard) = ensure_model_for(state, &model, Some(headers), None, task).await?;
     prepare_openai_request(state, req, model, target, guard).await
 }
 
@@ -501,8 +504,9 @@ pub(super) async fn proxy_openai_passthrough(
             }
         }
     }
+    let task = if embeddings { Task::Embed } else { Task::Other };
     let (req, target, activity, response_model_override) =
-        resolve_openai_request(state, headers, body).await?;
+        resolve_openai_request(state, headers, body, task).await?;
     forward_openai_request(
         state,
         headers,
@@ -731,6 +735,125 @@ pub(super) async fn handle_openai_embeddings(
     proxy_openai_passthrough(&state, &headers, body, "/v1/embeddings").await
 }
 
+// -- Decision models (/v1/systemone) -------------------------------------------
+
+/// Images ride in the body as base64, past axum's 2 MiB default. Ollama's cap.
+pub(super) const SYSTEMONE_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+const SYSTEMONE_ROUTE: &str = "/v1/systemone";
+
+/// A JSON object whose members pass through as written, in order: Clef
+/// reads `questions` in the order given, and `answers` come back in it.
+type Members = Ordered<Box<serde_json::value::RawValue>>;
+
+fn member<T: serde::de::DeserializeOwned>(members: &Members, key: &str) -> Option<T> {
+    serde_json::from_str(members.get(key)?.get()).ok()
+}
+
+fn raw_member(value: &impl serde::Serialize) -> Result<Box<serde_json::value::RawValue>, AppError> {
+    Ok(serde_json::value::to_raw_value(value).context("encode a request member")?)
+}
+
+/// `/v1/systemone`: llama-server's route, plus what ollama's has: bare
+/// base64 `images`, `keep_alive`, the client's own model name in the reply,
+/// and a 400 (not a 500) for a text too long for one batch.
+pub(super) async fn handle_openai_systemone(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let mut req: Members = serde_json::from_slice(&body).map_err(|e| {
+        AppError::status(
+            StatusCode::BAD_REQUEST,
+            format!("parse OpenAI request body: {e}"),
+        )
+    })?;
+    let model_ref: String = member(&req, "model").unwrap_or_default();
+    let keep_alive = resolve_keep_alive(&member(&req, "keep_alive"));
+    if let Some(mut images) = member::<Vec<serde_json::Value>>(&req, "images") {
+        for image in &mut images {
+            if let Some(base64) = image.as_str() {
+                *image = serde_json::Value::String(image_data_uri(base64));
+            }
+        }
+        req.set("images", raw_member(&images)?);
+    }
+
+    let (model, target, guard) =
+        ensure_model_for(&state, &model_ref, Some(&headers), None, Task::Other).await?;
+    let activity = begin_activity(guard, Some(keep_alive)).await;
+    // A peer is another llmman and applies `keep_alive` itself.
+    if !matches!(target, Target::Peer(_)) {
+        req.remove("keep_alive");
+    }
+    req.set(
+        "model",
+        raw_member(&backend_wire_model(&state, &target, &model).await)?,
+    );
+    if let Some(refusal) = unsupported_on_wire(&target, SYSTEMONE_ROUTE) {
+        drop(activity);
+        return Ok(refusal);
+    }
+    let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize the request")?);
+    let resp = proxy_buffered(
+        &state.0.client,
+        &target,
+        SYSTEMONE_ROUTE,
+        &headers,
+        body,
+        activity,
+        |raw| Ok(with_model(raw, &model_ref)),
+    )
+    .await?;
+    explain_prompt_too_long(resp).await
+}
+
+/// `raw` with its `model` renamed in place; unchanged if it has none (an
+/// error body) or is not an object.
+fn with_model(raw: &Bytes, model: &str) -> Bytes {
+    let renamed = serde_json::from_slice::<Members>(raw)
+        .ok()
+        .filter(|reply| reply.get("model").is_some())
+        .and_then(|mut reply| {
+            reply.set("model", serde_json::value::to_raw_value(model).ok()?);
+            serde_json::to_vec(&reply).ok()
+        });
+    renamed.map_or_else(|| raw.clone(), Bytes::from)
+}
+
+/// llama-server's 500 for a prompt past its batch, as a 400 with a way out.
+async fn explain_prompt_too_long(resp: Response) -> Result<Response, AppError> {
+    if resp.status() != StatusCode::INTERNAL_SERVER_ERROR {
+        return Ok(resp);
+    }
+    let (parts, body) = resp.into_parts();
+    let body = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .context("read inference backend response")?;
+    let text = String::from_utf8_lossy(&body);
+    if !text.contains("physical batch size") {
+        return Ok(Response::from_parts(parts, Body::from(body)));
+    }
+    let limit = text
+        .split("current batch size: ")
+        .nth(1)
+        .map(|rest| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .filter(|digits| !digits.is_empty())
+        .map_or_else(|| "what".into(), |tokens| format!("the {tokens} tokens"));
+    Ok(AppError::status(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "the text and questions are longer than {limit} this model reads at once; \
+             shorten them, or raise LLMMAN_CONTEXT_LENGTH"
+        ),
+    )
+    .into_response())
+}
+
 // -- OpenAI media generation (/v1/images/generations, /v1/videos,
 //    /v1/audio/speech) --------------------------------------------------------
 //
@@ -761,7 +884,8 @@ async fn handle_openai_media(
     body: Bytes,
     route: &str,
 ) -> Result<Response, AppError> {
-    let (req, target, activity, override_) = resolve_openai_request(state, headers, body).await?;
+    let (req, target, activity, override_) =
+        resolve_openai_request(state, headers, body, Task::Other).await?;
     if local_engine(state, &target).await == Some(Engine::VllmOmni) {
         return if route == "/v1/videos" {
             omni_videos(state, &target, req, activity).await

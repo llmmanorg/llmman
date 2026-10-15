@@ -1309,6 +1309,13 @@ impl ShowResponse {
             .any(|c| c == crate::modelpack::CAPABILITY_VISION)
     }
 
+    /// A decision model (see `cmd::run::decide`).
+    pub fn decision(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c == crate::modelpack::CAPABILITY_DECISION)
+    }
+
     /// An image generation model (see `crate::imagegen`).
     pub fn image(&self) -> bool {
         self.capabilities
@@ -1493,15 +1500,18 @@ pub fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T>
         .with_context(|| format!("parse response from {path}"))
 }
 
-/// The `error` message out of an `AppError` response body, or `None` for
-/// a body that isn't one (an empty 404 from axum's router, say). Public
-/// for `cmd::run`, the one client that reads a body itself rather than
-/// through `get_json`.
+/// The `error` message out of a failed response body: an `AppError`'s
+/// `{"error": "…"}`, or the `{"error": {"message": "…"}}` of a backend it was
+/// passed through from; `None` for a body that is neither (an empty 404 from
+/// axum's router, say). Public for the clients that read a body themselves.
 pub fn api_error(body: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(body)
+    let error = serde_json::from_str::<serde_json::Value>(body)
         .ok()?
         .get("error")?
+        .clone();
+    error
         .as_str()
+        .or_else(|| error.get("message")?.as_str())
         .map(str::to_string)
         .filter(|e| !e.is_empty())
 }
@@ -1876,6 +1886,11 @@ mod tests {
         assert_eq!(api_error(""), None);
         assert_eq!(api_error("Not Found"), None);
         assert_eq!(api_error(r#"{"error":""}"#), None);
+        // A backend's own envelope, passed through.
+        assert_eq!(
+            api_error(r#"{"error":{"code":501,"message":"not a decision model"}}"#).as_deref(),
+            Some("not a decision model")
+        );
         assert_eq!(api_error(r#"{"detail":"nope"}"#), None);
     }
 

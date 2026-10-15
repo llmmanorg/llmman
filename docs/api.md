@@ -7,7 +7,7 @@ Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
 | API | Endpoints |
 |-----|-----------|
 | Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/pull`, `/api/push`, `/api/copy`, `/api/create`, `/api/blobs/{digest}`, `/api/ps`, `/api/delete`, `/api/version` |
-| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`) |
+| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`), `/v1/systemone` (llama-server's own API for decision models) |
 | Anthropic | `/v1/messages` |
 | llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/providers/{id}/key`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/shell` |
 | Web UI | `/` and `/ui/*` — see [webui.md](webui.md) |
@@ -66,8 +66,9 @@ is cut to that many values and re-normalised.
 `high`, `xhigh`, `max`), forwarded as llama-server's
 `chat_template_kwargs`. `/api/show` returns `capabilities` and, for a
 local model with one, `template`. They are `completion` (`embedding` for a
-pooling model), `vision` with a projector, `tools` when the chat template
-renders a request's `tools`, and `thinking` when it handles reasoning.
+pooling model, `decision` for a decision model), `vision` with a projector,
+`tools` when the chat template renders a request's `tools`, and `thinking`
+when it handles reasoning.
 
 `/api/create` supports `from` (alias a model) and `files` (GGUFs uploaded
 via `/api/blobs/{digest}`, as `ollama create` does). Modelfile fields such
@@ -112,6 +113,22 @@ llama-server's `timings` need no asking.
 `/v1/audio/transcriptions` is likewise a pass-through. The model needs
 audio support (an `--mmproj` projector, supplied when the model image
 carries one). Bodies up to 200 MiB are accepted.
+
+`/v1/systemone` answers typed questions about a `state` with a decision model
+(a GGUF with a `<arch>.decision.type`, such as Clef), with a probability for
+each answer; `llmman run MODEL --ask ...` is its client. It is
+`llama-server`'s [own route](https://github.com/ggml-org/llama.cpp/tree/master/tools/server#post-v1systemone-typesafe-compatible-system-one-api),
+plus what Ollama's takes: `images` as bare base64 and `keep_alive`. The reply
+names the model as the request did, and `questions` and `answers` keep the
+order written.
+
+Such a model generates no text and makes no embeddings, so chat, completion,
+responses, messages and embedding requests get a `400`, as in Ollama, without
+loading it. `/api/show` reports it as `decision`.
+
+It reads its whole prompt in one batch: `LLMMAN_CONTEXT_LENGTH` up to the
+trained context, `8192` tokens when unset. A longer text is a `400`. Bodies up
+to 32 MiB are accepted.
 
 ## Anthropic API notes
 

@@ -186,6 +186,7 @@ pub(super) fn running_model_fixture(
         context_window: None,
         keep_alive,
         in_flight,
+        decision: false,
     }
 }
 
@@ -209,6 +210,7 @@ pub(super) fn running_model_fixture_with_engine(
         context_window: None,
         keep_alive: None,
         in_flight: 0,
+        decision: false,
     }
 }
 

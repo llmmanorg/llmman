@@ -755,7 +755,7 @@ fn render(hits: &[Hit], fits: &[Option<u64>], color: bool) -> String {
             fit.map_or_else(dash, |p| paint(&format!("{p}%"), fit_color(p), color)),
         ]);
     }
-    columns(&rows)
+    columns(&rows, 4)
 }
 
 #[cfg(test)]

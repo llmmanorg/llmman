@@ -99,7 +99,7 @@ pub(super) fn secs_to_keep_alive(secs: f64) -> Option<Option<Duration>> {
 /// `ns`/`us`, no fractional-only forms beyond what `str::parse::<f64>`
 /// already accepts per component) — enough for every value Ollama's own
 /// documentation and SDKs actually produce.
-pub(super) fn parse_keep_alive_str(s: &str) -> Option<Option<Duration>> {
+pub(crate) fn parse_keep_alive_str(s: &str) -> Option<Option<Duration>> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -186,6 +186,8 @@ pub(super) struct ActivityGuard {
     /// resolve an explicit value (a request's own `keep_alive`, or the
     /// daemon default when it's absent) via `resolve_keep_alive`.
     pub(super) keep_alive: Option<Option<Duration>>,
+    /// Whether dropping counts as activity (refreshes `last_active`).
+    touch: bool,
 }
 
 impl ActivityGuard {
@@ -197,7 +199,14 @@ impl ActivityGuard {
             state: state.clone(),
             model_key: model_key.to_string(),
             keep_alive: None,
+            touch: true,
         }
+    }
+
+    /// Drops the claim without counting it as activity, for a request
+    /// refused before it did anything: it must not defer the idle unload.
+    pub(super) fn release_idle(mut self) {
+        self.touch = false;
     }
 }
 
@@ -206,6 +215,7 @@ impl Drop for ActivityGuard {
         let state = self.state.clone();
         let model_key = std::mem::take(&mut self.model_key);
         let keep_alive = self.keep_alive;
+        let touch = self.touch;
         // Drop can't be async; the update is best-effort and doesn't need
         // to happen before this function returns. tokio::spawn panics
         // outside a running Tokio runtime (e.g. this guard outliving the
@@ -218,8 +228,10 @@ impl Drop for ActivityGuard {
             let mut mgr = state.0.manager.lock().await;
             if let Some(m) = mgr.running.get_mut(&model_key) {
                 m.in_flight = m.in_flight.saturating_sub(1);
-                m.last_active = Instant::now();
-                m.last_active_wall = chrono::Utc::now();
+                if touch {
+                    m.last_active = Instant::now();
+                    m.last_active_wall = chrono::Utc::now();
+                }
                 if let Some(kx) = keep_alive {
                     m.keep_alive = kx;
                 }

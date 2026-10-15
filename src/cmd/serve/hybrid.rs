@@ -16,8 +16,8 @@ use futures::StreamExt;
 
 use super::sched::ActivityGuard;
 use super::{
-    context_overflow_message, ensure_model, running_key, AppError, AppState, ContextOverflow,
-    Target,
+    context_overflow_message, ensure_model_for, running_key, AppError, AppState, ContextOverflow,
+    Target, Task,
 };
 
 /// Picks which half of a hybrid pair serves this request and returns
@@ -160,8 +160,9 @@ where
     F: Fn(String, Target, ActivityGuard) -> Fut,
     Fut: std::future::Future<Output = Result<Response, AppError>>,
 {
-    let resolve =
-        |m: String| async move { ensure_model(state, &m, headers, request_threads).await };
+    let resolve = |m: String| async move {
+        ensure_model_for(state, &m, headers, request_threads, Task::Generate).await
+    };
     with_hybrid_fallback(model_ref, headers, resolve, send).await
 }
 
