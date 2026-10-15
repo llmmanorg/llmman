@@ -164,8 +164,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         overflow.is_none() || args.model.as_deref().is_some_and(|m| !m.trim().is_empty()),
         "--overflow-model needs --model naming the local model to pair it with"
     );
-    // Before the Cline install check, which an image-based sandbox makes
-    // moot (see `find_on_path`), and before the daemon starts.
+    // Before the daemon starts.
     if let Some(kind) = args.sandbox {
         let id = name.to_lowercase();
         let carries_key =
@@ -180,11 +179,6 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             configured_by_file,
             carries_key,
         )?;
-    }
-    // Cline follows the install-on-demand behavior expected by its launch
-    // integration. Do this before starting the daemon or pulling a model.
-    if name.eq_ignore_ascii_case("cline") {
-        cline::ensure_cline_installed()?;
     }
     // Rejects the arguments after `--` that docker-agent cannot be
     // launched with. Here rather than in the launcher so the refusal
@@ -868,10 +862,7 @@ fn integration(name: &str) -> Option<&'static Integration> {
 fn print_integrations() {
     println!("Available integrations:\n");
     for i in INTEGRATIONS {
-        // dsh resolves to npx when it isn't installed (see `dsh::find_dsh`),
-        // and that launch downloads the package before running it.
         let how = match find_integration_binary(i) {
-            Some(bin) if bin.file_stem().is_some_and(|s| s == "npx") => " (via npx)",
             Some(_) => "",
             None => " (not installed)",
         };
@@ -973,17 +964,17 @@ fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
 
 /// Fails, before anything is started or pulled, when `name`'s program is
 /// not there to run, looked up as its launcher will look for it (so an
-/// image-based `--sandbox`, prepared just before, counts as there). Cline
-/// installs itself on demand, and an unknown name is left to the
-/// launcher's own error.
+/// image-based `--sandbox`, prepared just before, counts as there). An
+/// unknown name is left to the launcher's own error.
 fn check_installed(name: &str) -> anyhow::Result<()> {
     let Some(i) = integration(name) else {
         return Ok(());
     };
-    if i.name == "cline" || find_integration_binary(i).is_some() {
+    if find_integration_binary(i).is_some() {
         return Ok(());
     }
     match i.name {
+        "cline" => anyhow::bail!("{}", cline::CLINE_MISSING),
         "dsh" => anyhow::bail!("{}", dsh::DSH_MISSING),
         "docker-agent" => Err(docker_agent::docker_agent_missing()),
         "goose-desktop" => Err(goose_desktop::goose_desktop_missing()),
@@ -991,8 +982,7 @@ fn check_installed(name: &str) -> anyhow::Result<()> {
     }
 }
 
-/// A yes to an interactive `[y/N]`. Shared by the Cline install
-/// prompt and goose-desktop's offer to quit.
+/// A yes to an interactive `[y/N]`, as goose-desktop's offer to quit reads it.
 fn accepts_prompt(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
@@ -1504,11 +1494,10 @@ fn server() -> String {
 mod tests {
     use super::*;
 
-    /// Cline installs itself, and a name launch does not know is left to
-    /// its own error, so neither is refused here whatever is on PATH.
+    /// A name launch does not know is left to its own error, so it is not
+    /// refused here whatever is on PATH.
     #[test]
-    fn check_installed_leaves_cline_and_unknown_names_alone() {
-        assert!(check_installed("cline").is_ok());
+    fn check_installed_leaves_unknown_names_alone() {
         assert!(check_installed("not-an-integration").is_ok());
     }
 
@@ -2250,5 +2239,68 @@ mod tests {
         for i in INTEGRATIONS {
             assert_eq!(canonical_integration(i.name), Some(i.name));
         }
+    }
+
+    /// Every npm integration CLI is pinned in `.mise.toml` at an explicit
+    /// version, so an upstream release cannot reach the e2e suite
+    /// unannounced. CI installs them all via `jdx/mise-action`.
+    #[test]
+    fn mise_toml_pins_every_npm_integration_at_an_explicit_version() {
+        const REQUIRED: &[&str] = &[
+            "cline",
+            "@deepseek-ai/dsh",
+            "@anthropic-ai/claude-code",
+            "opencode-ai",
+            "@openai/codex",
+            "@github/copilot",
+            "droid",
+            "@earendil-works/pi-coding-agent",
+            "@qwen-code/qwen-code",
+            "openclaw",
+        ];
+
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/.mise.toml")).unwrap();
+        let doc: toml::Value = text.parse().expect("mise.toml is not valid TOML");
+        let tools = doc
+            .get("tools")
+            .and_then(toml::Value::as_table)
+            .expect("mise.toml has no [tools] table");
+
+        let mut found: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (key, value) in tools {
+            let Some(pkg) = key.strip_prefix("npm:") else {
+                continue;
+            };
+            let version = match value {
+                toml::Value::String(v) => v.clone(),
+                toml::Value::Table(t) => t
+                    .get("version")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or_else(|| panic!("npm:{pkg} has no version field in .mise.toml"))
+                    .to_string(),
+                other => panic!("npm:{pkg} has unexpected value type in .mise.toml: {other:?}"),
+            };
+            assert!(
+                !version.is_empty() && version != "latest",
+                "npm:{pkg} = {version:?}"
+            );
+            assert!(
+                version.starts_with(|c: char| c.is_ascii_digit()),
+                "npm:{pkg} version {version:?} does not start with a digit"
+            );
+            if let Some(r) = REQUIRED.iter().copied().find(|&r| r == pkg) {
+                found.insert(r);
+            }
+        }
+        let missing: Vec<&str> = REQUIRED
+            .iter()
+            .copied()
+            .filter(|r| !found.contains(r))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "missing npm pins in .mise.toml: {missing:?}"
+        );
     }
 }

@@ -291,9 +291,7 @@ Qwen Code, Gemini CLI, Grok Build, AGY, DeepSeek Harness, Docker Agent,
 goose, goose Desktop, ...) and whether
 each is installed. Installing an
 integration is up to you; llmman only execs what is already on your
-machine, except that a missing Cline can be installed with npm after an
-interactive confirmation. `dsh` runs under `npx` when it isn't installed
-globally. Any extra arguments after `--` are forwarded to the integration's
+machine. Any extra arguments after `--` are forwarded to the integration's
 own CLI. Short names work wherever a model reference is accepted.
 
 To stop retyping flags, set them once, e.g. `llmman config set
