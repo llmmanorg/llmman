@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `copilot`, `cline`,
+//! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `copilot`, `droid`, `cline`,
 //! `grok`, `qwen`, `hermes`,
 //! `openclaw`, `dsh`, `goose`) — not mocks. The one exception is
 //! [`launch_goose_desktop_env`]: Goose Desktop is a GUI with no headless
@@ -1273,6 +1273,49 @@ fn launch_copilot_with_model() {
     // reply on stdout, and the strict assertion prevents Copilot's unusual
     // zero-exit "Failed to get response" path from passing this test.
     launch_and_assert_strict("copilot", &["--silent", "-p", PROMPT]);
+}
+
+#[test]
+fn launch_droid_with_model() {
+    eprintln!("[test] launch_droid_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_droid_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("droid") {
+        eprintln!(
+            "skipping: droid not on PATH — https://docs.factory.ai/cli/getting-started/quickstart"
+        );
+        return;
+    }
+
+    // `exec` is Droid's non-interactive mode. The fresh HOME verifies that
+    // launch creates a usable custom-model entry without prior setup/login.
+    launch_and_assert_strict_inspecting(
+        "droid",
+        &["exec", "--output-format", "text", PROMPT],
+        |_stdout, _stderr| false,
+        reply_contains_pong,
+        |home| {
+            let path = home.join(".factory/settings.json");
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let settings: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+            let model = llmman::shortnames::resolve_ollama_api(MODEL).expect("MODEL resolves");
+            let entry = settings["customModels"]
+                .as_array()
+                .and_then(|models| models.iter().find(|entry| entry["model"] == model))
+                .unwrap_or_else(|| panic!("Droid model missing from {}: {text}", path.display()));
+            assert_eq!(entry["baseUrl"], format!("{}/v1", llmman::daemon::server()));
+            assert_eq!(entry["apiKey"], "${LLMMAN_API_KEY}");
+            assert_eq!(entry["provider"], "generic-chat-completion-api");
+            assert_eq!(entry["id"], format!("custom:{model}-[llmman]-0"));
+            assert_eq!(entry["index"], 0);
+        },
+    );
 }
 
 /// `launch codex --sandbox docker|podman`: codex from Docker Sandboxes'

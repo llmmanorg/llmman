@@ -4,6 +4,32 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+/// Launchers that hand the daemon's real client key to another process must
+/// not send it to a remote cleartext endpoint. Call this before anything
+/// probes or starts the daemon; loopback HTTP and remote HTTPS remain valid.
+pub(super) fn check_daemon_key_transport(integration: &str) -> anyhow::Result<()> {
+    check_daemon_key_transport_to(
+        integration,
+        crate::auth::client_key().is_some(),
+        crate::daemon::connects_securely(),
+        &crate::daemon::server(),
+    )
+}
+
+fn check_daemon_key_transport_to(
+    integration: &str,
+    has_client_key: bool,
+    connects_securely: bool,
+    server: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !has_client_key || connects_securely,
+        "{integration} needs a local llmman serve, or one over TLS: LLMMAN_HOST points at \
+         {server}, and the daemon API key would cross the network in cleartext."
+    );
+    Ok(())
+}
+
 pub(super) fn write_yaml_merged(
     path: &Path,
     label: &str,
@@ -308,6 +334,20 @@ pub(super) fn provider_models_merged(
 mod tests {
     use super::super::{pair_context_window, served_context_window};
     use super::*;
+
+    #[test]
+    fn a_real_daemon_key_never_crosses_remote_cleartext() {
+        let remote_http = "http://192.0.2.1:17434";
+        let error = check_daemon_key_transport_to("agent", true, false, remote_http)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("agent"));
+        assert!(error.contains(remote_http));
+        assert!(error.contains("cleartext"));
+
+        assert!(check_daemon_key_transport_to("agent", false, false, remote_http).is_ok());
+        assert!(check_daemon_key_transport_to("agent", true, true, remote_http).is_ok());
+    }
 
     /// Regression test for a real CodeRabbit finding: an unquoted model
     /// value in generated YAML could be misparsed as a non-string

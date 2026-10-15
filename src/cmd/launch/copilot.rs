@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{exec_with_env_removing, find_on_path, has_forwarded_model_flag, server};
+use super::{common, exec_with_env_removing, find_on_path, has_forwarded_model_flag, server};
 
 const COPILOT_ENV_TO_CLEAR: &[&str] = &[
     "COPILOT_PROVIDER_API_KEY_COMMAND",
@@ -13,24 +13,7 @@ const COPILOT_ENV_TO_CLEAR: &[&str] = &[
 /// Reject remote cleartext before `run` probes or starts the daemon; loopback
 /// HTTP and remote HTTPS remain valid.
 pub(super) fn check_daemon_key_transport() -> anyhow::Result<()> {
-    check_daemon_key_transport_to(
-        crate::auth::client_key().is_some(),
-        crate::daemon::connects_securely(),
-        &crate::daemon::server(),
-    )
-}
-
-fn check_daemon_key_transport_to(
-    has_client_key: bool,
-    connects_securely: bool,
-    server: &str,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !has_client_key || connects_securely,
-        "copilot needs a local llmman serve, or one over TLS: LLMMAN_HOST points at {server}, \
-         and the daemon API key would cross the network in cleartext."
-    );
-    Ok(())
+    common::check_daemon_key_transport("copilot")
 }
 
 /// GitHub Copilot CLI's OpenAI-compatible BYOK mode, pointed at llmman.
@@ -130,19 +113,6 @@ mod tests {
                 "COPILOT_PROVIDER_BEARER_TOKEN"
             ]
         );
-    }
-
-    #[test]
-    fn a_real_daemon_key_never_crosses_remote_cleartext() {
-        let remote_http = "http://192.0.2.1:17434";
-        let error = check_daemon_key_transport_to(true, false, remote_http)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains(remote_http));
-        assert!(error.contains("cleartext"));
-
-        assert!(check_daemon_key_transport_to(false, false, remote_http).is_ok());
-        assert!(check_daemon_key_transport_to(true, true, remote_http).is_ok());
     }
 
     #[test]

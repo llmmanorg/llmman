@@ -34,6 +34,7 @@ mod codex;
 mod common;
 mod copilot;
 mod docker_agent;
+mod droid;
 mod dsh;
 mod gemini;
 mod goose;
@@ -155,6 +156,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     check_model_flag(name, args.model.as_deref(), provider, &args.extra_args)?;
     if name.eq_ignore_ascii_case("copilot") || name.eq_ignore_ascii_case("copilot-cli") {
         copilot::check_daemon_key_transport()?;
+    }
+    if name.eq_ignore_ascii_case("droid") {
+        droid::check_daemon_key_transport()?;
     }
     anyhow::ensure!(
         overflow.is_none() || args.model.as_deref().is_some_and(|m| !m.trim().is_empty()),
@@ -383,6 +387,7 @@ fn integration_key() -> String {
 /// OMP needs a model so the launcher can select the matching entry its
 /// Ollama discovery reads from llmman's `/api/tags`.
 /// Copilot's BYOK mode also requires an explicit model.
+/// Droid needs one to create and select its custom-model entry.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
 const MODEL_REQUIRED: &[&str] = &[
     "qwen",
@@ -396,6 +401,7 @@ const MODEL_REQUIRED: &[&str] = &[
     "omp",
     "copilot",
     "copilot-cli",
+    "droid",
     "docker-agent",
 ];
 
@@ -409,6 +415,7 @@ const MODEL_REQUIRED: &[&str] = &[
 /// OMP's argument builder drops the generated Ollama model when the caller
 /// supplies one.
 /// Copilot's argument builder likewise yields to its own `--model`.
+/// Droid's argument builder does the same for its custom model id.
 /// claude: `claude::claude_args` likewise drops the generated `--model`.
 /// Not docker-agent: its `--model` replaces the whole model entry
 /// `docker_agent::docker_agent_document` wrote, `base_url` included, so
@@ -432,6 +439,7 @@ const MODEL_FLAG_FORWARDED: &[&str] = &[
     "omp",
     "copilot",
     "copilot-cli",
+    "droid",
 ];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
@@ -779,6 +787,11 @@ const INTEGRATIONS: &[Integration] = &[
         binary: "copilot",
     },
     Integration {
+        name: "droid",
+        description: "Factory Droid CLI",
+        binary: "droid",
+    },
+    Integration {
         name: "kimi",
         description: "Kimi Code CLI",
         binary: "kimi",
@@ -944,6 +957,7 @@ fn test_temp_dir(tag: &str) -> PathBuf {
 fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
         "copilot" => copilot::find_copilot(),
+        "droid" => droid::find_droid(),
         "opencode" => opencode::find_opencode(),
         "omp" => omp::find_omp(),
         "qwen" => qwen::find_qwen(),
@@ -990,6 +1004,10 @@ fn accepts_prompt(answer: &str) -> bool {
 const VARIANT_UNSUPPORTED: &[(&str, &str)] = &[
     ("kimi", "it picks its own model"),
     ("openclaw", "it only takes settings at onboarding"),
+    (
+        "droid",
+        "Droid does not support reasoning effort for custom models",
+    ),
     ("gemini", "llmman's Gemini API ignores thinkingConfig"),
     ("agy", "llmman's Gemini API ignores thinkingConfig"),
     ("goose", "it sends effort only for OpenAI's models"),
@@ -1162,6 +1180,7 @@ fn launch(
         "cline" => cline::launch_cline(model, extra_args),
         "aider" => aider::launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => copilot::launch_copilot(model, api_key, extra_args),
+        "droid" => droid::launch_droid(model, api_key, vision, max_output, extra_args),
         "kimi" => launch_simple("kimi", model, extra_args),
         "gemini" => gemini::launch_gemini(model, api_key, extra_args),
         "agy" => agy::launch_agy(model, api_key, extra_args),
@@ -1205,6 +1224,7 @@ const CONFIGURED_BY_FILE: &[&str] = &[
     "codex",
     "docker-agent",
     "dsh",
+    "droid",
     "grok",
     "hermes",
     "omp",
@@ -1243,6 +1263,7 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
             Dir(env_dir("COPILOT_HOME").unwrap_or_else(|| home.join(".copilot"))),
             Dir(env_dir("GH_CONFIG_DIR").unwrap_or_else(|| config.join("gh"))),
         ],
+        "droid" => vec![Dir(droid::droid_home()?)],
         "kimi" => vec![Dir(home.join(".kimi"))],
         "gemini" => vec![Dir(home.join(".gemini"))],
         "agy" => vec![Dir(agy::agy_settings_dir()?)],
@@ -1506,6 +1527,17 @@ mod tests {
             assert!(!PROVIDER_UNSUPPORTED.iter().any(|(name, _)| *name == id));
             assert_eq!(effort_args(id, "high"), ["--reasoning-effort", "high"]);
         }
+    }
+
+    #[test]
+    fn droid_is_a_file_configured_model_required_integration() {
+        let droid = INTEGRATIONS.iter().find(|i| i.name == "droid").unwrap();
+        assert_eq!(droid.binary, "droid");
+        assert!(MODEL_REQUIRED.contains(&"droid"));
+        assert!(MODEL_FLAG_FORWARDED.contains(&"droid"));
+        assert!(CONFIGURED_BY_FILE.contains(&"droid"));
+        assert!(check_provider_supported("droid").is_ok());
+        assert!(VARIANT_UNSUPPORTED.iter().any(|(name, _)| *name == "droid"));
     }
 
     /// Every integration `--provider` refuses must be one `launch`

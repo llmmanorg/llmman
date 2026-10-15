@@ -278,6 +278,7 @@ integration:
 ```
 llmman launch claude --model qwen3.8
 llmman launch copilot --model qwen3.8 -- -p "Explain this repository"
+llmman launch droid --model qwen3.8 -- exec "Explain this repository"
 llmman launch omp --model qwen3.8 -- -p "Explain this repository"
 llmman launch agy --model qwen3.8 -- -p "Explain this repository"
 llmman launch cline --model qwen3.8 -- --json "Explain this repository"
@@ -285,7 +286,7 @@ llmman launch grok --model qwen3.8 -- -p "Explain this repository"
 ```
 
 Run `llmman launch` with no arguments to list the supported integrations
-(Claude Code, OpenCode, Codex, GitHub Copilot CLI, Pi, OMP, Cline, Aider,
+(Claude Code, OpenCode, Codex, GitHub Copilot CLI, Factory Droid, Pi, OMP, Cline, Aider,
 Qwen Code, Gemini CLI, Grok Build, AGY, DeepSeek Harness, Docker Agent,
 goose, goose Desktop, ...) and whether
 each is installed. Installing an
