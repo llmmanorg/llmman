@@ -15,11 +15,13 @@ keywords = ["llm", "oci", "inference", "gguf", "ai"]
 categories = ["command-line-utilities", "science"]
 
 # Not shipped in the .crate. build.rs needs go-shim/ (the CGO archive) and
-# webui/ (embedded via include_bytes!); the rest is dev/CI-only. An
+# webui/ (embedded via include_bytes!); the rest is dev/CI-only, app/
+# included (webui/ is its committed export). An
 # `exclude`, not an `include`, so a new build.rs input is never dropped
 # silently. (fuzz/ is its own crate; Cargo already leaves it out.)
 exclude = [
 	"vllm-plugin/",
+	"app/",
 	"packaging/",
 	"docs/",
 	".github/",

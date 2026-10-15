@@ -1,0 +1,4 @@
+data: {"type":"image_generation.progress","step":1,"total":20}
+
+data: {"type":"error","error":{"message":"the requested size exceeds the model's pixel budget"}}
+

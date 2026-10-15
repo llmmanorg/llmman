@@ -1,0 +1,1 @@
+{"error":"pull failed: HF model info: GET https://huggingface.co/api/models/nope/nope: HTTP 401"}

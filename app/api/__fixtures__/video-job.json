@@ -1,0 +1,1 @@
+{"id": "video_1760500000_0a1b2c3d_0", "object": "video", "model": "ltx-video", "status": "completed", "progress": 100, "created_at": 1760500000, "completed_at": 1760500004, "size": "768x512", "seconds": "4", "fps": 24.0, "n_frames": 97, "has_audio": false, "revised_prompt": "", "content_url": "/v1/videos/video_1760500000_0a1b2c3d_0/content"}

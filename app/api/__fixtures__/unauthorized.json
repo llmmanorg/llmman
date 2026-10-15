@@ -1,0 +1,1 @@
+{"error":"this llmman serve requires an API key: send it as `Authorization: Bearer <key>` or `x-api-key: <key>` or `x-goog-api-key: <key>` (for the CLI, set LLMMAN_API_KEY)"}

@@ -1,0 +1,8 @@
+ios/
+android/
+.expo/
+coverage/
+package-lock.json
+api/__fixtures__/
+dist/
+components/terminal/xtermBundle.generated.ts

@@ -611,7 +611,7 @@ jobs:
                       src/main.rs src/lib.rs src/webui/mod.rs src/webui/content_type.rs src/ffi.rs; do
             grep -qx "$must" "$files" || { echo "::error::$must is missing from the .crate"; exit 1; }
           done
-          for never in '^packaging/' '^vllm-plugin/' '^docs/' '^\.github/' '^fuzz/' '^go-shim/go-shim$'; do
+          for never in '^packaging/' '^vllm-plugin/' '^app/' '^docs/' '^\.github/' '^fuzz/' '^go-shim/go-shim$'; do
             if grep -q "$never" "$files"; then
               echo "::error::.crate contains files matching $never:"; grep "$never" "$files"; exit 1
             fi

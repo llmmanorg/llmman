@@ -1,0 +1,3 @@
+{"status":"pulling manifest"}
+{"status":"pulling"}
+{"error":"HF model info: GET https://huggingface.co/api/models/nonexistent-xyz/none: HTTP 401"}
