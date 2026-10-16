@@ -30,6 +30,8 @@ import (
 	dockercliconfig "github.com/docker/cli/cli/config"
 	"github.com/docker/cli/cli/config/credentials"
 	clitypes "github.com/docker/cli/cli/config/types"
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
@@ -75,6 +77,23 @@ func dockerCredentials(host string) (string, string, error) {
 		return creds.Username, creds.Password, nil
 	}
 	return "", "", nil // not an error — just not found under any key
+}
+
+// registryAuthenticator gives the shared referrers client the same Docker
+// credential lookup (including Docker Hub aliases and helper timeouts) as the
+// containerd resolver used for ordinary pulls and pushes.
+func registryAuthenticator(_ context.Context, repo name.Repository) (authn.Authenticator, error) {
+	username, secret, err := dockerCredentials(repo.RegistryStr())
+	if err != nil {
+		return nil, err
+	}
+	if username == "" && secret == "" {
+		return authn.Anonymous, nil
+	}
+	if username == "" {
+		return authn.FromConfig(authn.AuthConfig{IdentityToken: secret}), nil
+	}
+	return authn.FromConfig(authn.AuthConfig{Username: username, Password: secret}), nil
 }
 
 // getCredentialsWithTimeout runs store.Get(lookup) with a hard deadline,
