@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -28,6 +29,10 @@ import (
 )
 
 const maxReferrersIndexBytes = 4 << 20
+
+// OCI does not require registries to support conditional tag updates, so the
+// fallback index's read-append-PUT sequence must be serialized in-process.
+var fallbackPublishMu sync.Mutex
 
 // llmman_push_artifact sets subject on the local manifest and pushes it. A
 // registry with the OCI 1.1 referrers API indexes the manifest itself; for an
@@ -177,6 +182,10 @@ func registryURL(repo name.Repository, elems ...string) string {
 }
 
 func getReferrersIndex(ctx context.Context, client *http.Client, endpoint string) (*ocispec.Index, bool, error) {
+	origin, err := url.Parse(endpoint)
+	if err != nil || origin.Scheme == "" || origin.Host == "" {
+		return nil, false, fmt.Errorf("invalid referrers endpoint %q", endpoint)
+	}
 	var combined *ocispec.Index
 	seen := map[string]bool{}
 	for endpoint != "" {
@@ -225,10 +234,19 @@ func getReferrersIndex(ctx context.Context, client *http.Client, endpoint string
 		} else {
 			combined.Manifests = append(combined.Manifests, page.Manifests...)
 		}
-		endpoint, err = nextLink(endpoint, resp.Header.Values("Link"))
+		next, err := nextLink(endpoint, resp.Header.Values("Link"))
 		if err != nil {
 			return nil, false, err
 		}
+		if next != "" {
+			nextURL, parseErr := url.Parse(next)
+			if parseErr != nil || nextURL.User != nil ||
+				!strings.EqualFold(nextURL.Scheme, origin.Scheme) ||
+				!strings.EqualFold(nextURL.Host, origin.Host) {
+				return nil, false, fmt.Errorf("referrers next link %q leaves registry origin", next)
+			}
+		}
+		endpoint = next
 	}
 	return combined, true, nil
 }
@@ -345,6 +363,9 @@ func fetchReferrersIndex(ctx context.Context, ref string, subject digest.Digest)
 }
 
 func publishFallbackReferrer(ctx context.Context, ref string, subject digest.Digest, artifact ocispec.Descriptor) error {
+	fallbackPublishMu.Lock()
+	defer fallbackPublishMu.Unlock()
+
 	index, native, err := fetchReferrersIndex(ctx, ref, subject)
 	if err != nil || native {
 		return err

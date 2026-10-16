@@ -5,7 +5,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/registry"
 	digest "github.com/opencontainers/go-digest"
@@ -31,6 +35,15 @@ func subjectDescriptor(t *testing.T, ref string, dgst digest.Digest) ocispec.Des
 }
 
 func pushTestArtifact(t *testing.T, ref, payload string, subject ocispec.Descriptor) ocispec.Descriptor {
+	t.Helper()
+	desc := pushTestArtifactManifest(t, ref, payload, subject)
+	if err := publishFallbackReferrer(context.Background(), ref, subject.Digest, desc); err != nil {
+		t.Fatalf("publish fallback referrer: %v", err)
+	}
+	return desc
+}
+
+func pushTestArtifactManifest(t *testing.T, ref, payload string, subject ocispec.Descriptor) ocispec.Descriptor {
 	t.Helper()
 	dir := t.TempDir()
 	if err := ensureLayout(dir); err != nil {
@@ -73,9 +86,6 @@ func pushTestArtifact(t *testing.T, ref, payload string, subject ocispec.Descrip
 	}
 	if _, err := pushToRegistry(context.Background(), dir, ref); err != nil {
 		t.Fatalf("push artifact: %v", err)
-	}
-	if err := publishFallbackReferrer(context.Background(), ref, subject.Digest, desc); err != nil {
-		t.Fatalf("publish fallback referrer: %v", err)
 	}
 	return desc
 }
@@ -147,5 +157,53 @@ func TestPushArtifactAndListFallbackReferrers(t *testing.T) {
 	}
 	if !got[first.Digest] || !got[second.Digest] {
 		t.Fatalf("fallback referrers = %+v, want %s and %s", refs, first.Digest, second.Digest)
+	}
+}
+
+func TestConcurrentFallbackPublicationsKeepBothReferrers(t *testing.T) {
+	var mu sync.Mutex
+	reads := 0
+	bothReading := make(chan struct{})
+	host := startRegistryWithOptions(t, func(_ http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodGet || !strings.Contains(r.URL.Path, "/manifests/sha256-") {
+			return false
+		}
+		mu.Lock()
+		reads++
+		if reads == 2 {
+			close(bothReading)
+		}
+		mu.Unlock()
+		select {
+		case <-bothReading:
+		case <-time.After(100 * time.Millisecond):
+		}
+		return false
+	}, registry.WithReferrersSupport(false))
+
+	subjectRef := host + "/org/model:v1"
+	subjectDigest := publishModel(t, subjectRef)
+	subject := subjectDescriptor(t, subjectRef, subjectDigest)
+	first := pushTestArtifactManifest(t, host+"/org/model:sbom-a", `{"name":"a"}`, subject)
+	second := pushTestArtifactManifest(t, host+"/org/model:sbom-b", `{"name":"b"}`, subject)
+
+	errs := make(chan error, 2)
+	for _, artifact := range []ocispec.Descriptor{first, second} {
+		go func(artifact ocispec.Descriptor) {
+			errs <- publishFallbackReferrer(context.Background(), subjectRef, subjectDigest, artifact)
+		}(artifact)
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("publish fallback referrer: %v", err)
+		}
+	}
+
+	refs, native, err := fetchReferrers(context.Background(), subjectRef, subjectDigest)
+	if err != nil {
+		t.Fatalf("list fallback referrers: %v", err)
+	}
+	if native || len(refs) != 2 {
+		t.Fatalf("fallback referrers = %+v, native = %v; want two fallback entries", refs, native)
 	}
 }
