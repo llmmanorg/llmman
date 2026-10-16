@@ -49,6 +49,10 @@ func pushTestArtifact(t *testing.T, ref, payload string, subject ocispec.Descrip
 		ArtifactType: "application/vnd.example.sbom.v1",
 		Config:       config,
 		Layers:       []ocispec.Descriptor{layer},
+		Annotations: map[string]string{
+			ocispec.AnnotationCreated: "2026-10-16T00:00:00Z",
+			"example.com/vendor":      payload,
+		},
 	}
 	manifest.SchemaVersion = 2
 	raw, err := json.Marshal(manifest)
@@ -136,6 +140,9 @@ func TestPushArtifactAndListFallbackReferrers(t *testing.T) {
 		got[ref.Digest] = true
 		if ref.ArtifactType != "application/vnd.example.sbom.v1" {
 			t.Errorf("artifact type = %q", ref.ArtifactType)
+		}
+		if ref.Annotations[ocispec.AnnotationCreated] != "2026-10-16T00:00:00Z" || ref.Annotations["example.com/vendor"] == "" {
+			t.Errorf("artifact annotations = %+v", ref.Annotations)
 		}
 	}
 	if !got[first.Digest] || !got[second.Digest] {
