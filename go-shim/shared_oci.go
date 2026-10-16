@@ -260,9 +260,13 @@ func isHTTP4xx(err error) bool {
 		return false
 	}
 	s := err.Error()
-	for _, code := range []string{"HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404"} {
-		if strings.Contains(s, code) {
-			return true
+	for _, code := range []string{"400", "401", "403", "404", "415"} {
+		// containerd and go.podman.io/image spell registry status errors
+		// differently; both forms represent a permanent request rejection.
+		for _, prefix := range []string{"HTTP ", "StatusCode: "} {
+			if strings.Contains(s, prefix+code) {
+				return true
+			}
 		}
 	}
 	return false
