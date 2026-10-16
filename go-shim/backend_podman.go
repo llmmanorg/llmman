@@ -158,6 +158,13 @@ func llmman_push(cLayoutDir, cRef *C.char) *C.char {
 // source straight at layoutDir/blobs, so every blob (manifest included)
 // is read from the real store directly.
 func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, err error) {
+	return pushToRegistryWithDestinationContext(ctx, layoutDir, ref, nil)
+}
+
+// pushToRegistryWithDestinationContext is pushToRegistry with an injectable
+// destination context for protocol tests. Production passes nil so podman's
+// normal registry configuration and credential lookup remain authoritative.
+func pushToRegistryWithDestinationContext(ctx context.Context, layoutDir, ref string, destinationCtx *types.SystemContext) (changed bool, err error) {
 	manifestDesc, err := findManifestForPush(layoutDir, ref)
 	if err != nil {
 		return false, err
@@ -194,7 +201,9 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 
 	progressSetStatus(ref, "pushing")
 	if _, err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pushing", "Pushed", &copy.Options{
-		SourceCtx: sharedBlobDirOpts(layoutDir),
+		SourceCtx:       sharedBlobDirOpts(layoutDir),
+		DestinationCtx:  destinationCtx,
+		PreserveDigests: true,
 	}, &changed, ref); err != nil {
 		return false, fmt.Errorf("copy image: %w", err)
 	}
