@@ -6,6 +6,12 @@ fetched from the network — and talks to the daemon over the same HTTP API
 every other client uses, so anything it shows is something `llmman`'s
 CLI or an Ollama/OpenAI client could ask for too.
 
+A browser asking for any other path outside the daemon's APIs gets the
+same page, so a UI route can be reloaded or linked to. The API prefixes
+(`/api`, `/v1`, `/llmman`, `/ui`, `/gemini`, `/audio`, `/props`,
+`/metrics`) never get it: an unknown path there is a `404`, as it is for
+any client that does not ask for HTML.
+
 The page has two modes, toggled at the top, and a Models page in the
 sidebar:
 

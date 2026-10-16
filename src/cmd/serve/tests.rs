@@ -4826,6 +4826,20 @@ async fn a_keyed_daemon_refuses_everything_but_its_own_page_without_the_key() {
         let r = client.get(format!("{url}{path}")).send().await.unwrap();
         assert_eq!(r.status(), StatusCode::OK, "{path}");
     }
+    // So do its other routes; an API path does not, HTML or not.
+    for (path, expected) in [
+        ("/models", StatusCode::OK),
+        ("/api/version", StatusCode::UNAUTHORIZED),
+        ("/api/nope", StatusCode::UNAUTHORIZED),
+    ] {
+        let r = client
+            .get(format!("{url}{path}"))
+            .header("accept", "text/html")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), expected, "{path}");
+    }
 }
 
 /// A browser's preflight carries no credential; refusing it would make

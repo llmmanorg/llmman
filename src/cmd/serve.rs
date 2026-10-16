@@ -3814,6 +3814,7 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         // Web UI — see the `webui` module
         .route("/", get(webui::handle_root))
         .route("/ui/*path", get(webui::handle_asset))
+        .fallback(webui::handle_page)
         // llama.cpp-compatible props endpoint (router mode)
         .route("/props", get(handle_props))
         // llmman's own API — see handle_llmman_providers

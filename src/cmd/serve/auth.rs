@@ -12,7 +12,7 @@
 //! key is removed before the handler runs, so it is never relayed to a
 //! provider as the caller's own (see `client_api_key`).
 
-use axum::extract::{Request, State};
+use axum::extract::{MatchedPath, Request, State};
 use axum::http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
@@ -123,8 +123,9 @@ pub(super) fn offered_ws_protocol(headers: &HeaderMap) -> Option<String> {
 /// Admits a request presenting a configured key, stripping every header
 /// that held one; refuses the rest with a 401 when keys are required.
 ///
-/// `GET /` and `/ui/*` are exempt: the web UI's own files carry nothing,
-/// and the page has to load before it can ask for a key.
+/// `GET /`, `/ui/*` and the UI's pages (`webui::is_page`) are exempt: the
+/// web UI's own files carry nothing, and the page has to load before it
+/// can ask for a key.
 pub(super) async fn require_key(
     State(state): State<AppState>,
     mut req: Request,
@@ -167,7 +168,10 @@ pub(super) async fn require_key(
 
 fn is_ui_asset(req: &Request) -> bool {
     let path = req.uri().path();
-    req.method() == axum::http::Method::GET && (path == "/" || path.starts_with("/ui/"))
+    (req.method() == axum::http::Method::GET && (path == "/" || path.starts_with("/ui/")))
+        // Unrouted only: a route outside every API prefix is still the API.
+        || (req.extensions().get::<MatchedPath>().is_none()
+            && super::webui::is_page(req.method(), path, req.headers()))
 }
 
 /// The 401, in the daemon's usual `{"error": ...}` shape.
