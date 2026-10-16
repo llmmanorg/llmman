@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	digest "github.com/opencontainers/go-digest"
@@ -60,6 +61,33 @@ func TestGetReferrersIndexFollowsNextLink(t *testing.T) {
 	}
 	if len(index.Manifests) != 2 || index.Manifests[0].Digest != first.Digest || index.Manifests[1].Digest != second.Digest {
 		t.Fatalf("manifests = %+v, want %s and %s", index.Manifests, first.Digest, second.Digest)
+	}
+}
+
+func TestGetReferrersIndexRejectsCrossOriginNextLink(t *testing.T) {
+	var crossOriginRequests atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		crossOriginRequests.Add(1)
+	}))
+	defer other.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		page := ocispec.Index{}
+		page.SchemaVersion = 2
+		page.MediaType = ocispec.MediaTypeImageIndex
+		w.Header().Set("Link", fmt.Sprintf("<%s/next>; rel=\"next\"", other.URL))
+		if err := json.NewEncoder(w).Encode(page); err != nil {
+			t.Errorf("encode page: %v", err)
+		}
+	}))
+	defer origin.Close()
+
+	_, _, err := getReferrersIndex(context.Background(), origin.Client(), origin.URL+"/referrers")
+	if err == nil || !strings.Contains(err.Error(), "leaves registry origin") {
+		t.Fatalf("getReferrersIndex error = %v, want cross-origin rejection", err)
+	}
+	if got := crossOriginRequests.Load(); got != 0 {
+		t.Fatalf("cross-origin server received %d requests, want zero", got)
 	}
 }
 
