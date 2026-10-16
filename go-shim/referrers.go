@@ -136,7 +136,7 @@ func setManifestSubject(layoutDir, ref string, subject ocispec.Descriptor) (ocis
 	if err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("write artifact manifest: %w", err)
 	}
-	updated.Annotations = desc.Annotations
+	updated.Annotations = manifest.Annotations
 	updated.ArtifactType = manifest.ArtifactType
 	if updated.ArtifactType == "" {
 		updated.ArtifactType = manifest.Config.MediaType
@@ -177,40 +177,121 @@ func registryURL(repo name.Repository, elems ...string) string {
 }
 
 func getReferrersIndex(ctx context.Context, client *http.Client, endpoint string) (*ocispec.Index, bool, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, false, err
+	var combined *ocispec.Index
+	seen := map[string]bool{}
+	for endpoint != "" {
+		if seen[endpoint] {
+			return nil, false, fmt.Errorf("referrers pagination cycle at %q", endpoint)
+		}
+		seen[endpoint] = true
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, false, err
+		}
+		req.Header.Set("Accept", ocispec.MediaTypeImageIndex)
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, false, err
+		}
+		if resp.StatusCode == http.StatusNotFound && combined == nil {
+			resp.Body.Close()
+			return nil, false, nil
+		}
+		if err := transport.CheckError(resp, http.StatusOK); err != nil {
+			resp.Body.Close()
+			return nil, false, err
+		}
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, maxReferrersIndexBytes+1))
+		resp.Body.Close()
+		if err != nil {
+			return nil, false, err
+		}
+		if len(raw) > maxReferrersIndexBytes {
+			return nil, false, fmt.Errorf("referrers index is over the %d-byte limit", maxReferrersIndexBytes)
+		}
+		var page ocispec.Index
+		if err := json.Unmarshal(raw, &page); err != nil {
+			return nil, false, fmt.Errorf("parse referrers index: %w", err)
+		}
+		if page.SchemaVersion != 2 || page.MediaType != ocispec.MediaTypeImageIndex {
+			return nil, false, fmt.Errorf(
+				"invalid referrers index: schemaVersion=%d mediaType=%q",
+				page.SchemaVersion, page.MediaType,
+			)
+		}
+		if combined == nil {
+			combined = &page
+		} else {
+			combined.Manifests = append(combined.Manifests, page.Manifests...)
+		}
+		endpoint, err = nextLink(endpoint, resp.Header.Values("Link"))
+		if err != nil {
+			return nil, false, err
+		}
 	}
-	req.Header.Set("Accept", ocispec.MediaTypeImageIndex)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, false, err
+	return combined, true, nil
+}
+
+func nextLink(base string, headers []string) (string, error) {
+	for _, header := range headers {
+		for _, entry := range splitLinkHeader(header) {
+			end := strings.IndexByte(entry, '>')
+			if !strings.HasPrefix(entry, "<") || end < 0 {
+				continue
+			}
+			isNext := false
+			for _, param := range strings.Split(entry[end+1:], ";") {
+				key, value, ok := strings.Cut(strings.TrimSpace(param), "=")
+				if ok && strings.EqualFold(key, "rel") {
+					for _, rel := range strings.Fields(strings.Trim(value, `"`)) {
+						isNext = isNext || strings.EqualFold(rel, "next")
+					}
+				}
+			}
+			if !isNext {
+				continue
+			}
+			baseURL, err := url.Parse(base)
+			if err != nil {
+				return "", err
+			}
+			target, err := url.Parse(entry[1:end])
+			if err != nil {
+				return "", fmt.Errorf("parse referrers next link: %w", err)
+			}
+			return baseURL.ResolveReference(target).String(), nil
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, false, nil
+	return "", nil
+}
+
+func splitLinkHeader(header string) []string {
+	var entries []string
+	start := 0
+	inAngle, inQuote := false, false
+	for i, char := range header {
+		switch char {
+		case '<':
+			if !inQuote {
+				inAngle = true
+			}
+		case '>':
+			if !inQuote {
+				inAngle = false
+			}
+		case '"':
+			if !inAngle {
+				inQuote = !inQuote
+			}
+		case ',':
+			if !inAngle && !inQuote {
+				entries = append(entries, strings.TrimSpace(header[start:i]))
+				start = i + 1
+			}
+		}
 	}
-	if err := transport.CheckError(resp, http.StatusOK); err != nil {
-		return nil, false, err
-	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxReferrersIndexBytes+1))
-	if err != nil {
-		return nil, false, err
-	}
-	if len(raw) > maxReferrersIndexBytes {
-		return nil, false, fmt.Errorf("referrers index is over the %d-byte limit", maxReferrersIndexBytes)
-	}
-	var index ocispec.Index
-	if err := json.Unmarshal(raw, &index); err != nil {
-		return nil, false, fmt.Errorf("parse referrers index: %w", err)
-	}
-	if index.SchemaVersion != 2 || index.MediaType != ocispec.MediaTypeImageIndex {
-		return nil, false, fmt.Errorf(
-			"invalid referrers index: schemaVersion=%d mediaType=%q",
-			index.SchemaVersion, index.MediaType,
-		)
-	}
-	return &index, true, nil
+	return append(entries, strings.TrimSpace(header[start:]))
 }
 
 func fallbackTag(dgst digest.Digest) string {
@@ -265,7 +346,12 @@ func publishFallbackReferrer(ctx context.Context, ref string, subject digest.Dig
 			return nil
 		}
 	}
-	artifact.Annotations = nil // local ref-name annotations do not belong in the remote index
+	annotations := make(map[string]string, len(artifact.Annotations))
+	for key, value := range artifact.Annotations {
+		annotations[key] = value
+	}
+	delete(annotations, ocispec.AnnotationRefName) // local ref-name annotations do not belong in the remote index
+	artifact.Annotations = annotations
 	index.Manifests = append(index.Manifests, artifact)
 	sort.Slice(index.Manifests, func(i, j int) bool {
 		return index.Manifests[i].Digest.String() < index.Manifests[j].Digest.String()
