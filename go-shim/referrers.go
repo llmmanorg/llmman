@@ -295,7 +295,15 @@ func splitLinkHeader(header string) []string {
 }
 
 func fallbackTag(dgst digest.Digest) string {
-	return strings.Replace(dgst.String(), ":", "-", 1)
+	algorithm := dgst.Algorithm().String()
+	if len(algorithm) > 32 {
+		algorithm = algorithm[:32]
+	}
+	encoded := dgst.Encoded()
+	if len(encoded) > 64 {
+		encoded = encoded[:64]
+	}
+	return algorithm + "-" + encoded
 }
 
 // fetchReferrers returns (descriptors, nativeAPI, error). nativeAPI is false
