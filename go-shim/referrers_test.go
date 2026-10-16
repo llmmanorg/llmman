@@ -6,11 +6,31 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
+
+func TestFallbackTagTruncatesDigestComponents(t *testing.T) {
+	cases := []struct {
+		name   string
+		digest digest.Digest
+		want   string
+	}{
+		{"sha256 unchanged", digest.Digest("sha256:" + strings.Repeat("a", 64)), "sha256-" + strings.Repeat("a", 64)},
+		{"sha512 encoded truncated", digest.Digest("sha512:" + strings.Repeat("b", 128)), "sha512-" + strings.Repeat("b", 64)},
+		{"algorithm truncated", digest.Digest(strings.Repeat("c", 40) + ":" + strings.Repeat("d", 64)), strings.Repeat("c", 32) + "-" + strings.Repeat("d", 64)},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if got := fallbackTag(test.digest); got != test.want {
+				t.Fatalf("fallbackTag(%q) = %q, want %q", test.digest, got, test.want)
+			}
+		})
+	}
+}
 
 func TestGetReferrersIndexFollowsNextLink(t *testing.T) {
 	first := ocispec.Descriptor{Digest: digest.FromString("first")}
