@@ -21,6 +21,8 @@ import (
 
 	"github.com/docker/distribution/registry/api/errcode"
 	v2 "github.com/docker/distribution/registry/api/v2"
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
 
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
@@ -30,6 +32,7 @@ import (
 	commonauth "go.podman.io/common/pkg/auth"
 	"go.podman.io/image/v5/copy"
 	"go.podman.io/image/v5/manifest"
+	podmanconfig "go.podman.io/image/v5/pkg/docker/config"
 	"go.podman.io/image/v5/signature"
 	"go.podman.io/image/v5/transports/alltransports"
 	"go.podman.io/image/v5/types"
@@ -53,6 +56,23 @@ func insecurePolicy() (*signature.PolicyContext, error) {
 		},
 	}
 	return signature.NewPolicyContext(policy)
+}
+
+// registryAuthenticator reads the same containers auth files as podman's
+// ordinary registry transport, including repository-scoped credentials.
+func registryAuthenticator(ctx context.Context, repo name.Repository) (authn.Authenticator, error) {
+	creds, err := podmanconfig.GetCredentials(registrySourceCtx(ctx), repo.String())
+	if err != nil {
+		return nil, err
+	}
+	if creds.Username == "" && creds.Password == "" && creds.IdentityToken == "" {
+		return authn.Anonymous, nil
+	}
+	return authn.FromConfig(authn.AuthConfig{
+		Username:      creds.Username,
+		Password:      creds.Password,
+		IdentityToken: creds.IdentityToken,
+	}), nil
 }
 
 // ---------------------------------------------------------------------------
