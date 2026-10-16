@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
+	remoteerrors "github.com/containerd/containerd/v2/core/remotes/errors"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
@@ -258,6 +260,13 @@ func (sw *stallWriter) stop() { sw.timer.Stop() }
 func isHTTP4xx(err error) bool {
 	if err == nil {
 		return false
+	}
+	var unexpected remoteerrors.ErrUnexpectedStatus
+	if errors.As(err, &unexpected) {
+		switch unexpected.StatusCode {
+		case 400, 401, 403, 404, 415:
+			return true
+		}
 	}
 	s := err.Error()
 	for _, code := range []string{"400", "401", "403", "404", "415"} {
