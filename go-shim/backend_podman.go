@@ -10,10 +10,12 @@ import "C"
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -21,6 +23,8 @@ import (
 
 	"github.com/docker/distribution/registry/api/errcode"
 	v2 "github.com/docker/distribution/registry/api/v2"
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
 
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
@@ -30,6 +34,9 @@ import (
 	commonauth "go.podman.io/common/pkg/auth"
 	"go.podman.io/image/v5/copy"
 	"go.podman.io/image/v5/manifest"
+	podmanconfig "go.podman.io/image/v5/pkg/docker/config"
+	"go.podman.io/image/v5/pkg/sysregistriesv2"
+	"go.podman.io/image/v5/pkg/tlsclientconfig"
 	"go.podman.io/image/v5/signature"
 	"go.podman.io/image/v5/transports/alltransports"
 	"go.podman.io/image/v5/types"
@@ -53,6 +60,54 @@ func insecurePolicy() (*signature.PolicyContext, error) {
 		},
 	}
 	return signature.NewPolicyContext(policy)
+}
+
+// registryAuthenticator reads the same containers auth files as podman's
+// ordinary registry transport, including repository-scoped credentials.
+func registryAuthenticator(ctx context.Context, repo name.Repository) (authn.Authenticator, error) {
+	creds, err := podmanconfig.GetCredentials(registrySourceCtx(ctx), repo.String())
+	if err != nil {
+		return nil, err
+	}
+	if creds.Username == "" && creds.Password == "" && creds.IdentityToken == "" {
+		return authn.Anonymous, nil
+	}
+	return authn.FromConfig(authn.AuthConfig{
+		Username:      creds.Username,
+		Password:      creds.Password,
+		IdentityToken: creds.IdentityToken,
+	}), nil
+}
+
+func registryBaseTransport(ctx context.Context, repo name.Repository) (http.RoundTripper, error) {
+	sys := registrySourceCtx(ctx)
+	reg, err := sysregistriesv2.FindRegistry(sys, repo.String())
+	if err != nil {
+		return nil, err
+	}
+	if reg != nil && reg.Blocked {
+		return nil, fmt.Errorf("registry %s is blocked", reg.Prefix)
+	}
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	tlsConfig := &tls.Config{}
+	if sys.BaseTLSConfig != nil {
+		tlsConfig = sys.BaseTLSConfig.Clone()
+	}
+	if sys.DockerCertPath != "" {
+		if err := tlsclientconfig.SetupCertificates(sys.DockerCertPath, tlsConfig); err != nil {
+			return nil, err
+		}
+	} else if sys.DockerPerHostCertDirPath != "" {
+		if err := tlsclientconfig.SetupCertificates(filepath.Join(sys.DockerPerHostCertDirPath, repo.RegistryStr()), tlsConfig); err != nil {
+			return nil, err
+		}
+	}
+	tlsConfig.InsecureSkipVerify = reg != nil && reg.Insecure
+	if sys.DockerInsecureSkipTLSVerify != types.OptionalBoolUndefined {
+		tlsConfig.InsecureSkipVerify = sys.DockerInsecureSkipTLSVerify == types.OptionalBoolTrue
+	}
+	base.TLSClientConfig = tlsConfig
+	return base, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -138,10 +193,25 @@ func llmman_push(cLayoutDir, cRef *C.char) *C.char {
 // source straight at layoutDir/blobs, so every blob (manifest included)
 // is read from the real store directly.
 func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, err error) {
+	return pushToRegistryWithDestinationContext(ctx, layoutDir, ref, nil)
+}
+
+// pushToRegistryWithDestinationContext is pushToRegistry with an injectable
+// destination context for protocol tests. Production passes nil so podman's
+// normal registry configuration and credential lookup remain authoritative.
+func pushToRegistryWithDestinationContext(ctx context.Context, layoutDir, ref string, destinationCtx *types.SystemContext) (changed bool, err error) {
 	manifestDesc, err := findManifestForPush(layoutDir, ref)
 	if err != nil {
 		return false, err
 	}
+	return pushDescriptorToRegistryWithDestinationContext(ctx, layoutDir, ref, manifestDesc, destinationCtx, false)
+}
+
+func pushDescriptorToRegistry(ctx context.Context, layoutDir, ref string, manifestDesc ocispec.Descriptor) (bool, error) {
+	return pushDescriptorToRegistryWithDestinationContext(ctx, layoutDir, ref, manifestDesc, nil, true)
+}
+
+func pushDescriptorToRegistryWithDestinationContext(ctx context.Context, layoutDir, ref string, manifestDesc ocispec.Descriptor, destinationCtx *types.SystemContext, preserveDigest bool) (changed bool, err error) {
 
 	scratchDir, cleanup, err := buildScratchOCILayout(layoutDir, manifestDesc)
 	if err != nil {
@@ -174,11 +244,37 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 
 	progressSetStatus(ref, "pushing")
 	if _, err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pushing", "Pushed", &copy.Options{
-		SourceCtx: sharedBlobDirOpts(layoutDir),
+		SourceCtx:       sharedBlobDirOpts(layoutDir),
+		DestinationCtx:  destinationCtx,
+		PreserveDigests: preserveDigest,
 	}, &changed, ref); err != nil {
 		return false, fmt.Errorf("copy image: %w", err)
 	}
 	return changed, nil
+}
+
+func pushIndexToRegistry(ctx context.Context, layoutDir, ref string, desc ocispec.Descriptor) error {
+	return pushIndexToRegistryWithDestinationContext(ctx, layoutDir, ref, desc, nil)
+}
+
+func pushIndexToRegistryWithDestinationContext(ctx context.Context, layoutDir, ref string, desc ocispec.Descriptor, destinationCtx *types.SystemContext) error {
+	raw, err := readBlob(layoutDir, desc.Digest)
+	if err != nil {
+		return err
+	}
+	dstRef, err := alltransports.ParseImageName("docker://" + normalizeTag(ref))
+	if err != nil {
+		return err
+	}
+	if destinationCtx == nil {
+		destinationCtx = registrySourceCtx(ctx)
+	}
+	dst, err := dstRef.NewImageDestination(ctx, destinationCtx)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+	return dst.PutManifest(ctx, raw, nil)
 }
 
 // buildScratchOCILayout assembles a throwaway OCI layout directory whose

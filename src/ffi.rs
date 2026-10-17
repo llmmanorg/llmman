@@ -7,7 +7,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
 use anyhow::{anyhow, Context};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Raw FFI declarations — symbols produced by the Go shim static archive
@@ -21,6 +21,12 @@ extern "C" {
     ) -> *mut c_char;
     fn llmman_logout(server: *const c_char) -> *mut c_char;
     fn llmman_push(layout_dir: *const c_char, reference: *const c_char) -> *mut c_char;
+    fn llmman_push_artifact(
+        layout_dir: *const c_char,
+        reference: *const c_char,
+        subject_json: *const c_char,
+    ) -> *mut c_char;
+    fn llmman_referrers(reference: *const c_char, digest: *const c_char) -> *mut c_char;
     fn llmman_pull(reference: *const c_char, layout_dir: *const c_char) -> *mut c_char;
     fn llmman_inspect(reference: *const c_char) -> *mut c_char;
     fn llmman_transfer(source: *const c_char, destination: *const c_char) -> *mut c_char;
@@ -231,6 +237,45 @@ pub fn push(layout_dir: &str, reference: &str) -> anyhow::Result<()> {
     let l = cstr(layout_dir)?;
     let r = cstr(reference)?;
     registry_call(|| unsafe { llmman_push(l.as_ptr(), r.as_ptr()) }).map(|_| ())
+}
+
+/// An OCI descriptor crossing the registry FFI boundary.
+///
+/// `artifact_type` is populated for referrers so callers can distinguish a
+/// signature, SBOM, or later attestation without fetching each manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryDescriptor {
+    pub media_type: String,
+    pub digest: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Set `subject` on the locally stored artifact manifest and push it to the
+/// registry. Registries without the OCI 1.1 referrers endpoint receive the
+/// standard digest-derived fallback index automatically.
+pub fn push_artifact(
+    layout_dir: &str,
+    reference: &str,
+    subject: &RegistryDescriptor,
+) -> anyhow::Result<()> {
+    let l = cstr(layout_dir)?;
+    let r = cstr(reference)?;
+    let s = cstr(&serde_json::to_string(subject).context("encode subject descriptor")?)?;
+    registry_call(|| unsafe { llmman_push_artifact(l.as_ptr(), r.as_ptr(), s.as_ptr()) })
+        .map(|_| ())
+}
+
+/// List the OCI artifacts attached to `digest` in `reference`'s repository.
+pub fn referrers(reference: &str, digest: &str) -> anyhow::Result<Vec<RegistryDescriptor>> {
+    let r = cstr(reference)?;
+    let d = cstr(digest)?;
+    let data = registry_call(|| unsafe { llmman_referrers(r.as_ptr(), d.as_ptr()) })?;
+    serde_json::from_str(&data).context("decode referrers")
 }
 
 /// Pull an image from a registry into `layout_dir` (OCI layout).

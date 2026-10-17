@@ -29,6 +29,8 @@ import (
 	dockercliconfig "github.com/docker/cli/cli/config"
 	"github.com/docker/cli/cli/config/credentials"
 	clitypes "github.com/docker/cli/cli/config/types"
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
@@ -74,6 +76,37 @@ func dockerCredentials(host string) (string, string, error) {
 		return creds.Username, creds.Password, nil
 	}
 	return "", "", nil // not an error — just not found under any key
+}
+
+// registryAuthenticator gives the shared referrers client the same Docker
+// credential lookup (including Docker Hub aliases and helper timeouts) as the
+// containerd resolver used for ordinary pulls and pushes.
+func registryAuthenticator(_ context.Context, repo name.Repository) (authn.Authenticator, error) {
+	username, secret, err := dockerCredentials(repo.RegistryStr())
+	if err != nil {
+		return nil, err
+	}
+	if username == "" && secret == "" {
+		return authn.Anonymous, nil
+	}
+	if username == "" {
+		return authn.FromConfig(authn.AuthConfig{IdentityToken: secret}), nil
+	}
+	return authn.FromConfig(authn.AuthConfig{Username: username, Password: secret}), nil
+}
+
+func registryBaseTransport(ctx context.Context, repo name.Repository) (http.RoundTripper, error) {
+	hosts, err := dockerconfig.ConfigureHosts(ctx, dockerconfig.HostOptions{Credentials: dockerCredentials})(repo.RegistryStr())
+	if err != nil {
+		return nil, fmt.Errorf("load registry host configuration: %w", err)
+	}
+	if len(hosts) == 0 {
+		return nil, fmt.Errorf("no registry hosts configured for %s", repo.RegistryStr())
+	}
+	if hosts[0].Client != nil && hosts[0].Client.Transport != nil {
+		return hosts[0].Client.Transport, nil
+	}
+	return http.DefaultTransport, nil
 }
 
 // getCredentialsWithTimeout runs store.Get(lookup) with a hard deadline,
@@ -505,7 +538,19 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 	if err != nil {
 		return false, err
 	}
+	return pushDescriptorToRegistry(ctx, layoutDir, ref, manifestDesc)
+}
 
+func pushDescriptorToRegistry(ctx context.Context, layoutDir, ref string, manifestDesc ocispec.Descriptor) (changed bool, err error) {
+	if manifestDesc.MediaType == ocispec.MediaTypeImageIndex {
+		resolver := newResolver(ctx)
+		pusher, err := resolver.Pusher(ctx, normalizeTag(ref))
+		if err != nil {
+			return false, fmt.Errorf("create pusher: %w", err)
+		}
+		present, err := pushBlob(ctx, pusher, &ociProvider{dir: layoutDir}, manifestDesc, nil, "")
+		return !present, err
+	}
 	// Read manifest
 	manifestData, err := readBlob(layoutDir, manifestDesc.Digest)
 	if err != nil {
@@ -578,6 +623,11 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 		fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
 	}
 	return changed, nil
+}
+
+func pushIndexToRegistry(ctx context.Context, layoutDir, ref string, desc ocispec.Descriptor) error {
+	_, err := pushDescriptorToRegistry(ctx, layoutDir, ref, desc)
+	return err
 }
 
 // llmman_pull pulls an image from a registry into a local OCI layout directory.
