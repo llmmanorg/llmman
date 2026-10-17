@@ -153,6 +153,9 @@ struct GoResponse {
     data: String,
     #[serde(default)]
     error: String,
+    /// Set by `llmman_pull` alone: the registry said the image is not there.
+    #[serde(default)]
+    not_found: bool,
 }
 
 /// Consume a raw C string returned by the Go shim and decode the JSON envelope.
@@ -161,10 +164,19 @@ fn consume(raw: *mut c_char) -> anyhow::Result<String> {
     assert!(!raw.is_null(), "Go shim returned a null pointer");
     let json_str = unsafe { CStr::from_ptr(raw).to_string_lossy().into_owned() };
     unsafe { llmman_free(raw) };
+    decode_response(&json_str)
+}
+
+/// [`consume`]'s decoding of the shim's JSON envelope.
+fn decode_response(json_str: &str) -> anyhow::Result<String> {
     let resp: GoResponse =
-        serde_json::from_str(&json_str).context("failed to decode Go shim response")?;
+        serde_json::from_str(json_str).context("failed to decode Go shim response")?;
     if resp.ok {
         Ok(resp.data)
+    } else if resp.not_found {
+        Err(crate::storage::oci::source_not_found(anyhow!(
+            "{}", resp.error
+        )))
     } else {
         Err(anyhow!("{}", resp.error))
     }
@@ -478,4 +490,44 @@ pub fn progress(key: &str) -> anyhow::Result<ProgressSnapshot> {
     let k = cstr(key)?;
     let data = consume(unsafe { llmman_progress(k.as_ptr()) })?;
     serde_json::from_str(&data).context("failed to decode progress snapshot")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::oci::is_source_not_found;
+
+    #[test]
+    fn a_successful_envelope_returns_its_data() {
+        assert_eq!(decode_response(r#"{"ok":true,"data":"x"}"#).unwrap(), "x");
+    }
+
+    #[test]
+    fn a_failed_envelope_is_the_message_and_nothing_more() {
+        let err = decode_response(r#"{"ok":false,"error":"dial tcp: no such host"}"#).unwrap_err();
+        assert_eq!(err.to_string(), "dial tcp: no such host");
+        assert!(!is_source_not_found(&err));
+    }
+
+    #[test]
+    fn a_not_found_envelope_is_marked_without_changing_the_message() {
+        let json =
+            r#"{"ok":false,"error":"resolve: docker.io/ai/nope:1b: not found","not_found":true}"#;
+        let err = decode_response(json).unwrap_err();
+        assert!(is_source_not_found(&err));
+        assert_eq!(err.to_string(), "resolve: docker.io/ai/nope:1b: not found");
+        let err = err.context("pull failed");
+        assert!(is_source_not_found(&err));
+        assert_eq!(
+            format!("{err:#}"),
+            "pull failed: resolve: docker.io/ai/nope:1b: not found"
+        );
+    }
+
+    /// An envelope from a shim built before the field existed.
+    #[test]
+    fn an_envelope_without_not_found_is_not_marked() {
+        let err = decode_response(r#"{"ok":false,"error":"x: not found"}"#).unwrap_err();
+        assert!(!is_source_not_found(&err));
+    }
 }

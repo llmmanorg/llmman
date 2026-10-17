@@ -816,7 +816,7 @@ func llmman_resolve_digest(cRef *C.char) *C.char {
 	}
 	d, err := resolveManifestDigest(context.Background(), normalizeTag(ref))
 	if err != nil {
-		return errResp(err)
+		return errResp(markIfMissing(err, ref))
 	}
 	return okResp(d.String())
 }

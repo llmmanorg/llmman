@@ -683,10 +683,13 @@ impl PullGuard {
                 notices: Vec::new(),
             });
         }
-        // Resolving here only saves the shim a round trip; its failure
-        // is not fatal, because the digest that matters comes back in
-        // the verdict either way.
-        let resolved = crate::ffi::resolved_digest_of(reference).ok();
+        // Resolving here only saves the shim a round trip, so its failure
+        // is not fatal (the verdict carries the digest either way) unless
+        // the registry says there is nothing to verify.
+        let resolved = match crate::ffi::resolved_digest_of(reference) {
+            Err(e) if crate::storage::oci::is_source_not_found(&e) => return Err(e),
+            resolved => resolved.ok(),
+        };
         let verdict = check_with(reference, resolved.as_deref(), &decision)?;
 
         // Under `enforce`, a pass with nothing to confirm against would

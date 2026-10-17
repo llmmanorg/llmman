@@ -60,7 +60,13 @@ chunk carries Ollama's counts and durations (`prompt_eval_count`,
 (one with a pooling type, e.g. `embeddinggemma`, `nomic-embed-text`):
 `llama-server` is started with `--embeddings` for it, so `/v1/embeddings`
 works too. `/api/embed` and `/v1/embeddings` honour `dimensions`: each vector
-is cut to that many values and re-normalised.
+is cut to that many values and re-normalised. An input longer than the
+model's context is cut to it by `/api/embed` (unless `truncate` is `false`)
+and is a `400` on `/v1/embeddings`, as on OpenAI's.
+
+`/api/tags` lists each model with the `details` `/api/show` gives it (`format`,
+`family`, `parameter_size`, `quantization_level`), read from the GGUF header
+once per model.
 
 `think` is `true`/`false` or a level (`minimal`, `low`, `medium`,
 `high`, `xhigh`, `max`), forwarded as llama-server's
@@ -74,6 +80,34 @@ when it handles reasoning.
 via `/api/blobs/{digest}`, as `ollama create` does). Modelfile fields such
 as `system` or `quantize` are refused with a 400: the GGUF's own chat
 template applies.
+
+## Errors
+
+These are not `500`s:
+
+- A model that is neither in the store nor on its registry (or Hugging Face)
+  is a `404` naming it, on every route that loads one. Docker Hub and Hugging
+  Face answer an anonymous request for a missing repository as for a private
+  one; that is a `404` too, with their words after the name. Any other failed
+  pull, a refused login or another registry's denial included, is a `500`.
+- A prompt longer than the context is a `400` on `/api/chat`, `/api/generate`
+  and `/v1/messages`, as on `/v1/chat/completions`.
+
+## What the model lists report
+
+`/v1/models` carries llama-server's `meta` and `architecture`, which clients
+size a model by (`meta.n_ctx_train` is OpenClaw's context window). A loaded
+llama-server's own are passed through, `meta.n_ctx` included. Before a model
+is loaded, `meta.n_ctx_train` comes from the GGUF header and
+`architecture.input_modalities` from what the model can do (`text`, plus
+`image` with a vision projector); a model that does not generate text has no
+`architecture`.
+
+`/props` is llama-server's router-mode endpoint: the router's own, or with
+`?model=` that model's llama-server's (context window, slots, modalities,
+chat template). A model that is not a loaded llama-server is a `404`. Unlike
+llama-server's router it never loads a model (`autoload` is ignored): a GET
+that started one is one any web page could send.
 
 ## OpenAI API notes
 

@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::time::{sleep, Duration, Instant};
 
 use super::sched::parse_keep_alive_str;
-use super::{canonical_ref, AppState, Engine, ModelProcess};
+use super::{canonical_ref, AppState, Engine, ModelProcess, Target};
 use crate::modelpack::{resolve_model, ModelPath};
 
 /// `LLMMAN_SAFETENSORS_ENGINE`: which engine serves a
@@ -706,16 +706,27 @@ pub(super) async fn spawn_ds4_server(
     spawn_piped(cmd, &resolved, "ds4-server")
 }
 
+/// `GET path` on the loopback backend at `port`, as JSON.
+pub(super) async fn backend_json(
+    client: &Client,
+    port: u16,
+    path: &str,
+    timeout: Duration,
+) -> reqwest::Result<serde_json::Value> {
+    client
+        .get(Target::Local(port).url(path))
+        .timeout(timeout)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+}
+
 /// The context window a running ds4-server reports in `GET /v1/models`:
 /// its `--ctx`, or its default.
 pub(super) async fn ds4_context_length(client: &Client, port: u16) -> Option<u32> {
-    let body: serde_json::Value = client
-        .get(format!("http://127.0.0.1:{port}/v1/models"))
-        .timeout(Duration::from_millis(500))
-        .send()
-        .await
-        .ok()?
-        .json()
+    let body = backend_json(client, port, "/v1/models", Duration::from_millis(500))
         .await
         .ok()?;
     ds4_models_context_length(&body)

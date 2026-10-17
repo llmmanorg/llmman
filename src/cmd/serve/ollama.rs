@@ -2,8 +2,9 @@
 //! `show`, `pull`, `push`, `copy`, `delete`, blobs and `create`) and the
 //! generation routes (`chat`, `generate`, `embed`, `embeddings`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context};
 use axum::body::{Body, Bytes};
@@ -52,21 +53,180 @@ fn served_format(store: &OciStore, manifest: &crate::storage::oci::Manifest) -> 
         .to_string()
 }
 
+/// The `details` fields a GGUF header answers; empty without one.
+#[derive(Debug, Clone, Default)]
+struct HeaderDetails {
+    family: String,
+    parameter_size: String,
+    quantization_level: String,
+}
+
+impl HeaderDetails {
+    fn read(gguf: Option<&crate::gguf::Info>, manifest: &crate::storage::oci::Manifest) -> Self {
+        Self {
+            family: gguf
+                .and_then(|i| i.architecture())
+                .unwrap_or_default()
+                .to_string(),
+            // The header's figure, else this file's tensors, which is the
+            // whole model only when it is not a split set.
+            parameter_size: gguf
+                .and_then(|i| {
+                    i.u64("general.parameter_count").or_else(|| {
+                        (crate::modelpack::gguf_shard_count(manifest) == 1)
+                            .then_some(i.parameter_count)
+                    })
+                })
+                .filter(|n| *n > 0)
+                .map(crate::fmt::human_count)
+                .unwrap_or_default(),
+            // The declared file type keeps the mixed-quant variant (the
+            // modal tensor type reads Q4_K for both Q4_K_M and Q4_K_S).
+            quantization_level: gguf
+                .and_then(|i| {
+                    i.u64("general.file_type")
+                        .and_then(crate::gguf::file_type_name)
+                        .map(str::to_string)
+                        .or_else(|| i.quantization.clone())
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn details(self, format: String) -> OllamaModelDetails {
+        OllamaModelDetails {
+            parent_model: String::new(),
+            format,
+            families: if self.family.is_empty() {
+                Vec::new()
+            } else {
+                vec![self.family.clone()]
+            },
+            family: self.family,
+            parameter_size: self.parameter_size,
+            quantization_level: self.quantization_level,
+        }
+    }
+}
+
+/// What the model lists (`/api/tags`, `/v1/models`) report of a stored model
+/// besides its name and size. A function of the manifest digest, so it is kept
+/// per digest ([`listed_model_facts`]): a GGUF header is 30-50ms of reads and
+/// clients list models constantly.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ModelFacts {
+    format: String,
+    header: HeaderDetails,
+    /// `{architecture}.context_length`: what the model was trained for.
+    context_length: Option<u64>,
+    /// As `/api/show` lists them, minus what only the chat template says
+    /// (`tools`, `thinking`).
+    capabilities: Vec<String>,
+}
+
+impl ModelFacts {
+    /// The `details` object both lists carry.
+    fn details(&self) -> OllamaModelDetails {
+        self.header.clone().details(self.format.clone())
+    }
+
+    /// The trained context, `meta.n_ctx_train` on `/v1/models`.
+    pub(super) fn context_length(&self) -> Option<u64> {
+        self.context_length
+    }
+
+    /// `architecture.input_modalities` as llama-server reports it: `text`,
+    /// plus `image` with vision. `None` for a model that does not generate
+    /// text (embedding, media, decision).
+    pub(super) fn input_modalities(&self) -> Option<Vec<&'static str>> {
+        let has = |c: &str| self.capabilities.iter().any(|have| have == c);
+        has(crate::modelpack::CAPABILITY_COMPLETION).then(|| {
+            let mut modalities = vec!["text"];
+            if has(crate::modelpack::CAPABILITY_VISION) {
+                modalities.push("image");
+            }
+            modalities
+        })
+    }
+}
+
+/// [`ModelFacts`] by store and manifest digest. Only a header that was read
+/// is kept: a tar layer's GGUF is unreadable until first extracted.
+static MODEL_FACTS: LazyLock<StdMutex<ModelFactsCache>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// The cache's rows: `(store, manifest digest)` to the facts read for it.
+type ModelFactsCache = HashMap<(PathBuf, String), Arc<ModelFacts>>;
+
+/// The [`ModelFacts`] of each of `list` (the whole store), cached where
+/// possible, forgetting models the store no longer lists. Blocking.
+pub(super) fn listed_model_facts(
+    store: &OciStore,
+    store_path: &Path,
+    cache_path: &Path,
+    list: &[crate::storage::oci::ImageSummary],
+) -> Vec<Arc<ModelFacts>> {
+    let key = |digest: &str| (store_path.to_path_buf(), digest.to_string());
+    let facts = list
+        .iter()
+        .map(|img| {
+            if let Some(facts) = MODEL_FACTS.lock().unwrap().get(&key(&img.digest)) {
+                return facts.clone();
+            }
+            let Ok(manifest) = store.read_manifest(&img.digest) else {
+                return Arc::default();
+            };
+            let gguf = crate::modelpack::gguf_info(store_path, cache_path, &manifest);
+            let facts = Arc::new(ModelFacts {
+                format: served_format(store, &manifest),
+                header: HeaderDetails::read(gguf.as_ref(), &manifest),
+                context_length: gguf.as_ref().and_then(crate::gguf::Info::context_length),
+                capabilities: crate::modelpack::model_capabilities(
+                    crate::modelpack::capabilities(store, &manifest),
+                    gguf.as_ref(),
+                    None,
+                ),
+            });
+            if gguf.is_some() {
+                MODEL_FACTS
+                    .lock()
+                    .unwrap()
+                    .insert(key(&img.digest), facts.clone());
+            }
+            facts
+        })
+        .collect();
+    let listed: HashSet<&str> = list.iter().map(|img| img.digest.as_str()).collect();
+    MODEL_FACTS
+        .lock()
+        .unwrap()
+        .retain(|(store, digest), _| store != store_path || listed.contains(digest.as_str()));
+    facts
+}
+
+#[cfg(test)]
+pub(super) fn cached_model_facts(store_path: &Path) -> usize {
+    let cache = MODEL_FACTS.lock().unwrap();
+    cache
+        .keys()
+        .filter(|(store, _)| store == store_path)
+        .count()
+}
+
 pub(super) async fn handle_tags(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    let store = OciStore::open(&state.0.store_path)?;
-    let list = store.list()?;
-    let mut models: Vec<OllamaModelInfo> = list
-        .into_iter()
-        .map(|img| {
-            // As handle_show reads it; none for a manifest that cannot be read.
-            let format = store
-                .read_manifest(&img.digest)
-                .map(|m| served_format(&store, &m))
-                .unwrap_or_default();
-            OllamaModelInfo {
+    let (store_path, cache_path) = (state.0.store_path.clone(), state.0.cache_path.clone());
+    // Off the worker: an uncached header is blocking reads.
+    let mut models = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let store = OciStore::open(&store_path)?;
+        let list = store.list()?;
+        let facts = listed_model_facts(&store, &store_path, &cache_path, &list);
+        Ok(list
+            .into_iter()
+            .zip(facts)
+            .map(|(img, facts)| OllamaModelInfo {
                 name: img.reference.clone(),
                 model: img.reference,
                 size: img.size,
@@ -77,17 +237,12 @@ pub(super) async fn handle_tags(
                     .and_then(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, 0))
                     .map(|dt| dt.to_rfc3339())
                     .unwrap_or_else(now_rfc3339),
-                details: OllamaModelDetails {
-                    parent_model: String::new(),
-                    format,
-                    family: String::new(),
-                    families: Vec::new(),
-                    parameter_size: String::new(),
-                    quantization_level: String::new(),
-                },
-            }
-        })
-        .collect();
+                details: facts.details(),
+            })
+            .collect::<Vec<_>>())
+    })
+    .await
+    .context("list models task panicked")??;
     // A peer's models are servable from here too, by forwarding.
     if aggregation::aggregates(&state, &headers) {
         for (_, peer) in aggregation::poll::<OllamaTagsResponse>(&state, "/api/tags").await {
@@ -190,14 +345,9 @@ pub(super) async fn handle_ps(
 /// vllm-backed model, which doesn't expose this endpoint at all) rather
 /// than failing the whole `ps` response over one unreachable model.
 async fn query_context_length(client: &Client, port: u16) -> Option<u64> {
-    let url = format!("http://127.0.0.1:{port}/props");
-    let resp = client
-        .get(&url)
-        .timeout(Duration::from_millis(500))
-        .send()
+    let body = backend_json(client, port, "/props", Duration::from_millis(500))
         .await
         .ok()?;
-    let body: serde_json::Value = resp.json().await.ok()?;
     body.get("default_generation_settings")?
         .get("n_ctx")?
         .as_u64()
@@ -289,44 +439,12 @@ pub(super) async fn handle_show(
     };
     let capabilities =
         crate::modelpack::model_capabilities(capabilities, gguf.as_ref(), template.as_deref());
-    let arch = gguf.as_ref().and_then(|i| i.architecture());
     Ok(Json(OllamaShowResponse {
         model_info: gguf
             .as_ref()
             .map_or_else(|| serde_json::json!({}), model_info_json),
-        details: OllamaModelDetails {
-            parent_model: String::new(),
-            format: served_format(&store, &manifest),
-            family: arch.unwrap_or_default().to_string(),
-            families: arch.map(|a| vec![a.to_string()]).unwrap_or_default(),
-            // The header's own figure when it declares one. Otherwise
-            // the sum of this file's tensors, which describes the whole
-            // model only when it is not a split set — shard 1 of six
-            // would understate it, and nothing beats no answer there.
-            parameter_size: gguf
-                .as_ref()
-                .and_then(|i| {
-                    i.u64("general.parameter_count").or_else(|| {
-                        (crate::modelpack::gguf_shard_count(&manifest) == 1)
-                            .then_some(i.parameter_count)
-                    })
-                })
-                .filter(|n| *n > 0)
-                .map(crate::fmt::human_count)
-                .unwrap_or_default(),
-            // The declared file type, which keeps the mixed-quant
-            // variant; the modal tensor type reads Q4_K for both
-            // Q4_K_M and Q4_K_S, so it is only the fallback.
-            quantization_level: gguf
-                .as_ref()
-                .and_then(|i| {
-                    i.u64("general.file_type")
-                        .and_then(crate::gguf::file_type_name)
-                        .map(str::to_string)
-                        .or_else(|| i.quantization.clone())
-                })
-                .unwrap_or_default(),
-        },
+        details: HeaderDetails::read(gguf.as_ref(), &manifest)
+            .details(served_format(&store, &manifest)),
         capabilities,
         template,
     }))
@@ -1472,6 +1590,11 @@ async fn embed_via_backend(
     Ok((embeddings, total_tokens, loaded))
 }
 
+/// Whether llama-server's error says an embeddings input is past its batch.
+pub(super) fn is_embedding_overflow(error: &str) -> bool {
+    error.contains("too large")
+}
+
 /// How many of one `/api/embed` request's inputs are in flight at once.
 const EMBED_CONCURRENCY: usize = 8;
 
@@ -1522,7 +1645,7 @@ async fn embed_one(
             if !truncate
                 && !target.is_remote()
                 && status.is_server_error()
-                && body.contains("too large") =>
+                && is_embedding_overflow(&body) =>
         {
             Err(AppError(
                 anyhow!("the input length exceeds the context length: {body}"),
@@ -1767,6 +1890,47 @@ fn opt_num_thread(opts: &Option<serde_json::Value>) -> Option<u32> {
 mod tests {
     use super::super::test_support::{running_model_fixture, test_state};
     use super::*;
+
+    fn facts_with(capabilities: &[&str]) -> ModelFacts {
+        ModelFacts {
+            capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+            ..ModelFacts::default()
+        }
+    }
+
+    #[test]
+    fn input_modalities_follow_the_vision_capability_of_a_text_model() {
+        let modalities = |caps: &[&str]| facts_with(caps).input_modalities();
+        assert_eq!(modalities(&["completion"]), Some(vec!["text"]));
+        assert_eq!(
+            modalities(&["completion", "vision"]),
+            Some(vec!["text", "image"])
+        );
+        for not_text in [&["embedding"][..], &["decision"], &["image"], &[]] {
+            assert_eq!(modalities(not_text), None, "{not_text:?}");
+        }
+    }
+
+    #[test]
+    fn header_details_list_the_family_only_when_there_is_one() {
+        let details = |family: &str| {
+            HeaderDetails {
+                family: family.into(),
+                parameter_size: "361.8M".into(),
+                quantization_level: "Q4_K_M".into(),
+            }
+            .details("gguf".into())
+        };
+        let llama = details("llama");
+        assert_eq!(
+            (llama.family.as_str(), llama.families.as_slice()),
+            ("llama", ["llama".to_string()].as_slice())
+        );
+        assert_eq!(llama.parameter_size, "361.8M");
+        assert_eq!(llama.format, "gguf");
+        let none = details("");
+        assert_eq!((none.family.as_str(), none.families.len()), ("", 0));
+    }
 
     /// The heartbeat must not come back once the bar is running: the
     /// shim drops its entry when the transfer ends, while the task still

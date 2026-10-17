@@ -6204,3 +6204,566 @@ async fn a_decision_model_is_refused_before_it_loads() {
     assert!(running.running.contains_key(&key), "nothing was evicted");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// -- failures a client took for an outage, and what the model lists carry --
+
+#[test]
+fn a_pull_the_source_says_found_nothing_is_a_404_and_any_other_failure_a_500() {
+    let missing =
+        || crate::storage::oci::source_not_found(anyhow!("resolve: docker.io/ai/nope: not found"));
+    let err = pull_failure("nope:1b", missing());
+    assert_eq!(err.1, StatusCode::NOT_FOUND);
+    assert_eq!(
+        format!("{:#}", err.0),
+        "model 'nope:1b' not found: resolve: docker.io/ai/nope: not found"
+    );
+    // However much context it picked up on the way.
+    assert_eq!(
+        pull_failure("nope:1b", missing().context("a")).1,
+        StatusCode::NOT_FOUND
+    );
+
+    let err = pull_failure("nope:1b", anyhow!("dial tcp: no such host"));
+    assert_eq!(err.1, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        format!("{:#}", err.0),
+        "pull failed: dial tcp: no such host"
+    );
+}
+
+fn chat_upstream(status: StatusCode, body: &'static str) -> ChatUpstream {
+    ChatUpstream {
+        status,
+        headers: HeaderMap::new(),
+        body: futures::stream::once(futures::future::ready(Ok(Bytes::from(body)))).boxed(),
+    }
+}
+
+const OVERFLOW: &str = r#"{"error":{"code":400,"message":"request (72031 tokens) exceeds the available context size (8192 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":72031,"n_ctx":8192}}"#;
+
+/// A prompt past the context is a 400 (the hybrid fallback still sees its
+/// marker); every other local failure stays a 500.
+#[tokio::test]
+async fn a_local_prompt_past_the_context_is_a_400_and_other_failures_stay_500() {
+    let Err(err) = chat_body(
+        &Target::Local(1),
+        chat_upstream(StatusCode::BAD_REQUEST, OVERFLOW),
+    )
+    .await
+    else {
+        panic!("an overflowing prompt is a failure");
+    };
+    assert_eq!(err.1, StatusCode::BAD_REQUEST);
+    assert!(err.0.downcast_ref::<ContextOverflow>().is_some());
+    assert!(format!("{:#}", err.0).contains("exceeds the available context size (8192 tokens)"));
+
+    for (status, body) in [
+        (
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"bad grammar"}}"#,
+        ),
+        (StatusCode::NOT_FOUND, "{}"),
+        (StatusCode::INTERNAL_SERVER_ERROR, OVERFLOW),
+    ] {
+        let Err(err) = chat_body(&Target::Local(1), chat_upstream(status, body)).await else {
+            panic!("{status} is a failure");
+        };
+        assert_eq!(err.1, StatusCode::INTERNAL_SERVER_ERROR, "{status} {body}");
+    }
+
+    // A provider's own status still stands.
+    let Err(err) = chat_body(
+        &remote_target("http://provider.invalid"),
+        chat_upstream(StatusCode::UNAUTHORIZED, "bad key"),
+    )
+    .await
+    else {
+        panic!("a refusal is a failure");
+    };
+    assert_eq!(err.1, StatusCode::UNAUTHORIZED);
+}
+
+const EMBEDDING_OVERFLOW: &str = r#"{"error":{"code":500,"message":"input (2603 tokens) is too large to process. increase the physical batch size (current batch size: 2048)","type":"server_error"}}"#;
+
+fn json_response(status: StatusCode, body: &str) -> Response {
+    (
+        status,
+        [(reqwest::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+async fn body_bytes(resp: Response) -> Bytes {
+    axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+}
+
+/// An embeddings input past the context is a 400 with the right `code` and
+/// `type`; anything else, a 200 included, goes back as it came.
+#[tokio::test]
+async fn an_embeddings_input_past_the_context_is_a_400_and_nothing_else_changes() {
+    let resp = openai::explain_embedding_overflow(json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        EMBEDDING_OVERFLOW,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(v["error"]["code"], 400);
+    assert_eq!(v["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        v["error"]["message"],
+        "the input is longer than the 2048 tokens this model reads at once; shorten it"
+    );
+
+    for (status, body) in [
+        (StatusCode::OK, r#"{"data":[{"embedding":[0.5]}]}"#),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":{"message":"out of memory"}}"#,
+        ),
+        (StatusCode::BAD_REQUEST, EMBEDDING_OVERFLOW),
+    ] {
+        let resp = openai::explain_embedding_overflow(json_response(status, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), status, "{body}");
+        assert_eq!(body_bytes(resp).await, body.as_bytes());
+    }
+}
+
+/// A stand-in llama-server that answers each path with its JSON; its port.
+async fn mock_llama_server(routes: &[(&str, serde_json::Value)]) -> u16 {
+    let mut app = Router::new();
+    for (path, body) in routes {
+        let body = body.clone();
+        app = app.route(
+            path,
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    port
+}
+
+/// Marks `model` loaded under `engine`, whose server is on `port`.
+async fn mark_loaded(state: &AppState, model: &str, engine: Engine, port: u16) {
+    let mut loaded = running_model_fixture_with_engine(engine, None);
+    loaded.port = port;
+    let key = running_key(state, model);
+    state.0.manager.lock().await.running.insert(key, loaded);
+}
+
+async fn get_json(base: &str, path_and_query: &str) -> (StatusCode, serde_json::Value) {
+    let resp = reqwest::get(format!("{base}{path_and_query}"))
+        .await
+        .unwrap();
+    (resp.status(), resp.json().await.unwrap())
+}
+
+#[tokio::test]
+async fn props_without_a_model_are_the_routers_own() {
+    let base = serve_router(test_state()).await;
+    for query in ["/props", "/props?model=", "/props?model=%20"] {
+        let (status, v) = get_json(&base, query).await;
+        assert_eq!(status, StatusCode::OK, "{query}");
+        assert_eq!(
+            (&v["role"], &v["total_slots"]),
+            (&"router".into(), &0.into()),
+            "{query}"
+        );
+    }
+}
+
+/// `?model=` gives the real props of a loaded llama-server under any
+/// spelling of the name, and asking leaves its claim and idle clock alone.
+#[tokio::test]
+async fn props_of_a_loaded_model_are_its_llama_servers() {
+    let props = serde_json::json!({
+        "total_slots": 4,
+        "default_generation_settings": { "n_ctx": 262144 },
+        "modalities": { "vision": true },
+    });
+    let port = mock_llama_server(&[("/props", props.clone())]).await;
+    let state = test_state();
+    mark_loaded(&state, "qwen3.5:2b", Engine::LlamaServer, port).await;
+    let key = running_key(&state, "qwen3.5:2b");
+    let idle_clock = state.0.manager.lock().await.running[&key].last_active;
+    let base = serve_router(state.clone()).await;
+
+    for spelling in ["qwen3.5:2b", "docker.io/ai/qwen3.5:2b"] {
+        let (status, v) = get_json(&base, &format!("/props?model={spelling}")).await;
+        assert_eq!(status, StatusCode::OK, "{spelling}");
+        assert_eq!(v, props, "{spelling}");
+    }
+    // The claim is released by a task of its own.
+    for _ in 0..100 {
+        if state.0.manager.lock().await.running[&key].in_flight == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mgr = state.0.manager.lock().await;
+    assert_eq!(mgr.running[&key].in_flight, 0);
+    assert_eq!(mgr.running[&key].last_active, idle_clock);
+}
+
+/// Not loaded, or not a llama-server, is a 404, and a GET never loads one,
+/// `autoload` or not.
+#[tokio::test]
+async fn props_of_a_model_that_is_not_a_loaded_llama_server_are_a_404() {
+    let port = mock_llama_server(&[("/props", serde_json::json!({"total_slots": 4}))]).await;
+    let state = test_state();
+    mark_loaded(&state, "vllm-model", Engine::Vllm, port).await;
+    let base = serve_router(state.clone()).await;
+
+    for model in ["not-loaded", "vllm-model", "llmman.provider/openai/gpt-5"] {
+        for autoload in ["", "&autoload=true"] {
+            let (status, v) = get_json(&base, &format!("/props?model={model}{autoload}")).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{model}{autoload}");
+            assert!(v["error"].as_str().unwrap().contains(model), "{v}");
+        }
+    }
+    assert_eq!(
+        state.0.manager.lock().await.running.len(),
+        1,
+        "nothing was loaded"
+    );
+}
+
+const GGUF_V3: &str = "application/vnd.docker.ai.gguf.v3";
+
+fn gguf_bytes(u32s: &[(&str, u32)]) -> Vec<u8> {
+    let path = crate::gguf::write_test_gguf_with(u32s);
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    bytes
+}
+
+/// A store holding `models` (name, media type, filepath, bytes), the state
+/// over it and the daemon serving that.
+async fn serve_store(
+    name: &str,
+    models: &[(&str, &str, &str, Vec<u8>)],
+) -> (AppState, String, PathBuf) {
+    let dir = fresh_store_dir(name);
+    let store = OciStore::open(&dir).unwrap();
+    for (model, media_type, filepath, bytes) in models {
+        store_one_model(&store, model, media_type, filepath, bytes);
+    }
+    let state = test_state_at(dir.clone());
+    let base = serve_router(state.clone()).await;
+    (state, base, dir)
+}
+
+fn listed<'a>(v: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == format!("docker.io/ai/{name}:latest"))
+        .unwrap_or_else(|| panic!("{name} not listed: {v}"))
+}
+
+/// Before anything is loaded, which is when a client discovers models, the
+/// trained context comes from the GGUF header and a text model says what it
+/// reads. No header means no context; a model that does not generate text
+/// has no modalities.
+#[tokio::test]
+async fn v1_models_carries_the_trained_context_of_models_that_are_not_loaded() {
+    let (_, base, dir) = serve_store(
+        "v1models",
+        &[
+            ("modelstext", GGUF_V3, "model.gguf", gguf_bytes(&[])),
+            (
+                "modelsembed",
+                GGUF_V3,
+                "model.gguf",
+                gguf_bytes(&[("llama.pooling_type", 1)]),
+            ),
+            (
+                "modelsst",
+                "application/vnd.cncf.model.weight.v1.tar",
+                "model.safetensors",
+                b"weights".to_vec(),
+            ),
+        ],
+    )
+    .await;
+    let (status, v) = get_json(&base, "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let text = listed(&v, "modelstext");
+    assert_eq!(text["meta"], serde_json::json!({ "n_ctx_train": 4096 }));
+    assert_eq!(
+        text["architecture"],
+        serde_json::json!({ "input_modalities": ["text"], "output_modalities": ["text"] })
+    );
+    assert_eq!(text["status"]["value"], "unloaded");
+
+    let embed = listed(&v, "modelsembed");
+    assert_eq!(embed["meta"], serde_json::json!({ "n_ctx_train": 4096 }));
+    assert_eq!(embed.get("architecture"), None);
+
+    let st = listed(&v, "modelsst");
+    assert_eq!(st.get("meta"), None);
+    assert_eq!(
+        st["architecture"]["input_modalities"],
+        serde_json::json!(["text"])
+    );
+}
+
+/// A loaded llama-server's own `meta` and `architecture` win, key by key; a
+/// backend that is another engine, or does not answer, is left out.
+#[tokio::test]
+async fn v1_models_prefers_what_a_loaded_llama_server_reports() {
+    let live = serde_json::json!({
+        "data": [{
+            "id": "/blobs/sha256/abc",
+            "meta": { "n_ctx": 32768, "n_ctx_train": 262144 },
+            "architecture": { "input_modalities": ["text", "image"], "output_modalities": ["text"] },
+        }]
+    });
+    let older = serde_json::json!({ "data": [{ "meta": { "n_ctx": 8192 } }] });
+    let wrong_engine = serde_json::json!({ "data": [{ "meta": { "n_ctx": 1 } }] });
+    // Bound but never served, so the port cannot be taken by another test:
+    // the probe times out.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = silent.local_addr().unwrap().port();
+
+    let models: Vec<_> = ["full", "older", "vllm", "dead"]
+        .into_iter()
+        .map(|name| (name, GGUF_V3, "model.gguf", gguf_bytes(&[])))
+        .collect();
+    let (state, base, dir) = serve_store("v1live", &models).await;
+    for (name, engine, port) in [
+        (
+            "full",
+            Engine::LlamaServer,
+            mock_llama_server(&[("/v1/models", live.clone())]).await,
+        ),
+        (
+            "older",
+            Engine::LlamaServer,
+            mock_llama_server(&[("/v1/models", older)]).await,
+        ),
+        (
+            "vllm",
+            Engine::Vllm,
+            mock_llama_server(&[("/v1/models", wrong_engine)]).await,
+        ),
+        ("dead", Engine::LlamaServer, dead_port),
+    ] {
+        mark_loaded(&state, &format!("docker.io/ai/{name}:latest"), engine, port).await;
+    }
+    let (_, v) = get_json(&base, "/v1/models").await;
+    drop(silent);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let full = listed(&v, "full");
+    assert_eq!(full["status"]["value"], "loaded");
+    assert_eq!(full["meta"], live["data"][0]["meta"]);
+    assert_eq!(full["architecture"], live["data"][0]["architecture"]);
+    assert_eq!(full["id"], "docker.io/ai/full:latest");
+
+    let older = listed(&v, "older");
+    assert_eq!(older["meta"], serde_json::json!({ "n_ctx": 8192 }));
+    assert_eq!(
+        older["architecture"]["input_modalities"],
+        serde_json::json!(["text"])
+    );
+
+    for name in ["vllm", "dead"] {
+        let entry = listed(&v, name);
+        assert_eq!(entry["status"]["value"], "loaded", "{name}");
+        assert_eq!(
+            entry["meta"],
+            serde_json::json!({ "n_ctx_train": 4096 }),
+            "{name}"
+        );
+    }
+}
+
+/// A model loaded by digest is registered under the digest-named reference;
+/// its tag reaches it, as in `ensure_model`, for `/props` and the list.
+#[tokio::test]
+async fn a_model_loaded_by_digest_is_found_through_its_tag() {
+    let props = serde_json::json!({ "total_slots": 4 });
+    let live = serde_json::json!({ "data": [{ "meta": { "n_ctx": 65536 } }] });
+    let port = mock_llama_server(&[("/props", props.clone()), ("/v1/models", live)]).await;
+    let (state, base, dir) = serve_store(
+        "bydigest",
+        &[("bydigest", GGUF_V3, "model.gguf", gguf_bytes(&[]))],
+    )
+    .await;
+    let digest = OciStore::open(&dir)
+        .unwrap()
+        .find("docker.io/ai/bydigest:latest")
+        .unwrap()
+        .digest;
+    let mut loaded = running_model_fixture_with_engine(Engine::LlamaServer, None);
+    (loaded.port, loaded.digest) = (port, digest.clone());
+    let key = format!("docker.io/ai/bydigest@{digest}");
+    state.0.manager.lock().await.running.insert(key, loaded);
+
+    let (status, v) = get_json(&base, "/props?model=bydigest").await;
+    assert_eq!((status, &v), (StatusCode::OK, &props));
+    let (_, v) = get_json(&base, "/v1/models").await;
+    let entry = listed(&v, "bydigest");
+    assert_eq!(entry["status"]["value"], "loaded");
+    assert_eq!(entry["meta"], serde_json::json!({ "n_ctx": 65536 }));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A model loaded only on a peer is listed with the peer's live facts; one
+/// also loaded here keeps its own.
+#[tokio::test]
+async fn v1_models_takes_a_peers_live_facts_for_a_model_loaded_only_there() {
+    let peer_row = |name: &str, n_ctx: u64| {
+        serde_json::json!({
+            "id": format!("docker.io/ai/{name}:latest"), "object": "model",
+            "status": { "value": "loaded" },
+            "meta": { "n_ctx": n_ctx },
+            "architecture": { "input_modalities": ["text", "image"] },
+        })
+    };
+    let peer = mock_llama_server(&[(
+        "/v1/models",
+        serde_json::json!({ "data": [peer_row("remote", 111), peer_row("local", 222)] }),
+    )])
+    .await;
+    let own = mock_llama_server(&[(
+        "/v1/models",
+        serde_json::json!({ "data": [{ "meta": { "n_ctx": 333 } }] }),
+    )])
+    .await;
+    let dir = fresh_store_dir("peerfacts");
+    let store = OciStore::open(&dir).unwrap();
+    for name in ["remote", "local"] {
+        store_one_model(&store, name, GGUF_V3, "model.gguf", &gguf_bytes(&[]));
+    }
+    let mut inner = test_inner(dir.clone());
+    inner.peers = vec![format!("http://127.0.0.1:{peer}")];
+    let state = AppState(Arc::new(inner));
+    mark_loaded(
+        &state,
+        "docker.io/ai/local:latest",
+        Engine::LlamaServer,
+        own,
+    )
+    .await;
+    let base = serve_router(state).await;
+    let (_, v) = get_json(&base, "/v1/models").await;
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let remote = listed(&v, "remote");
+    assert_eq!(remote["status"]["value"], "loaded");
+    assert_eq!(remote["meta"], serde_json::json!({ "n_ctx": 111 }));
+    assert_eq!(
+        remote["architecture"]["input_modalities"],
+        serde_json::json!(["text", "image"])
+    );
+    assert_eq!(
+        listed(&v, "local")["meta"],
+        serde_json::json!({ "n_ctx": 333 })
+    );
+}
+
+/// `/api/tags` reports what `/api/show` does for the same model. The GGUF is
+/// read once and kept by digest, and forgotten when the store drops it.
+#[tokio::test]
+async fn handle_tags_reports_the_family_size_and_quantization_of_each_gguf() {
+    // file_type 15 is Q4_K_M while the fixture's lone tensor is Q4_K, so the
+    // assertion says which of the two sources won.
+    let (state, _, dir) = serve_store(
+        "tagsdetails",
+        &[
+            (
+                "tagsmeta",
+                GGUF_V3,
+                "model.gguf",
+                gguf_bytes(&[("general.file_type", 15)]),
+            ),
+            (
+                "tagsnoheader",
+                "application/vnd.cncf.model.weight.v1.tar",
+                "model.safetensors",
+                b"weights".to_vec(),
+            ),
+        ],
+    )
+    .await;
+    let tags = |state: AppState| async move {
+        let resp = handle_tags(State(state), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        serde_json::from_slice::<serde_json::Value>(&body_bytes(resp).await).unwrap()
+    };
+    let details = |v: &serde_json::Value, name: &str| {
+        v["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == format!("docker.io/ai/{name}:latest"))
+            .unwrap_or_else(|| panic!("{name} not listed: {v}"))["details"]
+            .clone()
+    };
+
+    let first = tags(state.clone()).await;
+    let gguf = details(&first, "tagsmeta");
+    assert_eq!(
+        gguf,
+        serde_json::json!({
+            "parent_model": "",
+            "format": "gguf",
+            "family": "llama",
+            "families": ["llama"],
+            "parameter_size": "32",
+            "quantization_level": "Q4_K_M",
+        })
+    );
+    // No header to read: empty, not a guess, and not kept.
+    let st = details(&first, "tagsnoheader");
+    assert_eq!(
+        (
+            &st["format"],
+            &st["family"],
+            &st["families"],
+            &st["parameter_size"]
+        ),
+        (
+            &"safetensors".into(),
+            &"".into(),
+            &serde_json::json!([]),
+            &"".into()
+        )
+    );
+    assert_eq!(ollama::cached_model_facts(&dir), 1);
+
+    // With the GGUF gone from disk the answer is the same: it was kept.
+    for entry in std::fs::read_dir(dir.join("blobs").join("sha256")).unwrap() {
+        let path = entry.unwrap().path();
+        if std::fs::read(&path).unwrap().starts_with(b"GGUF") {
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+    assert_eq!(details(&tags(state.clone()).await, "tagsmeta"), gguf);
+
+    OciStore::open(&dir)
+        .unwrap()
+        .remove("docker.io/ai/tagsmeta:latest")
+        .unwrap();
+    tags(state).await;
+    assert_eq!(ollama::cached_model_facts(&dir), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

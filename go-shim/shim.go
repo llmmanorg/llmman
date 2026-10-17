@@ -11,7 +11,9 @@ import "C"
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
+	"strings"
 	"unsafe"
 
 	"github.com/sirupsen/logrus"
@@ -61,6 +63,41 @@ type response struct {
 	OK    bool   `json:"ok"`
 	Data  string `json:"data,omitempty"`
 	Error string `json:"error,omitempty"`
+	// NotFound: the registry said the image does not exist (see
+	// imageNotFoundError).
+	NotFound bool `json:"not_found,omitempty"`
+}
+
+// imageNotFoundError marks a failure as the registry's "no such image", so
+// the daemon need not match the backend-specific wording.
+// Its message is the wrapped error's.
+type imageNotFoundError struct{ err error }
+
+func (e imageNotFoundError) Error() string { return e.err.Error() }
+func (e imageNotFoundError) Unwrap() error { return e.err }
+
+// isDockerHubRef reports whether ref is on Docker Hub, which answers an
+// anonymous pull of a missing repository as it does a private one. Another
+// registry's anonymous denial is an auth failure, not a missing image.
+func isDockerHubRef(ref string) bool {
+	host, _, _ := strings.Cut(ref, "/")
+	switch host {
+	case "docker.io", "index.docker.io", "registry-1.docker.io":
+		return true
+	}
+	return false
+}
+
+// markImageNotFound is err, marked as the registry's "no such image".
+func markImageNotFound(err error) error { return imageNotFoundError{err} }
+
+// markIfMissing is err, marked as a missing image if the registry said so
+// about ref.
+func markIfMissing(err error, ref string) error {
+	if isImageNotFound(err, ref) {
+		return markImageNotFound(err)
+	}
+	return err
 }
 
 func okResp(data string) *C.char {
@@ -69,8 +106,14 @@ func okResp(data string) *C.char {
 }
 
 func errResp(err error) *C.char {
-	b, _ := json.Marshal(response{OK: false, Error: err.Error()})
+	b, _ := json.Marshal(failure(err))
 	return C.CString(string(b))
+}
+
+// failure is the response for err, which reports not_found if it is marked.
+func failure(err error) response {
+	var notFound imageNotFoundError
+	return response{Error: err.Error(), NotFound: errors.As(err, &notFound)}
 }
 
 func errMsg(msg string) *C.char {
