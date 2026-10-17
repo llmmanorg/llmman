@@ -11,6 +11,7 @@ import "C"
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"unsafe"
 
@@ -61,6 +62,36 @@ type response struct {
 	OK    bool   `json:"ok"`
 	Data  string `json:"data,omitempty"`
 	Error string `json:"error,omitempty"`
+	// NotFound is set by llmman_pull alone, when the registry answered
+	// that the image does not exist (see imageNotFoundError). Everything
+	// else about a failed pull, the network and credentials included, is
+	// still only the message.
+	NotFound bool `json:"not_found,omitempty"`
+}
+
+// imageNotFoundError marks a pull failure as the registry's answer that
+// the image does not exist, so llmman_pull can say so in its response
+// rather than leave the daemon to pick it out of the message, whose words
+// differ between the two backends. It adds nothing to the message.
+type imageNotFoundError struct{ err error }
+
+func (e imageNotFoundError) Error() string { return e.err.Error() }
+func (e imageNotFoundError) Unwrap() error { return e.err }
+
+// markImageNotFound is err, marked as the registry's "no such image".
+func markImageNotFound(err error) error { return imageNotFoundError{err} }
+
+// pullFailure is the response for a failed pull.
+func pullFailure(err error) response {
+	var notFound imageNotFoundError
+	return response{Error: err.Error(), NotFound: errors.As(err, &notFound)}
+}
+
+// pullErrResp is errResp for llmman_pull, which also reports whether the
+// registry said the image does not exist.
+func pullErrResp(err error) *C.char {
+	b, _ := json.Marshal(pullFailure(err))
+	return C.CString(string(b))
 }
 
 func okResp(data string) *C.char {

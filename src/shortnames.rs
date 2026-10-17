@@ -1,5 +1,6 @@
 //! Short-name alias resolution — from the `[aliases]` table of
-//! `llmman.conf`, at runtime. Nothing is compiled into the binary.
+//! `llmman.conf`, at runtime. Beyond [`OLLAMA_NAMES`], below, nothing is
+//! compiled into the binary.
 //!
 //! Mirrors podman's approach: files are merged in priority order, later
 //! entries winning. See [`crate::config`] for the locations.
@@ -30,6 +31,34 @@ fn load_aliases() -> HashMap<String, String> {
 fn aliases() -> &'static HashMap<String, String> {
     static CACHE: OnceLock<HashMap<String, String>> = OnceLock::new();
     CACHE.get_or_init(load_aliases)
+}
+
+/// Ollama library names that resolve to a model published somewhere else
+/// under another name, because Docker's `ai/` namespace has no model of
+/// that name and `llmman pull bge-m3` would only fail. The embedding
+/// models people move over from Ollama first: `nomic-embed-text` (what
+/// OpenClaw defaults to) is nomic-embed-text v1.5, and `bge-m3` is
+/// ggml-org's Q8_0 build of BGE-M3. Each gives the vectors it gives on
+/// Ollama (768 and 1024 dimensions).
+///
+/// Consulted after the user's own `[aliases]`, so a configured name always
+/// wins, and only for the bare name or `:latest`: the tags of the Ollama
+/// model do not carry over to a model of another name.
+const OLLAMA_NAMES: &[(&str, &str)] = &[
+    ("nomic-embed-text", "docker.io/ai/nomic-embed-text-v1.5"),
+    ("bge-m3", "hf.co/ggml-org/bge-m3-Q8_0-GGUF"),
+];
+
+/// Where [`OLLAMA_NAMES`] sends `reference`, unless the user has claimed
+/// the name themselves.
+fn ollama_name(reference: &str) -> Option<&'static str> {
+    let name = reference.strip_suffix(":latest").unwrap_or(reference);
+    if aliases().contains_key(name) {
+        return None;
+    }
+    OLLAMA_NAMES
+        .iter()
+        .find_map(|(ollama, target)| (*ollama == name).then_some(*target))
 }
 
 /// Registry/HF URI schemes [`parse_registry_ref`] strips before parsing the
@@ -642,6 +671,9 @@ pub fn resolve_ollama_api(reference: &str) -> Result<String, InvalidReference> {
         if let Some(mapped) = aliases().get(reference) {
             return Ok(mapped.clone());
         }
+        if let Some(target) = ollama_name(reference) {
+            return Ok(target.to_string());
+        }
         return Ok(format!("docker.io/ai/{reference}"));
     }
     // Already validated: use the non-validating body so we don't validate twice.
@@ -967,6 +999,65 @@ mod tests {
             resolve_ollama_api("qwen3.5:0.8B").unwrap(),
             "docker.io/ai/qwen3.5:0.8B"
         );
+    }
+
+    #[test]
+    fn resolve_ollama_api_maps_the_ollama_embedding_names() {
+        // Bare, and with Ollama's default tag, which is how `/api/tags`
+        // lists them and what clients send back.
+        for (name, target) in [
+            ("nomic-embed-text", "docker.io/ai/nomic-embed-text-v1.5"),
+            (
+                "nomic-embed-text:latest",
+                "docker.io/ai/nomic-embed-text-v1.5",
+            ),
+            ("bge-m3", "hf.co/ggml-org/bge-m3-Q8_0-GGUF"),
+            ("bge-m3:latest", "hf.co/ggml-org/bge-m3-Q8_0-GGUF"),
+        ] {
+            assert_eq!(resolve_ollama_api(name).unwrap(), target, "{name}");
+        }
+        // The target is itself a plain reference, so resolving it again
+        // changes nothing: a name the store holds it under finds it.
+        assert_eq!(
+            resolve_ollama_api("docker.io/ai/nomic-embed-text-v1.5").unwrap(),
+            "docker.io/ai/nomic-embed-text-v1.5"
+        );
+    }
+
+    /// The mapping is for the Ollama model, not for anything that merely
+    /// starts with its name: another tag, another model, or a path.
+    #[test]
+    fn resolve_ollama_api_maps_only_the_exact_ollama_names() {
+        for (reference, expected) in [
+            (
+                "nomic-embed-text:v1.5",
+                "docker.io/ai/nomic-embed-text:v1.5",
+            ),
+            (
+                "nomic-embed-text-v1.5",
+                "docker.io/ai/nomic-embed-text-v1.5",
+            ),
+            ("bge-m3:567m", "docker.io/ai/bge-m3:567m"),
+            ("bge-m3-large", "docker.io/ai/bge-m3-large"),
+            ("someone/bge-m3", "hf.co/someone/bge-m3"),
+        ] {
+            assert_eq!(
+                resolve_ollama_api(reference).unwrap(),
+                expected,
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn ollama_names_are_bare_names_with_a_target_resolve_leaves_alone() {
+        for (name, target) in OLLAMA_NAMES {
+            assert!(is_bare(name), "{name} must be a bare name");
+            assert!(
+                !is_bare(target) && resolve_ollama_api(target).unwrap() == resolve(target).unwrap(),
+                "{target} must be a structured reference"
+            );
+        }
     }
 
     #[test]

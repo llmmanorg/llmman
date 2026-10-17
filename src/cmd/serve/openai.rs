@@ -3,6 +3,8 @@
 //! routes, and the request preparation and relay the Responses and
 //! Anthropic routes share with them.
 
+use std::collections::HashMap;
+
 use anyhow::Context;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -15,7 +17,7 @@ use tokio::time::{sleep, Duration, Instant};
 use super::backend::would_use_mlx;
 use super::hybrid::{request_pin, send_with_hybrid_fallback};
 use super::messages::content_text;
-use super::ollama::truncate_embedding;
+use super::ollama::{listed_model_facts, truncate_embedding};
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::relay::{
     proxy, proxy_buffered, proxy_rewriting_model, relay, relay_chat_upstream,
@@ -38,24 +40,69 @@ pub(super) async fn handle_openai_models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    let store = OciStore::open(&state.0.store_path)?;
-    let list = store.list()?;
-    let mut data: Vec<serde_json::Value> = {
+    let (store_path, cache_path) = (state.0.store_path.clone(), state.0.cache_path.clone());
+    // Off the worker: an uncached model's GGUF header is blocking reads.
+    let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let store = OciStore::open(&store_path)?;
+        let list = store.list()?;
+        let facts = listed_model_facts(&store, &store_path, &cache_path, &list);
+        Ok(list.into_iter().zip(facts).collect::<Vec<_>>())
+    })
+    .await
+    .context("list models task panicked")??;
+    // What is loaded, by the name it is listed under; the port only for a
+    // llama-server, the one backend whose own `/v1/models` is read below.
+    let loaded: HashMap<String, Option<u16>> = {
         let mgr = state.0.manager.lock().await;
-        list.into_iter()
-            .map(|img| {
-                let loaded = mgr.running.contains_key(&img.reference);
-                serde_json::json!({
-                    "id": img.reference,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "llmman",
-                    // status field consumed by the web UI to track loaded/unloaded state
-                    "status": { "value": if loaded { "loaded" } else { "unloaded" } },
-                })
+        mgr.running
+            .iter()
+            .map(|(key, m)| {
+                let llama = m.process.engine() == Engine::LlamaServer;
+                (key.clone(), llama.then_some(m.port))
             })
             .collect()
     };
+    // At once, each bounded: a stuck backend must not hold up the list.
+    let live = futures::future::join_all(rows.iter().map(|(img, _)| async {
+        match loaded.get(&img.reference) {
+            Some(Some(port)) => backend_model_facts(&state.0.client, *port).await,
+            _ => None,
+        }
+    }))
+    .await;
+    let mut data: Vec<serde_json::Value> = rows
+        .into_iter()
+        .zip(live)
+        .map(|((img, facts), live)| {
+            let mut entry = serde_json::json!({
+                "id": img.reference,
+                "object": "model",
+                "created": 0,
+                "owned_by": "llmman",
+                // status field consumed by the web UI to track loaded/unloaded state
+                "status": { "value": if loaded.contains_key(&img.reference) { "loaded" } else { "unloaded" } },
+            });
+            // What clients size a model's context window by. The GGUF
+            // header gives the trained one, which is the part a client
+            // needs before anything is loaded; a loaded llama-server's
+            // own answer then replaces it, with the window it was loaded
+            // with as well, key by key, so an older llama-server that
+            // reports no `architecture` does not take ours away.
+            if let Some(trained) = facts.context_length() {
+                entry["meta"] = serde_json::json!({ "n_ctx_train": trained });
+            }
+            if let Some(input) = facts.input_modalities() {
+                entry["architecture"] = serde_json::json!({
+                    "input_modalities": input,
+                    "output_modalities": ["text"],
+                });
+            }
+            if let Some(live) = live {
+                entry.as_object_mut().unwrap().extend(live);
+            }
+            entry
+        })
+        .collect();
     // As `handle_tags`; loaded anywhere counts as loaded.
     if aggregation::aggregates(&state, &headers) {
         for (_, peer) in aggregation::poll::<serde_json::Value>(&state, "/v1/models").await {
@@ -71,6 +118,33 @@ pub(super) async fn handle_openai_models(
         }
     }
     Ok(Json(serde_json::json!({ "object": "list", "data": data })))
+}
+
+/// The `meta` and `architecture` a running llama-server reports for its
+/// model on `/v1/models`, which `handle_openai_models` passes through as
+/// they are. `None` when it cannot be asked, or reports neither.
+async fn backend_model_facts(
+    client: &reqwest::Client,
+    port: u16,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let body: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{port}/v1/models"))
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let entry = body["data"].as_array()?.first()?;
+    let facts: serde_json::Map<String, serde_json::Value> = ["meta", "architecture"]
+        .into_iter()
+        .filter_map(|key| {
+            let value = entry.get(key).filter(|v| v.is_object())?;
+            Some((key.to_string(), value.clone()))
+        })
+        .collect();
+    (!facts.is_empty()).then_some(facts)
 }
 
 /// Sets `repeat_penalty` to `DEFAULT_REPEAT_PENALTY` on `req` (an
@@ -594,9 +668,56 @@ async fn forward_openai_request(
             .await
         }
     }?;
+    let resp = if embeddings && !target.is_remote() {
+        explain_embedding_overflow(resp).await?
+    } else {
+        resp
+    };
     // `/v1/responses/input_tokens` comes through here, and a provider
     // without the Responses API 404s it just the same.
     Ok(explain_missing_route(&target, llama_path, resp))
+}
+
+/// llama-server's 500 for an embeddings input past its batch (which is
+/// sized to the context), as the 400 it is: the caller's input can never
+/// succeed, and a 500 is what clients retry. OpenAI answers a too-long
+/// input with a 400 too; `/api/embed` copes by truncating it. The reply
+/// keeps llama-server's `error` object, now with the right `code` and
+/// `type`, and its own wording after what to do about it.
+pub(super) async fn explain_embedding_overflow(resp: Response) -> Result<Response, AppError> {
+    if resp.status() != StatusCode::INTERNAL_SERVER_ERROR {
+        return Ok(resp);
+    }
+    let (parts, body) = resp.into_parts();
+    let body = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .context("read inference backend response")?;
+    let overflow = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|reply| reply["error"]["message"].as_str().map(str::to_owned))
+        .filter(|message| message.contains("too large to process"));
+    let Some(detail) = overflow else {
+        return Ok(Response::from_parts(parts, Body::from(body)));
+    };
+    let limit = batch_size_limit(&detail)
+        .map_or_else(|| "what".into(), |tokens| format!("the {tokens} tokens"));
+    let message =
+        format!("the input is longer than {limit} this model reads at once; shorten it ({detail})");
+    let error = serde_json::json!({
+        "error": { "code": 400, "message": message, "type": "invalid_request_error" }
+    });
+    Ok((StatusCode::BAD_REQUEST, Json(error)).into_response())
+}
+
+/// The token count in llama-server's "(current batch size: N)".
+fn batch_size_limit(text: &str) -> Option<String> {
+    let digits: String = text
+        .split("current batch size: ")
+        .nth(1)?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    (!digits.is_empty()).then_some(digits)
 }
 
 /// `dimensions` of an OpenAI embeddings request; absent, zero or not a
@@ -834,15 +955,7 @@ async fn explain_prompt_too_long(resp: Response) -> Result<Response, AppError> {
     if !text.contains("physical batch size") {
         return Ok(Response::from_parts(parts, Body::from(body)));
     }
-    let limit = text
-        .split("current batch size: ")
-        .nth(1)
-        .map(|rest| {
-            rest.chars()
-                .take_while(char::is_ascii_digit)
-                .collect::<String>()
-        })
-        .filter(|digits| !digits.is_empty())
+    let limit = batch_size_limit(&text)
         .map_or_else(|| "what".into(), |tokens| format!("the {tokens} tokens"));
     Ok(AppError::status(
         StatusCode::BAD_REQUEST,

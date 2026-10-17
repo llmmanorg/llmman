@@ -588,7 +588,7 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	progressReset(ref, "pulling manifest")
 	defer progressDone(ref)
 	if err := pullToLayout(context.Background(), ref, C.GoString(cLayoutDir)); err != nil {
-		return errResp(err)
+		return pullErrResp(err)
 	}
 	return okResp("")
 }
@@ -619,7 +619,11 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	// Including ref here too just repeats it two or three times over.
 	name, manifestDesc, err := resolver.Resolve(ctx, ref)
 	if err != nil {
-		return fmt.Errorf("resolve: %w", err)
+		err = fmt.Errorf("resolve: %w", err)
+		if isImageNotFound(err, ref) {
+			err = markImageNotFound(err)
+		}
+		return err
 	}
 	fetcher, err := resolver.Fetcher(ctx, name)
 	if err != nil {
@@ -870,4 +874,25 @@ func llmman_transfer(cSource, cDestination *C.char) *C.char {
 // more reliable than any message match. See sigstore.go's isNotFoundError.
 func isBackendNotFound(err error) bool {
 	return errdefs.IsNotFound(err)
+}
+
+// isImageNotFound reports whether err, from resolving ref, is the registry
+// saying the image does not exist: containerd's typed not-found, or the
+// 401 Docker Hub gives an anonymous caller for a repository that is not
+// there, which it cannot tell from a private one (containerd words it
+// "repository does not exist or may require authorization"). The 401 only
+// counts when no credentials were presented for ref's registry: with
+// them, it is the credentials being refused, which is not the same thing.
+func isImageNotFound(err error, ref string) bool {
+	if isBackendNotFound(err) {
+		return true
+	}
+	return errors.Is(err, docker.ErrInvalidAuthorization) && !hasCredentials(ref)
+}
+
+// hasCredentials reports whether a login is stored for ref's registry.
+func hasCredentials(ref string) bool {
+	host, _, _ := strings.Cut(ref, "/")
+	user, secret, _ := dockerCredentials(host)
+	return user != "" || secret != ""
 }

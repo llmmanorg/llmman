@@ -209,7 +209,29 @@ pub async fn fetch_model_info(
     token: Option<&str>,
 ) -> Result<ModelInfo> {
     let url = format!("{endpoint}api/models/{owner}/{repo}");
-    get_json(client, &url, token).await.context("HF model info")
+    get_json(client, &url, token)
+        .await
+        .map_err(|e| {
+            if repo_is_missing(&e, token.is_some()) {
+                crate::storage::oci::source_not_found(e)
+            } else {
+                e
+            }
+        })
+        .context("HF model info")
+}
+
+/// Whether `err`, from asking the Hub about a repository, says it is not
+/// there. A 404 does. A 401 does too when no token was sent: the Hub
+/// answers an anonymous request for a repository that does not exist the
+/// way it answers one for a private repository, `huggingface_hub` raises
+/// `RepositoryNotFoundError` for it, and an anonymous caller cannot tell
+/// the two apart anyway. With a token it is the token being refused,
+/// which is another matter.
+fn repo_is_missing(err: &anyhow::Error, had_token: bool) -> bool {
+    err.chain()
+        .filter_map(|e| e.downcast_ref::<HttpStatusError>())
+        .any(|e| e.status == 404 || (e.status == 401 && !had_token))
 }
 
 pub async fn fetch_files(
@@ -730,6 +752,50 @@ mod tests {
             size,
             kind: "file".to_string(),
             lfs: None,
+        }
+    }
+
+    /// A Hub that answers every request with `status`; its endpoint.
+    async fn hub_answering(status: u16) -> String {
+        let status = axum::http::StatusCode::from_u16(status).unwrap();
+        let app = axum::Router::new().fallback(move || async move { (status, "{}") });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    /// What `/v1/*` and `/api/*` answer 404 for: a 404, and the 401 the Hub
+    /// gives an anonymous request for a repository that is not there. With
+    /// a token a 401 is the token refused, and a 403 is a gated repository
+    /// that does exist; neither is "no such model".
+    #[tokio::test]
+    async fn a_repo_the_hub_says_is_missing_is_marked_as_such() {
+        let client = reqwest::Client::new();
+        for (status, token, missing) in [
+            (404, None, true),
+            (404, Some("hf_token"), true),
+            (401, None, true),
+            (401, Some("hf_token"), false),
+            (403, None, false),
+            (500, None, false),
+        ] {
+            let endpoint = hub_answering(status).await;
+            let err = fetch_model_info(&client, &endpoint, "owner", "repo", token)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                crate::storage::oci::is_source_not_found(&err),
+                missing,
+                "HTTP {status}, token {token:?}"
+            );
+            // Marked or not, it reads the way it always did.
+            let message = format!("{err:#}");
+            assert!(
+                message.starts_with("HF model info: GET http://127.0.0.1:")
+                    && message.ends_with(&format!("/api/models/owner/repo: HTTP {status}")),
+                "{message}"
+            );
         }
     }
 

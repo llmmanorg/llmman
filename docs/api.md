@@ -60,7 +60,50 @@ chunk carries Ollama's counts and durations (`prompt_eval_count`,
 (one with a pooling type, e.g. `embeddinggemma`, `nomic-embed-text`):
 `llama-server` is started with `--embeddings` for it, so `/v1/embeddings`
 works too. `/api/embed` and `/v1/embeddings` honour `dimensions`: each vector
-is cut to that many values and re-normalised.
+is cut to that many values and re-normalised. An input longer than the
+model's context is cut to it by `/api/embed` (unless `truncate` is `false`)
+and is a `400` on `/v1/embeddings`, as it is on OpenAI's.
+
+`/api/tags` lists each model with the `details` `/api/show` gives for it
+(`format`, `family`, `parameter_size`, `quantization_level`). The GGUF
+header they come from is read once per model and kept, so listing is cheap.
+
+## Errors
+
+A client tells its own mistakes from the server's by the status, so these
+are not `500`s:
+
+- A model that is neither in the store nor on its registry (or Hugging
+  Face) is a `404` naming the model, on every route that loads one:
+  `/api/chat`, `/api/generate`, `/api/embed`, `/v1/chat/completions`,
+  `/v1/embeddings`, `/v1/messages` and the rest. A registry that cannot tell
+  a missing repository from a private one, as Docker Hub does not for an
+  anonymous caller, is a `404` too, with the registry's own words after the
+  model's name. A pull that fails any other way, the network or a refused
+  login, is still a `500`.
+- A prompt longer than the model's context is a `400` on `/api/chat`,
+  `/api/generate` and `/v1/messages`, as it already was on
+  `/v1/chat/completions`; the message says how long it was and how long
+  the context is.
+
+## What the model lists report
+
+`/v1/models` carries, beside llmman's own `status`, the `meta` and
+`architecture` llama-server reports, which clients size a model by
+(`meta.n_ctx_train` is what OpenClaw reads for a context window). For a loaded
+llama-server they are its own, passed through, including the window it was
+loaded with (`meta.n_ctx`). For a model that is not loaded, `meta.n_ctx_train`
+comes from the GGUF header and `architecture.input_modalities` from what the
+model can do (`text`, plus `image` with a vision projector), so a client
+discovering models before it loads one has them too. A model that does not
+generate text has no `architecture`.
+
+`/props` is llama-server's router-mode endpoint. Without `model` it is the
+router's own. With `?model=` it is that model's llama-server's: the real
+context window, slot count, modalities and chat template. A model that is not
+loaded is loaded first, as in llama-server, unless `autoload=false`, which is
+what a probe sends; it, and a model that is not served by llama-server, is a
+`404`, so the client falls back to its own defaults.
 
 `think` is `true`/`false` or a level (`minimal`, `low`, `medium`,
 `high`, `xhigh`, `max`), forwarded as llama-server's

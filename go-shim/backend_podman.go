@@ -29,7 +29,9 @@ import (
 	"github.com/vbauerster/mpb/v8/decor"
 	commonauth "go.podman.io/common/pkg/auth"
 	"go.podman.io/image/v5/copy"
+	"go.podman.io/image/v5/docker/reference"
 	"go.podman.io/image/v5/manifest"
+	dockerconfig "go.podman.io/image/v5/pkg/docker/config"
 	"go.podman.io/image/v5/signature"
 	"go.podman.io/image/v5/transports/alltransports"
 	"go.podman.io/image/v5/types"
@@ -230,7 +232,7 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	progressReset(ref, "pulling manifest")
 	defer progressDone(ref)
 	if err := pullToLayout(context.Background(), ref, C.GoString(cLayoutDir)); err != nil {
-		return errResp(err)
+		return pullErrResp(err)
 	}
 	return okResp("")
 }
@@ -284,8 +286,14 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 
 	// copy.Image never shows the layers before fetching them, so the
 	// manifest is read once more for their sizes. An index (or anything
-	// unreadable) is left to copy.Image unchecked.
-	if raw, err := fetchManifestRaw(ctx, ref); err == nil {
+	// unreadable) is left to copy.Image unchecked, except an image the
+	// registry says is not there: copy.Image would retry that for every
+	// attempt of its budget before failing the same way.
+	raw, err := fetchManifestRaw(ctx, ref)
+	if err != nil && isImageNotFound(err, ref) {
+		return markImageNotFound(err)
+	}
+	if err == nil {
 		var m ocispec.Manifest
 		if json.Unmarshal(raw, &m) == nil && len(m.Layers) > 0 {
 			if err := ensureRoom(progressKey, layoutDir, layersMissing(layoutDir, m.Layers)); err != nil {
@@ -807,4 +815,36 @@ func isBackendNotFound(err error) bool {
 	var ec errcode.ErrorCoder
 	return errors.As(err, &ec) &&
 		(ec.ErrorCode() == v2.ErrorCodeManifestUnknown || ec.ErrorCode() == v2.ErrorCodeNameUnknown)
+}
+
+// isImageNotFound reports whether err, from reading ref's manifest, is the
+// registry saying the image does not exist: its typed "manifest unknown"
+// or "name unknown", or the denial Docker Hub gives an anonymous caller
+// for a repository that is not there, which it cannot tell from a private
+// one. The denial only counts when no credentials were presented for
+// ref's registry: with them, it is the credentials being refused, which
+// is not the same thing.
+func isImageNotFound(err error, ref string) bool {
+	if isBackendNotFound(err) {
+		return true
+	}
+	var ec errcode.ErrorCoder
+	if !errors.As(err, &ec) {
+		return false
+	}
+	switch ec.ErrorCode() {
+	case errcode.ErrorCodeDenied, errcode.ErrorCodeUnauthorized:
+		return !hasCredentials(ref)
+	}
+	return false
+}
+
+// hasCredentials reports whether a login is stored for ref's registry.
+func hasCredentials(ref string) bool {
+	named, err := reference.ParseNormalizedNamed(ref)
+	if err != nil {
+		return false
+	}
+	creds, err := dockerconfig.GetCredentialsForRef(&types.SystemContext{}, named)
+	return err == nil && (creds.Username != "" || creds.Password != "" || creds.IdentityToken != "")
 }

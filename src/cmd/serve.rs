@@ -861,6 +861,23 @@ fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<
     result
 }
 
+/// A failed on-demand pull, as the caller sees it. A model its source says
+/// does not exist is a 404, as `/api/show` answers for one the store lacks
+/// and as Ollama and OpenAI answer a request for one: a misspelt name must
+/// not look like an outage, nor be retried. The source's own words follow,
+/// since for a registry that cannot tell a missing repository from a
+/// private one they are the only hint that credentials may be wanted.
+/// Any other failure, the network and credentials included, is a 500.
+fn pull_failure(requested: &str, e: anyhow::Error) -> AppError {
+    if crate::storage::oci::is_source_not_found(&e) {
+        return AppError(
+            anyhow!("model '{requested}' not found: {e:#}"),
+            StatusCode::NOT_FOUND,
+        );
+    }
+    AppError::from(e.context("pull failed"))
+}
+
 /// Re-checks an already-stored model against the current policy, using
 /// the digest held rather than re-resolving the tag. Callers must have
 /// established `is_registry_reference` first.
@@ -1922,6 +1939,8 @@ async fn resolve_target(
     // same reason; the two have to agree, or an unload by one spelling
     // passes a load by another.
     let load_id = load_identity(&state.0.store_path, model_ref).map_err(AppError::bad_request)?;
+    // As the caller spelled it, for the 404 below.
+    let requested = model_ref;
     let model_ref =
         crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
     // Default the tag before the store lookups: otherwise "gemma4" and
@@ -1988,7 +2007,7 @@ async fn resolve_target(
             tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_ref_owned))
                 .await
                 .context("pull task panicked")?
-                .context("pull failed")?;
+                .map_err(|e| pull_failure(requested, e))?;
         // No progress stream to relay over on this path — an inference
         // request triggered it, not `llmman pull` — so the daemon log is
         // the only place left. Better there than nowhere.
@@ -2844,17 +2863,23 @@ async fn chat_body(target: &Target, upstream: ChatUpstream) -> Result<ChatBody, 
         let message = format!("{} {status}: {body}", target.describe());
         // Same message either way; the marker lets a hybrid pair retry
         // on its hosted half (see send_with_hybrid_fallback).
-        let error = match target {
+        let (error, status) = match target {
+            // A prompt that cannot fit the context can never succeed, and
+            // is the caller's to shorten: a 400, as `/v1/chat/completions`
+            // relays it, not a 500 that clients retry.
             Target::Local(_) => match context_overflow_message(status, &body) {
-                Some(refusal) => anyhow::Error::new(ContextOverflow { message, refusal }),
-                None => anyhow!("{message}"),
+                Some(refusal) => (
+                    anyhow::Error::new(ContextOverflow { message, refusal }),
+                    StatusCode::BAD_REQUEST,
+                ),
+                None => (anyhow!("{message}"), remote_status(target, status)),
             },
-            _ => anyhow!("{message}"),
+            _ => (anyhow!("{message}"), remote_status(target, status)),
         };
         // A provider's own 4xx is the actionable answer — a bad key has
-        // to reach the user as 401, not as llmman's 500. A local backend
-        // keeps the blanket 500 it always returned.
-        return Err(AppError(error, remote_status(target, status)));
+        // to reach the user as 401, not as llmman's 500. Any other
+        // failure of a local backend keeps the blanket 500.
+        return Err(AppError(error, status));
     }
     Ok(upstream.body)
 }
@@ -2901,9 +2926,10 @@ fn context_overflow_message(status: StatusCode, body: &str) -> Option<String> {
 /// The status llmman reports for an unsuccessful upstream response.
 ///
 /// A [`Target::Local`] backend failing is llmman's own problem, so it
-/// stays a 500 as it always has. A provider's 4xx is about the caller's
-/// request or credentials, so it is passed through rather than buried;
-/// anything else from a provider is a bad gateway. A peer already
+/// stays a 500 as it always has (bar a prompt past the context, which
+/// `chat_body` answers as the 400 it is). A provider's 4xx is about the
+/// caller's request or credentials, so it is passed through rather than
+/// buried; anything else from a provider is a bad gateway. A peer already
 /// applied this mapping, so its status stands.
 fn remote_status(target: &Target, upstream: StatusCode) -> StatusCode {
     match target {
@@ -2918,11 +2944,108 @@ fn remote_status(target: &Target, upstream: StatusCode) -> StatusCode {
 // Route handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_props() -> impl IntoResponse {
-    // A minimal llama.cpp-compatible /props reply in ROUTER mode, for
-    // clients that probe it to learn they are talking to a multi-model
-    // server. llmman's own web UI does not use it.
-    Json(serde_json::json!({
+/// The query of `GET /props`, as llama-server's router mode reads it.
+#[derive(Deserialize)]
+struct PropsQuery {
+    /// Whose props to answer with. Without it, the router's own.
+    #[serde(default)]
+    model: Option<String>,
+    /// Whether to load `model` when it is not loaded. llama-server's
+    /// default is to; a probe that only wants to know sends `false`.
+    #[serde(default)]
+    autoload: Option<String>,
+}
+
+impl PropsQuery {
+    fn model(&self) -> Option<&str> {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+    }
+
+    fn autoload(&self) -> bool {
+        !matches!(
+            self.autoload
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("false" | "0" | "no" | "off")
+        )
+    }
+}
+
+/// How long a loaded llama-server has to answer `/props`. Its HTTP thread
+/// answers while the model decodes, so a stall is a wedged backend.
+const PROPS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `GET /props`, in llama-server's router mode: the router's own props,
+/// or with `?model=` the props of that model's llama-server, which are
+/// what a client reads the context window, slot count, modalities and
+/// chat template from. A model that is not loaded and is not to be loaded
+/// (`autoload=false`), or is not served by a llama-server, is a 404, so
+/// the client falls back to what it assumes of any model.
+async fn handle_props(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PropsQuery>,
+) -> Result<Response, AppError> {
+    let Some(model) = query.model() else {
+        return Ok(Json(router_props()).into_response());
+    };
+    if crate::providers::is_remote_ref(model) {
+        return Err(props_unavailable(model));
+    }
+    let mut port = loaded_llama_server(&state, &running_key(&state, model)).await;
+    if port.is_none() && query.autoload() {
+        let (key, _, guard) =
+            ensure_model_for(&state, model, Some(&headers), None, Task::Other).await?;
+        drop(guard);
+        port = loaded_llama_server(&state, &key).await;
+    }
+    let port = port.ok_or_else(|| props_unavailable(model))?;
+    let backend = |e: reqwest::Error| {
+        AppError::status(
+            StatusCode::BAD_GATEWAY,
+            format!("inference backend /props: {e}"),
+        )
+    };
+    let props: serde_json::Value = state
+        .0
+        .client
+        .get(format!("http://127.0.0.1:{port}/props"))
+        .timeout(PROPS_TIMEOUT)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(backend)?
+        .json()
+        .await
+        .map_err(backend)?;
+    Ok(Json(props).into_response())
+}
+
+fn props_unavailable(model: &str) -> AppError {
+    AppError::status(
+        StatusCode::NOT_FOUND,
+        format!("no props for '{model}': it is not a loaded llama-server model"),
+    )
+}
+
+/// The port of `key`'s llama-server, if it is loaded and alive. A read:
+/// unlike `check_running` it claims nothing, so asking does not count as
+/// the model being used.
+async fn loaded_llama_server(state: &AppState, key: &str) -> Option<u16> {
+    let mut mgr = state.0.manager.lock().await;
+    let m = mgr.running.get_mut(key)?;
+    (m.process.engine() == Engine::LlamaServer && m.process.is_alive()).then_some(m.port)
+}
+
+/// A minimal llama.cpp-compatible /props reply in ROUTER mode, for
+/// clients that probe it to learn they are talking to a multi-model
+/// server. llmman's own web UI does not use it.
+fn router_props() -> serde_json::Value {
+    serde_json::json!({
         "role": "router",
         "total_slots": 0,
         "model_path": "",
@@ -2997,7 +3120,7 @@ async fn handle_props() -> impl IntoResponse {
                 "stopping_word": ""
             }
         }
-    }))
+    })
 }
 
 // -- llmman's own API --------------------------------------------------------

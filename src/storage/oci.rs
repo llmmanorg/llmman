@@ -109,6 +109,44 @@ impl std::fmt::Display for NotFound {
 
 impl std::error::Error for NotFound {}
 
+/// A pull the source answered with "no such model": a registry's 404, a
+/// Hugging Face repository that is not there. Distinct from a pull that
+/// failed on the network, on credentials or part way through a transfer, so
+/// the daemon can answer a request for a model that is not there with a
+/// 404 instead of the 500 of a server fault (see [`source_not_found`]).
+///
+/// Transparent: it displays as the error it wraps and exposes that error's
+/// own source, so a message, and a downcast to an inner error such as
+/// `hf::client::HttpStatusError`, come out as they did before it was
+/// wrapped.
+#[derive(Debug)]
+pub struct SourceNotFound {
+    cause: anyhow::Error,
+}
+
+impl std::fmt::Display for SourceNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.cause, f)
+    }
+}
+
+impl std::error::Error for SourceNotFound {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // The cause itself is what `Display` already printed.
+        self.cause.source()
+    }
+}
+
+/// `cause`, marked as the source's "no such model". See [`SourceNotFound`].
+pub fn source_not_found(cause: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(SourceNotFound { cause })
+}
+
+/// Whether `err`, or anything it wraps, is a [`SourceNotFound`].
+pub fn is_source_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<SourceNotFound>())
+}
+
 /// Summary of a locally stored image shown by `list`.
 #[derive(Debug)]
 pub struct ImageSummary {
@@ -932,6 +970,45 @@ fn make_single_file_tar(path: &Path, name: &str) -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What [`source_not_found`] promises: the marked error prints, and
+    /// exposes its sources, exactly as the error it wraps.
+    #[test]
+    fn source_not_found_is_transparent() {
+        use crate::hf::client::HttpStatusError;
+        use anyhow::Context as _;
+
+        let plain = || {
+            Err::<(), _>(HttpStatusError::new(
+                "GET https://huggingface.co/api/models/x/y",
+                401,
+                &reqwest::header::HeaderMap::new(),
+            ))
+            .context("HF model info")
+            .unwrap_err()
+        };
+        let marked = source_not_found(plain());
+
+        assert!(is_source_not_found(&marked));
+        assert!(!is_source_not_found(&plain()));
+        assert_eq!(marked.to_string(), plain().to_string());
+        assert_eq!(format!("{marked:#}"), format!("{:#}", plain()));
+        assert_eq!(
+            marked.chain().count(),
+            plain().chain().count(),
+            "the marker takes the place of its cause's own link"
+        );
+        // A retry loop's downcast still reaches the inner error.
+        assert!(crate::hf::client::is_permanent(&marked));
+
+        // Further context on top does not hide it.
+        let wrapped = marked.context("pull failed");
+        assert!(is_source_not_found(&wrapped));
+        assert_eq!(
+            format!("{wrapped:#}"),
+            "pull failed: HF model info: GET https://huggingface.co/api/models/x/y: HTTP 401"
+        );
+    }
 
     fn desc_with_ref(ref_name: &str) -> Descriptor {
         let mut ann = std::collections::HashMap::new();
