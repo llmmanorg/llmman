@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -61,6 +63,67 @@ func TestGetReferrersIndexFollowsNextLink(t *testing.T) {
 	}
 	if len(index.Manifests) != 2 || index.Manifests[0].Digest != first.Digest || index.Manifests[1].Digest != second.Digest {
 		t.Fatalf("manifests = %+v, want %s and %s", index.Manifests, first.Digest, second.Digest)
+	}
+}
+
+func TestParseReferrersIndexAllowsAbsentMediaType(t *testing.T) {
+	index, err := parseReferrersIndex([]byte(`{"schemaVersion":2,"manifests":[]}`))
+	if err != nil || len(index.Manifests) != 0 {
+		t.Fatalf("parse referrers index = %+v, %v", index, err)
+	}
+}
+
+func TestNextLinkTrimsParameters(t *testing.T) {
+	got, err := nextLink("https://registry.example/v2/model/referrers/sha256:abc", []string{`</v2/model/referrers/sha256:abc?page=2>; rel = "next"`})
+	if err != nil || got != "https://registry.example/v2/model/referrers/sha256:abc?page=2" {
+		t.Fatalf("next link = %q, %v", got, err)
+	}
+}
+
+func TestRegistryClientRejectsCrossOriginRedirect(t *testing.T) {
+	var crossOriginRequests atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		crossOriginRequests.Add(1)
+	}))
+	defer other.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Redirect(w, r, other.URL+"/next", http.StatusFound)
+	}))
+	defer origin.Close()
+	u, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := repositoryForRef(u.Host + "/org/model:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := registryClient(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = getReferrersIndex(context.Background(), client, origin.URL+"/referrers")
+	if err == nil || crossOriginRequests.Load() != 0 {
+		t.Fatalf("redirect error = %v, cross-origin requests = %d", err, crossOriginRequests.Load())
+	}
+}
+
+func TestRegistryClientSetupRespectsDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	blocked := make(chan struct{})
+	defer close(blocked)
+	_, err := registryClientWithin(ctx, func() (*http.Client, error) {
+		<-blocked
+		return nil, nil
+	})
+	if err != context.DeadlineExceeded {
+		t.Fatalf("setup error = %v, want deadline exceeded", err)
 	}
 }
 

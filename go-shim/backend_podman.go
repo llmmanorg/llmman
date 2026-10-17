@@ -10,10 +10,12 @@ import "C"
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -34,6 +36,8 @@ import (
 	"go.podman.io/image/v5/docker/reference"
 	"go.podman.io/image/v5/manifest"
 	dockerconfig "go.podman.io/image/v5/pkg/docker/config"
+	"go.podman.io/image/v5/pkg/sysregistriesv2"
+	"go.podman.io/image/v5/pkg/tlsclientconfig"
 	"go.podman.io/image/v5/signature"
 	"go.podman.io/image/v5/transports/alltransports"
 	"go.podman.io/image/v5/types"
@@ -74,6 +78,37 @@ func registryAuthenticator(ctx context.Context, repo name.Repository) (authn.Aut
 		Password:      creds.Password,
 		IdentityToken: creds.IdentityToken,
 	}), nil
+}
+
+func registryBaseTransport(ctx context.Context, repo name.Repository) (http.RoundTripper, error) {
+	sys := registrySourceCtx(ctx)
+	reg, err := sysregistriesv2.FindRegistry(sys, repo.String())
+	if err != nil {
+		return nil, err
+	}
+	if reg != nil && reg.Blocked {
+		return nil, fmt.Errorf("registry %s is blocked", reg.Prefix)
+	}
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	tlsConfig := &tls.Config{}
+	if sys.BaseTLSConfig != nil {
+		tlsConfig = sys.BaseTLSConfig.Clone()
+	}
+	if sys.DockerCertPath != "" {
+		if err := tlsclientconfig.SetupCertificates(sys.DockerCertPath, tlsConfig); err != nil {
+			return nil, err
+		}
+	} else if sys.DockerPerHostCertDirPath != "" {
+		if err := tlsclientconfig.SetupCertificates(filepath.Join(sys.DockerPerHostCertDirPath, repo.RegistryStr()), tlsConfig); err != nil {
+			return nil, err
+		}
+	}
+	tlsConfig.InsecureSkipVerify = reg != nil && reg.Insecure
+	if sys.DockerInsecureSkipTLSVerify != types.OptionalBoolUndefined {
+		tlsConfig.InsecureSkipVerify = sys.DockerInsecureSkipTLSVerify == types.OptionalBoolTrue
+	}
+	base.TLSClientConfig = tlsConfig
+	return base, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +205,14 @@ func pushToRegistryWithDestinationContext(ctx context.Context, layoutDir, ref st
 	if err != nil {
 		return false, err
 	}
+	return pushDescriptorToRegistryWithDestinationContext(ctx, layoutDir, ref, manifestDesc, destinationCtx, false)
+}
+
+func pushDescriptorToRegistry(ctx context.Context, layoutDir, ref string, manifestDesc ocispec.Descriptor) (bool, error) {
+	return pushDescriptorToRegistryWithDestinationContext(ctx, layoutDir, ref, manifestDesc, nil, true)
+}
+
+func pushDescriptorToRegistryWithDestinationContext(ctx context.Context, layoutDir, ref string, manifestDesc ocispec.Descriptor, destinationCtx *types.SystemContext, preserveDigest bool) (changed bool, err error) {
 
 	scratchDir, cleanup, err := buildScratchOCILayout(layoutDir, manifestDesc)
 	if err != nil {
@@ -204,11 +247,35 @@ func pushToRegistryWithDestinationContext(ctx context.Context, layoutDir, ref st
 	if _, err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pushing", "Pushed", &copy.Options{
 		SourceCtx:       sharedBlobDirOpts(layoutDir),
 		DestinationCtx:  destinationCtx,
-		PreserveDigests: true,
+		PreserveDigests: preserveDigest,
 	}, &changed, ref); err != nil {
 		return false, fmt.Errorf("copy image: %w", err)
 	}
 	return changed, nil
+}
+
+func pushIndexToRegistry(ctx context.Context, layoutDir, ref string, desc ocispec.Descriptor) error {
+	return pushIndexToRegistryWithDestinationContext(ctx, layoutDir, ref, desc, nil)
+}
+
+func pushIndexToRegistryWithDestinationContext(ctx context.Context, layoutDir, ref string, desc ocispec.Descriptor, destinationCtx *types.SystemContext) error {
+	raw, err := readBlob(layoutDir, desc.Digest)
+	if err != nil {
+		return err
+	}
+	dstRef, err := alltransports.ParseImageName("docker://" + normalizeTag(ref))
+	if err != nil {
+		return err
+	}
+	if destinationCtx == nil {
+		destinationCtx = registrySourceCtx(ctx)
+	}
+	dst, err := dstRef.NewImageDestination(ctx, destinationCtx)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+	return dst.PutManifest(ctx, raw, nil)
 }
 
 // buildScratchOCILayout assembles a throwaway OCI layout directory whose

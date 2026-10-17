@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -65,6 +66,7 @@ func pushTestArtifactManifest(t *testing.T, ref, payload string, subject ocispec
 		Annotations: map[string]string{
 			ocispec.AnnotationCreated: "2026-10-16T00:00:00Z",
 			"example.com/vendor":      payload,
+			ocispec.AnnotationRefName: "user-provided",
 		},
 	}
 	manifest.SchemaVersion = 2
@@ -126,6 +128,49 @@ func TestPushArtifactAndListNativeReferrers(t *testing.T) {
 	}
 }
 
+func TestPushDescriptorIgnoresChangedLocalRef(t *testing.T) {
+	host := startReferrersRegistry(t, true)
+	ref := host + "/org/model:artifact"
+	dir := t.TempDir()
+	if err := ensureLayout(dir); err != nil {
+		t.Fatal(err)
+	}
+	config, err := writeBlob(dir, "application/vnd.example.config.v1+json", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := ocispec.Manifest{MediaType: ocispec.MediaTypeImageManifest, Config: config}
+	manifest.SchemaVersion = 2
+	manifest.Annotations = map[string]string{"selected": "first"}
+	firstRaw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := writeBlob(dir, ocispec.MediaTypeImageManifest, firstRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Annotations["selected"] = "second"
+	secondRaw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := writeBlob(dir, ocispec.MediaTypeImageManifest, secondRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManifestRef(dir, ref, second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pushDescriptorToRegistry(context.Background(), dir, ref, first); err != nil {
+		t.Fatal(err)
+	}
+	got, err := fetchManifestRaw(context.Background(), ref)
+	if err != nil || string(got) != string(firstRaw) {
+		t.Fatalf("pushed manifest = %s, %v; want first descriptor", got, err)
+	}
+}
+
 func TestPushArtifactAndListFallbackReferrers(t *testing.T) {
 	host := startReferrersRegistry(t, false)
 	subjectRef := host + "/org/model:v1"
@@ -154,9 +199,35 @@ func TestPushArtifactAndListFallbackReferrers(t *testing.T) {
 		if ref.Annotations[ocispec.AnnotationCreated] != "2026-10-16T00:00:00Z" || ref.Annotations["example.com/vendor"] == "" {
 			t.Errorf("artifact annotations = %+v", ref.Annotations)
 		}
+		if ref.Annotations[ocispec.AnnotationRefName] != "user-provided" {
+			t.Errorf("manifest ref-name annotation was changed: %+v", ref.Annotations)
+		}
 	}
 	if !got[first.Digest] || !got[second.Digest] {
 		t.Fatalf("fallback referrers = %+v, want %s and %s", refs, first.Digest, second.Digest)
+	}
+}
+
+func TestFallbackIndexSizeCheckedBeforePush(t *testing.T) {
+	var fallbackPuts atomic.Int32
+	host := startRegistryWithOptions(t, func(_ http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/manifests/sha256-") {
+			fallbackPuts.Add(1)
+		}
+		return false
+	}, registry.WithReferrersSupport(false))
+	ref := host + "/org/model:artifact"
+	artifact := ocispec.Descriptor{
+		MediaType:   ocispec.MediaTypeImageManifest,
+		Digest:      digest.FromString("artifact"),
+		Annotations: map[string]string{"large": strings.Repeat("a", int(maxManifestBytes))},
+	}
+	err := publishFallbackReferrer(context.Background(), ref, digest.FromString("subject"), artifact)
+	if err == nil || !strings.Contains(err.Error(), "over the") {
+		t.Fatalf("oversized fallback index error = %v", err)
+	}
+	if got := fallbackPuts.Load(); got != 0 {
+		t.Fatalf("oversized index caused %d manifest PUTs", got)
 	}
 }
 
