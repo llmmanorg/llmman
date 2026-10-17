@@ -256,7 +256,16 @@ so a new definition needs a restart. See
 ### Short-name aliases
 
 `[aliases]` maps a short name to a full reference, so `llmman pull gemma4`
-resolves to whatever you point it at. Nothing is compiled into the binary.
+resolves to whatever you point it at. An alias for `name` answers `name:latest`
+too, unless `name:latest` has an alias of its own.
+
+Nothing is compiled into the binary but two Ollama names that Docker's `ai/`
+namespace has no model for, used when `[aliases]` has nothing for them:
+
+| Name | Resolves to |
+|------|-------------|
+| `nomic-embed-text` | `docker.io/ai/nomic-embed-text-v1.5` (768 dimensions) |
+| `bge-m3` | `hf.co/ggml-org/bge-m3-Q8_0-GGUF` (1024 dimensions) |
 
 ### Signature trust policy
 

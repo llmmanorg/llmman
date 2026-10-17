@@ -57,7 +57,7 @@ mod usage;
 mod webui;
 
 use backend::{
-    ds4_context_length, find_free_port, gguf_engine_from_env, gguf_goes_to_ds4,
+    backend_json, ds4_context_length, find_free_port, gguf_engine_from_env, gguf_goes_to_ds4,
     safetensors_engine_from_env, sglang_serve_args_from_env, sglang_served_model_name,
     spawn_ds4_server, spawn_llama_server, spawn_mlx_server, spawn_sglang_server,
     spawn_vllm_omni_server, spawn_vllm_server, tail_child_output, use_mlx_for_safetensors,
@@ -83,7 +83,7 @@ use ollama::{
 use openai::{
     handle_openai_chat, handle_openai_completions, handle_openai_embeddings, handle_openai_images,
     handle_openai_models, handle_openai_speech, handle_openai_systemone,
-    handle_openai_transcriptions, handle_openai_video_get, handle_openai_videos,
+    handle_openai_transcriptions, handle_openai_video_get, handle_openai_videos, local_engine,
     SYSTEMONE_BODY_LIMIT_BYTES, TRANSCRIPTION_BODY_LIMIT_BYTES,
 };
 use relay::proxy;
@@ -859,6 +859,20 @@ fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<
     drop(lock);
     release_model_lock(model);
     result
+}
+
+/// A failed on-demand pull as the caller sees it: a 404 when the source says
+/// the model does not exist (not an outage, and not worth retrying), with the
+/// source's words after the name since a registry cannot tell a missing
+/// repository from a private one; any other failure is a 500.
+fn pull_failure(requested: &str, e: anyhow::Error) -> AppError {
+    if crate::storage::oci::is_source_not_found(&e) {
+        return AppError(
+            anyhow!("model '{requested}' not found: {e:#}"),
+            StatusCode::NOT_FOUND,
+        );
+    }
+    AppError::from(e.context("pull failed"))
 }
 
 /// Re-checks an already-stored model against the current policy, using
@@ -1922,6 +1936,7 @@ async fn resolve_target(
     // same reason; the two have to agree, or an unload by one spelling
     // passes a load by another.
     let load_id = load_identity(&state.0.store_path, model_ref).map_err(AppError::bad_request)?;
+    let requested = model_ref;
     let model_ref =
         crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
     // Default the tag before the store lookups: otherwise "gemma4" and
@@ -1988,7 +2003,7 @@ async fn resolve_target(
             tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_ref_owned))
                 .await
                 .context("pull task panicked")?
-                .context("pull failed")?;
+                .map_err(|e| pull_failure(requested, e))?;
         // No progress stream to relay over on this path — an inference
         // request triggered it, not `llmman pull` — so the daemon log is
         // the only place left. Better there than nowhere.
@@ -2844,17 +2859,21 @@ async fn chat_body(target: &Target, upstream: ChatUpstream) -> Result<ChatBody, 
         let message = format!("{} {status}: {body}", target.describe());
         // Same message either way; the marker lets a hybrid pair retry
         // on its hosted half (see send_with_hybrid_fallback).
-        let error = match target {
+        let (error, status) = match target {
+            // A prompt past the context can never succeed: a 400, as
+            // `/v1/chat/completions` relays it, not a 500 clients retry.
             Target::Local(_) => match context_overflow_message(status, &body) {
-                Some(refusal) => anyhow::Error::new(ContextOverflow { message, refusal }),
-                None => anyhow!("{message}"),
+                Some(refusal) => (
+                    anyhow::Error::new(ContextOverflow { message, refusal }),
+                    StatusCode::BAD_REQUEST,
+                ),
+                None => (anyhow!("{message}"), remote_status(target, status)),
             },
-            _ => anyhow!("{message}"),
+            _ => (anyhow!("{message}"), remote_status(target, status)),
         };
-        // A provider's own 4xx is the actionable answer — a bad key has
-        // to reach the user as 401, not as llmman's 500. A local backend
-        // keeps the blanket 500 it always returned.
-        return Err(AppError(error, remote_status(target, status)));
+        // A provider's own 4xx is the actionable answer (a bad key must
+        // reach the user as 401); any other local failure stays a 500.
+        return Err(AppError(error, status));
     }
     Ok(upstream.body)
 }
@@ -2901,10 +2920,10 @@ fn context_overflow_message(status: StatusCode, body: &str) -> Option<String> {
 /// The status llmman reports for an unsuccessful upstream response.
 ///
 /// A [`Target::Local`] backend failing is llmman's own problem, so it
-/// stays a 500 as it always has. A provider's 4xx is about the caller's
-/// request or credentials, so it is passed through rather than buried;
-/// anything else from a provider is a bad gateway. A peer already
-/// applied this mapping, so its status stands.
+/// stays a 500 (bar a prompt past the context: see `chat_body`). A
+/// provider's 4xx is about the caller's request or credentials, so it is
+/// passed through; anything else from a provider is a bad gateway. A peer
+/// already applied this mapping, so its status stands.
 fn remote_status(target: &Target, upstream: StatusCode) -> StatusCode {
     match target {
         Target::Local(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -2918,11 +2937,74 @@ fn remote_status(target: &Target, upstream: StatusCode) -> StatusCode {
 // Route handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_props() -> impl IntoResponse {
-    // A minimal llama.cpp-compatible /props reply in ROUTER mode, for
-    // clients that probe it to learn they are talking to a multi-model
-    // server. llmman's own web UI does not use it.
-    Json(serde_json::json!({
+/// The query of `GET /props`, as llama-server's router mode reads it.
+#[derive(Deserialize)]
+struct PropsQuery {
+    /// Whose props to answer with; without it, the router's own.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// How long a loaded llama-server has to answer `/props`.
+const PROPS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `GET /props`: the router's own, or with `?model=` that model's
+/// llama-server's (real context window, slots, modalities, chat template).
+/// A model that is not a loaded llama-server is a 404, so the client falls
+/// back to its own defaults. Unlike llama-server's router this never loads
+/// one (`autoload` is ignored): a GET that starts a model is one any web
+/// page could send.
+async fn handle_props(
+    State(state): State<AppState>,
+    Query(query): Query<PropsQuery>,
+) -> Result<Response, AppError> {
+    let Some(model) = query
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    else {
+        return Ok(Json(router_props()).into_response());
+    };
+    let claimed = if crate::providers::is_remote_ref(model) {
+        None
+    } else {
+        claim_llama_server(&state, &running_key(&state, model)).await
+    };
+    let (port, guard) = claimed.ok_or_else(|| {
+        AppError::status(
+            StatusCode::NOT_FOUND,
+            format!("no props for '{model}': it is not a loaded llama-server model"),
+        )
+    })?;
+    let props = backend_json(&state.0.client, port, "/props", PROPS_TIMEOUT).await;
+    guard.release_idle();
+    let props = props.map_err(|e| {
+        AppError::status(
+            StatusCode::BAD_GATEWAY,
+            format!("inference backend /props: {e}"),
+        )
+    })?;
+    Ok(Json(props).into_response())
+}
+
+/// `key`'s model, claimed so an eviction or the idle reaper leaves it alone
+/// meanwhile, if it is a loaded llama-server. Release the claim with
+/// `release_idle`: asking is not using.
+async fn claim_llama_server(state: &AppState, key: &str) -> Option<(u16, ActivityGuard)> {
+    let (port, guard) = check_running(state, key).await?;
+    if local_engine(state, &Target::Local(port)).await == Some(Engine::LlamaServer) {
+        return Some((port, guard));
+    }
+    guard.release_idle();
+    None
+}
+
+/// A minimal llama.cpp-compatible /props reply in ROUTER mode, for
+/// clients that probe it to learn they are talking to a multi-model
+/// server. llmman's own web UI does not use it.
+fn router_props() -> serde_json::Value {
+    serde_json::json!({
         "role": "router",
         "total_slots": 0,
         "model_path": "",
@@ -2997,7 +3079,7 @@ async fn handle_props() -> impl IntoResponse {
                 "stopping_word": ""
             }
         }
-    }))
+    })
 }
 
 // -- llmman's own API --------------------------------------------------------

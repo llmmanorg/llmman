@@ -25,6 +25,7 @@ import (
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	dockerconfig "github.com/containerd/containerd/v2/core/remotes/docker/config"
 	remoteerrors "github.com/containerd/containerd/v2/core/remotes/errors"
+	"github.com/containerd/containerd/v2/pkg/reference"
 	"github.com/containerd/errdefs"
 	dockercliconfig "github.com/docker/cli/cli/config"
 	"github.com/docker/cli/cli/config/credentials"
@@ -588,7 +589,7 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	progressReset(ref, "pulling manifest")
 	defer progressDone(ref)
 	if err := pullToLayout(context.Background(), ref, C.GoString(cLayoutDir)); err != nil {
-		return errResp(err)
+		return pullErrResp(err)
 	}
 	return okResp("")
 }
@@ -619,7 +620,11 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	// Including ref here too just repeats it two or three times over.
 	name, manifestDesc, err := resolver.Resolve(ctx, ref)
 	if err != nil {
-		return fmt.Errorf("resolve: %w", err)
+		err = fmt.Errorf("resolve: %w", err)
+		if isImageNotFound(err, ref) {
+			err = markImageNotFound(err)
+		}
+		return err
 	}
 	fetcher, err := resolver.Fetcher(ctx, name)
 	if err != nil {
@@ -870,4 +875,26 @@ func llmman_transfer(cSource, cDestination *C.char) *C.char {
 // more reliable than any message match. See sigstore.go's isNotFoundError.
 func isBackendNotFound(err error) bool {
 	return errdefs.IsNotFound(err)
+}
+
+// isImageNotFound reports whether err, from resolving ref, is the registry
+// saying the image does not exist: containerd's typed not-found, or the 401
+// Docker Hub gives an anonymous caller for a missing repository. With a
+// login stored the 401 is the login being refused, so it does not count.
+func isImageNotFound(err error, ref string) bool {
+	if isBackendNotFound(err) {
+		return true
+	}
+	return errors.Is(err, docker.ErrInvalidAuthorization) && isDockerHubRef(ref) && !hasCredentials(ref)
+}
+
+// hasCredentials reports whether a login is stored for ref's registry,
+// which is the host containerd's resolver takes from ref.
+func hasCredentials(ref string) bool {
+	spec, err := reference.Parse(ref)
+	if err != nil {
+		return false
+	}
+	user, secret, _ := dockerCredentials(spec.Hostname())
+	return user != "" || secret != ""
 }

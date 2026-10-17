@@ -82,6 +82,9 @@ scoop bucket add llmman https://github.com/llmmanorg/scoop-bucket
 scoop install llmman
 ```
 
+To start `llmman serve` at every logon, see
+[Run in the background](packaging/scoop/README.md#run-in-the-background).
+
 **Cargo:**
 
 ```sh
