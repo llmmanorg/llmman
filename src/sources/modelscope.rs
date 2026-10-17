@@ -82,7 +82,12 @@ pub(crate) async fn pull(reference: &str, ms_ref: &str, target: &Target<'_>) -> 
     let resp = req.send().await.context("ModelScope list")?;
     let status = resp.status();
     if !status.is_success() {
-        anyhow::bail!("ModelScope list: HTTP {}", status.as_u16());
+        let err = anyhow::anyhow!("ModelScope list: HTTP {}", status.as_u16());
+        return Err(if status == reqwest::StatusCode::NOT_FOUND {
+            crate::storage::oci::source_not_found(err)
+        } else {
+            err
+        });
     }
     let listing: MsListing = resp.json().await.context("ModelScope list decode")?;
     super::ensure_room(

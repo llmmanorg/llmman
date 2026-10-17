@@ -1,5 +1,6 @@
 //! Short-name alias resolution — from the `[aliases]` table of
-//! `llmman.conf`, at runtime. Nothing is compiled into the binary.
+//! `llmman.conf`, at runtime. Beyond [`OLLAMA_NAMES`], nothing is compiled
+//! into the binary.
 //!
 //! Mirrors podman's approach: files are merged in priority order, later
 //! entries winning. See [`crate::config`] for the locations.
@@ -30,6 +31,34 @@ fn load_aliases() -> HashMap<String, String> {
 fn aliases() -> &'static HashMap<String, String> {
     static CACHE: OnceLock<HashMap<String, String>> = OnceLock::new();
     CACHE.get_or_init(load_aliases)
+}
+
+/// Ollama library names with no model of that name in Docker's `ai/`
+/// namespace, resolved to the model that gives the same vectors: OpenClaw's
+/// default `nomic-embed-text` (v1.5, 768 dimensions) and `bge-m3` (ggml-org's
+/// Q8_0 build, 1024). Used only when `[aliases]` has nothing for the name,
+/// and only for the bare name or `:latest`.
+const OLLAMA_NAMES: &[(&str, &str)] = &[
+    ("nomic-embed-text", "docker.io/ai/nomic-embed-text-v1.5"),
+    ("bge-m3", "hf.co/ggml-org/bge-m3-Q8_0-GGUF"),
+];
+
+/// Where `aliases` send `reference`: its own entry or, for `name:latest`
+/// (Ollama's spelling of `name`), the entry for `name`.
+fn alias_for<'a>(aliases: &'a HashMap<String, String>, reference: &str) -> Option<&'a str> {
+    let bare = reference.strip_suffix(":latest");
+    [Some(reference), bare]
+        .into_iter()
+        .flatten()
+        .find_map(|key| aliases.get(key).map(String::as_str))
+}
+
+/// Where [`OLLAMA_NAMES`] sends `reference`.
+fn ollama_name(reference: &str) -> Option<&'static str> {
+    let name = reference.strip_suffix(":latest").unwrap_or(reference);
+    OLLAMA_NAMES
+        .iter()
+        .find_map(|(ollama, target)| (*ollama == name).then_some(*target))
 }
 
 /// Registry/HF URI schemes [`parse_registry_ref`] strips before parsing the
@@ -639,8 +668,8 @@ pub fn resolve_ollama_api(reference: &str) -> Result<String, InvalidReference> {
     // resolve, so validation cannot be deferred to it.
     let parsed = validate_reference_parsed(reference)?;
     if is_bare(reference) {
-        if let Some(mapped) = aliases().get(reference) {
-            return Ok(mapped.clone());
+        if let Some(target) = alias_for(aliases(), reference).or_else(|| ollama_name(reference)) {
+            return Ok(target.to_string());
         }
         return Ok(format!("docker.io/ai/{reference}"));
     }
@@ -967,6 +996,46 @@ mod tests {
             resolve_ollama_api("qwen3.5:0.8B").unwrap(),
             "docker.io/ai/qwen3.5:0.8B"
         );
+    }
+
+    #[test]
+    fn resolve_ollama_api_maps_the_ollama_embedding_names() {
+        for (name, target) in [
+            ("nomic-embed-text", "docker.io/ai/nomic-embed-text-v1.5"),
+            (
+                "nomic-embed-text:latest",
+                "docker.io/ai/nomic-embed-text-v1.5",
+            ),
+            ("bge-m3", "hf.co/ggml-org/bge-m3-Q8_0-GGUF"),
+            ("bge-m3:latest", "hf.co/ggml-org/bge-m3-Q8_0-GGUF"),
+            // Anything else keeps the `ai/` default.
+            (
+                "nomic-embed-text:v1.5",
+                "docker.io/ai/nomic-embed-text:v1.5",
+            ),
+            ("bge-m3-large", "docker.io/ai/bge-m3-large"),
+        ] {
+            assert_eq!(resolve_ollama_api(name).unwrap(), target, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_configured_alias_answers_name_latest_too_and_exact_entries_win() {
+        let aliases = HashMap::from([
+            ("bge-m3".to_string(), "hf.co/acme/custom".to_string()),
+            ("gemma4:latest".to_string(), "hf.co/acme/pinned".to_string()),
+            ("gemma4".to_string(), "hf.co/acme/floating".to_string()),
+        ]);
+        for (reference, target) in [
+            ("bge-m3", Some("hf.co/acme/custom")),
+            ("bge-m3:latest", Some("hf.co/acme/custom")),
+            ("gemma4", Some("hf.co/acme/floating")),
+            ("gemma4:latest", Some("hf.co/acme/pinned")),
+            ("bge-m3:v2", None),
+            ("other", None),
+        ] {
+            assert_eq!(alias_for(&aliases, reference), target, "{reference}");
+        }
     }
 
     #[test]
