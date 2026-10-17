@@ -703,6 +703,12 @@ jobs:
   # mlx-lm (macOS arm64, e2e)" below actually installs it; every other
   # entry's copy of that same test skips itself instead (mlx-lm has no
   # non-Apple-Silicon build to test against).
+  #
+  # `tests/launch_e2e.rs`'s `mediagen_qwen_image_metal_matches_cpu` runs on
+  # the same two macOS aarch64 legs (the `aarch64-apple-darwin` targets, the
+  # only ones with Metal) and skips on Linux and Windows, whose llama.cpp
+  # assets are CPU-only. It generates from a tiny synthetic Qwen-Image pack
+  # on Metal and on the CPU and requires the two images to match (#575).
   # --------------------------------------------------------------------------
   e2e:
     name: E2E (launch claude/agy/opencode/pi/omp/codex/copilot/droid/cline/grok/qwen/hermes/openclaw/dsh/goose/goose-desktop/docker-agent, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
