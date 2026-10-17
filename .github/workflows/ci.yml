@@ -51,6 +51,12 @@ env:
   # 404s within hours. The 0.3.0.dev20260825040033 pinned here before
   # went that way and took every macOS e2e run with it. Bump deliberately.
   VLLM_METAL_VERSION: "0.30.0"
+  # transformers for the macOS "Install vLLM (e2e)" step. Neither vLLM nor
+  # vllm-metal 0.30.0 caps it, and 5.20.0 (2026-10-15) broke vllm-metal's
+  # register(); vLLM swallows that and falls back to its CPU platform, which
+  # fails serve_vllm_safetensors_model on both macOS legs. 5.19.0 is what the
+  # last green run had. Bump deliberately, with VLLM_METAL_VERSION.
+  METAL_TRANSFORMERS_VERSION: "5.19.0"
   # SGLang git tag (`v` added at use) the e2e job installs from source
   # for tests/launch_e2e.rs's `serve_sglang_safetensors_model`: upstream's
   # PyPI wheel and `sglang-kernel` are CUDA builds, so the CPU engine
@@ -1610,9 +1616,25 @@ jobs:
 
           if [ "${{ runner.os }}" = "macOS" ]; then
             "$venv/bin/pip" install \
-              "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl"
+              "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl" \
+              "transformers==${METAL_TRANSFORMERS_VERSION}"
             "$venv/bin/pip" install \
               "https://github.com/vllm-project/vllm-metal/releases/download/v${VLLM_METAL_VERSION}/vllm_metal-${VLLM_METAL_VERSION}-cp312-cp312-macosx_15_0_arm64.whl"
+
+            # vLLM swallows an exception from a platform plugin's register()
+            # and falls back to CPU. Call register() first for its traceback,
+            # then check the platform vLLM resolves.
+            "$venv/bin/python" - <<'EOF'
+          import vllm_metal
+
+          qualname = vllm_metal.register()
+          assert qualname == "vllm_metal.platform.MetalPlatform", qualname
+          from vllm.platforms import current_platform
+
+          name = type(current_platform).__name__
+          assert name == "MetalPlatform", f"vLLM resolved {name}, not MetalPlatform"
+          print(f"vllm-metal active: {name}")
+          EOF
           else
             case "${{ matrix.target }}" in
               x86_64-*) arch=x86_64 ;;
