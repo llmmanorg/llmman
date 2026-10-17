@@ -371,7 +371,8 @@ pub(super) const DS4_ARGS_VAR: &str = "LLMMAN_DS4_ARGS";
 
 /// Splits an `LLMMAN_*_ARGS` value on whitespace, like `LLMMAN_SHELL` (no
 /// quoting). Appended after llmman's own flags, so a repeated flag wins
-/// on an argparse engine.
+/// on an argparse engine, except a local engine's `--host` (see
+/// [`force_loopback_host`]).
 pub(super) fn split_extra_args(value: Option<&str>) -> Vec<String> {
     value
         .unwrap_or_default()
@@ -383,6 +384,13 @@ pub(super) fn split_extra_args(value: Option<&str>) -> Vec<String> {
 /// [`split_extra_args`] on the environment variable `var`.
 fn extra_args_from_env(var: &str) -> Vec<String> {
     split_extra_args(std::env::var(var).ok().as_deref())
+}
+
+/// Appends `--host 127.0.0.1` after a local engine's `LLMMAN_*_ARGS`.
+/// vllm, sglang and ds4-server keep the last `--host`, so the engine binds
+/// loopback however the extra args spell it (argparse takes abbreviations).
+fn force_loopback_host(args: &mut Vec<String>) {
+    args.extend(["--host".into(), "127.0.0.1".into()]);
 }
 
 /// argv after the `vllm` binary, shared with `container::spawn_engine`
@@ -445,13 +453,14 @@ pub(super) async fn spawn_vllm_server(
     max_model_len: Option<u32>,
 ) -> anyhow::Result<tokio::process::Child> {
     let vllm = which_binary("vllm")?;
-    let args = vllm_serve_args_from_env(
+    let mut args = vllm_serve_args_from_env(
         model_dir.to_str().context("non-UTF-8 model path")?,
         "127.0.0.1",
         port,
         model_name,
         max_model_len,
     );
+    force_loopback_host(&mut args);
     let mut cmd = grouped_command(&vllm, args);
     crate::debug_log!("spawning {}: {:?}", vllm.display(), cmd);
     cmd.spawn()
@@ -521,12 +530,13 @@ pub(super) async fn spawn_vllm_omni_server(
             vllm.display()
         );
     }
-    let args = vllm_omni_serve_args_from_env(
+    let mut args = vllm_omni_serve_args_from_env(
         model_dir.to_str().context("non-UTF-8 model path")?,
         "127.0.0.1",
         port,
         model_name,
     );
+    force_loopback_host(&mut args);
     spawn_piped(grouped_command(&vllm, args), &vllm, "vllm --omni")
 }
 
@@ -618,6 +628,7 @@ pub(super) async fn spawn_sglang_server(
         model_name,
         context_length,
     ));
+    force_loopback_host(&mut args);
     spawn_piped(grouped_command(&sglang, args), &sglang, "sglang")
 }
 
@@ -689,6 +700,7 @@ pub(super) async fn spawn_ds4_server(
         ctx,
     );
     args.extend(extra_args_from_env(DS4_ARGS_VAR));
+    force_loopback_host(&mut args);
     let mut cmd = tokio::process::Command::new(&resolved);
     cmd.args(args).kill_on_drop(true);
     spawn_piped(cmd, &resolved, "ds4-server")
@@ -1241,6 +1253,16 @@ mod tests {
         assert_eq!(
             ds4_models_context_length(&serde_json::json!({"data": [{"context_length": 0}]})),
             None
+        );
+    }
+
+    #[test]
+    fn force_loopback_host_follows_any_extra_args_host() {
+        let mut args = split_extra_args(Some("--hos 0.0.0.0 --tp 2"));
+        force_loopback_host(&mut args);
+        assert_eq!(
+            args,
+            ["--hos", "0.0.0.0", "--tp", "2", "--host", "127.0.0.1"]
         );
     }
 
