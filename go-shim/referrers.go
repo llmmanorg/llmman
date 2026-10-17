@@ -7,7 +7,6 @@ package main
 import "C"
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,13 +14,13 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
@@ -52,12 +51,13 @@ func llmman_push_artifact(cLayoutDir, cRef, cSubjectJSON *C.char) *C.char {
 		return errResp(err)
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 	artifact, err := setManifestSubject(C.GoString(cLayoutDir), ref, subject)
 	if err != nil {
 		return errResp(err)
 	}
-	if _, err := pushToRegistry(ctx, C.GoString(cLayoutDir), ref); err != nil {
+	if _, err := pushDescriptorToRegistry(ctx, C.GoString(cLayoutDir), ref, artifact); err != nil {
 		return errResp(err)
 	}
 	if err := publishFallbackReferrer(ctx, ref, subject.Digest, artifact); err != nil {
@@ -76,7 +76,9 @@ func llmman_referrers(cRef, cDigest *C.char) *C.char {
 	if err != nil {
 		return errResp(fmt.Errorf("parse subject digest: %w", err))
 	}
-	refs, _, err := fetchReferrers(context.Background(), C.GoString(cRef), dgst)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	refs, _, err := fetchReferrers(ctx, C.GoString(cRef), dgst)
 	if err != nil {
 		return errResp(err)
 	}
@@ -160,20 +162,75 @@ func repositoryForRef(ref string) (name.Repository, error) {
 	return repo, nil
 }
 
-func registryClient(ctx context.Context, repo name.Repository, push bool) (*http.Client, error) {
+func registryClient(ctx context.Context, repo name.Repository) (*http.Client, error) {
+	base, err := registryBaseTransport(ctx, repo)
+	if err != nil {
+		return nil, fmt.Errorf("load registry transport: %w", err)
+	}
 	auth, err := registryAuthenticator(ctx, repo)
 	if err != nil {
 		return nil, fmt.Errorf("load registry credentials: %w", err)
 	}
 	scopes := []string{repo.Scope(transport.PullScope)}
-	if push {
-		scopes = append(scopes, repo.Scope(transport.PushScope))
-	}
-	roundTripper, err := transport.NewWithContext(ctx, repo.Registry, auth, remote.DefaultTransport, scopes)
+	origin := &url.URL{Scheme: repo.Scheme(), Host: repo.RegistryStr()}
+	roundTripper, err := transport.NewWithContext(ctx, repo.Registry, auth, base, scopes)
 	if err != nil {
 		return nil, fmt.Errorf("configure registry transport: %w", err)
 	}
-	return &http.Client{Transport: roundTripper, Timeout: 120 * time.Second}, nil
+	return &http.Client{
+		Transport: &registryOriginTransport{origin: origin, next: roundTripper},
+		Timeout:   120 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 || !sameRegistryOrigin(origin, req.URL) {
+				return fmt.Errorf("referrers redirect leaves registry origin: %s", req.URL)
+			}
+			return nil
+		},
+	}, nil
+}
+
+// Restrict the referrers client, not the transport used inside bearer-token
+// setup: a registry may legitimately delegate authentication to another host.
+type registryOriginTransport struct {
+	origin *url.URL
+	next   http.RoundTripper
+}
+
+func (t *registryOriginTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !sameRegistryOrigin(t.origin, req.URL) {
+		return nil, fmt.Errorf("referrers request leaves registry origin: %s", req.URL)
+	}
+	return t.next.RoundTrip(req)
+}
+
+// Credential helpers and transport setup may block before the first HTTP
+// request. Bound that phase as well as the requests made by the client.
+func registryClientWithin(ctx context.Context, create func() (*http.Client, error)) (*http.Client, error) {
+	type result struct {
+		client *http.Client
+		err    error
+	}
+	ready := make(chan result)
+	go func() {
+		client, err := create()
+		select {
+		case ready <- result{client, err}:
+		case <-ctx.Done():
+			if client != nil {
+				client.CloseIdleConnections()
+			}
+		}
+	}()
+	select {
+	case got := <-ready:
+		return got.client, got.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func sameRegistryOrigin(origin, target *url.URL) bool {
+	return target.User == nil && strings.EqualFold(target.Scheme, origin.Scheme) && strings.EqualFold(target.Host, origin.Host)
 }
 
 func registryURL(repo name.Repository, elems ...string) string {
@@ -219,18 +276,12 @@ func getReferrersIndex(ctx context.Context, client *http.Client, endpoint string
 		if len(raw) > maxReferrersIndexBytes {
 			return nil, false, fmt.Errorf("referrers index is over the %d-byte limit", maxReferrersIndexBytes)
 		}
-		var page ocispec.Index
-		if err := json.Unmarshal(raw, &page); err != nil {
-			return nil, false, fmt.Errorf("parse referrers index: %w", err)
-		}
-		if page.SchemaVersion != 2 || page.MediaType != ocispec.MediaTypeImageIndex {
-			return nil, false, fmt.Errorf(
-				"invalid referrers index: schemaVersion=%d mediaType=%q",
-				page.SchemaVersion, page.MediaType,
-			)
+		page, err := parseReferrersIndex(raw)
+		if err != nil {
+			return nil, false, err
 		}
 		if combined == nil {
-			combined = &page
+			combined = page
 		} else {
 			combined.Manifests = append(combined.Manifests, page.Manifests...)
 		}
@@ -240,15 +291,24 @@ func getReferrersIndex(ctx context.Context, client *http.Client, endpoint string
 		}
 		if next != "" {
 			nextURL, parseErr := url.Parse(next)
-			if parseErr != nil || nextURL.User != nil ||
-				!strings.EqualFold(nextURL.Scheme, origin.Scheme) ||
-				!strings.EqualFold(nextURL.Host, origin.Host) {
+			if parseErr != nil || !sameRegistryOrigin(origin, nextURL) {
 				return nil, false, fmt.Errorf("referrers next link %q leaves registry origin", next)
 			}
 		}
 		endpoint = next
 	}
 	return combined, true, nil
+}
+
+func parseReferrersIndex(raw []byte) (*ocispec.Index, error) {
+	var index ocispec.Index
+	if err := json.Unmarshal(raw, &index); err != nil {
+		return nil, fmt.Errorf("parse referrers index: %w", err)
+	}
+	if index.SchemaVersion != 2 || (index.MediaType != "" && index.MediaType != ocispec.MediaTypeImageIndex) {
+		return nil, fmt.Errorf("invalid referrers index: schemaVersion=%d mediaType=%q", index.SchemaVersion, index.MediaType)
+	}
+	return &index, nil
 }
 
 func nextLink(base string, headers []string) (string, error) {
@@ -261,6 +321,7 @@ func nextLink(base string, headers []string) (string, error) {
 			isNext := false
 			for _, param := range strings.Split(entry[end+1:], ";") {
 				key, value, ok := strings.Cut(strings.TrimSpace(param), "=")
+				key, value = strings.TrimSpace(key), strings.TrimSpace(value)
 				if ok && strings.EqualFold(key, "rel") {
 					for _, rel := range strings.Fields(strings.Trim(value, `"`)) {
 						isNext = isNext || strings.EqualFold(rel, "next")
@@ -333,11 +394,24 @@ func fetchReferrers(ctx context.Context, ref string, subject digest.Digest) ([]o
 }
 
 func fetchReferrersIndex(ctx context.Context, ref string, subject digest.Digest) (ocispec.Index, bool, error) {
+	index, found, err := fetchNativeReferrersIndex(ctx, ref, subject)
+	if err != nil || found {
+		return index, found, err
+	}
+	index, err = fetchFallbackReferrersIndex(ctx, ref, subject)
+	return index, false, err
+}
+
+func fetchNativeReferrersIndex(ctx context.Context, ref string, subject digest.Digest) (ocispec.Index, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 	repo, err := repositoryForRef(ref)
 	if err != nil {
 		return ocispec.Index{}, false, err
 	}
-	client, err := registryClient(ctx, repo, false)
+	client, err := registryClientWithin(ctx, func() (*http.Client, error) {
+		return registryClient(ctx, repo)
+	})
 	if err != nil {
 		return ocispec.Index{}, false, err
 	}
@@ -345,29 +419,49 @@ func fetchReferrersIndex(ctx context.Context, ref string, subject digest.Digest)
 	if err != nil {
 		return ocispec.Index{}, false, fmt.Errorf("list referrers: %w", err)
 	}
-	if found {
-		return *index, true, nil
-	}
-	index, found, err = getReferrersIndex(ctx, client, registryURL(repo, "manifests", fallbackTag(subject)))
-	if err != nil {
-		return ocispec.Index{}, false, fmt.Errorf("read fallback referrers index: %w", err)
-	}
 	if !found {
+		return ocispec.Index{}, false, nil
+	}
+	return *index, true, nil
+}
+
+func fetchFallbackReferrersIndex(ctx context.Context, ref string, subject digest.Digest) (ocispec.Index, error) {
+	repo, err := repositoryForRef(ref)
+	if err != nil {
+		return ocispec.Index{}, err
+	}
+	fallbackRef := repo.String() + ":" + fallbackTag(subject)
+	raw, err := fetchManifestRaw(ctx, fallbackRef)
+	if err != nil && isNotFoundError(err) {
 		empty := ocispec.Index{}
 		empty.Versioned = specs.Versioned{SchemaVersion: 2}
 		empty.MediaType = ocispec.MediaTypeImageIndex
 		empty.Manifests = []ocispec.Descriptor{}
-		return empty, false, nil
+		return empty, nil
 	}
-	return *index, false, nil
+	if err != nil {
+		return ocispec.Index{}, fmt.Errorf("read fallback referrers index: %w", err)
+	}
+	index, err := parseReferrersIndex(raw)
+	if err != nil {
+		return ocispec.Index{}, err
+	}
+	return *index, nil
 }
 
 func publishFallbackReferrer(ctx context.Context, ref string, subject digest.Digest, artifact ocispec.Descriptor) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	_, native, err := fetchNativeReferrersIndex(ctx, ref, subject)
+	if err != nil || native {
+		return err
+	}
+
 	fallbackPublishMu.Lock()
 	defer fallbackPublishMu.Unlock()
 
-	index, native, err := fetchReferrersIndex(ctx, ref, subject)
-	if err != nil || native {
+	index, err := fetchFallbackReferrersIndex(ctx, ref, subject)
+	if err != nil {
 		return err
 	}
 	for _, existing := range index.Manifests {
@@ -375,12 +469,6 @@ func publishFallbackReferrer(ctx context.Context, ref string, subject digest.Dig
 			return nil
 		}
 	}
-	annotations := make(map[string]string, len(artifact.Annotations))
-	for key, value := range artifact.Annotations {
-		annotations[key] = value
-	}
-	delete(annotations, ocispec.AnnotationRefName) // local ref-name annotations do not belong in the remote index
-	artifact.Annotations = annotations
 	index.Manifests = append(index.Manifests, artifact)
 	sort.Slice(index.Manifests, func(i, j int) bool {
 		return index.Manifests[i].Digest.String() < index.Manifests[j].Digest.String()
@@ -389,25 +477,28 @@ func publishFallbackReferrer(ctx context.Context, ref string, subject digest.Dig
 	if err != nil {
 		return err
 	}
-
+	if len(raw) > maxManifestBytes {
+		return fmt.Errorf("fallback referrers index is over the %d-byte limit", maxManifestBytes)
+	}
+	staging, err := os.MkdirTemp("", "llmman-referrers-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(staging)
+	if err := ensureLayout(staging); err != nil {
+		return err
+	}
+	desc, err := writeBlob(staging, ocispec.MediaTypeImageIndex, raw)
+	if err != nil {
+		return err
+	}
 	repo, err := repositoryForRef(ref)
 	if err != nil {
 		return err
 	}
-	client, err := registryClient(ctx, repo, true)
-	if err != nil {
+	fallbackRef := repo.String() + ":" + fallbackTag(subject)
+	if err := writeManifestRef(staging, fallbackRef, desc); err != nil {
 		return err
 	}
-	endpoint := registryURL(repo, "manifests", fallbackTag(subject))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(raw))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", ocispec.MediaTypeImageIndex)
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	return transport.CheckError(resp, http.StatusOK, http.StatusCreated, http.StatusAccepted)
+	return pushIndexToRegistry(ctx, staging, fallbackRef, desc)
 }

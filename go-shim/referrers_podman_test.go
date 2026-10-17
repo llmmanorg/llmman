@@ -17,6 +17,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/registry"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"go.podman.io/image/v5/transports/alltransports"
 	"go.podman.io/image/v5/types"
 )
 
@@ -79,7 +80,7 @@ func TestPodmanArtifactPushRefusesManifestDigestRewrite(t *testing.T) {
 	}
 
 	destinationCtx := &types.SystemContext{DockerInsecureSkipTLSVerify: types.OptionalBoolTrue}
-	if _, err := pushToRegistryWithDestinationContext(context.Background(), dir, ref, destinationCtx); err == nil {
+	if _, err := pushDescriptorToRegistryWithDestinationContext(context.Background(), dir, ref, desc, destinationCtx, true); err == nil {
 		t.Fatal("push succeeded by rewriting an OCI artifact the registry rejected")
 	}
 	if ociPuts.Load() == 0 {
@@ -87,5 +88,69 @@ func TestPodmanArtifactPushRefusesManifestDigestRewrite(t *testing.T) {
 	}
 	if convertedPuts.Load() != 0 {
 		t.Fatalf("push retried with %d digest-changing converted manifest(s)", convertedPuts.Load())
+	}
+}
+
+func TestPodmanPushesFallbackIndexWithoutArtifactBlobs(t *testing.T) {
+	reg := registry.New(registry.Logger(log.New(io.Discard, "", 0)))
+	srv := httptest.NewTLSServer(reg)
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := u.Host + "/org/model:sha256-" + strings.Repeat("a", 64)
+	sys := &types.SystemContext{DockerInsecureSkipTLSVerify: types.OptionalBoolTrue}
+	artifactDir := t.TempDir()
+	if err := ensureLayout(artifactDir); err != nil {
+		t.Fatal(err)
+	}
+	config, err := writeBlob(artifactDir, "application/vnd.example.config.v1+json", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifactManifest := ocispec.Manifest{MediaType: ocispec.MediaTypeImageManifest, Config: config}
+	artifactManifest.SchemaVersion = 2
+	artifactRaw, err := json.Marshal(artifactManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := writeBlob(artifactDir, ocispec.MediaTypeImageManifest, artifactRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pushDescriptorToRegistryWithDestinationContext(context.Background(), artifactDir, u.Host+"/org/model:artifact", artifact, sys, true); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := ensureLayout(dir); err != nil {
+		t.Fatal(err)
+	}
+	index := ocispec.Index{Manifests: []ocispec.Descriptor{artifact}}
+	index.SchemaVersion = 2
+	index.MediaType = ocispec.MediaTypeImageIndex
+	raw, err := json.Marshal(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desc, err := writeBlob(dir, ocispec.MediaTypeImageIndex, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pushIndexToRegistryWithDestinationContext(context.Background(), dir, ref, desc, sys); err != nil {
+		t.Fatal(err)
+	}
+	srcRef, err := alltransports.ParseImageName("docker://" + ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := srcRef.NewImageSource(context.Background(), sys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	got, _, err := src.GetManifest(context.Background(), nil)
+	if err != nil || string(got) != string(raw) {
+		t.Fatalf("published index = %s, %v; want %s", got, err, raw)
 	}
 }
