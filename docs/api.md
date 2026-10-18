@@ -50,11 +50,17 @@ constrained structured output). `/api/generate` takes `system` and
 since llmman leaves templating to the backend.
 
 Of `options`, `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stop`,
-`num_predict`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`
-and `num_thread` apply; `num_ctx` is `LLMMAN_CONTEXT_LENGTH`. The `done`
+`num_predict`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`,
+`num_thread` and `num_ctx` apply. `num_ctx` is the window a llama-server
+model is loaded with, over `LLMMAN_CONTEXT_LENGTH` and cut to its trained
+context. As in Ollama, a model loaded with another window is reloaded once
+its requests finish, and requests that arrive meanwhile wait. A request with
+no `num_ctx` uses whichever window is loaded. The `done`
 chunk carries Ollama's counts and durations (`prompt_eval_count`,
 `eval_count`, `total_duration`, ...) and `done_reason` is `stop` or
 `length` as in Ollama, which reports a tool-calling turn as `stop`.
+`prompt_eval_count` is the whole prompt, as in Ollama, and
+`prompt_eval_cached_count` how much of it came from the cache.
 
 `/api/embed` and `/api/embeddings` work with any GGUF embedding model
 (one with a pooling type, e.g. `embeddinggemma`, `nomic-embed-text`):
@@ -92,6 +98,11 @@ These are not `500`s:
   pull, a refused login or another registry's denial included, is a `500`.
 - A prompt longer than the context is a `400` on `/api/chat`, `/api/generate`
   and `/v1/messages`, as on `/v1/chat/completions`.
+
+A chat template that needs alternating roles (Gemma, Llama 2, Mistral)
+refuses two messages of one role in a row. The chat routes then retry once
+with adjacent `user` (or `assistant`) messages merged, joined by a blank
+line; a message with tool calls is never merged.
 
 ## What the model lists report
 

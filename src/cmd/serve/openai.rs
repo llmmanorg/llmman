@@ -29,7 +29,7 @@ use super::types::*;
 use super::{
     aggregation, backend_wire_model, ensure_model, ensure_model_for, provider_compat,
     running_by_digest, send_chat_completion, strip_llama_fields, AppError, AppState, Engine,
-    Target, Task, CHAT_COMPLETIONS_ROUTE,
+    LoadOptions, Target, Task, CHAT_COMPLETIONS_ROUTE,
 };
 use crate::ordered::Ordered;
 use crate::storage::OciStore;
@@ -212,6 +212,80 @@ pub(super) fn consolidate_chat_system_messages(req: &mut serde_json::Value) {
     );
 }
 
+/// `body` with adjacent same-role messages merged, if `reply` is `target`'s
+/// chat template refusing them with a 400 ("Conversation roles must
+/// alternate", as Gemma's, Llama 2's and Mistral's raise). A client may
+/// legitimately send two user turns in a row, and a template that allows it
+/// renders them as two, so this is only ever done after a refusal. `None`
+/// when the refusal is another or there is nothing to merge.
+pub(super) fn merged_after_refusal(
+    target: &Target,
+    status: StatusCode,
+    reply: &[u8],
+    body: &[u8],
+) -> Option<Bytes> {
+    let refused = status == StatusCode::BAD_REQUEST
+        && String::from_utf8_lossy(reply)
+            .to_ascii_lowercase()
+            .contains("roles must alternate");
+    let mut req: serde_json::Value = serde_json::from_slice(body).ok().filter(|_| refused)?;
+    if !merge_adjacent_roles(&mut req) {
+        return None;
+    }
+    eprintln!(
+        "[llmman] {} refused consecutive same-role messages; retrying with them merged",
+        target.describe()
+    );
+    serde_json::to_vec(&req).ok().map(Bytes::from)
+}
+
+/// Merges each run of adjacent `user` messages, and of adjacent `assistant`
+/// ones, into one (as Ollama's `template.collate` does): text joins with a
+/// blank line and other blocks are kept, as when system messages merge. A
+/// message with anything beside `role` and `content` (tool calls, a tool id,
+/// reasoning) is left alone. Returns whether anything merged.
+fn merge_adjacent_roles(req: &mut serde_json::Value) -> bool {
+    fn mergeable_role(message: &serde_json::Value) -> Option<&str> {
+        let message = message.as_object()?;
+        let role = message.get("role")?.as_str()?;
+        (matches!(role, "user" | "assistant")
+            && message.keys().all(|key| key == "role" || key == "content"))
+        .then_some(role)
+    }
+
+    let Some(messages) = req.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+    let mut merged_any = false;
+    let mut merged = Vec::with_capacity(messages.len());
+    let mut pending = std::mem::take(messages).into_iter().peekable();
+    while let Some(first) = pending.next() {
+        let Some(role) = mergeable_role(&first).map(str::to_owned) else {
+            merged.push(first);
+            continue;
+        };
+        let mut run = vec![first];
+        while let Some(next) = pending.next_if(|m| mergeable_role(m) == Some(role.as_str())) {
+            run.push(next);
+        }
+        if run.len() == 1 {
+            merged.extend(run);
+            continue;
+        }
+        merged_any = true;
+        let mut content = MergedInstructions::default();
+        for message in &run {
+            content.push(message.get("content").unwrap_or(&serde_json::Value::Null));
+        }
+        merged.push(serde_json::json!({
+            "role": role,
+            "content": content.finish().unwrap_or_else(|| serde_json::json!("")),
+        }));
+    }
+    *messages = merged;
+    merged_any
+}
+
 /// The merged instruction content, built in order. One entry per
 /// message, its own text parts joined by a newline; the entries join
 /// into one run separated by a blank line. A non-text block closes that
@@ -350,7 +424,8 @@ pub(super) async fn resolve_openai_request(
     let model = req["model"].as_str().unwrap_or("").to_string();
     // No `request_threads`: the OpenAI-compatible surface has no Ollama
     // options blob, so there is no num_thread to forward.
-    let (model, target, guard) = ensure_model_for(state, &model, Some(headers), None, task).await?;
+    let (model, target, guard) =
+        ensure_model_for(state, &model, Some(headers), LoadOptions::default(), task).await?;
     prepare_openai_request(state, req, model, target, guard).await
 }
 
@@ -407,7 +482,7 @@ pub(super) async fn proxy_openai_generation(
         state,
         &model_ref,
         Some(headers),
-        None,
+        LoadOptions::default(),
         |model, target, guard| {
             proxy_openai_generation_to(
                 state,
@@ -922,8 +997,14 @@ pub(super) async fn handle_openai_systemone(
         req.set("images", raw_member(&images)?);
     }
 
-    let (model, target, guard) =
-        ensure_model_for(&state, &model_ref, Some(&headers), None, Task::Other).await?;
+    let (model, target, guard) = ensure_model_for(
+        &state,
+        &model_ref,
+        Some(&headers),
+        LoadOptions::default(),
+        Task::Other,
+    )
+    .await?;
     let activity = begin_activity(guard, Some(keep_alive)).await;
     // A peer is another llmman and applies `keep_alive` itself.
     if !matches!(target, Target::Peer(_)) {
@@ -2031,6 +2112,161 @@ mod tests {
                 {"role": "user", "content": "hi"}
             ])
         );
+    }
+
+    /// The shapes from the report: a second user turn in a row, whether
+    /// after the system prompt or deep in a conversation.
+    #[test]
+    fn merge_adjacent_roles_joins_a_run_into_one_turn() {
+        let mut req = serde_json::json!({
+            "model": "gemma3:1b",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "a"},
+                {"role": "user", "content": [{"type": "text", "text": "b"}]},
+            ]
+        });
+        assert!(merge_adjacent_roles(&mut req));
+        assert_eq!(
+            req["messages"],
+            serde_json::json!([
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "a\n\nb"},
+            ])
+        );
+        assert_eq!(req["model"], "gemma3:1b", "only the messages change");
+
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "assistant", "content": "a2"},
+                {"role": "user", "content": "q2"},
+                {"role": "user", "content": "q3"},
+                {"role": "user", "content": "q4"},
+            ]
+        });
+        assert!(merge_adjacent_roles(&mut req));
+        assert_eq!(
+            req["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1\n\na2"},
+                {"role": "user", "content": "q2\n\nq3\n\nq4"},
+            ])
+        );
+    }
+
+    /// Nothing to merge is no change, and no claim of one.
+    #[test]
+    fn merge_adjacent_roles_leaves_an_alternating_request_alone() {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": [{"type": "text", "text": "a"}]},
+                {"role": "assistant", "content": "b"},
+                {"role": "user", "content": "c"},
+            ]
+        });
+        let before = req.clone();
+        assert!(!merge_adjacent_roles(&mut req));
+        assert_eq!(req, before);
+
+        let mut no_messages = serde_json::json!({"input": "hi"});
+        assert!(!merge_adjacent_roles(&mut no_messages));
+    }
+
+    /// Tool turns are not two plain turns of one speaker: parallel results
+    /// are separate `tool` messages with their own ids, and a call carries
+    /// fields a merge would lose.
+    #[test]
+    fn merge_adjacent_roles_keeps_tool_turns_apart() {
+        let call = serde_json::json!([{"id": "c1", "type": "function",
+            "function": {"name": "f", "arguments": "{}"}}]);
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": null, "tool_calls": call},
+                {"role": "assistant", "content": "calling"},
+                {"role": "assistant", "content": "again"},
+                {"role": "tool", "tool_call_id": "c1", "content": "1"},
+                {"role": "tool", "tool_call_id": "c2", "content": "2"},
+                {"role": "user", "content": "x", "name": "alice"},
+                {"role": "user", "content": "y"},
+            ]
+        });
+        assert!(merge_adjacent_roles(&mut req));
+        assert_eq!(
+            req["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": null, "tool_calls": call},
+                {"role": "assistant", "content": "calling\n\nagain"},
+                {"role": "tool", "tool_call_id": "c1", "content": "1"},
+                {"role": "tool", "tool_call_id": "c2", "content": "2"},
+                {"role": "user", "content": "x", "name": "alice"},
+                {"role": "user", "content": "y"},
+            ])
+        );
+    }
+
+    /// An image between two texts is kept in place rather than folded away,
+    /// as when system messages merge.
+    #[test]
+    fn merge_adjacent_roles_keeps_non_text_blocks() {
+        let image = serde_json::json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}});
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "look"},
+                {"role": "user", "content": [image, {"type": "text", "text": "what is it"}]},
+            ]
+        });
+        assert!(merge_adjacent_roles(&mut req));
+        assert_eq!(
+            req["messages"],
+            serde_json::json!([{"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                image,
+                {"type": "text", "text": "what is it"},
+            ]}])
+        );
+
+        // Two empty turns are still a turn, not a missing one.
+        let mut req = serde_json::json!({
+            "messages": [{"role": "user", "content": ""}, {"role": "user", "content": null}]
+        });
+        assert!(merge_adjacent_roles(&mut req));
+        assert_eq!(
+            req["messages"],
+            serde_json::json!([{"role": "user", "content": ""}])
+        );
+    }
+
+    /// Gemma's and Mistral's wordings of the rule are both read, and only on
+    /// a 400: any other refusal, or nothing to merge, is not retried.
+    #[test]
+    fn merged_after_refusal_reads_the_templates_own_rule() {
+        let gemma = r#"{"error":{"code":400,"message":"Unable to generate parser for this template. Automatic parser generation failed: Conversation roles must alternate user/assistant/user/assistant/...","type":"invalid_request_error"}}"#;
+        let mistral = "After the optional system message, conversation roles must alternate user and assistant roles except for tool calls and results.";
+        let sent = br#"{"messages":[{"role":"user","content":"a"},{"role":"user","content":"b"}]}"#;
+        let target = Target::Local(1);
+        let retry = |status, reply: &str, body: &[u8]| {
+            merged_after_refusal(&target, status, reply.as_bytes(), body)
+        };
+        for reply in [gemma, mistral] {
+            let merged = retry(StatusCode::BAD_REQUEST, reply, sent).expect(reply);
+            let merged: serde_json::Value = serde_json::from_slice(&merged).unwrap();
+            assert_eq!(
+                merged["messages"],
+                serde_json::json!([{"role": "user", "content": "a\n\nb"}])
+            );
+            assert_eq!(retry(StatusCode::INTERNAL_SERVER_ERROR, reply, sent), None);
+        }
+        let other = "the request exceeds the available context size";
+        assert_eq!(retry(StatusCode::BAD_REQUEST, other, sent), None);
+        let alternating = br#"{"messages":[{"role":"user","content":"a"}]}"#;
+        assert_eq!(retry(StatusCode::BAD_REQUEST, gemma, alternating), None);
+        assert_eq!(retry(StatusCode::BAD_REQUEST, gemma, b"not json"), None);
     }
 
     /// A local `reasoning_effort` becomes the `chat_template_kwargs` Ollama's

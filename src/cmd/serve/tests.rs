@@ -5867,6 +5867,716 @@ async fn a_backend_dying_mid_stream_aborts_the_clients_stream() {
     );
 }
 
+// -- options.num_ctx sizes the load -------------------------------------------
+
+/// A llama-server model loaded with `window`, from a model trained on `trained`.
+fn loaded_with(window: Option<u32>, trained: Option<u32>) -> RunningModel {
+    let mut model = running_model_fixture(None, Duration::ZERO, 0);
+    model.context_window = window;
+    model.trained_ctx = trained;
+    model
+}
+
+/// A request's `num_ctx` is met by a load at that window, floored at 4 and cut
+/// to the trained context as Ollama does; only llama-server loads take one.
+#[tokio::test]
+async fn num_ctx_is_applied_as_ollama_applies_it() {
+    assert_eq!(effective_ctx(4096, Some(40960)), 4096);
+    assert_eq!(effective_ctx(1 << 20, Some(40960)), 40960);
+    assert_eq!(effective_ctx(1 << 20, None), 1 << 20);
+    assert_eq!(effective_ctx(1, Some(40960)), 4);
+
+    let model = loaded_with(Some(8192), Some(40960));
+    assert!(!model.needs_context(Some(8192)) && !model.needs_context(None));
+    assert!(model.needs_context(Some(4096)) && model.needs_context(Some(1 << 20)));
+    assert!(!loaded_with(Some(40960), Some(40960)).needs_context(Some(1 << 20)));
+    // An unrecorded window counts as different: the reload records one.
+    assert!(loaded_with(None, Some(4096)).needs_context(Some(4096)));
+    for engine in [Engine::Mlx, Engine::Vllm, Engine::Sglang, Engine::VllmOmni] {
+        let mut other = running_model_fixture_with_engine(engine, None);
+        other.context_window = Some(8192);
+        assert!(!other.needs_context(Some(4096)), "{engine:?}");
+    }
+
+    let gguf = ModelPath::Gguf(PathBuf::from("m.gguf"), None);
+    assert_eq!(ctx_for_load(Some(4096), &gguf, false), Some(4096));
+    assert_eq!(ctx_for_load(Some(4096), &gguf, true), None, "ds4");
+    assert_eq!(ctx_for_load(None, &gguf, false), None);
+    let diffusion = ModelPath::Diffusion(Default::default());
+    assert_eq!(ctx_for_load(Some(4096), &diffusion, false), Some(4096));
+    for other in [
+        ModelPath::SafeTensors(PathBuf::from("m")),
+        ModelPath::Omni(PathBuf::from("m")),
+    ] {
+        assert_eq!(ctx_for_load(Some(4096), &other, false), None);
+    }
+}
+
+/// A model at another window is neither claimed nor dropped by the lookup;
+/// no window, or the one it has, uses it as before.
+#[tokio::test]
+async fn a_model_at_another_window_is_not_reused_for_a_request_that_names_one() {
+    let state = test_state();
+    let key = running_key(&state, "qwen3:0.6b");
+    let in_flight = |state: &AppState, key: &str| {
+        let (state, key) = (state.clone(), key.to_string());
+        async move { state.0.manager.lock().await.running[&key].in_flight }
+    };
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .insert(key.clone(), loaded_with(Some(40960), Some(40960)));
+
+    assert!(check_running_for(&state, &key, Some(4096)).await.is_none());
+    assert_eq!(in_flight(&state, &key).await, 0);
+    for ctx in [None, Some(40960), Some(1 << 20)] {
+        let (_, guard) = check_running_for(&state, &key, ctx).await.unwrap();
+        assert_eq!(in_flight(&state, &key).await, 1);
+        drop(guard);
+        for _ in 0..100 {
+            if in_flight(&state, &key).await == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(in_flight(&state, &key).await, 0, "{ctx:?}");
+    }
+}
+
+/// An idle model at another window is unloaded, and only that one; the slot
+/// comes back reserved for its replacement.
+#[tokio::test]
+async fn retiring_a_model_for_its_window_unloads_only_a_mismatch() {
+    let state = test_state();
+    let key = running_key(&state, "qwen3:0.6b");
+    let other = running_key(&state, "gemma3:1b");
+    {
+        let mut mgr = state.0.manager.lock().await;
+        mgr.running
+            .insert(key.clone(), loaded_with(Some(40960), Some(40960)));
+        mgr.running
+            .insert(other.clone(), loaded_with(Some(8192), Some(40960)));
+    }
+    for ctx in [None, Some(40960), Some(1 << 20)] {
+        assert!(
+            retire_for_context(&state, &key, ctx).await.is_none(),
+            "{ctx:?}"
+        );
+    }
+    let never = "docker.io/ai/never-loaded:latest";
+    assert!(retire_for_context(&state, never, Some(4096))
+        .await
+        .is_none());
+    assert_eq!(state.0.manager.lock().await.pending_loads, 0);
+
+    let reserved = retire_for_context(&state, &key, Some(4096)).await;
+    let mgr = state.0.manager.lock().await;
+    assert!(reserved.is_some() && mgr.pending_loads == 1);
+    assert!(!mgr.running.contains_key(&key));
+    assert!(
+        mgr.running.contains_key(&other),
+        "another model is untouched"
+    );
+}
+
+/// With room for one model, another model's load waits for the slot a
+/// retired model frees instead of starting while the old backend stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_slot_a_retired_model_frees_is_kept_for_its_replacement() {
+    let mut inner = test_inner(std::env::temp_dir());
+    inner.max_loaded_models = 1;
+    let state = AppState(Arc::new(inner));
+    let key = running_key(&state, "qwen3:0.6b");
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .insert(key.clone(), loaded_with(Some(40960), Some(40960)));
+
+    let reserved = retire_for_context(&state, &key, Some(4096)).await.unwrap();
+    let competitor = {
+        let state = state.clone();
+        tokio::spawn(async move { enforce_max_loaded_models(&state, 1).await })
+    };
+    sleep(Duration::from_millis(300)).await;
+    assert!(!competitor.is_finished(), "it must not take the room");
+    drop(reserved);
+    let slot = tokio::time::timeout(Duration::from_secs(10), competitor)
+        .await
+        .expect("takes the room once it is released")
+        .unwrap();
+    assert!(slot.is_ok());
+}
+
+/// A model waiting to be retired keeps what it is serving and takes no new
+/// requests, whatever they ask: left taking them, traffic could keep it busy
+/// and the reload would never come. A retirer that gives up clears the mark.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_waiting_to_be_retired_takes_no_new_requests() {
+    let state = test_state();
+    let key = running_key(&state, "qwen3:0.6b");
+    let mut busy = loaded_with(Some(40960), Some(40960));
+    busy.in_flight = 1;
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .insert(key.clone(), busy);
+    let retire = || {
+        let (state, key) = (state.clone(), key.clone());
+        tokio::spawn(async move { retire_for_context(&state, &key, Some(4096)).await })
+    };
+    let retiring = || async {
+        for _ in 0..200 {
+            if state.0.manager.lock().await.running[&key]
+                .retiring
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return true;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        false
+    };
+
+    let waiting = retire();
+    assert!(retiring().await, "it marks the model");
+    assert!(!waiting.is_finished(), "and waits for the request");
+    for ctx in [None, Some(40960), Some(4096)] {
+        assert!(
+            check_running_for(&state, &key, ctx).await.is_none(),
+            "{ctx:?}"
+        );
+    }
+    assert_eq!(state.0.manager.lock().await.running[&key].in_flight, 1);
+
+    waiting.abort();
+    let _ = waiting.await;
+    let (_, guard) = check_running_for(&state, &key, None).await.unwrap();
+    drop(guard);
+
+    let waiting = retire();
+    assert!(retiring().await);
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .get_mut(&key)
+        .unwrap()
+        .in_flight = 0;
+    let reserved = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("retires once idle")
+        .unwrap();
+    assert!(reserved.is_some());
+    assert!(!state.0.manager.lock().await.running.contains_key(&key));
+}
+
+/// The same content under another name is not this load's to unload.
+#[tokio::test]
+async fn retiring_leaves_the_same_content_under_another_name_alone() {
+    let state = test_state();
+    let by_digest = "docker.io/ai/m@sha256:d16e".to_string();
+    let mut model = loaded_with(Some(40960), Some(40960));
+    model.digest = "sha256:d16e".into();
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .insert(by_digest.clone(), model);
+
+    let retired = retire_for_context(&state, "docker.io/ai/m:v1", Some(4096)).await;
+    assert!(retired.is_none());
+    assert!(state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .contains_key(&by_digest));
+}
+
+/// Not a test: the `llama-server` [`FakeLlamaServer`] runs, this binary
+/// re-entered through its script. It answers every request on `--port` with
+/// `200 {}` until killed, and does nothing run on its own.
+#[cfg(unix)]
+#[test]
+#[ignore = "entered by FakeLlamaServer, not a test of its own"]
+fn fake_llama_server_child() {
+    use std::io::{Read, Write};
+    let Ok(args) = std::env::var("LLMMAN_FAKE_LLAMA_ARGS") else {
+        return;
+    };
+    let port: u16 = args
+        .split_whitespace()
+        .skip_while(|arg| *arg != "--port")
+        .nth(1)
+        .and_then(|port| port.parse().ok())
+        .expect("--port <n>");
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    for stream in listener.incoming().flatten() {
+        let mut stream = stream;
+        let _ = stream.read(&mut [0u8; 1024]);
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}");
+    }
+}
+
+/// A `llama-server` the daemon can really spawn: a script that logs its
+/// arguments, then becomes [`fake_llama_server_child`].
+#[cfg(unix)]
+struct FakeLlamaServer {
+    dir: PathBuf,
+    bin: PathBuf,
+    log: PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeLlamaServer {
+    fn new(name: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fresh_store_dir(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (bin, log) = (dir.join("llama-server"), dir.join("args.log"));
+        // libtest lists tests without the crate name.
+        let test = format!(
+            "{}::fake_llama_server_child",
+            module_path!().split_once("::").unwrap().1
+        );
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in --selftest) exit 0;; esac\necho \"$*\" >> '{}'\n\
+             LLMMAN_FAKE_LLAMA_ARGS=\"$*\" exec '{}' --ignored --exact '{test}'\n",
+            log.display(),
+            std::env::current_exe().unwrap().display(),
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A fork in another test while the script was open for writing
+        // leaves it "text file busy" to exec for a moment.
+        for attempt in 0.. {
+            match std::process::Command::new(&bin).arg("--selftest").status() {
+                Ok(status) if status.success() => break,
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 100 => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => panic!("the fake llama-server will not run: {other:?}"),
+            }
+        }
+        Self { dir, bin, log }
+    }
+
+    /// A daemon that runs it, over a store holding `docker.io/ai/ctxmodel`.
+    fn state(&self) -> AppState {
+        let store = self.dir.join("store");
+        let gguf = crate::gguf::write_test_gguf_with(&[]);
+        let bytes = std::fs::read(&gguf).unwrap();
+        let _ = std::fs::remove_file(&gguf);
+        store_one_model(
+            &OciStore::open(&store).unwrap(),
+            "ctxmodel",
+            "application/vnd.docker.ai.gguf.v3",
+            "model.gguf",
+            &bytes,
+        );
+        let mut inner = test_inner(store);
+        inner.runtime = runtime::Lazy::new(
+            runtime::Runtime::Path,
+            None,
+            Some(runtime::Resolved::Local {
+                source: runtime::Runtime::Path,
+                bin: self.bin.clone(),
+            }),
+        );
+        AppState(Arc::new(inner))
+    }
+
+    /// The `--ctx-size` of each spawn so far, in order.
+    fn ctx_sizes(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                line.split_whitespace()
+                    .skip_while(|arg| *arg != "--ctx-size")
+                    .nth(1)
+                    .unwrap_or("(none)")
+                    .to_string()
+            })
+            .collect()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FakeLlamaServer {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// `num_ctx` is the window a model is loaded with (cut to the trained
+/// context); a different one reloads it, while none uses what is loaded.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn num_ctx_sizes_the_load_and_a_different_one_reloads_it() {
+    let fake = FakeLlamaServer::new("num-ctx");
+    let state = fake.state();
+    let model = "docker.io/ai/ctxmodel";
+    // The fixture is trained on 4096; a request for more is cut to that.
+    let mut ports = Vec::new();
+    for (ctx, spawns, window) in [
+        (Some(2048), vec!["2048"], 2048),
+        (Some(2048), vec!["2048"], 2048),
+        (None, vec!["2048"], 2048),
+        (Some(3072), vec!["2048", "3072"], 3072),
+        (Some(1 << 20), vec!["2048", "3072", "4096"], 4096),
+        (Some(4096), vec!["2048", "3072", "4096"], 4096),
+        (Some(1 << 20), vec!["2048", "3072", "4096"], 4096),
+    ] {
+        let opts = LoadOptions {
+            ctx,
+            ..Default::default()
+        };
+        let (name, target, guard) = ensure_model_for(&state, model, None, opts, Task::Other)
+            .await
+            .unwrap_or_else(|e| panic!("{ctx:?}: {:#}", e.0));
+        let Target::Local(port) = target else {
+            panic!("{ctx:?}: not a local target");
+        };
+        ports.push(port);
+        drop(guard);
+        assert_eq!(fake.ctx_sizes(), spawns, "{ctx:?}");
+        // The next request reloads only once nothing is using the model.
+        for _ in 0..200 {
+            if state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .values()
+                .all(|m| m.in_flight == 0)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let mgr = state.0.manager.lock().await;
+        assert_eq!(mgr.running.len(), 1, "{ctx:?}: the old load is gone");
+        assert_eq!(mgr.running[&name].context_window, Some(window), "{ctx:?}");
+    }
+    // One port per load: the reuses kept theirs, the reloads took new ones.
+    assert_eq!(
+        ports
+            .iter()
+            .map(|p| ports.iter().position(|q| q == p).unwrap())
+            .collect::<Vec<_>>(),
+        [0, 0, 0, 3, 4, 4, 4]
+    );
+}
+
+// -- consecutive same-role messages ------------------------------------------
+
+/// A llama-server stand-in that may refuse two messages of one role in a row,
+/// and records every chat request it gets.
+struct RoleStandin {
+    router: Router,
+    seen: Arc<StdMutex<Vec<serde_json::Value>>>,
+}
+
+impl RoleStandin {
+    /// Refuses such a request with a 400 saying `refusal`, as llama-server
+    /// does when the model's template needs alternation (`None`: the
+    /// template takes any order).
+    fn new(refusal: Option<&'static str>) -> Self {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let record = seen.clone();
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(req): Json<serde_json::Value>| {
+                let record = record.clone();
+                async move {
+                    record.lock().unwrap().push(req.clone());
+                    let roles: Vec<&str> = req["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|m| m["role"].as_str().unwrap_or(""))
+                        .filter(|role| *role != "system")
+                        .collect();
+                    if let Some(message) =
+                        refusal.filter(|_| roles.windows(2).any(|w| w[0] == w[1]))
+                    {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": {
+                                "code": 400, "message": message, "type": "invalid_request_error",
+                            } })),
+                        )
+                            .into_response();
+                    }
+                    let delta = |content: &str, finish: serde_json::Value| {
+                        let chunk = serde_json::json!({
+                            "id": "chatcmpl-1", "object": "chat.completion.chunk",
+                            "model": BACKEND_MODEL_PATH,
+                            "choices": [{ "index": 0, "delta": { "content": content },
+                                          "finish_reason": finish }],
+                        });
+                        format!("data: {chunk}\n\n")
+                    };
+                    if req["stream"] == true {
+                        let body = format!(
+                            "{}{}data: [DONE]\n\n",
+                            delta("Hel", serde_json::Value::Null),
+                            delta("lo", "stop".into())
+                        );
+                        return ([("content-type", "text/event-stream")], body).into_response();
+                    }
+                    Json(serde_json::json!({
+                        "id": "chatcmpl-1", "object": "chat.completion",
+                        "model": BACKEND_MODEL_PATH,
+                        "choices": [{ "index": 0, "finish_reason": "stop",
+                                      "message": { "role": "assistant", "content": "Hello" } }],
+                        "usage": { "prompt_tokens": 3, "completion_tokens": 1 },
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        Self { router, seen }
+    }
+
+    /// The `[role, content]` pairs of each request received, in order.
+    fn requests(&self) -> Vec<Vec<(String, String)>> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|req| {
+                req["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|m| {
+                        (
+                            m["role"].as_str().unwrap().to_string(),
+                            m["content"].as_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+const ALTERNATION_REFUSAL: &str = "Unable to generate parser for this template. Automatic parser \
+     generation failed: Conversation roles must alternate user/assistant/user/assistant/...";
+
+fn turns(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(role, content)| (role.to_string(), content.to_string()))
+        .collect()
+}
+
+/// A template that needs alternating roles gets a client's adjacent turns
+/// merged, on every surface, instead of a 400.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_template_that_needs_alternation_is_sent_merged_turns() {
+    let standin = RoleStandin::new(Some(ALTERNATION_REFUSAL));
+    let base = serve_over("gemma3:1b", standin.router.clone()).await;
+    // The request the stand-in saw last: the retry, after its refusal.
+    let last = |standin: &RoleStandin| standin.requests().pop().unwrap();
+
+    // /v1/chat/completions: refused once, then the merged request.
+    let reply: serde_json::Value = post_with(
+        &base,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "model": "gemma3:1b",
+            "messages": [
+                { "role": "system", "content": "be terse" },
+                { "role": "user", "content": "one" },
+                { "role": "user", "content": "two" },
+            ],
+        }),
+        serde_json::json!({}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(reply["choices"][0]["message"]["content"], "Hello");
+    assert_eq!(
+        standin.requests(),
+        [
+            turns(&[("system", "be terse"), ("user", "one"), ("user", "two")]),
+            turns(&[("system", "be terse"), ("user", "one\n\ntwo")]),
+        ]
+    );
+
+    // The same, streamed.
+    let text = post_with(
+        &base,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "model": "gemma3:1b",
+            "messages": [
+                { "role": "user", "content": "a" },
+                { "role": "assistant", "content": "b" },
+                { "role": "user", "content": "c" },
+                { "role": "user", "content": "d" },
+            ],
+        }),
+        serde_json::json!({ "stream": true }),
+    )
+    .await
+    .text()
+    .await
+    .unwrap();
+    assert!(
+        text.contains("Hel") && text.ends_with("data: [DONE]\n\n"),
+        "{text}"
+    );
+    assert_eq!(
+        last(&standin),
+        turns(&[("user", "a"), ("assistant", "b"), ("user", "c\n\nd")])
+    );
+
+    // /api/chat goes out as a typed request.
+    let reply: serde_json::Value = post_with(
+        &base,
+        "/api/chat",
+        serde_json::json!({
+            "model": "gemma3:1b",
+            "messages": [
+                { "role": "user", "content": "x" },
+                { "role": "user", "content": "y" },
+            ],
+        }),
+        serde_json::json!({ "stream": false }),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(reply["message"]["content"], "Hello");
+    assert_eq!(reply["done"], true);
+    assert_eq!(last(&standin), turns(&[("user", "x\n\ny")]));
+
+    // So does /v1/messages, where two user turns in a row are legal.
+    let reply: serde_json::Value = post_with(
+        &base,
+        "/v1/messages",
+        serde_json::json!({
+            "model": "gemma3:1b",
+            "max_tokens": 8,
+            "messages": [
+                { "role": "user", "content": "p" },
+                { "role": "user", "content": "q" },
+            ],
+        }),
+        serde_json::json!({}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(reply["content"][0]["text"], "Hello");
+    assert_eq!(last(&standin), turns(&[("user", "p\n\nq")]));
+}
+
+/// Merging follows a refusal: a lenient template gets the turns as written,
+/// once, and any other 400 reaches the client untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn turns_are_merged_only_for_a_template_that_refused_them() {
+    let two_user_turns = serde_json::json!({
+        "model": "qwen3.5:0.8b",
+        "messages": [
+            { "role": "user", "content": "one" },
+            { "role": "user", "content": "two" },
+        ],
+    });
+
+    let lenient = RoleStandin::new(None);
+    let base = serve_over("qwen3.5:0.8b", lenient.router.clone()).await;
+    post_with(
+        &base,
+        "/v1/chat/completions",
+        two_user_turns.clone(),
+        serde_json::json!({}),
+    )
+    .await;
+    post_with(
+        &base,
+        "/api/chat",
+        two_user_turns.clone(),
+        serde_json::json!({ "stream": false }),
+    )
+    .await;
+    assert_eq!(
+        lenient.requests(),
+        [
+            turns(&[("user", "one"), ("user", "two")]),
+            turns(&[("user", "one"), ("user", "two")]),
+        ]
+    );
+
+    let other = RoleStandin::new(Some("the request exceeds the available context size"));
+    let base = serve_over("qwen3.5:0.8b", other.router.clone()).await;
+    for route in ["/v1/chat/completions", "/api/chat"] {
+        let resp = Client::new()
+            .post(format!("{base}{route}"))
+            .json(&two_user_turns)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{route}");
+        let text = resp.text().await.unwrap();
+        assert!(
+            text.contains("exceeds the available context size"),
+            "{route}: {text}"
+        );
+    }
+    assert_eq!(
+        other.requests().len(),
+        2,
+        "no second attempt for another 400"
+    );
+
+    // Nothing to merge: a refusal for another reason is the client's.
+    let refusing = RoleStandin::new(Some(ALTERNATION_REFUSAL));
+    let base = serve_over("gemma3:1b", refusing.router.clone()).await;
+    let with_tool_calls = serde_json::json!({
+        "model": "gemma3:1b",
+        "messages": [
+            { "role": "assistant", "content": null,
+              "tool_calls": [{ "id": "c", "type": "function",
+                               "function": { "name": "f", "arguments": "{}" } }] },
+            { "role": "assistant", "content": "again" },
+        ],
+    });
+    let resp = Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&with_tool_calls)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(resp.text().await.unwrap().contains("must alternate"));
+    assert_eq!(refusing.requests().len(), 1);
+}
+
 /// llama-server ignores `dimensions`; the vectors are cut on the way back.
 #[tokio::test(flavor = "multi_thread")]
 async fn openai_embeddings_honour_dimensions() {
@@ -6208,8 +6918,14 @@ async fn a_decision_model_is_refused_before_it_loads() {
         .insert(key.clone(), running_model_fixture(None, Duration::ZERO, 0));
 
     for task in [Task::Generate, Task::Embed] {
-        let Err(err) =
-            ensure_model_for(&state, "docker.io/ai/decisioncold", None, None, task).await
+        let Err(err) = ensure_model_for(
+            &state,
+            "docker.io/ai/decisioncold",
+            None,
+            LoadOptions::default(),
+            task,
+        )
+        .await
         else {
             panic!("a decision model cannot do {task:?}");
         };

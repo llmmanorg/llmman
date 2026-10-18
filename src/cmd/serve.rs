@@ -364,6 +364,10 @@ struct RunningModel {
     context_window: Option<u32>,
     /// A decision model: refuses what [`Task::refuse_decision`] says.
     decision: bool,
+    /// The GGUF header's trained context, if any: what `num_ctx` is cut to.
+    trained_ctx: Option<u32>,
+    /// Set while [`retire_for_context`] waits on this model: nothing new joins.
+    retiring: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Which engine is actually serving requests for a [`RunningModel`] — surfaced
@@ -373,6 +377,19 @@ struct RunningModel {
 /// equivalent of Ollama's "100% GPU"/"N%/N% CPU/GPU" figure to show here —
 /// only which engine, and (for containers) which engine manager, is running.
 impl RunningModel {
+    /// Whether a request's `num_ctx` (`want`) asks for a window other than
+    /// the one this model is loaded with. Only a llama-server's window is
+    /// ours to set; an unknown one counts as different, and the reload
+    /// records it.
+    fn needs_context(&self, want: Option<u32>) -> bool {
+        match want {
+            Some(want) if self.process.engine() == Engine::LlamaServer => {
+                self.context_window != Some(effective_ctx(want, self.trained_ctx))
+            }
+            _ => false,
+        }
+    }
+
     fn processor(&self) -> String {
         match &self.process {
             ModelProcess::Local(engine, _, _) => format!("{} (local)", engine.label()),
@@ -1145,9 +1162,23 @@ async fn unload_everywhere(
 /// claim always has an owner, from this moment until the caller's own
 /// `begin_activity`/`refresh_activity` takes over.
 async fn check_running(state: &AppState, model_ref: &str) -> Option<(u16, ActivityGuard)> {
+    check_running_for(state, model_ref, None).await
+}
+
+/// [`check_running`] for a request with a `num_ctx`: a model loaded with
+/// another window, or being retired, is not reused (see
+/// [`retire_for_context`]).
+async fn check_running_for(
+    state: &AppState,
+    model_ref: &str,
+    ctx: Option<u32>,
+) -> Option<(u16, ActivityGuard)> {
     let mut mgr = state.0.manager.lock().await;
     if let Some(m) = mgr.running.get_mut(model_ref) {
         if m.process.is_alive() {
+            if m.needs_context(ctx) || m.retiring.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
             m.in_flight += 1;
             return Some((m.port, ActivityGuard::new(state, model_ref)));
         }
@@ -1193,6 +1224,7 @@ async fn check_running_by_digest(
     state: &AppState,
     model_ref: &str,
     digest: &str,
+    ctx: Option<u32>,
 ) -> Option<(String, u16, ActivityGuard)> {
     let mut mgr = state.0.manager.lock().await;
     let key = running_by_digest(&mgr.running, model_ref, digest)?
@@ -1205,6 +1237,11 @@ async fn check_running_by_digest(
             m.port
         );
         mgr.running.remove(&key);
+        return None;
+    }
+    // Joins a retiring model too: this name does not hold the retirer's
+    // lock, and declining would load a second copy beside it.
+    if m.needs_context(ctx) {
         return None;
     }
     m.in_flight += 1;
@@ -1244,6 +1281,75 @@ async fn evict_other_models(state: &AppState, model_ref: &str) -> bool {
         running.process.stop_and_wait().await;
     }
     any
+}
+
+/// Marks a model as retiring while it lives, and clears the mark on drop, so
+/// a request that gives up waiting does not leave the model turned away.
+struct RetireMark(Arc<std::sync::atomic::AtomicBool>);
+
+impl RetireMark {
+    fn new(flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for RetireMark {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Unloads `model_ref` if it is loaded with a window other than `ctx` (a
+/// request's `num_ctx`), once the requests it is serving finish, as Ollama's
+/// scheduler does. While waiting the model is marked and takes no new
+/// requests, which wait for the load behind the caller's lock; otherwise
+/// steady traffic could keep it busy forever. The wait is unbounded but
+/// cancel-safe: the lock, queue slot and mark are all RAII.
+///
+/// Only the entry under `model_ref` is retired, as that name's load lock is
+/// the one held; the same content under another name is left running.
+///
+/// Returns the freed slot, reserved for the replacement under the lock that
+/// removes the model (as eviction does), so another model's load cannot
+/// take it while the old backend stops. `None` when nothing was unloaded.
+async fn retire_for_context(
+    state: &AppState,
+    model_ref: &str,
+    ctx: Option<u32>,
+) -> Option<PendingLoadGuard> {
+    let want = ctx?;
+    let mut mark = None;
+    loop {
+        let mut mgr = state.0.manager.lock().await;
+        let model = mgr.running.get(model_ref)?;
+        if !model.needs_context(ctx) {
+            return None;
+        }
+        if model.in_flight > 0 {
+            mark.get_or_insert_with(|| RetireMark::new(model.retiring.clone()));
+            drop(mgr);
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        let mut retired = mgr.running.remove(model_ref)?;
+        mgr.pending_loads += 1;
+        let reserved = PendingLoadGuard {
+            state: state.clone(),
+            armed: true,
+        };
+        metrics::record_model_unload(model_ref, UnloadReason::Reloaded);
+        drop(mgr);
+        eprintln!(
+            "[llmman] {model_ref} is loaded with a context of {}; unloading it to load it with {}",
+            retired
+                .context_window
+                .map_or_else(|| "an unknown size".to_string(), |n| n.to_string()),
+            effective_ctx(want, retired.trained_ctx),
+        );
+        retired.process.stop_and_wait().await;
+        return Some(reserved);
+    }
 }
 
 /// Releases a `pending_loads` reservation on drop — see
@@ -1845,7 +1951,22 @@ async fn ensure_model(
     headers: Option<&HeaderMap>,
     request_threads: Option<u32>,
 ) -> Result<(String, Target, ActivityGuard), AppError> {
-    ensure_model_for(state, model_ref, headers, request_threads, Task::Other).await
+    let opts = LoadOptions {
+        threads: request_threads,
+        ..LoadOptions::default()
+    };
+    ensure_model_for(state, model_ref, headers, opts, Task::Other).await
+}
+
+/// What a request's Ollama `options` ask of the load that serves it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LoadOptions {
+    /// `num_thread`, for a fresh load only. See [`ensure_model`].
+    threads: Option<u32>,
+    /// `num_ctx`: the window to load with, over `LLMMAN_CONTEXT_LENGTH`. A
+    /// model loaded with another is reloaded (see [`retire_for_context`]);
+    /// none uses whichever is loaded. See [`ctx_for_load`] for what takes it.
+    ctx: Option<u32>,
 }
 
 /// What a request does with its model, so a decision model (see
@@ -1882,11 +2003,10 @@ async fn ensure_model_for(
     state: &AppState,
     model_ref: &str,
     headers: Option<&HeaderMap>,
-    request_threads: Option<u32>,
+    opts: LoadOptions,
     task: Task,
 ) -> Result<(String, Target, ActivityGuard), AppError> {
-    let (model, target, guard) =
-        resolve_target(state, model_ref, headers, request_threads, task).await?;
+    let (model, target, guard) = resolve_target(state, model_ref, headers, opts, task).await?;
     // A cold load was refused in resolve_target; this is a model already
     // loaded. A peer or provider judges for itself.
     if task != Task::Other && matches!(target, Target::Local(_)) {
@@ -1910,7 +2030,7 @@ async fn resolve_target(
     state: &AppState,
     model_ref: &str,
     headers: Option<&HeaderMap>,
-    request_threads: Option<u32>,
+    opts: LoadOptions,
     task: Task,
 ) -> Result<(String, Target, ActivityGuard), AppError> {
     // First, so everything below sees one half rather than the pair. A
@@ -1962,7 +2082,7 @@ async fn resolve_target(
     // reusable runner (server/sched.go): only a request that actually
     // needs scheduling work (waiting on a concurrent load, or starting
     // a fresh one) below counts against the cap.
-    if let Some((port, guard)) = check_running(state, model_ref).await {
+    if let Some((port, guard)) = check_running_for(state, model_ref, opts.ctx).await {
         // Already loaded, so no pull and no re-check: a policy tightened
         // since the load takes effect on the next load, not mid-flight.
         return Ok((model_ref.to_string(), Target::Local(port), guard));
@@ -1993,7 +2113,7 @@ async fn resolve_target(
 
     // Someone else may have finished loading this model while we
     // waited for the lock above.
-    if let Some((port, guard)) = check_running(state, model_ref).await {
+    if let Some((port, guard)) = check_running_for(state, model_ref, opts.ctx).await {
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
@@ -2028,7 +2148,7 @@ async fn resolve_target(
     let model_ref = model_ref.as_str();
 
     // Re-check in case that stored form differs from the key above.
-    if let Some((port, guard)) = check_running(state, model_ref).await {
+    if let Some((port, guard)) = check_running_for(state, model_ref, opts.ctx).await {
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
@@ -2049,7 +2169,9 @@ async fn resolve_target(
     // not resolve to; see `check_running_by_digest`'s doc comment for the
     // order that produces one.
     if !digest.is_empty() {
-        if let Some((key, port, guard)) = check_running_by_digest(state, model_ref, &digest).await {
+        if let Some((key, port, guard)) =
+            check_running_by_digest(state, model_ref, &digest, opts.ctx).await
+        {
             return Ok((key, Target::Local(port), guard));
         }
     }
@@ -2073,10 +2195,19 @@ async fn resolve_target(
             return Err(refusal);
         }
     }
-    // See enforce_max_loaded_models's doc comment — held for the rest
-    // of this function.
-    let mut pending_load_guard =
-        enforce_max_loaded_models(state, state.0.max_loaded_models).await?;
+    let ds4 = gguf_goes_to_ds4(
+        gguf_engine_from_env(),
+        &model_path,
+        embedding_ctx.is_some(),
+        decision,
+    );
+    let load_ctx = ctx_for_load(opts.ctx, &model_path, ds4);
+    // A model loaded with another window goes first, and its slot is this
+    // load's. See enforce_max_loaded_models: held for the rest of this function.
+    let mut pending_load_guard = match retire_for_context(state, model_ref, load_ctx).await {
+        Some(reserved) => reserved,
+        None => enforce_max_loaded_models(state, state.0.max_loaded_models).await?,
+    };
     // OOM retry loop — on a llama-server load that fails with a
     // memory-allocation-looking error, tries progressively more invasive
     // fallbacks before giving up (see each branch's own comment for which
@@ -2085,9 +2216,14 @@ async fn resolve_target(
     // attempt, not just the first — otherwise a retry's replacement
     // process could try to bind the same port the previous (failed,
     // possibly not-yet-fully-exited) one was still holding.
+    // A request's `num_ctx` is explicit, so never auto-shrunk below.
+    let (ctx_configured, ctx_explicit) = match load_ctx {
+        Some(num_ctx) => (Some(effective_ctx(num_ctx, trained_ctx)), true),
+        None => (state.0.ctx_size, state.0.ctx_size_explicit),
+    };
     let mut ctx_size = initial_ctx_size(
-        state.0.ctx_size,
-        state.0.ctx_size_explicit,
+        ctx_configured,
+        ctx_explicit,
         trained_ctx,
         embedding_ctx.is_some(),
     );
@@ -2127,12 +2263,12 @@ async fn resolve_target(
                 embedding_ctx.is_some(),
                 decision,
                 ctx_size,
-                state.0.ctx_size_explicit,
+                ctx_explicit,
                 trained_ctx,
             ),
             // See ensure_model's `request_threads` doc comment for the
             // full precedence chain this `.or` implements.
-            threads: request_threads.or(state.0.threads),
+            threads: opts.threads.or(state.0.threads),
             cpus: state.0.cpu_limit,
         };
         // Every piped child gets an output tail for crash reasons; only
@@ -2140,15 +2276,9 @@ async fn resolve_target(
         // fallbacks are llama-server flags.
         let mut stderr_tail: Option<OutputTail> = None;
         let mut oom_retryable = false;
-        let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
+        let max_model_len = vllm_max_model_len(ctx_size, ctx_explicit);
         // Per load, like use_mlx_for_safetensors, which it gates.
         let safetensors_engine = safetensors_engine_from_env();
-        let ds4 = gguf_goes_to_ds4(
-            gguf_engine_from_env(),
-            &model_path,
-            embedding_ctx.is_some(),
-            decision,
-        );
         // May fetch llama.cpp if startup could not (runtime::Lazy).
         // Skipped for ds4, which uses neither llama.cpp nor a container.
         let ociman = if ds4 {
@@ -2350,8 +2480,7 @@ async fn resolve_target(
                 // would ignore the user's own stated choice (mirrors
                 // Ollama's own numCtxAuto gate on
                 // reduceAutoNumCtxForLoadOOM).
-                let can_shrink =
-                    !state.0.ctx_size_explicit && shrink_attempts < MAX_CTX_SHRINK_ATTEMPTS;
+                let can_shrink = !ctx_explicit && shrink_attempts < MAX_CTX_SHRINK_ATTEMPTS;
                 let Some(next) = can_shrink
                     .then(|| ctx_size.and_then(next_ctx_size_after_oom))
                     .flatten()
@@ -2386,7 +2515,7 @@ async fn resolve_target(
         ctx_size,
         trained_ctx,
         num_parallel,
-        state.0.ctx_size_explicit,
+        ctx_explicit,
     );
     // ds4 reports its window, including the default it uses without --ctx.
     let context_window = match process.engine() {
@@ -2413,6 +2542,8 @@ async fn resolve_target(
             // 1, not 0 — see this function's own doc comment.
             in_flight: 1,
             decision,
+            trained_ctx,
+            retiring: Default::default(),
         },
     );
     // Same locked step as the insert, so this load is never both in
@@ -2425,6 +2556,27 @@ async fn resolve_target(
         Target::Local(port),
         ActivityGuard::new(state, model_ref),
     ))
+}
+
+/// The request's `num_ctx` if this load takes one: llama-server's, GGUF or
+/// diffusion. Not a safetensors engine's (vLLM refuses a `--max-model-len`
+/// past the model's, and there is no GGUF header to cut it by), nor ds4's,
+/// which is never reloaded, so the first client's would stick.
+fn ctx_for_load(request: Option<u32>, model: &ModelPath, ds4: bool) -> Option<u32> {
+    request.filter(|_| match model {
+        ModelPath::Gguf(..) => !ds4,
+        ModelPath::Diffusion(_) => true,
+        ModelPath::SafeTensors(_) | ModelPath::Omni(_) => false,
+    })
+}
+
+/// A request's `num_ctx` as Ollama applies it: at least 4, and cut to the
+/// trained context if known.
+fn effective_ctx(num_ctx: u32, trained: Option<u32>) -> u32 {
+    let num_ctx = num_ctx.max(4);
+    trained
+        .filter(|t| *t > 0)
+        .map_or(num_ctx, |t| num_ctx.min(t))
 }
 
 /// The per-request context window a finished load ended up serving, for
@@ -2736,7 +2888,11 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
             .send()
             .await
             .with_context(|| format!("send to {}", target.describe()))?;
-        return Ok(ChatUpstream::relay(resp));
+        let upstream = ChatUpstream::relay(resp);
+        if matches!(target, Target::Local(_)) && upstream.status == StatusCode::BAD_REQUEST {
+            return retry_merging_roles(client, target, req, upstream).await;
+        }
+        return Ok(upstream);
     };
 
     let mut req = serde_json::to_value(req).context("serialize chat request")?;
@@ -2834,6 +2990,39 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
         status: StatusCode::OK,
         headers,
         body,
+    })
+}
+
+/// `refused`, a local backend's 400 for `req`: if its chat template refused
+/// adjacent same-role messages, `req` sent again with them merged, else
+/// `refused` as it came.
+async fn retry_merging_roles<T: Serialize + ?Sized>(
+    client: &Client,
+    target: &Target,
+    req: &T,
+    refused: ChatUpstream,
+) -> Result<ChatUpstream, AppError> {
+    let ChatUpstream {
+        status,
+        headers,
+        body,
+    } = refused;
+    let reply = Bytes::from(collect_body(body).await);
+    let sent = serde_json::to_vec(req).context("serialize chat request")?;
+    if let Some(merged) = openai::merged_after_refusal(target, status, &reply, &sent) {
+        let resp = target
+            .authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(merged)
+            .send()
+            .await
+            .with_context(|| format!("send to {}", target.describe()))?;
+        return Ok(ChatUpstream::relay(resp));
+    }
+    Ok(ChatUpstream {
+        status,
+        headers,
+        body: futures::stream::once(futures::future::ready(Ok(reply))).boxed(),
     })
 }
 
@@ -3010,7 +3199,7 @@ async fn claim_llama_server(state: &AppState, key: &str) -> Option<(u16, Activit
                 .and_then(|store| store.find(key))
                 .ok()?
                 .digest;
-            let (_, port, guard) = check_running_by_digest(state, key, &digest).await?;
+            let (_, port, guard) = check_running_by_digest(state, key, &digest, None).await?;
             (port, guard)
         }
     };

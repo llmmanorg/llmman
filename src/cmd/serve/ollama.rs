@@ -26,7 +26,7 @@ use super::types::*;
 use super::{
     aggregation, backend_wire_model, ensure_model_for, forward_ollama, model_lock, now_rfc3339,
     pull_serialized, release_model_lock, remote_status, unload_everywhere, AppError, AppState,
-    Target, Task,
+    LoadOptions, Target, Task,
 };
 use crate::metrics::{self, UnloadReason};
 use crate::storage::OciStore;
@@ -1221,17 +1221,16 @@ pub(super) async fn handle_ollama_chat(
     }
 
     // The options blob still applies to a load-only request (the
-    // empty-messages branch inside): a preload that names num_thread
-    // should start the process with it, same as a generating request
-    // would.
+    // empty-messages branch inside): a preload that names num_thread or
+    // num_ctx should start the process with it, same as a generating
+    // request would.
     let model_ref = req.model.clone();
-    let request_threads = opt_num_thread(&req.options);
     let started = Instant::now();
     send_with_hybrid_fallback(
         &state,
         &model_ref,
         Some(&headers),
-        request_threads,
+        opt_load_options(&req.options),
         |model, target, guard| {
             ollama_chat_to(&state, &headers, &req, model, target, guard, started)
         },
@@ -1312,7 +1311,8 @@ async fn ollama_chat_to(
 /// Ollama's `options` under their OpenAI (or llama-server) names. The
 /// sampling knobs Ollama documents that have no equivalent on a chat
 /// completion (`num_ctx`, `num_keep`, `repeat_last_n`, `typical_p`,
-/// `mirostat*`) are left out; `num_ctx` is `LLMMAN_CONTEXT_LENGTH`.
+/// `mirostat*`) are left out; `num_ctx` sizes the load instead (see
+/// [`opt_num_ctx`]).
 fn options_to_oai(options: &Option<serde_json::Value>) -> OAIChatRequest {
     OAIChatRequest {
         temperature: opt_f64(options, "temperature"),
@@ -1396,13 +1396,12 @@ pub(super) async fn handle_ollama_generate(
     }
 
     let model_ref = req.model.clone();
-    let request_threads = opt_num_thread(&req.options);
     let started = Instant::now();
     send_with_hybrid_fallback(
         &state,
         &model_ref,
         Some(&headers),
-        request_threads,
+        opt_load_options(&req.options),
         |model, target, guard| {
             ollama_generate_to(&state, &headers, &req, model, target, guard, started)
         },
@@ -1548,10 +1547,15 @@ async fn embed_via_backend(
         }
     }
     let started = Instant::now();
-    // No `request_threads`: OllamaEmbedRequest carries no `options`
-    // blob here, so there is no num_thread to forward.
-    let (model, target, guard) =
-        ensure_model_for(state, model_ref, Some(headers), None, Task::Embed).await?;
+    // No `LoadOptions`: OllamaEmbedRequest has no `options` blob.
+    let (model, target, guard) = ensure_model_for(
+        state,
+        model_ref,
+        Some(headers),
+        LoadOptions::default(),
+        Task::Embed,
+    )
+    .await?;
     let loaded = started.elapsed();
     if !target.is_remote() && would_use_mlx(state, &model).await.is_some() {
         return Err(mlx_unsupported(&model));
@@ -1876,13 +1880,28 @@ fn opt_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32> {
 /// `ensure_model`'s `request_threads` parameter for the full precedence
 /// chain and the reuse/container caveats). Zero, negative, fractional,
 /// or above-u32 numbers are dropped, falling back down that chain, the
-/// same way `parse_num_parallel` rejects zero for `--parallel`. Unlike
-/// that env-string parser this value arrives as a JSON number (Ollama's
-/// `num_thread` is an int field), so `as_u64` does the type filtering;
-/// not built on [`opt_u32`], whose `as u32` truncation is harmless for
-/// `num_predict` but would turn e.g. 2^32+1 into `--threads 1` here.
+/// same way `parse_num_parallel` rejects zero for `--parallel`.
 fn opt_num_thread(opts: &Option<serde_json::Value>) -> Option<u32> {
-    let n = opts.as_ref()?.get("num_thread")?.as_u64()?;
+    opt_positive_u32(opts, "num_thread")
+}
+
+/// `num_ctx` from the options blob (see [`LoadOptions::ctx`]), dropped like
+/// `num_thread` when not a positive integer.
+fn opt_num_ctx(opts: &Option<serde_json::Value>) -> Option<u32> {
+    opt_positive_u32(opts, "num_ctx")
+}
+
+fn opt_load_options(opts: &Option<serde_json::Value>) -> LoadOptions {
+    LoadOptions {
+        threads: opt_num_thread(opts),
+        ctx: opt_num_ctx(opts),
+    }
+}
+
+/// A positive integer option. Not built on [`opt_u32`], whose `as u32`
+/// would turn 2^32+1 into 1.
+fn opt_positive_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32> {
+    let n = opts.as_ref()?.get(key)?.as_u64()?;
     u32::try_from(n).ok().filter(|&n| n != 0)
 }
 
@@ -2217,6 +2236,25 @@ mod tests {
         // Missing key, and no options blob at all.
         assert_eq!(opt_num_thread(&Some(serde_json::json!({}))), None);
         assert_eq!(opt_num_thread(&None), None);
+    }
+
+    /// `num_ctx` and `num_thread` are read apart; the parser they share is
+    /// covered by the `opt_num_thread` tests.
+    #[test]
+    fn opt_load_options_reads_threads_and_context_apart() {
+        let load = |options: serde_json::Value| opt_load_options(&Some(options));
+        let both = serde_json::json!({"num_thread": 4, "num_ctx": 8192, "temperature": 0.5});
+        let expect = |threads, ctx| LoadOptions { threads, ctx };
+        assert_eq!(load(both), expect(Some(4), Some(8192)));
+        assert_eq!(
+            load(serde_json::json!({"num_ctx": 8192})),
+            expect(None, Some(8192))
+        );
+        assert_eq!(
+            load(serde_json::json!({"num_ctx": 0})),
+            LoadOptions::default()
+        );
+        assert_eq!(opt_load_options(&None), LoadOptions::default());
     }
 
     /// vLLM and MLX expose no `/props`, so there is no live `n_ctx` to

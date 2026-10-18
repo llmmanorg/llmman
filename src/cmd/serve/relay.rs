@@ -22,13 +22,47 @@ use axum::Json;
 use futures::StreamExt;
 use reqwest::Client;
 
+use super::openai::merged_after_refusal;
 use super::sched::ActivityGuard;
 use super::stream::bytes_to_lines;
-use super::{messages, responses, AppError, ChatBody, ChatUpstream, Target};
+use super::{
+    messages, responses, AppError, ChatBody, ChatUpstream, Target, CHAT_COMPLETIONS_ROUTE,
+};
 
 /// POSTs `body` to `route` on `target` with the caller's `content-type`;
-/// the request half of every `proxy*` helper.
+/// the request half of every `proxy*` helper. A local chat template that
+/// refuses adjacent same-role messages is asked again with them merged.
 async fn send_proxied(
+    client: &Client,
+    target: &Target,
+    route: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<reqwest::Response, AppError> {
+    let resp = post_proxied(client, target, route, headers, body.clone()).await?;
+    if route != CHAT_COMPLETIONS_ROUTE
+        || !matches!(target, Target::Local(_))
+        || resp.status() != StatusCode::BAD_REQUEST
+    {
+        return Ok(resp);
+    }
+    // A refusal is small and ends before any output: read it, and hand it
+    // back as it came unless it is this one.
+    let (status, reply_headers) = (resp.status(), resp.headers().clone());
+    let reply = resp
+        .bytes()
+        .await
+        .with_context(|| format!("proxy request to {}", target.describe()))?;
+    if let Some(merged) = merged_after_refusal(target, status, &reply, &body) {
+        return post_proxied(client, target, route, headers, merged).await;
+    }
+    let mut refusal = axum::http::Response::new(reply);
+    *refusal.status_mut() = status;
+    *refusal.headers_mut() = reply_headers;
+    Ok(refusal.into())
+}
+
+async fn post_proxied(
     client: &Client,
     target: &Target,
     route: &str,
