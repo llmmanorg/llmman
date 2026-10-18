@@ -364,6 +364,9 @@ struct RunningModel {
     context_window: Option<u32>,
     /// A decision model: refuses what [`Task::refuse_decision`] says.
     decision: bool,
+    /// The GGUF header's trained context, if it names one: what a
+    /// request's `num_ctx` is cut to, as the load that follows would.
+    trained_ctx: Option<u32>,
 }
 
 /// Which engine is actually serving requests for a [`RunningModel`] — surfaced
@@ -373,6 +376,23 @@ struct RunningModel {
 /// equivalent of Ollama's "100% GPU"/"N%/N% CPU/GPU" figure to show here —
 /// only which engine, and (for containers) which engine manager, is running.
 impl RunningModel {
+    /// Whether this model is loaded with a context window other than the
+    /// one `want`, a request's `options.num_ctx`, asks for. `want` is cut
+    /// to the trained context first, as a load does it, so a request for
+    /// more than the model has is met by the most it has.
+    ///
+    /// Only a llama-server's window is the daemon's to set per load: the
+    /// other engines are left out, a MLX or Omni backend taking no such
+    /// flag at all. One whose window is not known is taken to differ, as
+    /// the load that replaces it records the one it gave.
+    fn needs_context(&self, want: u32) -> bool {
+        if self.process.engine() != Engine::LlamaServer {
+            return false;
+        }
+        let want = clamp_to_trained(want, self.trained_ctx);
+        self.context_window != Some(want)
+    }
+
     fn processor(&self) -> String {
         match &self.process {
             ModelProcess::Local(engine, _, _) => format!("{} (local)", engine.label()),
@@ -1145,9 +1165,23 @@ async fn unload_everywhere(
 /// claim always has an owner, from this moment until the caller's own
 /// `begin_activity`/`refresh_activity` takes over.
 async fn check_running(state: &AppState, model_ref: &str) -> Option<(u16, ActivityGuard)> {
+    check_running_for(state, model_ref, None).await
+}
+
+/// [`check_running`] for a request that asks for a context window (`ctx`,
+/// its `options.num_ctx`): a model loaded with another one is not reused,
+/// and is left for [`retire_for_context`] to replace.
+async fn check_running_for(
+    state: &AppState,
+    model_ref: &str,
+    ctx: Option<u32>,
+) -> Option<(u16, ActivityGuard)> {
     let mut mgr = state.0.manager.lock().await;
     if let Some(m) = mgr.running.get_mut(model_ref) {
         if m.process.is_alive() {
+            if ctx.is_some_and(|want| m.needs_context(want)) {
+                return None;
+            }
             m.in_flight += 1;
             return Some((m.port, ActivityGuard::new(state, model_ref)));
         }
@@ -1193,6 +1227,7 @@ async fn check_running_by_digest(
     state: &AppState,
     model_ref: &str,
     digest: &str,
+    ctx: Option<u32>,
 ) -> Option<(String, u16, ActivityGuard)> {
     let mut mgr = state.0.manager.lock().await;
     let key = running_by_digest(&mgr.running, model_ref, digest)?
@@ -1205,6 +1240,9 @@ async fn check_running_by_digest(
             m.port
         );
         mgr.running.remove(&key);
+        return None;
+    }
+    if ctx.is_some_and(|want| m.needs_context(want)) {
         return None;
     }
     m.in_flight += 1;
@@ -1244,6 +1282,55 @@ async fn evict_other_models(state: &AppState, model_ref: &str) -> bool {
         running.process.stop_and_wait().await;
     }
     any
+}
+
+/// Unloads `model_ref` if it is loaded with a context window other than
+/// `ctx`, a request's `options.num_ctx`, so the load that follows gives it
+/// the one asked for. Waits for the requests it is serving first, as
+/// Ollama's scheduler does before it reloads a runner: killing them
+/// mid-reply would fail another client's request for this one's sake.
+/// `digest` finds the model when it is loaded under another spelling (see
+/// [`check_running_by_digest`]).
+///
+/// Waits without a limit, but holds nothing a dropped request would not
+/// release: the caller's load lock and queue slot are RAII guards, so a
+/// client that gives up frees them, and nothing here is half-done until
+/// the unload itself.
+async fn retire_for_context(state: &AppState, model_ref: &str, digest: &str, ctx: Option<u32>) {
+    let Some(want) = ctx else { return };
+    loop {
+        let mut mgr = state.0.manager.lock().await;
+        let key = if mgr.running.contains_key(model_ref) {
+            model_ref.to_string()
+        } else if let Some((key, _)) = running_by_digest(&mgr.running, model_ref, digest) {
+            key.clone()
+        } else {
+            return;
+        };
+        let model = &mgr.running[&key];
+        if !model.needs_context(want) {
+            return;
+        }
+        if model.in_flight > 0 {
+            drop(mgr);
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        let Some(mut retired) = mgr.running.remove(&key) else {
+            return;
+        };
+        metrics::record_model_unload(&key, UnloadReason::Reloaded);
+        drop(mgr);
+        eprintln!(
+            "[llmman] {key} is loaded with a context of {}; unloading it to load it with {}",
+            retired
+                .context_window
+                .map_or_else(|| "an unknown size".to_string(), |n| n.to_string()),
+            clamp_to_trained(want, retired.trained_ctx),
+        );
+        retired.process.stop_and_wait().await;
+        return;
+    }
 }
 
 /// Releases a `pending_loads` reservation on drop — see
@@ -1825,7 +1912,8 @@ async fn resolve_remote_target(
 ///
 /// `request_threads` is the caller's Ollama `options.num_thread` (see
 /// [`ollama::opt_num_thread`]); `None` from every surface without an Ollama
-/// options blob (OpenAI-compat, Anthropic, embeddings, preload).
+/// options blob (OpenAI-compat, Anthropic, embeddings, preload). It is one
+/// of the [`LoadOptions`] `ensure_model_for` takes.
 /// Precedence for the thread count a local llama-server ends up with:
 /// request option > `LLAMA_ARG_THREADS` > the derived `state.threads`
 /// (see [`threads_from_env_or_host`]) > llama-server's own
@@ -1845,7 +1933,28 @@ async fn ensure_model(
     headers: Option<&HeaderMap>,
     request_threads: Option<u32>,
 ) -> Result<(String, Target, ActivityGuard), AppError> {
-    ensure_model_for(state, model_ref, headers, request_threads, Task::Other).await
+    let opts = LoadOptions {
+        threads: request_threads,
+        ..LoadOptions::default()
+    };
+    ensure_model_for(state, model_ref, headers, opts, Task::Other).await
+}
+
+/// What a request asks of the load that serves it, from its Ollama
+/// `options`; the default, from every surface without them, asks nothing.
+/// A local llama-server is what they apply to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LoadOptions {
+    /// `options.num_thread` (see [`ollama::opt_num_thread`]), applied to
+    /// a fresh load only. See [`ensure_model`] for its precedence.
+    threads: Option<u32>,
+    /// `options.num_ctx` (see [`ollama::opt_num_ctx`]): the context window
+    /// to load the model with, over the daemon's `LLMMAN_CONTEXT_LENGTH`.
+    /// Unlike `threads`, a llama-server model already loaded with a
+    /// different window is reloaded for it (see [`retire_for_context`]), as
+    /// Ollama does. A request that sets none uses whichever window is
+    /// loaded. Not carried to a safetensors engine (see `load_ctx`).
+    ctx: Option<u32>,
 }
 
 /// What a request does with its model, so a decision model (see
@@ -1882,11 +1991,10 @@ async fn ensure_model_for(
     state: &AppState,
     model_ref: &str,
     headers: Option<&HeaderMap>,
-    request_threads: Option<u32>,
+    opts: LoadOptions,
     task: Task,
 ) -> Result<(String, Target, ActivityGuard), AppError> {
-    let (model, target, guard) =
-        resolve_target(state, model_ref, headers, request_threads, task).await?;
+    let (model, target, guard) = resolve_target(state, model_ref, headers, opts, task).await?;
     // A cold load was refused in resolve_target; this is a model already
     // loaded. A peer or provider judges for itself.
     if task != Task::Other && matches!(target, Target::Local(_)) {
@@ -1910,7 +2018,7 @@ async fn resolve_target(
     state: &AppState,
     model_ref: &str,
     headers: Option<&HeaderMap>,
-    request_threads: Option<u32>,
+    opts: LoadOptions,
     task: Task,
 ) -> Result<(String, Target, ActivityGuard), AppError> {
     // First, so everything below sees one half rather than the pair. A
@@ -1962,7 +2070,7 @@ async fn resolve_target(
     // reusable runner (server/sched.go): only a request that actually
     // needs scheduling work (waiting on a concurrent load, or starting
     // a fresh one) below counts against the cap.
-    if let Some((port, guard)) = check_running(state, model_ref).await {
+    if let Some((port, guard)) = check_running_for(state, model_ref, opts.ctx).await {
         // Already loaded, so no pull and no re-check: a policy tightened
         // since the load takes effect on the next load, not mid-flight.
         return Ok((model_ref.to_string(), Target::Local(port), guard));
@@ -1993,7 +2101,7 @@ async fn resolve_target(
 
     // Someone else may have finished loading this model while we
     // waited for the lock above.
-    if let Some((port, guard)) = check_running(state, model_ref).await {
+    if let Some((port, guard)) = check_running_for(state, model_ref, opts.ctx).await {
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
@@ -2028,7 +2136,7 @@ async fn resolve_target(
     let model_ref = model_ref.as_str();
 
     // Re-check in case that stored form differs from the key above.
-    if let Some((port, guard)) = check_running(state, model_ref).await {
+    if let Some((port, guard)) = check_running_for(state, model_ref, opts.ctx).await {
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
@@ -2049,12 +2157,21 @@ async fn resolve_target(
     // not resolve to; see `check_running_by_digest`'s doc comment for the
     // order that produces one.
     if !digest.is_empty() {
-        if let Some((key, port, guard)) = check_running_by_digest(state, model_ref, &digest).await {
+        if let Some((key, port, guard)) =
+            check_running_by_digest(state, model_ref, &digest, opts.ctx).await
+        {
             return Ok((key, Target::Local(port), guard));
         }
     }
     let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
         .with_context(|| format!("resolve model {model_ref}"))?;
+    // A safetensors engine is left to the window the daemon was told, as
+    // before: its limit is the model's own, vLLM refuses a `--max-model-len`
+    // past it outright, and with no GGUF header there is no trained context
+    // to cut a client's `num_ctx` to.
+    let load_ctx = opts
+        .ctx
+        .filter(|_| matches!(model_path, ModelPath::Gguf(..) | ModelPath::Diffusion(_)));
     let context_shift = supports_context_shift(model_ref);
     // One header read feeds initial_ctx_size, embedding_model_ctx and
     // is_decision; unreadable means "generation model, unknown trained
@@ -2073,6 +2190,10 @@ async fn resolve_target(
             return Err(refusal);
         }
     }
+    // A model loaded with another context window than this request asked
+    // for goes first, so its memory is back before this load wants it and
+    // `enforce_max_loaded_models` does not count it against the cap.
+    retire_for_context(state, model_ref, &digest, load_ctx).await;
     // See enforce_max_loaded_models's doc comment — held for the rest
     // of this function.
     let mut pending_load_guard =
@@ -2085,9 +2206,17 @@ async fn resolve_target(
     // attempt, not just the first — otherwise a retry's replacement
     // process could try to bind the same port the previous (failed,
     // possibly not-yet-fully-exited) one was still holding.
+    // A request's `num_ctx` is the caller's own choice, so it counts as
+    // explicit — never auto-shrunk below — and is cut to the trained
+    // context. Without one, the daemon's `LLMMAN_CONTEXT_LENGTH` and
+    // whether it was set stand.
+    let (ctx_configured, ctx_explicit) = match load_ctx {
+        Some(num_ctx) => (Some(clamp_to_trained(num_ctx, trained_ctx)), true),
+        None => (state.0.ctx_size, state.0.ctx_size_explicit),
+    };
     let mut ctx_size = initial_ctx_size(
-        state.0.ctx_size,
-        state.0.ctx_size_explicit,
+        ctx_configured,
+        ctx_explicit,
         trained_ctx,
         embedding_ctx.is_some(),
     );
@@ -2127,12 +2256,12 @@ async fn resolve_target(
                 embedding_ctx.is_some(),
                 decision,
                 ctx_size,
-                state.0.ctx_size_explicit,
+                ctx_explicit,
                 trained_ctx,
             ),
             // See ensure_model's `request_threads` doc comment for the
             // full precedence chain this `.or` implements.
-            threads: request_threads.or(state.0.threads),
+            threads: opts.threads.or(state.0.threads),
             cpus: state.0.cpu_limit,
         };
         // Every piped child gets an output tail for crash reasons; only
@@ -2140,7 +2269,7 @@ async fn resolve_target(
         // fallbacks are llama-server flags.
         let mut stderr_tail: Option<OutputTail> = None;
         let mut oom_retryable = false;
-        let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
+        let max_model_len = vllm_max_model_len(ctx_size, ctx_explicit);
         // Per load, like use_mlx_for_safetensors, which it gates.
         let safetensors_engine = safetensors_engine_from_env();
         let ds4 = gguf_goes_to_ds4(
@@ -2350,8 +2479,7 @@ async fn resolve_target(
                 // would ignore the user's own stated choice (mirrors
                 // Ollama's own numCtxAuto gate on
                 // reduceAutoNumCtxForLoadOOM).
-                let can_shrink =
-                    !state.0.ctx_size_explicit && shrink_attempts < MAX_CTX_SHRINK_ATTEMPTS;
+                let can_shrink = !ctx_explicit && shrink_attempts < MAX_CTX_SHRINK_ATTEMPTS;
                 let Some(next) = can_shrink
                     .then(|| ctx_size.and_then(next_ctx_size_after_oom))
                     .flatten()
@@ -2386,7 +2514,7 @@ async fn resolve_target(
         ctx_size,
         trained_ctx,
         num_parallel,
-        state.0.ctx_size_explicit,
+        ctx_explicit,
     );
     // ds4 reports its window, including the default it uses without --ctx.
     let context_window = match process.engine() {
@@ -2413,6 +2541,7 @@ async fn resolve_target(
             // 1, not 0 — see this function's own doc comment.
             in_flight: 1,
             decision,
+            trained_ctx,
         },
     );
     // Same locked step as the insert, so this load is never both in
@@ -2425,6 +2554,15 @@ async fn resolve_target(
         Target::Local(port),
         ActivityGuard::new(state, model_ref),
     ))
+}
+
+/// A request's `num_ctx` cut to the model's trained context, if known: a
+/// window past it is one the model was not trained for, and Ollama cuts it
+/// too.
+fn clamp_to_trained(num_ctx: u32, trained: Option<u32>) -> u32 {
+    trained
+        .filter(|t| *t > 0)
+        .map_or(num_ctx, |t| num_ctx.min(t))
 }
 
 /// The per-request context window a finished load ended up serving, for
@@ -2736,7 +2874,11 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
             .send()
             .await
             .with_context(|| format!("send to {}", target.describe()))?;
-        return Ok(ChatUpstream::relay(resp));
+        let upstream = ChatUpstream::relay(resp);
+        if matches!(target, Target::Local(_)) && upstream.status == StatusCode::BAD_REQUEST {
+            return retry_merging_roles(client, target, req, upstream).await;
+        }
+        return Ok(upstream);
     };
 
     let mut req = serde_json::to_value(req).context("serialize chat request")?;
@@ -2834,6 +2976,50 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
         status: StatusCode::OK,
         headers,
         body,
+    })
+}
+
+/// `refused`, a local backend's 400 for `req`, if that is its chat template
+/// refusing two messages of one role in a row: `req` sent again with them
+/// merged (see [`openai::merge_adjacent_roles`]), for a model whose template
+/// needs the roles to alternate. Any other 400, or one with nothing to
+/// merge, is `refused` as it came: the refusal is small and ends before any
+/// output, so reading it costs nothing.
+async fn retry_merging_roles<T: Serialize + ?Sized>(
+    client: &Client,
+    target: &Target,
+    req: &T,
+    refused: ChatUpstream,
+) -> Result<ChatUpstream, AppError> {
+    let ChatUpstream {
+        status,
+        headers,
+        body,
+    } = refused;
+    let reply = Bytes::from(collect_body(body).await);
+    if openai::is_role_alternation_refusal(status, &reply) {
+        let mut merged = serde_json::to_value(req).context("serialize chat request")?;
+        if openai::merge_adjacent_roles(&mut merged) {
+            eprintln!(
+                "[llmman] {} refused consecutive same-role messages; retrying with them merged",
+                target.describe()
+            );
+            let resp = target
+                .authorize(
+                    client
+                        .post(target.url(CHAT_COMPLETIONS_ROUTE))
+                        .json(&merged),
+                )
+                .send()
+                .await
+                .with_context(|| format!("send to {}", target.describe()))?;
+            return Ok(ChatUpstream::relay(resp));
+        }
+    }
+    Ok(ChatUpstream {
+        status,
+        headers,
+        body: futures::stream::once(futures::future::ready(Ok(reply))).boxed(),
     })
 }
 
@@ -3010,7 +3196,7 @@ async fn claim_llama_server(state: &AppState, key: &str) -> Option<(u16, Activit
                 .and_then(|store| store.find(key))
                 .ok()?
                 .digest;
-            let (_, port, guard) = check_running_by_digest(state, key, &digest).await?;
+            let (_, port, guard) = check_running_by_digest(state, key, &digest, None).await?;
             (port, guard)
         }
     };

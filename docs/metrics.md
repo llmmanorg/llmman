@@ -40,7 +40,7 @@ Fifteen metric families:
 | `llmman_model_loads_total` | counter | `model` | Cold starts per model — the churn a too-small `LLMMAN_MAX_LOADED_MODELS` produces. |
 | `llmman_model_load_duration_seconds` | histogram | `model` | How long a cold start takes, from admission to ready. |
 | `llmman_model_load_oom_retries_total` | counter | `model`, `strategy` | Loads that hit an out-of-memory failure and retried: `evict_others`, `split_mode`, `ctx_shrink`. |
-| `llmman_model_unloads_total` | counter | `model`, `reason` | `idle`, `requested`, `crashed`, `oom`, `evicted`. |
+| `llmman_model_unloads_total` | counter | `model`, `reason` | `idle`, `requested`, `crashed`, `oom`, `evicted`, `reloaded`. |
 | `llmman_http_requests_total` | counter | `route`, `status` | Request rate and error rate by matched route. |
 | `llmman_http_request_ttfb_seconds` | histogram | `route` | Time to response headers. This is the latency number. |
 | `llmman_http_request_duration_seconds` | histogram | `route` | Time to the last byte of the body. |

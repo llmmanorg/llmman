@@ -52,7 +52,7 @@ const DURATION_BUCKETS: [f64; 13] = [
 ];
 
 /// Why a model left `ModelManager::running`, as the `reason` label on
-/// `llmman_model_unloads_total`. Five closed cases, one per production
+/// `llmman_model_unloads_total`. Six closed cases, one per production
 /// site that removes an entry, so that half of the label set is bounded
 /// by the code rather than by traffic. The distinction is the
 /// operationally useful part: steady `Evicted` means
@@ -78,6 +78,9 @@ pub(crate) enum UnloadReason {
     /// `enforce_max_loaded_models`: freeing a `LLMMAN_MAX_LOADED_MODELS`
     /// slot for a new load.
     Evicted,
+    /// `retire_for_context`: replaced by a load of the same model at the
+    /// context window a request's `options.num_ctx` asked for.
+    Reloaded,
 }
 
 impl UnloadReason {
@@ -88,6 +91,7 @@ impl UnloadReason {
             Self::Crashed => "crashed",
             Self::Oom => "oom",
             Self::Evicted => "evicted",
+            Self::Reloaded => "reloaded",
         }
     }
 }
@@ -1014,11 +1018,15 @@ mod tests {
             UnloadReason::Crashed,
             UnloadReason::Oom,
             UnloadReason::Evicted,
+            UnloadReason::Reloaded,
         ]
         .iter()
         .map(|r| r.as_str())
         .collect();
-        assert_eq!(unloads, ["idle", "requested", "crashed", "oom", "evicted"]);
+        assert_eq!(
+            unloads,
+            ["idle", "requested", "crashed", "oom", "evicted", "reloaded"]
+        );
 
         let retries: Vec<&str> = [
             OomRetry::EvictOthers,
