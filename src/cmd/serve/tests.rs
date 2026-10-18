@@ -6795,3 +6795,87 @@ async fn handle_tags_reports_the_family_size_and_quantization_of_each_gguf() {
     assert_eq!(ollama::cached_model_facts(&dir), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// DIAGNOSTIC, not for merging: which Windows placeholder processes survive
+/// a loaded test run, and how the ones that do not exit.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn diag_windows_placeholders_survive() {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    type Spawn = fn() -> tokio::process::Child;
+    fn null(mut c: Command) -> tokio::process::Child {
+        c.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+    let candidates: [(&str, Spawn); 4] = [
+        ("ping -n 61, null stdio", || {
+            let mut c = Command::new("ping");
+            c.args(["-n", "61", "127.0.0.1"]);
+            null(c)
+        }),
+        ("cmd /C timeout, inherited", || {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "timeout", "/T", "60", "/NOBREAK"])
+                .kill_on_drop(true);
+            c.spawn().unwrap()
+        }),
+        ("findstr on a held stdin pipe", || {
+            let mut c = Command::new("findstr");
+            c.arg("x")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            c.spawn().unwrap()
+        }),
+        ("ping -n 61, inherited stdio", || {
+            let mut c = Command::new("ping");
+            c.args(["-n", "61", "127.0.0.1"]).kill_on_drop(true);
+            c.spawn().unwrap()
+        }),
+    ];
+
+    let mut report = String::new();
+    for (name, spawn) in candidates {
+        let mut children: Vec<_> = (0..40).map(|_| spawn()).collect();
+        let started = Instant::now();
+        let mut first_death = None;
+        let mut codes: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut dead = vec![false; children.len()];
+        while started.elapsed() < Duration::from_millis(2500) {
+            for (i, child) in children.iter_mut().enumerate() {
+                if dead[i] {
+                    continue;
+                }
+                match child.try_wait() {
+                    Ok(None) => {}
+                    Ok(Some(status)) => {
+                        dead[i] = true;
+                        first_death.get_or_insert(started.elapsed());
+                        *codes.entry(format!("{status}")).or_default() += 1;
+                    }
+                    Err(e) => {
+                        dead[i] = true;
+                        *codes.entry(format!("try_wait error: {e}")).or_default() += 1;
+                    }
+                }
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        report += &format!(
+            "{name}: {} of {} died within 2.5s, first at {first_death:?}, exits {codes:?}\n",
+            dead.iter().filter(|d| **d).count(),
+            children.len(),
+        );
+        for child in &mut children {
+            let _ = child.kill().await;
+        }
+    }
+    panic!("DIAGNOSTIC REPORT\n{report}");
+}
