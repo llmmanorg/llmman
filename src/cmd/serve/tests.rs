@@ -5862,9 +5862,15 @@ async fn a_backend_dying_mid_stream_aborts_the_clients_stream() {
         serde_json::json!({ "stream": true }),
     )
     .await;
+    let err = resp
+        .text()
+        .await
+        .expect_err("a truncated reply must not look complete");
+    // The client gives up after a while; a stream that merely stalled would
+    // end that way too, without the backend's abort having reached it.
     assert!(
-        resp.text().await.is_err(),
-        "a truncated reply must not look complete"
+        !err.is_timeout(),
+        "the abort must reach the client before its timeout: {err}"
     );
 }
 
