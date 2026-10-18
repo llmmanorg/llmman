@@ -94,7 +94,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The exact short name every `llmman launch ... --model` invocation in
@@ -148,6 +148,9 @@ fn lock_serial() -> std::sync::MutexGuard<'static, ()> {
 /// once per test binary run, no matter how many of the three tests below
 /// actually reach it.
 static WARM: Once = Once::new();
+
+/// The window `warm_model` loaded `MODEL` with; see [`restore_model_window`].
+static DEFAULT_WINDOW: OnceLock<u64> = OnceLock::new();
 
 /// The `llmman` binary every test in this file launches.
 ///
@@ -568,8 +571,8 @@ fn try_spawn_with_timeout(
 fn warm_model() {
     WARM.call_once(|| {
         eprintln!("[warm_model] starting");
-        let output = run_model_prompt(TIMEOUT, "llmman run (model warm-up)")
-            .unwrap_or_else(|timed_out| panic!("{}", timed_out.message));
+        let output = reload_model("llmman run (model warm-up)")
+            .unwrap_or_else(|message| panic!("{message}"));
         eprintln!("[warm_model] done, status={:?}", output.status);
         assert!(
             output.status.success(),
@@ -579,7 +582,73 @@ fn warm_model() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
+        // Only a measured window is a baseline, so a transient miss is retried.
+        let window = (0..3).find_map(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            llmman::daemon::running_context_length(&model_reference())
+        });
+        match window {
+            Some(window) => {
+                let _ = DEFAULT_WINDOW.set(window);
+            }
+            None => eprintln!("[warm_model] no context window reported; not restoring it"),
+        }
     });
+    restore_model_window();
+}
+
+/// `MODEL` as the daemon names it, which is how `/api/ps` lists it.
+fn model_reference() -> String {
+    llmman::shortnames::resolve_ollama_api(MODEL).expect("MODEL resolves")
+}
+
+/// Unloads `MODEL` and loads it again with `llmman run`, at the daemon's
+/// own window. A live daemon that will not unload it would hand back the
+/// old window, so that is an error; no daemon yet is fine, the run starts one.
+fn reload_model(description: &str) -> Result<std::process::Output, String> {
+    if llmman::daemon::server_alive() {
+        llmman::daemon::unload(&model_reference())
+            .map_err(|error| format!("unloading {MODEL} failed: {error:#}"))?;
+    }
+    run_model_prompt(TIMEOUT, description).map_err(|timed_out| timed_out.message)
+}
+
+/// Reloads `MODEL` unless it has at least the window `warm_model` gave it.
+///
+/// The daemon is shared, and a request that names `num_ctx` reloads the
+/// model at that window for every later request too (#684). Cline's Ollama
+/// provider sends 32768, so later tests ran at an eighth of the warmed
+/// 262144: Hermes refuses a window under 64K, and the qwen test's prompts
+/// overflow it. A failed reload is logged and left for the test to hit.
+fn restore_model_window() {
+    let Some(&default) = DEFAULT_WINDOW.get() else {
+        return;
+    };
+    let model = model_reference();
+    // Read-only. An unknown window (idle, or `/api/ps` failed) reloads too,
+    // which loads an idle model at the default.
+    let window = llmman::daemon::running_context_length(&model);
+    if window.is_some_and(|window| window >= default) {
+        return;
+    }
+    eprintln!(
+        "[restore_model_window] {model} has a window of {window:?}, want {default}+; reloading"
+    );
+    match reload_model("llmman run (model window restore)") {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => eprintln!(
+            "[restore_model_window] reload failed (status: {:?})\n--- stderr ---\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(message) => eprintln!("[restore_model_window] {message}"),
+    }
+    eprintln!(
+        "[restore_model_window] window is now {:?}",
+        llmman::daemon::running_context_length(&model)
+    );
 }
 
 /// `llmman run MODEL PROMPT` with `warm_model`'s guard flags, bounded by
@@ -1304,7 +1373,7 @@ fn launch_droid_with_model() {
                 .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
             let settings: serde_json::Value = serde_json::from_str(&text)
                 .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
-            let model = llmman::shortnames::resolve_ollama_api(MODEL).expect("MODEL resolves");
+            let model = model_reference();
             let entry = settings["customModels"]
                 .as_array()
                 .and_then(|models| models.iter().find(|entry| entry["model"] == model))
@@ -1562,10 +1631,7 @@ fn launch_opencode_variant_outranks_the_saved_selection() {
     if !installed("opencode", "https://opencode.ai") {
         return;
     }
-    let model = format!(
-        "ollama/{}",
-        llmman::shortnames::resolve_ollama_api(MODEL).expect("MODEL resolves")
-    );
+    let model = format!("ollama/{}", model_reference());
     let state = ".local/state/opencode/model.json";
     let launch = launch_at_variant("opencode", &["run", PROMPT], |home| {
         let saved = serde_json::json!({ "variant": { &model: "none" } });

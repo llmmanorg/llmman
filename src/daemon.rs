@@ -1423,6 +1423,12 @@ pub fn loaded_context_length(reference: &str) -> Option<u64> {
         .ok()?
         .error_for_status()
         .ok()?;
+    running_context_length(reference)
+}
+
+/// `reference`'s window from `/api/ps`, without loading it: `None` when it
+/// is not loaded, or the daemon reports no window or cannot be asked.
+pub fn running_context_length(reference: &str) -> Option<u64> {
     let ps: PsWindows = get_json("/api/ps").ok()?;
     ps_window(ps.models, reference)
 }

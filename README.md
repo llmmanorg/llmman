@@ -16,8 +16,8 @@ llmman launch claude --model qwen3.8
 ```
 
 That starts a local inference server, fetches the tested `llama.cpp` release for
-your GPU (as a container on Linux with Docker or Podman, otherwise a prebuilt
-binary), loads the model, and execs an agent against it.
+your GPU (as a container on Linux, otherwise a prebuilt binary), loads the
+model, and execs an agent against it.
 
 <p align="center">
   <img src="https://github.com/llmmanorg/llmman/releases/download/docs-assets/launch.gif" alt="llmman launch claude --model qwen3.8, answering from a local model" width="900">
@@ -245,11 +245,10 @@ OLLAMA_HOST=127.0.0.1:17434 ollama run unsloth/Qwen3.5-0.8B-GGUF
 
 Models load on demand, each in its own backend process, and unload after
 five idle minutes (`keep_alive`, as in Ollama). GGUF is served by upstream
-[`llama.cpp`](https://github.com/ggml-org/llama.cpp) at a pinned release —
-in a Docker/Podman container, as a downloaded prebuilt binary, or from
-`PATH`, whichever `--runtime` picks ([docs/backends.md](docs/backends.md#choosing-a-runtime));
-safetensors by
-[`vllm`](https://github.com/vllm-project/vllm), by
+[`llama.cpp`](https://github.com/ggml-org/llama.cpp) at a pinned release,
+in a container, as a downloaded prebuilt binary, or from `PATH`, whichever
+`--runtime` picks ([docs/backends.md](docs/backends.md#choosing-a-runtime));
+safetensors by [`vllm`](https://github.com/vllm-project/vllm), by
 [`sglang`](https://github.com/sgl-project/sglang) with
 `LLMMAN_SAFETENSORS_ENGINE=sglang`, or by
 [`mlx-lm`](https://github.com/ml-explore/mlx-lm) on macOS
