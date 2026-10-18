@@ -367,6 +367,9 @@ struct RunningModel {
     /// The GGUF header's trained context, if it names one: what a
     /// request's `num_ctx` is cut to, as the load that follows would.
     trained_ctx: Option<u32>,
+    /// Set while [`retire_for_context`] waits for this model's requests to
+    /// finish, so that no new one joins it and keeps it busy.
+    retiring: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Which engine is actually serving requests for a [`RunningModel`] — surfaced
@@ -385,6 +388,10 @@ impl RunningModel {
     /// other engines are left out, a MLX or Omni backend taking no such
     /// flag at all. One whose window is not known is taken to differ, as
     /// the load that replaces it records the one it gave.
+    fn is_retiring(&self) -> bool {
+        self.retiring.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn needs_context(&self, want: u32) -> bool {
         if self.process.engine() != Engine::LlamaServer {
             return false;
@@ -1170,7 +1177,8 @@ async fn check_running(state: &AppState, model_ref: &str) -> Option<(u16, Activi
 
 /// [`check_running`] for a request that asks for a context window (`ctx`,
 /// its `options.num_ctx`): a model loaded with another one is not reused,
-/// and is left for [`retire_for_context`] to replace.
+/// and is left for [`retire_for_context`] to replace. Nor is a model that
+/// is being retired, whatever the request asks: it waits for the load.
 async fn check_running_for(
     state: &AppState,
     model_ref: &str,
@@ -1179,7 +1187,7 @@ async fn check_running_for(
     let mut mgr = state.0.manager.lock().await;
     if let Some(m) = mgr.running.get_mut(model_ref) {
         if m.process.is_alive() {
-            if ctx.is_some_and(|want| m.needs_context(want)) {
+            if m.is_retiring() || ctx.is_some_and(|want| m.needs_context(want)) {
                 return None;
             }
             m.in_flight += 1;
@@ -1242,7 +1250,7 @@ async fn check_running_by_digest(
         mgr.running.remove(&key);
         return None;
     }
-    if ctx.is_some_and(|want| m.needs_context(want)) {
+    if m.is_retiring() || ctx.is_some_and(|want| m.needs_context(want)) {
         return None;
     }
     m.in_flight += 1;
@@ -1284,6 +1292,24 @@ async fn evict_other_models(state: &AppState, model_ref: &str) -> bool {
     any
 }
 
+/// Marks a model as being retired for as long as it lives, and unmarks it
+/// on drop, so a request that gives up while [`retire_for_context`] waits
+/// does not leave the model turned away from everyone.
+struct RetireMark(Arc<std::sync::atomic::AtomicBool>);
+
+impl RetireMark {
+    fn new(flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for RetireMark {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Unloads `model_ref` if it is loaded with a context window other than
 /// `ctx`, a request's `options.num_ctx`, so the load that follows gives it
 /// the one asked for. Waits for the requests it is serving first, as
@@ -1292,12 +1318,16 @@ async fn evict_other_models(state: &AppState, model_ref: &str) -> bool {
 /// `digest` finds the model when it is loaded under another spelling (see
 /// [`check_running_by_digest`]).
 ///
-/// Waits without a limit, but holds nothing a dropped request would not
-/// release: the caller's load lock and queue slot are RAII guards, so a
-/// client that gives up frees them, and nothing here is half-done until
-/// the unload itself.
+/// While it waits the model is marked, and takes no new requests: they wait
+/// for the load behind this one's lock instead of joining the model and
+/// keeping it busy, so the wait ends once what it is serving does. It has
+/// no other limit, but holds nothing a dropped request would not release:
+/// the load lock, queue slot and mark are all RAII guards, so a client
+/// that gives up frees them, and nothing here is half-done until the
+/// unload itself.
 async fn retire_for_context(state: &AppState, model_ref: &str, digest: &str, ctx: Option<u32>) {
     let Some(want) = ctx else { return };
+    let mut mark = None;
     loop {
         let mut mgr = state.0.manager.lock().await;
         let key = if mgr.running.contains_key(model_ref) {
@@ -1312,6 +1342,7 @@ async fn retire_for_context(state: &AppState, model_ref: &str, digest: &str, ctx
             return;
         }
         if model.in_flight > 0 {
+            mark.get_or_insert_with(|| RetireMark::new(model.retiring.clone()));
             drop(mgr);
             sleep(Duration::from_millis(100)).await;
             continue;
@@ -2542,6 +2573,7 @@ async fn resolve_target(
             in_flight: 1,
             decision,
             trained_ctx,
+            retiring: Default::default(),
         },
     );
     // Same locked step as the insert, so this load is never both in

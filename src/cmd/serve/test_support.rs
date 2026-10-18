@@ -188,6 +188,7 @@ pub(super) fn running_model_fixture(
         in_flight,
         decision: false,
         trained_ctx: None,
+        retiring: Default::default(),
     }
 }
 
@@ -213,6 +214,7 @@ pub(super) fn running_model_fixture_with_engine(
         in_flight: 0,
         decision: false,
         trained_ctx: None,
+        retiring: Default::default(),
     }
 }
 

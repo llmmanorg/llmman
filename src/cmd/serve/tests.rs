@@ -5997,6 +5997,83 @@ async fn retiring_a_model_waits_for_its_requests_to_finish() {
     assert!(!state.0.manager.lock().await.running.contains_key(&key));
 }
 
+/// A model waiting to be reloaded takes no new requests, whatever they ask
+/// for: left taking them, steady traffic would keep it busy and the reload
+/// would never come. They wait for the load instead. A request that gives up
+/// on the reload lets the model take requests again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_waiting_to_be_retired_turns_new_requests_away() {
+    let state = test_state();
+    let key = running_key(&state, "qwen3:0.6b");
+    let mut busy = loaded_with(Some(40960), Some(40960));
+    busy.in_flight = 1;
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .insert(key.clone(), busy);
+    let retiring = |state: &AppState, key: &str| {
+        let (state, key) = (state.clone(), key.to_string());
+        tokio::spawn(async move { retire_for_context(&state, &key, "", Some(4096)).await })
+    };
+    let marked = |state: AppState, key: String| async move {
+        for _ in 0..200 {
+            if state.0.manager.lock().await.running[&key].is_retiring() {
+                return true;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        false
+    };
+
+    let waiting = retiring(&state, &key);
+    assert!(
+        marked(state.clone(), key.clone()).await,
+        "it marks the model"
+    );
+    // None of them is let in: not one with no window, nor one for the
+    // window the model has, nor a lookup with no window to ask for.
+    for ctx in [None, Some(40960), Some(4096)] {
+        assert!(
+            check_running_for(&state, &key, ctx).await.is_none(),
+            "{ctx:?}"
+        );
+    }
+    assert!(check_running(&state, &key).await.is_none());
+    assert_eq!(
+        state.0.manager.lock().await.running[&key].in_flight,
+        1,
+        "nothing joined it"
+    );
+
+    // Giving up on the reload unmarks the model.
+    waiting.abort();
+    let _ = waiting.await;
+    assert!(!state.0.manager.lock().await.running[&key].is_retiring());
+    let (_, guard) = check_running_for(&state, &key, None).await.unwrap();
+    drop(guard);
+
+    // And one that stays marks it only until the model is gone.
+    let waiting = retiring(&state, &key);
+    assert!(marked(state.clone(), key.clone()).await);
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .get_mut(&key)
+        .unwrap()
+        .in_flight = 0;
+    tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("retires once idle")
+        .unwrap();
+    assert!(!state.0.manager.lock().await.running.contains_key(&key));
+}
+
 /// The same model loaded under another spelling, found by its content.
 #[tokio::test]
 async fn retiring_finds_a_model_loaded_under_its_digest() {
