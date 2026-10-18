@@ -375,8 +375,12 @@ impl OllamaLineDecoder {
         let usage = self.usage.get();
         let timings = self.timings.get();
         let total = self.started.elapsed();
-        // `prompt_tokens` includes the cached prefix; `prompt_eval_count`
-        // is what was evaluated, as llama-server's `prompt_n`.
+        // Ollama's `prompt_eval_count` is the whole prompt, the cached
+        // prefix included: its own CLI takes the uncached part as
+        // `prompt_eval_count - prompt_eval_cached_count`, and clients size
+        // their context meters from it. `prompt_tokens` is that already;
+        // llama-server's `prompt_n` is only what it evaluated this time,
+        // the cache hit being `cache_n` beside it.
         let cached = usage.map(|u| {
             let details = &u.prompt_tokens_details;
             let read = details.cached_tokens.unwrap_or(0).min(u.prompt_tokens);
@@ -385,7 +389,7 @@ impl OllamaLineDecoder {
                 .unwrap_or(0)
                 .min(u.prompt_tokens - read);
             (
-                u.prompt_tokens - read,
+                u.prompt_tokens,
                 details.cached_tokens.map(|_| read),
                 written,
             )
@@ -393,7 +397,9 @@ impl OllamaLineDecoder {
         OllamaMetrics {
             total_duration: Some(total.as_nanos() as u64),
             load_duration: Some(self.load_duration.as_nanos() as u64),
-            prompt_eval_count: timings.map(|t| t.prompt_n).or(cached.map(|c| c.0)),
+            prompt_eval_count: timings
+                .map(|t| t.prompt_n.saturating_add(t.cache_n.unwrap_or(0)))
+                .or(cached.map(|c| c.0)),
             prompt_eval_cached_count: timings.and_then(|t| t.cache_n).or(cached.and_then(|c| c.1)),
             prompt_eval_cache_write_count: cached.map(|c| c.2).filter(|&n| n > 0),
             prompt_eval_duration: timings.map(|t| ns(t.prompt_ms)),
@@ -656,10 +662,10 @@ mod tests {
         assert_eq!(calls[0].function.arguments["city"], "Paris");
     }
 
-    /// A provider's cached prefix is not counted as evaluated too, and an
-    /// over-report is clamped to the prompt.
+    /// A provider's cached prefix is part of the prompt count, as Ollama's
+    /// is, and an over-report is clamped to the prompt.
     #[test]
-    fn a_providers_cached_prefix_is_not_counted_as_evaluated() {
+    fn a_providers_cached_prefix_is_part_of_the_prompt_count() {
         let metrics = |usage: &str| {
             let lines = [
                 r#"data: {"choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]}"#
@@ -672,21 +678,54 @@ mod tests {
         let m = metrics(
             r#"{"prompt_tokens":100,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":80,"cache_write_tokens":15}}"#,
         );
-        assert_eq!(m.prompt_eval_count, Some(20));
+        assert_eq!(m.prompt_eval_count, Some(100));
         assert_eq!(m.prompt_eval_cached_count, Some(80));
         assert_eq!(m.prompt_eval_cache_write_count, Some(15));
         let m = metrics(r#"{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":80}}"#);
         assert_eq!(
             (m.prompt_eval_count, m.prompt_eval_cached_count),
-            (Some(0), Some(10))
+            (Some(10), Some(10))
         );
         assert_eq!(m.prompt_eval_cache_write_count, None);
+    }
+
+    /// A cache hit does not shrink the prompt: the same prompt sent twice
+    /// reports one `prompt_eval_count` both times, the cached part moving
+    /// to `prompt_eval_cached_count`. A client's context meter reads it.
+    #[test]
+    fn a_cache_hit_leaves_the_prompt_count_whole() {
+        let counts = |timings: &str| {
+            let lines = [
+                r#"data: {"choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]}"#
+                    .to_string(),
+                format!(r#"data: {{"choices":[],"timings":{timings}}}"#),
+                "data: [DONE]".to_string(),
+            ];
+            let m = fold_ollama_lines(lines).metrics;
+            (m.prompt_eval_count, m.prompt_eval_cached_count)
+        };
+        let timings = |prompt_n: u64, cache_n: &str| {
+            format!(
+                r#"{{"prompt_n":{prompt_n},"prompt_ms":1.0,{cache_n}"predicted_n":1,"predicted_ms":1.0}}"#
+            )
+        };
+        assert_eq!(
+            counts(&timings(5422, r#""cache_n":0,"#)),
+            (Some(5422), Some(0))
+        );
+        assert_eq!(
+            counts(&timings(4, r#""cache_n":5418,"#)),
+            (Some(5422), Some(5418))
+        );
+        // A llama-server too old to report `cache_n` has nothing to add.
+        assert_eq!(counts(&timings(7, "")), (Some(7), None));
     }
 
     /// The done chunk is sent once, at `[DONE]`, never at the finish
     /// chunk too; a stream that ends without `[DONE]` is closed by
     /// `finish` when a finish reason was seen. `length` survives, and
-    /// llama-server's `timings` supply the counts and durations.
+    /// llama-server's `timings` supply the counts and durations: its
+    /// evaluated `prompt_n` and cached `cache_n` make the prompt.
     #[test]
     fn the_decoder_emits_one_done_chunk() {
         let decoder = OllamaLineDecoder::new(Instant::now(), Duration::from_millis(5));
@@ -706,7 +745,7 @@ mod tests {
         let done = decoder.decode("data: [DONE]").unwrap();
         assert!(done.done);
         assert_eq!(done.done_reason.as_deref(), Some("length"));
-        assert_eq!(done.metrics.prompt_eval_count, Some(3));
+        assert_eq!(done.metrics.prompt_eval_count, Some(4));
         assert_eq!(done.metrics.prompt_eval_cached_count, Some(1));
         assert_eq!(done.metrics.eval_count, Some(2));
         assert_eq!(done.metrics.prompt_eval_duration, Some(10_000_000));

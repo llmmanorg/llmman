@@ -435,11 +435,13 @@ impl Decoder {
                 if prompt.is_none() && output.is_none() {
                     return;
                 }
-                // `prompt_eval_count` is what was evaluated (cache writes
-                // included); llmman reports the cached rest beside it.
+                // `prompt_eval_count` is the whole prompt, as Ollama's is:
+                // the cached prefix and any cache writes are inside it.
+                // `max` only so a reply that says otherwise cannot make
+                // the cached part larger than the input.
                 let cached = n(v, "/prompt_eval_cached_count").unwrap_or(0);
                 *c = Counts {
-                    input: Some(prompt.unwrap_or(0).saturating_add(cached)),
+                    input: Some(prompt.unwrap_or(0).max(cached)),
                     cache_read: Some(cached),
                     cache_write: n(v, "/prompt_eval_cache_write_count"),
                     output: Some(output.unwrap_or(0)),
@@ -690,7 +692,7 @@ mod tests {
     #[test]
     fn ollama_counts_come_off_the_done_object() {
         let ndjson = "{\"message\":{\"content\":\"a\"},\"done\":false}\n\
-            {\"message\":{\"content\":\"\"},\"done\":true,\"prompt_eval_count\":10,\
+            {\"message\":{\"content\":\"\"},\"done\":true,\"prompt_eval_count\":100,\
             \"prompt_eval_cached_count\":90,\"prompt_eval_cache_write_count\":6,\"eval_count\":4}\n";
         assert_eq!(
             decode(Dialect::Ollama, "application/x-ndjson", ndjson),

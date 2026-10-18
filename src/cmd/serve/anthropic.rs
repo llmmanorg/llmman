@@ -31,7 +31,7 @@ use super::relay::{convert_upstream, relay_rewriting_model, relay_stream_rewriti
 use super::sched::{begin_activity, ActivityGuard};
 use super::{
     backend_wire_model, chat_body, messages, repeat_penalty_applies, send_chat_completion,
-    AppError, AppState, Target,
+    AppError, AppState, LoadOptions, Target,
 };
 
 /// The generating Messages route, appended to a provider's base URL.
@@ -1206,7 +1206,7 @@ pub(super) async fn handle_anthropic_messages(
         &state,
         &model_ref,
         Some(&headers),
-        None,
+        LoadOptions::default(),
         |model, target, guard| anthropic_messages_to(&state, &headers, &raw, model, target, guard),
     )
     .await
