@@ -5716,6 +5716,15 @@ async fn serve_over(model: &str, backend: Router) -> String {
 async fn serve_over_state(model: &str, backend: Router, decision: bool) -> (String, AppState) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut loaded = running_model_fixture(None, Duration::ZERO, 0);
+    // A fixture whose process has already exited is not a loaded model:
+    // `check_running` would drop it and the request would pull the real one.
+    // Failing here, before any request, is the only way that fails fast, as
+    // a pull in flight is waited on when the test's runtime shuts down.
+    sleep(Duration::from_millis(250)).await;
+    assert!(
+        loaded.process.is_alive(),
+        "the placeholder process exited as soon as it was spawned"
+    );
     loaded.port = listener.local_addr().unwrap().port();
     loaded.decision = decision;
     tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
@@ -5723,6 +5732,19 @@ async fn serve_over_state(model: &str, backend: Router, decision: bool) -> (Stri
     let key = running_key(&state, model);
     state.0.manager.lock().await.running.insert(key, loaded);
     (serve_router(state.clone()).await, state)
+}
+
+/// A client for the daemons [`serve_over_state`] builds, which gives up.
+///
+/// The model it loads is a fixture, so if the fixture's process is ever
+/// found dead the daemon reloads the model for real: a pull over the
+/// network that nothing here would time out, wedging the whole test run
+/// until CI's job cap. A timeout turns that into a failure at the request.
+fn stand_in_client() -> Client {
+    Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap()
 }
 
 /// POSTs `body` with the fields of `extra` added.
@@ -5735,7 +5757,7 @@ async fn post_with(
     body.as_object_mut()
         .unwrap()
         .extend(extra.as_object().unwrap().clone());
-    let resp = Client::new()
+    let resp = stand_in_client()
         .post(format!("{base}{route}"))
         .json(&body)
         .send()
@@ -5882,7 +5904,7 @@ async fn openai_embeddings_honour_dimensions() {
 }
 
 async fn systemone(base: &str, body: serde_json::Value) -> reqwest::Response {
-    Client::new()
+    stand_in_client()
         .post(format!("{base}/v1/systemone"))
         .json(&body)
         .send()
@@ -5901,7 +5923,7 @@ fn received(reply: &str) -> String {
 async fn systemone_keeps_the_order_of_questions_and_answers() {
     let (base, _) = serve_over_state("clef-flash", decision_server_standin(), true).await;
     let text = r#"{"model":"clef-flash","state":"Win a cruise","questions":{"zebra?":{"type":"noul","instructions":"zebra?"},"apple?":{"type":"noul","instructions":"apple?"}}}"#;
-    let resp = Client::new()
+    let resp = stand_in_client()
         .post(format!("{base}/v1/systemone"))
         .header("content-type", "application/json")
         .body(text)
@@ -6103,7 +6125,7 @@ async fn a_decision_model_refuses_to_generate_or_embed() {
         ),
         ("/v1/embeddings", &embed, "does not support embeddings"),
     ] {
-        let resp = Client::new()
+        let resp = stand_in_client()
             .post(format!("{base}{route}"))
             .json(body)
             .send()

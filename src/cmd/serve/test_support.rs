@@ -160,13 +160,24 @@ fn spawn_placeholder_process() -> tokio::process::Child {
         .expect("spawn placeholder `sleep` process")
 }
 
+/// `ping`, not `timeout`: `timeout.exe` needs a console and refuses
+/// redirected input ("Input redirection is not supported, exiting the
+/// process immediately"), so on a runner with neither it exits at once.
+/// `ModelProcess::is_alive` then reports the fixture's model dead, and
+/// `check_running` drops it and sends the request down the cold-load path,
+/// which pulls the real model over the network: tests that proxy through
+/// a fixture (`serve_over`) hung until CI's 60-minute cap. `ping` touches
+/// neither stdin nor a console; `-n 61` is 60 seconds of one-second gaps.
 #[cfg(windows)]
 fn spawn_placeholder_process() -> tokio::process::Child {
-    tokio::process::Command::new("cmd")
-        .args(["/C", "timeout", "/T", "60", "/NOBREAK"])
+    tokio::process::Command::new("ping")
+        .args(["-n", "61", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .expect("spawn placeholder `cmd /C timeout` process")
+        .expect("spawn placeholder `ping` process")
 }
 
 pub(super) fn running_model_fixture(
