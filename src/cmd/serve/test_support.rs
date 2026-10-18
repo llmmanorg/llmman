@@ -160,13 +160,21 @@ fn spawn_placeholder_process() -> tokio::process::Child {
         .expect("spawn placeholder `sleep` process")
 }
 
+/// `ping`, not `timeout`: `timeout.exe` refuses redirected input and exited
+/// with code 1 within 190-320 ms in 40 of 40 spawns on GitHub's Windows
+/// runners, where `ping -n 61` (60 s) on null stdio outlived 2.5 s. A dead
+/// fixture makes `check_running` drop the model, and the request pulls the
+/// real one over the network.
 #[cfg(windows)]
 fn spawn_placeholder_process() -> tokio::process::Child {
-    tokio::process::Command::new("cmd")
-        .args(["/C", "timeout", "/T", "60", "/NOBREAK"])
+    tokio::process::Command::new("ping")
+        .args(["-n", "61", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .expect("spawn placeholder `cmd /C timeout` process")
+        .expect("spawn placeholder `ping` process")
 }
 
 pub(super) fn running_model_fixture(
