@@ -15,7 +15,7 @@ use super::stream::{bytes_to_lines, oai_chunk_to_content};
 use super::types::{OAIChatRequest, OAIChunk, OAIMessage, OAIToolCall, OAIToolCallFunction};
 use super::{
     accumulate_tool_call_deltas, backend_wire_model, collect_body, post_chat, AppError, AppState,
-    Target, ToolCallAccumulator,
+    LoadOptions, Target, ToolCallAccumulator,
 };
 
 // ---------------------------------------------------------------------------
@@ -603,7 +603,7 @@ pub(super) async fn handle_pinned_gemini(
         &state,
         &selected_model,
         Some(&headers),
-        None,
+        LoadOptions::default(),
         |model, target, guard| gemini_request_to(&state, &req, model, target, guard, method),
     )
     .await

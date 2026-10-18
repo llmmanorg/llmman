@@ -22,13 +22,57 @@ use axum::Json;
 use futures::StreamExt;
 use reqwest::Client;
 
+use super::openai::{is_role_alternation_refusal, merge_adjacent_roles_in};
 use super::sched::ActivityGuard;
 use super::stream::bytes_to_lines;
-use super::{messages, responses, AppError, ChatBody, ChatUpstream, Target};
+use super::{
+    messages, responses, AppError, ChatBody, ChatUpstream, Target, CHAT_COMPLETIONS_ROUTE,
+};
 
 /// POSTs `body` to `route` on `target` with the caller's `content-type`;
 /// the request half of every `proxy*` helper.
+///
+/// A local backend's chat template that refuses two messages of one role
+/// in a row is answered again with them merged (see
+/// [`merge_adjacent_roles_in`]) rather than relayed as the client's error.
 async fn send_proxied(
+    client: &Client,
+    target: &Target,
+    route: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<reqwest::Response, AppError> {
+    let resp = post_proxied(client, target, route, headers, body.clone()).await?;
+    if route != CHAT_COMPLETIONS_ROUTE
+        || !matches!(target, Target::Local(_))
+        || resp.status() != StatusCode::BAD_REQUEST
+    {
+        return Ok(resp);
+    }
+    // A refusal is small and ends before any output, so reading it whole
+    // costs nothing; it is handed back as it came if it is not this one.
+    let status = resp.status();
+    let reply_headers = resp.headers().clone();
+    let reply = resp
+        .bytes()
+        .await
+        .with_context(|| format!("proxy request to {}", target.describe()))?;
+    if is_role_alternation_refusal(status, &reply) {
+        if let Some(merged) = merge_adjacent_roles_in(&body) {
+            eprintln!(
+                "[llmman] {} refused consecutive same-role messages; retrying with them merged",
+                target.describe()
+            );
+            return post_proxied(client, target, route, headers, merged).await;
+        }
+    }
+    let mut refusal = axum::http::Response::new(reply);
+    *refusal.status_mut() = status;
+    *refusal.headers_mut() = reply_headers;
+    Ok(refusal.into())
+}
+
+async fn post_proxied(
     client: &Client,
     target: &Target,
     route: &str,

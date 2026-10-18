@@ -50,11 +50,21 @@ constrained structured output). `/api/generate` takes `system` and
 since llmman leaves templating to the backend.
 
 Of `options`, `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stop`,
-`num_predict`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`
-and `num_thread` apply; `num_ctx` is `LLMMAN_CONTEXT_LENGTH`. The `done`
+`num_predict`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`,
+`num_thread` and `num_ctx` apply. `num_ctx` is the context window a
+llama-server model is loaded with, over `LLMMAN_CONTEXT_LENGTH` and cut to
+the model's trained context. As in Ollama, a model loaded with a different
+window is reloaded for it, once the requests it is serving have finished;
+requests for that model that arrive meanwhile wait for the reload. A request
+with no `num_ctx` uses whichever window is loaded, so only a client that
+asks for one pays for a reload. `llmman ps` shows the window
+each model was loaded with. The `done`
 chunk carries Ollama's counts and durations (`prompt_eval_count`,
 `eval_count`, `total_duration`, ...) and `done_reason` is `stop` or
 `length` as in Ollama, which reports a tool-calling turn as `stop`.
+`prompt_eval_count` is the whole prompt, as in Ollama: a prompt served
+from the cache still counts in full, and `prompt_eval_cached_count` is how
+much of it that was.
 
 `/api/embed` and `/api/embeddings` work with any GGUF embedding model
 (one with a pooling type, e.g. `embeddinggemma`, `nomic-embed-text`):
@@ -82,6 +92,15 @@ as `system` or `quantize` are refused with a 400: the GGUF's own chat
 template applies.
 
 ## Errors
+
+A model whose chat template needs the roles to alternate (Gemma, Llama 2
+and Mistral's do) refuses two messages of one role in a row. Rather than
+relay that `400`, `/v1/chat/completions`, `/api/chat`, `/v1/messages` and
+the Gemini routes send the request again with each run of adjacent `user`
+messages, and of adjacent `assistant` messages, merged into one, their text
+joined by a blank line. Other models get the messages as written. A message
+carrying tool calls or other fields beside `role` and `content` is never
+merged.
 
 These are not `500`s:
 
