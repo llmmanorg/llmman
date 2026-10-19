@@ -168,7 +168,9 @@ pub(super) async fn require_key(
 
 fn is_ui_asset(req: &Request) -> bool {
     let path = req.uri().path();
-    (req.method() == axum::http::Method::GET && (path == "/" || path.starts_with("/ui/")))
+    // HEAD too: axum answers it through the same `get` route.
+    (matches!(*req.method(), axum::http::Method::GET | axum::http::Method::HEAD)
+        && (path == "/" || path.starts_with("/ui/")))
         // Unrouted only: a route outside every API prefix is still the API.
         || (req.extensions().get::<MatchedPath>().is_none()
             && super::webui::is_page(req.method(), path, req.headers()))

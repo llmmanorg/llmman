@@ -79,7 +79,7 @@ fn wants_html(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.contains("text/html"))
+        .is_some_and(|s| s.to_ascii_lowercase().contains("text/html"))
 }
 
 async fn serve_index(headers: &HeaderMap) -> Response {
@@ -293,8 +293,34 @@ mod tests {
             );
             assert_eq!(page.bytes().await.unwrap(), index, "{path}");
         }
+        // What a nested link loads: index.html names its files as `ui/…`
+        // under the <base> its loader sets, which is `/` here.
+        let page = html(reqwest::Method::GET, "/c/abc123")
+            .send()
+            .await
+            .unwrap();
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(&page.bytes().await.unwrap()[..]),
+            &mut text,
+        )
+        .unwrap();
+        let assets: Vec<&str> = text.split('"').filter(|s| s.starts_with("ui/")).collect();
+        assert!(assets.iter().any(|a| a.ends_with(".js")), "{text}");
+        for asset in assets {
+            let r = client.get(format!("{url}/{asset}")).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{asset}");
+        }
         let head = html(reqwest::Method::HEAD, "/models").send().await.unwrap();
         assert_eq!(head.status(), StatusCode::OK);
+        // Media types are case-insensitive.
+        let upper = client
+            .get(format!("{url}/models"))
+            .header("accept", "Text/HTML")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upper.status(), StatusCode::OK);
         let cached = html(reqwest::Method::GET, "/models")
             .header("if-none-match", &etag)
             .send()

@@ -4863,6 +4863,8 @@ async fn a_keyed_daemon_refuses_everything_but_its_own_page_without_the_key() {
     for path in ["/", "/ui/index.html"] {
         let r = client.get(format!("{url}{path}")).send().await.unwrap();
         assert_eq!(r.status(), StatusCode::OK, "{path}");
+        let r = client.head(format!("{url}{path}")).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "HEAD {path}");
     }
     // So do its other routes; an API path does not, HTML or not.
     for (path, expected) in [
