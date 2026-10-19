@@ -27,7 +27,13 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-const maxReferrersIndexBytes = 4 << 20
+const (
+	maxReferrersIndexBytes  = 4 << 20
+	maxReferrersPages       = 64
+	maxReferrersDescriptors = 10000
+	maxReferrersTotalBytes  = 16 << 20
+	fallbackPublishAttempts = 3
+)
 
 // OCI does not require registries to support conditional tag updates, so the
 // fallback index's read-append-PUT sequence must be serialized in-process.
@@ -245,7 +251,11 @@ func getReferrersIndex(ctx context.Context, client *http.Client, endpoint string
 	}
 	var combined *ocispec.Index
 	seen := map[string]bool{}
+	totalBytes, totalDescriptors := 0, 0
 	for endpoint != "" {
+		if len(seen) >= maxReferrersPages {
+			return nil, false, fmt.Errorf("referrers pagination exceeds %d pages", maxReferrersPages)
+		}
 		if seen[endpoint] {
 			return nil, false, fmt.Errorf("referrers pagination cycle at %q", endpoint)
 		}
@@ -276,9 +286,17 @@ func getReferrersIndex(ctx context.Context, client *http.Client, endpoint string
 		if len(raw) > maxReferrersIndexBytes {
 			return nil, false, fmt.Errorf("referrers index is over the %d-byte limit", maxReferrersIndexBytes)
 		}
+		totalBytes += len(raw)
+		if totalBytes > maxReferrersTotalBytes {
+			return nil, false, fmt.Errorf("referrers pagination exceeds %d bytes", maxReferrersTotalBytes)
+		}
 		page, err := parseReferrersIndex(raw)
 		if err != nil {
 			return nil, false, err
+		}
+		totalDescriptors += len(page.Manifests)
+		if totalDescriptors > maxReferrersDescriptors {
+			return nil, false, fmt.Errorf("referrers pagination exceeds %d descriptors", maxReferrersDescriptors)
 		}
 		if combined == nil {
 			combined = page
@@ -452,6 +470,7 @@ func fetchFallbackReferrersIndex(ctx context.Context, ref string, subject digest
 func publishFallbackReferrer(ctx context.Context, ref string, subject digest.Digest, artifact ocispec.Descriptor) error {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
+	ctx = withoutMirrors(ctx)
 	_, native, err := fetchNativeReferrersIndex(ctx, ref, subject)
 	if err != nil || native {
 		return err
@@ -460,13 +479,37 @@ func publishFallbackReferrer(ctx context.Context, ref string, subject digest.Dig
 	fallbackPublishMu.Lock()
 	defer fallbackPublishMu.Unlock()
 
+	for attempt := 0; attempt < fallbackPublishAttempts; attempt++ {
+		pushed, err := appendFallbackReferrer(ctx, ref, subject, artifact)
+		if err != nil {
+			return err
+		}
+		if !pushed {
+			return nil
+		}
+		landed, err := fetchFallbackReferrersIndex(ctx, ref, subject)
+		if err != nil {
+			return fmt.Errorf("confirm published referrer: %w", err)
+		}
+		for _, entry := range landed.Manifests {
+			if entry.Digest == artifact.Digest {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("referrer %s kept being overwritten by another publisher after %d attempts", artifact.Digest, fallbackPublishAttempts)
+}
+
+// appendFallbackReferrer performs one read-append-PUT of the digest-derived
+// fallback tag. The caller confirms that its descriptor actually landed.
+func appendFallbackReferrer(ctx context.Context, ref string, subject digest.Digest, artifact ocispec.Descriptor) (bool, error) {
 	index, err := fetchFallbackReferrersIndex(ctx, ref, subject)
 	if err != nil {
-		return err
+		return false, err
 	}
 	for _, existing := range index.Manifests {
 		if existing.Digest == artifact.Digest {
-			return nil
+			return false, nil
 		}
 	}
 	index.Manifests = append(index.Manifests, artifact)
@@ -475,30 +518,26 @@ func publishFallbackReferrer(ctx context.Context, ref string, subject digest.Dig
 	})
 	raw, err := json.Marshal(index)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(raw) > maxManifestBytes {
-		return fmt.Errorf("fallback referrers index is over the %d-byte limit", maxManifestBytes)
+		return false, fmt.Errorf("fallback referrers index is over the %d-byte limit", maxManifestBytes)
 	}
 	staging, err := os.MkdirTemp("", "llmman-referrers-")
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer os.RemoveAll(staging)
 	if err := ensureLayout(staging); err != nil {
-		return err
-	}
-	desc, err := writeBlob(staging, ocispec.MediaTypeImageIndex, raw)
-	if err != nil {
-		return err
+		return false, err
 	}
 	repo, err := repositoryForRef(ref)
 	if err != nil {
-		return err
+		return false, err
 	}
 	fallbackRef := repo.String() + ":" + fallbackTag(subject)
-	if err := writeManifestRef(staging, fallbackRef, desc); err != nil {
-		return err
+	if err := pushStagedManifest(ctx, staging, fallbackRef, ocispec.MediaTypeImageIndex, raw, pushIndexToRegistry); err != nil {
+		return false, err
 	}
-	return pushIndexToRegistry(ctx, staging, fallbackRef, desc)
+	return true, nil
 }

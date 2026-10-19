@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -228,6 +229,66 @@ func TestFallbackIndexSizeCheckedBeforePush(t *testing.T) {
 	}
 	if got := fallbackPuts.Load(); got != 0 {
 		t.Fatalf("oversized index caused %d manifest PUTs", got)
+	}
+}
+
+func TestFallbackPublicationRetriesWhenFirstIndexPushDoesNotLand(t *testing.T) {
+	var fallbackPuts atomic.Int32
+	host := startRegistryWithOptions(t, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/manifests/sha256-") {
+			if fallbackPuts.Add(1) == 1 {
+				raw, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read first index PUT: %v", err)
+				}
+				w.Header().Set("Docker-Content-Digest", digest.FromBytes(raw).String())
+				w.WriteHeader(http.StatusCreated) // another publisher replaced this write
+				return true
+			}
+		}
+		return false
+	}, registry.WithReferrersSupport(false))
+	subjectRef := host + "/org/model:v1"
+	subjectDigest := publishModel(t, subjectRef)
+	subject := subjectDescriptor(t, subjectRef, subjectDigest)
+	artifact := pushTestArtifactManifest(t, host+"/org/model:artifact", `{"name":"retry"}`, subject)
+	if err := publishFallbackReferrer(context.Background(), subjectRef, subjectDigest, artifact); err != nil {
+		t.Fatalf("publish fallback referrer: %v", err)
+	}
+	if got := fallbackPuts.Load(); got != 2 {
+		t.Fatalf("fallback index PUTs = %d, want retry after missing first write", got)
+	}
+	index, err := fetchFallbackReferrersIndex(withoutMirrors(context.Background()), subjectRef, subjectDigest)
+	if err != nil || len(index.Manifests) != 1 || index.Manifests[0].Digest != artifact.Digest {
+		t.Fatalf("published index = %+v, %v", index, err)
+	}
+}
+
+func TestFallbackPublicationBypassesStaleMirror(t *testing.T) {
+	var upstreamLog, mirrorLog requestLog
+	upstream := startRegistryWithOptions(t, func(_ http.ResponseWriter, r *http.Request) bool {
+		upstreamLog.record(r)
+		return false
+	}, registry.WithReferrersSupport(false))
+	mirror := startLoggedRegistry(t, &mirrorLog, nil)
+	subjectRef := upstream + "/org/model:v1"
+	subjectDigest := publishModel(t, subjectRef)
+	subject := subjectDescriptor(t, subjectRef, subjectDigest)
+	first := pushTestArtifactManifest(t, upstream+"/org/model:sbom-a", `{"name":"first"}`, subject)
+	second := pushTestArtifactManifest(t, upstream+"/org/model:sbom-b", `{"name":"second"}`, subject)
+	if err := publishFallbackReferrer(context.Background(), subjectRef, subjectDigest, first); err != nil {
+		t.Fatal(err)
+	}
+	withMirror(t, upstream, mirror)
+	if err := publishFallbackReferrer(context.Background(), subjectRef, subjectDigest, second); err != nil {
+		t.Fatal(err)
+	}
+	index, err := fetchFallbackReferrersIndex(withoutMirrors(context.Background()), subjectRef, subjectDigest)
+	if err != nil || len(index.Manifests) != 2 {
+		t.Fatalf("published index = %+v, %v; want both entries", index, err)
+	}
+	if got := mirrorLog.count(http.MethodGet, "/v2/org/model/manifests/sha256-"); got != 0 {
+		t.Fatalf("fallback read sent %d requests to stale mirror", got)
 	}
 }
 

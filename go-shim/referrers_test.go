@@ -66,6 +66,45 @@ func TestGetReferrersIndexFollowsNextLink(t *testing.T) {
 	}
 }
 
+func TestGetReferrersIndexLimitsPages(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := requests.Add(1)
+		w.Header().Set("Link", fmt.Sprintf("<?page=%d>; rel=next", page))
+		_, _ = w.Write([]byte(`{"schemaVersion":2,"manifests":[]}`))
+	}))
+	defer server.Close()
+
+	_, _, err := getReferrersIndex(context.Background(), server.Client(), server.URL+"/referrers")
+	if err == nil || !strings.Contains(err.Error(), "pages") {
+		t.Fatalf("pagination error = %v, want page limit", err)
+	}
+	if got := requests.Load(); got != maxReferrersPages {
+		t.Fatalf("requested %d pages, want %d", got, maxReferrersPages)
+	}
+}
+
+func TestGetReferrersIndexLimitsDescriptors(t *testing.T) {
+	page := ocispec.Index{Manifests: make([]ocispec.Descriptor, maxReferrersDescriptors+1)}
+	page.SchemaVersion = 2
+	raw, err := json.Marshal(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) > maxReferrersIndexBytes {
+		t.Fatalf("test page exceeds per-page byte limit: %d", len(raw))
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(raw)
+	}))
+	defer server.Close()
+
+	_, _, err = getReferrersIndex(context.Background(), server.Client(), server.URL+"/referrers")
+	if err == nil || !strings.Contains(err.Error(), "descriptors") {
+		t.Fatalf("pagination error = %v, want descriptor limit", err)
+	}
+}
+
 func TestParseReferrersIndexAllowsAbsentMediaType(t *testing.T) {
 	index, err := parseReferrersIndex([]byte(`{"schemaVersion":2,"manifests":[]}`))
 	if err != nil || len(index.Manifests) != 0 {

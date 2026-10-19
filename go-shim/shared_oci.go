@@ -54,6 +54,25 @@ func writeBlob(layoutDir string, mediaType string, data []byte) (ocispec.Descrip
 	return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: int64(len(data))}, nil
 }
 
+// pushStagedManifest writes and tags a manifest in an existing OCI staging
+// layout, then lets the caller use the appropriate backend push path.
+func pushStagedManifest(
+	ctx context.Context, layoutDir, ref, mediaType string, raw []byte,
+	push func(context.Context, string, string, ocispec.Descriptor) error,
+) error {
+	desc, err := writeBlob(layoutDir, mediaType, raw)
+	if err != nil {
+		return fmt.Errorf("stage manifest: %w", err)
+	}
+	if err := writeManifestRef(layoutDir, ref, desc); err != nil {
+		return fmt.Errorf("tag staged manifest: %w", err)
+	}
+	if err := push(ctx, layoutDir, ref, desc); err != nil {
+		return fmt.Errorf("push staged manifest %s: %w", ref, err)
+	}
+	return nil
+}
+
 // openForResume opens path for appending if a previously-partial download of
 // resumeFrom bytes already exists there, re-hashing those bytes into the
 // returned digester so the digest computed over subsequent writes still
