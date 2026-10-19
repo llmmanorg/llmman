@@ -25,12 +25,11 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { Buffer } from "node:buffer";
 import { readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
-
-import sharp from "sharp";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const out = resolve(process.argv[2] ?? "dist");
@@ -75,6 +74,18 @@ async function routeDirs(dir = join(root, "app")) {
   return [...new Set(dirs)].sort();
 }
 
+/** A PNG's signature and the chunks that draw it, each kept byte for byte. */
+function pixelsOnly(png) {
+  const kept = [png.subarray(0, 8)];
+  for (let at = 8; at < png.length;) {
+    const end = at + 12 + png.readUInt32BE(at);
+    const type = png.toString("latin1", at + 4, at + 8);
+    if (["IHDR", "PLTE", "tRNS", "IDAT", "IEND"].includes(type)) kept.push(png.subarray(at, end));
+    at = end;
+  }
+  return Buffer.concat(kept);
+}
+
 // What each exported image becomes: llmman's mark, a data: URI, or a 404 for
 // an unused one (Expo writes every scale of an image; the web asks for 1x).
 const images = new Map();
@@ -85,10 +96,10 @@ for (const path of await files(join(out, "assets"))) {
   if (createHash("sha256").update(bytes).digest("hex") === MARK.sha256) {
     images.set(url, `${UI}+${JSON.stringify(MARK.served)}`);
   } else if (/\.png$/.test(rel) && bytes.length <= MAX_INLINE) {
-    // Re-encoded when that is smaller: the same pixels, without the metadata
-    // some carry (expo-router's 48 px arrow is 9 KB of it).
-    const packed = await sharp(bytes).png({ compressionLevel: 9, effort: 10 }).toBuffer();
-    const png = packed.length < bytes.length ? packed : bytes;
+    // Without the metadata some carry (expo-router's 48 px arrow is 9 KB
+    // of it). Not re-encoded: an encoder's bytes differ between machines,
+    // and CI checks the export is the same everywhere.
+    const png = pixelsOnly(bytes);
     images.set(url, JSON.stringify(`data:image/png;base64,${png.toString("base64")}`));
   } else {
     images.set(url, null);
