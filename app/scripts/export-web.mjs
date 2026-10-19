@@ -28,6 +28,7 @@ import { createHash } from "node:crypto";
 import { readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runInNewContext } from "node:vm";
 
 import sharp from "sharp";
 
@@ -160,6 +161,24 @@ if (!html.includes(headScript) || !html.includes(bodyScript))
   throw new Error("index.html: no place for the loader");
 if (html.includes(PLACEHOLDER) || /(href|src)="\//.test(html))
   throw new Error(`index.html keeps an absolute path:\n${html}`);
+// The base the loader sets, run as a browser would at a few addresses: at
+// the root, under a gateway's prefix, and deep in one of the app's routes.
+for (const [path, base] of [
+  ["/", "/"],
+  ["/models", "/"],
+  ["/c/abc123", "/"],
+  ["/settings/", "/"],
+  ["/team/llmman/", "/team/llmman/"],
+  ["/team/llmman/c/abc123", "/team/llmman/"],
+]) {
+  const head = { appendChild: (el) => el.tagName === "base" && (got = el.href) };
+  let got;
+  runInNewContext(headScript.replace(/^<script>|<\/script>$/g, ""), {
+    location: { pathname: path },
+    document: { head, createElement: (tagName) => ({ tagName }) },
+  });
+  if (got !== base) throw new Error(`index.html at ${path}: base ${got}, not ${base}`);
+}
 await writeFile(join(out, "index.html"), html);
 
 const listing = await files(out);
