@@ -12,7 +12,6 @@ import { alert } from "@/lib/alert";
 import { dropConversations } from "@/lib/chatStore";
 import { useDaemon } from "@/lib/DaemonContext";
 import { allConversations, deleteAllConversations, exportJson } from "@/lib/conversations";
-import { setPageKey } from "@/lib/page";
 import { setPrefs, usePrefs, type SendWith, type ThemePref } from "@/lib/prefs";
 import { saveFile } from "@/lib/saveFile";
 import { useServers } from "@/lib/ServersContext";
@@ -60,7 +59,6 @@ export default function Settings() {
       ...(active.name ? { name: active.name } : {}),
       ...(trimmed ? { key: trimmed } : {}),
     });
-    setPageKey(trimmed || undefined);
   };
 
   const exportAll = async () => {

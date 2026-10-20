@@ -7,7 +7,7 @@ import type { ReactNode } from "react";
 
 import { ApiClient } from "@/api/client";
 import type { ChatSettings } from "@/lib/chatSettings";
-import { onPageKeyEntered, pageKeySource, pageUrl } from "@/lib/page";
+import { onPageKeyEntered, pageKeySource, pageUrl, setPageKey } from "@/lib/page";
 import { adoptPageServer } from "@/lib/pageServer";
 import {
   getServerKey,
@@ -130,6 +130,9 @@ export function ServersProvider({ children }: { children: ReactNode }) {
       client,
       save: async (entry, opts) => {
         await run((l) => saveServer(l, entry, opts));
+        // The page's own daemon is sent the page's key (page.web.ts), so a
+        // key saved for it goes there too; another server's never does.
+        if (entry.url === pageUrl()) setPageKey(entry.key?.trim() || undefined);
         setKeyVersion((v) => v + 1);
       },
       remove: (url) => run((l) => removeServer(l, url)),
