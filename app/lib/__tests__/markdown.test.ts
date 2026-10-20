@@ -1,4 +1,4 @@
-import { isSafeUrl, parseInline, parseMarkdown, type Block } from "../markdown";
+import { isSafeUrl, MAX_DEPTH, parseInline, parseMarkdown, type Block } from "../markdown";
 
 const types = (blocks: Block[]) => blocks.map((b) => b.type);
 
@@ -131,5 +131,29 @@ describe("inline", () => {
     const start = Date.now();
     parseInline("[".repeat(20000) + "*_~".repeat(5000));
     expect(Date.now() - start).toBeLessThan(2000);
+  });
+});
+
+describe("nesting", () => {
+  /** How deep quotes and lists go in `blocks`. */
+  const depth = (blocks: Block[]): number =>
+    Math.max(
+      0,
+      ...blocks.map((b) =>
+        b.type === "quote"
+          ? 1 + depth(b.children)
+          : b.type === "list"
+            ? 1 + Math.max(0, ...b.items.map(depth))
+            : 0,
+      ),
+    );
+
+  it.each([
+    ["quotes", ">".repeat(3000) + " deep"],
+    ["lists", Array.from({ length: 3000 }, (_, i) => " ".repeat(i * 2) + "- deep").join("\n")],
+  ])("stops at MAX_DEPTH for thousands of nested %s, keeping the rest as text", (_, source) => {
+    const blocks = parseMarkdown(source);
+    expect(depth(blocks)).toBe(MAX_DEPTH + 1);
+    expect(JSON.stringify(blocks)).toContain("deep");
   });
 });

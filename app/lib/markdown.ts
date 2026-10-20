@@ -32,7 +32,7 @@ const splitLines = (source: string) => source.replace(/\r\n?/g, "\n").split("\n"
 
 /** The blocks of `source`. Each carries its `raw` text, so a re-render can keep unchanged blocks. */
 export function parseMarkdown(source: string): Block[] {
-  return parseBlocks(splitLines(source));
+  return parseBlocks(splitLines(source), 0);
 }
 
 // ---- Block parsing ----------------------------------------------------
@@ -45,12 +45,26 @@ const OL = /^(\s*)(\d{1,9})[.)]\s+(.*)$/;
 const QUOTE = /^ {0,3}>\s?(.*)$/;
 const TABLE_SEP = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
 
-function parseBlocks(lines: string[]): Block[] {
+/**
+ * How deep quotes and lists nest. A reply of thousands of `>` or `- `
+ * levels would overflow the stack, in here and in the renderer; past this,
+ * what is left shows as text.
+ */
+export const MAX_DEPTH = 32;
+
+function parseBlocks(lines: string[], depth: number): Block[] {
+  if (depth > MAX_DEPTH) {
+    const text = lines
+      .map((l) => l.trimStart())
+      .join("\n")
+      .trim();
+    return text ? [{ type: "paragraph", text, raw: lines.join("\n") }] : [];
+  }
   const blocks: Block[] = [];
   let i = 0;
   while (i < lines.length) {
     const start = i;
-    const [block, next] = nextBlock(lines, i);
+    const [block, next] = nextBlock(lines, i, depth);
     i = next;
     if (block) blocks.push({ ...block, raw: lines.slice(start, i).join("\n") } as Block);
   }
@@ -58,7 +72,7 @@ function parseBlocks(lines: string[]): Block[] {
 }
 
 /** The block starting at line `i` (null for a blank line) and the index after it. */
-function nextBlock(lines: string[], i: number): [BlockNoRaw | null, number] {
+function nextBlock(lines: string[], i: number, depth: number): [BlockNoRaw | null, number] {
   const line = lines[i]!;
   if (!line.trim()) return [null, i + 1];
 
@@ -87,10 +101,10 @@ function nextBlock(lines: string[], i: number): [BlockNoRaw | null, number] {
     }
     // Lazy continuation: a non-blank line right after keeps the quote.
     while (i < lines.length && lines[i]!.trim() && !startsBlock(lines[i]!)) inner.push(lines[i++]!);
-    return [{ type: "quote", children: parseBlocks(inner) }, i];
+    return [{ type: "quote", children: parseBlocks(inner, depth + 1) }, i];
   }
 
-  if (UL.test(line) || OL.test(line)) return parseList(lines, i);
+  if (UL.test(line) || OL.test(line)) return parseList(lines, i, depth);
 
   if (i + 1 < lines.length && line.includes("|") && TABLE_SEP.test(lines[i + 1]!)) {
     const header = splitRow(line);
@@ -154,7 +168,7 @@ function splitRow(line: string): string[] {
 }
 
 /** Parse a list starting at `start`; returns `[block, nextIndex]`. */
-function parseList(lines: string[], start: number): [BlockNoRaw, number] {
+function parseList(lines: string[], start: number, depth: number): [BlockNoRaw, number] {
   const first = (UL.exec(lines[start]!) || OL.exec(lines[start]!))!;
   const ordered = /\d/.test(first[2]!);
   const indent = first[1]!.length;
@@ -207,7 +221,7 @@ function parseList(lines: string[], start: number): [BlockNoRaw, number] {
       }
       break;
     }
-    items.push(parseBlocks(body));
+    items.push(parseBlocks(body, depth + 1));
   }
   return [{ type: "list", ordered, start: startNumber, items }, i];
 }
