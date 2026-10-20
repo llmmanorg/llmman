@@ -108,7 +108,7 @@ export function setModel(id: string, model: string) {
   if (!conv || conv.model === model) return;
   const { effort: _old, ...rest } = conv;
   set(id, { conv: { ...rest, model } });
-  void saveConversation(states.get(id)!.conv!);
+  void saveConversation(states.get(id)!.conv!).catch(() => {});
 }
 
 /** The chat's thinking level; undefined for the model's default. */

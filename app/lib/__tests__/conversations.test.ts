@@ -128,3 +128,18 @@ describe("export and delete all", () => {
     expect(await listConversations("http://a")).toEqual([]);
   });
 });
+
+it("fails a save when the index can't be read, leaving the index as it was", async () => {
+  const a = newConversation("http://a:1", "m");
+  a.messages.push({ role: "user", content: "a", at: 1 });
+  await saveConversation(a);
+  const stored = await AsyncStorage.getItem("llmman.chats");
+
+  const b = newConversation("http://a:1", "m");
+  b.messages.push({ role: "user", content: "b", at: 2 });
+  jest.mocked(AsyncStorage.getItem).mockRejectedValueOnce(new Error("busy"));
+  await expect(saveConversation(b)).rejects.toThrow("busy");
+
+  expect(await AsyncStorage.getItem("llmman.chats")).toBe(stored);
+  expect((await listConversations("http://a:1")).map((s) => s.id)).toEqual([a.id]);
+});

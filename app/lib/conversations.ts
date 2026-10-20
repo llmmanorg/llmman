@@ -96,10 +96,16 @@ function summarize(conv: Conversation): ConversationSummary {
   return { ...rest, preview: last ? last.content.trim().slice(0, 120) : "" };
 }
 
+/** The stored index; a read that fails throws. */
+async function readIndexStrict(): Promise<ConversationSummary[]> {
+  const parsed = await storage.getIndex();
+  return Array.isArray(parsed) ? parsed.filter((s) => s && typeof s.id === "string") : [];
+}
+
+/** The stored index for showing, empty when it can't be read. */
 async function readIndex(): Promise<ConversationSummary[]> {
   try {
-    const parsed = await storage.getIndex();
-    return Array.isArray(parsed) ? parsed.filter((s) => s && typeof s.id === "string") : [];
+    return await readIndexStrict();
   } catch {
     return [];
   }
@@ -114,10 +120,12 @@ export function onConversationsChanged(fn: () => void): () => void {
 }
 
 // Index writes are serialized: two chats saving at once must not drop one.
+// An index that can't be read fails the write: writing over it would leave
+// only the chat being saved.
 let indexQueue: Promise<unknown> = Promise.resolve();
 function updateIndex(fn: (index: ConversationSummary[]) => ConversationSummary[]): Promise<void> {
   const next = indexQueue.then(async () => {
-    await storage.setIndex(fn(await readIndex()));
+    await storage.setIndex(fn(await readIndexStrict()));
     for (const l of indexListeners) l();
   });
   indexQueue = next.catch(() => {});
