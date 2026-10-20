@@ -30,6 +30,7 @@ require (
 	// go.podman.io/* vanity-imports to)
 	go.podman.io/common v0.67.2-0.20260430110239-06cbc5da36f1
 	go.podman.io/image/v5 v5.39.3-0.20260430110239-06cbc5da36f1
+	go.podman.io/storage v1.62.1-0.20260427104901-081c2519fc6a
 
 	// Parallel layer downloads
 	golang.org/x/sync v0.22.0
@@ -116,7 +117,6 @@ require (
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
-	go.podman.io/storage v1.62.1-0.20260427104901-081c2519fc6a // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/term v0.45.0 // indirect

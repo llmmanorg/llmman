@@ -16,8 +16,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -41,6 +43,8 @@ import (
 	"go.podman.io/image/v5/signature"
 	"go.podman.io/image/v5/transports/alltransports"
 	"go.podman.io/image/v5/types"
+	"go.podman.io/storage/pkg/configfile"
+	"go.podman.io/storage/pkg/unshare"
 )
 
 // scratchTag is the tag used inside the throwaway, single-manifest OCI
@@ -80,26 +84,64 @@ func registryAuthenticator(ctx context.Context, repo name.Repository) (authn.Aut
 	}), nil
 }
 
-func registryBaseTransport(ctx context.Context, repo name.Repository) (http.RoundTripper, error) {
+func registryReadRepository(ctx context.Context, repo name.Repository) (name.Repository, bool, error) {
 	sys := registrySourceCtx(ctx)
 	reg, err := sysregistriesv2.FindRegistry(sys, repo.String())
+	if err != nil {
+		return name.Repository{}, false, err
+	}
+	if reg != nil && reg.Blocked {
+		return name.Repository{}, false, fmt.Errorf("registry %s is blocked", reg.Prefix)
+	}
+	allowHTTP := sys.DockerInsecureSkipTLSVerify == types.OptionalBoolTrue
+	if reg == nil {
+		return repo, allowHTTP, nil
+	}
+	named, err := reference.ParseNamed(repo.String())
+	if err != nil {
+		return name.Repository{}, false, err
+	}
+	sources, err := reg.PullSourcesFromReference(named)
+	if err != nil {
+		return name.Repository{}, false, err
+	}
+	if len(sources) == 0 {
+		return name.Repository{}, false, fmt.Errorf("no registry source for %s", repo)
+	}
+	primary := sources[len(sources)-1] // mirrors are not authoritative for referrers
+	resolved, err := name.NewRepository(reference.TrimNamed(primary.Reference).Name(), name.WeakValidation)
+	if err != nil {
+		return name.Repository{}, false, err
+	}
+	if sys.DockerInsecureSkipTLSVerify == types.OptionalBoolUndefined {
+		allowHTTP = primary.Endpoint.Insecure
+	}
+	return resolved, allowHTTP, nil
+}
+
+func registryBaseTransport(ctx context.Context, logical, resolved name.Repository) (http.RoundTripper, error) {
+	return podmanRegistryTransport(registrySourceCtx(ctx), logical, resolved)
+}
+
+func podmanRegistryTransport(sys *types.SystemContext, logical, resolved name.Repository) (http.RoundTripper, error) {
+	reg, err := sysregistriesv2.FindRegistry(sys, logical.String())
 	if err != nil {
 		return nil, err
 	}
 	if reg != nil && reg.Blocked {
 		return nil, fmt.Errorf("registry %s is blocked", reg.Prefix)
 	}
-	base := http.DefaultTransport.(*http.Transport).Clone()
+	base := tlsclientconfig.NewTransport()
 	tlsConfig := &tls.Config{}
 	if sys.BaseTLSConfig != nil {
 		tlsConfig = sys.BaseTLSConfig.Clone()
 	}
-	if sys.DockerCertPath != "" {
-		if err := tlsclientconfig.SetupCertificates(sys.DockerCertPath, tlsConfig); err != nil {
-			return nil, err
-		}
-	} else if sys.DockerPerHostCertDirPath != "" {
-		if err := tlsclientconfig.SetupCertificates(filepath.Join(sys.DockerPerHostCertDirPath, repo.RegistryStr()), tlsConfig); err != nil {
+	certDir, err := podmanCertDir(sys, resolved.RegistryStr())
+	if err != nil {
+		return nil, err
+	}
+	if certDir != "" {
+		if err := tlsclientconfig.SetupCertificates(certDir, tlsConfig); err != nil {
 			return nil, err
 		}
 	}
@@ -108,7 +150,52 @@ func registryBaseTransport(ctx context.Context, repo name.Repository) (http.Roun
 		tlsConfig.InsecureSkipVerify = sys.DockerInsecureSkipTLSVerify == types.OptionalBoolTrue
 	}
 	base.TLSClientConfig = tlsConfig
+	if sys.DockerProxyURL != nil {
+		base.Proxy = http.ProxyURL(sys.DockerProxyURL)
+	}
+	if sys.DockerProxy != nil {
+		base.Proxy = func(req *http.Request) (*url.URL, error) { return sys.DockerProxy(req.URL) }
+	}
 	return base, nil
+}
+
+// Match Podman's explicit overrides, then its implicit containers certs.d
+// search order (including the Docker compatibility directory).
+func podmanCertDir(sys *types.SystemContext, host string) (string, error) {
+	if sys.DockerCertPath != "" {
+		return sys.DockerCertPath, nil
+	}
+	if sys.DockerPerHostCertDirPath != "" {
+		return filepath.Join(sys.DockerPerHostCertDirPath, host), nil
+	}
+	paths, err := configfile.GetSearchPaths(&configfile.File{
+		Name: "certs", Extension: "d", DoNotUseExtensionForConfigName: true,
+		UserId: unshare.GetRootlessUID(), RootForImplicitAbsolutePaths: sys.RootForImplicitAbsolutePaths,
+	})
+	if err != nil {
+		return "", err
+	}
+	candidates := append([]string{}, paths.DropInDirectories...)
+	etcDir := "/etc"
+	if runtime.GOOS == "freebsd" {
+		etcDir = "/usr/local/etc"
+	}
+	if sys.RootForImplicitAbsolutePaths != "" {
+		etcDir = filepath.Join(sys.RootForImplicitAbsolutePaths, etcDir)
+	}
+	candidates = append(candidates, filepath.Join(etcDir, "docker/certs.d"))
+	for _, base := range candidates {
+		candidate := filepath.Join(base, host)
+		_, err := os.Stat(candidate)
+		if err == nil {
+			return candidate, nil
+		}
+		if os.IsNotExist(err) || os.IsPermission(err) {
+			continue
+		}
+		return "", err
+	}
+	return "", nil
 }
 
 // ---------------------------------------------------------------------------

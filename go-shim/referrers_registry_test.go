@@ -292,6 +292,28 @@ func TestFallbackPublicationBypassesStaleMirror(t *testing.T) {
 	}
 }
 
+func TestNativePublicationProbesWithoutEnumerating(t *testing.T) {
+	var fallbackPuts atomic.Int32
+	host := startRegistryWithOptions(t, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/referrers/") {
+			w.Header().Set("Link", `<?page=2>; rel=next`)
+			_, _ = w.Write([]byte(`not an index`))
+			return true
+		}
+		if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/manifests/sha256-") {
+			fallbackPuts.Add(1)
+		}
+		return false
+	})
+	err := publishFallbackReferrer(context.Background(), host+"/org/model:v1", digest.FromString("subject"), ocispec.Descriptor{})
+	if err != nil {
+		t.Fatalf("native capability probe should not parse or paginate: %v", err)
+	}
+	if got := fallbackPuts.Load(); got != 0 {
+		t.Fatalf("native endpoint caused %d fallback index PUTs", got)
+	}
+}
+
 func TestConcurrentFallbackPublicationsKeepBothReferrers(t *testing.T) {
 	var mu sync.Mutex
 	reads := 0

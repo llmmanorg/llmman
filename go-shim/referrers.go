@@ -168,22 +168,60 @@ func repositoryForRef(ref string) (name.Repository, error) {
 	return repo, nil
 }
 
-func registryClient(ctx context.Context, repo name.Repository) (*http.Client, error) {
-	base, err := registryBaseTransport(ctx, repo)
+type registryReadClient struct {
+	client *http.Client
+	repo   name.Repository
+	scheme string
+}
+
+func registryClient(ctx context.Context, logical name.Repository) (registryReadClient, error) {
+	repo, allowHTTP, err := registryReadRepository(ctx, logical)
 	if err != nil {
-		return nil, fmt.Errorf("load registry transport: %w", err)
+		return registryReadClient{}, fmt.Errorf("resolve registry read location: %w", err)
+	}
+	base, err := registryBaseTransport(ctx, logical, repo)
+	if err != nil {
+		return registryReadClient{}, fmt.Errorf("load registry transport: %w", err)
+	}
+	return registryClientWithTransport(ctx, repo, allowHTTP, base)
+}
+
+func registryClientWithTransport(ctx context.Context, repo name.Repository, allowHTTP bool, base http.RoundTripper) (registryReadClient, error) {
+	scheme := repo.Scheme()
+	// Podman allows HTTP only for insecure registries. Ping with that option
+	// selects the actual scheme before constructing the referrers URL and its
+	// same-origin guard. This also handles HTTPS test registries on loopback.
+	if allowHTTP || repo.Scheme() == "http" {
+		insecure, err := name.NewRepository(repo.Name(), name.WeakValidation, name.Insecure)
+		if err != nil {
+			return registryReadClient{}, err
+		}
+		challenge, err := transport.Ping(ctx, insecure.Registry, base)
+		if err != nil {
+			return registryReadClient{}, fmt.Errorf("probe registry scheme: %w", err)
+		}
+		if challenge.Insecure {
+			scheme = "http"
+			repo = insecure
+		} else {
+			scheme = "https"
+			repo, err = name.NewRepository(repo.Name(), name.WeakValidation)
+			if err != nil {
+				return registryReadClient{}, err
+			}
+		}
 	}
 	auth, err := registryAuthenticator(ctx, repo)
 	if err != nil {
-		return nil, fmt.Errorf("load registry credentials: %w", err)
+		return registryReadClient{}, fmt.Errorf("load registry credentials: %w", err)
 	}
 	scopes := []string{repo.Scope(transport.PullScope)}
-	origin := &url.URL{Scheme: repo.Scheme(), Host: repo.RegistryStr()}
+	origin := &url.URL{Scheme: scheme, Host: repo.RegistryStr()}
 	roundTripper, err := transport.NewWithContext(ctx, repo.Registry, auth, base, scopes)
 	if err != nil {
-		return nil, fmt.Errorf("configure registry transport: %w", err)
+		return registryReadClient{}, fmt.Errorf("configure registry transport: %w", err)
 	}
-	return &http.Client{
+	client := &http.Client{
 		Transport: &registryOriginTransport{origin: origin, next: roundTripper},
 		Timeout:   120 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -192,7 +230,8 @@ func registryClient(ctx context.Context, repo name.Repository) (*http.Client, er
 			}
 			return nil
 		},
-	}, nil
+	}
+	return registryReadClient{client: client, repo: repo, scheme: scheme}, nil
 }
 
 // Restrict the referrers client, not the transport used inside bearer-token
@@ -211,9 +250,9 @@ func (t *registryOriginTransport) RoundTrip(req *http.Request) (*http.Response, 
 
 // Credential helpers and transport setup may block before the first HTTP
 // request. Bound that phase as well as the requests made by the client.
-func registryClientWithin(ctx context.Context, create func() (*http.Client, error)) (*http.Client, error) {
+func registryClientWithin(ctx context.Context, create func() (registryReadClient, error)) (registryReadClient, error) {
 	type result struct {
-		client *http.Client
+		client registryReadClient
 		err    error
 	}
 	ready := make(chan result)
@@ -222,8 +261,8 @@ func registryClientWithin(ctx context.Context, create func() (*http.Client, erro
 		select {
 		case ready <- result{client, err}:
 		case <-ctx.Done():
-			if client != nil {
-				client.CloseIdleConnections()
+			if client.client != nil {
+				client.client.CloseIdleConnections()
 			}
 		}
 	}()
@@ -231,7 +270,7 @@ func registryClientWithin(ctx context.Context, create func() (*http.Client, erro
 	case got := <-ready:
 		return got.client, got.err
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return registryReadClient{}, ctx.Err()
 	}
 }
 
@@ -239,9 +278,9 @@ func sameRegistryOrigin(origin, target *url.URL) bool {
 	return target.User == nil && strings.EqualFold(target.Scheme, origin.Scheme) && strings.EqualFold(target.Host, origin.Host)
 }
 
-func registryURL(repo name.Repository, elems ...string) string {
+func registryURLWithScheme(repo name.Repository, scheme string, elems ...string) string {
 	path := "/v2/" + repo.RepositoryStr() + "/" + strings.Join(elems, "/")
-	return (&url.URL{Scheme: repo.Scheme(), Host: repo.RegistryStr(), Path: path}).String()
+	return (&url.URL{Scheme: scheme, Host: repo.RegistryStr(), Path: path}).String()
 }
 
 func getReferrersIndex(ctx context.Context, client *http.Client, endpoint string) (*ocispec.Index, bool, error) {
@@ -421,19 +460,33 @@ func fetchReferrersIndex(ctx context.Context, ref string, subject digest.Digest)
 }
 
 func fetchNativeReferrersIndex(ctx context.Context, ref string, subject digest.Digest) (ocispec.Index, bool, error) {
+	return readNativeReferrers(ctx, ref, subject, false)
+}
+
+func probeNativeReferrers(ctx context.Context, ref string, subject digest.Digest) (bool, error) {
+	_, found, err := readNativeReferrers(ctx, ref, subject, true)
+	return found, err
+}
+
+func readNativeReferrers(ctx context.Context, ref string, subject digest.Digest, probeOnly bool) (ocispec.Index, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	repo, err := repositoryForRef(ref)
 	if err != nil {
 		return ocispec.Index{}, false, err
 	}
-	client, err := registryClientWithin(ctx, func() (*http.Client, error) {
+	client, err := registryClientWithin(ctx, func() (registryReadClient, error) {
 		return registryClient(ctx, repo)
 	})
 	if err != nil {
 		return ocispec.Index{}, false, err
 	}
-	index, found, err := getReferrersIndex(ctx, client, registryURL(repo, "referrers", subject.String()))
+	endpoint := registryURLWithScheme(client.repo, client.scheme, "referrers", subject.String())
+	if probeOnly {
+		found, err := probeReferrersEndpoint(ctx, client.client, endpoint)
+		return ocispec.Index{}, found, err
+	}
+	index, found, err := getReferrersIndex(ctx, client.client, endpoint)
 	if err != nil {
 		return ocispec.Index{}, false, fmt.Errorf("list referrers: %w", err)
 	}
@@ -441,6 +494,28 @@ func fetchNativeReferrersIndex(ctx context.Context, ref string, subject digest.D
 		return ocispec.Index{}, false, nil
 	}
 	return *index, true, nil
+}
+
+// Publication needs only the endpoint's 200/404 capability signal, not every
+// descriptor page. Do not read a potentially large response body here.
+func probeReferrersEndpoint(ctx context.Context, client *http.Client, endpoint string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Accept", ocispec.MediaTypeImageIndex)
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if err := transport.CheckError(resp, http.StatusOK); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func fetchFallbackReferrersIndex(ctx context.Context, ref string, subject digest.Digest) (ocispec.Index, error) {
@@ -471,7 +546,7 @@ func publishFallbackReferrer(ctx context.Context, ref string, subject digest.Dig
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	ctx = withoutMirrors(ctx)
-	_, native, err := fetchNativeReferrersIndex(ctx, ref, subject)
+	native, err := probeNativeReferrers(ctx, ref, subject)
 	if err != nil || native {
 		return err
 	}

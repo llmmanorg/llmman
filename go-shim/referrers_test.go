@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/name"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -105,6 +106,37 @@ func TestGetReferrersIndexLimitsDescriptors(t *testing.T) {
 	}
 }
 
+func TestProbeReferrersEndpointStopsAtFirstResponse(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Link", `<?page=2>; rel=next`)
+		_, _ = w.Write([]byte(`not an index`))
+	}))
+	defer server.Close()
+	found, err := probeReferrersEndpoint(context.Background(), server.Client(), server.URL+"/referrers")
+	if err != nil || !found || requests.Load() != 1 {
+		t.Fatalf("probe = %t, %v, requests = %d; want first response only", found, err, requests.Load())
+	}
+}
+
+func TestProbeReferrersEndpointDistinguishes404FromOtherErrors(t *testing.T) {
+	status := http.StatusNotFound
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+	}))
+	defer server.Close()
+	found, err := probeReferrersEndpoint(context.Background(), server.Client(), server.URL+"/referrers")
+	if err != nil || found {
+		t.Fatalf("404 probe = %t, %v; want unsupported", found, err)
+	}
+	status = http.StatusForbidden
+	_, err = probeReferrersEndpoint(context.Background(), server.Client(), server.URL+"/referrers")
+	if err == nil {
+		t.Fatal("403 must not select fallback publication")
+	}
+}
+
 func TestParseReferrersIndexAllowsAbsentMediaType(t *testing.T) {
 	index, err := parseReferrersIndex([]byte(`{"schemaVersion":2,"manifests":[]}`))
 	if err != nil || len(index.Manifests) != 0 {
@@ -146,9 +178,38 @@ func TestRegistryClientRejectsCrossOriginRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = getReferrersIndex(context.Background(), client, origin.URL+"/referrers")
+	_, _, err = getReferrersIndex(context.Background(), client.client, origin.URL+"/referrers")
 	if err == nil || crossOriginRequests.Load() != 0 {
 		t.Fatalf("redirect error = %v, cross-origin requests = %d", err, crossOriginRequests.Load())
+	}
+}
+
+func TestRegistryClientUsesHTTPSWhenLoopbackSupportsIt(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/" {
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := name.NewRepository(u.Host+"/org/model", name.WeakValidation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := registryClientWithTransport(context.Background(), repo, false, server.Client().Transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.scheme != "https" {
+		t.Fatalf("selected scheme = %s, want https", client.scheme)
+	}
+	endpoint := registryURLWithScheme(client.repo, client.scheme, "referrers", digest.FromString("subject").String())
+	if found, err := probeReferrersEndpoint(context.Background(), client.client, endpoint); err != nil || found {
+		t.Fatalf("HTTPS referrers probe = %t, %v; want 404", found, err)
 	}
 }
 
@@ -157,9 +218,9 @@ func TestRegistryClientSetupRespectsDeadline(t *testing.T) {
 	defer cancel()
 	blocked := make(chan struct{})
 	defer close(blocked)
-	_, err := registryClientWithin(ctx, func() (*http.Client, error) {
+	_, err := registryClientWithin(ctx, func() (registryReadClient, error) {
 		<-blocked
-		return nil, nil
+		return registryReadClient{}, nil
 	})
 	if err != context.DeadlineExceeded {
 		t.Fatalf("setup error = %v, want deadline exceeded", err)

@@ -96,7 +96,11 @@ func registryAuthenticator(_ context.Context, repo name.Repository) (authn.Authe
 	return authn.FromConfig(authn.AuthConfig{Username: username, Password: secret}), nil
 }
 
-func registryBaseTransport(ctx context.Context, repo name.Repository) (http.RoundTripper, error) {
+func registryReadRepository(_ context.Context, repo name.Repository) (name.Repository, bool, error) {
+	return repo, false, nil
+}
+
+func registryBaseTransport(ctx context.Context, _ name.Repository, repo name.Repository) (http.RoundTripper, error) {
 	hosts, err := dockerconfig.ConfigureHosts(ctx, dockerconfig.HostOptions{Credentials: dockerCredentials})(repo.RegistryStr())
 	if err != nil {
 		return nil, fmt.Errorf("load registry host configuration: %w", err)
