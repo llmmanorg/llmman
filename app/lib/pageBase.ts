@@ -7,7 +7,7 @@
 // are paths (`/models`, `/c/<id>`), so the base is the page's directory
 // without the app's own route directories.
 
-/** Where the web UI and earlier versions of this app kept the key of a daemon at `/`. */
+/** Where the web UI keeps the key of a daemon at `/`. */
 export const LEGACY_KEY_STORAGE = "llmman.apiKey:/";
 
 /** The app's route directories (app/), which are never part of the base. */
@@ -42,17 +42,7 @@ export function keyStorageName(path: string): string {
   return `llmman.apiKey:${path}`;
 }
 
-/** The key stored for the page's base path, taking over the one at `/` from earlier versions. */
-export function readScopedKey(
-  storage: Pick<Storage, "getItem" | "setItem">,
-  path: string,
-): string | undefined {
-  const name = keyStorageName(path);
-  const own = storage.getItem(name)?.trim();
-  if (own) return own;
-  if (name === LEGACY_KEY_STORAGE) return undefined;
-  const legacy = storage.getItem(LEGACY_KEY_STORAGE)?.trim();
-  if (!legacy) return undefined;
-  storage.setItem(name, legacy);
-  return legacy;
+/** The key stored for the page's base path, and no other: a daemon at `/` never lends its key to another. */
+export function readScopedKey(storage: Pick<Storage, "getItem">, path: string): string | undefined {
+  return storage.getItem(keyStorageName(path))?.trim() || undefined;
 }

@@ -32,12 +32,11 @@ function memory(init: Record<string, string>) {
   };
 }
 
-test("the key at / still works, and is taken over by a prefixed base", () => {
+test("each base path reads its own key only", () => {
   expect(readScopedKey(memory({ "llmman.apiKey:/": "root" }), "/")).toBe("root");
+  // The key at / is another daemon's: a prefixed base never gets it.
   const s = memory({ "llmman.apiKey:/": "root" });
-  expect(readScopedKey(s, "/a/")).toBe("root");
-  expect(s.m.get("llmman.apiKey:/a/")).toBe("root");
-  // Its own key wins once there is one.
+  expect(readScopedKey(s, "/a/")).toBeUndefined();
+  expect(s.m.has("llmman.apiKey:/a/")).toBe(false);
   expect(readScopedKey(memory({ "llmman.apiKey:/": "root", "llmman.apiKey:/a/": "own" }), "/a/")).toBe("own");
-  expect(readScopedKey(memory({}), "/a/")).toBeUndefined();
 });
