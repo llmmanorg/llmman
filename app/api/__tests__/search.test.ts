@@ -1,5 +1,7 @@
 /** @jest-environment node */
 
+import { Platform } from "react-native";
+
 import { ApiClient, ApiError } from "../client";
 import { avatarUrl, modelCard, popular, search, SEARCH_LIMIT } from "../search";
 import { fakeFetch, fixture, response } from "@/test/fakeFetch";
@@ -110,6 +112,19 @@ describe("avatarUrl", () => {
   ])("ignores a location of %p", async (location) => {
     const { fetch } = fakeFetch(() => redirect(location));
     expect(await avatarUrl(new ApiClient({ url: URL }, fetch), "hf.co/o/r")).toBeNull();
+  });
+
+  it("on the web, is the daemon's route, which the browser's image loader follows without the key", async () => {
+    const os = Platform.OS;
+    Platform.OS = "web";
+    try {
+      const { fetch, calls } = fakeFetch(() => redirect(picture));
+      const url = await avatarUrl(new ApiClient({ url: URL, key: "sk-1" }, fetch), "hf.co/o/r");
+      expect(url).toBe(`${URL}/llmman/search/avatar?name=hf.co%2Fo%2Fr`);
+      expect(calls).toHaveLength(0);
+    } finally {
+      Platform.OS = os;
+    }
   });
 
   it("ignores a 200, which means a redirect was followed", async () => {

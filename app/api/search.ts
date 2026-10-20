@@ -2,6 +2,8 @@
 // `/llmman/search/model` and `/llmman/search/avatar`. Pulls, `/llmman/node` and the local store are
 // `ApiClient` methods (api/client.ts).
 
+import { Platform } from "react-native";
+
 import type { ApiClient, RequestOptions } from "./client";
 
 /** A `/llmman/search` or `/llmman/search/popular` row; `name` pulls as is. */
@@ -80,17 +82,20 @@ export async function modelCard(client: ApiClient, name: string, opts?: RequestO
  * `location` instead of letting an image loader follow it, so the key the
  * daemon needs never goes along to the picture's host. Only an absolute
  * https URL is used.
+ *
+ * A browser hides a manual redirect's location, so on the web the image
+ * loads from the daemon's route itself: an `<img>` follows the redirect and
+ * sends no Authorization header. A 404 (no picture) fails the image, which
+ * leaves the monogram.
  */
 export async function avatarUrl(
   client: ApiClient,
   repo: string,
   opts?: RequestOptions,
 ): Promise<string | null> {
-  const r = await client.request(
-    `llmman/search/avatar?name=${encodeURIComponent(repo)}`,
-    { redirect: "manual" },
-    opts,
-  );
+  const path = `llmman/search/avatar?name=${encodeURIComponent(repo)}`;
+  if (Platform.OS === "web") return client.urlFor(path);
+  const r = await client.request(path, { redirect: "manual" }, opts);
   if (r.status < 300 || r.status >= 400) return null;
   const location = r.headers.get("location");
   return location && /^https:\/\/[^/]/i.test(location) ? location : null;
