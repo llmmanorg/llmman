@@ -3,27 +3,21 @@
 // two daemons behind one gateway (`/a/`, `/b/`) never share a key; the app
 // does the same, and its server URL keeps the path too.
 //
-// Unlike llmman's web UI, which routes in the fragment, this app's routes
-// are paths (`/models`, `/c/<id>`), so the base is the page's directory
-// without the app's own route directories.
+// The app's routes are paths (`/models`, `/c/<id>`), so the base is not the
+// address's directory: index.html's first script works it out and sets it
+// as the page's <base> (scripts/export-web.mjs), and `document.baseURI` is
+// that base.
 
 /** Where the web UI keeps the key of a daemon at `/`. */
 export const LEGACY_KEY_STORAGE = "llmman.apiKey:/";
 
-/** The app's route directories (app/), which are never part of the base. */
-const ROUTE_DIRS = new Set(["c", "models", "providers", "settings", "servers", "server", "connect"]);
-
 /** The page's base path, with leading and trailing slashes: `/`, or `/gateway/llmman/`. */
 export function basePath(baseURI: string): string {
-  let path: string;
   try {
-    path = new URL(".", baseURI).pathname;
+    return new URL(".", baseURI).pathname;
   } catch {
     return "/";
   }
-  const parts = path.split("/").filter(Boolean);
-  if (parts.length && ROUTE_DIRS.has(parts[parts.length - 1]!)) parts.pop();
-  return parts.length ? `/${parts.join("/")}/` : "/";
 }
 
 /** The page's daemon as a server URL: origin and base path, no trailing slash. */

@@ -1,14 +1,13 @@
 import { basePath, keyStorageName, LEGACY_KEY_STORAGE, pageServerUrl, readScopedKey } from "@/lib/pageBase";
 
-test("the base path is the page's directory, without the app's own routes", () => {
+test("the base path is the directory of the page's <base>", () => {
   expect(basePath("http://127.0.0.1:17434/")).toBe("/");
   expect(basePath("http://127.0.0.1:17434/#/models")).toBe("/");
-  expect(basePath("http://127.0.0.1:17434/models")).toBe("/");
-  expect(basePath("http://127.0.0.1:17434/models/variants")).toBe("/");
-  expect(basePath("http://127.0.0.1:17434/c/abc123")).toBe("/");
   expect(basePath("https://gw.example/llmman/")).toBe("/llmman/");
   expect(basePath("https://gw.example/llmman/index.html")).toBe("/llmman/");
-  expect(basePath("https://gw.example/team/a/settings")).toBe("/team/a/");
+  // A prefix named like one of the app's routes is still the prefix.
+  expect(basePath("https://gw.example/servers/x/")).toBe("/servers/x/");
+  expect(basePath("https://gw.example/team/models/")).toBe("/team/models/");
   expect(basePath("not a url")).toBe("/");
 });
 

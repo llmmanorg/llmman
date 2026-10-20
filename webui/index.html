@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <script>(function(){var d=location.pathname.split("/").slice(1,-1),r=["c","connect","models","providers","server","servers","settings"];for(var i=0;i<d.length;i++)if(r.indexOf(d[i])>=0){d=d.slice(0,i);break}var h=document.head,b=document.createElement("base"),p="/"+d.map(function(s){return s+"/"}).join("");b.href=p;h.appendChild(b);["ui/_expo/static/css/xterm-8a7c4e0dca731c11dbe6bdff98fb667c.css"].forEach(function(s){var l=document.createElement("link");l.rel="stylesheet";l.href=s;h.appendChild(l)})})()</script>
+    <script>(function(){var s=location.pathname.split("/").slice(1),r=[["c","*"],["chat-actions"],["chat-settings"],["connect"],["generate-settings"],["model-picker"],["models"],["models","*"],["models","variants"],["provider-key"],["providers"],["server","*"],["servers"],["settings"],["shell"],["welcome"]],n=0;if(s[s.length-1]==="")s.pop();else n=1;r.forEach(function(t){if(t.length>=n&&t.length<=s.length&&t.every(function(x,j){return x==="*"||x===s[s.length-t.length+j]}))n=t.length});var h=document.head,b=document.createElement("base"),p="/"+s.slice(0,s.length-n).map(function(x){return x+"/"}).join("");b.href=p;h.appendChild(b);["ui/_expo/static/css/xterm-8a7c4e0dca731c11dbe6bdff98fb667c.css"].forEach(function(s){var l=document.createElement("link");l.rel="stylesheet";l.href=s;h.appendChild(l)})})()</script>
     <meta httpEquiv="X-UA-Compatible" content="IE=edge" />
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
     <title>llmman</title>
@@ -34,6 +34,6 @@
     </noscript>
     <!-- The root element for your Expo app. -->
     <div id="root"></div>
-  <script>["ui/_expo/static/js/web/__expo-metro-runtime-1f8f5d3ca6b7f58204d51e14506d73fb.js","ui/_expo/static/js/web/__common-249e12273673b0eddc4dbd7fe81db251.js","ui/_expo/static/js/web/entry-eadbc20420af9d93095d073b0a57afbd.js"].forEach(function(s){var e=document.createElement("script");e.src=s;e.async=false;document.body.appendChild(e)})</script>
+  <script>["ui/_expo/static/js/web/__expo-metro-runtime-1f8f5d3ca6b7f58204d51e14506d73fb.js","ui/_expo/static/js/web/__common-190d105b0e16dfdebf703cc8980ee2a8.js","ui/_expo/static/js/web/entry-96438bf8aaee325cf2478f18faccb6e1.js"].forEach(function(s){var e=document.createElement("script");e.src=s;e.async=false;document.body.appendChild(e)})</script>
 </body>
 </html>

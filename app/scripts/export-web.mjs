@@ -8,9 +8,10 @@
 // absolute path, as in llmman's own web UI:
 //
 // - index.html refers to `ui/…`, resolved against a <base> its first
-//   script sets from the page's address: the directory the page is in,
-//   without one of the app's route directories (`/team/llmman/c/x` →
-//   `/team/llmman/`).
+//   script sets from the page's address: the address less the app route
+//   it ends with (`/team/llmman/c/x` → `/team/llmman/`, `/shell/` → `/`).
+//   A prefix may be named like a route (`/servers/x/`): only a whole route
+//   at the end is taken off.
 // - Scripts load chunks and images from `ui/` relative to their own URL
 //   (`globalThis.__llmmanUi`), and the router takes its base path from the
 //   same place. Expo bakes one base path into the build
@@ -63,15 +64,27 @@ async function files(dir) {
   return all.sort();
 }
 
-/** Route directories under app/ (groups like `(drawer)` looked into, not counted). */
-async function routeDirs(dir = join(root, "app")) {
-  const dirs = [];
+/**
+ * The app's routes under app/, each as its path's segments, `*` for a
+ * dynamic one: `c/[id].tsx` → ["c", "*"], `servers/index.tsx` → ["servers"].
+ * Groups like `(drawer)` add no segment; layouts and `+` files are no route.
+ */
+async function routes(dir = join(root, "app"), at = []) {
+  const all = [];
   for (const entry of await readdir(dir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    if (/^\(.*\)$/.test(entry.name)) dirs.push(...(await routeDirs(join(dir, entry.name))));
-    else if (!/^[[+_]/.test(entry.name)) dirs.push(entry.name);
+    if (/^[_+]/.test(entry.name)) continue;
+    if (/^\[\.\.\./.test(entry.name))
+      throw new Error(`app/: a catch-all route (${entry.name}) has no base to find`);
+    if (entry.isDirectory()) {
+      const group = /^\(.*\)$/.test(entry.name);
+      all.push(...(await routes(join(dir, entry.name), group ? at : [...at, entry.name])));
+    } else if (/\.tsx?$/.test(entry.name)) {
+      const name = entry.name.replace(/\.tsx?$/, "");
+      const path = name === "index" ? at : [...at, name];
+      if (path.length) all.push(path.map((s) => (/^\[.*\]$/.test(s) ? "*" : s)));
+    }
   }
-  return [...new Set(dirs)].sort();
+  return [...new Map(all.map((r) => [r.join("/"), r])).values()].sort();
 }
 
 /** A PNG's signature and the chunks that draw it, each kept byte for byte. */
@@ -139,7 +152,7 @@ for (const path of await files(out)) {
   }
 }
 
-const ROUTE_DIRS = await routeDirs();
+const ROUTES = await routes();
 let html = await readFile(join(out, "index.html"), "utf8");
 // The page's stylesheets and scripts, taken out of the markup: a browser's
 // preload scanner fetches tags it sees before any script has set the base,
@@ -156,8 +169,10 @@ const ui = (url) => {
   return `ui/${url.slice(PLACEHOLDER.length + 1)}`;
 };
 if (!scripts.length) throw new Error("index.html: no scripts found");
-// First thing in <head>: the page's base, as described above, then its stylesheets.
-const headScript = `<script>(function(){var d=location.pathname.split("/").slice(1,-1),r=${JSON.stringify(ROUTE_DIRS)};for(var i=0;i<d.length;i++)if(r.indexOf(d[i])>=0){d=d.slice(0,i);break}var h=document.head,b=document.createElement("base"),p="/"+d.map(function(s){return s+"/"}).join("");b.href=p;h.appendChild(b);${JSON.stringify(styles.map(ui))}.forEach(function(s){var l=document.createElement("link");l.rel="stylesheet";l.href=s;h.appendChild(l)})})()</script>`;
+// First thing in <head>: the page's base, as described above, then its
+// stylesheets. The longest route the address ends with is taken off; with
+// none, the page's directory, as a relative URL would have it.
+const headScript = `<script>(function(){var s=location.pathname.split("/").slice(1),r=${JSON.stringify(ROUTES)},n=0;if(s[s.length-1]==="")s.pop();else n=1;r.forEach(function(t){if(t.length>=n&&t.length<=s.length&&t.every(function(x,j){return x==="*"||x===s[s.length-t.length+j]}))n=t.length});var h=document.head,b=document.createElement("base"),p="/"+s.slice(0,s.length-n).map(function(x){return x+"/"}).join("");b.href=p;h.appendChild(b);${JSON.stringify(styles.map(ui))}.forEach(function(s){var l=document.createElement("link");l.rel="stylesheet";l.href=s;h.appendChild(l)})})()</script>`;
 // Where the scripts were, in order, as the deferred scripts they were.
 const bodyScript = `<script>${JSON.stringify(scripts.map(ui))}.forEach(function(s){var e=document.createElement("script");e.src=s;e.async=false;document.body.appendChild(e)})</script>`;
 html = html
@@ -173,14 +188,24 @@ if (!html.includes(headScript) || !html.includes(bodyScript))
 if (html.includes(PLACEHOLDER) || /(href|src)="\//.test(html))
   throw new Error(`index.html keeps an absolute path:\n${html}`);
 // The base the loader sets, run as a browser would at a few addresses: at
-// the root, under a gateway's prefix, and deep in one of the app's routes.
+// the root, under a gateway's prefix, deep in one of the app's routes, and
+// under a prefix named like a route.
 for (const [path, base] of [
   ["/", "/"],
+  ["/index.html", "/"],
   ["/models", "/"],
+  ["/models/hf.co%2Fo%2Fr", "/"],
   ["/c/abc123", "/"],
+  ["/c/abc123/", "/"],
   ["/settings/", "/"],
+  ["/shell", "/"],
+  ["/shell/", "/"],
   ["/team/llmman/", "/team/llmman/"],
   ["/team/llmman/c/abc123", "/team/llmman/"],
+  ["/team/llmman/shell/", "/team/llmman/"],
+  ["/servers/x/", "/servers/x/"],
+  ["/servers/x/models", "/servers/x/"],
+  ["/servers/x/c/abc123", "/servers/x/"],
 ]) {
   const head = { appendChild: (el) => el.tagName === "base" && (got = el.href) };
   let got;
