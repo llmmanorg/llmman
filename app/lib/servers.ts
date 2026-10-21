@@ -73,23 +73,31 @@ export async function saveServer(
   entry: { url: string; name?: string; key?: string },
   { activate = true }: { activate?: boolean } = {},
 ): Promise<ServerList> {
-  const existing = list.servers.find((s) => s.url === entry.url);
-  const server: Server = existing
-    ? { ...existing, ...(entry.name ? { name: entry.name } : {}) }
-    : { id: newId(), url: entry.url, addedAt: Date.now(), ...(entry.name ? { name: entry.name } : {}) };
-
+  const { next, server } = withServer(list, entry, { activate });
   const key = entry.key?.trim();
   if (key) {
     await SecureStore.setItemAsync(secretKey(server.id), key);
   } else {
     await SecureStore.deleteItemAsync(secretKey(server.id));
   }
+  await saveList(next);
+  return next;
+}
+
+/** The list with `entry` added or updated, as saveServer stores it, without storing anything (or its key). */
+export function withServer(
+  list: ServerList,
+  entry: { url: string; name?: string },
+  { activate = true }: { activate?: boolean } = {},
+): { next: ServerList; server: Server } {
+  const existing = list.servers.find((s) => s.url === entry.url);
+  const server: Server = existing
+    ? { ...existing, ...(entry.name ? { name: entry.name } : {}) }
+    : { id: newId(), url: entry.url, addedAt: Date.now(), ...(entry.name ? { name: entry.name } : {}) };
   const servers = existing
     ? list.servers.map((s) => (s.url === entry.url ? server : s))
     : [...list.servers, server];
-  const next = { servers, active: activate || !list.active ? server.url : list.active };
-  await saveList(next);
-  return next;
+  return { next: { servers, active: activate || !list.active ? server.url : list.active }, server };
 }
 
 export async function removeServer(list: ServerList, url: string): Promise<ServerList> {

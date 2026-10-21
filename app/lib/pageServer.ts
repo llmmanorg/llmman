@@ -5,7 +5,7 @@
 import { testConnection } from "@/api/connection";
 import { importWebUiChats } from "@/lib/conversations";
 import { askPageKey, pageKey, pageUrl, setPageKey } from "@/lib/page";
-import { getServerKey, saveServer, type ServerList } from "@/lib/servers";
+import { getServerKey, saveServer, withServer, type ServerList } from "@/lib/servers";
 
 export async function adoptPageServer(list: ServerList): Promise<ServerList> {
   const url = pageUrl();
@@ -22,7 +22,11 @@ export async function adoptPageServer(list: ServerList): Promise<ServerList> {
   // The page's key is the one requests send (page.web.ts): keep it in step.
   if (key && key !== pageKey()) setPageKey(key);
   const name = known?.name ?? new URL(url).hostname;
-  const next = await saveServer(list, { url, name, ...(key ? { key } : {}) }, { activate: true });
+  // Storage full or blocked: the daemon answered, so this page uses it all
+  // the same, for as long as it is open (its key is the page's, page.web.ts).
+  const next = await saveServer(list, { url, name, ...(key ? { key } : {}) }, { activate: true }).catch(
+    () => withServer(list, { url, name }, { activate: true }).next,
+  );
   // The built-in web UI's chats on this page were with this daemon: they
   // come along, once (its database is left as it is). Before the app shows
   // anything, so an old link to one of them (`/c/<id>`) finds it.
