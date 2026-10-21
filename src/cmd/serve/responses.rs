@@ -61,7 +61,9 @@ pub(super) fn falls_back(status: StatusCode) -> bool {
 }
 
 fn falls_back_for(target: &Target, status: StatusCode) -> bool {
-    falls_back(status) || (target.is_provider("opencode") && status.is_server_error())
+    falls_back(status)
+        || (status.is_server_error()
+            && matches!(target, Target::Remote(remote) if remote.server_errors_on_responses()))
 }
 
 // ---------------------------------------------------------------------------

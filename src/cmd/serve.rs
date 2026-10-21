@@ -1626,6 +1626,12 @@ impl RemoteTarget {
     fn refuses_stream_options(&self) -> bool {
         self.provider == "cohere"
     }
+
+    /// opencode's gateway 5xxs `/v1/responses` for every non-OpenAI model
+    /// rather than 404ing it, so a 5xx there means "no such route".
+    fn server_errors_on_responses(&self) -> bool {
+        self.provider == "opencode"
+    }
 }
 
 impl std::fmt::Debug for RemoteTarget {
@@ -1698,10 +1704,6 @@ impl Target {
     /// Whether a chat completion here is translated to the Messages API.
     fn is_anthropic(&self) -> bool {
         self.wire() == Some(Wire::Anthropic)
-    }
-
-    fn is_provider(&self, provider: &str) -> bool {
-        matches!(self, Self::Remote(remote) if remote.provider == provider)
     }
 
     /// Names this target for an error message. "inference backend" is
