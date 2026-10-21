@@ -2,16 +2,19 @@
 
 export type ChatGroup = "Today" | "Yesterday" | "Previous 7 days" | "Older";
 
-const DAY = 24 * 60 * 60 * 1000;
+/** Local midnight `days` days before `now`'s: a local day may be 23 or 25 hours long. */
+function midnight(now: number, days: number): number {
+  const d = new Date(now);
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - days);
+  return d.getTime();
+}
 
 /** The group for a chat last used at `at`, seen at `now` (local days). */
 export function groupOf(at: number, now = Date.now()): ChatGroup {
-  const today = new Date(now);
-  today.setHours(0, 0, 0, 0);
-  const start = today.getTime();
-  if (at >= start) return "Today";
-  if (at >= start - DAY) return "Yesterday";
-  if (at >= start - 7 * DAY) return "Previous 7 days";
+  if (at >= midnight(now, 0)) return "Today";
+  if (at >= midnight(now, 1)) return "Yesterday";
+  if (at >= midnight(now, 7)) return "Previous 7 days";
   return "Older";
 }
 
