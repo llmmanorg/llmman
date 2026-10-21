@@ -24,6 +24,7 @@ import {
 import { KeyboardAvoidingView } from "react-native-keyboard-controller";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { hostLabel } from "@/api/serverUrl";
 import { KindToggle } from "@/components/chat/KindToggle";
 import { MessageView } from "@/components/chat/MessageView";
 import { Icon } from "@/components/Icon";
@@ -90,11 +91,22 @@ export function ChatScreen({ id, onSent }: { id: string; onSent?: () => void }) 
   const side = Math.max(spacing.md, insets.left, insets.right);
   // The web's textarea does not grow by itself: it follows its content's height.
   const [inputHeight, setInputHeight] = useState(0);
-  const { client, active } = useServers();
+  const { client: activeClient, active, servers, activate } = useServers();
   const server = active ? { name: active.name, url: active.url } : undefined;
   const models = useModels();
   const prefs = usePrefs();
   const { conv, phase, generation } = useConversation(id);
+  const focused = useIsFocused();
+  // A chat goes only to the server it was had with. Opened from a link
+  // while another server is active, it switches to its own (when it is the
+  // screen in front: a chat left open behind must not undo a switch made
+  // elsewhere); one whose server is not added here can be read, not continued.
+  const elsewhere = !!conv && !!active && conv.server !== active.url;
+  const known = elsewhere && servers.some((s) => s.url === conv.server);
+  const client = elsewhere ? null : activeClient;
+  useEffect(() => {
+    if (known && focused && conv) void activate(conv.server);
+  }, [known, focused, conv, activate]);
   const [draft, setDraft] = useState("");
   const [images, setImages] = useState<string[]>([]);
   const [attaching, setAttaching] = useState(false);
@@ -154,6 +166,7 @@ export function ChatScreen({ id, onSent }: { id: string; onSent?: () => void }) 
 
   // A chat whose model the server no longer offers says so, as the web UI does.
   const gone =
+    !elsewhere &&
     !!model &&
     !!conv?.messages.length &&
     models.loadedAt > 0 &&
@@ -187,7 +200,6 @@ export function ChatScreen({ id, onSent }: { id: string; onSent?: () => void }) 
   };
 
   // The web also takes a pasted or dropped image, as long as this chat is on screen.
-  const focused = useIsFocused();
   useEffect(() => {
     if (Platform.OS !== "web" || !focused || !canAttach) return;
     const take = (files: FileList | null | undefined) => {
@@ -404,7 +416,13 @@ export function ChatScreen({ id, onSent }: { id: string; onSent?: () => void }) 
           />
         )}
 
-        {gone ? (
+        {elsewhere && !known ? (
+          <View style={[styles.gone, { paddingHorizontal: side }]} accessibilityLiveRegion="polite">
+            <Text style={{ color: c.textMuted, fontSize: font.small + 1, flexShrink: 1 }}>
+              This chat was with {hostLabel(conv!.server)}, which is not one of your servers here
+            </Text>
+          </View>
+        ) : gone ? (
           <View style={[styles.gone, { paddingHorizontal: side }]} accessibilityLiveRegion="polite">
             <Text style={{ color: c.textMuted, fontSize: font.small + 1, flexShrink: 1 }}>
               {models.displayName(model)} is no longer available; pick a model
