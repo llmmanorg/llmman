@@ -398,7 +398,7 @@ fn repeat_penalty_is_local_only() {
 /// A bad provider key must reach the user as the 401 it is. Burying
 /// it in llmman's blanket 500 is what makes "check your key" look
 /// like "llmman is broken" — while a local backend, whose failures
-/// really are llmman's own, keeps the 500 it always returned.
+/// really are llmman's own, keeps the 500 it always returned (bar a 400).
 #[test]
 fn a_providers_own_status_is_not_buried_in_a_500() {
     let remote = remote_target("https://example.invalid/v1");
@@ -428,6 +428,11 @@ fn a_providers_own_status_is_not_buried_in_a_500() {
             "a local backend's status changed"
         );
     }
+    // Except a request it refuses.
+    assert_eq!(
+        remote_status(&local, StatusCode::BAD_REQUEST),
+        StatusCode::BAD_REQUEST
+    );
 
     // And the message says which of the two failed, without the key.
     assert_eq!(local.describe(), "inference backend");
@@ -6979,9 +6984,10 @@ fn chat_upstream(status: StatusCode, body: &'static str) -> ChatUpstream {
 const OVERFLOW: &str = r#"{"error":{"code":400,"message":"request (72031 tokens) exceeds the available context size (8192 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":72031,"n_ctx":8192}}"#;
 
 /// A prompt past the context is a 400 (the hybrid fallback still sees its
-/// marker); every other local failure stays a 500.
+/// marker), and so is any other 400 llama-server answers with, which a
+/// client would retry as a 5xx (llmmanorg/llmman#687). Other failures stay 500.
 #[tokio::test]
-async fn a_local_prompt_past_the_context_is_a_400_and_other_failures_stay_500() {
+async fn a_local_400_is_a_400_and_other_failures_stay_500() {
     let Err(err) = chat_body(
         &Target::Local(1),
         chat_upstream(StatusCode::BAD_REQUEST, OVERFLOW),
@@ -6994,11 +7000,23 @@ async fn a_local_prompt_past_the_context_is_a_400_and_other_failures_stay_500() 
     assert!(err.0.downcast_ref::<ContextOverflow>().is_some());
     assert!(format!("{:#}", err.0).contains("exceeds the available context size (8192 tokens)"));
 
+    // Not the hybrid fallback's to retry, but the backend's words reach the client.
+    let template = r#"{"error":{"code":400,"message":"Conversation roles must alternate user/assistant/user/assistant/...","type":"invalid_request_error"}}"#;
+    let Err(err) = chat_body(
+        &Target::Local(1),
+        chat_upstream(StatusCode::BAD_REQUEST, template),
+    )
+    .await
+    else {
+        panic!("a refused request is a failure");
+    };
+    assert_eq!(err.1, StatusCode::BAD_REQUEST);
+    assert!(err.0.downcast_ref::<ContextOverflow>().is_none());
+    assert!(format!("{:#}", err.0).contains("Conversation roles must alternate"));
+
+    // About llmman's own connection to the backend, not the caller's request.
     for (status, body) in [
-        (
-            StatusCode::BAD_REQUEST,
-            r#"{"error":{"message":"bad grammar"}}"#,
-        ),
+        (StatusCode::UNAUTHORIZED, "{}"),
         (StatusCode::NOT_FOUND, "{}"),
         (StatusCode::INTERNAL_SERVER_ERROR, OVERFLOW),
     ] {

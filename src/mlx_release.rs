@@ -286,10 +286,11 @@ mod tests {
 
     #[test]
     fn uv_download_is_pinned_not_latest() {
-        let url = uv_download_url("0.12.13", "uv-aarch64-apple-darwin.tar.gz");
+        let version = default_uv_release();
+        let url = uv_download_url(version, "uv-aarch64-apple-darwin.tar.gz");
         assert_eq!(
             url,
-            "https://github.com/astral-sh/uv/releases/download/0.12.13/uv-aarch64-apple-darwin.tar.gz"
+            format!("https://github.com/astral-sh/uv/releases/download/{version}/uv-aarch64-apple-darwin.tar.gz")
         );
     }
 

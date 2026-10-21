@@ -1427,6 +1427,20 @@ pub(super) async fn handle_openai_speech(
 /// higher cap instead of disabling it outright.
 pub(super) const TRANSCRIPTION_BODY_LIMIT_BYTES: usize = 200 * 1024 * 1024;
 
+/// A parser over a `multipart/form-data` `body`, with its boundary; `None`
+/// if the request is not multipart or names no boundary.
+fn multipart_parser(
+    body: &Bytes,
+    headers: &HeaderMap,
+) -> Option<(String, multer::Multipart<'static>)> {
+    let content_type = headers.get("content-type")?.to_str().ok()?;
+    let boundary = multer::parse_boundary(content_type).ok()?;
+    // The body is already buffered: one chunk over a cheap `Bytes` clone.
+    let chunk = body.clone();
+    let stream = futures::stream::once(async { Ok::<_, std::io::Error>(chunk) });
+    Some((boundary.clone(), multer::Multipart::new(stream, boundary)))
+}
+
 /// Extracts a top-level form field's text value from a
 /// `multipart/form-data` body, or `None` if not multipart / no boundary /
 /// field not found.
@@ -1435,18 +1449,105 @@ async fn multipart_text_field(
     headers: &HeaderMap,
     field_name: &str,
 ) -> Option<String> {
-    let content_type = headers.get("content-type")?.to_str().ok()?;
-    let boundary = multer::parse_boundary(content_type).ok()?;
-    // Single-chunk stream over a cheap Bytes clone — the body is already
-    // fully buffered, so there's nothing to actually stream.
-    let stream = futures::stream::once(async { Ok::<_, std::io::Error>(body.clone()) });
-    let mut multipart = multer::Multipart::new(stream, boundary);
+    let (_, mut multipart) = multipart_parser(body, headers)?;
     while let Ok(Some(field)) = multipart.next_field().await {
         if field.name() == Some(field_name) {
             return field.text().await.ok();
         }
     }
     None
+}
+
+/// What a transcription request with no `prompt` is asked. llama-server's
+/// own stand-in ("Transcribe audio to text") makes Voxtral answer the
+/// speech (llmmanorg/llmman#688); "...verbatim. Output only the
+/// transcript." came back as `The transcript is: "..."`.
+const DEFAULT_TRANSCRIPTION_PROMPT: &str = "Transcribe the speech in this audio. Reply with only the words spoken, with no introduction, heading or quotation marks.";
+
+/// Whether the client sent a non-blank `prompt`.
+async fn has_prompt(body: &Bytes, headers: &HeaderMap) -> bool {
+    multipart_text_field(body, headers, "prompt")
+        .await
+        .is_some_and(|p| !p.trim().is_empty())
+}
+
+/// `body` with `prompt` set, replacing any `prompt` part. `None` leaves
+/// the request as it came: not multipart, or a part with headers other
+/// than Content-Disposition and Content-Type. Rebuilt under the request's
+/// own boundary, so its `content-type` stays right.
+async fn multipart_with_prompt(body: &Bytes, headers: &HeaderMap, prompt: &str) -> Option<Bytes> {
+    let (boundary, mut multipart) = multipart_parser(body, headers)?;
+    let mut out = Vec::with_capacity(body.len() + prompt.len() + 256);
+    while let Some(mut field) = multipart.next_field().await.ok()? {
+        if field.name() == Some("prompt") {
+            continue;
+        }
+        if (field.headers().keys()).any(|k| k != "content-disposition" && k != "content-type") {
+            return None;
+        }
+        let disposition = field.headers().get("content-disposition")?.clone();
+        let part_type = field.headers().get("content-type").cloned();
+        out.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: ").as_bytes());
+        out.extend_from_slice(disposition.as_bytes());
+        if let Some(part_type) = part_type {
+            out.extend_from_slice(b"\r\nContent-Type: ");
+            out.extend_from_slice(part_type.as_bytes());
+        }
+        out.extend_from_slice(b"\r\n\r\n");
+        // Chunk by chunk, not `bytes()`: that would hold a second copy of the audio.
+        while let Some(chunk) = field.chunk().await.ok()? {
+            out.extend_from_slice(&chunk);
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{prompt}\r\n--{boundary}--\r\n"
+        )
+        .as_bytes(),
+    );
+    Some(Bytes::from(out))
+}
+
+/// llama.cpp's own `is_lfm2_template`.
+fn is_lfm2_template(template: &str) -> bool {
+    template.contains("<|tool_list_start|>") && template.contains("<|tool_list_end|>")
+}
+
+/// `body` with [`DEFAULT_TRANSCRIPTION_PROMPT`] filled in if the client sent
+/// no prompt. Only for a llama-server: vLLM's Whisper reads `prompt` as the
+/// text before the clip, a peer applies its own, and an LFM2 model's
+/// preset (system "Perform ASR.", empty user turn) would be displaced by
+/// one. The body is rebuilt last, so a request that stays as it came is
+/// never copied.
+async fn with_default_transcription_prompt(
+    state: &AppState,
+    target: &Target,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Bytes {
+    let Target::Local(port) = target else {
+        return body;
+    };
+    if local_engine(state, target).await != Some(Engine::LlamaServer)
+        || has_prompt(&body, headers).await
+    {
+        return body;
+    }
+    // Short: /props is loopback, and an unreadable one leaves the request alone.
+    let props = backend_json(&state.0.client, *port, "/props", Duration::from_secs(1)).await;
+    let Ok(props) = props else {
+        return body;
+    };
+    if props["chat_template"]
+        .as_str()
+        .is_some_and(is_lfm2_template)
+    {
+        return body;
+    }
+    multipart_with_prompt(&body, headers, DEFAULT_TRANSCRIPTION_PROMPT)
+        .await
+        .unwrap_or(body)
 }
 
 pub(super) async fn handle_openai_transcriptions(
@@ -1501,6 +1602,7 @@ pub(super) async fn handle_openai_transcriptions(
     // No `keep_alive` field on this API surface either — see
     // resolve_openai_request's own comment on the same choice.
     let activity = begin_activity(guard, None).await;
+    let body = with_default_transcription_prompt(&state, &target, &headers, body).await;
     proxy(
         &state.0.client,
         &target,
@@ -1610,29 +1712,50 @@ mod tests {
         );
     }
 
+    const BOUNDARY: &str = "llmman-test-boundary";
+
+    /// `(name, file as (filename, content-type), bytes)`.
+    type Part<'a> = (&'a str, Option<(&'a str, &'a str)>, &'a [u8]);
+
     /// Builds a `multipart/form-data` body + matching `content-type`
-    /// header out of `fields` (name, value) pairs — a hand-rolled encoder
-    /// rather than a dependency, just enough to exercise
-    /// `multipart_text_field` against real (if minimal) multipart wire
-    /// format.
-    fn multipart_body(fields: &[(&str, &str)]) -> (Bytes, HeaderMap) {
-        let boundary = "llmman-test-boundary";
-        let mut body = String::new();
-        for (name, value) in fields {
-            body.push_str(&format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
-            ));
+    /// header out of `parts` — a hand-rolled encoder rather than a
+    /// dependency, just enough to exercise the parsers against real (if
+    /// minimal) multipart wire format.
+    fn multipart_upload(parts: &[Part]) -> (Bytes, HeaderMap) {
+        let mut body = Vec::new();
+        for (name, file, data) in parts {
+            body.extend_from_slice(
+                format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"")
+                    .as_bytes(),
+            );
+            if let Some((filename, content_type)) = file {
+                body.extend_from_slice(
+                    format!("; filename=\"{filename}\"\r\nContent-Type: {content_type}").as_bytes(),
+                );
+            }
+            body.extend_from_slice(b"\r\n\r\n");
+            body.extend_from_slice(data);
+            body.extend_from_slice(b"\r\n");
         }
-        body.push_str(&format!("--{boundary}--\r\n"));
+        body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
 
         let mut headers = HeaderMap::new();
         headers.insert(
             "content-type",
-            format!("multipart/form-data; boundary={boundary}")
+            format!("multipart/form-data; boundary={BOUNDARY}")
                 .parse()
                 .unwrap(),
         );
         (Bytes::from(body), headers)
+    }
+
+    /// [`multipart_upload`] of text fields only.
+    fn multipart_body(fields: &[(&str, &str)]) -> (Bytes, HeaderMap) {
+        let parts: Vec<_> = fields
+            .iter()
+            .map(|(name, value)| (*name, None, value.as_bytes()))
+            .collect();
+        multipart_upload(&parts)
     }
 
     #[tokio::test]
@@ -2311,5 +2434,129 @@ mod tests {
         assert_eq!(with(absent.clone()), absent);
         let not_a_string = serde_json::json!({ "model": "m", "reasoning_effort": 3 });
         assert_eq!(with(not_a_string.clone()), not_a_string);
+    }
+
+    /// Every part of `body`: `(name, filename, content-type, bytes)`.
+    async fn multipart_parts(
+        body: &Bytes,
+        headers: &HeaderMap,
+    ) -> Vec<(String, Option<String>, Option<String>, Vec<u8>)> {
+        let (_, mut multipart) = multipart_parser(body, headers).unwrap();
+        let mut parts = Vec::new();
+        while let Some(field) = multipart.next_field().await.unwrap() {
+            let name = field.name().unwrap().to_string();
+            let file_name = field.file_name().map(str::to_string);
+            let content_type = field.content_type().map(|m| m.to_string());
+            let data = field.bytes().await.unwrap().to_vec();
+            parts.push((name, file_name, content_type, data));
+        }
+        parts
+    }
+
+    /// Binary, and holding a CRLF and boundary-like text.
+    const AUDIO: &[u8] = b"RIFF\x00\xff\r\n--not-the-boundary\r\n\x00\x01WAVE";
+
+    #[tokio::test]
+    async fn a_prompt_is_added_and_every_other_part_carried_over() {
+        let wav = Some(("a b.wav", "audio/wav"));
+        let (body, headers) = multipart_upload(&[
+            ("model", None, b"voxtral"),
+            ("file", wav, AUDIO),
+            ("language", None, b"en"),
+        ]);
+        let out = multipart_with_prompt(&body, &headers, "Transcribe it.")
+            .await
+            .unwrap();
+        let owned = |s: &str| Some(s.to_string());
+        assert_eq!(
+            multipart_parts(&out, &headers).await,
+            vec![
+                ("model".to_string(), None, None, b"voxtral".to_vec()),
+                (
+                    "file".to_string(),
+                    owned("a b.wav"),
+                    owned("audio/wav"),
+                    AUDIO.to_vec()
+                ),
+                ("language".to_string(), None, None, b"en".to_vec()),
+                ("prompt".to_string(), None, None, b"Transcribe it.".to_vec()),
+            ]
+        );
+    }
+
+    /// A big part, with the start of the real delimiter inside it.
+    #[tokio::test]
+    async fn a_large_part_is_carried_over_byte_for_byte() {
+        let mut audio: Vec<u8> = (0..300_000u32).map(|i| (i * 31 % 251) as u8).collect();
+        let lookalike = format!("\r\n--{}\r\n", &BOUNDARY[..10]);
+        audio.splice(65_529..65_529 + lookalike.len(), lookalike.bytes());
+        let wav = Some(("long.wav", "audio/wav"));
+        let (body, headers) = multipart_upload(&[("file", wav, &audio), ("model", None, b"m")]);
+        let out = multipart_with_prompt(&body, &headers, "p").await.unwrap();
+        let parts = multipart_parts(&out, &headers).await;
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0].3 == audio, "the audio changed in transit");
+        assert_eq!(parts[1].3, b"m");
+        assert_eq!(parts[2].3, b"p");
+    }
+
+    #[tokio::test]
+    async fn an_existing_prompt_part_is_replaced_not_duplicated() {
+        for old in ["", "  \r\n ", "x"] {
+            let (body, headers) = multipart_upload(&[
+                ("prompt", None, old.as_bytes()),
+                ("file", Some(("a.wav", "audio/wav")), AUDIO),
+            ]);
+            let out = multipart_with_prompt(&body, &headers, "Transcribe it.")
+                .await
+                .unwrap();
+            let parts = multipart_parts(&out, &headers).await;
+            let names: Vec<_> = parts.iter().map(|p| p.0.as_str()).collect();
+            assert_eq!(names, ["file", "prompt"], "{old:?}");
+            assert_eq!(parts[0].3, AUDIO);
+            assert_eq!(parts[1].3, b"Transcribe it.");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_non_blank_prompt_counts_as_one() {
+        let cases = [
+            (Some("Transcribe in French."), true),
+            (Some(" \r\n"), false),
+            (Some(""), false),
+            (None, false),
+        ];
+        for (prompt, expected) in cases {
+            let mut fields = vec![("model", "m")];
+            fields.extend(prompt.map(|p| ("prompt", p)));
+            let (body, headers) = multipart_body(&fields);
+            assert_eq!(has_prompt(&body, &headers).await, expected, "{prompt:?}");
+        }
+        assert!(!has_prompt(&Bytes::from_static(b"{}"), &HeaderMap::new()).await);
+    }
+
+    #[tokio::test]
+    async fn what_is_not_a_plain_multipart_upload_is_left_alone() {
+        let (body, headers) = multipart_body(&[("model", "m")]);
+        assert!(multipart_with_prompt(&body, &HeaderMap::new(), "x")
+            .await
+            .is_none());
+
+        // A part header RFC 7578 has no use for is not ours to reshape.
+        let odd = format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"\r\nContent-Transfer-Encoding: base64\r\n\r\nAAAA\r\n--{BOUNDARY}--\r\n"
+        );
+        assert!(multipart_with_prompt(&Bytes::from(odd), &headers, "x")
+            .await
+            .is_none());
+    }
+
+    #[test]
+    fn lfm2_is_told_by_its_tool_list_tokens() {
+        assert!(is_lfm2_template(
+            "a <|tool_list_start|>[]<|tool_list_end|> b"
+        ));
+        assert!(!is_lfm2_template("<|tool_list_start|> never closed"));
+        assert!(!is_lfm2_template("{{ messages }}"));
     }
 }

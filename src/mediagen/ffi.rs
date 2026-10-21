@@ -168,6 +168,8 @@ pub struct LlamaContextParams {
     pub cb_eval_user_data: *mut c_void,
     pub type_k: u32,
     pub type_v: u32,
+    /// Added mid-struct at b11669.
+    pub moe_cache_size: usize,
     pub abort_callback: *const c_void,
     pub abort_callback_data: *mut c_void,
     pub embeddings: bool,

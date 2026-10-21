@@ -722,8 +722,8 @@ pub struct LlamaOptions<'a> {
     /// `layer` — see `cmd::serve::config::sched_spread_from_env`.
     pub split_mode: Option<&'a str>,
 
-    /// `--parallel <n>`. `None` falls back to llama-server's own single
-    /// slot — see `cmd::serve::config::num_parallel_from_env`.
+    /// `--parallel <n>`. `None` falls back to llama-server's own `auto`
+    /// (four slots) — see `cmd::serve::config::effective_num_parallel`.
     pub num_parallel: Option<u32>,
 
     /// `--embeddings`: an embedding model (see

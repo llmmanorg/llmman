@@ -120,7 +120,7 @@ Environment Variables:
       LLMMAN_MAX_QUEUE               Maximum number of queued requests (default 512)
       LLMMAN_METRICS                 Serve a Prometheus scrape endpoint at /metrics (default: off)
       LLMMAN_MODELS                  The path to the models directory
-      LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only)
+      LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only; default: llama-server's auto, one for embedding models)
       LLMMAN_MLX_LM_VERSION          Exact mlx-lm release to install on macOS (default: PyPI's current)
       LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on macOS, installed at startup; else vllm)
       LLMMAN_VLLM_ARGS               Extra whitespace-separated arguments appended to every `vllm serve`, before llmman's --port/--host (e.g. \"--dtype bfloat16 --tp 2\")
@@ -2231,8 +2231,9 @@ async fn resolve_target(
     // A `None` ctx_size has nothing to scale — an unscaled --parallel
     // would divide the trained context across slots. Decided once so the
     // retries below can't start multiplying by it partway through.
-    let num_parallel = effective_num_parallel(ctx_size, state.0.num_parallel);
-    if state.0.num_parallel.is_some() && num_parallel.is_none() {
+    let num_parallel =
+        effective_num_parallel(ctx_size, state.0.num_parallel, embedding_ctx.is_some());
+    if state.0.num_parallel.is_some() && num_parallel != state.0.num_parallel {
         eprintln!(
             "[llmman] {model_ref}: no explicit ctx-size to scale, ignoring LLMMAN_NUM_PARALLEL for this load"
         );
@@ -3071,7 +3072,8 @@ async fn chat_body(target: &Target, upstream: ChatUpstream) -> Result<ChatBody, 
             _ => (anyhow!("{message}"), remote_status(target, status)),
         };
         // A provider's own 4xx is the actionable answer (a bad key must
-        // reach the user as 401); any other local failure stays a 500.
+        // reach the user as 401), as is a local 400; any other local
+        // failure stays a 500.
         return Err(AppError(error, status));
     }
     Ok(upstream.body)
@@ -3119,12 +3121,15 @@ fn context_overflow_message(status: StatusCode, body: &str) -> Option<String> {
 /// The status llmman reports for an unsuccessful upstream response.
 ///
 /// A [`Target::Local`] backend failing is llmman's own problem, so it
-/// stays a 500 (bar a prompt past the context: see `chat_body`). A
-/// provider's 4xx is about the caller's request or credentials, so it is
-/// passed through; anything else from a provider is a bad gateway. A peer
-/// already applied this mapping, so its status stands.
+/// stays a 500 (bar a prompt past the context: see `chat_body`), except
+/// the 400 llama-server answers a request it will not serve with: that is
+/// the caller's to fix, and a 5xx would be retried. A provider's 4xx is
+/// about the caller's request or credentials, so it is passed through;
+/// anything else from a provider is a bad gateway. A peer already applied
+/// this mapping, so its status stands.
 fn remote_status(target: &Target, upstream: StatusCode) -> StatusCode {
     match target {
+        Target::Local(_) if upstream == StatusCode::BAD_REQUEST => upstream,
         Target::Local(_) => StatusCode::INTERNAL_SERVER_ERROR,
         Target::Peer(_) => upstream,
         Target::Remote(_) if upstream.is_client_error() => upstream,

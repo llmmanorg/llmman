@@ -473,7 +473,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      GOLANGCI_LINT_VERSION: v2.13.2
+      # v2.13.2 cannot read Go 1.27.3's export data and typechecks nothing.
+      GOLANGCI_LINT_VERSION: v2.15.0
       # Mirrors build.rs's podman tag list exactly.
       PODMAN_TAGS: podman,containers_image_openpgp,exclude_graphdriver_btrfs,exclude_graphdriver_devicemapper
     steps:

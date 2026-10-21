@@ -112,7 +112,8 @@ fn parse_sched_spread(value: Option<&str>) -> Option<&'static str> {
 /// models only — vllm/mlx_lm.server handle concurrency their own way,
 /// with no equivalent flag), from `LLMMAN_NUM_PARALLEL`. Mirrors
 /// Ollama's `OLLAMA_NUM_PARALLEL`; unset leaves llama-server's own
-/// default of 1 untouched.
+/// default untouched (`auto`: four slots sharing one KV cache), bar an
+/// embedding model's — see [`effective_num_parallel`].
 pub(super) fn num_parallel_from_env() -> Option<u32> {
     parse_num_parallel(std::env::var("LLMMAN_NUM_PARALLEL").ok().as_deref())
 }
@@ -276,11 +277,16 @@ pub(super) fn backend_ctx_size(ctx_size: Option<u32>, num_parallel: Option<u32>)
 /// against — see `backend_ctx_size`'s doc comment), in which case
 /// `None`: forwarding `--parallel` unscaled would silently divide that
 /// trained context across slots instead.
+///
+/// An `embedding` model with none left gets one slot, not llama-server's
+/// `auto` of four, which cost 3.5x the memory (llmmanorg/llmman#686). One
+/// divides nothing, so needs no `ctx_size`.
 pub(super) fn effective_num_parallel(
     ctx_size: Option<u32>,
     num_parallel: Option<u32>,
+    embedding: bool,
 ) -> Option<u32> {
-    ctx_size.and(num_parallel)
+    ctx_size.and(num_parallel).or(embedding.then_some(1))
 }
 
 /// Matches Ollama's own default for `OLLAMA_MAX_QUEUE`.
@@ -696,10 +702,22 @@ mod tests {
         // Nothing to scale --parallel against, so don't forward it at
         // all rather than let llama-server silently divide the model's
         // own trained context across slots.
-        assert_eq!(effective_num_parallel(None, Some(4)), None);
-        assert_eq!(effective_num_parallel(Some(4096), Some(4)), Some(4));
-        assert_eq!(effective_num_parallel(Some(4096), None), None);
-        assert_eq!(effective_num_parallel(None, None), None);
+        assert_eq!(effective_num_parallel(None, Some(4), false), None);
+        assert_eq!(effective_num_parallel(Some(4096), Some(4), false), Some(4));
+        assert_eq!(effective_num_parallel(Some(4096), None, false), None);
+        assert_eq!(effective_num_parallel(None, None, false), None);
+    }
+
+    /// An embedding model defaults to one slot (llmmanorg/llmman#686); an
+    /// explicit `LLMMAN_NUM_PARALLEL` wins, and other models are untouched.
+    #[test]
+    fn an_embedding_model_defaults_to_one_slot() {
+        assert_eq!(effective_num_parallel(Some(2048), None, true), Some(1));
+        assert_eq!(effective_num_parallel(None, None, true), Some(1));
+        assert_eq!(effective_num_parallel(Some(2048), Some(4), true), Some(4));
+        // Dropped for want of a ctx_size to scale: one slot, not `auto`.
+        assert_eq!(effective_num_parallel(None, Some(4), true), Some(1));
+        assert_eq!(effective_num_parallel(Some(2048), None, false), None);
     }
 
     /// The GGUF test (ollama's own): a `{arch}.pooling_type` key marks an

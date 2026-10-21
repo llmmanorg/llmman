@@ -157,7 +157,9 @@ llama-server's `timings` need no asking.
 
 `/v1/audio/transcriptions` is likewise a pass-through. The model needs
 audio support (an `--mmproj` projector, supplied when the model image
-carries one). Bodies up to 200 MiB are accepted.
+carries one). Bodies up to 200 MiB are accepted. A llama-server is given
+a transcription `prompt` if the request has none (not for LFM2 models,
+which have their own).
 
 `/v1/systemone` answers typed questions about a `state` with a decision model
 (a GGUF with a `<arch>.decision.type`, such as Clef), with a probability for
