@@ -8,14 +8,14 @@ import { KeyboardAvoidingView } from "react-native-keyboard-controller";
 
 import { Button, Field } from "@/components/ui";
 import { alert } from "@/lib/alert";
-import { dropConversation, getConversationState, renameConversation } from "@/lib/chatStore";
+import { dropConversation, renameConversation } from "@/lib/chatStore";
 import { deleteConversation } from "@/lib/conversations";
 import { readable, spacing, useTheme, useTextSizeKey } from "@/lib/theme";
 
 export default function ChatActions() {
   const c = useTheme();
   const sizeKey = useTextSizeKey();
-  const { id = "", title = "" } = useLocalSearchParams<{ id: string; title: string }>();
+  const { id = "", title = "", open } = useLocalSearchParams<{ id: string; title: string; open?: string }>();
   const [name, setName] = useState(title);
 
   const rename = async () => {
@@ -30,12 +30,11 @@ export default function ChatActions() {
         text: "Delete",
         style: "destructive",
         onPress: async () => {
-          const open = getConversationState(id).conv;
           dropConversation(id);
           await deleteConversation(id);
           router.back();
-          // Leaving a chat that no longer exists for a new one.
-          if (open) router.navigate("/");
+          // Leaving the chat on screen, which no longer exists, for a new one.
+          if (open === "1") router.navigate("/");
         },
       },
     ]);

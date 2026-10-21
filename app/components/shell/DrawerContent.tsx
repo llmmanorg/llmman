@@ -66,9 +66,13 @@ export function DrawerContent({ state, navigation }: DrawerContentComponentProps
     close();
   };
 
-  // Rename or delete: a small sheet, the same on every platform.
+  // Rename or delete: a small sheet, the same on every platform. It is told
+  // whether the chat is the one on screen, which a delete then leaves.
   const openActions = (chat: ConversationSummary) =>
-    router.push({ pathname: "/chat-actions", params: { id: chat.id, title: chat.title || "New chat" } });
+    router.push({
+      pathname: "/chat-actions",
+      params: { id: chat.id, title: chat.title || "New chat", ...(chat.id === current ? { open: "1" } : {}) },
+    });
 
   // The 15 s /api/version poll, as llmman's web UI drives its dot; the
   // model list's answer until the first poll is in.
