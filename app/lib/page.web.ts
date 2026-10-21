@@ -16,12 +16,16 @@ const KEY_STORAGE = keyStorageName(BASE);
 
 const listeners = new Set<(key: string) => void>();
 
+/** The key last set when storage would not take it (blocked, or full): it holds for this page. */
+let unsaved: { key: string | undefined } | null = null;
+
 /** The page's daemon as a server URL (origin and base path), when the page is on http(s). */
 export function pageUrl(): string | null {
   return BASE_URI ? pageServerUrl(BASE_URI) : null;
 }
 
 export function pageKey(): string | undefined {
+  if (unsaved) return unsaved.key;
   try {
     return readScopedKey(localStorage, BASE);
   } catch {
@@ -33,8 +37,10 @@ function storeKey(key: string | undefined): void {
   try {
     if (key) localStorage.setItem(KEY_STORAGE, key);
     else localStorage.removeItem(KEY_STORAGE);
+    unsaved = null;
   } catch {
-    // Storage blocked: the key lasts as long as the page.
+    // Storage blocked or full: the key lasts as long as the page.
+    unsaved = { key };
   }
 }
 
