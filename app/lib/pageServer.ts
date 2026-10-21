@@ -24,7 +24,8 @@ export async function adoptPageServer(list: ServerList): Promise<ServerList> {
   const name = known?.name ?? new URL(url).hostname;
   const next = await saveServer(list, { url, name, ...(key ? { key } : {}) }, { activate: true });
   // The built-in web UI's chats on this page were with this daemon: they
-  // come along, once (its database is left as it is).
-  void importWebUiChats(url).catch(() => {});
+  // come along, once (its database is left as it is). Before the app shows
+  // anything, so an old link to one of them (`/c/<id>`) finds it.
+  await importWebUiChats(url).catch(() => {});
   return next;
 }
