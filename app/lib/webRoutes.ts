@@ -34,7 +34,14 @@ export function documentTitle(pathname: string): string {
 }
 
 /** Screens shown as a sheet or popover over the page: Escape closes them. */
-const SHEETS = new Set(["/model-picker", "/chat-settings", "/chat-actions", "/provider-key", "/connect"]);
+const SHEETS = new Set([
+  "/model-picker",
+  "/chat-settings",
+  "/generate-settings",
+  "/chat-actions",
+  "/provider-key",
+  "/connect",
+]);
 
 export function isSheet(pathname: string): boolean {
   return SHEETS.has(pathname.replace(/\/+$/, ""));

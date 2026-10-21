@@ -29,6 +29,7 @@ test("the page is named per screen, as the web UI names its views", () => {
 test("Escape closes sheets only", () => {
   expect(isSheet("/model-picker")).toBe(true);
   expect(isSheet("/chat-settings")).toBe(true);
+  expect(isSheet("/generate-settings")).toBe(true);
   expect(isSheet("/")).toBe(false);
   expect(isSheet("/models")).toBe(false);
 });
