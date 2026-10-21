@@ -19,7 +19,10 @@ export default function Home() {
   const [id, setId] = useState<string | null>(null);
   const [round, setRound] = useState(0);
 
-  // A fresh conversation for the active server (it is only saved once it has a message).
+  // A fresh conversation for the active server (it is only saved once it has
+  // a message), and another when the server's chat defaults change, so the
+  // next chat starts with the ones just saved.
+  const defaults = JSON.stringify(active?.chatDefaults ?? {});
   useEffect(() => {
     if (!active) return;
     const conv = newConversation(active.url, selected, active.chatDefaults);
@@ -28,9 +31,9 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-    // Only a new server or a sent chat starts another; the model follows below.
+    // Only a new server, new defaults or a sent chat starts another; the model follows below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active?.url, round]);
+  }, [active?.url, defaults, round]);
 
   // Until it has a message, the new chat uses whichever model was chosen last.
   useEffect(() => {
