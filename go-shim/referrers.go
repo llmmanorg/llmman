@@ -20,8 +20,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -160,69 +158,42 @@ func setManifestSubject(layoutDir, ref string, subject ocispec.Descriptor) (ocis
 	return updated, nil
 }
 
-func repositoryForRef(ref string) (name.Repository, error) {
-	repo, err := name.NewRepository(repositoryOf(ref), name.WeakValidation)
-	if err != nil {
-		return name.Repository{}, fmt.Errorf("parse repository %q: %w", repositoryOf(ref), err)
+// splitRepository separates "registry/path" for a fully qualified reference.
+// llmman always resolves short names before they reach the shim, so a missing
+// registry is a caller error rather than an implied Docker Hub.
+func splitRepository(ref string) (registry, path string, err error) {
+	repo := repositoryOf(ref)
+	registry, path, ok := strings.Cut(repo, "/")
+	if !ok || registry == "" || path == "" || !strings.ContainsAny(registry, ".:") {
+		return "", "", fmt.Errorf("reference %q has no registry component", ref)
 	}
-	return repo, nil
+	return registry, path, nil
 }
 
-type registryReadClient struct {
-	client *http.Client
-	repo   name.Repository
-	scheme string
+func sameRegistryOrigin(origin, target *url.URL) bool {
+	return strings.EqualFold(origin.Scheme, target.Scheme) && strings.EqualFold(origin.Host, target.Host)
 }
 
-func registryClient(ctx context.Context, logical name.Repository) (registryReadClient, error) {
-	repo, allowHTTP, err := registryReadRepository(ctx, logical)
-	if err != nil {
-		return registryReadClient{}, fmt.Errorf("resolve registry read location: %w", err)
-	}
-	base, err := registryBaseTransport(ctx, logical, repo)
-	if err != nil {
-		return registryReadClient{}, fmt.Errorf("load registry transport: %w", err)
-	}
-	return registryClientWithTransport(ctx, repo, allowHTTP, base)
+// originTransport keeps a paginated read inside the registry it started from.
+// A Link header is registry-controlled, so a cross-origin next page would let
+// one registry put descriptors it does not host into another's referrers list.
+type originTransport struct {
+	origin *url.URL
+	next   http.RoundTripper
 }
 
-func registryClientWithTransport(ctx context.Context, repo name.Repository, allowHTTP bool, base http.RoundTripper) (registryReadClient, error) {
-	scheme := repo.Scheme()
-	// Podman allows HTTP only for insecure registries. Ping with that option
-	// selects the actual scheme before constructing the referrers URL and its
-	// same-origin guard. This also handles HTTPS test registries on loopback.
-	if allowHTTP || repo.Scheme() == "http" {
-		insecure, err := name.NewRepository(repo.Name(), name.WeakValidation, name.Insecure)
-		if err != nil {
-			return registryReadClient{}, err
-		}
-		challenge, err := transport.Ping(ctx, insecure.Registry, base)
-		if err != nil {
-			return registryReadClient{}, fmt.Errorf("probe registry scheme: %w", err)
-		}
-		if challenge.Insecure {
-			scheme = "http"
-			repo = insecure
-		} else {
-			scheme = "https"
-			repo, err = name.NewRepository(repo.Name(), name.WeakValidation)
-			if err != nil {
-				return registryReadClient{}, err
-			}
-		}
+func (t *originTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !sameRegistryOrigin(t.origin, req.URL) {
+		return nil, fmt.Errorf("referrers request leaves registry origin: %s", req.URL)
 	}
-	auth, err := registryAuthenticator(ctx, repo)
-	if err != nil {
-		return registryReadClient{}, fmt.Errorf("load registry credentials: %w", err)
-	}
-	scopes := []string{repo.Scope(transport.PullScope)}
-	origin := &url.URL{Scheme: scheme, Host: repo.RegistryStr()}
-	roundTripper, err := transport.NewWithContext(ctx, repo.Registry, auth, base, scopes)
-	if err != nil {
-		return registryReadClient{}, fmt.Errorf("configure registry transport: %w", err)
-	}
-	client := &http.Client{
-		Transport: &registryOriginTransport{origin: origin, next: roundTripper},
+	return t.next.RoundTrip(req)
+}
+
+// originBoundClient refuses both a next-page link and a redirect that leave
+// the registry the read started from.
+func originBoundClient(origin *url.URL, rt http.RoundTripper) *http.Client {
+	return &http.Client{
+		Transport: &originTransport{origin: origin, next: rt},
 		Timeout:   120 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 || !sameRegistryOrigin(origin, req.URL) {
@@ -231,56 +202,6 @@ func registryClientWithTransport(ctx context.Context, repo name.Repository, allo
 			return nil
 		},
 	}
-	return registryReadClient{client: client, repo: repo, scheme: scheme}, nil
-}
-
-// Restrict the referrers client, not the transport used inside bearer-token
-// setup: a registry may legitimately delegate authentication to another host.
-type registryOriginTransport struct {
-	origin *url.URL
-	next   http.RoundTripper
-}
-
-func (t *registryOriginTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if !sameRegistryOrigin(t.origin, req.URL) {
-		return nil, fmt.Errorf("referrers request leaves registry origin: %s", req.URL)
-	}
-	return t.next.RoundTrip(req)
-}
-
-// Credential helpers and transport setup may block before the first HTTP
-// request. Bound that phase as well as the requests made by the client.
-func registryClientWithin(ctx context.Context, create func() (registryReadClient, error)) (registryReadClient, error) {
-	type result struct {
-		client registryReadClient
-		err    error
-	}
-	ready := make(chan result)
-	go func() {
-		client, err := create()
-		select {
-		case ready <- result{client, err}:
-		case <-ctx.Done():
-			if client.client != nil {
-				client.client.CloseIdleConnections()
-			}
-		}
-	}()
-	select {
-	case got := <-ready:
-		return got.client, got.err
-	case <-ctx.Done():
-		return registryReadClient{}, ctx.Err()
-	}
-}
-
-func sameRegistryOrigin(origin, target *url.URL) bool {
-	return target.User == nil && strings.EqualFold(target.Scheme, origin.Scheme) && strings.EqualFold(target.Host, origin.Host)
-}
-
-func registryURLWithScheme(repo name.Repository, scheme string, elems ...string) string {
-	path := "/v2/" + repo.RepositoryStr() + "/" + strings.Join(elems, "/")
-	return (&url.URL{Scheme: scheme, Host: repo.RegistryStr(), Path: path}).String()
 }
 
 func getReferrersIndex(ctx context.Context, client *http.Client, endpoint string) (*ocispec.Index, bool, error) {
@@ -313,7 +234,7 @@ func getReferrersIndex(ctx context.Context, client *http.Client, endpoint string
 			resp.Body.Close()
 			return nil, false, nil
 		}
-		if err := transport.CheckError(resp, http.StatusOK); err != nil {
+		if err := checkRegistryStatus(resp); err != nil {
 			resp.Body.Close()
 			return nil, false, err
 		}
@@ -355,6 +276,21 @@ func getReferrersIndex(ctx context.Context, client *http.Client, endpoint string
 		endpoint = next
 	}
 	return combined, true, nil
+}
+
+// checkRegistryStatus turns a non-200 referrers response into an error that
+// carries a bounded excerpt of the registry's body, so a 401 or a 429 is
+// distinguishable without streaming whatever the registry chose to send.
+func checkRegistryStatus(resp *http.Response) error {
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	detail := strings.TrimSpace(string(body))
+	if detail == "" {
+		return fmt.Errorf("registry responded %s", resp.Status)
+	}
+	return fmt.Errorf("registry responded %s: %s", resp.Status, detail)
 }
 
 func parseReferrersIndex(raw []byte) (*ocispec.Index, error) {
@@ -471,22 +407,22 @@ func probeNativeReferrers(ctx context.Context, ref string, subject digest.Digest
 func readNativeReferrers(ctx context.Context, ref string, subject digest.Digest, probeOnly bool) (ocispec.Index, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	repo, err := repositoryForRef(ref)
+	rt, root, supported, err := nativeReferrersTransport(ctx, ref)
+	if err != nil || !supported {
+		return ocispec.Index{}, false, err
+	}
+	_, path, err := splitRepository(ref)
 	if err != nil {
 		return ocispec.Index{}, false, err
 	}
-	client, err := registryClientWithin(ctx, func() (registryReadClient, error) {
-		return registryClient(ctx, repo)
-	})
-	if err != nil {
-		return ocispec.Index{}, false, err
-	}
-	endpoint := registryURLWithScheme(client.repo, client.scheme, "referrers", subject.String())
+	client := originBoundClient(&url.URL{Scheme: root.Scheme, Host: root.Host}, rt)
+	defer client.CloseIdleConnections()
+	endpoint := root.JoinPath(path, "referrers", subject.String()).String()
 	if probeOnly {
-		found, err := probeReferrersEndpoint(ctx, client.client, endpoint)
+		found, err := probeReferrersEndpoint(ctx, client, endpoint)
 		return ocispec.Index{}, found, err
 	}
-	index, found, err := getReferrersIndex(ctx, client.client, endpoint)
+	index, found, err := getReferrersIndex(ctx, client, endpoint)
 	if err != nil {
 		return ocispec.Index{}, false, fmt.Errorf("list referrers: %w", err)
 	}
@@ -512,18 +448,14 @@ func probeReferrersEndpoint(ctx context.Context, client *http.Client, endpoint s
 	if resp.StatusCode == http.StatusNotFound {
 		return false, nil
 	}
-	if err := transport.CheckError(resp, http.StatusOK); err != nil {
+	if err := checkRegistryStatus(resp); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
 func fetchFallbackReferrersIndex(ctx context.Context, ref string, subject digest.Digest) (ocispec.Index, error) {
-	repo, err := repositoryForRef(ref)
-	if err != nil {
-		return ocispec.Index{}, err
-	}
-	fallbackRef := repo.String() + ":" + fallbackTag(subject)
+	fallbackRef := repositoryOf(ref) + ":" + fallbackTag(subject)
 	raw, err := fetchManifestRaw(ctx, fallbackRef)
 	if err != nil && isNotFoundError(err) {
 		empty := ocispec.Index{}
@@ -606,11 +538,7 @@ func appendFallbackReferrer(ctx context.Context, ref string, subject digest.Dige
 	if err := ensureLayout(staging); err != nil {
 		return false, err
 	}
-	repo, err := repositoryForRef(ref)
-	if err != nil {
-		return false, err
-	}
-	fallbackRef := repo.String() + ":" + fallbackTag(subject)
+	fallbackRef := repositoryOf(ref) + ":" + fallbackTag(subject)
 	if err := pushStagedManifest(ctx, staging, fallbackRef, ocispec.MediaTypeImageIndex, raw, pushIndexToRegistry); err != nil {
 		return false, err
 	}

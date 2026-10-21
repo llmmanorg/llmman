@@ -8,8 +8,7 @@ require (
 	github.com/containerd/errdefs v1.0.0
 	github.com/docker/cli v29.4.1+incompatible
 
-	// Common OCI types and authenticated distribution transport
-	github.com/google/go-containerregistry v0.21.5
+	// Common OCI types
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 
@@ -30,7 +29,6 @@ require (
 	// go.podman.io/* vanity-imports to)
 	go.podman.io/common v0.67.2-0.20260430110239-06cbc5da36f1
 	go.podman.io/image/v5 v5.39.3-0.20260430110239-06cbc5da36f1
-	go.podman.io/storage v1.62.1-0.20260427104901-081c2519fc6a
 
 	// Parallel layer downloads
 	golang.org/x/sync v0.22.0
@@ -39,8 +37,17 @@ require (
 	golang.org/x/sys v0.47.0
 )
 
-// Structured logging shared by the registry backends.
-require github.com/sirupsen/logrus v1.9.4
+require (
+	// Test-only: pkg/registry is an in-memory OCI registry, used by
+	// sigstore_registry_test.go to exercise signing and verification
+	// over the real distribution protocol instead of against mocks.
+	// (That test earned its keep immediately, catching both a
+	// signature-dedup bug and a pullToLayout hang on manifests that name
+	// one blob twice.) Go has no test-only require, so it lands here
+	// rather than under `// indirect`, where it already was.
+	github.com/google/go-containerregistry v0.21.5
+	github.com/sirupsen/logrus v1.9.4
+)
 
 // Podman backend only: the registry error codes go.podman.io/image
 // wraps, so isBackendNotFound can tell "manifest unknown" from "I could
@@ -87,7 +94,6 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.42 // indirect
 	github.com/miekg/pkcs11 v1.1.1 // indirect
 	github.com/mistifyio/go-zfs/v4 v4.0.0 // indirect
-	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/locker v1.0.1 // indirect
 	github.com/moby/moby/api v1.54.2 // indirect
@@ -117,6 +123,7 @@ require (
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
+	go.podman.io/storage v1.62.1-0.20260427104901-081c2519fc6a // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/term v0.45.0 // indirect

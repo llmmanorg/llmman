@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -30,8 +31,6 @@ import (
 	dockercliconfig "github.com/docker/cli/cli/config"
 	"github.com/docker/cli/cli/config/credentials"
 	clitypes "github.com/docker/cli/cli/config/types"
-	"github.com/google/go-containerregistry/pkg/authn"
-	"github.com/google/go-containerregistry/pkg/name"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
@@ -79,39 +78,77 @@ func dockerCredentials(host string) (string, string, error) {
 	return "", "", nil // not an error — just not found under any key
 }
 
-// registryAuthenticator gives the shared referrers client the same Docker
-// credential lookup (including Docker Hub aliases and helper timeouts) as the
-// containerd resolver used for ordinary pulls and pushes.
-func registryAuthenticator(_ context.Context, repo name.Repository) (authn.Authenticator, error) {
-	username, secret, err := dockerCredentials(repo.RegistryStr())
+// nativeReferrersTransport hands the referrers GET the same transport and
+// authorizer containerd already uses for pulls and pushes, so TLS, proxies,
+// credential helpers and registry hosts cannot diverge from the backend.
+// Mirrors are skipped: a mirror is not authoritative for referrers.
+func nativeReferrersTransport(ctx context.Context, ref string) (http.RoundTripper, *url.URL, bool, error) {
+	registry, _, err := splitRepository(ref)
 	if err != nil {
+		return nil, nil, false, err
+	}
+	hosts, err := dockerconfig.ConfigureHosts(withoutMirrors(ctx), dockerconfig.HostOptions{
+		Credentials: dockerCredentials,
+	})(registry)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("load registry host configuration: %w", err)
+	}
+	for _, host := range hosts {
+		if host.Capabilities&docker.HostCapabilityResolve == 0 {
+			continue
+		}
+		base := http.DefaultTransport
+		if host.Client != nil && host.Client.Transport != nil {
+			base = host.Client.Transport
+		}
+		path := host.Path
+		path = strings.TrimSuffix(path, "/")
+		if path == "" {
+			path = "/v2"
+		}
+		root := &url.URL{Scheme: host.Scheme, Host: host.Host, Path: path}
+		return &authorizedTransport{base: base, auth: host.Authorizer, header: host.Header}, root, true, nil
+	}
+	return nil, nil, false, fmt.Errorf("no registry host configured for %s", registry)
+}
+
+// authorizedTransport runs containerd's Authorizer over each request: sign,
+// send, and on a 401 feed the challenge back and retry once. That is the same
+// exchange remotes/docker performs for a pull.
+type authorizedTransport struct {
+	base   http.RoundTripper
+	auth   docker.Authorizer
+	header http.Header
+}
+
+func (t *authorizedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	for key, values := range t.header {
+		if req.Header.Get(key) == "" {
+			for _, value := range values {
+				req.Header.Add(key, value)
+			}
+		}
+	}
+	if t.auth == nil {
+		return t.base.RoundTrip(req)
+	}
+	first, err := t.roundTripOnce(req)
+	if err != nil || first.StatusCode != http.StatusUnauthorized {
+		return first, err
+	}
+	if err := t.auth.AddResponses(req.Context(), []*http.Response{first}); err != nil {
+		return first, nil // not a challenge this authorizer understands
+	}
+	first.Body.Close()
+	return t.roundTripOnce(req)
+}
+
+func (t *authorizedTransport) roundTripOnce(req *http.Request) (*http.Response, error) {
+	signed := req.Clone(req.Context())
+	if err := t.auth.Authorize(signed.Context(), signed); err != nil {
 		return nil, err
 	}
-	if username == "" && secret == "" {
-		return authn.Anonymous, nil
-	}
-	if username == "" {
-		return authn.FromConfig(authn.AuthConfig{IdentityToken: secret}), nil
-	}
-	return authn.FromConfig(authn.AuthConfig{Username: username, Password: secret}), nil
-}
-
-func registryReadRepository(_ context.Context, repo name.Repository) (name.Repository, bool, error) {
-	return repo, false, nil
-}
-
-func registryBaseTransport(ctx context.Context, _ name.Repository, repo name.Repository) (http.RoundTripper, error) {
-	hosts, err := dockerconfig.ConfigureHosts(ctx, dockerconfig.HostOptions{Credentials: dockerCredentials})(repo.RegistryStr())
-	if err != nil {
-		return nil, fmt.Errorf("load registry host configuration: %w", err)
-	}
-	if len(hosts) == 0 {
-		return nil, fmt.Errorf("no registry hosts configured for %s", repo.RegistryStr())
-	}
-	if hosts[0].Client != nil && hosts[0].Client.Transport != nil {
-		return hosts[0].Client.Transport, nil
-	}
-	return http.DefaultTransport, nil
+	return t.base.RoundTrip(signed)
 }
 
 // getCredentialsWithTimeout runs store.Get(lookup) with a hard deadline,

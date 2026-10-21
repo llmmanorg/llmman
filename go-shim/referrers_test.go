@@ -10,9 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
-	"github.com/google/go-containerregistry/pkg/name"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -151,7 +149,10 @@ func TestNextLinkTrimsParameters(t *testing.T) {
 	}
 }
 
-func TestRegistryClientRejectsCrossOriginRedirect(t *testing.T) {
+// The scheme probe and the bounded client setup moved into each backend's own
+// transport (containerd's RegistryHost for Docker), so what referrers.go still
+// owns is the origin guard: these cover it on both a redirect and a next link.
+func TestOriginBoundClientRejectsCrossOriginRedirect(t *testing.T) {
 	var crossOriginRequests atomic.Int32
 	other := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		crossOriginRequests.Add(1)
@@ -159,10 +160,6 @@ func TestRegistryClientRejectsCrossOriginRedirect(t *testing.T) {
 	defer other.Close()
 
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v2/" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
 		http.Redirect(w, r, other.URL+"/next", http.StatusFound)
 	}))
 	defer origin.Close()
@@ -170,60 +167,11 @@ func TestRegistryClientRejectsCrossOriginRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	repo, err := repositoryForRef(u.Host + "/org/model:v1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	client, err := registryClient(context.Background(), repo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _, err = getReferrersIndex(context.Background(), client.client, origin.URL+"/referrers")
+
+	client := originBoundClient(&url.URL{Scheme: u.Scheme, Host: u.Host}, origin.Client().Transport)
+	_, _, err = getReferrersIndex(context.Background(), client, origin.URL+"/referrers")
 	if err == nil || crossOriginRequests.Load() != 0 {
 		t.Fatalf("redirect error = %v, cross-origin requests = %d", err, crossOriginRequests.Load())
-	}
-}
-
-func TestRegistryClientUsesHTTPSWhenLoopbackSupportsIt(t *testing.T) {
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v2/" {
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-	u, err := url.Parse(server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	repo, err := name.NewRepository(u.Host+"/org/model", name.WeakValidation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client, err := registryClientWithTransport(context.Background(), repo, false, server.Client().Transport)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if client.scheme != "https" {
-		t.Fatalf("selected scheme = %s, want https", client.scheme)
-	}
-	endpoint := registryURLWithScheme(client.repo, client.scheme, "referrers", digest.FromString("subject").String())
-	if found, err := probeReferrersEndpoint(context.Background(), client.client, endpoint); err != nil || found {
-		t.Fatalf("HTTPS referrers probe = %t, %v; want 404", found, err)
-	}
-}
-
-func TestRegistryClientSetupRespectsDeadline(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-	blocked := make(chan struct{})
-	defer close(blocked)
-	_, err := registryClientWithin(ctx, func() (registryReadClient, error) {
-		<-blocked
-		return registryReadClient{}, nil
-	})
-	if err != context.DeadlineExceeded {
-		t.Fatalf("setup error = %v, want deadline exceeded", err)
 	}
 }
 
@@ -245,7 +193,12 @@ func TestGetReferrersIndexRejectsCrossOriginNextLink(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	_, _, err := getReferrersIndex(context.Background(), origin.Client(), origin.URL+"/referrers")
+	u, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := originBoundClient(&url.URL{Scheme: u.Scheme, Host: u.Host}, origin.Client().Transport)
+	_, _, err = getReferrersIndex(context.Background(), client, origin.URL+"/referrers")
 	if err == nil || !strings.Contains(err.Error(), "leaves registry origin") {
 		t.Fatalf("getReferrersIndex error = %v, want cross-origin rejection", err)
 	}

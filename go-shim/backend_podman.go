@@ -10,7 +10,6 @@ import "C"
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,14 +18,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"time"
 
 	"github.com/docker/distribution/registry/api/errcode"
 	v2 "github.com/docker/distribution/registry/api/v2"
-	"github.com/google/go-containerregistry/pkg/authn"
-	"github.com/google/go-containerregistry/pkg/name"
 
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
@@ -38,13 +34,9 @@ import (
 	"go.podman.io/image/v5/docker/reference"
 	"go.podman.io/image/v5/manifest"
 	dockerconfig "go.podman.io/image/v5/pkg/docker/config"
-	"go.podman.io/image/v5/pkg/sysregistriesv2"
-	"go.podman.io/image/v5/pkg/tlsclientconfig"
 	"go.podman.io/image/v5/signature"
 	"go.podman.io/image/v5/transports/alltransports"
 	"go.podman.io/image/v5/types"
-	"go.podman.io/storage/pkg/configfile"
-	"go.podman.io/storage/pkg/unshare"
 )
 
 // scratchTag is the tag used inside the throwaway, single-manifest OCI
@@ -67,135 +59,17 @@ func insecurePolicy() (*signature.PolicyContext, error) {
 	return signature.NewPolicyContext(policy)
 }
 
-// registryAuthenticator reads the same containers auth files as podman's
-// ordinary registry transport, including repository-scoped credentials.
-func registryAuthenticator(ctx context.Context, repo name.Repository) (authn.Authenticator, error) {
-	creds, err := dockerconfig.GetCredentials(registrySourceCtx(ctx), repo.String())
-	if err != nil {
-		return nil, err
-	}
-	if creds.Username == "" && creds.Password == "" && creds.IdentityToken == "" {
-		return authn.Anonymous, nil
-	}
-	return authn.FromConfig(authn.AuthConfig{
-		Username:      creds.Username,
-		Password:      creds.Password,
-		IdentityToken: creds.IdentityToken,
-	}), nil
-}
-
-func registryReadRepository(ctx context.Context, repo name.Repository) (name.Repository, bool, error) {
-	sys := registrySourceCtx(ctx)
-	reg, err := sysregistriesv2.FindRegistry(sys, repo.String())
-	if err != nil {
-		return name.Repository{}, false, err
-	}
-	if reg != nil && reg.Blocked {
-		return name.Repository{}, false, fmt.Errorf("registry %s is blocked", reg.Prefix)
-	}
-	allowHTTP := sys.DockerInsecureSkipTLSVerify == types.OptionalBoolTrue
-	if reg == nil {
-		return repo, allowHTTP, nil
-	}
-	named, err := reference.ParseNamed(repo.String())
-	if err != nil {
-		return name.Repository{}, false, err
-	}
-	sources, err := reg.PullSourcesFromReference(named)
-	if err != nil {
-		return name.Repository{}, false, err
-	}
-	if len(sources) == 0 {
-		return name.Repository{}, false, fmt.Errorf("no registry source for %s", repo)
-	}
-	primary := sources[len(sources)-1] // mirrors are not authoritative for referrers
-	resolved, err := name.NewRepository(reference.TrimNamed(primary.Reference).Name(), name.WeakValidation)
-	if err != nil {
-		return name.Repository{}, false, err
-	}
-	if sys.DockerInsecureSkipTLSVerify == types.OptionalBoolUndefined {
-		allowHTTP = primary.Endpoint.Insecure
-	}
-	return resolved, allowHTTP, nil
-}
-
-func registryBaseTransport(ctx context.Context, logical, resolved name.Repository) (http.RoundTripper, error) {
-	return podmanRegistryTransport(registrySourceCtx(ctx), logical, resolved)
-}
-
-func podmanRegistryTransport(sys *types.SystemContext, logical, resolved name.Repository) (http.RoundTripper, error) {
-	reg, err := sysregistriesv2.FindRegistry(sys, logical.String())
-	if err != nil {
-		return nil, err
-	}
-	if reg != nil && reg.Blocked {
-		return nil, fmt.Errorf("registry %s is blocked", reg.Prefix)
-	}
-	base := tlsclientconfig.NewTransport()
-	tlsConfig := &tls.Config{}
-	if sys.BaseTLSConfig != nil {
-		tlsConfig = sys.BaseTLSConfig.Clone()
-	}
-	certDir, err := podmanCertDir(sys, resolved.RegistryStr())
-	if err != nil {
-		return nil, err
-	}
-	if certDir != "" {
-		if err := tlsclientconfig.SetupCertificates(certDir, tlsConfig); err != nil {
-			return nil, err
-		}
-	}
-	tlsConfig.InsecureSkipVerify = reg != nil && reg.Insecure
-	if sys.DockerInsecureSkipTLSVerify != types.OptionalBoolUndefined {
-		tlsConfig.InsecureSkipVerify = sys.DockerInsecureSkipTLSVerify == types.OptionalBoolTrue
-	}
-	base.TLSClientConfig = tlsConfig
-	if sys.DockerProxyURL != nil {
-		base.Proxy = http.ProxyURL(sys.DockerProxyURL)
-	}
-	if sys.DockerProxy != nil {
-		base.Proxy = func(req *http.Request) (*url.URL, error) { return sys.DockerProxy(req.URL) }
-	}
-	return base, nil
-}
-
-// Match Podman's explicit overrides, then its implicit containers certs.d
-// search order (including the Docker compatibility directory).
-func podmanCertDir(sys *types.SystemContext, host string) (string, error) {
-	if sys.DockerCertPath != "" {
-		return sys.DockerCertPath, nil
-	}
-	if sys.DockerPerHostCertDirPath != "" {
-		return filepath.Join(sys.DockerPerHostCertDirPath, host), nil
-	}
-	paths, err := configfile.GetSearchPaths(&configfile.File{
-		Name: "certs", Extension: "d", DoNotUseExtensionForConfigName: true,
-		UserId: unshare.GetRootlessUID(), RootForImplicitAbsolutePaths: sys.RootForImplicitAbsolutePaths,
-	})
-	if err != nil {
-		return "", err
-	}
-	candidates := append([]string{}, paths.DropInDirectories...)
-	etcDir := "/etc"
-	if runtime.GOOS == "freebsd" {
-		etcDir = "/usr/local/etc"
-	}
-	if sys.RootForImplicitAbsolutePaths != "" {
-		etcDir = filepath.Join(sys.RootForImplicitAbsolutePaths, etcDir)
-	}
-	candidates = append(candidates, filepath.Join(etcDir, "docker/certs.d"))
-	for _, base := range candidates {
-		candidate := filepath.Join(base, host)
-		_, err := os.Stat(candidate)
-		if err == nil {
-			return candidate, nil
-		}
-		if os.IsNotExist(err) || os.IsPermission(err) {
-			continue
-		}
-		return "", err
-	}
-	return "", nil
+// nativeReferrersTransport reports that this backend cannot query the OCI
+// referrers endpoint. go.podman.io/image keeps its request machinery
+// (dockerClient, makeRequest) unexported; its public surface is CheckAuth,
+// SearchRegistry, GetRepositoryTags, GetDigest and the ImageSource interface,
+// none of which can GET /v2/<name>/referrers/<digest>. Reaching that endpoint
+// would mean rebuilding podman's auth, certs.d and registries.conf handling
+// alongside the backend, which is exactly the divergence this indirection
+// exists to prevent. Referrers therefore come from the fallback tag, which
+// fetchManifestRaw and pushToRegistry already serve.
+func nativeReferrersTransport(context.Context, string) (http.RoundTripper, *url.URL, bool, error) {
+	return nil, nil, false, nil
 }
 
 // ---------------------------------------------------------------------------

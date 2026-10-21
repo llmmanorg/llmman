@@ -4,157 +4,38 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 
-	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"go.podman.io/image/v5/pkg/sysregistriesv2"
 	"go.podman.io/image/v5/transports/alltransports"
 	"go.podman.io/image/v5/types"
 )
 
-func TestPodmanReferrersUsePrimaryRemappedRepository(t *testing.T) {
-	seenPaths := make(chan string, 1)
-	const username, password = "physical-user", "physical-secret"
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v2/" {
-			return
-		}
-		if user, pass, ok := r.BasicAuth(); !ok || user != username || pass != password {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		seenPaths <- r.URL.Path
-		_, _ = w.Write([]byte(`{"schemaVersion":2,"manifests":[]}`))
-	}))
-	defer srv.Close()
-	u, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conf := filepath.Join(t.TempDir(), "registries.conf")
-	contents := `[[registry]]
-prefix = "logical.example/org"
-location = "` + u.Host + `/remapped"
-insecure = true
-`
-	if err := os.WriteFile(conf, []byte(contents), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("CONTAINERS_REGISTRIES_CONF", conf)
-	authDir := t.TempDir()
-	authFile := filepath.Join(authDir, "config.json")
-	auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
-	credentials := `{"auths":{"` + u.Host + `":{"auth":"` + auth + `"}}}`
-	if err := os.WriteFile(authFile, []byte(credentials), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("DOCKER_CONFIG", authDir)
-	sysregistriesv2.InvalidateCache() // Podman caches config independently of env changes.
-	t.Cleanup(sysregistriesv2.InvalidateCache)
-	logical, err := name.NewRepository("logical.example/org/model", name.WeakValidation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, allowHTTP, err := registryReadRepository(context.Background(), logical)
-	if err != nil || resolved.String() != u.Host+"/remapped/model" || !allowHTTP {
-		t.Fatalf("resolved = %s, allowHTTP = %t, %v", resolved, allowHTTP, err)
-	}
-	client, err := registryClient(context.Background(), logical)
-	if err != nil {
-		t.Fatal(err)
-	}
-	endpoint := registryURLWithScheme(client.repo, client.scheme, "referrers", digest.FromString("subject").String())
-	if _, found, err := getReferrersIndex(context.Background(), client.client, endpoint); err != nil || !found {
-		t.Fatalf("remapped referrers read = %t, %v", found, err)
-	}
-	seenPath := <-seenPaths
-	if !strings.HasPrefix(seenPath, "/v2/remapped/model/referrers/") {
-		t.Fatalf("referrers request path = %q, want remapped repository", seenPath)
+// Podman has no native referrers path: go.podman.io/image exposes no
+// authenticated GET, so the backend says so and every read falls through to
+// the fallback tag, which fetchManifestRaw and pushToRegistry already serve.
+func TestPodmanReportsNoNativeReferrersTransport(t *testing.T) {
+	rt, root, supported, err := nativeReferrersTransport(context.Background(), "example.test/org/model:v1")
+	if err != nil || supported || rt != nil || root != nil {
+		t.Fatalf("nativeReferrersTransport = (%v, %v, %t, %v), want unsupported", rt, root, supported, err)
 	}
 }
 
-func TestPodmanReferrersLoadImplicitPerHostCA(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
-	defer srv.Close()
-	u, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	root := t.TempDir()
-	certDir := filepath.Join(root, "etc/containers/certs.d", u.Host)
-	if err := os.MkdirAll(certDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
-	if err := os.WriteFile(filepath.Join(certDir, "ca.crt"), ca, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	repo, err := name.NewRepository(u.Host+"/org/model", name.WeakValidation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sys := &types.SystemContext{RootForImplicitAbsolutePaths: root}
-	transport, err := podmanRegistryTransport(sys, repo, repo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := &http.Client{Transport: transport}
-	resp, err := client.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("TLS request with implicit CA: %v", err)
-	}
-	resp.Body.Close()
-}
-
-func TestPodmanReferrersAllowHTTPOnlyWhenInsecure(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v2/" {
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer srv.Close()
-	u, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	base := http.DefaultTransport.(*http.Transport).Clone()
-	base.Proxy = nil
-	base.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, network, u.Host)
-	}
-	repo, err := name.NewRepository("registry.example/org/model", name.WeakValidation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := registryClientWithTransport(context.Background(), repo, false, base); err == nil {
-		t.Fatal("HTTP-only registry accepted without insecure configuration")
-	}
-	client, err := registryClientWithTransport(context.Background(), repo, true, base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if client.repo.Scheme() != "http" {
-		t.Fatalf("selected scheme = %s, want http", client.repo.Scheme())
-	}
-	if found, err := probeReferrersEndpoint(context.Background(), client.client, registryURLWithScheme(client.repo, client.scheme, "referrers", digest.FromString("subject").String())); err != nil || found {
-		t.Fatalf("HTTP referrers probe = %t, %v; want fallback 404", found, err)
+func TestPodmanNativeReadFallsThroughToTag(t *testing.T) {
+	index, native, err := readNativeReferrers(context.Background(), "example.test/org/model:v1",
+		digest.FromString("subject"), false)
+	if err != nil || native || len(index.Manifests) != 0 {
+		t.Fatalf("readNativeReferrers = (%+v, %t, %v), want an unused native path", index, native, err)
 	}
 }
 
