@@ -120,7 +120,8 @@ way:
 `{"enabled": true}` or `{"enabled": false, "reason": "…"}`; only the
 upgrade itself is refused with `403`. That is how the UI knows before it
 tries. The page is also served with `frame-ancestors 'none'`, so another
-site cannot frame it and reach the shell through the trusted origin.
+site cannot frame it and reach the shell through the trusted origin, and
+`base-uri 'self'`, so its base cannot move to another site.
 
 ### Protocol
 

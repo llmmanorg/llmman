@@ -23,7 +23,7 @@ import java.security.SecureRandom
  *
  * Loopback is shared by every app on the phone, and the daemon offers a
  * shell, so it runs with an API key ([apiKey]) that only this app knows:
- * the WebView is handed it at document start, `llmman` in the Shell tab
+ * the WebView is handed it at document start, `llmman` in the Shell
  * gets it as `LLMMAN_API_KEY`, and anything else on 127.0.0.1 gets a 401.
  */
 class Daemon(private val context: Context) {
@@ -57,13 +57,13 @@ class Daemon(private val context: Context) {
             put("LLMMAN_RUNTIME", "path")
             put("PATH", listOf(binDir.path, "/system/bin", "/system/xbin").joinToString(":"))
             put("LD_LIBRARY_PATH", nativeDir.path)
-            // The web UI's Shell tab; there is no /bin/sh on Android.
+            // The web UI's Shell; there is no /bin/sh on Android.
             put("SHELL", "/system/bin/sh")
             put("LLMMAN_SHELL", "/system/bin/sh")
             put("LLMMAN_HOST", "127.0.0.1:$PORT")
             val key = apiKey(context)
             put("LLMMAN_API_KEYS", key)
-            // The CLI's own key, so `llmman ps` works in the Shell tab.
+            // The CLI's own key, so `llmman ps` works in the Shell.
             put("LLMMAN_API_KEY", key)
             // Bionic's getpwuid() gives app UIDs a placeholder; tools that
             // ask for a user name (Go's os/user, git) prefer these.
@@ -119,7 +119,7 @@ class Daemon(private val context: Context) {
             if (!dir.isDirectory && !dir.mkdirs()) throw IOException("mkdir ${dir.path}")
         }
         symlink(File(nativeDir, "libllama-server.so"), File(binDir, "llama-server"))
-        // For the web UI's Shell tab: `llmman ps`, `llmman list`, …
+        // For the web UI's Shell: `llmman ps`, `llmman list`, …
         symlink(File(nativeDir, "libllmman.so"), File(binDir, "llmman"))
     }
 

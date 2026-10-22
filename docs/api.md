@@ -10,7 +10,7 @@ Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`), `/v1/systemone` (llama-server's own API for decision models) |
 | Anthropic | `/v1/messages` |
 | llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/providers/{id}/key`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/shell` |
-| Web UI | `/` and `/ui/*` — see [webui.md](webui.md) |
+| Web UI | `/`, `/ui/*` and, for a browser, any other path outside the prefixes above (`/models`, `/c/<id>`) — see [webui.md](webui.md) |
 | llama.cpp | `/props` |
 | Prometheus | `/metrics` (off unless `LLMMAN_METRICS` is `1`, `true`, `yes` or `on`) |
 
@@ -273,12 +273,13 @@ x-api-key: <key>                 # Anthropic clients
 ```
 
 Anything else is a `401` with `WWW-Authenticate: Bearer realm="llmman"`
-and the daemon's usual `{"error": ...}` body. Only `GET /` and `/ui/*`
-— the web UI's own files — are exempt, so the page can load and ask its
-user for the key; it then sends the key on every call, and, since a
-browser cannot set a header on a WebSocket, opens `/llmman/shell` with
-the subprotocol `llmman.bearer.<base64url(key)>`, which the daemon
-echoes back.
+and the daemon's usual `{"error": ...}` body. Only `GET`/`HEAD` of `/`,
+`/ui/*` and the web UI's own routes (an unrouted path, outside the API
+prefixes, from a client that accepts HTML) are exempt, so the page can
+load and ask its user for the key; it then sends the key on every call,
+and, since a browser cannot set a header on a WebSocket, opens
+`/llmman/shell` with the subprotocol `llmman.bearer.<base64url(key)>`,
+which the daemon echoes back.
 
 The `llmman` CLI sends `LLMMAN_API_KEY`, defaulting to the first
 configured server key; `llmman launch` hands the same key to the

@@ -1,5 +1,5 @@
 //! `/llmman/shell`: the user's login shell in a pty, over a WebSocket, for
-//! the web UI's Shell tab.
+//! the web UI's Shell.
 //!
 //! A real shell as the daemon's user, so who may open one is the design:
 //! only when the daemon is bound to loopback

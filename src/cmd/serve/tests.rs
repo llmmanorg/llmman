@@ -4871,6 +4871,7 @@ async fn a_keyed_daemon_refuses_everything_but_its_own_page_without_the_key() {
         ("/models", StatusCode::OK),
         ("/api/version", StatusCode::UNAUTHORIZED),
         ("/api/nope", StatusCode::UNAUTHORIZED),
+        ("//evil.example/c/x", StatusCode::UNAUTHORIZED),
     ] {
         let r = client
             .get(format!("{url}{path}"))

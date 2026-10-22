@@ -67,11 +67,14 @@ const API_SEGMENTS: &[&str] = &[
 
 /// Whether a request is a browser loading a page of the UI: a `GET` or
 /// `HEAD` that accepts HTML, outside every API prefix. `auth::require_key`
-/// exempts these too, as it does `/` and `/ui/*`.
+/// exempts these too, as it does `/` and `/ui/*`. Never a path that opens
+/// with `//`: a browser reads `//host/…` as another site, and no route of
+/// the UI starts with an empty segment.
 pub(super) fn is_page(method: &Method, path: &str, headers: &HeaderMap) -> bool {
     let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
     matches!(*method, Method::GET | Method::HEAD)
         && wants_html(headers)
+        && !path.starts_with("//")
         && !API_SEGMENTS.contains(&first)
 }
 
@@ -89,8 +92,13 @@ async fn serve_index(headers: &HeaderMap) -> Response {
     }
 }
 
+/// `frame-ancestors` keeps another site from framing the page, `base-uri`
+/// from pointing its relative script URLs at another site.
+const CSP: &str = "frame-ancestors 'none'; base-uri 'self'";
+
 /// Every HTML reply is unframeable: a page that framed the UI would open
-/// its WebSocket to /llmman/shell from a trusted localhost origin.
+/// its WebSocket to /llmman/shell from a trusted localhost origin. Its
+/// `<base>` stays on its own origin too, whatever the address says.
 fn finish(mut response: Response) -> Response {
     let is_html = response
         .headers()
@@ -98,10 +106,7 @@ fn finish(mut response: Response) -> Response {
         .is_some_and(|v| v.as_bytes().starts_with(b"text/html"));
     if is_html {
         let h = response.headers_mut();
-        h.insert(
-            header::CONTENT_SECURITY_POLICY,
-            "frame-ancestors 'none'".parse().unwrap(),
-        );
+        h.insert(header::CONTENT_SECURITY_POLICY, CSP.parse().unwrap());
         h.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
     }
     response
@@ -288,7 +293,7 @@ mod tests {
             assert_eq!(page.headers()["x-frame-options"], "DENY", "{path}");
             assert_eq!(
                 page.headers()["content-security-policy"],
-                "frame-ancestors 'none'",
+                "frame-ancestors 'none'; base-uri 'self'",
                 "{path}"
             );
             assert_eq!(page.bytes().await.unwrap(), index, "{path}");
@@ -337,6 +342,9 @@ mod tests {
             "/audio/nope",
             "/metrics",
             "//api/tags",
+            // Another site to a browser: never the page.
+            "//evil.example/c/x",
+            "///evil.example/models",
         ] {
             let r = html(reqwest::Method::GET, path).send().await.unwrap();
             assert_eq!(r.status(), StatusCode::NOT_FOUND, "{path}");
@@ -417,7 +425,7 @@ mod tests {
             assert_eq!(page.headers()["x-frame-options"], "DENY", "{path}");
             assert_eq!(
                 page.headers()["content-security-policy"],
-                "frame-ancestors 'none'",
+                "frame-ancestors 'none'; base-uri 'self'",
                 "{path}"
             );
         }
