@@ -171,8 +171,11 @@ const ui = (url) => {
 if (!scripts.length) throw new Error("index.html: no scripts found");
 // First thing in <head>: the page's base, as described above, then its
 // stylesheets. The longest route the address ends with is taken off; with
-// none, the page's directory, as a relative URL would have it.
-const headScript = `<script>(function(){var s=location.pathname.split("/").slice(1),r=${JSON.stringify(ROUTES)},n=0;if(s[s.length-1]==="")s.pop();else n=1;r.forEach(function(t){if(t.length>=n&&t.length<=s.length&&t.every(function(x,j){return x==="*"||x===s[s.length-t.length+j]}))n=t.length});var h=document.head,b=document.createElement("base"),p="/"+s.slice(0,s.length-n).map(function(x){return x+"/"}).join("");b.href=p;h.appendChild(b);${JSON.stringify(styles.map(ui))}.forEach(function(s){var l=document.createElement("link");l.rel="stylesheet";l.href=s;h.appendChild(l)})})()</script>`;
+// none, the page's directory, as a relative URL would have it. Empty
+// segments are dropped: `//evil.example/c/x` must not make the base
+// `//evil.example/`, another site the page's scripts would then load from.
+// Nor may anything else lead off the page's origin.
+const headScript = `<script>(function(){var q=location.pathname,s=q.split("/").filter(function(x){return x}),r=${JSON.stringify(ROUTES)},n=/\\/$/.test(q)?0:1;r.forEach(function(t){if(t.length>=n&&t.length<=s.length&&t.every(function(x,j){return x==="*"||x===s[s.length-t.length+j]}))n=t.length});var h=document.head,b=document.createElement("base"),p="/"+s.slice(0,s.length-n).map(function(x){return x+"/"}).join("");if(new URL(p,location.href).origin!==location.origin)p="/";b.href=p;h.appendChild(b);${JSON.stringify(styles.map(ui))}.forEach(function(s){var l=document.createElement("link");l.rel="stylesheet";l.href=s;h.appendChild(l)})})()</script>`;
 // Where the scripts were, in order, as the deferred scripts they were.
 const bodyScript = `<script>${JSON.stringify(scripts.map(ui))}.forEach(function(s){var e=document.createElement("script");e.src=s;e.async=false;document.body.appendChild(e)})</script>`;
 html = html
@@ -206,11 +209,17 @@ for (const [path, base] of [
   ["/servers/x/", "/servers/x/"],
   ["/servers/x/models", "/servers/x/"],
   ["/servers/x/c/abc123", "/servers/x/"],
+  // Never another origin.
+  ["//evil.example/c/abc", "/evil.example/"],
+  ["//evil.example/", "/evil.example/"],
+  ["///evil.example/models", "/evil.example/"],
+  ["/a//b/", "/a/b/"],
 ]) {
   const head = { appendChild: (el) => el.tagName === "base" && (got = el.href) };
   let got;
   runInNewContext(headScript.replace(/^<script>|<\/script>$/g, ""), {
-    location: { pathname: path },
+    location: { pathname: path, href: `http://127.0.0.1:17434${path}`, origin: "http://127.0.0.1:17434" },
+    URL,
     document: { head, createElement: (tagName) => ({ tagName }) },
   });
   if (got !== base) throw new Error(`index.html at ${path}: base ${got}, not ${base}`);
