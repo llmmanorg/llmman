@@ -212,16 +212,44 @@ impl OciStore {
         serde_json::from_slice(&data).context("parse manifest ref")
     }
 
+    fn read_ref_if_present(
+        &self,
+        path: &Path,
+        reference: &str,
+    ) -> anyhow::Result<Option<Descriptor>> {
+        match self.read_ref_at(path, reference) {
+            Ok(desc) => Ok(Some(desc)),
+            Err(err)
+                if err.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                }) =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn read_legacy_ref(&self, reference: &str) -> anyhow::Result<Option<Descriptor>> {
+        match self.read_ref_if_present(&self.legacy_ref_path(reference), reference) {
+            Err(err) if err.chain().any(|cause| cause.is::<serde_json::Error>()) => Ok(None),
+            result => result,
+        }
+    }
+
     fn write_ref(&self, reference: &str, desc: &Descriptor) -> anyhow::Result<()> {
         let path = self.ref_path(reference);
         let legacy = self.legacy_ref_path(reference);
         // An older store may hold this reference at the lossy path. Only
         // remove that pointer if it actually names this reference: another
         // reference can have collided with it there.
-        let remove_legacy = legacy != path
-            && legacy.exists()
-            && stored_ref_name(&self.read_ref_at(&legacy, reference)?)
-                .is_some_and(|stored| same_ref_name(stored, reference));
+        let remove_legacy = self
+            .read_legacy_ref(reference)?
+            .as_ref()
+            .and_then(stored_ref_name)
+            .is_some_and(|stored| same_ref_name(stored, reference));
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -253,19 +281,29 @@ impl OciStore {
     fn remove_ref(&self, reference: &str) -> anyhow::Result<bool> {
         let path = self.ref_path(reference);
         let legacy = self.legacy_ref_path(reference);
-        let mut removed = false;
-        for candidate in [&path, &legacy] {
-            if !candidate.exists() {
-                continue;
-            }
-            let desc = self.read_ref_at(candidate, reference)?;
-            if stored_ref_name(&desc).is_some_and(|stored| same_ref_name(stored, reference)) {
-                fs::remove_file(candidate)
-                    .with_context(|| format!("remove manifest ref {reference}"))?;
-                removed = true;
-            }
+        // Read both candidates before deleting either one, so a filesystem
+        // error on the legacy path cannot leave a partially removed ref.
+        let remove_new = self
+            .read_ref_if_present(&path, reference)?
+            .as_ref()
+            .and_then(stored_ref_name)
+            .is_some_and(|stored| same_ref_name(stored, reference));
+        let remove_legacy = self
+            .read_legacy_ref(reference)?
+            .as_ref()
+            .and_then(stored_ref_name)
+            .is_some_and(|stored| same_ref_name(stored, reference));
+        for candidate in [
+            remove_new.then_some(&path),
+            remove_legacy.then_some(&legacy),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            fs::remove_file(candidate)
+                .with_context(|| format!("remove manifest ref {reference}"))?;
         }
-        Ok(removed)
+        Ok(remove_new || remove_legacy)
     }
 
     /// Every stored manifest descriptor, read from current and legacy paths — each
@@ -1470,6 +1508,43 @@ mod tests {
         assert_eq!(store.find(first).unwrap().digest, "sha256:updated");
         assert_eq!(store.find(second).unwrap().digest, "sha256:second");
         assert_eq!(store.list_refs_strict().unwrap().len(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn malformed_legacy_pointer_does_not_block_tag_or_remove() {
+        let dir = temp_store_dir("malformed-legacy");
+        let store = OciStore::open(&dir).unwrap();
+        let reference = "docker.io/ai/model:latest";
+        let legacy = store.legacy_ref_path(reference);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"not JSON").unwrap();
+
+        store.tag(desc_with_ref(reference), reference).unwrap();
+        assert!(store.ref_path(reference).is_file());
+        assert_eq!(fs::read(&legacy).unwrap(), b"not JSON");
+        assert_eq!(store.remove(reference).unwrap(), reference);
+        assert!(!store.ref_path(reference).exists());
+        assert_eq!(fs::read(&legacy).unwrap(), b"not JSON");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_read_error_is_reported_before_writing_or_removing() {
+        let dir = temp_store_dir("unreadable-legacy");
+        let store = OciStore::open(&dir).unwrap();
+        let reference = "docker.io/ai/model:latest";
+        fs::create_dir_all(store.legacy_ref_path(reference)).unwrap();
+
+        assert!(store.tag(desc_with_ref(reference), reference).is_err());
+        assert!(!store.ref_path(reference).exists());
+        fs::write(
+            store.ref_path(reference),
+            serde_json::to_vec(&desc_with_ref(reference)).unwrap(),
+        )
+        .unwrap();
+        assert!(store.remove(reference).is_err());
+        assert!(store.ref_path(reference).exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
