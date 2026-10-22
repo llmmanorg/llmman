@@ -145,10 +145,17 @@ func writeManifestRef(layoutDir, ref string, manifestDesc ocispec.Descriptor) er
 	path := manifestRefPath(layoutDir, ref)
 	legacy := legacyManifestRefPath(layoutDir, ref)
 	removeLegacy := false
-	if data, err := os.ReadFile(legacy); err == nil {
-		var old ocispec.Descriptor
-		if json.Unmarshal(data, &old) == nil && canonicalRefKey(old.Annotations[ocispec.AnnotationRefName]) == canonicalRefKey(ref) {
-			removeLegacy = true
+	if info, err := os.Lstat(legacy); err == nil {
+		// Another legacy ref may use this path as a parent directory.
+		if info.Mode().IsRegular() {
+			if data, err := os.ReadFile(legacy); err == nil {
+				var old ocispec.Descriptor
+				if json.Unmarshal(data, &old) == nil && canonicalRefKey(old.Annotations[ocispec.AnnotationRefName]) == canonicalRefKey(ref) {
+					removeLegacy = true
+				}
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err

@@ -233,7 +233,16 @@ impl OciStore {
     }
 
     fn read_legacy_ref(&self, reference: &str) -> anyhow::Result<Option<Descriptor>> {
-        match self.read_ref_if_present(&self.legacy_ref_path(reference), reference) {
+        let path = self.legacy_ref_path(reference);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.is_file() => return Ok(None),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err).with_context(|| format!("inspect manifest ref {reference}"))
+            }
+        }
+        match self.read_ref_if_present(&path, reference) {
             Err(err) if err.chain().any(|cause| cause.is::<serde_json::Error>()) => Ok(None),
             result => result,
         }
@@ -245,11 +254,14 @@ impl OciStore {
         // An older store may hold this reference at the lossy path. Only
         // remove that pointer if it actually names this reference: another
         // reference can have collided with it there.
-        let remove_legacy = self
-            .read_legacy_ref(reference)?
-            .as_ref()
-            .and_then(stored_ref_name)
-            .is_some_and(|stored| same_ref_name(stored, reference));
+        // This is only a cleanup probe. An unreadable old pointer must not
+        // prevent publishing the independent v2 pointer; leave it untouched.
+        let remove_legacy = match self.read_legacy_ref(reference) {
+            Ok(Some(old)) => {
+                stored_ref_name(&old).is_some_and(|stored| same_ref_name(stored, reference))
+            }
+            Ok(None) | Err(_) => false,
+        };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -272,8 +284,14 @@ impl OciStore {
             return Err(e.into());
         }
         if remove_legacy {
-            fs::remove_file(&legacy)
-                .with_context(|| format!("remove old manifest ref {reference}"))?;
+            match fs::remove_file(&legacy) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("remove old manifest ref {reference}"));
+                }
+            }
         }
         Ok(())
     }
@@ -330,7 +348,6 @@ impl OciStore {
         let mut out = Vec::new();
         collect_refs_strict(&self.root.join(MANIFESTS_V2_DIR), &mut out)?;
         collect_refs_strict(&self.root.join("manifests"), &mut out)?;
-        dedup_refs(&mut out);
         Ok(out)
     }
 
@@ -1530,21 +1547,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_read_error_is_reported_before_writing_or_removing() {
-        let dir = temp_store_dir("unreadable-legacy");
+    fn legacy_directory_does_not_block_writing_or_removing() {
+        let dir = temp_store_dir("legacy-directory");
         let store = OciStore::open(&dir).unwrap();
         let reference = "docker.io/ai/model:latest";
-        fs::create_dir_all(store.legacy_ref_path(reference)).unwrap();
+        let legacy = store.legacy_ref_path(reference);
+        fs::create_dir_all(&legacy).unwrap();
+        let nested = legacy.join("another-tag");
+        fs::write(&nested, b"another model's pointer").unwrap();
 
-        assert!(store.tag(desc_with_ref(reference), reference).is_err());
-        assert!(!store.ref_path(reference).exists());
-        fs::write(
-            store.ref_path(reference),
-            serde_json::to_vec(&desc_with_ref(reference)).unwrap(),
-        )
-        .unwrap();
-        assert!(store.remove(reference).is_err());
+        store.tag(desc_with_ref(reference), reference).unwrap();
         assert!(store.ref_path(reference).exists());
+        assert_eq!(store.remove(reference).unwrap(), reference);
+        assert!(!store.ref_path(reference).exists());
+        assert!(legacy.is_dir());
+        assert!(nested.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

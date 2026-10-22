@@ -132,6 +132,32 @@ func TestManifestRefLegacyCollisionDoesNotOverwriteOtherReference(t *testing.T) 
 	}
 }
 
+func TestWriteManifestRefSkipsLegacyDirectory(t *testing.T) {
+	dir := t.TempDir()
+	ref := "reg.example/ns/model:sub"
+	nested := "reg.example/ns/model/sub:t"
+	legacy := legacyManifestRefPath(dir, ref)
+	nestedPath := legacyManifestRefPath(dir, nested)
+	if filepath.Dir(nestedPath) != legacy {
+		t.Fatalf("test references do not share the expected legacy directory")
+	}
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nestedPath, []byte("nested pointer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManifestRef(dir, ref, ocispec.Descriptor{Digest: digest.FromString("new")}); err != nil {
+		t.Fatalf("a legacy parent directory blocked an independent v2 write: %v", err)
+	}
+	if _, err := os.Stat(nestedPath); err != nil {
+		t.Fatalf("nested legacy pointer was disturbed: %v", err)
+	}
+	if got, err := readManifestRef(dir, ref); err != nil || got.Digest != digest.FromString("new") {
+		t.Fatalf("read v2 ref: %+v, %v", got, err)
+	}
+}
+
 func TestOpaqueReferenceSuffixDoesNotAliasDefaultTag(t *testing.T) {
 	dir := t.TempDir()
 	for _, pair := range [][2]string{

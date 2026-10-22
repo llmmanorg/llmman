@@ -432,7 +432,11 @@ pub fn write_manifest_ref(
     std::fs::write(&tmp, &data)?;
     std::fs::rename(&tmp, &path)?;
     if remove_legacy {
-        std::fs::remove_file(legacy)?;
+        match std::fs::remove_file(legacy) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
     }
     Ok(())
 }
