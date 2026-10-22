@@ -2,11 +2,11 @@
 // button in the composer, or the model picker's "Generation settings…").
 
 import { router, Stack, useLocalSearchParams } from "expo-router";
-import { ScrollView, Text } from "react-native";
+import { ScrollView, Text, View } from "react-native";
 import { KeyboardAvoidingView } from "react-native-keyboard-controller";
 
 import { GenerateSettingsForm } from "@/components/GenerateSettingsForm";
-import { setMediaOptions, useConversation } from "@/lib/chatStore";
+import { setMediaOptions, useStoredConversation } from "@/lib/chatStore";
 import { KIND_LABELS, optionsFor } from "@/lib/media";
 import { useModels } from "@/lib/ModelsContext";
 import { font, readable, spacing, useTheme, useTextSizeKey } from "@/lib/theme";
@@ -16,7 +16,16 @@ export default function GenerateSettingsScreen() {
   const sizeKey = useTextSizeKey();
   const models = useModels();
   const { conversation } = useLocalSearchParams<{ conversation: string }>();
-  const { conv } = useConversation(conversation);
+  // Opened by its address (a reload), the chat is read from storage first.
+  const { conv, missing } = useStoredConversation(conversation);
+  if (missing) {
+    return (
+      <View style={{ flex: 1, backgroundColor: c.background, padding: spacing.xl }}>
+        <Stack.Screen options={{ title: "Generation settings" }} />
+        <Text style={{ color: c.textMuted }}>This conversation no longer exists.</Text>
+      </View>
+    );
+  }
   if (!conv) return null;
   const options = optionsFor(conv.media, models.mediaKinds(conv.model));
   return (

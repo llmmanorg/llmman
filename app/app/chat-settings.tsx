@@ -1,18 +1,27 @@
 // A chat's own settings (the ⋯ button in a conversation).
 
 import { router, Stack, useLocalSearchParams } from "expo-router";
-import { ScrollView, Text } from "react-native";
+import { ScrollView, Text, View } from "react-native";
 import { KeyboardAvoidingView } from "react-native-keyboard-controller";
 
 import { ChatSettingsForm } from "@/components/ChatSettingsForm";
-import { setSettings, useConversation } from "@/lib/chatStore";
+import { setSettings, useStoredConversation } from "@/lib/chatStore";
 import { font, readable, spacing, useTheme, useTextSizeKey } from "@/lib/theme";
 
 export default function ChatSettingsScreen() {
   const c = useTheme();
   const sizeKey = useTextSizeKey();
   const { conversation } = useLocalSearchParams<{ conversation: string }>();
-  const { conv } = useConversation(conversation);
+  // Opened by its address (a reload), the chat is read from storage first.
+  const { conv, missing } = useStoredConversation(conversation);
+  if (missing) {
+    return (
+      <View style={{ flex: 1, backgroundColor: c.background, padding: spacing.xl }}>
+        <Stack.Screen options={{ title: "Chat settings" }} />
+        <Text style={{ color: c.textMuted }}>This conversation no longer exists.</Text>
+      </View>
+    );
+  }
   if (!conv) return null;
   return (
     <KeyboardAvoidingView key={sizeKey} style={{ flex: 1, backgroundColor: c.background }} behavior="padding">

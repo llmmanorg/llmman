@@ -3,7 +3,7 @@
 // Stop works from wherever the conversation is shown. Screens read it with
 // `useConversation(id)`.
 
-import { useSyncExternalStore } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 
 import { isAbort, splitRemoteRef, type ApiClient, type ChatMessage } from "@/api/client";
 import { explain } from "@/api/errors";
@@ -74,6 +74,25 @@ export function getConversationState(id: string | undefined): ConversationState 
 
 export function useConversation(id: string | undefined): ConversationState {
   return useSyncExternalStore(subscribe, () => getConversationState(id));
+}
+
+/**
+ * A conversation, read from storage when it is not in the store yet (a
+ * screen opened by its address, after a reload); `missing` once there is
+ * no such conversation.
+ */
+export function useStoredConversation(id: string | undefined): ConversationState & { missing: boolean } {
+  const state = useConversation(id);
+  const [missing, setMissing] = useState<string | null>(null);
+  useEffect(() => {
+    if (!id) return;
+    let cancelled = false;
+    void openConversation(id).then((found) => !cancelled && !found && setMissing(id));
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+  return { ...state, missing: !id || missing === id };
 }
 
 /** Whether any reply is streaming (e.g. to warn before removing a server). */
