@@ -23,11 +23,16 @@
 // images the router's own screens carry are inlined as data: URIs. Files
 // the daemon never serves (metadata.json, the favicon.ico Expo makes) are
 // left out.
+//
+// The bundle carries third-party code without its license comments, so the
+// export adds their notices: THIRD-PARTY-NOTICES.txt, every npm package the
+// scripts include (read from the export's source maps, which are then
+// dropped) with its license text.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { Buffer } from "node:buffer";
-import { readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
@@ -48,7 +53,39 @@ const MAX_INLINE = 16 * 1024;
 const UI = "globalThis.__llmmanUi";
 const UI_PRELUDE = `${UI}||(${UI}=new URL("../../../../",document.currentScript.src).href);`;
 
-execFileSync("npx", ["expo", "export", "-p", "web", "--clear", "--output-dir", out], {
+/** Where the notices of the bundled packages go, next to index.html. */
+const NOTICES = "THIRD-PARTY-NOTICES.txt";
+/**
+ * Packages published without a license file, by their repository: one of
+ * the same repository whose LICENSE covers them.
+ */
+const SAME_REPO = [
+  [/github\.com\/(react|facebook)\/react-native/, "react-native"],
+  [/github\.com\/expo\/expo\b/, "expo"],
+];
+const MIT = (holder) => `MIT License
+
+Copyright (c) ${holder}
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.`;
+
+execFileSync("npx", ["expo", "export", "-p", "web", "--clear", "--source-maps", "--output-dir", out], {
   stdio: "inherit",
   cwd: root,
   env: { ...process.env, LLMMAN_EXPORT_BASE: PLACEHOLDER },
@@ -122,6 +159,61 @@ await rm(join(out, "assets"), { recursive: true, force: true });
 await rm(join(out, "metadata.json"), { force: true });
 await rm(join(out, "favicon.ico"), { force: true });
 
+/** A package's license file text, or null when it ships none. */
+async function licenseFile(dir) {
+  const names = (await readdir(dir)).filter((f) => /^licen[cs]e(\.(md|txt))?$/i.test(f)).sort();
+  return names.length ? (await readFile(join(dir, names[0]), "utf8")).replace(/\r\n?/g, "\n").trim() : null;
+}
+
+/** The license text for a bundled package, from its own file or where SAME_REPO and MIT() say. */
+async function licenseText(dir, pkg) {
+  const own = await licenseFile(dir);
+  if (own) return own;
+  const repo = typeof pkg.repository === "string" ? pkg.repository : (pkg.repository?.url ?? "");
+  const same = SAME_REPO.find(([re]) => re.test(repo));
+  if (same) {
+    const text = await licenseFile(join(root, "node_modules", same[1]));
+    if (text) return text;
+  }
+  const author = typeof pkg.author === "string" ? pkg.author : pkg.author?.name;
+  if (pkg.license === "MIT" && author) return MIT(author.replace(/\s*[<(].*$/, ""));
+  throw new Error(`${pkg.name} ships no license text, and none is known for it`);
+}
+
+// The bundled packages, from the source maps, which go: the daemon never
+// serves them, and each script's comment naming one goes too.
+const packages = new Map();
+for (const path of (await files(out)).filter((f) => f.endsWith(".map"))) {
+  for (const source of JSON.parse(await readFile(path, "utf8")).sources) {
+    const at = source.lastIndexOf("node_modules/");
+    if (at < 0) continue;
+    const parts = source.slice(at + "node_modules/".length).split("/");
+    const name = parts[0].startsWith("@") ? `${parts[0]}/${parts[1]}` : parts[0];
+    packages.set(join(root, source.slice(0, at), "node_modules", name), name);
+  }
+  await rm(path);
+}
+if (!packages.size) throw new Error("no source maps: the export's packages are unknown");
+const notices = [];
+for (const dir of packages.keys()) {
+  if (!(await stat(join(dir, "package.json")).catch(() => null))) throw new Error(`${dir}: no package.json`);
+  const pkg = JSON.parse(await readFile(join(dir, "package.json"), "utf8"));
+  const license = typeof pkg.license === "string" ? pkg.license : "see below";
+  notices.push({
+    key: `${pkg.name}@${pkg.version}`,
+    text: `${pkg.name} ${pkg.version} (${license})\n\n${await licenseText(dir, pkg)}`,
+  });
+}
+const unique = [...new Map(notices.map((n) => [n.key, n.text])).entries()].sort(([a], [b]) =>
+  a < b ? -1 : a > b ? 1 : 0,
+);
+await writeFile(
+  join(out, NOTICES),
+  `llmman's web UI includes the following third-party software.\n\n${unique
+    .map(([, text]) => `${"=".repeat(72)}\n${text}\n`)
+    .join("\n")}`,
+);
+
 const escape = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
 const quoted = new RegExp(`"${escape(PLACEHOLDER)}(/[^"]*)?"`, "g");
 
@@ -129,6 +221,9 @@ for (const path of await files(out)) {
   const rel = relative(out, path);
   if (rel.endsWith(".js")) {
     let text = await readFile(path, "utf8");
+    // The source map (dropped above) and its id.
+    text = text.replace(/\n\/\/# (sourceMappingURL|debugId)=[^\n]*/g, "");
+    if (/\/\/# sourceMappingURL/.test(text)) throw new Error(`${rel} still names a source map`);
     // The app config Expo embeds, as JSON in a string: no base path there.
     text = text.replaceAll(`\\"baseUrl\\":\\"${PLACEHOLDER}\\"`, `\\"baseUrl\\":\\"\\"`);
     text = text.replace(quoted, (whole, rest) => {
@@ -147,7 +242,7 @@ for (const path of await files(out)) {
   } else if (rel.endsWith(".css")) {
     const text = await readFile(path, "utf8");
     if (text.includes(PLACEHOLDER)) throw new Error(`${rel} names ${PLACEHOLDER}`);
-  } else if (rel !== "index.html") {
+  } else if (rel !== "index.html" && rel !== NOTICES) {
     throw new Error(`unexpected file in the export: ${rel}`);
   }
 }

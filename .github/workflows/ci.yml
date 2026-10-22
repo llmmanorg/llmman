@@ -607,7 +607,7 @@ jobs:
           cargo package --no-verify --allow-dirty --list > "$files"
           for must in build.rs Cargo.toml Cargo.lock LICENSE README.md go-shim/go.mod go-shim/go.sum go-shim/shim.go \
                       go-shim/backend_docker.go go-shim/backend_podman.go \
-                      webui/index.html \
+                      webui/index.html webui/THIRD-PARTY-NOTICES.txt \
                       src/main.rs src/lib.rs src/webui/mod.rs src/webui/content_type.rs src/ffi.rs; do
             grep -qx "$must" "$files" || { echo "::error::$must is missing from the .crate"; exit 1; }
           done
