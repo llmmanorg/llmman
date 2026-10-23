@@ -22,7 +22,8 @@ use super::relay::{
     stream_rewriting_model,
 };
 use super::responses::{
-    is_responses_route, remote_responses, sanitize_responses_request, RESPONSES_ROUTE,
+    falls_back, is_responses_route, remote_responses, route_missing, sanitize_responses_request,
+    RESPONSES_ROUTE,
 };
 use super::sched::{begin_activity, resolve_keep_alive, ActivityGuard};
 use super::types::*;
@@ -370,7 +371,7 @@ impl MergedInstructions {
 /// llama-server reads `reasoning_effort` itself; older builds and vLLM
 /// read only the kwargs. The caller's own kwargs win key by key.
 /// [`provider_compat`] is the reverse, for a provider.
-fn apply_reasoning_effort(req: &mut serde_json::Value) {
+pub(super) fn apply_reasoning_effort(req: &mut serde_json::Value) {
     let Some(effort) = req.get("reasoning_effort").and_then(|v| v.as_str()) else {
         return;
     };
@@ -502,7 +503,7 @@ pub(super) async fn proxy_openai_generation(
 /// [`proxy_openai_generation`] against one resolved target; the reply
 /// names `model_ref`, the model as the client wrote it.
 #[allow(clippy::too_many_arguments)]
-async fn proxy_openai_generation_to(
+pub(super) async fn proxy_openai_generation_to(
     state: &AppState,
     headers: &HeaderMap,
     req: serde_json::Value,
@@ -515,21 +516,50 @@ async fn proxy_openai_generation_to(
     // OpenClaw reads any difference as a reroute; llama-server answers
     // with its own model path.
     let reply_model = model_ref.to_string();
-    let (mut req, target, activity, _) =
+    let (mut req, target, activity, response_model_override) =
         prepare_openai_request(state, req, model, target, guard).await?;
+    if llama_path == super::responses::MUSE_RESPONSES_ROUTE {
+        let canonical = response_model_override
+            .unwrap_or_else(|| req["model"].as_str().unwrap_or_default().to_string());
+        if target.is_remote() {
+            strip_llama_fields(&mut req);
+            return remote_responses(
+                &state.0.client,
+                &target,
+                headers,
+                req,
+                activity,
+                canonical,
+                route_missing,
+            )
+            .await;
+        }
+        return super::responses::translated_responses(
+            &state.0.client,
+            &target,
+            req,
+            activity,
+            canonical,
+        )
+        .await;
+    }
     if let Some(refusal) = unsupported_on_wire(&target, llama_path) {
         drop(activity);
         return Ok(refusal);
     }
     if llama_path == RESPONSES_ROUTE && target.is_remote() {
         strip_llama_fields(&mut req);
+        // A remote target always has an override (see backend_wire_model).
+        let canonical = response_model_override
+            .unwrap_or_else(|| req["model"].as_str().unwrap_or_default().to_string());
         return remote_responses(
             &state.0.client,
             &target,
             headers,
             req,
             activity,
-            reply_model,
+            canonical,
+            falls_back,
         )
         .await;
     }
