@@ -327,6 +327,7 @@ async fn remote_responses_falls_back_only_on_a_missing_or_broken_route() {
             max_output: None,
             cost: None,
             api_key: Some("sk-test".into()),
+            session: None,
         }));
         let (status, headers, body) = call_remote_responses_target(target, true).await;
         assert_eq!(status, StatusCode::OK, "{native}");
@@ -632,6 +633,7 @@ async fn max_tokens_is_clamped_to_the_catalogs_ceiling_for_an_anthropic_provider
         max_output: Some(64_000),
         cost: None,
         api_key: Some("sk-test".into()),
+        session: None,
     }));
     let send = |target: &Target, req: serde_json::Value| {
         let target = target.clone();
@@ -675,6 +677,7 @@ async fn a_thinking_level_reaches_each_claude_in_its_own_form() {
             max_output: Some(64_000),
             cost: None,
             api_key: Some("sk-test".into()),
+            session: None,
         }));
         let req = serde_json::json!({
             "model": model,
@@ -811,6 +814,7 @@ fn remote(provider: &str, model: &str, wire: Wire) -> RemoteTarget {
         max_output: None,
         cost: None,
         api_key: Some("k".into()),
+        session: None,
     }
 }
 
@@ -1637,6 +1641,7 @@ async fn a_local_refusal_is_retried_on_the_hosted_half_unless_pinned() {
                     max_output: None,
                     cost: None,
                     api_key: Some("k".into()),
+                    session: None,
                 }))
             } else {
                 Target::Local(1)
@@ -1987,6 +1992,7 @@ fn a_keyless_remote_target_sends_no_credential_header() {
             max_output: None,
             cost: None,
             api_key: None,
+            session: None,
         }))
     };
     let headers = |target: &Target| {
@@ -2017,6 +2023,157 @@ fn a_keyless_remote_target_sends_no_credential_header() {
         keyed.get(reqwest::header::AUTHORIZATION).unwrap(),
         "Bearer sk-test"
     );
+}
+
+/// opencode's Go gateway needs a session id and an identifying User-Agent
+/// on every request. A daemon-wide id stands in when the caller sent none,
+/// stays stable across requests, and gives way to the caller's own id.
+#[test]
+fn an_opencode_go_target_sends_a_session_and_user_agent() {
+    let client = Client::new();
+    let build = |target: RemoteTarget| {
+        Target::Remote(Arc::new(target))
+            .authorize(client.post("http://x/v1/chat/completions"))
+            .build()
+            .unwrap()
+    };
+
+    let req1 = build(remote("opencode-go", "m", Wire::OpenAi));
+    let session1 = req1
+        .headers()
+        .get("x-opencode-session")
+        .expect("x-opencode-session missing")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(!session1.is_empty());
+    let ua1 = req1
+        .headers()
+        .get(reqwest::header::USER_AGENT)
+        .expect("User-Agent missing")
+        .to_str()
+        .unwrap();
+    assert!(
+        ua1.starts_with("llmman/"),
+        "expected llmman/<ver>, got {ua1}"
+    );
+
+    // A second build must reuse the same daemon session id.
+    let req2 = build(remote("opencode-go", "m", Wire::OpenAi));
+    let session2 = req2
+        .headers()
+        .get("x-opencode-session")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(session1, session2, "daemon session must be stable");
+
+    // A caller's own session id is sent in place of the daemon's.
+    let with_session = RemoteTarget {
+        session: Some("conv-1".into()),
+        ..remote("opencode-go", "m", Wire::OpenAi)
+    };
+    let req3 = build(with_session);
+    assert_eq!(
+        req3.headers()
+            .get("x-opencode-session")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "conv-1"
+    );
+
+    // Other providers must not get the header.
+    for provider in ["openrouter", "opencode", "anthropic"] {
+        let req = build(remote(provider, "m", Wire::OpenAi));
+        assert!(
+            req.headers().get("x-opencode-session").is_none(),
+            "{provider} should not send x-opencode-session"
+        );
+    }
+}
+
+/// `client_opencode_session` reads the caller's header trimmed, and treats
+/// an empty or absent one as no session at all.
+#[test]
+fn client_opencode_session_reads_the_callers_header() {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+    let mut h = HeaderMap::new();
+    h.insert(
+        HeaderName::from_static("x-opencode-session"),
+        HeaderValue::from_static(" conv-1 "),
+    );
+    assert_eq!(client_opencode_session(Some(&h)), Some("conv-1".to_owned()));
+
+    // Empty value -> None.
+    let mut h2 = HeaderMap::new();
+    h2.insert(
+        HeaderName::from_static("x-opencode-session"),
+        HeaderValue::from_static("   "),
+    );
+    assert_eq!(client_opencode_session(Some(&h2)), None);
+
+    // Missing header -> None.
+    assert_eq!(client_opencode_session(Some(&HeaderMap::new())), None);
+
+    // No headers at all -> None.
+    assert_eq!(client_opencode_session(None), None);
+}
+
+/// A stand-in for opencode's Go gateway, which answers 400 MissingSessionID
+/// to any request without `x-opencode-session`. Both routes below must get
+/// past it, so the test fails if `authorize` stops sending the header.
+#[tokio::test]
+async fn opencode_go_requests_carry_a_session_on_both_routes() {
+    use axum::routing::post;
+    async fn gateway(headers: HeaderMap) -> Response {
+        if headers.get("x-opencode-session").is_none() {
+            return (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":{"type":"MissingSessionID"}}"#,
+            )
+                .into_response();
+        }
+        (
+            [("content-type", "application/json")],
+            r#"{"id":"r1","object":"response","model":"m","output":[]}"#,
+        )
+            .into_response()
+    }
+    let app = Router::new()
+        .route("/v1/responses", post(gateway))
+        .route("/v1/chat/completions", post(gateway));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let target = Target::Remote(Arc::new(RemoteTarget {
+        base_url: format!("http://{addr}/v1"),
+        ..remote("opencode-go", "m", Wire::OpenAi)
+    }));
+
+    let chat = serde_json::json!({
+        "model": "m",
+        "messages": [{ "role": "user", "content": "hello" }]
+    });
+    let upstream = send_chat_completion(&Client::new(), &target, &chat, "m")
+        .await
+        .unwrap();
+    assert_eq!(upstream.status, StatusCode::OK);
+
+    let state = test_state();
+    let responses = serde_json::json!({ "model": "m", "input": "hi", "stream": false });
+    let resp = remote_responses(
+        &state.0.client,
+        &target,
+        &HeaderMap::new(),
+        responses,
+        ActivityGuard::new(&state, "m"),
+        "llmman.provider/opencode-go/m".to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 /// The models of a configured provider come from its own `/models`,
@@ -5492,6 +5649,7 @@ async fn the_usage_ledger_prices_a_provider_reply_and_skips_the_rest() {
             max_output: None,
             cost: Some(cost),
             api_key: None,
+            session: None,
         }));
         usage::note_target(
             "llmman.provider/openrouter/anthropic/claude-sonnet-4",

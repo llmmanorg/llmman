@@ -289,6 +289,11 @@ Each provider is spoken to in one of two wire formats, reported as
 A provider that takes no key gets no credential header at all, not an
 empty one.
 
+Requests to `opencode-go` also carry `x-opencode-session` (the caller's own
+header value if present, otherwise a stable per-daemon id) and
+`User-Agent: llmman/<version>`, because its gateway rejects requests that
+omit the session header.
+
 Anthropic is never reached through its OpenAI-compatibility shim. What a
 request becomes on the way to a `wire: anthropic` provider depends on
 the surface it arrived on:

@@ -20,6 +20,7 @@ pub(super) fn remote_target_on(base_url: &str, wire: Wire) -> Target {
         max_output: None,
         cost: None,
         api_key: Some("sk-test".into()),
+        session: None,
     }))
 }
 

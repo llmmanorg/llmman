@@ -1619,6 +1619,10 @@ struct RemoteTarget {
     /// none (see `Provider::key_optional`). See [`resolve_remote_target`]
     /// for where it comes from.
     api_key: Option<String>,
+    /// The caller's own `x-opencode-session` if it sent one, `None`
+    /// otherwise. Used only when [`RemoteTarget::sends_opencode_session`]
+    /// holds, where a stable daemon-wide id stands in for it.
+    session: Option<String>,
 }
 
 impl RemoteTarget {
@@ -1632,6 +1636,13 @@ impl RemoteTarget {
     fn server_errors_on_responses(&self) -> bool {
         self.provider == "opencode"
     }
+
+    /// opencode's Go gateway answers 400 MissingSessionID to a request
+    /// without `x-opencode-session`, and asks for an identifying
+    /// User-Agent.
+    fn sends_opencode_session(&self) -> bool {
+        self.provider == "opencode-go"
+    }
 }
 
 impl std::fmt::Debug for RemoteTarget {
@@ -1642,6 +1653,7 @@ impl std::fmt::Debug for RemoteTarget {
             .field("wire", &self.wire)
             .field("model", &self.model)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("session", &self.session.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -1674,17 +1686,28 @@ impl Target {
         match self {
             Self::Local(_) => req,
             Self::Peer(peer) => aggregation::hop(req, peer.api_key.as_deref()),
-            Self::Remote(remote) => match (remote.wire, remote.api_key.as_deref()) {
-                (Wire::OpenAi, Some(key)) => req.bearer_auth(key),
-                (Wire::OpenAi, None) => req,
-                (Wire::Anthropic, key) => {
-                    let req = req.header("anthropic-version", anthropic::VERSION);
-                    match key {
-                        Some(key) => req.header("x-api-key", key),
-                        None => req,
+            Self::Remote(remote) => {
+                let req = match (remote.wire, remote.api_key.as_deref()) {
+                    (Wire::OpenAi, Some(key)) => req.bearer_auth(key),
+                    (Wire::OpenAi, None) => req,
+                    (Wire::Anthropic, key) => {
+                        let req = req.header("anthropic-version", anthropic::VERSION);
+                        match key {
+                            Some(key) => req.header("x-api-key", key),
+                            None => req,
+                        }
                     }
+                };
+                if remote.sends_opencode_session() {
+                    req.header(
+                        OPENCODE_SESSION_HEADER,
+                        remote.session.as_deref().unwrap_or(DAEMON_SESSION.as_str()),
+                    )
+                    .header(reqwest::header::USER_AGENT, UPSTREAM_USER_AGENT)
+                } else {
+                    req
                 }
-            },
+            }
         }
     }
 
@@ -1727,6 +1750,27 @@ impl Target {
 /// gets that completion translated once more in [`send_chat_completion`],
 /// the only place the wire is consulted for generation.
 const CHAT_COMPLETIONS_ROUTE: &str = "/v1/chat/completions";
+
+/// The header opencode's Go gateway routes a conversation by.
+const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+
+/// The caller's own [`OPENCODE_SESSION_HEADER`], trimmed; `None` when it is
+/// absent or empty.
+fn client_opencode_session(headers: Option<&HeaderMap>) -> Option<String> {
+    headers
+        .and_then(|h| h.get(OPENCODE_SESSION_HEADER))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// Stands in for a caller's session id: one per daemon run, so the gateway
+/// sees a stable id across requests.
+static DAEMON_SESSION: LazyLock<String> = LazyLock::new(|| format!("llmman-{}", types::gen_id()));
+
+/// The `User-Agent` llmman identifies itself with to a gateway that asks for one.
+const UPSTREAM_USER_AGENT: &str = concat!("llmman/", env!("CARGO_PKG_VERSION"));
 
 /// Extracts the caller's own API key from a request, in either spelling
 /// the surfaces below accept: `Authorization: Bearer <key>` (OpenAI) or
@@ -1895,6 +1939,7 @@ async fn resolve_remote_target(
         cost: listed.and_then(|m| m.cost.clone()),
         model,
         api_key,
+        session: client_opencode_session(headers),
     };
     // No key on this line: it is the one piece of a remote target that
     // must never reach a log file.
