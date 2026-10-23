@@ -14,6 +14,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -55,6 +57,19 @@ func insecurePolicy() (*signature.PolicyContext, error) {
 		},
 	}
 	return signature.NewPolicyContext(policy)
+}
+
+// nativeReferrersTransport reports that this backend cannot query the OCI
+// referrers endpoint. go.podman.io/image keeps its request machinery
+// (dockerClient, makeRequest) unexported; its public surface is CheckAuth,
+// SearchRegistry, GetRepositoryTags, GetDigest and the ImageSource interface,
+// none of which can GET /v2/<name>/referrers/<digest>. Reaching that endpoint
+// would mean rebuilding podman's auth, certs.d and registries.conf handling
+// alongside the backend, which is exactly the divergence this indirection
+// exists to prevent. Referrers therefore come from the fallback tag, which
+// fetchManifestRaw and pushToRegistry already serve.
+func nativeReferrersTransport(context.Context, string) (http.RoundTripper, *url.URL, bool, error) {
+	return nil, nil, false, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -140,10 +155,25 @@ func llmman_push(cLayoutDir, cRef *C.char) *C.char {
 // source straight at layoutDir/blobs, so every blob (manifest included)
 // is read from the real store directly.
 func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, err error) {
+	return pushToRegistryWithDestinationContext(ctx, layoutDir, ref, nil)
+}
+
+// pushToRegistryWithDestinationContext is pushToRegistry with an injectable
+// destination context for protocol tests. Production passes nil so podman's
+// normal registry configuration and credential lookup remain authoritative.
+func pushToRegistryWithDestinationContext(ctx context.Context, layoutDir, ref string, destinationCtx *types.SystemContext) (changed bool, err error) {
 	manifestDesc, err := findManifestForPush(layoutDir, ref)
 	if err != nil {
 		return false, err
 	}
+	return pushDescriptorToRegistryWithDestinationContext(ctx, layoutDir, ref, manifestDesc, destinationCtx, false)
+}
+
+func pushDescriptorToRegistry(ctx context.Context, layoutDir, ref string, manifestDesc ocispec.Descriptor) (bool, error) {
+	return pushDescriptorToRegistryWithDestinationContext(ctx, layoutDir, ref, manifestDesc, nil, true)
+}
+
+func pushDescriptorToRegistryWithDestinationContext(ctx context.Context, layoutDir, ref string, manifestDesc ocispec.Descriptor, destinationCtx *types.SystemContext, preserveDigest bool) (changed bool, err error) {
 
 	scratchDir, cleanup, err := buildScratchOCILayout(layoutDir, manifestDesc)
 	if err != nil {
@@ -176,11 +206,37 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 
 	progressSetStatus(ref, "pushing")
 	if _, err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pushing", "Pushed", &copy.Options{
-		SourceCtx: sharedBlobDirOpts(layoutDir),
+		SourceCtx:       sharedBlobDirOpts(layoutDir),
+		DestinationCtx:  destinationCtx,
+		PreserveDigests: preserveDigest,
 	}, &changed, ref); err != nil {
 		return false, fmt.Errorf("copy image: %w", err)
 	}
 	return changed, nil
+}
+
+func pushIndexToRegistry(ctx context.Context, layoutDir, ref string, desc ocispec.Descriptor) error {
+	return pushIndexToRegistryWithDestinationContext(ctx, layoutDir, ref, desc, nil)
+}
+
+func pushIndexToRegistryWithDestinationContext(ctx context.Context, layoutDir, ref string, desc ocispec.Descriptor, destinationCtx *types.SystemContext) error {
+	raw, err := readBlob(layoutDir, desc.Digest)
+	if err != nil {
+		return err
+	}
+	dstRef, err := alltransports.ParseImageName("docker://" + normalizeTag(ref))
+	if err != nil {
+		return err
+	}
+	if destinationCtx == nil {
+		destinationCtx = registrySourceCtx(ctx)
+	}
+	dst, err := dstRef.NewImageDestination(ctx, destinationCtx)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+	return dst.PutManifest(ctx, raw, nil)
 }
 
 // buildScratchOCILayout assembles a throwaway OCI layout directory whose

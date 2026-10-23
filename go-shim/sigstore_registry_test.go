@@ -66,7 +66,13 @@ func startRegistry(t *testing.T) string {
 // nothing at the requested tag.
 func startRegistryWithFault(t *testing.T, fault func(http.ResponseWriter, *http.Request) bool) string {
 	t.Helper()
-	reg := registry.New(registry.Logger(nopLogger(t)))
+	return startRegistryWithOptions(t, fault)
+}
+
+func startRegistryWithOptions(t *testing.T, fault func(http.ResponseWriter, *http.Request) bool, opts ...registry.Option) string {
+	t.Helper()
+	opts = append(opts, registry.Logger(nopLogger(t)))
+	reg := registry.New(opts...)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if fault != nil && fault(w, r) {
 			return

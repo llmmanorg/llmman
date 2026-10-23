@@ -719,15 +719,12 @@ func appendSignature(
 	if err != nil {
 		return false, fmt.Errorf("marshal signature manifest: %w", err)
 	}
-	manifestDesc, err := writeBlob(staging, ocispec.MediaTypeImageManifest, manifestJSON)
-	if err != nil {
-		return false, fmt.Errorf("stage signature manifest: %w", err)
-	}
-	if err := writeManifestRef(staging, sigRef, manifestDesc); err != nil {
-		return false, fmt.Errorf("tag signature manifest: %w", err)
-	}
-	if _, err := pushToRegistry(ctx, staging, sigRef); err != nil {
-		return false, fmt.Errorf("push signature %s: %w", sigRef, err)
+	if err := pushStagedManifest(ctx, staging, sigRef, ocispec.MediaTypeImageManifest, manifestJSON,
+		func(ctx context.Context, layoutDir, ref string, _ ocispec.Descriptor) error {
+			_, err := pushToRegistry(ctx, layoutDir, ref)
+			return err
+		}); err != nil {
+		return false, err
 	}
 	return true, nil
 }

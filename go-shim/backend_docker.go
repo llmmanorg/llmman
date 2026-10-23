@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -75,6 +76,79 @@ func dockerCredentials(host string) (string, string, error) {
 		return creds.Username, creds.Password, nil
 	}
 	return "", "", nil // not an error — just not found under any key
+}
+
+// nativeReferrersTransport hands the referrers GET the same transport and
+// authorizer containerd already uses for pulls and pushes, so TLS, proxies,
+// credential helpers and registry hosts cannot diverge from the backend.
+// Mirrors are skipped: a mirror is not authoritative for referrers.
+func nativeReferrersTransport(ctx context.Context, ref string) (http.RoundTripper, *url.URL, bool, error) {
+	registry, _, err := splitRepository(ref)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	hosts, err := dockerconfig.ConfigureHosts(withoutMirrors(ctx), dockerconfig.HostOptions{
+		Credentials: dockerCredentials,
+	})(registry)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("load registry host configuration: %w", err)
+	}
+	for _, host := range hosts {
+		if host.Capabilities&docker.HostCapabilityResolve == 0 {
+			continue
+		}
+		base := http.DefaultTransport
+		if host.Client != nil && host.Client.Transport != nil {
+			base = host.Client.Transport
+		}
+		path := host.Path
+		path = strings.TrimSuffix(path, "/")
+		if path == "" {
+			path = "/v2"
+		}
+		root := &url.URL{Scheme: host.Scheme, Host: host.Host, Path: path}
+		return &authorizedTransport{base: base, auth: host.Authorizer, header: host.Header}, root, true, nil
+	}
+	return nil, nil, false, fmt.Errorf("no registry host configured for %s", registry)
+}
+
+// authorizedTransport runs containerd's Authorizer over each request: sign,
+// send, and on a 401 feed the challenge back and retry once. That is the same
+// exchange remotes/docker performs for a pull.
+type authorizedTransport struct {
+	base   http.RoundTripper
+	auth   docker.Authorizer
+	header http.Header
+}
+
+func (t *authorizedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	for key, values := range t.header {
+		if req.Header.Get(key) == "" {
+			for _, value := range values {
+				req.Header.Add(key, value)
+			}
+		}
+	}
+	if t.auth == nil {
+		return t.base.RoundTrip(req)
+	}
+	first, err := t.roundTripOnce(req)
+	if err != nil || first.StatusCode != http.StatusUnauthorized {
+		return first, err
+	}
+	if err := t.auth.AddResponses(req.Context(), []*http.Response{first}); err != nil {
+		return first, nil // not a challenge this authorizer understands
+	}
+	first.Body.Close()
+	return t.roundTripOnce(req)
+}
+
+func (t *authorizedTransport) roundTripOnce(req *http.Request) (*http.Response, error) {
+	signed := req.Clone(req.Context())
+	if err := t.auth.Authorize(signed.Context(), signed); err != nil {
+		return nil, err
+	}
+	return t.base.RoundTrip(signed)
 }
 
 // getCredentialsWithTimeout runs store.Get(lookup) with a hard deadline,
@@ -506,7 +580,19 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 	if err != nil {
 		return false, err
 	}
+	return pushDescriptorToRegistry(ctx, layoutDir, ref, manifestDesc)
+}
 
+func pushDescriptorToRegistry(ctx context.Context, layoutDir, ref string, manifestDesc ocispec.Descriptor) (changed bool, err error) {
+	if manifestDesc.MediaType == ocispec.MediaTypeImageIndex {
+		resolver := newResolver(ctx)
+		pusher, err := resolver.Pusher(ctx, normalizeTag(ref))
+		if err != nil {
+			return false, fmt.Errorf("create pusher: %w", err)
+		}
+		present, err := pushBlob(ctx, pusher, &ociProvider{dir: layoutDir}, manifestDesc, nil, "")
+		return !present, err
+	}
 	// Read manifest
 	manifestData, err := readBlob(layoutDir, manifestDesc.Digest)
 	if err != nil {
@@ -579,6 +665,11 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 		fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
 	}
 	return changed, nil
+}
+
+func pushIndexToRegistry(ctx context.Context, layoutDir, ref string, desc ocispec.Descriptor) error {
+	_, err := pushDescriptorToRegistry(ctx, layoutDir, ref, desc)
+	return err
 }
 
 // llmman_pull pulls an image from a registry into a local OCI layout directory.

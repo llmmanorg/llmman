@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
+	remoteerrors "github.com/containerd/containerd/v2/core/remotes/errors"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
@@ -50,6 +52,25 @@ func writeBlob(layoutDir string, mediaType string, data []byte) (ocispec.Descrip
 		return ocispec.Descriptor{}, err
 	}
 	return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: int64(len(data))}, nil
+}
+
+// pushStagedManifest writes and tags a manifest in an existing OCI staging
+// layout, then lets the caller use the appropriate backend push path.
+func pushStagedManifest(
+	ctx context.Context, layoutDir, ref, mediaType string, raw []byte,
+	push func(context.Context, string, string, ocispec.Descriptor) error,
+) error {
+	desc, err := writeBlob(layoutDir, mediaType, raw)
+	if err != nil {
+		return fmt.Errorf("stage manifest: %w", err)
+	}
+	if err := writeManifestRef(layoutDir, ref, desc); err != nil {
+		return fmt.Errorf("tag staged manifest: %w", err)
+	}
+	if err := push(ctx, layoutDir, ref, desc); err != nil {
+		return fmt.Errorf("push staged manifest %s: %w", ref, err)
+	}
+	return nil
 }
 
 // openForResume opens path for appending if a previously-partial download of
@@ -259,10 +280,21 @@ func isHTTP4xx(err error) bool {
 	if err == nil {
 		return false
 	}
-	s := err.Error()
-	for _, code := range []string{"HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404"} {
-		if strings.Contains(s, code) {
+	var unexpected remoteerrors.ErrUnexpectedStatus
+	if errors.As(err, &unexpected) {
+		switch unexpected.StatusCode {
+		case 400, 401, 403, 404, 415:
 			return true
+		}
+	}
+	s := err.Error()
+	for _, code := range []string{"400", "401", "403", "404", "415"} {
+		// containerd and go.podman.io/image spell registry status errors
+		// differently; both forms represent a permanent request rejection.
+		for _, prefix := range []string{"HTTP ", "StatusCode: "} {
+			if strings.Contains(s, prefix+code) {
+				return true
+			}
 		}
 	}
 	return false
