@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -81,7 +82,7 @@ func TestWriteManifestRefDoesNotMutateTheCallersAnnotations(t *testing.T) {
 
 // TestManifestRefPathIsOneFilePerModel is the core regression test for
 // this change: two different refs must live at two different paths under
-// manifests/, so a torn write (or a race between two writers) to one
+// manifests-v2/, so a torn write (or a race between two writers) to one
 // model can never affect any other model's own file.
 func TestManifestRefPathIsOneFilePerModel(t *testing.T) {
 	dir := t.TempDir()
@@ -90,8 +91,93 @@ func TestManifestRefPathIsOneFilePerModel(t *testing.T) {
 	if a == b {
 		t.Fatalf("expected distinct paths for distinct refs, got %q for both", a)
 	}
-	if filepath.Dir(a) == filepath.Dir(b) {
-		t.Fatalf("expected distinct parent directories, got %q for both", filepath.Dir(a))
+	if filepath.Dir(a) != filepath.Dir(b) {
+		t.Fatalf("expected one versioned pointer directory, got %q and %q", filepath.Dir(a), filepath.Dir(b))
+	}
+}
+
+func TestManifestRefLegacyCollisionDoesNotOverwriteOtherReference(t *testing.T) {
+	dir := t.TempDir()
+	first := "reg.example:5000/ns/model:t"
+	second := "reg.example_5000/ns/model:t"
+	if legacyManifestRefPath(dir, first) != legacyManifestRefPath(dir, second) {
+		t.Fatal("test references must collide in the old layout")
+	}
+	if manifestRefPath(dir, first) == manifestRefPath(dir, second) {
+		t.Fatal("new paths must be distinct")
+	}
+	old := ocispec.Descriptor{Digest: digest.FromString("old"), Annotations: map[string]string{ocispec.AnnotationRefName: first}}
+	data, err := json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := legacyManifestRefPath(dir, first)
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManifestRef(dir, second, ocispec.Descriptor{Digest: digest.FromString("new")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		t.Fatalf("other reference's legacy pointer was removed: %v", err)
+	}
+	for ref, want := range map[string]digest.Digest{first: old.Digest, second: digest.FromString("new")} {
+		got, err := readManifestRef(dir, ref)
+		if err != nil || got.Digest != want {
+			t.Fatalf("read %s: digest %s, error %v; want %s", ref, got.Digest, err, want)
+		}
+	}
+}
+
+func TestWriteManifestRefSkipsLegacyDirectory(t *testing.T) {
+	dir := t.TempDir()
+	ref := "reg.example/ns/model:sub"
+	nested := "reg.example/ns/model/sub:t"
+	legacy := legacyManifestRefPath(dir, ref)
+	nestedPath := legacyManifestRefPath(dir, nested)
+	if filepath.Dir(nestedPath) != legacy {
+		t.Fatalf("test references do not share the expected legacy directory")
+	}
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nestedPath, []byte("nested pointer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManifestRef(dir, ref, ocispec.Descriptor{Digest: digest.FromString("new")}); err != nil {
+		t.Fatalf("a legacy parent directory blocked an independent v2 write: %v", err)
+	}
+	if _, err := os.Stat(nestedPath); err != nil {
+		t.Fatalf("nested legacy pointer was disturbed: %v", err)
+	}
+	if got, err := readManifestRef(dir, ref); err != nil || got.Digest != digest.FromString("new") {
+		t.Fatalf("read v2 ref: %+v, %v", got, err)
+	}
+}
+
+func TestOpaqueReferenceSuffixDoesNotAliasDefaultTag(t *testing.T) {
+	dir := t.TempDir()
+	for _, pair := range [][2]string{
+		{"s3://bucket/key", "s3://bucket/key:latest"},
+		{"/models/a", "/models/a:latest"},
+	} {
+		if manifestRefPath(dir, pair[0]) == manifestRefPath(dir, pair[1]) {
+			t.Fatalf("opaque references %q and %q share a path", pair[0], pair[1])
+		}
+		for i, ref := range pair {
+			if err := writeManifestRef(dir, ref, ocispec.Descriptor{Digest: digest.FromString(fmt.Sprintf("%d", i))}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for i, ref := range pair {
+			got, err := readManifestRef(dir, ref)
+			if err != nil || got.Digest != digest.FromString(fmt.Sprintf("%d", i)) {
+				t.Fatalf("read %q: %+v, %v", ref, got, err)
+			}
+		}
 	}
 }
 

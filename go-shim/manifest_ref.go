@@ -5,9 +5,9 @@
 // which manifest blob (content-addressed under blobs/, see writeBlob in
 // shared_oci.go) it currently points to — one file per model, replacing
 // the old shared index.json every model in the store used to live in
-// (breaking change: existing stores need a re-pull, no migration is
-// provided). Mirrors Ollama's per-model manifest layout
-// (manifest.WriteManifest, named by <host>/<namespace>/<model>/<tag>).
+// (breaking change: existing index.json stores need a re-pull). The
+// pointer filename is a hash of the reference; legacy per-segment
+// pointers remain readable and are migrated when rewritten.
 //
 // Unlike Ollama, the manifest *content* stays a content-addressed blob
 // rather than being inlined under the ref path: llmman must preserve a
@@ -23,6 +23,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +38,19 @@ import (
 // manifestsDirName is the top-level directory under a layout root holding
 // every ref's manifest-pointer file — the sibling of blobs/.
 const manifestsDirName = "manifests"
+const manifestsV2DirName = "manifests-v2"
+
+func canonicalRefKey(ref string) string {
+	// An object-store key or local path is opaque; ":latest" is not a
+	// default-tag alias there.
+	if strings.HasPrefix(ref, "/") || strings.Contains(ref, "://") {
+		return ref
+	}
+	if strings.LastIndex(ref, ":") > strings.LastIndex(ref, "/") {
+		return ref
+	}
+	return ref + ":latest"
+}
 
 // refPathSegments splits ref into the path segments used to lay it out
 // under manifests/ — one directory per "/"-delimited path segment, with
@@ -82,6 +96,11 @@ func sanitizeRefSegment(s string) string {
 // manifestRefPath returns the path of ref's manifest-pointer file under
 // layoutDir.
 func manifestRefPath(layoutDir, ref string) string {
+	sum := sha256.Sum256([]byte(canonicalRefKey(ref)))
+	return filepath.Join(layoutDir, manifestsV2DirName, fmt.Sprintf("%x", sum))
+}
+
+func legacyManifestRefPath(layoutDir, ref string) string {
 	parts := append([]string{layoutDir, manifestsDirName}, refPathSegments(ref)...)
 	return filepath.Join(parts...)
 }
@@ -89,12 +108,23 @@ func manifestRefPath(layoutDir, ref string) string {
 // readManifestRef reads the manifest descriptor stored for ref, or an
 // error if ref has never been tagged in this store.
 func readManifestRef(layoutDir, ref string) (ocispec.Descriptor, error) {
-	data, err := os.ReadFile(manifestRefPath(layoutDir, ref))
-	if err != nil {
-		return ocispec.Descriptor{}, err
+	for _, path := range []string{manifestRefPath(layoutDir, ref), legacyManifestRefPath(layoutDir, ref)} {
+		data, err := os.ReadFile(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return ocispec.Descriptor{}, err
+		}
+		var desc ocispec.Descriptor
+		if err := json.Unmarshal(data, &desc); err != nil {
+			return ocispec.Descriptor{}, err
+		}
+		if canonicalRefKey(desc.Annotations[ocispec.AnnotationRefName]) == canonicalRefKey(ref) {
+			return desc, nil
+		}
 	}
-	var desc ocispec.Descriptor
-	return desc, json.Unmarshal(data, &desc)
+	return ocispec.Descriptor{}, fs.ErrNotExist
 }
 
 // writeManifestRef atomically records that ref now points at
@@ -113,6 +143,23 @@ func writeManifestRef(layoutDir, ref string, manifestDesc ocispec.Descriptor) er
 	manifestDesc.Annotations = ann
 
 	path := manifestRefPath(layoutDir, ref)
+	legacy := legacyManifestRefPath(layoutDir, ref)
+	removeLegacy := false
+	if info, err := os.Lstat(legacy); err == nil {
+		// Another legacy ref may use this path as a parent directory.
+		if info.Mode().IsRegular() {
+			if data, err := os.ReadFile(legacy); err == nil {
+				var old ocispec.Descriptor
+				if json.Unmarshal(data, &old) == nil && canonicalRefKey(old.Annotations[ocispec.AnnotationRefName]) == canonicalRefKey(ref) {
+					removeLegacy = true
+				}
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -139,6 +186,11 @@ func writeManifestRef(layoutDir, ref string, manifestDesc ocispec.Descriptor) er
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
 		return err
+	}
+	if removeLegacy {
+		if err := os.Remove(legacy); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
 	}
 	return nil
 }
@@ -168,6 +220,9 @@ func ensureLayout(layoutDir string) error {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Join(layoutDir, manifestsDirName), 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Join(layoutDir, manifestsV2DirName), 0o755); err != nil {
 		return err
 	}
 	markerPath := filepath.Join(layoutDir, "oci-layout")

@@ -2,7 +2,8 @@
 //! extracted-model cache.
 //!
 //! Because the store is fully content-addressed and every tag is just a
-//! small pointer file under `manifests/` (see [`crate::storage::oci`]),
+//! small pointer file under `manifests-v2/` or the legacy `manifests/`
+//! (see [`crate::storage::oci`]),
 //! "what's still needed" can always be recomputed from scratch by reading
 //! every *surviving* manifest — there's no refcount or journal to keep in
 //! sync (a crash, a manual edit, an interrupted pull can never desync it,
@@ -829,6 +830,57 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn referenced_digests_keeps_differing_legacy_and_v2_manifests() {
+        let root = temp_dir("referenced-digests-migration");
+        let store = OciStore::open(&root).unwrap();
+        let config = store.write_blob("application/json", b"{}").unwrap();
+        let old_layer = store
+            .write_blob("application/octet-stream", b"old layer")
+            .unwrap();
+        let new_layer = store
+            .write_blob("application/octet-stream", b"new layer")
+            .unwrap();
+        let make_manifest = |layer| crate::storage::oci::Manifest {
+            schema_version: 2,
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            artifact_type: None,
+            config: config.clone(),
+            layers: vec![layer],
+            annotations: None,
+        };
+        let old = store
+            .write_manifest(&make_manifest(old_layer.clone()))
+            .unwrap();
+        let new = store
+            .write_manifest(&make_manifest(new_layer.clone()))
+            .unwrap();
+        let reference = format!("docker.io/ai/model:latest@{}", old.digest);
+        store.tag(new.clone(), &reference).unwrap();
+
+        let mut old_ref = old.clone();
+        old_ref.annotations = Some(std::collections::HashMap::from([(
+            "org.opencontainers.image.ref.name".into(),
+            reference.clone(),
+        )]));
+        let legacy = crate::storage::oci::legacy_manifest_ref_path(&root, &reference);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, serde_json::to_vec(&old_ref).unwrap()).unwrap();
+
+        assert_eq!(store.find(&reference).unwrap().digest, old.digest);
+        let live = referenced_digests(&store).unwrap();
+        for digest in [
+            &old.digest,
+            &new.digest,
+            &old_layer.digest,
+            &new_layer.digest,
+        ] {
+            assert!(live.contains(digest), "GC omitted {digest}");
+        }
+        assert_eq!(prune_blobs(&root, &live, Duration::ZERO).unwrap().count, 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
