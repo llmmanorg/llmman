@@ -1619,9 +1619,10 @@ struct RemoteTarget {
     /// none (see `Provider::key_optional`). See [`resolve_remote_target`]
     /// for where it comes from.
     api_key: Option<String>,
-    /// The caller's own `x-opencode-session` if it sent one, `None`
-    /// otherwise. Used only when [`RemoteTarget::sends_opencode_session`]
-    /// holds, where a stable daemon-wide id stands in for it.
+    /// The caller's own `x-opencode-session` if it sent one. Populated only
+    /// for an opencode-go target (via [`RemoteTarget::adopt_session`]) and
+    /// `None` otherwise. When `None` for opencode-go, a stable daemon-wide
+    /// id stands in for it in `authorize`.
     session: Option<String>,
 }
 
@@ -1642,6 +1643,14 @@ impl RemoteTarget {
     /// User-Agent.
     fn sends_opencode_session(&self) -> bool {
         self.provider == "opencode-go"
+    }
+
+    /// Takes the caller's `x-opencode-session` for an opencode-go target
+    /// only; every other provider keeps `session` as `None`.
+    fn adopt_session(&mut self, headers: Option<&HeaderMap>) {
+        if self.sends_opencode_session() {
+            self.session = client_opencode_session(headers);
+        }
     }
 }
 
@@ -1931,7 +1940,7 @@ async fn resolve_remote_target(
     };
 
     let listed = provider.models.iter().find(|m| m.id == model);
-    let target = RemoteTarget {
+    let mut target = RemoteTarget {
         provider: provider_id,
         base_url: provider.base_url.clone(),
         wire: provider.wire,
@@ -1939,8 +1948,9 @@ async fn resolve_remote_target(
         cost: listed.and_then(|m| m.cost.clone()),
         model,
         api_key,
-        session: client_opencode_session(headers),
+        session: None,
     };
+    target.adopt_session(headers);
     // No key on this line: it is the one piece of a remote target that
     // must never reach a log file.
     eprintln!(

@@ -2120,6 +2120,84 @@ fn client_opencode_session_reads_the_callers_header() {
     assert_eq!(client_opencode_session(None), None);
 }
 
+#[test]
+fn only_an_opencode_go_target_adopts_the_callers_session() {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+    let mut h = HeaderMap::new();
+    h.insert(
+        HeaderName::from_static(OPENCODE_SESSION_HEADER),
+        HeaderValue::from_static("conv-1"),
+    );
+
+    // opencode-go adopts the caller's session
+    let mut t = remote("opencode-go", "m", Wire::OpenAi);
+    t.adopt_session(Some(&h));
+    assert_eq!(t.session, Some("conv-1".into()));
+
+    // other providers do not
+    for provider in ["openrouter", "opencode", "anthropic"] {
+        let mut t = remote(provider, "m", Wire::OpenAi);
+        t.adopt_session(Some(&h));
+        assert!(t.session.is_none(), "{provider} should not adopt a session");
+    }
+
+    // opencode-go with no headers also produces None (daemon fallback applies in authorize)
+    let mut t = remote("opencode-go", "m", Wire::OpenAi);
+    t.adopt_session(None);
+    assert!(t.session.is_none());
+}
+
+/// `resolve_remote_target` is where a caller's `x-opencode-session` is
+/// adopted: an opencode-go target keeps it, any other provider drops it.
+/// Pins the production call to `adopt_session`, not just the method.
+#[tokio::test]
+async fn resolve_remote_target_adopts_the_session_for_opencode_go_only() {
+    // Takes the lock every catalog-holding test shares; the catalog it
+    // holds is replaced with one that knows both providers below.
+    let _fx = ProviderKeyFixture::new("resolve-opencode-session");
+    crate::providers::hold_catalog_for_tests(
+        r#"{
+            "opencode-go": {"id": "opencode-go", "name": "OpenCode Go",
+                "api": "https://opencode.ai/zen/go/v1",
+                "npm": "@ai-sdk/openai-compatible",
+                "env": ["LLMMAN_TEST_PROVIDER_KEY_UNSET"],
+                "models": {"m": {}}},
+            "openrouter": {"id": "openrouter", "name": "OpenRouter",
+                "api": "https://openrouter.ai/api/v1",
+                "npm": "@openrouter/ai-sdk-provider",
+                "env": ["LLMMAN_TEST_PROVIDER_KEY_UNSET"],
+                "models": {"m": {}}}
+        }"#,
+    );
+    let state = test_state();
+    // The caller's own key, so the daemon's environment never matters.
+    let headers = headers_with(&[
+        ("authorization", "Bearer sk-test"),
+        (OPENCODE_SESSION_HEADER, "conv-1"),
+    ]);
+
+    let Some(Target::Remote(go)) =
+        resolve_remote_target(&state, "llmman.provider/opencode-go/m", Some(&headers))
+            .await
+            .unwrap()
+    else {
+        panic!("an opencode-go reference resolves to a remote target");
+    };
+    assert_eq!(go.session.as_deref(), Some("conv-1"));
+
+    let Some(Target::Remote(other)) =
+        resolve_remote_target(&state, "llmman.provider/openrouter/m", Some(&headers))
+            .await
+            .unwrap()
+    else {
+        panic!("an openrouter reference resolves to a remote target");
+    };
+    assert!(
+        other.session.is_none(),
+        "openrouter must not adopt the caller's session"
+    );
+}
+
 /// A stand-in for opencode's Go gateway, which answers 400 MissingSessionID
 /// to any request without `x-opencode-session`. Both routes below must get
 /// past it, so the test fails if `authorize` stops sending the header.
