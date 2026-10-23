@@ -4,7 +4,7 @@
 //! Codex speaks only `/v1/responses` (`wire_api = "responses"` is the only
 //! value it accepts). llama-server, `openai`, `groq` and `openrouter`
 //! implement it; most OpenAI-compatible providers stop at
-//! `/v1/chat/completions` (`mistral` 404s the route, `opencode` 500s it
+//! `/v1/chat/completions` (`mistral` 404s the route, `opencode` 5xxs it
 //! for every non-OpenAI model), so the daemon bridges the two. An
 //! Anthropic-wire provider has no Responses route and is bridged without
 //! being asked (see the `anthropic` sibling module).
@@ -28,8 +28,9 @@
 //! the file are not: [`handle_openai_responses`] proxies to whichever
 //! target the request resolved to, and [`remote_responses`] reaches for
 //! the conversion only once that provider has answered the native route
-//! with a [`falls_back`] status, so one that implements the API keeps
-//! it.
+//! with a status [`falls_back_for`] treats as a missing or broken route
+//! (404/405/501 from any provider, or any 5xx from `opencode`), so one
+//! that implements the API keeps it.
 
 use std::collections::BTreeMap;
 
@@ -49,17 +50,18 @@ use super::relay::{
 use super::sched::ActivityGuard;
 use super::{remote_status, send_chat_completion, AppError, AppState, Target};
 
-/// Whether a provider's answer on `/v1/responses` means "retry as a chat
-/// completion": 404/405/501 (no such route). opencode also 500s the
-/// route for every non-OpenAI model, so keep its compatibility fallback
-/// without treating every provider's transient 5xx as no route support.
-pub(super) fn falls_back(status: StatusCode) -> bool {
+/// Whether a status code means the provider does not implement
+/// `/v1/responses`: 404 Not Found, 405 Method Not Allowed, or
+/// 501 Not Implemented. [`falls_back_for`] widens this for opencode.
+fn falls_back(status: StatusCode) -> bool {
     matches!(
         status,
         StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
     )
 }
 
+/// [`falls_back`], plus any 5xx from a target whose gateway 5xxs the route
+/// instead of 404ing it (`RemoteTarget::server_errors_on_responses`).
 fn falls_back_for(target: &Target, status: StatusCode) -> bool {
     falls_back(status)
         || (status.is_server_error()
@@ -1149,11 +1151,10 @@ pub(super) const RESPONSES_ROUTE: &str = "/v1/responses";
 ///
 /// The provider is asked first rather than consulted in a list (models.dev
 /// has no capability data, and a list would go stale). A success is
-/// relayed; a status [`falls_back`] recognises as the route
-/// being missing or broken (anthropic 404s, opencode 500s for non-OpenAI
-/// models) is retried as a chat completion; any other failure is the
-/// provider's own answer about the caller's key or request, relayed
-/// untouched. The retry happens before any body has been relayed.
+/// relayed; a status that [`falls_back_for`] treats as the route being
+/// missing or broken (404/405/501 from any provider, or any 5xx from
+/// `opencode`) is retried as a chat completion; any other HTTP response is
+/// relayed untouched. The retry happens before any body has been relayed.
 pub(super) async fn remote_responses(
     client: &Client,
     target: &Target,
