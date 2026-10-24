@@ -41,6 +41,17 @@
 //! `serve_with_engine`. So does [`serve_ds4_gguf_model`], for
 //! `ds4-server`.
 //!
+//! The two mediagen tests cover image generation, which `llmman run` serves
+//! through `llmman::mediagen` (ggml, linked against llama.cpp's libraries)
+//! rather than llama-server. [`mediagen_qwen_image_metal_matches_cpu`] builds
+//! a tiny synthetic Qwen-Image 2.1 pack from seeded random weights and
+//! requires its Metal and CPU images to match. It runs on the two
+//! `aarch64-apple-darwin` CI legs on every push and guards against
+//! #575-class graph bugs. [`generate_image_with_a_real_diffusion_model`] is
+//! opt-in (`LLMMAN_E2E_IMAGE_MODEL=qwen-image-2.1`, ~33 GB) and checks the
+//! real model's output. Run it when bumping `LLAMA_CPP_RELEASE`, since a new
+//! llama.cpp build is what broke image output in #575.
+//!
 //! `llmman serve` is a process-wide singleton bound to a single loopback
 //! port (127.0.0.1:17434 by default, or wherever `LLMMAN_HOST` points —
 //! see `daemon::server`/`daemon::bind_addr`), so these tests can't
@@ -91,12 +102,16 @@
 //!     ggml-org/llama.cpp#20733/#23423) — fixed in
 //!     `cmd::serve::responses::consolidate_responses_instructions`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use llmman::mediagen::ffi::Api;
+use llmman::mediagen::weights::{write_safetensors_raw, RawTensor};
+use llmman::mediagen::{Context, ContextParams, GenParams};
 
 /// The exact short name every `llmman launch ... --model` invocation in
 /// this suite uses — resolves (via `resolve_ollama_api`, the same path
@@ -3013,4 +3028,609 @@ fn mediagen_ffi_binds_the_llama_cpp_on_path() {
     eprintln!("binding the ggml/llama libraries in {}", dir.display());
     let api = llmman::mediagen::ffi::Api::load(&dir).unwrap();
     api.check_layout().unwrap();
+}
+
+fn decode_rgba_png(png: &[u8]) -> image::RgbaImage {
+    image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .expect("failed to decode PNG")
+        .into_rgba8()
+}
+
+fn opaque_image_problem(img: &image::RgbaImage) -> Option<String> {
+    // #575: bad PNG had ~97% alpha=0 pixels and mean RGB ~4; good PNG had alpha 252-255
+    let pixels = img.pixels();
+    let total = img.width() as usize * img.height() as usize;
+    let alpha_zero = pixels.clone().filter(|p| p[3] == 0).count() as f64 / total as f64;
+    if alpha_zero > 0.05 {
+        return Some(format!(
+            "{:.1}% pixels have alpha=0 (threshold 5%)",
+            alpha_zero * 100.0
+        ));
+    }
+    let mean_alpha: f64 = pixels.clone().map(|p| p[3] as f64).sum::<f64>() / total as f64;
+    if mean_alpha < 200.0 {
+        return Some(format!("mean alpha {:.1} < 200", mean_alpha));
+    }
+    let rgb_vals: Vec<f64> = pixels
+        .flat_map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+        .collect();
+    let mean_rgb = rgb_vals.iter().sum::<f64>() / rgb_vals.len() as f64;
+    let std_rgb = (rgb_vals.iter().map(|v| (v - mean_rgb).powi(2)).sum::<f64>()
+        / rgb_vals.len() as f64)
+        .sqrt();
+    if std_rgb < 4.0 {
+        return Some(format!(
+            "RGB std dev {:.2} < 4 (image is flat/black)",
+            std_rgb
+        ));
+    }
+    None
+}
+
+/// Compares two images by Pearson correlation and mean absolute difference over
+/// RGB only: alpha is excluded because it is constant (255) in opaque output and
+/// would inflate the correlation, hiding subtle RGB divergences.
+fn image_mismatch(a: &image::RgbaImage, b: &image::RgbaImage) -> Option<String> {
+    if a.dimensions() != b.dimensions() {
+        return Some(format!(
+            "dimensions differ: {:?} vs {:?}",
+            a.dimensions(),
+            b.dimensions()
+        ));
+    }
+    let a_vals: Vec<f64> = a
+        .pixels()
+        .flat_map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+        .collect();
+    let b_vals: Vec<f64> = b
+        .pixels()
+        .flat_map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+        .collect();
+    let n = a_vals.len() as f64;
+    let mean_a = a_vals.iter().sum::<f64>() / n;
+    let mean_b = b_vals.iter().sum::<f64>() / n;
+    let cov: f64 = a_vals
+        .iter()
+        .zip(b_vals.iter())
+        .map(|(a, b)| (a - mean_a) * (b - mean_b))
+        .sum::<f64>()
+        / n;
+    let std_a = (a_vals.iter().map(|v| (v - mean_a).powi(2)).sum::<f64>() / n).sqrt();
+    let std_b = (b_vals.iter().map(|v| (v - mean_b).powi(2)).sum::<f64>() / n).sqrt();
+    if std_a < 1e-9 || std_b < 1e-9 {
+        return Some("one image is uniform (std dev ~0)".to_string());
+    }
+    let corr = cov / (std_a * std_b);
+    // Calibration: the b11146 baseline with the default Metal graph optimizer
+    // scores Pearson 0.9685, below this 0.98 threshold.
+    if corr < 0.98 {
+        return Some(format!(
+            "Pearson correlation {:.4} < 0.98 — Metal/CPU outputs diverge (see #575; try GGML_METAL_GRAPH_OPTIMIZE_DISABLE=1)",
+            corr
+        ));
+    }
+    let mad: f64 = a_vals
+        .iter()
+        .zip(b_vals.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f64>()
+        / n
+        / 255.0;
+    if mad > 6.0 / 255.0 {
+        return Some(format!("mean abs diff {:.4}/255 > 6/255", mad * 255.0));
+    }
+    None
+}
+
+#[test]
+fn png_checks_reject_the_575_failure_mode() {
+    // Build a 64x64 image with ~97% alpha=0 (the #575 bad PNG profile)
+    let mut bad = image::RgbaImage::new(64, 64);
+    for (i, pixel) in bad.pixels_mut().enumerate() {
+        if i % 33 == 0 {
+            *pixel = image::Rgba([10, 5, 3, 200]);
+        } else {
+            *pixel = image::Rgba([2, 1, 1, 0]);
+        }
+    }
+    assert!(
+        opaque_image_problem(&bad).is_some(),
+        "should reject the #575 bad-PNG profile"
+    );
+
+    // Good opaque gradient
+    let mut good = image::RgbaImage::new(64, 64);
+    for (x, y, pixel) in good.enumerate_pixels_mut() {
+        *pixel = image::Rgba([x as u8, y as u8, 128, 255]);
+    }
+    assert!(
+        opaque_image_problem(&good).is_none(),
+        "should accept a good opaque image"
+    );
+
+    // Two images that are the same should match
+    assert!(
+        image_mismatch(&good, &good).is_none(),
+        "identical images should match"
+    );
+
+    // Two unrelated random images should not match
+    let mut other = image::RgbaImage::new(64, 64);
+    for (x, y, pixel) in other.enumerate_pixels_mut() {
+        *pixel = image::Rgba([255 - x as u8, 255 - y as u8, 64, 255]);
+    }
+    assert!(
+        image_mismatch(&good, &other).is_some(),
+        "unrelated images should not match"
+    );
+}
+
+/// Qwen-Image 2.1's text encoder and transformer: the real widths where
+/// they set the topology, at two layers and two heads.
+const TINY_LATENT: i64 = 64;
+const TINY_HEAD_DIM: i64 = 128;
+const TINY_HEADS: i64 = 2;
+const TINY_DIM: i64 = TINY_HEADS * TINY_HEAD_DIM;
+const TINY_LAYERS: i64 = 2;
+const TINY_TEXT_HIDDEN: i64 = 64;
+const TINY_TEXT_LAYERS: i64 = 2;
+const TINY_TEXT_HEADS: i64 = 2;
+const TINY_TEXT_KV_HEADS: i64 = 1;
+const TINY_TEXT_HEAD_DIM: i64 = 16;
+const TINY_TEXT_FF: i64 = 128;
+const TINY_TEXT_VOCAB: i64 = 64;
+/// The VAE decoder's width at its input; each up block halves it.
+const TINY_VAE_WIDTH: i64 = 64;
+
+/// The real `scheduler/scheduler_config.json` of `Qwen/Qwen-Image-2.1`.
+const REAL_SCHEDULER_CONFIG: &str = r#"{
+  "_class_name": "FlowMatchEulerDiscreteScheduler",
+  "_diffusers_version": "0.37.0.dev0",
+  "base_image_seq_len": 256,
+  "base_shift": 0.5,
+  "invert_sigmas": false,
+  "max_image_seq_len": 8192,
+  "max_shift": 0.9,
+  "num_train_timesteps": 1000,
+  "shift": 1.0,
+  "shift_terminal": 0.02,
+  "stochastic_sampling": false,
+  "time_shift_type": "exponential",
+  "use_beta_sigmas": false,
+  "use_dynamic_shifting": true,
+  "use_exponential_sigmas": false,
+  "use_karras_sigmas": false
+}"#;
+
+/// Every token maps to `[UNK]`: the prompt's token count is all the pipeline
+/// reads from the tokenizer, and the random text encoder has no meaning to lose.
+const TINY_TOKENIZER: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0},"unk_token":"[UNK]"}}"#;
+
+/// splitmix64, the seeded stream behind the synthetic pack's weights.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in (0, 1].
+    fn uniform(&mut self) -> f64 {
+        ((self.next_u64() >> 11) as f64 + 1.0) / (1u64 << 53) as f64
+    }
+
+    /// Standard normal, by Box-Muller.
+    fn normal(&mut self) -> f64 {
+        let (u1, u2) = (self.uniform(), self.uniform());
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+}
+
+/// A tensor to create: its name in the file and its shape in torch order.
+type Spec = (String, Vec<i64>);
+
+/// Seeded bf16 tensors, each scaled by 1/sqrt(fan-in) so activations stay near unit scale.
+fn random_tensors(rng: &mut SplitMix64, spec: &[Spec]) -> Vec<RawTensor> {
+    spec.iter()
+        .map(|(name, shape)| {
+            let fan_in: i64 = shape.iter().skip(1).product();
+            let scale = if shape.len() > 1 {
+                1.0 / (fan_in as f64).sqrt()
+            } else {
+                1.0
+            };
+            let n: i64 = shape.iter().product();
+            let bytes = (0..n)
+                .flat_map(|_| {
+                    let bits = ((rng.normal() * scale) as f32).to_bits();
+                    ((bits >> 16) as u16).to_le_bytes()
+                })
+                .collect();
+            RawTensor {
+                name: name.clone(),
+                dtype: "BF16".to_string(),
+                shape: shape.clone(),
+                bytes,
+            }
+        })
+        .collect()
+}
+
+fn transformer_spec() -> Vec<Spec> {
+    let (d, m) = (TINY_DIM, 3 * TINY_DIM);
+    let mut s: Vec<Spec> = vec![
+        (
+            "time_text_embed.timestep_embedder.linear_1.weight".into(),
+            vec![d, 256],
+        ),
+        (
+            "time_text_embed.timestep_embedder.linear_2.weight".into(),
+            vec![d, d],
+        ),
+        ("modulation.1.weight".into(), vec![4 * d, d]),
+        ("img_in.weight".into(), vec![d, TINY_LATENT]),
+        ("txt_in.text_norm.weight".into(), vec![TINY_TEXT_HIDDEN]),
+        ("txt_in.in_layer.weight".into(), vec![d, TINY_TEXT_HIDDEN]),
+        ("txt_in.out_layer.weight".into(), vec![d, d]),
+        ("norm_out.linear.weight".into(), vec![d, d]),
+        ("proj_out.weight".into(), vec![TINY_LATENT, d]),
+    ];
+    for l in 0..TINY_LAYERS {
+        let p = format!("transformer_blocks.{l}");
+        for name in ["attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0"] {
+            s.push((format!("{p}.{name}.weight"), vec![d, d]));
+        }
+        for name in ["attn.norm_q", "attn.norm_k"] {
+            s.push((format!("{p}.{name}.weight"), vec![TINY_HEAD_DIM]));
+        }
+        s.push((format!("{p}.img_mlp.gate_layer.weight"), vec![m, d]));
+        s.push((format!("{p}.img_mlp.proj.weight"), vec![m, d]));
+        s.push((format!("{p}.img_mlp.out.weight"), vec![d, m]));
+    }
+    s
+}
+
+fn text_encoder_spec() -> Vec<Spec> {
+    let (h, hd) = (TINY_TEXT_HIDDEN, TINY_TEXT_HEAD_DIM);
+    let mut s: Vec<Spec> = vec![(
+        "model.language_model.embed_tokens.weight".into(),
+        vec![TINY_TEXT_VOCAB, h],
+    )];
+    for l in 0..TINY_TEXT_LAYERS {
+        let p = format!("model.language_model.layers.{l}");
+        s.extend([
+            (format!("{p}.input_layernorm.weight"), vec![h]),
+            (
+                format!("{p}.self_attn.q_proj.weight"),
+                vec![TINY_TEXT_HEADS * hd, h],
+            ),
+            (
+                format!("{p}.self_attn.k_proj.weight"),
+                vec![TINY_TEXT_KV_HEADS * hd, h],
+            ),
+            (
+                format!("{p}.self_attn.v_proj.weight"),
+                vec![TINY_TEXT_KV_HEADS * hd, h],
+            ),
+            (
+                format!("{p}.self_attn.o_proj.weight"),
+                vec![h, TINY_TEXT_HEADS * hd],
+            ),
+            (format!("{p}.self_attn.q_norm.weight"), vec![hd]),
+            (format!("{p}.self_attn.k_norm.weight"), vec![hd]),
+            (format!("{p}.post_attention_layernorm.weight"), vec![h]),
+            (format!("{p}.mlp.gate_proj.weight"), vec![TINY_TEXT_FF, h]),
+            (format!("{p}.mlp.up_proj.weight"), vec![TINY_TEXT_FF, h]),
+            (format!("{p}.mlp.down_proj.weight"), vec![h, TINY_TEXT_FF]),
+        ]);
+    }
+    s
+}
+
+fn push_conv(s: &mut Vec<Spec>, name: &str, ic: i64, oc: i64, k: i64) {
+    s.push((format!("{name}.weight"), vec![oc, ic, k, k]));
+    s.push((format!("{name}.bias"), vec![oc]));
+}
+
+fn push_resnet(s: &mut Vec<Spec>, prefix: &str, c: i64) {
+    s.push((format!("{prefix}.norm1.gamma"), vec![c, 1, 1]));
+    push_conv(s, &format!("{prefix}.conv1"), c, c, 3);
+    s.push((format!("{prefix}.norm2.gamma"), vec![c, 1, 1]));
+    push_conv(s, &format!("{prefix}.conv2"), c, c, 3);
+}
+
+/// The decoder of `wan_vae::decode` in its 2-D (image) form: five up blocks
+/// of three resnets, the first four upsampling 2x and halving the channels,
+/// so 16x in all. The RGBA output has four channels.
+fn vae_spec() -> Vec<Spec> {
+    let w = TINY_VAE_WIDTH;
+    let mut s: Vec<Spec> = Vec::new();
+    push_conv(&mut s, "post_quant_conv", TINY_LATENT, TINY_LATENT, 1);
+    push_conv(&mut s, "decoder.conv_in", TINY_LATENT, w, 3);
+    push_resnet(&mut s, "decoder.mid_block.resnets.0", w);
+    s.push((
+        "decoder.mid_block.attentions.0.norm.gamma".into(),
+        vec![w, 1, 1],
+    ));
+    push_conv(&mut s, "decoder.mid_block.attentions.0.to_qkv", w, 3 * w, 1);
+    push_conv(&mut s, "decoder.mid_block.attentions.0.proj", w, w, 1);
+    push_resnet(&mut s, "decoder.mid_block.resnets.1", w);
+    for b in 0..5 {
+        let c = w >> b;
+        let p = format!("decoder.up_blocks.{b}");
+        for r in 0..3 {
+            push_resnet(&mut s, &format!("{p}.resnets.{r}"), c);
+        }
+        if b < 4 {
+            push_conv(&mut s, &format!("{p}.upsampler.resample.1"), c, c / 2, 3);
+        }
+    }
+    s.push(("decoder.norm_out.gamma".into(), vec![4, 1, 1]));
+    push_conv(&mut s, "decoder.conv_out", 4, 4, 3);
+    s
+}
+
+/// Writes a Diffusers pack's files under one directory, keyed by their
+/// relative path the way `modelpack` keys a pack's `files`.
+struct PackWriter {
+    dir: PathBuf,
+    files: BTreeMap<String, PathBuf>,
+}
+
+impl PackWriter {
+    /// Records `rel` in the pack and returns its path on disk.
+    fn file(&mut self, rel: &str) -> PathBuf {
+        let path = self.dir.join(rel);
+        std::fs::create_dir_all(path.parent().expect("a file in a directory"))
+            .expect("create the pack directory");
+        self.files.insert(rel.to_string(), path.clone());
+        path
+    }
+
+    fn text(&mut self, rel: &str, body: &str) {
+        std::fs::write(self.file(rel), body).expect("write a pack file");
+    }
+
+    fn tensors(&mut self, rel: &str, tensors: &[RawTensor]) {
+        let path = self.file(rel);
+        write_safetensors_raw(&path, tensors, "llmman e2e synthetic pack").expect("write weights");
+    }
+}
+
+/// A tiny Qwen-Image 2.1 Diffusers pack with seeded random bf16 weights, laid
+/// out as `qwen_image::Model::load` reads it. Returns the pack's
+/// `model_index.json` and its `files` map.
+fn write_tiny_qwen_image_pack(dir: &Path) -> (PathBuf, BTreeMap<String, PathBuf>) {
+    let mut rng = SplitMix64(42);
+    let mut pack = PackWriter {
+        dir: dir.to_path_buf(),
+        files: BTreeMap::new(),
+    };
+    pack.text(
+        "model_index.json",
+        r#"{"_class_name": "QwenImage21Pipeline"}"#,
+    );
+    pack.text("scheduler/scheduler_config.json", REAL_SCHEDULER_CONFIG);
+    pack.text("processor/tokenizer.json", TINY_TOKENIZER);
+
+    pack.text(
+        "transformer/config.json",
+        &serde_json::json!({
+            "_class_name": "QwenImage21Transformer2DModel",
+            "attention_head_dim": TINY_HEAD_DIM,
+            "axes_dims_rope": [16, 56, 56],
+            "context_in_dim": TINY_TEXT_HIDDEN,
+            "in_channels": TINY_LATENT,
+            "out_channels": TINY_LATENT,
+            "num_attention_heads": TINY_HEADS,
+            "num_layers": TINY_LAYERS,
+            "patch_size": 1,
+            "mlp_ratio": 3,
+            "eps": 1e-6,
+            "causal_condition": true
+        })
+        .to_string(),
+    );
+    let weights = random_tensors(&mut rng, &transformer_spec());
+    pack.tensors("transformer/diffusion_pytorch_model.safetensors", &weights);
+
+    pack.text(
+        "text_encoder/config.json",
+        &serde_json::json!({
+            "text_config": {
+                "hidden_size": TINY_TEXT_HIDDEN,
+                "num_hidden_layers": TINY_TEXT_LAYERS,
+                "num_attention_heads": TINY_TEXT_HEADS,
+                "num_key_value_heads": TINY_TEXT_KV_HEADS,
+                "head_dim": TINY_TEXT_HEAD_DIM,
+                "intermediate_size": TINY_TEXT_FF,
+                "vocab_size": TINY_TEXT_VOCAB,
+                "hidden_act": "silu",
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 5000000,
+                "rope_scaling": {"mrope_section": [4, 2, 2], "rope_type": "default"}
+            }
+        })
+        .to_string(),
+    );
+    let weights = random_tensors(&mut rng, &text_encoder_spec());
+    pack.tensors("text_encoder/model.safetensors", &weights);
+
+    // The real `vae/config.json` shape, with the latents statistics flattened
+    // to mean 0 / std 1 and a small `base_dim` (the decoder's widths come from
+    // its weights, so `base_dim` is informational here).
+    pack.text(
+        "vae/config.json",
+        &serde_json::json!({
+            "_class_name": "AutoencoderKLQwenImage21",
+            "base_dim": 8,
+            "decoder_base_dim": 8,
+            "latents_mean": vec![0.0; TINY_LATENT as usize],
+            "latents_std": vec![1.0; TINY_LATENT as usize],
+            "out_channels": 4,
+            "patch_size": null,
+            "scale_factor_spatial": 16,
+            "temperal_downsample": [false, true, true, true],
+            "z_dim": TINY_LATENT
+        })
+        .to_string(),
+    );
+    let weights = random_tensors(&mut rng, &vae_spec());
+    pack.tensors("vae/diffusion_pytorch_model.safetensors", &weights);
+
+    (dir.join("model_index.json"), pack.files)
+}
+
+/// One 256x256, 4-step, seed-42 image from a fresh `Context`, as RGBA.
+fn generate_tiny_image(api: &'static Api, p: &ContextParams) -> image::RgbaImage {
+    let mut ctx = Context::init(api, p).expect("loading the tiny Qwen-Image pack");
+    let out = ctx
+        .generate(
+            &GenParams {
+                prompt: "a tiny test image".to_string(),
+                width: 256,
+                height: 256,
+                n_steps: 4,
+                seed: Some(42),
+                ..Default::default()
+            },
+            |_, _| true,
+        )
+        .expect("generating the tiny Qwen-Image");
+    let rgba: Vec<u8> = out
+        .rgb
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(&out.alpha)
+        .flat_map(|(rgb, &a)| [rgb[0], rgb[1], rgb[2], a])
+        .collect();
+    image::RgbaImage::from_raw(out.width as u32, out.height as u32, rgba)
+        .expect("RGBA buffer of the output size")
+}
+
+/// Name of the GPU backend `Backend::new(use_gpu: true)` would acquire (GPU,
+/// then integrated GPU, as in `backend::init_gpu`), or `None` without one.
+fn gpu_backend_name(api: &Api) -> Option<String> {
+    use llmman::mediagen::ffi::{GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU};
+    for ty in [GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU] {
+        unsafe {
+            let backend = (api.ggml_backend_init_by_type)(ty, std::ptr::null());
+            if !backend.is_null() {
+                let name = std::ffi::CStr::from_ptr((api.ggml_backend_name)(backend))
+                    .to_string_lossy()
+                    .into_owned();
+                (api.ggml_backend_free)(backend);
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// The Metal backend's image matches the CPU's on the same synthetic Qwen-Image
+/// pack: the #575 bug class (a Metal graph miscompile that made near-transparent
+/// PNGs) changes the Metal output, not just its speed. Runs on the two
+/// `aarch64-apple-darwin` CI legs; skipped elsewhere (CPU-only assets).
+#[test]
+fn mediagen_qwen_image_metal_matches_cpu() {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        eprintln!("skipping: Metal is only on aarch64-apple-darwin");
+        return;
+    }
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH");
+        return;
+    }
+    let _guard = lock_serial();
+    let dir = fresh_home("mediagen-qwen-parity");
+    let (model, files) = write_tiny_qwen_image_pack(&dir);
+    let lib_dir =
+        llmman::cmd::serve::llama_lib_dir(llmman::cmd::serve::Runtime::Path, None).unwrap();
+    // the graph builders hold `&'static Api`
+    let api: &'static Api = Box::leak(Box::new(Api::load(&lib_dir).unwrap()));
+    // `Backend::new(use_gpu: true)` silently falls back to CPU when Metal fails
+    // to initialize, which would make the "Metal" run a second CPU run and let
+    // this test pass vacuously. Probe for the GPU the same way it does first.
+    let Some(gpu) = gpu_backend_name(api) else {
+        eprintln!("skipping: cannot test Metal/CPU parity: no GPU acquired");
+        return;
+    };
+    eprintln!("Metal/CPU parity: GPU backend is {gpu}");
+    let params = |use_gpu: bool| ContextParams {
+        model: model.clone(),
+        vae: None,
+        audio_vae: None,
+        text_proj: None,
+        text_model: None,
+        files: files.clone(),
+        use_gpu,
+        text_gpu_layers: 999,
+        n_threads: std::thread::available_parallelism().map_or(4, |n| n.get() as i32),
+        flash_attn: true,
+    };
+    let metal = generate_tiny_image(api, &params(true));
+    let cpu = generate_tiny_image(api, &params(false));
+    if let Some(problem) = image_mismatch(&metal, &cpu) {
+        let (metal_png, cpu_png) = (dir.join("metal.png"), dir.join("cpu.png"));
+        metal.save(&metal_png).expect("save the Metal PNG");
+        cpu.save(&cpu_png).expect("save the CPU PNG");
+        panic!(
+            "Metal and CPU images differ: {problem}. This is the #575 failure mode; \
+             rerun with GGML_METAL_GRAPH_OPTIMIZE_DISABLE=1 to confirm the Metal graph \
+             optimizer is the cause. Both PNGs are in {}",
+            dir.display()
+        );
+    }
+}
+
+/// The real Qwen-Image 2.1 model through `llmman run`, for validating a
+/// llama.cpp bump. Opt-in: set `LLMMAN_E2E_IMAGE_MODEL=qwen-image-2.1`
+/// (~33 GB of weights, ~32 GB of unified memory).
+///
+///   LLMMAN_E2E_IMAGE_MODEL=qwen-image-2.1 cargo test --release --test launch_e2e \
+///     generate_image_with_a_real_diffusion_model -- --nocapture
+#[test]
+fn generate_image_with_a_real_diffusion_model() {
+    let Ok(model) = std::env::var("LLMMAN_E2E_IMAGE_MODEL") else {
+        eprintln!(
+            "skipping: set LLMMAN_E2E_IMAGE_MODEL=qwen-image-2.1 (needs ~33 GB, ~32 GB unified memory)"
+        );
+        return;
+    };
+    let _guard = lock_serial();
+    // `llmman run` saves the PNG in its working directory
+    let dir = fresh_home("mediagen-real");
+    let mut cmd = Command::new(llmman_bin());
+    cmd.current_dir(&dir)
+        .arg("run")
+        .arg(&model)
+        .args([
+            "--width", "256", "--height", "256", "--steps", "4", "--seed", "42",
+        ])
+        .arg("A manatee in a sunlit lagoon");
+    let output = spawn_with_timeout(cmd, TIMEOUT, "llmman run (real diffusion model)");
+    assert!(
+        output.status.success(),
+        "llmman run failed\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // find the PNG in the run's directory rather than parsing "Image saved to:"
+    // from stdout, which would break if llmman moved that line to stderr
+    let png_path = std::fs::read_dir(&dir)
+        .expect("read output dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "png"))
+        .expect("no PNG found in output dir — llmman run may have failed");
+    let png = std::fs::read(&png_path).expect("read the saved PNG");
+    let img = decode_rgba_png(&png);
+    assert_eq!(img.dimensions(), (256, 256), "{}", png_path.display());
+    if let Some(problem) = opaque_image_problem(&img) {
+        panic!("{}: {problem}", png_path.display());
+    }
 }
