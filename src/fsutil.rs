@@ -1,22 +1,15 @@
-//! Whole-file writes a reader never sees half done, and the free space a
-//! download needs.
+//! Filesystem utilities
 
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Distinguishes the temp files of concurrent writers in one process; the
-/// pid does the same across processes.
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Writes `bytes` to `path` through a temp file beside it and a rename,
-/// so a reader sees the old file or the new one and not a partial one;
-/// the temp name carries the pid and a counter, so no two writers share
-/// one.
-/// A symlink whose target exists is written through to the target, the
-/// old file's permissions go on the temp before it holds anything, and
-/// the temp is synced before the rename.
+/// Symlinks are followed to their target; the target's permissions are
+/// copied onto the temp file before any bytes are written.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // Distinguishes the temp files of concurrent writers in one process; the
+    // pid does the same across processes.
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
     let path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut tmp = path.clone().into_os_string();
     tmp.push(format!(
@@ -44,9 +37,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })
 }
 
-/// Fails when `needed` bytes will not fit in the `available` bytes free
-/// at `dir`, before `what` is pulled there. Free space that could not be
-/// read passes: running out still fails the write, as it always has.
+/// Unreadable free space passes silently; the write will fail naturally if space runs out.
 pub fn ensure_room(
     what: &str,
     dir: &Path,
@@ -65,9 +56,7 @@ pub fn ensure_room(
     }
 }
 
-/// The bytes this user may still write to the filesystem holding `dir`,
-/// or `None` where that can't be read (or a filesystem reports no size,
-/// as some FUSE ones do).
+/// Returns `None` if free space can't be read, or the filesystem reports no size (e.g. some FUSE mounts).
 pub fn available_space(dir: &Path) -> Option<u64> {
     #[cfg(all(unix, not(target_vendor = "apple")))]
     {
