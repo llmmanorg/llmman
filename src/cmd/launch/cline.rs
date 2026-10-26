@@ -1,77 +1,26 @@
 //! `llmman launch cline`.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::Context;
 
-use super::{accepts_prompt, env_dir, exec_with_env, find_on_path, node_user_profile, server};
+use super::{env_dir, exec_with_env, find_on_path, node_user_profile, server};
 
-const CLINE_NPM_INSTALL_ARGS: &[&str] = &["install", "-g", "cline@latest"];
-const CLINE_INSTALL_PROMPT: &str = "Cline is not installed. Install with npm? [y/N] ";
-const CLINE_INSTALL_CANCELLED: &str = "cline installation cancelled";
-
-/// Offers the official npm install when Cline is missing. This runs before
-/// the daemon starts, so declining or lacking npm has no model-pull side
-/// effects. Re-resolving from PATH after npm exits also catches a global npm
-/// prefix that the current shell does not yet know about.
-pub(super) fn ensure_cline_installed() -> anyhow::Result<()> {
-    use std::io::{BufRead, IsTerminal, Write};
-
-    if find_on_path("cline").is_some() {
-        return Ok(());
-    }
-    let npm = find_on_path("npm").ok_or_else(|| {
-        anyhow::anyhow!(
-            "cline is not installed and npm is not on PATH\n\n\
-             Install Node.js from https://nodejs.org/, then re-run:\n  \
-             llmman launch cline"
-        )
-    })?;
-    anyhow::ensure!(
-        std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
-        "cline is not installed\n\nInstall it with:\n  npm install -g cline@latest\n\n\
-         Then re-run:\n  llmman launch cline"
-    );
-
-    eprint!("{CLINE_INSTALL_PROMPT}");
-    std::io::stderr().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
-    anyhow::ensure!(accepts_prompt(&answer), CLINE_INSTALL_CANCELLED);
-
-    eprintln!("\nInstalling Cline...");
-    let status = Command::new(&npm)
-        .args(CLINE_NPM_INSTALL_ARGS)
-        .status()
-        .with_context(|| format!("failed to run {}", npm.display()))?;
-    anyhow::ensure!(status.success(), "failed to install cline: {status}");
-    let cline = find_on_path("cline").ok_or_else(|| {
-        anyhow::anyhow!(
-            "cline was installed but the binary was not found on PATH\n\n\
-         You may need to restart your shell"
-        )
-    })?;
-    let version = Command::new(&cline)
-        .arg("--version")
-        .status()
-        .with_context(|| format!("failed to run {} --version", cline.display()))?;
-    anyhow::ensure!(
-        version.success(),
-        "cline was installed but failed to start ({version})"
-    );
-    eprintln!("Cline installed successfully\n");
-    Ok(())
-}
+pub(super) const CLINE_MISSING: &str = "cline is not installed\n\n\
+     From an llmman source checkout, install via mise:\n  \
+     mise install\n\n\
+     From a release binary, install globally with npm:\n  \
+     npm install -g cline@2.18.0\n\n\
+     Ensure the install directory is on PATH, then retry.";
 
 /// cline: merge llmman's Ollama route into Cline's own settings, then pass
 /// through exactly the arguments supplied after `--`. Cline reads both the
 /// current provider store and legacy global-state fields, so keep them in
 /// sync while preserving unrelated user settings in each file.
 pub(super) fn launch_cline(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("cline").ok_or_else(|| anyhow::anyhow!("cline is not installed"))?;
+    let bin = find_on_path("cline").ok_or_else(|| anyhow::anyhow!("{}", CLINE_MISSING))?;
     write_cline_settings(model)?;
-    exec_with_env(&bin, extra_args, &[])
+    exec_with_env(&bin, extra_args, &[("CLINE_NO_AUTO_UPDATE", "1")])
 }
 
 /// Cline's own resolution: `CLINE_DIR || path.join(os.homedir(), ".cline")`.
@@ -416,22 +365,6 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&global_path).unwrap()).unwrap();
         assert_eq!(global["requestTimeoutMs"], 90000);
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn cline_install_contract_uses_latest_and_only_yes_accepts() {
-        assert_eq!(CLINE_NPM_INSTALL_ARGS, ["install", "-g", "cline@latest"]);
-        assert_eq!(
-            CLINE_INSTALL_PROMPT,
-            "Cline is not installed. Install with npm? [y/N] "
-        );
-        assert_eq!(CLINE_INSTALL_CANCELLED, "cline installation cancelled");
-        for answer in ["y", "Y", "yes", "YES", " yes\n"] {
-            assert!(accepts_prompt(answer));
-        }
-        for answer in ["", "\n", "n", "no", "yep"] {
-            assert!(!accepts_prompt(answer));
-        }
     }
 
     /// Same precedence as Cline: `CLINE_DIR`, then `USERPROFILE` (Windows'

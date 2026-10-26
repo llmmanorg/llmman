@@ -11,8 +11,12 @@ use super::{exec_with_env, find_on_path, has_flag, server, Effort};
 /// key value is ever written to disk (same role as `qwen::QWEN_ENV_KEY`).
 const DSH_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 
-pub(super) const DSH_MISSING: &str =
-    "dsh is not installed, and there is no npx on PATH to run it with";
+pub(super) const DSH_MISSING: &str = "dsh is not installed\n\n\
+     From an llmman source checkout, install via mise:\n  \
+     mise install\n\n\
+     From a release binary, install globally with npm:\n  \
+     npm install -g @deepseek-ai/dsh@0.1.2-rc.1\n\n\
+     Ensure the install directory is on PATH, then retry.";
 
 /// dsh: unlike qwen, hermes and codex, nothing here merges into a file
 /// dsh reads by default. dsh's own `--patch` overlay mechanism lets both
@@ -57,36 +61,20 @@ pub(super) fn launch_dsh(
     write_dsh_patch(&patch_path, &settings_path)?;
 
     let mut args = prefix;
-    if !args.is_empty() {
-        // Said before it happens: this launch downloads a package.
-        eprintln!("[llmman] dsh is not installed; running {DSH_NPM_PACKAGE} with npx");
-    }
     args.extend(dsh_args(&patch_path, extra_args));
     exec_with_env(&bin, &args, &[(DSH_API_KEY_ENV, api_key)])
 }
 
-/// The npm package `npx` fetches when dsh isn't installed. Unpinned, so
-/// a one-off run gets what a global install would have.
-const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh@latest";
-
-/// dsh, and the arguments that must lead whatever it is handed: none for
-/// an installed `dsh`, `--yes <package>` for the `npx` that stands in when
-/// there is none. `find_integration_binary` resolves it the same way, so
-/// the listing agrees with what a launch would run.
+/// The installed `dsh`, as `find_integration_binary` resolves it, so the
+/// listing agrees with what a launch would run.
 pub(super) fn find_dsh() -> Option<(PathBuf, Vec<String>)> {
-    dsh_command(find_on_path("dsh"), || find_on_path("npx"))
+    dsh_command(find_on_path("dsh"))
 }
 
-/// Split from [`find_dsh`] so which binary wins can be asserted without
-/// depending on what the test machine has installed.
-fn dsh_command(
-    dsh: Option<PathBuf>,
-    npx: impl FnOnce() -> Option<PathBuf>,
-) -> Option<(PathBuf, Vec<String>)> {
-    match dsh {
-        Some(bin) => Some((bin, Vec::new())),
-        None => Some((npx()?, vec!["--yes".into(), DSH_NPM_PACKAGE.into()])),
-    }
+/// Split from [`find_dsh`] so the lookup can be asserted without depending
+/// on what the test machine has installed.
+fn dsh_command(dsh: Option<PathBuf>) -> Option<(PathBuf, Vec<String>)> {
+    dsh.map(|bin| (bin, Vec::new()))
 }
 
 /// The tokens dsh reads as its own launcher flags, rather than forwards
@@ -283,27 +271,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The fallback that makes `llmman launch dsh` work without a global
-    /// install — and stays out of the way of one that exists.
+    /// An installed dsh is the one launched, with no arguments ahead of
+    /// dsh's own; with none installed there is nothing to run.
     #[test]
-    fn dsh_falls_back_to_the_published_package_under_npx() {
+    fn dsh_uses_installed_dsh_binary() {
         let dsh = PathBuf::from("/usr/local/bin/dsh");
-        let npx = PathBuf::from("/usr/local/bin/npx");
-
-        // An install wins, and npx is never even looked for.
-        assert_eq!(
-            dsh_command(Some(dsh.clone()), || panic!("npx looked up anyway")),
-            Some((dsh, Vec::new()))
-        );
-        // Without one, npx runs the package: `--yes` so a first run
-        // isn't blocked on a prompt, ahead of dsh's own arguments.
-        assert_eq!(
-            dsh_command(None, || Some(npx.clone())),
-            Some((npx, vec!["--yes".to_string(), DSH_NPM_PACKAGE.to_string()]))
-        );
-        assert!(DSH_NPM_PACKAGE.starts_with("@deepseek-ai/dsh@"));
-        // Neither: "dsh is not installed", not an npm error.
-        assert_eq!(dsh_command(None, || None), None);
+        assert_eq!(dsh_command(Some(dsh.clone())), Some((dsh, Vec::new())));
+        assert_eq!(dsh_command(None), None);
     }
 
     #[test]
