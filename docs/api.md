@@ -129,10 +129,12 @@ that started one is one any web page could send.
 
 `/v1/responses` implements the OpenAI Responses API (the dialect
 [OpenAI Codex](https://github.com/openai/codex) requires), including
-streaming SSE and function-tool-call re-mapping. For a local model this
-is a plain pass-through to `llama-server`'s own native `/v1/responses`
-support, so a recent enough `llama-server` build is required for it to
-work. For a [provider](providers.md) without the route, the daemon
+streaming SSE and function-tool-call re-mapping. A local model's request is
+translated to its backend's `/v1/chat/completions` and the reply translated
+back, the same bridge a [provider](providers.md) without the route uses.
+`llama-server`'s native route is not used: it rejects namespace and other
+non-function tools, and its event stream is incomplete for clients such as
+Muse. For a [provider](providers.md) without the route, the daemon
 translates to and from `/v1/chat/completions` itself, and for a provider
 that speaks the Anthropic Messages API from there to `/v1/messages` (see
 [wire formats](providers.md#wire-formats)).
@@ -140,6 +142,10 @@ that speaks the Anthropic Messages API from there to `/v1/messages` (see
 The `model` in a `/v1/chat/completions`, `/v1/completions` or `/v1/responses`
 reply (every streamed chunk too) is the one the client asked for, not the
 path llama-server loaded the weights from.
+
+When bridging Responses API requests, a `namespace` tool's members are sent upstream as `<namespace>_<member>`, with dots replaced by `_` and everything else kept verbatim.
+
+Since llmman #563, a member whose name starts with `_` keeps that underscore: `agents._wait` is sent upstream as `agents__wait`. Earlier versions sent `agents_wait`. Clients always receive the original member names, and replayed `function_call` items are re-encoded per request from their original `namespace` and `name`, the same way as tool definitions, so stored history is unaffected. Only provider-side logs and prompt caches see the new spelling.
 
 A request bound for a provider loses llama-server's own fields
 (`repeat_penalty`, `top_k`, `min_p`, `chat_template_kwargs`, ...), which
