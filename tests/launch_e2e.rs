@@ -3048,3 +3048,362 @@ fn mediagen_ffi_binds_the_llama_cpp_on_path() {
     let api = llmman::mediagen::ffi::Api::load(&dir).unwrap();
     api.check_layout().unwrap();
 }
+
+/// Tensor names transcribe.cpp's Canary loader reads (`src/arch/canary/
+/// weights.cpp:443-573` at db678a0), outside the per-layer blocks.
+const CANARY_FIXED_TENSORS: &[&str] = &[
+    "enc.pre_encode.conv.0.weight",
+    "enc.pre_encode.conv.0.bias",
+    "enc.pre_encode.conv.2.weight",
+    "enc.pre_encode.conv.2.bias",
+    "enc.pre_encode.conv.3.weight",
+    "enc.pre_encode.conv.3.bias",
+    "enc.pre_encode.conv.5.weight",
+    "enc.pre_encode.conv.5.bias",
+    "enc.pre_encode.conv.6.weight",
+    "enc.pre_encode.conv.6.bias",
+    "enc.pre_encode.out.weight",
+    "enc.pre_encode.out.bias",
+    "dec.embed.token.weight",
+    "dec.embed.pos_enc",
+    "dec.embed.norm.weight",
+    "dec.embed.norm.bias",
+    "dec.norm.weight",
+    "dec.norm.bias",
+    "dec.head.weight",
+    "dec.head.bias",
+];
+
+/// Per-block suffixes under `enc.blocks.N.` (same source, `:460-506`).
+const CANARY_ENC_BLOCK_TENSORS: &[&str] = &[
+    "norm_ff1.weight",
+    "norm_ff1.bias",
+    "ff1.linear1.weight",
+    "ff1.linear1.bias",
+    "ff1.linear2.weight",
+    "ff1.linear2.bias",
+    "norm_attn.weight",
+    "norm_attn.bias",
+    "attn.linear_q.weight",
+    "attn.linear_q.bias",
+    "attn.linear_k.weight",
+    "attn.linear_k.bias",
+    "attn.linear_v.weight",
+    "attn.linear_v.bias",
+    "attn.linear_out.weight",
+    "attn.linear_out.bias",
+    "attn.linear_pos.weight",
+    "attn.pos_bias_u",
+    "attn.pos_bias_v",
+    "norm_conv.weight",
+    "norm_conv.bias",
+    "conv.pointwise1.weight",
+    "conv.pointwise1.bias",
+    "conv.depthwise.weight",
+    "conv.depthwise.bias",
+    "conv.pointwise2.weight",
+    "conv.pointwise2.bias",
+    "conv.bn.weight",
+    "conv.bn.bias",
+    "conv.bn.running_mean",
+    "conv.bn.running_var",
+    "norm_ff2.weight",
+    "norm_ff2.bias",
+    "ff2.linear1.weight",
+    "ff2.linear1.bias",
+    "ff2.linear2.weight",
+    "ff2.linear2.bias",
+    "norm_out.weight",
+    "norm_out.bias",
+];
+
+/// Per-layer suffixes under `dec.layer.N.` (same source, `:534-565`).
+const CANARY_DEC_LAYER_TENSORS: &[&str] = &[
+    "norm1.weight",
+    "norm1.bias",
+    "self_attn.q.weight",
+    "self_attn.q.bias",
+    "self_attn.k.weight",
+    "self_attn.k.bias",
+    "self_attn.v.weight",
+    "self_attn.v.bias",
+    "self_attn.o.weight",
+    "self_attn.o.bias",
+    "norm2.weight",
+    "norm2.bias",
+    "cross_attn.q.weight",
+    "cross_attn.q.bias",
+    "cross_attn.k.weight",
+    "cross_attn.k.bias",
+    "cross_attn.v.weight",
+    "cross_attn.v.bias",
+    "cross_attn.o.weight",
+    "cross_attn.o.bias",
+    "norm3.weight",
+    "norm3.bias",
+    "ffn.up.weight",
+    "ffn.up.bias",
+    "ffn.down.weight",
+    "ffn.down.bias",
+];
+
+/// The full transcribe.cpp tensor contract for `n_enc` encoder blocks
+/// and `n_dec` decoder layers: `enc.proj.*` is absent, since 1B v2 has
+/// no encoder-decoder projection (`weights.cpp:509-512`).
+fn canary_contract_names(n_enc: u64, n_dec: u64) -> std::collections::BTreeSet<String> {
+    let fixed = CANARY_FIXED_TENSORS.iter().map(|s| s.to_string());
+    let enc = (0..n_enc).flat_map(|i| {
+        CANARY_ENC_BLOCK_TENSORS
+            .iter()
+            .map(move |s| format!("enc.blocks.{i}.{s}"))
+    });
+    let dec = (0..n_dec).flat_map(|i| {
+        CANARY_DEC_LAYER_TENSORS
+            .iter()
+            .map(move |s| format!("dec.layer.{i}.{s}"))
+    });
+    fixed.chain(enc).chain(dec).collect()
+}
+
+/// A GGUF metadata value on one line: strings bare, arrays joined,
+/// numbers with their type.
+fn gguf_value_text(v: &llmman::gguf::Value) -> String {
+    use llmman::gguf::Value;
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(gguf_value_text).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+/// Canary 1B v2 feasibility (handy-computer/canary-1b-v2-gguf): each
+/// GGUF in `LLMMAN_CANARY_GGUF_DIR` is read with `gguf::read_info` (all
+/// value types) and `mediagen::weights::read_index` (the loader's own
+/// tensor index), its tensor names are matched against the transcribe.cpp
+/// contract above with zero unmapped and zero missing, a few shapes are
+/// checked against the `stt.canary.*` hyperparameters, and one Q8_0 plus
+/// one Q6_K tensor are pushed through a ggml CPU buffer and read back
+/// byte for byte through the same `ggml_backend_tensor_set` the loader
+/// uses. Needs the real files, so it is ignored and run by hand:
+/// `LLMMAN_CANARY_GGUF_DIR=<dir> cargo test --release --test launch_e2e
+/// canary -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn canary_gguf_loads_through_mediagen_weights() {
+    use llmman::mediagen::ffi;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::Seek;
+
+    // `enum ggml_type` ids (ggml.h:398 and :404 at b11669); `ffi::ty`
+    // only names the types the media pipelines use.
+    const GGML_TYPE_Q8_0: u32 = 8;
+    const GGML_TYPE_Q6_K: u32 = 14;
+
+    let Some(dir) = std::env::var_os("LLMMAN_CANARY_GGUF_DIR")
+        .map(PathBuf::from)
+        .filter(|d| !d.as_os_str().is_empty())
+    else {
+        eprintln!("skipping: LLMMAN_CANARY_GGUF_DIR is not set");
+        return;
+    };
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH");
+        return;
+    }
+
+    // Candidates for the byte round-trip: (file, tensor) per ggml type.
+    let mut q8_0: Option<(PathBuf, llmman::mediagen::weights::TensorDesc)> = None;
+    let mut q6_k: Option<(PathBuf, llmman::mediagen::weights::TensorDesc)> = None;
+    for file in [
+        "canary-1b-v2-Q8_0.gguf",
+        "canary-1b-v2-F16.gguf",
+        "canary-1b-v2-Q6_K.gguf",
+    ] {
+        let path = dir.join(file);
+        if !path.is_file() {
+            // Q8_0 and F16 are the pinned artifacts; only Q6_K is optional.
+            assert!(
+                file.contains("Q6_K"),
+                "{file}: missing in {}",
+                dir.display()
+            );
+            eprintln!("{file}: absent, skipped");
+            continue;
+        }
+        eprintln!("== {}", path.display());
+
+        let info = llmman::gguf::read_info(&path).unwrap();
+        assert_eq!(info.architecture(), Some("canary"), "{file}");
+        let mut keys: Vec<&String> = info
+            .metadata
+            .keys()
+            .filter(|k| {
+                k.starts_with("stt.canary.")
+                    || k.starts_with("stt.frontend.")
+                    || *k == "general.languages"
+                    || *k == "stt.translation.pairs"
+            })
+            .collect();
+        keys.sort();
+        for k in keys {
+            eprintln!("  {k} = {}", gguf_value_text(&info.metadata[k]));
+        }
+        let hp = |key: &str| {
+            info.u64(key)
+                .unwrap_or_else(|| panic!("{file}: {key} missing or not an integer"))
+        };
+        let n_enc = hp("stt.canary.encoder.n_layers");
+        let n_dec = hp("stt.canary.decoder.n_layers");
+        let d_enc = hp("stt.canary.encoder.d_model");
+        let n_heads = hp("stt.canary.encoder.n_heads");
+        let d_dec = hp("stt.canary.decoder.d_model");
+        let vocab = hp("stt.canary.decoder.vocab_size");
+        let max_pos = hp("stt.canary.decoder.max_position");
+
+        let idx = llmman::mediagen::weights::read_index(&path).unwrap();
+        let mut histogram: BTreeMap<u32, usize> = BTreeMap::new();
+        for t in &idx.tensors {
+            *histogram.entry(t.ty).or_default() += 1;
+        }
+        eprintln!(
+            "  tensors: {}, types {{ggml type id: count}}: {histogram:?}",
+            idx.tensors.len()
+        );
+
+        let expected = canary_contract_names(n_enc, n_dec);
+        let found: BTreeSet<String> = idx.tensors.iter().map(|t| t.name.clone()).collect();
+        let unmapped: Vec<&String> = found.difference(&expected).collect();
+        let missing: Vec<&String> = expected.difference(&found).collect();
+        for n in &unmapped {
+            eprintln!("  unmapped: {n}");
+        }
+        for n in &missing {
+            eprintln!("  missing: {n}");
+        }
+        assert!(
+            unmapped.is_empty(),
+            "{file}: {} unmapped tensors",
+            unmapped.len()
+        );
+        assert!(
+            missing.is_empty(),
+            "{file}: {} missing tensors",
+            missing.len()
+        );
+        eprintln!("  contract: {} names, all mapped", expected.len());
+
+        let shape = |name: &str| -> Vec<i64> {
+            idx.tensors
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{file}: {name} not in index"))
+                .ne
+                .clone()
+        };
+        let u = |v: u64| v as i64;
+        assert_eq!(
+            shape("dec.embed.token.weight"),
+            [u(d_dec), u(vocab)],
+            "{file}"
+        );
+        assert_eq!(shape("dec.embed.pos_enc"), [u(d_dec), u(max_pos)], "{file}");
+        assert_eq!(shape("dec.head.weight"), [u(d_dec), u(vocab)], "{file}");
+        assert_eq!(
+            shape("enc.blocks.0.attn.pos_bias_u"),
+            [u(d_enc / n_heads), u(n_heads)],
+            "{file}"
+        );
+        eprintln!("  shapes: token/pos_enc/head/pos_bias_u match the hyperparameters");
+
+        for t in &idx.tensors {
+            let slot = match t.ty {
+                GGML_TYPE_Q8_0 => &mut q8_0,
+                GGML_TYPE_Q6_K => &mut q6_k,
+                _ => continue,
+            };
+            if slot.is_none() {
+                *slot = Some((path.clone(), t.clone()));
+            }
+        }
+    }
+
+    let picks: Vec<_> = [("Q8_0", q8_0), ("Q6_K", q6_k)]
+        .into_iter()
+        .filter_map(|(label, pick)| match pick {
+            Some(p) => Some((label, p)),
+            None => {
+                eprintln!("round-trip: no {label} tensor in any file, skipped");
+                None
+            }
+        })
+        .collect();
+    assert!(!picks.is_empty(), "no quantized tensor to round-trip");
+
+    let lib_dir =
+        llmman::cmd::serve::llama_lib_dir(llmman::cmd::serve::Runtime::Path, None).unwrap();
+    eprintln!(
+        "== round-trip through the ggml CPU backend in {}",
+        lib_dir.display()
+    );
+    let api = ffi::Api::load(&lib_dir).unwrap();
+    // SAFETY: plain ggml calls on handles this block creates and frees;
+    // every pointer is checked for null before use.
+    unsafe {
+        let backend =
+            (api.ggml_backend_init_by_type)(ffi::GGML_BACKEND_DEVICE_TYPE_CPU, std::ptr::null());
+        assert!(!backend.is_null(), "no ggml CPU backend");
+        let buft = (api.ggml_backend_get_default_buffer_type)(backend);
+        for (label, (path, desc)) in picks {
+            let ctx = (api.ggml_init)(ffi::GgmlInitParams {
+                mem_size: (api.ggml_tensor_overhead)(),
+                mem_buffer: std::ptr::null_mut(),
+                no_alloc: true,
+            });
+            assert!(!ctx.is_null(), "ggml_init");
+            let t = (api.ggml_new_tensor)(
+                ctx,
+                desc.ty,
+                desc.ne.len() as std::ffi::c_int,
+                desc.ne.as_ptr(),
+            );
+            assert!(!t.is_null(), "ggml_new_tensor {}", desc.name);
+            let buf = (api.ggml_backend_alloc_ctx_tensors_from_buft)(ctx, buft);
+            assert!(!buf.is_null(), "alloc {}", desc.name);
+            // `read_gguf` leaves `nbytes` at 0; the loader sizes the read
+            // with `ggml_row_size` (weights.rs `load_files`), as here.
+            let elems: i64 = desc.ne.iter().product();
+            let nbytes = (api.ggml_row_size)(desc.ty, elems);
+            assert_eq!((api.ggml_nbytes)(t), nbytes, "{}: ggml_nbytes", desc.name);
+            let mut file = std::fs::File::open(&path).unwrap();
+            let file_len = file.metadata().unwrap().len();
+            assert!(
+                desc.offset + nbytes as u64 <= file_len,
+                "{}: offset {} + {nbytes} past the end of {}",
+                desc.name,
+                desc.offset,
+                path.display()
+            );
+            file.seek(std::io::SeekFrom::Start(desc.offset)).unwrap();
+            let mut src = vec![0u8; nbytes];
+            file.read_exact(&mut src).unwrap();
+            (api.ggml_backend_tensor_set)(t, src.as_ptr() as *const _, 0, nbytes);
+            let mut back = vec![0u8; nbytes];
+            (api.ggml_backend_tensor_get)(t, back.as_mut_ptr() as *mut _, 0, nbytes);
+            assert!(
+                src == back,
+                "{}: bytes differ after the round-trip",
+                desc.name
+            );
+            eprintln!(
+                "  {label} {} ne={:?} ty={} offset={} {nbytes} bytes: identical",
+                desc.name, desc.ne, desc.ty, desc.offset
+            );
+            (api.ggml_backend_buffer_free)(buf);
+            (api.ggml_free)(ctx);
+        }
+        (api.ggml_backend_free)(backend);
+    }
+}
