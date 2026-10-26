@@ -286,6 +286,228 @@ async fn call_remote_responses(base_url: &str, stream: bool) -> (StatusCode, Hea
     call_remote_responses_target(remote_target(base_url), stream).await
 }
 
+async fn call_generation_responses(
+    base_url: &str,
+    req: serde_json::Value,
+) -> (StatusCode, HeaderMap, String) {
+    let state = test_state();
+    let canonical = "llmman.provider/mockprov/mock-model";
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", "application/json".parse().unwrap());
+    let resp = openai::proxy_openai_generation_to(
+        &state,
+        &headers,
+        req,
+        RESPONSES_ROUTE,
+        canonical,
+        canonical.to_string(),
+        remote_target(base_url),
+        ActivityGuard::new(&state, canonical),
+    )
+    .await
+    .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, headers, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
+async fn remote_responses_route_tries_native_first_through_the_proxy() {
+    let seen = Arc::new(tokio::sync::Mutex::new(serde_json::Value::Null));
+    let capture = seen.clone();
+    let app = Router::new()
+        .route(
+            "/v1/responses",
+            post(move |Json(body): Json<serde_json::Value>| async move {
+                *capture.lock().await = body;
+                (
+                    [("content-type", "application/json")],
+                    r#"{"id":"resp_1","object":"response","model":"mock-model","status":"completed","output":[]}"#,
+                )
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(|| async { (StatusCode::IM_A_TEAPOT, "translation was not expected") }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (status, _, body) = call_generation_responses(
+        &format!("http://127.0.0.1:{}/v1", addr.port()),
+        serde_json::json!({
+            "model": "llmman.provider/mockprov/mock-model",
+            "input": "hi",
+            "stream": false,
+            "tools": [
+                {"type": "web_search"},
+                {"type": "namespace", "name": "muse", "tools": [
+                    {"type": "function", "name": "read_file", "parameters": {"type": "object"}}
+                ]}
+            ],
+            "repeat_penalty": 1.1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let request = seen.lock().await;
+    assert_eq!(request["model"], "mock-model");
+    assert_eq!(request["tools"][0]["type"], "web_search");
+    assert_eq!(request["tools"][1]["type"], "namespace");
+    assert_eq!(request["tools"][1]["tools"][0]["name"], "read_file");
+    assert!(request.get("repeat_penalty").is_none(), "{request}");
+    assert!(
+        body.contains("\"model\":\"llmman.provider/mockprov/mock-model\""),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn remote_responses_route_translates_when_native_is_missing() {
+    let seen = Arc::new(tokio::sync::Mutex::new(serde_json::Value::Null));
+    let capture = seen.clone();
+    let app = Router::new()
+        .route("/v1/responses", post(|| async { StatusCode::NOT_FOUND }))
+        .route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| async move {
+                *capture.lock().await = body;
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n\
+                     data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                     data: [DONE]\n\n",
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (status, headers, body) = call_generation_responses(
+        &format!("http://127.0.0.1:{}/v1", addr.port()),
+        serde_json::json!({
+            "model": "llmman.provider/mockprov/mock-model",
+            "input": "hi",
+            "stream": true,
+            "tools": [
+                {"type": "web_search"},
+                {"type": "namespace", "name": "muse", "tools": [
+                    {"type": "function", "name": "read_file", "parameters": {"type": "object"}}
+                ]}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(headers["content-type"], "text/event-stream");
+    assert!(body.contains("event: response.created"), "{body}");
+    assert!(body.contains("\"delta\":\"OK\""), "{body}");
+    let request = seen.lock().await;
+    assert_eq!(request["model"], "mock-model");
+    assert_eq!(request["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(request["tools"][0]["function"]["name"], "muse_read_file");
+}
+
+#[tokio::test]
+async fn translated_responses_reject_invalid_tool_identities_before_forwarding() {
+    let state = test_state();
+    for tools in [
+        serde_json::json!([{ "type": "function", "name": "a".repeat(129) }]),
+        serde_json::json!([
+            {"type": "namespace", "name": "a_b", "tools": [{"type": "function", "name": "x"}]},
+            {"type": "namespace", "name": "a", "tools": [
+                {"type": "namespace", "name": "b", "tools": [{"type": "function", "name": "x"}]}
+            ]}
+        ]),
+    ] {
+        // An unreachable backend makes accidental forwarding fail with a
+        // different status; invalid identities must be rejected locally.
+        let result = responses::translated_responses(
+            &state.0.client,
+            &Target::Local(0),
+            serde_json::json!({"model": "local-model", "input": "go", "tools": tools}),
+            ActivityGuard::new(&state, "local-model"),
+            "local-model".into(),
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert_eq!(error.1, StatusCode::BAD_REQUEST, "{}", error.0);
+    }
+}
+
+/// A local model's `/v1/responses` is bridged through its
+/// `/v1/chat/completions`. The native route answers 418 here, so a 200
+/// proves the request never reached it.
+#[tokio::test]
+async fn local_responses_translate_through_chat_completions() {
+    let seen = Arc::new(tokio::sync::Mutex::new(serde_json::Value::Null));
+    let capture = seen.clone();
+    let app = Router::new()
+        .route(
+            "/v1/responses",
+            post(|| async { (StatusCode::IM_A_TEAPOT, "native route was not expected") }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| async move {
+                *capture.lock().await = body;
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"},\"finish_reason\":null}]}\n\n\
+                     data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                     data: [DONE]\n\n",
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let state = test_state();
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", "application/json".parse().unwrap());
+    let response = openai::proxy_openai_generation_to(
+        &state,
+        &headers,
+        serde_json::json!({
+            "model": "local-model", "stream": true, "instructions": "first",
+            "input": [
+                {"role": "user", "content": "pong"},
+                {"role": "developer", "content": "second"}
+            ],
+            "tools": [{"type": "namespace", "name": "muse", "tools": [
+                {"type": "function", "name": "read_file", "parameters": {"type": "object"}}
+            ]}]
+        }),
+        RESPONSES_ROUTE,
+        "local-model",
+        "local-model".to_string(),
+        Target::Local(port),
+        ActivityGuard::new(&state, "local-model"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("event: response.completed"), "{body}");
+    assert!(body.contains("\"sequence_number\":0"), "{body}");
+    assert!(body.contains("\"delta\":\"pong\""), "{body}");
+    assert!(body.contains("\"model\":\"local-model\""), "{body}");
+    let request = seen.lock().await;
+    assert_eq!(request["model"], "local-model");
+    assert_eq!(request["messages"][0]["content"], "first\n\nsecond");
+    assert_eq!(request["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(request["tools"][0]["function"]["name"], "muse_read_file");
+    task.abort();
+}
+
 /// The provider's own answer on `/v1/responses` decides: a missing or
 /// broken route falls back to a chat completion translated both ways,
 /// anything else is relayed as it came.
@@ -350,6 +572,40 @@ async fn remote_responses_falls_back_only_on_a_missing_or_broken_route() {
         // Relayed whole or re-streamed line by line, the provider's
         // own headers reach the client either way.
         assert!(headers.contains_key("x-provider"), "{native}");
+    }
+}
+
+#[tokio::test]
+async fn responses_route_relays_server_errors_without_a_second_generation() {
+    for native in [
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::BAD_GATEWAY,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        // A retry as a chat completion would answer 418 here, so a relayed
+        // 5xx proves the request was not generated a second time.
+        let app = Router::new()
+            .route("/v1/responses", post(move || async move { native }))
+            .route(
+                "/v1/chat/completions",
+                post(|| async { (StatusCode::IM_A_TEAPOT, "retried as chat completion") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        for stream in [false, true] {
+            let (status, _, body) = call_generation_responses(
+                &format!("http://{addr}/v1"),
+                serde_json::json!({
+                    "model": "llmman.provider/mockprov/mock-model",
+                    "input": "hi",
+                    "stream": stream
+                }),
+            )
+            .await;
+            assert_eq!(status, native, "{body}");
+        }
     }
 }
 
@@ -5051,14 +5307,16 @@ async fn a_keyed_daemon_refuses_everything_but_its_own_page_without_the_key() {
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED, "{path}");
     }
 
-    // A POST route too, with a body that would otherwise be a 400.
-    let r = client
-        .post(format!("{url}/api/show"))
-        .body("{}")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    // POST routes too, with a body that would otherwise be a 400.
+    for path in ["/api/show", "/v1/responses"] {
+        let r = client
+            .post(format!("{url}{path}"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
 
     // Either spelling, either key.
     let bearer = client
@@ -5893,16 +6151,24 @@ fn llama_server_standin() -> Router {
                 if req["stream"] != true {
                     return completion().into_response();
                 }
-                let chunk = |content: &str| {
+                let chunk = |content: &str, finish_reason: serde_json::Value| {
                     let chunk = serde_json::json!({
                         "id": "chatcmpl-1",
                         "object": "chat.completion.chunk",
                         "model": BACKEND_MODEL_PATH,
-                        "choices": [{ "index": 0, "delta": { "content": content } }],
+                        "choices": [{
+                            "index": 0,
+                            "delta": { "content": content },
+                            "finish_reason": finish_reason,
+                        }],
                     });
                     format!("data: {chunk}\n\n")
                 };
-                sse(format!("{}{}data: [DONE]\n\n", chunk("Hel"), chunk("lo")))
+                sse(format!(
+                    "{}{}data: [DONE]\n\n",
+                    chunk("Hel", serde_json::Value::Null),
+                    chunk("lo", serde_json::json!("stop")),
+                ))
             }),
         )
         .route("/v1/completions", post(move || async move { completion() }))
