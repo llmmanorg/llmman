@@ -46,6 +46,27 @@ pub fn default_release() -> &'static str {
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/LLAMA_CPP_RELEASE")).trim()
 }
 
+/// What the ggml library of a llama.cpp release reports about itself:
+/// `ggml_version()` is `GGML_VERSION_BASE` from `ggml/CMakeLists.txt` at
+/// the tag and `ggml_commit()` the llama.cpp commit the tag points at, as
+/// `git rev-parse --short HEAD` printed it (`-dirty` appended on a dirty
+/// tree). `tag` ties the pair to `LLAMA_CPP_RELEASE`; a unit test keeps
+/// them in step.
+pub struct PinnedGgml {
+    pub tag: &'static str,
+    pub version: &'static str,
+    pub commit: &'static str,
+}
+
+/// The identity [`crate::mediagen::ffi::Api::load`] expects from the
+/// libraries of [`default_release`]. Update it with every bump of
+/// `LLAMA_CPP_RELEASE`.
+pub const PINNED_GGML: PinnedGgml = PinnedGgml {
+    tag: "b11669",
+    version: "0.27.0",
+    commit: "620d2225c",
+};
+
 // ---------------------------------------------------------------------------
 // GitHub Releases API
 // ---------------------------------------------------------------------------
@@ -910,6 +931,19 @@ fn newest_cached(label: &str, bin_name: &str) -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_ggml_matches_the_release_file() {
+        assert_eq!(
+            PINNED_GGML.tag,
+            default_release(),
+            "LLAMA_CPP_RELEASE is {} but PINNED_GGML.tag is {}: when bumping \
+             LLAMA_CPP_RELEASE also update PINNED_GGML in src/llama_release.rs \
+             (version from ggml/CMakeLists.txt at the tag, commit from the tag)",
+            default_release(),
+            PINNED_GGML.tag
+        );
+    }
 
     #[test]
     fn parse_tmp_dir_returns_none_when_unset_or_blank() {

@@ -3049,122 +3049,6 @@ fn mediagen_ffi_binds_the_llama_cpp_on_path() {
     api.check_layout().unwrap();
 }
 
-/// Tensor names transcribe.cpp's Canary loader reads (`src/arch/canary/
-/// weights.cpp:443-573` at db678a0), outside the per-layer blocks.
-const CANARY_FIXED_TENSORS: &[&str] = &[
-    "enc.pre_encode.conv.0.weight",
-    "enc.pre_encode.conv.0.bias",
-    "enc.pre_encode.conv.2.weight",
-    "enc.pre_encode.conv.2.bias",
-    "enc.pre_encode.conv.3.weight",
-    "enc.pre_encode.conv.3.bias",
-    "enc.pre_encode.conv.5.weight",
-    "enc.pre_encode.conv.5.bias",
-    "enc.pre_encode.conv.6.weight",
-    "enc.pre_encode.conv.6.bias",
-    "enc.pre_encode.out.weight",
-    "enc.pre_encode.out.bias",
-    "dec.embed.token.weight",
-    "dec.embed.pos_enc",
-    "dec.embed.norm.weight",
-    "dec.embed.norm.bias",
-    "dec.norm.weight",
-    "dec.norm.bias",
-    "dec.head.weight",
-    "dec.head.bias",
-];
-
-/// Per-block suffixes under `enc.blocks.N.` (same source, `:460-506`).
-const CANARY_ENC_BLOCK_TENSORS: &[&str] = &[
-    "norm_ff1.weight",
-    "norm_ff1.bias",
-    "ff1.linear1.weight",
-    "ff1.linear1.bias",
-    "ff1.linear2.weight",
-    "ff1.linear2.bias",
-    "norm_attn.weight",
-    "norm_attn.bias",
-    "attn.linear_q.weight",
-    "attn.linear_q.bias",
-    "attn.linear_k.weight",
-    "attn.linear_k.bias",
-    "attn.linear_v.weight",
-    "attn.linear_v.bias",
-    "attn.linear_out.weight",
-    "attn.linear_out.bias",
-    "attn.linear_pos.weight",
-    "attn.pos_bias_u",
-    "attn.pos_bias_v",
-    "norm_conv.weight",
-    "norm_conv.bias",
-    "conv.pointwise1.weight",
-    "conv.pointwise1.bias",
-    "conv.depthwise.weight",
-    "conv.depthwise.bias",
-    "conv.pointwise2.weight",
-    "conv.pointwise2.bias",
-    "conv.bn.weight",
-    "conv.bn.bias",
-    "conv.bn.running_mean",
-    "conv.bn.running_var",
-    "norm_ff2.weight",
-    "norm_ff2.bias",
-    "ff2.linear1.weight",
-    "ff2.linear1.bias",
-    "ff2.linear2.weight",
-    "ff2.linear2.bias",
-    "norm_out.weight",
-    "norm_out.bias",
-];
-
-/// Per-layer suffixes under `dec.layer.N.` (same source, `:534-565`).
-const CANARY_DEC_LAYER_TENSORS: &[&str] = &[
-    "norm1.weight",
-    "norm1.bias",
-    "self_attn.q.weight",
-    "self_attn.q.bias",
-    "self_attn.k.weight",
-    "self_attn.k.bias",
-    "self_attn.v.weight",
-    "self_attn.v.bias",
-    "self_attn.o.weight",
-    "self_attn.o.bias",
-    "norm2.weight",
-    "norm2.bias",
-    "cross_attn.q.weight",
-    "cross_attn.q.bias",
-    "cross_attn.k.weight",
-    "cross_attn.k.bias",
-    "cross_attn.v.weight",
-    "cross_attn.v.bias",
-    "cross_attn.o.weight",
-    "cross_attn.o.bias",
-    "norm3.weight",
-    "norm3.bias",
-    "ffn.up.weight",
-    "ffn.up.bias",
-    "ffn.down.weight",
-    "ffn.down.bias",
-];
-
-/// The full transcribe.cpp tensor contract for `n_enc` encoder blocks
-/// and `n_dec` decoder layers: `enc.proj.*` is absent, since 1B v2 has
-/// no encoder-decoder projection (`weights.cpp:509-512`).
-fn canary_contract_names(n_enc: u64, n_dec: u64) -> std::collections::BTreeSet<String> {
-    let fixed = CANARY_FIXED_TENSORS.iter().map(|s| s.to_string());
-    let enc = (0..n_enc).flat_map(|i| {
-        CANARY_ENC_BLOCK_TENSORS
-            .iter()
-            .map(move |s| format!("enc.blocks.{i}.{s}"))
-    });
-    let dec = (0..n_dec).flat_map(|i| {
-        CANARY_DEC_LAYER_TENSORS
-            .iter()
-            .map(move |s| format!("dec.layer.{i}.{s}"))
-    });
-    fixed.chain(enc).chain(dec).collect()
-}
-
 /// A GGUF metadata value on one line: strings bare, arrays joined,
 /// numbers with their type.
 fn gguf_value_text(v: &llmman::gguf::Value) -> String {
@@ -3179,22 +3063,20 @@ fn gguf_value_text(v: &llmman::gguf::Value) -> String {
     }
 }
 
-/// Canary 1B v2 feasibility (handy-computer/canary-1b-v2-gguf): each
-/// GGUF in `LLMMAN_CANARY_GGUF_DIR` is read with `gguf::read_info` (all
-/// value types) and `mediagen::weights::read_index` (the loader's own
-/// tensor index), its tensor names are matched against the transcribe.cpp
-/// contract above with zero unmapped and zero missing, a few shapes are
-/// checked against the `stt.canary.*` hyperparameters, and one Q8_0 plus
-/// one Q6_K tensor are pushed through a ggml CPU buffer and read back
-/// byte for byte through the same `ggml_backend_tensor_set` the loader
-/// uses. Needs the real files, so it is ignored and run by hand:
+/// Canary 1B v2 (handy-computer/canary-1b-v2-gguf): each GGUF in
+/// `LLMMAN_CANARY_GGUF_DIR` meets the transcribe.cpp tensor contract
+/// (`src/arch/canary/weights.cpp` at db678a0, kept in `speech::model`)
+/// through the loader's own index, and a quantized tensor survives a
+/// byte round-trip through the same `ggml_backend_tensor_set` the loader
+/// uses. Q8_0 and F16 are required, Q6_K optional. Run by hand:
 /// `LLMMAN_CANARY_GGUF_DIR=<dir> cargo test --release --test launch_e2e
 /// canary -- --ignored --nocapture`.
 #[test]
 #[ignore]
 fn canary_gguf_loads_through_mediagen_weights() {
     use llmman::mediagen::ffi;
-    use std::collections::{BTreeMap, BTreeSet};
+    use llmman::speech::model::{check_index, contract_names, CanaryHParams};
+    use std::collections::BTreeMap;
     use std::io::Seek;
 
     // `enum ggml_type` ids (ggml.h:398 and :404 at b11669); `ffi::ty`
@@ -3209,10 +3091,6 @@ fn canary_gguf_loads_through_mediagen_weights() {
         eprintln!("skipping: LLMMAN_CANARY_GGUF_DIR is not set");
         return;
     };
-    if !on_path("llama-server") {
-        eprintln!("skipping: llama-server not on PATH");
-        return;
-    }
 
     // Candidates for the byte round-trip: (file, tensor) per ggml type.
     let mut q8_0: Option<(PathBuf, llmman::mediagen::weights::TensorDesc)> = None;
@@ -3251,17 +3129,8 @@ fn canary_gguf_loads_through_mediagen_weights() {
         for k in keys {
             eprintln!("  {k} = {}", gguf_value_text(&info.metadata[k]));
         }
-        let hp = |key: &str| {
-            info.u64(key)
-                .unwrap_or_else(|| panic!("{file}: {key} missing or not an integer"))
-        };
-        let n_enc = hp("stt.canary.encoder.n_layers");
-        let n_dec = hp("stt.canary.decoder.n_layers");
-        let d_enc = hp("stt.canary.encoder.d_model");
-        let n_heads = hp("stt.canary.encoder.n_heads");
-        let d_dec = hp("stt.canary.decoder.d_model");
-        let vocab = hp("stt.canary.decoder.vocab_size");
-        let max_pos = hp("stt.canary.decoder.max_position");
+        let hp = CanaryHParams::from_info(&info)
+            .unwrap_or_else(|e| panic!("{file}: hyperparameters: {e:#}"));
 
         let idx = llmman::mediagen::weights::read_index(&path).unwrap();
         let mut histogram: BTreeMap<u32, usize> = BTreeMap::new();
@@ -3273,50 +3142,15 @@ fn canary_gguf_loads_through_mediagen_weights() {
             idx.tensors.len()
         );
 
-        let expected = canary_contract_names(n_enc, n_dec);
-        let found: BTreeSet<String> = idx.tensors.iter().map(|t| t.name.clone()).collect();
-        let unmapped: Vec<&String> = found.difference(&expected).collect();
-        let missing: Vec<&String> = expected.difference(&found).collect();
-        for n in &unmapped {
-            eprintln!("  unmapped: {n}");
-        }
-        for n in &missing {
-            eprintln!("  missing: {n}");
-        }
-        assert!(
-            unmapped.is_empty(),
-            "{file}: {} unmapped tensors",
-            unmapped.len()
+        // `check_index` lists every unmapped, missing and misshapen name.
+        check_index(&idx, &hp).unwrap_or_else(|e| panic!("{file}: {e:#}"));
+        let expected = contract_names(hp.enc_n_layers, hp.dec_n_layers, hp.encoder_decoder_proj);
+        eprintln!(
+            "  contract: {} names, all mapped (encoder_decoder_proj = {})",
+            expected.len(),
+            hp.encoder_decoder_proj
         );
-        assert!(
-            missing.is_empty(),
-            "{file}: {} missing tensors",
-            missing.len()
-        );
-        eprintln!("  contract: {} names, all mapped", expected.len());
-
-        let shape = |name: &str| -> Vec<i64> {
-            idx.tensors
-                .iter()
-                .find(|t| t.name == name)
-                .unwrap_or_else(|| panic!("{file}: {name} not in index"))
-                .ne
-                .clone()
-        };
-        let u = |v: u64| v as i64;
-        assert_eq!(
-            shape("dec.embed.token.weight"),
-            [u(d_dec), u(vocab)],
-            "{file}"
-        );
-        assert_eq!(shape("dec.embed.pos_enc"), [u(d_dec), u(max_pos)], "{file}");
-        assert_eq!(shape("dec.head.weight"), [u(d_dec), u(vocab)], "{file}");
-        assert_eq!(
-            shape("enc.blocks.0.attn.pos_bias_u"),
-            [u(d_enc / n_heads), u(n_heads)],
-            "{file}"
-        );
-        eprintln!("  shapes: token/pos_enc/head/pos_bias_u match the hyperparameters");
+        eprintln!("  shapes: every tensor matches the hyperparameters");
 
         for t in &idx.tensors {
             let slot = match t.ty {
@@ -3342,6 +3176,12 @@ fn canary_gguf_loads_through_mediagen_weights() {
         .collect();
     assert!(!picks.is_empty(), "no quantized tensor to round-trip");
 
+    // The metadata and contract checks above need no libraries; only the
+    // round-trip does, so an opted-in run never passes without them.
+    if !on_path("llama-server") {
+        eprintln!("skipping round-trip: llama-server not on PATH");
+        return;
+    }
     let lib_dir =
         llmman::cmd::serve::llama_lib_dir(llmman::cmd::serve::Runtime::Path, None).unwrap();
     eprintln!(
@@ -3349,8 +3189,9 @@ fn canary_gguf_loads_through_mediagen_weights() {
         lib_dir.display()
     );
     let api = ffi::Api::load(&lib_dir).unwrap();
-    // SAFETY: plain ggml calls on handles this block creates and frees;
-    // every pointer is checked for null before use.
+    // SAFETY: plain ggml calls on handles this block creates and frees.
+    // The backend, context, tensor and buffer pointers are null-checked
+    // before use; `buft` is the backend's default buffer type and is not.
     unsafe {
         let backend =
             (api.ggml_backend_init_by_type)(ffi::GGML_BACKEND_DEVICE_TYPE_CPU, std::ptr::null());
@@ -3406,4 +3247,99 @@ fn canary_gguf_loads_through_mediagen_weights() {
         }
         (api.ggml_backend_free)(backend);
     }
+}
+
+/// Canary 1B v2 (handy-computer/canary-1b-v2-gguf) through
+/// `speech::model::load` on the ggml CPU backend of the llama.cpp on
+/// `PATH`: each GGUF in `LLMMAN_CANARY_GGUF_DIR` comes back as a
+/// `CanaryModel` with its hyperparameters, vocabulary and every contract
+/// tensor in one weight buffer. Run by hand:
+/// `LLMMAN_CANARY_GGUF_DIR=<dir> cargo test --release --test launch_e2e
+/// canary -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn canary_model_loads_on_cpu_backend() {
+    use llmman::mediagen::backend::Backend;
+    use llmman::mediagen::ffi::Api;
+    use std::collections::BTreeMap;
+
+    let Some(dir) = std::env::var_os("LLMMAN_CANARY_GGUF_DIR")
+        .map(PathBuf::from)
+        .filter(|d| !d.as_os_str().is_empty())
+    else {
+        eprintln!("skipping: LLMMAN_CANARY_GGUF_DIR is not set");
+        return;
+    };
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH");
+        return;
+    }
+    let lib_dir =
+        llmman::cmd::serve::llama_lib_dir(llmman::cmd::serve::Runtime::Path, None).unwrap();
+    eprintln!("== CPU backend from {}", lib_dir.display());
+    // the weight contexts hold `&'static Api`, as in `mediagen_backend`
+    let api: &'static Api = Box::leak(Box::new(Api::load(&lib_dir).unwrap()));
+    let n_threads = std::thread::available_parallelism().map_or(4, |n| n.get() as i32);
+    let be = Backend::new(api, false, n_threads, 1024).unwrap();
+
+    let mut weight_bytes: BTreeMap<&str, usize> = BTreeMap::new();
+    for (label, file) in [
+        ("Q8_0", "canary-1b-v2-Q8_0.gguf"),
+        ("F16", "canary-1b-v2-F16.gguf"),
+        ("Q6_K", "canary-1b-v2-Q6_K.gguf"),
+    ] {
+        let path = dir.join(file);
+        if !path.is_file() {
+            // Q8_0 and F16 are the pinned artifacts; only Q6_K is optional.
+            assert!(label == "Q6_K", "{file}: missing in {}", dir.display());
+            eprintln!("{file}: absent, skipped");
+            continue;
+        }
+        eprintln!("== {}", path.display());
+        let model = llmman::speech::model::load(&path, &be).unwrap();
+        eprintln!("  tensors: {}", model.tensor_count());
+        eprintln!("  hparams: {:?}", model.hp);
+        eprintln!(
+            "  weights: {} bytes ({:.1} MiB)",
+            model.weight_bytes(),
+            model.weight_bytes() as f64 / 1024.0 / 1024.0
+        );
+        assert_eq!(model.tensor_count(), 1476, "{file}");
+        assert_eq!(model.tensors.enc_blocks.len(), 32, "{file}");
+        assert_eq!(model.tensors.dec_layers.len(), 8, "{file}");
+        let hp = &model.hp;
+        assert_eq!(
+            (
+                hp.enc_n_layers,
+                hp.enc_d_model,
+                hp.enc_n_heads,
+                hp.enc_d_ff,
+                hp.enc_conv_kernel,
+                hp.enc_subsampling_factor,
+                hp.enc_subsampling_channels,
+                hp.enc_pos_emb_max_len,
+            ),
+            (32, 1024, 8, 4096, 9, 8, 256, 5000),
+            "{file}: encoder"
+        );
+        assert_eq!(
+            (hp.dec_n_layers, hp.dec_max_position, hp.dec_vocab_size),
+            (8, 1024, 16384),
+            "{file}: decoder"
+        );
+        assert_eq!(model.vocab.pieces.len(), 16384, "{file}: vocab");
+        assert_eq!(
+            (hp.eos, hp.bos, hp.pad, hp.startofcontext),
+            (3, 4, 2, 7),
+            "{file}: special tokens"
+        );
+        weight_bytes.insert(label, model.weight_bytes());
+        // the buffer goes before the backend it lives on
+        drop(model);
+    }
+    assert!(
+        weight_bytes["Q8_0"] < weight_bytes["F16"],
+        "weight buffers: {weight_bytes:?}"
+    );
+    drop(be);
 }
