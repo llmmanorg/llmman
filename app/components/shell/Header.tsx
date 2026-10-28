@@ -68,14 +68,30 @@ export function MenuButton() {
 }
 
 /**
- * A page's padding at its sides for the safe area there: a notch in
- * landscape, or the vertical bar a foldable iPhone keeps beside the page.
- * Beside the sidebar only the right edge can be the screen's.
+ * A page's padding at its sides, at least `gap`, for the safe area there: a
+ * notch in landscape, or the vertical bar a foldable iPhone keeps beside the
+ * page. Beside the sidebar only the right edge can be the screen's.
  */
-export function usePageSides(): { paddingLeft: number; paddingRight: number } {
+export function usePageSides(gap = 0): { paddingLeft: number; paddingRight: number } {
   const insets = useSafeAreaInsets();
   const { docked } = useSidebar();
-  return { paddingLeft: docked ? 0 : insets.left, paddingRight: insets.right };
+  return { paddingLeft: Math.max(gap, docked ? 0 : insets.left), paddingRight: Math.max(gap, insets.right) };
+}
+
+/**
+ * A stack's header and page in the drawer, as every page has them. With
+ * `sides`, the page keeps to the safe area at its sides (usePageSides).
+ */
+export function useStackOptions({ sides }: { sides: boolean }): NativeStackNavigationOptions {
+  const c = useTheme();
+  const padding = usePageSides();
+  return {
+    headerStyle: { backgroundColor: c.background },
+    headerTintColor: c.text,
+    headerShadowVisible: false,
+    headerTitleStyle: { color: c.text },
+    contentStyle: { backgroundColor: c.background, ...(sides ? padding : {}) },
+  };
 }
 
 /** A native stack's header buttons: React views, or on iOS the system's own. */
@@ -136,16 +152,12 @@ export function useChatHeaderButtons(): HeaderButtons {
   return { ...menu, unstable_headerRightItems: () => [item] };
 }
 
-/** The chat stacks' header, as the drawer's own looks on the other pages. */
+/** The chat stacks' options: the page's sides are the chat's own (ChatScreen). */
 export function useChatStackOptions(): NativeStackNavigationOptions {
-  const c = useTheme();
   return {
-    headerStyle: { backgroundColor: c.background },
-    headerShadowVisible: false,
+    ...useStackOptions({ sides: false }),
     headerTitleAlign: "center",
-    headerTintColor: c.text,
     headerBackButtonDisplayMode: "minimal",
-    contentStyle: { backgroundColor: c.background },
     ...useChatHeaderButtons(),
   };
 }

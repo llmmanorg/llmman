@@ -27,7 +27,7 @@ import { hostLabel } from "@/api/serverUrl";
 import { KindToggle } from "@/components/chat/KindToggle";
 import { MessageView } from "@/components/chat/MessageView";
 import { Icon } from "@/components/Icon";
-import { ModelTitle, useSidebar, useWide } from "@/components/shell/Header";
+import { ModelTitle, usePageSides, useWide } from "@/components/shell/Header";
 import {
   editFrom,
   openConversation,
@@ -86,15 +86,10 @@ export function ChatScreen({ id, onSent }: { id: string; onSent?: () => void }) 
   const shell = useRef<View>(null);
   const [top, setTop] = useState(0);
   const keyboardShown = useKeyboardShown();
-  // The page keeps to the safe area at its sides: a notch in landscape, or
-  // the vertical bar a foldable iPhone keeps beside it. Beside the sidebar
-  // only the right edge can be the screen's.
-  const { docked } = useSidebar();
-  const edge = (gap: number) => ({
-    paddingLeft: Math.max(gap, docked ? 0 : insets.left),
-    paddingRight: Math.max(gap, insets.right),
-  });
-  const sides = edge(spacing.md);
+  // Each part keeps to the safe area at the sides, with its own gap at least.
+  const sides = usePageSides(spacing.md);
+  const emptySides = usePageSides(spacing.xl);
+  const listSides = usePageSides(spacing.lg);
   // The web's textarea does not grow by itself: it follows its content's height.
   const [inputHeight, setInputHeight] = useState(0);
   const { client: activeClient, active, servers, activate } = useServers();
@@ -345,7 +340,7 @@ export function ChatScreen({ id, onSent }: { id: string; onSent?: () => void }) 
       <KeyboardAvoidingView style={{ flex: 1 }} behavior="padding" keyboardVerticalOffset={top}>
         {messages.length === 0 ? (
           // Not the inverted list's empty view: Android inverts that on both axes.
-          <View style={[styles.empty, edge(spacing.xl)]}>
+          <View style={[styles.empty, emptySides]}>
             <Image
               source={require("@/assets/llmman-mark.png")}
               style={styles.mark}
@@ -384,7 +379,7 @@ export function ChatScreen({ id, onSent }: { id: string; onSent?: () => void }) 
             inverted
             data={reversed}
             keyExtractor={(_, i) => String(messages.length - 1 - i)}
-            contentContainerStyle={[styles.list, edge(spacing.lg), readable]}
+            contentContainerStyle={[styles.list, listSides, readable]}
             keyboardDismissMode="interactive"
             keyboardShouldPersistTaps="handled"
             renderItem={({ item, index }) => {
@@ -541,7 +536,7 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
   },
   list: { paddingHorizontal: spacing.lg, paddingVertical: spacing.lg, gap: spacing.xl, flexGrow: 1 },
-  // No vertical padding (only edge() at the sides): in landscape with the keyboard up it must shrink to nothing.
+  // No vertical padding (emptySides at the sides): in landscape with the keyboard up it must shrink to nothing.
   empty: {
     flex: 1,
     justifyContent: "center",
