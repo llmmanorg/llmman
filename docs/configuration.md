@@ -21,6 +21,13 @@ If `LLMMAN_MODELS` puts the store on a different filesystem from its sibling cac
 
 The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), readable by `docker` and `podman`.
 
+When listing OCI artifact referrers, the Docker-backed build reads the registry's
+native referrers API when available and otherwise uses the digest-derived
+fallback tag. The Podman-backed build reads and writes only the fallback tag,
+even if the registry supports the native API, because its backend does not
+expose an authenticated request for that endpoint. Consequently, Podman
+listing does not include artifacts published only through the native API.
+
 ## llmman.conf
 
 Everything that needs a file rather than an environment variable lives in

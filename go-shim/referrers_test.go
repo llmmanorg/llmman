@@ -34,6 +34,13 @@ func TestFallbackTagTruncatesDigestComponents(t *testing.T) {
 	}
 }
 
+func TestSplitRepositoryAcceptsLocalhost(t *testing.T) {
+	registry, path, err := splitRepository("localhost/org/model:latest")
+	if err != nil || registry != "localhost" || path != "org/model" {
+		t.Fatalf("splitRepository = %q, %q, %v", registry, path, err)
+	}
+}
+
 func TestGetReferrersIndexFollowsNextLink(t *testing.T) {
 	first := ocispec.Descriptor{Digest: digest.FromString("first")}
 	second := ocispec.Descriptor{Digest: digest.FromString("second")}
@@ -62,6 +69,27 @@ func TestGetReferrersIndexFollowsNextLink(t *testing.T) {
 	}
 	if len(index.Manifests) != 2 || index.Manifests[0].Digest != first.Digest || index.Manifests[1].Digest != second.Digest {
 		t.Fatalf("manifests = %+v, want %s and %s", index.Manifests, first.Digest, second.Digest)
+	}
+}
+
+func TestGetReferrersIndexResolvesLinkFromRedirectDestination(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/referrers":
+			http.Redirect(w, r, "/pages/first", http.StatusFound)
+		case "/pages/first":
+			if r.URL.Query().Get("page") != "2" {
+				w.Header().Set("Link", `<?page=2>; rel="next"`)
+			}
+			_, _ = w.Write([]byte(`{"schemaVersion":2,"manifests":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	_, found, err := getReferrersIndex(context.Background(), server.Client(), server.URL+"/referrers")
+	if err != nil || !found {
+		t.Fatalf("get referrers after redirect = %t, %v", found, err)
 	}
 }
 

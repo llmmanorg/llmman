@@ -55,24 +55,25 @@ func llmman_push_artifact(cLayoutDir, cRef, cSubjectJSON *C.char) *C.char {
 		return errResp(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
 	artifact, err := setManifestSubject(C.GoString(cLayoutDir), ref, subject)
 	if err != nil {
 		return errResp(err)
 	}
-	if _, err := pushDescriptorToRegistry(ctx, C.GoString(cLayoutDir), ref, artifact); err != nil {
+	if _, err := pushDescriptorToRegistry(context.Background(), C.GoString(cLayoutDir), ref, artifact); err != nil {
 		return errResp(err)
 	}
-	if err := publishFallbackReferrer(ctx, ref, subject.Digest, artifact); err != nil {
+	if err := publishFallbackReferrer(context.Background(), ref, subject.Digest, artifact); err != nil {
 		return errResp(fmt.Errorf("publish referrer index: %w", err))
 	}
 	return okResp("")
 }
 
 // llmman_referrers lists the descriptors attached to digest in ref's
-// repository. It uses the OCI 1.1 endpoint first and falls back to the
-// sha256-<hex> tag only when the registry reports that endpoint absent.
+// repository. Docker uses the OCI 1.1 endpoint first and falls back to the
+// digest-derived tag only when the registry reports that endpoint absent.
+// Podman always reads that tag because its backend has no public authenticated
+// native-referrers GET; artifact publication writes the tag on both backends
+// when the native endpoint cannot be checked or is absent.
 //
 //export llmman_referrers
 func llmman_referrers(cRef, cDigest *C.char) *C.char {
@@ -164,7 +165,7 @@ func setManifestSubject(layoutDir, ref string, subject ocispec.Descriptor) (ocis
 func splitRepository(ref string) (registry, path string, err error) {
 	repo := repositoryOf(ref)
 	registry, path, ok := strings.Cut(repo, "/")
-	if !ok || registry == "" || path == "" || !strings.ContainsAny(registry, ".:") {
+	if !ok || registry == "" || path == "" || (registry != "localhost" && !strings.ContainsAny(registry, ".:")) {
 		return "", "", fmt.Errorf("reference %q has no registry component", ref)
 	}
 	return registry, path, nil
@@ -221,23 +222,18 @@ func getReferrersIndex(ctx context.Context, client *http.Client, endpoint string
 		}
 		seen[endpoint] = true
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		resp, found, err := requestReferrersPage(ctx, client, endpoint)
 		if err != nil {
 			return nil, false, err
 		}
-		req.Header.Set("Accept", ocispec.MediaTypeImageIndex)
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, false, err
-		}
-		if resp.StatusCode == http.StatusNotFound && combined == nil {
-			resp.Body.Close()
+		if !found && combined == nil {
 			return nil, false, nil
 		}
-		if err := checkRegistryStatus(resp); err != nil {
-			resp.Body.Close()
-			return nil, false, err
+		if !found {
+			return nil, false, fmt.Errorf("referrers pagination endpoint %q returned 404", endpoint)
 		}
+		responseURL := resp.Request.URL.String()
+		linkHeaders := resp.Header.Values("Link")
 		raw, err := io.ReadAll(io.LimitReader(resp.Body, maxReferrersIndexBytes+1))
 		resp.Body.Close()
 		if err != nil {
@@ -263,7 +259,7 @@ func getReferrersIndex(ctx context.Context, client *http.Client, endpoint string
 		} else {
 			combined.Manifests = append(combined.Manifests, page.Manifests...)
 		}
-		next, err := nextLink(endpoint, resp.Header.Values("Link"))
+		next, err := nextLink(responseURL, linkHeaders)
 		if err != nil {
 			return nil, false, err
 		}
@@ -382,7 +378,12 @@ func fallbackTag(dgst digest.Digest) string {
 // only for a 404 from the OCI 1.1 endpoint, the signal that selects the
 // distribution-spec fallback tag scheme.
 func fetchReferrers(ctx context.Context, ref string, subject digest.Digest) ([]ocispec.Descriptor, bool, error) {
-	index, native, err := fetchReferrersIndex(ctx, ref, subject)
+	// Like publication: a mirror is not authoritative, and a stale one would
+	// hide a freshly published referrer.
+	index, native, err := fetchReferrersIndex(withoutMirrors(ctx), ref, subject)
+	if index.Manifests == nil {
+		index.Manifests = []ocispec.Descriptor{}
+	}
 	return index.Manifests, native, err
 }
 
@@ -432,26 +433,40 @@ func readNativeReferrers(ctx context.Context, ref string, subject digest.Digest,
 	return *index, true, nil
 }
 
-// Publication needs only the endpoint's 200/404 capability signal, not every
-// descriptor page. Do not read a potentially large response body here.
-func probeReferrersEndpoint(ctx context.Context, client *http.Client, endpoint string) (bool, error) {
+// requestReferrersPage shares the authenticated GET and status handling used
+// by both listing and the bounded capability probe. A 404 selects fallback.
+func requestReferrersPage(ctx context.Context, client *http.Client, endpoint string) (*http.Response, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	req.Header.Set("Accept", ocispec.MediaTypeImageIndex)
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return false, nil
+		resp.Body.Close()
+		return nil, false, nil
 	}
 	if err := checkRegistryStatus(resp); err != nil {
+		resp.Body.Close()
+		return nil, false, err
+	}
+	return resp, true, nil
+}
+
+// Publication needs only the endpoint's 200/404 capability signal, not every
+// descriptor page. Do not read a potentially large response body here.
+func probeReferrersEndpoint(ctx context.Context, client *http.Client, endpoint string) (bool, error) {
+	resp, found, err := requestReferrersPage(ctx, client, endpoint)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if err != nil {
 		return false, err
 	}
-	return true, nil
+	return found, nil
 }
 
 func fetchFallbackReferrersIndex(ctx context.Context, ref string, subject digest.Digest) (ocispec.Index, error) {

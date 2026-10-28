@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/google/go-containerregistry/pkg/registry"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -127,6 +128,45 @@ func TestPushArtifactAndListNativeReferrers(t *testing.T) {
 	if len(refs) != 1 || refs[0].Digest != artifact.Digest {
 		t.Fatalf("referrers = %+v, want artifact %s", refs, artifact.Digest)
 	}
+}
+
+func TestEmptyNativeReferrersMarshalAsArray(t *testing.T) {
+	host := startReferrersRegistry(t, true)
+	ref := host + "/org/model:v1"
+	dgst := publishModel(t, ref)
+	refs, native, err := fetchReferrers(context.Background(), ref, dgst)
+	if err != nil || !native {
+		t.Fatalf("fetch referrers = %+v, %t, %v", refs, native, err)
+	}
+	raw, err := json.Marshal(refs)
+	if err != nil || string(raw) != "[]" {
+		t.Fatalf("marshal empty referrers = %s, %v", raw, err)
+	}
+}
+
+type scopeCheckingTransport struct {
+	t *testing.T
+}
+
+func (s scopeCheckingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	scopes := docker.GetTokenScopes(req.Context(), nil)
+	if len(scopes) != 1 || scopes[0] != "repository:org/model:pull" {
+		s.t.Errorf("referrers auth scopes = %v", scopes)
+	}
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header), Request: req}, nil
+}
+
+func TestNativeReferrersTransportAddsPullScope(t *testing.T) {
+	transport := &authorizedTransport{base: scopeCheckingTransport{t}, repository: "org/model"}
+	req, err := http.NewRequest(http.MethodGet, "https://registry.example/v2/org/model/referrers/sha256:abc", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
 }
 
 func TestPushDescriptorIgnoresChangedLocalRef(t *testing.T) {
@@ -289,6 +329,25 @@ func TestFallbackPublicationBypassesStaleMirror(t *testing.T) {
 	}
 	if got := mirrorLog.count(http.MethodGet, "/v2/org/model/manifests/sha256-"); got != 0 {
 		t.Fatalf("fallback read sent %d requests to stale mirror", got)
+	}
+}
+
+func TestListFallbackReferrersBypassesMirror(t *testing.T) {
+	var mirrorLog requestLog
+	upstream := startReferrersRegistry(t, false)
+	mirror := startLoggedRegistry(t, &mirrorLog, nil)
+	subjectRef := upstream + "/org/model:v1"
+	subjectDigest := publishModel(t, subjectRef)
+	subject := subjectDescriptor(t, subjectRef, subjectDigest)
+	artifact := pushTestArtifact(t, upstream+"/org/model:sbom-a", `{"name":"a"}`, subject)
+	withMirror(t, upstream, mirror)
+
+	refs, _, err := fetchReferrers(context.Background(), subjectRef, subjectDigest)
+	if err != nil || len(refs) != 1 || refs[0].Digest != artifact.Digest {
+		t.Fatalf("referrers = %+v, %v; want %s", refs, err, artifact.Digest)
+	}
+	if got := mirrorLog.count("", "/v2/"); got != 0 {
+		t.Fatalf("fallback listing sent %d requests to the mirror", got)
 	}
 }
 

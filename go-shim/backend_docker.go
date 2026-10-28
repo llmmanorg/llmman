@@ -83,7 +83,7 @@ func dockerCredentials(host string) (string, string, error) {
 // credential helpers and registry hosts cannot diverge from the backend.
 // Mirrors are skipped: a mirror is not authoritative for referrers.
 func nativeReferrersTransport(ctx context.Context, ref string) (http.RoundTripper, *url.URL, bool, error) {
-	registry, _, err := splitRepository(ref)
+	registry, repository, err := splitRepository(ref)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -107,7 +107,7 @@ func nativeReferrersTransport(ctx context.Context, ref string) (http.RoundTrippe
 			path = "/v2"
 		}
 		root := &url.URL{Scheme: host.Scheme, Host: host.Host, Path: path}
-		return &authorizedTransport{base: base, auth: host.Authorizer, header: host.Header}, root, true, nil
+		return &authorizedTransport{base: base, auth: host.Authorizer, header: host.Header, repository: repository}, root, true, nil
 	}
 	return nil, nil, false, fmt.Errorf("no registry host configured for %s", registry)
 }
@@ -116,12 +116,14 @@ func nativeReferrersTransport(ctx context.Context, ref string) (http.RoundTrippe
 // send, and on a 401 feed the challenge back and retry once. That is the same
 // exchange remotes/docker performs for a pull.
 type authorizedTransport struct {
-	base   http.RoundTripper
-	auth   docker.Authorizer
-	header http.Header
+	base       http.RoundTripper
+	auth       docker.Authorizer
+	header     http.Header
+	repository string
 }
 
 func (t *authorizedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(docker.ContextWithAppendPullRepositoryScope(req.Context(), t.repository))
 	for key, values := range t.header {
 		if req.Header.Get(key) == "" {
 			for _, value := range values {
