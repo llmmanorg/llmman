@@ -8,10 +8,10 @@
 //! ```text
 //! <store-root>/
 //!   oci-layout             {"imageLayoutVersion":"1.0.0"}
-//!   manifests-v2/<hash>    one small JSON OCI descriptor per reference,
+//!   manifests-v2/<host>/<repo>/<tag>.json
+//!                          one small JSON OCI descriptor per reference,
 //!                          pointing at the manifest blob under blobs/.
-//!   manifests/<...>/<tag>  legacy per-reference paths, read and migrated
-//!                          when a reference is written again.
+//!   manifests/<...>/<tag>  legacy per-reference paths, read as a fallback.
 //!   blobs/
 //!     sha256/
 //!       <hex>              one file per blob — config, layers, and each
@@ -169,7 +169,6 @@ impl OciStore {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         fs::create_dir_all(root.join("blobs").join("sha256"))?;
-        fs::create_dir_all(root.join("manifests"))?;
         fs::create_dir_all(root.join(MANIFESTS_V2_DIR))?;
 
         // Write oci-layout marker if absent
@@ -237,7 +236,14 @@ impl OciStore {
         match fs::symlink_metadata(&path) {
             Ok(meta) if !meta.is_file() => return Ok(None),
             Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None)
+            }
             Err(err) => {
                 return Err(err).with_context(|| format!("inspect manifest ref {reference}"))
             }
@@ -250,18 +256,6 @@ impl OciStore {
 
     fn write_ref(&self, reference: &str, desc: &Descriptor) -> anyhow::Result<()> {
         let path = self.ref_path(reference);
-        let legacy = self.legacy_ref_path(reference);
-        // An older store may hold this reference at the lossy path. Only
-        // remove that pointer if it actually names this reference: another
-        // reference can have collided with it there.
-        // This is only a cleanup probe. An unreadable old pointer must not
-        // prevent publishing the independent v2 pointer; leave it untouched.
-        let remove_legacy = match self.read_legacy_ref(reference) {
-            Ok(Some(old)) => {
-                stored_ref_name(&old).is_some_and(|stored| same_ref_name(stored, reference))
-            }
-            Ok(None) | Err(_) => false,
-        };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -283,22 +277,15 @@ impl OciStore {
             let _ = fs::remove_file(&tmp);
             return Err(e.into());
         }
-        if remove_legacy {
-            match fs::remove_file(&legacy) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(err)
-                        .with_context(|| format!("remove old manifest ref {reference}"));
-                }
-            }
-        }
         Ok(())
     }
 
     fn remove_ref(&self, reference: &str) -> anyhow::Result<bool> {
         let path = self.ref_path(reference);
         let legacy = self.legacy_ref_path(reference);
+        // Explicit removal is the only operation allowed to delete an old
+        // pointer; normal writes leave the legacy tree untouched. Otherwise
+        // an old pointer would resurrect a model immediately after `rm`.
         // Read both candidates before deleting either one, so a filesystem
         // error on the legacy path cannot leave a partially removed ref.
         let remove_new = self
@@ -450,7 +437,7 @@ impl OciStore {
     /// Records that `reference` now points at `desc`, replacing any prior
     /// entry stored under that exact reference. The full `reference`
     /// string is stored in the annotation so `list` shows it verbatim —
-    /// `manifest_ref_path` hashes the name into a portable filename;
+    /// `manifest_ref_path` encodes the name into a portable readable tree;
     /// a tagless reference and its `:latest` spelling share a pointer.
     pub fn tag(&self, mut desc: Descriptor, reference: &str) -> anyhow::Result<()> {
         let mut ann = desc.annotations.take().unwrap_or_default();
@@ -920,9 +907,107 @@ pub(crate) fn canonical_ref_key(reference: &str) -> String {
 }
 
 pub(crate) fn manifest_ref_path(root: &Path, reference: &str) -> PathBuf {
-    root.join(MANIFESTS_V2_DIR).join(hex::encode(Sha256::digest(
-        canonical_ref_key(reference).as_bytes(),
-    )))
+    let key = canonical_ref_key(reference);
+    let opaque = reference.starts_with('/') || reference.contains("://");
+    let mut path = root.join(MANIFESTS_V2_DIR);
+    if opaque {
+        // `~` cannot be emitted by escape_ref_segment, so opaque names cannot
+        // collide with a registry named "~" or with its ordinary repo tree.
+        path.push("~");
+    }
+    let (name, tag) = if opaque {
+        key.rsplit_once('/')
+            .map_or(("", key.as_str()), |(name, tag)| (name, tag))
+    } else {
+        let pos = key
+            .rfind(':')
+            .expect("canonical registry reference has a tag");
+        (&key[..pos], &key[pos + 1..])
+    };
+    if !name.is_empty() || opaque {
+        for segment in name.split('/') {
+            push_ref_segment(&mut path, segment, true);
+        }
+    }
+    push_ref_segment(&mut path, tag, false);
+    path
+}
+
+// Percent encoding can triple a long uppercase component. Keep each filesystem
+// component below common 255-byte limits without losing any source bytes.
+// `~` and `~~` are reserved markers: ordinary escaped names cannot emit them.
+fn push_ref_segment(path: &mut PathBuf, segment: &str, directory: bool) {
+    let encoded = escape_ref_segment(segment, directory);
+    if encoded.len() <= 200 {
+        path.push(if directory {
+            encoded
+        } else {
+            format!("{encoded}.json")
+        });
+    } else {
+        for chunk in encoded.as_bytes().chunks(180) {
+            path.push(format!(
+                "~{}",
+                std::str::from_utf8(chunk).expect("escaped ASCII")
+            ));
+        }
+        path.push(if directory { "~~" } else { "~~.json" });
+    }
+}
+
+/// Percent-escape unsafe bytes and uppercase letters so paths stay distinct
+/// even on case-insensitive filesystems. A repo component may never end in
+/// `.json`: pointer files do, preventing file-as-ancestor collisions.
+fn escape_ref_segment(segment: &str, directory: bool) -> String {
+    if segment.is_empty() {
+        return "~".to_owned();
+    }
+    let reserved = matches!(
+        segment
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    );
+    let mut out = String::new();
+    for (i, byte) in segment.bytes().enumerate() {
+        let safe = byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(byte, b'-' | b'_' | b'.');
+        if safe && !(reserved && i == 0) && !(matches!(segment, "." | "..") && byte == b'.') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if directory && (out.ends_with(".json") || out.ends_with('.')) {
+        let dot = out.rfind('.').expect("suffix contains a dot");
+        out.replace_range(dot..=dot, "%2E");
+    }
+    out
 }
 
 pub(crate) fn legacy_manifest_ref_path(root: &Path, reference: &str) -> PathBuf {
@@ -1439,11 +1524,51 @@ mod tests {
     fn current_paths_are_portable_and_distinct() {
         let root = Path::new("store");
         let path = manifest_ref_path(root, "s3://bucket/key");
-        assert_eq!(path.parent().unwrap(), root.join(MANIFESTS_V2_DIR));
-        assert_eq!(path.file_name().unwrap().len(), 64);
+        assert_eq!(
+            path,
+            root.join(MANIFESTS_V2_DIR)
+                .join("~")
+                .join("s3%3A")
+                .join("~")
+                .join("bucket")
+                .join("key.json")
+        );
+        assert_eq!(
+            manifest_ref_path(root, "reg.example:5000/ns/model:t"),
+            root.join(MANIFESTS_V2_DIR)
+                .join("reg.example%3A5000/ns/model/t.json")
+        );
         assert_ne!(path, manifest_ref_path(root, "../../etc/passwd"));
         assert_ne!(path, manifest_ref_path(root, "S3://bucket/key"));
         assert_ne!(path, manifest_ref_path(root, "s3://bucket/key:latest"));
+        assert_ne!(
+            manifest_ref_path(root, "reg.example/ns/model:Prod"),
+            manifest_ref_path(root, "reg.example/ns/model:prod")
+        );
+        assert_ne!(
+            manifest_ref_path(root, "reg.example/ns/model:t"),
+            manifest_ref_path(root, "reg.example/ns/model/t.json:x")
+        );
+    }
+
+    #[test]
+    fn new_store_does_not_create_legacy_tree() {
+        let dir = temp_store_dir("new-v2-only");
+        let store = OciStore::open(&dir).unwrap();
+        assert!(store.root().join(MANIFESTS_V2_DIR).is_dir());
+        assert!(!store.root().join("manifests").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn long_escaped_tags_stay_within_component_limits() {
+        let root = Path::new("store");
+        let ref_name = format!("reg.example/ns/model:{}", "A".repeat(128));
+        let path = manifest_ref_path(root, &ref_name);
+        for part in path.components() {
+            assert!(part.as_os_str().len() <= 255);
+        }
+        assert!(path.ends_with("~~.json"));
     }
 
     #[test]
@@ -1493,7 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_pointer_is_read_and_migrated_without_deleting_a_colliding_reference() {
+    fn legacy_pointer_is_read_and_preserved_without_hiding_a_v2_reference() {
         let dir = temp_store_dir("legacy-collision");
         let store = OciStore::open(&dir).unwrap();
         let first = "reg.example:5000/ns/model:t";
@@ -1518,13 +1643,14 @@ mod tests {
         let mut updated = desc_with_ref(first);
         updated.digest = "sha256:updated".into();
         store.tag(updated, first).unwrap();
-        assert!(
-            !legacy.exists(),
-            "the migrated old pointer should be removed"
-        );
+        assert!(legacy.exists(), "the old tree remains a read-only fallback");
         assert_eq!(store.find(first).unwrap().digest, "sha256:updated");
         assert_eq!(store.find(second).unwrap().digest, "sha256:second");
-        assert_eq!(store.list_refs_strict().unwrap().len(), 2);
+        assert_eq!(store.list_refs_strict().unwrap().len(), 3);
+        store.remove(first).unwrap();
+        assert!(store.find(first).is_err());
+        assert!(!legacy.exists());
+        assert_eq!(store.find(second).unwrap().digest, "sha256:second");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1562,6 +1688,23 @@ mod tests {
         assert!(!store.ref_path(reference).exists());
         assert!(legacy.is_dir());
         assert!(nested.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_ancestor_file_does_not_block_tag_or_remove() {
+        let dir = temp_store_dir("legacy-ancestor-file");
+        let store = OciStore::open(&dir).unwrap();
+        let reference = "reg.example/ns/model/sub:t";
+        let ancestor = store.legacy_ref_path("reg.example/ns/model:sub");
+        fs::create_dir_all(ancestor.parent().unwrap()).unwrap();
+        fs::write(&ancestor, b"another pointer").unwrap();
+
+        store.tag(desc_with_ref(reference), reference).unwrap();
+        assert!(store.ref_path(reference).is_file());
+        assert_eq!(store.remove(reference).unwrap(), reference);
+        assert!(!store.ref_path(reference).exists());
+        assert_eq!(fs::read(&ancestor).unwrap(), b"another pointer");
         fs::remove_dir_all(dir).unwrap();
     }
 
