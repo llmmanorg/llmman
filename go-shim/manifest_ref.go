@@ -156,7 +156,7 @@ func escapeRefSegment(segment string, directory bool) string {
 	var out strings.Builder
 	for i, b := range []byte(segment) {
 		safe := b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b == '-' || b == '_' || b == '.'
-		if safe && !(reserved && i == 0) && !(segment == "." || segment == "..") {
+		if safe && (!reserved || i != 0) && segment != "." && segment != ".." {
 			out.WriteByte(b)
 		} else {
 			out.WriteString("%")
