@@ -2,7 +2,7 @@
 // conversations by date, then Models and Servers, and the server in use.
 
 import type { DrawerContentComponentProps } from "expo-router/drawer";
-import { router } from "expo-router";
+import { router, usePathname } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Image, Platform, Pressable, SectionList, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -21,6 +21,9 @@ import { useOpenChat } from "@/lib/useOpenChat";
 export function DrawerContent({ state, navigation }: DrawerContentComponentProps) {
   const c = useTheme();
   const insets = useSafeAreaInsets();
+  // With no safe area above or beside it (iPhone Duo, whose status bar is in
+  // the vertical bar at its side), the logo keeps off the rounded corner.
+  const corner = Platform.OS === "ios" && insets.top === 0 && insets.left === 0;
   const { docked, setCollapsed } = useSidebar();
   const { active } = useServers();
   const models = useModels();
@@ -40,7 +43,9 @@ export function DrawerContent({ state, navigation }: DrawerContentComponentProps
   const sections = useMemo(() => groupChats(chats), [chats]);
 
   const route = state.routes[state.index];
-  const current = route?.name === "c/[id]" ? (route.params as { id?: string } | undefined)?.id : undefined;
+  // The chat shown, from its path: the route's own params are its stack's.
+  const pathname = usePathname();
+  const current = route?.name === "c" ? /^\/c\/([^/]+)$/.exec(pathname)?.[1] : undefined;
   const section = route?.name;
 
   const close = () => {
@@ -87,7 +92,7 @@ export function DrawerContent({ state, navigation }: DrawerContentComponentProps
 
   return (
     <View style={[styles.root, { paddingTop: insets.top + spacing.sm, paddingBottom: insets.bottom }]}>
-      <View style={styles.brand}>
+      <View style={[styles.brand, corner && styles.corner]}>
         <Image
           source={require("@/assets/llmman-mark.png")}
           style={styles.mark}
@@ -113,7 +118,7 @@ export function DrawerContent({ state, navigation }: DrawerContentComponentProps
       <Row
         icon={{ ios: "square.and.pencil", android: "edit_square" }}
         label="New chat"
-        selected={section === "index"}
+        selected={section === "(home)"}
         onPress={() => go(() => openChat())}
       />
       <SectionList
@@ -267,6 +272,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.sm,
     paddingBottom: spacing.md,
   },
+  corner: { paddingTop: spacing.sm, paddingLeft: spacing.md },
   mark: { width: 30, height: 22 },
   collapse: { padding: 6, borderRadius: radius.sm },
   brandText: { fontSize: font.body, fontWeight: "700" },

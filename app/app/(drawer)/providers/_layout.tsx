@@ -1,10 +1,12 @@
 import { Stack } from "expo-router";
 
-import { MenuButton } from "@/components/shell/Header";
+import { useMenuHeaderLeft, usePageSides } from "@/components/shell/Header";
 import { usePageHeader } from "@/components/shell/PageHeader";
 import { useTheme } from "@/lib/theme";
 
 export default function Layout() {
+  const menu = useMenuHeaderLeft();
+  const sides = usePageSides();
   const c = useTheme();
   // The desktop header: the title over the page's column.
   const page = usePageHeader();
@@ -15,11 +17,11 @@ export default function Layout() {
         headerTintColor: c.text,
         headerShadowVisible: false,
         headerTitleStyle: { color: c.text },
-        contentStyle: { backgroundColor: c.background },
+        contentStyle: { backgroundColor: c.background, ...sides },
         ...page,
       }}
     >
-      <Stack.Screen name="index" options={{ title: "Providers", headerLeft: () => <MenuButton /> }} />
+      <Stack.Screen name="index" options={{ title: "Providers", ...menu }} />
     </Stack>
   );
 }

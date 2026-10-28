@@ -57,8 +57,8 @@ export default function DrawerLayout() {
         sceneStyle: { backgroundColor: c.background },
       }}
     >
-      <Drawer.Screen name="index" options={{ title: "New chat" }} />
-      <Drawer.Screen name="c/[id]" options={{ title: "Chat" }} />
+      <Drawer.Screen name="(home)" options={{ title: "New chat", headerShown: false }} />
+      <Drawer.Screen name="c" options={{ title: "Chat", headerShown: false }} />
       <Drawer.Screen name="models" options={{ title: "Models", headerShown: false }} />
       <Drawer.Screen name="providers" options={{ title: "Providers", headerShown: false }} />
       <Drawer.Screen name="shell" options={{ title: "Shell", ...page }} />
