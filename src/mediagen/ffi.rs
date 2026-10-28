@@ -31,13 +31,27 @@ pub type LlamaToken = i32;
 pub const GGML_MAX_DIMS: usize = 4;
 pub const GGML_MAX_NAME: usize = 64;
 
-/// `enum ggml_type` values used here.
+/// `enum ggml_type` values used here (`ggml.h` at b11669); ids 4 and 5
+/// are removed types whose block size ggml reports as 0.
 pub mod ty {
     pub const F32: u32 = 0;
     pub const F16: u32 = 1;
+    pub const Q4_0: u32 = 2;
+    pub const Q4_1: u32 = 3;
+    pub const Q5_0: u32 = 6;
+    pub const Q5_1: u32 = 7;
+    pub const Q8_0: u32 = 8;
+    pub const Q2_K: u32 = 10;
+    pub const Q3_K: u32 = 11;
+    pub const Q4_K: u32 = 12;
+    pub const Q5_K: u32 = 13;
+    pub const Q6_K: u32 = 14;
+    pub const IQ4_NL: u32 = 20;
     pub const I32: u32 = 26;
     pub const BF16: u32 = 30;
-    pub const COUNT: u32 = 44;
+    /// `GGML_TYPE_COUNT`; `ggml_blck_size` and `ggml_type_size` index a
+    /// table of this length and only assert the bound in debug builds.
+    pub const COUNT: u32 = 43;
 }
 
 pub const GGML_BACKEND_DEVICE_TYPE_CPU: c_int = 0;
@@ -491,9 +505,22 @@ impl Api {
         for stem in ["ggml-base", "ggml", "llama"] {
             libs.push(open(&dir.join(lib_name(stem)))?);
         }
-        let api = Api::bind(libs)?;
-        let version = c_string(api.ggml_version);
-        let commit = c_string(api.ggml_commit);
+        let api = Api::bind_checked(dir, libs, check)?;
+        let cdir = std::ffi::CString::new(dir.to_string_lossy().as_bytes())
+            .context("library directory path")?;
+        unsafe {
+            (api.ggml_backend_load_all_from_path)(cdir.as_ptr());
+            (api.llama_backend_init)();
+        }
+        Ok(api)
+    }
+
+    /// Checks the identity of `libs` per `check`, then binds the API. The
+    /// identity goes first so that a mismatched build which also lacks a
+    /// symbol is reported as the wrong build, not as the missing symbol.
+    fn bind_checked(dir: &Path, libs: Vec<Library>, check: IdentityCheck) -> Result<Api> {
+        let version = c_string(lookup(&libs, "ggml_version").ok());
+        let commit = c_string(lookup(&libs, "ggml_commit").ok());
         match check {
             IdentityCheck::Strict(expected) => {
                 check_identity(dir, expected, version.as_deref(), commit.as_deref())?
@@ -505,13 +532,7 @@ impl Api {
                 commit.as_deref().unwrap_or("(no ggml_commit)")
             ),
         }
-        let cdir = std::ffi::CString::new(dir.to_string_lossy().as_bytes())
-            .context("library directory path")?;
-        unsafe {
-            (api.ggml_backend_load_all_from_path)(cdir.as_ptr());
-            (api.llama_backend_init)();
-        }
-        Ok(api)
+        Api::bind(libs)
     }
 
     /// Everything the pipeline assumes about this llama.cpp that binding
@@ -623,5 +644,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("ggml 0.27.0 620d222"), "{err}");
+    }
+
+    /// The test binary itself stands in for a build without ggml: it has
+    /// neither `ggml_version` nor `ggml_init`, and the strict check must
+    /// name the former before `bind` can fail on the latter.
+    #[cfg(unix)]
+    #[test]
+    fn bind_checked_reports_the_identity_before_a_missing_symbol() {
+        let this: Library = libloading::os::unix::Library::this().into();
+        let err = match Api::bind_checked(
+            Path::new("/opt/llama"),
+            vec![this],
+            IdentityCheck::Strict(&PIN),
+        ) {
+            Ok(_) => panic!("the test binary bound as a llama.cpp build"),
+            Err(e) => e.to_string(),
+        };
+        assert_eq!(
+            err,
+            "unsupported llama.cpp build (no ggml_version) in /opt/llama"
+        );
     }
 }

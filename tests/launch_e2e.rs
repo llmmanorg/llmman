@@ -3079,6 +3079,10 @@ fn canary_gguf_loads_through_mediagen_weights() {
     use std::collections::BTreeMap;
     use std::io::Seek;
 
+    // ggml registers backend modules without a lock; two `Api::load`
+    // calls on parallel test threads race on that registry.
+    let _guard = lock_serial();
+
     // `enum ggml_type` ids (ggml.h:398 and :404 at b11669); `ffi::ty`
     // only names the types the media pipelines use.
     const GGML_TYPE_Q8_0: u32 = 8;
@@ -3262,6 +3266,9 @@ fn canary_model_loads_on_cpu_backend() {
     use llmman::mediagen::backend::Backend;
     use llmman::mediagen::ffi::Api;
     use std::collections::BTreeMap;
+
+    // Same registry race as the test above.
+    let _guard = lock_serial();
 
     let Some(dir) = std::env::var_os("LLMMAN_CANARY_GGUF_DIR")
         .map(PathBuf::from)

@@ -10,9 +10,9 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 
-use crate::gguf::{Info, Value};
+use crate::gguf::{ggml_type_name, Info, Value};
 use crate::mediagen::backend::Backend;
-use crate::mediagen::ffi::Tensor;
+use crate::mediagen::ffi::{ty, Tensor};
 use crate::mediagen::weights::{self, Index, LoadOpts, Weights};
 
 /// Layer counts past this are a corrupt or hostile header, not a model;
@@ -262,6 +262,15 @@ impl CanaryHParams {
                 hp.enc_subsampling_factor,
                 hp.frontend.num_mels
             );
+        }
+        // Every special token is looked up in the embedding table.
+        for (name, id) in &hp.special {
+            if u64::from(*id) >= hp.dec_vocab_size {
+                bail!(
+                    "stt.canary.special.{name}_id: {id} is not below stt.canary.decoder.vocab_size {}",
+                    hp.dec_vocab_size
+                );
+            }
         }
         Ok(hp)
     }
@@ -550,6 +559,124 @@ pub fn check_index(idx: &Index, hp: &CanaryHParams) -> Result<()> {
     )
 }
 
+/// How a contract tensor is consumed, which bounds its storage type.
+/// After transcribe.cpp's quantize buckets
+/// (`tools/transcribe-quantize/policy.cpp`): its loader reads vectors as
+/// F32, conv kernels as F32 or F16, and feeds every other weight to
+/// `mul_mat`. Vectors stay F32 because ggml's CPU add and mul take an
+/// F32 second operand only.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TensorClass {
+    /// Biases, norm scales, BatchNorm stats, `pos_bias_*`, `pos_enc`.
+    Vector,
+    /// `enc.pre_encode.conv.*.weight` and `conv.depthwise.weight`.
+    Conv,
+    /// A `mul_mat` operand.
+    Linear,
+}
+
+impl TensorClass {
+    fn of(name: &str) -> Self {
+        let vector = name.ends_with(".bias")
+            || name.contains(".bn.")
+            || (name.contains("norm") && name.ends_with(".weight"))
+            || name.ends_with(".pos_bias_u")
+            || name.ends_with(".pos_bias_v")
+            || name.ends_with(".pos_enc");
+        let conv = name.ends_with(".weight")
+            && (name.starts_with("enc.pre_encode.conv.")
+                || name.ends_with(".conv.depthwise.weight"));
+        if vector {
+            Self::Vector
+        } else if conv {
+            Self::Conv
+        } else {
+            Self::Linear
+        }
+    }
+
+    /// The ggml types this class may be stored as: floats for vectors
+    /// and kernels; for a linear also the quantized types ggml's CPU
+    /// `mul_mat` accepts (`ggml-cpu.c` at b11669).
+    fn allowed(self) -> &'static [u32] {
+        match self {
+            Self::Vector => &[ty::F32],
+            Self::Conv => &[ty::F32, ty::F16],
+            Self::Linear => &[
+                ty::F32,
+                ty::F16,
+                ty::BF16,
+                ty::Q4_0,
+                ty::Q4_1,
+                ty::Q5_0,
+                ty::Q5_1,
+                ty::Q8_0,
+                ty::Q2_K,
+                ty::Q3_K,
+                ty::Q4_K,
+                ty::Q5_K,
+                ty::Q6_K,
+                ty::IQ4_NL,
+            ],
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Vector => "a bias or norm must be F32",
+            Self::Conv => "a conv kernel must be F32 or F16",
+            Self::Linear => {
+                "a linear weight must be F32, F16, BF16 or a quantized type ggml's CPU mul_mat accepts"
+            }
+        }
+    }
+}
+
+/// Checks the storage type of every tensor against its [`TensorClass`]
+/// and ggml's block size, before `ggml_new_tensor` can assert on a type
+/// it does not know: one error listing every problem. `blck_size` is
+/// `api.ggml_blck_size`, passed as a closure so the policy tests run
+/// without the libraries; the class check runs first, so it is only
+/// called with an id below `GGML_TYPE_COUNT`.
+pub fn check_types(idx: &Index, blck_size: &dyn Fn(u32) -> i64) -> Result<()> {
+    let mut problems = Vec::new();
+    for t in &idx.tensors {
+        let class = TensorClass::of(&t.name);
+        let stored = format!("{} ({})", ggml_type_name(t.ty), t.ty);
+        if !class.allowed().contains(&t.ty) {
+            problems.push(format!(
+                "type: {} is {stored}, {}",
+                t.name,
+                class.describe()
+            ));
+            continue;
+        }
+        let blck = blck_size(t.ty);
+        if blck <= 0 {
+            problems.push(format!(
+                "type: {} is {stored}, which this ggml does not support",
+                t.name
+            ));
+            continue;
+        }
+        let width = t.ne.first().copied().unwrap_or(1);
+        if width % blck != 0 {
+            problems.push(format!(
+                "type: {} is {stored} with a row of {width}, not a multiple of its block {blck}",
+                t.name
+            ));
+        }
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "canary tensor types: {} problems\n  {}",
+        problems.len(),
+        problems.join("\n  ")
+    )
+}
+
 /// `enc.pre_encode.*`: the dw_striding subsampler, three 3x3 convolutions
 /// (`conv.0`, `conv.2`, `conv.5`), two 1x1 (`conv.3`, `conv.6`) and the
 /// linear onto `d_model`. `_b` is the bias of the tensor before it.
@@ -826,6 +953,8 @@ pub fn load(path: &Path, be: &Backend) -> Result<CanaryModel> {
     let vocab = Vocab::from_info(&info, &hp).with_context(|| path.display().to_string())?;
     let idx = weights::read_index(path)?;
     check_index(&idx, &hp).with_context(|| path.display().to_string())?;
+    check_types(&idx, &|t| unsafe { (be.api.ggml_blck_size)(t) })
+        .with_context(|| path.display().to_string())?;
     let weights = Weights::load(be.api, path, be.weight_buft(), &LoadOpts::default())?;
     let tensors = CanaryTensors::build(&hp, &mut |name| weights.get(name))?;
     Ok(CanaryModel {
@@ -962,12 +1091,28 @@ mod tests {
     }
 
     fn desc(name: &str, ne: &[i64]) -> TensorDesc {
+        typed(name, ne, ty::F32)
+    }
+
+    fn typed(name: &str, ne: &[i64], ty: u32) -> TensorDesc {
         TensorDesc {
             name: name.to_string(),
-            ty: 0,
+            ty,
             ne: ne.to_vec(),
             offset: 0,
             nbytes: 0,
+        }
+    }
+
+    /// `ggml_blck_size` of b11669 for the ids a test uses; an id past
+    /// `GGML_TYPE_COUNT` would read past ggml's table, so it panics here.
+    fn blck_size(ty: u32) -> i64 {
+        match ty {
+            0 | 1 | 30 => 1,
+            2 | 3 | 6 | 7 | 8 | 20 => 32,
+            10..=14 => 256,
+            4 | 5 => 0,
+            t => panic!("ggml_blck_size({t}): not a type the allowlist can reach"),
         }
     }
 
@@ -1052,6 +1197,22 @@ mod tests {
             err.starts_with("stt.canary.special.pad_id: not a token id"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn from_info_rejects_a_special_id_outside_the_vocabulary() {
+        for (key, id) in [
+            ("stt.canary.special.startoftranscript_id", 16384),
+            ("stt.canary.special.lang.en_id", 20000),
+        ] {
+            let mut m = phase1_metadata();
+            m.insert(key.into(), Value::U32(id));
+            let err = CanaryHParams::from_info(&info(m)).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!("{key}: {id} is not below stt.canary.decoder.vocab_size 16384")
+            );
+        }
     }
 
     #[test]
@@ -1151,6 +1312,106 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn tensor_class_follows_the_quantize_policy() {
+        let class = TensorClass::of;
+        for name in [
+            "enc.pre_encode.conv.0.bias",
+            "enc.blocks.0.norm_attn.weight",
+            "enc.blocks.0.conv.bn.running_var",
+            "enc.blocks.0.attn.pos_bias_u",
+            "dec.layer.0.norm1.weight",
+            "dec.embed.norm.weight",
+            "dec.norm.weight",
+            "dec.embed.pos_enc",
+            "dec.head.bias",
+        ] {
+            assert_eq!(class(name), TensorClass::Vector, "{name}");
+        }
+        for name in [
+            "enc.pre_encode.conv.0.weight",
+            "enc.pre_encode.conv.3.weight",
+            "enc.blocks.0.conv.depthwise.weight",
+        ] {
+            assert_eq!(class(name), TensorClass::Conv, "{name}");
+        }
+        for name in [
+            "enc.pre_encode.out.weight",
+            "enc.blocks.0.attn.linear_q.weight",
+            "enc.blocks.0.conv.pointwise1.weight",
+            "dec.layer.0.ffn.up.weight",
+            "dec.embed.token.weight",
+            "dec.head.weight",
+        ] {
+            assert_eq!(class(name), TensorClass::Linear, "{name}");
+        }
+    }
+
+    #[test]
+    fn check_types_accepts_the_pinned_mix() {
+        let mut idx = Index::default();
+        idx.tensors
+            .push(typed("dec.head.weight", &[1024, 16384], ty::Q8_0));
+        idx.tensors
+            .push(typed("dec.layer.0.ffn.up.weight", &[1024, 4096], ty::Q6_K));
+        idx.tensors
+            .push(typed("enc.pre_encode.out.weight", &[4096, 1024], ty::BF16));
+        idx.tensors.push(typed(
+            "enc.blocks.0.conv.pointwise1.weight",
+            &[1, 1024, 2048],
+            ty::F16,
+        ));
+        idx.tensors.push(typed(
+            "enc.pre_encode.conv.0.weight",
+            &[3, 3, 1, 256],
+            ty::F16,
+        ));
+        idx.tensors
+            .push(typed("enc.blocks.0.norm_attn.bias", &[1024], ty::F32));
+        check_types(&idx, &blck_size).unwrap();
+    }
+
+    #[test]
+    fn check_types_names_every_problem() {
+        let mut idx = Index::default();
+        idx.tensors.push(typed(
+            "enc.blocks.0.attn.linear_q.weight",
+            &[1024, 1024],
+            9999,
+        ));
+        idx.tensors
+            .push(typed("enc.blocks.1.attn.linear_q.weight", &[1024, 1024], 4));
+        idx.tensors
+            .push(typed("dec.layer.0.ffn.up.weight", &[33, 4096], ty::Q8_0));
+        idx.tensors
+            .push(typed("enc.blocks.0.norm_attn.bias", &[1024], ty::Q8_0));
+        idx.tensors
+            .push(typed("dec.embed.pos_enc", &[1024, 1024], ty::BF16));
+        idx.tensors.push(typed(
+            "enc.blocks.0.conv.depthwise.weight",
+            &[9, 1, 1024],
+            ty::Q6_K,
+        ));
+        idx.tensors.push(typed(
+            "enc.blocks.0.conv.pointwise1.weight",
+            &[1, 1024, 2048],
+            ty::Q8_0,
+        ));
+        let err = check_types(&idx, &blck_size).unwrap_err().to_string();
+        assert!(err.starts_with("canary tensor types: 7 problems"), "{err}");
+        for line in [
+            "type: enc.blocks.0.attn.linear_q.weight is unknown (9999), a linear weight must be",
+            "type: enc.blocks.1.attn.linear_q.weight is unknown (4), a linear weight must be",
+            "type: dec.layer.0.ffn.up.weight is Q8_0 (8) with a row of 33, not a multiple of its block 32",
+            "type: enc.blocks.0.norm_attn.bias is Q8_0 (8), a bias or norm must be F32",
+            "type: dec.embed.pos_enc is BF16 (30), a bias or norm must be F32",
+            "type: enc.blocks.0.conv.depthwise.weight is Q6_K (14), a conv kernel must be F32 or F16",
+            "type: enc.blocks.0.conv.pointwise1.weight is Q8_0 (8) with a row of 1, not a multiple of its block 32",
+        ] {
+            assert!(err.contains(line), "{line}\n{err}");
+        }
     }
 
     /// `build` over a recording lookup: dangling non-null handles stand in
