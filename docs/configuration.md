@@ -356,6 +356,30 @@ its own: `llmman login mirror.corp:5000` (the `host[:port]`, no scheme or
 path), and the registry's are never sent to it. Hugging Face has no
 mirrors in this sense; `HF_ENDPOINT` moves the whole host instead.
 
+### Hugging Face token
+
+Gated and private Hugging Face repositories need an access token. llmman
+looks for one the way `huggingface_hub` does, so a token either tool
+saved is used by the other: `HF_TOKEN`, then the legacy
+`HUGGING_FACE_HUB_TOKEN`, then the token file at `$HF_TOKEN_PATH`
+(default `$HF_HOME/token`, i.e. `~/.cache/huggingface/token`). Blank
+values are skipped.
+
+```bash
+llmman login hf.co              # prompts; or: llmman login hf.co --token hf_...
+llmman pull hf.co/<org>/<gated-repo>
+llmman logout hf.co
+```
+
+`llmman pull` runs in the daemon, so the variables that count are the
+daemon's: export `HF_TOKEN` before `llmman serve`, or before the first
+command that starts the daemon. Setting it for one `llmman pull` against
+a daemon that is already running has no effect. An uncached pull reads
+the token file again, so `llmman login hf.co` works without restarting
+the daemon, provided neither `HF_TOKEN` nor `HUGGING_FACE_HUB_TOKEN` is
+set to a nonblank value in the daemon's environment and both processes
+resolve the same token file (`HF_TOKEN_PATH`, else `HF_HOME`).
+
 ## Environment variables
 
 Daemon-wide settings, set before `llmman serve` starts. llmman is a very

@@ -111,17 +111,33 @@ pub fn token_path() -> PathBuf {
 /// the Python client checks: `HF_TOKEN`, then the legacy
 /// `HUGGING_FACE_HUB_TOKEN`, then the on-disk token file written by
 /// [`login`].
+///
+/// Resolved on every call, in the process that makes the request: for
+/// `llmman pull` that is the daemon, so the env vars are the daemon's.
+/// A `llmman login hf.co` made after it started is picked up only when no
+/// nonblank env var is set there and both resolve the same token file.
 pub fn token() -> Option<String> {
+    resolve_token(
+        |var| std::env::var(var).ok(),
+        || std::fs::read_to_string(token_path()).ok(),
+    )
+}
+
+/// [`token`] with the environment and the token file injected, so its
+/// order can be tested without touching the process environment.
+fn resolve_token(
+    env: impl Fn(&str) -> Option<String>,
+    file: impl FnOnce() -> Option<String>,
+) -> Option<String> {
     for var in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
-        if let Ok(t) = std::env::var(var) {
+        if let Some(t) = env(var) {
             let t = t.trim().to_string();
             if !t.is_empty() {
                 return Some(t);
             }
         }
     }
-    std::fs::read_to_string(token_path())
-        .ok()
+    file()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -442,6 +458,74 @@ mod tests {
         // Matches Ollama's own max(1, ...) — an explicit 0 means
         // "minimize concurrency", not "same as unset".
         assert_eq!(parse_max_transfer_streams(Some("0")), 1);
+    }
+
+    #[test]
+    fn resolve_token_prefers_hf_token_then_legacy_var_then_file() {
+        fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+            move |var| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == var)
+                    .map(|(_, v)| v.to_string())
+            }
+        }
+        fn file(s: Option<&str>) -> impl FnOnce() -> Option<String> + '_ {
+            move || s.map(str::to_string)
+        }
+        // (environment, token file, expected token)
+        type Case<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>, Option<&'a str>);
+        let cases: &[Case] = &[
+            (&[], None, None),
+            (&[], Some("hf_file\n"), Some("hf_file")),
+            (&[], Some(" \n"), None),
+            (&[("HF_TOKEN", " hf_env ")], Some("hf_file"), Some("hf_env")),
+            (
+                &[
+                    ("HF_TOKEN", "hf_env"),
+                    ("HUGGING_FACE_HUB_TOKEN", "hf_legacy"),
+                ],
+                None,
+                Some("hf_env"),
+            ),
+            (
+                &[("HUGGING_FACE_HUB_TOKEN", "hf_legacy")],
+                Some("hf_file"),
+                Some("hf_legacy"),
+            ),
+            // A set-but-blank variable falls through rather than
+            // shadowing the next source.
+            (
+                &[("HF_TOKEN", ""), ("HUGGING_FACE_HUB_TOKEN", "hf_legacy")],
+                None,
+                Some("hf_legacy"),
+            ),
+            (&[("HF_TOKEN", "  ")], Some("hf_file"), Some("hf_file")),
+        ];
+        for (pairs, on_disk, expected) in cases {
+            assert_eq!(
+                resolve_token(env(pairs), file(*on_disk)).as_deref(),
+                *expected,
+                "env {pairs:?}, file {on_disk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_token_reads_the_file_only_when_no_env_var_is_set() {
+        let read = std::cell::Cell::new(false);
+        let token = resolve_token(
+            |var| (var == "HF_TOKEN").then(|| "hf_env".to_string()),
+            || {
+                read.set(true);
+                Some("hf_file".to_string())
+            },
+        );
+        assert_eq!(token.as_deref(), Some("hf_env"));
+        assert!(
+            !read.get(),
+            "the token file was read although HF_TOKEN was set"
+        );
     }
 
     #[test]
