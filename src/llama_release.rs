@@ -62,9 +62,9 @@ pub struct PinnedGgml {
 /// libraries of [`default_release`]. Update it with every bump of
 /// `LLAMA_CPP_RELEASE`.
 pub const PINNED_GGML: PinnedGgml = PinnedGgml {
-    tag: "b11669",
-    version: "0.27.0",
-    commit: "620d2225c",
+    tag: "b11960",
+    version: "0.28.0",
+    commit: "8642541b2",
 };
 
 // ---------------------------------------------------------------------------
