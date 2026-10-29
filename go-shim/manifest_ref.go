@@ -45,10 +45,7 @@ func canonicalRefKey(ref string) string {
 	if strings.HasPrefix(ref, "/") || strings.Contains(ref, "://") {
 		return ref
 	}
-	if strings.LastIndex(ref, ":") > strings.LastIndex(ref, "/") {
-		return ref
-	}
-	return ref + ":latest"
+	return normalizeTag(ref)
 }
 
 // refPathSegments splits ref into the path segments used to lay it out
@@ -130,14 +127,21 @@ func appendRefSegment(parts []string, segment string, directory bool) []string {
 		return append(parts, encoded+".json")
 	}
 	for len(encoded) > 180 {
-		parts = append(parts, "~"+encoded[:180])
+		parts = append(parts, "~"+escapeChunkTrailingDot(encoded[:180]))
 		encoded = encoded[180:]
 	}
-	parts = append(parts, "~"+encoded)
+	parts = append(parts, "~"+escapeChunkTrailingDot(encoded))
 	if directory {
 		return append(parts, "~~")
 	}
 	return append(parts, "~~.json")
+}
+
+func escapeChunkTrailingDot(chunk string) string {
+	if strings.HasSuffix(chunk, ".") {
+		return strings.TrimSuffix(chunk, ".") + "%2E"
+	}
+	return chunk
 }
 
 // escapeRefSegment mirrors Rust's escape_ref_segment. Percent-encoding is
@@ -173,7 +177,7 @@ func escapeRefSegment(segment string, directory bool) string {
 }
 
 func missingLegacyPointer(err error) bool {
-	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ENAMETOOLONG)
 }
 
 func legacyManifestRefPath(layoutDir, ref string) string {

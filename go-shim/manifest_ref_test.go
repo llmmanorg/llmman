@@ -102,6 +102,27 @@ func TestManifestRefPathIsOneFilePerModel(t *testing.T) {
 	}
 }
 
+func TestManifestRefPathsMatchSharedGoldenVectors(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "tests", "fixtures", "manifest-ref-paths.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vectors []struct {
+		Reference string `json:"reference"`
+		Path      string `json:"path"`
+	}
+	if err := json.Unmarshal(data, &vectors); err != nil {
+		t.Fatal(err)
+	}
+	for _, vector := range vectors {
+		got := manifestRefPath("store", vector.Reference)
+		want := filepath.Join("store", filepath.FromSlash(vector.Path))
+		if got != want {
+			t.Errorf("manifestRefPath(%q) = %q, want %q", vector.Reference, got, want)
+		}
+	}
+}
+
 func TestManifestRefPathEscapesCollisionsAndAncestors(t *testing.T) {
 	dir := t.TempDir()
 	for _, pair := range [][2]string{
@@ -135,6 +156,24 @@ func TestManifestRefPathSplitsLongEncodedTag(t *testing.T) {
 	}
 	if got, err := readManifestRef(dir, ref); err != nil || got.Digest != digest.FromString("long") {
 		t.Fatalf("long tag read = %+v, %v", got, err)
+	}
+}
+
+func TestLongOpaqueKeyIgnoresUnrepresentableLegacyPointer(t *testing.T) {
+	dir := t.TempDir()
+	ref := "s3://bucket/" + strings.Repeat("a", 256)
+	legacyParent := filepath.Dir(filepath.Dir(legacyManifestRefPath(dir, ref)))
+	if err := os.MkdirAll(legacyParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readManifestRef(dir, ref); !os.IsNotExist(err) {
+		t.Fatalf("unrepresentable legacy pointer: got %v, want not-exist", err)
+	}
+	if err := writeManifestRef(dir, ref, ocispec.Descriptor{Digest: digest.FromString("long")}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := readManifestRef(dir, ref); err != nil || got.Digest != digest.FromString("long") {
+		t.Fatalf("read long opaque key = %+v, %v", got, err)
 	}
 }
 

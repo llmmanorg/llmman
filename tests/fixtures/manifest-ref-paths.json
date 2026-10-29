@@ -1,0 +1,30 @@
+[
+  {
+    "reference": "docker.io/ai/qwen3.5:0.8b",
+    "path": "manifests-v2/docker.io/ai/qwen3.5/0.8b.json"
+  },
+  {
+    "reference": "docker.io/ai/qwen3.5",
+    "path": "manifests-v2/docker.io/ai/qwen3.5/latest.json"
+  },
+  {
+    "reference": "reg.example:5000/ns/model:t",
+    "path": "manifests-v2/reg.example%3A5000/ns/model/t.json"
+  },
+  {
+    "reference": "s3://bucket/key",
+    "path": "manifests-v2/~/s3%3A/~/bucket/key.json"
+  },
+  {
+    "reference": "reg.example/ns/model:Prod",
+    "path": "manifests-v2/reg.example/ns/model/%50rod.json"
+  },
+  {
+    "reference": "reg.example/ns/model:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbb",
+    "path": "manifests-v2/reg.example/ns/model/~aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%2E/~bbbbbbbbbbbbbbbbbbbbbb/~~.json"
+  },
+  {
+    "reference": "reg.example/ns/model:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbb",
+    "path": "manifests-v2/reg.example/ns/model/~aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab/~bbbbbbbbbbbbbbbbbbbbb/~~.json"
+  }
+]

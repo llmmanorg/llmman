@@ -385,8 +385,7 @@ pub fn read_manifest_ref(layout_dir: &Path, reference: &str) -> Result<Descripto
                     .as_ref()
                     .and_then(|ann| ann.get(ANNOTATION_REF_NAME))
                     .is_some_and(|name| {
-                        crate::storage::oci::canonical_ref_key(name)
-                            == crate::storage::oci::canonical_ref_key(reference)
+                        crate::storage::default_tag(name) == crate::storage::default_tag(reference)
                     })
                 {
                     return Ok(desc);
@@ -394,7 +393,7 @@ pub fn read_manifest_ref(layout_dir: &Path, reference: &str) -> Result<Descripto
             }
             Err(err)
                 if err.kind() == std::io::ErrorKind::NotFound
-                    || (i == 1 && err.kind() == std::io::ErrorKind::NotADirectory) =>
+                    || (i == 1 && crate::storage::oci::missing_legacy_ref(&err)) =>
             {
                 continue
             }
@@ -623,6 +622,31 @@ mod tests {
             "sha256:abc"
         );
         assert_eq!(std::fs::read(&ancestor).unwrap(), b"another pointer");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_opaque_key_ignores_unrepresentable_legacy_pointer() {
+        let dir = tempfile();
+        ensure_layout(&dir).unwrap();
+        let reference = format!("s3://bucket/{}", "a".repeat(256));
+        let legacy = crate::storage::oci::legacy_manifest_ref_path(&dir, &reference);
+        std::fs::create_dir_all(legacy.parent().unwrap().parent().unwrap()).unwrap();
+        assert!(read_manifest_ref(&dir, &reference).is_err());
+        write_manifest_ref(
+            &dir,
+            &reference,
+            Descriptor {
+                digest: "sha256:abc".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_manifest_ref(&dir, &reference).unwrap().digest,
+            "sha256:abc"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
