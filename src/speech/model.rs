@@ -263,6 +263,15 @@ impl CanaryHParams {
                 hp.frontend.num_mels
             );
         }
+        // Without `enc.proj.*` the decoder's cross attention reads the
+        // encoder output at its own width.
+        if !hp.encoder_decoder_proj && hp.enc_d_model != hp.dec_d_model {
+            bail!(
+                "stt.canary.decoder.encoder_decoder_proj is false but encoder d_model {} differs from decoder d_model {}",
+                hp.enc_d_model,
+                hp.dec_d_model
+            );
+        }
         // Every special token is looked up in the embedding table.
         for (name, id) in &hp.special {
             if u64::from(*id) >= hp.dec_vocab_size {
@@ -945,6 +954,7 @@ impl CanaryModel {
 }
 
 /// Reads, checks and uploads a Canary GGUF onto `be`'s weight buffer type.
+/// The upload plans from the same index the checks ran on.
 /// Types stay as stored: `Weights` converts BF16 alone, so quantized
 /// linears and F16/F32 conv kernels arrive byte for byte.
 pub fn load(path: &Path, be: &Backend) -> Result<CanaryModel> {
@@ -955,7 +965,13 @@ pub fn load(path: &Path, be: &Backend) -> Result<CanaryModel> {
     check_index(&idx, &hp).with_context(|| path.display().to_string())?;
     check_types(&idx, &|t| unsafe { (be.api.ggml_blck_size)(t) })
         .with_context(|| path.display().to_string())?;
-    let weights = Weights::load(be.api, path, be.weight_buft(), &LoadOpts::default())?;
+    let weights = Weights::load_files_indexed(
+        be.api,
+        &[path],
+        std::slice::from_ref(&idx),
+        be.weight_buft(),
+        &LoadOpts::default(),
+    )?;
     let tensors = CanaryTensors::build(&hp, &mut |name| weights.get(name))?;
     Ok(CanaryModel {
         hp,
@@ -1237,6 +1253,27 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn from_info_rejects_width_mismatch_without_projection() {
+        let mut m = phase1_metadata();
+        m.insert("stt.canary.decoder.d_model".into(), Value::U32(512));
+        let err = CanaryHParams::from_info(&info(m)).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "stt.canary.decoder.encoder_decoder_proj is false but encoder d_model 1024 differs from decoder d_model 512"
+        );
+
+        let mut m = phase1_metadata();
+        m.insert("stt.canary.decoder.d_model".into(), Value::U32(512));
+        m.insert(
+            "stt.canary.decoder.encoder_decoder_proj".into(),
+            Value::Bool(true),
+        );
+        let hp = CanaryHParams::from_info(&info(m)).unwrap();
+        assert!(hp.encoder_decoder_proj);
+        assert_eq!((hp.enc_d_model, hp.dec_d_model), (1024, 512));
     }
 
     /// `num_mels = 2^59 + 128` divides by the factor 8, and

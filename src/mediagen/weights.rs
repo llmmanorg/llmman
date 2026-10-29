@@ -324,6 +324,24 @@ impl Weights {
         buft: GgmlBackendBuft,
         opts: &LoadOpts,
     ) -> Result<Weights> {
+        let idxs = paths
+            .iter()
+            .map(|p| read_index(p))
+            .collect::<Result<Vec<_>>>()?;
+        Self::load_files_indexed(api, paths, &idxs, buft, opts)
+    }
+
+    /// Like [`Self::load_files`], from indices the caller already read, one per path.
+    pub fn load_files_indexed(
+        api: &'static Api,
+        paths: &[&Path],
+        idxs: &[Index],
+        buft: GgmlBackendBuft,
+        opts: &LoadOpts,
+    ) -> Result<Weights> {
+        if paths.len() != idxs.len() {
+            bail!("{} paths but {} indices", paths.len(), idxs.len());
+        }
         struct Item {
             dst: Tensor,
             src: TensorDesc,
@@ -331,10 +349,6 @@ impl Weights {
             tap: i32,
             name: String,
         }
-        let idxs = paths
-            .iter()
-            .map(|p| read_index(p))
-            .collect::<Result<Vec<_>>>()?;
         let mut plan: Vec<Item> = Vec::new();
         let n_planned: usize = idxs
             .iter()

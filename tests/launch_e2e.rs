@@ -3068,7 +3068,8 @@ fn gguf_value_text(v: &llmman::gguf::Value) -> String {
 /// (`src/arch/canary/weights.cpp` at db678a0, kept in `speech::model`)
 /// through the loader's own index, and a quantized tensor survives a
 /// byte round-trip through the same `ggml_backend_tensor_set` the loader
-/// uses. Q8_0 and F16 are required, Q6_K optional. Run by hand:
+/// uses. All three files are required: Q8_0, F16 and Q6_K, the
+/// acceptance list of issue #714. Run by hand:
 /// `LLMMAN_CANARY_GGUF_DIR=<dir> cargo test --release --test launch_e2e
 /// canary -- --ignored --nocapture`.
 #[test]
@@ -3105,16 +3106,7 @@ fn canary_gguf_loads_through_mediagen_weights() {
         "canary-1b-v2-Q6_K.gguf",
     ] {
         let path = dir.join(file);
-        if !path.is_file() {
-            // Q8_0 and F16 are the pinned artifacts; only Q6_K is optional.
-            assert!(
-                file.contains("Q6_K"),
-                "{file}: missing in {}",
-                dir.display()
-            );
-            eprintln!("{file}: absent, skipped");
-            continue;
-        }
+        assert!(path.is_file(), "{file}: missing in {}", dir.display());
         eprintln!("== {}", path.display());
 
         let info = llmman::gguf::read_info(&path).unwrap();
@@ -3257,15 +3249,17 @@ fn canary_gguf_loads_through_mediagen_weights() {
 /// `speech::model::load` on the ggml CPU backend of the llama.cpp on
 /// `PATH`: each GGUF in `LLMMAN_CANARY_GGUF_DIR` comes back as a
 /// `CanaryModel` with its hyperparameters, vocabulary and every contract
-/// tensor in one weight buffer. Run by hand:
+/// tensor in one weight buffer. All three files are required: Q8_0, F16
+/// and Q6_K, the acceptance list of issue #714. Run by hand:
 /// `LLMMAN_CANARY_GGUF_DIR=<dir> cargo test --release --test launch_e2e
 /// canary -- --ignored --nocapture`.
 #[test]
 #[ignore]
 fn canary_model_loads_on_cpu_backend() {
     use llmman::mediagen::backend::Backend;
-    use llmman::mediagen::ffi::Api;
+    use llmman::mediagen::ffi::{ty, Api, Tensor};
     use std::collections::BTreeMap;
+    use std::io::Seek;
 
     // Same registry race as the test above.
     let _guard = lock_serial();
@@ -3296,12 +3290,7 @@ fn canary_model_loads_on_cpu_backend() {
         ("Q6_K", "canary-1b-v2-Q6_K.gguf"),
     ] {
         let path = dir.join(file);
-        if !path.is_file() {
-            // Q8_0 and F16 are the pinned artifacts; only Q6_K is optional.
-            assert!(label == "Q6_K", "{file}: missing in {}", dir.display());
-            eprintln!("{file}: absent, skipped");
-            continue;
-        }
+        assert!(path.is_file(), "{file}: missing in {}", dir.display());
         eprintln!("== {}", path.display());
         let model = llmman::speech::model::load(&path, &be).unwrap();
         eprintln!("  tensors: {}", model.tensor_count());
@@ -3340,6 +3329,60 @@ fn canary_model_loads_on_cpu_backend() {
             (3, 4, 2, 7),
             "{file}: special tokens"
         );
+        // The bytes `load` uploaded against the file: one conv kernel,
+        // one quantized (or F16) linear, one F32 vector and the stored
+        // position table. `read_index` offsets are absolute in the file.
+        let idx = llmman::mediagen::weights::read_index(&path).unwrap();
+        let samples: [(&str, Tensor); 4] = [
+            (
+                "enc.pre_encode.conv.0.weight",
+                model.tensors.pre_encode.conv0,
+            ),
+            (
+                "enc.blocks.0.ff1.linear1.weight",
+                model.tensors.enc_blocks[0].ff1_linear1,
+            ),
+            (
+                "enc.blocks.0.norm_ff1.weight",
+                model.tensors.enc_blocks[0].norm_ff1,
+            ),
+            ("dec.embed.pos_enc", model.tensors.dec_embed.pos_enc),
+        ];
+        let mut file_h = std::fs::File::open(&path).unwrap();
+        for (name, t) in samples {
+            let desc = idx
+                .tensors
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("{file}: {name}: not in the index"));
+            // BF16 is the one type `Weights` converts; these files carry none.
+            assert_ne!(desc.ty, ty::BF16, "{file}: {name}: BF16 in the file");
+            assert!(!t.is_null(), "{file}: {name}: null tensor");
+            // SAFETY: `model` keeps the tensor context and its backing
+            // buffer alive; `t` is null-checked above and `back` has
+            // `ggml_nbytes(t)` writable bytes.
+            let (loaded_ty, back) = unsafe {
+                assert_eq!((*t).type_, desc.ty, "{file}: {name}: type");
+                let nbytes = (api.ggml_nbytes)(t);
+                let mut back = vec![0u8; nbytes];
+                (api.ggml_backend_tensor_get)(t, back.as_mut_ptr() as *mut _, 0, nbytes);
+                ((*t).type_, back)
+            };
+            let elems: i64 = desc.ne.iter().product();
+            // SAFETY: a pure size computation on a ggml type id.
+            let nbytes = unsafe { (api.ggml_row_size)(desc.ty, elems) };
+            file_h.seek(std::io::SeekFrom::Start(desc.offset)).unwrap();
+            let mut src = vec![0u8; nbytes];
+            file_h.read_exact(&mut src).unwrap();
+            assert_eq!(src.len(), back.len(), "{file}: {name}: size");
+            let first_mismatch = src.iter().zip(&back).position(|(a, b)| a != b);
+            assert!(
+                src == back,
+                "{file}: {name}: first mismatch at byte {}",
+                first_mismatch.unwrap()
+            );
+            eprintln!("  {name} ty={loaded_ty} {} bytes: identical", back.len());
+        }
         weight_bytes.insert(label, model.weight_bytes());
         // the buffer goes before the backend it lives on
         drop(model);
