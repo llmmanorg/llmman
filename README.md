@@ -189,6 +189,11 @@ llmman transfer hf.co/unsloth/Qwen3.5-0.8B-GGUF docker.io/owner/model:latest
 
 Any source `llmman pull` understands (an OCI registry, `hf://`, `ms://`, ...) can be paired with any OCI registry destination.
 
+On Docker-backed builds, transfers from `hf://` or an OCI registry skip
+blobs the destination already has, so re-running an unchanged transfer does
+not re-download its weights and prints `already up to date`. Other sources
+(`ms://`, ...) and the Podman fallback still stage a full download.
+
 ### Sign a model, and verify what you pull
 
 No gatekeeper means nothing vouches for a model implicitly, so llmman

@@ -458,16 +458,49 @@ pub struct PushStream {
 #[cfg(feature = "docker")]
 #[derive(Deserialize)]
 struct PushStreamOpenResult {
+    /// The destination already has the blob; `fd`/`handle` are unset.
+    #[serde(default)]
+    exists: bool,
+    #[serde(default)]
     fd: u64,
+    #[serde(default)]
     handle: i64,
+}
+
+/// What [`push_stream_open`] found at the destination.
+#[cfg(feature = "docker")]
+pub enum PushStreamOpen {
+    /// The destination already has this blob: nothing to write or wait on.
+    Exists,
+    /// An upload is in progress: write the content to the stream's
+    /// `fd`, close it, then [`push_stream_wait`].
+    Stream(PushStream),
+}
+
+#[cfg(feature = "docker")]
+impl PushStreamOpen {
+    fn decode(data: &str) -> anyhow::Result<Self> {
+        let result: PushStreamOpenResult =
+            serde_json::from_str(data).context("decode push_stream_open response")?;
+        Ok(if result.exists {
+            Self::Exists
+        } else {
+            Self::Stream(PushStream {
+                fd: result.fd,
+                handle: result.handle,
+            })
+        })
+    }
 }
 
 /// Starts pushing one blob (or the final manifest — the registry tells
 /// them apart by `media_type`, not anything passed here) within
 /// `session` (see [`push_session_open`]). `digest` is `"sha256:<hex>"`.
 /// `annotations_json` is an optional JSON object (`""` for none).
-/// Returns immediately with the write end of a pipe to stream the
-/// content into; see [`push_stream_wait`].
+///
+/// Checks the destination first: [`PushStreamOpen::Exists`] if it has the
+/// blob (a registry failure is an `Err` here), otherwise the write end of
+/// a pipe to stream into; see [`push_stream_wait`].
 #[cfg(feature = "docker")]
 pub fn push_stream_open(
     session: &PushSession,
@@ -475,19 +508,14 @@ pub fn push_stream_open(
     digest: &str,
     size: i64,
     annotations_json: &str,
-) -> anyhow::Result<PushStream> {
+) -> anyhow::Result<PushStreamOpen> {
     let m = cstr(media_type)?;
     let g = cstr(digest)?;
     let a = cstr(annotations_json)?;
     let data = consume(unsafe {
         llmman_push_stream_open(session.0, m.as_ptr(), g.as_ptr(), size, a.as_ptr())
     })?;
-    let result: PushStreamOpenResult =
-        serde_json::from_str(&data).context("decode push_stream_open response")?;
-    Ok(PushStream {
-        fd: result.fd,
-        handle: result.handle,
-    })
+    PushStreamOpen::decode(&data)
 }
 
 /// Blocks until the streamed push started by [`push_stream_open`]
@@ -574,5 +602,28 @@ mod tests {
     fn an_envelope_without_not_found_is_not_marked() {
         let err = decode_response(r#"{"ok":false,"error":"x: not found"}"#).unwrap_err();
         assert!(!is_source_not_found(&err));
+    }
+
+    #[cfg(feature = "docker")]
+    #[test]
+    fn push_stream_open_decodes_exists_without_a_stream() {
+        let open = PushStreamOpen::decode(r#"{"exists":true,"fd":0,"handle":0}"#).unwrap();
+        assert!(matches!(open, PushStreamOpen::Exists));
+    }
+
+    #[cfg(feature = "docker")]
+    #[test]
+    fn push_stream_open_decodes_a_stream() {
+        let open = PushStreamOpen::decode(r#"{"exists":false,"fd":7,"handle":3}"#).unwrap();
+        match open {
+            PushStreamOpen::Stream(s) => assert_eq!((s.fd, s.handle), (7, 3)),
+            PushStreamOpen::Exists => panic!("expected a stream"),
+        }
+    }
+
+    #[cfg(feature = "docker")]
+    #[test]
+    fn push_stream_open_rejects_garbage() {
+        assert!(PushStreamOpen::decode("not json").is_err());
     }
 }

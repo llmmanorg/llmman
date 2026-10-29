@@ -320,13 +320,104 @@ func (r *fileReaderAt) ReadAt(p []byte, off int64) (int, error) { return r.f.Rea
 func (r *fileReaderAt) Close() error                            { return r.f.Close() }
 func (r *fileReaderAt) Size() int64                             { return r.size }
 
-// pushLazy is the one place that actually talks to pusher.Push. It checks
-// whether the destination already has desc *before* calling open — open
-// returns the content to upload plus a cleanup func (call it even on a nil
-// reader/error, may be nil itself) — and open is only ever invoked once
-// that check has confirmed an upload is actually needed. Returns whether
-// the blob already existed, so callers can print their own "already
-// present" line instead of ever creating a progress bar for it.
+// pushAttempt is an upload beginPush found necessary: the writer plus the
+// cancelable context it is bound to, so a stalled write can abort just
+// this attempt. Call close exactly once.
+type pushAttempt struct {
+	cancel context.CancelFunc
+	ctx    context.Context
+	cw     content.Writer
+}
+
+// close releases the writer, then the context, so an in-flight Commit
+// doesn't race its own cancellation.
+func (a *pushAttempt) close() {
+	_ = a.cw.Close()
+	a.cancel()
+}
+
+// beginPush is the existence check, the one place that calls
+// pusher.Push. It returns (nil, true, nil) if the destination already has
+// desc, else an attempt the caller must close. Nothing source-side is
+// opened yet, so callers fetch content only after seeing the answer.
+//
+// The attempt gets its own cancelable ctx (see stallWriter), so canceling
+// it affects only this push and never the caller's ctx.
+func beginPush(ctx context.Context, pusher remotes.Pusher, desc ocispec.Descriptor) (a *pushAttempt, alreadyExists bool, err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	cw, err := pusher.Push(ctx, desc)
+	if err != nil {
+		cancel()
+		if errdefs.IsAlreadyExists(err) {
+			return nil, true, nil
+		}
+		return nil, false, describeErr(err)
+	}
+	return &pushAttempt{cancel: cancel, ctx: ctx, cw: cw}, false, nil
+}
+
+// copy uploads desc's content from the reader open returns, plus a
+// cleanup func (may be nil; run even on error). The bar, if any, is
+// aborted on a failed copy; see pushLazy for why.
+func (a *pushAttempt) copy(
+	desc ocispec.Descriptor,
+	open func() (r io.Reader, bar *mpb.Bar, cleanup func(), err error),
+) error {
+	r, bar, cleanup, err := open()
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		return err
+	}
+
+	// See stallWriter's own comment (shared_oci.go) for why this exists:
+	// content.Copy below has no way on its own to notice or escape a
+	// destination write that's stopped making progress — observed in
+	// practice as a registry PUT that goes quiet mid-upload and simply
+	// never completes or fails, hanging the whole transfer (and, per
+	// transfer.yml's job timeout, the whole CI job) for hours rather
+	// than the few seconds it'd otherwise take retryStream to notice and
+	// retry this file from scratch.
+	sw := newStallWriter(a.cw, dlStallTimeout, a.cancel)
+	defer sw.stop()
+
+	// containerd's pushWriter (core/remotes/docker/pusher.go) only ever
+	// initializes its underlying pipe inside its own Write method, the
+	// first time that's called with actual data — but content.Copy below
+	// never calls Write at all for a zero-byte blob (its io.ReadAtLeast
+	// loop immediately gets 0, io.EOF, so the "if nr > 0" guard around
+	// the Write call is never entered), leaving that pipe nil. Commit
+	// then unconditionally does pw.pipe.Write(...) to check for a prior
+	// read error, which panics on that nil pipe rather than returning
+	// one — see docker/llmman-publisher's nemotron-3-nano:4b-safetensors
+	// transfer, which crashed exactly this way pushing a real, ordinary
+	// zero-byte file from that HuggingFace repository. A zero-length
+	// write of our own first is a genuine no-op otherwise, and is enough
+	// to make Write actually run once, initializing that pipe before
+	// Commit ever gets to it.
+	if desc.Size == 0 {
+		if _, err := sw.Write(nil); err != nil {
+			return describeErr(err)
+		}
+	}
+
+	if copyErr := describeErr(content.Copy(a.ctx, sw, r, desc.Size, desc.Digest)); copyErr != nil {
+		// A real failure partway through: the bar (if any) was already
+		// incremented some amount short of its total, and never will be
+		// any further — abort it explicitly so it doesn't likewise leave
+		// pool.Wait() hanging on a bar that's now never going anywhere.
+		if bar != nil {
+			bar.Abort(false)
+		}
+		return copyErr
+	}
+	return nil
+}
+
+// pushLazy is beginPush followed by copy: open is only invoked once the
+// destination is known to lack desc. Returns whether the blob already
+// existed, so callers can print their own "already present" line.
 //
 // Checking existence first, unconditionally, matters for two different
 // reasons depending on the caller:
@@ -352,75 +443,12 @@ func pushLazy(
 	desc ocispec.Descriptor,
 	open func() (r io.Reader, bar *mpb.Bar, cleanup func(), err error),
 ) (alreadyExists bool, err error) {
-	// Owns its own cancelable derivative of ctx so a stalled write (see
-	// stallWriter) can abort this attempt without needing every caller
-	// to plumb a cancel func down to here itself — canceling it only
-	// ever affects this one push attempt, and it composes fine with a
-	// caller's own cancelable ctx: cancellation flows one way, parent to
-	// child, so either one firing aborts this attempt, and firing this one
-	// can't reach back up to affect the caller's.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	cw, err := pusher.Push(ctx, desc)
-	if err != nil {
-		if errdefs.IsAlreadyExists(err) {
-			return true, nil
-		}
-		return false, describeErr(err)
+	a, exists, err := beginPush(ctx, pusher, desc)
+	if exists || err != nil {
+		return exists, err
 	}
-	defer cw.Close()
-
-	r, bar, cleanup, err := open()
-	if cleanup != nil {
-		defer cleanup()
-	}
-	if err != nil {
-		return false, err
-	}
-
-	// See stallWriter's own comment (shared_oci.go) for why this exists:
-	// content.Copy below has no way on its own to notice or escape a
-	// destination write that's stopped making progress — observed in
-	// practice as a registry PUT that goes quiet mid-upload and simply
-	// never completes or fails, hanging the whole transfer (and, per
-	// transfer.yml's job timeout, the whole CI job) for hours rather
-	// than the few seconds it'd otherwise take retryStream to notice and
-	// retry this file from scratch.
-	sw := newStallWriter(cw, dlStallTimeout, cancel)
-	defer sw.stop()
-
-	// containerd's pushWriter (core/remotes/docker/pusher.go) only ever
-	// initializes its underlying pipe inside its own Write method, the
-	// first time that's called with actual data — but content.Copy below
-	// never calls Write at all for a zero-byte blob (its io.ReadAtLeast
-	// loop immediately gets 0, io.EOF, so the "if nr > 0" guard around
-	// the Write call is never entered), leaving that pipe nil. Commit
-	// then unconditionally does pw.pipe.Write(...) to check for a prior
-	// read error, which panics on that nil pipe rather than returning
-	// one — see docker/llmman-publisher's nemotron-3-nano:4b-safetensors
-	// transfer, which crashed exactly this way pushing a real, ordinary
-	// zero-byte file from that HuggingFace repository. A zero-length
-	// write of our own first is a genuine no-op otherwise, and is enough
-	// to make Write actually run once, initializing that pipe before
-	// Commit ever gets to it.
-	if desc.Size == 0 {
-		if _, err := sw.Write(nil); err != nil {
-			return false, describeErr(err)
-		}
-	}
-
-	if copyErr := describeErr(content.Copy(ctx, sw, r, desc.Size, desc.Digest)); copyErr != nil {
-		// A real failure partway through: the bar (if any) was already
-		// incremented some amount short of its total, and never will be
-		// any further — abort it explicitly so it doesn't likewise leave
-		// pool.Wait() hanging on a bar that's now never going anywhere.
-		if bar != nil {
-			bar.Abort(false)
-		}
-		return false, copyErr
-	}
-	return false, nil
+	defer a.close()
+	return false, a.copy(desc, open)
 }
 
 // withBar wraps r in newBar's progress bar (if newBar is non-nil, via the

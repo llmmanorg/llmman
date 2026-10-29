@@ -8,11 +8,13 @@
 //
 // Shape: llmman_push_session_open resolves destination once, returning
 // a session handle. Each llmman_push_stream_open within that session
-// creates a pipe, returns its *write* end's raw fd/HANDLE to Rust, and
-// starts a goroutine that reads the other end into the same pushLazy
-// (backend_docker.go) every push path already uses — the registry never
-// knows its source was a pipe rather than a file. Rust writes, closes
-// its end, then calls llmman_push_stream_wait to block for the outcome.
+// first checks whether the destination already has the blob (beginPush,
+// backend_docker.go) and, if so, answers {"exists": true}: no pipe, no
+// goroutine, and Rust never fetches the source. Otherwise it creates a
+// pipe, returns its *write* end's raw fd/HANDLE to Rust, and starts a
+// goroutine that uploads from the other end — the registry never knows
+// its source was a pipe rather than a file. Rust writes, closes its end, then calls
+// llmman_push_stream_wait to block for the outcome.
 // llmman_push_session_close releases the session once done.
 //
 // One resolver/pusher per *session*, not per blob: resolving a
@@ -113,20 +115,64 @@ func llmman_push_session_close(cSession C.longlong) *C.char {
 	return okResp("")
 }
 
-// pushStreamOpenResult is push_stream_open's data payload — the write
-// end's raw fd (POSIX) or HANDLE (Windows), both of which fit in a
-// int64/uint64 either way, plus the handle to later pass to
-// llmman_push_stream_wait.
+// pushStreamOpenResult is push_stream_open's data payload. If Exists,
+// nothing was opened and FD/Handle must be ignored. Otherwise FD is the
+// write end's raw fd (POSIX) or HANDLE (Windows), and Handle is what to
+// pass to llmman_push_stream_wait.
 type pushStreamOpenResult struct {
+	Exists bool   `json:"exists"`
 	FD     uint64 `json:"fd"`
 	Handle int64  `json:"handle"`
 }
 
+// openPushStream is llmman_push_stream_open without the C marshaling
+// (cgo is not usable from tests).
+func openPushStream(session *pushSession, desc ocispec.Descriptor) (pushStreamOpenResult, error) {
+	attempt, exists, err := beginPush(session.ctx, session.pusher, desc)
+	if err != nil {
+		return pushStreamOpenResult{}, err
+	}
+	if exists {
+		return pushStreamOpenResult{Exists: true}, nil
+	}
+
+	readFile, writeFD, err := newRawPipe()
+	if err != nil {
+		attempt.close()
+		return pushStreamOpenResult{}, fmt.Errorf("create pipe: %w", err)
+	}
+
+	handle := &pushStreamHandle{done: make(chan struct{})}
+	pushStreamMu.Lock()
+	pushStreamNextID++
+	id := pushStreamNextID
+	pushStreams[id] = handle
+	pushStreamMu.Unlock()
+
+	go func() {
+		defer readFile.Close()
+		pushErr := attempt.copy(desc, func() (io.Reader, *mpb.Bar, func(), error) {
+			return readFile, nil, nil, nil
+		})
+		attempt.close()
+		// Drain so a failed push gives the writer a clean EOF rather
+		// than a broken pipe whose error would mask this one.
+		_, _ = io.Copy(io.Discard, readFile)
+		handle.changed = true
+		handle.err = pushErr
+		close(handle.done)
+	}()
+
+	return pushStreamOpenResult{FD: writeFD, Handle: id}, nil
+}
+
 // llmman_push_stream_open starts pushing one blob (or the final
 // manifest — containerd's Pusher tells them apart by MediaType) within
-// session, reading from a pipe this call creates. Returns immediately;
-// the push itself runs on a background goroutine reading from the pipe
-// as the caller writes into the returned fd/HANDLE.
+// session. If the destination already has the blob it returns
+// {"exists": true} and the caller must not fetch the content. Otherwise
+// it returns a pipe's write end and the push runs on a background
+// goroutine. Errors from the existence check (auth, network) surface
+// here; upload and commit errors surface from llmman_push_stream_wait.
 //
 // annotationsJSON is an optional JSON object, or "" for none.
 //
@@ -150,36 +196,11 @@ func llmman_push_stream_open(cSession C.longlong, cMediaType, cDigest *C.char, c
 		}
 	}
 
-	readFile, writeFD, err := newRawPipe()
+	result, err := openPushStream(session, desc)
 	if err != nil {
-		return errResp(fmt.Errorf("create pipe: %w", err))
+		return errResp(err)
 	}
-
-	handle := &pushStreamHandle{done: make(chan struct{})}
-	pushStreamMu.Lock()
-	pushStreamNextID++
-	id := pushStreamNextID
-	pushStreams[id] = handle
-	pushStreamMu.Unlock()
-
-	go func() {
-		defer readFile.Close()
-		alreadyExists, pushErr := pushLazy(session.ctx, session.pusher, desc, func() (io.Reader, *mpb.Bar, func(), error) {
-			return readFile, nil, nil, nil
-		})
-		// pushLazy returns as soon as the registry says it already has
-		// this digest, without ever reading readFile — most often true
-		// on a repeat transfer of an unchanged model. The caller on the
-		// other end of the pipe doesn't know that and is still writing
-		// (or about to), so draining here first avoids handing it a
-		// broken pipe instead of a clean EOF once we do close.
-		_, _ = io.Copy(io.Discard, readFile)
-		handle.changed = !alreadyExists
-		handle.err = pushErr
-		close(handle.done)
-	}()
-
-	data, _ := json.Marshal(pushStreamOpenResult{FD: writeFD, Handle: id})
+	data, _ := json.Marshal(result)
 	return okResp(string(data))
 }
 
@@ -190,7 +211,18 @@ func llmman_push_stream_open(cSession C.longlong, cMediaType, cDigest *C.char, c
 //
 //export llmman_push_stream_wait
 func llmman_push_stream_wait(cHandle C.longlong) *C.char {
-	id := int64(cHandle)
+	changed, err := waitPushStream(int64(cHandle))
+	if err != nil {
+		return errResp(err)
+	}
+	data, _ := json.Marshal(struct {
+		Changed bool `json:"changed"`
+	}{Changed: changed})
+	return okResp(string(data))
+}
+
+// waitPushStream is llmman_push_stream_wait without the C marshaling.
+func waitPushStream(id int64) (changed bool, err error) {
 	pushStreamMu.Lock()
 	handle, ok := pushStreams[id]
 	if ok {
@@ -198,15 +230,12 @@ func llmman_push_stream_wait(cHandle C.longlong) *C.char {
 	}
 	pushStreamMu.Unlock()
 	if !ok {
-		return errMsg(fmt.Sprintf("no push stream with handle %d (already waited on, or never opened)", id))
+		return false, fmt.Errorf("no push stream with handle %d (already waited on, or never opened)", id)
 	}
 
 	<-handle.done
 	if handle.err != nil {
-		return errResp(handle.err)
+		return false, handle.err
 	}
-	data, _ := json.Marshal(struct {
-		Changed bool `json:"changed"`
-	}{Changed: handle.changed})
-	return okResp(string(data))
+	return handle.changed, nil
 }

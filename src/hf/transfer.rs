@@ -500,44 +500,59 @@ mod docker {
     /// retrying the *whole* open-fetch-close-wait cycle (never reusing a
     /// pipe across attempts — see `download::fetch_once`'s own doc
     /// comment on why that would corrupt rather than actually retry).
+    ///
+    /// Returns `Ok(false)` without touching the source if the destination
+    /// already has the blob.
     async fn fetch_and_push_stream(
         client: &reqwest::Client,
         req: &FetchRequest<'_>,
         session: &crate::ffi::PushSession,
         desc: &Descriptor,
     ) -> Result<bool> {
-        retry_push(&req.label, |attempt| {
-            let _ = attempt;
-            async {
-                let (mut writer, stream) = open_push_stream(session, desc)?;
-                let write_result = download::fetch_once(client, req, &mut writer).await;
-                drop(writer); // close our end first, or push_stream_wait hangs waiting for an EOF we're still holding open
-                              // The goroutine's own error is more informative than a
-                              // local write symptom like "broken pipe" (usually just
-                              // the registry side having already failed and closed
-                              // its end first), so it takes priority when both are present.
-                let pushed = crate::ffi::push_stream_wait(stream)?;
-                write_result?;
-                Ok(pushed)
-            }
+        retry_push(&req.label, |_| {
+            stream_push(session, desc, |mut w| async move {
+                download::fetch_once(client, req, &mut w).await.map(drop)
+            })
         })
         .await
     }
 
+    /// Pushes an in-memory blob, unless the destination already has it.
     async fn push_bytes(
         session: &crate::ffi::PushSession,
         desc: &Descriptor,
         data: &[u8],
     ) -> Result<bool> {
-        retry_push("push blob", |_| async {
-            let (mut writer, stream) = open_push_stream(session, desc)?;
-            let write_result = writer.write_all(data).map_err(anyhow::Error::from);
-            drop(writer); // close our end first, or push_stream_wait hangs waiting for an EOF we're still holding open
-            let pushed = crate::ffi::push_stream_wait(stream)?;
-            write_result?;
-            Ok(pushed)
+        retry_push("push blob", |_| {
+            stream_push(session, desc, |mut w| async move {
+                w.write_all(data).map_err(anyhow::Error::from)
+            })
         })
         .await
+    }
+
+    /// One open-write-close-wait cycle on a fresh push stream. `write`
+    /// gets the pipe and must finish (dropping it) before the wait, or
+    /// the wait hangs on an EOF that never comes. `Ok(false)` without
+    /// calling `write` if the destination already has the blob.
+    async fn stream_push<F, Fut>(
+        session: &crate::ffi::PushSession,
+        desc: &Descriptor,
+        write: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(std::fs::File) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let Some((writer, stream)) = open_push_stream(session, desc)? else {
+            return Ok(false);
+        };
+        let write_result = write(writer).await;
+        // The goroutine's error is more informative than a local write
+        // symptom like "broken pipe", so it takes priority.
+        let pushed = crate::ffi::push_stream_wait(stream)?;
+        write_result?;
+        Ok(pushed)
     }
 
     /// The push-side retry loop: retries `attempt` (the whole
@@ -595,21 +610,27 @@ mod docker {
     /// the other end) *before* calling `ffi::push_stream_wait` with the
     /// returned handle, or that call hangs waiting for an EOF that will
     /// never come while this side is still holding its own end open.
+    ///
+    /// Returns `None` if the destination already has the blob: no pipe,
+    /// nothing to wait on, and the caller must not fetch the content.
     fn open_push_stream(
         session: &crate::ffi::PushSession,
         desc: &Descriptor,
-    ) -> Result<(std::fs::File, crate::ffi::PushStream)> {
+    ) -> Result<Option<(std::fs::File, crate::ffi::PushStream)>> {
         let annotations_json = match &desc.annotations {
             Some(a) if !a.is_empty() => serde_json::to_string(a)?,
             _ => String::new(),
         };
-        let stream = crate::ffi::push_stream_open(
+        let stream = match crate::ffi::push_stream_open(
             session,
             &desc.media_type,
             &desc.digest,
             desc.size,
             &annotations_json,
-        )?;
+        )? {
+            crate::ffi::PushStreamOpen::Exists => return Ok(None),
+            crate::ffi::PushStreamOpen::Stream(stream) => stream,
+        };
 
         // SAFETY: `stream.fd` is a fresh, valid, write-only fd/HANDLE
         // that Go just created via its own os.Pipe and handed to us as
@@ -629,6 +650,199 @@ mod docker {
             )
         };
 
-        Ok((file, stream))
+        Ok(Some((file, stream)))
+    }
+
+    /// Real Go push via FFI against axum mocks of the registry and HF.
+    #[cfg(test)]
+    mod tests {
+        use std::sync::{Arc, Mutex};
+
+        use axum::extract::Request;
+        use axum::http::{header, Method, StatusCode};
+        use axum::response::{IntoResponse, Response};
+        use axum::Router;
+
+        use super::*;
+
+        type Log = Arc<Mutex<Vec<String>>>;
+
+        fn count(log: &Log, method: &str, path_contains: &str) -> usize {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.starts_with(&format!("{method} ")) && r.contains(path_contains))
+                .count()
+        }
+
+        async fn serve(app: Router) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            addr.to_string()
+        }
+
+        /// A registry that either has every blob (`has_blobs`) or none, and
+        /// accepts any upload.
+        async fn mock_registry(has_blobs: bool) -> (String, Log) {
+            let log = Log::default();
+            let seen = log.clone();
+            let app = Router::new().fallback(move |req: Request| {
+                let seen = seen.clone();
+                async move {
+                    let (method, path) = (req.method().clone(), req.uri().path().to_string());
+                    let query = req.uri().query().unwrap_or_default().to_string();
+                    seen.lock().unwrap().push(format!("{method} {path}"));
+                    let _ = axum::body::to_bytes(req.into_body(), usize::MAX).await;
+                    match method {
+                        Method::HEAD if path.contains("/blobs/") && has_blobs => {
+                            StatusCode::OK.into_response()
+                        }
+                        Method::HEAD => StatusCode::NOT_FOUND.into_response(),
+                        Method::POST => Response::builder()
+                            .status(StatusCode::ACCEPTED)
+                            .header(header::LOCATION, format!("{path}upload-1"))
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                        // containerd rejects (and retries) a commit that
+                        // doesn't echo the digest back.
+                        Method::PUT => {
+                            let digest = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("digest="))
+                                .unwrap_or_default()
+                                .replace("%3A", ":");
+                            Response::builder()
+                                .status(StatusCode::CREATED)
+                                .header("Docker-Content-Digest", digest)
+                                .body(axum::body::Body::empty())
+                                .unwrap()
+                        }
+                        _ => StatusCode::CREATED.into_response(),
+                    }
+                }
+            });
+            (serve(app).await, log)
+        }
+
+        /// A stand-in for huggingface.co that answers every request with
+        /// `body` and records it.
+        async fn mock_source(body: &'static str) -> (String, Log) {
+            let log = Log::default();
+            let seen = log.clone();
+            let app = Router::new().fallback(move |req: Request| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock()
+                        .unwrap()
+                        .push(format!("{} {}", req.method(), req.uri().path()));
+                    body
+                }
+            });
+            (serve(app).await, log)
+        }
+
+        fn session(registry: &str) -> crate::ffi::PushSession {
+            // The test harness skips `main()`; windows-msvc needs this
+            // before any Go call or the call hangs.
+            crate::ffi::ensure_runtime_init();
+            crate::ffi::push_session_open(&format!("{registry}/org/model:v1")).unwrap()
+        }
+
+        fn desc_of(data: &[u8]) -> Descriptor {
+            Descriptor {
+                media_type: oci::MEDIA_TYPE_MODEL_WEIGHT_RAW.to_string(),
+                digest: format!("sha256:{:x}", sha2::Sha256::digest(data)),
+                size: data.len() as i64,
+                ..Default::default()
+            }
+        }
+
+        fn request(source: &str) -> FetchRequest<'static> {
+            FetchRequest {
+                url: format!("http://{source}/org/model/resolve/abc/model.gguf"),
+                token: None,
+                xet: None,
+                label: "Transferring model.gguf".to_string(),
+            }
+        }
+
+        // Multi-thread: a blocking FFI call would starve the mock otherwise.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn open_push_stream_returns_none_for_a_blob_the_registry_has() {
+            let (registry, reg_log) = mock_registry(true).await;
+            let session = session(&registry);
+            let opened = open_push_stream(&session, &desc_of(b"hello")).unwrap();
+            assert!(opened.is_none(), "an existing blob must not open a pipe");
+            assert_eq!(count(&reg_log, "HEAD", "/blobs/sha256:"), 1);
+            assert_eq!(count(&reg_log, "POST", "/blobs/uploads/"), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_existing_blob_is_never_fetched_from_the_source() {
+            let (registry, reg_log) = mock_registry(true).await;
+            let (source, src_log) = mock_source("hello").await;
+            let session = session(&registry);
+
+            let pushed = fetch_and_push_stream(
+                &reqwest::Client::new(),
+                &request(&source),
+                &session,
+                &desc_of(b"hello"),
+            )
+            .await
+            .unwrap();
+
+            assert!(!pushed, "nothing changed at the destination");
+            assert!(
+                src_log.lock().unwrap().is_empty(),
+                "the source must not be contacted: {:?}",
+                src_log.lock().unwrap()
+            );
+            assert_eq!(count(&reg_log, "POST", "/blobs/uploads/"), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_missing_blob_is_fetched_once_and_uploaded() {
+            let (registry, reg_log) = mock_registry(false).await;
+            let (source, src_log) = mock_source("hello").await;
+            let session = session(&registry);
+
+            let pushed = fetch_and_push_stream(
+                &reqwest::Client::new(),
+                &request(&source),
+                &session,
+                &desc_of(b"hello"),
+            )
+            .await
+            .unwrap();
+
+            assert!(pushed);
+            assert_eq!(count(&src_log, "GET", "/resolve/"), 1);
+            assert_eq!(count(&reg_log, "POST", "/blobs/uploads/"), 1);
+            assert!(
+                count(&reg_log, "PUT", "/blobs/uploads/")
+                    + count(&reg_log, "PATCH", "/blobs/uploads/")
+                    >= 1
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn push_bytes_skips_the_upload_for_a_blob_the_registry_has() {
+            let (registry, reg_log) = mock_registry(true).await;
+            let session = session(&registry);
+            let pushed = push_bytes(&session, &desc_of(b"{}"), b"{}").await.unwrap();
+            assert!(!pushed);
+            assert_eq!(count(&reg_log, "POST", "/blobs/uploads/"), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn push_bytes_uploads_a_missing_blob() {
+            let (registry, reg_log) = mock_registry(false).await;
+            let session = session(&registry);
+            let pushed = push_bytes(&session, &desc_of(b"{}"), b"{}").await.unwrap();
+            assert!(pushed);
+            assert_eq!(count(&reg_log, "POST", "/blobs/uploads/"), 1);
+        }
     }
 }
