@@ -28,6 +28,7 @@ pub mod promptlog;
 pub mod providers;
 pub mod shortnames;
 pub mod sources;
+pub mod speech;
 pub mod storage;
 pub mod thinking;
 pub mod usage;

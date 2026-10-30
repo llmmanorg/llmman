@@ -1975,24 +1975,46 @@ fn docker_agent_retries_only_its_own_degenerate_loop_guard() {
     assert!(!docker_agent_stopped_a_degenerate_loop(""));
 }
 
-/// Whether the model's *reply* was "pong", ignoring the reasoning
-/// docker-agent prints above it.
-///
-/// A thinking model reasons about the prompt, so the word appears in its
-/// reasoning whether or not it ever answers — `stdout.contains("pong")`
-/// passes on a run that produced no reply. The reply is the last
-/// non-empty line.
+/// Whether the model's *reply* was "pong", not just reasoning that
+/// mentions it. docker-agent streams reasoning and reply with no
+/// separator, so a reply is the last line alone or glued onto the end of
+/// the reasoning's last sentence (`...no extra text.pong`).
 fn docker_agent_reply_is_pong(stdout: &str) -> bool {
-    stdout
-        .lines()
-        .map(str::trim)
-        .rev()
-        .find(|line| !line.is_empty())
-        .is_some_and(|reply| {
-            reply
-                .trim_matches(|c: char| !c.is_alphanumeric())
-                .eq_ignore_ascii_case("pong")
-        })
+    let Some(last) = stdout.lines().map(str::trim).rev().find(|l| !l.is_empty()) else {
+        return false;
+    };
+    let alone = last.trim_matches(|c: char| !c.is_alphanumeric());
+    let tail = last.len().saturating_sub("pong".len());
+    alone.eq_ignore_ascii_case("pong")
+        || (last
+            .get(tail..)
+            .is_some_and(|t| t.eq_ignore_ascii_case("pong"))
+            && last[..tail].ends_with(['.', '!', '?']))
+}
+
+#[test]
+fn docker_agent_reply_is_pong_tells_a_reply_from_reasoning() {
+    for reply in [
+        "pong\n",
+        "Pong.\n",
+        "Thinking.\n\npong\n",
+        "I just need to output \"pong\".pong\n",
+        "no extra text or punctuation.pong",
+    ] {
+        assert!(docker_agent_reply_is_pong(reply), "{reply:?}");
+    }
+    for reasoning in [
+        "",
+        "po",
+        "The word is pong.\n",
+        "They said \"say the word: pong\"\n",
+        "I should say pong",
+        "I should say \"pong\"",
+        "I should avoid saying pingpong",
+        "I should say &#39;pong",
+    ] {
+        assert!(!docker_agent_reply_is_pong(reasoning), "{reasoning:?}");
+    }
 }
 
 /// Checks what `launch_docker_agent` promises: it writes its own agent
@@ -3077,4 +3099,341 @@ fn mediagen_ffi_binds_the_llama_cpp_on_path() {
     eprintln!("binding the ggml/llama libraries in {}", dir.display());
     let api = llmman::mediagen::ffi::Api::load(&dir).unwrap();
     api.check_layout().unwrap();
+}
+
+/// A GGUF metadata value on one line: strings bare, arrays joined,
+/// numbers with their type.
+fn gguf_value_text(v: &llmman::gguf::Value) -> String {
+    use llmman::gguf::Value;
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(gguf_value_text).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+/// Canary 1B v2 (handy-computer/canary-1b-v2-gguf): each GGUF in
+/// `LLMMAN_CANARY_GGUF_DIR` meets the transcribe.cpp tensor contract
+/// (`src/arch/canary/weights.cpp` at db678a0, kept in `speech::model`)
+/// through the loader's own index, and a quantized tensor survives a
+/// byte round-trip through the same `ggml_backend_tensor_set` the loader
+/// uses. All three files are required: Q8_0, F16 and Q6_K, the
+/// acceptance list of issue #714. Run by hand:
+/// `LLMMAN_CANARY_GGUF_DIR=<dir> cargo test --release --test launch_e2e
+/// canary -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn canary_gguf_loads_through_mediagen_weights() {
+    use llmman::mediagen::ffi;
+    use llmman::speech::model::{check_index, contract_names, CanaryHParams};
+    use std::collections::BTreeMap;
+    use std::io::Seek;
+
+    // ggml registers backend modules without a lock; two `Api::load`
+    // calls on parallel test threads race on that registry.
+    let _guard = lock_serial();
+
+    let Some(dir) = std::env::var_os("LLMMAN_CANARY_GGUF_DIR")
+        .map(PathBuf::from)
+        .filter(|d| !d.as_os_str().is_empty())
+    else {
+        eprintln!("skipping: LLMMAN_CANARY_GGUF_DIR is not set");
+        return;
+    };
+
+    // Candidates for the byte round-trip: (file, tensor) per ggml type.
+    let mut q8_0: Option<(PathBuf, llmman::mediagen::weights::TensorDesc)> = None;
+    let mut q6_k: Option<(PathBuf, llmman::mediagen::weights::TensorDesc)> = None;
+    for file in [
+        "canary-1b-v2-Q8_0.gguf",
+        "canary-1b-v2-F16.gguf",
+        "canary-1b-v2-Q6_K.gguf",
+    ] {
+        let path = dir.join(file);
+        assert!(path.is_file(), "{file}: missing in {}", dir.display());
+        eprintln!("== {}", path.display());
+
+        let info = llmman::gguf::read_info(&path).unwrap();
+        assert_eq!(info.architecture(), Some("canary"), "{file}");
+        let mut keys: Vec<&String> = info
+            .metadata
+            .keys()
+            .filter(|k| {
+                k.starts_with("stt.canary.")
+                    || k.starts_with("stt.frontend.")
+                    || *k == "general.languages"
+                    || *k == "stt.translation.pairs"
+            })
+            .collect();
+        keys.sort();
+        for k in keys {
+            eprintln!("  {k} = {}", gguf_value_text(&info.metadata[k]));
+        }
+        let hp = CanaryHParams::from_info(&info)
+            .unwrap_or_else(|e| panic!("{file}: hyperparameters: {e:#}"));
+
+        let idx = llmman::mediagen::weights::read_index(&path).unwrap();
+        let mut histogram: BTreeMap<u32, usize> = BTreeMap::new();
+        for t in &idx.tensors {
+            *histogram.entry(t.ty).or_default() += 1;
+        }
+        eprintln!(
+            "  tensors: {}, types {{ggml type id: count}}: {histogram:?}",
+            idx.tensors.len()
+        );
+
+        // `check_index` lists every unmapped, missing and misshapen name.
+        check_index(&idx, &hp).unwrap_or_else(|e| panic!("{file}: {e:#}"));
+        let expected = contract_names(hp.enc_n_layers, hp.dec_n_layers, hp.encoder_decoder_proj);
+        eprintln!(
+            "  contract: {} names, all mapped (encoder_decoder_proj = {})",
+            expected.len(),
+            hp.encoder_decoder_proj
+        );
+        eprintln!("  shapes: every tensor matches the hyperparameters");
+
+        for t in &idx.tensors {
+            let slot = match t.ty {
+                ffi::ty::Q8_0 => &mut q8_0,
+                ffi::ty::Q6_K => &mut q6_k,
+                _ => continue,
+            };
+            if slot.is_none() {
+                *slot = Some((path.clone(), t.clone()));
+            }
+        }
+    }
+
+    // All three files are required, so both quantized types must turn up.
+    let picks: Vec<_> = [("Q8_0", q8_0), ("Q6_K", q6_k)]
+        .into_iter()
+        .map(|(label, pick)| {
+            let pick = pick.unwrap_or_else(|| panic!("round-trip: no {label} tensor in any file"));
+            (label, pick)
+        })
+        .collect();
+
+    // The metadata and contract checks above need no libraries; only the
+    // round-trip does, so an opted-in run never passes without them.
+    if !on_path("llama-server") {
+        eprintln!("skipping round-trip: llama-server not on PATH");
+        return;
+    }
+    let lib_dir =
+        llmman::cmd::serve::llama_lib_dir(llmman::cmd::serve::Runtime::Path, None).unwrap();
+    eprintln!(
+        "== round-trip through the ggml CPU backend in {}",
+        lib_dir.display()
+    );
+    let api = ffi::Api::load(&lib_dir).unwrap();
+    // SAFETY: plain ggml calls on handles this block creates and frees.
+    // The backend, context, tensor and buffer pointers are null-checked
+    // before use; `buft` is the backend's default buffer type and is not.
+    unsafe {
+        let backend =
+            (api.ggml_backend_init_by_type)(ffi::GGML_BACKEND_DEVICE_TYPE_CPU, std::ptr::null());
+        assert!(!backend.is_null(), "no ggml CPU backend");
+        let buft = (api.ggml_backend_get_default_buffer_type)(backend);
+        for (label, (path, desc)) in picks {
+            let ctx = (api.ggml_init)(ffi::GgmlInitParams {
+                mem_size: (api.ggml_tensor_overhead)(),
+                mem_buffer: std::ptr::null_mut(),
+                no_alloc: true,
+            });
+            assert!(!ctx.is_null(), "ggml_init");
+            let t = (api.ggml_new_tensor)(
+                ctx,
+                desc.ty,
+                desc.ne.len() as std::ffi::c_int,
+                desc.ne.as_ptr(),
+            );
+            assert!(!t.is_null(), "ggml_new_tensor {}", desc.name);
+            let buf = (api.ggml_backend_alloc_ctx_tensors_from_buft)(ctx, buft);
+            assert!(!buf.is_null(), "alloc {}", desc.name);
+            // `read_gguf` leaves `nbytes` at 0; the loader sizes the read
+            // with `ggml_row_size` (weights.rs `load_files`), as here.
+            let elems: i64 = desc.ne.iter().product();
+            let nbytes = (api.ggml_row_size)(desc.ty, elems);
+            assert_eq!((api.ggml_nbytes)(t), nbytes, "{}: ggml_nbytes", desc.name);
+            let mut file = std::fs::File::open(&path).unwrap();
+            let file_len = file.metadata().unwrap().len();
+            assert!(
+                desc.offset + nbytes as u64 <= file_len,
+                "{}: offset {} + {nbytes} past the end of {}",
+                desc.name,
+                desc.offset,
+                path.display()
+            );
+            file.seek(std::io::SeekFrom::Start(desc.offset)).unwrap();
+            let mut src = vec![0u8; nbytes];
+            file.read_exact(&mut src).unwrap();
+            (api.ggml_backend_tensor_set)(t, src.as_ptr() as *const _, 0, nbytes);
+            let mut back = vec![0u8; nbytes];
+            (api.ggml_backend_tensor_get)(t, back.as_mut_ptr() as *mut _, 0, nbytes);
+            assert!(
+                src == back,
+                "{}: bytes differ after the round-trip",
+                desc.name
+            );
+            eprintln!(
+                "  {label} {} ne={:?} ty={} offset={} {nbytes} bytes: identical",
+                desc.name, desc.ne, desc.ty, desc.offset
+            );
+            (api.ggml_backend_buffer_free)(buf);
+            (api.ggml_free)(ctx);
+        }
+        (api.ggml_backend_free)(backend);
+    }
+}
+
+/// Canary 1B v2 (handy-computer/canary-1b-v2-gguf) through
+/// `speech::model::load` on the ggml CPU backend of the llama.cpp on
+/// `PATH`: each GGUF in `LLMMAN_CANARY_GGUF_DIR` comes back as a
+/// `CanaryModel` with its hyperparameters, vocabulary and every contract
+/// tensor in one weight buffer. All three files are required: Q8_0, F16
+/// and Q6_K, the acceptance list of issue #714. Run by hand:
+/// `LLMMAN_CANARY_GGUF_DIR=<dir> cargo test --release --test launch_e2e
+/// canary -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn canary_model_loads_on_cpu_backend() {
+    use llmman::mediagen::backend::Backend;
+    use llmman::mediagen::ffi::{ty, Api, Tensor};
+    use std::collections::BTreeMap;
+    use std::io::Seek;
+
+    // Same registry race as the test above.
+    let _guard = lock_serial();
+
+    let Some(dir) = std::env::var_os("LLMMAN_CANARY_GGUF_DIR")
+        .map(PathBuf::from)
+        .filter(|d| !d.as_os_str().is_empty())
+    else {
+        eprintln!("skipping: LLMMAN_CANARY_GGUF_DIR is not set");
+        return;
+    };
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH");
+        return;
+    }
+    let lib_dir =
+        llmman::cmd::serve::llama_lib_dir(llmman::cmd::serve::Runtime::Path, None).unwrap();
+    eprintln!("== CPU backend from {}", lib_dir.display());
+    // the weight contexts hold `&'static Api`, as in `mediagen_backend`
+    let api: &'static Api = Box::leak(Box::new(Api::load(&lib_dir).unwrap()));
+    let n_threads = std::thread::available_parallelism().map_or(4, |n| n.get() as i32);
+    let be = Backend::new(api, false, n_threads, 1024).unwrap();
+
+    let mut weight_bytes: BTreeMap<&str, usize> = BTreeMap::new();
+    for (label, file) in [
+        ("Q8_0", "canary-1b-v2-Q8_0.gguf"),
+        ("F16", "canary-1b-v2-F16.gguf"),
+        ("Q6_K", "canary-1b-v2-Q6_K.gguf"),
+    ] {
+        let path = dir.join(file);
+        assert!(path.is_file(), "{file}: missing in {}", dir.display());
+        eprintln!("== {}", path.display());
+        let model = llmman::speech::model::load(&path, &be).unwrap();
+        eprintln!("  tensors: {}", model.tensor_count());
+        eprintln!("  hparams: {:?}", model.hp);
+        eprintln!(
+            "  weights: {} bytes ({:.1} MiB)",
+            model.weight_bytes(),
+            model.weight_bytes() as f64 / 1024.0 / 1024.0
+        );
+        assert_eq!(model.tensor_count(), 1476, "{file}");
+        assert_eq!(model.tensors.enc_blocks.len(), 32, "{file}");
+        assert_eq!(model.tensors.dec_layers.len(), 8, "{file}");
+        let hp = &model.hp;
+        assert_eq!(
+            (
+                hp.enc_n_layers,
+                hp.enc_d_model,
+                hp.enc_n_heads,
+                hp.enc_d_ff,
+                hp.enc_conv_kernel,
+                hp.enc_subsampling_factor,
+                hp.enc_subsampling_channels,
+                hp.enc_pos_emb_max_len,
+            ),
+            (32, 1024, 8, 4096, 9, 8, 256, 5000),
+            "{file}: encoder"
+        );
+        assert_eq!(
+            (hp.dec_n_layers, hp.dec_max_position, hp.dec_vocab_size),
+            (8, 1024, 16384),
+            "{file}: decoder"
+        );
+        assert_eq!(model.vocab.pieces.len(), 16384, "{file}: vocab");
+        assert_eq!(
+            (hp.eos, hp.bos, hp.pad, hp.startofcontext),
+            (3, 4, 2, 7),
+            "{file}: special tokens"
+        );
+        // The bytes `load` uploaded against the file: one conv kernel,
+        // one quantized (or F16) linear, one F32 vector and the stored
+        // position table. `read_index` offsets are absolute in the file.
+        let idx = llmman::mediagen::weights::read_index(&path).unwrap();
+        let samples: [(&str, Tensor); 4] = [
+            (
+                "enc.pre_encode.conv.0.weight",
+                model.tensors.pre_encode.conv0,
+            ),
+            (
+                "enc.blocks.0.ff1.linear1.weight",
+                model.tensors.enc_blocks[0].ff1_linear1,
+            ),
+            (
+                "enc.blocks.0.norm_ff1.weight",
+                model.tensors.enc_blocks[0].norm_ff1,
+            ),
+            ("dec.embed.pos_enc", model.tensors.dec_embed.pos_enc),
+        ];
+        let mut file_h = std::fs::File::open(&path).unwrap();
+        for (name, t) in samples {
+            let desc = idx
+                .tensors
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("{file}: {name}: not in the index"));
+            // BF16 is the one type `Weights` converts; these files carry none.
+            assert_ne!(desc.ty, ty::BF16, "{file}: {name}: BF16 in the file");
+            assert!(!t.is_null(), "{file}: {name}: null tensor");
+            // SAFETY: `model` keeps the tensor context and its backing
+            // buffer alive; `t` is null-checked above and `back` has
+            // `ggml_nbytes(t)` writable bytes.
+            let (loaded_ty, back) = unsafe {
+                assert_eq!((*t).type_, desc.ty, "{file}: {name}: type");
+                let nbytes = (api.ggml_nbytes)(t);
+                let mut back = vec![0u8; nbytes];
+                (api.ggml_backend_tensor_get)(t, back.as_mut_ptr() as *mut _, 0, nbytes);
+                ((*t).type_, back)
+            };
+            let elems: i64 = desc.ne.iter().product();
+            // SAFETY: a pure size computation on a ggml type id.
+            let nbytes = unsafe { (api.ggml_row_size)(desc.ty, elems) };
+            file_h.seek(std::io::SeekFrom::Start(desc.offset)).unwrap();
+            let mut src = vec![0u8; nbytes];
+            file_h.read_exact(&mut src).unwrap();
+            assert_eq!(src.len(), back.len(), "{file}: {name}: size");
+            let first_mismatch = src.iter().zip(&back).position(|(a, b)| a != b);
+            assert!(
+                src == back,
+                "{file}: {name}: first mismatch at byte {}",
+                first_mismatch.unwrap()
+            );
+            eprintln!("  {name} ty={loaded_ty} {} bytes: identical", back.len());
+        }
+        weight_bytes.insert(label, model.weight_bytes());
+        // the buffer goes before the backend it lives on
+        drop(model);
+    }
+    assert!(
+        weight_bytes["Q8_0"] < weight_bytes["F16"],
+        "weight buffers: {weight_bytes:?}"
+    );
+    drop(be);
 }

@@ -4167,12 +4167,21 @@ async fn mediagen_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyho
         anyhow::bail!("{model_ref}: no text encoder in the model pack");
     }
     let pinned = runtime::llama_cpp_pin(args.llama_cpp_version.as_deref());
+    // The tested release must be the libraries it says; a user-chosen
+    // release or `latest` is only reported. The daemon forwards its own
+    // pin, so a default daemon makes this child strict too.
+    let check = if pinned.as_deref() == Some(crate::llama_release::default_release()) {
+        crate::mediagen::ffi::IdentityCheck::Strict(&crate::llama_release::PINNED_GGML)
+    } else {
+        crate::mediagen::ffi::IdentityCheck::Log
+    };
     let runtime = args.runtime;
     let lib_dir =
         tokio::task::spawn_blocking(move || llama_lib_dir(runtime, pinned.as_deref())).await??;
     // the graph builders hold `&'static Api`
-    let api: &'static crate::mediagen::ffi::Api =
-        Box::leak(Box::new(crate::mediagen::ffi::Api::load(&lib_dir)?));
+    let api: &'static crate::mediagen::ffi::Api = Box::leak(Box::new(
+        crate::mediagen::ffi::Api::load_with(&lib_dir, check)?,
+    ));
     let params = crate::mediagen::ContextParams {
         model: paths.model.clone(),
         vae: paths.vae.clone(),

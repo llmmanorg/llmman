@@ -427,7 +427,7 @@ fn dominant_quantization(tensors: &[TensorInfo]) -> Option<String> {
 /// table. Deprecated/removed ids (4, 5, 31-33) map to a placeholder rather
 /// than panicking or erroring — an old file naming one is still a file we
 /// should be able to at least partially describe.
-fn ggml_type_name(ty: u32) -> &'static str {
+pub(crate) fn ggml_type_name(ty: u32) -> &'static str {
     match ty {
         0 => "F32",
         1 => "F16",
