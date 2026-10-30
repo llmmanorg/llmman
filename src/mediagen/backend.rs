@@ -3,6 +3,8 @@
 use std::cell::Cell;
 use std::ffi::{c_int, CString};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 
@@ -22,6 +24,10 @@ pub struct Backend {
     probe: Option<(Ctx, *mut ffi::GgmlCgraph)>,
     /// The GPU failed and must be recreated by [`Backend::release_compute`].
     gpu_failed: Cell<bool>,
+    /// Polled by the CPU backend after every node once
+    /// [`Backend::set_abort_flag`] registered it; held here so the pointer
+    /// ggml keeps stays valid for the backend's lifetime.
+    _abort: Option<Arc<AtomicBool>>,
 }
 
 unsafe impl Send for Backend {}
@@ -69,6 +75,7 @@ impl Backend {
                 max_nodes,
                 probe,
                 gpu_failed: Cell::new(false),
+                _abort: None,
             };
             be.release_compute()?;
             Ok(be)
@@ -181,6 +188,21 @@ impl Backend {
         Ok(())
     }
 
+    /// Reads an F32 tensor allocated on a backend buffer.
+    pub fn read_f32(&self, t: Tensor) -> Vec<f32> {
+        read_f32(self.api, t)
+    }
+
+    /// Makes every CPU compute stop after the current node while `flag` is
+    /// set; [`Graph::compute`] then fails with "graph compute cancelled".
+    /// The caller clears the flag before the next run it wants to finish.
+    pub fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) {
+        let data = Arc::as_ptr(&flag) as *mut std::ffi::c_void;
+        self._abort = Some(flag);
+        self.api
+            .set_abort_callback(self.cpu, Some(abort_requested), data);
+    }
+
     /// Asks the GPU whether its last compute actually succeeded.
     fn check_gpu(&self) -> Result<()> {
         let Some((_, gf)) = &self.probe else {
@@ -198,6 +220,20 @@ impl Backend {
         }
         Ok(())
     }
+}
+
+/// The [`ffi::AbortCallback`] behind [`Backend::set_abort_flag`]; `data`
+/// is the `AtomicBool` the backend keeps alive.
+unsafe extern "C" fn abort_requested(data: *mut std::ffi::c_void) -> bool {
+    (*(data as *const AtomicBool)).load(Ordering::Relaxed)
+}
+
+/// Copies an F32 tensor out of its backend buffer.
+fn read_f32(api: &Api, t: Tensor) -> Vec<f32> {
+    let n = unsafe { (api.ggml_nelements)(t) } as usize;
+    let mut out = vec![0f32; n];
+    unsafe { (api.ggml_backend_tensor_get)(t, out.as_mut_ptr() as *mut _, 0, n * 4) };
+    out
 }
 
 fn init_gpu(api: &Api) -> GgmlBackend {
@@ -257,6 +293,7 @@ ops! {
     rms_norm => ggml_rms_norm(a: Tensor, eps: f32);
     norm => ggml_norm(a: Tensor, eps: f32);
     silu => ggml_silu(a: Tensor);
+    relu => ggml_relu(a: Tensor);
     gelu => ggml_gelu(a: Tensor);
     sigmoid => ggml_sigmoid(a: Tensor);
     tanh => ggml_tanh(a: Tensor);
@@ -284,6 +321,8 @@ ops! {
     conv_1d => ggml_conv_1d(a: Tensor, b: Tensor, s0: c_int, p0: c_int, d0: c_int);
     conv_2d => ggml_conv_2d(a: Tensor, b: Tensor, s0: c_int, s1: c_int, p0: c_int, p1: c_int, d0: c_int, d1: c_int);
     conv_transpose_1d => ggml_conv_transpose_1d(a: Tensor, b: Tensor, s0: c_int, p0: c_int, d0: c_int);
+    conv_2d_dw_direct => ggml_conv_2d_dw_direct(a: Tensor, b: Tensor, stride0: c_int, stride1: c_int, pad0: c_int, pad1: c_int, dilation0: c_int, dilation1: c_int);
+    ssm_conv => ggml_ssm_conv(sx: Tensor, c: Tensor);
     interpolate => ggml_interpolate(a: Tensor, ne0: i64, ne1: i64, ne2: i64, ne3: i64, mode: u32);
     timestep_embedding => ggml_timestep_embedding(t: Tensor, dim: c_int, max_period: c_int);
     flash_attn_ext => ggml_flash_attn_ext(q: Tensor, k: Tensor, v: Tensor, mask: Tensor, scale: f32, max_bias: f32, logit_softcap: f32);
@@ -330,6 +369,17 @@ impl Ctx {
             Some(b) => self.add(y, b),
             None => y,
         }
+    }
+
+    /// Asks for F32 accumulation in the matmul (or flash attention) `t`
+    /// and returns it; ggml ignores the hint on any other op. A release
+    /// without `ggml_prec_set_acc` leaves `t` as it is: the speech encoder
+    /// checks for the symbol before it builds a graph.
+    pub fn prec_f32(&self, t: Tensor) -> Tensor {
+        if let Some(set_acc) = self.api.ggml_prec_set_acc {
+            unsafe { set_acc(t, ffi::GGML_PREC_F32) };
+        }
+        t
     }
 }
 
@@ -462,6 +512,9 @@ impl Graph {
                 (api.ggml_backend_tensor_set)(*t, bytes.as_ptr() as *const _, 0, bytes.len());
             }
             let status = (api.ggml_backend_sched_graph_compute)(be.sched, self.gf);
+            if status == ffi::GGML_STATUS_ABORTED {
+                return Err(anyhow!("graph compute cancelled"));
+            }
             if status != ffi::GGML_STATUS_SUCCESS {
                 be.gpu_failed.set(!be.gpu.is_null());
                 return Err(anyhow!("graph compute failed with status {status}"));
@@ -471,10 +524,6 @@ impl Graph {
     }
 
     pub fn output_f32(&self, t: Tensor) -> Vec<f32> {
-        let api = self.ctx.api;
-        let n = unsafe { (api.ggml_nelements)(t) } as usize;
-        let mut out = vec![0f32; n];
-        unsafe { (api.ggml_backend_tensor_get)(t, out.as_mut_ptr() as *mut _, 0, n * 4) };
-        out
+        read_f32(self.ctx.api, t)
     }
 }

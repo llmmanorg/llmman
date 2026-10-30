@@ -62,6 +62,8 @@ pub const GGML_BACKEND_BUFFER_USAGE_WEIGHTS: c_int = 1;
 pub const GGML_PREC_F32: c_int = 10;
 pub const GGML_SCALE_MODE_NEAREST: u32 = 0;
 pub const GGML_STATUS_SUCCESS: c_int = 0;
+/// A CPU compute stopped by the abort callback (`enum ggml_status`).
+pub const GGML_STATUS_ABORTED: c_int = 1;
 pub const LLAMA_POOLING_TYPE_NONE: c_int = 0;
 pub const LLAMA_FLASH_ATTN_TYPE_AUTO: c_int = -1;
 pub const LLAMA_FLASH_ATTN_TYPE_DISABLED: c_int = 0;
@@ -155,6 +157,10 @@ pub struct LlamaModelParams {
 }
 
 pub type EvalCallback = unsafe extern "C" fn(t: Tensor, ask: bool, user_data: *mut c_void) -> bool;
+
+/// `ggml_abort_callback`: polled by the CPU backend after each node; a
+/// `true` return stops the graph with [`GGML_STATUS_ABORTED`].
+pub type AbortCallback = unsafe extern "C" fn(data: *mut c_void) -> bool;
 
 /// Prefix of `struct llama_context_params`.
 #[repr(C)]
@@ -258,6 +264,7 @@ api! {
     fn ggml_rms_norm(ctx: *mut GgmlContext, a: Tensor, eps: f32) -> Tensor;
     fn ggml_norm(ctx: *mut GgmlContext, a: Tensor, eps: f32) -> Tensor;
     fn ggml_silu(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
+    fn ggml_relu(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
     fn ggml_gelu(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
     fn ggml_sigmoid(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
     fn ggml_tanh(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
@@ -286,6 +293,8 @@ api! {
     fn ggml_conv_1d(ctx: *mut GgmlContext, a: Tensor, b: Tensor, s0: c_int, p0: c_int, d0: c_int) -> Tensor;
     fn ggml_conv_2d(ctx: *mut GgmlContext, a: Tensor, b: Tensor, s0: c_int, s1: c_int, p0: c_int, p1: c_int, d0: c_int, d1: c_int) -> Tensor;
     fn ggml_conv_transpose_1d(ctx: *mut GgmlContext, a: Tensor, b: Tensor, s0: c_int, p0: c_int, d0: c_int) -> Tensor;
+    fn ggml_conv_2d_dw_direct(ctx: *mut GgmlContext, a: Tensor, b: Tensor, stride0: c_int, stride1: c_int, pad0: c_int, pad1: c_int, dilation0: c_int, dilation1: c_int) -> Tensor;
+    fn ggml_ssm_conv(ctx: *mut GgmlContext, sx: Tensor, c: Tensor) -> Tensor;
     fn ggml_interpolate(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64, ne2: i64, ne3: i64, mode: u32) -> Tensor;
     fn ggml_timestep_embedding(ctx: *mut GgmlContext, timesteps: Tensor, dim: c_int, max_period: c_int) -> Tensor;
     fn ggml_flash_attn_ext(ctx: *mut GgmlContext, q: Tensor, k: Tensor, v: Tensor, mask: Tensor, scale: f32, max_bias: f32, logit_softcap: f32) -> Tensor;
@@ -356,6 +365,8 @@ api! {
     // library identity, ggml >= 2025-07-02
     fn ggml_version() -> *const c_char;
     fn ggml_commit() -> *const c_char;
+    // F32 accumulation hint for mul_mat / flash attention, only the speech encoder needs it
+    fn ggml_prec_set_acc(a: Tensor, prec: c_int) -> bool;
 }
 
 fn lookup<T: Copy>(libs: &[Library], name: &str) -> Result<T> {
@@ -562,6 +573,30 @@ impl Api {
             }
         }
     }
+
+    /// Registers `cb` with `data` on the CPU `backend` through the
+    /// registry's `ggml_backend_set_abort_callback` entry (the CPU module
+    /// maps it to `ggml_backend_cpu_set_abort_callback`); a backend without
+    /// that entry is left as it is. `data` must outlive the backend.
+    pub fn set_abort_callback(
+        &self,
+        backend: GgmlBackend,
+        cb: Option<AbortCallback>,
+        data: *mut c_void,
+    ) {
+        unsafe {
+            let reg = (self.ggml_backend_dev_backend_reg)((self.ggml_backend_get_device)(backend));
+            let p = (self.ggml_backend_reg_get_proc_address)(
+                reg,
+                c"ggml_backend_set_abort_callback".as_ptr(),
+            );
+            if !p.is_null() {
+                let f: unsafe extern "C" fn(GgmlBackend, Option<AbortCallback>, *mut c_void) =
+                    std::mem::transmute(p);
+                f(backend, cb, data);
+            }
+        }
+    }
 }
 
 /// Shape of a tensor in ggml order.
@@ -571,6 +606,11 @@ pub fn shape(t: Tensor) -> [i64; 4] {
 
 pub fn strides(t: Tensor) -> [usize; 4] {
     unsafe { (*t).nb }
+}
+
+/// Storage type of a tensor, one of [`ty`].
+pub fn dtype(t: Tensor) -> u32 {
+    unsafe { (*t).type_ }
 }
 
 #[cfg(test)]
