@@ -33,17 +33,26 @@ pub struct Index {
 
 pub fn read_index(path: &Path) -> Result<Index> {
     let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    read_index_from(&mut f, path)
+}
+
+/// Reads the tensor index of an already open safetensors or GGUF file,
+/// from offset zero whatever the current position. `path` only names the
+/// file in error messages. The file position after the call is
+/// unspecified; callers seek before reading tensor data.
+pub fn read_index_from(f: &mut File, path: &Path) -> Result<Index> {
+    f.seek(SeekFrom::Start(0))?;
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
     f.seek(SeekFrom::Start(0))?;
     if &magic == b"GGUF" {
-        read_gguf(BufReader::new(f), path)
+        read_gguf(BufReader::new(&mut *f), path)
     } else {
         read_safetensors(f, path)
     }
 }
 
-fn read_safetensors(mut f: File, path: &Path) -> Result<Index> {
+fn read_safetensors(f: &mut File, path: &Path) -> Result<Index> {
     let mut len = [0u8; 8];
     f.read_exact(&mut len)?;
     let n = u64::from_le_bytes(len);

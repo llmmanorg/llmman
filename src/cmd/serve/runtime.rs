@@ -219,7 +219,7 @@ impl Lazy {
             bin.display()
         );
         let pin = self.llama_cpp_version.clone();
-        let bin = tokio::task::spawn_blocking(move || resolve_local(source, pin.as_deref()))
+        let (_, bin) = tokio::task::spawn_blocking(move || resolve_local(source, pin.as_deref()))
             .await
             .context("resolve llama-server task panicked")??;
         self.set(Resolved::Local {
@@ -243,18 +243,24 @@ pub fn resolve(runtime: Runtime, llama_cpp_version: Option<&str>) -> Result<Reso
 /// [`resolve`] for callers that need a local binary (the mediagen backend
 /// dlopens the libraries next to it): `auto` is `bin` then `path`, and a
 /// container runtime is an error.
-pub fn resolve_local(runtime: Runtime, llama_cpp_version: Option<&str>) -> Result<PathBuf> {
+///
+/// Returns the source (`Bin` or `Path`) with the binary: only `Bin` is
+/// selected by `llama_cpp_version`; a `Path` binary is whatever is
+/// installed, whatever the pin says.
+pub fn resolve_local(
+    runtime: Runtime,
+    llama_cpp_version: Option<&str>,
+) -> Result<(Runtime, PathBuf)> {
     if let Some(m) = runtime.ociman() {
         anyhow::bail!(
             "--runtime {} runs llama-server in a container; there is no local binary",
             m.binary()
         );
     }
-    let resolved = resolve_from(&candidates(runtime, true), runtime, llama_cpp_version)?;
-    Ok(resolved
-        .llama_server_bin()
-        .expect("bin and path resolve to a local binary")
-        .clone())
+    match resolve_from(&candidates(runtime, true), runtime, llama_cpp_version)? {
+        Resolved::Local { source, bin } => Ok((source, bin)),
+        Resolved::Container(_) => unreachable!("bin and path resolve to a local binary"),
+    }
 }
 
 /// What `runtime` expands to, in order.

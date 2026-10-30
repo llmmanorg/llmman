@@ -4144,15 +4144,35 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
 
 /// The ggml/llama libraries of the `llama-server` we would run locally
 /// under `runtime` (see `runtime::resolve_local`), pinned to
-/// `pinned_version` for `bin`.
-pub fn llama_lib_dir(runtime: Runtime, pinned_version: Option<&str>) -> anyhow::Result<PathBuf> {
-    let bin = runtime::resolve_local(runtime, pinned_version)?;
-    crate::mediagen::ffi::lib_dir_of(&bin).ok_or_else(|| {
+/// `pinned_version` for `bin`, with which source (`Bin` or `Path`) they
+/// came from.
+pub fn llama_libs(
+    runtime: Runtime,
+    pinned_version: Option<&str>,
+) -> anyhow::Result<(Runtime, PathBuf)> {
+    let (source, bin) = runtime::resolve_local(runtime, pinned_version)?;
+    let dir = crate::mediagen::ffi::lib_dir_of(&bin).ok_or_else(|| {
         anyhow!(
             "no ggml/llama shared libraries next to {}; media generation needs a llama.cpp release or installed build",
             bin.display()
         )
-    })
+    })?;
+    Ok((source, dir))
+}
+
+/// How the mediagen backend checks the identity of the libraries it
+/// loads. Strict only for llmman's own download of the tested release:
+/// a `bin` source pinned to the default release. A user-chosen release,
+/// `latest`, or a `path` build (which the pin never selects) is logged.
+fn identity_check_for(
+    source: Runtime,
+    pinned: Option<&str>,
+) -> crate::mediagen::ffi::IdentityCheck {
+    if source == Runtime::Bin && pinned == Some(crate::llama_release::default_release()) {
+        crate::mediagen::ffi::IdentityCheck::Strict(&crate::llama_release::PINNED_GGML)
+    } else {
+        crate::mediagen::ffi::IdentityCheck::Log
+    }
 }
 
 /// `llmman serve MODEL --port PORT`: the media backend the daemon spawns
@@ -4167,17 +4187,15 @@ async fn mediagen_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyho
         anyhow::bail!("{model_ref}: no text encoder in the model pack");
     }
     let pinned = runtime::llama_cpp_pin(args.llama_cpp_version.as_deref());
-    // The tested release must be the libraries it says; a user-chosen
-    // release or `latest` is only reported. The daemon forwards its own
-    // pin, so a default daemon makes this child strict too.
-    let check = if pinned.as_deref() == Some(crate::llama_release::default_release()) {
-        crate::mediagen::ffi::IdentityCheck::Strict(&crate::llama_release::PINNED_GGML)
-    } else {
-        crate::mediagen::ffi::IdentityCheck::Log
-    };
+    // `identity_check_for` holds the rule. The daemon forwards its
+    // resolved runtime and pin (`spawn_mediagen_backend`), so a default
+    // daemon on its own download makes this child strict too.
     let runtime = args.runtime;
-    let lib_dir =
-        tokio::task::spawn_blocking(move || llama_lib_dir(runtime, pinned.as_deref())).await??;
+    let (lib_dir, check) = tokio::task::spawn_blocking(move || {
+        let (source, lib_dir) = llama_libs(runtime, pinned.as_deref())?;
+        anyhow::Ok((lib_dir, identity_check_for(source, pinned.as_deref())))
+    })
+    .await??;
     // the graph builders hold `&'static Api`
     let api: &'static crate::mediagen::ffi::Api = Box::leak(Box::new(
         crate::mediagen::ffi::Api::load_with(&lib_dir, check)?,

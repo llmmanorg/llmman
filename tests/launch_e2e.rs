@@ -3069,11 +3069,9 @@ fn serve_ds4_gguf_model() {
 /// a moved struct `check_layout`.
 #[test]
 fn mediagen_ffi_binds_the_llama_cpp_on_path() {
-    if !on_path("llama-server") {
-        eprintln!("skipping: llama-server not on PATH");
+    let Some(dir) = llama_libs_on_path() else {
         return;
-    }
-    let dir = llmman::cmd::serve::llama_lib_dir(llmman::cmd::serve::Runtime::Path, None).unwrap();
+    };
     eprintln!("binding the ggml/llama libraries in {}", dir.display());
     let api = llmman::mediagen::ffi::Api::load(&dir).unwrap();
     api.check_layout().unwrap();
@@ -3093,6 +3091,55 @@ fn gguf_value_text(v: &llmman::gguf::Value) -> String {
     }
 }
 
+/// Shared setup of the two ignored Canary tests: the serial lock and the
+/// three GGUFs of `LLMMAN_CANARY_GGUF_DIR`, the acceptance list of issue
+/// #714, as `(label, path)`.
+struct CanaryFixture {
+    // ggml registers backend modules without a lock; two `Api::load`
+    // calls on parallel test threads race on that registry.
+    _guard: std::sync::MutexGuard<'static, ()>,
+    files: [(&'static str, PathBuf); 3],
+}
+
+/// Takes the serial lock and resolves the three required files. Skips
+/// (None) when `LLMMAN_CANARY_GGUF_DIR` is unset or empty; a missing
+/// file fails.
+fn canary_fixture() -> Option<CanaryFixture> {
+    let guard = lock_serial();
+    let Some(dir) = std::env::var_os("LLMMAN_CANARY_GGUF_DIR")
+        .map(PathBuf::from)
+        .filter(|d| !d.as_os_str().is_empty())
+    else {
+        eprintln!("skipping: LLMMAN_CANARY_GGUF_DIR is not set");
+        return None;
+    };
+    let files = [
+        ("Q8_0", "canary-1b-v2-Q8_0.gguf"),
+        ("F16", "canary-1b-v2-F16.gguf"),
+        ("Q6_K", "canary-1b-v2-Q6_K.gguf"),
+    ]
+    .map(|(label, file)| {
+        let path = dir.join(file);
+        assert!(path.is_file(), "{file}: missing in {}", dir.display());
+        (label, path)
+    });
+    Some(CanaryFixture {
+        _guard: guard,
+        files,
+    })
+}
+
+/// The ggml/llama library directory of the `llama-server` on `PATH`, or
+/// None (skip) when there is none.
+fn llama_libs_on_path() -> Option<PathBuf> {
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH");
+        return None;
+    }
+    let (_, dir) = llmman::cmd::serve::llama_libs(llmman::cmd::serve::Runtime::Path, None).unwrap();
+    Some(dir)
+}
+
 /// Canary 1B v2 (handy-computer/canary-1b-v2-gguf): each GGUF in
 /// `LLMMAN_CANARY_GGUF_DIR` meets the transcribe.cpp tensor contract
 /// (`src/arch/canary/weights.cpp` at db678a0, kept in `speech::model`)
@@ -3110,28 +3157,17 @@ fn canary_gguf_loads_through_mediagen_weights() {
     use std::collections::BTreeMap;
     use std::io::Seek;
 
-    // ggml registers backend modules without a lock; two `Api::load`
-    // calls on parallel test threads race on that registry.
-    let _guard = lock_serial();
-
-    let Some(dir) = std::env::var_os("LLMMAN_CANARY_GGUF_DIR")
-        .map(PathBuf::from)
-        .filter(|d| !d.as_os_str().is_empty())
-    else {
-        eprintln!("skipping: LLMMAN_CANARY_GGUF_DIR is not set");
+    let Some(fixture) = canary_fixture() else {
         return;
     };
 
-    // Candidates for the byte round-trip: (file, tensor) per ggml type.
-    let mut q8_0: Option<(PathBuf, llmman::mediagen::weights::TensorDesc)> = None;
-    let mut q6_k: Option<(PathBuf, llmman::mediagen::weights::TensorDesc)> = None;
-    for file in [
-        "canary-1b-v2-Q8_0.gguf",
-        "canary-1b-v2-F16.gguf",
-        "canary-1b-v2-Q6_K.gguf",
-    ] {
-        let path = dir.join(file);
-        assert!(path.is_file(), "{file}: missing in {}", dir.display());
+    // Every GGUF stays open for the byte round-trip below. Candidates per
+    // ggml type: (index into `opened`, tensor).
+    let mut opened: Vec<(PathBuf, std::fs::File)> = Vec::new();
+    let mut q8_0: Option<(usize, llmman::mediagen::weights::TensorDesc)> = None;
+    let mut q6_k: Option<(usize, llmman::mediagen::weights::TensorDesc)> = None;
+    for (_, path) in fixture.files {
+        let file = path.file_name().unwrap().to_string_lossy();
         eprintln!("== {}", path.display());
 
         let info = llmman::gguf::read_info(&path).unwrap();
@@ -3153,7 +3189,8 @@ fn canary_gguf_loads_through_mediagen_weights() {
         let hp = CanaryHParams::from_info(&info)
             .unwrap_or_else(|e| panic!("{file}: hyperparameters: {e:#}"));
 
-        let idx = llmman::mediagen::weights::read_index(&path).unwrap();
+        let mut file_h = std::fs::File::open(&path).unwrap();
+        let idx = llmman::mediagen::weights::read_index_from(&mut file_h, &path).unwrap();
         let mut histogram: BTreeMap<u32, usize> = BTreeMap::new();
         for t in &idx.tensors {
             *histogram.entry(t.ty).or_default() += 1;
@@ -3180,9 +3217,10 @@ fn canary_gguf_loads_through_mediagen_weights() {
                 _ => continue,
             };
             if slot.is_none() {
-                *slot = Some((path.clone(), t.clone()));
+                *slot = Some((opened.len(), t.clone()));
             }
         }
+        opened.push((path, file_h));
     }
 
     // All three files are required, so both quantized types must turn up.
@@ -3196,12 +3234,9 @@ fn canary_gguf_loads_through_mediagen_weights() {
 
     // The metadata and contract checks above need no libraries; only the
     // round-trip does, so an opted-in run never passes without them.
-    if !on_path("llama-server") {
-        eprintln!("skipping round-trip: llama-server not on PATH");
+    let Some(lib_dir) = llama_libs_on_path() else {
         return;
-    }
-    let lib_dir =
-        llmman::cmd::serve::llama_lib_dir(llmman::cmd::serve::Runtime::Path, None).unwrap();
+    };
     eprintln!(
         "== round-trip through the ggml CPU backend in {}",
         lib_dir.display()
@@ -3215,7 +3250,8 @@ fn canary_gguf_loads_through_mediagen_weights() {
             (api.ggml_backend_init_by_type)(ffi::GGML_BACKEND_DEVICE_TYPE_CPU, std::ptr::null());
         assert!(!backend.is_null(), "no ggml CPU backend");
         let buft = (api.ggml_backend_get_default_buffer_type)(backend);
-        for (label, (path, desc)) in picks {
+        for (label, (i, desc)) in picks {
+            let (path, file) = &mut opened[i];
             let ctx = (api.ggml_init)(ffi::GgmlInitParams {
                 mem_size: (api.ggml_tensor_overhead)(),
                 mem_buffer: std::ptr::null_mut(),
@@ -3236,7 +3272,6 @@ fn canary_gguf_loads_through_mediagen_weights() {
             let elems: i64 = desc.ne.iter().product();
             let nbytes = (api.ggml_row_size)(desc.ty, elems);
             assert_eq!((api.ggml_nbytes)(t), nbytes, "{}: ggml_nbytes", desc.name);
-            let mut file = std::fs::File::open(&path).unwrap();
             let file_len = file.metadata().unwrap().len();
             assert!(
                 desc.offset + nbytes as u64 <= file_len,
@@ -3283,22 +3318,12 @@ fn canary_model_loads_on_cpu_backend() {
     use std::collections::BTreeMap;
     use std::io::Seek;
 
-    // Same registry race as the test above.
-    let _guard = lock_serial();
-
-    let Some(dir) = std::env::var_os("LLMMAN_CANARY_GGUF_DIR")
-        .map(PathBuf::from)
-        .filter(|d| !d.as_os_str().is_empty())
-    else {
-        eprintln!("skipping: LLMMAN_CANARY_GGUF_DIR is not set");
+    let Some(fixture) = canary_fixture() else {
         return;
     };
-    if !on_path("llama-server") {
-        eprintln!("skipping: llama-server not on PATH");
+    let Some(lib_dir) = llama_libs_on_path() else {
         return;
-    }
-    let lib_dir =
-        llmman::cmd::serve::llama_lib_dir(llmman::cmd::serve::Runtime::Path, None).unwrap();
+    };
     eprintln!("== CPU backend from {}", lib_dir.display());
     // the weight contexts hold `&'static Api`, as in `mediagen_backend`
     let api: &'static Api = Box::leak(Box::new(Api::load(&lib_dir).unwrap()));
@@ -3306,15 +3331,10 @@ fn canary_model_loads_on_cpu_backend() {
     let be = Backend::new(api, false, n_threads, 1024).unwrap();
 
     let mut weight_bytes: BTreeMap<&str, usize> = BTreeMap::new();
-    for (label, file) in [
-        ("Q8_0", "canary-1b-v2-Q8_0.gguf"),
-        ("F16", "canary-1b-v2-F16.gguf"),
-        ("Q6_K", "canary-1b-v2-Q6_K.gguf"),
-    ] {
-        let path = dir.join(file);
-        assert!(path.is_file(), "{file}: missing in {}", dir.display());
+    for (label, path) in &fixture.files {
+        let file = path.file_name().unwrap().to_string_lossy();
         eprintln!("== {}", path.display());
-        let model = llmman::speech::model::load(&path, &be).unwrap();
+        let model = llmman::speech::model::load(path, &be).unwrap();
         eprintln!("  tensors: {}", model.tensor_count());
         eprintln!("  hparams: {:?}", model.hp);
         eprintln!(
@@ -3353,8 +3373,9 @@ fn canary_model_loads_on_cpu_backend() {
         );
         // The bytes `load` uploaded against the file: one conv kernel,
         // one quantized (or F16) linear, one F32 vector and the stored
-        // position table. `read_index` offsets are absolute in the file.
-        let idx = llmman::mediagen::weights::read_index(&path).unwrap();
+        // position table. `read_index_from` offsets are absolute in the file.
+        let mut file_h = std::fs::File::open(path).unwrap();
+        let idx = llmman::mediagen::weights::read_index_from(&mut file_h, path).unwrap();
         let samples: [(&str, Tensor); 4] = [
             (
                 "enc.pre_encode.conv.0.weight",
@@ -3370,7 +3391,6 @@ fn canary_model_loads_on_cpu_backend() {
             ),
             ("dec.embed.pos_enc", model.tensors.dec_embed.pos_enc),
         ];
-        let mut file_h = std::fs::File::open(&path).unwrap();
         for (name, t) in samples {
             let desc = idx
                 .tensors
@@ -3405,7 +3425,7 @@ fn canary_model_loads_on_cpu_backend() {
             );
             eprintln!("  {name} ty={loaded_ty} {} bytes: identical", back.len());
         }
-        weight_bytes.insert(label, model.weight_bytes());
+        weight_bytes.insert(*label, model.weight_bytes());
         // the buffer goes before the backend it lives on
         drop(model);
     }
