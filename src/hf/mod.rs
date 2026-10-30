@@ -10,9 +10,11 @@
 //! `inspect`, and registry `pull`/`transfer`), the only part that needs
 //! containerd's/podman's Go libraries.
 //!
-//! Auth (this module): token storage/validation matches
-//! `huggingface_hub`'s own on-disk conventions, so a token saved by
-//! either tool is picked up by the other. Resolution order: `HF_TOKEN`
+//! Auth (this module): `token_path()` uses `huggingface_hub`'s variables
+//! and defaults for the token file, except that `hf_home()` ignores
+//! `XDG_CACHE_HOME`. A token saved by either tool is picked up by the
+//! other when both resolve the same file and no `HF_TOKEN` /
+//! `HUGGING_FACE_HUB_TOKEN` shadows it. Resolution order: `HF_TOKEN`
 //! env var (fallback `HUGGING_FACE_HUB_TOKEN`), then the token file at
 //! `token_path()` (`$HF_HOME/token`, or `$HF_TOKEN_PATH` if set).
 

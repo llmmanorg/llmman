@@ -359,11 +359,21 @@ mirrors in this sense; `HF_ENDPOINT` moves the whole host instead.
 ### Hugging Face token
 
 Gated and private Hugging Face repositories need an access token. llmman
-looks for one the way `huggingface_hub` does, so a token either tool
-saved is used by the other: `HF_TOKEN`, then the legacy
-`HUGGING_FACE_HUB_TOKEN`, then the token file at `$HF_TOKEN_PATH`
-(default `$HF_HOME/token`, i.e. `~/.cache/huggingface/token`). Blank
-values are skipped.
+checks `HF_TOKEN`, then the legacy `HUGGING_FACE_HUB_TOKEN`, then the
+token file at `$HF_TOKEN_PATH` (default `$HF_HOME/token`, i.e.
+`~/.cache/huggingface/token`). Blank tokens (in the variables or the
+file) are skipped; an empty `HF_TOKEN_PATH` or `HF_HOME` counts as unset.
+
+`huggingface_hub` keeps its token in the same file by default, so a
+token saved by `hf auth login` or `llmman login hf.co` is found by the
+other tool, provided both resolve the same token file and no nonblank
+`HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` in the reading process shadows
+it. One case where the files differ: `huggingface_hub` defaults
+`HF_HOME` to `$XDG_CACHE_HOME/huggingface` when `XDG_CACHE_HOME` is set,
+while llmman's `HF_HOME` default ignores `XDG_CACHE_HOME`. If you set
+`XDG_CACHE_HOME` to anything other than `~/.cache`, also set `HF_HOME`
+(or `HF_TOKEN_PATH`) to the same value in every environment that writes
+or reads the token file, including the daemon's for `llmman pull`.
 
 ```bash
 llmman login hf.co              # prompts; or: llmman login hf.co --token hf_...
