@@ -3084,11 +3084,6 @@ fn canary_gguf_loads_through_mediagen_weights() {
     // calls on parallel test threads race on that registry.
     let _guard = lock_serial();
 
-    // `enum ggml_type` ids (ggml.h:398 and :404 at b11669); `ffi::ty`
-    // only names the types the media pipelines use.
-    const GGML_TYPE_Q8_0: u32 = 8;
-    const GGML_TYPE_Q6_K: u32 = 14;
-
     let Some(dir) = std::env::var_os("LLMMAN_CANARY_GGUF_DIR")
         .map(PathBuf::from)
         .filter(|d| !d.as_os_str().is_empty())
@@ -3150,8 +3145,8 @@ fn canary_gguf_loads_through_mediagen_weights() {
 
         for t in &idx.tensors {
             let slot = match t.ty {
-                GGML_TYPE_Q8_0 => &mut q8_0,
-                GGML_TYPE_Q6_K => &mut q6_k,
+                ffi::ty::Q8_0 => &mut q8_0,
+                ffi::ty::Q6_K => &mut q6_k,
                 _ => continue,
             };
             if slot.is_none() {
@@ -3160,17 +3155,14 @@ fn canary_gguf_loads_through_mediagen_weights() {
         }
     }
 
+    // All three files are required, so both quantized types must turn up.
     let picks: Vec<_> = [("Q8_0", q8_0), ("Q6_K", q6_k)]
         .into_iter()
-        .filter_map(|(label, pick)| match pick {
-            Some(p) => Some((label, p)),
-            None => {
-                eprintln!("round-trip: no {label} tensor in any file, skipped");
-                None
-            }
+        .map(|(label, pick)| {
+            let pick = pick.unwrap_or_else(|| panic!("round-trip: no {label} tensor in any file"));
+            (label, pick)
         })
         .collect();
-    assert!(!picks.is_empty(), "no quantized tensor to round-trip");
 
     // The metadata and contract checks above need no libraries; only the
     // round-trip does, so an opted-in run never passes without them.

@@ -31,8 +31,9 @@ pub type LlamaToken = i32;
 pub const GGML_MAX_DIMS: usize = 4;
 pub const GGML_MAX_NAME: usize = 64;
 
-/// `enum ggml_type` values used here (`ggml.h` at b11669); ids 4 and 5
-/// are removed types whose block size ggml reports as 0.
+/// `enum ggml_type` values used here (`ggml.h` at the release in
+/// `LLAMA_CPP_RELEASE`); ids 4 and 5 are removed types whose block size
+/// ggml reports as 0.
 pub mod ty {
     pub const F32: u32 = 0;
     pub const F16: u32 = 1;

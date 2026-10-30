@@ -606,7 +606,7 @@ impl TensorClass {
 
     /// The ggml types this class may be stored as: floats for vectors
     /// and kernels; for a linear also the quantized types ggml's CPU
-    /// `mul_mat` accepts (`ggml-cpu.c` at b11669).
+    /// `mul_mat` accepts (`ggml-cpu.c` at the pinned release).
     fn allowed(self) -> &'static [u32] {
         match self {
             Self::Vector => &[ty::F32],
@@ -1120,7 +1120,7 @@ mod tests {
         }
     }
 
-    /// `ggml_blck_size` of b11669 for the ids a test uses; an id past
+    /// `ggml_blck_size` of the pinned release for the ids a test uses; an id past
     /// `GGML_TYPE_COUNT` would read past ggml's table, so it panics here.
     fn blck_size(ty: u32) -> i64 {
         match ty {
