@@ -10,13 +10,17 @@
 //! `inspect`, and registry `pull`/`transfer`), the only part that needs
 //! containerd's/podman's Go libraries.
 //!
-//! Auth (this module): `token_path()` uses `huggingface_hub`'s variables
-//! and defaults for the token file, except that `hf_home()` ignores
-//! `XDG_CACHE_HOME`. A token saved by either tool is picked up by the
-//! other when both resolve the same file and no `HF_TOKEN` /
-//! `HUGGING_FACE_HUB_TOKEN` shadows it. Resolution order: `HF_TOKEN`
-//! env var (fallback `HUGGING_FACE_HUB_TOKEN`), then the token file at
-//! `token_path()` (`$HF_HOME/token`, or `$HF_TOKEN_PATH` if set).
+//! Auth (this module): `token_path()` follows `huggingface_hub`'s default
+//! chain for the token file (`HF_TOKEN_PATH`, else `HF_HOME`, else
+//! `XDG_CACHE_HOME`, else `~/.cache`). Differences remain, among them:
+//! llmman does not expand `~`/`$VAR` in these variables, treats an empty
+//! value as unset, and has no staging mode (`HUGGINGFACE_CO_STAGING`). A
+//! token saved by either tool is picked up by the other when both resolve
+//! the same file and nothing shadows it in the reading process (here a
+//! nonblank `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`; `huggingface_hub` has
+//! further sources, such as `HF_OIDC_RESOURCE`). Resolution order:
+//! `HF_TOKEN` env var (fallback `HUGGING_FACE_HUB_TOKEN`), then the token
+//! file at `token_path()` (`$HF_HOME/token`, or `$HF_TOKEN_PATH` if set).
 
 pub mod api;
 pub mod client;
@@ -62,17 +66,28 @@ pub fn endpoint() -> String {
         .to_string()
 }
 
-/// `$HF_HOME`, defaulting to `~/.cache/huggingface`.
+/// `$HF_HOME`, else `$XDG_CACHE_HOME/huggingface`, else
+/// `~/.cache/huggingface`: the same fallback order as `huggingface_hub`'s
+/// default (which, unlike this, expands `~`/`$VAR` and does not treat an
+/// empty value as unset).
 fn hf_home() -> PathBuf {
-    if let Ok(dir) = std::env::var("HF_HOME") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cache")
-        .join("huggingface")
+    hf_home_from(|var| std::env::var_os(var), dirs::home_dir())
+}
+
+/// [`hf_home`] with the environment and home directory injected, so the
+/// fallback order can be tested without touching the process
+/// environment. An empty variable counts as unset, like `xdg_dir` in
+/// `cmd::launch`.
+fn hf_home_from(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    let dir = |var: &str| env(var).filter(|v| !v.is_empty()).map(PathBuf::from);
+    dir("HF_HOME").unwrap_or_else(|| {
+        dir("XDG_CACHE_HOME")
+            .unwrap_or_else(|| home.unwrap_or_else(|| PathBuf::from(".")).join(".cache"))
+            .join("huggingface")
+    })
 }
 
 /// Matches Ollama's own default for `OLLAMA_MAX_TRANSFER_STREAMS`.
@@ -101,12 +116,10 @@ fn parse_max_transfer_streams(value: Option<&str>) -> usize {
 
 /// Path to the active-token file, honoring `HF_TOKEN_PATH`.
 pub fn token_path() -> PathBuf {
-    if let Ok(p) = std::env::var("HF_TOKEN_PATH") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
+    match std::env::var_os("HF_TOKEN_PATH").filter(|p| !p.is_empty()) {
+        Some(p) => PathBuf::from(p),
+        None => hf_home().join("token"),
     }
-    hf_home().join("token")
 }
 
 /// Resolve the token to use for HuggingFace requests, in the same order
@@ -460,6 +473,38 @@ mod tests {
         // Matches Ollama's own max(1, ...) — an explicit 0 means
         // "minimize concurrency", not "same as unset".
         assert_eq!(parse_max_transfer_streams(Some("0")), 1);
+    }
+
+    #[test]
+    fn hf_home_follows_huggingface_hub_defaults() {
+        let home = || Some(PathBuf::from("/home/u"));
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |var: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == var)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            }
+        };
+        // (environment, expected HF home)
+        let cases: &[(&'static [(&'static str, &'static str)], &str)] = &[
+            (&[], "/home/u/.cache/huggingface"),
+            (&[("XDG_CACHE_HOME", "/x")], "/x/huggingface"),
+            (&[("HF_HOME", "/h"), ("XDG_CACHE_HOME", "/x")], "/h"),
+            // Empty counts as unset at each step.
+            (
+                &[("HF_HOME", ""), ("XDG_CACHE_HOME", "/x")],
+                "/x/huggingface",
+            ),
+            (&[("XDG_CACHE_HOME", "")], "/home/u/.cache/huggingface"),
+        ];
+        for (pairs, expected) in cases {
+            assert_eq!(
+                hf_home_from(env(pairs), home()),
+                PathBuf::from(expected),
+                "env {pairs:?}"
+            );
+        }
     }
 
     #[test]
