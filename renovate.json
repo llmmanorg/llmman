@@ -3,5 +3,9 @@
   "extends": [
     "config:recommended",
     "group:all"
+  ],
+  "ignoreDeps": [
+    "go.podman.io/common",
+    "go.podman.io/image/v5"
   ]
 }
