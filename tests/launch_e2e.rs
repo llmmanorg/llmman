@@ -3116,6 +3116,40 @@ fn mediagen_ffi_binds_the_llama_cpp_on_path() {
     api.check_layout().unwrap();
 }
 
+/// The abort flag [`Backend::set_abort_flag`] registers reaches the CPU
+/// backend through the registry: a set flag turns a one-node compute into
+/// "graph compute cancelled", a cleared one lets the same graph finish.
+#[test]
+fn mediagen_backend_abort_flag_cancels_compute() {
+    use llmman::mediagen::backend::{Backend, Graph};
+    use llmman::mediagen::ffi::Api;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let Some(dir) = llama_libs_on_path() else {
+        return;
+    };
+    // ggml registers backend modules without a lock; see the canary tests.
+    let _guard = lock_serial();
+    let api: &'static Api = Box::leak(Box::new(Api::load(&dir).unwrap()));
+    let mut be = Backend::new(api, false, 1, 64).unwrap();
+    let flag = Arc::new(AtomicBool::new(true));
+    be.set_abort_flag(flag.clone());
+
+    let mut g = Graph::new(api, 64).unwrap();
+    let a = g.input_f32(&[4], &[1.0, 2.0, 3.0, 4.0], "a");
+    let b = g.input_f32(&[4], &[10.0, 20.0, 30.0, 40.0], "b");
+    let sum = g.ctx.add(a, b);
+    g.mark_output(sum);
+
+    let err = g.compute(&be).unwrap_err().to_string();
+    assert_eq!(err, "graph compute cancelled");
+
+    flag.store(false, Ordering::Relaxed);
+    g.compute(&be).unwrap();
+    assert_eq!(g.output_f32(sum), vec![11.0, 22.0, 33.0, 44.0]);
+    assert_eq!(be.read_f32(sum), vec![11.0, 22.0, 33.0, 44.0]);
+}
+
 /// A GGUF metadata value on one line: strings bare, arrays joined,
 /// numbers with their type.
 fn gguf_value_text(v: &llmman::gguf::Value) -> String {
@@ -3473,4 +3507,303 @@ fn canary_model_loads_on_cpu_backend() {
         "weight buffers: {weight_bytes:?}"
     );
     drop(be);
+}
+
+/// Per-stage comparison against a NeMo reference dump: `max`, `rms` and
+/// `p99` of `|ours - ref|` over the compared rows in f64.
+struct StageDiff {
+    max: f64,
+    rms: f64,
+    p99: f64,
+    /// `rms(diff)` over the rms of the compared reference rows: the
+    /// magnitude-aware check that does not depend on the weight type.
+    rel_rms: f64,
+}
+
+/// Compares `ours`, frame-major `[rows, cols]`, with the rows from
+/// `ref_row0` on of `<ref_dir>/<name>.f32` (raw LE f32, row-major, shape
+/// and statistics in `<name>.json`) and prints the numbers next to the
+/// sidecar's rms and p99_abs.
+fn compare_stage(
+    name: &str,
+    ours: &[f32],
+    rows: usize,
+    ref_row0: usize,
+    ref_dir: &Path,
+) -> StageDiff {
+    let side: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ref_dir.join(format!("{name}.json"))).unwrap())
+            .unwrap();
+    let shape: Vec<usize> = side["shape"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as usize)
+        .collect();
+    let (ref_rows, cols) = (shape[0], shape[1]);
+    let bytes = std::fs::read(ref_dir.join(format!("{name}.f32"))).unwrap();
+    let (words, rest) = bytes.as_chunks::<4>();
+    assert!(rest.is_empty(), "{name}: dump size is not a multiple of 4");
+    let reference: Vec<f32> = words.iter().map(|c| f32::from_le_bytes(*c)).collect();
+    assert_eq!(
+        reference.len(),
+        ref_rows * cols,
+        "{name}: dump size vs sidecar shape"
+    );
+    assert!(
+        ref_row0 + rows <= ref_rows,
+        "{name}: {rows} rows from {ref_row0} exceed {ref_rows}"
+    );
+    assert_eq!(
+        ours.len(),
+        rows * cols,
+        "{name}: ours is not [{rows}, {cols}]"
+    );
+
+    let theirs = &reference[ref_row0 * cols..(ref_row0 + rows) * cols];
+    let mut diffs: Vec<f64> = ours
+        .iter()
+        .zip(theirs)
+        .map(|(a, b)| (f64::from(*a) - f64::from(*b)).abs())
+        .collect();
+    let n = diffs.len() as f64;
+    let max = diffs.iter().cloned().fold(0.0, f64::max);
+    let rms = (diffs.iter().map(|d| d * d).sum::<f64>() / n).sqrt();
+    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p99 = diffs[((diffs.len() - 1) as f64 * 0.99).floor() as usize];
+    let ours_rms = (ours.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / n).sqrt();
+    let theirs_rms = (theirs.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / n).sqrt();
+    let rel_rms = rms / theirs_rms;
+    eprintln!(
+        "  {name}: rows {rows} x {cols} (dump rows {ref_row0}..{}): max|diff| {max:.6e} rms(diff) {rms:.6e} \
+         p99|diff| {p99:.6e} rel rms {rel_rms:.3e}; ours rms {ours_rms:.6}, dump rms {} p99_abs {}",
+        ref_row0 + rows,
+        side["rms"],
+        side["p99_abs"]
+    );
+    StageDiff {
+        max,
+        rms,
+        p99,
+        rel_rms,
+    }
+}
+
+/// One dump point of the encoder: the probe that produces it (`None`
+/// is [`Run::out`]), the rows compared and where they start in the dump,
+/// and the max|diff| bound for the F16 and the Q8_0 file. The bounds are
+/// 1.5x the values measured on 2026-10-30 against the NeMo 2.7.3 dump
+/// (the tolerance table's rule), recorded next to the table.
+struct EncoderStage {
+    name: &'static str,
+    probe: Option<llmman::speech::encoder::Probe>,
+    rows: usize,
+    ref_row0: usize,
+    f16_max: f64,
+    q8_max: f64,
+}
+
+/// `rms(diff) / rms(reference)` bounds for every stage: F16 weights
+/// round activations to F16 inside the CPU `mul_mat` (measured 4e-4 to
+/// 1.2e-3), Q8_0 weights add quantization noise (measured up to 3.8e-2).
+/// A graph defect moves these by orders of magnitude.
+const F16_REL_RMS: f64 = 2e-3;
+const Q8_REL_RMS: f64 = 6e-2;
+
+/// Loads `file`, runs the encoder on `mel` and compares every stage,
+/// returning its [`StageDiff`]s in `stages` order; the model is dropped
+/// on return.
+fn encoder_stage_diffs(
+    file: &Path,
+    be: &llmman::mediagen::backend::Backend,
+    mel: &[f32],
+    stages: &[EncoderStage],
+    ref_dir: &Path,
+) -> Vec<StageDiff> {
+    use llmman::speech::encoder::{Encoder, Probe};
+
+    eprintln!("== {}", file.display());
+    let started = Instant::now();
+    let model = llmman::speech::model::load(file, be).unwrap();
+    let enc = Encoder::new(&model, be).unwrap();
+    eprintln!("  loaded in {:.2?}", started.elapsed());
+    let probes: Vec<Probe> = stages.iter().filter_map(|s| s.probe).collect();
+    let started = Instant::now();
+    let run = enc.run(&model, be, mel, &probes).unwrap();
+    eprintln!(
+        "  encoder: {} frames in {:.2?}",
+        run.frames,
+        started.elapsed()
+    );
+    assert_eq!(run.frames, 132);
+    assert_eq!(run.out.len(), 132 * 1024);
+    let last = model.tensors.enc_blocks.len() - 1;
+    let mut probed = run.probes.iter();
+    stages
+        .iter()
+        .map(|s| {
+            let ours = match s.probe {
+                Some(p) => {
+                    let ours = probed.next().unwrap();
+                    if p == Probe::Block(last) {
+                        assert_eq!(*ours, run.out, "the last block's output is enc.final");
+                    }
+                    ours
+                }
+                None => &run.out,
+            };
+            compare_stage(s.name, ours, s.rows, s.ref_row0, ref_dir)
+        })
+        .collect()
+}
+
+/// `VmHWM` from `/proc/self/status`, the process's peak resident set.
+fn peak_rss() -> String {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("VmHWM:").map(|v| v.trim().to_string()))
+        })
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+/// The encoder graph against the NeMo dump of the fixture: the mel front
+/// end on `fleurs-en.wav`, then `enc.pre_encode.out`, `enc.pos_emb`,
+/// `enc.block.{0,15,31}.out` and `enc.final` from the Q8_0 and the F16
+/// file on the CPU backend. Ours has 132 encoder frames for the dump's
+/// 133 (the dump's extra column comes from the zeroed 1057th mel column
+/// and NeMo masks it), so the first 132 rows are compared; the position
+/// table has 263 rows against the dump's 265, its rows 1..=263. The
+/// Q8_0 file runs first so the peak RSS printed after it is that pass
+/// alone. Each file is held to its measured max bound and to the
+/// relative rms bound. Every stage of both files is printed
+/// before any bound fails, so one run reports every number. Run with
+/// `cargo test --release --test launch_e2e speech_encoder -- --ignored
+/// --nocapture`.
+#[test]
+#[ignore]
+fn speech_encoder_matches_the_reference() {
+    use llmman::mediagen::backend::Backend;
+    use llmman::mediagen::ffi::Api;
+    use llmman::speech::encoder::Probe;
+
+    // Same registry race as the canary tests above.
+    let _guard = lock_serial();
+
+    let env_dir = |key: &str| {
+        std::env::var_os(key)
+            .map(PathBuf::from)
+            .filter(|d| !d.as_os_str().is_empty())
+    };
+    let Some(gguf_dir) = env_dir("LLMMAN_CANARY_GGUF_DIR") else {
+        eprintln!("skipping: LLMMAN_CANARY_GGUF_DIR is not set");
+        return;
+    };
+    let Some(ref_dir) = env_dir("LLMMAN_CANARY_REF_DIR") else {
+        eprintln!("skipping: LLMMAN_CANARY_REF_DIR is not set");
+        return;
+    };
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH");
+        return;
+    }
+
+    let wav = std::fs::read(ref_dir.join("fleurs-en.wav")).unwrap();
+    let pcm = llmman::speech::wav::parse(&wav, 64 << 20).unwrap();
+    let cfg = llmman::speech::mel::MelConfig::default();
+    let mel = llmman::speech::mel::features(&pcm, &cfg).unwrap();
+    let frames = mel.len() / cfg.n_mels;
+    eprintln!("== mel: {frames} frames x {} bins", cfg.n_mels);
+    assert_eq!(frames, 1056);
+
+    let Some(lib_dir) = llama_libs_on_path() else {
+        return;
+    };
+    let api: &'static Api = Box::leak(Box::new(Api::load(&lib_dir).unwrap()));
+    let n_threads = std::thread::available_parallelism().map_or(4, |n| n.get() as i32);
+    let be = Backend::new(api, false, n_threads, 8192).unwrap();
+
+    let stage = |name, probe, rows, ref_row0, f16_max, q8_max| EncoderStage {
+        name,
+        probe,
+        rows,
+        ref_row0,
+        f16_max,
+        q8_max,
+    };
+    // The host-built position table has no weights, so both files share
+    // its bound (measured 8.3e-6).
+    let stages = [
+        stage(
+            "enc.pre_encode.out",
+            Some(Probe::PreEncode),
+            132,
+            0,
+            3.9,
+            16.5,
+        ),
+        stage("enc.pos_emb", Some(Probe::PosEmb), 263, 1, 1e-4, 1e-4),
+        stage(
+            "enc.block.0.out",
+            Some(Probe::Block(0)),
+            132,
+            0,
+            9.5e-2,
+            0.77,
+        ),
+        stage(
+            "enc.block.15.out",
+            Some(Probe::Block(15)),
+            132,
+            0,
+            0.38,
+            43.0,
+        ),
+        stage(
+            "enc.block.31.out",
+            Some(Probe::Block(31)),
+            132,
+            0,
+            1.3e-2,
+            0.8,
+        ),
+        stage("enc.final", None, 132, 0, 1.3e-2, 0.8),
+    ];
+
+    let q8 = encoder_stage_diffs(
+        &gguf_dir.join("canary-1b-v2-Q8_0.gguf"),
+        &be,
+        &mel,
+        &stages,
+        &ref_dir,
+    );
+    eprintln!("  peak RSS after the Q8_0 pass: {}", peak_rss());
+    let f16 = encoder_stage_diffs(
+        &gguf_dir.join("canary-1b-v2-F16.gguf"),
+        &be,
+        &mel,
+        &stages,
+        &ref_dir,
+    );
+    eprintln!("  peak RSS after the F16 pass: {}", peak_rss());
+
+    let mut failures = Vec::new();
+    for (s, d) in stages.iter().zip(&q8) {
+        if d.max > s.q8_max || d.rel_rms > Q8_REL_RMS {
+            failures.push(format!(
+                "Q8_0 {}: max|diff| {:e} (bound {:e}), rel rms {:e} (bound {:e}), rms {:e}, p99 {:e}",
+                s.name, d.max, s.q8_max, d.rel_rms, Q8_REL_RMS, d.rms, d.p99
+            ));
+        }
+    }
+    for (s, d) in stages.iter().zip(&f16) {
+        if d.max > s.f16_max || d.rel_rms > F16_REL_RMS {
+            failures.push(format!(
+                "F16 {}: max|diff| {:e} (bound {:e}), rel rms {:e} (bound {:e}), rms {:e}, p99 {:e}",
+                s.name, d.max, s.f16_max, d.rel_rms, F16_REL_RMS, d.rms, d.p99
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
