@@ -38,7 +38,7 @@ jobs:
       matrix:
         target: [parse_registry_ref, validate_reference, resolve_ollama_api]
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # cargo-fuzz's libfuzzer-sys backend needs nightly (sanitizer/coverage
       # instrumentation flags are unstable), unlike every other Rust step in
