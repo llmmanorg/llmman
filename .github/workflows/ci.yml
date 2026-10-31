@@ -178,7 +178,7 @@ jobs:
       # ── Rust toolchain ────────────────────────────────────────────────────
       # rustfmt only on the check-fmt leg; an empty extra component is fine.
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
           components: clippy${{ matrix.check-fmt && ', rustfmt' || '' }}
@@ -371,7 +371,7 @@ jobs:
           cache-dependency-path: go-shim/go.sum
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-linux-android
 
@@ -490,7 +490,7 @@ jobs:
         run: shellcheck packaging/version.sh packaging/render.sh packaging/release-tag.sh
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       # MAJOR.MINOR from Cargo.toml (PATCH must stay 0), PATCH = commit
       # count; --apply must leave Cargo.toml and Cargo.lock agreeing.
@@ -908,7 +908,7 @@ jobs:
       # there for genuinely cross-compiled targets, harmless here where
       # every target is actually native.
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -2310,7 +2310,7 @@ jobs:
           cache-dependency-path: go-shim/go.sum
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Install build dependencies
         run: sudo apt-get install -y gcc
