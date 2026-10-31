@@ -41,9 +41,9 @@ clap       = { version = "4", features = ["derive", "env", "wrap_help"] }
 serde      = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 yaml_serde = "0.10"
-sha2       = "0.10"
+sha2       = "0.11"
 hex        = "0.4"
-base64     = "0.22"
+base64     = "0.23"
 # `llmman run`'s image-path detection is a verbatim port of ollama's
 # extractFileNames regex (cmd/interactive.go) — see cmd::run.
 regex      = "1"
@@ -51,40 +51,40 @@ anyhow     = "1"
 walkdir    = "2"
 dunce      = "1"
 chrono     = { version = "0.4", features = ["serde"] }
-dirs       = "5"
+dirs       = "7"
 tar        = "0.4"
 # `ws` for the web UI's terminal (`/llmman/shell`, src/cmd/serve/shell.rs).
-axum       = { version = "0.7", features = ["ws"] }
+axum       = { version = "0.8", features = ["ws"] }
 # TLS termination for `llmman serve` (LLMMAN_TLS_CERT/LLMMAN_TLS_KEY).
 # `no-provider`: rustls's ring and aws-lc-rs providers are both already
 # in the tree (reqwest's and the AWS SDK's); serve installs ring itself
 # rather than have this pull a preference of its own.
-axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 rustls     = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 # The pty behind that terminal: one crate for Unix ptys and Windows
 # ConPTY, and its default program is already "the user's login shell".
 portable-pty = "0.9"
 libc       = "0.2"
 tokio-util = { version = "0.7", features = ["io"] }
-toml       = { version = "0.8", default-features = false, features = ["parse"] }
+toml       = { version = "1.0", default-features = false, features = ["parse"] }
 # `llmman config set` edits a file people also hand-edit, so comments and
 # layout have to survive a one-key write; serializing a `Conf` back out
 # would drop both. Already compiled as `toml`'s own parser.
-toml_edit  = "0.22"
+toml_edit  = "0.25"
 tokio      = { version = "1", features = ["full"] }
-reqwest    = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls", "http2", "charset"] }
+reqwest    = { version = "0.13", default-features = false, features = ["json", "stream", "blocking", "rustls-tls", "http2", "charset"] }
 futures    = "0.3"
 bytes      = "1"
 indicatif  = "0.18"
 console    = { version = "0.16", default-features = false, features = ["std"] }
 flate2     = "1"
-zip        = { version = "2", default-features = false, features = ["deflate"] }
-libloading = "0.8"
+zip        = { version = "9", default-features = false, features = ["deflate"] }
+libloading = "0.9"
 multer     = "3"
 # Cosmos3 prompts are tokenized from the pack's tokenizer.json (mediagen::cosmos3);
 # pure-Rust build, the pre-tokenizer regexes need fancy-regex's lookahead.
-tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 # conditioning images for image-to-video and action runs
 image      = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
@@ -95,7 +95,7 @@ image      = { version = "0.25", default-features = false, features = ["png", "j
 # here. Exact-pinned (not "1.6") since it's one of xet-core's own
 # internal workspace crates, not an independently semver-stable API,
 # despite being on crates.io.
-hf-xet = "=1.6.0"
+hf-xet = "=1.8.0"
 
 # `s3://` source support (src/sources/s3.rs) — the official SDK rather
 # than a hand-rolled SigV4 signer so the whole credential chain (env
@@ -127,7 +127,7 @@ fuzzing = []
 tempfile = "3"
 # A WebSocket client for the `/llmman/shell` tests; the same crate axum's
 # `ws` feature already builds, at the version it pins.
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.30"
 # Shared-listener and pinned-upstream TLS tests generate short-lived identities
 # instead of storing a private key in the repository.
 rcgen = "0.14"
@@ -135,7 +135,7 @@ rcgen = "0.14"
 [build-dependencies]
 flate2 = "1"
 # build.rs pins the web UI's downloaded mark by hash (see FETCHED_ASSETS).
-sha2   = "0.10"
+sha2   = "0.11"
 hex    = "0.4"
 
 # `cargo binstall llmman` fetches the prebuilt release binary instead of
