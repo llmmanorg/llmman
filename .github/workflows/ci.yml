@@ -151,7 +151,7 @@ jobs:
 
     steps:
       # fetch-depth: 0 — packaging/version.sh needs the full commit count.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -170,7 +170,7 @@ jobs:
 
       # ── Go toolchain ──────────────────────────────────────────────────────
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go-shim/go.mod
           cache-dependency-path: go-shim/go.sum
@@ -178,7 +178,7 @@ jobs:
       # ── Rust toolchain ────────────────────────────────────────────────────
       # rustfmt only on the check-fmt leg; an empty extra component is fine.
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
           components: clippy${{ matrix.check-fmt && ', rustfmt' || '' }}
@@ -187,7 +187,7 @@ jobs:
       # never gets an exact key hit; its prefix fallback still restores
       # all dependency artefacts.
       - name: Cache Rust build artefacts
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.target }}
 
@@ -346,12 +346,12 @@ jobs:
   # --------------------------------------------------------------------------
   android:
     name: Build Android app
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     env:
       ANDROID_NDK_VERSION: "27.2.12479018"
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -365,18 +365,18 @@ jobs:
           echo "LLMMAN_GIT_DESCRIBE=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go-shim/go.mod
           cache-dependency-path: go-shim/go.sum
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-linux-android
 
       - name: Cache Rust build artefacts
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: aarch64-linux-android
           cache-bin: true
@@ -387,13 +387,13 @@ jobs:
         run: cargo install cargo-ndk --locked
 
       - name: Set up JDK
-        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "25"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
 
       # The runner image ships the SDK and cmdline-tools; the NDK version
       # is the one app/build.gradle.kts names (AGP uses it to strip the
@@ -470,7 +470,7 @@ jobs:
   # --------------------------------------------------------------------------
   lint-packaging:
     name: Lint (go-shim) + Packaging (version, brew/scoop templates, crate)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     env:
       # v2.13.2 cannot read Go 1.27.3's export data and typechecks nothing.
@@ -480,7 +480,7 @@ jobs:
     steps:
       # fetch-depth: 0 — version.sh needs the full commit count.
       # persist-credentials: false — `go test` runs the PR's own code.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -490,7 +490,7 @@ jobs:
         run: shellcheck packaging/version.sh packaging/render.sh packaging/release-tag.sh
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       # MAJOR.MINOR from Cargo.toml (PATCH must stay 0), PATCH = commit
       # count; --apply must leave Cargo.toml and Cargo.lock agreeing.
@@ -628,7 +628,7 @@ jobs:
 
       # ── Lint (go-shim) ───────────────────────────────────────────────────
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go-shim/go.mod
           cache-dependency-path: go-shim/go.sum
@@ -688,21 +688,21 @@ jobs:
   # --------------------------------------------------------------------------
   webui:
     name: Web UI (app/ checks, webui/ is its export)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     defaults:
       run:
         working-directory: app
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       # react-native and metro ask for ^20.19.4 || ^22.13.0 || ^24.3.0.
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: "24"
+          node-version: "26"
           cache: npm
           cache-dependency-path: app/package-lock.json
 
@@ -896,10 +896,10 @@ jobs:
             feature-flags: ""
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go-shim/go.mod
           cache-dependency-path: go-shim/go.sum
@@ -908,12 +908,12 @@ jobs:
       # there for genuinely cross-compiled targets, harmless here where
       # every target is actually native.
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache Rust build artefacts
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # backend, not just target: the docker/podman entries sharing a
           # target build with different --features, and Cargo's target dir
@@ -945,9 +945,9 @@ jobs:
 
       # ── Node.js (for the claude/opencode/codex CLIs under test) ────────────
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: "22"
+          node-version: "26"
 
       # `shell: bash` (not the Windows default of `pwsh`) for consistent
       # multi-line/array syntax; ubuntu/macOS already default to bash.
@@ -969,7 +969,7 @@ jobs:
       - name: Set up Bun for OMP
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.4
 
       - name: Install OMP
         shell: bash
@@ -1598,9 +1598,9 @@ jobs:
       # PYTHON_RELEASE's value (`with:` cannot read a file); keep in step.
       - name: Set up Python (mlx e2e)
         if: matrix.target == 'aarch64-apple-darwin'
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
-          python-version: "3.13"
+          python-version: "3.15"
 
       - name: Install mlx-lm (macOS arm64, e2e)
         if: matrix.target == 'aarch64-apple-darwin'
@@ -1626,9 +1626,9 @@ jobs:
       # is actually discoverable by the vllm process.
       - name: Set up Python (vllm-plugin e2e)
         if: runner.os == 'Linux' || runner.os == 'macOS'
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
-          python-version: "3.12"
+          python-version: "3.15"
 
       - name: Install vllm-plugin (e2e)
         if: runner.os == 'Linux' || runner.os == 'macOS'
@@ -1964,7 +1964,7 @@ jobs:
   # --------------------------------------------------------------------------
   tag:
     name: Tag
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:
@@ -1975,7 +1975,7 @@ jobs:
 
     steps:
       # fetch-depth: 0 for the commit count.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -2004,7 +2004,7 @@ jobs:
     # Everything must be green first. e2e only runs on the same push event
     # this job fires on, so this never waits on a run that will not happen.
     needs: [tag, build, android, lint-packaging, webui, e2e]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:
@@ -2017,7 +2017,7 @@ jobs:
     steps:
       # fetch-depth: 0 for the commit count. Checkout before
       # download-artifact, since it cleans the workspace.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -2043,14 +2043,14 @@ jobs:
         run: packaging/release-tag.sh ensure "$TAG" "$GITHUB_SHA"
 
       # Patterns: a retried upload is `<name>-retry` (upload-artifact-retry).
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
           pattern: llmman-docker-*
           merge-multiple: false
 
       # The APK is already named for release (llmman-<triple>.apk).
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
           pattern: llmman-android-aarch64-linux-android*
@@ -2148,7 +2148,7 @@ jobs:
       # it and succeeds without; asset upload and the draft-publishing
       # PATCH succeed too. Unset, the action omits the field.
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ steps.version.outputs.tag_name }}
           name: ${{ steps.version.outputs.tag_name }}
@@ -2169,13 +2169,13 @@ jobs:
     needs: [tag, release]
     # always(): also after a cancellation. Skipped unless `tag` made one.
     if: always() && needs.tag.result == 'success' && needs.release.result != 'success'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: write
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -2198,7 +2198,7 @@ jobs:
     name: Publish ${{ matrix.tag }} image
     needs: [release]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -2215,12 +2215,12 @@ jobs:
           - tag: server-vulkan
             platforms: linux/amd64,linux/arm64
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       # Trailing `*`: a retried upload is `<name>-retry` (upload-artifact-retry).
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
           pattern: llmman-docker-*-unknown-linux-gnu*
@@ -2283,10 +2283,10 @@ jobs:
     name: Publish to crates.io
     needs: [release, publish-images]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -2304,13 +2304,13 @@ jobs:
       # compiles the Go shim via CGO -- the only thing that proves the
       # .crate (with Cargo.toml's `exclude` applied) still builds.
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go-shim/go.mod
           cache-dependency-path: go-shim/go.sum
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Install build dependencies
         run: sudo apt-get install -y gcc
@@ -2354,7 +2354,7 @@ jobs:
     name: Publish ${{ matrix.name }}
     needs: [release, publish-images]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -2378,12 +2378,12 @@ jobs:
       cancel-in-progress: false
     steps:
       # persist-credentials: false -- only the target repo checkout needs a token.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       # Pattern: a retried upload is `<name>-retry` (upload-artifact-retry).
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: release-checksums*
           merge-multiple: true
@@ -2398,7 +2398,7 @@ jobs:
             --out-dir rendered
 
       - name: Check out ${{ matrix.repo }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ matrix.repo }}
           token: ${{ secrets.TAP_GITHUB_TOKEN }}
