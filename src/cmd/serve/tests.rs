@@ -6324,15 +6324,7 @@ async fn a_model_waiting_to_be_retired_takes_no_new_requests() {
 
     let waiting = retire();
     assert!(retiring().await);
-    state
-        .0
-        .manager
-        .lock()
-        .await
-        .running
-        .get_mut(&key)
-        .unwrap()
-        .in_flight = 0;
+    change_loaded(&state, "qwen3:0.6b", |m| m.in_flight = 0).await;
     let reserved = tokio::time::timeout(Duration::from_secs(10), waiting)
         .await
         .expect("retires once idle")
