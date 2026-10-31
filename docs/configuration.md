@@ -360,20 +360,22 @@ mirrors in this sense; `HF_ENDPOINT` moves the whole host instead.
 
 Gated and private Hugging Face repositories need an access token. llmman
 checks `HF_TOKEN`, then the legacy `HUGGING_FACE_HUB_TOKEN`, then the
-token file at `$HF_TOKEN_PATH` (default `$HF_HOME/token`, i.e.
-`~/.cache/huggingface/token`). Blank tokens (in the variables or the
-file) are skipped; an empty `HF_TOKEN_PATH` or `HF_HOME` counts as unset.
+token file at `$HF_TOKEN_PATH` (default `$HF_HOME/token`; `HF_HOME`
+defaults to `$XDG_CACHE_HOME/huggingface`, else
+`~/.cache/huggingface`). Blank tokens (in the variables or the file) are
+skipped; an empty `HF_TOKEN_PATH`, `HF_HOME` or `XDG_CACHE_HOME` counts
+as unset.
 
-`huggingface_hub` keeps its token in the same file by default, so a
-token saved by `hf auth login` or `llmman login hf.co` is found by the
-other tool, provided both resolve the same token file and no nonblank
-`HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` in the reading process shadows
-it. One case where the files differ: `huggingface_hub` defaults
-`HF_HOME` to `$XDG_CACHE_HOME/huggingface` when `XDG_CACHE_HOME` is set,
-while llmman's `HF_HOME` default ignores `XDG_CACHE_HOME`. If you set
-`XDG_CACHE_HOME` to anything other than `~/.cache`, also set `HF_HOME`
-(or `HF_TOKEN_PATH`) to the same value in every environment that writes
-or reads the token file, including the daemon's for `llmman pull`.
+`huggingface_hub` uses the same variables in the same fallback order for
+its default token file, so a token saved by `hf auth login` or
+`llmman login hf.co` is found by the other tool, provided both resolve
+the same token file and nothing shadows it in the reading process: a
+nonblank `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN`, or, for
+`huggingface_hub`, its further sources such as `HF_OIDC_RESOURCE`.
+Cases where the files can still differ include: `huggingface_hub`
+expands `~` and `$VAR` in these variables, does not treat an empty value
+as unset, and uses a separate token file (`~/.cache/huggingface_staging/token`) when
+`HUGGINGFACE_CO_STAGING` is set to a true value such as `1`.
 
 ```bash
 llmman login hf.co              # prompts; or: llmman login hf.co --token hf_...
@@ -388,7 +390,8 @@ a daemon that is already running has no effect. An uncached pull reads
 the token file again, so `llmman login hf.co` works without restarting
 the daemon, provided neither `HF_TOKEN` nor `HUGGING_FACE_HUB_TOKEN` is
 set to a nonblank value in the daemon's environment and both processes
-resolve the same token file (`HF_TOKEN_PATH`, else `HF_HOME`).
+resolve the same token file (`HF_TOKEN_PATH`, else `HF_HOME`, else
+`XDG_CACHE_HOME`, else the home directory).
 
 ## Environment variables
 
