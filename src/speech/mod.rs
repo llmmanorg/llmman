@@ -5,8 +5,14 @@
 //! reads. `encoder` builds the FastConformer encoder as a ggml graph on
 //! that backend, with the host-side arithmetic it consumes: subsampled
 //! frame count, relative-position table and the folded BatchNorm.
+//! `prompt` builds the canary2 decoder prompt from the hyperparameters
+//! and the vocabulary; `decoder` runs the Transformer decoder over the
+//! encoder output with a KV cache; `Vocab::detokenize` turns decoder
+//! output back into text.
 
+pub mod decoder;
 pub mod encoder;
 pub mod mel;
 pub mod model;
+pub mod prompt;
 pub mod wav;

@@ -314,6 +314,36 @@ impl Vocab {
         }
         Ok(Vocab { pieces })
     }
+
+    /// The id of `piece`, by exact string match over the table.
+    pub fn id_of(&self, piece: &str) -> Option<u32> {
+        self.pieces
+            .iter()
+            .position(|p| p == piece)
+            .map(|i| i as u32)
+    }
+
+    /// Text for decoder output, as transcribe.cpp strips it
+    /// (`model.cpp:1216-1250` at db678a0): control pieces of the form
+    /// `<|...|>`, `<unk>`, `<pad>` and ids outside the table are dropped,
+    /// the rest is joined with the SentencePiece word marker `\u{2581}`
+    /// turned into a space, and the result trimmed.
+    pub fn detokenize(&self, ids: &[i32]) -> String {
+        let text: String = ids
+            .iter()
+            .filter_map(|&id| usize::try_from(id).ok())
+            .filter_map(|id| self.pieces.get(id))
+            .filter(|piece| !is_special_piece(piece))
+            .map(String::as_str)
+            .collect();
+        text.replace('\u{2581}', " ").trim().to_owned()
+    }
+}
+
+/// A piece [`Vocab::detokenize`] drops: a `<|...|>` control token,
+/// `<unk>` or `<pad>`.
+fn is_special_piece(piece: &str) -> bool {
+    (piece.starts_with("<|") && piece.ends_with("|>")) || piece == "<unk>" || piece == "<pad>"
 }
 
 /// Tensor names transcribe.cpp's Canary loader reads (`src/arch/canary/
@@ -981,68 +1011,70 @@ pub fn load(path: &Path, be: &Backend) -> Result<CanaryModel> {
     })
 }
 
+/// The pinned canary-1b-v2 file's values (Phase 1 record), shared by the
+/// tests of this module and of `speech::prompt`.
+#[cfg(test)]
+pub(crate) fn phase1_hparams() -> CanaryHParams {
+    let special: BTreeMap<String, u32> = [
+        ("endoftext", 3),
+        ("startoftranscript", 4),
+        ("pad", 2),
+        ("startofcontext", 7),
+        ("nospeech", 1),
+        ("lang.en", 64),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    CanaryHParams {
+        enc_n_layers: 32,
+        enc_d_model: 1024,
+        enc_n_heads: 8,
+        enc_d_ff: 4096,
+        enc_conv_kernel: 9,
+        enc_subsampling_factor: 8,
+        enc_subsampling_channels: 256,
+        enc_pos_emb_max_len: 5000,
+        enc_use_bias: true,
+        dec_n_layers: 8,
+        dec_d_model: 1024,
+        dec_n_heads: 8,
+        dec_d_ff: 4096,
+        dec_max_position: 1024,
+        dec_vocab_size: 16384,
+        dec_activation: "relu".into(),
+        dec_pre_ln: true,
+        dec_learn_positional_encodings: false,
+        encoder_decoder_proj: false,
+        frontend: Frontend {
+            kind: "mel".into(),
+            num_mels: 128,
+            sample_rate: 16000,
+            n_fft: 512,
+            win_length: 400,
+            hop_length: 160,
+            window: "hann".into(),
+            normalize: "per_feature".into(),
+            pre_emphasis: 0.97,
+            f_min: 0.0,
+            f_max: 8000.0,
+        },
+        prompt_format: "canary2".into(),
+        single_sp: true,
+        languages: vec!["en".into(), "de".into()],
+        special,
+        eos: 3,
+        bos: 4,
+        pad: 2,
+        startofcontext: 7,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mediagen::weights::TensorDesc;
     use std::collections::HashMap;
-
-    /// The pinned canary-1b-v2 file's values (Phase 1 record).
-    fn phase1_hparams() -> CanaryHParams {
-        let special: BTreeMap<String, u32> = [
-            ("endoftext", 3),
-            ("startoftranscript", 4),
-            ("pad", 2),
-            ("startofcontext", 7),
-            ("nospeech", 1),
-            ("lang.en", 64),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v))
-        .collect();
-        CanaryHParams {
-            enc_n_layers: 32,
-            enc_d_model: 1024,
-            enc_n_heads: 8,
-            enc_d_ff: 4096,
-            enc_conv_kernel: 9,
-            enc_subsampling_factor: 8,
-            enc_subsampling_channels: 256,
-            enc_pos_emb_max_len: 5000,
-            enc_use_bias: true,
-            dec_n_layers: 8,
-            dec_d_model: 1024,
-            dec_n_heads: 8,
-            dec_d_ff: 4096,
-            dec_max_position: 1024,
-            dec_vocab_size: 16384,
-            dec_activation: "relu".into(),
-            dec_pre_ln: true,
-            dec_learn_positional_encodings: false,
-            encoder_decoder_proj: false,
-            frontend: Frontend {
-                kind: "mel".into(),
-                num_mels: 128,
-                sample_rate: 16000,
-                n_fft: 512,
-                win_length: 400,
-                hop_length: 160,
-                window: "hann".into(),
-                normalize: "per_feature".into(),
-                pre_emphasis: 0.97,
-                f_min: 0.0,
-                f_max: 8000.0,
-            },
-            prompt_format: "canary2".into(),
-            single_sp: true,
-            languages: vec!["en".into(), "de".into()],
-            special,
-            eos: 3,
-            bos: 4,
-            pad: 2,
-            startofcontext: 7,
-        }
-    }
 
     /// The same values as GGUF metadata, typed as the file stores them.
     fn phase1_metadata() -> HashMap<String, Value> {

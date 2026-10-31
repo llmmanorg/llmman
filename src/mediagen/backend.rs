@@ -25,9 +25,10 @@ pub struct Backend {
     /// The GPU failed and must be recreated by [`Backend::release_compute`].
     gpu_failed: Cell<bool>,
     /// Polled by the CPU backend after every node once
-    /// [`Backend::set_abort_flag`] registered it; held here so the pointer
-    /// ggml keeps stays valid for the backend's lifetime.
-    _abort: Option<Arc<AtomicBool>>,
+    /// [`Backend::set_abort_flag`] registered it, and read by
+    /// [`Backend::cancelled`]. Held here so the pointer ggml keeps stays
+    /// valid for the backend's lifetime.
+    abort: Option<Arc<AtomicBool>>,
 }
 
 unsafe impl Send for Backend {}
@@ -75,7 +76,7 @@ impl Backend {
                 max_nodes,
                 probe,
                 gpu_failed: Cell::new(false),
-                _abort: None,
+                abort: None,
             };
             be.release_compute()?;
             Ok(be)
@@ -198,9 +199,16 @@ impl Backend {
     /// The caller clears the flag before the next run it wants to finish.
     pub fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) {
         let data = Arc::as_ptr(&flag) as *mut std::ffi::c_void;
-        self._abort = Some(flag);
+        self.abort = Some(flag);
         self.api
             .set_abort_callback(self.cpu, Some(abort_requested), data);
+    }
+
+    /// Is the flag of [`Backend::set_abort_flag`] set? False without one.
+    pub fn cancelled(&self) -> bool {
+        self.abort
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
     }
 
     /// Asks the GPU whether its last compute actually succeeded.
@@ -381,6 +389,13 @@ impl Ctx {
         }
         t
     }
+
+    /// `ggml_set_rows` when this release has the symbol, else None:
+    /// writes the rows of `b` into `a` at the row indices `c`.
+    pub fn set_rows(&self, a: Tensor, b: Tensor, c: Tensor) -> Option<Tensor> {
+        let f = self.api.ggml_set_rows?;
+        Some(unsafe { f(self.raw, a, b, c) })
+    }
 }
 
 /// Tensors in their own backend buffer, outliving the graphs that use them:
@@ -411,6 +426,13 @@ impl Resident {
             ));
         }
         Ok(Resident { ctx, buf, tensors })
+    }
+
+    /// Zeroes every tensor, so a graph reading a window past the rows
+    /// written so far (a decoder step over its full cache) meets zeros,
+    /// not whatever the allocation held.
+    pub fn clear(&self) {
+        unsafe { (self.ctx.api.ggml_backend_buffer_clear)(self.buf, 0) }
     }
 }
 
@@ -462,6 +484,42 @@ impl Graph {
         debug_assert_eq!(unsafe { (self.ctx.api.ggml_nbytes)(t) }, bytes.len());
         self.inputs.push((t, bytes));
         t
+    }
+
+    /// Replaces the bytes of the input `t` for the next [`Graph::compute`]
+    /// in place: a graph built once runs again on new data without
+    /// allocating. Panics when `t` is not an input of this graph or the
+    /// lengths differ.
+    pub fn update_input(&mut self, t: Tensor, bytes: &[u8]) {
+        let slot = self.input_slot(t);
+        assert_eq!(slot.len(), bytes.len(), "input size changed");
+        slot.copy_from_slice(bytes);
+    }
+
+    /// [`Graph::update_input`] for an F32 input.
+    pub fn update_input_f32(&mut self, t: Tensor, data: &[f32]) {
+        self.update_words(t, data.iter().map(|v| v.to_le_bytes()));
+    }
+
+    /// [`Graph::update_input`] for an I32 input.
+    pub fn update_input_i32(&mut self, t: Tensor, data: &[i32]) {
+        self.update_words(t, data.iter().map(|v| v.to_le_bytes()));
+    }
+
+    fn update_words(&mut self, t: Tensor, words: impl ExactSizeIterator<Item = [u8; 4]>) {
+        let slot = self.input_slot(t);
+        assert_eq!(slot.len(), words.len() * 4, "input size changed");
+        for (dst, w) in slot.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+            *dst = w;
+        }
+    }
+
+    fn input_slot(&mut self, t: Tensor) -> &mut Vec<u8> {
+        self.inputs
+            .iter_mut()
+            .find(|(it, _)| *it == t)
+            .map(|(_, bytes)| bytes)
+            .expect("tensor is not an input of this graph")
     }
 
     /// Copies `src` into the [`Resident`] tensor `dst` when the graph runs.
