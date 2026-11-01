@@ -209,6 +209,7 @@ installed:
 | `kimi` | Kimi Code CLI | no: llmman has not verified it with a provider-routed model |
 | `copilot` | GitHub Copilot CLI (`gh`) | no: it has no way to send a key |
 | `openclaw` | OpenClaw | no: it only takes a model during first-run onboarding |
+| `muse` | Meta Muse Code (requires `--model`) | yes |
 
 Any extra arguments after `--` are forwarded to the integration's own CLI.
 
@@ -265,6 +266,7 @@ such as one models.dev does not list yet, takes any effort level.
 | `grok` | `--effort` | all |
 | `qwen` | its model entry | all but `minimal` |
 | `dsh` | its route | all |
+| `muse` | `--reasoning-effort` | all but `none` |
 
 `thinking` goes to all but opencode as `medium`, which llmman serves as
 thinking on. `kimi`, `openclaw`, `gemini`, `agy`, `goose`,
