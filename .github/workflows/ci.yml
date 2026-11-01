@@ -67,11 +67,6 @@ env:
   # Pinned because its command-line and custom-model contracts are what
   # the test verifies; bump deliberately and rerun the launch suite.
   GROK_CLI_VERSION: "1.0.34"
-  # Official Cline CLI used by launch_e2e's real `launch cline` test.
-  # Pinned because its provider-settings schema and CLI flags are the
-  # integration contract under test. The macOS GitHub runner kills 3.0.62;
-  # that failure is runner-specific, not a general macOS release failure.
-  CLINE_CLI_VERSION: "2.18.0"
   # Docker Agent release used by launch_e2e's real `launch docker-agent`
   # test. Pinned because the agent-file contract launch_docker_agent
   # writes is what that test verifies; bump deliberately and rerun the
@@ -724,6 +719,34 @@ jobs:
           fi
 
   # --------------------------------------------------------------------------
+  # e2e is skipped on pull_request; this runs the same .mise.toml install and smoke
+  # check on every PR so a bad pin, a missing platform tarball, or a mise-action change
+  # fails before merge. No secrets. Behaviour changes in a bumped CLI still only show up in e2e (runs on push to main, not on the PR that bumps it).
+  mise-tools:
+    name: Integration CLIs (.mise.toml) — ${{ matrix.runner }}
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      MISE_DATA_DIR: ${{ github.workspace }}/.mise-data
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-15
+          - windows-2025
+          - windows-11-arm
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Install and smoke-check mise tools
+        uses: ./.github/actions/mise-tools
+
+  # --------------------------------------------------------------------------
   # E2E: `llmman launch
   # <claude|agy|opencode|pi|omp|codex|copilot|droid|cline|grok|qwen|hermes|openclaw|dsh|
   # goose|goose-desktop|docker-agent> --model
@@ -767,6 +790,12 @@ jobs:
     # `release` job's own `needs`, which includes this job for exactly
     # that reason, and its own identical `if:` condition below — or when
     # dispatched by hand on a branch (see `workflow_dispatch` above).
+    #
+    # No secrets or environments: nothing in this job reads `secrets.*`, so a skip on a PR
+    # is this `if:` alone, not missing credentials. A PR from a fork cannot be dispatched
+    # here without write access; dispatch it in the fork instead:
+    #   gh workflow run ci.yml --repo <fork> --ref <branch>
+    # The `mise-tools` job above covers this job's .mise.toml install on every PR.
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     # 15 tests run serialized (--test-threads=1 + lock_serial()), so the
     # worst case sums all 15's own retry budgets: MAX_ATTEMPTS * TIMEOUT
@@ -809,6 +838,9 @@ jobs:
       LLMMAN_RUNTIME: path
       # pip's 15s default kills stalled downloads.
       PIP_DEFAULT_TIMEOUT: "120"
+      # Absolute, so mise shims still resolve installs when the E2E tests
+      # override HOME and XDG_DATA_HOME for each launch.
+      MISE_DATA_DIR: ${{ github.workspace }}/.mise-data
     strategy:
       fail-fast: false
       matrix:
@@ -952,20 +984,15 @@ jobs:
       # `shell: bash` (not the Windows default of `pwsh`) for consistent
       # multi-line/array syntax; ubuntu/macOS already default to bash.
       #
-      # Unlike hermes/mlx_lm.server (legitimately missing on some
-      # platforms), these ten are plain npm packages expected to work
-      # everywhere — so install_cli fails the job, rather than letting
-      # tests/launch_e2e.rs's on_path check silently skip, when one never
-      # becomes a working binary.
-      #
-      # install_cli also verifies with `<bin> --version`, not just a
-      # bare `npm install -g`: CI 33006723521 saw `npm install -g
-      # @openai/codex` exit 0 while the `codex` it produced failed every
-      # invocation with "Missing optional dependency
-      # @openai/codex-darwin-arm64" — optionalDependencies working as
-      # designed (npm tolerates one failed platform-tarball fetch, here
-      # a registry blip, instead of failing the install), just not
-      # detectable by a mere on_path/PATH check. Retrying rides that out.
+      # Unlike hermes/mlx_lm.server (legitimately missing on some platforms),
+      # these ten (every `npm:` entry in .mise.toml) are plain npm packages
+      # expected to work everywhere, so the smoke check fails the job, rather
+      # than letting tests/launch_e2e.rs's on_path check silently skip, when
+      # one never becomes a working binary. It runs `<bin> --version` through
+      # the mise shim, not just a PATH lookup: CI 33006723521 saw
+      # `npm install -g @openai/codex` exit 0 while the `codex` it produced
+      # failed every invocation with "Missing optional dependency
+      # @openai/codex-darwin-arm64".
       - name: Set up Bun for OMP
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
@@ -979,79 +1006,8 @@ jobs:
           bun install -g @oh-my-pi/pi-coding-agent@18.2.11
           omp --version
 
-      - name: Install integration CLIs (claude, opencode, pi, codex, copilot, droid, cline, qwen, openclaw, dsh)
-        shell: bash
-        run: |
-          failed_clis=()
-
-          install_cli() {
-            local install_spec="$1" pkg_name="$2" bin="$3"
-            local max_attempts=6
-            for attempt in $(seq 1 "$max_attempts"); do
-              if [ "$attempt" -gt 1 ]; then
-                # Clear npm's cache so a corrupted/incomplete cached
-                # response from the last attempt can't repeat itself.
-                npm cache clean --force >/dev/null 2>&1 || true
-              fi
-              local next="retrying"
-              [ "$attempt" -eq "$max_attempts" ] && next="giving up"
-              if ! npm install -g "$install_spec"; then
-                echo "::warning::$pkg_name install failed on ${{ runner.os }} (attempt $attempt/$max_attempts); $next"
-              else
-                if version_output=$("$bin" --version 2>&1); then
-                  return 0
-                fi
-                echo "::warning::$pkg_name installed but \"$bin --version\" failed on ${{ runner.os }} (attempt $attempt/$max_attempts); $next — output: $version_output"
-              fi
-              # Exponential backoff: 1s, 2s, 4s, 8s, 16s.
-              if [ "$attempt" -lt "$max_attempts" ]; then
-                sleep "$((2 ** (attempt - 1)))"
-              fi
-            done
-            echo "::error::$pkg_name never produced a working \"$bin\" on ${{ runner.os }} after $max_attempts attempts"
-            failed_clis+=("$pkg_name")
-          }
-
-          install_cli "@anthropic-ai/claude-code" "@anthropic-ai/claude-code" "claude"
-          install_cli "opencode-ai" "opencode-ai" "opencode"
-          install_cli "@openai/codex" "@openai/codex" "codex"
-          # Pinned: the standalone CLI's BYOK environment and `-p` mode are
-          # exercised against this release by tests/launch_e2e.rs.
-          install_cli "@github/copilot@1.0.91" "@github/copilot" "copilot"
-          # Pinned: tests/launch_e2e.rs verifies this release's custom-model
-          # settings schema, model id, and non-interactive `exec` interface.
-          install_cli "droid@0.242.0" "droid" "droid"
-          # Pinned: launch_cline depends on this release's provider-settings
-          # schema and headless JSON/yolo flags.
-          install_cli "cline@${CLINE_CLI_VERSION}" "cline" "cline"
-          # Pinned (not @latest): pi is pre-1.0 and tests/launch_e2e.rs's
-          # own invocation (-p) plus the models.json/settings.json shapes
-          # `launch pi` writes were verified against this exact release;
-          # an unpinned upgrade could change either with no warning here.
-          install_cli "@earendil-works/pi-coding-agent@0.86.1" "@earendil-works/pi-coding-agent" "pi"
-          # Pinned (not @latest): tests/launch_e2e.rs's qwen test relies on
-          # this release's tool set under --safe-mode and on the
-          # report_findings schema it excludes by name; a newer release can
-          # change either. Bump deliberately, re-running that test.
-          install_cli "@qwen-code/qwen-code@0.22.3" "@qwen-code/qwen-code" "qwen"
-          # Pinned (not @latest): tests/launch_e2e.rs's own openclaw
-          # invocation was verified against this exact release — its
-          # docs describe CLI commands/flags this build doesn't actually
-          # have (see launch_and_assert_tolerating's own doc comment),
-          # so an unpinned upgrade could silently break the same way
-          # again with no warning here.
-          install_cli "openclaw@2026.7.1-2" "openclaw" "openclaw"
-          # Pinned (not @latest): dsh is pre-1.0 (0.1.2-rc.1) and
-          # tests/launch_e2e.rs's own invocation (--profile headless) was
-          # verified against this exact release; an unpinned upgrade
-          # could silently change that profile's flags or behavior with
-          # no warning here.
-          install_cli "@deepseek-ai/dsh@0.1.2-rc.1" "@deepseek-ai/dsh" "dsh"
-
-          if [ "${#failed_clis[@]}" -gt 0 ]; then
-            echo "::error::the following integration CLIs never became installable on ${{ runner.os }} after retries: ${failed_clis[*]}"
-            exit 1
-          fi
+      - name: Install and smoke-check mise tools (cline, dsh, claude, opencode, codex, copilot, droid, pi, qwen, openclaw)
+        uses: ./.github/actions/mise-tools
 
       # hermes has no npm package (install.sh/install.ps1 only, like
       # llmman's own install scripts) — --skip-setup skips its
@@ -1074,14 +1030,14 @@ jobs:
           & ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -SkipSetup
 
       # goose has no npm package (a Rust binary via download_cli.sh), so
-      # install_cli above can't reach it. The pin has to be
+      # .mise.toml's npm: entries can't cover it. The pin has to be
       # GOOSE_VERSION, not the tag the script is fetched from: the script
       # resolves its own download tag, and installs `stable` without it.
       # GOOSE_BIN_DIR because its default differs on Windows
       # ($USERPROFILE/goose) and $GITHUB_PATH below names one directory.
       # CONFIGURE=false skips the `goose configure` wizard, which a launch
-      # configured through the environment never needs. Retried like
-      # install_cli: `release` needs this job, so a GitHub-releases blip
+      # configured through the environment never needs. Retried:
+      # `release` needs this job, so a GitHub-releases blip
       # must not block a release.
       #
       # Two legs can't install goose and warn instead of failing:

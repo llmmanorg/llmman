@@ -1,0 +1,49 @@
+name: Install and smoke-check mise tools
+description: >
+  Installs the npm CLIs listed in .mise.toml via jdx/mise-action (v5.2.5)
+  and verifies each one launches. Callers must run actions/checkout and
+  actions/setup-node (with node-version: 22) first and set MISE_DATA_DIR job-wide.
+
+runs:
+  using: composite
+  steps:
+    - name: Install mise tools
+      # v5 extracts mise.exe with PowerShell Expand-Archive on Windows,
+      # so no `unzip` binary and no PATH prepend are needed.
+      uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      with:
+        version: "2026.10.11"
+        github_token: ""
+      env:
+        MISE_DATA_DIR: ${{ env.MISE_DATA_DIR }}
+
+    - name: Smoke-check mise tools
+      shell: bash
+      env:
+        HOME: ${{ runner.temp }}/mise-smoke-home
+        USERPROFILE: ${{ runner.temp }}/mise-smoke-home
+        XDG_DATA_HOME: ${{ runner.temp }}/mise-smoke-home/.local/share
+      run: |
+        mkdir -p "$HOME"
+        : "${MISE_DATA_DIR:?MISE_DATA_DIR must be set so the shims location is known}"
+        # mise-action puts $MISE_DATA_DIR/shims on PATH. Git Bash reports
+        # /d/a/... while MISE_DATA_DIR is D:\a\..., so compare in one form.
+        to_unix() { if command -v cygpath >/dev/null 2>&1; then cygpath -u "$1"; else printf '%s\n' "$1"; fi; }
+        shims=$(to_unix "$MISE_DATA_DIR/shims")
+        for bin in cline dsh claude opencode codex copilot droid pi qwen openclaw; do
+          if ! resolved=$(command -v "$bin"); then
+            echo "::error::$bin is not on PATH"
+            exit 1
+          fi
+          resolved=$(to_unix "$resolved")
+          case "$resolved" in
+            "$shims"/*) ;;
+            *) echo "::error::$bin resolves to $resolved, not a mise shim under $shims"; exit 1 ;;
+          esac
+          if output=$("$bin" --version 2>&1); then
+            echo "$bin ($resolved): $output"
+          else
+            echo "::error::$bin --version failed (exit $?): $output"
+            exit 1
+          fi
+        done

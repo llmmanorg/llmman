@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+const MISE_TOML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/.mise.toml"));
+
 /// Launchers that hand the daemon's real client key to another process must
 /// not send it to a remote cleartext endpoint. Call this before anything
 /// probes or starts the daemon; loopback HTTP and remote HTTPS remain valid.
@@ -331,6 +333,97 @@ pub(super) fn provider_models_merged(
     configure(provider);
     provider.insert("models".into(), serde_json::json!(models));
     root
+}
+
+/// The `npm:` tools in `.mise.toml`, package name to version.
+pub(super) fn npm_pins() -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    use std::str::FromStr as _;
+    let value = toml::Value::from_str(MISE_TOML).context("failed to parse .mise.toml")?;
+    let tools = value
+        .get("tools")
+        .and_then(|v| v.as_table())
+        .context(".mise.toml has no [tools] table")?;
+    let mut pins = std::collections::BTreeMap::new();
+    for (key, val) in tools {
+        let Some(pkg) = key.strip_prefix("npm:") else {
+            continue;
+        };
+        let version = match val {
+            toml::Value::String(s) => s.clone(),
+            toml::Value::Table(t) => t
+                .get("version")
+                .and_then(|v| v.as_str())
+                .with_context(|| format!("npm:{pkg} table has no string `version`"))?
+                .to_owned(),
+            other => anyhow::bail!("npm:{pkg} has unexpected TOML type: {other:?}"),
+        };
+        pins.insert(pkg.to_owned(), version);
+    }
+    Ok(pins)
+}
+
+pub(super) fn npm_install_spec(pkg: &str) -> anyhow::Result<String> {
+    let pins = npm_pins()?;
+    let version = pins
+        .get(pkg)
+        .with_context(|| format!("`{pkg}` is not pinned in llmman's .mise.toml"))?;
+    Ok(format!("{pkg}@{version}"))
+}
+
+pub(super) fn npm_missing(name: &str, pkg: &str) -> anyhow::Error {
+    let spec = match npm_install_spec(pkg) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    anyhow::anyhow!(
+        "{name} is not installed\n\n\
+         From an llmman source checkout, install the pinned release with mise:\n  \
+         mise install npm:{pkg}\n\
+         mise puts it on PATH only through `mise exec`, its shims, or shell activation, so retry with:\n  \
+         mise exec -- llmman launch {name}\n\
+         or activate mise in your shell first: eval \"$(mise activate bash)\" (or zsh/fish)\n\n\
+         From a release binary, install globally with npm:\n  \
+         npm install -g {spec}\n\n\
+         Ensure npm's global bin directory is on PATH, then retry."
+    )
+}
+
+pub(super) fn npm_install(npm: &std::path::Path, spec: &str) -> anyhow::Result<()> {
+    let status = std::process::Command::new(npm)
+        .args(["install", "-g", spec])
+        .status()
+        .with_context(|| format!("failed to run {}", npm.display()))?;
+    anyhow::ensure!(status.success(), "npm install -g {spec} failed: {status}");
+    Ok(())
+}
+
+pub(super) fn install_missing_with_npm(name: &str, pkg: &str) -> anyhow::Result<()> {
+    let spec = npm_install_spec(pkg)?;
+    let Some(npm) = super::find_on_path("npm") else {
+        return Err(npm_missing(name, pkg));
+    };
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || !std::io::IsTerminal::is_terminal(&std::io::stderr())
+    {
+        return Err(npm_missing(name, pkg));
+    }
+    eprint!("[llmman] {name} is not installed. Install {spec} globally with npm? [y/N] ");
+    use std::io::Write as _;
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    if !super::accepts_prompt(&line) {
+        anyhow::bail!("{name} installation cancelled");
+    }
+    eprintln!("[llmman] {name} not found; installing {spec} via npm...");
+    npm_install(&npm, &spec)?;
+    if super::find_on_path(name).is_none() {
+        anyhow::bail!(
+            "npm installed {spec}, but {name} is still not on PATH\n\n\
+             Add npm's global bin directory (`npm prefix -g`) to PATH, then retry."
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

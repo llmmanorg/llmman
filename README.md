@@ -318,10 +318,10 @@ Qwen Code, Gemini CLI, Grok Build, AGY, DeepSeek Harness, Docker Agent,
 goose, goose Desktop, ...) and whether
 each is installed. Installing an
 integration is up to you; llmman only execs what is already on your
-machine, except that a missing Cline can be installed with npm after an
-interactive confirmation. `dsh` runs under `npx` when it isn't installed
-globally. Any extra arguments after `--` are forwarded to the integration's
-own CLI. Short names work wherever a model reference is accepted.
+machine, except that cline and dsh can be installed with npm at the version
+pinned in `.mise.toml`, after you confirm. Any extra arguments after `--` are
+forwarded to the integration's own CLI. Short names work wherever a model
+reference is accepted.
 
 To stop retyping flags, set them once, e.g. `llmman config set
 launch.opencode.model claude-sonnet-5-5` (also `.provider`, `.variant`);
