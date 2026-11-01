@@ -106,6 +106,78 @@
       "matchManagers": ["gradle"],
       "matchDepNames": ["com.android.application"],
       "allowedVersions": "<9.0.0"
+    },
+    {
+      "description": "Gradle 9 breaks AGP 8.x (plugin fails to apply with AndroidProblemReporterProvider); lift together with the AGP 9 migration",
+      "matchManagers": ["gradle-wrapper"],
+      "matchPackageNames": ["gradle"],
+      "allowedVersions": "<9.0.0"
+    },
+    {
+      "description": "Gradle wrapper is capped at 8.x, which cannot run on JDK 25; keep the Android CI setup-java java-version at 17 until the Gradle 9/AGP 9 migration. allowedVersions must be \"17\" (semver-partial): \"<18.0.0\" would be parsed as the 18.0 line",
+      "matchManagers": ["github-actions"],
+      "matchDepNames": ["java-jdk"],
+      "allowedVersions": "17"
+    },
+    {
+      "description": "Kotlin 2.2+ promotes kotlinOptions {} to an error; migration not done (~37 call sites)",
+      "matchManagers": ["gradle"],
+      "matchDepNames": ["org.jetbrains.kotlin.android"],
+      "allowedVersions": "<2.2.0"
+    },
+    {
+      "description": "core-ktx 1.17+ needs compileSdk 36 (we use 35) and 1.19+ needs compileSdk 37 and AGP 9.1",
+      "matchManagers": ["gradle"],
+      "matchPackageNames": ["androidx.core:core-ktx"],
+      "allowedVersions": "<1.17.0"
+    },
+    {
+      "description": "activity-ktx 1.11+ needs compileSdk 36 (we use 35); blocked until compileSdk is raised",
+      "matchManagers": ["gradle"],
+      "matchPackageNames": ["androidx.activity:activity-ktx"],
+      "allowedVersions": "<1.11.0"
+    },
+    {
+      "description": "react/react-dom >19.2.3 conflict with jest-expo 57 which pins react-test-renderer 19.2.3; remove when Expo SDK 58 block is lifted",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["react", "react-dom"],
+      "allowedVersions": "<=19.2.3"
+    },
+    {
+      "description": "react-native-webview 14.x introduces TypeScript errors in components/terminal/Terminal.tsx; migration not done",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["react-native-webview"],
+      "allowedVersions": "<14.0.0"
+    },
+    {
+      "description": "Expo SDK 57 bundledNativeModules pins keyboard-controller at 1.21.9; remove when Expo SDK 58 block is lifted",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["react-native-keyboard-controller"],
+      "allowedVersions": "<=1.21.9"
+    },
+    {
+      "description": "Expo SDK 57 bundledNativeModules pins screens at ~4.26.0; remove when Expo SDK 58 block is lifted",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["react-native-screens"],
+      "allowedVersions": "~4.26.0"
+    },
+    {
+      "description": "Expo SDK 57 bundledNativeModules pins safe-area-context at ~5.7.0; remove when Expo SDK 58 block is lifted",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["react-native-safe-area-context"],
+      "allowedVersions": "~5.7.0"
+    },
+    {
+      "description": "jest 30 is incompatible with jest-expo 57 which depends on jest 29 internals; remove when Expo SDK 58 block is lifted",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["jest", "@types/jest"],
+      "allowedVersions": "<30.0.0"
+    },
+    {
+      "description": "Expo SDK 57 pins react at 19.2.3; @types/react must match; remove when Expo SDK 58 block is lifted",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["@types/react"],
+      "allowedVersions": "~19.2.0"
     }
   ]
 }
