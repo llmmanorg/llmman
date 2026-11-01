@@ -332,6 +332,30 @@ jobs:
       - name: cargo test --lib --bins
         run: cargo test --release --target ${{ matrix.target }} --lib --bins
 
+      # tests/launch_e2e.rs's mediagen_qwen_image_metal_matches_cpu (#575) on PRs too:
+      # the e2e job that also runs it is push-to-main only. It links the ggml libraries
+      # next to llama-server, so this puts the pinned LLAMA_CPP_RELEASE build on PATH
+      # (a macOS-only copy of e2e's "Install llama-server").
+      - name: Install llama-server (mediagen parity)
+        if: ${{ !cancelled() && matrix.target == 'aarch64-apple-darwin' }}
+        run: |
+          set -euo pipefail
+          LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"
+          asset="llama-${LLAMA_CPP_RELEASE}-bin-macos-arm64.tar.gz"
+          curl -fsSL --retry 16 --retry-all-errors -o "$RUNNER_TEMP/$asset" \
+            "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE}/${asset}"
+          mkdir -p "$RUNNER_TEMP/llama-cpp"
+          tar -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/llama-cpp"
+          bin="$(find "$RUNNER_TEMP/llama-cpp" -type f -name llama-server | head -n1)"
+          [ -n "$bin" ] || { echo "::error::llama-server not found in $asset"; exit 1; }
+          dirname "$bin" >> "$GITHUB_PATH"
+
+      # --nocapture: the "Metal/CPU parity: ... matches" line, or the skip's ::warning::
+      # annotation, must reach the log.
+      - name: Metal/CPU image parity (mediagen)
+        if: ${{ !cancelled() && matrix.target == 'aarch64-apple-darwin' }}
+        run: cargo test --release --target ${{ matrix.target }} --test launch_e2e -- --exact mediagen_qwen_image_metal_matches_cpu --nocapture
+
   # --------------------------------------------------------------------------
   # Android app (android/, docs/android.md): the web UI in a WebView over
   # an embedded `llmman serve`, cross-compiled for aarch64-linux-android
@@ -757,6 +781,16 @@ jobs:
   # mlx-lm (macOS arm64, e2e)" below actually installs it; every other
   # entry's copy of that same test skips itself instead (mlx-lm has no
   # non-Apple-Silicon build to test against).
+  #
+  # tests/launch_e2e.rs's mediagen_qwen_image_metal_matches_cpu generates from a tiny
+  # synthetic Qwen-Image pack on Metal and on the CPU and requires the two images to match
+  # (#575). It runs on the two aarch64-apple-darwin legs below and on PRs in the `build`
+  # job's macOS leg ("Metal/CPU image parity (mediagen)"). It skips (and passes)
+  # on Linux and Windows (CPU-only llama.cpp assets), without llama-server on PATH, and
+  # whenever its `Context` gets no GPU backend on the hosted VM. A
+  # `Metal/CPU parity: the <backend> image matches the CPU's` line in the log means it
+  # compared images and they matched. When it skips for lack of a GPU backend it also
+  # emits a `::warning title=Metal/CPU parity skipped::` annotation, visible in the run summary.
   # --------------------------------------------------------------------------
   e2e:
     name: E2E (launch claude/agy/opencode/pi/omp/codex/copilot/droid/cline/grok/qwen/hermes/openclaw/dsh/goose/goose-desktop/docker-agent, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
