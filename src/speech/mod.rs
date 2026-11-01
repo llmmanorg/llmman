@@ -8,11 +8,14 @@
 //! `prompt` builds the canary2 decoder prompt from the hyperparameters
 //! and the vocabulary; `decoder` runs the Transformer decoder over the
 //! encoder output with a KV cache; `Vocab::detokenize` turns decoder
-//! output back into text.
+//! output back into text. `server` is the worker process's HTTP side:
+//! it parses and bounds a transcription request, runs that sequence
+//! one request at a time and answers in the OpenAI shapes.
 
 pub mod decoder;
 pub mod encoder;
 pub mod mel;
 pub mod model;
 pub mod prompt;
+pub mod server;
 pub mod wav;

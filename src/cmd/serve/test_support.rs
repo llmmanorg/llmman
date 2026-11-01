@@ -245,6 +245,59 @@ pub(super) fn rendered_registry() -> String {
     })
 }
 
+pub(super) const BOUNDARY: &str = "llmman-test-boundary";
+
+/// `(name, file as (filename, content-type), bytes)`.
+pub(super) type Part<'a> = (&'a str, Option<(&'a str, &'a str)>, &'a [u8]);
+
+/// Builds a `multipart/form-data` body + matching `content-type`
+/// header out of `parts` — a hand-rolled encoder rather than a
+/// dependency, just enough to exercise the parsers against real (if
+/// minimal) multipart wire format.
+pub(super) fn multipart_upload(parts: &[Part]) -> (Bytes, HeaderMap) {
+    let mut body = Vec::new();
+    for (name, file, data) in parts {
+        body.extend_from_slice(
+            format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"").as_bytes(),
+        );
+        if let Some((filename, content_type)) = file {
+            body.extend_from_slice(
+                format!("; filename=\"{filename}\"\r\nContent-Type: {content_type}").as_bytes(),
+            );
+        }
+        body.extend_from_slice(b"\r\n\r\n");
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-type",
+        format!("multipart/form-data; boundary={BOUNDARY}")
+            .parse()
+            .unwrap(),
+    );
+    (Bytes::from(body), headers)
+}
+
+/// Every part of `body`: `(name, filename, content-type, bytes)`.
+pub(super) async fn multipart_parts(
+    body: &Bytes,
+    headers: &HeaderMap,
+) -> Vec<(String, Option<String>, Option<String>, Vec<u8>)> {
+    let (_, mut multipart) = super::openai::multipart_parser(body, headers).unwrap();
+    let mut parts = Vec::new();
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        let name = field.name().unwrap().to_string();
+        let file_name = field.file_name().map(str::to_string);
+        let content_type = field.content_type().map(|m| m.to_string());
+        let data = field.bytes().await.unwrap().to_vec();
+        parts.push((name, file_name, content_type, data));
+    }
+    parts
+}
+
 /// Binds `build_router(state, false)` on a free loopback port.
 pub(super) async fn serve_router(state: AppState) -> String {
     serve_router_with(state, false).await

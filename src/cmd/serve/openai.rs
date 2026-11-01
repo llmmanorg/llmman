@@ -748,7 +748,11 @@ pub(super) async fn proxy_openai_passthrough(
             }
         }
     }
-    let task = if embeddings { Task::Embed } else { Task::Other };
+    let task = if embeddings {
+        Task::Embed
+    } else {
+        Task::Forward
+    };
     let (req, target, activity, response_model_override) =
         resolve_openai_request(state, headers, body, task).await?;
     forward_openai_request(
@@ -1099,7 +1103,7 @@ pub(super) async fn handle_openai_systemone(
         &model_ref,
         Some(&headers),
         LoadOptions::default(),
-        Task::Other,
+        Task::Forward,
     )
     .await?;
     let activity = begin_activity(guard, Some(keep_alive)).await;
@@ -1173,7 +1177,7 @@ async fn handle_openai_media(
     route: &str,
 ) -> Result<Response, AppError> {
     let (req, target, activity, override_) =
-        resolve_openai_request(state, headers, body, Task::Other).await?;
+        resolve_openai_request(state, headers, body, Task::Forward).await?;
     if local_engine(state, &target).await == Some(Engine::VllmOmni) {
         return if route == "/v1/videos" {
             omni_videos(state, &target, req, activity).await
@@ -1533,7 +1537,7 @@ pub(super) const TRANSCRIPTION_BODY_LIMIT_BYTES: usize = 200 * 1024 * 1024;
 
 /// A parser over a `multipart/form-data` `body`, with its boundary; `None`
 /// if the request is not multipart or names no boundary.
-fn multipart_parser(
+pub(super) fn multipart_parser(
     body: &Bytes,
     headers: &HeaderMap,
 ) -> Option<(String, multer::Multipart<'static>)> {
@@ -1566,7 +1570,7 @@ async fn multipart_text_field(
 /// own stand-in ("Transcribe audio to text") makes Voxtral answer the
 /// speech (llmmanorg/llmman#688); "...verbatim. Output only the
 /// transcript." came back as `The transcript is: "..."`.
-const DEFAULT_TRANSCRIPTION_PROMPT: &str = "Transcribe the speech in this audio. Reply with only the words spoken, with no introduction, heading or quotation marks.";
+pub(super) const DEFAULT_TRANSCRIPTION_PROMPT: &str = "Transcribe the speech in this audio. Reply with only the words spoken, with no introduction, heading or quotation marks.";
 
 /// Whether the client sent a non-blank `prompt`.
 async fn has_prompt(body: &Bytes, headers: &HeaderMap) -> bool {
@@ -1720,6 +1724,7 @@ pub(super) async fn handle_openai_transcriptions(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{multipart_parts, multipart_upload, BOUNDARY};
     use super::*;
 
     fn embeddings_response(embedding: serde_json::Value) -> Bytes {
@@ -1814,43 +1819,6 @@ mod tests {
             requested_dimensions(&serde_json::json!({ "model": "m" })),
             None
         );
-    }
-
-    const BOUNDARY: &str = "llmman-test-boundary";
-
-    /// `(name, file as (filename, content-type), bytes)`.
-    type Part<'a> = (&'a str, Option<(&'a str, &'a str)>, &'a [u8]);
-
-    /// Builds a `multipart/form-data` body + matching `content-type`
-    /// header out of `parts` — a hand-rolled encoder rather than a
-    /// dependency, just enough to exercise the parsers against real (if
-    /// minimal) multipart wire format.
-    fn multipart_upload(parts: &[Part]) -> (Bytes, HeaderMap) {
-        let mut body = Vec::new();
-        for (name, file, data) in parts {
-            body.extend_from_slice(
-                format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"")
-                    .as_bytes(),
-            );
-            if let Some((filename, content_type)) = file {
-                body.extend_from_slice(
-                    format!("; filename=\"{filename}\"\r\nContent-Type: {content_type}").as_bytes(),
-                );
-            }
-            body.extend_from_slice(b"\r\n\r\n");
-            body.extend_from_slice(data);
-            body.extend_from_slice(b"\r\n");
-        }
-        body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "content-type",
-            format!("multipart/form-data; boundary={BOUNDARY}")
-                .parse()
-                .unwrap(),
-        );
-        (Bytes::from(body), headers)
     }
 
     /// [`multipart_upload`] of text fields only.
@@ -2632,23 +2600,6 @@ mod tests {
         ] {
             assert_eq!(budget(unchanged.clone()), unchanged);
         }
-    }
-
-    /// Every part of `body`: `(name, filename, content-type, bytes)`.
-    async fn multipart_parts(
-        body: &Bytes,
-        headers: &HeaderMap,
-    ) -> Vec<(String, Option<String>, Option<String>, Vec<u8>)> {
-        let (_, mut multipart) = multipart_parser(body, headers).unwrap();
-        let mut parts = Vec::new();
-        while let Some(field) = multipart.next_field().await.unwrap() {
-            let name = field.name().unwrap().to_string();
-            let file_name = field.file_name().map(str::to_string);
-            let content_type = field.content_type().map(|m| m.to_string());
-            let data = field.bytes().await.unwrap().to_vec();
-            parts.push((name, file_name, content_type, data));
-        }
-        parts
     }
 
     /// Binary, and holding a CRLF and boundary-like text.

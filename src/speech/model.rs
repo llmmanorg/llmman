@@ -972,6 +972,12 @@ pub struct CanaryModel {
     weights: Weights,
 }
 
+// SAFETY: the tensor pointers in `tensors` address the weight buffer
+// `weights` owns, and ggml ties neither to a thread; the one worker
+// that moves a model between threads uses it under a mutex, as
+// `Weights` and `Backend` are moved.
+unsafe impl Send for CanaryModel {}
+
 impl CanaryModel {
     /// Size of the weight buffer in bytes.
     pub fn weight_bytes(&self) -> usize {
