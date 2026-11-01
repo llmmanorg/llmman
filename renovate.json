@@ -7,5 +7,105 @@
   "ignoreDeps": [
     "go.podman.io/common",
     "go.podman.io/image/v5"
+  ],
+  "packageRules": [
+    {
+      "description": "reqwest 0.13 switches to platform TLS verifier; not validated on Android",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["reqwest"],
+      "allowedVersions": "<0.13.0"
+    },
+    {
+      "description": "sha2 0.11 removed io::Write and hex formatting (~37 call sites)",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["sha2"],
+      "allowedVersions": "<0.11.0"
+    },
+    {
+      "description": "axum 0.8 requires route syntax migration (:param -> {param}) not yet done",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["axum"],
+      "allowedVersions": "<0.8.0"
+    },
+    {
+      "description": "axum-server 0.8 made from_tcp_rustls return io::Result (serve.rs, managed/tests.rs)",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["axum-server"],
+      "allowedVersions": "<0.8.0"
+    },
+    {
+      "description": "toml 0.9 split serde/std into default features (default-features = false drops from_str) and Value::from_str now parses a value, not a document",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["toml"],
+      "allowedVersions": "<0.9.0"
+    },
+    {
+      "description": "tokio-tungstenite 0.25+ changed Message payloads (Vec<u8> -> Payload/Bytes); test client must match axum 0.7's ws pin (0.24)",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["tokio-tungstenite"],
+      "allowedVersions": "<0.25.0"
+    },
+    {
+      "description": "mpb 8.16 changed ProxyReader signature; go.podman.io/image pins 8.12",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["github.com/vbauerster/mpb/v8"],
+      "allowedVersions": "<8.16.0"
+    },
+    {
+      "description": "typescript-eslint 8.x peer range is >=4.8.4 <6.1.0; 6.1+ unsupported",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["typescript"],
+      "allowedVersions": "<6.1.0"
+    },
+    {
+      "description": "ESLint 10 crashes eslint-plugin-react 7.37.5 used by eslint-config-expo 58",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["eslint"],
+      "allowedVersions": "<10.0.0"
+    },
+    {
+      "description": "@testing-library/react-native v14 made render/renderHook async; tests not updated",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["@testing-library/react-native"],
+      "allowedVersions": "<14.0.0"
+    },
+    {
+      "description": "@react-native-async-storage/async-storage v3 removed jest mock path and renamed API methods",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["@react-native-async-storage/async-storage"],
+      "allowedVersions": "<3.0.0"
+    },
+    {
+      "description": "react-native 0.87 made the strict types_generated API the default types export, dropping TextInputKeyPressEventData (ChatScreen.tsx); @react-native/jest-preset peer-pins to the same minor",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["react-native", "@react-native/jest-preset"],
+      "allowedVersions": "<0.87.0"
+    },
+    {
+      "description": "Expo SDK 58 bundles react-native 0.88 and jest-expo 58 needs @react-native/jest-preset ^0.88; hold the SDK at 57 while react-native is capped at 0.86",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["expo", "expo-*", "@expo/metro-runtime", "jest-expo", "eslint-config-expo"],
+      "allowedVersions": "<58.0.0"
+    },
+    {
+      "description": "vLLM e2e step installs hard-coded cp312 vllm/vllm-metal wheels (ci.yml); needs Python 3.12",
+      "matchManagers": ["github-actions"],
+      "matchDepNames": ["python"],
+      "matchCurrentValue": "/^3\\.12/",
+      "allowedVersions": "<3.13.0"
+    },
+    {
+      "description": "mlx e2e step must match PYTHON_RELEASE (3.13), which Renovate does not update",
+      "matchManagers": ["github-actions"],
+      "matchDepNames": ["python"],
+      "matchCurrentValue": "/^3\\.13/",
+      "allowedVersions": "<3.14.0"
+    },
+    {
+      "description": "AGP 9 has built-in Kotlin and rejects org.jetbrains.kotlin.android; plugin removal/migration not done",
+      "matchManagers": ["gradle"],
+      "matchDepNames": ["com.android.application"],
+      "allowedVersions": "<9.0.0"
+    }
   ]
 }
