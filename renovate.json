@@ -8,7 +8,24 @@
     "go.podman.io/common",
     "go.podman.io/image/v5"
   ],
+  "customManagers": [
+    {
+      "description": "Track llama.cpp releases via the repo-root LLAMA_CPP_RELEASE file",
+      "customType": "regex",
+      "managerFilePatterns": ["/^LLAMA_CPP_RELEASE$/"],
+      "matchStrings": ["(?<currentValue>b\\d+)"],
+      "depNameTemplate": "ggml-org/llama.cpp",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "regex:^b(?<major>\\d+)$"
+    }
+  ],
   "packageRules": [
+    {
+      "description": "llama.cpp bumps get their own PR outside renovate/all, on which the build job's mediagen Metal/CPU parity steps run. Renovate cannot derive PINNED_GGML automatically (it needs GGML_VERSION_BASE + a short SHA from the tag's CMakeLists.txt), so a bump PR will fail pinned_ggml_matches_the_release_file until PINNED_GGML in src/llama_release.rs is updated manually. The Metal/CPU parity step still runs via !cancelled().",
+      "matchDepNames": ["ggml-org/llama.cpp"],
+      "groupName": "llama.cpp",
+      "groupSlug": "llama-cpp"
+    },
     {
       "description": "reqwest 0.13 switches to platform TLS verifier; not validated on Android",
       "matchManagers": ["cargo"],

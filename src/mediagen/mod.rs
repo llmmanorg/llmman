@@ -383,6 +383,10 @@ impl Context {
         }
     }
 
+    pub fn gpu_name(&self) -> String {
+        self.be.gpu_name()
+    }
+
     /// Denoising steps when a request does not say (0: the schedule decides).
     pub fn default_steps(&self) -> i32 {
         match &self.inner {
