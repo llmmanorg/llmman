@@ -2123,7 +2123,7 @@ fn launch_openclaw_with_model() {
 
     // `agent --local --message <prompt> --agent main`: one embedded turn,
     // no Gateway/TUI. Verified directly against the real published
-    // `openclaw` npm package (2026.7.1-2) — its `--help` doesn't actually
+    // `openclaw` npm package (2026.10.9) — its `--help` doesn't actually
     // have an `exec` subcommand despite docs.openclaw.ai/cli/agent
     // describing one; `--local` still requires an explicit session
     // selector (`--agent main`, the default agent onboarding creates).
@@ -2221,7 +2221,7 @@ fn launch_qwen_with_model() {
     let _guard = lock_serial();
     eprintln!("[test] launch_qwen_with_model: acquired SERIAL");
 
-    // No on_path skips: ci.yml's install_cli already fails the job when
+    // No on_path skips: ci.yml's mise smoke check (.github/actions/mise-tools) already fails the job when
     // qwen did not become a working binary, and a skip here would hide
     // exactly that (the ask on #332).
     //

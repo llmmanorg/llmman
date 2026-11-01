@@ -178,6 +178,12 @@
       "matchManagers": ["npm"],
       "matchPackageNames": ["@types/react"],
       "allowedVersions": "~19.2.0"
+    },
+    {
+      "description": "cline 3.x: the macOS GitHub runner kills 3.0.62 (was noted on CLINE_CLI_VERSION in ci.yml); hold at 2.x until launch_cline is re-verified there",
+      "matchManagers": ["mise"],
+      "matchPackageNames": ["cline"],
+      "allowedVersions": "<3.0.0"
     }
   ]
 }

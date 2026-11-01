@@ -1,0 +1,22 @@
+[tools]
+# Hold at 2.x: macOS GitHub runner kills 3.0.62 (renovate.json). Provider-settings
+# schema. Rerun launch_cline tests when bumping.
+"npm:cline" = "2.18.0"
+# Rerun launch_dsh tests when bumping (`--profile headless`).
+"npm:@deepseek-ai/dsh" = "0.1.2-rc.1"
+# Rerun launch_claude tests when bumping.
+"npm:@anthropic-ai/claude-code" = { version = "2.1.300", allow_builds = ["@anthropic-ai/claude-code"] }
+# Rerun launch_opencode tests when bumping.
+"npm:opencode-ai" = "1.19.0"
+# Rerun launch_codex tests when bumping.
+"npm:@openai/codex" = "0.162.1"
+# Pinned for BYOK / `-p` flag. Rerun launch_copilot tests when bumping.
+"npm:@github/copilot" = "1.0.91"
+# Custom-model schema and `exec`. Rerun launch_droid tests when bumping.
+"npm:droid" = "0.242.0"
+# Rerun launch_pi tests when bumping.
+"npm:@earendil-works/pi-coding-agent" = "0.86.1"
+# `--safe-mode` / `report_findings`. Rerun launch_qwen tests when bumping.
+"npm:@qwen-code/qwen-code" = "0.22.3"
+# Rerun launch_openclaw tests when bumping.
+"npm:openclaw" = "2026.10.9"

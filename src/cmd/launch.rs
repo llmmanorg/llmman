@@ -165,8 +165,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         overflow.is_none() || args.model.as_deref().is_some_and(|m| !m.trim().is_empty()),
         "--overflow-model needs --model naming the local model to pair it with"
     );
-    // Before the Cline install check, which an image-based sandbox makes
-    // moot (see `find_on_path`), and before the daemon starts.
+    // Before the daemon starts.
     if let Some(kind) = args.sandbox {
         let id = name.to_lowercase();
         let carries_key =
@@ -181,11 +180,6 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             configured_by_file,
             carries_key,
         )?;
-    }
-    // Cline follows the install-on-demand behavior expected by its launch
-    // integration. Do this before starting the daemon or pulling a model.
-    if name.eq_ignore_ascii_case("cline") {
-        cline::ensure_cline_installed()?;
     }
     // Rejects the arguments after `--` that docker-agent cannot be
     // launched with. Here rather than in the launcher so the refusal
@@ -870,10 +864,7 @@ fn integration(name: &str) -> Option<&'static Integration> {
 fn print_integrations() {
     println!("Available integrations:\n");
     for i in INTEGRATIONS {
-        // dsh resolves to npx when it isn't installed (see `dsh::find_dsh`),
-        // and that launch downloads the package before running it.
         let how = match find_integration_binary(i) {
-            Some(bin) if bin.file_stem().is_some_and(|s| s == "npx") => " (via npx)",
             Some(_) => "",
             None => " (not installed)",
         };
@@ -975,26 +966,26 @@ fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
 
 /// Fails, before anything is started or pulled, when `name`'s program is
 /// not there to run, looked up as its launcher will look for it (so an
-/// image-based `--sandbox`, prepared just before, counts as there). Cline
-/// installs itself on demand, and an unknown name is left to the
-/// launcher's own error.
+/// image-based `--sandbox`, prepared just before, counts as there). An
+/// unknown name is left to the launcher's own error.
 fn check_installed(name: &str) -> anyhow::Result<()> {
     let Some(i) = integration(name) else {
         return Ok(());
     };
-    if i.name == "cline" || find_integration_binary(i).is_some() {
+    if find_integration_binary(i).is_some() {
         return Ok(());
     }
     match i.name {
-        "dsh" => anyhow::bail!("{}", dsh::DSH_MISSING),
+        "cline" => common::install_missing_with_npm(i.binary, cline::CLINE_NPM_PACKAGE),
+        "dsh" => common::install_missing_with_npm(i.binary, dsh::DSH_NPM_PACKAGE),
         "docker-agent" => Err(docker_agent::docker_agent_missing()),
         "goose-desktop" => Err(goose_desktop::goose_desktop_missing()),
         _ => anyhow::bail!("{} is not installed", i.binary),
     }
 }
 
-/// A yes to an interactive `[y/N]`. Shared by the Cline install
-/// prompt and goose-desktop's offer to quit.
+/// A yes to an interactive `[y/N]`. Shared by the cline/dsh npm install prompt
+/// (`common::install_missing_with_npm`) and goose-desktop's offer to quit.
 fn accepts_prompt(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
@@ -1498,12 +1489,29 @@ fn server() -> String {
 mod tests {
     use super::*;
 
-    /// Cline installs itself, and a name launch does not know is left to
-    /// its own error, so neither is refused here whatever is on PATH.
+    fn is_exact_version(v: &str) -> bool {
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        RE.get_or_init(|| {
+            regex::Regex::new(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$").unwrap()
+        })
+        .is_match(v)
+    }
+
+    /// A name launch does not know is left to its own error, so it is not
+    /// refused here whatever is on PATH.
     #[test]
-    fn check_installed_leaves_cline_and_unknown_names_alone() {
-        assert!(check_installed("cline").is_ok());
+    fn check_installed_leaves_unknown_names_alone() {
         assert!(check_installed("not-an-integration").is_ok());
+    }
+
+    #[test]
+    fn accepts_prompt_takes_only_y_and_yes() {
+        for a in ["y", "Y", "yes", "YES", " yes\n"] {
+            assert!(accepts_prompt(a), "{a:?}");
+        }
+        for a in ["", "\n", "n", "no", "yep"] {
+            assert!(!accepts_prompt(a), "{a:?}");
+        }
     }
 
     #[test]
@@ -2244,6 +2252,135 @@ mod tests {
         assert_eq!(canonical_integration("nonesuch"), None);
         for i in INTEGRATIONS {
             assert_eq!(canonical_integration(i.name), Some(i.name));
+        }
+    }
+
+    /// Every npm integration CLI is pinned in `.mise.toml` at an exact
+    /// three-component version, so an upstream release cannot reach the e2e
+    /// suite unannounced. CI installs them all via `jdx/mise-action`.
+    #[test]
+    fn mise_toml_pins_every_npm_integration_at_an_explicit_version() {
+        const REQUIRED: &[&str] = &[
+            "cline",
+            "@deepseek-ai/dsh",
+            "@anthropic-ai/claude-code",
+            "opencode-ai",
+            "@openai/codex",
+            "@github/copilot",
+            "droid",
+            "@earendil-works/pi-coding-agent",
+            "@qwen-code/qwen-code",
+            "openclaw",
+        ];
+
+        let pins = super::common::npm_pins().unwrap();
+        for (pkg, version) in &pins {
+            assert!(
+                !version.is_empty() && version != "latest",
+                "npm:{pkg} = {version:?}"
+            );
+            assert!(
+                is_exact_version(version),
+                "npm:{pkg} version {version:?} is not an exact MAJOR.MINOR.PATCH pin"
+            );
+        }
+        let missing: Vec<&str> = REQUIRED
+            .iter()
+            .copied()
+            .filter(|r| !pins.contains_key(*r))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "missing npm pins in .mise.toml: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn missing_hints_match_mise_pins_and_say_how_to_run_through_mise() {
+        let pins = super::common::npm_pins().unwrap();
+        for (hint, pkg, name) in [
+            (
+                super::common::npm_missing("cline", cline::CLINE_NPM_PACKAGE).to_string(),
+                "cline",
+                "cline",
+            ),
+            (
+                super::common::npm_missing("dsh", dsh::DSH_NPM_PACKAGE).to_string(),
+                "@deepseek-ai/dsh",
+                "dsh",
+            ),
+        ] {
+            let version = pins
+                .get(pkg)
+                .unwrap_or_else(|| panic!("npm:{pkg} is not pinned in .mise.toml"));
+            for want in [
+                format!("mise install npm:{pkg}\n"),
+                format!("mise exec -- llmman launch {name}\n"),
+                "mise activate".to_string(),
+                format!("npm install -g {pkg}@{version}"),
+            ] {
+                assert!(hint.contains(&want), "{name} hint lacks {want:?}:\n{hint}");
+            }
+        }
+    }
+
+    #[test]
+    fn npm_install_spec_uses_the_mise_pin() {
+        let pins = super::common::npm_pins().unwrap();
+        for pkg in ["cline", "@deepseek-ai/dsh"] {
+            let spec = super::common::npm_install_spec(pkg).unwrap();
+            let version = &pins[pkg];
+            assert_eq!(spec, format!("{pkg}@{version}"));
+            assert!(
+                is_exact_version(version),
+                "{pkg} pin {version:?} is not an exact version"
+            );
+            assert!(
+                !spec.ends_with("@latest"),
+                "{pkg} spec must not be @latest: {spec}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_install_passes_install_g_spec_and_reports_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("npm");
+        let args_file = dir.path().join("args");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+                args_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Use the live pin so this test tracks .mise.toml automatically.
+        let spec = super::common::npm_install_spec("cline").unwrap();
+        super::common::npm_install(&fake, &spec).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&args_file).unwrap(),
+            format!("install\n-g\n{spec}\n")
+        );
+
+        // failing npm
+        std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(super::common::npm_install(&fake, &spec).is_err());
+    }
+
+    #[test]
+    fn is_exact_version_accepts_only_exact_pins() {
+        for v in &["2.18.0", "0.1.2-rc.1", "2026.7.1-2", "2.1.300"] {
+            assert!(is_exact_version(v), "{v:?} should be accepted");
+        }
+        for v in &[
+            "", "latest", "2", "2.18", "2.18.x", "^2.18.0", "~2.18.0", ">=2.18.0", "v2.18.0",
+            "2.18.0.1",
+        ] {
+            assert!(!is_exact_version(v), "{v:?} should be rejected");
         }
     }
 }
