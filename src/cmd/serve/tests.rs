@@ -4010,13 +4010,25 @@ async fn handle_delete_rejects_an_invalid_ref_with_400() {
 /// Stores `docker.io/ai/{name}:latest` in `store` as one model whose
 /// single layer is `(media_type, filepath, blob)`.
 fn store_one_model(store: &OciStore, name: &str, media_type: &str, filepath: &str, blob: &[u8]) {
+    store_one_model_with_config(store, name, media_type, filepath, blob, b"{}");
+}
+
+/// [`store_one_model`] with `config` as the manifest's config blob.
+fn store_one_model_with_config(
+    store: &OciStore,
+    name: &str,
+    media_type: &str,
+    filepath: &str,
+    blob: &[u8],
+    config: &[u8],
+) {
     let mut layer = store.write_blob(media_type, blob).unwrap();
     layer.annotations = Some(HashMap::from([(
         "org.cncf.model.filepath".to_string(),
         filepath.to_string(),
     )]));
     let config = store
-        .write_blob("application/vnd.cncf.model.config.v1+json", b"{}")
+        .write_blob("application/vnd.cncf.model.config.v1+json", config)
         .unwrap();
     let manifest = crate::storage::oci::Manifest {
         schema_version: 2,
@@ -7620,7 +7632,10 @@ async fn v1_models_carries_the_trained_context_of_models_that_are_not_loaded() {
     let _ = std::fs::remove_dir_all(&dir);
 
     let text = listed(&v, "modelstext");
-    assert_eq!(text["meta"], serde_json::json!({ "n_ctx_train": 4096 }));
+    assert_eq!(
+        text["meta"],
+        serde_json::json!({ "n_ctx": 4096, "n_ctx_train": 4096 })
+    );
     assert_eq!(
         text["architecture"],
         serde_json::json!({ "input_modalities": ["text"], "output_modalities": ["text"] })
@@ -7628,7 +7643,10 @@ async fn v1_models_carries_the_trained_context_of_models_that_are_not_loaded() {
     assert_eq!(text["status"]["value"], "unloaded");
 
     let embed = listed(&v, "modelsembed");
-    assert_eq!(embed["meta"], serde_json::json!({ "n_ctx_train": 4096 }));
+    assert_eq!(
+        embed["meta"],
+        serde_json::json!({ "n_ctx": 4096, "n_ctx_train": 4096 })
+    );
     assert_eq!(embed.get("architecture"), None);
 
     let st = listed(&v, "modelsst");
@@ -7637,6 +7655,53 @@ async fn v1_models_carries_the_trained_context_of_models_that_are_not_loaded() {
         st["architecture"]["input_modalities"],
         serde_json::json!(["text"])
     );
+}
+
+/// An unloaded model's `meta.n_ctx` is the per-slot context a llama-server
+/// load would report (llmmanorg/llmman#733); a media model has none.
+#[tokio::test]
+async fn v1_models_reports_the_context_an_unloaded_model_would_start_with() {
+    let dir = fresh_store_dir("v1startctx");
+    let store = OciStore::open(&dir).unwrap();
+    store_one_model(&store, "text", GGUF_V3, "model.gguf", &gguf_bytes(&[]));
+    let embed = gguf_bytes(&[("llama.pooling_type", 1)]);
+    store_one_model(&store, "embed", GGUF_V3, "model.gguf", &embed);
+    let image = br#"{"config":{"capabilities":{"outputTypes":["image"]}}}"#;
+    store_one_model_with_config(
+        &store,
+        "image",
+        GGUF_V3,
+        "model.gguf",
+        &gguf_bytes(&[]),
+        image,
+    );
+
+    // (LLMMAN_CONTEXT_LENGTH, explicitly set, LLMMAN_NUM_PARALLEL) ->
+    // (text, embedding), for the fixture's trained context of 4096.
+    let cases = [
+        ((Some(DEFAULT_CTX_SIZE), false, None), (4096, 4096)),
+        ((Some(DEFAULT_CTX_SIZE), false, Some(4)), (4096, 4096)),
+        ((Some(2048), true, None), (2048, 2048)),
+        ((Some(65536), true, None), (4096, 4096)),
+        ((Some(0), true, None), (4096, 4096)),
+        // 0 is the trained context split across the slots; an embedding
+        // model's 0 becomes the trained context before the slots scale it.
+        ((Some(0), true, Some(2)), (2048, 4096)),
+        ((Some(2048), true, Some(4)), (2048, 2048)),
+    ];
+    for ((ctx_size, explicit, num_parallel), (text, embedding)) in cases {
+        let mut inner = test_inner(dir.clone());
+        inner.ctx_size = ctx_size;
+        inner.ctx_size_explicit = explicit;
+        inner.num_parallel = num_parallel;
+        let base = serve_router(AppState(Arc::new(inner))).await;
+        let (_, v) = get_json(&base, "/v1/models").await;
+        let case = format!("ctx_size {ctx_size:?} ({explicit}), num_parallel {num_parallel:?}");
+        assert_eq!(listed(&v, "text")["meta"]["n_ctx"], text, "{case}");
+        assert_eq!(listed(&v, "embed")["meta"]["n_ctx"], embedding, "{case}");
+        assert_eq!(listed(&v, "image")["meta"].get("n_ctx"), None, "{case}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A loaded llama-server's own `meta` and `architecture` win, key by key; a

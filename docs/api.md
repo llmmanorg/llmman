@@ -114,10 +114,16 @@ line; a message with tool calls is never merged.
 `/v1/models` carries llama-server's `meta` and `architecture`, which clients
 size a model by (`meta.n_ctx_train` is OpenClaw's context window). A loaded
 llama-server's own are passed through, `meta.n_ctx` included. Before a model
-is loaded, `meta.n_ctx_train` comes from the GGUF header and
-`architecture.input_modalities` from what the model can do (`text`, plus
+is loaded, `meta.n_ctx_train` comes from the GGUF header, `meta.n_ctx` is the
+per-slot context the llama-server a load starts would report (from
+`LLMMAN_CONTEXT_LENGTH` and `LLMMAN_NUM_PARALLEL`, never past `n_ctx_train`; a
+request's `num_ctx` or an out-of-memory retry can still change it), and
+`architecture.input_modalities` comes from what the model can do (`text`, plus
 `image` with a vision projector); a model that does not generate text has no
-`architecture`.
+`architecture`. `meta.n_ctx` is left out for a model llama-server does not
+serve (media, or a GGUF that goes to ds4-server), and when `LLMMAN_LLAMA_ARGS`
+or a `LLAMA_ARG_*` variable sets llama-server's context size, slots or KV
+unification itself.
 
 `/props` is llama-server's router-mode endpoint: the router's own, or with
 `?model=` that model's llama-server's (context window, slots, modalities,

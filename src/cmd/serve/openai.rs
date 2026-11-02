@@ -12,7 +12,10 @@ use axum::Json;
 use futures::StreamExt;
 use tokio::time::{sleep, Duration, Instant};
 
-use super::backend::{backend_json, would_use_mlx};
+use super::backend::{
+    backend_json, extra_args_from_env, gguf_engine_from_env, llama_sets_slot_context,
+    would_use_mlx, LLAMA_ARGS_VAR,
+};
 use super::hybrid::{request_pin, send_with_hybrid_fallback};
 use super::messages::content_text;
 use super::ollama::{is_embedding_overflow, listed_model_facts, truncate_embedding};
@@ -70,6 +73,10 @@ pub(super) async fn handle_openai_models(
         }
     }))
     .await;
+    // The environment counts even for a container, which does not inherit
+    // it: whether llama-server runs in one is settled only at the load.
+    let user_sizes_slots = llama_sets_slot_context(&extra_args_from_env(LLAMA_ARGS_VAR), true);
+    let gguf_engine = gguf_engine_from_env();
     let mut data: Vec<serde_json::Value> = rows
         .into_iter()
         .zip(serving.iter().zip(live))
@@ -83,10 +90,16 @@ pub(super) async fn handle_openai_models(
                 "status": { "value": if serving.is_some() { "loaded" } else { "unloaded" } },
             });
             // `meta`/`architecture` size a model's context for clients. The
-            // header gives them before anything is loaded; a loaded
-            // llama-server's own then replace them, key by key.
+            // header and this daemon's configuration give them before
+            // anything is loaded; a loaded llama-server's own then replace
+            // them, key by key.
             if let Some(trained) = facts.context_length() {
                 entry["meta"] = serde_json::json!({ "n_ctx_train": trained });
+                if serving.is_none() && !user_sizes_slots {
+                    if let Some(n_ctx) = facts.starting_context_window(&state, gguf_engine) {
+                        entry["meta"]["n_ctx"] = n_ctx.into();
+                    }
+                }
             }
             if let Some(input) = facts.input_modalities() {
                 entry["architecture"] = serde_json::json!({

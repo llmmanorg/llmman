@@ -123,7 +123,19 @@ pub(super) fn gguf_goes_to_ds4(
     decision: bool,
     ds4_on_path: impl FnOnce() -> bool,
 ) -> bool {
-    if !matches!(model, ModelPath::Gguf(..)) || embedding || decision {
+    matches!(model, ModelPath::Gguf(..))
+        && ds4_serves_gguf(engine, arch, embedding, decision, ds4_on_path)
+}
+
+/// [`gguf_goes_to_ds4`] for a model already known to be a GGUF.
+pub(super) fn ds4_serves_gguf(
+    engine: GgufEngine,
+    arch: Option<&str>,
+    embedding: bool,
+    decision: bool,
+    ds4_on_path: impl FnOnce() -> bool,
+) -> bool {
+    if embedding || decision {
         return false;
     }
     match engine {
@@ -450,6 +462,28 @@ pub(super) fn llama_sets(extra: &[String], flag: &str, env: Option<&str>) -> boo
         a.strip_prefix(flag)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
     }) || env.is_some_and(|env| std::env::var_os(env).is_some())
+}
+
+/// llama-server's flags that size each slot's context, with their env vars.
+const LLAMA_SLOT_CONTEXT_FLAGS: &[(&str, &str)] = &[
+    ("-c", "LLAMA_ARG_CTX_SIZE"),
+    ("--ctx-size", "LLAMA_ARG_CTX_SIZE"),
+    ("-np", "LLAMA_ARG_N_PARALLEL"),
+    ("--parallel", "LLAMA_ARG_N_PARALLEL"),
+    ("-kvu", "LLAMA_ARG_KV_UNIFIED"),
+    ("--kv-unified", "LLAMA_ARG_KV_UNIFIED"),
+    ("-no-kvu", "LLAMA_ARG_KV_UNIFIED"),
+    ("--no-kv-unified", "LLAMA_ARG_KV_UNIFIED"),
+    ("--kv-unified-per-slot", "LLAMA_ARG_KV_UNIFIED_PER_SLOT"),
+];
+
+/// Whether `extra` (a split `LLMMAN_LLAMA_ARGS`, which overrides llmman's
+/// flags) or, if `inherits_env`, the environment sets one of
+/// [`LLAMA_SLOT_CONTEXT_FLAGS`].
+pub(super) fn llama_sets_slot_context(extra: &[String], inherits_env: bool) -> bool {
+    LLAMA_SLOT_CONTEXT_FLAGS
+        .iter()
+        .any(|(flag, env)| llama_sets(extra, flag, inherits_env.then_some(*env)))
 }
 
 /// Fails on the first `LLMMAN_*_ARGS` that [`split_quoted_args`] rejects,
@@ -1428,6 +1462,36 @@ mod tests {
         // Unknown names are reported by the caller, not silently mapped.
         assert_eq!(parse_gguf_engine(Some("llama")), None);
         assert_eq!(parse_gguf_engine(Some("ds4-server")), None);
+    }
+
+    /// A flag counts `=`-joined or not; one that only starts like it does not.
+    #[test]
+    fn llama_sets_slot_context_names_the_flags_that_size_a_slot() {
+        let sets = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            llama_sets_slot_context(&args, false)
+        };
+        for args in [
+            &["-c", "8192"][..],
+            &["--ctx-size=8192"],
+            &["-np", "2"],
+            &["--parallel", "2"],
+            &["-kvu"],
+            &["--no-kv-unified"],
+            &["--kv-unified-per-slot", "8192"],
+            &["--jinja", "--ctx-size", "8192"],
+        ] {
+            assert!(sets(args), "{args:?}");
+        }
+        for args in [
+            &[][..],
+            &["--jinja"],
+            &["--cache-reuse", "64"],
+            &["-cb"],
+            &["--ctx-size-draft", "8192"],
+        ] {
+            assert!(!sets(args), "{args:?}");
+        }
     }
 
     #[test]
