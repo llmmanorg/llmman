@@ -3660,16 +3660,16 @@ fn canary_model_loads_on_cpu_backend() {
                 .unwrap_or_else(|| panic!("{file}: {name}: not in the index"));
             // BF16 is the one type `Weights` converts; these files carry none.
             assert_ne!(desc.ty, ty::BF16, "{file}: {name}: BF16 in the file");
-            assert!(!t.is_null(), "{file}: {name}: null tensor");
-            // SAFETY: `model` keeps the tensor context and its backing
-            // buffer alive; `t` is null-checked above and `back` has
-            // `ggml_nbytes(t)` writable bytes.
-            let (loaded_ty, back) = unsafe {
-                assert_eq!((*t).type_, desc.ty, "{file}: {name}: type");
-                let nbytes = (api.ggml_nbytes)(t);
+            let loaded_ty = t.dtype();
+            assert_eq!(loaded_ty, desc.ty, "{file}: {name}: type");
+            // SAFETY: the handle came from `Weights`, whose context and
+            // backing buffer `model` keeps alive; `back` has `ggml_nbytes`
+            // writable bytes.
+            let back = unsafe {
+                let nbytes = (api.ggml_nbytes)(t.as_ptr());
                 let mut back = vec![0u8; nbytes];
-                (api.ggml_backend_tensor_get)(t, back.as_mut_ptr() as *mut _, 0, nbytes);
-                ((*t).type_, back)
+                (api.ggml_backend_tensor_get)(t.as_ptr(), back.as_mut_ptr() as *mut _, 0, nbytes);
+                back
             };
             let elems: i64 = desc.ne.iter().product();
             // SAFETY: a pure size computation on a ggml type id.

@@ -6,6 +6,7 @@
 
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 
 use anyhow::{Context, Result};
 use libloading::Library;
@@ -87,7 +88,80 @@ pub struct GgmlTensor {
     pub padding: [c_char; 8],
 }
 
-pub type Tensor = *mut GgmlTensor;
+pub type TensorPtr = *mut GgmlTensor;
+
+/// A tensor ggml owns: a node of a `ggml_context` or graph, or a weight
+/// in its buffer. The shape, strides and type are copied out when the
+/// handle is made, so the safe accessors never touch ggml's memory: a
+/// handle kept past its context's `ggml_free` still answers them from
+/// the copy. Only [`Tensor::as_ptr`] hands the pointer back to ggml,
+/// inside the callers' own `unsafe` FFI calls, and those need the owner
+/// alive. ggml never resizes a tensor in place (a reshape or view is a
+/// new tensor), so the copy stays current.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tensor {
+    ptr: NonNull<GgmlTensor>,
+    ne: [i64; GGML_MAX_DIMS],
+    nb: [usize; GGML_MAX_DIMS],
+    ty: u32,
+}
+
+impl Tensor {
+    /// Wraps a pointer ggml returned, copying its shape, strides and
+    /// type. Panics on null.
+    ///
+    /// # Safety
+    /// `p` must point at a live ggml tensor now, so the copy reads valid
+    /// memory: one of a live `ggml_context`, graph or weight buffer.
+    pub unsafe fn from_raw(p: TensorPtr) -> Tensor {
+        let ptr = NonNull::new(p).expect("null ggml tensor");
+        // SAFETY: the caller guarantees `p` points at a live tensor.
+        let t = unsafe { ptr.as_ref() };
+        Tensor {
+            ptr,
+            ne: t.ne,
+            nb: t.nb,
+            ty: t.type_,
+        }
+    }
+
+    pub fn as_ptr(self) -> TensorPtr {
+        self.ptr.as_ptr()
+    }
+
+    /// Shape in ggml order.
+    pub fn shape(self) -> [i64; 4] {
+        self.ne
+    }
+
+    /// Strides in bytes, ggml order.
+    pub fn strides(self) -> [usize; 4] {
+        self.nb
+    }
+
+    /// Storage type, one of [`ty`].
+    pub fn dtype(self) -> u32 {
+        self.ty
+    }
+
+    /// A placeholder for tests: an empty shape and a pointer at no
+    /// tensor, which only `as_ptr` could misuse.
+    #[cfg(test)]
+    pub(crate) fn dangling() -> Tensor {
+        Tensor {
+            ptr: NonNull::dangling(),
+            ne: [0; GGML_MAX_DIMS],
+            nb: [0; GGML_MAX_DIMS],
+            ty: 0,
+        }
+    }
+}
+
+impl From<Tensor> for TensorPtr {
+    fn from(t: Tensor) -> TensorPtr {
+        t.as_ptr()
+    }
+}
 
 impl GgmlTensor {
     pub fn name(&self) -> String {
@@ -156,7 +230,8 @@ pub struct LlamaModelParams {
     pub load_mtp: bool,
 }
 
-pub type EvalCallback = unsafe extern "C" fn(t: Tensor, ask: bool, user_data: *mut c_void) -> bool;
+pub type EvalCallback =
+    unsafe extern "C" fn(t: TensorPtr, ask: bool, user_data: *mut c_void) -> bool;
 
 /// `ggml_abort_callback`: polled by the CPU backend after each node; a
 /// `true` return stops the graph with [`GGML_STATUS_ABORTED`].
@@ -238,10 +313,10 @@ api! {
     fn ggml_free(ctx: *mut GgmlContext);
     fn ggml_tensor_overhead() -> usize;
     fn ggml_graph_overhead_custom(size: usize, grads: bool) -> usize;
-    fn ggml_new_tensor(ctx: *mut GgmlContext, type_: u32, n_dims: c_int, ne: *const i64) -> Tensor;
-    fn ggml_set_name(t: Tensor, name: *const c_char) -> Tensor;
-    fn ggml_set_input(t: Tensor);
-    fn ggml_set_output(t: Tensor);
+    fn ggml_new_tensor(ctx: *mut GgmlContext, type_: u32, n_dims: c_int, ne: *const i64) -> TensorPtr;
+    fn ggml_set_name(t: TensorPtr, name: *const c_char) -> TensorPtr;
+    fn ggml_set_input(t: TensorPtr);
+    fn ggml_set_output(t: TensorPtr);
     fn ggml_nbytes(t: *const GgmlTensor) -> usize;
     fn ggml_nelements(t: *const GgmlTensor) -> i64;
     fn ggml_type_size(type_: u32) -> usize;
@@ -249,57 +324,57 @@ api! {
     fn ggml_row_size(type_: u32, ne: i64) -> usize;
     fn ggml_is_contiguous(t: *const GgmlTensor) -> bool;
     fn ggml_new_graph_custom(ctx: *mut GgmlContext, size: usize, grads: bool) -> *mut GgmlCgraph;
-    fn ggml_build_forward_expand(gf: *mut GgmlCgraph, t: Tensor);
+    fn ggml_build_forward_expand(gf: *mut GgmlCgraph, t: TensorPtr);
     fn ggml_graph_n_nodes(gf: *mut GgmlCgraph) -> c_int;
     fn ggml_fp32_to_fp16_row(x: *const f32, y: *mut u16, n: i64);
     fn ggml_fp16_to_fp32_row(x: *const u16, y: *mut f32, n: i64);
     fn ggml_bf16_to_fp32_row(x: *const u16, y: *mut f32, n: i64);
     // ops
-    fn ggml_add(ctx: *mut GgmlContext, a: Tensor, b: Tensor) -> Tensor;
-    fn ggml_sub(ctx: *mut GgmlContext, a: Tensor, b: Tensor) -> Tensor;
-    fn ggml_mul(ctx: *mut GgmlContext, a: Tensor, b: Tensor) -> Tensor;
-    fn ggml_scale(ctx: *mut GgmlContext, a: Tensor, s: f32) -> Tensor;
-    fn ggml_scale_bias(ctx: *mut GgmlContext, a: Tensor, s: f32, b: f32) -> Tensor;
-    fn ggml_mul_mat(ctx: *mut GgmlContext, a: Tensor, b: Tensor) -> Tensor;
-    fn ggml_rms_norm(ctx: *mut GgmlContext, a: Tensor, eps: f32) -> Tensor;
-    fn ggml_norm(ctx: *mut GgmlContext, a: Tensor, eps: f32) -> Tensor;
-    fn ggml_silu(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
-    fn ggml_relu(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
-    fn ggml_gelu(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
-    fn ggml_sigmoid(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
-    fn ggml_tanh(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
-    fn ggml_sin(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
-    fn ggml_sqr(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
-    fn ggml_sqrt(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
-    fn ggml_log(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
-    fn ggml_clamp(ctx: *mut GgmlContext, a: Tensor, min: f32, max: f32) -> Tensor;
-    fn ggml_cpy(ctx: *mut GgmlContext, a: Tensor, b: Tensor) -> Tensor;
-    fn ggml_reshape_2d(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64) -> Tensor;
-    fn ggml_reshape_3d(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64, ne2: i64) -> Tensor;
-    fn ggml_reshape_4d(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64, ne2: i64, ne3: i64) -> Tensor;
-    fn ggml_view_2d(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64, nb1: usize, offset: usize) -> Tensor;
-    fn ggml_view_3d(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64, ne2: i64, nb1: usize, nb2: usize, offset: usize) -> Tensor;
-    fn ggml_view_4d(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64, ne2: i64, ne3: i64, nb1: usize, nb2: usize, nb3: usize, offset: usize) -> Tensor;
-    fn ggml_permute(ctx: *mut GgmlContext, a: Tensor, a0: c_int, a1: c_int, a2: c_int, a3: c_int) -> Tensor;
-    fn ggml_transpose(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
-    fn ggml_cont(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
-    fn ggml_cont_2d(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64) -> Tensor;
-    fn ggml_concat(ctx: *mut GgmlContext, a: Tensor, b: Tensor, dim: c_int) -> Tensor;
-    fn ggml_cast(ctx: *mut GgmlContext, a: Tensor, type_: u32) -> Tensor;
-    fn ggml_get_rows(ctx: *mut GgmlContext, a: Tensor, b: Tensor) -> Tensor;
-    fn ggml_repeat(ctx: *mut GgmlContext, a: Tensor, b: Tensor) -> Tensor;
-    fn ggml_pad(ctx: *mut GgmlContext, a: Tensor, p0: c_int, p1: c_int, p2: c_int, p3: c_int) -> Tensor;
-    fn ggml_pad_ext(ctx: *mut GgmlContext, a: Tensor, lp0: c_int, rp0: c_int, lp1: c_int, rp1: c_int, lp2: c_int, rp2: c_int, lp3: c_int, rp3: c_int) -> Tensor;
-    fn ggml_conv_1d(ctx: *mut GgmlContext, a: Tensor, b: Tensor, s0: c_int, p0: c_int, d0: c_int) -> Tensor;
-    fn ggml_conv_2d(ctx: *mut GgmlContext, a: Tensor, b: Tensor, s0: c_int, s1: c_int, p0: c_int, p1: c_int, d0: c_int, d1: c_int) -> Tensor;
-    fn ggml_conv_transpose_1d(ctx: *mut GgmlContext, a: Tensor, b: Tensor, s0: c_int, p0: c_int, d0: c_int) -> Tensor;
-    fn ggml_conv_2d_dw_direct(ctx: *mut GgmlContext, a: Tensor, b: Tensor, stride0: c_int, stride1: c_int, pad0: c_int, pad1: c_int, dilation0: c_int, dilation1: c_int) -> Tensor;
-    fn ggml_ssm_conv(ctx: *mut GgmlContext, sx: Tensor, c: Tensor) -> Tensor;
-    fn ggml_interpolate(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64, ne2: i64, ne3: i64, mode: u32) -> Tensor;
-    fn ggml_timestep_embedding(ctx: *mut GgmlContext, timesteps: Tensor, dim: c_int, max_period: c_int) -> Tensor;
-    fn ggml_flash_attn_ext(ctx: *mut GgmlContext, q: Tensor, k: Tensor, v: Tensor, mask: Tensor, scale: f32, max_bias: f32, logit_softcap: f32) -> Tensor;
-    fn ggml_flash_attn_ext_set_prec(a: Tensor, prec: c_int);
-    fn ggml_soft_max_ext(ctx: *mut GgmlContext, a: Tensor, mask: Tensor, scale: f32, max_bias: f32) -> Tensor;
+    fn ggml_add(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr) -> TensorPtr;
+    fn ggml_sub(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr) -> TensorPtr;
+    fn ggml_mul(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr) -> TensorPtr;
+    fn ggml_scale(ctx: *mut GgmlContext, a: TensorPtr, s: f32) -> TensorPtr;
+    fn ggml_scale_bias(ctx: *mut GgmlContext, a: TensorPtr, s: f32, b: f32) -> TensorPtr;
+    fn ggml_mul_mat(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr) -> TensorPtr;
+    fn ggml_rms_norm(ctx: *mut GgmlContext, a: TensorPtr, eps: f32) -> TensorPtr;
+    fn ggml_norm(ctx: *mut GgmlContext, a: TensorPtr, eps: f32) -> TensorPtr;
+    fn ggml_silu(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
+    fn ggml_relu(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
+    fn ggml_gelu(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
+    fn ggml_sigmoid(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
+    fn ggml_tanh(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
+    fn ggml_sin(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
+    fn ggml_sqr(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
+    fn ggml_sqrt(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
+    fn ggml_log(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
+    fn ggml_clamp(ctx: *mut GgmlContext, a: TensorPtr, min: f32, max: f32) -> TensorPtr;
+    fn ggml_cpy(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr) -> TensorPtr;
+    fn ggml_reshape_2d(ctx: *mut GgmlContext, a: TensorPtr, ne0: i64, ne1: i64) -> TensorPtr;
+    fn ggml_reshape_3d(ctx: *mut GgmlContext, a: TensorPtr, ne0: i64, ne1: i64, ne2: i64) -> TensorPtr;
+    fn ggml_reshape_4d(ctx: *mut GgmlContext, a: TensorPtr, ne0: i64, ne1: i64, ne2: i64, ne3: i64) -> TensorPtr;
+    fn ggml_view_2d(ctx: *mut GgmlContext, a: TensorPtr, ne0: i64, ne1: i64, nb1: usize, offset: usize) -> TensorPtr;
+    fn ggml_view_3d(ctx: *mut GgmlContext, a: TensorPtr, ne0: i64, ne1: i64, ne2: i64, nb1: usize, nb2: usize, offset: usize) -> TensorPtr;
+    fn ggml_view_4d(ctx: *mut GgmlContext, a: TensorPtr, ne0: i64, ne1: i64, ne2: i64, ne3: i64, nb1: usize, nb2: usize, nb3: usize, offset: usize) -> TensorPtr;
+    fn ggml_permute(ctx: *mut GgmlContext, a: TensorPtr, a0: c_int, a1: c_int, a2: c_int, a3: c_int) -> TensorPtr;
+    fn ggml_transpose(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
+    fn ggml_cont(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
+    fn ggml_cont_2d(ctx: *mut GgmlContext, a: TensorPtr, ne0: i64, ne1: i64) -> TensorPtr;
+    fn ggml_concat(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr, dim: c_int) -> TensorPtr;
+    fn ggml_cast(ctx: *mut GgmlContext, a: TensorPtr, type_: u32) -> TensorPtr;
+    fn ggml_get_rows(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr) -> TensorPtr;
+    fn ggml_repeat(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr) -> TensorPtr;
+    fn ggml_pad(ctx: *mut GgmlContext, a: TensorPtr, p0: c_int, p1: c_int, p2: c_int, p3: c_int) -> TensorPtr;
+    fn ggml_pad_ext(ctx: *mut GgmlContext, a: TensorPtr, lp0: c_int, rp0: c_int, lp1: c_int, rp1: c_int, lp2: c_int, rp2: c_int, lp3: c_int, rp3: c_int) -> TensorPtr;
+    fn ggml_conv_1d(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr, s0: c_int, p0: c_int, d0: c_int) -> TensorPtr;
+    fn ggml_conv_2d(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr, s0: c_int, s1: c_int, p0: c_int, p1: c_int, d0: c_int, d1: c_int) -> TensorPtr;
+    fn ggml_conv_transpose_1d(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr, s0: c_int, p0: c_int, d0: c_int) -> TensorPtr;
+    fn ggml_conv_2d_dw_direct(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr, stride0: c_int, stride1: c_int, pad0: c_int, pad1: c_int, dilation0: c_int, dilation1: c_int) -> TensorPtr;
+    fn ggml_ssm_conv(ctx: *mut GgmlContext, sx: TensorPtr, c: TensorPtr) -> TensorPtr;
+    fn ggml_interpolate(ctx: *mut GgmlContext, a: TensorPtr, ne0: i64, ne1: i64, ne2: i64, ne3: i64, mode: u32) -> TensorPtr;
+    fn ggml_timestep_embedding(ctx: *mut GgmlContext, timesteps: TensorPtr, dim: c_int, max_period: c_int) -> TensorPtr;
+    fn ggml_flash_attn_ext(ctx: *mut GgmlContext, q: TensorPtr, k: TensorPtr, v: TensorPtr, mask: TensorPtr, scale: f32, max_bias: f32, logit_softcap: f32) -> TensorPtr;
+    fn ggml_flash_attn_ext_set_prec(a: TensorPtr, prec: c_int);
+    fn ggml_soft_max_ext(ctx: *mut GgmlContext, a: TensorPtr, mask: TensorPtr, scale: f32, max_bias: f32) -> TensorPtr;
     // backend
     fn ggml_backend_load_all_from_path(dir: *const c_char);
     fn ggml_backend_init_by_type(type_: c_int, params: *const c_char) -> GgmlBackend;
@@ -320,7 +395,7 @@ api! {
     fn ggml_backend_buffer_free(buf: GgmlBackendBuffer);
     fn ggml_backend_buffer_clear(buf: GgmlBackendBuffer, value: u8);
     fn ggml_backend_buffer_get_size(buf: GgmlBackendBuffer) -> usize;
-    fn ggml_backend_tensor_set(t: Tensor, data: *const c_void, offset: usize, size: usize);
+    fn ggml_backend_tensor_set(t: TensorPtr, data: *const c_void, offset: usize, size: usize);
     fn ggml_backend_tensor_get(t: *const GgmlTensor, data: *mut c_void, offset: usize, size: usize);
     fn ggml_backend_sched_new(backends: *mut GgmlBackend, bufts: *mut GgmlBackendBuft, n: c_int, graph_size: usize, parallel: bool, op_offload: bool) -> GgmlBackendSched;
     fn ggml_backend_sched_free(sched: GgmlBackendSched);
@@ -361,15 +436,15 @@ api! {
 
     optional:
     // direct 2-D convolution (no im2col), ggml >= mid-2025
-    fn ggml_conv_2d_direct(ctx: *mut GgmlContext, a: Tensor, b: Tensor, s0: c_int, s1: c_int, p0: c_int, p1: c_int, d0: c_int, d1: c_int) -> Tensor;
-    fn ggml_backend_supports_op(backend: GgmlBackend, op: Tensor) -> bool;
+    fn ggml_conv_2d_direct(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr, s0: c_int, s1: c_int, p0: c_int, p1: c_int, d0: c_int, d1: c_int) -> TensorPtr;
+    fn ggml_backend_supports_op(backend: GgmlBackend, op: TensorPtr) -> bool;
     // library identity, ggml >= 2025-07-02
     fn ggml_version() -> *const c_char;
     fn ggml_commit() -> *const c_char;
     // F32 accumulation hint for mul_mat / flash attention, only the speech encoder needs it
-    fn ggml_prec_set_acc(a: Tensor, prec: c_int) -> bool;
+    fn ggml_prec_set_acc(a: TensorPtr, prec: c_int) -> bool;
     // row writes into a KV cache, only the speech decoder needs it
-    fn ggml_set_rows(ctx: *mut GgmlContext, a: Tensor, b: Tensor, c: Tensor) -> Tensor;
+    fn ggml_set_rows(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr, c: TensorPtr) -> TensorPtr;
 }
 
 fn lookup<T: Copy>(libs: &[Library], name: &str) -> Result<T> {
@@ -602,22 +677,27 @@ impl Api {
     }
 }
 
-/// Shape of a tensor in ggml order.
-pub fn shape(t: Tensor) -> [i64; 4] {
-    unsafe { (*t).ne }
-}
-
-pub fn strides(t: Tensor) -> [usize; 4] {
-    unsafe { (*t).nb }
-}
-
-/// Storage type of a tensor, one of [`ty`].
-pub fn dtype(t: Tensor) -> u32 {
-    unsafe { (*t).type_ }
-}
-
 #[cfg(test)]
 mod tests {
+    /// The accessors read the copy taken at construction, so a handle
+    /// kept past its tensor's memory still answers them; only `as_ptr`
+    /// would reach the freed tensor.
+    #[test]
+    fn a_handle_keeps_its_shape_after_the_tensor_is_freed() {
+        use super::{ty, GgmlTensor, Tensor};
+        // SAFETY: an all-zero GgmlTensor is a valid value (integers and
+        // null pointers), and `from_raw` reads it while the box lives.
+        let mut raw: Box<GgmlTensor> = unsafe { Box::new(std::mem::zeroed()) };
+        raw.type_ = ty::F16;
+        raw.ne = [3, 5, 1, 1];
+        raw.nb = [2, 6, 30, 30];
+        let t = unsafe { Tensor::from_raw(&mut *raw as *mut GgmlTensor) };
+        drop(raw);
+        assert_eq!(t.shape(), [3, 5, 1, 1]);
+        assert_eq!(t.strides(), [2, 6, 30, 30]);
+        assert_eq!(t.dtype(), ty::F16);
+    }
+
     use super::*;
 
     const PIN: PinnedGgml = PinnedGgml {

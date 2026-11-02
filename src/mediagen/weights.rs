@@ -294,20 +294,30 @@ impl Weights {
     /// Reads a small f32 / f16 tensor back to the host.
     pub fn read_f32(&self, name: &str) -> Result<Vec<f32>> {
         let t = self.get(name)?;
-        let n = unsafe { (self.api.ggml_nelements)(t) } as usize;
-        let ty = unsafe { (*t).type_ };
+        let n = unsafe { (self.api.ggml_nelements)(t.as_ptr()) } as usize;
+        let ty = t.dtype();
         match ty {
             ffi::ty::F32 => {
                 let mut out = vec![0f32; n];
                 unsafe {
-                    (self.api.ggml_backend_tensor_get)(t, out.as_mut_ptr() as *mut _, 0, n * 4)
+                    (self.api.ggml_backend_tensor_get)(
+                        t.as_ptr(),
+                        out.as_mut_ptr() as *mut _,
+                        0,
+                        n * 4,
+                    )
                 };
                 Ok(out)
             }
             ffi::ty::F16 => {
                 let mut h = vec![0u16; n];
                 unsafe {
-                    (self.api.ggml_backend_tensor_get)(t, h.as_mut_ptr() as *mut _, 0, n * 2)
+                    (self.api.ggml_backend_tensor_get)(
+                        t.as_ptr(),
+                        h.as_mut_ptr() as *mut _,
+                        0,
+                        n * 2,
+                    )
                 };
                 let mut out = vec![0f32; n];
                 unsafe { (self.api.ggml_fp16_to_fp32_row)(h.as_ptr(), out.as_mut_ptr(), n as i64) };
@@ -474,8 +484,8 @@ impl Weights {
             {
                 bail!("tensor {}: data past the end of the file", d.name);
             }
-            let dst_bytes = unsafe { (api.ggml_nbytes)(item.dst) };
-            let dst_ty = unsafe { (*item.dst).type_ };
+            let dst_bytes = unsafe { (api.ggml_nbytes)(item.dst.as_ptr()) };
+            let dst_ty = item.dst.dtype();
             read_buf.resize(src_bytes, 0);
             f.seek(SeekFrom::Start(d.offset))?;
             f.read_exact(&mut read_buf)
@@ -497,7 +507,7 @@ impl Weights {
                 }
                 &conv_buf
             };
-            let n = unsafe { (api.ggml_nelements)(item.dst) };
+            let n = unsafe { (api.ggml_nelements)(item.dst.as_ptr()) };
             let converted = convert(api, d.ty, dst_ty, src, n)?;
             let mut data = converted.unwrap_or_else(|| src.to_vec());
             if dst_ty == ffi::ty::F32 {
@@ -521,7 +531,12 @@ impl Weights {
                 );
             }
             unsafe {
-                (api.ggml_backend_tensor_set)(item.dst, data.as_ptr() as *const _, 0, dst_bytes)
+                (api.ggml_backend_tensor_set)(
+                    item.dst.as_ptr(),
+                    data.as_ptr() as *const _,
+                    0,
+                    dst_bytes,
+                )
             };
         }
         eprintln!(

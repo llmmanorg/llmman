@@ -1497,7 +1497,8 @@ mod tests {
         let mut asked = Vec::new();
         let tensors = CanaryTensors::build(hp, &mut |name| {
             asked.push(name.to_string());
-            Ok(std::ptr::dangling_mut())
+            // SAFETY: the test only stores the handle; no method runs on it.
+            Ok(Tensor::dangling())
         })
         .unwrap();
         (tensors, asked)
@@ -1528,7 +1529,8 @@ mod tests {
             if name == "dec.layer.5.cross_attn.k.bias" {
                 bail!("missing tensor {name:?}");
             }
-            Ok(std::ptr::dangling_mut())
+            // SAFETY: the test only stores the handle; no method runs on it.
+            Ok(Tensor::dangling())
         })
         .map(|_| ())
         .unwrap_err()

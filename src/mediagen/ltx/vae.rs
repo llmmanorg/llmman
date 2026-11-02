@@ -7,7 +7,7 @@
 use anyhow::{bail, Result};
 
 use super::super::backend::{Backend, Ctx, Graph};
-use super::super::ffi::{self, Tensor};
+use super::super::ffi::Tensor;
 use super::super::weights::Weights;
 use super::{Hparams, Model, VideoLatent};
 
@@ -52,8 +52,8 @@ fn conv3d_nodes(wd: i64, h: i64, c: i64, t: i64) -> usize {
 
 /// 3x3x3 conv, replicate padded in time, as the sum of three 2-D convs over the temporal taps.
 fn conv3d(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, causal: bool) -> Result<Tensor> {
-    let [wd, h, c, t] = ffi::shape(x);
-    let nb = ffi::strides(x);
+    let [wd, h, c, t] = x.shape();
+    let nb = x.strides();
     let ks = [
         w.get(&format!("{prefix}.weight.t0"))?,
         w.get(&format!("{prefix}.weight.t1"))?,
@@ -75,7 +75,7 @@ fn conv3d(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, causal: bool) -> Result
     }
     let mut y = y.unwrap();
     if let Some(b) = w.opt(&format!("{prefix}.bias")) {
-        y = g.add(y, g.reshape_4d(b, 1, 1, ffi::shape(b)[0], 1));
+        y = g.add(y, g.reshape_4d(b, 1, 1, b.shape()[0], 1));
     }
     Ok(y)
 }
@@ -97,7 +97,7 @@ fn resblock(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, causal: bool) -> Resu
 
 /// Innermost channel factor `p` into the width: [W, H, p*R, T] -> [p*W, H, R, T]
 fn shuffle_w(g: &Ctx, y: Tensor, p: i64) -> Tensor {
-    let [w, h, c, t] = ffi::shape(y);
+    let [w, h, c, t] = y.shape();
     let v = g.reshape_4d(y, w * h, p, c / p, t);
     let v = g.cont(g.permute(v, 1, 0, 2, 3));
     g.reshape_4d(v, p * w, h, c / p, t)
@@ -105,7 +105,7 @@ fn shuffle_w(g: &Ctx, y: Tensor, p: i64) -> Tensor {
 
 /// Innermost channel factor `p` into the height: [W, H, p*R, T] -> [W, p*H, R, T]
 fn shuffle_h(g: &Ctx, y: Tensor, p: i64) -> Tensor {
-    let [w, h, c, t] = ffi::shape(y);
+    let [w, h, c, t] = y.shape();
     let v = g.reshape_4d(y, w, h, p, (c / p) * t);
     let v = g.cont(g.permute(v, 0, 2, 1, 3));
     g.reshape_4d(v, w, p * h, c / p, t)
@@ -113,7 +113,7 @@ fn shuffle_h(g: &Ctx, y: Tensor, p: i64) -> Tensor {
 
 /// Innermost channel factor `p` into time: [W, H, p*R, T] -> [W, H, R, p*T]
 fn shuffle_t(g: &Ctx, y: Tensor, p: i64) -> Tensor {
-    let [w, h, c, t] = ffi::shape(y);
+    let [w, h, c, t] = y.shape();
     let v = g.reshape_4d(y, w * h, p, c / p, t);
     let v = g.cont(g.permute(v, 0, 2, 1, 3));
     g.reshape_4d(v, w, h, c / p, p * t)
@@ -137,8 +137,8 @@ fn upsample(
     }
     if pt > 1 {
         y = shuffle_t(g, y, pt);
-        let [wd, h, c, t] = ffi::shape(y);
-        let nb = ffi::strides(y);
+        let [wd, h, c, t] = y.shape();
+        let nb = y.strides();
         y = g.cont(g.view_4d(y, wd, h, c, t - 1, nb[1], nb[2], nb[3], nb[3]));
     }
     Ok(y)
@@ -171,7 +171,7 @@ fn count_nodes(w: &Weights, lat: &VideoLatent) -> Result<usize> {
     let mut n = 1; // the input
     let conv = |n: &mut usize, prefix: &str, wd, h, c, t| -> Result<i64> {
         *n += conv3d_nodes(wd, h, c, t);
-        Ok(ffi::shape(w.get(&format!("{prefix}.weight.t0"))?)[3])
+        Ok(w.get(&format!("{prefix}.weight.t0"))?.shape()[3])
     };
     c = conv(&mut n, "decoder.conv_in.conv", wd, h, c, t)?;
     for (i, b) in BLOCKS.iter().enumerate() {
@@ -264,7 +264,7 @@ fn build(model: &Model, be: &Backend, lat: &VideoLatent) -> Result<(Graph, Tenso
 fn decode_tile(model: &Model, be: &Backend, lat: &VideoLatent) -> Result<Vec<f32>> {
     let (g, cur) = build(model, be, lat)?;
     g.compute(be)?;
-    let [ow, oh, oc, of] = ffi::shape(cur);
+    let [ow, oh, oc, of] = cur.shape();
     let (want_f, want_h, want_w) = output_dims(&model.hp, lat);
     if (of, oh, ow, oc) != (want_f, want_h, want_w, 3) {
         bail!("decoder produced {of} frames of {ow}x{oh}x{oc}, expected {want_f} of {want_w}x{want_h}x3");

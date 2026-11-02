@@ -12,14 +12,13 @@
 //! second half-step feed-forward and a LayerNorm.
 
 use std::ffi::c_int;
-use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail, Result};
 
 use super::model::{CanaryModel, EncBlock};
 use crate::mediagen::backend::{Backend, Ctx, Graph};
-use crate::mediagen::ffi::{self, ty, Tensor};
+use crate::mediagen::ffi::{ty, Tensor};
 
 /// `nn.BatchNorm1d` default `eps`, the value NeMo's conv module uses.
 const BN_EPS: f32 = 1e-5;
@@ -181,7 +180,7 @@ impl Encoder {
             })
             .collect();
         let g = &gr.ctx;
-        let bias = |b: Tensor| g.reshape_4d(b, 1, 1, ffi::shape(b)[0], 1);
+        let bias = |b: Tensor| g.reshape_4d(b, 1, 1, b.shape()[0], 1);
         let mut cur = g.conv_2d(pre.conv0, x, 2, 2, 1, 1, 1, 1);
         cur = g.relu(g.add(cur, bias(pre.conv0_b)));
         cur = g.conv_2d_dw_direct(pre.conv2, cur, 2, 2, 1, 1, 1, 1);
@@ -194,8 +193,8 @@ impl Encoder {
         cur = g.relu(g.add(cur, bias(pre.conv6_b)));
         // [mel, time, chan] -> [mel, chan, time]
         cur = g.cont(g.permute(cur, 0, 2, 1, 3));
-        let [n_freq, n_chan, n_time, _] = ffi::shape(cur);
-        let in_dim = ffi::shape(pre.out)[0];
+        let [n_freq, n_chan, n_time, _] = cur.shape();
+        let in_dim = pre.out.shape()[0];
         if n_time != t_enc as i64 || n_freq * n_chan != in_dim {
             bail!(
                 "encoder: subsampler produced [{n_freq}, {n_chan}, {n_time}] for {frames} frames, \
@@ -296,9 +295,9 @@ fn feed_forward(
 /// scores are summed, scaled by `1 / sqrt(d_head)` and softmaxed over
 /// the keys; no mask, batch 1 attends to every frame.
 fn attention(g: &Ctx, b: &EncBlock, x: Tensor, pos: Tensor, n_heads: i64) -> Tensor {
-    let [d_model, t, _, _] = ffi::shape(x);
+    let [d_model, t, _, _] = x.shape();
     let d_head = d_model / n_heads;
-    let n_pos = ffi::shape(pos)[1];
+    let n_pos = pos.shape()[1];
     let h = layer_norm(g, x, b.norm_attn, b.norm_attn_b);
     // [d_head, head, t]
     let heads = |y: Tensor| g.reshape_3d(y, d_head, n_heads, t);
@@ -315,7 +314,7 @@ fn attention(g: &Ctx, b: &EncBlock, x: Tensor, pos: Tensor, n_heads: i64) -> Ten
     // [t_k, t_q, head] and [2t - 1, t_q, head]
     let ac = g.prec_f32(g.mul_mat(k, q_u));
     let bd = g.prec_f32(g.mul_mat(p, q_v));
-    let nb = ffi::strides(bd);
+    let nb = bd.strides();
     let shifted = g.view_3d(
         bd,
         t,
@@ -326,7 +325,7 @@ fn attention(g: &Ctx, b: &EncBlock, x: Tensor, pos: Tensor, n_heads: i64) -> Ten
         (t - 1) as usize * nb[0],
     );
     let scores = g.add(ac, g.cont(shifted));
-    let probs = g.soft_max_ext(scores, ptr::null_mut(), 1.0 / (d_head as f32).sqrt(), 0.0);
+    let probs = g.soft_max_ext(scores, None, 1.0 / (d_head as f32).sqrt(), 0.0);
     // [t_k, d_head, head] so that probs . v gives [t_q, d_head, head]
     let v = g.cont(g.permute(v, 1, 2, 0, 3));
     let o = g.prec_f32(g.mul_mat(probs, v));
@@ -343,22 +342,22 @@ fn attention(g: &Ctx, b: &EncBlock, x: Tensor, pos: Tensor, n_heads: i64) -> Ten
 /// `shift`, SiLU and pointwise2. `ggml_ssm_conv` reads an F32 kernel,
 /// so an F16 `conv.depthwise.weight` is cast in the graph.
 fn conv_module(g: &Ctx, b: &EncBlock, x: Tensor, bn_scale: Tensor, bn_shift: Tensor) -> Tensor {
-    let [d_model, t, _, _] = ffi::shape(x);
+    let [d_model, t, _, _] = x.shape();
     let h = layer_norm(g, x, b.norm_conv, b.norm_conv_b);
-    let [_, pw_in, pw_out, _] = ffi::shape(b.pointwise1);
+    let [_, pw_in, pw_out, _] = b.pointwise1.shape();
     let pw1 = g.reshape_2d(b.pointwise1, pw_in, pw_out);
     // [2 * d_model, t]
     let h = g.linear(h, pw1, Some(b.pointwise1_b));
-    let nb = ffi::strides(h);
+    let nb = h.strides();
     let signal = g.view_2d(h, d_model, t, nb[1], 0);
     let gate = g.view_2d(h, d_model, t, nb[1], d_model as usize * nb[0]);
     let h = g.mul(signal, g.sigmoid(gate));
     // [t, d_model], padded on the time axis for a same-length conv
     let h = g.cont(g.transpose(h));
-    let [k, _, _, _] = ffi::shape(b.depthwise);
+    let [k, _, _, _] = b.depthwise.shape();
     let pad = ((k - 1) / 2) as c_int;
     let h = g.pad_ext(h, pad, pad, 0, 0, 0, 0, 0, 0);
-    let kernel = if ffi::dtype(b.depthwise) == ty::F32 {
+    let kernel = if b.depthwise.dtype() == ty::F32 {
         b.depthwise
     } else {
         g.cast(b.depthwise, ty::F32)
@@ -369,7 +368,7 @@ fn conv_module(g: &Ctx, b: &EncBlock, x: Tensor, bn_scale: Tensor, bn_shift: Ten
     let h = g.add(g.reshape_2d(h, d_model, t), b.depthwise_b);
     let h = g.add(g.mul(h, bn_scale), bn_shift);
     let h = g.silu(h);
-    let [_, pw_in, pw_out, _] = ffi::shape(b.pointwise2);
+    let [_, pw_in, pw_out, _] = b.pointwise2.shape();
     let pw2 = g.reshape_2d(b.pointwise2, pw_in, pw_out);
     g.add(x, g.linear(h, pw2, Some(b.pointwise2_b)))
 }

@@ -16,7 +16,7 @@ fn avae_conv(g: &Ctx, w: &Weights, prefix: &str, mut x: Tensor, k: i32) -> Resul
     }
     let mut y = g.conv_2d(kw, x, 1, 1, 0, 0, 1, 1);
     if let Some(b) = w.opt(&format!("{prefix}.bias")) {
-        y = g.add(y, g.reshape_4d(b, 1, 1, ffi::shape(b)[0], 1));
+        y = g.add(y, g.reshape_4d(b, 1, 1, b.shape()[0], 1));
     }
     Ok(y)
 }
@@ -40,7 +40,7 @@ fn avae_resblock(g: &Ctx, w: &Weights, prefix: &str, mut x: Tensor) -> Result<Te
 
 /// Nearest x2 upsample, conv, drop the first time row.
 fn avae_upsample(g: &Ctx, w: &Weights, prefix: &str, mut x: Tensor) -> Result<Tensor> {
-    let s = ffi::shape(x);
+    let s = x.shape();
     x = g.interpolate(
         x,
         s[0] * 2,
@@ -50,8 +50,8 @@ fn avae_upsample(g: &Ctx, w: &Weights, prefix: &str, mut x: Tensor) -> Result<Te
         ffi::GGML_SCALE_MODE_NEAREST,
     );
     x = avae_conv(g, w, &format!("{prefix}.conv.conv"), x, 3)?;
-    let s = ffi::shape(x);
-    let nb = ffi::strides(x);
+    let s = x.shape();
+    let nb = x.strides();
     Ok(g.cont(g.view_4d(x, s[0], s[1] - 1, s[2], s[3], nb[1], nb[2], nb[3], nb[1])))
 }
 
@@ -85,7 +85,7 @@ fn conv1d(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, pad: i32, dil: i32) -> 
     let kw = w.get(&format!("{prefix}.weight"))?;
     let mut y = g.conv_1d(kw, x, 1, pad, dil);
     if let Some(b) = w.opt(&format!("{prefix}.bias")) {
-        y = g.add(y, g.reshape_3d(b, 1, ffi::shape(b)[0], 1));
+        y = g.add(y, g.reshape_3d(b, 1, b.shape()[0], 1));
     }
     Ok(y)
 }
@@ -93,28 +93,28 @@ fn conv1d(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, pad: i32, dil: i32) -> 
 /// PyTorch ConvTranspose1d(k, stride, padding = (k - stride) / 2).
 fn conv_transpose1d(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, stride: i32) -> Result<Tensor> {
     let kw = w.get(&format!("{prefix}.weight"))?; // [K, OC, IC]
-    let k = ffi::shape(kw)[0] as i32;
+    let k = kw.shape()[0] as i32;
     let pad = (k - stride) / 2;
-    let s = ffi::shape(x);
+    let s = x.shape();
     let x2 = g.reshape_2d(x, s[0], s[1]);
     let mut y = g.conv_transpose_1d(kw, x2, stride, 0, 1); // [T', OC]
     if pad > 0 {
-        let s = ffi::shape(y);
-        let nb = ffi::strides(y);
+        let s = y.shape();
+        let nb = y.strides();
         y = g.cont(g.view_2d(y, s[0] - 2 * pad as i64, s[1], nb[1], pad as usize * nb[0]));
     }
-    let s = ffi::shape(y);
+    let s = y.shape();
     y = g.reshape_3d(y, s[0], s[1], 1);
     if let Some(b) = w.opt(&format!("{prefix}.bias")) {
-        y = g.add(y, g.reshape_3d(b, 1, ffi::shape(b)[0], 1));
+        y = g.add(y, g.reshape_3d(b, 1, b.shape()[0], 1));
     }
     Ok(y)
 }
 
 /// Replicate padding along time.
 fn replicate_pad1d(g: &Ctx, x: Tensor, left: i64, right: i64) -> Tensor {
-    let [t, c, ..] = ffi::shape(x);
-    let nb = ffi::strides(x);
+    let [t, c, ..] = x.shape();
+    let nb = x.strides();
     let mut out = x;
     if left > 0 {
         let first = g.view_3d(x, 1, c, 1, nb[1], nb[2], 0);
@@ -131,23 +131,23 @@ fn replicate_pad1d(g: &Ctx, x: Tensor, left: i64, right: i64) -> Tensor {
 
 /// One filter for every channel: channels become the batch of a 1-channel conv; x: [T, C, 1], filter: [K, 1, 1].
 fn filter_conv1d(g: &Ctx, filter: Tensor, x: Tensor, stride: i32, pad: i32) -> Tensor {
-    let [t, c, ..] = ffi::shape(x);
+    let [t, c, ..] = x.shape();
     let xb = g.reshape_3d(x, t, 1, c);
     let y = g.conv_1d(filter, xb, stride, pad, 1); // [T', 1, C]
-    g.reshape_3d(y, ffi::shape(y)[0], c, 1)
+    g.reshape_3d(y, y.shape()[0], c, 1)
 }
 
 /// Zero insertion: [T, C] -> [(T-1)*ratio+1, C].
 /// Concat rather than pad: the CUDA pad kernel maps ne1 to gridDim.y (max 65535).
 fn zero_stuff(g: &Ctx, x: Tensor, ratio: i64) -> Tensor {
-    let [t, c, ..] = ffi::shape(x);
+    let [t, c, ..] = x.shape();
     let mut v = g.reshape_3d(g.cont(x), 1, t, c);
     let zeros = g.scale(v, 0.0);
     for _ in 1..ratio {
         v = g.concat(v, zeros, 0);
     }
     v = g.reshape_3d(v, ratio * t, c, 1);
-    let nb = ffi::strides(v);
+    let nb = v.strides();
     g.cont(g.view_3d(v, (t - 1) * ratio + 1, c, 1, nb[1], nb[2], 0))
 }
 
@@ -161,12 +161,12 @@ fn aa_upsample(
     pad_left: i64,
     pad_right: i64,
 ) -> Tensor {
-    let k = ffi::shape(filter)[0] as i32;
+    let k = filter.shape()[0] as i32;
     x = replicate_pad1d(g, x, pad, pad);
     x = zero_stuff(g, x, ratio);
     let y = g.scale(filter_conv1d(g, filter, x, 1, k - 1), ratio as f32);
-    let [t, c, ..] = ffi::shape(y);
-    let nb = ffi::strides(y);
+    let [t, c, ..] = y.shape();
+    let nb = y.strides();
     g.cont(g.view_3d(
         y,
         t - pad_left - pad_right,
@@ -180,7 +180,7 @@ fn aa_upsample(
 
 /// BigVGAN DownSample1d: replicate pad then strided lowpass.
 fn aa_downsample(g: &Ctx, filter: Tensor, x: Tensor, ratio: i32) -> Tensor {
-    let k = ffi::shape(filter)[0];
+    let k = filter.shape()[0];
     let x = replicate_pad1d(g, x, k / 2 - 1, k / 2);
     filter_conv1d(g, filter, x, ratio, 0)
 }
@@ -189,8 +189,8 @@ fn aa_downsample(g: &Ctx, filter: Tensor, x: Tensor, ratio: i32) -> Tensor {
 fn snake_beta(g: &Ctx, w: &Weights, prefix: &str, x: Tensor) -> Result<Tensor> {
     let a = w.get(&format!("{prefix}.alpha"))?;
     let ib = w.get(&format!("{prefix}.beta"))?;
-    let s = g.sin(g.mul(x, g.reshape_3d(a, 1, ffi::shape(a)[0], 1)));
-    let s = g.mul(g.sqr(s), g.reshape_3d(ib, 1, ffi::shape(ib)[0], 1));
+    let s = g.sin(g.mul(x, g.reshape_3d(a, 1, a.shape()[0], 1)));
+    let s = g.mul(g.sqr(s), g.reshape_3d(ib, 1, ib.shape()[0], 1));
     Ok(g.add(x, s))
 }
 
@@ -198,7 +198,7 @@ fn snake_beta(g: &Ctx, w: &Weights, prefix: &str, x: Tensor) -> Result<Tensor> {
 fn activation1d(g: &Ctx, w: &Weights, prefix: &str, mut x: Tensor) -> Result<Tensor> {
     let up = w.get(&format!("{prefix}.upsample.filter"))?;
     let down = w.get(&format!("{prefix}.downsample.lowpass.filter"))?;
-    let k = ffi::shape(up)[0];
+    let k = up.shape()[0];
     let ratio = 2;
     let pad = k / ratio - 1;
     let pad_left = pad * ratio + (k - ratio) / 2;
@@ -287,9 +287,9 @@ fn mel_stft(g: &Ctx, w: &Weights, mut x: Tensor, n_fft: i32, hop: i32) -> Result
     let melb = w.get("vocoder.mel_stft.mel_basis")?; // [n_freqs, n_mels]
     x = g.pad_ext(x, n_fft - hop, 0, 0, 0, 0, 0, 0, 0);
     let spec = g.conv_1d(basis, x, hop, 0, 1); // [frames, 2 * n_freqs, 1]
-    let [f, n2, ..] = ffi::shape(spec);
+    let [f, n2, ..] = spec.shape();
     let nf = n2 / 2;
-    let nb = ffi::strides(spec);
+    let nb = spec.strides();
     let re = g.view_2d(spec, f, nf, nb[1], 0);
     let im = g.view_2d(spec, f, nf, nb[1], nf as usize * nb[1]);
     let mag = g.sqrt(g.add(g.sqr(g.cont(re)), g.sqr(g.cont(im)))); // [F, nf]
@@ -297,7 +297,7 @@ fn mel_stft(g: &Ctx, w: &Weights, mut x: Tensor, n_fft: i32, hop: i32) -> Result
     let mel = g.mul_mat(melb, mag); // [n_mels, F]
     let mel = g.log(g.clamp(mel, 1e-5, f32::INFINITY));
     let mel = g.cont(g.transpose(mel)); // [F, n_mels]
-    let s = ffi::shape(mel);
+    let s = mel.shape();
     Ok(g.reshape_3d(mel, s[0], s[1], 1))
 }
 
@@ -358,17 +358,17 @@ pub fn decode(model: &Model, be: &Backend, lat: &AudioLatent) -> Result<(i32, i3
     // vae decoder: -> [64, T_mel, 2, 1]
     let mut mel = avae_decode(ctx, w, zt, 3, 2)?;
     let t_mel = t * hp.audio_latent_downsample - (hp.audio_latent_downsample - 1);
-    let ms = ffi::shape(mel);
+    let ms = mel.shape();
     if ms[1] < t_mel || ms[0] * ms[2] != 128 {
         bail!("unexpected mel shape [{}, {}, {}]", ms[0], ms[1], ms[2]);
     }
     if ms[1] != t_mel {
-        let nb = ffi::strides(mel);
+        let nb = mel.strides();
         mel = ctx.cont(ctx.view_4d(mel, ms[0], t_mel, ms[2], 1, nb[1], nb[2], nb[3], 0));
     }
     // stereo mels stacked along channels: [T_mel, 128, 1]
     let vin = ctx.cont(ctx.permute(mel, 1, 0, 2, 3)); // [T_mel, 64, 2]
-    let vs = ffi::shape(vin);
+    let vs = vin.shape();
     let vin = ctx.reshape_3d(vin, vs[0], vs[1] * vs[2], 1);
 
     // vocoder to 16 kHz stereo: [T16, 2, 1]
@@ -379,15 +379,15 @@ pub fn decode(model: &Model, be: &Backend, lat: &AudioLatent) -> Result<(i32, i3
     if w.has("vocoder.bwe_generator.conv_pre.weight") {
         let (in_rate, out_rate_bwe, hop, n_fft) = (16000i64, 48000i32, 80i64, 512i32);
         let ratio = out_rate_bwe as i64 / in_rate;
-        let t_low = ffi::shape(x16)[0];
+        let t_low = x16.shape()[0];
         let t_out = t_low * ratio;
         let mut xpad = x16;
         if t_low % hop != 0 {
             xpad = ctx.pad(x16, (hop - t_low % hop) as i32, 0, 0, 0);
         }
         // mel of each low rate channel, stacked along channels: [frames, 128, 1]
-        let ps = ffi::shape(xpad);
-        let pnb = ffi::strides(xpad);
+        let ps = xpad.shape();
+        let pnb = xpad.strides();
         let mut m: Option<Tensor> = None;
         for ch in 0..ps[1] {
             let xc = ctx.view_3d(xpad, ps[0], 1, 1, pnb[1], pnb[2], ch as usize * pnb[1]);
@@ -406,12 +406,12 @@ pub fn decode(model: &Model, be: &Backend, lat: &AudioLatent) -> Result<(i32, i3
             false,
         )?; // [frames * 480, 2]
         let skip = aa_upsample(ctx, hfilt, xpad, ratio, pad, pad_left, pad_right);
-        if ffi::shape(skip)[0] != ffi::shape(residual)[0] {
+        if skip.shape()[0] != residual.shape()[0] {
             bail!("bandwidth extension length mismatch");
         }
         out = ctx.clamp(ctx.add(residual, skip), -1.0, 1.0);
-        let os = ffi::shape(out);
-        let onb = ffi::strides(out);
+        let os = out.shape();
+        let onb = out.strides();
         out = ctx.cont(ctx.view_3d(out, t_out, os[1], 1, onb[1], onb[2], 0));
         out_rate = out_rate_bwe;
     }
@@ -419,7 +419,7 @@ pub fn decode(model: &Model, be: &Backend, lat: &AudioLatent) -> Result<(i32, i3
     g.mark_output(out);
     g.compute(be)?;
     let y = g.output_f32(out);
-    let [n, nch, ..] = ffi::shape(out);
+    let [n, nch, ..] = out.shape();
     let mut pcm = vec![0f32; (n * nch) as usize];
     for ti in 0..n as usize {
         for ci in 0..nch as usize {

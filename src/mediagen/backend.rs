@@ -143,7 +143,7 @@ impl Backend {
         };
         let k = ctx.new_tensor(ffi::ty::F16, &[3, 3, 8, 8]);
         let x = ctx.new_tensor(ffi::ty::F32, &[16, 16, 8, 2]);
-        let y = unsafe { conv(ctx.raw, k, x, 1, 1, 1, 1, 1, 1) };
+        let y = unsafe { conv(ctx.raw, k.as_ptr(), x.as_ptr(), 1, 1, 1, 1, 1, 1) };
         unsafe { supports(self.gpu, y) }
     }
 
@@ -238,9 +238,9 @@ unsafe extern "C" fn abort_requested(data: *mut std::ffi::c_void) -> bool {
 
 /// Copies an F32 tensor out of its backend buffer.
 fn read_f32(api: &Api, t: Tensor) -> Vec<f32> {
-    let n = unsafe { (api.ggml_nelements)(t) } as usize;
+    let n = unsafe { (api.ggml_nelements)(t.as_ptr()) } as usize;
     let mut out = vec![0f32; n];
-    unsafe { (api.ggml_backend_tensor_get)(t, out.as_mut_ptr() as *mut _, 0, n * 4) };
+    unsafe { (api.ggml_backend_tensor_get)(t.as_ptr(), out.as_mut_ptr() as *mut _, 0, n * 4) };
     out
 }
 
@@ -281,11 +281,14 @@ impl Drop for Ctx {
     }
 }
 
+// `.into()` turns a `Tensor` handle into the raw pointer the FFI takes;
+// scalar arguments go through the identity conversion, so keep each
+// entry's scalar types equal to the `api!` signature.
 macro_rules! ops {
     ($($name:ident => $sym:ident($($arg:ident: $ty:ty),*);)*) => {
         impl Ctx {
             $(pub fn $name(&self, $($arg: $ty),*) -> Tensor {
-                unsafe { (self.api.$sym)(self.raw, $($arg),*) }
+                unsafe { Tensor::from_raw((self.api.$sym)(self.raw, $($arg.into()),*)) }
             })*
         }
     };
@@ -333,8 +336,55 @@ ops! {
     ssm_conv => ggml_ssm_conv(sx: Tensor, c: Tensor);
     interpolate => ggml_interpolate(a: Tensor, ne0: i64, ne1: i64, ne2: i64, ne3: i64, mode: u32);
     timestep_embedding => ggml_timestep_embedding(t: Tensor, dim: c_int, max_period: c_int);
-    flash_attn_ext => ggml_flash_attn_ext(q: Tensor, k: Tensor, v: Tensor, mask: Tensor, scale: f32, max_bias: f32, logit_softcap: f32);
-    soft_max_ext => ggml_soft_max_ext(a: Tensor, mask: Tensor, scale: f32, max_bias: f32);
+}
+
+/// `None` is ggml's null, the "no tensor" argument of an optional input.
+fn opt_ptr(t: Option<Tensor>) -> ffi::TensorPtr {
+    t.map_or(ptr::null_mut(), Tensor::as_ptr)
+}
+
+impl Ctx {
+    pub fn flash_attn_ext(
+        &self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        mask: Option<Tensor>,
+        scale: f32,
+        max_bias: f32,
+        logit_softcap: f32,
+    ) -> Tensor {
+        unsafe {
+            Tensor::from_raw((self.api.ggml_flash_attn_ext)(
+                self.raw,
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                opt_ptr(mask),
+                scale,
+                max_bias,
+                logit_softcap,
+            ))
+        }
+    }
+
+    pub fn soft_max_ext(
+        &self,
+        a: Tensor,
+        mask: Option<Tensor>,
+        scale: f32,
+        max_bias: f32,
+    ) -> Tensor {
+        unsafe {
+            Tensor::from_raw((self.api.ggml_soft_max_ext)(
+                self.raw,
+                a.as_ptr(),
+                opt_ptr(mask),
+                scale,
+                max_bias,
+            ))
+        }
+    }
 }
 
 impl Ctx {
@@ -353,12 +403,19 @@ impl Ctx {
     }
 
     pub fn new_tensor(&self, ty: u32, ne: &[i64]) -> Tensor {
-        unsafe { (self.api.ggml_new_tensor)(self.raw, ty, ne.len() as c_int, ne.as_ptr()) }
+        unsafe {
+            Tensor::from_raw((self.api.ggml_new_tensor)(
+                self.raw,
+                ty,
+                ne.len() as c_int,
+                ne.as_ptr(),
+            ))
+        }
     }
 
     pub fn set_name(&self, t: Tensor, name: &str) {
         let name = CString::new(name).unwrap_or_default();
-        unsafe { (self.api.ggml_set_name)(t, name.as_ptr()) };
+        unsafe { (self.api.ggml_set_name)(t.as_ptr(), name.as_ptr()) };
     }
 
     /// x * (1 + scale) + shift; not `x * scale + x`, which Metal's
@@ -385,7 +442,7 @@ impl Ctx {
     /// checks for the symbol before it builds a graph.
     pub fn prec_f32(&self, t: Tensor) -> Tensor {
         if let Some(set_acc) = self.api.ggml_prec_set_acc {
-            unsafe { set_acc(t, ffi::GGML_PREC_F32) };
+            unsafe { set_acc(t.as_ptr(), ffi::GGML_PREC_F32) };
         }
         t
     }
@@ -394,7 +451,15 @@ impl Ctx {
     /// writes the rows of `b` into `a` at the row indices `c`.
     pub fn set_rows(&self, a: Tensor, b: Tensor, c: Tensor) -> Option<Tensor> {
         let f = self.api.ggml_set_rows?;
-        Some(unsafe { f(self.raw, a, b, c) })
+        Some(unsafe { Tensor::from_raw(f(self.raw, a.as_ptr(), b.as_ptr(), c.as_ptr())) })
+    }
+
+    /// `ggml_conv_2d_direct` when this release has the symbol, else None;
+    /// the kernel `k` over `x` with stride `s` and padding `pad` on both
+    /// axes.
+    pub fn conv_2d_direct(&self, k: Tensor, x: Tensor, s: i32, pad: i32) -> Option<Tensor> {
+        let f = self.api.ggml_conv_2d_direct?;
+        Some(unsafe { Tensor::from_raw(f(self.raw, k.as_ptr(), x.as_ptr(), s, s, pad, pad, 1, 1)) })
     }
 }
 
@@ -480,8 +545,11 @@ impl Graph {
     fn input(&mut self, ty: u32, ne: &[i64], bytes: Vec<u8>, name: &str) -> Tensor {
         let t = self.ctx.new_tensor(ty, ne);
         self.ctx.set_name(t, name);
-        unsafe { (self.ctx.api.ggml_set_input)(t) };
-        debug_assert_eq!(unsafe { (self.ctx.api.ggml_nbytes)(t) }, bytes.len());
+        unsafe { (self.ctx.api.ggml_set_input)(t.as_ptr()) };
+        debug_assert_eq!(
+            unsafe { (self.ctx.api.ggml_nbytes)(t.as_ptr()) },
+            bytes.len()
+        );
         self.inputs.push((t, bytes));
         t
     }
@@ -524,13 +592,19 @@ impl Graph {
 
     /// Copies `src` into the [`Resident`] tensor `dst` when the graph runs.
     pub fn store(&self, src: Tensor, dst: Tensor) {
-        self.mark_output(unsafe { (self.ctx.api.ggml_cpy)(self.ctx.raw, src, dst) });
+        self.mark_output(unsafe {
+            Tensor::from_raw((self.ctx.api.ggml_cpy)(
+                self.ctx.raw,
+                src.as_ptr(),
+                dst.as_ptr(),
+            ))
+        });
     }
 
     pub fn mark_output(&self, t: Tensor) {
         unsafe {
-            (self.ctx.api.ggml_set_output)(t);
-            (self.ctx.api.ggml_build_forward_expand)(self.gf, t);
+            (self.ctx.api.ggml_set_output)(t.as_ptr());
+            (self.ctx.api.ggml_build_forward_expand)(self.gf, t.as_ptr());
         }
     }
 
@@ -567,7 +641,12 @@ impl Graph {
                 ));
             }
             for (t, bytes) in &self.inputs {
-                (api.ggml_backend_tensor_set)(*t, bytes.as_ptr() as *const _, 0, bytes.len());
+                (api.ggml_backend_tensor_set)(
+                    t.as_ptr(),
+                    bytes.as_ptr() as *const _,
+                    0,
+                    bytes.len(),
+                );
             }
             let status = (api.ggml_backend_sched_graph_compute)(be.sched, self.gf);
             if status == ffi::GGML_STATUS_ABORTED {
