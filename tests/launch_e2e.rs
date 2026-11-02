@@ -3150,6 +3150,59 @@ fn mediagen_backend_abort_flag_cancels_compute() {
     assert_eq!(be.read_f32(sum), vec![11.0, 22.0, 33.0, 44.0]);
 }
 
+/// A graph built once recomputes on new data: [`Graph::update_input`]
+/// overwrites a registered input in place and
+/// [`Graph::output_f32`] reads the new result.
+#[test]
+fn mediagen_graph_recomputes_on_updated_inputs() {
+    use llmman::mediagen::backend::{Backend, Graph};
+    use llmman::mediagen::ffi::Api;
+
+    let Some(dir) = llama_libs_on_path() else {
+        return;
+    };
+    // ggml registers backend modules without a lock; see the canary tests.
+    let _guard = lock_serial();
+    let api: &'static Api = Box::leak(Box::new(Api::load(&dir).unwrap()));
+    let be = Backend::new(api, false, 1, 64).unwrap();
+    assert!(!be.cancelled());
+
+    let mut g = Graph::new(api, 64).unwrap();
+    let a = g.input_f32(&[4], &[1.0, 2.0, 3.0, 4.0], "a");
+    let b = g.input_f32(&[4], &[10.0, 20.0, 30.0, 40.0], "b");
+    let sum = g.ctx.add(a, b);
+    g.mark_output(sum);
+    g.compute(&be).unwrap();
+    assert_eq!(g.output_f32(sum), vec![11.0, 22.0, 33.0, 44.0]);
+
+    g.update_input_f32(b, &[100.0, 200.0, 300.0, 400.0]);
+    g.compute(&be).unwrap();
+    let out = g.output_f32(sum);
+    assert_eq!(out, vec![101.0, 202.0, 303.0, 404.0]);
+
+    let bytes: Vec<u8> = [5.0f32, 6.0, 7.0, 8.0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    g.update_input(a, &bytes);
+    g.compute(&be).unwrap();
+    let out = g.output_f32(sum);
+    assert_eq!(out, vec![105.0, 206.0, 307.0, 408.0]);
+
+    // An I32 input drives `get_rows`, as the decoder's token and position
+    // ids do each step.
+    let mut g = Graph::new(api, 64).unwrap();
+    let table = g.input_f32(&[1, 4], &[1.0, 2.0, 3.0, 4.0], "table");
+    let ids = g.input_i32(&[2], &[0, 3], "ids");
+    let rows = g.ctx.get_rows(table, ids);
+    g.mark_output(rows);
+    g.compute(&be).unwrap();
+    assert_eq!(g.output_f32(rows), vec![1.0, 4.0]);
+    g.update_input_i32(ids, &[1, 2]);
+    g.compute(&be).unwrap();
+    assert_eq!(g.output_f32(rows), vec![2.0, 3.0]);
+}
+
 /// A GGUF metadata value on one line: strings bare, arrays joined,
 /// numbers with their type.
 fn gguf_value_text(v: &llmman::gguf::Value) -> String {
@@ -3526,7 +3579,8 @@ struct StageDiff {
 
 /// Compares `ours`, frame-major `[rows, cols]`, with the rows from
 /// `ref_row0` on of `<ref_dir>/<name>.f32` (raw LE f32, row-major, shape
-/// and statistics in `<name>.json`) and prints the numbers next to the
+/// and statistics in `<name>.json`; a one-dimensional `[n]` sidecar is
+/// the single row `[1, n]`) and prints the numbers next to the
 /// sidecar's rms and p99_abs.
 fn compare_stage(
     name: &str,
@@ -3544,7 +3598,11 @@ fn compare_stage(
         .iter()
         .map(|v| v.as_u64().unwrap() as usize)
         .collect();
-    let (ref_rows, cols) = (shape[0], shape[1]);
+    let (ref_rows, cols) = match shape[..] {
+        [n] => (1, n),
+        [rows, cols] => (rows, cols),
+        _ => panic!("{name}: sidecar shape {shape:?} is not 1-D or 2-D"),
+    };
     let bytes = std::fs::read(ref_dir.join(format!("{name}.f32"))).unwrap();
     let (words, rest) = bytes.as_chunks::<4>();
     assert!(rest.is_empty(), "{name}: dump size is not a multiple of 4");
@@ -3790,6 +3848,281 @@ fn speech_encoder_matches_the_reference() {
                 "F16 {}: max|diff| {:e} (bound {:e}), rel rms {:e} (bound {:e}), rms {:e}, p99 {:e}",
                 s.name, d.max, s.f16_max, d.rel_rms, F16_REL_RMS, d.rms, d.p99
             ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// `rms(diff) / rms(reference)` bounds for the decoder prefill points:
+/// the embedding and the nine sublayer outputs. F16 weights round inside
+/// the CPU `mul_mat` as in the encoder; Q8_0 adds quantization noise
+/// over nine matmuls per layer.
+const DEC_F16_REL_RMS: f64 = 5e-3;
+const DEC_Q8_REL_RMS: f64 = 1e-1;
+/// max|diff| bounds on `dec.lm_head.logits.0`: 1.5x the values measured on
+/// 2026-10-31 (8.9e-3 F16, 0.25 Q8_0).
+const DEC_F16_LOGIT_MAX: f64 = 1.3e-2;
+const DEC_Q8_LOGIT_MAX: f64 = 0.37;
+
+/// One decoder run on `file` against the dump: every prefill point whose
+/// sidecar exists is compared and printed, the rest skipped with a line,
+/// then the greedy transcript.
+struct DecoderRun {
+    label: &'static str,
+    /// `dec.prompt_ids` equal to ours, when the dump has them.
+    prompt_ids_match: Option<bool>,
+    /// The host argmax of the last prompt position.
+    next: i32,
+    /// `(name, diff)` for the embedding and the nine sublayer outputs
+    /// that are in the dump.
+    diffs: Vec<(String, StageDiff)>,
+    /// The greedy token ids and their text from `transcribe`.
+    ids: Vec<i32>,
+    text: String,
+}
+
+/// Loads `file`, runs the mel through the encoder and the prompt through
+/// [`Session::prefill`] with the embedding and the nine layer probes,
+/// compares every dump point that exists, then runs `transcribe` and
+/// prints its ids, text and timing; the model is dropped on return.
+fn decoder_prefill_run(
+    label: &'static str,
+    file: &Path,
+    be: &llmman::mediagen::backend::Backend,
+    mel: &[f32],
+    ref_dir: &Path,
+) -> DecoderRun {
+    use llmman::speech::decoder::{transcribe, Decoder, Probe, Session};
+    use llmman::speech::encoder::Encoder;
+
+    let present = |name: &str| {
+        let found = ref_dir.join(format!("{name}.json")).is_file();
+        if !found {
+            eprintln!("  skipping {name}: not in the reference dir");
+        }
+        found
+    };
+
+    eprintln!("== {}", file.display());
+    let started = Instant::now();
+    let model = llmman::speech::model::load(file, be).unwrap();
+    let enc = Encoder::new(&model, be).unwrap();
+    let dec = Decoder::new(&model).unwrap();
+    eprintln!("  loaded in {:.2?}", started.elapsed());
+    let started = Instant::now();
+    let run = enc.run(&model, be, mel, &[]).unwrap();
+    eprintln!(
+        "  encoder: {} frames in {:.2?}",
+        run.frames,
+        started.elapsed()
+    );
+    let ids = llmman::speech::prompt::build(&model.hp, &model.vocab, "en", true).unwrap();
+    eprintln!("  prompt ids: {ids:?}");
+    let prompt_ids_match = present("dec.prompt_ids").then(|| {
+        let bytes = std::fs::read(ref_dir.join("dec.prompt_ids.f32")).unwrap();
+        let theirs: Vec<i32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c) as i32)
+            .collect();
+        eprintln!("  dec.prompt_ids: dump {theirs:?}");
+        theirs == ids
+    });
+
+    let started = Instant::now();
+    let mut session = Session::new(&dec, &model, be, &run.out, run.frames, 1024).unwrap();
+    eprintln!(
+        "  cross KV for {} frames in {:.2?}",
+        run.frames,
+        started.elapsed()
+    );
+    let layers = [0usize, 3, 7];
+    let mut probes = vec![Probe::EmbedIn];
+    for l in layers {
+        probes.extend([Probe::SelfAttn(l), Probe::CrossAttn(l), Probe::Ffn(l)]);
+    }
+    let started = Instant::now();
+    let prefill = session.prefill(&ids, &probes).unwrap();
+    eprintln!(
+        "  prefill: {} tokens in {:.2?}, next token {}",
+        ids.len(),
+        started.elapsed(),
+        prefill.next
+    );
+    assert_eq!(session.n_past(), ids.len());
+
+    let mut names = vec!["dec.embed.in".to_string()];
+    for l in layers {
+        for sub in ["self_attn", "cross_attn", "ffn"] {
+            names.push(format!("dec.layer.{l}.{sub}.out"));
+        }
+    }
+    let mut diffs: Vec<(String, StageDiff)> = names
+        .into_iter()
+        .zip(&prefill.probes)
+        .filter(|(name, _)| present(name))
+        .map(|(name, ours)| {
+            let diff = compare_stage(&name, ours, ids.len(), 0, ref_dir);
+            (name, diff)
+        })
+        .collect();
+    if present("dec.lm_head.logits.0") {
+        let d = compare_stage("dec.lm_head.logits.0", &prefill.logits, 1, 0, ref_dir);
+        eprintln!(
+            "  {label} dec.lm_head.logits.0: max|diff| {:e}, top-1 {}",
+            d.max, prefill.next
+        );
+        diffs.push(("dec.lm_head.logits.0".to_string(), d));
+    }
+    // the buffers go before the backend they live on
+    drop(session);
+
+    let started = Instant::now();
+    let tr = transcribe(&dec, &model, be, &run.out, run.frames, "en", true).unwrap();
+    eprintln!(
+        "  transcribe: {} ids in {} steps, {:.2?} total, prefill {:.2?}, {:.2?} per step",
+        tr.ids.len(),
+        tr.n_steps,
+        started.elapsed(),
+        tr.prefill,
+        tr.steps.checked_div(tr.n_steps as u32).unwrap_or_default()
+    );
+    eprintln!("  {label} ids: {:?}", tr.ids);
+    eprintln!("  {label} text: {:?}", tr.text);
+    drop(model);
+    DecoderRun {
+        label,
+        prompt_ids_match,
+        next: prefill.next,
+        diffs,
+        ids: tr.ids,
+        text: tr.text,
+    }
+}
+
+/// The decoder prefill against the NeMo dump of the fixture: the mel
+/// front end and the encoder on `fleurs-en.wav`, the canary2 prompt,
+/// then one prefill graph over the ten prompt tokens from the Q8_0 and
+/// the F16 file on the CPU backend. `dec.prompt_ids` must match exactly,
+/// the argmax of the last position must be `tokens[0]` of
+/// `transcript.json`, and `dec.embed.in` plus the nine
+/// `dec.layer.{0,3,7}.{self_attn,cross_attn,ffn}.out` sublayer outputs
+/// (captured before their residual add) are held to the relative rms
+/// bounds; `dec.lm_head.logits.0` is printed. A point whose sidecar is
+/// absent is skipped with a line. Then `transcribe` runs the greedy loop
+/// on each file: its ids must equal `tokens` and its text `text` of
+/// `transcript.json`; the per-step time and the peak RSS are printed.
+/// Every number of both files prints before any bound fails. Run with
+/// `cargo test --release --test launch_e2e speech_decoder -- --ignored
+/// --nocapture`.
+#[test]
+#[ignore]
+fn speech_decoder_matches_the_reference() {
+    use llmman::mediagen::backend::Backend;
+    use llmman::mediagen::ffi::Api;
+
+    // Same registry race as the canary tests above.
+    let _guard = lock_serial();
+
+    let env_dir = |key: &str| {
+        std::env::var_os(key)
+            .map(PathBuf::from)
+            .filter(|d| !d.as_os_str().is_empty())
+    };
+    let Some(gguf_dir) = env_dir("LLMMAN_CANARY_GGUF_DIR") else {
+        eprintln!("skipping: LLMMAN_CANARY_GGUF_DIR is not set");
+        return;
+    };
+    let Some(ref_dir) = env_dir("LLMMAN_CANARY_REF_DIR") else {
+        eprintln!("skipping: LLMMAN_CANARY_REF_DIR is not set");
+        return;
+    };
+    let Some(lib_dir) = llama_libs_on_path() else {
+        return;
+    };
+
+    let transcript: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ref_dir.join("transcript.json")).unwrap()).unwrap();
+    let tokens: Vec<i32> = transcript["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_i64().unwrap() as i32)
+        .collect();
+    let text = transcript["text"].as_str().unwrap();
+    let token0 = tokens[0];
+    eprintln!(
+        "== transcript.json: {} tokens, first {token0}",
+        tokens.len()
+    );
+    eprintln!("== transcript.json: text {text:?}");
+
+    let wav = std::fs::read(ref_dir.join("fleurs-en.wav")).unwrap();
+    let pcm = llmman::speech::wav::parse(&wav, 64 << 20).unwrap();
+    let cfg = llmman::speech::mel::MelConfig::default();
+    let mel = llmman::speech::mel::features(&pcm, &cfg).unwrap();
+    assert_eq!(mel.len() / cfg.n_mels, 1056);
+
+    let api: &'static Api = Box::leak(Box::new(Api::load(&lib_dir).unwrap()));
+    let n_threads = std::thread::available_parallelism().map_or(4, |n| n.get() as i32);
+    let be = Backend::new(api, false, n_threads, 8192).unwrap();
+
+    let q8 = decoder_prefill_run(
+        "Q8_0",
+        &gguf_dir.join("canary-1b-v2-Q8_0.gguf"),
+        &be,
+        &mel,
+        &ref_dir,
+    );
+    eprintln!("  peak RSS after the Q8_0 pass: {}", peak_rss());
+    let f16 = decoder_prefill_run(
+        "F16",
+        &gguf_dir.join("canary-1b-v2-F16.gguf"),
+        &be,
+        &mel,
+        &ref_dir,
+    );
+    eprintln!("  peak RSS after the F16 pass: {}", peak_rss());
+
+    let mut failures = Vec::new();
+    for (run, bound, logit_max) in [
+        (&q8, DEC_Q8_REL_RMS, DEC_Q8_LOGIT_MAX),
+        (&f16, DEC_F16_REL_RMS, DEC_F16_LOGIT_MAX),
+    ] {
+        if run.prompt_ids_match == Some(false) {
+            failures.push(format!("{} dec.prompt_ids differ from the dump", run.label));
+        }
+        if run.next != token0 {
+            failures.push(format!(
+                "{} first token {} (transcript.json has {token0})",
+                run.label, run.next
+            ));
+        }
+        if run.ids != tokens {
+            failures.push(format!(
+                "{} ids {:?} (transcript.json has {tokens:?})",
+                run.label, run.ids
+            ));
+        }
+        if run.text != text {
+            failures.push(format!(
+                "{} text {:?} (transcript.json has {text:?})",
+                run.label, run.text
+            ));
+        }
+        for (name, d) in &run.diffs {
+            let max_bound = if name == "dec.lm_head.logits.0" {
+                logit_max
+            } else {
+                f64::INFINITY
+            };
+            if d.rel_rms > bound || d.max > max_bound {
+                failures.push(format!(
+                    "{} {name}: rel rms {:e} (bound {bound:e}), max|diff| {:e} (bound {max_bound:e}), rms {:e}, p99 {:e}",
+                    run.label, d.rel_rms, d.max, d.rms, d.p99
+                ));
+            }
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

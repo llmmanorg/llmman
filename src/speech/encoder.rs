@@ -161,7 +161,7 @@ impl Encoder {
         let t_enc = subsampled_len(frames);
         let pre = &model.tensors.pre_encode;
 
-        let mut gr = Graph::new(be.api, 1024 + model.tensors.enc_blocks.len() * 128)?;
+        let mut gr = Graph::new(be.api, graph_nodes(model.tensors.enc_blocks.len()))?;
         let x = gr.input_f32(&[self.n_mels as i64, frames as i64, 1, 1], mel, "mel");
         let pos = gr.input_f32(
             &[self.d_model as i64, 2 * t_enc as i64 - 1],
@@ -259,8 +259,9 @@ impl Encoder {
     }
 }
 
-/// `nn.LayerNorm` over `d_model`: `norm(x) * w + b` on `[d_model, t]`.
-fn layer_norm(g: &Ctx, x: Tensor, w: Tensor, b: Tensor) -> Tensor {
+/// `nn.LayerNorm` over `d_model`: `norm(x) * w + b` on `[d_model, t]`;
+/// the decoder's norms share it.
+pub(super) fn layer_norm(g: &Ctx, x: Tensor, w: Tensor, b: Tensor) -> Tensor {
     g.add(g.mul(g.norm(x, LN_EPS), w), b)
 }
 
@@ -392,6 +393,13 @@ pub fn subsampled_len(frames: usize) -> usize {
     (0..3).fold(frames, |len, _| {
         (len + 2).checked_sub(3).map_or(0, |n| n / 2 + 1)
     })
+}
+
+/// Graph nodes the encoder over `n_blocks` blocks needs, with room to
+/// spare; the scheduler of the `Backend` must be sized at least this
+/// large (see `Backend::new`).
+pub fn graph_nodes(n_blocks: usize) -> usize {
+    1024 + n_blocks * 128
 }
 
 /// NeMo `RelPositionalEncoding` table for `t_enc` encoder frames, row

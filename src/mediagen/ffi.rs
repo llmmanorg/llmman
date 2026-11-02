@@ -318,6 +318,7 @@ api! {
     fn ggml_backend_alloc_ctx_tensors_from_buft(ctx: *mut GgmlContext, buft: GgmlBackendBuft) -> GgmlBackendBuffer;
     fn ggml_backend_buffer_set_usage(buf: GgmlBackendBuffer, usage: c_int);
     fn ggml_backend_buffer_free(buf: GgmlBackendBuffer);
+    fn ggml_backend_buffer_clear(buf: GgmlBackendBuffer, value: u8);
     fn ggml_backend_buffer_get_size(buf: GgmlBackendBuffer) -> usize;
     fn ggml_backend_tensor_set(t: Tensor, data: *const c_void, offset: usize, size: usize);
     fn ggml_backend_tensor_get(t: *const GgmlTensor, data: *mut c_void, offset: usize, size: usize);
@@ -367,6 +368,8 @@ api! {
     fn ggml_commit() -> *const c_char;
     // F32 accumulation hint for mul_mat / flash attention, only the speech encoder needs it
     fn ggml_prec_set_acc(a: Tensor, prec: c_int) -> bool;
+    // row writes into a KV cache, only the speech decoder needs it
+    fn ggml_set_rows(ctx: *mut GgmlContext, a: Tensor, b: Tensor, c: Tensor) -> Tensor;
 }
 
 fn lookup<T: Copy>(libs: &[Library], name: &str) -> Result<T> {
