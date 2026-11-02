@@ -123,6 +123,10 @@ pub(super) async fn handle_openai_models(
                         if m["status"]["value"] == "loaded"
                             && have["status"]["value"] != "loaded" =>
                     {
+                        // A local `n_ctx` is this daemon's prediction, not the peer's load.
+                        if let Some(meta) = have["meta"].as_object_mut() {
+                            meta.remove("n_ctx");
+                        }
                         for key in ["status", "meta", "architecture"] {
                             if let Some(value) = m.get(key) {
                                 have[key] = value.clone();

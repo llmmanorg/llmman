@@ -7806,8 +7806,9 @@ async fn a_model_loaded_by_digest_is_found_through_its_tag() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A model loaded only on a peer is listed with the peer's live facts; one
-/// also loaded here keeps its own.
+/// A model loaded only on a peer is listed with the peer's live facts, and
+/// without this daemon's predicted `n_ctx` when the peer reports no `meta`;
+/// one also loaded here keeps its own.
 #[tokio::test]
 async fn v1_models_takes_a_peers_live_facts_for_a_model_loaded_only_there() {
     let peer_row = |name: &str, n_ctx: u64| {
@@ -7818,9 +7819,15 @@ async fn v1_models_takes_a_peers_live_facts_for_a_model_loaded_only_there() {
             "architecture": { "input_modalities": ["text", "image"] },
         })
     };
+    let metaless = serde_json::json!({
+        "id": "docker.io/ai/metaless:latest", "object": "model",
+        "status": { "value": "loaded" },
+    });
     let peer = mock_llama_server(&[(
         "/v1/models",
-        serde_json::json!({ "data": [peer_row("remote", 111), peer_row("local", 222)] }),
+        serde_json::json!({
+            "data": [peer_row("remote", 111), peer_row("local", 222), metaless],
+        }),
     )])
     .await;
     let own = mock_llama_server(&[(
@@ -7830,7 +7837,7 @@ async fn v1_models_takes_a_peers_live_facts_for_a_model_loaded_only_there() {
     .await;
     let dir = fresh_store_dir("peerfacts");
     let store = OciStore::open(&dir).unwrap();
-    for name in ["remote", "local"] {
+    for name in ["remote", "local", "metaless"] {
         store_one_model(&store, name, GGUF_V3, "model.gguf", &gguf_bytes(&[]));
     }
     let mut inner = test_inner(dir.clone());
@@ -7858,6 +7865,9 @@ async fn v1_models_takes_a_peers_live_facts_for_a_model_loaded_only_there() {
         listed(&v, "local")["meta"],
         serde_json::json!({ "n_ctx": 333 })
     );
+    let metaless = listed(&v, "metaless");
+    assert_eq!(metaless["status"]["value"], "loaded");
+    assert_eq!(metaless["meta"], serde_json::json!({ "n_ctx_train": 4096 }));
 }
 
 /// `/api/tags` reports what `/api/show` does for the same model. The GGUF is

@@ -123,7 +123,7 @@ pub(super) struct ModelFacts {
     /// As `/api/show` lists them, minus what only the chat template says
     /// (`tools`, `thinking`).
     capabilities: Vec<String>,
-    /// The GGUF's `general.architecture`, `None` without a header.
+    /// The GGUF's `general.architecture`, if it has one.
     architecture: Option<String>,
 }
 
@@ -140,9 +140,9 @@ impl ModelFacts {
 
     /// The `meta.n_ctx` a llama-server load would report: `ensure_model`'s
     /// starting context and slots, capped at the trained context as
-    /// llama-server caps each slot. `None` for a model llama-server does not
-    /// serve (media, or a GGUF `gguf_engine` sends to ds4-server). Assumes
-    /// [`llama_sets_slot_context`] is false.
+    /// llama-server caps each slot. `None` without a trained context, or for
+    /// a model llama-server does not serve (media, or a GGUF `gguf_engine`
+    /// sends to ds4-server). Assumes [`llama_sets_slot_context`] is false.
     pub(super) fn starting_context_window(
         &self,
         state: &AppState,
@@ -150,7 +150,7 @@ impl ModelFacts {
     ) -> Option<u32> {
         let trained = super::config::trained_ctx(self.context_length)?;
         let has = |c: &str| self.capabilities.iter().any(|have| have == c);
-        // An embedding or decision model has these in place of `completion`.
+        // `embedding` and `decision` replace `completion` in a model's capabilities.
         let embedding = has(crate::modelpack::CAPABILITY_EMBEDDING);
         let decision = has(crate::modelpack::CAPABILITY_DECISION);
         if !(has(crate::modelpack::CAPABILITY_COMPLETION) || embedding || decision) {
@@ -1989,6 +1989,29 @@ mod tests {
             capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
             ..ModelFacts::default()
         }
+    }
+
+    /// ds4-server picks its own window, so a GGUF sent there has none; an
+    /// embedding model always stays on llama-server.
+    #[test]
+    fn a_gguf_sent_to_ds4_has_no_starting_context_window() {
+        let state = test_state();
+        let ds4 = |capability: &str| ModelFacts {
+            context_length: Some(4096),
+            architecture: Some("deepseek41".to_string()),
+            ..facts_with(&[capability])
+        };
+        let text = ds4(crate::modelpack::CAPABILITY_COMPLETION);
+        assert_eq!(text.starting_context_window(&state, GgufEngine::Ds4), None);
+        assert_eq!(
+            text.starting_context_window(&state, GgufEngine::LlamaServer),
+            Some(4096)
+        );
+        let embedding = ds4(crate::modelpack::CAPABILITY_EMBEDDING);
+        assert_eq!(
+            embedding.starting_context_window(&state, GgufEngine::Ds4),
+            Some(4096)
+        );
     }
 
     #[test]
