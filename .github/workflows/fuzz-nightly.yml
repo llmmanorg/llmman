@@ -30,7 +30,7 @@ env:
 jobs:
   fuzz:
     name: Fuzz ${{ matrix.target }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       # One target crashing or timing out must not cancel the other runs;
       # each target's findings are independent.
@@ -38,7 +38,7 @@ jobs:
       matrix:
         target: [parse_registry_ref, validate_reference, resolve_ollama_api]
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # cargo-fuzz's libfuzzer-sys backend needs nightly (sanitizer/coverage
       # instrumentation flags are unstable), unlike every other Rust step in
@@ -81,7 +81,7 @@ jobs:
       # GitHub notification and can triage and add the seed by hand.
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ matrix.target }}-crash-artifacts
           path: fuzz/artifacts/${{ matrix.target }}/
@@ -94,7 +94,7 @@ jobs:
       # above on why this workflow makes no repo writes at all).
       - name: Upload corpus
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ matrix.target }}-corpus
           path: fuzz/corpus/${{ matrix.target }}/
