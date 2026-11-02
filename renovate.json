@@ -144,10 +144,10 @@
       "allowedVersions": "<=19.2.3"
     },
     {
-      "description": "react-native-webview 14.x introduces TypeScript errors in components/terminal/Terminal.tsx; migration not done",
+      "description": "react-native-webview 13.17.0+ introduces TypeScript errors in components/terminal/Terminal.tsx (WebView props resolve to never in both overloads); migration not done",
       "matchManagers": ["npm"],
       "matchPackageNames": ["react-native-webview"],
-      "allowedVersions": "<14.0.0"
+      "allowedVersions": "<=13.16.1"
     },
     {
       "description": "Expo SDK 57 bundledNativeModules pins keyboard-controller at 1.21.9; remove when Expo SDK 58 block is lifted",
