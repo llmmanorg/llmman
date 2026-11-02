@@ -139,6 +139,19 @@ fn parse_env_flag(value: Option<&str>) -> bool {
     )
 }
 
+/// `key` looked up in `env` as a path, an empty value counting as unset.
+/// `env` is injected so a caller's fallback order can be tested without
+/// touching the process environment; `cmd::launch::env_dir` and
+/// `hf::token_path` pass `std::env::var_os`.
+pub(crate) fn env_dir_from(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    key: &str,
+) -> Option<PathBuf> {
+    env(key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 /// The first `name` (`name.exe` on Windows) that is a file in a `PATH`
 /// directory.
 pub fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -156,6 +169,18 @@ pub fn find_on_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_dir_from_treats_unset_and_empty_alike() {
+        let env = |key: &str| match key {
+            "SET" => Some(std::ffi::OsString::from("/d")),
+            "EMPTY" => Some(std::ffi::OsString::new()),
+            _ => None,
+        };
+        assert_eq!(env_dir_from(env, "SET"), Some(PathBuf::from("/d")));
+        assert_eq!(env_dir_from(env, "EMPTY"), None);
+        assert_eq!(env_dir_from(env, "UNSET"), None);
+    }
 
     #[test]
     fn parse_env_path_returns_none_when_unset_or_blank() {

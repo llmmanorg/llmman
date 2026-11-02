@@ -14,13 +14,17 @@
 //! chain for the token file (`HF_TOKEN_PATH`, else `HF_HOME`, else
 //! `XDG_CACHE_HOME`, else `~/.cache`). Differences remain, among them:
 //! llmman does not expand `~`/`$VAR` in these variables, treats an empty
-//! value as unset, and has no staging mode (`HUGGINGFACE_CO_STAGING`). A
+//! value as unset, has no staging mode (`HUGGINGFACE_CO_STAGING`), and
+//! falls back to a pre-#736 token file `huggingface_hub` does not read
+//! (`legacy_token_path()`). A
 //! token saved by either tool is picked up by the other when both resolve
 //! the same file and nothing shadows it in the reading process (here a
 //! nonblank `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`; `huggingface_hub` has
 //! further sources, such as `HF_OIDC_RESOURCE`). Resolution order:
 //! `HF_TOKEN` env var (fallback `HUGGING_FACE_HUB_TOKEN`), then the token
-//! file at `token_path()` (`$HF_HOME/token`, or `$HF_TOKEN_PATH` if set).
+//! file at `token_path()` (`$HF_HOME/token`, or `$HF_TOKEN_PATH` if set),
+//! then, only while that file does not exist, the pre-#736 location
+//! `legacy_token_path()`.
 
 pub mod api;
 pub mod client;
@@ -69,22 +73,16 @@ pub fn endpoint() -> String {
 /// `$HF_HOME`, else `$XDG_CACHE_HOME/huggingface`, else
 /// `~/.cache/huggingface`: the same fallback order as `huggingface_hub`'s
 /// default (which, unlike this, expands `~`/`$VAR` and does not treat an
-/// empty value as unset).
-fn hf_home() -> PathBuf {
-    hf_home_from(|var| std::env::var_os(var), dirs::home_dir())
-}
-
-/// [`hf_home`] with the environment and home directory injected, so the
-/// fallback order can be tested without touching the process
-/// environment. An empty variable counts as unset, like `xdg_dir` in
-/// `cmd::launch`.
+/// empty value as unset). The environment and home directory are
+/// injected, so the fallback order can be tested without touching the
+/// process environment. An empty variable counts as unset
+/// (`crate::env_dir_from`, shared with `cmd::launch`).
 fn hf_home_from(
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
     home: Option<PathBuf>,
 ) -> PathBuf {
-    let dir = |var: &str| env(var).filter(|v| !v.is_empty()).map(PathBuf::from);
-    dir("HF_HOME").unwrap_or_else(|| {
-        dir("XDG_CACHE_HOME")
+    crate::env_dir_from(&env, "HF_HOME").unwrap_or_else(|| {
+        crate::env_dir_from(&env, "XDG_CACHE_HOME")
             .unwrap_or_else(|| home.unwrap_or_else(|| PathBuf::from(".")).join(".cache"))
             .join("huggingface")
     })
@@ -116,9 +114,58 @@ fn parse_max_transfer_streams(value: Option<&str>) -> usize {
 
 /// Path to the active-token file, honoring `HF_TOKEN_PATH`.
 pub fn token_path() -> PathBuf {
-    match std::env::var_os("HF_TOKEN_PATH").filter(|p| !p.is_empty()) {
-        Some(p) => PathBuf::from(p),
-        None => hf_home().join("token"),
+    token_path_from(|var| std::env::var_os(var), dirs::home_dir())
+}
+
+/// [`token_path`] with the environment and home directory injected.
+fn token_path_from(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    match crate::env_dir_from(&env, "HF_TOKEN_PATH") {
+        Some(path) => path,
+        None => hf_home_from(&env, home).join("token"),
+    }
+}
+
+/// Where llmman kept the token file before the default honoured
+/// `XDG_CACHE_HOME` (#736): `~/.cache/huggingface/token`. `Some` only
+/// when that is no longer [`token_path`], i.e. neither `HF_TOKEN_PATH`
+/// nor `HF_HOME` is set (nonempty) and `XDG_CACHE_HOME` moved the
+/// default; [`token`] reads it while the current file does not exist,
+/// so a token saved before the change keeps working, and [`logout`]
+/// removes it too.
+fn legacy_token_path() -> Option<PathBuf> {
+    legacy_token_path_from(|var| std::env::var_os(var), dirs::home_dir())
+}
+
+/// [`legacy_token_path`] with the environment and home directory injected.
+fn legacy_token_path_from(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if crate::env_dir_from(&env, "HF_TOKEN_PATH").is_some()
+        || crate::env_dir_from(&env, "HF_HOME").is_some()
+    {
+        return None;
+    }
+    let legacy = home
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cache")
+        .join("huggingface")
+        .join("token");
+    (legacy != token_path_from(&env, home)).then_some(legacy)
+}
+
+/// The contents of `path`, or, only when `path` does not exist, of
+/// `legacy`. A file that exists but cannot be read is not skipped over.
+fn read_token_file(path: &std::path::Path, legacy: Option<&std::path::Path>) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            legacy.and_then(|legacy| std::fs::read_to_string(legacy).ok())
+        }
+        other => other.ok(),
     }
 }
 
@@ -134,7 +181,7 @@ pub fn token_path() -> PathBuf {
 pub fn token() -> Option<String> {
     resolve_token(
         |var| std::env::var(var).ok(),
-        || std::fs::read_to_string(token_path()).ok(),
+        || read_token_file(&token_path(), legacy_token_path().as_deref()),
     )
 }
 
@@ -228,14 +275,17 @@ pub fn login(token: &str) -> Result<String> {
     Ok(username)
 }
 
-/// Remove the stored active token, if present.
+/// Remove the stored active token, if present, and the pre-#736 one
+/// [`token`] would otherwise fall back to (see [`legacy_token_path`]).
 pub fn logout() -> Result<()> {
-    let path = token_path();
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).context(format!("remove {}", path.display())),
+    for path in std::iter::once(token_path()).chain(legacy_token_path()) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context(format!("remove {}", path.display())),
+        }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +555,66 @@ mod tests {
                 "env {pairs:?}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_token_path_only_when_xdg_cache_home_moved_the_default() {
+        let home = || Some(PathBuf::from("/home/u"));
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |var: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == var)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            }
+        };
+        type Env = &'static [(&'static str, &'static str)];
+        let legacy = Some("/home/u/.cache/huggingface/token");
+        // (environment, expected legacy path)
+        let cases: &[(Env, Option<&str>)] = &[
+            (&[], None),
+            (&[("XDG_CACHE_HOME", "/x")], legacy),
+            (&[("XDG_CACHE_HOME", "/home/u/.cache")], None),
+            (&[("XDG_CACHE_HOME", "")], None),
+            (&[("HF_HOME", "/h"), ("XDG_CACHE_HOME", "/x")], None),
+            (&[("HF_TOKEN_PATH", "/t"), ("XDG_CACHE_HOME", "/x")], None),
+            // Empty counts as unset, as in token_path.
+            (&[("HF_HOME", ""), ("XDG_CACHE_HOME", "/x")], legacy),
+        ];
+        for (pairs, expected) in cases {
+            assert_eq!(
+                legacy_token_path_from(env(pairs), home()),
+                expected.map(PathBuf::from),
+                "env {pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_token_file_falls_back_only_when_the_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("current");
+        let legacy = dir.path().join("legacy");
+        std::fs::write(&legacy, "hf_old").unwrap();
+
+        assert_eq!(
+            read_token_file(&current, Some(&legacy)).as_deref(),
+            Some("hf_old")
+        );
+        assert_eq!(read_token_file(&current, None), None);
+
+        std::fs::write(&current, "hf_new").unwrap();
+        assert_eq!(
+            read_token_file(&current, Some(&legacy)).as_deref(),
+            Some("hf_new")
+        );
+        // An existing but blank file is not skipped over: resolve_token
+        // then finds no token, as before.
+        std::fs::write(&current, "").unwrap();
+        assert_eq!(
+            read_token_file(&current, Some(&legacy)).as_deref(),
+            Some("")
+        );
     }
 
     #[test]

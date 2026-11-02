@@ -366,6 +366,16 @@ defaults to `$XDG_CACHE_HOME/huggingface`, else
 skipped; an empty `HF_TOKEN_PATH`, `HF_HOME` or `XDG_CACHE_HOME` counts
 as unset.
 
+Before llmman honoured `XDG_CACHE_HOME` here, its token file was always
+`~/.cache/huggingface/token` unless `HF_HOME` or `HF_TOKEN_PATH` was set.
+So that a token saved then keeps working, llmman still reads that file
+when neither `HF_TOKEN_PATH` nor `HF_HOME` is set, `XDG_CACHE_HOME` moves
+the default elsewhere, and the token file at the new default does not
+exist; `huggingface_hub` does not read it in that case. In that same
+case `llmman logout hf.co` removes both files, including a token that
+`hf auth login` saved at `~/.cache/huggingface/token` from an
+environment without `XDG_CACHE_HOME`.
+
 `huggingface_hub` uses the same variables in the same fallback order for
 its default token file, so a token saved by `hf auth login` or
 `llmman login hf.co` is found by the other tool, provided both resolve
