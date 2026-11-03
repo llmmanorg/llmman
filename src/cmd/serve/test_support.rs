@@ -67,6 +67,7 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
         runtime: runtime::Lazy::new(Runtime::Path, None, None),
         llama_cpp_version: None,
         vllm_version: None,
+        vllm_image: None,
         sglang_version: None,
         ctx_size: None,
         ctx_size_explicit: false,

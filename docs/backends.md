@@ -143,6 +143,11 @@ host architecture:
 
 `--vllm-version <tag>` pins the release (the arch suffix is added for the
 `vllm/` images; for `rocm/vllm` it is the whole tag).
+`--vllm-image <ref>` (or `LLMMAN_VLLM_IMAGE`) runs a different image for
+plain safetensors models, such as `dhi.io/vllm-openai:0.32`. It is used as
+written, so it must suit your CUDA driver and architecture, and the
+runtime must be logged in if its registry requires it. It conflicts
+with `--vllm-version`; Diffusers models keep `vllm/vllm-omni`.
 `llmman serve --runtime docker --pull-only <model>` pulls the image an
 already-pulled model needs (without a model, the llama.cpp image).
 `CUDA_VISIBLE_DEVICES` and friends plus every `VLLM_*` variable are

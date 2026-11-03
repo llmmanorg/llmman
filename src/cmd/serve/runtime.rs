@@ -337,6 +337,7 @@ fn try_one(
                             ociman,
                             ContainerEngine::LlamaServer,
                             llama_cpp_version,
+                            None,
                         )
                     },
                     (!explicit).then_some(|| {

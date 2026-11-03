@@ -312,9 +312,32 @@ impl VllmBackend {
         }
     }
 
-    /// This host's backend and architecture, from the shared GPU probe.
-    fn detect() -> Result<(VllmBackend, HostArch)> {
-        Ok((VllmBackend::from_gpu(detect_backend()), HostArch::detect()?))
+    /// This host's backend, from the shared GPU probe.
+    fn detect() -> VllmBackend {
+        VllmBackend::from_gpu(detect_backend())
+    }
+
+    /// The image for a safetensors `engine`. `vllm_image` (`--vllm-image`)
+    /// replaces [`ContainerEngine::Vllm`]'s, verbatim, without needing a
+    /// supported architecture; no other engine's.
+    fn engine_image(
+        self,
+        engine: ContainerEngine,
+        version: Option<&str>,
+        vllm_image: Option<&str>,
+    ) -> Result<String> {
+        if let (ContainerEngine::Vllm, Some(image)) = (engine, vllm_image) {
+            return Ok(image.to_string());
+        }
+        let arch = HostArch::detect()?;
+        match engine {
+            ContainerEngine::Vllm => self.image_ref(arch, version),
+            ContainerEngine::VllmOmni => self.omni_image_ref(arch, version),
+            ContainerEngine::Sglang => self.sglang_image_ref(arch, version),
+            ContainerEngine::LlamaServer => {
+                anyhow::bail!("llama-server containers go through spawn")
+            }
+        }
     }
 
     /// The `docker.io/`-qualified image (so podman doesn't prompt for a
@@ -421,21 +444,14 @@ pub enum ContainerEngine {
 }
 
 /// The image [`spawn`] / [`spawn_engine`] would run here for `engine`.
-fn image_for(engine: ContainerEngine, version: Option<&str>) -> Result<String> {
+fn image_for(
+    engine: ContainerEngine,
+    version: Option<&str>,
+    vllm_image: Option<&str>,
+) -> Result<String> {
     match engine {
         ContainerEngine::LlamaServer => Ok(detect_backend().image_ref(version)),
-        ContainerEngine::Vllm => {
-            let (backend, arch) = VllmBackend::detect()?;
-            backend.image_ref(arch, version)
-        }
-        ContainerEngine::VllmOmni => {
-            let (backend, arch) = VllmBackend::detect()?;
-            backend.omni_image_ref(arch, version)
-        }
-        ContainerEngine::Sglang => {
-            let (backend, arch) = VllmBackend::detect()?;
-            backend.sglang_image_ref(arch, version)
-        }
+        _ => VllmBackend::detect().engine_image(engine, version, vllm_image),
     }
 }
 
@@ -468,7 +484,8 @@ fn image_for(engine: ContainerEngine, version: Option<&str>) -> Result<String> {
 /// this host, with the pull's own progress output (a real `docker pull`/
 /// `podman pull` progress bar — not something llmman re-implements)
 /// inherited directly to this process's stdout/stderr. `version` is the
-/// engine's pin (`--llama-cpp-version` / `--vllm-version`), if any.
+/// engine's pin (`--llama-cpp-version` / `--vllm-version`), if any, and
+/// `vllm_image` is `--vllm-image`.
 ///
 /// `spawn`'s underlying `docker run`/`podman run` would pull an image that
 /// isn't already cached locally on its own, but silently and without any
@@ -482,10 +499,11 @@ pub fn pull_image(
     ociman: ContainerManager,
     engine: ContainerEngine,
     version: Option<&str>,
+    vllm_image: Option<&str>,
 ) -> Result<()> {
     use std::io::Write;
 
-    let image = image_for(engine, version)?;
+    let image = image_for(engine, version, vllm_image)?;
     let cli = ociman.binary();
     let header = format!("[llmman] {cli}: pulling {image}...");
     eprintln!("{header}");
@@ -979,31 +997,28 @@ impl ContainerEngine {
 /// [`VllmBackend`] picks for it. `serve_args` builds the argv after the
 /// launcher from the in-container model dir and bind address. The
 /// engine's own env vars (`VLLM_*` / `SGLANG_*`) are forwarded, as a local
-/// child would inherit them, plus the Hub token variables.
+/// child would inherit them, plus the Hub token variables. `vllm_image`
+/// is `--vllm-image`; the GPU flags still follow the host probe.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_engine(
     ociman: ContainerManager,
     engine: ContainerEngine,
     model_dir: &Path,
     version: Option<&str>,
+    vllm_image: Option<&str>,
     port: u16,
     cpus: Option<f64>,
     serve_args: impl FnOnce(&str, &str) -> Vec<String>,
 ) -> Result<tokio::process::Child> {
-    let (backend, arch) = VllmBackend::detect()?;
-    let image = match engine {
-        ContainerEngine::VllmOmni => backend.omni_image_ref(arch, version)?,
-        ContainerEngine::Sglang => backend.sglang_image_ref(arch, version)?,
-        ContainerEngine::Vllm => backend.image_ref(arch, version)?,
-        ContainerEngine::LlamaServer => anyhow::bail!("llama-server containers go through spawn"),
-    };
+    let backend = VllmBackend::detect();
+    let image = backend.engine_image(engine, version, vllm_image)?;
     let Some((launcher, env_prefix)) = engine.launcher() else {
         unreachable!("LlamaServer bailed above");
     };
     eprintln!(
-        "[llmman] {}: detected {:?} on {:?}, using image {:?}",
+        "[llmman] {}: detected {:?}, using image {:?}",
         ociman.binary(),
         backend,
-        arch,
         image
     );
     let model_dir = mount_source(model_dir)?;
@@ -1397,6 +1412,27 @@ mod tests {
             VllmBackend::Cpu.image_ref(HostArch::Aarch64, None).unwrap(),
             "docker.io/vllm/vllm-openai-cpu:latest-arm64"
         );
+    }
+
+    #[test]
+    fn vllm_image_override_is_verbatim_and_for_plain_vllm_only() {
+        let img = Some("dhi.io/vllm-openai:0.32");
+        let backend = VllmBackend::Cuda13;
+        // No `docker.io/`, arch suffix or version pin.
+        assert_eq!(
+            backend
+                .engine_image(ContainerEngine::Vllm, Some("v0.11.0"), img)
+                .unwrap(),
+            "dhi.io/vllm-openai:0.32"
+        );
+        // Arch-independent: other engines keep their own repos.
+        for (engine, repo) in [
+            (ContainerEngine::VllmOmni, "vllm/vllm-omni:"),
+            (ContainerEngine::Sglang, "lmsysorg/sglang:"),
+        ] {
+            let image = backend.engine_image(engine, None, img).unwrap();
+            assert!(image.contains(repo), "{image}");
+        }
     }
 
     #[test]

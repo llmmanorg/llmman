@@ -24,6 +24,20 @@ fn unknown_subcommand_exits_2() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+/// A pinned vLLM release and an explicit vLLM image conflict.
+#[test]
+fn serve_vllm_image_conflicts_with_vllm_version() {
+    let out = llmman()
+        .args(["serve", "--vllm-image", "dhi.io/vllm-openai:0.32"])
+        .args(["--vllm-version", "v0.28.0"])
+        .output()
+        .expect("spawn llmman");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot be used with"), "stderr: {stderr}");
+    assert!(stderr.contains("--vllm-version"), "stderr: {stderr}");
+}
+
 #[cfg(unix)]
 #[test]
 fn log_follow_filters_new_prompts_and_does_not_limit_them_to_max_count() {
