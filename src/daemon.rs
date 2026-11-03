@@ -334,10 +334,45 @@ fn stop_stale_daemon(identity: &DaemonIdentity) -> anyhow::Result<()> {
     if wait_for_port_free() {
         return Ok(());
     }
-    anyhow::bail!(
-        "a stale llmman serve daemon is still holding {} after being asked to stop; \
-         stop it manually (e.g. pkill -f 'llmman serve') and retry",
-        bind_addr()
+    // Not `identity.pid`: that was read before the two kill attempts, so
+    // the process it named may be gone and its pid already reused. Name
+    // only one `/api/version` still reports — and nothing, when whatever
+    // holds the port does not answer (see [`stale_daemon`]).
+    let pid = stale_daemon().and_then(|current| current.pid);
+    anyhow::bail!("{}", stale_daemon_message(&bind_addr(), pid))
+}
+
+/// `pid` as a `pid_t` that names one daemon, or `None` for one that cannot.
+/// kill(0) hits the caller's own process group and kill(-1) every process
+/// the user owns, so 0 and 1 are refused, and a pid past `pid_t` names
+/// nothing.
+fn signalable_pid(pid: u32) -> Option<i32> {
+    i32::try_from(pid).ok().filter(|pid| *pid > 1)
+}
+
+/// [`stop_stale_daemon`]'s give-up message, naming the daemon's own pid,
+/// which it publishes on `/api/version` for exactly this.
+///
+/// The earlier suggestion, `pkill -f 'llmman serve'`, matches whole
+/// command lines — including the one of the shell it is typed into, which
+/// it then kills along with the daemon. A daemon too old to report a pid
+/// gets no suggestion rather than that one, and so does one reporting a
+/// pid [`signalable_pid`] refuses, which is the same footgun again. The
+/// command is the one this module stops a daemon with on the platform it
+/// is printed on.
+fn stale_daemon_message(addr: &str, pid: Option<u32>) -> String {
+    let hint = pid
+        .and_then(signalable_pid)
+        .map_or_else(String::new, |pid| {
+            if cfg!(windows) {
+                format!(" (taskkill /PID {pid} /T /F)")
+            } else {
+                format!(" (kill {pid})")
+            }
+        });
+    format!(
+        "a stale llmman serve daemon is still holding {addr} after being \
+         asked to stop; stop it manually{hint} and retry"
     )
 }
 
@@ -360,8 +395,7 @@ fn kill_daemon(identity: &DaemonIdentity, force: bool) {
         // — which /api/version just proved alive — if it leads no group.
         Some(pid) => {
             if !kill_group(pid, signal) {
-                // Same pid guard as kill_group.
-                if let Some(pid) = i32::try_from(pid).ok().filter(|pid| *pid > 1) {
+                if let Some(pid) = signalable_pid(pid) {
                     // SAFETY: see kill_group.
                     unsafe { libc::kill(pid, signal) };
                 }
@@ -783,15 +817,9 @@ fn fetch_message(status: &str) -> String {
 /// check.
 #[cfg(unix)]
 fn kill_group(pid: u32, signal: libc::c_int) -> bool {
-    // Never a daemon pid, and catastrophic: kill(0) hits the caller's own
-    // group, kill(-1) every process the user owns. Past pid_t names no
-    // group.
-    let Ok(pid) = i32::try_from(pid) else {
+    let Some(pid) = signalable_pid(pid) else {
         return false;
     };
-    if pid <= 1 {
-        return false;
-    }
     // SAFETY: kill(2) has no memory-safety preconditions.
     unsafe { libc::kill(-pid, signal) == 0 }
 }
@@ -2373,6 +2401,49 @@ mod tests {
                     "{reference} at {width}: {line:?}"
                 );
             }
+        }
+    }
+
+    /// The whole message, not just its hint: a `pkill -f` pattern put
+    /// back at the call site has to fail here — see
+    /// [`stale_daemon_message`] for why that pattern is the bug.
+    #[test]
+    fn the_stale_daemon_message_names_the_pid_rather_than_a_pkill_pattern() {
+        // The command this module would itself use on this platform.
+        let stop = if cfg!(windows) {
+            " (taskkill /PID 931970 /T /F)"
+        } else {
+            " (kill 931970)"
+        };
+        let with_pid = stale_daemon_message("127.0.0.1:17434", Some(931970));
+        assert!(
+            with_pid.contains("still holding 127.0.0.1:17434"),
+            "{with_pid}"
+        );
+        assert!(
+            with_pid.ends_with(&format!("stop it manually{stop} and retry")),
+            "{with_pid}"
+        );
+        assert!(!with_pid.contains("pkill"), "{with_pid}");
+        // The no-pid case, for the reason the function gives.
+        let without = stale_daemon_message("127.0.0.1:17434", None);
+        assert!(without.ends_with("stop it manually and retry"), "{without}");
+        assert!(!without.contains("pkill"), "{without}");
+    }
+
+    /// The pids `kill_group` refuses are the ones that would signal the
+    /// caller's own group or everything the user owns, so the message
+    /// must not hand them over either.
+    #[test]
+    fn the_stale_daemon_message_omits_pids_kill_group_would_refuse() {
+        for pid in [0, 1, u32::MAX] {
+            let message = stale_daemon_message("127.0.0.1:17434", Some(pid));
+            assert!(
+                message.ends_with("stop it manually and retry"),
+                "pid {pid}: {message}"
+            );
+            // No parenthetical at all, so no command to copy.
+            assert!(!message.contains('('), "pid {pid}: {message}");
         }
     }
 }
