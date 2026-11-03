@@ -334,10 +334,21 @@ fn stop_stale_daemon(identity: &DaemonIdentity) -> anyhow::Result<()> {
     if wait_for_port_free() {
         return Ok(());
     }
-    anyhow::bail!(
-        "a stale llmman serve daemon is still holding {} after being asked to stop; \
-         stop it manually (e.g. pkill -f 'llmman serve') and retry",
-        bind_addr()
+    anyhow::bail!("{}", stale_daemon_message(&bind_addr(), identity.pid))
+}
+
+/// [`stop_stale_daemon`]'s give-up message, naming the daemon's own pid,
+/// which it publishes on `/api/version` for exactly this.
+///
+/// The earlier suggestion, `pkill -f 'llmman serve'`, matches whole
+/// command lines — including the one of the shell it is typed into, which
+/// it then kills along with the daemon. A daemon too old to report a pid
+/// gets no suggestion rather than that one.
+fn stale_daemon_message(addr: &str, pid: Option<u32>) -> String {
+    let hint = pid.map_or_else(String::new, |pid| format!(" (kill {pid})"));
+    format!(
+        "a stale llmman serve daemon is still holding {addr} after being \
+         asked to stop; stop it manually{hint} and retry"
     )
 }
 
@@ -2374,5 +2385,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The whole message, not just its hint: a `pkill -f` pattern put
+    /// back at the call site has to fail here — see
+    /// [`stale_daemon_message`] for why that pattern is the bug.
+    #[test]
+    fn the_stale_daemon_message_names_the_pid_rather_than_a_pkill_pattern() {
+        let with_pid = stale_daemon_message("127.0.0.1:17434", Some(931970));
+        assert!(
+            with_pid.contains("still holding 127.0.0.1:17434"),
+            "{with_pid}"
+        );
+        assert!(
+            with_pid.ends_with("stop it manually (kill 931970) and retry"),
+            "{with_pid}"
+        );
+        assert!(!with_pid.contains("pkill"), "{with_pid}");
+        // The no-pid case, for the reason the function gives.
+        let without = stale_daemon_message("127.0.0.1:17434", None);
+        assert!(without.ends_with("stop it manually and retry"), "{without}");
+        assert!(!without.contains("pkill"), "{without}");
     }
 }
