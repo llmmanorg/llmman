@@ -123,6 +123,7 @@ Environment Variables:
       LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only; default: llama-server's auto, one for embedding models)
       LLMMAN_MLX_LM_VERSION          Exact mlx-lm release to install on macOS (default: PyPI's current)
       LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on macOS, installed at startup; else vllm)
+      LLMMAN_VLLM_IMAGE              Container image to run vLLM from for safetensors models, e.g. dhi.io/vllm-openai:0.32 — same as --vllm-image
       LLMMAN_VLLM_ARGS               Extra whitespace-separated arguments ('quote' one to keep its spaces) appended to every `vllm serve`, before llmman's --port/--host (e.g. \"--dtype bfloat16 --tp 2\")
       LLMMAN_SGLANG_ARGS             Extra whitespace-separated arguments ('quote' one to keep its spaces) appended to every sglang launch, before llmman's --port/--host (e.g. \"--disable-cuda-graph\")
       LLMMAN_GGUF_ENGINE             Engine for GGUF generation models: ds4 or llama-server (default: ds4-server on PATH for DeepSeek V4.1, else llama-server)
@@ -185,6 +186,19 @@ pub struct ServeArgs {
     #[arg(long, value_name = "TAG")]
     pub vllm_version: Option<String>,
 
+    /// With a container runtime, run this image for safetensors models
+    /// instead of the host's vllm/vllm-openai, rocm/vllm or
+    /// vllm/vllm-openai-cpu one (e.g. `dhi.io/vllm-openai:0.32`). Used as
+    /// given, so it must suit the host's CUDA version and architecture.
+    /// Not used for Diffusers models (vllm-omni).
+    #[arg(
+        long,
+        value_name = "IMAGE",
+        env = "LLMMAN_VLLM_IMAGE",
+        conflicts_with = "vllm_version"
+    )]
+    pub vllm_image: Option<String>,
+
     /// With a container runtime and LLMMAN_SAFETENSORS_ENGINE=sglang, pin
     /// the lmsysorg/sglang image tag (e.g. `v0.5.19`; `-cu129` is added
     /// for a CUDA 12 driver). For an AMD GPU the value is the whole tag
@@ -235,6 +249,8 @@ struct Inner {
     llama_cpp_version: Option<String>,
     // --vllm-version; only meaningful with a container runtime.
     vllm_version: Option<String>,
+    // --vllm-image.
+    vllm_image: Option<String>,
     // --sglang-version; only meaningful with a container runtime and
     // LLMMAN_SAFETENSORS_ENGINE=sglang.
     sglang_version: Option<String>,
@@ -2436,6 +2452,7 @@ async fn resolve_target(
                     container_engine,
                     dir,
                     version,
+                    state.0.vllm_image.as_deref(),
                     port,
                     state.0.cpu_limit,
                     |model_dir, host| {
@@ -2469,6 +2486,7 @@ async fn resolve_target(
                     crate::container::ContainerEngine::VllmOmni,
                     dir,
                     state.0.vllm_version.as_deref(),
+                    None,
                     port,
                     state.0.cpu_limit,
                     |model_dir, host| {
@@ -4535,7 +4553,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
                 }
             };
             if let Some(version) = version {
-                crate::container::pull_image(ociman, engine, version)?;
+                crate::container::pull_image(ociman, engine, version, _args.vllm_image.as_deref())?;
             }
         }
         return Ok(());
@@ -4686,6 +4704,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         runtime,
         llama_cpp_version,
         vllm_version: _args.vllm_version.clone(),
+        vllm_image: _args.vllm_image.clone(),
         sglang_version: _args.sglang_version.clone(),
         ctx_size,
         ctx_size_explicit: ctx_size_explicit.is_some(),
