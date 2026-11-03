@@ -123,6 +123,8 @@ pub(super) struct ModelFacts {
     /// As `/api/show` lists them, minus what only the chat template says
     /// (`tools`, `thinking`).
     capabilities: Vec<String>,
+    /// The GGUF's `general.architecture`, if it has one.
+    architecture: Option<String>,
 }
 
 impl ModelFacts {
@@ -134,6 +136,50 @@ impl ModelFacts {
     /// The trained context, `meta.n_ctx_train` on `/v1/models`.
     pub(super) fn context_length(&self) -> Option<u64> {
         self.context_length
+    }
+
+    /// The `meta.n_ctx` a llama-server load would report: `ensure_model`'s
+    /// starting context and slots, capped at the trained context as
+    /// llama-server caps each slot. `None` without a trained context, or for
+    /// a model llama-server does not serve (media, or a GGUF `gguf_engine`
+    /// sends to ds4-server). Assumes [`llama_sets_slot_context`] is false.
+    pub(super) fn starting_context_window(
+        &self,
+        state: &AppState,
+        gguf_engine: GgufEngine,
+    ) -> Option<u32> {
+        let trained = super::config::trained_ctx(self.context_length)?;
+        let has = |c: &str| self.capabilities.iter().any(|have| have == c);
+        // `embedding` and `decision` replace `completion` in a model's capabilities.
+        let embedding = has(crate::modelpack::CAPABILITY_EMBEDDING);
+        let decision = has(crate::modelpack::CAPABILITY_DECISION);
+        if !(has(crate::modelpack::CAPABILITY_COMPLETION) || embedding || decision) {
+            return None;
+        }
+        if ds4_serves_gguf(
+            gguf_engine,
+            self.architecture.as_deref(),
+            embedding,
+            decision,
+            ds4_server_on_path,
+        ) {
+            return None;
+        }
+        let ctx_size = super::initial_ctx_size(
+            state.0.ctx_size,
+            state.0.ctx_size_explicit,
+            Some(trained),
+            embedding,
+        );
+        let num_parallel = super::effective_num_parallel(ctx_size, state.0.num_parallel, embedding);
+        let window = super::loaded_context_window(
+            super::Engine::LlamaServer,
+            ctx_size,
+            Some(trained),
+            num_parallel,
+            state.0.ctx_size_explicit,
+        )?;
+        Some(window.min(trained))
     }
 
     /// `architecture.input_modalities` as llama-server reports it: `text`,
@@ -187,6 +233,10 @@ pub(super) fn listed_model_facts(
                     gguf.as_ref(),
                     None,
                 ),
+                architecture: gguf
+                    .as_ref()
+                    .and_then(|info| info.architecture())
+                    .map(str::to_string),
             });
             if gguf.is_some() {
                 MODEL_FACTS
@@ -1939,6 +1989,29 @@ mod tests {
             capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
             ..ModelFacts::default()
         }
+    }
+
+    /// ds4-server picks its own window, so a GGUF sent there has none; an
+    /// embedding model always stays on llama-server.
+    #[test]
+    fn a_gguf_sent_to_ds4_has_no_starting_context_window() {
+        let state = test_state();
+        let ds4 = |capability: &str| ModelFacts {
+            context_length: Some(4096),
+            architecture: Some("deepseek41".to_string()),
+            ..facts_with(&[capability])
+        };
+        let text = ds4(crate::modelpack::CAPABILITY_COMPLETION);
+        assert_eq!(text.starting_context_window(&state, GgufEngine::Ds4), None);
+        assert_eq!(
+            text.starting_context_window(&state, GgufEngine::LlamaServer),
+            Some(4096)
+        );
+        let embedding = ds4(crate::modelpack::CAPABILITY_EMBEDDING);
+        assert_eq!(
+            embedding.starting_context_window(&state, GgufEngine::Ds4),
+            Some(4096)
+        );
     }
 
     #[test]

@@ -382,7 +382,13 @@ pub(super) fn supports_context_shift(model_ref: &str) -> bool {
 /// A GGUF's `{arch}.context_length` (`n_ctx_train`), if present and
 /// non-zero.
 pub(super) fn gguf_trained_ctx(info: &crate::gguf::Info) -> Option<u32> {
-    info.context_length()
+    trained_ctx(info.context_length())
+}
+
+/// A header's `{arch}.context_length` as a trained context: `None` if
+/// absent, zero or past `u32`.
+pub(super) fn trained_ctx(context_length: Option<u64>) -> Option<u32> {
+    context_length
         .and_then(|n| u32::try_from(n).ok())
         .filter(|n| *n > 0)
 }
