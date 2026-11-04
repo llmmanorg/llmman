@@ -234,6 +234,10 @@ supply chain looks like the container supply chain:
 llmman serve
 ```
 
+To start the daemon only if needed and return once it is listening, use
+`llmman serve --detach`. The daemon keeps running after the command exits;
+`--runtime` and other serve options are applied when it starts a new daemon.
+
 One endpoint on `127.0.0.1:17434` that speaks Ollama, OpenAI and Anthropic:
 
 | API | Endpoints |

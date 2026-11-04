@@ -38,6 +38,22 @@ fn serve_vllm_image_conflicts_with_vllm_version() {
     assert!(stderr.contains("--vllm-version"), "stderr: {stderr}");
 }
 
+#[test]
+fn serve_detach_conflicts_with_non_daemon_modes() {
+    for args in [
+        vec!["serve", "--detach", "--pull-only"],
+        vec!["serve", "model", "--detach", "--port", "12345"],
+    ] {
+        let out = llmman().args(args).output().expect("spawn llmman");
+        assert_eq!(out.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("cannot be used with"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn log_follow_filters_new_prompts_and_does_not_limit_them_to_max_count() {

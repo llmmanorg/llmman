@@ -2558,6 +2558,116 @@ fn ensure_server_fails_fast_when_daemon_dies_at_startup() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn serve_detach_starts_once_and_outlives_its_caller() {
+    fn version(host: &str) -> Result<serde_json::Value, reqwest::Error> {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()?
+            .get(format!("http://{host}/api/version"))
+            .send()?
+            .error_for_status()?
+            .json()
+    }
+
+    struct StopDaemon {
+        host: String,
+        pid: Option<u32>,
+    }
+    impl Drop for StopDaemon {
+        fn drop(&mut self) {
+            // The test's unique loopback port identified this daemon via
+            // /api/version; retry here if the earlier identity read panicked.
+            let pid = self.pid.or_else(|| {
+                version(&self.host).ok()?["pid"]
+                    .as_u64()
+                    .and_then(|pid| u32::try_from(pid).ok())
+            });
+            if let Some(pid) = pid.filter(|pid| *pid > 1 && *pid != std::process::id()) {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let host = format!("127.0.0.1:{}", free_loopback_port());
+    let start = || {
+        let mut cmd = Command::new(llmman_bin());
+        cmd.args(["serve", "--detach", "--runtime", "path"])
+            .env("LLMMAN_HOST", &host)
+            .env("LLMMAN_MODELS", dir.path().join("store"))
+            .env("LLMMAN_SAFETENSORS_ENGINE", "vllm")
+            .env("LLMMAN_AUTH", "off")
+            .env_remove("LLMMAN_TLS_CERT")
+            .env_remove("LLMMAN_TLS_KEY");
+        let out = spawn_with_timeout(cmd, Duration::from_secs(30), "llmman serve --detach");
+        assert!(
+            out.status.success(),
+            "serve --detach failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    start();
+    let mut daemon = StopDaemon {
+        host: host.clone(),
+        pid: None,
+    };
+    let pid = version(&host).unwrap()["pid"].as_u64().unwrap() as u32;
+    assert!(pid > 1 && pid != std::process::id());
+    daemon.pid = Some(pid);
+    start();
+    assert_eq!(
+        version(&host).unwrap()["pid"].as_u64(),
+        Some(u64::from(pid))
+    );
+}
+
+#[test]
+fn serve_detach_rejects_an_unrelated_listener() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let host = listener.local_addr().unwrap().to_string();
+    listener.set_nonblocking(true).unwrap();
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let responder = std::thread::spawn(move || loop {
+        if !matches!(
+            stopped.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ) {
+            break;
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                let _ = stream.read(&mut [0u8; 512]);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 19\r\nConnection: close\r\n\r\n{\"version\":\"other\"}",
+                );
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!("accept fake listener: {err}"),
+        }
+    });
+
+    let mut cmd = Command::new(llmman_bin());
+    cmd.args(["serve", "--detach"]).env("LLMMAN_HOST", &host);
+    let out = spawn_with_timeout(
+        cmd,
+        Duration::from_secs(10),
+        "serve --detach at non-llmman port",
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("did not return a llmman daemon identity"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(stop);
+    responder.join().unwrap();
+}
+
 /// `llmman launch qwen` with no `--model` is refused on the flag before
 /// any daemon work: under the dead-daemon setup a build that checked
 /// after `ensure_server` would report the daemon's startup exit instead.
