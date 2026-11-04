@@ -463,6 +463,12 @@ fn kill_daemon(identity: &DaemonIdentity, _force: bool) {
 /// preloads, since its whole point is warming up one model for the
 /// integration it's about to hand off to).
 pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
+    ensure_server_with_args(preload_model, &[])
+}
+
+/// Like [`ensure_server`], forwarding additional `serve` options only when
+/// spawning a new daemon. The caller must not pass `--detach` back to the child.
+pub fn ensure_server_with_args(preload_model: &str, serve_args: &[&str]) -> anyhow::Result<()> {
     if server_alive() {
         // A remote LLMMAN_HOST: reuse whatever's there, and never touch
         // its PID (see host_is_local) or spawn a "replacement" over it.
@@ -516,6 +522,7 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     if !preload_model.is_empty() {
         cmd.arg(preload_model);
     }
+    cmd.args(serve_args);
     cmd.stdin(Stdio::null());
     let pull_relay = log_path
         .as_deref()

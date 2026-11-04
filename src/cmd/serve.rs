@@ -157,6 +157,10 @@ pub struct ServeArgs {
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
 
+    /// Start the server in the background if needed, then return once it is listening.
+    #[arg(long, conflicts_with_all = ["pull_only", "port"])]
+    pub detach: bool,
+
     /// Where the inference engine comes from. `docker`/`podman` (Linux
     /// only) run the ghcr.io/ggml-org/llama.cpp server image for the
     /// host's GPU, and a vLLM image for safetensors models (an SGLang
@@ -4154,10 +4158,34 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
+    if args.detach {
+        return crate::daemon::ensure_server_with_args(
+            args.model.as_deref().unwrap_or(""),
+            &args.detached_child_args(),
+        );
+    }
     if let (Some(port), Some(model)) = (args.port, &args.model) {
         return tokio::runtime::Runtime::new()?.block_on(mediagen_backend(model, port, args));
     }
     tokio::runtime::Runtime::new()?.block_on(serve_async(args))
+}
+
+impl ServeArgs {
+    /// The child is an ordinary foreground `serve`, never another `--detach`.
+    fn detached_child_args(&self) -> Vec<&str> {
+        let mut args = vec!["--runtime", self.runtime.as_str()];
+        for (flag, value) in [
+            ("--llama-cpp-version", self.llama_cpp_version.as_deref()),
+            ("--vllm-version", self.vllm_version.as_deref()),
+            ("--vllm-image", self.vllm_image.as_deref()),
+            ("--sglang-version", self.sglang_version.as_deref()),
+        ] {
+            if let Some(value) = value {
+                args.extend([flag, value]);
+            }
+        }
+        args
+    }
 }
 
 /// The ggml/llama libraries of the `llama-server` we would run locally

@@ -18,6 +18,35 @@ use super::test_support::{
 };
 use super::*;
 
+#[test]
+fn detached_serve_forwards_configuration_without_detaching_the_child() {
+    let args = ServeArgs {
+        model: Some("docker.io/ai/model:latest".into()),
+        detach: true,
+        runtime: Runtime::Path,
+        llama_cpp_version: Some("b1234".into()),
+        vllm_version: None,
+        vllm_image: Some("example/vllm:1".into()),
+        sglang_version: Some("v0.5".into()),
+        pull_only: false,
+        port: None,
+        host: "127.0.0.1".parse().unwrap(),
+    };
+    assert_eq!(
+        args.detached_child_args(),
+        [
+            "--runtime",
+            "path",
+            "--llama-cpp-version",
+            "b1234",
+            "--vllm-image",
+            "example/vllm:1",
+            "--sglang-version",
+            "v0.5",
+        ]
+    );
+}
+
 // -- pull/push progress relay -------------------------------------------
 
 /// Regression test for tagless pulls losing their bar: the shim

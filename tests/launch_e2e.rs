@@ -2558,6 +2558,58 @@ fn ensure_server_fails_fast_when_daemon_dies_at_startup() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn serve_detach_starts_once_and_outlives_its_caller() {
+    struct StopDaemon(u32);
+    impl Drop for StopDaemon {
+        fn drop(&mut self) {
+            // The test's unique loopback port identified this daemon via
+            // /api/version; do not let it outlive the test as well.
+            unsafe { libc::kill(self.0 as libc::pid_t, libc::SIGTERM) };
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let host = format!("127.0.0.1:{}", free_loopback_port());
+    let start = || {
+        let mut cmd = Command::new(llmman_bin());
+        cmd.args(["serve", "--detach", "--runtime", "path"])
+            .env("LLMMAN_HOST", &host)
+            .env("LLMMAN_MODELS", dir.path().join("store"))
+            .env("LLMMAN_SAFETENSORS_ENGINE", "vllm")
+            .env("LLMMAN_AUTH", "off")
+            .env_remove("LLMMAN_TLS_CERT")
+            .env_remove("LLMMAN_TLS_KEY");
+        let out = spawn_with_timeout(cmd, Duration::from_secs(30), "llmman serve --detach");
+        assert!(
+            out.status.success(),
+            "serve --detach failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let version = || -> serde_json::Value {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("http://{host}/api/version"))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap()
+    };
+
+    start();
+    let pid = version()["pid"].as_u64().unwrap() as u32;
+    assert!(pid > 1 && pid != std::process::id());
+    let _daemon = StopDaemon(pid);
+    start();
+    assert_eq!(version()["pid"].as_u64(), Some(u64::from(pid)));
+}
+
 /// `llmman launch qwen` with no `--model` is refused on the flag before
 /// any daemon work: under the dead-daemon setup a build that checked
 /// after `ensure_server` would report the daemon's startup exit instead.
