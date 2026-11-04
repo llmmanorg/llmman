@@ -6380,11 +6380,12 @@ async fn retiring_leaves_the_same_content_under_another_name_alone() {
 #[ignore = "entered by FakeLlamaServer, not a test of its own"]
 fn fake_llama_server_child() {
     use std::io::{Read, Write};
+    // One argument per line, so a path keeps its spaces.
     let Ok(args) = std::env::var("LLMMAN_FAKE_LLAMA_ARGS") else {
         return;
     };
     let flag = |name: &str| {
-        args.split_whitespace()
+        args.lines()
             .skip_while(|arg| *arg != name)
             .nth(1)
             .map(str::to_string)
@@ -6449,7 +6450,7 @@ impl FakeLlamaServer {
         );
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in --selftest) exit 0;; esac\necho \"$*\" >> '{}'\n\
-             LLMMAN_FAKE_LLAMA_ARGS=\"$*\" exec '{}' --ignored --exact '{test}'\n",
+             LLMMAN_FAKE_LLAMA_ARGS=\"$(printf '%s\\n' \"$@\")\" exec '{}' --ignored --exact '{test}'\n",
             log.display(),
             std::env::current_exe().unwrap().display(),
         );
@@ -6623,9 +6624,10 @@ async fn an_unloaded_models_n_ctx_is_what_its_load_reports() {
         .into_iter()
         .flat_map(|config| kinds.map(|kind| (config, kind)))
         .enumerate();
+    // The space puts one in every `--model` path the fake reads.
+    let fake = FakeLlamaServer::new("ctx parity");
     // One model and daemon per case, each loaded on its own task: the load
     // path blocks, and loads of one name queue behind each other.
-    let fake = FakeLlamaServer::new("ctxparity");
     let tasks: Vec<_> = cases
         .map(
             |(i, ((ctx_size, explicit, num_parallel), (kind, u32s, strings)))| {
@@ -6650,10 +6652,23 @@ async fn an_unloaded_models_n_ctx_is_what_its_load_reports() {
                     assert!(predicted.is_u64(), "{case}: {predicted}");
 
                     let model = format!("docker.io/ai/{name}");
-                    let opts = LoadOptions::default();
-                    let (_, _, guard) = ensure_model_for(&state, &model, None, opts, Task::Other)
-                        .await
-                        .unwrap_or_else(|e| panic!("{case}: {:#}", e.0));
+                    // Another bind can take the port `ensure_model` picked
+                    // before llama-server binds it, likelier with every case
+                    // loading at once.
+                    let mut attempts = 0;
+                    let (_, _, guard) = loop {
+                        let opts = LoadOptions::default();
+                        match ensure_model_for(&state, &model, None, opts, Task::Other).await {
+                            Ok(loaded) => break loaded,
+                            Err(e)
+                                if attempts < 3
+                                    && format!("{:#}", e.0).contains("Address already in use") =>
+                            {
+                                attempts += 1;
+                            }
+                            Err(e) => panic!("{case}: {:#}", e.0),
+                        }
+                    };
                     let (_, v) = get_json(&base, "/v1/models").await;
                     drop(guard);
                     assert_eq!(n_ctx(&v), ("loaded".into(), predicted), "{case}");
