@@ -6372,8 +6372,9 @@ async fn retiring_leaves_the_same_content_under_another_name_alone() {
 }
 
 /// Not a test: the `llama-server` [`FakeLlamaServer`] runs, this binary
-/// re-entered through its script. It answers every request on `--port` with
-/// `200 {}` until killed, and does nothing run on its own.
+/// re-entered through its script. It answers `/v1/models` with the `meta`
+/// llama-server reports for its flags and every other request on `--port`
+/// with `200 {}` until killed, and does nothing run on its own.
 #[cfg(unix)]
 #[test]
 #[ignore = "entered by FakeLlamaServer, not a test of its own"]
@@ -6382,18 +6383,46 @@ fn fake_llama_server_child() {
     let Ok(args) = std::env::var("LLMMAN_FAKE_LLAMA_ARGS") else {
         return;
     };
-    let port: u16 = args
-        .split_whitespace()
-        .skip_while(|arg| *arg != "--port")
-        .nth(1)
-        .and_then(|port| port.parse().ok())
-        .expect("--port <n>");
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let flag = |name: &str| {
+        args.split_whitespace()
+            .skip_while(|arg| *arg != name)
+            .nth(1)
+            .map(str::to_string)
+    };
+    let number = |name: &str| flag(name).and_then(|n| n.parse::<u64>().ok());
+    let port = number("--port").expect("--port <n>");
+    let trained = flag("--model")
+        .and_then(|model| crate::gguf::read_info(std::path::Path::new(&model)).ok())
+        .and_then(|info| info.context_length())
+        .expect("a --model with a trained context");
+    // llama-server's `n_ctx_slot`: `--ctx-size` (none or 0 is the trained
+    // context) rounded up to 256, over `--parallel` slots rounded up again,
+    // or all of it for the unified slots it picks without one; never past
+    // the trained context.
+    let pad = |n: u64| n.div_ceil(256) * 256;
+    let n_ctx = pad(number("--ctx-size").filter(|n| *n > 0).unwrap_or(trained));
+    let slot = number("--parallel")
+        .map_or(n_ctx, |slots| pad(n_ctx / slots))
+        .min(trained);
+    let models = serde_json::json!({
+        "data": [{ "meta": { "n_ctx": slot, "n_ctx_train": trained } }],
+    })
+    .to_string();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port as u16)).unwrap();
     for stream in listener.incoming().flatten() {
         let mut stream = stream;
-        let _ = stream.read(&mut [0u8; 1024]);
-        let _ = stream
-            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}");
+        let mut request = [0u8; 1024];
+        let read = stream.read(&mut request).unwrap_or(0);
+        let body = if request[..read].starts_with(b"GET /v1/models ") {
+            models.as_str()
+        } else {
+            "{}"
+        };
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
     }
 }
 
@@ -6442,13 +6471,25 @@ impl FakeLlamaServer {
 
     /// A daemon that runs it, over a store holding `docker.io/ai/ctxmodel`.
     fn state(&self) -> AppState {
+        self.state_with("ctxmodel", &[], &[], |_| {})
+    }
+
+    /// [`Self::state`] over `docker.io/ai/<name>`, with `u32s` and `strings`
+    /// added to its GGUF header and `configure` applied to the daemon.
+    fn state_with(
+        &self,
+        name: &str,
+        u32s: &[(&str, u32)],
+        strings: &[(&str, &str)],
+        configure: impl FnOnce(&mut Inner),
+    ) -> AppState {
         let store = self.dir.join("store");
-        let gguf = crate::gguf::write_test_gguf_with(&[]);
+        let gguf = crate::gguf::write_test_gguf_with_strings(u32s, strings);
         let bytes = std::fs::read(&gguf).unwrap();
         let _ = std::fs::remove_file(&gguf);
         store_one_model(
             &OciStore::open(&store).unwrap(),
-            "ctxmodel",
+            name,
             "application/vnd.docker.ai.gguf.v3",
             "model.gguf",
             &bytes,
@@ -6462,6 +6503,7 @@ impl FakeLlamaServer {
                 bin: self.bin.clone(),
             }),
         );
+        configure(&mut inner);
         AppState(Arc::new(inner))
     }
 
@@ -6547,6 +6589,83 @@ async fn num_ctx_sizes_the_load_and_a_different_one_reloads_it() {
             .collect::<Vec<_>>(),
         [0, 0, 0, 3, 4, 4, 4]
     );
+}
+
+/// The `meta.n_ctx` an unloaded model is listed with is the one llama-server
+/// reports once `ensure_model` has loaded it, so the prediction cannot drift
+/// from the load (llmmanorg/llmman#755).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unloaded_models_n_ctx_is_what_its_load_reports() {
+    // Each kind of model llama-server serves, by the GGUF keys that mark it.
+    type Header = (
+        &'static str,
+        &'static [(&'static str, u32)],
+        &'static [(&'static str, &'static str)],
+    );
+    let kinds: [Header; 3] = [
+        ("text", &[], &[]),
+        ("embedding", &[("llama.pooling_type", 1)], &[]),
+        ("decision", &[], &[("llama.decision.type", "clef")]),
+    ];
+    // (LLMMAN_CONTEXT_LENGTH, explicitly set, LLMMAN_NUM_PARALLEL), for the
+    // fixture's trained context of 4096.
+    let configs = [
+        (Some(DEFAULT_CTX_SIZE), false, None),
+        (Some(DEFAULT_CTX_SIZE), false, Some(4)),
+        (Some(2048), true, None),
+        (Some(65536), true, None),
+        (Some(0), true, None),
+        (Some(0), true, Some(2)),
+        (Some(2048), true, Some(4)),
+    ];
+    let cases = configs
+        .into_iter()
+        .flat_map(|config| kinds.map(|kind| (config, kind)))
+        .enumerate();
+    // One model and daemon per case, each loaded on its own task: the load
+    // path blocks, and loads of one name queue behind each other.
+    let fake = FakeLlamaServer::new("ctxparity");
+    let tasks: Vec<_> = cases
+        .map(
+            |(i, ((ctx_size, explicit, num_parallel), (kind, u32s, strings)))| {
+                let case = format!(
+                    "{kind}: ctx_size {ctx_size:?} explicit {explicit} parallel {num_parallel:?}"
+                );
+                let name = format!("ctxparity{i}");
+                let state = fake.state_with(&name, u32s, strings, |inner| {
+                    inner.ctx_size = ctx_size;
+                    inner.ctx_size_explicit = explicit;
+                    inner.num_parallel = num_parallel;
+                });
+                tokio::spawn(async move {
+                    let base = serve_router(state.clone()).await;
+                    let n_ctx = |v: &serde_json::Value| {
+                        let row = listed(v, &name);
+                        (row["status"]["value"].clone(), row["meta"]["n_ctx"].clone())
+                    };
+                    let (_, v) = get_json(&base, "/v1/models").await;
+                    let (status, predicted) = n_ctx(&v);
+                    assert_eq!(status, "unloaded", "{case}");
+                    assert!(predicted.is_u64(), "{case}: {predicted}");
+
+                    let model = format!("docker.io/ai/{name}");
+                    let opts = LoadOptions::default();
+                    let (_, _, guard) = ensure_model_for(&state, &model, None, opts, Task::Other)
+                        .await
+                        .unwrap_or_else(|e| panic!("{case}: {:#}", e.0));
+                    let (_, v) = get_json(&base, "/v1/models").await;
+                    drop(guard);
+                    assert_eq!(n_ctx(&v), ("loaded".into(), predicted), "{case}");
+                })
+            },
+        )
+        .collect();
+    for task in tasks {
+        if let Err(e) = task.await {
+            std::panic::resume_unwind(e.into_panic());
+        }
+    }
 }
 
 // -- consecutive same-role messages ------------------------------------------
