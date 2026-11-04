@@ -156,7 +156,7 @@ fn nvidia_toolkit_present(ociman: ContainerManager) -> bool {
 /// OpenCL release is a Windows ARM64 Adreno binary, not a published Linux
 /// container image, and this module is used only for Linux containers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GpuBackend {
+pub(crate) enum GpuBackend {
     Cpu,
     Cuda12,
     Cuda13,
@@ -234,9 +234,14 @@ impl GpuBackend {
 /// that misconfiguration directly and clearly enough on its own; only
 /// `--runtime auto`, which has to decide whether to try the engine at
 /// all, adds a heuristic ([`ContainerManager::probe`]).
-fn detect_backend() -> GpuBackend {
+pub(crate) fn detect_backend() -> GpuBackend {
     backend_from_hostgpu(hostgpu::detect())
 }
+
+/// The image the speech worker runs in, whatever the host has: it
+/// computes on the CPU, and a GPU image would ask the engine for devices
+/// it may not pass through. The spawn arm and `--pull-only` both read it.
+pub(crate) const SPEECH_BACKEND: GpuBackend = GpuBackend::Cpu;
 
 /// Pure mapping from [`HostGpu`] to the available container [`GpuBackend`], split out from
 /// [`detect_backend`] so the CUDA 12-vs-13 image split (llama.cpp's own
@@ -334,8 +339,8 @@ impl VllmBackend {
             ContainerEngine::Vllm => self.image_ref(arch, version),
             ContainerEngine::VllmOmni => self.omni_image_ref(arch, version),
             ContainerEngine::Sglang => self.sglang_image_ref(arch, version),
-            ContainerEngine::LlamaServer => {
-                anyhow::bail!("llama-server containers go through spawn")
+            ContainerEngine::LlamaServer | ContainerEngine::Speech => {
+                anyhow::bail!("llama-server and speech containers go through spawn")
             }
         }
     }
@@ -441,6 +446,10 @@ pub enum ContainerEngine {
     VllmOmni,
     /// `lmsysorg/sglang` (safetensors, `LLMMAN_SAFETENSORS_ENGINE=sglang`).
     Sglang,
+    /// `ghcr.io/ggml-org/llama.cpp`'s CPU image, running this binary's
+    /// speech worker over a bind mount ([`spawn_mediagen`] with
+    /// [`SPEECH_BACKEND`]) for a Canary GGUF.
+    Speech,
 }
 
 /// The image [`spawn`] / [`spawn_engine`] would run here for `engine`.
@@ -451,6 +460,7 @@ fn image_for(
 ) -> Result<String> {
     match engine {
         ContainerEngine::LlamaServer => Ok(detect_backend().image_ref(version)),
+        ContainerEngine::Speech => Ok(SPEECH_BACKEND.image_ref(version)),
         _ => VllmBackend::detect().engine_image(engine, version, vllm_image),
     }
 }
@@ -983,7 +993,7 @@ impl ContainerEngine {
     /// `python3 -m sglang.launch_server` is SGLang's own Docker recipe.
     fn launcher(self) -> Option<(&'static [&'static str], &'static str)> {
         match self {
-            ContainerEngine::LlamaServer => None,
+            ContainerEngine::LlamaServer | ContainerEngine::Speech => None,
             ContainerEngine::Vllm | ContainerEngine::VllmOmni => Some((&["vllm"], "VLLM_")),
             ContainerEngine::Sglang => {
                 Some((&["python3", "-m", "sglang.launch_server"], "SGLANG_"))
@@ -1013,7 +1023,7 @@ pub fn spawn_engine(
     let backend = VllmBackend::detect();
     let image = backend.engine_image(engine, version, vllm_image)?;
     let Some((launcher, env_prefix)) = engine.launcher() else {
-        unreachable!("LlamaServer bailed above");
+        unreachable!("LlamaServer and Speech bailed above");
     };
     eprintln!(
         "[llmman] {}: detected {:?}, using image {:?}",
@@ -1084,13 +1094,16 @@ fn run(ociman: ContainerManager, args: Vec<String>) -> Result<tokio::process::Ch
         .with_context(|| format!("spawn {} {}", ociman.binary(), args.join(" ")))
 }
 
-/// Runs this binary as the media backend of a diffusion model inside the
-/// image [`spawn`] would use: it carries the ggml/llama libraries (in
-/// `/app`, next to `llama-server`), and for CUDA the runtime too. The
-/// binary, store and cache are bind-mounted read-only at their host paths.
-/// The image's glibc must be at least the host's.
-pub fn spawn_mediagen(
+/// Runs this binary as `model_ref`'s backend (`llmman serve MODEL --port
+/// PORT`: the media backend of a diffusion model, the speech worker of a
+/// Canary GGUF) inside the image [`spawn`] would use: it carries the
+/// ggml/llama libraries (in `/app`, next to `llama-server`), and for CUDA
+/// the runtime too. The binary, store and cache are bind-mounted read-only
+/// at their host paths. The image's glibc must be at least the host's.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_mediagen(
     ociman: ContainerManager,
+    backend: GpuBackend,
     model_ref: &str,
     store_path: &Path,
     cache_path: &Path,
@@ -1098,10 +1111,9 @@ pub fn spawn_mediagen(
     port: u16,
     cpus: Option<f64>,
 ) -> Result<tokio::process::Child> {
-    let backend = detect_backend();
     let image = backend.image_ref(llama_cpp_version);
     eprintln!(
-        "[llmman] {}: detected {:?}, using image {:?} for media generation",
+        "[llmman] {}: {:?} backend, using image {:?} for {model_ref}'s worker",
         ociman.binary(),
         backend,
         image
@@ -1274,6 +1286,20 @@ mod tests {
         assert_eq!(GpuBackend::Cuda13.image_tag(), "server-cuda13");
         assert_eq!(GpuBackend::Rocm.image_tag(), "server-rocm");
         assert_eq!(GpuBackend::Vulkan.image_tag(), "server-vulkan");
+    }
+
+    /// Whatever GPU this host has, the speech worker's image is the CPU
+    /// one, pinned like the others.
+    #[test]
+    fn speech_image_is_the_cpu_image_on_any_host() {
+        assert_eq!(
+            image_for(ContainerEngine::Speech, Some("b9994"), None).unwrap(),
+            GpuBackend::Cpu.image_ref(Some("b9994"))
+        );
+        assert_eq!(
+            image_for(ContainerEngine::Speech, None, None).unwrap(),
+            GpuBackend::Cpu.image_ref(None)
+        );
     }
 
     #[test]

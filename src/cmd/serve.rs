@@ -3,7 +3,7 @@
 //! sub-processes from llama.cpp.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context};
@@ -221,12 +221,13 @@ pub struct ServeArgs {
     #[arg(long)]
     pub pull_only: bool,
 
-    /// Run as the media backend for MODEL on this port, the way
-    /// `llama-server --port` is for a GGUF; see `mediagen_backend`.
+    /// Run as the backend for MODEL on this port, the way `llama-server
+    /// --port` is for a GGUF: the media backend of a diffusion model or
+    /// the speech worker of a Canary GGUF; see `model_backend`.
     #[arg(long, hide = true, requires = "model")]
     pub port: Option<u16>,
 
-    /// Bind address of the media backend; `0.0.0.0` in a container.
+    /// Bind address of that backend; `0.0.0.0` in a container.
     #[arg(long, hide = true, requires = "port", default_value = "127.0.0.1")]
     pub host: std::net::IpAddr,
 }
@@ -476,6 +477,13 @@ enum Engine {
     /// `ds4-server` ([antirez/ds4](https://github.com/antirez/ds4)) for a
     /// [`ModelPath::Gguf`] load [`gguf_goes_to_ds4`] accepts.
     Ds4,
+    /// This binary's speech worker (`llmman serve MODEL --port PORT`,
+    /// spawned by [`spawn_mediagen_backend`]) for a [`ModelPath::Gguf`]
+    /// [`is_speech_model`] accepts. It serves `/v1/audio/transcriptions`
+    /// only: [`Task::refuse_speech`] turns text and embeddings away
+    /// before the worker is spawned or reached. One process, killed like
+    /// [`Engine::LlamaServer`].
+    Speech,
 }
 
 impl Engine {
@@ -489,6 +497,7 @@ impl Engine {
             Engine::Sglang => "sglang",
             Engine::Mlx => "mlx",
             Engine::Ds4 => "ds4",
+            Engine::Speech => "speech",
         }
     }
 
@@ -571,7 +580,7 @@ impl Drop for ModelProcess {
             // one pid is already sufficient; nothing extra to do here.
             ModelProcess::Local(Engine::Mlx, _, _) => {}
             // Single processes, like mlx_lm.server above.
-            ModelProcess::Local(Engine::LlamaServer | Engine::Ds4, _, _) => {}
+            ModelProcess::Local(Engine::LlamaServer | Engine::Ds4 | Engine::Speech, _, _) => {}
         }
     }
 }
@@ -2062,7 +2071,11 @@ enum Task {
     /// Chat, completions, responses, messages: anything that generates text.
     Generate,
     Embed,
-    /// Anything else, `/v1/systemone` included: the backend judges.
+    /// A route forwarded as it came, for the backend to judge:
+    /// `/v1/systemone`, images, videos, speech synthesis, token counts.
+    Forward,
+    /// A plain load (`ensure_model`): a preload, or a transcription, the
+    /// one route the speech worker serves.
     Other,
 }
 
@@ -2077,10 +2090,35 @@ impl Task {
             Self::Embed => {
                 format!("{model} is a decision model, which does not support embeddings")
             }
-            Self::Other => return None,
+            Self::Forward | Self::Other => return None,
         };
         Some(AppError::status(StatusCode::BAD_REQUEST, message))
     }
+
+    /// The 400 for sending this task to the speech model `model`, which
+    /// transcribes audio and nothing else ([`Engine::Speech`]).
+    fn refuse_speech(self, model: &str) -> Option<AppError> {
+        let what = match self {
+            Self::Generate => "does not generate text",
+            Self::Embed => "does not support embeddings",
+            Self::Forward => "serves no other route",
+            Self::Other => return None,
+        };
+        Some(AppError::status(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{model} is a speech model: it transcribes audio through \
+                 /v1/audio/transcriptions and {what}"
+            ),
+        ))
+    }
+}
+
+/// Whether `info` is a Canary speech model: `general.architecture` is
+/// `canary`, the header `speech::model::load` requires. Such a GGUF runs in
+/// the speech worker ([`Engine::Speech`]), not llama-server or ds4.
+fn is_speech_model(info: &crate::gguf::Info) -> bool {
+    info.architecture() == Some("canary")
 }
 
 /// [`ensure_model`] for a request that says what it will do with the model.
@@ -2093,13 +2131,22 @@ async fn ensure_model_for(
 ) -> Result<(String, Target, ActivityGuard), AppError> {
     let (model, target, guard) = resolve_target(state, model_ref, headers, opts, task).await?;
     // A cold load was refused in resolve_target; this is a model already
-    // loaded. A peer or provider judges for itself.
+    // loaded: a decision model, or a speech worker another request loaded.
+    // A peer or provider judges for itself.
     if task != Task::Other && matches!(target, Target::Local(_)) {
-        let decision = {
+        let (decision, speech) = {
             let mgr = state.0.manager.lock().await;
-            mgr.running.get(&model).is_some_and(|m| m.decision)
+            let running = mgr.running.get(&model);
+            (
+                running.is_some_and(|m| m.decision),
+                running.is_some_and(|m| m.process.engine() == Engine::Speech),
+            )
         };
-        if let Some(refusal) = decision.then(|| task.refuse_decision(&model)).flatten() {
+        let refusal = decision
+            .then(|| task.refuse_decision(&model))
+            .flatten()
+            .or_else(|| speech.then(|| task.refuse_speech(&model)).flatten());
+        if let Some(refusal) = refusal {
             guard.release_idle();
             return Err(refusal);
         }
@@ -2273,8 +2320,9 @@ async fn resolve_target(
     let trained_ctx = gguf_info.as_ref().and_then(gguf_trained_ctx);
     // `Some` marks an embedding model; see embedding_model_ctx.
     let embedding_ctx = gguf_info.as_ref().and_then(embedding_model_ctx);
-    // Refused before anything is evicted or spawned.
+    // Both refused before anything is evicted or spawned.
     let decision = gguf_info.as_ref().is_some_and(|info| info.is_decision());
+    let speech = gguf_info.as_ref().is_some_and(is_speech_model);
     let thinks_without_levels = gguf_info
         .as_ref()
         .and_then(|info| info.str("tokenizer.chat_template"))
@@ -2286,14 +2334,21 @@ async fn resolve_target(
             return Err(refusal);
         }
     }
-    let ds4 = gguf_goes_to_ds4(
-        gguf_engine_from_env(),
-        &model_path,
-        gguf_info.as_ref().and_then(|info| info.architecture()),
-        embedding_ctx.is_some(),
-        decision,
-        backend::ds4_server_on_path,
-    );
+    if speech {
+        if let Some(refusal) = task.refuse_speech(model_ref) {
+            return Err(refusal);
+        }
+    }
+    // A speech model is the speech worker's whatever LLMMAN_GGUF_ENGINE says.
+    let ds4 = !speech
+        && gguf_goes_to_ds4(
+            gguf_engine_from_env(),
+            &model_path,
+            gguf_info.as_ref().and_then(|info| info.architecture()),
+            embedding_ctx.is_some(),
+            decision,
+            backend::ds4_server_on_path,
+        );
     let load_ctx = ctx_for_load(opts.ctx, &model_path, ds4);
     // A model loaded with another window goes first, and its slot is this
     // load's. See enforce_max_loaded_models: held for the rest of this function.
@@ -2392,6 +2447,28 @@ async fn resolve_target(
                 stderr_tail = Some(tail);
                 ModelProcess::Local(Engine::Ds4, child, None)
             }
+            // A Canary GGUF runs in this binary's speech worker, spawned
+            // the way the media backend is but from the CPU image (see
+            // SPEECH_BACKEND). Not OOM-retryable either.
+            (ModelPath::Gguf(..), Some(ociman)) if speech => {
+                let mut child = crate::container::spawn_mediagen(
+                    ociman,
+                    crate::container::SPEECH_BACKEND,
+                    model_ref,
+                    &state.0.store_path,
+                    &state.0.cache_path,
+                    state.0.llama_cpp_version.as_deref(),
+                    port,
+                    state.0.cpu_limit,
+                )?;
+                stderr_tail = Some(tail_child_output(&mut child));
+                ModelProcess::Container(ociman, Engine::Speech, child)
+            }
+            (ModelPath::Gguf(..), None) if speech => {
+                let (child, tail) = spawn_mediagen_backend(model_ref, port, state).await?;
+                stderr_tail = Some(tail);
+                ModelProcess::Local(Engine::Speech, child, None)
+            }
             (ModelPath::Gguf(path, mmproj), Some(ociman)) => {
                 let mut child = crate::container::spawn(
                     ociman,
@@ -2416,6 +2493,7 @@ async fn resolve_target(
             (ModelPath::Diffusion(_), Some(ociman)) => {
                 let mut child = crate::container::spawn_mediagen(
                     ociman,
+                    crate::container::detect_backend(),
                     model_ref,
                     &state.0.store_path,
                     &state.0.cache_path,
@@ -2605,7 +2683,9 @@ async fn resolve_target(
     let backend_model_path = match process.engine() {
         Engine::Mlx => model_path.path().to_str().map(|s| s.to_string()),
         Engine::Sglang => Some(sglang_served_model_name(model_ref)),
-        Engine::LlamaServer | Engine::Vllm | Engine::VllmOmni | Engine::Ds4 => None,
+        Engine::LlamaServer | Engine::Vllm | Engine::VllmOmni | Engine::Ds4 | Engine::Speech => {
+            None
+        }
     };
     // `ctx_size` carries any shrink the retry loop above applied.
     let configured_window = loaded_context_window(
@@ -2724,8 +2804,9 @@ fn loaded_context_window(
             vllm_max_model_len(ctx_size, ctx_size_explicit)
         }
         // `vllm_omni_serve_args` passes no `--max-model-len` at all, so
-        // the Omni engine's window is its own, like MLX's.
-        Engine::VllmOmni | Engine::Mlx => None,
+        // the Omni engine's window is its own, like MLX's. A speech
+        // worker has no context window.
+        Engine::VllmOmni | Engine::Mlx | Engine::Speech => None,
     }
     .filter(|n| *n > 0)
 }
@@ -4169,7 +4250,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         return crate::daemon::check_server_identity();
     }
     if let (Some(port), Some(model)) = (args.port, &args.model) {
-        return tokio::runtime::Runtime::new()?.block_on(mediagen_backend(model, port, args));
+        return tokio::runtime::Runtime::new()?.block_on(model_backend(model, port, args));
     }
     tokio::runtime::Runtime::new()?.block_on(serve_async(args))
 }
@@ -4225,17 +4306,39 @@ fn identity_check_for(
     }
 }
 
-/// `llmman serve MODEL --port PORT`: the media backend the daemon spawns
-/// for a diffusion model; same endpoints and `/health` as llama-server.
-async fn mediagen_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyhow::Result<()> {
+/// `llmman serve MODEL --port PORT`: the backend the daemon spawns in
+/// this binary (see [`spawn_mediagen_backend`]), with the same `/health`
+/// as llama-server. A diffusion model runs [`mediagen_backend`], a GGUF
+/// [`is_speech_model`] accepts runs [`speech_backend`]; anything else
+/// is llama-server's or another engine's and fails here.
+async fn model_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyhow::Result<()> {
     let store_path = default_store()?;
     let cache_path = crate::default_cache()?;
-    let ModelPath::Diffusion(paths) = resolve_model(&store_path, &cache_path, model_ref)? else {
-        anyhow::bail!("{model_ref} is not a diffusion model");
-    };
-    if paths.text_encoder.is_none() && crate::mediagen::needs_text_encoder(&paths.model) {
-        anyhow::bail!("{model_ref}: no text encoder in the model pack");
+    match resolve_model(&store_path, &cache_path, model_ref)? {
+        ModelPath::Diffusion(paths) => mediagen_backend(model_ref, paths, port, args).await,
+        ModelPath::Gguf(path, _) => {
+            if !is_speech_model(&crate::gguf::read_info(&path)?) {
+                anyhow::bail!(
+                    "{model_ref} is a GGUF for llama-server, not a Canary GGUF; \
+                     `llmman serve MODEL --port PORT` runs only a diffusion model or a Canary GGUF"
+                );
+            }
+            speech_backend(model_ref, &path, port, args).await
+        }
+        other => anyhow::bail!(
+            "{model_ref} is a {} model; `llmman serve MODEL --port PORT` runs only \
+             a diffusion model or a Canary GGUF",
+            other.format()
+        ),
     }
+}
+
+/// The ggml API of the llama.cpp build `args` selects, leaked because
+/// the graph builders hold `&'static Api`, with its library directory
+/// for error messages.
+async fn load_ggml_api(
+    args: &ServeArgs,
+) -> anyhow::Result<(&'static crate::mediagen::ffi::Api, PathBuf)> {
     let pinned = runtime::llama_cpp_pin(args.llama_cpp_version.as_deref());
     // `identity_check_for` holds the rule. The daemon forwards its
     // resolved runtime and pin (`spawn_mediagen_backend`), so a default
@@ -4246,10 +4349,35 @@ async fn mediagen_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyho
         anyhow::Ok((lib_dir, identity_check_for(source, pinned.as_deref())))
     })
     .await??;
-    // the graph builders hold `&'static Api`
-    let api: &'static crate::mediagen::ffi::Api = Box::leak(Box::new(
-        crate::mediagen::ffi::Api::load_with(&lib_dir, check)?,
-    ));
+    let api = Box::leak(Box::new(crate::mediagen::ffi::Api::load_with(
+        &lib_dir, check,
+    )?));
+    Ok((api, lib_dir))
+}
+
+/// The compute thread count of an in-process ggml backend:
+/// `LLAMA_ARG_THREADS`, then the daemon's own rule
+/// ([`threads_from_env_or_host`]), then every CPU.
+fn backend_threads() -> i32 {
+    std::env::var("LLAMA_ARG_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| threads_from_env_or_host().map(|n| n as i32))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() as i32))
+}
+
+/// The media backend of a diffusion model, resolved to `paths` by
+/// [`model_backend`].
+async fn mediagen_backend(
+    model_ref: &str,
+    paths: crate::modelpack::DiffusionPaths,
+    port: u16,
+    args: &ServeArgs,
+) -> anyhow::Result<()> {
+    if paths.text_encoder.is_none() && crate::mediagen::needs_text_encoder(&paths.model) {
+        anyhow::bail!("{model_ref}: no text encoder in the model pack");
+    }
+    let (api, lib_dir) = load_ggml_api(args).await?;
     let params = crate::mediagen::ContextParams {
         model: paths.model.clone(),
         vae: paths.vae.clone(),
@@ -4263,11 +4391,7 @@ async fn mediagen_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyho
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(999),
-        n_threads: std::env::var("LLAMA_ARG_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or_else(|| threads_from_env_or_host().map(|n| n as i32))
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() as i32)),
+        n_threads: backend_threads(),
         flash_attn: flash_attention_from_env().as_deref() != Some("off"),
     };
     let ctx = tokio::task::spawn_blocking(move || crate::mediagen::Context::init(api, &params))
@@ -4284,10 +4408,52 @@ async fn mediagen_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyho
         model_ref.to_string(),
         paths.model.to_string_lossy().into_owned(),
     );
-    crate::mediagen::server::serve(router, (args.host, port).into()).await
+    crate::mediagen::http::serve("mediagen", router, (args.host, port).into()).await
 }
 
-/// Spawns this binary as a [`mediagen_backend`].
+/// The speech worker of a Canary GGUF at `path` ([`Engine::Speech`]):
+/// the model loads once onto the CPU backend, then
+/// `speech::server` answers `/v1/audio/transcriptions` on `port`.
+async fn speech_backend(
+    model_ref: &str,
+    path: &Path,
+    port: u16,
+    args: &ServeArgs,
+) -> anyhow::Result<()> {
+    let (api, lib_dir) = load_ggml_api(args).await?;
+    let n_threads = backend_threads();
+    let model_path = path.to_path_buf();
+    let worker = tokio::task::spawn_blocking(move || {
+        // The scheduler must hold the largest graph the model builds; an
+        // undersized one aborts the process inside ggml.
+        let info = crate::gguf::read_info(&model_path)?;
+        let hp = crate::speech::model::CanaryHParams::from_info(&info)?;
+        let max_nodes = crate::speech::encoder::graph_nodes(hp.enc_n_layers as usize).max(
+            crate::speech::decoder::graph_nodes(hp.dec_n_layers as usize),
+        );
+        let be = crate::mediagen::backend::Backend::new(api, false, n_threads, max_nodes)?;
+        let model = crate::speech::model::load(&model_path, &be)?;
+        crate::speech::server::Worker::new(be, model)
+    })
+    .await?
+    .with_context(|| {
+        format!(
+            "loading {} with the llama.cpp libraries in {}",
+            path.display(),
+            lib_dir.display()
+        )
+    })?;
+    let router = crate::speech::server::router(
+        worker,
+        model_ref.to_string(),
+        path.to_string_lossy().into_owned(),
+    );
+    crate::mediagen::http::serve("speech", router, (args.host, port).into()).await
+}
+
+/// Spawns this binary as `model_ref`'s backend, `llmman serve MODEL --port
+/// PORT` (see `run`): the media backend of a diffusion model, the speech
+/// worker of a Canary GGUF.
 async fn spawn_mediagen_backend(
     model_ref: &str,
     port: u16,
@@ -4504,9 +4670,22 @@ fn pull_only_engine(model: Option<&str>) -> anyhow::Result<crate::container::Con
         }
         crate::modelpack::ModelFormat::SafeTensors => crate::container::ContainerEngine::Vllm,
         crate::modelpack::ModelFormat::Omni => crate::container::ContainerEngine::VllmOmni,
-        crate::modelpack::ModelFormat::Gguf | crate::modelpack::ModelFormat::Diffusion => {
-            crate::container::ContainerEngine::LlamaServer
+        // A Canary GGUF runs in the speech worker's CPU image, whatever
+        // the host's GPU; every other GGUF in llama-server's.
+        crate::modelpack::ModelFormat::Gguf => {
+            let speech = match resolve_model(&store_path, &crate::default_cache()?, &model_ref)? {
+                ModelPath::Gguf(path, _) => {
+                    crate::gguf::read_info(&path).is_ok_and(|info| is_speech_model(&info))
+                }
+                _ => false,
+            };
+            if speech {
+                crate::container::ContainerEngine::Speech
+            } else {
+                crate::container::ContainerEngine::LlamaServer
+            }
         }
+        crate::modelpack::ModelFormat::Diffusion => crate::container::ContainerEngine::LlamaServer,
     })
 }
 
@@ -4574,10 +4753,11 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         // Resolved for certain: a failure returned above.
         if let Some(ociman) = runtime.known().and_then(|r| r.ociman()) {
             // resolve() pulled the llama.cpp image; a safetensors MODEL
-            // needs vLLM's (or SGLang's) too.
+            // needs vLLM's (or SGLang's) too, a Canary GGUF the CPU one.
             let engine = pull_only_engine(_args.model.as_deref())?;
             let version = match engine {
                 crate::container::ContainerEngine::LlamaServer => None,
+                crate::container::ContainerEngine::Speech => Some(llama_cpp_version.as_deref()),
                 crate::container::ContainerEngine::Sglang => Some(_args.sglang_version.as_deref()),
                 crate::container::ContainerEngine::Vllm
                 | crate::container::ContainerEngine::VllmOmni => {

@@ -4,9 +4,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
 use axum::body::Body;
 use axum::extract::{Path as AxPath, State};
 use axum::http::{header, StatusCode};
@@ -17,6 +15,7 @@ use base64::Engine;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use super::http::{self, now, Discovery};
 use super::{encode, ActionMode, ActionParams, Context, GenParams};
 
 const MAX_DIM: i64 = 4096;
@@ -34,7 +33,6 @@ struct Video {
 pub struct Server {
     ctx: Mutex<Context>,
     model_name: String,
-    model_path: String,
     videos: Mutex<VecDeque<Video>>,
     counter: AtomicU32,
     supports_image: bool,
@@ -67,19 +65,8 @@ impl IntoResponse for Error {
             Error::NotFound(m) => (StatusCode::NOT_FOUND, "not_found_error", m),
             Error::NotSupported(m) => (StatusCode::NOT_IMPLEMENTED, "not_supported_error", m),
         };
-        (
-            status,
-            Json(json!({"error": {"code": status.as_u16(), "message": msg, "type": ty}})),
-        )
-            .into_response()
+        http::error_response(status, ty, &msg)
     }
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn b64(data: &[u8]) -> String {
@@ -263,54 +250,38 @@ fn parse_body(body: &[u8]) -> Result<Value, Error> {
     serde_json::from_slice(body).map_err(|e| Error::Invalid(format!("invalid JSON: {e}")))
 }
 
-fn caps(s: &Server) -> Vec<&'static str> {
-    let mut c = Vec::new();
+/// What the daemon learns about the model from the discovery routes.
+fn discovery(s: &Server, model_path: String) -> Discovery {
+    let mut capabilities = Vec::new();
     if s.supports_image {
-        c.push("image");
+        capabilities.push("image");
     }
     if s.supports_video {
-        c.push("video");
+        capabilities.push("video");
     }
     if s.supports_audio {
-        c.push("audio");
+        capabilities.push("audio");
     }
-    c
-}
-
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
-}
-
-async fn models(State(s): State<Shared>) -> Json<Value> {
-    let caps = caps(&s);
-    Json(json!({
-        "models": [{
-            "name": s.model_name, "model": s.model_name, "modified_at": "", "size": "", "digest": "",
-            "type": "model", "description": "", "tags": [""], "capabilities": caps, "parameters": "",
-            "details": {"parent_model": "", "format": "gguf", "family": s.family, "families": [s.family],
-                        "parameter_size": "", "quantization_level": ""}
-        }],
-        "object": "list",
-        "data": [{"id": s.model_name, "object": "model", "created": now(), "owned_by": "llmman", "capabilities": caps}]
-    }))
-}
-
-async fn props(State(s): State<Shared>) -> Json<Value> {
-    Json(json!({
-        "model_alias": s.model_name,
-        "model_path": s.model_path,
-        "modalities": {
+    let mut extra_props = serde_json::Map::new();
+    extra_props.insert(
+        "default_generation_settings".into(),
+        json!({"width": s.default_size.0, "height": s.default_size.1, "fps": 24.0, "steps": s.default_steps, "cfg_scale": s.default_cfg}),
+    );
+    Discovery {
+        model_name: s.model_name.clone(),
+        model_path,
+        capabilities,
+        family: s.family,
+        modalities: json!({
             "vision": false, "video": false, "audio": false,
             "image_generation": s.supports_image, "video_generation": s.supports_video, "audio_generation": s.supports_audio,
-        },
-        "default_generation_settings": {"width": s.default_size.0, "height": s.default_size.1, "fps": 24.0, "steps": s.default_steps, "cfg_scale": s.default_cfg},
-        "build_info": format!("llmman {}", env!("CARGO_PKG_VERSION")),
-    }))
+        }),
+        extra_props,
+    }
 }
 
-async fn not_supported() -> Error {
-    Error::Invalid("the loaded model is a media generation model, use /v1/images/generations, /v1/videos or /v1/audio/speech".into())
-}
+/// The 400 for the text routes.
+const NOT_SUPPORTED: &str = "the loaded model is a media generation model, use /v1/images/generations, /v1/videos or /v1/audio/speech";
 
 /// Runs the pipeline on a blocking thread; `progress` receives (step, total).
 async fn generate(
@@ -605,6 +576,8 @@ async fn speech(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
         .unwrap())
 }
 
+/// The worker's routes over `ctx`, with the discovery routes and the text
+/// route refusals every worker shares ([`http`]).
 pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
     let s = Arc::new(Server {
         supports_image: ctx.supports_image(),
@@ -617,34 +590,17 @@ pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
         default_size: ctx.default_size(),
         ctx: Mutex::new(ctx),
         model_name,
-        model_path,
         videos: Mutex::new(VecDeque::new()),
         counter: AtomicU32::new(0),
     });
+    let discovery = discovery(&s, model_path);
     Router::new()
-        .route("/health", get(health))
-        .route("/v1/models", get(models))
-        .route("/models", get(models))
-        .route("/props", get(props))
         .route("/v1/images/generations", post(images))
         .route("/v1/videos", post(videos))
         .route("/v1/videos/:id", get(video_get))
         .route("/v1/videos/:id/content", get(video_content))
         .route("/v1/audio/speech", post(speech))
-        .route("/v1/chat/completions", post(not_supported))
-        .route("/completion", post(not_supported))
-        .route("/v1/completions", post(not_supported))
-        .route("/v1/embeddings", post(not_supported))
         .with_state(s)
-}
-
-/// Serves until the listener fails or the parent goes away.
-pub async fn serve(router: Router, addr: std::net::SocketAddr) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    eprintln!(
-        "[llmman] mediagen: listening on http://{}",
-        listener.local_addr()?
-    );
-    axum::serve(listener, router).await?;
-    Ok(())
+        .merge(http::discovery_routes(discovery))
+        .merge(http::text_routes_refused(NOT_SUPPORTED))
 }

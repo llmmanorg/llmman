@@ -4257,3 +4257,542 @@ fn speech_decoder_matches_the_reference() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// The reference the speech e2e tests tag the Q8_0 Canary GGUF as.
+#[cfg(unix)]
+const CANARY_MODEL_REF: &str = "docker.io/ai/canary:latest";
+
+/// `transcript.json`'s text for `fleurs-en.wav`.
+#[cfg(unix)]
+const CANARY_TRANSCRIPT: &str = "However, due to the slow communication channels, styles in the \
+                                 West could lag behind by 25 to 30 years.";
+
+/// A fresh OCI store holding `<gguf_dir>/canary-1b-v2-Q8_0.gguf` as
+/// [`CANARY_MODEL_REF`], seeded the way `store_one_model` in
+/// `cmd::serve::tests` seeds one. The caller removes it.
+#[cfg(unix)]
+fn seed_canary_store(gguf_dir: &Path) -> PathBuf {
+    use llmman::storage::oci::{Manifest, OciStore};
+
+    let store_dir = fresh_home("speech-store");
+    let store = OciStore::open(&store_dir).unwrap();
+    let mut layer = store
+        .write_blob_file(
+            "application/vnd.docker.ai.gguf.v3",
+            gguf_dir.join("canary-1b-v2-Q8_0.gguf"),
+        )
+        .unwrap();
+    layer.annotations = Some(std::collections::HashMap::from([(
+        "org.cncf.model.filepath".to_string(),
+        "canary-1b-v2-Q8_0.gguf".to_string(),
+    )]));
+    let config = store
+        .write_blob("application/vnd.cncf.model.config.v1+json", b"{}")
+        .unwrap();
+    let manifest = Manifest {
+        schema_version: 2,
+        media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+        artifact_type: None,
+        config,
+        layers: vec![layer],
+        annotations: None,
+    };
+    let mdesc = store
+        .write_blob(
+            "application/vnd.oci.image.manifest.v1+json",
+            &serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    store.tag(mdesc, CANARY_MODEL_REF).unwrap();
+    store_dir
+}
+
+/// `parts` posted as multipart to `<base>/v1/audio/transcriptions`, with
+/// the status and the JSON reply.
+#[cfg(unix)]
+fn post_transcription(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    parts: &[(&str, Option<&str>, &[u8])],
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let (content_type, body) = multipart_body(parts);
+    let resp = client
+        .post(format!("{base}/v1/audio/transcriptions"))
+        .header("content-type", content_type)
+        .body(body)
+        .send()
+        .expect("send the transcription request");
+    let status = resp.status();
+    let json: serde_json::Value = resp.json().expect("a JSON reply");
+    (status, json)
+}
+
+/// The speech worker end to end: a fresh OCI store holding the Q8_0
+/// Canary GGUF as `docker.io/ai/canary:latest`, the built binary as
+/// `llmman serve docker.io/ai/canary:latest --port PORT --runtime path`
+/// (what the daemon spawns for [`Engine::Speech`]), `/health` polled
+/// until the model is loaded, then `fleurs-en.wav` posted as the
+/// OpenAI multipart. The text must equal `transcript.json`'s, once and
+/// from two threads at the same time (the worker serializes them). A
+/// client that closes its socket mid-decode must not delay the next
+/// request by a whole decode: the abandoned one is cancelled. Three
+/// copies of the fixture in one file are cut into two clips and come
+/// back with the transcript twice. A body that is not a WAV gets 415
+/// and `response_format=srt` gets 400.
+/// Load, first-request and concurrent-pair timings are printed. Run
+/// with `cargo test --release --test launch_e2e speech_worker --
+/// --ignored --nocapture`.
+#[test]
+#[ignore]
+#[cfg(unix)]
+fn speech_worker_transcribes_the_fixture() {
+    use std::os::unix::process::CommandExt;
+
+    const MODEL_REF: &str = CANARY_MODEL_REF;
+    const EXPECTED: &str = CANARY_TRANSCRIPT;
+
+    // Same registry race as the canary tests above, and the load needs
+    // the memory other tests would hold.
+    let _guard = lock_serial();
+
+    let env_dir = |key: &str| {
+        std::env::var_os(key)
+            .map(PathBuf::from)
+            .filter(|d| !d.as_os_str().is_empty())
+    };
+    let Some(gguf_dir) = env_dir("LLMMAN_CANARY_GGUF_DIR") else {
+        eprintln!("skipping: LLMMAN_CANARY_GGUF_DIR is not set");
+        return;
+    };
+    let Some(ref_dir) = env_dir("LLMMAN_CANARY_REF_DIR") else {
+        eprintln!("skipping: LLMMAN_CANARY_REF_DIR is not set");
+        return;
+    };
+    // `--runtime path` below needs the same llama-server.
+    if llama_libs_on_path().is_none() {
+        return;
+    }
+    let wav = std::fs::read(ref_dir.join("fleurs-en.wav")).unwrap();
+    let store_dir = seed_canary_store(&gguf_dir);
+
+    // Bound once for a free number, then released for the worker.
+    let port = free_loopback_port();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let home = fresh_home("speech-home");
+    let mut cmd = Command::new(llmman_bin());
+    cmd.args([
+        "serve",
+        MODEL_REF,
+        "--port",
+        &port.to_string(),
+        "--runtime",
+        "path",
+    ])
+    .env("HOME", &home)
+    .env("LLMMAN_MODELS", &store_dir)
+    .stdin(Stdio::null())
+    .stdout(Stdio::inherit())
+    .stderr(Stdio::inherit())
+    .process_group(0);
+    let started = Instant::now();
+    let mut child = cmd.spawn().expect("spawn the speech worker");
+
+    // Killed on every exit path, a panic included.
+    struct Reap(Option<std::process::Child>, PathBuf, PathBuf);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                kill_process_tree(&mut child);
+            }
+            let _ = std::fs::remove_dir_all(&self.1);
+            let _ = std::fs::remove_dir_all(&self.2);
+        }
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap();
+    let deadline = started + Duration::from_secs(300);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            let _ = std::fs::remove_dir_all(&store_dir);
+            panic!("the speech worker exited before /health answered: {status}");
+        }
+        if client
+            .get(format!("{base}/health"))
+            .send()
+            .is_ok_and(|r| r.status().is_success())
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            kill_process_tree(&mut child);
+            let _ = std::fs::remove_dir_all(&store_dir);
+            panic!("the speech worker did not answer /health within 300s");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _reap = Reap(Some(child), store_dir.clone(), home.clone());
+    eprintln!("== worker loaded in {:.2?}", started.elapsed());
+
+    let post = |parts: &[(&str, Option<&str>, &[u8])]| post_transcription(&client, &base, parts);
+
+    let t = Instant::now();
+    let (status, reply) = post(&[
+        ("file", Some("fleurs-en.wav"), &wav),
+        ("model", None, MODEL_REF.as_bytes()),
+        ("language", None, b"en"),
+    ]);
+    let first = t.elapsed();
+    eprintln!("== first request: {status} in {first:.2?}: {reply}");
+    assert_eq!(status, reqwest::StatusCode::OK, "{reply}");
+    assert_eq!(reply["text"].as_str(), Some(EXPECTED), "{reply}");
+
+    // Two at once: the worker runs one and the other waits.
+    let t = Instant::now();
+    let results: Vec<(reqwest::StatusCode, serde_json::Value, Duration)> =
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let wav = &wav;
+                    let base = &base;
+                    s.spawn(move || {
+                        let client = reqwest::blocking::Client::builder()
+                            .timeout(Duration::from_secs(120))
+                            .build()
+                            .unwrap();
+                        let t = Instant::now();
+                        let (status, json) = post_transcription(
+                            &client,
+                            base,
+                            &[
+                                ("file", Some("fleurs-en.wav"), wav),
+                                ("model", None, MODEL_REF.as_bytes()),
+                                ("language", None, b"en"),
+                            ],
+                        );
+                        (status, json, t.elapsed())
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+    eprintln!("== concurrent pair done in {:.2?}", t.elapsed());
+    for (i, (status, reply, took)) in results.iter().enumerate() {
+        eprintln!("   request {i}: {status} in {took:.2?}: {reply}");
+        assert_eq!(*status, reqwest::StatusCode::OK, "{reply}");
+        assert_eq!(reply["text"].as_str(), Some(EXPECTED), "{reply}");
+    }
+    // One decode, as fast as this host has shown it.
+    let single = results
+        .iter()
+        .map(|(_, _, took)| *took)
+        .fold(first, Duration::min);
+
+    // A client that leaves mid-decode: the whole POST goes out on a raw
+    // socket, which closes 300 ms later. The next request then takes
+    // about one decode when the abandoned one was cancelled, and about
+    // two when it ran on under the worker lock.
+    {
+        use std::io::Write;
+        let (content_type, body) = multipart_body(&[
+            ("file", Some("fleurs-en.wav"), &wav),
+            ("model", None, MODEL_REF.as_bytes()),
+            ("language", None, b"en"),
+        ]);
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            sock,
+            "POST /v1/audio/transcriptions HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        sock.write_all(&body).unwrap();
+        sock.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        drop(sock);
+    }
+    let t = Instant::now();
+    let (status, reply) = post(&[
+        ("file", Some("fleurs-en.wav"), &wav),
+        ("model", None, MODEL_REF.as_bytes()),
+        ("language", None, b"en"),
+    ]);
+    let after_leave = t.elapsed();
+    eprintln!("== after a client left mid-decode: {status} in {after_leave:.2?} (one decode {single:.2?}): {reply}");
+    assert_eq!(status, reqwest::StatusCode::OK, "{reply}");
+    assert_eq!(reply["text"].as_str(), Some(EXPECTED), "{reply}");
+    assert!(
+        after_leave < single + single / 2,
+        "the abandoned decode was not cancelled: {after_leave:.2?} after it, one decode {single:.2?}"
+    );
+
+    // Three copies of the fixture, 31.7 s, above the 30 s clip cap: two
+    // clips of 15.85 s. The first and the third copy each sit whole in a
+    // clip, so the text carries the transcript twice; the second copy
+    // straddles the cut.
+    let samples = llmman::speech::wav::parse(&wav, usize::MAX).expect("the fixture is a PCM16 WAV");
+    let long = pcm16_wav(&samples.repeat(3));
+    let t = Instant::now();
+    let (status, reply) = post(&[
+        ("file", Some("long.wav"), &long),
+        ("model", None, MODEL_REF.as_bytes()),
+        ("language", None, b"en"),
+    ]);
+    eprintln!(
+        "== three copies ({:.1} s): {status} in {:.2?}: {reply}",
+        samples.len() as f64 * 3.0 / 16000.0,
+        t.elapsed()
+    );
+    assert_eq!(status, reqwest::StatusCode::OK, "{reply}");
+    // Case-insensitive: with more context in a clip the model has
+    // capitalised "Styles" after the comma.
+    let text = reply["text"].as_str().unwrap_or_default().to_lowercase();
+    assert!(
+        text.matches(&EXPECTED.to_lowercase()).count() >= 2,
+        "two whole copies should come back: {text}"
+    );
+
+    let (status, reply) = post(&[
+        ("file", Some("not.wav"), b"RIFF but not a WAV file"),
+        ("model", None, MODEL_REF.as_bytes()),
+    ]);
+    eprintln!("== non-WAV body: {status}: {reply}");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "{reply}"
+    );
+
+    let (status, reply) = post(&[
+        ("file", Some("fleurs-en.wav"), &wav),
+        ("model", None, MODEL_REF.as_bytes()),
+        ("response_format", None, b"srt"),
+    ]);
+    eprintln!("== response_format=srt: {status}: {reply}");
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{reply}");
+}
+
+/// A PCM16 mono 16 kHz WAV of `samples`: the 44-byte header and the data.
+#[cfg(unix)]
+fn pcm16_wav(samples: &[i16]) -> Vec<u8> {
+    let data_len = (samples.len() * 2) as u32;
+    let mut out = Vec::with_capacity(44 + samples.len() * 2);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&1u16.to_le_bytes()); // mono
+    out.extend_from_slice(&16000u32.to_le_bytes());
+    out.extend_from_slice(&32000u32.to_le_bytes()); // byte rate
+    out.extend_from_slice(&2u16.to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// A `multipart/form-data` body of `parts` as `(name, filename, bytes)`,
+/// with its content type. reqwest's multipart feature is not enabled.
+#[cfg(unix)]
+fn multipart_body(parts: &[(&str, Option<&str>, &[u8])]) -> (String, Vec<u8>) {
+    const BOUNDARY: &str = "llmman-e2e-boundary-7f3a9c";
+    let mut body = Vec::new();
+    for (name, filename, bytes) in parts {
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        match filename {
+            Some(f) => body.extend_from_slice(
+                format!(
+                    "Content-Disposition: form-data; name=\"{name}\"; filename=\"{f}\"\r\n\
+                     Content-Type: application/octet-stream\r\n\r\n"
+                )
+                .as_bytes(),
+            ),
+            None => body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            ),
+        }
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={BOUNDARY}"), body)
+}
+
+/// The daemon routing a Canary GGUF end to end: `llmman serve` on a free
+/// loopback port with the store of [`seed_canary_store`], `--runtime
+/// path` and `LLMMAN_KEEP_ALIVE=5s`. The fixture posted to the daemon's
+/// `/v1/audio/transcriptions` loads the speech worker and answers
+/// `transcript.json`'s text; chat completions and embeddings for the
+/// model get 400 naming `/v1/audio/transcriptions` and `/api/ps` shows
+/// the model on `speech (local)`. Once keep-alive and the idle check
+/// (15 s) pass, `/api/ps` is empty and the worker's pid is gone; a new
+/// transcription reloads it and succeeds. Run with `cargo test --release
+/// --test launch_e2e speech_daemon -- --ignored --nocapture`.
+#[test]
+#[ignore]
+#[cfg(unix)]
+fn speech_daemon_routes_the_fixture() {
+    // Same registry race as the canary tests above, and the load needs
+    // the memory other tests would hold.
+    let _guard = lock_serial();
+
+    let env_dir = |key: &str| {
+        std::env::var_os(key)
+            .map(PathBuf::from)
+            .filter(|d| !d.as_os_str().is_empty())
+    };
+    let Some(gguf_dir) = env_dir("LLMMAN_CANARY_GGUF_DIR") else {
+        eprintln!("skipping: LLMMAN_CANARY_GGUF_DIR is not set");
+        return;
+    };
+    let Some(ref_dir) = env_dir("LLMMAN_CANARY_REF_DIR") else {
+        eprintln!("skipping: LLMMAN_CANARY_REF_DIR is not set");
+        return;
+    };
+    // The daemon spawns the worker with `--runtime path`.
+    if llama_libs_on_path().is_none() {
+        return;
+    }
+    let wav = std::fs::read(ref_dir.join("fleurs-en.wav")).unwrap();
+    let store_dir = seed_canary_store(&gguf_dir);
+    let home = fresh_home("speech-daemon-home");
+
+    let host = format!("127.0.0.1:{}", free_loopback_port());
+    let base = format!("http://{host}");
+    let store = store_dir.to_string_lossy().into_owned();
+    let home_str = home.to_string_lossy().into_owned();
+    let mut daemon = spawn_test_daemon(
+        &host,
+        &[
+            ("HOME", &home_str),
+            ("LLMMAN_MODELS", &store),
+            ("LLMMAN_KEEP_ALIVE", "5s"),
+        ],
+    );
+    eprintln!("[test] speech daemon pid {} on {host}", daemon.id());
+
+    let result = std::panic::catch_unwind(|| {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(600))
+            .build()
+            .unwrap();
+        let fixture: [(&str, Option<&str>, &[u8]); 3] = [
+            ("file", Some("fleurs-en.wav"), &wav),
+            ("model", None, CANARY_MODEL_REF.as_bytes()),
+            ("language", None, b"en"),
+        ];
+
+        // Cold: the daemon spawns the worker and waits for its /health.
+        let t = Instant::now();
+        let (status, reply) = post_transcription(&client, &base, &fixture);
+        eprintln!(
+            "== cold transcription through the daemon: {status} in {:.2?}: {reply}",
+            t.elapsed()
+        );
+        assert_eq!(status, reqwest::StatusCode::OK, "{reply}");
+        assert_eq!(reply["text"].as_str(), Some(CANARY_TRANSCRIPT), "{reply}");
+
+        // Text and embeddings never reach the worker.
+        for (route, body) in [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({
+                    "model": CANARY_MODEL_REF,
+                    "messages": [{"role": "user", "content": "ping"}],
+                }),
+            ),
+            (
+                "/v1/embeddings",
+                serde_json::json!({"model": CANARY_MODEL_REF, "input": "ping"}),
+            ),
+        ] {
+            let resp = client
+                .post(format!("{base}{route}"))
+                .json(&body)
+                .send()
+                .unwrap_or_else(|e| panic!("send {route}: {e}"));
+            let status = resp.status();
+            let reply: serde_json::Value = resp.json().expect("a JSON reply");
+            eprintln!("== {route}: {status}: {reply}");
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{route}: {reply}");
+            let message = reply["error"].as_str().unwrap_or_default();
+            assert!(message.contains("is a speech model"), "{route}: {reply}");
+            assert!(
+                message.contains("/v1/audio/transcriptions"),
+                "{route}: {reply}"
+            );
+        }
+
+        let ps = |client: &reqwest::blocking::Client| -> serde_json::Value {
+            client
+                .get(format!("{base}/api/ps"))
+                .send()
+                .expect("GET /api/ps")
+                .json()
+                .expect("a JSON /api/ps")
+        };
+        let loaded = ps(&client);
+        eprintln!("== /api/ps while loaded: {loaded}");
+        let row = loaded["models"]
+            .as_array()
+            .and_then(|models| {
+                models
+                    .iter()
+                    .find(|m| m["name"].as_str() == Some(CANARY_MODEL_REF))
+            })
+            .unwrap_or_else(|| panic!("{CANARY_MODEL_REF} missing from /api/ps: {loaded}"));
+        assert_eq!(row["processor"].as_str(), Some("speech (local)"), "{row}");
+        let pid = row["pid"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no worker pid in /api/ps: {row}")) as i32;
+
+        // Keep-alive (5 s) plus the idle check interval (15 s), with slack.
+        let t = Instant::now();
+        let deadline = t + Duration::from_secs(90);
+        loop {
+            let now = ps(&client);
+            let listed = now["models"]
+                .as_array()
+                .is_some_and(|models| !models.is_empty());
+            // ESRCH once the daemon has killed and reaped the worker.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !listed && !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the speech worker (pid {pid}) was not unloaded within 90s: listed={listed} alive={alive}: {now}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        eprintln!(
+            "== worker pid {pid} unloaded {:.2?} after the keep-alive check began",
+            t.elapsed()
+        );
+
+        // Warm again: a new request reloads the worker.
+        let t = Instant::now();
+        let (status, reply) = post_transcription(&client, &base, &fixture);
+        eprintln!(
+            "== transcription after the unload: {status} in {:.2?}: {reply}",
+            t.elapsed()
+        );
+        assert_eq!(status, reqwest::StatusCode::OK, "{reply}");
+        assert_eq!(reply["text"].as_str(), Some(CANARY_TRANSCRIPT), "{reply}");
+    });
+
+    terminate_daemon(&mut daemon);
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let _ = std::fs::remove_dir_all(&home);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}

@@ -9,6 +9,7 @@ pub mod backend;
 pub mod cosmos3;
 pub mod encode;
 pub mod ffi;
+pub mod http;
 pub mod ltx;
 pub mod qwen_image;
 pub mod server;

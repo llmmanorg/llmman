@@ -2,7 +2,8 @@ use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
 use super::hybrid::{request_pin, resolve_hybrid_side, with_hybrid_fallback};
 use super::openai::{
-    apply_default_repeat_penalty, decode_f32s, encode_f32s, EFFORT_BUDGET_MESSAGE,
+    apply_default_repeat_penalty, decode_f32s, encode_f32s, DEFAULT_TRANSCRIPTION_PROMPT,
+    EFFORT_BUDGET_MESSAGE,
 };
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::responses::{
@@ -12,9 +13,10 @@ use super::responses::{
 use super::sched::{reap_idle_models_once, DEFAULT_KEEP_ALIVE};
 use super::stream::{fold_ollama_lines, stream_ollama};
 use super::test_support::{
-    headers_with, mock_peer, node, remote_target, remote_target_on, rendered_registry,
-    running_model_fixture, running_model_fixture_with_engine, serve_router, serve_router_with,
-    test_inner, test_state, test_state_at, test_state_with_budget, ws_upgrade, HOSTED, PAIR,
+    headers_with, mock_peer, multipart_parts, multipart_upload, node, remote_target,
+    remote_target_on, rendered_registry, running_model_fixture, running_model_fixture_with_engine,
+    serve_router, serve_router_with, test_inner, test_state, test_state_at, test_state_with_budget,
+    ws_upgrade, HOSTED, PAIR,
 };
 use super::*;
 
@@ -1468,6 +1470,7 @@ fn only_ds4_is_probed_somewhere_other_than_health() {
         Engine::VllmOmni,
         Engine::Sglang,
         Engine::Mlx,
+        Engine::Speech,
     ] {
         assert_eq!(engine.ready_path(), "/health");
     }
@@ -2362,6 +2365,7 @@ async fn the_engine_label_names_the_engine_not_the_runtime() {
         (Engine::Sglang, "sglang"),
         (Engine::Mlx, "mlx"),
         (Engine::Ds4, "ds4"),
+        (Engine::Speech, "speech"),
     ] {
         assert_eq!(
             running_model_fixture_with_engine(engine, None).engine_label(),
@@ -2525,6 +2529,10 @@ async fn reap_idle_models_unloads_only_idle_expired_models_not_in_flight_or_fore
             "not-yet-expired".into(),
             running_model_fixture(Some(Duration::from_secs(300)), Duration::from_secs(1), 0),
         );
+        let mut speech = running_model_fixture_with_engine(Engine::Speech, None);
+        speech.keep_alive = Some(Duration::from_secs(1));
+        speech.last_active = Instant::now() - Duration::from_secs(10);
+        mgr.running.insert("expired-speech-worker".into(), speech);
     }
 
     reap_idle_models_once(&state).await;
@@ -2533,6 +2541,10 @@ async fn reap_idle_models_unloads_only_idle_expired_models_not_in_flight_or_fore
     assert!(
         !mgr.running.contains_key("expired-and-idle"),
         "an idle model past its keep_alive deadline must be unloaded"
+    );
+    assert!(
+        !mgr.running.contains_key("expired-speech-worker"),
+        "a speech worker is unloaded like every other local process"
     );
     assert!(
         mgr.running.contains_key("expired-but-in-flight"),
@@ -7484,6 +7496,87 @@ async fn a_decision_model_is_refused_before_it_loads() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `general.architecture = canary` marks a speech model. The test writer's
+/// later key replaces its default `llama` (`Info::metadata` is a map).
+#[test]
+fn is_speech_model_keys_off_the_canary_architecture() {
+    let info = |strings: &[(&str, &str)]| {
+        let path = crate::gguf::write_test_gguf_with_strings(&[], strings);
+        let info = crate::gguf::read_info(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        info
+    };
+    let canary = info(&[("general.architecture", "canary")]);
+    assert!(is_speech_model(&canary));
+    assert!(!is_speech_model(&info(&[])));
+}
+
+/// A Canary GGUF generates no text and no embeddings and serves no
+/// forwarded route: all three are refused with a 400 naming the
+/// transcription route before anything is spawned, and again once its
+/// worker is loaded, so the worker never sees them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_speech_model_is_refused_text_and_embeddings_cold_and_loaded() {
+    let dir = fresh_store_dir("speech-cold");
+    let state = test_state_at(dir.clone());
+    let path =
+        crate::gguf::write_test_gguf_with_strings(&[], &[("general.architecture", "canary")]);
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    store_one_model(
+        &OciStore::open(&dir).unwrap(),
+        "speechcold",
+        "application/vnd.docker.ai.gguf.v3",
+        "model.gguf",
+        &bytes,
+    );
+    let refused = |task: Task| {
+        let state = state.clone();
+        async move {
+            let Err(err) = ensure_model_for(
+                &state,
+                "docker.io/ai/speechcold",
+                None,
+                LoadOptions::default(),
+                task,
+            )
+            .await
+            else {
+                panic!("a speech model cannot do {task:?}");
+            };
+            assert_eq!(err.1, StatusCode::BAD_REQUEST);
+            let message = format!("{:#}", err.0);
+            assert!(message.contains("is a speech model"), "{message}");
+            assert!(message.contains("/v1/audio/transcriptions"), "{message}");
+        }
+    };
+    for task in [Task::Generate, Task::Embed, Task::Forward] {
+        refused(task).await;
+    }
+    assert!(
+        state.0.manager.lock().await.running.is_empty(),
+        "nothing was loaded"
+    );
+
+    // Loaded by a transcription request: the admitted task is the only one.
+    mark_loaded(&state, "docker.io/ai/speechcold", Engine::Speech, 1).await;
+    for task in [Task::Generate, Task::Embed, Task::Forward] {
+        refused(task).await;
+    }
+    let (_, target, guard) = ensure_model_for(
+        &state,
+        "docker.io/ai/speechcold",
+        None,
+        LoadOptions::default(),
+        Task::Other,
+    )
+    .await
+    .expect("a transcription reaches the loaded worker");
+    assert!(matches!(target, Target::Local(1)), "{target:?}");
+    guard.release_idle();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // -- failures a client took for an outage, and what the model lists carry --
 
 #[test]
@@ -7652,6 +7745,116 @@ async fn mark_loaded(state: &AppState, model: &str, engine: Engine, port: u16) {
     loaded.port = port;
     let key = running_key(state, model);
     state.0.manager.lock().await.running.insert(key, loaded);
+}
+
+/// A stand-in speech worker; its port. `/v1/audio/transcriptions` answers
+/// `reply`, or echoes the request body under its own content type without
+/// one. `/props` is empty, for a comparison against a llama-server, whose
+/// default prompt the daemon reads it for.
+async fn fake_speech_server(reply: Option<(StatusCode, serde_json::Value)>) -> u16 {
+    let app = Router::new()
+        .route("/props", get(|| async { Json(serde_json::json!({})) }))
+        .route(
+            "/v1/audio/transcriptions",
+            post(move |headers: HeaderMap, body: Bytes| async move {
+                match reply {
+                    Some((status, body)) => (status, Json(body)).into_response(),
+                    None => {
+                        let content_type = headers["content-type"].clone();
+                        ([("content-type", content_type)], body).into_response()
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    port
+}
+
+/// Binary, and holding a CRLF and boundary-like text.
+const TRANSCRIPTION_AUDIO: &[u8] = b"RIFF\x00\xff\r\n--not-the-boundary\r\n\x00\x01WAVE";
+
+/// POSTs a transcription of [`TRANSCRIPTION_AUDIO`] for `model` to the
+/// daemon at `base`.
+async fn post_transcription(base: &str, model: &str) -> reqwest::Response {
+    let (body, headers) = multipart_upload(&[
+        ("model", None, model.as_bytes()),
+        ("file", Some(("a.wav", "audio/wav")), TRANSCRIPTION_AUDIO),
+        ("language", None, b"en"),
+    ]);
+    stand_in_client()
+        .post(format!("{base}/v1/audio/transcriptions"))
+        .header("content-type", headers["content-type"].clone())
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A speech worker gets the transcription request as the client sent it:
+/// the default prompt is a llama-server's (llmmanorg/llmman#688), and its
+/// reply passes through unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_speech_worker_gets_the_transcription_as_sent() {
+    for (engine, prompt) in [
+        (Engine::Speech, None),
+        (Engine::LlamaServer, Some(DEFAULT_TRANSCRIPTION_PROMPT)),
+    ] {
+        let port = fake_speech_server(None).await;
+        let state = test_state();
+        mark_loaded(&state, "canary", engine, port).await;
+        let base = serve_router(state).await;
+        let resp = post_transcription(&base, "canary").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{engine:?}");
+        let headers = headers_with(&[(
+            "content-type",
+            resp.headers()["content-type"].to_str().unwrap(),
+        )]);
+        let forwarded = multipart_parts(&resp.bytes().await.unwrap(), &headers).await;
+        let owned = |s: &str| Some(s.to_string());
+        let mut expected = vec![
+            ("model".to_string(), None, None, b"canary".to_vec()),
+            (
+                "file".to_string(),
+                owned("a.wav"),
+                owned("audio/wav"),
+                TRANSCRIPTION_AUDIO.to_vec(),
+            ),
+            ("language".to_string(), None, None, b"en".to_vec()),
+        ];
+        if let Some(prompt) = prompt {
+            expected.push(("prompt".to_string(), None, None, prompt.as_bytes().to_vec()));
+        }
+        assert_eq!(forwarded, expected, "{engine:?}");
+    }
+}
+
+/// The worker's reply is the client's, status and body alike: a 415 for
+/// audio it cannot read is not turned into a 500 (llmmanorg/llmman#687).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_speech_workers_reply_passes_through_unchanged() {
+    let error = serde_json::json!({
+        "error": {
+            "code": "unsupported_media_type",
+            "message": "the file is not a PCM16 mono 16 kHz WAV",
+            "type": "invalid_request_error"
+        }
+    });
+    let transcript =
+        serde_json::json!({ "text": "However, due to the slow communication channels" });
+    for (status, body) in [
+        (StatusCode::UNSUPPORTED_MEDIA_TYPE, error),
+        (StatusCode::OK, transcript),
+    ] {
+        let port = fake_speech_server(Some((status, body.clone()))).await;
+        let state = test_state();
+        mark_loaded(&state, "canary", Engine::Speech, port).await;
+        let base = serve_router(state).await;
+        let resp = post_transcription(&base, "canary").await;
+        assert_eq!(resp.status(), status);
+        assert_eq!(resp.json::<serde_json::Value>().await.unwrap(), body);
+    }
 }
 
 async fn get_json(base: &str, path_and_query: &str) -> (StatusCode, serde_json::Value) {
