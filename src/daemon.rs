@@ -312,6 +312,50 @@ fn stale_daemon() -> Option<DaemonIdentity> {
     }
 }
 
+/// The systemd unit managing `pid`, read off its cgroup — `None` when no
+/// unit does.
+///
+/// A unit's processes sit in a cgroup path whose last segment is the unit
+/// name (`.../user@1000.service/session.slice/sh.brew.llmman.service`);
+/// a process started from a shell sits in a `.scope` instead.
+///
+/// A unit this process is itself in does not count. `detach` changes the
+/// process group and not the cgroup, so a daemon llmman spawned from
+/// inside a unit inherits that unit's path without the manager knowing
+/// it exists — treating that as managed would both stop llmman replacing
+/// its own daemon and name a unit that does not control it.
+///
+/// Linux only: launchd keeps no equivalent file, so a Homebrew service
+/// on macOS is not recognised and still gets superseded.
+fn service_unit(pid: Option<u32>) -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    managing_unit(unit_of(pid?), unit_of(std::process::id()))
+}
+
+/// `daemon`'s unit, unless it is the one this process is in — see
+/// [`service_unit`] for why sharing it means nothing manages the daemon.
+fn managing_unit(daemon: Option<String>, ours: Option<String>) -> Option<String> {
+    daemon.filter(|unit| Some(unit) != ours.as_ref())
+}
+
+/// The unit in `pid`'s cgroup file, whoever put it there.
+fn unit_of(pid: u32) -> Option<String> {
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    unit_from_cgroup(&cgroup)
+}
+
+/// The unit name in a `/proc/<pid>/cgroup` body — see [`service_unit`].
+fn unit_from_cgroup(cgroup: &str) -> Option<String> {
+    cgroup
+        .lines()
+        .filter_map(|line| line.rsplit_once('/'))
+        .map(|(_, last)| last)
+        .find(|last| last.ends_with(".service"))
+        .map(str::to_string)
+}
+
 /// Best-effort stop of a stale daemon (see `stale_daemon`), then waits for
 /// the port to actually free up. Kills the daemon's whole process group —
 /// it was started as a group leader (see `detach`/sbx's equivalent), so
@@ -474,7 +518,25 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
         // long-obsolete build whose llama-server (and bug fixes) are gone.
         match stale_daemon() {
             None => return Ok(()),
-            Some(identity) => stop_stale_daemon(&identity)?,
+            // A daemon a service manager started is that manager's to
+            // stop: killing it here leaves the unit dead and the port
+            // held by an unmanaged process, which `systemctl --user
+            // start` then fights over. Keep serving with the older build
+            // — the tradeoff the comment above names — and say what to
+            // run to replace it.
+            Some(identity) => match service_unit(identity.pid) {
+                Some(unit) => {
+                    eprintln!(
+                        "[llmman] {} is serving {} and is managed by {unit}; \
+                         leaving it alone. To restart it, which runs the unit's own \
+                         executable: systemctl [--user] restart {unit}",
+                        identity.version.as_deref().unwrap_or("an older daemon"),
+                        bind_addr()
+                    );
+                    return Ok(());
+                }
+                None => stop_stale_daemon(&identity)?,
+            },
         }
     } else if !host_is_local() {
         anyhow::bail!(
@@ -2445,5 +2507,73 @@ mod tests {
             // No parenthetical at all, so no command to copy.
             assert!(!message.contains('('), "pid {pid}: {message}");
         }
+    }
+
+    /// Real `/proc/<pid>/cgroup` bodies: a unit's processes end in the
+    /// unit name, a shell's in a `.scope` — see [`service_unit`] for why
+    /// the difference decides whether llmman may stop the daemon.
+    #[test]
+    fn unit_from_cgroup_names_the_unit_and_only_a_unit() {
+        assert_eq!(
+            unit_from_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/session.slice/sh.brew.llmman.service\n"
+            )
+            .as_deref(),
+            Some("sh.brew.llmman.service")
+        );
+        // Started from a shell: a scope, not a unit llmman must defer to.
+        assert_eq!(
+            unit_from_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/tmux-spawn-0e9dd425.scope\n"
+            ),
+            None
+        );
+        // cgroup v1 lists one line per controller; the unit is still the
+        // last segment of whichever line has it.
+        assert_eq!(
+            unit_from_cgroup(
+                "11:name=systemd:/user.slice/user@1000.service/sh.brew.llmman.service\n\
+                 2:cpu:/\n"
+            )
+            .as_deref(),
+            Some("sh.brew.llmman.service")
+        );
+        assert_eq!(unit_from_cgroup(""), None);
+        // The user manager itself is a `.service`, but a daemon under it
+        // sits deeper; a path ending there is the manager, not a daemon.
+        assert_eq!(
+            unit_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service\n").as_deref(),
+            Some("user@1000.service")
+        );
+    }
+
+    /// The comparison [`service_unit`] rests on: a daemon sharing this
+    /// process's unit inherited it from `detach` rather than being
+    /// started by the manager, so it is llmman's to replace.
+    #[test]
+    fn managing_unit_ignores_a_unit_this_process_is_itself_in() {
+        let brew = || Some("sh.brew.llmman.service".to_string());
+        let ours = || Some("llmman-probe.service".to_string());
+        // Started by a manager llmman is not running under.
+        assert_eq!(managing_unit(brew(), None), brew());
+        assert_eq!(managing_unit(brew(), ours()), brew());
+        // Spawned by an llmman that was itself inside the unit.
+        assert_eq!(managing_unit(ours(), ours()), None);
+        // No unit either side: a plain shell's daemon.
+        assert_eq!(managing_unit(None, ours()), None);
+        assert_eq!(managing_unit(None, None), None);
+    }
+
+    /// The live reading half. Nothing is claimed for this process, both
+    /// because a test binary is not a unit's and because a unit this
+    /// process shares cannot be managing a daemon llmman spawned into it
+    /// — see [`service_unit`].
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn service_unit_claims_nothing_for_this_process_or_its_own_unit() {
+        assert_eq!(service_unit(Some(std::process::id())), None);
+        assert_eq!(service_unit(None), None);
+        // A pid that cannot exist has no cgroup file to read.
+        assert_eq!(service_unit(Some(u32::MAX)), None);
     }
 }
