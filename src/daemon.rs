@@ -214,6 +214,41 @@ struct DaemonIdentity {
     pid: Option<u32>,
 }
 
+impl DaemonIdentity {
+    /// Any nonzero pid counts: a daemon that is a container's entrypoint
+    /// (the documented `docker run` deployment) reports pid 1, which is
+    /// only unsafe to *signal* (see [`signalable_pid`]), not to recognise.
+    fn is_llmman(&self) -> bool {
+        self.version.as_deref().is_some_and(|v| !v.is_empty())
+            && self.exe.as_deref().is_some_and(|exe| !exe.is_empty())
+            && self.pid.is_some_and(|pid| pid > 0)
+    }
+}
+
+fn daemon_identity() -> anyhow::Result<DaemonIdentity> {
+    client_builder()?
+        .timeout(Some(Duration::from_secs(2)))
+        .build()?
+        .get(format!("{}/api/version", server()))
+        .send()
+        .context("request /api/version")?
+        .error_for_status()?
+        .json()
+        .context("parse /api/version")
+}
+
+/// A reachable port is not necessarily a llmman daemon.
+pub fn check_server_identity() -> anyhow::Result<()> {
+    let identity =
+        daemon_identity().with_context(|| format!("check llmman daemon at {}", server()))?;
+    anyhow::ensure!(
+        identity.is_llmman(),
+        "{} is reachable but did not return a llmman daemon identity",
+        server()
+    );
+    Ok(())
+}
+
 /// Whether the configured host is this machine — a remote one's PID
 /// belongs to another machine, so spawning/killing based on it must be
 /// skipped.
@@ -290,18 +325,7 @@ fn is_local_host(host: &str) -> bool {
 /// fetched/parsed at all — whatever is holding the port in that case,
 /// killing processes based on it would be a guess.
 fn stale_daemon() -> Option<DaemonIdentity> {
-    let resp = client_builder()
-        .ok()?
-        .timeout(Some(Duration::from_secs(2)))
-        .build()
-        .ok()?
-        .get(format!("{}/api/version", server()))
-        .send()
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let identity: DaemonIdentity = resp.json().ok()?;
+    let identity = daemon_identity().ok()?;
     match (&identity.version, &identity.exe) {
         (Some(version), Some(exe))
             if version == env!("LLMMAN_VERSION") && std::path::Path::new(exe).exists() =>
@@ -1795,6 +1819,25 @@ fn encode_path_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_identity_requires_llmman_fields() {
+        let mut identity: DaemonIdentity =
+            serde_json::from_str(r#"{"version":"0.1.0","exe":"/bin/llmman","pid":42}"#).unwrap();
+        assert!(identity.is_llmman());
+        identity.pid = Some(1);
+        assert!(identity.is_llmman());
+        identity.pid = Some(0);
+        assert!(!identity.is_llmman());
+        identity.pid = None;
+        assert!(!identity.is_llmman());
+        identity.pid = Some(42);
+        identity.version = None;
+        assert!(!identity.is_llmman());
+        identity.version = Some("0.1.0".into());
+        identity.exe = None;
+        assert!(!identity.is_llmman());
+    }
 
     fn show_response(body: serde_json::Value) -> ShowResponse {
         serde_json::from_value(body).expect("a ShowResponse")

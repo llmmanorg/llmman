@@ -4159,10 +4159,14 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
 
 pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     if args.detach {
-        return crate::daemon::ensure_server_with_args(
+        if crate::daemon::server_alive() {
+            crate::daemon::check_server_identity()?;
+        }
+        crate::daemon::ensure_server_with_args(
             args.model.as_deref().unwrap_or(""),
             &args.detached_child_args(),
-        );
+        )?;
+        return crate::daemon::check_server_identity();
     }
     if let (Some(port), Some(model)) = (args.port, &args.model) {
         return tokio::runtime::Runtime::new()?.block_on(mediagen_backend(model, port, args));
