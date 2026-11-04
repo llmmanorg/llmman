@@ -7,6 +7,19 @@ require (
 	github.com/containerd/containerd/v2 v2.0.13
 	github.com/containerd/errdefs v1.0.0
 	github.com/docker/cli v29.4.1+incompatible
+	// Podman backend only: the registry error codes go.podman.io/image
+	// wraps, so isBackendNotFound can tell "manifest unknown" from "I could
+	// not find out" by type rather than by message. Already in the graph as
+	// an indirect dependency of go.podman.io/image.
+	github.com/docker/distribution v2.8.3+incompatible
+	// Test-only: pkg/registry is an in-memory OCI registry, used by
+	// sigstore_registry_test.go to exercise signing and verification
+	// over the real distribution protocol instead of against mocks.
+	// (That test earned its keep immediately, catching both a
+	// signature-dedup bug and a pullToLayout hang on manifests that name
+	// one blob twice.) Go has no test-only require, so it lands here
+	// rather than under `// indirect`, where it already was.
+	github.com/google/go-containerregistry v0.21.5
 
 	// Common OCI types
 	github.com/opencontainers/go-digest v1.0.0
@@ -19,6 +32,7 @@ require (
 	// before this became a direct one, so promoting it adds nothing to
 	// go.sum.
 	github.com/sigstore/sigstore v1.10.6
+	github.com/sirupsen/logrus v1.9.4
 
 	// Progress bars
 	github.com/vbauerster/mpb/v8 v8.12.0
@@ -36,24 +50,6 @@ require (
 	// Free disk space on Windows (diskspace_windows.go)
 	golang.org/x/sys v0.47.0
 )
-
-require (
-	// Test-only: pkg/registry is an in-memory OCI registry, used by
-	// sigstore_registry_test.go to exercise signing and verification
-	// over the real distribution protocol instead of against mocks.
-	// (That test earned its keep immediately, catching both a
-	// signature-dedup bug and a pullToLayout hang on manifests that name
-	// one blob twice.) Go has no test-only require, so it lands here
-	// rather than under `// indirect`, where it already was.
-	github.com/google/go-containerregistry v0.21.5
-	github.com/sirupsen/logrus v1.9.4
-)
-
-// Podman backend only: the registry error codes go.podman.io/image
-// wraps, so isBackendNotFound can tell "manifest unknown" from "I could
-// not find out" by type rather than by message. Already in the graph as
-// an indirect dependency of go.podman.io/image.
-require github.com/docker/distribution v2.8.3+incompatible
 
 require (
 	cyphar.com/go-pathrs v0.2.4 // indirect
@@ -78,7 +74,7 @@ require (
 	github.com/docker/go-connections v0.7.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.6 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
