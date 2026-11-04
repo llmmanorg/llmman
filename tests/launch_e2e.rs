@@ -2127,11 +2127,31 @@ fn launch_openclaw_with_model() {
     // have an `exec` subcommand despite docs.openclaw.ai/cli/agent
     // describing one; `--local` still requires an explicit session
     // selector (`--agent main`, the default agent onboarding creates).
-    launch_and_assert_tolerating(
+    launch_and_assert_with(
         "openclaw",
         &["agent", "--local", "--message", PROMPT, "--agent", "main"],
-        openclaw_pull_registry_flake,
+        retry_on_stderr(openclaw_pull_registry_flake),
+        |_stdout| false,
+        reply_contains_pong,
+        false,
+        assert_openclaw_declares_the_served_window,
     );
+}
+
+fn assert_openclaw_declares_the_served_window(home: &Path) {
+    let path = home.join(".openclaw").join("openclaw.json");
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+    )
+    .expect("openclaw.json is JSON");
+    let entry = config["models"]["providers"]["ollama"]["models"]
+        .as_array()
+        .and_then(|models| models.iter().find(|m| m["id"] == MODEL))
+        .unwrap_or_else(|| panic!("no {MODEL} entry in {}", path.display()));
+    let served = llmman::daemon::running_context_length(&model_reference())
+        .expect("the daemon reports the window it serves");
+    assert_eq!(entry["contextWindow"], served, "{entry}");
+    assert_eq!(entry["contextTokens"], served, "{entry}");
 }
 
 /// Posts `body` to `route` and asserts the reply stopped with an answer;
