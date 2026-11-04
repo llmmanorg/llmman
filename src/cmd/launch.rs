@@ -572,7 +572,7 @@ const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes", "cline", "pi"];
 fn declares_context_window(integration: &str) -> bool {
     matches!(
         integration.to_lowercase().as_str(),
-        "opencode" | "codex" | "pi" | "omp" | "kimi"
+        "opencode" | "codex" | "pi" | "omp" | "kimi" | "openclaw"
     )
 }
 
@@ -1185,7 +1185,7 @@ fn launch(
         "gemini" => gemini::launch_gemini(model, api_key, extra_args),
         "agy" => agy::launch_agy(model, api_key, extra_args),
         "hermes" => hermes::launch_hermes(model, vision, extra_args),
-        "openclaw" => openclaw::launch_openclaw(model, extra_args),
+        "openclaw" => openclaw::launch_openclaw(model, context_window, extra_args),
         "qwen" => qwen::launch_qwen(model, api_key, vision, listed.as_ref(), extra_args),
         "dsh" => dsh::launch_dsh(model, api_key, vision, listed.as_ref(), extra_args),
         "goose" => goose::launch_goose(model, api_key, extra_args),
@@ -1843,6 +1843,7 @@ mod tests {
         assert!(declares_context_window("pi"));
         assert!(declares_context_window("omp"));
         assert!(declares_context_window("kimi"));
+        assert!(declares_context_window("openclaw"));
         assert!(!declares_context_window("claude"));
         assert!(!declares_context_window("aider"));
     }
