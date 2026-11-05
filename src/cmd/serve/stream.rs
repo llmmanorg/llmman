@@ -71,11 +71,12 @@ pub(super) fn oai_chunk_to_content(
     let chunk = serde_json::from_str::<OAIChunk>(payload).ok()?;
     let choice = chunk.choices.first()?;
     let content = choice.delta.content.as_deref().unwrap_or("").to_string();
-    // Accept both field names: "reasoning_content" (Homebrew llama-server) and "thinking" (git)
+    // "reasoning_content" (Homebrew llama-server), "reasoning" (vLLM), "thinking" (git)
     let thinking = choice
         .delta
         .reasoning_content
         .clone()
+        .or_else(|| choice.delta.reasoning.clone())
         .or_else(|| choice.delta.thinking.clone())
         .filter(|s| !s.is_empty());
     let finish = choice
@@ -809,21 +810,16 @@ mod tests {
             oai_chunk_to_content("[DONE]"),
             Some((String::new(), None, Some(String::new())))
         );
-        // llama-server's two reasoning field spellings both surface as
-        // thinking: "reasoning_content" (Homebrew builds) and "thinking"
-        // (git builds).
-        assert_eq!(
-            oai_chunk_to_content(
-                r#"{"choices":[{"delta":{"reasoning_content":"hmm"},"finish_reason":null}]}"#
-            ),
-            Some((String::new(), Some("hmm".into()), None))
-        );
-        assert_eq!(
-            oai_chunk_to_content(
-                r#"{"choices":[{"delta":{"thinking":"hmm"},"finish_reason":null}]}"#
-            ),
-            Some((String::new(), Some("hmm".into()), None))
-        );
+        // Every reasoning field spelling surfaces as thinking: llama-server's
+        // "reasoning_content" (Homebrew) and "thinking" (git), vLLM's "reasoning".
+        for field in ["reasoning_content", "reasoning", "thinking"] {
+            assert_eq!(
+                oai_chunk_to_content(&format!(
+                    r#"{{"choices":[{{"delta":{{"{field}":"hmm"}},"finish_reason":null}}]}}"#
+                )),
+                Some((String::new(), Some("hmm".into()), None))
+            );
+        }
         // An empty reasoning string is filtered out rather than surfaced.
         assert_eq!(
             oai_chunk_to_content(
