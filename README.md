@@ -423,7 +423,7 @@ so it works from any client on every inference endpoint. Details in
 
 ### Sandboxes
 
-`--sandbox` runs the integration inside a sandbox. It can write to the
+`--sandbox` runs the integration inside a sandbox, `sbx` if none is named. It can write to the
 current Git work tree and to its own settings, but not to the rest of your
 files. Under seatbelt it can also write to the temporary and cache
 directories.

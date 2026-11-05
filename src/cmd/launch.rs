@@ -82,8 +82,15 @@ pub struct LaunchArgs {
     #[arg(long, value_name = "MODEL")]
     pub overflow_model: Option<String>,
 
-    /// Run the integration in a sandbox. See docs/sandbox.md.
-    #[arg(long, value_enum, value_name = "SANDBOX")]
+    /// Run the integration in a sandbox, sbx unless one is named. See
+    /// docs/sandbox.md.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "SANDBOX",
+        num_args = 0..=1,
+        default_missing_value = "sbx"
+    )]
     pub sandbox: Option<Sandbox>,
 
     /// Start at this variant of the model (see `llmman show`), as
@@ -884,7 +891,7 @@ fn print_integrations() {
         println!("  {:<14} {}{}", i.name, i.description, how);
     }
     println!(
-        "\nUsage: llmman launch <integration> [--model <model>] [--provider <provider>] [--sandbox <sandbox>]"
+        "\nUsage: llmman launch <integration> [--model <model>] [--provider <provider>] [--sandbox [sandbox]]"
     );
     println!("       llmman providers   (the providers --provider accepts)");
 }
@@ -2117,6 +2124,25 @@ mod tests {
         .args;
         let err = run(&args).unwrap_err().to_string();
         assert!(err.contains("openshell cannot run opencode"), "{err}");
+    }
+
+    /// A bare `--sandbox` is `--sandbox sbx`, and a named one is kept.
+    #[test]
+    fn a_bare_sandbox_is_sbx() {
+        assert_eq!(launch_args(&["claude"]).sandbox, None);
+        assert_eq!(
+            launch_args(&["claude", "--sandbox"]).sandbox,
+            Some(Sandbox::Sbx)
+        );
+        assert_eq!(
+            launch_args(&["claude", "--sandbox", "docker"]).sandbox,
+            Some(Sandbox::Docker)
+        );
+        // Another flag after a bare one is not taken as its value.
+        let args = launch_args(&["claude", "--sandbox", "--model", "qwen3.8", "--", "hi"]);
+        assert_eq!(args.sandbox, Some(Sandbox::Sbx));
+        assert_eq!(args.model.as_deref(), Some("qwen3.8"));
+        assert_eq!(args.extra_args, ["hi"]);
     }
 
     /// `llmman launch <argv...>` as the command line parses it.

@@ -212,8 +212,7 @@ pub fn prepare(
         .then(|| image(integration, std::env::var(IMAGE_ENV).ok().as_deref()))
         .transpose()?;
     let server = agent_server_for(&daemon, sandbox.host_alias(cfg!(target_os = "linux")))?;
-    let home = dirs::home_dir().context("no home directory")?;
-    let cwd = std::env::current_dir().context("current directory")?;
+    let (cwd, home) = cwd_and_home()?;
     // A relative state path (`GROK_HOME=state`) is relative to the cwd,
     // which the guest shares; mount destinations must be absolute.
     let state: Vec<State> = state
@@ -295,6 +294,9 @@ pub fn run_sbx(
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let agent = sbx_agent(integration)?;
+    // sbx mounts the current directory, which must not contain the home directory
+    let (cwd, home) = cwd_and_home()?;
+    workspace(&cwd, &home)?;
     let sbx = crate::find_on_path("sbx").context("sbx is not installed")?;
     let mut cmd = Command::new(sbx);
     cmd.args(sbx_args(agent, model, provider, overflow, extra_args));
@@ -506,6 +508,13 @@ fn workspace(cwd: &Path, home: &Path) -> anyhow::Result<PathBuf> {
 /// `env` less `PATH`: a launcher's (qwen sets one) names host directories.
 fn without_path(env: &[(String, String)]) -> Vec<(String, String)> {
     env.iter().filter(|(k, _)| k != "PATH").cloned().collect()
+}
+
+fn cwd_and_home() -> anyhow::Result<(PathBuf, PathBuf)> {
+    Ok((
+        std::env::current_dir().context("current directory")?,
+        dirs::home_dir().context("no home directory")?,
+    ))
 }
 
 /// Whether writing all of `dir` would include the home directory.
