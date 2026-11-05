@@ -81,6 +81,9 @@ struct Release {
 struct Asset {
     name: String,
     browser_download_url: String,
+    size: u64,
+    /// `sha256:<hex>`. `None` on assets uploaded before GitHub recorded digests.
+    digest: Option<String>,
 }
 
 pub(crate) fn http_client() -> Result<reqwest::blocking::Client> {
@@ -691,6 +694,43 @@ pub(crate) fn download_to_file(
     Ok(())
 }
 
+pub(crate) fn sha256_of_file(path: &Path) -> Result<String> {
+    use sha2::Digest;
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut file, &mut hasher).context("hash download")?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Fails unless the file at `path` matches the size and digest that the
+/// release lists for `asset`. An asset with no digest is checked by size only.
+fn check_download(path: &Path, asset: &Asset) -> Result<()> {
+    let size = std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    if size != asset.size {
+        anyhow::bail!(
+            "{}: downloaded {size} bytes, release lists {}",
+            asset.name,
+            asset.size
+        );
+    }
+    let Some(digest) = &asset.digest else {
+        return Ok(());
+    };
+    let expected = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| anyhow!("{}: unsupported digest {digest}", asset.name))?;
+    let actual = sha256_of_file(path)?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        anyhow::bail!(
+            "{}: sha256 {actual} does not match published {expected}",
+            asset.name
+        );
+    }
+    Ok(())
+}
+
 /// One line of download progress — the same text the daemon logs and
 /// leaves in the [`DownloadMarker`] for a waiting client to show.
 fn download_progress_text(label: &str, downloaded: u64, total: u64) -> String {
@@ -844,6 +884,7 @@ fn try_ensure_from_network(
                 &asset.name,
                 Some(&marker),
             )?;
+            check_download(&tmp, asset)?;
             marker.set_status(&format!("extracting {}", asset.name));
             extract(&tmp, &asset.name, dest)
         };
@@ -983,6 +1024,93 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn release_assets_parse_size_and_digest() {
+        let release: Release = serde_json::from_str(
+            r#"{"tag_name": "b1", "assets": [
+                {"name": "a.zip", "browser_download_url": "", "size": 3, "digest": "sha256:ab"},
+                {"name": "b.zip", "browser_download_url": "", "size": 4, "digest": null}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(release.assets[0].size, 3);
+        assert_eq!(release.assets[0].digest.as_deref(), Some("sha256:ab"));
+        assert_eq!(release.assets[1].size, 4);
+        assert_eq!(release.assets[1].digest, None);
+    }
+
+    fn temp_download(name: &str, contents: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "llmman-check-download-test-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn listed_asset(size: u64, digest: Option<&str>) -> Asset {
+        Asset {
+            name: "llama-bin.zip".into(),
+            browser_download_url: String::new(),
+            size,
+            digest: digest.map(String::from),
+        }
+    }
+
+    fn sha256_hex(contents: &[u8]) -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(contents))
+    }
+
+    fn check_download_error(path: &Path, asset: &Asset) -> String {
+        format!("{:#}", check_download(path, asset).unwrap_err())
+    }
+
+    #[test]
+    fn check_download_accepts_the_listed_size_and_digest() {
+        let path = temp_download("match", b"archive");
+        let hex = sha256_hex(b"archive");
+        for digest in [
+            format!("sha256:{hex}"),
+            format!("sha256:{}", hex.to_uppercase()),
+        ] {
+            check_download(&path, &listed_asset(7, Some(&digest))).unwrap();
+        }
+        check_download(&path, &listed_asset(7, None)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn check_download_rejects_a_size_the_release_does_not_list() {
+        let path = temp_download("short", b"<BlockList/>");
+        assert_eq!(
+            check_download_error(&path, &listed_asset(18407457, None)),
+            "llama-bin.zip: downloaded 12 bytes, release lists 18407457"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn check_download_rejects_a_digest_the_release_does_not_list() {
+        let path = temp_download("tampered", b"archive");
+        let published = sha256_hex(b"another");
+        assert_eq!(
+            check_download_error(
+                &path,
+                &listed_asset(7, Some(&format!("sha256:{published}")))
+            ),
+            format!(
+                "llama-bin.zip: sha256 {} does not match published {published}",
+                sha256_hex(b"archive")
+            )
+        );
+        assert_eq!(
+            check_download_error(&path, &listed_asset(7, Some("sha512:ab"))),
+            "llama-bin.zip: unsupported digest sha512:ab"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
     /// A release of the pinned llama.cpp build carrying `names`.
     fn pinned_release(names: impl IntoIterator<Item = String>) -> Release {
         Release {
@@ -992,6 +1120,8 @@ mod tests {
                 .map(|name| Asset {
                     name,
                     browser_download_url: String::new(),
+                    size: 0,
+                    digest: None,
                 })
                 .collect(),
         }
@@ -1067,6 +1197,8 @@ mod tests {
             assets: vec![Asset {
                 name: "nightly-tag.txt".into(),
                 browser_download_url: String::new(),
+                size: 0,
+                digest: None,
             }],
         };
         assert_eq!(
@@ -1079,6 +1211,8 @@ mod tests {
             assets: vec![Asset {
                 name: "llama-b10621-bin-ubuntu-vulkan-x64.tar.gz".into(),
                 browser_download_url: String::new(),
+                size: 0,
+                digest: None,
             }],
         };
         assert_eq!(
@@ -1094,10 +1228,14 @@ mod tests {
                 Asset {
                     name: "nightly-tag.txt".into(),
                     browser_download_url: String::new(),
+                    size: 0,
+                    digest: None,
                 },
                 Asset {
                     name: "llama-b10621-bin-ubuntu-vulkan-x64.tar.gz".into(),
                     browser_download_url: String::new(),
+                    size: 0,
+                    digest: None,
                 },
             ],
         };
@@ -1118,6 +1256,8 @@ mod tests {
             assets: vec![Asset {
                 name: NIGHTLY_POINTER.into(),
                 browser_download_url: format!("https://example.invalid/{tag}/{NIGHTLY_POINTER}"),
+                size: 0,
+                digest: None,
             }],
         }
     }
@@ -1128,6 +1268,8 @@ mod tests {
             assets: vec![Asset {
                 name: format!("llama-{tag}-bin-ubuntu-x64.tar.gz"),
                 browser_download_url: String::new(),
+                size: 0,
+                digest: None,
             }],
         }
     }
