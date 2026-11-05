@@ -57,12 +57,13 @@ mod usage;
 mod webui;
 
 use backend::{
-    backend_json, ds4_context_length, find_free_port, gguf_engine_from_env, gguf_goes_to_ds4,
-    safetensors_engine_from_env, sglang_serve_args_from_env, sglang_served_model_name,
-    spawn_ds4_server, spawn_llama_server, spawn_mlx_server, spawn_sglang_server,
-    spawn_vllm_omni_server, spawn_vllm_server, tail_child_output, use_mlx_for_safetensors,
-    vllm_family_args, vllm_max_model_len, vllm_omni_serve_args_from_env, vllm_serve_args_from_env,
-    wait_for_ready, GgufEngine, OutputTail, SafetensorsEngine, POLL_INTERVAL,
+    backend_json, ds4_context_length, find_free_port, gguf_arm, gguf_engine_from_env,
+    gguf_goes_to_ds4, safetensors_engine_from_env, sglang_serve_args_from_env,
+    sglang_served_model_name, spawn_ds4_server, spawn_llama_server, spawn_mlx_server,
+    spawn_sglang_server, spawn_vllm_omni_server, spawn_vllm_server, tail_child_output,
+    use_mlx_for_safetensors, vllm_family_args, vllm_max_model_len, vllm_omni_serve_args_from_env,
+    vllm_serve_args_from_env, wait_for_ready, GgufArm, GgufEngine, OutputTail, SafetensorsEngine,
+    POLL_INTERVAL,
 };
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
 use config::{
@@ -2114,11 +2115,11 @@ impl Task {
     }
 }
 
-/// Whether `info` is a Canary speech model: `general.architecture` is
-/// `canary`, the header `speech::model::load` requires. Such a GGUF runs in
-/// the speech worker ([`Engine::Speech`]), not llama-server or ds4.
+/// Whether `info` is a Canary speech model (`Info::is_speech`, which the
+/// listings read too). Such a GGUF runs in the speech worker
+/// ([`Engine::Speech`]), not llama-server or ds4.
 fn is_speech_model(info: &crate::gguf::Info) -> bool {
-    info.architecture() == Some("canary")
+    info.is_speech()
 }
 
 /// [`ensure_model`] for a request that says what it will do with the model.
@@ -2438,56 +2439,62 @@ async fn resolve_target(
             state.0.runtime.ociman().await?
         };
         process = match (&model_path, ociman) {
-            // ds4 has no container image, so it runs from PATH under any
-            // runtime. Not OOM-retryable: those fallbacks are
-            // llama-server flags.
-            (ModelPath::Gguf(path, mmproj), _) if ds4 => {
-                let (child, tail) =
-                    spawn_ds4_server(path, mmproj.as_deref(), port, max_model_len).await?;
-                stderr_tail = Some(tail);
-                ModelProcess::Local(Engine::Ds4, child, None)
-            }
-            // A Canary GGUF runs in this binary's speech worker, spawned
-            // the way the media backend is but from the CPU image (see
-            // SPEECH_BACKEND). Not OOM-retryable either.
-            (ModelPath::Gguf(..), Some(ociman)) if speech => {
-                let mut child = crate::container::spawn_mediagen(
-                    ociman,
-                    crate::container::SPEECH_BACKEND,
-                    model_ref,
-                    &state.0.store_path,
-                    &state.0.cache_path,
-                    state.0.llama_cpp_version.as_deref(),
-                    port,
-                    state.0.cpu_limit,
-                )?;
-                stderr_tail = Some(tail_child_output(&mut child));
-                ModelProcess::Container(ociman, Engine::Speech, child)
-            }
-            (ModelPath::Gguf(..), None) if speech => {
-                let (child, tail) = spawn_mediagen_backend(model_ref, port, state).await?;
-                stderr_tail = Some(tail);
-                ModelProcess::Local(Engine::Speech, child, None)
-            }
-            (ModelPath::Gguf(path, mmproj), Some(ociman)) => {
-                let mut child = crate::container::spawn(
-                    ociman,
-                    path,
-                    mmproj.as_deref(),
-                    state.0.llama_cpp_version.as_deref(),
-                    llama_opts,
-                )?;
-                stderr_tail = Some(tail_child_output(&mut child));
-                oom_retryable = true;
-                ModelProcess::Container(ociman, Engine::LlamaServer, child)
-            }
-            (ModelPath::Gguf(path, mmproj), None) => {
-                let bin = state.0.runtime.local_llama_server_bin().await?;
-                let (child, tail) =
-                    spawn_llama_server(&bin, path, mmproj.as_deref(), llama_opts).await?;
-                stderr_tail = Some(tail);
-                oom_retryable = true;
-                ModelProcess::Local(Engine::LlamaServer, child, None)
+            // The GGUF arms, in gguf_arm's order.
+            (ModelPath::Gguf(path, mmproj), ociman) => {
+                match (gguf_arm(ds4, speech, ociman.is_some()), ociman) {
+                    // ds4 has no container image, so it runs from PATH
+                    // under any runtime. Not OOM-retryable: those
+                    // fallbacks are llama-server flags.
+                    (GgufArm::Ds4, _) => {
+                        let (child, tail) =
+                            spawn_ds4_server(path, mmproj.as_deref(), port, max_model_len).await?;
+                        stderr_tail = Some(tail);
+                        ModelProcess::Local(Engine::Ds4, child, None)
+                    }
+                    // A Canary GGUF runs in this binary's speech worker,
+                    // spawned the way the media backend is but from the
+                    // CPU image (see SPEECH_BACKEND). Not OOM-retryable
+                    // either.
+                    (GgufArm::Speech { container: true }, Some(ociman)) => {
+                        let mut child = crate::container::spawn_mediagen(
+                            ociman,
+                            crate::container::SPEECH_BACKEND,
+                            model_ref,
+                            &state.0.store_path,
+                            &state.0.cache_path,
+                            state.0.llama_cpp_version.as_deref(),
+                            port,
+                            state.0.cpu_limit,
+                        )?;
+                        stderr_tail = Some(tail_child_output(&mut child));
+                        ModelProcess::Container(ociman, Engine::Speech, child)
+                    }
+                    (GgufArm::Speech { .. }, _) => {
+                        let (child, tail) = spawn_mediagen_backend(model_ref, port, state).await?;
+                        stderr_tail = Some(tail);
+                        ModelProcess::Local(Engine::Speech, child, None)
+                    }
+                    (GgufArm::LlamaServer { container: true }, Some(ociman)) => {
+                        let mut child = crate::container::spawn(
+                            ociman,
+                            path,
+                            mmproj.as_deref(),
+                            state.0.llama_cpp_version.as_deref(),
+                            llama_opts,
+                        )?;
+                        stderr_tail = Some(tail_child_output(&mut child));
+                        oom_retryable = true;
+                        ModelProcess::Container(ociman, Engine::LlamaServer, child)
+                    }
+                    (GgufArm::LlamaServer { .. }, _) => {
+                        let bin = state.0.runtime.local_llama_server_bin().await?;
+                        let (child, tail) =
+                            spawn_llama_server(&bin, path, mmproj.as_deref(), llama_opts).await?;
+                        stderr_tail = Some(tail);
+                        oom_retryable = true;
+                        ModelProcess::Local(Engine::LlamaServer, child, None)
+                    }
+                }
             }
             // diffusion models run in this binary (see mediagen_backend)
             (ModelPath::Diffusion(_), Some(ociman)) => {
@@ -4429,9 +4436,7 @@ async fn speech_backend(
         // undersized one aborts the process inside ggml.
         let info = crate::gguf::read_info(&model_path)?;
         let hp = crate::speech::model::CanaryHParams::from_info(&info)?;
-        let max_nodes = crate::speech::encoder::graph_nodes(hp.enc_n_layers as usize).max(
-            crate::speech::decoder::graph_nodes(hp.dec_n_layers as usize),
-        );
+        let max_nodes = crate::speech::graph_nodes(hp.enc_n_layers.max(hp.dec_n_layers) as usize);
         let be = crate::mediagen::backend::Backend::new(api, false, n_threads, max_nodes)?;
         let model = crate::speech::model::load(&model_path, &be)?;
         crate::speech::server::Worker::new(be, model)

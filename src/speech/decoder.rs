@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 
 use super::encoder::layer_norm;
+use super::graph_nodes;
 use super::model::{CanaryModel, DecLayer};
 use super::prompt;
 use crate::mediagen::backend::{Backend, Ctx, Graph, Resident};
@@ -442,13 +443,6 @@ pub fn transcribe(
         steps: started.elapsed(),
         n_steps,
     })
-}
-
-/// Graph nodes a prefill or step over `n_layers` decoder layers needs,
-/// with room to spare; the scheduler of the `Backend` must be sized at
-/// least this large (see `Backend::new`).
-pub fn graph_nodes(n_layers: usize) -> usize {
-    1024 + n_layers * 128
 }
 
 /// Cache rows for a prompt of `prompt_len` tokens over `frames` encoder

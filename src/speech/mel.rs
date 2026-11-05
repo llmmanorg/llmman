@@ -224,7 +224,9 @@ impl std::error::Error for MelError {}
 
 /// Rejects configs the pipeline would panic on or produce NaN for. The
 /// config may come from model metadata, so it is checked, not trusted.
-fn validate(cfg: &MelConfig) -> Result<(), MelError> {
+/// `InvalidConfig` when a `cfg` field is out of range; `features` runs it
+/// per call, a worker once at load.
+pub fn validate(cfg: &MelConfig) -> Result<(), MelError> {
     if cfg.n_mels == 0 {
         return Err(MelError::InvalidConfig("n_mels must be at least 1"));
     }

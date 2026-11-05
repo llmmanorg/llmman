@@ -127,6 +127,28 @@ pub(super) fn gguf_goes_to_ds4(
         && ds4_serves_gguf(engine, arch, embedding, decision, ds4_on_path)
 }
 
+/// How a [`ModelPath::Gguf`] is served once `ensure_model` has decided
+/// `ds4` and `speech` (see `resolve_target`): ds4 first, since it runs
+/// from PATH under any runtime; then the speech worker; then llama-server.
+/// `container` is whether a container runtime resolved, which the speech
+/// and llama-server arms honour and ds4 ignores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GgufArm {
+    Ds4,
+    Speech { container: bool },
+    LlamaServer { container: bool },
+}
+
+pub(super) fn gguf_arm(ds4: bool, speech: bool, container: bool) -> GgufArm {
+    if ds4 {
+        GgufArm::Ds4
+    } else if speech {
+        GgufArm::Speech { container }
+    } else {
+        GgufArm::LlamaServer { container }
+    }
+}
+
 /// [`gguf_goes_to_ds4`] for a model already known to be a GGUF.
 pub(super) fn ds4_serves_gguf(
     engine: GgufEngine,
@@ -1817,5 +1839,29 @@ mod tests {
         std::fs::write(&script, b"\x7fELF\x02\x01\x01").unwrap();
         assert_eq!(console_script_interpreter(&script), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ds4 wins, then the speech worker, then llama-server; the two
+    /// latter follow the runtime, ds4 runs from PATH either way.
+    #[test]
+    fn gguf_arm_picks_ds4_then_speech_then_llama_server_by_runtime() {
+        assert_eq!(gguf_arm(true, false, true), GgufArm::Ds4);
+        assert_eq!(gguf_arm(true, true, false), GgufArm::Ds4);
+        assert_eq!(
+            gguf_arm(false, true, true),
+            GgufArm::Speech { container: true }
+        );
+        assert_eq!(
+            gguf_arm(false, true, false),
+            GgufArm::Speech { container: false }
+        );
+        assert_eq!(
+            gguf_arm(false, false, true),
+            GgufArm::LlamaServer { container: true }
+        );
+        assert_eq!(
+            gguf_arm(false, false, false),
+            GgufArm::LlamaServer { container: false }
+        );
     }
 }

@@ -19,3 +19,11 @@ pub mod model;
 pub mod prompt;
 pub mod server;
 pub mod wav;
+
+/// Graph nodes the encoder over `n_layers` blocks, or a decoder prefill
+/// or step over `n_layers` layers, needs, with room to spare; the
+/// scheduler of the `Backend` must be sized at least this large (see
+/// `Backend::new`). Both graphs grow by the same per-layer count.
+pub fn graph_nodes(n_layers: usize) -> usize {
+    1024 + n_layers * 128
+}

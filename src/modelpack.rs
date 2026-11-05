@@ -362,10 +362,11 @@ pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) 
 }
 
 /// `caps` (from [`capabilities`]) plus what only the GGUF header and chat
-/// template say, in ollama's order: `"embedding"` for a pooling model or
-/// `"decision"` for a decision model, in place of `"completion"`, then
-/// `"tools"` and `"thinking"` from the template. A media, embedding or
-/// decision model has no chat to equip and keeps what it has.
+/// template say, in ollama's order: `"embedding"` for a pooling model,
+/// `"decision"` for a decision model or `"audio"` for a speech model, in
+/// place of `"completion"`, then `"tools"` and `"thinking"` from the
+/// template. A media, embedding, decision or speech model has no chat to
+/// equip and keeps what it has.
 pub fn model_capabilities(
     mut caps: Vec<String>,
     gguf: Option<&crate::gguf::Info>,
@@ -380,6 +381,10 @@ pub fn model_capabilities(
     }
     if gguf.is_some_and(|info| info.is_decision()) {
         caps[completion] = CAPABILITY_DECISION.to_string();
+        return caps;
+    }
+    if gguf.is_some_and(|info| info.is_speech()) {
+        caps[completion] = CAPABILITY_AUDIO.to_string();
         return caps;
     }
     let Some(template) = template else {
@@ -1086,6 +1091,28 @@ mod tests {
         );
         assert!(header.is_decision());
         assert!(!gguf_header(false).is_decision());
+    }
+
+    /// A speech model transcribes: `audio` in place of `completion`, so
+    /// listings agree with the 400 the daemon gives a chat request.
+    #[test]
+    fn model_capabilities_reports_a_speech_model_as_audio() {
+        use crate::gguf::Value;
+        let mut header = crate::gguf::Info::default();
+        header.metadata.insert(
+            "general.architecture".into(),
+            Value::String("canary".into()),
+        );
+        assert_eq!(
+            model_capabilities(
+                vec!["completion".into()],
+                Some(&header),
+                Some(TOOLS_AND_THINKING)
+            ),
+            ["audio"]
+        );
+        assert!(header.is_speech());
+        assert!(!gguf_header(false).is_speech());
     }
 
     /// A media model's capabilities are what it generates.

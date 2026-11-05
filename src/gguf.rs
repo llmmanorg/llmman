@@ -174,6 +174,14 @@ impl Info {
         })
     }
 
+    /// Whether this is a Canary speech model: `general.architecture` is
+    /// `canary`, the header `speech::model::load` requires. Such a GGUF
+    /// transcribes audio and nothing else, so listings, `/api/show` and
+    /// the daemon's refusals all read this one answer.
+    pub fn is_speech(&self) -> bool {
+        self.architecture() == Some("canary")
+    }
+
     /// `{architecture}.block_count` (i.e. number of transformer layers).
     pub fn block_count(&self) -> Option<u64> {
         let arch = self.architecture()?;
@@ -691,6 +699,19 @@ mod tests {
         assert!(!info(&[("llama.decision.type", "")]).is_decision());
         // Another architecture's key says nothing about this one.
         assert!(!info(&[("clef.decision.type", "clef")]).is_decision());
+    }
+
+    #[test]
+    fn is_speech_keys_off_the_canary_architecture() {
+        let info = |strings: &[(&str, &str)]| {
+            let path = write_test_gguf_with_strings(&[], strings);
+            let info = read_info(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            info
+        };
+        assert!(info(&[("general.architecture", "canary")]).is_speech());
+        assert!(!info(&[("general.architecture", "llama")]).is_speech());
+        assert!(!info(&[]).is_speech());
     }
 
     /// Regression test: two tensors whose declared dimensions each
