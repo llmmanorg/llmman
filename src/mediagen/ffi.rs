@@ -52,7 +52,7 @@ pub mod ty {
     pub const BF16: u32 = 30;
     /// `GGML_TYPE_COUNT`; `ggml_blck_size` and `ggml_type_size` index a
     /// table of this length and only assert the bound in debug builds.
-    pub const COUNT: u32 = 43;
+    pub const COUNT: u32 = 44;
 }
 
 pub const GGML_BACKEND_DEVICE_TYPE_CPU: c_int = 0;
