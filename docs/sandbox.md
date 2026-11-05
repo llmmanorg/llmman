@@ -1,11 +1,13 @@
 # Sandboxed launches
 
-`llmman launch --sandbox <sandbox>` runs the integration inside a sandbox
-instead of directly on your machine. The model setup is the same with or
-without it: `--model`, `--provider` and `--overflow-*` work as usual, and
-the integration still talks to `llmman serve`.
+`llmman launch <integration> --sandbox [sandbox]` runs the integration inside
+a sandbox instead of directly on your machine. Without a name it is `sbx`. For
+every sandbox but `sbx`, the model setup is the same with or without it:
+`--model`, `--provider` and `--overflow-*` work as usual, and the integration
+still talks to `llmman serve`. `sbx` serves the model itself, see below.
 
 ```sh
+llmman launch claude --model qwen3.8 --sandbox
 llmman launch claude --model qwen3.8 --sandbox docker
 llmman launch opencode --provider openrouter --model qwen/qwen3-coder --sandbox podman
 llmman launch codex --model qwen3.8 --sandbox microsandbox -- exec "Explain this repository"
