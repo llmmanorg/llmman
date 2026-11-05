@@ -179,9 +179,26 @@ fn read_token_file(path: &std::path::Path, legacy: Option<&std::path::Path>) -> 
 /// A `llmman login hf.co` made after it started is picked up only when no
 /// nonblank env var is set there and both resolve the same token file.
 pub fn token() -> Option<String> {
+    token_from(|var| std::env::var_os(var), dirs::home_dir())
+}
+
+/// [`token`] with the environment and home directory injected, so the
+/// whole resolution (env vars, then the token file, then the legacy
+/// file) can be tested without touching the process environment. A
+/// variable that is not valid Unicode counts as unset for the token
+/// variables, as with `std::env::var`.
+fn token_from(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<String> {
     resolve_token(
-        |var| std::env::var(var).ok(),
-        || read_token_file(&token_path(), legacy_token_path().as_deref()),
+        |var| env(var).and_then(|v| v.into_string().ok()),
+        || {
+            read_token_file(
+                &token_path_from(&env, home.clone()),
+                legacy_token_path_from(&env, home).as_deref(),
+            )
+        },
     )
 }
 
@@ -615,6 +632,104 @@ mod tests {
             read_token_file(&current, Some(&legacy)).as_deref(),
             Some("")
         );
+    }
+
+    #[test]
+    fn read_token_file_does_not_fall_back_when_the_path_cannot_be_read() {
+        // A directory at the token path fails with an error other than
+        // NotFound, so the legacy file is not read in its place.
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("current");
+        let legacy = dir.path().join("legacy");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::write(&legacy, "hf_old").unwrap();
+        assert_eq!(read_token_file(&current, Some(&legacy)), None);
+    }
+
+    #[test]
+    fn token_resolves_env_then_token_file_then_legacy_file() {
+        let home = tempfile::tempdir().unwrap();
+        let xdg = home.path().join("xdg");
+        let legacy = home.path().join(".cache/huggingface/token");
+        let current = xdg.join("huggingface/token");
+        let env = |pairs: Vec<(&'static str, std::ffi::OsString)>| {
+            move |var: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == var)
+                    .map(|(_, v)| v.clone())
+            }
+        };
+        let token = |pairs: Vec<(&'static str, std::ffi::OsString)>| {
+            token_from(env(pairs), Some(home.path().to_path_buf()))
+        };
+        let xdg_only = || vec![("XDG_CACHE_HOME", xdg.clone().into_os_string())];
+
+        // Nothing on disk, only XDG_CACHE_HOME set.
+        assert_eq!(token(xdg_only()), None);
+
+        // XDG_CACHE_HOME moved the default: the pre-#736 file is read
+        // while the current one does not exist.
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "hf_old\n").unwrap();
+        assert_eq!(token(xdg_only()).as_deref(), Some("hf_old"));
+        // HF_HOME set: no legacy fallback.
+        let hf_home = home.path().join("hf");
+        assert_eq!(
+            token(vec![
+                ("HF_HOME", hf_home.into_os_string()),
+                ("XDG_CACHE_HOME", xdg.clone().into_os_string()),
+            ]),
+            None
+        );
+
+        // Once the current file exists, it wins over the legacy one.
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&current, "hf_new").unwrap();
+        assert_eq!(token(xdg_only()).as_deref(), Some("hf_new"));
+
+        // HF_TOKEN_PATH points elsewhere.
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::write(&elsewhere, "hf_path").unwrap();
+        assert_eq!(
+            token(vec![("HF_TOKEN_PATH", elsewhere.clone().into_os_string())]).as_deref(),
+            Some("hf_path")
+        );
+
+        // HF_TOKEN_PATH wins over a simultaneously set HF_HOME.
+        let both = home.path().join("both");
+        std::fs::create_dir_all(&both).unwrap();
+        std::fs::write(both.join("token"), "hf_home").unwrap();
+        assert_eq!(
+            token(vec![
+                ("HF_TOKEN_PATH", elsewhere.into_os_string()),
+                ("HF_HOME", both.into_os_string()),
+            ])
+            .as_deref(),
+            Some("hf_path")
+        );
+
+        // A nonblank HF_TOKEN wins over every file.
+        let mut pairs = xdg_only();
+        pairs.push(("HF_TOKEN", " hf_env ".into()));
+        assert_eq!(token(pairs).as_deref(), Some("hf_env"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_from_treats_a_non_unicode_env_var_as_unset() {
+        use std::os::unix::ffi::OsStringExt;
+        let home = tempfile::tempdir().unwrap();
+        let invalid = std::ffi::OsString::from_vec(vec![0xff]);
+        let token = token_from(
+            |var| match var {
+                "HF_TOKEN" => Some(invalid.clone()),
+                "HUGGING_FACE_HUB_TOKEN" => Some("hf_legacy".into()),
+                _ => None,
+            },
+            Some(home.path().to_path_buf()),
+        );
+        assert_eq!(token.as_deref(), Some("hf_legacy"));
     }
 
     #[test]
