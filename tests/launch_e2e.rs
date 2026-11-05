@@ -3430,7 +3430,8 @@ fn canary_gguf_loads_through_mediagen_weights() {
         let file = path.file_name().unwrap().to_string_lossy();
         eprintln!("== {}", path.display());
 
-        let info = llmman::gguf::read_info(&path).unwrap();
+        // Read as `speech::model::load` does: every array in full.
+        let info = llmman::gguf::read_info_full(&path).unwrap();
         assert_eq!(info.architecture(), Some("canary"), "{file}");
         let mut keys: Vec<&String> = info
             .metadata

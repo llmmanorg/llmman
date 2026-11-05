@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
 use anyhow::{bail, Context};
@@ -31,10 +31,42 @@ pub enum Value {
     F32(f32),
     Bool(bool),
     String(String),
+    /// An array of at most [`MAX_ARRAY_ELEMENTS`] elements.
     Array(Vec<Value>),
+    /// A longer array, by its length: its elements were skipped. A tokenizer's
+    /// `tokens` and `merges` cost tens of megabytes as `Value`s.
+    LargeArray(u64),
     U64(u64),
     I64(i64),
     F64(f64),
+}
+
+/// The byte size of a value of type `ty` when every value of it has the
+/// same one: the numbers and booleans, not strings or arrays.
+fn fixed_size(ty: u32) -> Option<i64> {
+    match ty {
+        0 | 1 | 7 => Some(1),
+        2 | 3 => Some(2),
+        4..=6 => Some(4),
+        10..=12 => Some(8),
+        _ => None,
+    }
+}
+
+/// Elements past this many are not read: the array is a [`Value::LargeArray`].
+/// Ollama's `/api/show` drops longer arrays too (`fs/gguf/metadata.go`).
+pub const MAX_ARRAY_ELEMENTS: usize = 1024;
+
+/// What a hostile or corrupt header is held to, read or skipped.
+const MAX_DEPTH: u32 = 8;
+const MAX_STRING_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ARRAY_LEN: u64 = 10_000_000;
+
+fn check_depth(depth: u32) -> anyhow::Result<()> {
+    if depth > MAX_DEPTH {
+        bail!("GGUF value nesting too deep (> {MAX_DEPTH} levels)");
+    }
+    Ok(())
 }
 
 impl Value {
@@ -150,10 +182,12 @@ impl Info {
 }
 
 struct Reader<R> {
-    inner: R,
+    inner: BufReader<R>,
+    /// An array of more elements than this is skipped, not read.
+    max_array_elements: u64,
 }
 
-impl<R: Read> Reader<R> {
+impl<R: Read + Seek> Reader<R> {
     fn u8(&mut self) -> anyhow::Result<u8> {
         let mut b = [0u8; 1];
         self.inner.read_exact(&mut b)?;
@@ -211,20 +245,80 @@ impl<R: Read> Reader<R> {
     /// invalid byte in, say, a license string must never fail the whole
     /// read.
     fn string(&mut self) -> anyhow::Result<String> {
-        let len = self.u64()? as usize;
-        // A malformed/corrupt length must not attempt a multi-GiB
-        // allocation on `show`'s behalf — real GGUF strings (names,
-        // templates, license text) are never anywhere close to this.
-        if len > 64 * 1024 * 1024 {
-            bail!("implausible GGUF string length: {len}");
-        }
-        let mut buf = vec![0u8; len];
+        let len = self.string_len()?;
+        let mut buf = vec![0u8; len as usize];
         self.inner.read_exact(&mut buf)?;
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
+    /// A string's byte length. A malformed/corrupt one must not attempt a
+    /// multi-GiB allocation on `show`'s behalf: real GGUF strings (names,
+    /// templates, license text) are never anywhere close to
+    /// [`MAX_STRING_BYTES`].
+    fn string_len(&mut self) -> anyhow::Result<u64> {
+        let len = self.u64()?;
+        if len > MAX_STRING_BYTES {
+            bail!("implausible GGUF string length: {len}");
+        }
+        Ok(len)
+    }
+
+    /// An array's element type and length, the length held to
+    /// [`MAX_ARRAY_LEN`].
+    fn array_header(&mut self) -> anyhow::Result<(u32, u64)> {
+        let elem_ty = self.u32()?;
+        let len = self.u64()?;
+        if len > MAX_ARRAY_LEN {
+            bail!("implausible GGUF array length: {len}");
+        }
+        Ok((elem_ty, len))
+    }
+
     fn value(&mut self, ty: u32) -> anyhow::Result<Value> {
         self.value_at(ty, 0)
+    }
+
+    /// Steps over a value of type `ty` without building it, under the same
+    /// bounds as [`Self::value_at`]. A skipped value is not checked to be
+    /// there: a seek can pass the end of the file, which [`read_info`]
+    /// checks for once the whole header is read.
+    fn skip_value_at(&mut self, ty: u32, depth: u32) -> anyhow::Result<()> {
+        check_depth(depth)?;
+        if let Some(size) = fixed_size(ty) {
+            self.inner.seek_relative(size)?;
+            return Ok(());
+        }
+        match ty {
+            8 => {
+                let len = self.string_len()?;
+                self.inner.seek_relative(len as i64)?;
+            }
+            9 => {
+                let (elem_ty, len) = self.array_header()?;
+                self.skip_elements(elem_ty, len, depth + 1)?;
+            }
+            other => bail!("unknown GGUF value type: {other}"),
+        }
+        Ok(())
+    }
+
+    /// Steps over `len` values of type `ty`: one seek when they all have
+    /// the same size.
+    fn skip_elements(&mut self, ty: u32, len: u64, depth: u32) -> anyhow::Result<()> {
+        // No elements, no nesting: `value_at` accepts an empty array at the
+        // deepest level too.
+        if len > 0 {
+            check_depth(depth)?;
+        }
+        match fixed_size(ty) {
+            Some(size) => self.inner.seek_relative(size * len as i64)?,
+            None => {
+                for _ in 0..len {
+                    self.skip_value_at(ty, depth)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `value`'s real implementation, tracking array-nesting `depth` —
@@ -237,9 +331,7 @@ impl<R: Read> Reader<R> {
     /// of just failing to read one untrusted (e.g. pulled-from-a-registry)
     /// file — bounding the depth turns that into an ordinary error.
     fn value_at(&mut self, ty: u32, depth: u32) -> anyhow::Result<Value> {
-        if depth > 8 {
-            bail!("GGUF value nesting too deep (> 8 levels)");
-        }
+        check_depth(depth)?;
         Ok(match ty {
             0 => Value::U8(self.u8()?),
             1 => Value::I8(self.i8()?),
@@ -251,10 +343,10 @@ impl<R: Read> Reader<R> {
             7 => Value::Bool(self.bool_()?),
             8 => Value::String(self.string()?),
             9 => {
-                let elem_ty = self.u32()?;
-                let len = self.u64()?;
-                if len > 10_000_000 {
-                    bail!("implausible GGUF array length: {len}");
+                let (elem_ty, len) = self.array_header()?;
+                if len > self.max_array_elements {
+                    self.skip_elements(elem_ty, len, depth + 1)?;
+                    return Ok(Value::LargeArray(len));
                 }
                 let mut items = Vec::with_capacity(len.min(1024) as usize);
                 for _ in 0..len {
@@ -274,10 +366,26 @@ impl<R: Read> Reader<R> {
 /// key/value pair, and the tensor-info array (name/shape/type only, never
 /// tensor data) — enough to derive parameter count and dominant
 /// quantization without loading the model itself.
+///
+/// An array past [`MAX_ARRAY_ELEMENTS`] is a [`Value::LargeArray`]: its
+/// length, not its elements. A caller that needs them (a tokenizer's
+/// pieces) reads with [`read_info_full`].
 pub fn read_info(path: &Path) -> anyhow::Result<Info> {
+    read_info_up_to(path, MAX_ARRAY_ELEMENTS as u64)
+}
+
+/// [`read_info`] with every array read, however long: a [`Value::Array`]
+/// each, as before the long ones were skipped.
+pub fn read_info_full(path: &Path) -> anyhow::Result<Info> {
+    read_info_up_to(path, u64::MAX)
+}
+
+fn read_info_up_to(path: &Path, max_array_elements: u64) -> anyhow::Result<Info> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let file_len = file.metadata()?.len();
     let mut r = Reader {
         inner: BufReader::new(file),
+        max_array_elements,
     };
 
     let mut magic = [0u8; 4];
@@ -321,6 +429,14 @@ pub fn read_info(path: &Path) -> anyhow::Result<Info> {
             dims,
             ggml_type,
         });
+    }
+
+    // A skip seeks without reading, and a seek past the end of the file
+    // succeeds: a header cut off inside a skipped array, with no read after
+    // it, would otherwise pass.
+    let end = r.inner.stream_position()?;
+    if end > file_len {
+        bail!("GGUF header runs past the end of the file ({end} > {file_len} bytes)");
     }
 
     let parameter_count = tensors
@@ -652,6 +768,217 @@ mod tests {
         assert_eq!(ggml_type_name(12), "Q4_K");
         assert_eq!(ggml_type_name(14), "Q6_K");
         assert_eq!(ggml_type_name(9999), "unknown");
+    }
+
+    /// A header's bytes: `kvs` (key, type, raw value bytes), then, when
+    /// `close`, a `llama.context_length`, whose value is read correctly only
+    /// if every skip before it landed exactly on the next key.
+    fn gguf_bytes(kvs: &[(&str, u32, Vec<u8>)], close: bool) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&(kvs.len() as u64 + 1 + u64::from(close)).to_le_bytes());
+        write_string(&mut buf, "general.architecture");
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        write_string(&mut buf, "llama");
+        for (key, ty, value) in kvs {
+            write_string(&mut buf, key);
+            buf.extend_from_slice(&ty.to_le_bytes());
+            buf.extend_from_slice(value);
+        }
+        if close {
+            write_string(&mut buf, "llama.context_length");
+            buf.extend_from_slice(&4u32.to_le_bytes());
+            buf.extend_from_slice(&4096u32.to_le_bytes());
+        }
+        buf
+    }
+
+    fn write_temp_gguf(buf: &[u8]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(buf).unwrap();
+        file
+    }
+
+    /// A header with `kvs` in front of a closing `llama.context_length`.
+    fn gguf_with_kvs(kvs: &[(&str, u32, Vec<u8>)]) -> tempfile::NamedTempFile {
+        write_temp_gguf(&gguf_bytes(kvs, true))
+    }
+
+    /// An ARRAY value's bytes: its element type, its length, then `body`.
+    fn array_bytes(elem_ty: u32, len: u64, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&elem_ty.to_le_bytes());
+        v.extend_from_slice(&len.to_le_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// `llmman serve` kept tens of megabytes for good after one
+    /// `/api/show`, most of it a tokenizer's arrays of strings read as
+    /// `Value`s. Past the ceiling they are skipped, and what follows must
+    /// still be read from the right place.
+    #[test]
+    fn read_info_skips_arrays_past_the_ceiling_and_stays_aligned() {
+        let n = MAX_ARRAY_ELEMENTS as u64 + 1;
+        let mut strings = Vec::new();
+        for i in 0..n {
+            write_string(&mut strings, &format!("token-{i}"));
+        }
+        // an array of arrays, long enough to be skipped, each of 2 bytes
+        let mut nested = Vec::new();
+        for _ in 0..n {
+            nested.extend_from_slice(&array_bytes(0, 2, &[7, 7]));
+        }
+        let file = gguf_with_kvs(&[
+            ("tok.tokens", 9, array_bytes(8, n, &strings)),
+            ("tok.types", 9, array_bytes(5, 5000, &vec![0u8; 5000 * 4])),
+            ("tok.nested", 9, array_bytes(9, n, &nested)),
+            ("tok.small", 9, array_bytes(4, 2, &[1, 0, 0, 0, 2, 0, 0, 0])),
+            (
+                "tok.exact",
+                9,
+                array_bytes(0, MAX_ARRAY_ELEMENTS as u64, &vec![0u8; MAX_ARRAY_ELEMENTS]),
+            ),
+            ("tok.after", 4, 99u32.to_le_bytes().to_vec()),
+        ]);
+        let info = read_info(file.path()).unwrap();
+
+        assert!(matches!(info.metadata["tok.tokens"], Value::LargeArray(l) if l == n));
+        assert!(matches!(
+            info.metadata["tok.types"],
+            Value::LargeArray(5000)
+        ));
+        assert!(matches!(info.metadata["tok.nested"], Value::LargeArray(l) if l == n));
+        // an array at the ceiling is still read
+        assert!(
+            matches!(&info.metadata["tok.exact"], Value::Array(a) if a.len() == MAX_ARRAY_ELEMENTS)
+        );
+        match &info.metadata["tok.small"] {
+            Value::Array(a) => assert_eq!(a.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(info.u64("tok.after"), Some(99));
+        assert_eq!(info.context_length(), Some(4096), "the key after the skips");
+    }
+
+    /// A skipped array's elements are still held to the reader's bounds.
+    #[test]
+    fn read_info_still_rejects_a_bad_array_it_would_skip() {
+        let n = MAX_ARRAY_ELEMENTS as u64 + 1;
+        // unknown element type
+        let file = gguf_with_kvs(&[("tok.bad", 9, array_bytes(99, n, &[]))]);
+        let err = read_info(file.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown GGUF value type"),
+            "{err:#}"
+        );
+
+        // an implausible string length inside it
+        let mut body = Vec::new();
+        body.extend_from_slice(&(u64::MAX).to_le_bytes());
+        let file = gguf_with_kvs(&[("tok.bad", 9, array_bytes(8, n, &body))]);
+        let err = read_info(file.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("implausible GGUF string length"),
+            "{err:#}"
+        );
+
+        // an implausible array length
+        let file = gguf_with_kvs(&[("tok.bad", 9, array_bytes(0, 10_000_001, &[]))]);
+        let err = read_info(file.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("implausible GGUF array length"),
+            "{err:#}"
+        );
+    }
+
+    /// `speech::model::load` needs a tokenizer's pieces as an array, however
+    /// many: Canary's are 16,384. `read_info_full` reads them all.
+    #[test]
+    fn read_info_full_reads_the_arrays_read_info_skips() {
+        let n = 16_384u64;
+        let mut strings = Vec::new();
+        for i in 0..n {
+            write_string(&mut strings, &format!("piece-{i}"));
+        }
+        let file = gguf_with_kvs(&[("tok.tokens", 9, array_bytes(8, n, &strings))]);
+        let skipped = read_info(file.path()).unwrap();
+        let full = read_info_full(file.path()).unwrap();
+
+        assert!(matches!(skipped.metadata["tok.tokens"], Value::LargeArray(l) if l == n));
+        match &full.metadata["tok.tokens"] {
+            Value::Array(a) => {
+                assert_eq!(a.len() as u64, n);
+                assert_eq!(a[16_383].as_str(), Some("piece-16383"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(full.context_length(), Some(4096), "the key after it");
+    }
+
+    /// A seek past the end of the file succeeds, so a header cut off inside
+    /// a skipped array, with no read after it, must still be rejected.
+    #[test]
+    fn read_info_rejects_a_header_that_ends_inside_a_skipped_array() {
+        let n = MAX_ARRAY_ELEMENTS as u64 + 1;
+        let one_short = |each: Vec<u8>, last: Vec<u8>| {
+            let mut body = each.repeat(n as usize - 1);
+            body.extend(last);
+            body
+        };
+        let mut a_string = Vec::new();
+        write_string(&mut a_string, "a");
+        let mut a_cut_string = 1000u64.to_le_bytes().to_vec(); // 1000 bytes, 5 there
+        a_cut_string.extend_from_slice(b"short");
+        let a_cut_array = array_bytes(4, 1_000_000, &[]);
+        let cut = [
+            // each is the last value in the file, with no tensors after it
+            ("u32s", array_bytes(4, n, &[0u8; 8])),
+            (
+                "strings",
+                array_bytes(8, n, &one_short(a_string, a_cut_string)),
+            ),
+            (
+                "arrays",
+                array_bytes(9, n, &one_short(array_bytes(0, 0, &[]), a_cut_array)),
+            ),
+        ];
+        for (what, value) in cut {
+            let file = write_temp_gguf(&gguf_bytes(&[("tok.cut", 9, value)], false));
+            let err = read_info(file.path());
+            let err = format!("{:#}", err.unwrap_err());
+            assert!(err.contains("past the end of the file"), "{what}: {err}");
+        }
+
+        // The same array, complete and last, is read: the end is not past it.
+        let kv = (
+            "tok.whole",
+            9,
+            array_bytes(4, n, &vec![0u8; n as usize * 4]),
+        );
+        let file = write_temp_gguf(&gguf_bytes(&[kv], false));
+        let info = read_info(file.path()).unwrap();
+        assert!(matches!(info.metadata["tok.whole"], Value::LargeArray(l) if l == n));
+    }
+
+    /// An empty array has no elements to nest: at the deepest level it is
+    /// read, so it is skipped too, inside an array long enough to be skipped.
+    #[test]
+    fn read_info_skips_an_empty_array_at_the_deepest_level() {
+        // Depths 1 to 7 are arrays of one array; the one at depth 8 is empty.
+        let mut chain = array_bytes(4, 0, &[]);
+        for _ in 1..8 {
+            chain = array_bytes(9, 1, &chain);
+        }
+        let n = MAX_ARRAY_ELEMENTS as u64 + 1;
+        let body: Vec<u8> = (0..n).flat_map(|_| chain.clone()).collect();
+        let file = gguf_with_kvs(&[("tok.deep", 9, array_bytes(9, n, &body))]);
+        let info = read_info(file.path());
+        let info = info.unwrap();
+        assert!(matches!(info.metadata["tok.deep"], Value::LargeArray(l) if l == n));
+        assert_eq!(info.context_length(), Some(4096));
     }
 
     /// Regression test: a GGUF file whose metadata contains a

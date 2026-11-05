@@ -331,6 +331,19 @@ To stop retyping flags, set them once, e.g. `llmman config set
 launch.opencode.model claude-sonnet-5-5` (also `.provider`, `.variant`);
 flags you type still win. See [launch defaults](docs/configuration.md#launch-defaults).
 
+Claude Code is told the model's context window in
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS`, so it doesn't warn that it doesn't recognize
+the model. llmman sets it when it knows a window for the launched model, the
+session runs that model (no `--model`, an alias, or the same model), and you
+haven't set it yourself.
+
+Codex runs with a profile llmman writes to `~/.codex/llmman.config.toml`,
+keeping what Codex saves there. The project it runs in (its repository root,
+or the directory; `--cd`/`-C` is followed) is marked trusted, so Codex doesn't
+ask every time. That lets Codex load the repository's own `.codex/config.toml`,
+so review a project before launching Codex in it. A decision Codex already has
+for the project, there or in `~/.codex/config.toml`, is kept.
+
 GitHub Copilot uses the standalone `copilot` CLI (`npm install -g
 @github/copilot`) in BYOK mode, so a local-model launch does not
 require a GitHub login.

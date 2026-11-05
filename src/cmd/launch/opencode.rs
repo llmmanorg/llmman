@@ -256,9 +256,12 @@ fn opencode_config(
     let config = Config {
         schema: "https://opencode.ai/config.json",
         provider: Providers {
+            // The id stays `ollama`: saved model selections are keyed by it
+            // (`ollama/<model>`). Only the name opencode shows beside the
+            // model changes, and the provider is llmman, not Ollama.
             ollama: Provider {
                 npm: "@ai-sdk/openai-compatible",
-                name: "Ollama",
+                name: "llmman",
                 options: Options {
                     base_url: format!("{server}/v1"),
                     api_key,
@@ -307,7 +310,7 @@ mod tests {
         assert_eq!(config["model"], "ollama/qwen3.5:0.8b");
         let provider = &config["provider"]["ollama"];
         assert_eq!(provider["npm"], "@ai-sdk/openai-compatible");
-        assert_eq!(provider["name"], "Ollama");
+        assert_eq!(provider["name"], "llmman");
         assert_eq!(provider["options"]["baseURL"], "http://127.0.0.1:17434/v1");
         assert_eq!(provider["options"]["apiKey"], "k");
         assert_eq!(provider["models"].as_object().map(|m| m.len()), Some(1));

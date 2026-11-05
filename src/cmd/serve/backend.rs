@@ -986,10 +986,13 @@ fn which_binary(name: &str) -> anyhow::Result<PathBuf> {
     crate::find_on_path(name).ok_or_else(|| anyhow::anyhow!("{name} not found on PATH"))
 }
 
-/// [`wait_for_ready`]'s default deadline — longer than Ollama's own 5m
-/// default since vllm can take several minutes to load a large model.
-/// Overridable via `LLMMAN_LOAD_TIMEOUT`.
-const DEFAULT_LOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// [`wait_for_ready`]'s default deadline — four times Ollama's own 5m
+/// default, since vllm can take many minutes to load a large model: a
+/// cold start of Qwen 3.8 27B (NVFP4) on a DGX Spark spends about ten
+/// minutes in `torch.compile` and FlashInfer's JIT before it serves, which
+/// the previous 10 minutes did not outlast. Overridable via
+/// `LLMMAN_LOAD_TIMEOUT`.
+const DEFAULT_LOAD_TIMEOUT: Duration = Duration::from_secs(1200);
 
 /// `None` = wait forever, from an `LLMMAN_LOAD_TIMEOUT` of 0 or
 /// negative (mirrors Ollama's `OLLAMA_LOAD_TIMEOUT`).
@@ -1218,6 +1221,11 @@ mod tests {
             Some(Some(Duration::from_secs(600)))
         );
         assert_eq!(parse_load_timeout("garbage"), None);
+    }
+
+    #[test]
+    fn the_default_load_timeout_is_twenty_minutes() {
+        assert_eq!(DEFAULT_LOAD_TIMEOUT, Duration::from_secs(20 * 60));
     }
 
     #[test]

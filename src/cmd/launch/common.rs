@@ -61,25 +61,34 @@ pub(super) fn yaml_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// The value of the last `--model`/`-m` after `--`, as a word or
+/// The value of the last `long` or `short` flag before a `--`, as a word or
 /// `=`-joined, the forms `has_flag` takes; yargs keeps the last too.
 /// Nothing after a second `--` counts, as in `has_forwarded_model_flag`.
-pub(super) fn forwarded_model(extra_args: &[String]) -> Option<&str> {
+pub(super) fn forwarded_value<'a>(
+    extra_args: &'a [String],
+    long: &str,
+    short: &str,
+) -> Option<&'a str> {
     let mut found = None;
     let mut args = super::before_terminator(extra_args)
         .iter()
         .map(String::as_str);
     while let Some(a) = args.next() {
-        match a {
-            "--model" | "-m" => found = args.next().or(found),
-            _ => {
-                if let Some(v) = a.strip_prefix("--model=").or_else(|| a.strip_prefix("-m=")) {
-                    found = Some(v);
-                }
-            }
+        if a == long || a == short {
+            found = args.next().or(found);
+        } else if let Some(v) = [long, short]
+            .iter()
+            .find_map(|f| a.strip_prefix(*f).and_then(|rest| rest.strip_prefix('=')))
+        {
+            found = Some(v);
         }
     }
     found.filter(|v| !v.is_empty())
+}
+
+/// The value of the last `--model`/`-m` after `--`; see [`forwarded_value`].
+pub(super) fn forwarded_model(extra_args: &[String]) -> Option<&str> {
+    forwarded_value(extra_args, "--model", "-m")
 }
 
 /// A leading `~` is `home`, as Qwen Code's `Storage.resolvePath` reads
@@ -382,6 +391,17 @@ mod tests {
             forwarded_model(&args(&["--model", "b", "--", "--model", "c"])),
             Some("b")
         );
+    }
+
+    #[test]
+    fn forwarded_value_reads_either_spelling_of_any_flag() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let cd = |a: &[&str]| forwarded_value(&args(a), "--cd", "-C").map(str::to_owned);
+        assert_eq!(cd(&["-C", "/b"]).as_deref(), Some("/b"));
+        assert_eq!(cd(&["--cd=/b", "--cd", "/c"]).as_deref(), Some("/c"));
+        assert_eq!(cd(&["exec", "-C=/b", "hi"]).as_deref(), Some("/b"));
+        assert_eq!(cd(&["--cdx=/b", "-Cx=/c"]), None);
+        assert_eq!(cd(&["--", "-C", "/b"]), None);
     }
 
     /// Comments go, as `strip-json-comments` takes them out for Qwen Code,

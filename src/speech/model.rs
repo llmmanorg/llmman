@@ -994,7 +994,9 @@ impl CanaryModel {
 /// Types stay as stored: `Weights` converts BF16 alone, so quantized
 /// linears and F16/F32 conv kernels arrive byte for byte.
 pub fn load(path: &Path, be: &Backend) -> Result<CanaryModel> {
-    let info = crate::gguf::read_info(path)?;
+    // The full read: the vocabulary is an array of 16,384 pieces, past the
+    // length `read_info` keeps.
+    let info = crate::gguf::read_info_full(path)?;
     let hp = CanaryHParams::from_info(&info).with_context(|| path.display().to_string())?;
     let vocab = Vocab::from_info(&info, &hp).with_context(|| path.display().to_string())?;
     let idx = weights::read_index(path)?;
