@@ -34,6 +34,12 @@ fn onboarded_config() -> Option<PathBuf> {
     .find(|path| path.exists())
 }
 
+/// Onboarding is given `{server}/v1` and stores it without the `/v1`.
+fn base_url(url: &str) -> &str {
+    let url = url.trim_end_matches('/');
+    url.strip_suffix("/v1").unwrap_or(url)
+}
+
 /// openclaw budgets against `contextTokens` when it is set. A provider at
 /// another server, from an earlier onboarding, is left alone.
 fn with_context_window(
@@ -42,16 +48,11 @@ fn with_context_window(
     model: &str,
     window: u64,
 ) -> serde_json::Value {
-    // Onboarding is given `{server}/v1` and stores it without the `/v1`.
-    let base = |url: &str| {
-        let url = url.trim_end_matches('/');
-        url.strip_suffix("/v1").unwrap_or(url).to_string()
-    };
     let mut config = config.clone();
     let Some(provider) = config.pointer_mut("/models/providers/ollama") else {
         return config;
     };
-    if provider["baseUrl"].as_str().map(base) != Some(base(server)) {
+    if provider["baseUrl"].as_str().map(base_url) != Some(base_url(server)) {
         return config;
     }
     let model = crate::storage::default_tag(model);
@@ -65,6 +66,61 @@ fn with_context_window(
         }
     }
     config
+}
+
+/// The id the `ollama` provider at `server` lists `model` under.
+fn listed_id(config: &serde_json::Value, server: &str, model: &str) -> Option<String> {
+    let provider = config.pointer("/models/providers/ollama")?;
+    if provider["baseUrl"].as_str().map(base_url) != Some(base_url(server)) {
+        return None;
+    }
+    let wanted = crate::storage::default_tag(model);
+    provider["models"]
+        .as_array()?
+        .iter()
+        .filter_map(|entry| entry["id"].as_str())
+        .find(|id| crate::storage::default_tag(id) == wanted)
+        .map(str::to_owned)
+}
+
+/// `agents.defaults.model.primary` is the model openclaw uses, and onboarding
+/// sets it once. Without this, a later `--model` is ignored and `llmman serve`
+/// loads whatever the first launch named. Only a model the provider lists.
+fn with_primary_model(config: &serde_json::Value, server: &str, model: &str) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+    fn child<'a>(map: &'a mut Map<String, Value>, key: &str) -> Option<&'a mut Map<String, Value>> {
+        map.entry(key).or_insert_with(|| json!({})).as_object_mut()
+    }
+    let mut config = config.clone();
+    let Some(id) = listed_id(&config, server, model) else {
+        return config;
+    };
+    let primary = format!("ollama/{id}");
+    let defaults = config
+        .as_object_mut()
+        .and_then(|c| child(c, "agents"))
+        .and_then(|a| child(a, "defaults"));
+    if let Some(defaults) = defaults {
+        match defaults.get_mut("model") {
+            Some(Value::Object(m)) => {
+                m.insert("primary".into(), primary.into());
+            }
+            // The older spelling, `"model": "ollama/..."`.
+            Some(m @ Value::String(_)) => *m = primary.into(),
+            _ => {
+                defaults.insert("model".into(), json!({ "primary": primary }));
+            }
+        }
+    }
+    config
+}
+
+/// The model `config` uses, if it names one other than `wanted`.
+fn other_primary_model<'a>(config: &'a serde_json::Value, wanted: &str) -> Option<&'a str> {
+    let model = config.pointer("/agents/defaults/model")?;
+    let primary = model.as_str().or_else(|| model["primary"].as_str())?;
+    let id = primary.strip_prefix("ollama/").unwrap_or(primary);
+    (crate::storage::default_tag(id) != crate::storage::default_tag(wanted)).then_some(primary)
 }
 
 /// openclaw: runs its non-interactive onboarding (once) against our
@@ -100,6 +156,21 @@ pub(super) fn launch_openclaw(
         .map(String::from);
         let code = run_with_env(&bin, &onboard, &[])?;
         anyhow::ensure!(code == 0, "openclaw onboarding failed");
+    }
+    if let (false, Some(config)) = (model.is_empty(), onboarded_config()) {
+        let (server, wanted) = (server(), openclaw_model_id(model));
+        let mut kept = None;
+        if let Err(e) = common::write_json_merged(&config, "openclaw", |existing| {
+            if listed_id(existing, &server, wanted).is_none() {
+                kept = other_primary_model(existing, wanted).map(str::to_owned);
+            }
+            with_primary_model(existing, &server, wanted)
+        }) {
+            eprintln!("[llmman] openclaw: primary model not set: {e:#}");
+        }
+        if let Some(kept) = kept {
+            eprintln!("[llmman] openclaw: it has no {wanted} from this server, so it keeps {kept}");
+        }
     }
     if let (Some(window), Some(config)) = (context_window, onboarded_config()) {
         let (server, model) = (server(), openclaw_model_id(model));
@@ -163,6 +234,75 @@ mod tests {
             with_context_window(&config, SERVER, "qwen3.5:0.8b", 32768),
             expected
         );
+    }
+
+    #[test]
+    fn a_listed_model_becomes_the_primary_one() {
+        let entry = |id: &str| serde_json::json!({ "id": id, "contextWindow": 128000 });
+        let mut config = onboarded(
+            SERVER,
+            serde_json::json!([entry("qwen3.8:27b-nvfp4"), entry("qwen3.8:27b")]),
+        );
+        config["agents"] = serde_json::json!({ "defaults": {
+            "workspace": "/w", "model": { "primary": "ollama/qwen3.8:27b-nvfp4" },
+        } });
+        let updated = with_primary_model(&config, SERVER, "qwen3.8:27b");
+        assert_eq!(
+            updated["agents"]["defaults"]["model"]["primary"],
+            "ollama/qwen3.8:27b"
+        );
+        assert_eq!(updated["agents"]["defaults"]["workspace"], "/w");
+        // The id is the listed one, whichever spelling was asked for.
+        let mut listed = onboarded(SERVER, serde_json::json!([entry("hf.co/a/b:latest")]));
+        listed["agents"] = config["agents"].clone();
+        assert_eq!(
+            with_primary_model(&listed, &format!("{SERVER}/v1"), "hf.co/a/b")["agents"]["defaults"]
+                ["model"]["primary"],
+            "ollama/hf.co/a/b:latest"
+        );
+        // The older, plain-string spelling of the model.
+        listed["agents"]["defaults"]["model"] = "ollama/other".into();
+        assert_eq!(
+            with_primary_model(&listed, SERVER, "hf.co/a/b")["agents"]["defaults"]["model"],
+            "ollama/hf.co/a/b:latest"
+        );
+        // No `agents` section yet.
+        let bare = onboarded(SERVER, serde_json::json!([entry("hf.co/a/b:latest")]));
+        assert_eq!(
+            with_primary_model(&bare, SERVER, "hf.co/a/b")["agents"]["defaults"]["model"]
+                ["primary"],
+            "ollama/hf.co/a/b:latest"
+        );
+    }
+
+    #[test]
+    fn an_unlisted_model_or_another_server_leaves_the_primary_model_alone() {
+        let entry = serde_json::json!({ "id": "qwen3.8:27b", "contextWindow": 128000 });
+        let mut config = onboarded(SERVER, serde_json::json!([entry]));
+        config["agents"] = serde_json::json!({ "defaults": { "model": {
+            "primary": "ollama/qwen3.8:27b",
+        } } });
+        assert_eq!(with_primary_model(&config, SERVER, "gemma4"), config);
+        // A different primary, so the server check is what keeps it.
+        let mut elsewhere = config.clone();
+        elsewhere["agents"]["defaults"]["model"]["primary"] = "ollama/gemma4".into();
+        assert_eq!(
+            with_primary_model(&elsewhere, "http://127.0.0.1:11434", "qwen3.8:27b"),
+            elsewhere
+        );
+        assert_eq!(
+            with_primary_model(&serde_json::json!({}), SERVER, "x"),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            other_primary_model(&config, "gemma4"),
+            Some("ollama/qwen3.8:27b")
+        );
+        assert_eq!(other_primary_model(&config, "qwen3.8:27b"), None);
+        // `:latest` is the default tag.
+        let mut tagged = config.clone();
+        tagged["agents"]["defaults"]["model"]["primary"] = "ollama/hf.co/a/b:latest".into();
+        assert_eq!(other_primary_model(&tagged, "hf.co/a/b"), None);
     }
 
     #[test]
