@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 
 use crate::llama_release::{
-    download_to_file, extract_tar_gz, find_binary, http_client, mark_executable, tmp_path,
-    DownloadMarker, RemoveOnDrop,
+    download_to_file, extract_tar_gz, find_binary, http_client, mark_executable, sha256_of_file,
+    tmp_path, DownloadMarker, RemoveOnDrop,
 };
 use crate::managed;
 
@@ -113,14 +113,6 @@ pub fn installed() -> bool {
 fn parse_sha256_file(text: &str) -> Option<String> {
     let hex = text.split_whitespace().next()?;
     (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then(|| hex.to_lowercase())
-}
-
-fn sha256_of_file(path: &Path) -> Result<String> {
-    use sha2::Digest;
-    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut hasher = sha2::Sha256::new();
-    std::io::copy(&mut file, &mut hasher).context("hash download")?;
-    Ok(hex::encode(hasher.finalize()))
 }
 
 /// The tool from `PATH` if `fallback` allows and it is there, else `err`
