@@ -1073,7 +1073,7 @@ fn run_openshell(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let name = format!("llmman-{}-{now}-{}", active.integration, std::process::id());
+    let name = openshell_sandbox_name(now, std::process::id());
     let workspace = utf8(&active.workspace)?;
     // `--upload` splits at the first ':'.
     anyhow::ensure!(
@@ -1092,10 +1092,20 @@ fn run_openshell(
         Ok(())
     };
 
-    openshell(
-        openshell_create_args(&name, image, workspace),
+    // Fixed at creation: `policy update` only reaches the network rules.
+    let policy_file = std::env::temp_dir().join(format!("{name}.policy.yaml"));
+    {
+        use std::io::Write as _;
+        crate::llama_release::create_new_file(&policy_file)?
+            .write_all(OPENSHELL_FILESYSTEM_POLICY.as_bytes())
+            .with_context(|| format!("write {}", policy_file.display()))?;
+    }
+    let created = openshell(
+        openshell_create_args(&name, image, workspace, utf8(&policy_file)?),
         "sandbox create",
-    )?;
+    );
+    let _ = std::fs::remove_file(&policy_file);
+    created?;
     let workdir = (|| {
         openshell(openshell_policy_args(&name, &endpoint), "policy update")?;
         let root = output(
@@ -1140,6 +1150,16 @@ fn run_openshell(
     Ok(code)
 }
 
+/// The longest sandbox name OpenShell's Docker driver accepts.
+const OPENSHELL_NAME_MAX: usize = 19;
+
+/// `llm-<epoch>-<pid>` in hex: 4 + 8 + 1 + 6 characters at most.
+fn openshell_sandbox_name(epoch_secs: u64, pid: u32) -> String {
+    let name = format!("llm-{epoch_secs:x}-{pid:x}");
+    debug_assert!(name.len() <= OPENSHELL_NAME_MAX, "{name}");
+    name
+}
+
 /// `host:port` of the daemon as the sandbox reaches it.
 fn openshell_endpoint(server: &str) -> anyhow::Result<String> {
     let url = reqwest::Url::parse(server).with_context(|| format!("parse {server}"))?;
@@ -1150,9 +1170,32 @@ fn openshell_endpoint(server: &str) -> anyhow::Result<String> {
     Ok(format!("{host}:{port}"))
 }
 
-fn openshell_create_args(name: &str, image: &str, workspace: &str) -> Vec<String> {
+/// OpenShell's default filesystem policy plus a writable `/home/agent`: the
+/// default hides the integration the template images keep in `~/.local/bin`.
+const OPENSHELL_FILESYSTEM_POLICY: &str = "\
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /bin
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /etc
+    - /var/log
+  read_write:
+    - /tmp
+    - /dev/null
+    - /home/agent
+landlock:
+  compatibility: best_effort
+";
+
+fn openshell_create_args(name: &str, image: &str, workspace: &str, policy: &str) -> Vec<String> {
     [
-        "sandbox", "create", "--name", name, "--from", image, "--upload", workspace, "--detach",
+        "sandbox", "create", "--name", name, "--from", image, "--policy", policy, "--upload",
+        workspace, "--detach",
     ]
     .map(String::from)
     .to_vec()
@@ -2216,6 +2259,19 @@ mod tests {
     }
 
     #[test]
+    fn openshell_filesystem_policy_makes_the_agents_home_writable() {
+        assert!(OPENSHELL_FILESYSTEM_POLICY.contains("    - /home/agent\n"));
+    }
+
+    #[test]
+    fn openshell_sandbox_names_fit_the_docker_drivers_limit() {
+        let name = openshell_sandbox_name(1_793_872_735, 473_650);
+        assert_eq!(name, "llm-6aec535f-73a32");
+        let longest = openshell_sandbox_name(0xffff_ffff, 1 << 22);
+        assert!(longest.len() <= OPENSHELL_NAME_MAX, "{longest}");
+    }
+
+    #[test]
     fn apple_dns_listing_is_matched_by_whole_domain() {
         let table = "DOMAIN\nhost.container.internal.\n";
         assert!(lists_domain(table, APPLE_HOST_DOMAIN));
@@ -2229,7 +2285,7 @@ mod tests {
     #[test]
     fn openshell_opens_the_daemons_port_to_every_program_and_execs_in_the_workspace() {
         assert_eq!(
-            openshell_create_args("llmman-claude-1", "img", "/src/app"),
+            openshell_create_args("llmman-claude-1", "img", "/src/app", "/tmp/p.yaml"),
             strings(&[
                 "sandbox",
                 "create",
@@ -2237,6 +2293,8 @@ mod tests {
                 "llmman-claude-1",
                 "--from",
                 "img",
+                "--policy",
+                "/tmp/p.yaml",
                 "--upload",
                 "/src/app",
                 "--detach"

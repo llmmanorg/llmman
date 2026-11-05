@@ -141,6 +141,10 @@ Mac restarts. Run the command again after a restart.
   change the labels of your own files.
 - **microsandbox** mounts with `host-perms=mirror`, so files the
   integration creates get their real permissions on the host.
+- **openshell** creates the sandbox with OpenShell's default filesystem
+  policy plus a writable `/home/agent`, since the default hides the
+  integration in the image's home. Names are `llm-<time>-<pid>`: the Docker
+  driver rejects more than 19 characters.
 - **openshell** can only pass the integration's environment on its
   command line (`--env`), and it stores that environment with the sandbox.
   So it refuses any launch that would hand the integration a real key:
