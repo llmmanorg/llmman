@@ -539,17 +539,43 @@ pub(super) fn vllm_serve_args(
     args
 }
 
-/// [`vllm_serve_args`] plus `LLMMAN_VLLM_ARGS`, `--port` and `--host` (see
-/// [`append_extra_args`]). Shared with `container::spawn_engine`, which
-/// passes its `/models` mount and `0.0.0.0`.
+/// The parsers vllm needs to serve a model family to an agent, by the
+/// `model_type` in `model_dir`'s `config.json` (a host path). Agents send
+/// `tool_choice: "auto"`, which vllm rejects with a 400 without them.
+/// They come before `LLMMAN_VLLM_ARGS`, so a flag set there wins.
+pub(super) fn vllm_family_args(model_dir: &Path) -> Vec<String> {
+    let model_type = std::fs::read_to_string(model_dir.join("config.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|config| config["model_type"].as_str().map(str::to_owned));
+    match model_type.as_deref() {
+        Some("qwen3_5" | "qwen3_5_moe") => [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "qwen3_coder",
+            "--reasoning-parser",
+            "qwen3",
+        ]
+        .map(String::from)
+        .to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// [`vllm_serve_args`], then `family` (see [`vllm_family_args`]), then
+/// `LLMMAN_VLLM_ARGS`, `--port` and `--host` (see [`append_extra_args`]).
+/// Shared with `container::spawn_engine`, which passes its `/models` mount
+/// and `0.0.0.0`.
 pub(super) fn vllm_serve_args_from_env(
     model_dir: &str,
     host: &str,
     port: u16,
     model_name: &str,
     max_model_len: Option<u32>,
+    family: &[String],
 ) -> Vec<String> {
     let mut args = vllm_serve_args(model_dir, model_name, max_model_len);
+    args.extend(family.iter().cloned());
     append_extra_args(&mut args, extra_args_from_env(VLLM_ARGS_VAR), host, port);
     args
 }
@@ -578,6 +604,7 @@ pub(super) async fn spawn_vllm_server(
         port,
         model_name,
         max_model_len,
+        &vllm_family_args(model_dir),
     );
     let mut cmd = grouped_command(&vllm, args);
     crate::debug_log!("spawning {}: {:?}", vllm.display(), cmd);
@@ -1243,6 +1270,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn vllm_gets_the_parsers_qwen3_5_needs_before_the_users_args() {
+        let _env = EXTRA_ARGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let family_of = |config: &str| {
+            std::fs::write(dir.path().join("config.json"), config).unwrap();
+            vllm_family_args(dir.path())
+        };
+        let qwen = family_of(r#"{"model_type": "qwen3_5"}"#);
+        assert_eq!(
+            qwen,
+            [
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "qwen3_coder",
+                "--reasoning-parser",
+                "qwen3"
+            ]
+        );
+        assert_eq!(family_of(r#"{"model_type": "qwen3_5_moe"}"#), qwen);
+        // Other families, and a model with no readable config, are left alone.
+        assert!(family_of(r#"{"model_type": "llama"}"#).is_empty());
+        assert!(family_of("not json").is_empty());
+        std::fs::remove_file(dir.path().join("config.json")).unwrap();
+        assert!(vllm_family_args(dir.path()).is_empty());
+
+        // After the model and before whatever LLMMAN_VLLM_ARGS holds, which
+        // vllm lets win by keeping each flag's last value.
+        let args = vllm_serve_args_from_env("/m", "0.0.0.0", 8000, "m", None, &qwen);
+        assert_eq!(&args[4..9], qwen.as_slice());
+        assert_eq!(
+            &args[args.len() - 4..],
+            ["--port", "8000", "--host", "0.0.0.0"]
+        );
+    }
+
     /// Whatever `LLMMAN_*_ARGS` holds, every builder ends with llmman's
     /// `--port` and `--host`.
     #[test]
@@ -1256,7 +1321,14 @@ mod tests {
         }
         for host in ["127.0.0.1", "0.0.0.0"] {
             assert_eq!(
-                tail(vllm_serve_args_from_env("/m", host, 41234, "m", Some(4096))),
+                tail(vllm_serve_args_from_env(
+                    "/m",
+                    host,
+                    41234,
+                    "m",
+                    Some(4096),
+                    &[]
+                )),
                 expect(host)
             );
             assert_eq!(
@@ -1303,7 +1375,7 @@ mod tests {
             );
             assert_eq!(without_dir_and_host(local), without_dir_and_host(container));
         };
-        pair(&|dir, host| vllm_serve_args_from_env(dir, host, 8000, "m", Some(4096)));
+        pair(&|dir, host| vllm_serve_args_from_env(dir, host, 8000, "m", Some(4096), &[]));
         pair(&|dir, host| vllm_omni_serve_args_from_env(dir, host, 8000, "m"));
         pair(&|dir, host| sglang_serve_args_from_env(dir, host, 30000, "m", Some(4096)));
     }
@@ -1334,7 +1406,8 @@ mod tests {
                 "127.0.0.1",
                 41234,
                 "m",
-                None
+                None,
+                &[]
             )),
             expected
         );

@@ -731,8 +731,9 @@ pub(super) struct OAIChunkChoice {
 pub(super) struct OAIChunkDelta {
     pub(super) content: Option<String>,
     /// llama-server (Homebrew b8880) sends reasoning content in this field.
-    /// The git repo uses "thinking" — accept both for forward compatibility.
+    /// The git repo uses "thinking", and vLLM "reasoning": accept all three.
     pub(super) reasoning_content: Option<String>,
+    pub(super) reasoning: Option<String>,
     pub(super) thinking: Option<String>,
     /// OpenAI-style streaming tool-call deltas — see
     /// `oai_chunk_tool_call_deltas`/`ToolCallAccumulator`.

@@ -61,8 +61,8 @@ use backend::{
     safetensors_engine_from_env, sglang_serve_args_from_env, sglang_served_model_name,
     spawn_ds4_server, spawn_llama_server, spawn_mlx_server, spawn_sglang_server,
     spawn_vllm_omni_server, spawn_vllm_server, tail_child_output, use_mlx_for_safetensors,
-    vllm_max_model_len, vllm_omni_serve_args_from_env, vllm_serve_args_from_env, wait_for_ready,
-    GgufEngine, OutputTail, SafetensorsEngine, POLL_INTERVAL,
+    vllm_family_args, vllm_max_model_len, vllm_omni_serve_args_from_env, vllm_serve_args_from_env,
+    wait_for_ready, GgufEngine, OutputTail, SafetensorsEngine, POLL_INTERVAL,
 };
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
 use config::{
@@ -2553,6 +2553,7 @@ async fn resolve_target(
                                 port,
                                 model_ref,
                                 max_model_len,
+                                &vllm_family_args(dir),
                             )
                         }
                     },
