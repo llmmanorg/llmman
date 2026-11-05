@@ -123,7 +123,7 @@ Mac (see [MLX](#mlx-macos)).
 Plain `vllm` is CPU-only on macOS unless
 [vllm-metal](https://github.com/vllm-project/vllm-metal) is installed.
 `LLMMAN_CONTEXT_LENGTH` is forwarded as `--max-model-len`;
-`LLMMAN_LOAD_TIMEOUT` (default 10 minutes) bounds a stalled load.
+`LLMMAN_LOAD_TIMEOUT` (default 20 minutes) bounds a stalled load.
 `LLMMAN_VLLM_ARGS` appends anything else (`--dtype bfloat16 --tp 2`) to
 the `vllm serve` command line, local or in a container; llmman's own
 `--port` and `--host` come last.

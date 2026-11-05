@@ -244,6 +244,7 @@ fn format_value(v: &crate::gguf::Value) -> String {
         }
         Value::String(s) => s.clone(),
         Value::Array(items) => format!("[{} items]", items.len()),
+        Value::LargeArray(len) => format!("[{len} items]"),
         Value::Bool(b) => b.to_string(),
         Value::F32(f) => f.to_string(),
         Value::F64(f) => f.to_string(),

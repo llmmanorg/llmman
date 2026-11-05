@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use toml_edit::{value, DocumentMut, Item, Table};
 
 use super::{exec_with_env, find_on_path, server};
 
@@ -17,7 +18,7 @@ pub(super) fn launch_codex(
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     // Write codex config
-    write_codex_config(model, vision, context_window)?;
+    write_codex_config(model, vision, context_window, extra_args)?;
 
     // Regression: this used to pass a bare PathBuf::from("codex") straight
     // to exec_with_env instead of resolving it via find_on_path like every
@@ -60,14 +61,16 @@ fn write_codex_config(
     model: &str,
     vision: bool,
     context_window: Option<u64>,
+    extra_args: &[String],
 ) -> anyhow::Result<()> {
     let config_dir = codex_dir()?;
     std::fs::create_dir_all(&config_dir)?;
 
     let config_path = config_dir.join("config.toml");
-    if let Ok(existing) = std::fs::read_to_string(&config_path) {
+    let user_config = std::fs::read_to_string(&config_path).ok();
+    if let Some(existing) = user_config.as_deref() {
         if existing.contains("[profiles.llmman]") {
-            std::fs::write(&config_path, strip_legacy_llmman_profile(&existing))?;
+            std::fs::write(&config_path, strip_legacy_llmman_profile(existing))?;
         }
     }
 
@@ -84,7 +87,101 @@ fn write_codex_config(
     let catalog = catalog.transpose()?;
 
     let profile_path = config_dir.join("llmman.config.toml");
-    write_codex_file(&profile_path, &codex_profile(&server(), catalog.as_deref()))
+    let profile = codex_profile(&server(), catalog.as_deref());
+    let existing = std::fs::read_to_string(&profile_path).ok();
+    let overlay = codex_overlay(
+        existing.as_deref(),
+        user_config.as_deref(),
+        &profile,
+        codex_trust_root(extra_args).as_deref(),
+    );
+    write_codex_file(&profile_path, &overlay)
+}
+
+/// The overlay's keys that are llmman's; the rest of the file is codex's.
+const CODEX_OVERLAY_OWNED: &[&str] = &["model_provider", "model_catalog_json", "model_providers"];
+
+/// The overlay to write: `profile`, what codex saved in the overlay it ran
+/// with (a trust decision, `[tui]` notices), and `trusted` as a trusted
+/// project. A plain rewrite erased those, so codex asked to trust the folder
+/// on every launch. A project with a `trust_level` already, in the overlay or
+/// in `user_config` (which the overlay would override), keeps it.
+fn codex_overlay(
+    existing: Option<&str>,
+    user_config: Option<&str>,
+    profile: &str,
+    trusted: Option<&Path>,
+) -> String {
+    let mut doc: DocumentMut = profile.parse().expect("the profile is valid TOML");
+    // An overlay that does not parse is replaced, as it always was.
+    if let Some(old) = existing.and_then(|text| text.parse::<DocumentMut>().ok()) {
+        for (key, item) in old.iter() {
+            if !CODEX_OVERLAY_OWNED.contains(&key) {
+                doc.insert(key, item.clone());
+            }
+        }
+    }
+    let user_config = user_config.and_then(|text| text.parse::<DocumentMut>().ok());
+    if let Some(root) = trusted {
+        let key = root.display().to_string();
+        let decided = |doc: &DocumentMut| {
+            doc.get("projects")
+                .and_then(Item::as_table_like)
+                .and_then(|projects| projects.get(&key))
+                .and_then(Item::as_table_like)
+                .is_some_and(|project| project.contains_key("trust_level"))
+        };
+        if !decided(&doc) && !user_config.as_ref().is_some_and(decided) {
+            // Not tables: codex's to fix, not llmman's to overwrite.
+            let projects = doc.entry("projects").or_insert_with(|| {
+                let mut table = Table::new();
+                table.set_implicit(true);
+                Item::Table(table)
+            });
+            let project = projects
+                .as_table_like_mut()
+                .map(|projects| projects.entry(&key).or_insert(Item::Table(Table::new())))
+                .and_then(Item::as_table_like_mut);
+            if let Some(project) = project {
+                project.insert("trust_level", value("trusted"));
+            }
+        }
+    }
+    doc.to_string()
+}
+
+/// The project codex would ask to trust: the repository `dir` is in, else
+/// `dir` itself.
+fn codex_project_root(dir: &Path) -> PathBuf {
+    dir.ancestors()
+        .find(|d| d.join(".git").exists())
+        .unwrap_or(dir)
+        .to_path_buf()
+}
+
+/// [`codex_project_root`] of the directory codex will run in: a forwarded
+/// `--cd`/`-C` (relative to the working directory), else the working
+/// directory. `None` when that directory is not there, as codex will refuse
+/// to start in it.
+fn codex_trust_root(extra_args: &[String]) -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    if let Some(cd) = super::common::forwarded_value(extra_args, "--cd", "-C") {
+        dir = dir.join(cd);
+    }
+    if !dir.is_dir() {
+        return None;
+    }
+    Some(codex_project_root(&codex_key_path(dir)))
+}
+
+/// `dir` as codex keys it: symlinks resolved, except on Windows, where
+/// `canonicalize` gives a `\\?\` path codex does not use.
+fn codex_key_path(dir: PathBuf) -> PathBuf {
+    if cfg!(unix) {
+        dir.canonicalize().unwrap_or(dir)
+    } else {
+        dir
+    }
 }
 
 pub(super) fn codex_dir() -> anyhow::Result<PathBuf> {
@@ -260,6 +357,190 @@ model = \"gpt-5\"
             profile.get("model_catalog_json").is_none(),
             "no model, no catalog to point at"
         );
+    }
+
+    const PROFILE: &str = "# Written by `llmman launch codex`; edits are overwritten.\n\
+        model_provider = \"llmman\"\n\
+        \n\
+        [model_providers.llmman]\n\
+        base_url = \"http://h/v1\"\n";
+
+    fn overlay(existing: Option<&str>, trusted: Option<&str>) -> toml::Value {
+        overlay_over(existing, None, trusted)
+    }
+
+    fn overlay_over(
+        existing: Option<&str>,
+        user_config: Option<&str>,
+        trusted: Option<&str>,
+    ) -> toml::Value {
+        codex_overlay(existing, user_config, PROFILE, trusted.map(Path::new))
+            .parse()
+            .expect("the overlay is valid TOML")
+    }
+
+    /// codex asked to trust the folder on every launch because llmman
+    /// rewrote the overlay codex had saved its answer in.
+    #[test]
+    fn overlay_trusts_the_project_and_keeps_what_codex_saved() {
+        let first = overlay(None, Some("/work/repo"));
+        assert_eq!(
+            first["projects"]["/work/repo"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(first["model_provider"].as_str(), Some("llmman"));
+
+        // codex then saves a notice it has shown, and another project it
+        // was asked about; the next launch must not lose either.
+        let saved = format!(
+            "{}\n[tui]\nscreen_reader_detection_done = true\n\n[projects.\"/work/other\"]\ntrust_level = \"trusted\"\n",
+            codex_overlay(None, None, PROFILE, Some(Path::new("/work/repo")))
+        );
+        let next = overlay(Some(&saved), Some("/work/repo"));
+        assert_eq!(
+            next["tui"]["screen_reader_detection_done"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            next["projects"]["/work/other"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(
+            next["projects"]["/work/repo"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn overlay_replaces_llmmans_own_keys_and_nothing_else() {
+        let stale = "model_provider = \"old\"\n\
+            model_catalog_json = \"/gone.json\"\n\
+            [model_providers.llmman]\n\
+            base_url = \"http://stale/v1\"\n\
+            [model_providers.mine]\n\
+            base_url = \"http://mine\"\n";
+        let next = overlay(Some(stale), None);
+        assert_eq!(next["model_provider"].as_str(), Some("llmman"));
+        assert!(
+            next.get("model_catalog_json").is_none(),
+            "no model, no catalog"
+        );
+        assert_eq!(
+            next["model_providers"]["llmman"]["base_url"].as_str(),
+            Some("http://h/v1")
+        );
+        assert!(next["model_providers"].get("mine").is_none());
+        assert!(next.get("projects").is_none(), "no project to trust");
+    }
+
+    /// A folder codex was told not to trust stays untrusted: that was the
+    /// user's answer.
+    #[test]
+    fn overlay_keeps_an_existing_decision_about_the_project() {
+        let saved = "[projects.\"/work/repo\"]\ntrust_level = \"untrusted\"\n";
+        let next = overlay(Some(saved), Some("/work/repo"));
+        assert_eq!(
+            next["projects"]["/work/repo"]["trust_level"].as_str(),
+            Some("untrusted")
+        );
+    }
+
+    /// The overlay is layered over `~/.codex/config.toml`, so a trust level
+    /// added to it would override the one the user set there.
+    #[test]
+    fn overlay_defers_to_a_decision_in_the_user_config() {
+        for level in ["untrusted", "trusted"] {
+            let user = format!("[projects.\"/work/repo\"]\ntrust_level = \"{level}\"\n");
+            let next = overlay_over(None, Some(&user), Some("/work/repo"));
+            assert!(next.get("projects").is_none(), "{level}: nothing added");
+        }
+        // another project's entry decides nothing about this one
+        let user = "[projects.\"/work/other\"]\ntrust_level = \"untrusted\"\n";
+        let next = overlay_over(None, Some(user), Some("/work/repo"));
+        assert_eq!(
+            next["projects"]["/work/repo"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    /// A project table with no `trust_level` is no decision: codex asks.
+    #[test]
+    fn overlay_adds_the_trust_level_a_project_table_lacks() {
+        let saved = "[projects.\"/work/repo\"]\nnote = \"mine\"\n";
+        let next = overlay(Some(saved), Some("/work/repo"));
+        let project = &next["projects"]["/work/repo"];
+        assert_eq!(project["trust_level"].as_str(), Some("trusted"));
+        assert_eq!(project["note"].as_str(), Some("mine"));
+        // and a user-config table that lacks one is no decision either
+        let next = overlay_over(None, Some(saved), Some("/work/repo"));
+        assert_eq!(
+            next["projects"]["/work/repo"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn overlay_starts_over_from_one_that_does_not_parse() {
+        let next = overlay(Some("this is [not toml"), Some("/work/repo"));
+        assert_eq!(next["model_provider"].as_str(), Some("llmman"));
+        assert_eq!(
+            next["projects"]["/work/repo"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    /// An unchanged overlay is not rewritten (`write_codex_file`), so
+    /// writing it twice must give the same text.
+    #[test]
+    fn overlay_is_stable() {
+        let once = codex_overlay(None, None, PROFILE, Some(Path::new("/work/repo")));
+        let twice = codex_overlay(Some(&once), None, PROFILE, Some(Path::new("/work/repo")));
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn project_root_is_the_enclosing_repository_else_the_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let sub = dir.join("repo/src/deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(dir.join("repo/.git")).unwrap();
+        assert_eq!(codex_project_root(&sub), dir.join("repo"));
+        assert_eq!(codex_project_root(&dir.join("repo")), dir.join("repo"));
+        // a worktree's `.git` is a file
+        std::fs::create_dir_all(dir.join("wt/sub")).unwrap();
+        std::fs::write(dir.join("wt/.git"), "gitdir: ../elsewhere").unwrap();
+        assert_eq!(codex_project_root(&dir.join("wt/sub")), dir.join("wt"));
+    }
+
+    /// `--cd`/`-C` makes codex run in another directory, which is the one
+    /// it asks about, so that is the one to trust.
+    #[test]
+    fn trust_root_follows_a_forwarded_working_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let sub = dir.join("repo/src");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(dir.join("repo/.git")).unwrap();
+        let repo = codex_key_path(dir.join("repo"));
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let sub = sub.display().to_string();
+        for forwarded in [
+            args(&["--cd", &sub]),
+            args(&["-C", &sub]),
+            args(&[&format!("--cd={sub}"), "--", "-C", "/elsewhere"]),
+        ] {
+            assert_eq!(codex_trust_root(&forwarded).as_deref(), Some(&*repo));
+        }
+        // a directory that is not there is not trusted
+        let gone = dir.join("gone").display().to_string();
+        assert_eq!(codex_trust_root(&args(&["-C", &gone])), None);
+        // none forwarded: the working directory
+        assert_eq!(
+            codex_trust_root(&[]),
+            codex_trust_root(&args(&["--", "-C", &gone]))
+        );
+        assert!(codex_trust_root(&[]).is_some());
     }
 
     #[test]

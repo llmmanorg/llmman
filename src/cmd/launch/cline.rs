@@ -114,7 +114,7 @@ fn write_cline_settings(model: &str) -> anyhow::Result<()> {
 /// Cline's ~12k-token system prompt, since no bytes are sent before the
 /// first token: on CPU that takes minutes (a 4-vCPU aarch64 runner
 /// manages ~44 tok/s even on a 0.8B model), and llmman's own load
-/// deadline is already 10 minutes. In CI run 35602511987 Cline dropped
+/// deadline is already 20 minutes. In CI run 35602511987 Cline dropped
 /// its first request 5:00 into the prefill and re-sent it. 30 minutes
 /// covers load plus a long prefill; connection failures still fail fast,
 /// and a user-set value is kept.

@@ -501,13 +501,6 @@ pub(super) async fn handle_show(
     }))
 }
 
-/// Elements past this many are not carried. A non-verbose `/api/show`
-/// reads the header with the same ceiling and discards any longer array
-/// outright rather than reading it (`fs/gguf/metadata.go`,
-/// `fs/gguf/gguf.go`), which reaches the response as `[]`, not `null`.
-/// `tokenizer.ggml.tokens` and `merges` alone run to megabytes.
-const MODEL_INFO_MAX_ARRAY: usize = 1024;
-
 /// Keys ollama's own `GetModelInfo` deletes before answering
 /// (`server/routes.go`). The chat template already has its own field on
 /// this response; carrying it here too made it 82% of the body on a
@@ -516,7 +509,7 @@ const MODEL_INFO_OMITTED: [&str; 2] = ["general.name", "tokenizer.chat_template"
 
 /// The GGUF header as ollama's `/api/show` reports it: every metadata key
 /// verbatim, minus [`MODEL_INFO_OMITTED`] and the bulk
-/// [`MODEL_INFO_MAX_ARRAY`] cuts.
+/// [`crate::gguf::MAX_ARRAY_ELEMENTS`] cuts.
 fn model_info_json(info: &crate::gguf::Info) -> serde_json::Value {
     info.metadata
         .iter()
@@ -527,6 +520,9 @@ fn model_info_json(info: &crate::gguf::Info) -> serde_json::Value {
 }
 
 /// One metadata value as JSON — see [`model_info_json`].
+///
+/// An array past [`crate::gguf::MAX_ARRAY_ELEMENTS`] is `[]`, not `null`, as
+/// Ollama's non-verbose `/api/show` has it.
 fn metadata_cell(v: &crate::gguf::Value) -> serde_json::Value {
     use crate::gguf::Value;
     match v {
@@ -542,7 +538,10 @@ fn metadata_cell(v: &crate::gguf::Value) -> serde_json::Value {
         Value::F64(f) => serde_json::Value::from(*f),
         Value::Bool(b) => serde_json::Value::from(*b),
         Value::String(s) => serde_json::Value::from(s.as_str()),
-        Value::Array(a) if a.len() > MODEL_INFO_MAX_ARRAY => serde_json::Value::Array(Vec::new()),
+        Value::LargeArray(_) => serde_json::Value::Array(Vec::new()),
+        Value::Array(a) if a.len() > crate::gguf::MAX_ARRAY_ELEMENTS => {
+            serde_json::Value::Array(Vec::new())
+        }
         // ollama holds a UINT8 array as Go's `[]byte`, which
         // `encoding/json` writes as a base64 string rather than a number
         // array, so that is the wire value for this element type. An

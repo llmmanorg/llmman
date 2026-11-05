@@ -141,7 +141,7 @@ Environment Variables:
       LLMMAN_RUNTIME                 Where the inference engine comes from: auto (default), docker, podman, bin or path — same as --runtime
       LLMMAN_LLM_LIBRARY             Set backend (cpu/cuda/cuda13/rocm/opencl/vulkan/metal) to bypass GPU autodetection
       LLMMAN_IGPU_ENABLE             Enable integrated GPUs
-      LLMMAN_LOAD_TIMEOUT            How long to allow model loads to stall before giving up (default \"10m\")
+      LLMMAN_LOAD_TIMEOUT            How long to allow model loads to stall before giving up (default \"20m\")
       LLMMAN_VLLM_OMNI_GUARDRAILS    Keep a Diffusers-layout model's vLLM-Omni safety guardrails on (default: off)
       LLMMAN_TMPDIR                  Staging directory for llama-server release downloads
       LLAMA_ARG_FIT                  Enable llama.cpp automatic fit of unset memory options (default \"on\")

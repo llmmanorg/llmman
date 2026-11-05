@@ -272,10 +272,14 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // Resolved once, and only for an integration that has
             // somewhere to put it: reading the live window loads the
             // model (see `local_context_window`), which every other
-            // launch would wait for and never use.
-            let local_window = (declares_context_window(name) && !model.is_empty())
-                .then(|| local_context_window(&model, context_length))
-                .flatten();
+            // launch would wait for and never use. That includes claude
+            // given another model, which drops the window.
+            let local_window = (declares_context_window(name)
+                && !model.is_empty()
+                && (!name.eq_ignore_ascii_case("claude")
+                    || claude::runs_model(&model, &args.extra_args)))
+            .then(|| local_context_window(&model, context_length))
+            .flatten();
             match overflow {
                 // The hosted half is validated and keyed exactly as a
                 // bare --provider model would be, then paired with the
@@ -572,7 +576,7 @@ const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes", "cline", "pi"];
 fn declares_context_window(integration: &str) -> bool {
     matches!(
         integration.to_lowercase().as_str(),
-        "opencode" | "codex" | "pi" | "omp" | "kimi" | "openclaw"
+        "claude" | "opencode" | "codex" | "pi" | "omp" | "kimi" | "openclaw"
     )
 }
 
@@ -1163,7 +1167,7 @@ fn launch(
             .and_then(Thinking::template)
             .is_some_and(|t| t.thinks);
     match name.as_str() {
-        "claude" => claude::launch_claude(model, api_key, extra_args),
+        "claude" => claude::launch_claude(model, api_key, context_window, extra_args),
         "opencode" => opencode::launch_opencode(
             model,
             api_key,
@@ -1844,7 +1848,8 @@ mod tests {
         assert!(declares_context_window("omp"));
         assert!(declares_context_window("kimi"));
         assert!(declares_context_window("openclaw"));
-        assert!(!declares_context_window("claude"));
+        // claude is told it through CLAUDE_CODE_MAX_CONTEXT_TOKENS
+        assert!(declares_context_window("claude"));
         assert!(!declares_context_window("aider"));
     }
 
