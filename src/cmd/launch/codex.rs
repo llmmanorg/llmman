@@ -67,7 +67,12 @@ fn write_codex_config(
     std::fs::create_dir_all(&config_dir)?;
 
     let config_path = config_dir.join("config.toml");
-    let user_config = std::fs::read_to_string(&config_path).ok();
+    let user_config = std::fs::read_to_string(&config_path);
+    // An unreadable file may hold a decision about the project.
+    let user_config_unreadable = user_config
+        .as_ref()
+        .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+    let user_config = user_config.ok();
     if let Some(existing) = user_config.as_deref() {
         if existing.contains("[profiles.llmman]") {
             std::fs::write(&config_path, strip_legacy_llmman_profile(existing))?;
@@ -93,7 +98,9 @@ fn write_codex_config(
         existing.as_deref(),
         user_config.as_deref(),
         &profile,
-        codex_trust_root(extra_args).as_deref(),
+        codex_trust_root(extra_args)
+            .filter(|_| !user_config_unreadable)
+            .as_deref(),
     );
     write_codex_file(&profile_path, &overlay)
 }
@@ -105,7 +112,8 @@ const CODEX_OVERLAY_OWNED: &[&str] = &["model_provider", "model_catalog_json", "
 /// with (a trust decision, `[tui]` notices), and `trusted` as a trusted
 /// project. A plain rewrite erased those, so codex asked to trust the folder
 /// on every launch. A project with a `trust_level` already, in the overlay or
-/// in `user_config` (which the overlay would override), keeps it.
+/// in `user_config` (which the overlay would override), keeps it; so does
+/// one in a `user_config` that does not parse.
 fn codex_overlay(
     existing: Option<&str>,
     user_config: Option<&str>,
@@ -121,7 +129,7 @@ fn codex_overlay(
             }
         }
     }
-    let user_config = user_config.and_then(|text| text.parse::<DocumentMut>().ok());
+    let user_config = user_config.map(|text| text.parse::<DocumentMut>());
     if let Some(root) = trusted {
         let key = root.display().to_string();
         let decided = |doc: &DocumentMut| {
@@ -131,7 +139,12 @@ fn codex_overlay(
                 .and_then(Item::as_table_like)
                 .is_some_and(|project| project.contains_key("trust_level"))
         };
-        if !decided(&doc) && !user_config.as_ref().is_some_and(decided) {
+        let user_decided = match &user_config {
+            Some(Ok(user)) => decided(user),
+            Some(Err(_)) => true,
+            None => false,
+        };
+        if !decided(&doc) && !user_decided {
             // Not tables: codex's to fix, not llmman's to overwrite.
             let projects = doc.entry("projects").or_insert_with(|| {
                 let mut table = Table::new();
@@ -461,6 +474,19 @@ model = \"gpt-5\"
             next["projects"]["/work/repo"]["trust_level"].as_str(),
             Some("trusted")
         );
+    }
+
+    /// A user config that does not parse may hold an `untrusted` that codex
+    /// reads, so nothing is trusted over it.
+    #[test]
+    fn overlay_trusts_nothing_over_a_user_config_that_does_not_parse() {
+        let next = overlay_over(
+            None,
+            Some("[projects.\"/work/repo\"\ntrust_level = "),
+            Some("/work/repo"),
+        );
+        assert!(next.get("projects").is_none());
+        assert_eq!(next["model_provider"].as_str(), Some("llmman"));
     }
 
     /// A project table with no `trust_level` is no decision: codex asks.
