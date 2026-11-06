@@ -23,9 +23,12 @@ fn openclaw_model_id(model: &str) -> &str {
     }
 }
 
-/// `.clawdbot` is openclaw's name before its rename.
+/// `.clawdbot` is openclaw's name before its rename. openclaw is node, so its
+/// home is the one `os.homedir()` reads, `%USERPROFILE%` on Windows, which
+/// `dirs::home_dir` ignores: with that, the config it wrote was never found
+/// and neither the primary model nor the context window was set there.
 fn onboarded_config() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
+    let home = crate::config::home_dir()?;
     [
         home.join(".openclaw").join("openclaw.json"),
         home.join(".clawdbot").join("clawdbot.json"),
