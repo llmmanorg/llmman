@@ -69,14 +69,37 @@ struct Complex {
     im: f64,
 }
 
+/// The twiddle factors `fft` reads for a length-`n` transform, stage by
+/// stage: for each `len` in 2, 4, ..., `n` the `len / 2` values
+/// `e^{-2 pi i k / len}`, `n - 1` in all. Each is evaluated directly from
+/// its own angle, not accumulated by multiplication, so the error stays
+/// independent of the stage count; building the table once per
+/// `features` call and reusing it across frames gives the same bits as
+/// evaluating it inside every frame. `n` must be a power of two.
+fn twiddles(n: usize) -> Vec<Complex> {
+    assert!(n.is_power_of_two(), "fft length {n} is not a power of two");
+    let mut table = Vec::with_capacity(n.saturating_sub(1));
+    let mut len = 2;
+    while len <= n {
+        for k in 0..len / 2 {
+            let (sin, cos) = (-2.0 * PI * k as f64 / len as f64).sin_cos();
+            table.push(Complex { re: cos, im: sin });
+        }
+        len *= 2;
+    }
+    table
+}
+
 /// In-place iterative radix-2 forward DFT, `X[k] = sum x[n] e^{-2 pi i kn/N}`
-/// (no scaling). `buf.len()` must be a power of two.
-fn fft(buf: &mut [Complex]) {
+/// (no scaling), over the table `twiddles(buf.len())` returns.
+/// `buf.len()` must be a power of two.
+fn fft(buf: &mut [Complex], twiddles: &[Complex]) {
     let n = buf.len();
     assert!(n.is_power_of_two(), "fft length {n} is not a power of two");
     if n < 2 {
         return;
     }
+    assert_eq!(twiddles.len(), n - 1, "twiddle table is for another length");
     let shift = n.leading_zeros() + 1;
     for i in 0..n {
         let j = i.reverse_bits() >> shift;
@@ -85,13 +108,10 @@ fn fft(buf: &mut [Complex]) {
         }
     }
     let mut len = 2;
+    let mut stage = 0;
     while len <= n {
         let half = len / 2;
-        for k in 0..half {
-            // Direct evaluation per twiddle keeps the error independent of
-            // the stage count, unlike accumulating w^k by multiplication.
-            let (sin, cos) = (-2.0 * PI * k as f64 / len as f64).sin_cos();
-            let w = Complex { re: cos, im: sin };
+        for (k, &w) in twiddles[stage..stage + half].iter().enumerate() {
             for start in (0..n).step_by(len) {
                 let a = buf[start + k];
                 let b = buf[start + k + half];
@@ -109,6 +129,7 @@ fn fft(buf: &mut [Complex]) {
                 };
             }
         }
+        stage += half;
         len *= 2;
     }
 }
@@ -184,6 +205,33 @@ fn slaney_filterbank(cfg: &MelConfig) -> Vec<f64> {
     weights
 }
 
+/// [`slaney_filterbank`] checked for a config `validate` admits but the
+/// pipeline cannot use: a `f_max` so close to `f_min` that an edge
+/// spacing underflows and a weight is not finite (the features would be
+/// NaN), or an `n_fft` so small for the mel spacing that a row has no bin
+/// with positive weight (audio and silence would give the same value).
+/// `features` builds its filterbank through this; a worker calls it once
+/// at load, so such a header is refused there and not per request.
+pub fn filterbank(cfg: &MelConfig) -> Result<Vec<f64>, MelError> {
+    validate(cfg)?;
+    let weights = slaney_filterbank(cfg);
+    if weights.iter().any(|w| !w.is_finite()) {
+        return Err(MelError::InvalidConfig(
+            "filterbank weights are not finite: f_min and f_max are too close for n_mels",
+        ));
+    }
+    let n_bins = cfg.n_fft / 2 + 1;
+    if weights
+        .chunks_exact(n_bins)
+        .any(|row| row.iter().all(|&w| w <= 0.0))
+    {
+        return Err(MelError::InvalidConfig(
+            "a filterbank row has no bin with positive weight: n_fft is too small for n_mels",
+        ));
+    }
+    Ok(weights)
+}
+
 /// NeMo's `CONSTANT`: added to the per-bin standard deviation so a
 /// constant bin does not divide by zero.
 const STD_FLOOR: f64 = 1e-5;
@@ -225,7 +273,8 @@ impl std::error::Error for MelError {}
 /// Rejects configs the pipeline would panic on or produce NaN for. The
 /// config may come from model metadata, so it is checked, not trusted.
 /// `InvalidConfig` when a `cfg` field is out of range; `features` runs it
-/// per call, a worker once at load.
+/// per call, a worker once at load. What only the built filterbank can
+/// tell is checked by [`filterbank`].
 pub fn validate(cfg: &MelConfig) -> Result<(), MelError> {
     if cfg.n_mels == 0 {
         return Err(MelError::InvalidConfig("n_mels must be at least 1"));
@@ -262,8 +311,8 @@ pub fn validate(cfg: &MelConfig) -> Result<(), MelError> {
             "f_min and f_max must satisfy 0 <= f_min < f_max <= sample_rate / 2",
         ));
     }
-    if !cfg.preemph.is_finite() {
-        return Err(MelError::InvalidConfig("preemph must be finite"));
+    if !(-1.0..=1.0).contains(&cfg.preemph) {
+        return Err(MelError::InvalidConfig("preemph must be between -1 and 1"));
     }
     if !(cfg.log_zero_guard > 0.0 && cfg.log_zero_guard.is_finite()) {
         return Err(MelError::InvalidConfig(
@@ -306,7 +355,8 @@ pub fn frame_count(len: usize, cfg: &MelConfig) -> usize {
 ///
 /// Allocations: the output (`frames * n_mels` f32), the padded
 /// pre-emphasized signal (`len + n_fft` f64), one complex FFT scratch of
-/// `n_fft` reused across frames, the window (`win_length` f64), the
+/// `n_fft` reused across frames, the FFT twiddle table (`n_fft - 1`
+/// complex, built once), the window (`win_length` f64), the
 /// filterbank (`n_mels * (n_fft / 2 + 1)` f64), one log-mel row
 /// (`n_mels` f64) and the per-bin mean and variance accumulators
 /// (`2 * n_mels` f64). There is no f64 copy of the matrix: with
@@ -319,11 +369,12 @@ pub fn frame_count(len: usize, cfg: &MelConfig) -> usize {
 /// same bits on every run.
 ///
 /// # Errors
-/// `InvalidConfig` when a `cfg` field is out of range (see `validate`)
-/// and `TooShort` when per-feature normalization gets fewer than two
-/// frames, that is fewer than `2 * hop` samples.
+/// `InvalidConfig` when a `cfg` field is out of range (see `validate`) or
+/// its filterbank is unusable (see `filterbank`), and `TooShort` when
+/// per-feature normalization gets fewer than two frames, that is fewer
+/// than `2 * hop` samples.
 pub fn features(pcm: &[i16], cfg: &MelConfig) -> Result<Vec<f32>, MelError> {
-    validate(cfg)?;
+    let fb = filterbank(cfg)?;
     let frames = frame_count(pcm.len(), cfg);
     if cfg.normalize == Normalize::PerFeature && frames < 2 {
         return Err(MelError::TooShort);
@@ -344,7 +395,8 @@ pub fn features(pcm: &[i16], cfg: &MelConfig) -> Result<Vec<f32>, MelError> {
         cfg,
         signal: &signal,
         window: hann_symmetric(cfg.win_length),
-        fb: slaney_filterbank(cfg),
+        fb,
+        twiddles: twiddles(cfg.n_fft),
         scratch: vec![Complex::default(); cfg.n_fft],
         row: vec![0.0; cfg.n_mels],
     };
@@ -390,6 +442,7 @@ struct Framer<'a> {
     signal: &'a [f64],
     window: Vec<f64>,
     fb: Vec<f64>,
+    twiddles: Vec<Complex>,
     scratch: Vec<Complex>,
     row: Vec<f64>,
 }
@@ -412,7 +465,7 @@ impl Framer<'_> {
         {
             dst.re = x * w;
         }
-        fft(&mut self.scratch);
+        fft(&mut self.scratch, &self.twiddles);
         // Power spectrum in place: only the real part of the first
         // n_bins entries is read below.
         for c in &mut self.scratch[..n_bins] {
@@ -477,7 +530,7 @@ mod tests {
             .collect();
         let expected = naive_dft(&input);
         let mut got = input;
-        fft(&mut got);
+        fft(&mut got, &twiddles(512));
         for (k, (g, e)) in got.iter().zip(&expected).enumerate() {
             assert!(
                 (g.re - e.re).abs() < 1e-9,
@@ -504,7 +557,7 @@ mod tests {
                 im: 0.0,
             })
             .collect();
-        fft(&mut buf);
+        fft(&mut buf, &twiddles(n));
         let mag: Vec<f64> = buf.iter().map(|c| c.re.hypot(c.im)).collect();
         assert!((mag[bin] - n as f64 / 2.0).abs() < 1e-9);
         assert!((mag[n - bin] - n as f64 / 2.0).abs() < 1e-9);
@@ -518,7 +571,7 @@ mod tests {
     #[test]
     fn fft_of_length_one_is_identity() {
         let mut one = [Complex { re: 3.0, im: -1.0 }];
-        fft(&mut one);
+        fft(&mut one, &twiddles(1));
         assert_eq!(one[0], Complex { re: 3.0, im: -1.0 });
     }
 
@@ -526,7 +579,67 @@ mod tests {
     #[should_panic(expected = "not a power of two")]
     fn fft_rejects_non_power_of_two() {
         let mut buf = vec![Complex::default(); 400];
-        fft(&mut buf);
+        fft(&mut buf, &[]);
+    }
+
+    /// The radix-2 FFT as it was before the table: every twiddle
+    /// evaluated inside the frame. The table-driven one must match it
+    /// bit for bit, which holds because each table entry comes from the
+    /// same `sin_cos` call on the same angle.
+    fn fft_evaluating_twiddles_per_call(buf: &mut [Complex]) {
+        let n = buf.len();
+        let shift = n.leading_zeros() + 1;
+        for i in 0..n {
+            let j = i.reverse_bits() >> shift;
+            if i < j {
+                buf.swap(i, j);
+            }
+        }
+        let mut len = 2;
+        while len <= n {
+            let half = len / 2;
+            for k in 0..half {
+                let (sin, cos) = (-2.0 * PI * k as f64 / len as f64).sin_cos();
+                let w = Complex { re: cos, im: sin };
+                for start in (0..n).step_by(len) {
+                    let a = buf[start + k];
+                    let b = buf[start + k + half];
+                    let t = Complex {
+                        re: b.re * w.re - b.im * w.im,
+                        im: b.re * w.im + b.im * w.re,
+                    };
+                    buf[start + k] = Complex {
+                        re: a.re + t.re,
+                        im: a.im + t.im,
+                    };
+                    buf[start + k + half] = Complex {
+                        re: a.re - t.re,
+                        im: a.im - t.im,
+                    };
+                }
+            }
+            len *= 2;
+        }
+    }
+
+    #[test]
+    fn table_driven_fft_is_bit_identical_to_per_call_twiddles() {
+        for n in [2usize, 8, 512, 2048] {
+            let re = pseudo_random(n, 11);
+            let im = pseudo_random(n, 12);
+            let input: Vec<Complex> = re
+                .iter()
+                .zip(&im)
+                .map(|(&re, &im)| Complex { re, im })
+                .collect();
+            let mut direct = input.clone();
+            fft_evaluating_twiddles_per_call(&mut direct);
+            let mut tabled = input;
+            let table = twiddles(n);
+            assert_eq!(table.len(), n - 1);
+            fft(&mut tabled, &table);
+            assert_eq!(tabled, direct, "n = {n}");
+        }
     }
 
     #[test]
@@ -801,6 +914,66 @@ mod tests {
                 MelError::InvalidConfig(msg) => assert!(msg.contains(what), "{msg}"),
                 other => panic!("expected InvalidConfig for {what}, got {other:?}"),
             }
+        }
+    }
+
+    /// `validate` passes these; only the built filterbank shows the
+    /// problem, so `filterbank` and `features` refuse them by name.
+    #[test]
+    fn unusable_filterbanks_are_refused_by_name() {
+        let base = MelConfig::default();
+        // A subnormal f_max: every edge spacing underflows and the
+        // weights are not finite.
+        let subnormal = MelConfig {
+            f_max: f64::from_bits(1),
+            ..base.clone()
+        };
+        assert!(validate(&subnormal).is_ok());
+        let err = filterbank(&subnormal).unwrap_err();
+        assert!(
+            matches!(err, MelError::InvalidConfig(m) if m.contains("not finite")),
+            "{err}"
+        );
+        assert_eq!(features(&[0; 320], &subnormal).unwrap_err(), err);
+        // Two bins and two mels: both rows are zero at both bin centres.
+        let sparse = MelConfig {
+            n_fft: 2,
+            n_mels: 2,
+            win_length: 2,
+            hop: 1,
+            ..base.clone()
+        };
+        assert!(validate(&sparse).is_ok());
+        let err = filterbank(&sparse).unwrap_err();
+        assert!(
+            matches!(err, MelError::InvalidConfig(m) if m.contains("positive weight")),
+            "{err}"
+        );
+        assert_eq!(features(&[0; 320], &sparse).unwrap_err(), err);
+        // The pinned recipe passes both checks.
+        assert_eq!(filterbank(&base).unwrap(), slaney_filterbank(&base));
+    }
+
+    #[test]
+    fn preemph_outside_the_unit_interval_is_refused() {
+        let base = MelConfig::default();
+        for bad in [1e200, -1.5, 1.0000001, f64::INFINITY, f64::NAN] {
+            let err = validate(&MelConfig {
+                preemph: bad,
+                ..base.clone()
+            })
+            .unwrap_err();
+            assert!(
+                matches!(err, MelError::InvalidConfig(m) if m.contains("preemph")),
+                "{bad}: {err}"
+            );
+        }
+        for good in [0.97, -1.0, 1.0, 0.0] {
+            assert!(validate(&MelConfig {
+                preemph: good,
+                ..base.clone()
+            })
+            .is_ok());
         }
     }
 
