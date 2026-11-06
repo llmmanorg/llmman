@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -23,8 +23,8 @@ use serde_json::{json, Value};
 
 use super::decoder::{self, Decoder};
 use super::encoder::Encoder;
-use super::mel::{self, MelConfig, MelError};
-use super::model::CanaryModel;
+use super::mel::{self, MelConfig, MelError, Normalize};
+use super::model::{CanaryModel, Frontend};
 use super::prompt::PromptError;
 use super::wav::{self, WavError};
 use crate::mediagen::backend::Backend;
@@ -231,11 +231,95 @@ pub struct Worker {
     enc: Encoder,
     dec: Decoder,
     be: Backend,
+    /// The front end the file asks for ([`mel_config`]).
+    mel: MelConfig,
+}
+
+/// Shortest hop the worker computes, 5 ms: a clip then yields at most
+/// twice the recipe's frames, which bounds the encoder's work per clip
+/// whatever a file's header says.
+const MIN_HOP: u64 = 80;
+/// Longest hop the worker computes: a full clip must yield the two frames
+/// per-feature normalization needs, so a longer one would refuse every
+/// transcription instead of the load.
+const MAX_HOP: u64 = (CLIP_SECONDS * SAMPLE_RATE / 2) as u64;
+/// Longest FFT the worker computes, eight times the recipe's.
+const MAX_N_FFT: u64 = 4096;
+
+/// The mel front end `frontend` (`stt.frontend.*`) describes, or why
+/// this worker cannot compute it: the file must ask for log-mel features
+/// over a Hann window at 16 kHz, the one rate the WAV parser admits, with
+/// per-feature or no normalization. Every numeric setting is honoured
+/// and range-checked, so a file with another hop or FFT size gets the
+/// frames it expects instead of the default recipe's; the hop stays
+/// within [`MIN_HOP`] and [`MAX_HOP`] and the FFT within [`MAX_N_FFT`],
+/// so a header cannot make one clip arbitrarily expensive.
+pub fn mel_config(frontend: &Frontend) -> Result<MelConfig> {
+    if frontend.kind != "mel" {
+        bail!(
+            "stt.frontend.type {:?}: only mel features are computed",
+            frontend.kind
+        );
+    }
+    if frontend.window != "hann" {
+        bail!(
+            "stt.frontend.window {:?}: only hann is computed",
+            frontend.window
+        );
+    }
+    let normalize = match frontend.normalize.as_str() {
+        "per_feature" => Normalize::PerFeature,
+        "" | "none" => Normalize::None,
+        other => bail!("stt.frontend.normalize {other:?}: only per_feature or none is computed"),
+    };
+    if frontend.sample_rate != SAMPLE_RATE as u64 {
+        bail!(
+            "stt.frontend.sample_rate {}: the worker accepts {SAMPLE_RATE} Hz WAV only",
+            frontend.sample_rate
+        );
+    }
+    if frontend.hop_length < MIN_HOP {
+        bail!(
+            "stt.frontend.hop_length {}: the worker computes hops of at least {MIN_HOP} samples",
+            frontend.hop_length
+        );
+    }
+    if frontend.hop_length > MAX_HOP {
+        bail!(
+            "stt.frontend.hop_length {}: the worker computes hops of at most {MAX_HOP} samples",
+            frontend.hop_length
+        );
+    }
+    if frontend.n_fft > MAX_N_FFT {
+        bail!(
+            "stt.frontend.n_fft {}: the worker computes FFTs of at most {MAX_N_FFT}",
+            frontend.n_fft
+        );
+    }
+    let to_usize = |name: &str, v: u64| -> Result<usize> {
+        usize::try_from(v).map_err(|_| anyhow::anyhow!("stt.frontend.{name} {v} is out of range"))
+    };
+    let cfg = MelConfig {
+        n_mels: to_usize("num_mels", frontend.num_mels)?,
+        sample_rate: SAMPLE_RATE as u32,
+        n_fft: to_usize("n_fft", frontend.n_fft)?,
+        win_length: to_usize("win_length", frontend.win_length)?,
+        hop: to_usize("hop_length", frontend.hop_length)?,
+        preemph: f64::from(frontend.pre_emphasis),
+        f_min: f64::from(frontend.f_min),
+        f_max: f64::from(frontend.f_max),
+        normalize,
+        ..MelConfig::default()
+    };
+    mel::validate(&cfg).map_err(|e| anyhow::anyhow!("stt.frontend: {e}"))?;
+    Ok(cfg)
 }
 
 impl Worker {
-    /// Checks the model against the encoder and decoder graphs.
+    /// Checks the model against the encoder and decoder graphs and its
+    /// front end against what [`mel_config`] computes.
     pub fn new(be: Backend, model: CanaryModel) -> Result<Worker> {
+        let mel = mel_config(&model.hp.frontend)?;
         let enc = Encoder::new(&model, &be)?;
         let dec = Decoder::new(&model)?;
         Ok(Worker {
@@ -243,6 +327,7 @@ impl Worker {
             enc,
             dec,
             be,
+            mel,
         })
     }
 
@@ -272,7 +357,7 @@ impl Worker {
 
     /// Mel features, encoder and decoder over one clip.
     fn transcribe_clip(&mut self, samples: &[i16], language: &str) -> Result<String, Error> {
-        let mel = mel::features(samples, &MelConfig::default()).map_err(|e| match e {
+        let mel = mel::features(samples, &self.mel).map_err(|e| match e {
             MelError::TooShort => Error::Invalid(format!("the audio is too short: {e}")),
             MelError::InvalidConfig(_) => Error::Failed(e.to_string()),
         })?;
@@ -638,6 +723,70 @@ mod tests {
         let err = parse(&[b'x'; 65], &limits).await.unwrap_err();
         assert_eq!(err.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert!(matches!(err, Error::TooLarge(_)));
+    }
+
+    fn pinned_frontend() -> Frontend {
+        Frontend {
+            kind: "mel".into(),
+            num_mels: 128,
+            sample_rate: 16_000,
+            n_fft: 512,
+            win_length: 400,
+            hop_length: 160,
+            window: "hann".into(),
+            normalize: "per_feature".into(),
+            pre_emphasis: 0.97,
+            f_min: 0.0,
+            f_max: 8000.0,
+        }
+    }
+
+    /// The pinned file's front end is the default recipe, the header's
+    /// f32 pre-emphasis aside; another hop is honoured; a window or rate
+    /// the worker cannot compute is refused by name at load, not
+    /// transcribed with the wrong preprocessing.
+    #[test]
+    fn mel_config_follows_the_frontend_and_refuses_what_it_cannot_compute() {
+        assert_eq!(
+            mel_config(&pinned_frontend()).unwrap(),
+            MelConfig {
+                preemph: f64::from(0.97f32),
+                ..MelConfig::default()
+            }
+        );
+
+        let mut hop = pinned_frontend();
+        hop.hop_length = 320;
+        assert_eq!(mel_config(&hop).unwrap().hop, 320);
+
+        let mut window = pinned_frontend();
+        window.window = "hamming".into();
+        let err = mel_config(&window).unwrap_err().to_string();
+        assert!(err.contains("stt.frontend.window"), "{err}");
+
+        let mut rate = pinned_frontend();
+        rate.sample_rate = 8_000;
+        let err = mel_config(&rate).unwrap_err().to_string();
+        assert!(err.contains("sample_rate"), "{err}");
+
+        let mut fft = pinned_frontend();
+        fft.n_fft = 500;
+        let err = mel_config(&fft).unwrap_err().to_string();
+        assert!(err.contains("power of two"), "{err}");
+
+        // A header cannot make a clip arbitrarily expensive.
+        let mut tiny_hop = pinned_frontend();
+        tiny_hop.hop_length = 1;
+        let err = mel_config(&tiny_hop).unwrap_err().to_string();
+        assert!(err.contains("hop_length"), "{err}");
+        let mut huge_hop = pinned_frontend();
+        huge_hop.hop_length = MAX_HOP + 1;
+        let err = mel_config(&huge_hop).unwrap_err().to_string();
+        assert!(err.contains("hop_length"), "{err}");
+        let mut huge_fft = pinned_frontend();
+        huge_fft.n_fft = 65_536;
+        let err = mel_config(&huge_fft).unwrap_err().to_string();
+        assert!(err.contains("n_fft"), "{err}");
     }
 
     #[test]

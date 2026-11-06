@@ -4676,6 +4676,9 @@ fn speech_daemon_routes_the_fixture() {
             ("HOME", &home_str),
             ("LLMMAN_MODELS", &store),
             ("LLMMAN_KEEP_ALIVE", "5s"),
+            // The local worker, whatever runtime the shell has set: the
+            // `speech (local)` row and the worker pid below assume it.
+            ("LLMMAN_RUNTIME", "path"),
         ],
     );
     eprintln!("[test] speech daemon pid {} on {host}", daemon.id());

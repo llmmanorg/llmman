@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail, Result};
 
+use super::graph_nodes;
 use super::model::{CanaryModel, EncBlock};
 use crate::mediagen::backend::{Backend, Ctx, Graph};
 use crate::mediagen::ffi::{self, ty, Tensor};
@@ -393,13 +394,6 @@ pub fn subsampled_len(frames: usize) -> usize {
     (0..3).fold(frames, |len, _| {
         (len + 2).checked_sub(3).map_or(0, |n| n / 2 + 1)
     })
-}
-
-/// Graph nodes the encoder over `n_blocks` blocks needs, with room to
-/// spare; the scheduler of the `Backend` must be sized at least this
-/// large (see `Backend::new`).
-pub fn graph_nodes(n_blocks: usize) -> usize {
-    1024 + n_blocks * 128
 }
 
 /// NeMo `RelPositionalEncoding` table for `t_enc` encoder frames, row
