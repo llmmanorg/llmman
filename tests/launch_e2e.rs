@@ -2633,7 +2633,7 @@ fn ensure_server_fails_fast_when_daemon_dies_at_startup() {
 
 #[cfg(unix)]
 #[test]
-fn serve_detach_starts_once_and_outlives_its_caller() {
+fn serve_detach_concurrent_starts_reuse_a_daemon_that_outlives_its_callers() {
     fn version(host: &str) -> Result<serde_json::Value, reqwest::Error> {
         reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -2681,11 +2681,26 @@ fn serve_detach_starts_once_and_outlives_its_caller() {
             String::from_utf8_lossy(&out.stderr)
         );
     };
-    start();
     let mut daemon = StopDaemon {
         host: host.clone(),
         pid: None,
     };
+    // Start both clients together against an initially empty port. They may
+    // both spawn: the port bind picks the winner, and both callers must
+    // succeed even if one child exits because the port is already in use.
+    let gate = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            gate.wait();
+            start();
+        });
+        let second = scope.spawn(|| {
+            gate.wait();
+            start();
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+    });
     let pid = version(&host).unwrap()["pid"].as_u64().unwrap() as u32;
     assert!(pid > 1 && pid != std::process::id());
     daemon.pid = Some(pid);
