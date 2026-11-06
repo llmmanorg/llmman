@@ -1,0 +1,53 @@
+name: Retry
+
+# macOS arm64 runners are short on capacity: a job can go unscheduled ("not
+# acquired by Runner of type hosted"), and a runner can die mid-job or hit
+# its timeout. That fails a CI run on main that is otherwise green. Re-run
+# the failed jobs when that is the only kind of failure; anything else stays
+# red.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+jobs:
+  retry:
+    # A timed-out job, and its run, end "cancelled"; the annotations below
+    # tell that from a cancelled run
+    if: >-
+      github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' &&
+      (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') &&
+      github.event.workflow_run.run_attempt < 3
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      checks: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          # Whole messages, from the start: a test that prints one of these
+          # phrases is not a runner problem
+          TRANSIENT: ^(The job was not acquired by Runner|The hosted runner lost communication with the server|The runner has received a shutdown signal|The job running on runner .* has exceeded the maximum execution time)
+        run: |
+          jobs=$(gh api --paginate "repos/$GH_REPO/actions/runs/$RUN/attempts/$ATTEMPT/jobs?per_page=100" \
+            --jq '.jobs[] | select(.conclusion | IN("failure", "cancelled", "timed_out")) | "\(.id)\t\(.name)"')
+          [ -n "$jobs" ] || exit 0
+          # Every failed job must have failed only by losing its runner or
+          # timing out. A cancelled job also says "The operation was
+          # canceled."; ignore it, the message left is the reason.
+          while IFS=$'\t' read -r id name; do
+            msgs=$(gh api --paginate "repos/$GH_REPO/check-runs/$id/annotations?per_page=100" \
+              --jq '.[] | select(.annotation_level == "failure") | .message | gsub("\n"; " ") | select(. != "The operation was canceled.")')
+            echo "$name: ${msgs:-no failure annotation}"
+            if [ -z "$msgs" ] || grep -vqE "$TRANSIENT" <<<"$msgs"; then
+              echo "not a runner problem, not retrying"
+              exit 0
+            fi
+          done <<<"$jobs"
+          # A newer commit has its own run; do not re-run a stale one beside it
+          latest=$(gh run list --workflow ci.yml --branch main --event push --limit 1 --json databaseId --jq '.[0].databaseId')
+          [ "$latest" = "$RUN" ] || { echo "superseded by run $latest"; exit 0; }
+          gh run rerun "$RUN" --failed
