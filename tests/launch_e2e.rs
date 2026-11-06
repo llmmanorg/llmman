@@ -2628,11 +2628,25 @@ fn serve_detach_starts_once_and_outlives_its_caller() {
             String::from_utf8_lossy(&out.stderr)
         );
     };
-    start();
     let mut daemon = StopDaemon {
         host: host.clone(),
         pid: None,
     };
+    // Both clients see an empty port initially. Only one should spawn;
+    // the other must wait and reuse the same daemon.
+    let gate = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            gate.wait();
+            start();
+        });
+        let second = scope.spawn(|| {
+            gate.wait();
+            start();
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+    });
     let pid = version(&host).unwrap()["pid"].as_u64().unwrap() as u32;
     assert!(pid > 1 && pid != std::process::id());
     daemon.pid = Some(pid);
