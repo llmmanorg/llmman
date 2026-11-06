@@ -302,10 +302,10 @@ pub fn rms(g: &Ctx, x: Tensor, eps: f32, w: Option<Tensor>) -> Tensor {
 
 /// x: [dim, T], cos/sin: [dim/2, T]; per head the first half is rotated with the second.
 pub fn rope_split(g: &Ctx, x: Tensor, cos: Tensor, sin: Tensor, n_heads: i64) -> Tensor {
-    let [dim, t, ..] = ffi::shape(x);
+    let [dim, t, ..] = x.shape();
     let hd = dim / n_heads;
     let x4 = g.reshape_4d(g.cont(x), hd / 2, 2, n_heads, t);
-    let nb = ffi::strides(x4);
+    let nb = x4.strides();
     let x1 = g.cont(g.view_4d(x4, hd / 2, 1, n_heads, t, nb[1], nb[2], nb[3], 0));
     let x2 = g.cont(g.view_4d(x4, hd / 2, 1, n_heads, t, nb[1], nb[2], nb[3], nb[1]));
     let c = g.reshape_4d(cos, hd / 2, 1, n_heads, t);
@@ -317,10 +317,10 @@ pub fn rope_split(g: &Ctx, x: Tensor, cos: Tensor, sin: Tensor, n_heads: i64) ->
 
 /// q: [dim_q, Tq], k, v: [dim_kv, Tk] -> [dim_v, Tq]
 pub fn sdpa(g: &Ctx, q: Tensor, k: Tensor, v: Tensor, n_heads: i64, flash: bool) -> Tensor {
-    let tq = ffi::shape(q)[1];
-    let tk = ffi::shape(k)[1];
-    let hd = ffi::shape(q)[0] / n_heads;
-    let hv = ffi::shape(v)[0] / n_heads;
+    let tq = q.shape()[1];
+    let tk = k.shape()[1];
+    let hd = q.shape()[0] / n_heads;
+    let hv = v.shape()[0] / n_heads;
     let scale = 1.0 / (hd as f32).sqrt();
     let q3 = g.permute(g.reshape_3d(q, hd, n_heads, tq), 0, 2, 1, 3);
     let k3 = g.permute(g.reshape_3d(k, hd, n_heads, tk), 0, 2, 1, 3);
@@ -328,12 +328,12 @@ pub fn sdpa(g: &Ctx, q: Tensor, k: Tensor, v: Tensor, n_heads: i64, flash: bool)
         let v3 = g.permute(g.reshape_3d(v, hv, n_heads, tk), 0, 2, 1, 3);
         let k3 = g.cast(k3, ffi::ty::F16);
         let v3 = g.cast(v3, ffi::ty::F16);
-        let cur = g.flash_attn_ext(q3, k3, v3, std::ptr::null_mut(), scale, 0.0, 0.0);
-        unsafe { (g.api.ggml_flash_attn_ext_set_prec)(cur, ffi::GGML_PREC_F32) };
+        let cur = g.flash_attn_ext(q3, k3, v3, None, scale, 0.0, 0.0);
+        unsafe { (g.api.ggml_flash_attn_ext_set_prec)(cur.as_ptr(), ffi::GGML_PREC_F32) };
         g.reshape_2d(cur, hv * n_heads, tq)
     } else {
         let v3 = g.cont(g.permute(g.reshape_3d(v, hv, n_heads, tk), 1, 2, 0, 3));
-        let kq = g.soft_max_ext(g.mul_mat(k3, q3), std::ptr::null_mut(), scale, 0.0);
+        let kq = g.soft_max_ext(g.mul_mat(k3, q3), None, scale, 0.0);
         let kqv = g.mul_mat(v3, kq);
         g.cont_2d(g.permute(kqv, 0, 2, 1, 3), hv * n_heads, tq)
     }
@@ -406,8 +406,8 @@ pub fn attention(
     }
     let mut out = sdpa(g, q, k, v, n_heads, flash);
     if let Some(gate) = w.gate {
-        let tq = ffi::shape(x)[1];
-        let hv = ffi::shape(out)[0] / n_heads;
+        let tq = x.shape()[1];
+        let hv = out.shape()[0] / n_heads;
         let gl = g.scale(g.sigmoid(g.linear(x, gate, w.gate_b)), 2.0);
         let o3 = g.mul(
             g.reshape_3d(out, hv, n_heads, tq),
@@ -457,9 +457,9 @@ pub fn adaln_single(g: &Ctx, w: &Weights, prefix: &str, t: Tensor) -> Result<(Te
 
 /// table[i] + mod[i*dim : (i+1)*dim]
 pub fn ada(g: &Ctx, table: Tensor, modv: Tensor, i: i64, dim: i64) -> Tensor {
-    let mnb = ffi::strides(modv);
-    let tnb = ffi::strides(table);
-    let esz = unsafe { (g.api.ggml_type_size)((*modv).type_) };
+    let mnb = modv.strides();
+    let tnb = table.strides();
+    let esz = unsafe { (g.api.ggml_type_size)(modv.dtype()) };
     let m = g.view_2d(modv, dim, 1, mnb[1], (i * dim) as usize * esz);
     let t = g.view_2d(table, dim, 1, tnb[1], i as usize * tnb[1]);
     g.add(m, t)
@@ -467,7 +467,7 @@ pub fn ada(g: &Ctx, table: Tensor, modv: Tensor, i: i64, dim: i64) -> Tensor {
 
 /// Row i of a [dim, n] table.
 pub fn table_row(g: &Ctx, table: Tensor, i: i64) -> Tensor {
-    let dim = ffi::shape(table)[0];
-    let nb = ffi::strides(table);
+    let dim = table.shape()[0];
+    let nb = table.strides();
     g.view_2d(table, dim, 1, nb[1], i as usize * nb[1])
 }

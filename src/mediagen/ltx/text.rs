@@ -9,7 +9,9 @@ use std::ptr;
 use anyhow::{bail, Result};
 
 use super::super::backend::{Backend, Graph};
-use super::super::ffi::{self, Api, LlamaContextParams, LlamaModel, LlamaModelParams, Tensor};
+use super::super::ffi::{
+    self, Api, LlamaContextParams, LlamaModel, LlamaModelParams, Tensor, TensorPtr,
+};
 use super::{attention, feed_forward, rms, rope_tables, AttnWeights, Model, Rope, TextCond};
 
 /// The LTX-2 system prompt for prompt enhancement (Lightricks, Apache-2.0):
@@ -53,7 +55,7 @@ pub struct TextEncoder {
 
 unsafe impl Send for TextEncoder {}
 
-unsafe extern "C" fn cb_eval(t: Tensor, ask: bool, user_data: *mut c_void) -> bool {
+unsafe extern "C" fn cb_eval(t: TensorPtr, ask: bool, user_data: *mut c_void) -> bool {
     let enc = &*(user_data as *const TextEncoder);
     if enc.capture.is_null() {
         return false;

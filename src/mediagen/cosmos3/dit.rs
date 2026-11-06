@@ -124,10 +124,10 @@ pub fn timestep_embedding(t: f32) -> Vec<f32> {
 
 /// Rotate-half RoPE on `x: [n_heads * hd, T]` with a `[hd/2, T]` table shared by all heads.
 pub fn rope(g: &Ctx, x: Tensor, cos: Tensor, sin: Tensor, n_heads: i64) -> Tensor {
-    let [dim, t, ..] = ffi::shape(x);
+    let [dim, t, ..] = x.shape();
     let hd = dim / n_heads;
     let x4 = g.reshape_4d(g.cont(x), hd / 2, 2, n_heads, t);
-    let nb = ffi::strides(x4);
+    let nb = x4.strides();
     let x1 = g.cont(g.view_4d(x4, hd / 2, 1, n_heads, t, nb[1], nb[2], nb[3], 0));
     let x2 = g.cont(g.view_4d(x4, hd / 2, 1, n_heads, t, nb[1], nb[2], nb[3], nb[1]));
     let c = g.reshape_4d(cos, hd / 2, 1, 1, t);
@@ -139,7 +139,7 @@ pub fn rope(g: &Ctx, x: Tensor, cos: Tensor, sin: Tensor, n_heads: i64) -> Tenso
 
 /// RMSNorm over each head of `x: [n_heads * head_dim, T]` with a `[head_dim]` weight.
 pub fn head_rms(g: &Ctx, x: Tensor, hd: i64, eps: f32, w: Option<Tensor>) -> Tensor {
-    let [dim, t, ..] = ffi::shape(x);
+    let [dim, t, ..] = x.shape();
     let x3 = g.reshape_3d(g.cont(x), hd, dim / hd, t);
     let y = rms(g, x3, eps, w);
     g.reshape_2d(y, dim, t)
@@ -156,9 +156,9 @@ pub fn sdpa_gqa(
     mask: Option<Tensor>,
     flash: bool,
 ) -> Tensor {
-    let tq = ffi::shape(q)[1];
-    let tk = ffi::shape(k)[1];
-    let hd = ffi::shape(q)[0] / n_heads;
+    let tq = q.shape()[1];
+    let tk = k.shape()[1];
+    let hd = q.shape()[0] / n_heads;
     let scale = 1.0 / (hd as f32).sqrt();
     let q3 = g.permute(g.reshape_3d(g.cont(q), hd, n_heads, tq), 0, 2, 1, 3);
     let k3 = g.permute(g.reshape_3d(g.cont(k), hd, n_kv, tk), 0, 2, 1, 3);
@@ -166,13 +166,13 @@ pub fn sdpa_gqa(
         let v3 = g.permute(g.reshape_3d(g.cont(v), hd, n_kv, tk), 0, 2, 1, 3);
         let k3 = g.cast(k3, ffi::ty::F16);
         let v3 = g.cast(v3, ffi::ty::F16);
-        let cur = g.flash_attn_ext(q3, k3, v3, std::ptr::null_mut(), scale, 0.0, 0.0);
-        unsafe { (g.api.ggml_flash_attn_ext_set_prec)(cur, ffi::GGML_PREC_F32) };
+        let cur = g.flash_attn_ext(q3, k3, v3, None, scale, 0.0, 0.0);
+        unsafe { (g.api.ggml_flash_attn_ext_set_prec)(cur.as_ptr(), ffi::GGML_PREC_F32) };
         g.reshape_2d(cur, hd * n_heads, tq)
     } else {
         let v3 = g.cont(g.permute(g.reshape_3d(g.cont(v), hd, n_kv, tk), 1, 2, 0, 3));
         let kq = g.mul_mat(k3, q3);
-        let kq = g.soft_max_ext(kq, mask.unwrap_or(std::ptr::null_mut()), scale, 0.0);
+        let kq = g.soft_max_ext(kq, mask, scale, 0.0);
         let kqv = g.mul_mat(v3, kq);
         g.cont_2d(g.permute(kqv, 0, 2, 1, 3), hd * n_heads, tq)
     }
@@ -512,7 +512,7 @@ pub fn gen_forward(hp: &Hparams, w: &Weights, be: &Backend, inp: &GenInputs) -> 
         x = g.add(x, mlp(g, w, &format!("{p}.mlp_moe_gen"), h2, hp.relu2)?);
     }
     let out = g.cont(rms(g, x, eps, Some(w.get("norm_moe_gen.weight")?)));
-    let nb = ffi::strides(out);
+    let nb = out.strides();
     let part = |off: i64, len: i64| g.view_2d(out, hp.hidden, len, nb[1], (off as usize) * nb[1]);
     let v_out = g.cont(g.linear(
         part(0, nv),

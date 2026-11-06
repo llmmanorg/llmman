@@ -11,7 +11,6 @@
 //! [`transcribe`] runs the whole greedy loop from the encoder output to
 //! the text.
 
-use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -22,7 +21,7 @@ use super::graph_nodes;
 use super::model::{CanaryModel, DecLayer};
 use super::prompt;
 use crate::mediagen::backend::{Backend, Ctx, Graph, Resident};
-use crate::mediagen::ffi::{self, ty, Tensor};
+use crate::mediagen::ffi::{ty, Tensor};
 
 /// Decoder steps a request may take beyond its encoder frames before it
 /// is cut off, as transcribe.cpp bounds its loop.
@@ -230,7 +229,24 @@ impl<'a> Session<'a> {
         }
         gr.compute(be)?;
 
-        let mut session = Session {
+        let mut gr = Graph::new(be.api, graph_nodes(dec.n_layers))?;
+        let mask_buf = causal_mask(max_kv, 1, 0);
+        let tokens = gr.input_i32(&[1], &[0], "tokens");
+        let pos = gr.input_i32(&[1], &[0], "positions");
+        let mask = gr.input_f32(&[max_kv as i64, 1], &mask_buf, "mask");
+        let body = body(
+            dec, model, &cross, &cache, frames, &gr, tokens, pos, mask, 1, max_kv,
+        );
+        let logits = body.logits;
+        gr.mark_output(logits);
+        if !dec.logged_step.swap(true, Ordering::Relaxed) {
+            let bytes = gr.measure(be)?;
+            eprintln!(
+                "[llmman] speech: decoder step compute buffer {bytes} bytes over a cache of \
+                 {max_kv} positions and {frames} frames"
+            );
+        }
+        Ok(Session {
             dec,
             model,
             be,
@@ -240,41 +256,14 @@ impl<'a> Session<'a> {
             cross,
             cache,
             step: Step {
-                gr: Graph::new(be.api, graph_nodes(dec.n_layers))?,
-                tokens: ptr::null_mut(),
-                pos: ptr::null_mut(),
-                mask: ptr::null_mut(),
-                logits: ptr::null_mut(),
-                mask_buf: causal_mask(max_kv, 1, 0),
+                gr,
+                tokens,
+                pos,
+                mask,
+                logits,
+                mask_buf,
             },
-        };
-        let st = &mut session.step;
-        st.tokens = st.gr.input_i32(&[1], &[0], "tokens");
-        st.pos = st.gr.input_i32(&[1], &[0], "positions");
-        st.mask = st.gr.input_f32(&[max_kv as i64, 1], &st.mask_buf, "mask");
-        let body = body(
-            dec,
-            model,
-            &session.cross,
-            &session.cache,
-            frames,
-            &st.gr,
-            st.tokens,
-            st.pos,
-            st.mask,
-            1,
-            max_kv,
-        );
-        st.logits = body.logits;
-        st.gr.mark_output(st.logits);
-        if !dec.logged_step.swap(true, Ordering::Relaxed) {
-            let bytes = st.gr.measure(be)?;
-            eprintln!(
-                "[llmman] speech: decoder step compute buffer {bytes} bytes over a cache of \
-                 {max_kv} positions and {frames} frames"
-            );
-        }
-        Ok(session)
+        })
     }
 
     /// Positions written to the self-attention cache so far.
@@ -544,7 +533,7 @@ fn body(
             q,
             window(k_cache, n_kv as i64),
             window(v_cache, n_kv as i64),
-            mask,
+            Some(mask),
         );
         let self_out = g.linear(o, layer.self_o, Some(layer.self_o_b));
         x = g.add(x, self_out);
@@ -556,7 +545,7 @@ fn body(
             q,
             window(cross.tensors[2 * l], frames as i64),
             window(cross.tensors[2 * l + 1], frames as i64),
-            ptr::null_mut(),
+            None,
         );
         let cross_out = g.linear(o, layer.cross_o, Some(layer.cross_o_b));
         x = g.add(x, cross_out);
@@ -566,7 +555,7 @@ fn body(
         sub.push([self_out, cross_out, ffn_out]);
     }
     let x = layer_norm(g, x, t.dec_norm, t.dec_norm_b);
-    let nb = ffi::strides(x);
+    let nb = x.strides();
     let last = g.view_2d(x, d_model, 1, nb[1], (n - 1) * nb[1]);
     let logits = g.linear(last, t.head, Some(t.head_b));
     Body {
@@ -584,12 +573,12 @@ fn resident_pairs(be: &Backend, n_layers: usize, ne: [i64; 2]) -> Result<Residen
 
 /// Multi-head attention of the queries `q`, `[d_model, n]`, over the key
 /// and value windows `[head_dim, n_heads, n_kv]`, with `mask` `[n_kv, n]`
-/// F32 or null; returns `[d_model, n]` with the heads merged head-major
+/// F32 or `None`; returns `[d_model, n]` with the heads merged head-major
 /// as NeMo does. Scores accumulate in F32 and are scaled by
 /// `1 / sqrt(head_dim)` inside the softmax.
-fn attention(g: &Ctx, q: Tensor, k: Tensor, v: Tensor, mask: Tensor) -> Tensor {
-    let [d_model, n, _, _] = ffi::shape(q);
-    let [head_dim, n_heads, _, _] = ffi::shape(k);
+fn attention(g: &Ctx, q: Tensor, k: Tensor, v: Tensor, mask: Option<Tensor>) -> Tensor {
+    let [d_model, n, _, _] = q.shape();
+    let [head_dim, n_heads, _, _] = k.shape();
     // [head_dim, n, head] and [head_dim, n_kv, head]
     let q = g.permute(g.reshape_3d(q, head_dim, n_heads, n), 0, 2, 1, 3);
     let k = g.permute(k, 0, 2, 1, 3);

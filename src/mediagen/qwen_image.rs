@@ -705,15 +705,15 @@ fn modulation(g: &Ctx, w: &Weights, temb: Tensor) -> Result<(Tensor, [Tensor; 4]
     );
     let tt = g.silu(te);
     let m = g.linear(tt, w.get("modulation.1.weight")?, None);
-    let dim = ffi::shape(m)[0] / 4;
-    let part = |i: usize| g.cont(g.view_2d(m, dim, 1, ffi::strides(m)[1], i * dim as usize * 4));
+    let dim = m.shape()[0] / 4;
+    let part = |i: usize| g.cont(g.view_2d(m, dim, 1, m.strides()[1], i * dim as usize * 4));
     Ok((tt, [part(0), g.tanh(part(1)), part(2), g.tanh(part(3))]))
 }
 
 /// Interleaved rotary pairs `(2i, 2i+1)` of each head moved to `(i, i + hd/2)`.
 /// Queries and keys only meet in dot products, so they stay permuted.
 fn halves(g: &Ctx, x: Tensor, hd: i64) -> Tensor {
-    let [dim, t, ..] = ffi::shape(x);
+    let [dim, t, ..] = x.shape();
     let x4 = g.reshape_4d(g.cont(x), 2, hd / 2, dim / hd, t);
     g.reshape_2d(g.cont(g.permute(x4, 1, 0, 2, 3)), dim, t)
 }
