@@ -62,12 +62,25 @@ pub fn is_hf_host(server: &str) -> bool {
 /// The HuggingFace Hub API base URL, honoring `HF_ENDPOINT` — same
 /// override the official client accepts.
 pub fn endpoint() -> String {
-    std::env::var("HF_ENDPOINT")
-        .ok()
+    endpoint_from(|var| std::env::var_os(var))
+}
+
+/// [`endpoint`] with the environment injected. A value that is not
+/// valid Unicode counts as unset, as with `std::env::var`; an empty
+/// value counts as unset too.
+fn endpoint_from(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> String {
+    env("HF_ENDPOINT")
+        .and_then(|v| v.into_string().ok())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "https://huggingface.co".to_string())
         .trim_end_matches('/')
         .to_string()
+}
+
+/// The process environment and home directory, in the form the `*_from`
+/// functions here take them.
+fn process_env() -> (impl Fn(&str) -> Option<std::ffi::OsString>, Option<PathBuf>) {
+    (|var: &str| std::env::var_os(var), dirs::home_dir())
 }
 
 /// `$HF_HOME`, else `$XDG_CACHE_HOME/huggingface`, else
@@ -114,7 +127,8 @@ fn parse_max_transfer_streams(value: Option<&str>) -> usize {
 
 /// Path to the active-token file, honoring `HF_TOKEN_PATH`.
 pub fn token_path() -> PathBuf {
-    token_path_from(|var| std::env::var_os(var), dirs::home_dir())
+    let (env, home) = process_env();
+    token_path_from(env, home)
 }
 
 /// [`token_path`] with the environment and home directory injected.
@@ -136,7 +150,8 @@ fn token_path_from(
 /// so a token saved before the change keeps working, and [`logout`]
 /// removes it too.
 fn legacy_token_path() -> Option<PathBuf> {
-    legacy_token_path_from(|var| std::env::var_os(var), dirs::home_dir())
+    let (env, home) = process_env();
+    legacy_token_path_from(env, home)
 }
 
 /// [`legacy_token_path`] with the environment and home directory injected.
@@ -179,7 +194,8 @@ fn read_token_file(path: &std::path::Path, legacy: Option<&std::path::Path>) -> 
 /// A `llmman login hf.co` made after it started is picked up only when no
 /// nonblank env var is set there and both resolve the same token file.
 pub fn token() -> Option<String> {
-    token_from(|var| std::env::var_os(var), dirs::home_dir())
+    let (env, home) = process_env();
+    token_from(env, home)
 }
 
 /// [`token`] with the environment and home directory injected, so the
@@ -876,6 +892,35 @@ mod tests {
             ClassifiedRef::Hf(got) => assert_eq!(got, "huggingface.co/owner/repo:latest"),
             _ => panic!("expected Hf"),
         }
+    }
+
+    #[test]
+    fn endpoint_defaults_to_huggingface_and_drops_trailing_slashes() {
+        let env = |value: Option<&'static str>| {
+            move |var: &str| match var {
+                "HF_ENDPOINT" => value.map(std::ffi::OsString::from),
+                _ => None,
+            }
+        };
+        assert_eq!(endpoint_from(env(None)), "https://huggingface.co");
+        assert_eq!(endpoint_from(env(Some(""))), "https://huggingface.co");
+        assert_eq!(
+            endpoint_from(env(Some("https://hf-mirror.example/"))),
+            "https://hf-mirror.example"
+        );
+        assert_eq!(
+            endpoint_from(env(Some("https://hf-mirror.example//"))),
+            "https://hf-mirror.example"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_from_treats_a_non_unicode_env_var_as_unset() {
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = std::ffi::OsString::from_vec(vec![0xff]);
+        let endpoint = endpoint_from(|var| (var == "HF_ENDPOINT").then(|| invalid.clone()));
+        assert_eq!(endpoint, "https://huggingface.co");
     }
 
     #[test]
