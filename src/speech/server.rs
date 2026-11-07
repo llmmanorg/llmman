@@ -311,7 +311,9 @@ pub fn mel_config(frontend: &Frontend) -> Result<MelConfig> {
         normalize,
         ..MelConfig::default()
     };
-    mel::validate(&cfg).map_err(|e| anyhow::anyhow!("stt.frontend: {e}"))?;
+    // The field checks, then the filterbank the fields describe: a header
+    // the fields admit can still yield weights the features cannot use.
+    mel::filterbank(&cfg).map_err(|e| anyhow::anyhow!("stt.frontend: {e}"))?;
     Ok(cfg)
 }
 
@@ -787,6 +789,13 @@ mod tests {
         huge_fft.n_fft = 65_536;
         let err = mel_config(&huge_fft).unwrap_err().to_string();
         assert!(err.contains("n_fft"), "{err}");
+
+        // The fields pass, the filterbank they describe does not: refused
+        // at load, not on every request.
+        let mut subnormal = pinned_frontend();
+        subnormal.f_max = f32::from_bits(1);
+        let err = mel_config(&subnormal).unwrap_err().to_string();
+        assert!(err.contains("filterbank"), "{err}");
     }
 
     #[test]
