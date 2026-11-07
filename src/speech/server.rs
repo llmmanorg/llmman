@@ -319,7 +319,7 @@ impl Worker {
     /// Checks the model against the encoder and decoder graphs and its
     /// front end against what [`mel_config`] computes.
     pub fn new(be: Backend, model: CanaryModel) -> Result<Worker> {
-        let mel = mel_config(&model.hp.frontend)?;
+        let mel = mel_config(&model.hp().frontend)?;
         let enc = Encoder::new(&model, &be)?;
         let dec = Decoder::new(&model)?;
         Ok(Worker {
@@ -517,7 +517,7 @@ async fn transcriptions(
 pub fn router(worker: Worker, model_name: String, model_path: String) -> Router {
     let limits = Limits::default();
     let s = Arc::new(Server {
-        languages: worker.model.hp.languages.clone(),
+        languages: worker.model.hp().languages.clone(),
         worker: Mutex::new(worker),
         limits,
         inflight: Arc::new(Semaphore::new(limits.max_inflight)),

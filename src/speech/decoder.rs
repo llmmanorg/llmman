@@ -11,6 +11,7 @@
 //! [`transcribe`] runs the whole greedy loop from the encoder output to
 //! the text.
 
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -18,9 +19,9 @@ use anyhow::{anyhow, bail, Result};
 
 use super::encoder::layer_norm;
 use super::graph_nodes;
-use super::model::{CanaryModel, DecLayer};
+use super::model::{CanaryModel, CanaryTensors, DecLayer};
 use super::prompt;
-use crate::mediagen::backend::{Backend, Ctx, Graph, Resident};
+use crate::mediagen::backend::{Backend, Graph, Resident};
 use crate::mediagen::ffi::{ty, Tensor};
 
 /// Decoder steps a request may take beyond its encoder frames before it
@@ -87,7 +88,7 @@ pub struct Decoder {
 impl Decoder {
     /// Checks the hyperparameters this graph is written for.
     pub fn new(model: &CanaryModel) -> Result<Decoder> {
-        let hp = &model.hp;
+        let hp = model.hp();
         if hp.dec_activation != "relu" {
             bail!(
                 "decoder: activation {:?} (the graph applies relu)",
@@ -120,35 +121,40 @@ impl Decoder {
     }
 }
 
-/// The step graph of a [`Session`], built once with fixed shapes and
-/// recomputed on updated inputs.
-struct Step {
-    gr: Graph,
-    /// `[1]` I32: the token fed in.
-    tokens: Tensor,
-    /// `[1]` I32: its position, also the cache row it is written to.
-    pos: Tensor,
-    /// `[max_kv, 1]` F32 over the full cache window.
-    mask: Tensor,
-    /// `[vocab]` F32.
-    logits: Tensor,
+/// The step graph of a [`Session`] on a graph the caller owns, built by
+/// [`Session::step_graph`] with fixed shapes and recomputed by
+/// [`Session::step`] on updated inputs. Its inputs, in order: `[1]` I32
+/// the token fed in; `[1]` I32 its position, also the cache row it is
+/// written to; `[max_kv, 1]` F32 the mask over the full cache window
+/// ([`STEP_TOKENS`], [`STEP_POS`], [`STEP_MASK`]).
+pub struct StepGraph<'o> {
+    gr: &'o Graph<'o>,
+    /// Output index of the `[vocab]` F32 logits.
+    logits: usize,
     /// Host copy of the mask the loop rewrites in place.
-    mask_buf: Vec<f32>,
+    mask_buf: RefCell<Vec<f32>>,
 }
+
+/// Input indices of the step graph, in the order [`Session::step_graph`]
+/// adds them.
+const STEP_TOKENS: usize = 0;
+const STEP_POS: usize = 1;
+const STEP_MASK: usize = 2;
 
 /// The decoder body on a graph: the logits of the last token and the
 /// tensors the probes read.
-struct Body {
-    logits: Tensor,
-    embed_in: Tensor,
+struct Body<'g> {
+    logits: Tensor<'g>,
+    embed_in: Tensor<'g>,
     /// Per layer: self-attention, cross-attention and feed-forward
     /// outputs before their residual add.
-    sub: Vec<[Tensor; 3]>,
+    sub: Vec<[Tensor<'g>; 3]>,
 }
 
 /// One transcription request: the cross-attention memory and the
-/// self-attention cache of every layer, resident on the backend, and
-/// the step graph over them.
+/// self-attention cache of every layer, resident on the backend. The
+/// step graph lives outside, on a graph the caller owns
+/// ([`Session::step_graph`]), so nothing here borrows itself.
 pub struct Session<'a> {
     dec: &'a Decoder,
     model: &'a CanaryModel,
@@ -158,7 +164,7 @@ pub struct Session<'a> {
     /// Rows of each self-attention cache tensor.
     max_kv: usize,
     /// Tokens already written to the cache; the next token's position.
-    n_past: usize,
+    n_past: Cell<usize>,
     /// `2 * n_layers` F32 `[d_model, frames]`: layer `l`'s cross keys at
     /// `2l` and values at `2l + 1`.
     cross: Resident,
@@ -166,7 +172,6 @@ pub struct Session<'a> {
     /// `2l` and values at `2l + 1`, row `p` holding position `p`; zero
     /// past `n_past`.
     cache: Resident,
-    step: Step,
 }
 
 impl<'a> Session<'a> {
@@ -174,7 +179,7 @@ impl<'a> Session<'a> {
     /// `speech::encoder::Run::out` holds it, into every layer's cross
     /// keys and values in one graph, allocates a zeroed self-attention
     /// cache of `max_kv` positions (at most the model's `max_position`)
-    /// and builds the step graph over it.
+    /// (see [`Session::step_graph`] for the step graph over it).
     pub fn new(
         dec: &'a Decoder,
         model: &'a CanaryModel,
@@ -199,7 +204,8 @@ impl<'a> Session<'a> {
                 dec.max_ctx
             );
         }
-        let layers = &model.tensors.dec_layers;
+        let tensors = model.tensors()?;
+        let layers = &tensors.dec_layers;
         if layers.len() != dec.n_layers {
             bail!(
                 "decoder: {} layer tensors for {} layers",
@@ -214,61 +220,84 @@ impl<'a> Session<'a> {
         // drop out of the softmax.
         cache.clear();
 
-        let mut gr = Graph::new(be.api, 64 + dec.n_layers * 16)?;
+        let gr = Graph::new(be.api, 64 + dec.n_layers * 16)?;
         let enc = gr.input_f32(&[dec.d_model as i64, frames as i64], enc_out, "enc_out");
-        let g = &gr.ctx;
+        let g = &gr;
         for (l, layer) in layers.iter().enumerate() {
             gr.store(
                 g.linear(enc, layer.cross_k, Some(layer.cross_k_b)),
-                cross.tensors[2 * l],
+                cross.tensor(2 * l),
             );
             gr.store(
                 g.linear(enc, layer.cross_v, Some(layer.cross_v_b)),
-                cross.tensors[2 * l + 1],
+                cross.tensor(2 * l + 1),
             );
         }
         gr.compute(be)?;
 
-        let mut gr = Graph::new(be.api, graph_nodes(dec.n_layers))?;
-        let mask_buf = causal_mask(max_kv, 1, 0);
-        let tokens = gr.input_i32(&[1], &[0], "tokens");
-        let pos = gr.input_i32(&[1], &[0], "positions");
-        let mask = gr.input_f32(&[max_kv as i64, 1], &mask_buf, "mask");
-        let body = body(
-            dec, model, &cross, &cache, frames, &gr, tokens, pos, mask, 1, max_kv,
-        );
-        let logits = body.logits;
-        gr.mark_output(logits);
-        if !dec.logged_step.swap(true, Ordering::Relaxed) {
-            let bytes = gr.measure(be)?;
-            eprintln!(
-                "[llmman] speech: decoder step compute buffer {bytes} bytes over a cache of \
-                 {max_kv} positions and {frames} frames"
-            );
-        }
         Ok(Session {
             dec,
             model,
             be,
             frames,
             max_kv,
-            n_past: 0,
+            n_past: Cell::new(0),
             cross,
             cache,
-            step: Step {
-                gr,
-                tokens,
-                pos,
-                mask,
-                logits,
-                mask_buf,
-            },
         })
     }
 
     /// Positions written to the self-attention cache so far.
     pub fn n_past(&self) -> usize {
-        self.n_past
+        self.n_past.get()
+    }
+
+    /// The step graph over this session's caches on `gr`, built once
+    /// with fixed shapes and recomputed by [`Session::step`] on updated
+    /// inputs. `gr` and the session outlive it, so the graph never reads
+    /// a cache that is gone. `gr` must be fresh: the step's three inputs
+    /// are addressed by index, so a graph that already holds inputs is
+    /// refused.
+    pub fn step_graph<'o>(&'o self, gr: &'o Graph<'o>) -> Result<StepGraph<'o>> {
+        if gr.n_inputs() != 0 {
+            bail!(
+                "decoder step graph: the graph already holds {} inputs, expected a fresh one",
+                gr.n_inputs()
+            );
+        }
+        let dec = self.dec;
+        let tensors = self.model.tensors()?;
+        let mask_buf = causal_mask(self.max_kv, 1, 0);
+        let tokens = gr.input_i32(&[1], &[0], "tokens");
+        let pos = gr.input_i32(&[1], &[0], "positions");
+        let mask = gr.input_f32(&[self.max_kv as i64, 1], &mask_buf, "mask");
+        let body = body(
+            dec,
+            &tensors,
+            &self.cross,
+            &self.cache,
+            self.frames,
+            gr,
+            tokens,
+            pos,
+            mask,
+            1,
+            self.max_kv,
+        );
+        let logits = gr.mark_output(body.logits);
+        if !dec.logged_step.swap(true, Ordering::Relaxed) {
+            let bytes = gr.measure(self.be)?;
+            eprintln!(
+                "[llmman] speech: decoder step compute buffer {bytes} bytes over a cache of \
+                 {} positions and {} frames",
+                self.max_kv, self.frames
+            );
+        }
+        Ok(StepGraph {
+            gr,
+            logits,
+            mask_buf: RefCell::new(mask_buf),
+        })
     }
 
     /// Runs `ids` at positions `n_past..n_past + n` in one graph, writes
@@ -282,37 +311,38 @@ impl<'a> Session<'a> {
     /// [`causal_mask`], `x += cross_attn(norm2(x))` over the encoder
     /// memory without a mask, `x += ffn_down(relu(ffn_up(norm3(x))))`.
     /// The final LayerNorm and the head run on the last position only.
-    pub fn prefill(&mut self, ids: &[i32], probes: &[Probe]) -> Result<Prefill> {
+    pub fn prefill(&self, ids: &[i32], probes: &[Probe]) -> Result<Prefill> {
         let dec = self.dec;
         let n = ids.len();
         if n == 0 {
             bail!("decoder: prefill of no tokens");
         }
-        if self.n_past + n > self.max_kv {
+        let n_past = self.n_past.get();
+        if n_past + n > self.max_kv {
             bail!(
-                "decoder: {n} tokens after {} exceed the cache of {} positions",
-                self.n_past,
+                "decoder: {n} tokens after {n_past} exceed the cache of {} positions",
                 self.max_kv
             );
         }
         for &id in ids {
             self.check_token(id)?;
         }
-        let n_kv = self.n_past + n;
+        let n_kv = n_past + n;
 
-        let mut gr = Graph::new(self.be.api, graph_nodes(dec.n_layers))?;
+        let tensors = self.model.tensors()?;
+        let gr = Graph::new(self.be.api, graph_nodes(dec.n_layers))?;
         let tokens = gr.input_i32(&[n as i64], ids, "tokens");
         // Positions double as the cache rows the keys and values go to.
-        let positions: Vec<i32> = (self.n_past..n_kv).map(|p| p as i32).collect();
+        let positions: Vec<i32> = (n_past..n_kv).map(|p| p as i32).collect();
         let pos = gr.input_i32(&[n as i64], &positions, "positions");
         let mask = gr.input_f32(
             &[n_kv as i64, n as i64],
-            &causal_mask(n_kv, n, self.n_past),
+            &causal_mask(n_kv, n, n_past),
             "mask",
         );
         let body = body(
             dec,
-            self.model,
+            &tensors,
             &self.cross,
             &self.cache,
             self.frames,
@@ -354,7 +384,7 @@ impl<'a> Session<'a> {
             );
         }
         gr.compute(self.be)?;
-        self.n_past = n_kv;
+        self.n_past.set(n_kv);
         let logits = gr.output_f32(body.logits);
         Ok(Prefill {
             next: argmax(&logits),
@@ -364,22 +394,25 @@ impl<'a> Session<'a> {
     }
 
     /// Writes `token` at position `n_past` and returns the greedy next
-    /// token, recomputing the step graph on its updated inputs without
-    /// allocating. Fails once the cache is full.
-    pub fn step(&mut self, token: i32) -> Result<i32> {
+    /// token, recomputing `st` on its updated inputs without allocating.
+    /// Fails once the cache is full.
+    pub fn step(&self, st: &StepGraph<'_>, token: i32) -> Result<i32> {
         self.check_token(token)?;
-        if self.n_past >= self.max_kv {
+        let p = self.n_past.get();
+        if p >= self.max_kv {
             bail!("decoder: the cache of {} positions is full", self.max_kv);
         }
-        let p = self.n_past;
-        let st = &mut self.step;
-        step_mask(&mut st.mask_buf, p);
-        st.gr.update_input_i32(st.tokens, &[token]);
-        st.gr.update_input_i32(st.pos, &[p as i32]);
-        st.gr.update_input_f32(st.mask, &st.mask_buf);
-        st.gr.compute(self.be)?;
-        let logits = self.be.read_f32(st.logits);
-        self.n_past = p + 1;
+        let gr = st.gr;
+        {
+            let mut mask_buf = st.mask_buf.borrow_mut();
+            step_mask(&mut mask_buf, p);
+            gr.update_input_f32(STEP_MASK, &mask_buf);
+        }
+        gr.update_input_i32(STEP_TOKENS, &[token]);
+        gr.update_input_i32(STEP_POS, &[p as i32]);
+        gr.compute(self.be)?;
+        let logits = gr.output_f32(gr.output(st.logits));
+        self.n_past.set(p + 1);
         Ok(argmax(&logits))
     }
 
@@ -409,21 +442,23 @@ pub fn transcribe(
     lang: &str,
     pnc: bool,
 ) -> Result<Transcript> {
-    let prompt = prompt::build(&model.hp, &model.vocab, lang, pnc)?;
+    let prompt = prompt::build(model.hp(), &model.vocab, lang, pnc)?;
     let max_kv = cache_size(dec.max_ctx, prompt.len(), frames);
-    let mut session = Session::new(dec, model, be, enc_out, frames, max_kv)?;
+    let session = Session::new(dec, model, be, enc_out, frames, max_kv)?;
     let started = Instant::now();
     let first = session.prefill(&prompt, &[])?.next;
     let prefill = started.elapsed();
     // Each step writes one cache row; the prefill left max_kv - prompt.
     let max_steps = max_kv - prompt.len();
+    let gr = Graph::new(be.api, graph_nodes(dec.n_layers))?;
+    let st = session.step_graph(&gr)?;
     let started = Instant::now();
     let (ids, n_steps) = greedy(
         first,
-        model.hp.eos as i32,
+        model.hp().eos as i32,
         max_steps,
         || be.cancelled(),
-        |token| session.step(token),
+        |token| session.step(&st, token),
     )?;
     Ok(Transcript {
         text: model.vocab.detokenize(&ids),
@@ -475,23 +510,22 @@ fn greedy(
 /// window of `n_kv` rows read by the self-attention. See
 /// [`Session::prefill`] for the recipe.
 #[allow(clippy::too_many_arguments)]
-fn body(
+fn body<'g>(
     dec: &Decoder,
-    model: &CanaryModel,
-    cross: &Resident,
-    cache: &Resident,
+    t: &CanaryTensors<'g>,
+    cross: &'g Resident,
+    cache: &'g Resident,
     frames: usize,
-    gr: &Graph,
-    tokens: Tensor,
-    pos: Tensor,
-    mask: Tensor,
+    gr: &'g Graph<'g>,
+    tokens: Tensor<'g>,
+    pos: Tensor<'g>,
+    mask: Tensor<'g>,
     n: usize,
     n_kv: usize,
-) -> Body {
+) -> Body<'g> {
     let d_model = dec.d_model as i64;
     let (head_dim, n_heads) = (dec.head_dim as i64, dec.n_heads as i64);
-    let t = &model.tensors;
-    let g = &gr.ctx;
+    let g = gr;
     let embed = &t.dec_embed;
     let x = g.add(
         g.get_rows(embed.token, tokens),
@@ -501,7 +535,7 @@ fn body(
     let mut x = embed_in;
     // Strided view of a resident `[d_model, rows]` tensor as
     // `[head_dim, n_heads, window]`.
-    let window = |cache: Tensor, rows: i64| {
+    let window = |cache, rows: i64| {
         g.view_3d(
             cache,
             head_dim,
@@ -514,7 +548,7 @@ fn body(
     };
     let mut sub = Vec::with_capacity(dec.n_layers);
     for (l, layer) in t.dec_layers.iter().enumerate() {
-        let (k_cache, v_cache) = (cache.tensors[2 * l], cache.tensors[2 * l + 1]);
+        let (k_cache, v_cache) = (cache.tensor(2 * l), cache.tensor(2 * l + 1));
         let h = layer_norm(g, x, layer.norm1, layer.norm1_b);
         let q = g.linear(h, layer.self_q, Some(layer.self_q_b));
         let k = g.linear(h, layer.self_k, Some(layer.self_k_b));
@@ -543,8 +577,8 @@ fn body(
         let o = attention(
             g,
             q,
-            window(cross.tensors[2 * l], frames as i64),
-            window(cross.tensors[2 * l + 1], frames as i64),
+            window(cross.tensor(2 * l), frames as i64),
+            window(cross.tensor(2 * l + 1), frames as i64),
             None,
         );
         let cross_out = g.linear(o, layer.cross_o, Some(layer.cross_o_b));
@@ -576,7 +610,13 @@ fn resident_pairs(be: &Backend, n_layers: usize, ne: [i64; 2]) -> Result<Residen
 /// F32 or `None`; returns `[d_model, n]` with the heads merged head-major
 /// as NeMo does. Scores accumulate in F32 and are scaled by
 /// `1 / sqrt(head_dim)` inside the softmax.
-fn attention(g: &Ctx, q: Tensor, k: Tensor, v: Tensor, mask: Option<Tensor>) -> Tensor {
+fn attention<'g>(
+    g: &'g Graph<'g>,
+    q: Tensor<'g>,
+    k: Tensor<'g>,
+    v: Tensor<'g>,
+    mask: Option<Tensor<'g>>,
+) -> Tensor<'g> {
     let [d_model, n, _, _] = q.shape();
     let [head_dim, n_heads, _, _] = k.shape();
     // [head_dim, n, head] and [head_dim, n_kv, head]
@@ -593,7 +633,7 @@ fn attention(g: &Ctx, q: Tensor, k: Tensor, v: Tensor, mask: Option<Tensor>) -> 
 }
 
 /// `ffn_down(relu(ffn_up(norm3(x))))` without its residual.
-fn feed_forward(g: &Ctx, layer: &DecLayer, x: Tensor) -> Tensor {
+fn feed_forward<'g>(g: &'g Graph<'g>, layer: &DecLayer<'g>, x: Tensor<'g>) -> Tensor<'g> {
     let h = layer_norm(g, x, layer.norm3, layer.norm3_b);
     let h = g.relu(g.linear(h, layer.ffn_up, Some(layer.ffn_up_b)));
     g.linear(h, layer.ffn_down, Some(layer.ffn_down_b))

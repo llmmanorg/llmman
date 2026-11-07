@@ -7,7 +7,7 @@ pub mod vae;
 
 use anyhow::{bail, Result};
 
-use super::backend::Ctx;
+use super::backend::Graph;
 use super::ffi::{self, Tensor};
 use super::weights::Weights;
 
@@ -200,7 +200,7 @@ pub struct Model {
 
 impl Model {
     /// Text projection tensors may live in their own file or in the transformer GGUF.
-    pub fn tp(&self, name: &str) -> Result<Tensor> {
+    pub fn tp(&self, name: &str) -> Result<Tensor<'_>> {
         if let Some(w) = &self.text_proj {
             if let Some(t) = w.opt(name) {
                 return Ok(t);
@@ -209,7 +209,7 @@ impl Model {
         self.dit.get(name)
     }
 
-    pub fn tp_opt(&self, name: &str) -> Option<Tensor> {
+    pub fn tp_opt(&self, name: &str) -> Option<Tensor<'_>> {
         self.text_proj
             .as_ref()
             .and_then(|w| w.opt(name))
@@ -292,7 +292,7 @@ pub fn rope_tables(
     (cos, sin)
 }
 
-pub fn rms(g: &Ctx, x: Tensor, eps: f32, w: Option<Tensor>) -> Tensor {
+pub fn rms<'g>(g: &'g Graph<'g>, x: Tensor<'g>, eps: f32, w: Option<Tensor<'g>>) -> Tensor<'g> {
     let y = g.rms_norm(x, eps);
     match w {
         Some(w) => g.mul(y, w),
@@ -301,7 +301,13 @@ pub fn rms(g: &Ctx, x: Tensor, eps: f32, w: Option<Tensor>) -> Tensor {
 }
 
 /// x: [dim, T], cos/sin: [dim/2, T]; per head the first half is rotated with the second.
-pub fn rope_split(g: &Ctx, x: Tensor, cos: Tensor, sin: Tensor, n_heads: i64) -> Tensor {
+pub fn rope_split<'g>(
+    g: &'g Graph<'g>,
+    x: Tensor<'g>,
+    cos: Tensor<'g>,
+    sin: Tensor<'g>,
+    n_heads: i64,
+) -> Tensor<'g> {
     let [dim, t, ..] = x.shape();
     let hd = dim / n_heads;
     let x4 = g.reshape_4d(g.cont(x), hd / 2, 2, n_heads, t);
@@ -316,7 +322,14 @@ pub fn rope_split(g: &Ctx, x: Tensor, cos: Tensor, sin: Tensor, n_heads: i64) ->
 }
 
 /// q: [dim_q, Tq], k, v: [dim_kv, Tk] -> [dim_v, Tq]
-pub fn sdpa(g: &Ctx, q: Tensor, k: Tensor, v: Tensor, n_heads: i64, flash: bool) -> Tensor {
+pub fn sdpa<'g>(
+    g: &'g Graph<'g>,
+    q: Tensor<'g>,
+    k: Tensor<'g>,
+    v: Tensor<'g>,
+    n_heads: i64,
+    flash: bool,
+) -> Tensor<'g> {
     let tq = q.shape()[1];
     let tk = k.shape()[1];
     let hd = q.shape()[0] / n_heads;
@@ -329,7 +342,7 @@ pub fn sdpa(g: &Ctx, q: Tensor, k: Tensor, v: Tensor, n_heads: i64, flash: bool)
         let k3 = g.cast(k3, ffi::ty::F16);
         let v3 = g.cast(v3, ffi::ty::F16);
         let cur = g.flash_attn_ext(q3, k3, v3, None, scale, 0.0, 0.0);
-        unsafe { (g.api.ggml_flash_attn_ext_set_prec)(cur.as_ptr(), ffi::GGML_PREC_F32) };
+        unsafe { (g.api().ggml_flash_attn_ext_set_prec)(cur.as_ptr(), ffi::GGML_PREC_F32) };
         g.reshape_2d(cur, hv * n_heads, tq)
     } else {
         let v3 = g.cont(g.permute(g.reshape_3d(v, hv, n_heads, tk), 1, 2, 0, 3));
@@ -340,23 +353,23 @@ pub fn sdpa(g: &Ctx, q: Tensor, k: Tensor, v: Tensor, n_heads: i64, flash: bool)
 }
 
 /// LTX CrossAttention weights.
-pub struct AttnWeights {
-    pub to_q: Tensor,
-    pub to_q_b: Option<Tensor>,
-    pub to_k: Tensor,
-    pub to_k_b: Option<Tensor>,
-    pub to_v: Tensor,
-    pub to_v_b: Option<Tensor>,
-    pub to_out: Tensor,
-    pub to_out_b: Option<Tensor>,
-    pub q_norm: Tensor,
-    pub k_norm: Tensor,
-    pub gate: Option<Tensor>,
-    pub gate_b: Option<Tensor>,
+pub struct AttnWeights<'w> {
+    pub to_q: Tensor<'w>,
+    pub to_q_b: Option<Tensor<'w>>,
+    pub to_k: Tensor<'w>,
+    pub to_k_b: Option<Tensor<'w>>,
+    pub to_v: Tensor<'w>,
+    pub to_v_b: Option<Tensor<'w>>,
+    pub to_out: Tensor<'w>,
+    pub to_out_b: Option<Tensor<'w>>,
+    pub q_norm: Tensor<'w>,
+    pub k_norm: Tensor<'w>,
+    pub gate: Option<Tensor<'w>>,
+    pub gate_b: Option<Tensor<'w>>,
 }
 
-impl AttnWeights {
-    pub fn load(w: &Weights, prefix: &str) -> Result<AttnWeights> {
+impl<'w> AttnWeights<'w> {
+    pub fn load(w: &'w Weights, prefix: &str) -> Result<AttnWeights<'w>> {
         Ok(AttnWeights {
             to_q: w.get(&format!("{prefix}.to_q.weight"))?,
             to_q_b: w.opt(&format!("{prefix}.to_q.bias")),
@@ -376,22 +389,22 @@ impl AttnWeights {
 
 /// Rope tables as graph inputs.
 #[derive(Clone, Copy)]
-pub struct Rope {
-    pub cos: Tensor,
-    pub sin: Tensor,
+pub struct Rope<'g> {
+    pub cos: Tensor<'g>,
+    pub sin: Tensor<'g>,
 }
 
 /// x: [dim_q, Tq] normalized input, context: [dim_kv, Tk] or None for self attention.
-pub fn attention(
-    g: &Ctx,
-    w: &AttnWeights,
-    x: Tensor,
-    context: Option<Tensor>,
-    rope_q: Option<Rope>,
-    rope_k: Option<Rope>,
+pub fn attention<'g>(
+    g: &'g Graph<'g>,
+    w: &AttnWeights<'g>,
+    x: Tensor<'g>,
+    context: Option<Tensor<'g>>,
+    rope_q: Option<Rope<'g>>,
+    rope_k: Option<Rope<'g>>,
     n_heads: i64,
     flash: bool,
-) -> Tensor {
+) -> Tensor<'g> {
     let kv_in = context.unwrap_or(x);
     let mut q = g.linear(x, w.to_q, w.to_q_b);
     let mut k = g.linear(kv_in, w.to_k, w.to_k_b);
@@ -419,7 +432,12 @@ pub fn attention(
 }
 
 /// gelu feed forward: net.0.proj -> gelu -> net.2
-pub fn feed_forward(g: &Ctx, w: &Weights, prefix: &str, x: Tensor) -> Result<Tensor> {
+pub fn feed_forward<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    x: Tensor<'g>,
+) -> Result<Tensor<'g>> {
     let h = g.linear(
         x,
         w.get(&format!("{prefix}.net.0.proj.weight"))?,
@@ -434,7 +452,12 @@ pub fn feed_forward(g: &Ctx, w: &Weights, prefix: &str, x: Tensor) -> Result<Ten
 }
 
 /// AdaLayerNormSingle: t [n] -> (mod [coef*dim, n], emb [dim, n])
-pub fn adaln_single(g: &Ctx, w: &Weights, prefix: &str, t: Tensor) -> Result<(Tensor, Tensor)> {
+pub fn adaln_single<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    t: Tensor<'g>,
+) -> Result<(Tensor<'g>, Tensor<'g>)> {
     let te = g.timestep_embedding(t, 256, 10000);
     let te = g.linear(
         te,
@@ -456,17 +479,23 @@ pub fn adaln_single(g: &Ctx, w: &Weights, prefix: &str, t: Tensor) -> Result<(Te
 }
 
 /// table[i] + mod[i*dim : (i+1)*dim]
-pub fn ada(g: &Ctx, table: Tensor, modv: Tensor, i: i64, dim: i64) -> Tensor {
+pub fn ada<'g>(
+    g: &'g Graph<'g>,
+    table: Tensor<'g>,
+    modv: Tensor<'g>,
+    i: i64,
+    dim: i64,
+) -> Tensor<'g> {
     let mnb = modv.strides();
     let tnb = table.strides();
-    let esz = unsafe { (g.api.ggml_type_size)(modv.dtype()) };
+    let esz = unsafe { (g.api().ggml_type_size)(modv.dtype()) };
     let m = g.view_2d(modv, dim, 1, mnb[1], (i * dim) as usize * esz);
     let t = g.view_2d(table, dim, 1, tnb[1], i as usize * tnb[1]);
     g.add(m, t)
 }
 
 /// Row i of a [dim, n] table.
-pub fn table_row(g: &Ctx, table: Tensor, i: i64) -> Tensor {
+pub fn table_row<'g>(g: &'g Graph<'g>, table: Tensor<'g>, i: i64) -> Tensor<'g> {
     let dim = table.shape()[0];
     let nb = table.strides();
     g.view_2d(table, dim, 1, nb[1], i as usize * nb[1])

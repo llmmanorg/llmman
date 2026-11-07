@@ -68,15 +68,15 @@ pub struct Inputs<'a> {
     pub flash: bool,
 }
 
-fn make_rope(
-    g: &mut Graph,
+fn make_rope<'g>(
+    g: &'g Graph<'g>,
     pos: &[f64],
     n: i64,
     n_axes: i64,
     dim: i64,
     theta: f64,
     name: &str,
-) -> Rope {
+) -> Rope<'g> {
     let (c, s) = rope_tables(pos, n, n_axes, dim, theta);
     Rope {
         cos: g.input_f32(&[dim / 2, n], &c, &format!("{name}_cos")),
@@ -94,7 +94,7 @@ pub fn forward(model: &Model, be: &Backend, inp: &Inputs) -> Result<(Vec<f32>, V
     let tc = inp.cond.n_tokens;
     let (vd, ad) = (hp.v_dim, hp.a_dim);
 
-    let mut g = Graph::new(be.api, 24 * 1024)?;
+    let g = Graph::new(be.api, 24 * 1024)?;
     let mut vx = g.input_f32(&[hp.in_channels, tv], &inp.video.x, "video_latent");
     let mut ax = inp.audio.filter(|_| has_audio).map(|a| {
         g.input_f32(
@@ -110,12 +110,12 @@ pub fn forward(model: &Model, be: &Backend, inp: &Inputs) -> Result<(Vec<f32>, V
         has_audio.then(|| g.input_f32(&[1], &[inp.sigma * hp.av_ca_timestep_scale], "timestep_av"));
 
     let pos = video_positions(hp, inp.video, inp.fps);
-    let v_pe = make_rope(&mut g, &pos, tv, 3, vd, hp.rope_theta, "v_pe");
+    let v_pe = make_rope(&g, &pos, tv, 3, vd, hp.rope_theta, "v_pe");
     let mut av_pe = None;
     if has_audio {
         let max_pos = hp.max_pos[0].max(hp.audio_max_pos);
         let a_pe = make_rope(
-            &mut g,
+            &g,
             &audio_positions(hp, ta, hp.audio_max_pos),
             ta,
             1,
@@ -124,7 +124,7 @@ pub fn forward(model: &Model, be: &Backend, inp: &Inputs) -> Result<(Vec<f32>, V
             "a_pe",
         );
         let v_cross = make_rope(
-            &mut g,
+            &g,
             &video_time_positions(hp, inp.video, inp.fps, max_pos),
             tv,
             1,
@@ -133,7 +133,7 @@ pub fn forward(model: &Model, be: &Backend, inp: &Inputs) -> Result<(Vec<f32>, V
             "v_cross",
         );
         let a_cross = make_rope(
-            &mut g,
+            &g,
             &audio_positions(hp, ta, max_pos),
             ta,
             1,
@@ -144,7 +144,7 @@ pub fn forward(model: &Model, be: &Backend, inp: &Inputs) -> Result<(Vec<f32>, V
         av_pe = Some((a_pe, v_cross, a_cross));
     }
 
-    let ctx = &g.ctx;
+    let ctx = &g;
     vx = ctx.linear(
         vx,
         w.get("patchify_proj.weight")?,
