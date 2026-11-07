@@ -3287,10 +3287,10 @@ fn mediagen_backend_abort_flag_cancels_compute() {
     let flag = Arc::new(AtomicBool::new(true));
     be.set_abort_flag(flag.clone());
 
-    let mut g = Graph::new(api, 64).unwrap();
+    let g = Graph::new(api, 64).unwrap();
     let a = g.input_f32(&[4], &[1.0, 2.0, 3.0, 4.0], "a");
     let b = g.input_f32(&[4], &[10.0, 20.0, 30.0, 40.0], "b");
-    let sum = g.ctx.add(a, b);
+    let sum = g.add(a, b);
     g.mark_output(sum);
 
     let err = g.compute(&be).unwrap_err().to_string();
@@ -3319,15 +3319,19 @@ fn mediagen_graph_recomputes_on_updated_inputs() {
     let be = Backend::new(api, false, 1, 64).unwrap();
     assert!(!be.cancelled());
 
-    let mut g = Graph::new(api, 64).unwrap();
+    let g = Graph::new(api, 64).unwrap();
     let a = g.input_f32(&[4], &[1.0, 2.0, 3.0, 4.0], "a");
     let b = g.input_f32(&[4], &[10.0, 20.0, 30.0, 40.0], "b");
-    let sum = g.ctx.add(a, b);
+    // Inputs are numbered in the order added: `a` is 0, `b` is 1, and
+    // `Graph::input` hands the same tensors back.
+    assert_eq!(g.input(0), a);
+    assert_eq!(g.input(1), b);
+    let sum = g.add(a, b);
     g.mark_output(sum);
     g.compute(&be).unwrap();
     assert_eq!(g.output_f32(sum), vec![11.0, 22.0, 33.0, 44.0]);
 
-    g.update_input_f32(b, &[100.0, 200.0, 300.0, 400.0]);
+    g.update_input_f32(1, &[100.0, 200.0, 300.0, 400.0]);
     g.compute(&be).unwrap();
     let out = g.output_f32(sum);
     assert_eq!(out, vec![101.0, 202.0, 303.0, 404.0]);
@@ -3336,21 +3340,21 @@ fn mediagen_graph_recomputes_on_updated_inputs() {
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
-    g.update_input(a, &bytes);
+    g.update_input(0, &bytes);
     g.compute(&be).unwrap();
     let out = g.output_f32(sum);
     assert_eq!(out, vec![105.0, 206.0, 307.0, 408.0]);
 
     // An I32 input drives `get_rows`, as the decoder's token and position
     // ids do each step.
-    let mut g = Graph::new(api, 64).unwrap();
+    let g = Graph::new(api, 64).unwrap();
     let table = g.input_f32(&[1, 4], &[1.0, 2.0, 3.0, 4.0], "table");
     let ids = g.input_i32(&[2], &[0, 3], "ids");
-    let rows = g.ctx.get_rows(table, ids);
+    let rows = g.get_rows(table, ids);
     g.mark_output(rows);
     g.compute(&be).unwrap();
     assert_eq!(g.output_f32(rows), vec![1.0, 4.0]);
-    g.update_input_i32(ids, &[1, 2]);
+    g.update_input_i32(1, &[1, 2]);
     g.compute(&be).unwrap();
     assert_eq!(g.output_f32(rows), vec![2.0, 3.0]);
 }
@@ -3619,16 +3623,17 @@ fn canary_model_loads_on_cpu_backend() {
         eprintln!("== {}", path.display());
         let model = llmman::speech::model::load(path, &be).unwrap();
         eprintln!("  tensors: {}", model.tensor_count());
-        eprintln!("  hparams: {:?}", model.hp);
+        eprintln!("  hparams: {:?}", model.hp());
         eprintln!(
             "  weights: {} bytes ({:.1} MiB)",
             model.weight_bytes(),
             model.weight_bytes() as f64 / 1024.0 / 1024.0
         );
         assert_eq!(model.tensor_count(), 1476, "{file}");
-        assert_eq!(model.tensors.enc_blocks.len(), 32, "{file}");
-        assert_eq!(model.tensors.dec_layers.len(), 8, "{file}");
-        let hp = &model.hp;
+        let tensors = model.tensors().unwrap();
+        assert_eq!(tensors.enc_blocks.len(), 32, "{file}");
+        assert_eq!(tensors.dec_layers.len(), 8, "{file}");
+        let hp = model.hp();
         assert_eq!(
             (
                 hp.enc_n_layers,
@@ -3660,19 +3665,16 @@ fn canary_model_loads_on_cpu_backend() {
         let mut file_h = std::fs::File::open(path).unwrap();
         let idx = llmman::mediagen::weights::read_index_from(&mut file_h, path).unwrap();
         let samples: [(&str, Tensor); 4] = [
-            (
-                "enc.pre_encode.conv.0.weight",
-                model.tensors.pre_encode.conv0,
-            ),
+            ("enc.pre_encode.conv.0.weight", tensors.pre_encode.conv0),
             (
                 "enc.blocks.0.ff1.linear1.weight",
-                model.tensors.enc_blocks[0].ff1_linear1,
+                tensors.enc_blocks[0].ff1_linear1,
             ),
             (
                 "enc.blocks.0.norm_ff1.weight",
-                model.tensors.enc_blocks[0].norm_ff1,
+                tensors.enc_blocks[0].norm_ff1,
             ),
-            ("dec.embed.pos_enc", model.tensors.dec_embed.pos_enc),
+            ("dec.embed.pos_enc", tensors.dec_embed.pos_enc),
         ];
         for (name, t) in samples {
             let desc = idx
@@ -3852,7 +3854,7 @@ fn encoder_stage_diffs(
     );
     assert_eq!(run.frames, 132);
     assert_eq!(run.out.len(), 132 * 1024);
-    let last = model.tensors.enc_blocks.len() - 1;
+    let last = model.hp().enc_n_layers as usize - 1;
     let mut probed = run.probes.iter();
     stages
         .iter()
@@ -4069,7 +4071,7 @@ fn decoder_prefill_run(
         run.frames,
         started.elapsed()
     );
-    let ids = llmman::speech::prompt::build(&model.hp, &model.vocab, "en", true).unwrap();
+    let ids = llmman::speech::prompt::build(model.hp(), &model.vocab, "en", true).unwrap();
     eprintln!("  prompt ids: {ids:?}");
     let prompt_ids_match = present("dec.prompt_ids").then(|| {
         let bytes = std::fs::read(ref_dir.join("dec.prompt_ids.f32")).unwrap();
@@ -4084,7 +4086,7 @@ fn decoder_prefill_run(
     });
 
     let started = Instant::now();
-    let mut session = Session::new(&dec, &model, be, &run.out, run.frames, 1024).unwrap();
+    let session = Session::new(&dec, &model, be, &run.out, run.frames, 1024).unwrap();
     eprintln!(
         "  cross KV for {} frames in {:.2?}",
         run.frames,

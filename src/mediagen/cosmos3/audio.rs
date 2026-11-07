@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::mediagen::backend::{Backend, Ctx, Graph};
+use crate::mediagen::backend::{Backend, Graph};
 use crate::mediagen::ffi::Tensor;
 use crate::mediagen::weights::{read_safetensors_raw, write_safetensors_raw, RawTensor, Weights};
 
@@ -80,19 +80,26 @@ pub fn transform(name: &str, data: &mut [f32]) {
     }
 }
 
-fn param(g: &Ctx, t: Tensor) -> Tensor {
+fn param<'g>(g: &'g Graph<'g>, t: Tensor<'g>) -> Tensor<'g> {
     let n: i64 = t.shape().iter().product();
     g.reshape_3d(t, 1, n, 1)
 }
 
-fn snake(g: &Ctx, w: &Weights, prefix: &str, x: Tensor) -> Result<Tensor> {
+fn snake<'g>(g: &'g Graph<'g>, w: &'g Weights, prefix: &str, x: Tensor<'g>) -> Result<Tensor<'g>> {
     let a = param(g, w.get(&format!("{prefix}.alpha"))?);
     let ib = param(g, w.get(&format!("{prefix}.beta"))?);
     let s = g.sin(g.mul(x, a));
     Ok(g.add(x, g.mul(g.sqr(s), ib)))
 }
 
-fn conv1d(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, pad: i32, dil: i32) -> Result<Tensor> {
+fn conv1d<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    x: Tensor<'g>,
+    pad: i32,
+    dil: i32,
+) -> Result<Tensor<'g>> {
     let k = w.get(&format!("{prefix}.weight"))?;
     let mut y = g.conv_1d(k, x, 1, pad, dil);
     if let Some(b) = w.opt(&format!("{prefix}.bias")) {
@@ -102,7 +109,13 @@ fn conv1d(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, pad: i32, dil: i32) -> 
 }
 
 /// `ConvTranspose1d(k = 2s, stride s, padding ceil(s/2), output_padding s % 2)`.
-fn conv_transpose(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, stride: i64) -> Result<Tensor> {
+fn conv_transpose<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    x: Tensor<'g>,
+    stride: i64,
+) -> Result<Tensor<'g>> {
     let k = w.get(&format!("{prefix}.weight"))?; // [K, OC, IC]
     let [t, c, ..] = x.shape();
     let y = g.conv_transpose_1d(k, g.reshape_2d(x, t, c), stride as i32, 0, 1); // [(t-1)s + K, OC]
@@ -119,7 +132,13 @@ fn conv_transpose(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, stride: i64) ->
     Ok(y)
 }
 
-fn res_unit(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, dil: i32) -> Result<Tensor> {
+fn res_unit<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    x: Tensor<'g>,
+    dil: i32,
+) -> Result<Tensor<'g>> {
     let h = snake(g, w, &format!("{prefix}.snake1"), x)?;
     let h = conv1d(g, w, &format!("{prefix}.conv1"), h, 3 * dil, dil)?;
     let h = snake(g, w, &format!("{prefix}.snake2"), h)?;
@@ -139,9 +158,9 @@ pub fn decode(w: &Weights, be: &Backend, latents: &[f32], n_frames: i64) -> Resu
             x[t + n_frames as usize * c] = latents[t * LATENT_DIM as usize + c];
         }
     }
-    let mut gr = Graph::new(be.api, 4 * 1024)?;
+    let gr = Graph::new(be.api, 4 * 1024)?;
     let z = gr.input_f32(&[n_frames, LATENT_DIM, 1], &x, "sound");
-    let g = &gr.ctx;
+    let g = &gr;
     let mut h = conv1d(g, w, "decoder.conv1", z, 3, 1)?;
     for (i, &stride) in STRIDES.iter().enumerate() {
         let p = format!("decoder.block.{i}");

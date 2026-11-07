@@ -5,6 +5,7 @@
 #![allow(non_camel_case_types, dead_code)]
 
 use std::ffi::{c_char, c_int, c_void, CStr};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
@@ -91,29 +92,73 @@ pub struct GgmlTensor {
 pub type TensorPtr = *mut GgmlTensor;
 
 /// A tensor ggml owns: a node of a `ggml_context` or graph, or a weight
-/// in its buffer. The shape, strides and type are copied out when the
-/// handle is made, so the safe accessors never touch ggml's memory: a
-/// handle kept past its context's `ggml_free` still answers them from
-/// the copy. Only [`Tensor::as_ptr`] hands the pointer back to ggml,
-/// inside the callers' own `unsafe` FFI calls, and those need the owner
-/// alive. ggml never resizes a tensor in place (a reshape or view is a
-/// new tensor), so the copy stays current.
+/// in its buffer. The handle borrows its owner for `'a`: the `Graph`,
+/// `Resident` or `Weights` that keeps the tensor alive, so a handle
+/// cannot outlive the memory it points at, and a graph's op builders only
+/// ever receive tensors whose owners outlive the graph (see `Graph`).
+/// The shape, strides and type are copied out when the handle is made, so
+/// the accessors never touch ggml's memory; only [`Tensor::as_ptr`] hands
+/// the pointer back to ggml. ggml never resizes a tensor in place (a
+/// reshape or view is a new tensor), so the copy stays current.
+///
+/// A node of one graph cannot be used once that graph is gone:
+///
+/// ```compile_fail,E0597
+/// use llmman::mediagen::backend::Graph;
+/// use llmman::mediagen::ffi::{ty, Api, Tensor};
+///
+/// fn keep<'o>(g: &'o Graph<'o>) -> Tensor<'o> {
+///     g.new_tensor(ty::F32, &[1])
+/// }
+///
+/// fn later<'o>(api: &'static Api, other: &'o Graph<'o>) {
+///     let t;
+///     {
+///         let g = Graph::new(api, 8).unwrap();
+///         t = keep(&g);
+///     }
+///     other.mark_output(t);
+/// }
+/// ```
+///
+/// A node can be marked as its own graph's output. A node may also enter
+/// another graph, but only while its own graph outlives every use of
+/// that other graph; the borrow checker holds the first graph alive for
+/// as long as the second one uses the node:
+///
+/// ```
+/// use llmman::mediagen::backend::Graph;
+/// use llmman::mediagen::ffi::{ty, Api, Tensor};
+///
+/// fn keep<'o>(g: &'o Graph<'o>) -> Tensor<'o> {
+///     g.new_tensor(ty::F32, &[1])
+/// }
+///
+/// fn later(api: &'static Api) {
+///     let g = Graph::new(api, 8).unwrap();
+///     let t = keep(&g);
+///     g.mark_output(t);
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Tensor {
+pub struct Tensor<'a> {
     ptr: NonNull<GgmlTensor>,
     ne: [i64; GGML_MAX_DIMS],
     nb: [usize; GGML_MAX_DIMS],
     ty: u32,
+    owner: PhantomData<&'a ()>,
 }
 
-impl Tensor {
+impl<'a> Tensor<'a> {
     /// Wraps a pointer ggml returned, copying its shape, strides and
-    /// type. Panics on null.
+    /// type, as a handle that borrows `owner`. Panics on null.
     ///
     /// # Safety
-    /// `p` must point at a live ggml tensor now, so the copy reads valid
-    /// memory: one of a live `ggml_context`, graph or weight buffer.
-    pub unsafe fn from_raw(p: TensorPtr) -> Tensor {
+    /// `p` must point at a live ggml tensor that `owner` keeps alive for
+    /// as long as `owner` is borrowed: one of its `ggml_context`, graph
+    /// or weight buffer.
+    pub unsafe fn from_raw<O: ?Sized>(p: TensorPtr, owner: &'a O) -> Tensor<'a> {
+        let _ = owner;
         let ptr = NonNull::new(p).expect("null ggml tensor");
         // SAFETY: the caller guarantees `p` points at a live tensor.
         let t = unsafe { ptr.as_ref() };
@@ -122,6 +167,7 @@ impl Tensor {
             ne: t.ne,
             nb: t.nb,
             ty: t.type_,
+            owner: PhantomData,
         }
     }
 
@@ -147,18 +193,19 @@ impl Tensor {
     /// A placeholder for tests: an empty shape and a pointer at no
     /// tensor, which only `as_ptr` could misuse.
     #[cfg(test)]
-    pub(crate) fn dangling() -> Tensor {
+    pub(crate) fn dangling() -> Tensor<'static> {
         Tensor {
             ptr: NonNull::dangling(),
             ne: [0; GGML_MAX_DIMS],
             nb: [0; GGML_MAX_DIMS],
             ty: 0,
+            owner: PhantomData,
         }
     }
 }
 
-impl From<Tensor> for TensorPtr {
-    fn from(t: Tensor) -> TensorPtr {
+impl From<Tensor<'_>> for TensorPtr {
+    fn from(t: Tensor<'_>) -> TensorPtr {
         t.as_ptr()
     }
 }
@@ -679,23 +726,26 @@ impl Api {
 
 #[cfg(test)]
 mod tests {
-    /// The accessors read the copy taken at construction, so a handle
-    /// kept past its tensor's memory still answers them; only `as_ptr`
-    /// would reach the freed tensor.
+    /// The accessors read the copy taken at construction, not the
+    /// tensor: the box that owns it is the handle's owner here and lives
+    /// through the reads, as `from_raw` requires.
     #[test]
-    fn a_handle_keeps_its_shape_after_the_tensor_is_freed() {
+    fn a_handle_answers_from_its_copy_of_the_tensor() {
         use super::{ty, GgmlTensor, Tensor};
         // SAFETY: an all-zero GgmlTensor is a valid value (integers and
-        // null pointers), and `from_raw` reads it while the box lives.
+        // null pointers).
         let mut raw: Box<GgmlTensor> = unsafe { Box::new(std::mem::zeroed()) };
         raw.type_ = ty::F16;
         raw.ne = [3, 5, 1, 1];
         raw.nb = [2, 6, 30, 30];
-        let t = unsafe { Tensor::from_raw(&mut *raw as *mut GgmlTensor) };
-        drop(raw);
+        let ptr: *mut GgmlTensor = &mut *raw;
+        // SAFETY: `ptr` points at the live tensor `raw` owns for as long
+        // as `raw` is borrowed.
+        let t = unsafe { Tensor::from_raw(ptr, &raw) };
         assert_eq!(t.shape(), [3, 5, 1, 1]);
         assert_eq!(t.strides(), [2, 6, 30, 30]);
         assert_eq!(t.dtype(), ty::F16);
+        drop(raw);
     }
 
     use super::*;

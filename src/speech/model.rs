@@ -719,123 +719,123 @@ pub fn check_types(idx: &Index, blck_size: &dyn Fn(u32) -> i64) -> Result<()> {
 /// `enc.pre_encode.*`: the dw_striding subsampler, three 3x3 convolutions
 /// (`conv.0`, `conv.2`, `conv.5`), two 1x1 (`conv.3`, `conv.6`) and the
 /// linear onto `d_model`. `_b` is the bias of the tensor before it.
-pub struct PreEncode {
-    pub conv0: Tensor,
-    pub conv0_b: Tensor,
-    pub conv2: Tensor,
-    pub conv2_b: Tensor,
-    pub conv3: Tensor,
-    pub conv3_b: Tensor,
-    pub conv5: Tensor,
-    pub conv5_b: Tensor,
-    pub conv6: Tensor,
-    pub conv6_b: Tensor,
-    pub out: Tensor,
-    pub out_b: Tensor,
+pub struct PreEncode<'w> {
+    pub conv0: Tensor<'w>,
+    pub conv0_b: Tensor<'w>,
+    pub conv2: Tensor<'w>,
+    pub conv2_b: Tensor<'w>,
+    pub conv3: Tensor<'w>,
+    pub conv3_b: Tensor<'w>,
+    pub conv5: Tensor<'w>,
+    pub conv5_b: Tensor<'w>,
+    pub conv6: Tensor<'w>,
+    pub conv6_b: Tensor<'w>,
+    pub out: Tensor<'w>,
+    pub out_b: Tensor<'w>,
 }
 
 /// One `enc.blocks.N.*` FastConformer block, a field per
 /// [`ENC_BLOCK_TENSORS`] suffix.
-pub struct EncBlock {
-    pub norm_ff1: Tensor,
-    pub norm_ff1_b: Tensor,
-    pub ff1_linear1: Tensor,
-    pub ff1_linear1_b: Tensor,
-    pub ff1_linear2: Tensor,
-    pub ff1_linear2_b: Tensor,
-    pub norm_attn: Tensor,
-    pub norm_attn_b: Tensor,
-    pub attn_q: Tensor,
-    pub attn_q_b: Tensor,
-    pub attn_k: Tensor,
-    pub attn_k_b: Tensor,
-    pub attn_v: Tensor,
-    pub attn_v_b: Tensor,
-    pub attn_out: Tensor,
-    pub attn_out_b: Tensor,
-    pub attn_pos: Tensor,
-    pub pos_bias_u: Tensor,
-    pub pos_bias_v: Tensor,
-    pub norm_conv: Tensor,
-    pub norm_conv_b: Tensor,
-    pub pointwise1: Tensor,
-    pub pointwise1_b: Tensor,
-    pub depthwise: Tensor,
-    pub depthwise_b: Tensor,
-    pub pointwise2: Tensor,
-    pub pointwise2_b: Tensor,
-    pub bn: Tensor,
-    pub bn_b: Tensor,
-    pub bn_mean: Tensor,
-    pub bn_var: Tensor,
-    pub norm_ff2: Tensor,
-    pub norm_ff2_b: Tensor,
-    pub ff2_linear1: Tensor,
-    pub ff2_linear1_b: Tensor,
-    pub ff2_linear2: Tensor,
-    pub ff2_linear2_b: Tensor,
-    pub norm_out: Tensor,
-    pub norm_out_b: Tensor,
+pub struct EncBlock<'w> {
+    pub norm_ff1: Tensor<'w>,
+    pub norm_ff1_b: Tensor<'w>,
+    pub ff1_linear1: Tensor<'w>,
+    pub ff1_linear1_b: Tensor<'w>,
+    pub ff1_linear2: Tensor<'w>,
+    pub ff1_linear2_b: Tensor<'w>,
+    pub norm_attn: Tensor<'w>,
+    pub norm_attn_b: Tensor<'w>,
+    pub attn_q: Tensor<'w>,
+    pub attn_q_b: Tensor<'w>,
+    pub attn_k: Tensor<'w>,
+    pub attn_k_b: Tensor<'w>,
+    pub attn_v: Tensor<'w>,
+    pub attn_v_b: Tensor<'w>,
+    pub attn_out: Tensor<'w>,
+    pub attn_out_b: Tensor<'w>,
+    pub attn_pos: Tensor<'w>,
+    pub pos_bias_u: Tensor<'w>,
+    pub pos_bias_v: Tensor<'w>,
+    pub norm_conv: Tensor<'w>,
+    pub norm_conv_b: Tensor<'w>,
+    pub pointwise1: Tensor<'w>,
+    pub pointwise1_b: Tensor<'w>,
+    pub depthwise: Tensor<'w>,
+    pub depthwise_b: Tensor<'w>,
+    pub pointwise2: Tensor<'w>,
+    pub pointwise2_b: Tensor<'w>,
+    pub bn: Tensor<'w>,
+    pub bn_b: Tensor<'w>,
+    pub bn_mean: Tensor<'w>,
+    pub bn_var: Tensor<'w>,
+    pub norm_ff2: Tensor<'w>,
+    pub norm_ff2_b: Tensor<'w>,
+    pub ff2_linear1: Tensor<'w>,
+    pub ff2_linear1_b: Tensor<'w>,
+    pub ff2_linear2: Tensor<'w>,
+    pub ff2_linear2_b: Tensor<'w>,
+    pub norm_out: Tensor<'w>,
+    pub norm_out_b: Tensor<'w>,
 }
 
 /// `dec.embed.*`: token table, the stored sinusoidal position table and
 /// the embedding norm.
-pub struct DecEmbed {
-    pub token: Tensor,
-    pub pos_enc: Tensor,
-    pub norm: Tensor,
-    pub norm_b: Tensor,
+pub struct DecEmbed<'w> {
+    pub token: Tensor<'w>,
+    pub pos_enc: Tensor<'w>,
+    pub norm: Tensor<'w>,
+    pub norm_b: Tensor<'w>,
 }
 
 /// One `dec.layer.N.*` Transformer layer, a field per [`DEC_LAYER_TENSORS`]
 /// suffix.
-pub struct DecLayer {
-    pub norm1: Tensor,
-    pub norm1_b: Tensor,
-    pub self_q: Tensor,
-    pub self_q_b: Tensor,
-    pub self_k: Tensor,
-    pub self_k_b: Tensor,
-    pub self_v: Tensor,
-    pub self_v_b: Tensor,
-    pub self_o: Tensor,
-    pub self_o_b: Tensor,
-    pub norm2: Tensor,
-    pub norm2_b: Tensor,
-    pub cross_q: Tensor,
-    pub cross_q_b: Tensor,
-    pub cross_k: Tensor,
-    pub cross_k_b: Tensor,
-    pub cross_v: Tensor,
-    pub cross_v_b: Tensor,
-    pub cross_o: Tensor,
-    pub cross_o_b: Tensor,
-    pub norm3: Tensor,
-    pub norm3_b: Tensor,
-    pub ffn_up: Tensor,
-    pub ffn_up_b: Tensor,
-    pub ffn_down: Tensor,
-    pub ffn_down_b: Tensor,
+pub struct DecLayer<'w> {
+    pub norm1: Tensor<'w>,
+    pub norm1_b: Tensor<'w>,
+    pub self_q: Tensor<'w>,
+    pub self_q_b: Tensor<'w>,
+    pub self_k: Tensor<'w>,
+    pub self_k_b: Tensor<'w>,
+    pub self_v: Tensor<'w>,
+    pub self_v_b: Tensor<'w>,
+    pub self_o: Tensor<'w>,
+    pub self_o_b: Tensor<'w>,
+    pub norm2: Tensor<'w>,
+    pub norm2_b: Tensor<'w>,
+    pub cross_q: Tensor<'w>,
+    pub cross_q_b: Tensor<'w>,
+    pub cross_k: Tensor<'w>,
+    pub cross_k_b: Tensor<'w>,
+    pub cross_v: Tensor<'w>,
+    pub cross_v_b: Tensor<'w>,
+    pub cross_o: Tensor<'w>,
+    pub cross_o_b: Tensor<'w>,
+    pub norm3: Tensor<'w>,
+    pub norm3_b: Tensor<'w>,
+    pub ffn_up: Tensor<'w>,
+    pub ffn_up_b: Tensor<'w>,
+    pub ffn_down: Tensor<'w>,
+    pub ffn_down_b: Tensor<'w>,
 }
 
 /// Every contract tensor as a handle into the model's weight buffer.
-pub struct CanaryTensors {
-    pub pre_encode: PreEncode,
-    pub enc_blocks: Vec<EncBlock>,
-    pub dec_embed: DecEmbed,
-    pub dec_layers: Vec<DecLayer>,
-    pub dec_norm: Tensor,
-    pub dec_norm_b: Tensor,
-    pub head: Tensor,
-    pub head_b: Tensor,
+pub struct CanaryTensors<'w> {
+    pub pre_encode: PreEncode<'w>,
+    pub enc_blocks: Vec<EncBlock<'w>>,
+    pub dec_embed: DecEmbed<'w>,
+    pub dec_layers: Vec<DecLayer<'w>>,
+    pub dec_norm: Tensor<'w>,
+    pub dec_norm_b: Tensor<'w>,
+    pub head: Tensor<'w>,
+    pub head_b: Tensor<'w>,
     /// `enc.proj.weight` and `enc.proj.bias` when `encoder_decoder_proj` is set.
-    pub enc_proj: Option<(Tensor, Tensor)>,
+    pub enc_proj: Option<(Tensor<'w>, Tensor<'w>)>,
 }
 
-impl CanaryTensors {
+impl<'w> CanaryTensors<'w> {
     /// Looks every contract name up through `get`; its error carries the
     /// name (`Weights::get` says `missing tensor "<name>"`).
-    fn build(hp: &CanaryHParams, get: &mut dyn FnMut(&str) -> Result<Tensor>) -> Result<Self> {
+    fn build(hp: &CanaryHParams, get: &mut dyn FnMut(&str) -> Result<Tensor<'w>>) -> Result<Self> {
         let mut t = |name: &str| get(name);
         let pre_encode = PreEncode {
             conv0: t("enc.pre_encode.conv.0.weight")?,
@@ -966,26 +966,36 @@ impl CanaryTensors {
 /// with the model. The caller drops the model before the [`Backend`] it
 /// was loaded on, as `mediagen::Context` orders its fields.
 pub struct CanaryModel {
-    pub hp: CanaryHParams,
+    /// Read at load and fixed from then on: [`CanaryModel::tensors`]
+    /// rebuilds the weight view from it, so a change would hand the
+    /// graphs a view of the wrong shape.
+    hp: CanaryHParams,
     pub vocab: Vocab,
-    pub tensors: CanaryTensors,
     weights: Weights,
+    /// How many tensors the contract names for `hp`, counted at load.
+    n_tensors: usize,
 }
 
-// SAFETY: the tensor pointers in `tensors` address the weight buffer
-// `weights` owns, and ggml ties neither to a thread; the one worker
-// that moves a model between threads uses it under a mutex, as
-// `Weights` and `Backend` are moved.
-unsafe impl Send for CanaryModel {}
-
 impl CanaryModel {
+    /// The hyperparameters the file was loaded with.
+    pub fn hp(&self) -> &CanaryHParams {
+        &self.hp
+    }
+
+    /// The contract's tensors as handles borrowed from the weights, built
+    /// per run: a handle borrows `self`, so none can outlive the buffer.
+    /// `load` built the same view once, so every lookup here succeeds.
+    pub fn tensors(&self) -> Result<CanaryTensors<'_>> {
+        CanaryTensors::build(&self.hp, &mut |name| self.weights.get(name))
+    }
+
     /// Size of the weight buffer in bytes.
     pub fn weight_bytes(&self) -> usize {
         self.weights.size()
     }
 
     pub fn tensor_count(&self) -> usize {
-        self.tensors.count()
+        self.n_tensors
     }
 }
 
@@ -1010,12 +1020,13 @@ pub fn load(path: &Path, be: &Backend) -> Result<CanaryModel> {
         be.weight_buft(),
         &LoadOpts::default(),
     )?;
-    let tensors = CanaryTensors::build(&hp, &mut |name| weights.get(name))?;
+    // Every tensor the contract names is present, checked once here.
+    let n_tensors = CanaryTensors::build(&hp, &mut |name| weights.get(name))?.count();
     Ok(CanaryModel {
         hp,
         vocab,
-        tensors,
         weights,
+        n_tensors,
     })
 }
 
@@ -1493,11 +1504,10 @@ mod tests {
 
     /// `build` over a recording lookup: dangling non-null handles stand in
     /// for ggml tensors, which `build` never dereferences.
-    fn build_names(hp: &CanaryHParams) -> (CanaryTensors, Vec<String>) {
+    fn build_names(hp: &CanaryHParams) -> (CanaryTensors<'static>, Vec<String>) {
         let mut asked = Vec::new();
         let tensors = CanaryTensors::build(hp, &mut |name| {
             asked.push(name.to_string());
-            // SAFETY: the test only stores the handle; no method runs on it.
             Ok(Tensor::dangling())
         })
         .unwrap();
@@ -1529,7 +1539,6 @@ mod tests {
             if name == "dec.layer.5.cross_attn.k.bias" {
                 bail!("missing tensor {name:?}");
             }
-            // SAFETY: the test only stores the handle; no method runs on it.
             Ok(Tensor::dangling())
         })
         .map(|_| ())
