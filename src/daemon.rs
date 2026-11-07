@@ -11,6 +11,7 @@
 //! per-invocation.
 
 use std::io::{BufRead, IsTerminal};
+use std::net::ToSocketAddrs;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -254,7 +255,29 @@ pub fn check_server_identity() -> anyhow::Result<()> {
 /// skipped.
 fn host_is_local() -> bool {
     let (_, host, _) = parsed_host();
-    is_local_host(host)
+    host_is_on_this_machine(host)
+}
+
+/// A daemon bound to a LAN address on this machine can also be started here.
+/// Require every resolved address to be bindable, so a name with a remote
+/// address can never make us signal a remote daemon's PID.
+fn host_is_on_this_machine(host: &str) -> bool {
+    if is_local_host(host) {
+        return true;
+    }
+    format_host_port(host, 0)
+        .to_socket_addrs()
+        .is_ok_and(|addrs| {
+            let mut found = false;
+            for mut addr in addrs {
+                found = true;
+                addr.set_port(0);
+                if std::net::TcpListener::bind(addr).is_err() {
+                    return false;
+                }
+            }
+            found
+        })
 }
 
 /// Whether the daemon is reachable *only* from this machine — i.e.
@@ -537,10 +560,14 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
 /// Like [`ensure_server`], forwarding additional `serve` options only when
 /// spawning a new daemon. The caller must not pass `--detach` back to the child.
 pub fn ensure_server_with_args(preload_model: &str, serve_args: &[&str]) -> anyhow::Result<()> {
+    // Hold the lock across the check, spawn and readiness wait. Another CLI
+    // starting the same local endpoint must recheck after the first finishes.
+    let local = host_is_local();
+    let _startup_lock = if local { Some(startup_lock()?) } else { None };
     if server_alive() {
         // A remote LLMMAN_HOST: reuse whatever's there, and never touch
         // its PID (see host_is_local) or spawn a "replacement" over it.
-        if !host_is_local() {
+        if !local {
             return Ok(());
         }
         // Reuse the running daemon — unless it outlived its own install
@@ -568,7 +595,7 @@ pub fn ensure_server_with_args(preload_model: &str, serve_args: &[&str]) -> anyh
                 None => stop_stale_daemon(&identity)?,
             },
         }
-    } else if !host_is_local() {
+    } else if !local {
         anyhow::bail!(
             "LLMMAN_HOST={} is unreachable, and llmman can't start a daemon on a remote host",
             server()
@@ -719,6 +746,24 @@ pub fn ensure_server_with_args(preload_model: &str, serve_args: &[&str]) -> anyh
         STARTUP_BUDGET.as_secs(),
         log_tail(log_path.as_deref())
     )
+}
+
+fn startup_lock() -> anyhow::Result<std::fs::File> {
+    let dir = crate::data_root()?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    // Different spellings (localhost, 127.0.0.1, 0.0.0.0) can contend
+    // for the same listening port. Serializing all local binds on that port
+    // also avoids a second spawn under a different LLMMAN_HOST spelling.
+    let path = dir.join(format!("serve-{}.lock", parsed_host().2));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("open daemon startup lock {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("lock daemon startup at {}", path.display()))?;
+    Ok(file)
 }
 
 /// How long [`ensure_server`] waits for a freshly spawned daemon that is
@@ -2185,6 +2230,20 @@ mod tests {
         }
         assert!(!is_local_host("example.com"));
         assert!(!is_local_host("192.168.1.5"));
+    }
+
+    #[test]
+    fn host_is_on_this_machine_accepts_a_local_non_loopback_address() {
+        assert!(host_is_on_this_machine("127.0.0.1"));
+        assert!(!host_is_on_this_machine("192.0.2.1"));
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        if socket.connect("192.0.2.1:9").is_ok() {
+            let addr = socket.local_addr().unwrap().ip();
+            if !addr.is_loopback() {
+                assert!(host_is_on_this_machine(&addr.to_string()));
+                assert!(!host_connects_over_loopback(&addr.to_string()));
+            }
+        }
     }
 
     #[test]
