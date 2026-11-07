@@ -41,6 +41,16 @@ so the first request is never stuck behind a silent download. On macOS
 llmman's own `uv` and `mlx-lm`, `path` uses `PATH`'s, `auto` installs
 and falls back to `PATH` (see [MLX](#mlx-macos)).
 
+A Canary speech model resolves `auto` on its own, on its first load. Its
+worker computes on the CPU and runs the CPU llama.cpp image, so a
+container engine "works" for it without the NVIDIA Container Toolkit, and
+no llama-server verify run follows the pull. The order is the same
+(`docker`, `podman`, `bin`, `path`), the answer is kept for later speech
+loads, and the general answer for every other model is untouched: a host
+whose GPU probe skipped containers for llama-server still runs its speech
+worker in one. `--pull-only` with a Canary model warms the CPU image under
+this rule. An explicit `--runtime` applies to both as written.
+
 Everything llmman installs for itself — llama.cpp, `uv`, `mlx-lm` — has
 one shape on disk: `~/.local/share/llmman/<tool>/<version>/`, a
 `.llmman-complete` sentinel written last (without it the directory is
