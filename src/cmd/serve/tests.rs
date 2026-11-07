@@ -8343,3 +8343,50 @@ fn identity_check_is_strict_only_for_a_bin_source_pinned_to_the_default_release(
         IdentityCheck::Log
     ));
 }
+
+/// `--pull-only` after the runtime resolved, over the matrix the review
+/// rounds hit: a local llama.cpp does nothing more and never classifies
+/// the model, so an unstored model is fine under `bin`, `path`, and
+/// `auto` landing local; a container engine classifies, and only there a
+/// classification error surfaces.
+#[test]
+fn pull_only_step_classifies_only_after_a_container_engine_was_picked() {
+    use crate::container::{ContainerEngine, ContainerManager};
+    use runtime::{Resolved, Runtime};
+
+    let local = Resolved::Local {
+        source: Runtime::Bin,
+        bin: std::path::PathBuf::from("/tmp/llama-server"),
+    };
+    let container = Resolved::Container(ContainerManager::Docker);
+    let unstored = || anyhow::bail!("--pull-only: pull first");
+
+    assert_eq!(
+        pull_only_step(&local, unstored).unwrap(),
+        PullOnlyStep::Done
+    );
+    assert_eq!(
+        pull_only_step(&local, || panic!("a local answer never classifies")).unwrap(),
+        PullOnlyStep::Done
+    );
+    assert!(pull_only_step(&container, unstored)
+        .unwrap_err()
+        .to_string()
+        .contains("pull first"));
+    assert_eq!(
+        pull_only_step(&container, || Ok(ContainerEngine::Speech)).unwrap(),
+        PullOnlyStep::ResolveCpuOnly
+    );
+    assert_eq!(
+        pull_only_step(&container, || Ok(ContainerEngine::LlamaServer)).unwrap(),
+        PullOnlyStep::Done
+    );
+    assert_eq!(
+        pull_only_step(&container, || Ok(ContainerEngine::Vllm)).unwrap(),
+        PullOnlyStep::PullEngine(ContainerEngine::Vllm)
+    );
+    assert_eq!(
+        pull_only_step(&container, || Ok(ContainerEngine::Sglang)).unwrap(),
+        PullOnlyStep::PullEngine(ContainerEngine::Sglang)
+    );
+}
