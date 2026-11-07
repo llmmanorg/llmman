@@ -1,7 +1,9 @@
 //! Backend, scheduler and graph building on top of [`ffi::Api`].
 
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::ffi::{c_int, CString};
+use std::marker::PhantomData;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -190,7 +192,7 @@ impl Backend {
     }
 
     /// Reads an F32 tensor allocated on a backend buffer.
-    pub fn read_f32(&self, t: Tensor) -> Vec<f32> {
+    pub fn read_f32(&self, t: Tensor<'_>) -> Vec<f32> {
         read_f32(self.api, t)
     }
 
@@ -237,7 +239,7 @@ unsafe extern "C" fn abort_requested(data: *mut std::ffi::c_void) -> bool {
 }
 
 /// Copies an F32 tensor out of its backend buffer.
-fn read_f32(api: &Api, t: Tensor) -> Vec<f32> {
+fn read_f32(api: &Api, t: Tensor<'_>) -> Vec<f32> {
     let n = unsafe { (api.ggml_nelements)(t.as_ptr()) } as usize;
     let mut out = vec![0f32; n];
     unsafe { (api.ggml_backend_tensor_get)(t.as_ptr(), out.as_mut_ptr() as *mut _, 0, n * 4) };
@@ -269,10 +271,13 @@ impl Drop for Backend {
     }
 }
 
-/// A ggml context with the op builders; graphs and weight contexts alike.
+/// A ggml context: the building block under [`Graph`], [`Resident`] and
+/// `Weights`, which own one each and hand out its tensors as handles
+/// borrowed from themselves. Nothing outside this module reaches it, so
+/// no handle can be made without an owner to borrow.
 pub struct Ctx {
-    pub api: &'static Api,
-    pub raw: *mut GgmlContext,
+    pub(super) api: &'static Api,
+    pub(super) raw: *mut GgmlContext,
 }
 
 impl Drop for Ctx {
@@ -286,109 +291,117 @@ impl Drop for Ctx {
 // entry's scalar types equal to the `api!` signature.
 macro_rules! ops {
     ($($name:ident => $sym:ident($($arg:ident: $ty:ty),*);)*) => {
-        impl Ctx {
-            $(pub fn $name(&self, $($arg: $ty),*) -> Tensor {
-                unsafe { Tensor::from_raw((self.api.$sym)(self.raw, $($arg.into()),*)) }
+        impl<'o> Graph<'o> {
+            $(pub fn $name(&'o self, $($arg: $ty),*) -> Tensor<'o> {
+                unsafe {
+                    Tensor::from_raw((self.ctx.api.$sym)(self.ctx.raw, $($arg.into()),*), self)
+                }
             })*
         }
     };
 }
 
 ops! {
-    add => ggml_add(a: Tensor, b: Tensor);
-    sub => ggml_sub(a: Tensor, b: Tensor);
-    mul => ggml_mul(a: Tensor, b: Tensor);
-    scale => ggml_scale(a: Tensor, s: f32);
-    scale_bias => ggml_scale_bias(a: Tensor, s: f32, b: f32);
-    mul_mat => ggml_mul_mat(a: Tensor, b: Tensor);
-    rms_norm => ggml_rms_norm(a: Tensor, eps: f32);
-    norm => ggml_norm(a: Tensor, eps: f32);
-    silu => ggml_silu(a: Tensor);
-    relu => ggml_relu(a: Tensor);
-    gelu => ggml_gelu(a: Tensor);
-    sigmoid => ggml_sigmoid(a: Tensor);
-    tanh => ggml_tanh(a: Tensor);
-    sin => ggml_sin(a: Tensor);
-    sqr => ggml_sqr(a: Tensor);
-    sqrt => ggml_sqrt(a: Tensor);
-    log => ggml_log(a: Tensor);
-    clamp => ggml_clamp(a: Tensor, min: f32, max: f32);
-    reshape_2d => ggml_reshape_2d(a: Tensor, ne0: i64, ne1: i64);
-    reshape_3d => ggml_reshape_3d(a: Tensor, ne0: i64, ne1: i64, ne2: i64);
-    reshape_4d => ggml_reshape_4d(a: Tensor, ne0: i64, ne1: i64, ne2: i64, ne3: i64);
-    view_2d => ggml_view_2d(a: Tensor, ne0: i64, ne1: i64, nb1: usize, offset: usize);
-    view_3d => ggml_view_3d(a: Tensor, ne0: i64, ne1: i64, ne2: i64, nb1: usize, nb2: usize, offset: usize);
-    view_4d => ggml_view_4d(a: Tensor, ne0: i64, ne1: i64, ne2: i64, ne3: i64, nb1: usize, nb2: usize, nb3: usize, offset: usize);
-    permute => ggml_permute(a: Tensor, a0: c_int, a1: c_int, a2: c_int, a3: c_int);
-    transpose => ggml_transpose(a: Tensor);
-    cont => ggml_cont(a: Tensor);
-    cont_2d => ggml_cont_2d(a: Tensor, ne0: i64, ne1: i64);
-    concat => ggml_concat(a: Tensor, b: Tensor, dim: c_int);
-    cast => ggml_cast(a: Tensor, ty: u32);
-    get_rows => ggml_get_rows(a: Tensor, b: Tensor);
-    repeat => ggml_repeat(a: Tensor, b: Tensor);
-    pad => ggml_pad(a: Tensor, p0: c_int, p1: c_int, p2: c_int, p3: c_int);
-    pad_ext => ggml_pad_ext(a: Tensor, lp0: c_int, rp0: c_int, lp1: c_int, rp1: c_int, lp2: c_int, rp2: c_int, lp3: c_int, rp3: c_int);
-    conv_1d => ggml_conv_1d(a: Tensor, b: Tensor, s0: c_int, p0: c_int, d0: c_int);
-    conv_2d => ggml_conv_2d(a: Tensor, b: Tensor, s0: c_int, s1: c_int, p0: c_int, p1: c_int, d0: c_int, d1: c_int);
-    conv_transpose_1d => ggml_conv_transpose_1d(a: Tensor, b: Tensor, s0: c_int, p0: c_int, d0: c_int);
-    conv_2d_dw_direct => ggml_conv_2d_dw_direct(a: Tensor, b: Tensor, stride0: c_int, stride1: c_int, pad0: c_int, pad1: c_int, dilation0: c_int, dilation1: c_int);
-    ssm_conv => ggml_ssm_conv(sx: Tensor, c: Tensor);
-    interpolate => ggml_interpolate(a: Tensor, ne0: i64, ne1: i64, ne2: i64, ne3: i64, mode: u32);
-    timestep_embedding => ggml_timestep_embedding(t: Tensor, dim: c_int, max_period: c_int);
+    add => ggml_add(a: Tensor<'o>, b: Tensor<'o>);
+    sub => ggml_sub(a: Tensor<'o>, b: Tensor<'o>);
+    mul => ggml_mul(a: Tensor<'o>, b: Tensor<'o>);
+    scale => ggml_scale(a: Tensor<'o>, s: f32);
+    scale_bias => ggml_scale_bias(a: Tensor<'o>, s: f32, b: f32);
+    mul_mat => ggml_mul_mat(a: Tensor<'o>, b: Tensor<'o>);
+    rms_norm => ggml_rms_norm(a: Tensor<'o>, eps: f32);
+    norm => ggml_norm(a: Tensor<'o>, eps: f32);
+    silu => ggml_silu(a: Tensor<'o>);
+    relu => ggml_relu(a: Tensor<'o>);
+    gelu => ggml_gelu(a: Tensor<'o>);
+    sigmoid => ggml_sigmoid(a: Tensor<'o>);
+    tanh => ggml_tanh(a: Tensor<'o>);
+    sin => ggml_sin(a: Tensor<'o>);
+    sqr => ggml_sqr(a: Tensor<'o>);
+    sqrt => ggml_sqrt(a: Tensor<'o>);
+    log => ggml_log(a: Tensor<'o>);
+    clamp => ggml_clamp(a: Tensor<'o>, min: f32, max: f32);
+    reshape_2d => ggml_reshape_2d(a: Tensor<'o>, ne0: i64, ne1: i64);
+    reshape_3d => ggml_reshape_3d(a: Tensor<'o>, ne0: i64, ne1: i64, ne2: i64);
+    reshape_4d => ggml_reshape_4d(a: Tensor<'o>, ne0: i64, ne1: i64, ne2: i64, ne3: i64);
+    view_2d => ggml_view_2d(a: Tensor<'o>, ne0: i64, ne1: i64, nb1: usize, offset: usize);
+    view_3d => ggml_view_3d(a: Tensor<'o>, ne0: i64, ne1: i64, ne2: i64, nb1: usize, nb2: usize, offset: usize);
+    view_4d => ggml_view_4d(a: Tensor<'o>, ne0: i64, ne1: i64, ne2: i64, ne3: i64, nb1: usize, nb2: usize, nb3: usize, offset: usize);
+    permute => ggml_permute(a: Tensor<'o>, a0: c_int, a1: c_int, a2: c_int, a3: c_int);
+    transpose => ggml_transpose(a: Tensor<'o>);
+    cont => ggml_cont(a: Tensor<'o>);
+    cont_2d => ggml_cont_2d(a: Tensor<'o>, ne0: i64, ne1: i64);
+    concat => ggml_concat(a: Tensor<'o>, b: Tensor<'o>, dim: c_int);
+    cast => ggml_cast(a: Tensor<'o>, ty: u32);
+    get_rows => ggml_get_rows(a: Tensor<'o>, b: Tensor<'o>);
+    repeat => ggml_repeat(a: Tensor<'o>, b: Tensor<'o>);
+    pad => ggml_pad(a: Tensor<'o>, p0: c_int, p1: c_int, p2: c_int, p3: c_int);
+    pad_ext => ggml_pad_ext(a: Tensor<'o>, lp0: c_int, rp0: c_int, lp1: c_int, rp1: c_int, lp2: c_int, rp2: c_int, lp3: c_int, rp3: c_int);
+    conv_1d => ggml_conv_1d(a: Tensor<'o>, b: Tensor<'o>, s0: c_int, p0: c_int, d0: c_int);
+    conv_2d => ggml_conv_2d(a: Tensor<'o>, b: Tensor<'o>, s0: c_int, s1: c_int, p0: c_int, p1: c_int, d0: c_int, d1: c_int);
+    conv_transpose_1d => ggml_conv_transpose_1d(a: Tensor<'o>, b: Tensor<'o>, s0: c_int, p0: c_int, d0: c_int);
+    conv_2d_dw_direct => ggml_conv_2d_dw_direct(a: Tensor<'o>, b: Tensor<'o>, stride0: c_int, stride1: c_int, pad0: c_int, pad1: c_int, dilation0: c_int, dilation1: c_int);
+    ssm_conv => ggml_ssm_conv(sx: Tensor<'o>, c: Tensor<'o>);
+    interpolate => ggml_interpolate(a: Tensor<'o>, ne0: i64, ne1: i64, ne2: i64, ne3: i64, mode: u32);
+    timestep_embedding => ggml_timestep_embedding(t: Tensor<'o>, dim: c_int, max_period: c_int);
 }
 
 /// `None` is ggml's null, the "no tensor" argument of an optional input.
-fn opt_ptr(t: Option<Tensor>) -> ffi::TensorPtr {
+fn opt_ptr(t: Option<Tensor<'_>>) -> ffi::TensorPtr {
     t.map_or(ptr::null_mut(), Tensor::as_ptr)
 }
 
-impl Ctx {
+impl<'o> Graph<'o> {
     pub fn flash_attn_ext(
-        &self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        mask: Option<Tensor>,
+        &'o self,
+        q: Tensor<'o>,
+        k: Tensor<'o>,
+        v: Tensor<'o>,
+        mask: Option<Tensor<'o>>,
         scale: f32,
         max_bias: f32,
         logit_softcap: f32,
-    ) -> Tensor {
+    ) -> Tensor<'o> {
         unsafe {
-            Tensor::from_raw((self.api.ggml_flash_attn_ext)(
-                self.raw,
-                q.as_ptr(),
-                k.as_ptr(),
-                v.as_ptr(),
-                opt_ptr(mask),
-                scale,
-                max_bias,
-                logit_softcap,
-            ))
+            Tensor::from_raw(
+                (self.ctx.api.ggml_flash_attn_ext)(
+                    self.ctx.raw,
+                    q.as_ptr(),
+                    k.as_ptr(),
+                    v.as_ptr(),
+                    opt_ptr(mask),
+                    scale,
+                    max_bias,
+                    logit_softcap,
+                ),
+                self,
+            )
         }
     }
 
     pub fn soft_max_ext(
-        &self,
-        a: Tensor,
-        mask: Option<Tensor>,
+        &'o self,
+        a: Tensor<'o>,
+        mask: Option<Tensor<'o>>,
         scale: f32,
         max_bias: f32,
-    ) -> Tensor {
+    ) -> Tensor<'o> {
         unsafe {
-            Tensor::from_raw((self.api.ggml_soft_max_ext)(
-                self.raw,
-                a.as_ptr(),
-                opt_ptr(mask),
-                scale,
-                max_bias,
-            ))
+            Tensor::from_raw(
+                (self.ctx.api.ggml_soft_max_ext)(
+                    self.ctx.raw,
+                    a.as_ptr(),
+                    opt_ptr(mask),
+                    scale,
+                    max_bias,
+                ),
+                self,
+            )
         }
     }
 }
 
 impl Ctx {
-    pub fn new(api: &'static Api, mem_size: usize, no_alloc: bool) -> Result<Ctx> {
+    pub(super) fn new(api: &'static Api, mem_size: usize, no_alloc: bool) -> Result<Ctx> {
         let raw = unsafe {
             (api.ggml_init)(ffi::GgmlInitParams {
                 mem_size,
@@ -402,25 +415,49 @@ impl Ctx {
         Ok(Ctx { api, raw })
     }
 
-    pub fn new_tensor(&self, ty: u32, ne: &[i64]) -> Tensor {
+    /// A tensor of this context, borrowed from it; an owner wraps the
+    /// result in its own borrow before it leaves the module.
+    pub(super) fn new_tensor(&self, ty: u32, ne: &[i64]) -> Tensor<'_> {
         unsafe {
-            Tensor::from_raw((self.api.ggml_new_tensor)(
-                self.raw,
-                ty,
-                ne.len() as c_int,
-                ne.as_ptr(),
-            ))
+            Tensor::from_raw(
+                (self.api.ggml_new_tensor)(self.raw, ty, ne.len() as c_int, ne.as_ptr()),
+                self,
+            )
         }
     }
 
-    pub fn set_name(&self, t: Tensor, name: &str) {
+    pub(super) fn set_name(&self, t: Tensor<'_>, name: &str) {
         let name = CString::new(name).unwrap_or_default();
         unsafe { (self.api.ggml_set_name)(t.as_ptr(), name.as_ptr()) };
+    }
+}
+
+impl<'o> Graph<'o> {
+    /// The ggml API the graph was built with, for calls that take a
+    /// node's pointer and nothing of the context.
+    pub fn api(&'o self) -> &'static Api {
+        self.ctx.api
+    }
+
+    /// A new tensor of the graph's context, for a shape another op
+    /// repeats into; it carries no data.
+    pub fn new_tensor(&'o self, ty: u32, ne: &[i64]) -> Tensor<'o> {
+        // SAFETY: the tensor is a node of `ctx`, which lives as long as self.
+        unsafe { Tensor::from_raw(self.ctx.new_tensor(ty, ne).as_ptr(), self) }
+    }
+
+    pub fn set_name(&'o self, t: Tensor<'o>, name: &str) {
+        self.ctx.set_name(t, name);
     }
 
     /// x * (1 + scale) + shift; not `x * scale + x`, which Metal's
     /// norm + mul + add fusion miscomputes when `x` is a norm's output.
-    pub fn modulate(&self, x: Tensor, scale: Tensor, shift: Option<Tensor>) -> Tensor {
+    pub fn modulate(
+        &'o self,
+        x: Tensor<'o>,
+        scale: Tensor<'o>,
+        shift: Option<Tensor<'o>>,
+    ) -> Tensor<'o> {
         let y = self.mul(x, self.scale_bias(scale, 1.0, 1.0));
         match shift {
             Some(s) => self.add(y, s),
@@ -428,7 +465,7 @@ impl Ctx {
         }
     }
 
-    pub fn linear(&self, x: Tensor, w: Tensor, b: Option<Tensor>) -> Tensor {
+    pub fn linear(&'o self, x: Tensor<'o>, w: Tensor<'o>, b: Option<Tensor<'o>>) -> Tensor<'o> {
         let y = self.mul_mat(w, x);
         match b {
             Some(b) => self.add(y, b),
@@ -440,8 +477,8 @@ impl Ctx {
     /// and returns it; ggml ignores the hint on any other op. A release
     /// without `ggml_prec_set_acc` leaves `t` as it is: the speech encoder
     /// checks for the symbol before it builds a graph.
-    pub fn prec_f32(&self, t: Tensor) -> Tensor {
-        if let Some(set_acc) = self.api.ggml_prec_set_acc {
+    pub fn prec_f32(&'o self, t: Tensor<'o>) -> Tensor<'o> {
+        if let Some(set_acc) = self.ctx.api.ggml_prec_set_acc {
             unsafe { set_acc(t.as_ptr(), ffi::GGML_PREC_F32) };
         }
         t
@@ -449,17 +486,28 @@ impl Ctx {
 
     /// `ggml_set_rows` when this release has the symbol, else None:
     /// writes the rows of `b` into `a` at the row indices `c`.
-    pub fn set_rows(&self, a: Tensor, b: Tensor, c: Tensor) -> Option<Tensor> {
-        let f = self.api.ggml_set_rows?;
-        Some(unsafe { Tensor::from_raw(f(self.raw, a.as_ptr(), b.as_ptr(), c.as_ptr())) })
+    pub fn set_rows(&'o self, a: Tensor<'o>, b: Tensor<'o>, c: Tensor<'o>) -> Option<Tensor<'o>> {
+        let f = self.ctx.api.ggml_set_rows?;
+        Some(unsafe { Tensor::from_raw(f(self.ctx.raw, a.as_ptr(), b.as_ptr(), c.as_ptr()), self) })
     }
 
     /// `ggml_conv_2d_direct` when this release has the symbol, else None;
     /// the kernel `k` over `x` with stride `s` and padding `pad` on both
     /// axes.
-    pub fn conv_2d_direct(&self, k: Tensor, x: Tensor, s: i32, pad: i32) -> Option<Tensor> {
-        let f = self.api.ggml_conv_2d_direct?;
-        Some(unsafe { Tensor::from_raw(f(self.raw, k.as_ptr(), x.as_ptr(), s, s, pad, pad, 1, 1)) })
+    pub fn conv_2d_direct(
+        &'o self,
+        k: Tensor<'o>,
+        x: Tensor<'o>,
+        s: i32,
+        pad: i32,
+    ) -> Option<Tensor<'o>> {
+        let f = self.ctx.api.ggml_conv_2d_direct?;
+        Some(unsafe {
+            Tensor::from_raw(
+                f(self.ctx.raw, k.as_ptr(), x.as_ptr(), s, s, pad, pad, 1, 1),
+                self,
+            )
+        })
     }
 }
 
@@ -468,7 +516,9 @@ impl Ctx {
 pub struct Resident {
     ctx: Ctx,
     buf: ffi::GgmlBackendBuffer,
-    pub tensors: Vec<Tensor>,
+    /// Raw, since a handle would borrow `ctx` inside the same struct;
+    /// [`Resident::tensor`] hands them out borrowed from `self`.
+    tensors: Vec<ffi::TensorPtr>,
 }
 
 unsafe impl Send for Resident {}
@@ -481,7 +531,10 @@ impl Resident {
             unsafe { (api.ggml_tensor_overhead)() } * (shapes.len() + 1),
             true,
         )?;
-        let tensors = shapes.iter().map(|ne| ctx.new_tensor(ty, ne)).collect();
+        let tensors = shapes
+            .iter()
+            .map(|ne| ctx.new_tensor(ty, ne).as_ptr())
+            .collect();
         let buf =
             unsafe { (api.ggml_backend_alloc_ctx_tensors_from_buft)(ctx.raw, be.weight_buft) };
         if buf.is_null() {
@@ -499,6 +552,20 @@ impl Resident {
     pub fn clear(&self) {
         unsafe { (self.ctx.api.ggml_backend_buffer_clear)(self.buf, 0) }
     }
+
+    /// The `i`th tensor, in the order of the shapes given to [`Resident::new`].
+    pub fn tensor(&self, i: usize) -> Tensor<'_> {
+        // SAFETY: the pointer came from `ctx`, which lives as long as self.
+        unsafe { Tensor::from_raw(self.tensors[i], self) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.tensors.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
+    }
 }
 
 impl Drop for Resident {
@@ -508,14 +575,95 @@ impl Drop for Resident {
 }
 
 /// One graph: inputs uploaded after allocation, outputs read after compute.
-pub struct Graph {
-    pub ctx: Ctx,
+/// Inputs are numbered in the order they are added; [`Graph::input`]
+/// reads one back and the `update_input` methods replace its bytes.
+///
+/// `'o` is the graph's own scope, and every owner whose tensors enter
+/// the graph must outlive it. Every method takes `&'o self` and tensors
+/// borrowed for `'o`: a node an op returns cannot outlive the graph, an
+/// operand from a `Resident` or `Weights` must outlive the graph's last
+/// use, compute included, and so must anything [`Graph::mark_output`] is
+/// given, so the graph never computes over or reads back freed memory.
+/// The context is private: only these methods create tensors in it.
+///
+/// An operand's owner cannot go before the graph that uses it:
+///
+/// ```compile_fail,E0505
+/// use llmman::mediagen::backend::{Backend, Graph};
+/// use llmman::mediagen::ffi::Api;
+/// use llmman::mediagen::weights::Weights;
+///
+/// fn f(api: &'static Api, be: &Backend, w: Weights) -> anyhow::Result<()> {
+///     let g = Graph::new(api, 16)?;
+///     let v = g.view_2d(w.get("a")?, 1, 1, 4, 0);
+///     drop(w);
+///     g.mark_output(v);
+///     g.compute(be)
+/// }
+/// ```
+///
+/// Nor can an output come from an owner that goes before the graph:
+///
+/// ```compile_fail,E0597
+/// use llmman::mediagen::backend::{Backend, Graph, Resident};
+/// use llmman::mediagen::ffi::{ty, Api};
+///
+/// fn f(api: &'static Api, be: &Backend) -> anyhow::Result<usize> {
+///     let g = Graph::new(api, 16)?;
+///     let i = {
+///         let r = Resident::new(be, ty::F32, &[&[1]])?;
+///         g.mark_output(r.tensor(0))
+///     };
+///     g.compute(be)?;
+///     Ok(i)
+/// }
+/// ```
+///
+/// And the context behind the graph is not reachable:
+///
+/// ```compile_fail,E0616
+/// use llmman::mediagen::backend::Graph;
+///
+/// fn f(g: &Graph<'_>) {
+///     let _ = &g.ctx;
+/// }
+/// ```
+///
+/// With every owner outliving the graph, the same shapes compile:
+///
+/// ```
+/// use llmman::mediagen::backend::{Backend, Graph, Resident};
+/// use llmman::mediagen::ffi::{ty, Api};
+/// use llmman::mediagen::weights::Weights;
+///
+/// fn f(api: &'static Api, be: &Backend, w: &Weights) -> anyhow::Result<Vec<f32>> {
+///     let r = Resident::new(be, ty::F32, &[&[1]])?;
+///     let g = Graph::new(api, 16)?;
+///     let v = g.view_2d(w.get("a")?, 1, 1, 4, 0);
+///     let i = g.mark_output(v);
+///     g.store(v, r.tensor(0));
+///     g.compute(be)?;
+///     Ok(g.output_f32(g.output(i)))
+/// }
+/// ```
+pub struct Graph<'o> {
+    ctx: Ctx,
     gf: *mut ffi::GgmlCgraph,
-    inputs: Vec<(Tensor, Vec<u8>)>,
+    /// Raw, since a handle would borrow `ctx` inside the same struct.
+    /// Behind a `RefCell` so adding an input borrows the graph like
+    /// building a node does, and the handles it returns stay usable.
+    inputs: RefCell<Vec<(ffi::TensorPtr, Vec<u8>)>>,
+    /// The tensors [`Graph::mark_output`] was given, in order, so a
+    /// builder can hand its graph back and name an output by index.
+    outputs: RefCell<Vec<ffi::TensorPtr>>,
+    /// The scope the owners of every tensor in the graph outlive.
+    /// Invariant in `'o`, so a method call cannot shrink it to its own
+    /// borrow: one `'o` spans every use of the graph, compute included.
+    owners: PhantomData<fn(&'o ()) -> &'o ()>,
 }
 
-impl Graph {
-    pub fn new(api: &'static Api, max_nodes: usize) -> Result<Graph> {
+impl<'o> Graph<'o> {
+    pub fn new(api: &'static Api, max_nodes: usize) -> Result<Graph<'o>> {
         let mem = unsafe {
             (api.ggml_tensor_overhead)() * max_nodes
                 + (api.ggml_graph_overhead_custom)(max_nodes, false)
@@ -528,90 +676,114 @@ impl Graph {
         Ok(Graph {
             ctx,
             gf,
-            inputs: Vec::new(),
+            inputs: RefCell::new(Vec::new()),
+            outputs: RefCell::new(Vec::new()),
+            owners: PhantomData,
         })
     }
 
-    pub fn input_f32(&mut self, ne: &[i64], data: &[f32], name: &str) -> Tensor {
+    /// Adds an F32 input holding `data`; the handle and its index, for
+    /// [`Graph::update_input_f32`], count up from zero.
+    pub fn input_f32(&'o self, ne: &[i64], data: &[f32], name: &str) -> Tensor<'o> {
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.input(ffi::ty::F32, ne, bytes, name)
+        self.add_input(ffi::ty::F32, ne, bytes, name)
     }
 
-    pub fn input_i32(&mut self, ne: &[i64], data: &[i32], name: &str) -> Tensor {
+    /// Adds an I32 input holding `data`; see [`Graph::input_f32`].
+    pub fn input_i32(&'o self, ne: &[i64], data: &[i32], name: &str) -> Tensor<'o> {
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.input(ffi::ty::I32, ne, bytes, name)
+        self.add_input(ffi::ty::I32, ne, bytes, name)
     }
 
-    fn input(&mut self, ty: u32, ne: &[i64], bytes: Vec<u8>, name: &str) -> Tensor {
-        let t = self.ctx.new_tensor(ty, ne);
-        self.ctx.set_name(t, name);
+    fn add_input(&'o self, ty: u32, ne: &[i64], bytes: Vec<u8>, name: &str) -> Tensor<'o> {
+        let t = self.new_tensor(ty, ne);
+        self.set_name(t, name);
         unsafe { (self.ctx.api.ggml_set_input)(t.as_ptr()) };
         debug_assert_eq!(
             unsafe { (self.ctx.api.ggml_nbytes)(t.as_ptr()) },
             bytes.len()
         );
-        self.inputs.push((t, bytes));
+        self.inputs.borrow_mut().push((t.as_ptr(), bytes));
         t
     }
 
-    /// Replaces the bytes of the input `t` for the next [`Graph::compute`]
-    /// in place: a graph built once runs again on new data without
-    /// allocating. Panics when `t` is not an input of this graph or the
-    /// lengths differ.
-    pub fn update_input(&mut self, t: Tensor, bytes: &[u8]) {
-        let slot = self.input_slot(t);
+    /// The `i`th input added, counting from zero.
+    pub fn input(&'o self, i: usize) -> Tensor<'o> {
+        let ptr = self.inputs.borrow()[i].0;
+        // SAFETY: the pointer came from `ctx`, which lives as long as self.
+        unsafe { Tensor::from_raw(ptr, self) }
+    }
+
+    /// How many inputs the graph has.
+    pub fn n_inputs(&'o self) -> usize {
+        self.inputs.borrow().len()
+    }
+
+    /// Replaces the bytes of input `i` for the next [`Graph::compute`] in
+    /// place: a graph built once runs again on new data without
+    /// allocating. Panics when there is no such input or the lengths
+    /// differ.
+    pub fn update_input(&'o self, i: usize, bytes: &[u8]) {
+        let mut inputs = self.inputs.borrow_mut();
+        let slot = &mut inputs.get_mut(i).expect("no such graph input").1;
         assert_eq!(slot.len(), bytes.len(), "input size changed");
         slot.copy_from_slice(bytes);
     }
 
     /// [`Graph::update_input`] for an F32 input.
-    pub fn update_input_f32(&mut self, t: Tensor, data: &[f32]) {
-        self.update_words(t, data.iter().map(|v| v.to_le_bytes()));
+    pub fn update_input_f32(&'o self, i: usize, data: &[f32]) {
+        self.update_words(i, data.iter().map(|v| v.to_le_bytes()));
     }
 
     /// [`Graph::update_input`] for an I32 input.
-    pub fn update_input_i32(&mut self, t: Tensor, data: &[i32]) {
-        self.update_words(t, data.iter().map(|v| v.to_le_bytes()));
+    pub fn update_input_i32(&'o self, i: usize, data: &[i32]) {
+        self.update_words(i, data.iter().map(|v| v.to_le_bytes()));
     }
 
-    fn update_words(&mut self, t: Tensor, words: impl ExactSizeIterator<Item = [u8; 4]>) {
-        let slot = self.input_slot(t);
+    fn update_words(&'o self, i: usize, words: impl ExactSizeIterator<Item = [u8; 4]>) {
+        let mut inputs = self.inputs.borrow_mut();
+        let slot = &mut inputs.get_mut(i).expect("no such graph input").1;
         assert_eq!(slot.len(), words.len() * 4, "input size changed");
         for (dst, w) in slot.as_chunks_mut::<4>().0.iter_mut().zip(words) {
             *dst = w;
         }
     }
 
-    fn input_slot(&mut self, t: Tensor) -> &mut Vec<u8> {
-        self.inputs
-            .iter_mut()
-            .find(|(it, _)| *it == t)
-            .map(|(_, bytes)| bytes)
-            .expect("tensor is not an input of this graph")
-    }
-
     /// Copies `src` into the [`Resident`] tensor `dst` when the graph runs.
-    pub fn store(&self, src: Tensor, dst: Tensor) {
+    pub fn store(&'o self, src: Tensor<'o>, dst: Tensor<'o>) {
         self.mark_output(unsafe {
-            Tensor::from_raw((self.ctx.api.ggml_cpy)(
-                self.ctx.raw,
-                src.as_ptr(),
-                dst.as_ptr(),
-            ))
+            Tensor::from_raw(
+                (self.ctx.api.ggml_cpy)(self.ctx.raw, src.as_ptr(), dst.as_ptr()),
+                self,
+            )
         });
     }
 
-    pub fn mark_output(&self, t: Tensor) {
+    /// Marks `t` as an output the graph computes, and returns its index
+    /// for [`Graph::output`]. `t` is a node of this graph or a tensor of
+    /// an owner that outlives it, so reading it back is always sound.
+    pub fn mark_output(&'o self, t: Tensor<'o>) -> usize {
         unsafe {
             (self.ctx.api.ggml_set_output)(t.as_ptr());
             (self.ctx.api.ggml_build_forward_expand)(self.gf, t.as_ptr());
         }
+        let mut outputs = self.outputs.borrow_mut();
+        outputs.push(t.as_ptr());
+        outputs.len() - 1
+    }
+
+    /// The `i`th tensor given to [`Graph::mark_output`].
+    pub fn output(&'o self, i: usize) -> Tensor<'o> {
+        let ptr = self.outputs.borrow()[i];
+        // SAFETY: the pointer came from a tensor borrowed for `'o` when
+        // it was marked, so its owner outlives this graph.
+        unsafe { Tensor::from_raw(ptr, self) }
     }
 
     /// Compute buffer bytes this graph needs, planned by a CPU graph
     /// allocator: nothing is allocated on the GPU, and the host memory is
     /// only reserved, not touched.
-    pub fn measure(&self, be: &Backend) -> Result<usize> {
+    pub fn measure(&'o self, be: &Backend) -> Result<usize> {
         let api = self.ctx.api;
         unsafe {
             let buft = (api.ggml_backend_get_default_buffer_type)(be.cpu);
@@ -630,7 +802,7 @@ impl Graph {
         }
     }
 
-    pub fn compute(&self, be: &Backend) -> Result<()> {
+    pub fn compute(&'o self, be: &Backend) -> Result<()> {
         let api = self.ctx.api;
         unsafe {
             (api.ggml_backend_sched_reset)(be.sched);
@@ -640,13 +812,8 @@ impl Graph {
                     (api.ggml_graph_n_nodes)(self.gf)
                 ));
             }
-            for (t, bytes) in &self.inputs {
-                (api.ggml_backend_tensor_set)(
-                    t.as_ptr(),
-                    bytes.as_ptr() as *const _,
-                    0,
-                    bytes.len(),
-                );
+            for (t, bytes) in self.inputs.borrow().iter() {
+                (api.ggml_backend_tensor_set)(*t, bytes.as_ptr() as *const _, 0, bytes.len());
             }
             let status = (api.ggml_backend_sched_graph_compute)(be.sched, self.gf);
             if status == ffi::GGML_STATUS_ABORTED {
@@ -660,7 +827,7 @@ impl Graph {
         be.check_gpu()
     }
 
-    pub fn output_f32(&self, t: Tensor) -> Vec<f32> {
+    pub fn output_f32(&'o self, t: Tensor<'o>) -> Vec<f32> {
         read_f32(self.ctx.api, t)
     }
 }

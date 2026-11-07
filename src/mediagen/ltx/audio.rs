@@ -3,13 +3,19 @@
 
 use anyhow::{anyhow, bail, Result};
 
-use super::super::backend::{Backend, Ctx, Graph};
+use super::super::backend::{Backend, Graph};
 use super::super::ffi::{self, Tensor};
 use super::super::weights::Weights;
 use super::{AudioLatent, Model, PI};
 
 /// 3x3 conv, zero padded: causal along time (2 before), symmetric along frequency.
-fn avae_conv(g: &Ctx, w: &Weights, prefix: &str, mut x: Tensor, k: i32) -> Result<Tensor> {
+fn avae_conv<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    mut x: Tensor<'g>,
+    k: i32,
+) -> Result<Tensor<'g>> {
     let kw = w.get(&format!("{prefix}.weight"))?;
     if k == 3 {
         x = g.pad_ext(x, 1, 1, 2, 0, 0, 0, 0, 0);
@@ -21,13 +27,18 @@ fn avae_conv(g: &Ctx, w: &Weights, prefix: &str, mut x: Tensor, k: i32) -> Resul
     Ok(y)
 }
 
-fn avae_pixel_norm(g: &Ctx, x: Tensor) -> Tensor {
+fn avae_pixel_norm<'g>(g: &'g Graph<'g>, x: Tensor<'g>) -> Tensor<'g> {
     let p = g.cont(g.permute(x, 1, 2, 0, 3)); // [C, F, T, 1]
     let p = g.rms_norm(p, 1e-6);
     g.cont(g.permute(p, 2, 0, 1, 3))
 }
 
-fn avae_resblock(g: &Ctx, w: &Weights, prefix: &str, mut x: Tensor) -> Result<Tensor> {
+fn avae_resblock<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    mut x: Tensor<'g>,
+) -> Result<Tensor<'g>> {
     let h = g.silu(avae_pixel_norm(g, x));
     let h = avae_conv(g, w, &format!("{prefix}.conv1.conv"), h, 3)?;
     let h = g.silu(avae_pixel_norm(g, h));
@@ -39,7 +50,12 @@ fn avae_resblock(g: &Ctx, w: &Weights, prefix: &str, mut x: Tensor) -> Result<Te
 }
 
 /// Nearest x2 upsample, conv, drop the first time row.
-fn avae_upsample(g: &Ctx, w: &Weights, prefix: &str, mut x: Tensor) -> Result<Tensor> {
+fn avae_upsample<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    mut x: Tensor<'g>,
+) -> Result<Tensor<'g>> {
     let s = x.shape();
     x = g.interpolate(
         x,
@@ -56,13 +72,13 @@ fn avae_upsample(g: &Ctx, w: &Weights, prefix: &str, mut x: Tensor) -> Result<Te
 }
 
 /// Latents `[freq, time, 8, 1]` -> mel `[64, time, 2, 1]`.
-fn avae_decode(
-    g: &Ctx,
-    w: &Weights,
-    z: Tensor,
+fn avae_decode<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    z: Tensor<'g>,
     n_levels: i32,
     n_res_blocks: i32,
-) -> Result<Tensor> {
+) -> Result<Tensor<'g>> {
     let pre = "audio_vae.decoder";
     let mut h = avae_conv(g, w, &format!("{pre}.conv_in.conv"), z, 3)?;
     h = avae_resblock(g, w, &format!("{pre}.mid.block_1"), h)?;
@@ -81,7 +97,14 @@ fn avae_decode(
 
 // vocoder building blocks (1-D, [T, C, 1])
 
-fn conv1d(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, pad: i32, dil: i32) -> Result<Tensor> {
+fn conv1d<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    x: Tensor<'g>,
+    pad: i32,
+    dil: i32,
+) -> Result<Tensor<'g>> {
     let kw = w.get(&format!("{prefix}.weight"))?;
     let mut y = g.conv_1d(kw, x, 1, pad, dil);
     if let Some(b) = w.opt(&format!("{prefix}.bias")) {
@@ -91,7 +114,13 @@ fn conv1d(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, pad: i32, dil: i32) -> 
 }
 
 /// PyTorch ConvTranspose1d(k, stride, padding = (k - stride) / 2).
-fn conv_transpose1d(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, stride: i32) -> Result<Tensor> {
+fn conv_transpose1d<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    x: Tensor<'g>,
+    stride: i32,
+) -> Result<Tensor<'g>> {
     let kw = w.get(&format!("{prefix}.weight"))?; // [K, OC, IC]
     let k = kw.shape()[0] as i32;
     let pad = (k - stride) / 2;
@@ -112,7 +141,7 @@ fn conv_transpose1d(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, stride: i32) 
 }
 
 /// Replicate padding along time.
-fn replicate_pad1d(g: &Ctx, x: Tensor, left: i64, right: i64) -> Tensor {
+fn replicate_pad1d<'g>(g: &'g Graph<'g>, x: Tensor<'g>, left: i64, right: i64) -> Tensor<'g> {
     let [t, c, ..] = x.shape();
     let nb = x.strides();
     let mut out = x;
@@ -130,7 +159,13 @@ fn replicate_pad1d(g: &Ctx, x: Tensor, left: i64, right: i64) -> Tensor {
 }
 
 /// One filter for every channel: channels become the batch of a 1-channel conv; x: [T, C, 1], filter: [K, 1, 1].
-fn filter_conv1d(g: &Ctx, filter: Tensor, x: Tensor, stride: i32, pad: i32) -> Tensor {
+fn filter_conv1d<'g>(
+    g: &'g Graph<'g>,
+    filter: Tensor<'g>,
+    x: Tensor<'g>,
+    stride: i32,
+    pad: i32,
+) -> Tensor<'g> {
     let [t, c, ..] = x.shape();
     let xb = g.reshape_3d(x, t, 1, c);
     let y = g.conv_1d(filter, xb, stride, pad, 1); // [T', 1, C]
@@ -139,7 +174,7 @@ fn filter_conv1d(g: &Ctx, filter: Tensor, x: Tensor, stride: i32, pad: i32) -> T
 
 /// Zero insertion: [T, C] -> [(T-1)*ratio+1, C].
 /// Concat rather than pad: the CUDA pad kernel maps ne1 to gridDim.y (max 65535).
-fn zero_stuff(g: &Ctx, x: Tensor, ratio: i64) -> Tensor {
+fn zero_stuff<'g>(g: &'g Graph<'g>, x: Tensor<'g>, ratio: i64) -> Tensor<'g> {
     let [t, c, ..] = x.shape();
     let mut v = g.reshape_3d(g.cont(x), 1, t, c);
     let zeros = g.scale(v, 0.0);
@@ -152,15 +187,15 @@ fn zero_stuff(g: &Ctx, x: Tensor, ratio: i64) -> Tensor {
 }
 
 /// BigVGAN UpSample1d; the filter is symmetric so the transposed conv is zero stuffing + full conv.
-fn aa_upsample(
-    g: &Ctx,
-    filter: Tensor,
-    mut x: Tensor,
+fn aa_upsample<'g>(
+    g: &'g Graph<'g>,
+    filter: Tensor<'g>,
+    mut x: Tensor<'g>,
     ratio: i64,
     pad: i64,
     pad_left: i64,
     pad_right: i64,
-) -> Tensor {
+) -> Tensor<'g> {
     let k = filter.shape()[0] as i32;
     x = replicate_pad1d(g, x, pad, pad);
     x = zero_stuff(g, x, ratio);
@@ -179,14 +214,24 @@ fn aa_upsample(
 }
 
 /// BigVGAN DownSample1d: replicate pad then strided lowpass.
-fn aa_downsample(g: &Ctx, filter: Tensor, x: Tensor, ratio: i32) -> Tensor {
+fn aa_downsample<'g>(
+    g: &'g Graph<'g>,
+    filter: Tensor<'g>,
+    x: Tensor<'g>,
+    ratio: i32,
+) -> Tensor<'g> {
     let k = filter.shape()[0];
     let x = replicate_pad1d(g, x, k / 2 - 1, k / 2);
     filter_conv1d(g, filter, x, ratio, 0)
 }
 
 /// Snake beta: x + inv_beta * sin(alpha * x)^2, parameters precomputed by `transform`.
-fn snake_beta(g: &Ctx, w: &Weights, prefix: &str, x: Tensor) -> Result<Tensor> {
+fn snake_beta<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    x: Tensor<'g>,
+) -> Result<Tensor<'g>> {
     let a = w.get(&format!("{prefix}.alpha"))?;
     let ib = w.get(&format!("{prefix}.beta"))?;
     let s = g.sin(g.mul(x, g.reshape_3d(a, 1, a.shape()[0], 1)));
@@ -195,7 +240,12 @@ fn snake_beta(g: &Ctx, w: &Weights, prefix: &str, x: Tensor) -> Result<Tensor> {
 }
 
 /// Activation1d: anti-aliased snake (2x up, act, 2x down), kernel 12.
-fn activation1d(g: &Ctx, w: &Weights, prefix: &str, mut x: Tensor) -> Result<Tensor> {
+fn activation1d<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    mut x: Tensor<'g>,
+) -> Result<Tensor<'g>> {
     let up = w.get(&format!("{prefix}.upsample.filter"))?;
     let down = w.get(&format!("{prefix}.downsample.lowpass.filter"))?;
     let k = up.shape()[0];
@@ -208,14 +258,14 @@ fn activation1d(g: &Ctx, w: &Weights, prefix: &str, mut x: Tensor) -> Result<Ten
     Ok(aa_downsample(g, down, x, ratio as i32))
 }
 
-fn amp_block(
-    g: &Ctx,
-    w: &Weights,
+fn amp_block<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
     prefix: &str,
-    mut x: Tensor,
+    mut x: Tensor<'g>,
     kernel: i32,
     dil: [i32; 3],
-) -> Result<Tensor> {
+) -> Result<Tensor<'g>> {
     for (i, d) in dil.iter().enumerate() {
         let xt = activation1d(g, w, &format!("{prefix}.acts1.{i}"), x)?;
         let xt = conv1d(
@@ -241,14 +291,14 @@ fn amp_block(
 }
 
 /// x: [T, 128, 1] stacked stereo mels -> [T * prod(up_rates), 2, 1]
-fn vocoder(
-    g: &Ctx,
-    w: &Weights,
+fn vocoder<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
     prefix: &str,
-    mut x: Tensor,
+    mut x: Tensor<'g>,
     up_rates: &[i32],
     clamp_output: bool,
-) -> Result<Tensor> {
+) -> Result<Tensor<'g>> {
     const KERNELS: [i32; 3] = [3, 7, 11];
     const DIL: [i32; 3] = [1, 3, 5];
     x = conv1d(g, w, &format!("{prefix}.conv_pre"), x, 3, 1)?;
@@ -282,7 +332,13 @@ fn vocoder(
 
 /// Causal log-mel of one channel [T, 1, 1] -> [frames, n_mels, 1].
 /// One channel at a time: ggml_conv_1d only lays out its output correctly for a batch of one.
-fn mel_stft(g: &Ctx, w: &Weights, mut x: Tensor, n_fft: i32, hop: i32) -> Result<Tensor> {
+fn mel_stft<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    mut x: Tensor<'g>,
+    n_fft: i32,
+    hop: i32,
+) -> Result<Tensor<'g>> {
     let basis = w.get("vocoder.mel_stft.stft_fn.forward_basis")?; // [n_fft, 1, 2 * n_freqs]
     let melb = w.get("vocoder.mel_stft.mel_basis")?; // [n_freqs, n_mels]
     x = g.pad_ext(x, n_fft - hop, 0, 0, 0, 0, 0, 0, 0);
@@ -349,11 +405,11 @@ pub fn decode(model: &Model, be: &Backend, lat: &AudioLatent) -> Result<(i32, i3
         }
     }
 
-    let mut g = Graph::new(be.api, 64 * 1024)?;
+    let g = Graph::new(be.api, 64 * 1024)?;
     let zt = g.input_f32(&[fq, t, c, 1], &z, "audio_latent");
     let (hf, pad, pad_left, pad_right) = hann_resample_filter(3);
     let hfilt = g.input_f32(&[hf.len() as i64, 1, 1], &hf, "resample_filter");
-    let ctx = &g.ctx;
+    let ctx = &g;
 
     // vae decoder: -> [64, T_mel, 2, 1]
     let mut mel = avae_decode(ctx, w, zt, 3, 2)?;

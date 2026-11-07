@@ -12,7 +12,7 @@ use std::time::Instant;
 use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
 
-use super::backend::{Backend, Ctx, Graph, Resident};
+use super::backend::{Backend, Graph, Resident};
 use super::cosmos3::{self, dit as qwen3, read_json};
 use super::ffi::{self, Api, Tensor};
 use super::wan_vae;
@@ -430,7 +430,7 @@ impl Model {
         let shapes: Vec<[i64; 2]> = (0..2 * hp.layers).map(|_| [dim, n]).collect();
         let refs: Vec<&[i64]> = shapes.iter().map(|s| s.as_slice()).collect();
         let kv = Resident::new(be, ffi::ty::F32, &refs)?;
-        let mut gr = Graph::new(be.api, 4096 + hp.layers as usize * 128)?;
+        let gr = Graph::new(be.api, 4096 + hp.layers as usize * 128)?;
         let ctx_t = gr.input_f32(&[ctx_dim, n], hidden, "context");
         let temb = gr.input_f32(&[256], &qwen3::timestep_embedding(0.0), "temb");
         let pos: Vec<[f64; 3]> = (0..n).map(|i| [i as f64; 3]).collect();
@@ -438,7 +438,7 @@ impl Model {
         let cos_t = gr.input_f32(&[hp.head_dim / 2, n], &cos, "cos");
         let sin_t = gr.input_f32(&[hp.head_dim / 2, n], &sin, "sin");
         let mask = gr.input_f32(&[n, n], &qwen3::causal_mask(n), "mask");
-        let g = &gr.ctx;
+        let g = &gr;
         let (_, m) = modulation(g, w, temb)?;
         // txt_in: zero-centered RMSNorm, then a GELU MLP
         let y = g.modulate(
@@ -451,8 +451,8 @@ impl Model {
         for l in 0..hp.layers {
             let last = l == hp.layers - 1;
             x = block(g, w, hp, l, x, &m, cos_t, sin_t, |q, k, v| {
-                gr.store(k, kv.tensors[2 * l as usize]);
-                gr.store(v, kv.tensors[2 * l as usize + 1]);
+                gr.store(k, kv.tensor(2 * l as usize));
+                gr.store(v, kv.tensor(2 * l as usize + 1));
                 // the last block's output is never read
                 (!last).then(|| qwen3::sdpa_gqa(g, q, k, v, hp.heads, hp.heads, Some(mask), false))
             })?;
@@ -477,19 +477,19 @@ impl Model {
         let w = self.dit.as_ref().expect("transformer loaded");
         let hp = &self.hp;
         let n = lh * lw;
-        let mut gr = Graph::new(be.api, 4096 + hp.layers as usize * 128)?;
+        let gr = Graph::new(be.api, 4096 + hp.layers as usize * 128)?;
         let x_t = gr.input_f32(&[hp.in_channels, n], x, "latents");
         let temb = gr.input_f32(&[256], &qwen3::timestep_embedding(t), "temb");
         let (cos, sin) = rope_tables(hp, &image_positions(prefix.n, lh, lw));
         let cos_t = gr.input_f32(&[hp.head_dim / 2, n], &cos, "cos");
         let sin_t = gr.input_f32(&[hp.head_dim / 2, n], &sin, "sin");
-        let g = &gr.ctx;
+        let g = &gr;
         let (tt, m) = modulation(g, w, temb)?;
         let mut x = g.linear(x_t, w.get("img_in.weight")?, None);
         for l in 0..hp.layers {
             let (pk, pv) = (
-                prefix.kv.tensors[2 * l as usize],
-                prefix.kv.tensors[2 * l as usize + 1],
+                prefix.kv.tensor(2 * l as usize),
+                prefix.kv.tensor(2 * l as usize + 1),
             );
             x = block(g, w, hp, l, x, &m, cos_t, sin_t, |q, k, v| {
                 let kk = g.concat(pk, g.cont(k), 1);
@@ -692,7 +692,11 @@ fn rope_tables(hp: &Hparams, positions: &[[f64; 3]]) -> (Vec<f32>, Vec<f32>) {
 }
 
 /// The shared modulation: `silu(temb)` and `[scale1, tanh(gate1), scale2, tanh(gate2)]`.
-fn modulation(g: &Ctx, w: &Weights, temb: Tensor) -> Result<(Tensor, [Tensor; 4])> {
+fn modulation<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    temb: Tensor<'g>,
+) -> Result<(Tensor<'g>, [Tensor<'g>; 4])> {
     let te = g.linear(
         g.reshape_2d(temb, 256, 1),
         w.get("time_text_embed.timestep_embedder.linear_1.weight")?,
@@ -712,7 +716,7 @@ fn modulation(g: &Ctx, w: &Weights, temb: Tensor) -> Result<(Tensor, [Tensor; 4]
 
 /// Interleaved rotary pairs `(2i, 2i+1)` of each head moved to `(i, i + hd/2)`.
 /// Queries and keys only meet in dot products, so they stay permuted.
-fn halves(g: &Ctx, x: Tensor, hd: i64) -> Tensor {
+fn halves<'g>(g: &'g Graph<'g>, x: Tensor<'g>, hd: i64) -> Tensor<'g> {
     let [dim, t, ..] = x.shape();
     let x4 = g.reshape_4d(g.cont(x), 2, hd / 2, dim / hd, t);
     g.reshape_2d(g.cont(g.permute(x4, 1, 0, 2, 3)), dim, t)
@@ -720,17 +724,17 @@ fn halves(g: &Ctx, x: Tensor, hd: i64) -> Tensor {
 
 /// One `QwenImage21TransformerBlock`; `attend(q, k, v)` runs the attention
 /// (`None` when the block's output is not needed).
-fn block(
-    g: &Ctx,
-    w: &Weights,
+fn block<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
     hp: &Hparams,
     l: i64,
-    x: Tensor,
-    m: &[Tensor; 4],
-    cos: Tensor,
-    sin: Tensor,
-    attend: impl FnOnce(Tensor, Tensor, Tensor) -> Option<Tensor>,
-) -> Result<Tensor> {
+    x: Tensor<'g>,
+    m: &[Tensor<'g>; 4],
+    cos: Tensor<'g>,
+    sin: Tensor<'g>,
+    attend: impl FnOnce(Tensor<'g>, Tensor<'g>, Tensor<'g>) -> Option<Tensor<'g>>,
+) -> Result<Tensor<'g>> {
     let p = format!("transformer_blocks.{l}");
     let wt = |s: &str| w.get(&format!("{p}.{s}.weight"));
     let hd = hp.head_dim;
