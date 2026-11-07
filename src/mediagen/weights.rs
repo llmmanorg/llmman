@@ -258,7 +258,10 @@ pub struct Weights {
     api: &'static Api,
     _ctx: Ctx,
     buf: GgmlBackendBuffer,
-    tensors: HashMap<String, Tensor>,
+    /// Raw, since a handle would borrow `_ctx` inside the same struct;
+    /// [`Weights::get`] and [`Weights::opt`] hand them out borrowed from
+    /// `self`.
+    tensors: HashMap<String, ffi::TensorPtr>,
 }
 
 unsafe impl Send for Weights {}
@@ -272,15 +275,16 @@ impl Drop for Weights {
 }
 
 impl Weights {
-    pub fn get(&self, name: &str) -> Result<Tensor> {
-        self.tensors
-            .get(name)
-            .copied()
+    pub fn get(&self, name: &str) -> Result<Tensor<'_>> {
+        self.opt(name)
             .ok_or_else(|| anyhow!("missing tensor {name:?}"))
     }
 
-    pub fn opt(&self, name: &str) -> Option<Tensor> {
-        self.tensors.get(name).copied()
+    pub fn opt(&self, name: &str) -> Option<Tensor<'_>> {
+        let ptr = *self.tensors.get(name)?;
+        // SAFETY: the pointer came from `_ctx`, whose tensors live in `buf`
+        // for as long as self.
+        Some(unsafe { Tensor::from_raw(ptr, self) })
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -362,7 +366,8 @@ impl Weights {
             bail!("{} paths but {} indices", paths.len(), idxs.len());
         }
         struct Item {
-            dst: Tensor,
+            dst: ffi::TensorPtr,
+            dst_ty: u32,
             src: TensorDesc,
             file: usize,
             tap: i32,
@@ -412,9 +417,10 @@ impl Weights {
                     let t = ctx.new_tensor(ty, &[d.ne[0], d.ne[1], d.ne[3], d.ne[4]]);
                     let tname = format!("{name}.t{k}");
                     ctx.set_name(t, &tname);
-                    tensors.insert(tname.clone(), t);
+                    tensors.insert(tname.clone(), t.as_ptr());
                     plan.push(Item {
-                        dst: t,
+                        dst: t.as_ptr(),
+                        dst_ty: t.dtype(),
                         src: d.clone(),
                         file,
                         tap: k as i32,
@@ -428,9 +434,10 @@ impl Weights {
             }
             let t = ctx.new_tensor(ty, &d.ne);
             ctx.set_name(t, &name);
-            tensors.insert(name.clone(), t);
+            tensors.insert(name.clone(), t.as_ptr());
             plan.push(Item {
-                dst: t,
+                dst: t.as_ptr(),
+                dst_ty: t.dtype(),
                 src: d.clone(),
                 file,
                 tap: -1,
@@ -484,8 +491,8 @@ impl Weights {
             {
                 bail!("tensor {}: data past the end of the file", d.name);
             }
-            let dst_bytes = unsafe { (api.ggml_nbytes)(item.dst.as_ptr()) };
-            let dst_ty = item.dst.dtype();
+            let dst_bytes = unsafe { (api.ggml_nbytes)(item.dst) };
+            let dst_ty = item.dst_ty;
             read_buf.resize(src_bytes, 0);
             f.seek(SeekFrom::Start(d.offset))?;
             f.read_exact(&mut read_buf)
@@ -507,7 +514,7 @@ impl Weights {
                 }
                 &conv_buf
             };
-            let n = unsafe { (api.ggml_nelements)(item.dst.as_ptr()) };
+            let n = unsafe { (api.ggml_nelements)(item.dst) };
             let converted = convert(api, d.ty, dst_ty, src, n)?;
             let mut data = converted.unwrap_or_else(|| src.to_vec());
             if dst_ty == ffi::ty::F32 {
@@ -531,12 +538,7 @@ impl Weights {
                 );
             }
             unsafe {
-                (api.ggml_backend_tensor_set)(
-                    item.dst.as_ptr(),
-                    data.as_ptr() as *const _,
-                    0,
-                    dst_bytes,
-                )
+                (api.ggml_backend_tensor_set)(item.dst, data.as_ptr() as *const _, 0, dst_bytes)
             };
         }
         eprintln!(
