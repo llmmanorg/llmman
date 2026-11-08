@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 
 use super::decoder::{self, Decoder};
 use super::encoder::Encoder;
-use super::mel::{self, MelConfig, MelError, Normalize};
+use super::mel::{FeatureExtractor, MelConfig, MelError, Normalize};
 use super::model::{CanaryModel, Frontend};
 use super::prompt::PromptError;
 use super::wav::{self, WavError};
@@ -231,8 +231,9 @@ pub struct Worker {
     enc: Encoder,
     dec: Decoder,
     be: Backend,
-    /// The front end the file asks for ([`mel_config`]).
-    mel: MelConfig,
+    /// The front end the file asks for ([`mel_front_end`]), its tables
+    /// built once here and read by every clip.
+    mel: FeatureExtractor,
 }
 
 /// Shortest hop the worker computes, 5 ms: a clip then yields at most
@@ -246,15 +247,15 @@ const MAX_HOP: u64 = (CLIP_SECONDS * SAMPLE_RATE / 2) as u64;
 /// Longest FFT the worker computes, eight times the recipe's.
 const MAX_N_FFT: u64 = 4096;
 
-/// The mel front end `frontend` (`stt.frontend.*`) describes, or why
-/// this worker cannot compute it: the file must ask for log-mel features
-/// over a Hann window at 16 kHz, the one rate the WAV parser admits, with
-/// per-feature or no normalization. Every numeric setting is honoured
-/// and range-checked, so a file with another hop or FFT size gets the
-/// frames it expects instead of the default recipe's; the hop stays
-/// within [`MIN_HOP`] and [`MAX_HOP`] and the FFT within [`MAX_N_FFT`],
-/// so a header cannot make one clip arbitrarily expensive.
-pub fn mel_config(frontend: &Frontend) -> Result<MelConfig> {
+/// The mel front end `frontend` (`stt.frontend.*`) describes, with its
+/// tables built, or why this worker cannot compute it: the file must ask
+/// for log-mel features over a Hann window at 16 kHz, the one rate the
+/// WAV parser admits, with per-feature or no normalization. Every numeric
+/// setting is honoured and range-checked, so a file with another hop or
+/// FFT size gets the frames it expects instead of the default recipe's;
+/// the hop stays within [`MIN_HOP`] and [`MAX_HOP`] and the FFT within
+/// [`MAX_N_FFT`], so a header cannot make one clip arbitrarily expensive.
+pub fn mel_front_end(frontend: &Frontend) -> Result<FeatureExtractor> {
     if frontend.kind != "mel" {
         bail!(
             "stt.frontend.type {:?}: only mel features are computed",
@@ -313,15 +314,15 @@ pub fn mel_config(frontend: &Frontend) -> Result<MelConfig> {
     };
     // The field checks, then the filterbank the fields describe: a header
     // the fields admit can still yield weights the features cannot use.
-    mel::filterbank(&cfg).map_err(|e| anyhow::anyhow!("stt.frontend: {e}"))?;
-    Ok(cfg)
+    // The tables built here serve every clip of every request.
+    FeatureExtractor::new(cfg).map_err(|e| anyhow::anyhow!("stt.frontend: {e}"))
 }
 
 impl Worker {
     /// Checks the model against the encoder and decoder graphs and its
-    /// front end against what [`mel_config`] computes.
+    /// front end against what [`mel_front_end`] computes.
     pub fn new(be: Backend, model: CanaryModel) -> Result<Worker> {
-        let mel = mel_config(&model.hp().frontend)?;
+        let mel = mel_front_end(&model.hp().frontend)?;
         let enc = Encoder::new(&model, &be)?;
         let dec = Decoder::new(&model)?;
         Ok(Worker {
@@ -359,7 +360,7 @@ impl Worker {
 
     /// Mel features, encoder and decoder over one clip.
     fn transcribe_clip(&mut self, samples: &[i16], language: &str) -> Result<String, Error> {
-        let mel = mel::features(samples, &self.mel).map_err(|e| match e {
+        let mel = self.mel.features(samples).map_err(|e| match e {
             MelError::TooShort => Error::Invalid(format!("the audio is too short: {e}")),
             MelError::InvalidConfig(_) => Error::Failed(e.to_string()),
         })?;
@@ -748,10 +749,10 @@ mod tests {
     /// the worker cannot compute is refused by name at load, not
     /// transcribed with the wrong preprocessing.
     #[test]
-    fn mel_config_follows_the_frontend_and_refuses_what_it_cannot_compute() {
+    fn mel_front_end_follows_the_frontend_and_refuses_what_it_cannot_compute() {
         assert_eq!(
-            mel_config(&pinned_frontend()).unwrap(),
-            MelConfig {
+            mel_front_end(&pinned_frontend()).unwrap().config(),
+            &MelConfig {
                 preemph: f64::from(0.97f32),
                 ..MelConfig::default()
             }
@@ -759,42 +760,42 @@ mod tests {
 
         let mut hop = pinned_frontend();
         hop.hop_length = 320;
-        assert_eq!(mel_config(&hop).unwrap().hop, 320);
+        assert_eq!(mel_front_end(&hop).unwrap().config().hop, 320);
 
         let mut window = pinned_frontend();
         window.window = "hamming".into();
-        let err = mel_config(&window).unwrap_err().to_string();
+        let err = mel_front_end(&window).unwrap_err().to_string();
         assert!(err.contains("stt.frontend.window"), "{err}");
 
         let mut rate = pinned_frontend();
         rate.sample_rate = 8_000;
-        let err = mel_config(&rate).unwrap_err().to_string();
+        let err = mel_front_end(&rate).unwrap_err().to_string();
         assert!(err.contains("sample_rate"), "{err}");
 
         let mut fft = pinned_frontend();
         fft.n_fft = 500;
-        let err = mel_config(&fft).unwrap_err().to_string();
+        let err = mel_front_end(&fft).unwrap_err().to_string();
         assert!(err.contains("power of two"), "{err}");
 
         // A header cannot make a clip arbitrarily expensive.
         let mut tiny_hop = pinned_frontend();
         tiny_hop.hop_length = 1;
-        let err = mel_config(&tiny_hop).unwrap_err().to_string();
+        let err = mel_front_end(&tiny_hop).unwrap_err().to_string();
         assert!(err.contains("hop_length"), "{err}");
         let mut huge_hop = pinned_frontend();
         huge_hop.hop_length = MAX_HOP + 1;
-        let err = mel_config(&huge_hop).unwrap_err().to_string();
+        let err = mel_front_end(&huge_hop).unwrap_err().to_string();
         assert!(err.contains("hop_length"), "{err}");
         let mut huge_fft = pinned_frontend();
         huge_fft.n_fft = 65_536;
-        let err = mel_config(&huge_fft).unwrap_err().to_string();
+        let err = mel_front_end(&huge_fft).unwrap_err().to_string();
         assert!(err.contains("n_fft"), "{err}");
 
         // The fields pass, the filterbank they describe does not: refused
         // at load, not on every request.
         let mut subnormal = pinned_frontend();
         subnormal.f_max = f32::from_bits(1);
-        let err = mel_config(&subnormal).unwrap_err().to_string();
+        let err = mel_front_end(&subnormal).unwrap_err().to_string();
         assert!(err.contains("filterbank"), "{err}");
     }
 
