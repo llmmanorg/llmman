@@ -4555,14 +4555,23 @@ fn speech_worker_transcribes_the_fixture() {
         .map(|(_, _, took)| *took)
         .fold(first, Duration::min);
 
-    // A client that leaves mid-decode: the whole POST goes out on a raw
-    // socket, which closes 300 ms later. The next request then takes
-    // about one decode when the abandoned one was cancelled, and about
-    // two when it ran on under the worker lock.
+    // Three copies of the fixture, 31.7 s, above the 30 s clip cap: two
+    // clips of 15.85 s. Used twice below: as the request a client
+    // abandons, and as the long file transcribed whole.
+    let samples = llmman::speech::wav::parse(&wav, usize::MAX).expect("the fixture is a PCM16 WAV");
+    let long = pcm16_wav(&samples.repeat(3));
+
+    // A client that leaves mid-decode: the whole POST of the three-copy
+    // file goes out on a raw socket, which closes 300 ms later. Uncancelled,
+    // that decode would hold the worker lock for several seconds (two
+    // clips, about three decodes); cancelled in the mel stage it frees the
+    // lock within a frame block. So the next request must finish within
+    // one second of a single decode: the bound is the cancellation latency
+    // plus the next request's own variance against `single`.
     {
         use std::io::Write;
         let (content_type, body) = multipart_body(&[
-            ("file", Some("fleurs-en.wav"), &wav),
+            ("file", Some("long.wav"), &long),
             ("model", None, MODEL_REF.as_bytes()),
             ("language", None, b"en"),
         ]);
@@ -4586,20 +4595,21 @@ fn speech_worker_transcribes_the_fixture() {
         ("language", None, b"en"),
     ]);
     let after_leave = t.elapsed();
-    eprintln!("== after a client left mid-decode: {status} in {after_leave:.2?} (one decode {single:.2?}): {reply}");
+    let latency = after_leave.saturating_sub(single);
+    eprintln!(
+        "== after a client left mid-decode: {status} in {after_leave:.2?} (one decode {single:.2?}, \
+         cancellation latency bound {latency:.2?}): {reply}"
+    );
     assert_eq!(status, reqwest::StatusCode::OK, "{reply}");
     assert_eq!(reply["text"].as_str(), Some(EXPECTED), "{reply}");
     assert!(
-        after_leave < single + single / 2,
-        "the abandoned decode was not cancelled: {after_leave:.2?} after it, one decode {single:.2?}"
+        after_leave < single + Duration::from_secs(1),
+        "the abandoned decode held the lock: {after_leave:.2?} after it, one decode {single:.2?}"
     );
 
-    // Three copies of the fixture, 31.7 s, above the 30 s clip cap: two
-    // clips of 15.85 s. The first and the third copy each sit whole in a
-    // clip, so the text carries the transcript twice; the second copy
-    // straddles the cut.
-    let samples = llmman::speech::wav::parse(&wav, usize::MAX).expect("the fixture is a PCM16 WAV");
-    let long = pcm16_wav(&samples.repeat(3));
+    // The three-copy file transcribed whole: the first and the third copy
+    // each sit whole in a clip, so the text carries the transcript twice;
+    // the second copy straddles the cut.
     let t = Instant::now();
     let (status, reply) = post(&[
         ("file", Some("long.wav"), &long),
