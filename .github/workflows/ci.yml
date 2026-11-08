@@ -332,6 +332,13 @@ jobs:
       - name: cargo test --lib --bins
         run: cargo test --release --target ${{ matrix.target }} --lib --bins
 
+      # The mediagen doctests pin the tensor ownership model: four
+      # `compile_fail` blocks that must stay uncompilable and two that
+      # must compile. They need no llama.cpp library, so every target
+      # runs them against the release library the step above built.
+      - name: cargo test --doc
+        run: cargo test --release --target ${{ matrix.target }} --doc
+
   # --------------------------------------------------------------------------
   # Android app (android/, docs/android.md): the web UI in a WebView over
   # an embedded `llmman serve`, cross-compiled for aarch64-linux-android
