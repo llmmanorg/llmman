@@ -724,10 +724,18 @@ impl<'o> Graph<'o> {
     /// allocating. Panics when there is no such input or the lengths
     /// differ.
     pub fn update_input(&'o self, i: usize, bytes: &[u8]) {
+        self.fill_input(i, bytes.len(), |slot| slot.copy_from_slice(bytes));
+    }
+
+    /// The one lookup behind every input update: borrows the inputs,
+    /// finds slot `i`, checks it holds `len` bytes and hands it to `fill`
+    /// to write in place. Panics on a missing input first, then on a
+    /// length that differs.
+    fn fill_input(&'o self, i: usize, len: usize, fill: impl FnOnce(&mut [u8])) {
         let mut inputs = self.inputs.borrow_mut();
         let slot = &mut inputs.get_mut(i).expect("no such graph input").1;
-        assert_eq!(slot.len(), bytes.len(), "input size changed");
-        slot.copy_from_slice(bytes);
+        assert_eq!(slot.len(), len, "input size changed");
+        fill(slot);
     }
 
     /// [`Graph::update_input`] for an F32 input.
@@ -740,13 +748,13 @@ impl<'o> Graph<'o> {
         self.update_words(i, data.iter().map(|v| v.to_le_bytes()));
     }
 
+    /// [`Graph::fill_input`] with four-byte words written in place.
     fn update_words(&'o self, i: usize, words: impl ExactSizeIterator<Item = [u8; 4]>) {
-        let mut inputs = self.inputs.borrow_mut();
-        let slot = &mut inputs.get_mut(i).expect("no such graph input").1;
-        assert_eq!(slot.len(), words.len() * 4, "input size changed");
-        for (dst, w) in slot.as_chunks_mut::<4>().0.iter_mut().zip(words) {
-            *dst = w;
-        }
+        self.fill_input(i, words.len() * 4, |slot| {
+            for (dst, w) in slot.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+                *dst = w;
+            }
+        });
     }
 
     /// Copies `src` into the [`Resident`] tensor `dst` when the graph runs.
