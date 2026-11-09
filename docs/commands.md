@@ -6,7 +6,7 @@ reference; this is the one-line summary of each subcommand.
 | Command | Description |
 |---------|-------------|
 | `serve`   | Start an inference server (Ollama / OpenAI / Anthropic APIs) |
-| `launch`  | Launch an integration (Claude Code, OpenCode, …) |
+| `launch`  | Launch an integration (Claude Code, OpenCode, …); `--optimizer tk` compacts the output of the agent's shell commands (see [optimizers.md](optimizers.md)) |
 | `run`     | Run a model interactively or with a one-shot prompt |
 | `pull`    | Pull a model from a registry or HuggingFace |
 | `search`  | Search for models on Docker Hub and Hugging Face (Docker Hub results first), with a `FIT` column: how much of this machine's model memory each default download takes |

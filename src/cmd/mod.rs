@@ -18,6 +18,7 @@ pub mod search;
 pub mod serve;
 pub mod show;
 pub mod stop;
+pub mod tk;
 pub mod transfer;
 pub mod usage;
 pub mod verify;

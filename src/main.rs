@@ -67,6 +67,19 @@ enum Commands {
     Show(cmd::show::ShowArgs),
     /// Start an inference server (Ollama, OpenAI, Anthropic compatible APIs)
     Serve(cmd::serve::ServeArgs),
+    /// Run a command and print its output compacted (internal, used by
+    /// `launch --optimizer tk`)
+    ///
+    /// The command keeps this process's stdin, cwd and environment, and
+    /// `llmman tk` exits with its status. Filters cover `git`, `cargo`, `go`,
+    /// `pytest`, `npm|pnpm|yarn test`, `grep`, `rg` and `docker ps`; other
+    /// commands only get a generic clean-up. Commands that ask for JSON,
+    /// porcelain, a format or NUL separators, `cat`, and interactive commands
+    /// run untouched, as does everything with LLMMAN_TK=off.
+    ///
+    /// Example: llmman tk git status
+    #[command(hide = true)]
+    Tk(cmd::tk::TkArgs),
     /// Probe the local host's GPU/accelerator support (internal diagnostic)
     #[command(hide = true)]
     GpuDiscover(cmd::gpu_discover::GpuDiscoverArgs),
@@ -140,10 +153,37 @@ fn main() {
         Commands::Stop(a) => cmd::stop::run(a),
         Commands::Show(a) => cmd::show::run(a),
         Commands::Serve(a) => cmd::serve::run(a),
+        Commands::Tk(a) => cmd::tk::run(a),
         Commands::GpuDiscover(a) => cmd::gpu_discover::run(a),
     };
     if let Err(e) = result {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `tk` is an internal command: absent from the list, but it has its
+    /// own `--help` and runs anything after its name.
+    #[test]
+    fn tk_is_hidden_from_the_main_help_but_has_its_own() {
+        let help = Cli::command().render_help().to_string();
+        assert!(
+            !help.lines().any(|l| l.trim_start().starts_with("tk ")),
+            "{help}"
+        );
+        assert!(help.lines().any(|l| l.trim_start().starts_with("launch ")));
+
+        let err = Cli::command()
+            .try_get_matches_from(["llmman", "tk", "--help"])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(err.to_string().contains("llmman tk git status"), "{err}");
+
+        let parsed = Cli::try_parse_from(["llmman", "tk", "git", "diff", "--stat"]).unwrap();
+        assert!(matches!(parsed.command, Some(Commands::Tk(_))));
     }
 }
