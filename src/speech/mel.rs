@@ -368,81 +368,132 @@ pub fn frame_count(len: usize, cfg: &MelConfig) -> usize {
 /// Single-threaded and deterministic: the same input and config give the
 /// same bits on every run.
 ///
+/// This builds a [`FeatureExtractor`] for `cfg` and runs it once. A
+/// caller with one config and many inputs, such as the speech worker,
+/// keeps an extractor instead and skips the three table builds per call.
+///
 /// # Errors
 /// `InvalidConfig` when a `cfg` field is out of range (see `validate`) or
 /// its filterbank is unusable (see `filterbank`), and `TooShort` when
 /// per-feature normalization gets fewer than two frames, that is fewer
 /// than `2 * hop` samples.
 pub fn features(pcm: &[i16], cfg: &MelConfig) -> Result<Vec<f32>, MelError> {
-    let fb = filterbank(cfg)?;
-    let frames = frame_count(pcm.len(), cfg);
-    if cfg.normalize == Normalize::PerFeature && frames < 2 {
-        return Err(MelError::TooShort);
-    }
-    let pad = cfg.n_fft / 2;
-
-    // Pre-emphasis first, then constant zero padding; `prev` starts at 0
-    // so y[0] = x[0] exactly.
-    let mut signal = vec![0.0f64; pcm.len() + 2 * pad];
-    let mut prev = 0.0;
-    for (dst, &s) in signal[pad..].iter_mut().zip(pcm) {
-        let x = f64::from(s) / 32768.0;
-        *dst = x - cfg.preemph * prev;
-        prev = x;
-    }
-
-    let mut framer = Framer {
-        cfg,
-        signal: &signal,
-        window: hann_symmetric(cfg.win_length),
-        fb,
-        twiddles: twiddles(cfg.n_fft),
-        scratch: vec![Complex::default(); cfg.n_fft],
-        row: vec![0.0; cfg.n_mels],
-    };
-    let mut out = vec![0.0f32; frames * cfg.n_mels];
-
-    if cfg.normalize == Normalize::None {
-        for (t, dst) in out.chunks_exact_mut(cfg.n_mels).enumerate() {
-            for (d, &v) in dst.iter_mut().zip(framer.log_mel(t)) {
-                *d = v as f32;
-            }
-        }
-        return Ok(out);
-    }
-
-    // Welford's update keeps a constant bin at exactly zero variance.
-    let mut mean = vec![0.0f64; cfg.n_mels];
-    let mut m2 = vec![0.0f64; cfg.n_mels];
-    for t in 0..frames {
-        let k = (t + 1) as f64;
-        for ((mu, acc), &v) in mean.iter_mut().zip(&mut m2).zip(framer.log_mel(t)) {
-            let delta = v - *mu;
-            *mu += delta / k;
-            *acc += delta * (v - *mu);
-        }
-    }
-    for acc in &mut m2 {
-        *acc = (*acc / (frames - 1) as f64).sqrt() + STD_FLOOR;
-    }
-    let std = m2;
-    for (t, dst) in out.chunks_exact_mut(cfg.n_mels).enumerate() {
-        let row = framer.log_mel(t);
-        for (((d, &v), &mu), &s) in dst.iter_mut().zip(row).zip(&mean).zip(&std) {
-            *d = ((v - mu) / s) as f32;
-        }
-    }
-    Ok(out)
+    FeatureExtractor::new(cfg.clone())?.features(pcm)
 }
 
-/// Per-frame state of `features`: the padded signal plus the buffers
-/// reused by every frame.
-struct Framer<'a> {
-    cfg: &'a MelConfig,
-    signal: &'a [f64],
+/// A mel front end prepared for one [`MelConfig`]: the symmetric Hann
+/// window, the checked Slaney filterbank and the FFT twiddle table, built
+/// once by [`FeatureExtractor::new`] and read by every
+/// [`FeatureExtractor::features`] call. The three tables are pure
+/// functions of the config, so reusing them gives the same bits as
+/// [`features`], which builds them per call. Memory held is the tables:
+/// `n_mels * (n_fft / 2 + 1)` plus `n_fft - 1` plus `win_length` values,
+/// about 330 KB for the default recipe.
+#[derive(Debug, Clone)]
+pub struct FeatureExtractor {
+    cfg: MelConfig,
     window: Vec<f64>,
     fb: Vec<f64>,
     twiddles: Vec<Complex>,
+}
+
+impl FeatureExtractor {
+    /// Checks `cfg` the way [`filterbank`] does and builds the tables.
+    ///
+    /// # Errors
+    /// Exactly what [`filterbank`] refuses, with its messages.
+    pub fn new(cfg: MelConfig) -> Result<FeatureExtractor, MelError> {
+        let fb = filterbank(&cfg)?;
+        Ok(FeatureExtractor {
+            window: hann_symmetric(cfg.win_length),
+            fb,
+            twiddles: twiddles(cfg.n_fft),
+            cfg,
+        })
+    }
+
+    /// The config the tables were built for.
+    pub fn config(&self) -> &MelConfig {
+        &self.cfg
+    }
+
+    /// [`features`] over this extractor's config and tables.
+    ///
+    /// # Errors
+    /// `TooShort` when per-feature normalization gets fewer than two
+    /// frames; the config errors were raised by [`FeatureExtractor::new`].
+    pub fn features(&self, pcm: &[i16]) -> Result<Vec<f32>, MelError> {
+        let cfg = &self.cfg;
+        let frames = frame_count(pcm.len(), cfg);
+        if cfg.normalize == Normalize::PerFeature && frames < 2 {
+            return Err(MelError::TooShort);
+        }
+        let pad = cfg.n_fft / 2;
+
+        // Pre-emphasis first, then constant zero padding; `prev` starts at
+        // 0 so y[0] = x[0] exactly.
+        let mut signal = vec![0.0f64; pcm.len() + 2 * pad];
+        let mut prev = 0.0;
+        for (dst, &s) in signal[pad..].iter_mut().zip(pcm) {
+            let x = f64::from(s) / 32768.0;
+            *dst = x - cfg.preemph * prev;
+            prev = x;
+        }
+
+        let mut framer = Framer {
+            cfg,
+            signal: &signal,
+            window: &self.window,
+            fb: &self.fb,
+            twiddles: &self.twiddles,
+            scratch: vec![Complex::default(); cfg.n_fft],
+            row: vec![0.0; cfg.n_mels],
+        };
+        let mut out = vec![0.0f32; frames * cfg.n_mels];
+
+        if cfg.normalize == Normalize::None {
+            for (t, dst) in out.chunks_exact_mut(cfg.n_mels).enumerate() {
+                for (d, &v) in dst.iter_mut().zip(framer.log_mel(t)) {
+                    *d = v as f32;
+                }
+            }
+            return Ok(out);
+        }
+
+        // Welford's update keeps a constant bin at exactly zero variance.
+        let mut mean = vec![0.0f64; cfg.n_mels];
+        let mut m2 = vec![0.0f64; cfg.n_mels];
+        for t in 0..frames {
+            let k = (t + 1) as f64;
+            for ((mu, acc), &v) in mean.iter_mut().zip(&mut m2).zip(framer.log_mel(t)) {
+                let delta = v - *mu;
+                *mu += delta / k;
+                *acc += delta * (v - *mu);
+            }
+        }
+        for acc in &mut m2 {
+            *acc = (*acc / (frames - 1) as f64).sqrt() + STD_FLOOR;
+        }
+        let std = m2;
+        for (t, dst) in out.chunks_exact_mut(cfg.n_mels).enumerate() {
+            let row = framer.log_mel(t);
+            for (((d, &v), &mu), &s) in dst.iter_mut().zip(row).zip(&mean).zip(&std) {
+                *d = ((v - mu) / s) as f32;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Per-frame state of one [`FeatureExtractor::features`] call: the padded
+/// signal and the extractor's tables, plus the scratch buffers reused by
+/// every frame.
+struct Framer<'a> {
+    cfg: &'a MelConfig,
+    signal: &'a [f64],
+    window: &'a [f64],
+    fb: &'a [f64],
+    twiddles: &'a [Complex],
     scratch: Vec<Complex>,
     row: Vec<f64>,
 }
@@ -461,11 +512,11 @@ impl Framer<'_> {
         for ((dst, &x), &w) in self.scratch[win_offset..]
             .iter_mut()
             .zip(frame)
-            .zip(&self.window)
+            .zip(self.window)
         {
             dst.re = x * w;
         }
-        fft(&mut self.scratch, &self.twiddles);
+        fft(&mut self.scratch, self.twiddles);
         // Power spectrum in place: only the real part of the first
         // n_bins entries is read below.
         for c in &mut self.scratch[..n_bins] {
@@ -489,6 +540,22 @@ mod tests {
 
     /// Bin spacing in Hz for the default config.
     const BIN_HZ: f64 = 16_000.0 / 512.0;
+
+    /// Hash of the features' f32 bit patterns on the pinned signal under
+    /// the default recipe, taken before the extractor existed.
+    const GOLDEN_DEFAULT_RECIPE_HASH: u64 = 11_752_689_296_640_047_510;
+
+    /// FNV-1a over the bit patterns, so one ULP anywhere changes it.
+    fn fnv1a_of_f32_bits(values: &[f32]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for v in values {
+            for byte in v.to_bits().to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
+    }
 
     /// Deterministic values in [-1, 1) from a 64-bit LCG (Knuth MMIX
     /// constants), so the test needs no rand crate.
@@ -1084,6 +1151,60 @@ mod tests {
             }
         }
         assert!(checked > 100, "only {checked} bins carry energy");
+    }
+
+    /// A prepared extractor gives the same bits as the per-call wrapper
+    /// under two configs, and refuses at construction what `filterbank`
+    /// refuses per call.
+    #[test]
+    fn extractor_matches_the_per_call_wrapper_and_refuses_the_same_configs() {
+        let pcm: Vec<i16> = pseudo_random(16_000, 7)
+            .into_iter()
+            .map(|v| (v * 12_000.0) as i16)
+            .collect();
+        let wide = MelConfig {
+            n_fft: 1024,
+            win_length: 800,
+            hop: 320,
+            n_mels: 80,
+            ..MelConfig::default()
+        };
+        for cfg in [MelConfig::default(), wide] {
+            let extractor = FeatureExtractor::new(cfg.clone()).unwrap();
+            assert_eq!(extractor.config(), &cfg);
+            let a = extractor.features(&pcm).unwrap();
+            let b = extractor.features(&pcm).unwrap();
+            let c = features(&pcm, &cfg).unwrap();
+            assert_eq!(a, b);
+            assert_eq!(a, c);
+        }
+        // Both paths share the arithmetic, so their agreement alone would
+        // not notice a change that moved both; the default recipe's output
+        // on this signal is pinned by a hash of its bit patterns, recorded
+        // from the per-call implementation before the extractor existed.
+        let pinned = features(&pcm, &MelConfig::default()).unwrap();
+        assert_eq!(
+            fnv1a_of_f32_bits(&pinned),
+            GOLDEN_DEFAULT_RECIPE_HASH,
+            "the default recipe's output on the pinned signal changed"
+        );
+
+        let subnormal = MelConfig {
+            f_max: f64::from(f32::from_bits(1)),
+            ..MelConfig::default()
+        };
+        let sparse = MelConfig {
+            n_fft: 2,
+            win_length: 2,
+            n_mels: 2,
+            ..MelConfig::default()
+        };
+        for cfg in [subnormal, sparse] {
+            let expected = filterbank(&cfg).unwrap_err();
+            let err = FeatureExtractor::new(cfg.clone()).unwrap_err();
+            assert_eq!(err, expected);
+            assert_eq!(features(&[0; 320], &cfg).unwrap_err(), expected);
+        }
     }
 
     #[test]
