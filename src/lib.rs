@@ -31,6 +31,7 @@ pub mod sources;
 pub mod speech;
 pub mod storage;
 pub mod thinking;
+pub mod tk;
 pub mod usage;
 pub mod verify;
 pub mod webui;

@@ -1,7 +1,11 @@
 //! `llmman launch claude`.
 
 use super::common;
-use super::{exec_with_env_removing, find_on_path, has_forwarded_model_flag, server};
+use super::optimizer::{Addition, Optimizer};
+use super::{
+    before_terminator, exec_with_env_removing, find_on_path, has_flag, has_forwarded_model_flag,
+    server,
+};
 
 /// Inherited variables that point claude at another provider or credential.
 const CLAUDE_ENV_TO_CLEAR: &[&str] = &[
@@ -44,8 +48,10 @@ pub(super) fn launch_claude(
     api_key: &str,
     context_window: Option<u64>,
     extra_args: &[String],
+    optimizer: Optimizer,
 ) -> anyhow::Result<()> {
     let bin = find_on_path("claude").ok_or_else(|| anyhow::anyhow!("claude is not installed"))?;
+    let added = optimizer.addition("claude")?;
     let server = server();
     let session_model = session_model(model, extra_args);
     let window = claude_context_window(
@@ -55,12 +61,48 @@ pub(super) fn launch_claude(
     )
     // an image sandbox does not inherit the caller's
     .or_else(|| std::env::var(CLAUDE_MAX_CONTEXT_ENV).ok());
-    exec_with_env_removing(
-        &bin,
-        &claude_args(model, extra_args),
-        &claude_env(session_model, api_key, &server, window.as_deref()),
-        CLAUDE_ENV_TO_CLEAR,
-    )
+    let (args, env) = with_addition(
+        claude_args(model, extra_args),
+        claude_env(session_model, api_key, &server, window.as_deref()),
+        &added,
+    );
+    if let Some(notice) = optimizer.notice("claude") {
+        eprintln!("{notice}");
+    }
+    exec_with_env_removing(&bin, &args, &env, CLAUDE_ENV_TO_CLEAR)
+}
+
+/// `args` and `env` with what an optimizer adds: its arguments first, its
+/// variables last. An empty [`Addition`] returns both as they were.
+fn with_addition<'a>(
+    mut args: Vec<String>,
+    mut env: Vec<(&'a str, &'a str)>,
+    added: &'a Addition,
+) -> (Vec<String>, Vec<(&'a str, &'a str)>) {
+    args.splice(0..0, added.args.iter().cloned());
+    env.extend(added.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    (args, env)
+}
+
+/// What in `extra_args` keeps `--optimizer tk` from working with claude:
+/// claude keeps only the last `--settings`; `--bare` skips hooks; the hook
+/// cannot see `--disallowedTools` rules or the project settings that
+/// `--setting-sources` can exclude.
+pub(super) fn optimizer_conflict(extra_args: &[String]) -> Option<&'static str> {
+    let args = before_terminator(extra_args);
+    if has_flag(args, "--settings", None) {
+        Some("--settings after --: claude keeps only the last one, so llmman's hook and yours could not both apply.\nPut your settings in a settings file, or launch without --optimizer.")
+    } else if has_flag(args, "--bare", None) {
+        Some("--bare after --: claude skips hooks then, so nothing would be compacted.")
+    } else if has_flag(args, "--disallowedTools", None)
+        || has_flag(args, "--disallowed-tools", None)
+    {
+        Some("--disallowedTools after --: claude checks those rules against the command as rewritten, which a rewrite could slip past.\nPut the rules in a settings file, or launch without --optimizer.")
+    } else if has_flag(args, "--setting-sources", None) {
+        Some("--setting-sources after --: the hook reads project settings files that claude would then skip, so it could approve a command claude would ask about.\nLaunch without --setting-sources, or without --optimizer.")
+    } else {
+        None
+    }
 }
 
 /// The value for [`CLAUDE_MAX_CONTEXT_ENV`]: `launch`'s window for llmman's
@@ -313,5 +355,69 @@ mod tests {
         for key in CLAUDE_ENV_TO_CLEAR {
             assert!(env.iter().all(|(name, _)| name != key), "{key}");
         }
+    }
+
+    fn strings(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--optimizer none` is a launch of today: the same arguments and the
+    /// same environment, in the same order.
+    #[test]
+    fn no_optimizer_leaves_the_arguments_and_environment_as_they_were() {
+        let added = Optimizer::None.addition("claude").unwrap();
+        for extra in [
+            strings(&[]),
+            strings(&["-p", "hi"]),
+            strings(&["--model", "o"]),
+        ] {
+            let args = claude_args("local/model", &extra);
+            let env = claude_env("local/model", "secret", "http://h", Some("1024"));
+            let (new_args, new_env) = with_addition(args.clone(), env.clone(), &added);
+            assert_eq!(new_args, args);
+            assert_eq!(new_env, env);
+        }
+    }
+
+    #[test]
+    fn tk_registers_its_hook_with_a_settings_argument_before_the_rest() {
+        let added = Optimizer::Tk
+            .addition_with("claude", std::path::Path::new("/opt/llmman"))
+            .unwrap();
+        let args = claude_args("local/model", &strings(&["-p", "hi"]));
+        let env = claude_env("local/model", "secret", "http://h", None);
+        let (new_args, new_env) = with_addition(args.clone(), env.clone(), &added);
+        assert_eq!(new_args[0], "--settings");
+        let settings: serde_json::Value = serde_json::from_str(&new_args[1]).unwrap();
+        let hook = &settings["hooks"]["PreToolUse"][0];
+        assert_eq!(hook["matcher"], "Bash");
+        assert_eq!(hook["hooks"][0]["command"], "'/opt/llmman' tk hook");
+        // Everything claude was started with is still there, in order.
+        assert_eq!(&new_args[2..], &args[..]);
+        assert_eq!(new_env, env);
+        // Nothing of the caller's, or of llmman's key, is in the settings.
+        assert!(!new_args[1].contains("secret"));
+    }
+
+    #[test]
+    fn conflicting_forwarded_flags_are_found_only_before_a_second_terminator() {
+        assert!(optimizer_conflict(&strings(&["-p", "hi"])).is_none());
+        for flag in [
+            "--settings",
+            "--settings=x.json",
+            "--bare",
+            "--disallowedTools",
+            "--disallowed-tools=Bash",
+            "--setting-sources",
+            "--setting-sources=user",
+        ] {
+            assert!(
+                optimizer_conflict(&strings(&["-p", "hi", flag])).is_some(),
+                "{flag}"
+            );
+        }
+        assert!(optimizer_conflict(&strings(&["--", "--settings", "--bare"])).is_none());
+        // `--settings-x` is some other flag.
+        assert!(optimizer_conflict(&strings(&["--settings-x"])).is_none());
     }
 }

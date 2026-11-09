@@ -331,6 +331,15 @@ To stop retyping flags, set them once, e.g. `llmman config set
 launch.opencode.model claude-sonnet-5-5` (also `.provider`, `.variant`);
 flags you type still win. See [launch defaults](docs/configuration.md#launch-defaults).
 
+`--optimizer tk` (`claude` only) compacts the output of the shell commands the agent
+runs (`git status`, `cargo test`, ...) before the agent reads it, preserving
+exit codes and keeping error text; `--optimizer none` is the default and
+changes nothing. See [docs/optimizers.md](docs/optimizers.md).
+
+```
+llmman launch claude --model qwen3.8 --optimizer tk
+```
+
 Claude Code is told the model's context window in
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, so it doesn't warn that it doesn't recognize
 the model. llmman sets it when it knows a window for the launched model, the
@@ -453,5 +462,6 @@ in [docs/sandbox.md](docs/sandbox.md).
 | [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, registry mirrors, environment variables, store layout |
 | [docs/providers.md](docs/providers.md) | Hosted providers, API keys, and which integrations can use them |
 | [docs/sandbox.md](docs/sandbox.md) | `launch --sandbox`: what each sandbox shares and how it reaches the daemon |
+| [docs/optimizers.md](docs/optimizers.md) | `launch --optimizer`: what `none` and `tk` do, what `tk` filters, and its limits |
 | [docs/verification.md](docs/verification.md) | Signing models and pull-time trust policy |
 | [docs/metrics.md](docs/metrics.md) | The Prometheus `/metrics` families |

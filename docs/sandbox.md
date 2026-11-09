@@ -25,6 +25,10 @@ llmman launch codex --model qwen3.8 --sandbox microsandbox -- exec "Explain this
 
 Windows is not supported except through `sbx`.
 
+`--optimizer tk` is refused with every sandbox: its hook runs this
+machine's `llmman`, which a sandbox does not have. See
+[optimizers.md](optimizers.md).
+
 ## What the integration can reach
 
 The **workspace** is the Git work tree containing the current directory,

@@ -118,6 +118,8 @@ above:
 | `llmman launch opencode --variant high` | `anthropic`, `claude-sonnet-5-5`, `high` |
 | `llmman launch opencode --model qwen3.8` | local `qwen3.8`, no variant |
 
+`--optimizer` is not one of these keys: type it (see [optimizers.md](optimizers.md)).
+
 The two files merge one key at a time, later over earlier, and a blank
 value (`variant = ""`) clears one that the system file set. A misspelled
 integration, key or variant is rejected. If a file does not parse, a
@@ -442,6 +444,7 @@ setting may not behave identically.
 | `LLMMAN_ORIGINS` | A comma-separated list of extra allowed CORS origins for the HTTP API. A single `*` anywhere in an entry matches any substring (`http://host:*` for any port, `https://*.example.com` for any subdomain, a bare `*` for everything), same as Ollama. Always includes every scheme/port on `localhost`/`127.0.0.1`/`0.0.0.0`/`[::1]` regardless of this variable. |
 | `LLMMAN_SHELL` | The web UI's Shell (`/llmman/shell`, a terminal on the daemon's machine as the daemon's user). `0`/`false`/`no`/`off` removes it; unset (or `1`/`true`/`yes`/`on`) runs the login shell; any other value is the command to run instead, split like `LLMMAN_VLLM_ARGS`, so a quoted argument can hold a space (`tmux new -A -s llmman`, `sh -c 'exec tmux new -A'`); an unclosed quote stops `llmman serve` at startup. Regardless of this variable the shell is off whenever `LLMMAN_HOST` binds beyond loopback, requires the daemon's API key when it has one, and a browser page may only open one from an origin `LLMMAN_ORIGINS` allows. See [webui.md](webui.md). |
 | `LLMMAN_WEBUI_DIR` | Serves the web UI from this directory instead of the copy built into the binary, uncompressed and uncached, for working on it (`LLMMAN_WEBUI_DIR=webui llmman serve`). Development only. |
+| `LLMMAN_TK` | `off` makes `llmman tk`, which `llmman launch --optimizer tk` routes the agent's shell commands through, run every command untouched. See [optimizers.md](optimizers.md). |
 | `LLMMAN_SANDBOX_IMAGE` | The image `llmman launch --sandbox` runs the integration from, for `docker`, `podman`, `apple-container`, `microsandbox` and `openshell`. Defaults to Docker Sandboxes' image for the agent (`docker.io/docker/sandbox-templates:<tag>`) where one exists. Other integrations need this set. `seatbelt` runs the installed integration rather than an image. `sbx` ignores this variable and uses its own agent image. See [sandbox.md](sandbox.md#images). |
 | `LLMMAN_SCHED_SPREAD` | Truthy forwards `--split-mode layer` (spread a model across every GPU, already llama-server's own default); falsey forwards `--split-mode none` (restrict to one GPU). |
 | `LLMMAN_FLASH_ATTENTION` | Flash Attention mode (`--flash-attn`): `on`, `off`, or `auto` (llama-server's own default). Also accepts `1`/`0`/`true`/`false`. |
