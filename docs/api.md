@@ -299,8 +299,10 @@ and the daemon's usual `{"error": ...}` body. Only `GET`/`HEAD` of `/`,
 prefixes, from a client that accepts HTML) are exempt, so the page can
 load and ask its user for the key; it then sends the key on every call,
 and, since a browser cannot set a header on a WebSocket, opens
-`/llmman/shell` with the subprotocol `llmman.bearer.<base64url(key)>`,
-which the daemon echoes back.
+`/llmman/shell` with the subprotocol `llmman.bearer.<base64url(key)>`.
+The shell also needs its own token, keys or not
+([webui.md](webui.md#the-shells-guard-rails)), as the subprotocol
+`llmman.shell.<token>`, which the daemon echoes back.
 
 The `llmman` CLI sends `LLMMAN_API_KEY`, defaulting to the first
 configured server key; `llmman launch` hands the same key to the

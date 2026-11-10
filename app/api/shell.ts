@@ -14,16 +14,26 @@ export interface ShellStatus {
   reason?: string;
   /** False for a daemon without the route at all (404). */
   endpoint: boolean;
+  /** True when the upgrade needs the daemon's shell token; unset from a daemon older than the token. */
+  tokenRequired?: boolean;
 }
 
 export const NO_SHELL_ENDPOINT = "This llmman serve has no shell endpoint.";
 
-/** `GET /llmman/shell` → `{enabled, reason?}`; a 404 is a daemon with no shell. */
+/** `GET /llmman/shell` → `{enabled, reason?, token_required?}`; a 404 is a daemon with no shell. */
 export async function shellStatus(client: ApiClient, opts?: RequestOptions): Promise<ShellStatus> {
   try {
-    const body = await client.getJson<{ enabled?: unknown; reason?: unknown }>("llmman/shell", opts);
+    const body = await client.getJson<{ enabled?: unknown; reason?: unknown; token_required?: unknown }>(
+      "llmman/shell",
+      opts,
+    );
     const reason = typeof body?.reason === "string" && body.reason.trim() ? body.reason.trim() : undefined;
-    return { enabled: body?.enabled === true, endpoint: true, ...(reason ? { reason } : {}) };
+    return {
+      enabled: body?.enabled === true,
+      endpoint: true,
+      ...(reason ? { reason } : {}),
+      ...(body?.token_required === true ? { tokenRequired: true } : {}),
+    };
   } catch (e) {
     if (e instanceof ApiError && e.status === 404) {
       return { enabled: false, endpoint: false, reason: NO_SHELL_ENDPOINT };
@@ -37,7 +47,12 @@ export function shellSocketUrl(url: string): string {
   return socketUrl(url, "llmman/shell");
 }
 
-/** A shell WebSocket, carrying the key when there is one (a subprotocol in a browser). */
-export function openShellSocket(url: string, key: string | undefined): WebSocket {
-  return openKeyedSocket(shellSocketUrl(url), key);
+/** The shell token as the subprotocol llmman serve takes it under. */
+export function shellTokenProtocol(token: string): string {
+  return `llmman.shell.${token}`;
+}
+
+/** A shell WebSocket, carrying the key when there is one (a subprotocol in a browser) and the shell token. */
+export function openShellSocket(url: string, key: string | undefined, token: string | undefined): WebSocket {
+  return openKeyedSocket(shellSocketUrl(url), key, token ? [shellTokenProtocol(token)] : []);
 }

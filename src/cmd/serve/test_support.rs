@@ -37,6 +37,11 @@ pub(super) fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
 
 pub(super) const PAIR: &str = "llmman.hybrid/gemma4,anthropic/claude-sonnet-4-5";
 pub(super) const HOSTED: &str = "llmman.provider/anthropic/claude-sonnet-4-5";
+pub(super) const SHELL_TOKEN: &str = "test-shell-token";
+
+pub(super) fn shell_token_protocol() -> String {
+    format!("{}{SHELL_TOKEN}", shell::TOKEN_PROTOCOL_PREFIX)
+}
 
 pub(super) fn test_state() -> AppState {
     test_state_at(std::env::temp_dir())
@@ -95,6 +100,7 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
             disabled: None,
             origins: default_allowed_origins(),
             command: Vec::new(),
+            token_digest: auth::digest(SHELL_TOKEN),
         },
         auth: auth::Policy::default(),
         peer_key: None,

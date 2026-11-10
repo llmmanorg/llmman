@@ -1,5 +1,5 @@
-//! Whole-file writes a reader never sees half done, and the free space a
-//! download needs.
+//! Whole-file writes a reader never sees half done, writes only their
+//! owner can read, and the free space a download needs.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -42,6 +42,20 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, &path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// Writes `bytes` to `path`, readable only by its owner on Unix; an
+/// existing file is truncated and narrowed to 0600 before it holds them.
+pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    // `mode` only applies when the open creates the file.
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    file.write_all(bytes)
 }
 
 /// Fails when `needed` bytes will not fit in the `available` bytes free
@@ -218,6 +232,26 @@ mod tests {
             std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_makes_a_new_file_and_an_existing_one_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir("private");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let new = dir.join("new");
+        write_private(&new, b"secret").unwrap();
+        assert_eq!(mode(&new), 0o600);
+        assert_eq!(std::fs::read(&new).unwrap(), b"secret");
+
+        let existing = dir.join("existing");
+        std::fs::write(&existing, b"a longer old secret").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&existing, b"new").unwrap();
+        assert_eq!(mode(&existing), 0o600);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"new");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

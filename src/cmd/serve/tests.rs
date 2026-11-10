@@ -15,8 +15,8 @@ use super::stream::{fold_ollama_lines, stream_ollama};
 use super::test_support::{
     headers_with, mock_peer, multipart_parts, multipart_upload, node, remote_target,
     remote_target_on, rendered_registry, running_model_fixture, running_model_fixture_with_engine,
-    serve_router, serve_router_with, test_inner, test_state, test_state_at, test_state_with_budget,
-    ws_upgrade, HOSTED, PAIR,
+    serve_router, serve_router_with, shell_token_protocol, test_inner, test_state, test_state_at,
+    test_state_with_budget, ws_upgrade, HOSTED, PAIR, SHELL_TOKEN,
 };
 use super::*;
 
@@ -4687,6 +4687,7 @@ async fn a_disabled_shell_reports_why_and_refuses_the_upgrade() {
         disabled: Some("LLMMAN_SHELL is off".into()),
         origins: default_allowed_origins(),
         command: Vec::new(),
+        token_digest: auth::digest(SHELL_TOKEN),
     }))
     .await;
     let client = Client::new();
@@ -4703,6 +4704,7 @@ async fn a_disabled_shell_reports_why_and_refuses_the_upgrade() {
         shell::Status {
             enabled: false,
             reason: Some("LLMMAN_SHELL is off".into()),
+            token_required: true,
         }
     );
     let upgrade = ws_upgrade(&client, &format!("{url}/llmman/shell"), None)
@@ -4722,6 +4724,7 @@ async fn only_a_page_the_daemon_would_answer_cors_for_may_open_a_shell() {
         disabled: None,
         origins: default_allowed_origins(),
         command: Vec::new(),
+        token_digest: auth::digest(SHELL_TOKEN),
     }))
     .await;
     let client = Client::new();
@@ -4772,6 +4775,7 @@ async fn only_a_page_the_daemon_would_answer_cors_for_may_open_a_shell() {
 #[tokio::test]
 async fn a_shell_session_round_trips_bytes_and_reports_the_exit_status() {
     use futures::SinkExt as _;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     #[cfg(windows)]
@@ -4782,10 +4786,16 @@ async fn a_shell_session_round_trips_bytes_and_reports_the_exit_status() {
         disabled: None,
         origins: default_allowed_origins(),
         command: command.map(str::to_string).to_vec(),
+        token_digest: auth::digest(SHELL_TOKEN),
     }))
     .await;
     let ws_url = format!("{}/llmman/shell", url.replace("http://", "ws://"));
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let mut request = ws_url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        shell_token_protocol().parse().unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
 
     ws.send(WsMessage::Text(
         r#"{"resize":{"cols":120,"rows":40}}"#.into(),
@@ -5488,8 +5498,45 @@ async fn the_provider_key_route_checks_before_it_writes() {
     assert!(!r.text().await.unwrap().contains("sk-secret"));
 }
 
+/// A client with no `Origin` (not a browser) and no API key needs the token.
+#[tokio::test]
+async fn a_keyless_daemon_opens_a_shell_only_with_its_token() {
+    let url = serve_router(shell_state(shell::Policy {
+        disabled: None,
+        origins: default_allowed_origins(),
+        command: Vec::new(),
+        token_digest: auth::digest(SHELL_TOKEN),
+    }))
+    .await;
+    let client = Client::new();
+    let shell_url = format!("{url}/llmman/shell");
+
+    let bare = ws_upgrade(&client, &shell_url, None).send().await.unwrap();
+    assert_eq!(bare.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong = ws_upgrade(&client, &shell_url, None)
+        .header("sec-websocket-protocol", "llmman.shell.nope")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    let protocol = shell_token_protocol();
+    let opened = ws_upgrade(&client, &shell_url, None)
+        .header("sec-websocket-protocol", protocol.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(
+        opened.headers()["sec-websocket-protocol"],
+        protocol.as_str()
+    );
+}
+
 /// The browser cannot set a header on an upgrade, so the shell takes
-/// the key as a subprotocol and echoes it, as the handshake requires.
+/// the key and the token as subprotocols and echoes the token's, as the
+/// handshake requires. The key alone opens no shell.
 #[tokio::test]
 async fn a_shell_upgrade_presents_its_key_as_a_subprotocol() {
     let mut inner = test_inner(std::env::temp_dir());
@@ -5498,6 +5545,7 @@ async fn a_shell_upgrade_presents_its_key_as_a_subprotocol() {
         disabled: None,
         origins: default_allowed_origins(),
         command: Vec::new(),
+        token_digest: auth::digest(SHELL_TOKEN),
     };
     let url = serve_router(AppState(Arc::new(inner))).await;
     let client = Client::new();
@@ -5514,13 +5562,24 @@ async fn a_shell_upgrade_presents_its_key_as_a_subprotocol() {
     assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
 
     let protocol = crate::auth::ws_protocol("k");
-    let keyed = ws_upgrade(&client, &shell_url, None)
+    let key_only = ws_upgrade(&client, &shell_url, None)
         .header("sec-websocket-protocol", format!("chat, {protocol}"))
         .send()
         .await
         .unwrap();
+    assert_eq!(key_only.status(), StatusCode::UNAUTHORIZED);
+
+    let token = shell_token_protocol();
+    let keyed = ws_upgrade(&client, &shell_url, None)
+        .header(
+            "sec-websocket-protocol",
+            format!("chat, {protocol}, {token}"),
+        )
+        .send()
+        .await
+        .unwrap();
     assert_eq!(keyed.status(), StatusCode::SWITCHING_PROTOCOLS);
-    assert_eq!(keyed.headers()["sec-websocket-protocol"], protocol.as_str());
+    assert_eq!(keyed.headers()["sec-websocket-protocol"], token.as_str());
 }
 
 /// A peer is sent this node's peer key along with the hop marker.

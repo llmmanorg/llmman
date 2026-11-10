@@ -1,4 +1,12 @@
-import { basePath, keyStorageName, LEGACY_KEY_STORAGE, pageServerUrl, readScopedKey } from "@/lib/pageBase";
+import {
+  basePath,
+  keyStorageName,
+  LEGACY_KEY_STORAGE,
+  pageServerUrl,
+  readScopedKey,
+  shellTokenFromHash,
+  shellTokenStorageName,
+} from "@/lib/pageBase";
 
 test("the base path is the directory of the page's <base>", () => {
   expect(basePath("http://127.0.0.1:17434/")).toBe("/");
@@ -38,4 +46,14 @@ test("each base path reads its own key only", () => {
   expect(readScopedKey(s, "/a/")).toBeUndefined();
   expect(s.m.has("llmman.apiKey:/a/")).toBe(false);
   expect(readScopedKey(memory({ "llmman.apiKey:/": "root", "llmman.apiKey:/a/": "own" }), "/a/")).toBe("own");
+});
+
+test("a shell link's fragment carries the token, and nothing else does", () => {
+  expect(shellTokenFromHash("#shell-token=aB3_-x")).toBe("aB3_-x");
+  expect(shellTokenFromHash("shell-token=aB3")).toBe("aB3");
+  expect(shellTokenFromHash("")).toBeUndefined();
+  expect(shellTokenFromHash("#shell-token=")).toBeUndefined();
+  expect(shellTokenFromHash("#/models")).toBeUndefined();
+  expect(shellTokenFromHash("#shell-token=a&b=c")).toBeUndefined();
+  expect(shellTokenStorageName("/a/")).toBe("llmman.shellToken:/a/");
 });
