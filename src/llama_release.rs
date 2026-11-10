@@ -29,6 +29,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 use crate::fmt::human_size;
+use crate::fsutil::sha256_of_file;
 // Only the Linux/Windows arms of `asset_query` below branch on the
 // detected accelerator; macOS publishes exactly one asset per
 // architecture, so this would be an unused import there.
@@ -692,14 +693,6 @@ pub(crate) fn download_to_file(
     }
     eprintln!("[llmman] downloaded {label}: {}", human_size(downloaded));
     Ok(())
-}
-
-pub(crate) fn sha256_of_file(path: &Path) -> Result<String> {
-    use sha2::Digest;
-    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut hasher = sha2::Sha256::new();
-    std::io::copy(&mut file, &mut hasher).context("hash download")?;
-    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Fails unless the file at `path` matches the size and digest that the

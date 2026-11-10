@@ -20,7 +20,6 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -371,29 +370,17 @@ impl OciStore {
         path: impl AsRef<Path>,
     ) -> anyhow::Result<Descriptor> {
         let path = path.as_ref();
-        let mut hasher = Sha256::new();
-        let mut size = 0u64;
         let tmp = self
             .root
             .join("blobs")
             .join("sha256")
             .join(format!("tmp-{}", std::process::id()));
-        {
+        let (size, hex) = {
             let mut src =
                 fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
             let mut dst = fs::File::create(&tmp)?;
-            let mut buf = vec![0u8; 1 << 20]; // 1 MiB chunks
-            loop {
-                let n = src.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-                dst.write_all(&buf[..n])?;
-                size += n as u64;
-            }
-        }
-        let hex = hex::encode(hasher.finalize());
+            crate::fsutil::copy_hashing(&mut src, &mut dst)?
+        };
         let digest = format!("sha256:{}", hex);
         let dest = self.root.join("blobs").join("sha256").join(&hex);
         if dest.exists() {
