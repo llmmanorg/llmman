@@ -5513,6 +5513,11 @@ async fn a_keyless_daemon_opens_a_shell_only_with_its_token() {
 
     let bare = ws_upgrade(&client, &shell_url, None).send().await.unwrap();
     assert_eq!(bare.status(), StatusCode::UNAUTHORIZED);
+    assert!(bare
+        .text()
+        .await
+        .unwrap()
+        .contains("the shell needs the token"));
 
     let wrong = ws_upgrade(&client, &shell_url, None)
         .header("sec-websocket-protocol", "llmman.shell.nope")
@@ -5520,6 +5525,11 @@ async fn a_keyless_daemon_opens_a_shell_only_with_its_token() {
         .await
         .unwrap();
     assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    assert!(wrong
+        .text()
+        .await
+        .unwrap()
+        .contains("the shell needs the token"));
 
     let protocol = shell_token_protocol();
     let opened = ws_upgrade(&client, &shell_url, None)
@@ -5568,6 +5578,11 @@ async fn a_shell_upgrade_presents_its_key_as_a_subprotocol() {
         .await
         .unwrap();
     assert_eq!(key_only.status(), StatusCode::UNAUTHORIZED);
+    assert!(key_only
+        .text()
+        .await
+        .unwrap()
+        .contains("the shell needs the token"));
 
     let token = shell_token_protocol();
     let keyed = ws_upgrade(&client, &shell_url, None)

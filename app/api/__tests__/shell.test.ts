@@ -1,3 +1,5 @@
+import { Platform } from "react-native";
+
 import { ApiClient } from "@/api/client";
 import {
   NO_SHELL_ENDPOINT,
@@ -57,25 +59,43 @@ test("the WebSocket address keeps a path prefix", () => {
   expect(keyProtocol("sk-test")).toMatch(/^llmman\.bearer\.[A-Za-z0-9_-]+$/);
 });
 
-test("the shell token is offered as its own subprotocol, with the key as a header off the web", () => {
-  expect(shellTokenProtocol("tok")).toBe("llmman.shell.tok");
+function socketsOpened(os: typeof Platform.OS, open: () => void): unknown[][] {
   const opened: unknown[][] = [];
-  const real = globalThis.WebSocket;
+  const real = { WebSocket: globalThis.WebSocket, os: Platform.OS };
   globalThis.WebSocket = class {
     constructor(...args: unknown[]) {
       opened.push(args);
     }
   } as unknown as typeof WebSocket;
+  Object.defineProperty(Platform, "OS", { value: os, configurable: true });
   try {
+    open();
+  } finally {
+    globalThis.WebSocket = real.WebSocket;
+    Object.defineProperty(Platform, "OS", { value: real.os, configurable: true });
+  }
+  return opened;
+}
+
+test("the shell token is offered as its own subprotocol, with the key as a header off the web", () => {
+  expect(shellTokenProtocol("tok")).toBe("llmman.shell.tok");
+  const opened = socketsOpened("ios", () => {
     openShellSocket(URL, "k", "tok");
     openShellSocket(URL, undefined, undefined);
-  } finally {
-    globalThis.WebSocket = real;
-  }
+  });
   expect(opened[0]).toEqual([
     "ws://127.0.0.1:17492/llmman/shell",
     ["llmman.shell.tok"],
     { headers: { Authorization: "Bearer k" } },
   ]);
   expect(opened[1]).toEqual(["ws://127.0.0.1:17492/llmman/shell", undefined, {}]);
+});
+
+test("in a browser, the key and the shell token are both offered as subprotocols", () => {
+  const opened = socketsOpened("web", () => {
+    openShellSocket(URL, "k", "tok");
+    openShellSocket(URL, undefined, "tok");
+  });
+  expect(opened[0]).toEqual(["ws://127.0.0.1:17492/llmman/shell", [keyProtocol("k"), "llmman.shell.tok"]]);
+  expect(opened[1]).toEqual(["ws://127.0.0.1:17492/llmman/shell", ["llmman.shell.tok"]]);
 });
