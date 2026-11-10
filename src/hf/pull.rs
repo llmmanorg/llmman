@@ -578,24 +578,10 @@ fn sanitize(s: &str) -> String {
 /// Off the async runtime: a full read of a possibly hundreds-of-GB file.
 async fn sha256_of_file(path: &Path) -> Result<String> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<String> {
-        use std::io::Read;
-        let mut f = std::fs::File::open(&path)
-            .with_context(|| format!("open {} for hashing", path.display()))?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 1 << 20];
-        loop {
-            match f.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => hasher.update(&buf[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(format!("sha256:{:x}", hasher.finalize()))
-    })
-    .await
-    .context("sha256 hashing task panicked")?
+    let hex = tokio::task::spawn_blocking(move || crate::fsutil::sha256_of_file(&path))
+        .await
+        .context("sha256 hashing task panicked")??;
+    Ok(format!("sha256:{hex}"))
 }
 
 /// Writes to a local file while hashing every byte and reporting it to

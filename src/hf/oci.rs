@@ -299,22 +299,21 @@ pub fn write_blob_from_file(
     let tmp = dir.join(format!("{}-{}.tmp", std::process::id(), next_counter()));
     let mut source =
         std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut hasher = Sha256::new();
 
     // Owning the file means nobody else is writing it, so hashing it
     // where it lies and then renaming is safe — and free.
-    let (size, staged) = if consume {
-        let size = std::io::copy(&mut source, &mut hasher)
+    let ((size, hex), staged) = if consume {
+        let hashed = crate::fsutil::copy_hashing(&mut source, &mut std::io::sink())
             .with_context(|| format!("hash {}", path.display()))?;
-        (size, path.to_path_buf())
+        (hashed, path.to_path_buf())
     } else {
         let mut out = std::fs::File::create(&tmp)?;
-        let size = std::io::copy(&mut source, &mut HashingWriter(&mut out, &mut hasher))
+        let copied = crate::fsutil::copy_hashing(&mut source, &mut out)
             .with_context(|| format!("copy {} into the blob store", path.display()))?;
-        (size, tmp.clone())
+        (copied, tmp.clone())
     };
     drop(source);
-    let digest = format!("sha256:{:x}", hasher.finalize());
+    let digest = format!("sha256:{hex}");
     let dest = dir.join(digest.trim_start_matches("sha256:"));
 
     // Content-addressed, so an existing blob of this digest already
@@ -344,21 +343,6 @@ pub fn write_blob_from_file(
         size: size as i64,
         ..Default::default()
     })
-}
-
-/// Tees writes into a hasher, so a copy hashes exactly the bytes it
-/// stores rather than re-reading the source a second time.
-struct HashingWriter<'a>(&'a mut std::fs::File, &'a mut Sha256);
-
-impl std::io::Write for HashingWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.0.write(buf)?;
-        self.1.update(&buf[..n]);
-        Ok(n)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
 }
 
 // ---------------------------------------------------------------------------

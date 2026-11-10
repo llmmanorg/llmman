@@ -23,9 +23,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::fsutil::sha256_of_file;
 use crate::llama_release::{
-    download_to_file, extract_tar_gz, find_binary, http_client, mark_executable, sha256_of_file,
-    tmp_path, DownloadMarker, RemoveOnDrop,
+    download_to_file, extract_tar_gz, find_binary, http_client, mark_executable, tmp_path,
+    DownloadMarker, RemoveOnDrop,
 };
 use crate::managed;
 
