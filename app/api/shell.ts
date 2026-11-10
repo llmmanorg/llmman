@@ -47,7 +47,6 @@ export function shellSocketUrl(url: string): string {
   return socketUrl(url, "llmman/shell");
 }
 
-/** The shell token as the subprotocol llmman serve takes it under. */
 export function shellTokenProtocol(token: string): string {
   return `llmman.shell.${token}`;
 }

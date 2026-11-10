@@ -43,8 +43,7 @@ use super::AppState;
 /// a browser on a keyed daemon offers both, and each check finds its own.
 pub(super) const TOKEN_PROTOCOL_PREFIX: &str = "llmman.shell.";
 
-/// A new shell token: 32 random bytes as URL-safe base64, which a
-/// subprotocol and a URL fragment both carry as it is.
+/// URL-safe base64, which a subprotocol and a URL fragment carry as is.
 pub(super) fn new_token() -> anyhow::Result<String> {
     use base64::Engine as _;
     let mut bytes = [0u8; 32];
@@ -62,7 +61,6 @@ pub(super) struct Policy {
     /// Program and arguments; empty means the login shell (`%ComSpec%`
     /// on Windows).
     pub(super) command: Vec<String>,
-    /// SHA-256 of the token an upgrade must present.
     pub(super) token_digest: [u8; 32],
 }
 
@@ -98,7 +96,6 @@ impl Policy {
         })
     }
 
-    /// The offered subprotocol that carries this start's token, verbatim.
     fn presented_token(&self, headers: &HeaderMap) -> Option<String> {
         super::auth::offered_ws_protocol_with(headers, TOKEN_PROTOCOL_PREFIX).filter(|protocol| {
             let token = &protocol[TOKEN_PROTOCOL_PREFIX.len()..];

@@ -130,7 +130,6 @@ if (typeof document !== "undefined") {
   window.addEventListener("hashchange", adoptShellToken);
 }
 
-/** The page's daemon's shell token, from the last shell link opened. */
 export function pageShellToken(): string | undefined {
   if (unsavedShellToken) return unsavedShellToken;
   try {
@@ -140,7 +139,6 @@ export function pageShellToken(): string | undefined {
   }
 }
 
-/** Calls `fn` with the token of each shell link opened on this page. */
 export function onPageShellToken(fn: (token: string) => void): () => void {
   shellTokenListeners.add(fn);
   return () => shellTokenListeners.delete(fn);

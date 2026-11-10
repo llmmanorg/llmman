@@ -168,7 +168,6 @@ class Daemon(private val context: Context) {
         private const val LOG_ROTATE_BYTES = 2L * 1024 * 1024
         fun logFile(context: Context): File = File(context.filesDir, "serve.log")
 
-        /** The daemon's shell token, written once it listens; null before. */
         fun shellToken(context: Context): String? {
             val file = File(context.filesDir, "home/.local/share/llmman/shell-$PORT.token")
             return file.takeIf { it.isFile }?.readText()?.trim()?.takeIf { it.matches(Regex("[A-Za-z0-9_-]+")) }

@@ -17,7 +17,7 @@ export function socketUrl(url: string, path: string): string {
   return `${url.replace(/^http/i, "ws")}/${path.replace(/^\/+/, "")}`;
 }
 
-/** A binary WebSocket to `target`, carrying `key` the way this platform can, and offering `protocols`. */
+/** A binary WebSocket to `target`, carrying `key` the way this platform can. */
 export function openKeyedSocket(
   target: string,
   key: string | undefined,

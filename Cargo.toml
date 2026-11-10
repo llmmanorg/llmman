@@ -44,7 +44,6 @@ yaml_serde = "0.10"
 sha2       = "0.10"
 hex        = "0.4"
 base64     = "0.22"
-# The shell token (cmd::serve::shell).
 getrandom  = "0.2"
 # `llmman run`'s image-path detection is a verbatim port of ollama's
 # extractFileNames regex (cmd/interactive.go) — see cmd::run.

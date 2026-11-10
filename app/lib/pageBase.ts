@@ -36,12 +36,10 @@ export function keyStorageName(path: string): string {
   return `llmman.apiKey:${path}`;
 }
 
-/** Where the shell token of the daemon at `path` is kept. */
 export function shellTokenStorageName(path: string): string {
   return `llmman.shellToken:${path}`;
 }
 
-/** The token in the fragment of the shell link llmman serve prints (`#shell-token=<token>`). */
 export function shellTokenFromHash(hash: string): string | undefined {
   return /^#?shell-token=([A-Za-z0-9_-]+)$/.exec(hash)?.[1];
 }

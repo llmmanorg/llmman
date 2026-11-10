@@ -117,8 +117,6 @@ pub(super) fn offered_ws_protocol(headers: &HeaderMap) -> Option<String> {
     offered_ws_protocol_with(headers, crate::auth::WS_PROTOCOL_PREFIX)
 }
 
-/// The first subprotocol a WebSocket client offered that starts with
-/// `prefix`, verbatim.
 pub(super) fn offered_ws_protocol_with(headers: &HeaderMap, prefix: &str) -> Option<String> {
     headers
         .get_all("sec-websocket-protocol")
