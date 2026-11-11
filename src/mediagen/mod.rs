@@ -822,10 +822,7 @@ pub(super) fn dump(name: &str, data: &[f32]) {
 
 pub(super) fn rand_seed() -> u32 {
     let mut b = [0u8; 4];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))
-        .is_ok()
-    {
+    if getrandom::getrandom(&mut b).is_ok() {
         return u32::from_le_bytes(b);
     }
     std::time::SystemTime::now()
