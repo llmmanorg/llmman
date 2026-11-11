@@ -948,11 +948,13 @@ jobs:
       # runner image, and both platforms' llama-server release archives
       # are fully self-contained (verified via `strings`/load-command
       # inspection — no external libomp/libcurl reference either way).
+      # libnuma-dev/cmake/ninja-build are for SGLang's kernel build. Installed
+      # here: ~10 min into the job apt's mirror stops resolving.
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         uses: ./.github/actions/apt-install
         with:
-          packages: gcc libgomp1 libcurl4
+          packages: gcc libgomp1 libcurl4 libnuma-dev cmake ninja-build
 
       # ── Node.js (for the claude/opencode/codex CLIs under test) ────────────
       - name: Set up Node.js
@@ -1734,13 +1736,6 @@ jobs:
       # UV_HTTP_RETRIES: uv's default of 3 exponential-backoff retries spans
       # ~10s, shorter than a PyPI 503 blip; a real run failed on exactly
       # that ("Request failed after 3 retries in 10.1s"). 8 spans minutes.
-      - name: Install SGLang build dependencies (e2e)
-        if: runner.os == 'Linux'
-        timeout-minutes: 10
-        uses: ./.github/actions/apt-install
-        with:
-          packages: libnuma-dev cmake ninja-build
-
       - name: Install SGLang (e2e)
         if: runner.os == 'Linux' || runner.os == 'macOS'
         timeout-minutes: 40
