@@ -1729,12 +1729,12 @@ fn launch_cline_with_model() {
     // approval. Parse only the final assistant text so an echoed prompt or a
     // question containing "pong" cannot satisfy the assertion. qwen3.5:0.8b
     // may answer correctly but never make a well-formed tool call, which
-    // Cline requires to finish; accept that one known nonzero shape only
-    // after this exact reply check.
+    // Cline requires to finish, or keep acting after answering; accept those
+    // nonzero shapes only with this exact reply.
     launch_and_assert_strict_inspecting(
         "cline",
         &["--json", "--yolo", PROMPT],
-        cline_nonzero_is_a_malformed_tool_call,
+        cline_nonzero_follows_a_pong_reply,
         cline_json_reply_is_exact_pong,
         |home| {
             let path = home.join(".cline/data/settings/providers.json");
@@ -1812,6 +1812,13 @@ fn cline_nonzero_is_a_malformed_tool_call(stdout: &str, stderr: &str) -> bool {
                         })
                 })
         })
+}
+
+/// Cline can exit 1 after the exact `pong`: the model keeps acting (CI run
+/// 42993570211 read README.md, overflowing the 32768 context). The reply
+/// proves the launch worked, and the fresh HOME is still inspected.
+fn cline_nonzero_follows_a_pong_reply(stdout: &str, stderr: &str) -> bool {
+    cline_json_reply_is_exact_pong(stdout) || cline_nonzero_is_a_malformed_tool_call(stdout, stderr)
 }
 
 /// Real llama-server b11429 lines: two finished requests are totalled, the
@@ -1897,6 +1904,23 @@ fn cline_json_reply_requires_the_final_result_to_be_exactly_pong() {
         "{\"type\":\"say\",\"say\":\"text\",\"text\":\"Cline tried to use x without value for required parameter 'y'\"}\n",
         ""
     ));
+}
+
+#[test]
+fn cline_nonzero_exit_is_tolerated_only_after_the_exact_pong_reply() {
+    // CI run 42993570211, condensed.
+    let wandered = "{\"type\":\"say\",\"say\":\"task\",\"text\":\"Reply with exactly the single word: pong\"}\n\
+         {\"type\":\"say\",\"say\":\"text\",\"text\":\"pong\",\"partial\":false}\n\
+         {\"type\":\"say\",\"say\":\"tool\",\"text\":\"{\\\"tool\\\":\\\"readFile\\\",\\\"path\\\":\\\"README.md\\\"}\"}\n\
+         {\"type\":\"say\",\"say\":\"api_req_started\",\"text\":\"{}\"}\n";
+    assert!(!cline_nonzero_is_a_malformed_tool_call(wandered, ""));
+    assert!(cline_nonzero_follows_a_pong_reply(wandered, ""));
+    // No reply, so no proof the launch worked.
+    assert!(!cline_nonzero_follows_a_pong_reply(
+        "{\"type\":\"error\",\"message\":\"connection refused\"}\n",
+        ""
+    ));
+    assert!(!cline_nonzero_follows_a_pong_reply("", "Error: crashed\n"));
 }
 
 #[test]
@@ -3165,13 +3189,18 @@ fn assert_engine_listens_only_on_loopback(host: &str) {
     let ip = non_loopback_ipv4()
         .expect("no non-loopback IPv4 address to check the engine is not reachable on");
     // Only a refusal shows nothing listens there; a timeout may be a firewall.
-    match connect(ip) {
-        Ok(_) => panic!(
-            "engine answers on {ip}:{port}: an LLMMAN_*_ARGS --host overrode llmman's loopback"
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
-        Err(e) => panic!("inconclusive: connecting to {ip}:{port} failed with {e}, not a refusal"),
+    // An engine on every interface answers every connect; a lone success can
+    // be a TCP self-connect to this ephemeral-range port, so require three.
+    for _ in 0..3 {
+        match connect(ip) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return,
+            Err(e) => {
+                panic!("inconclusive: connecting to {ip}:{port} failed with {e}, not a refusal")
+            }
+        }
     }
+    panic!("engine answers on {ip}:{port}: an LLMMAN_*_ARGS --host overrode llmman's loopback");
 }
 
 /// This machine's address on its default route: the local end of a UDP
