@@ -60,7 +60,7 @@ class Daemon(private val context: Context) {
             // The web UI's Shell; there is no /bin/sh on Android.
             put("SHELL", "/system/bin/sh")
             put("LLMMAN_SHELL", "/system/bin/sh")
-            put("LLMMAN_HOST", "127.0.0.1:$PORT")
+            put("LLMMAN_HOST", "$HOST:$PORT")
             val key = apiKey(context)
             put("LLMMAN_API_KEYS", key)
             // The CLI's own key, so `llmman ps` works in the Shell.
@@ -162,14 +162,16 @@ class Daemon(private val context: Context) {
 
     companion object {
         const val TAG = "llmman"
+        // The daemon names its shell token file by this host too.
+        private const val HOST = "127.0.0.1"
         const val PORT = 17434
-        const val BASE_URL = "http://127.0.0.1:$PORT/"
+        const val BASE_URL = "http://$HOST:$PORT/"
         private const val STOP_GRACE_MS = 5000L
         private const val LOG_ROTATE_BYTES = 2L * 1024 * 1024
         fun logFile(context: Context): File = File(context.filesDir, "serve.log")
 
         fun shellToken(context: Context): String? {
-            val file = File(context.filesDir, "home/.local/share/llmman/shell-$PORT.token")
+            val file = File(context.filesDir, "home/.local/share/llmman/shell-$HOST-$PORT.token")
             return file.takeIf { it.isFile }?.readText()?.trim()?.takeIf { it.matches(Regex("[A-Za-z0-9_-]+")) }
         }
 

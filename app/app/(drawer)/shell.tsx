@@ -24,7 +24,7 @@ import { font, radius, spacing, useTheme } from "@/lib/theme";
 const NO_TOKEN_HELP =
   Platform.OS === "web"
     ? "llmman serve makes a new shell token each time it starts. Open the link it prints in its terminal, " +
-      "or add #shell-token= and the token from shell-<port>.token in llmman's data directory to this page's address."
+      "or add #shell-token= and the token from shell-<host>-<port>.token in llmman's data directory to this page's address."
     : "The shell needs the token llmman serve makes each time it starts, which only a browser on the same " +
       "computer can take from the link llmman serve prints.";
 
