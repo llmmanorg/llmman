@@ -1,0 +1,24 @@
+name: apt install (with retry)
+description: >-
+  `apt-get install`, retried with an `update` between attempts: runner DNS
+  drops now and then ("Temporary failure resolving").
+inputs:
+  packages:
+    description: Space-separated packages
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        for attempt in 1 2 3 4 5; do
+          # shellcheck disable=SC2086
+          sudo apt-get install -y -qq $PACKAGES && exit 0
+          echo "::warning::apt install $PACKAGES failed (attempt $attempt/5)"
+          [ "$attempt" -lt 5 ] || break
+          sleep $((attempt * 10))
+          sudo apt-get update -qq || true
+        done
+        exit 1

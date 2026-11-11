@@ -204,7 +204,9 @@ jobs:
       # ── Linux: C compiler (always needed for CGO) ─────────────────────────
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y gcc
+        uses: ./.github/actions/apt-install
+        with:
+          packages: gcc
 
       # ── Diagnostics: show which C/linker tools will be used (Windows) ───────
       - name: Show Windows toolchain info
@@ -948,7 +950,9 @@ jobs:
       # inspection — no external libomp/libcurl reference either way).
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y gcc libgomp1 libcurl4
+        uses: ./.github/actions/apt-install
+        with:
+          packages: gcc libgomp1 libcurl4
 
       # ── Node.js (for the claude/opencode/codex CLIs under test) ────────────
       - name: Set up Node.js
@@ -1730,6 +1734,13 @@ jobs:
       # UV_HTTP_RETRIES: uv's default of 3 exponential-backoff retries spans
       # ~10s, shorter than a PyPI 503 blip; a real run failed on exactly
       # that ("Request failed after 3 retries in 10.1s"). 8 spans minutes.
+      - name: Install SGLang build dependencies (e2e)
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libnuma-dev cmake ninja-build
+
       - name: Install SGLang (e2e)
         if: runner.os == 'Linux' || runner.os == 'macOS'
         timeout-minutes: 40
@@ -1748,8 +1759,6 @@ jobs:
             cp "$src/python/pyproject_other.toml" "$src/python/pyproject.toml"
             VIRTUAL_ENV="$venv" "$venv/bin/uv" pip install --prerelease=allow "$src/python[srt_mps]"
           else
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq libnuma-dev cmake ninja-build
             cat > "$RUNNER_TEMP/sglang-uv.toml" <<'EOF'
           [[index]]
           name = "torch"
@@ -2320,7 +2329,9 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Install build dependencies
-        run: sudo apt-get install -y gcc
+        uses: ./.github/actions/apt-install
+        with:
+          packages: gcc
 
       # Re-runs must not fail on crates.io's duplicate-version error. Only
       # an explicit 404 means "not published"; anything else (rate limit,
