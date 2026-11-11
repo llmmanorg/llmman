@@ -4688,6 +4688,7 @@ async fn a_disabled_shell_reports_why_and_refuses_the_upgrade() {
         origins: default_allowed_origins(),
         command: Vec::new(),
         token_digest: auth::digest(SHELL_TOKEN),
+        token_unsaved: Default::default(),
     }))
     .await;
     let client = Client::new();
@@ -4725,6 +4726,7 @@ async fn only_a_page_the_daemon_would_answer_cors_for_may_open_a_shell() {
         origins: default_allowed_origins(),
         command: Vec::new(),
         token_digest: auth::digest(SHELL_TOKEN),
+        token_unsaved: Default::default(),
     }))
     .await;
     let client = Client::new();
@@ -4787,6 +4789,7 @@ async fn a_shell_session_round_trips_bytes_and_reports_the_exit_status() {
         origins: default_allowed_origins(),
         command: command.map(str::to_string).to_vec(),
         token_digest: auth::digest(SHELL_TOKEN),
+        token_unsaved: Default::default(),
     }))
     .await;
     let ws_url = format!("{}/llmman/shell", url.replace("http://", "ws://"));
@@ -5506,6 +5509,7 @@ async fn a_keyless_daemon_opens_a_shell_only_with_its_token() {
         origins: default_allowed_origins(),
         command: Vec::new(),
         token_digest: auth::digest(SHELL_TOKEN),
+        token_unsaved: Default::default(),
     }))
     .await;
     let client = Client::new();
@@ -5556,6 +5560,7 @@ async fn a_shell_upgrade_presents_its_key_as_a_subprotocol() {
         origins: default_allowed_origins(),
         command: Vec::new(),
         token_digest: auth::digest(SHELL_TOKEN),
+        token_unsaved: Default::default(),
     };
     let url = serve_router(AppState(Arc::new(inner))).await;
     let client = Client::new();

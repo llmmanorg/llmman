@@ -288,6 +288,15 @@ fn a_default_keyless_serve_opens_its_shell_only_with_the_token() {
         req.send().unwrap().status().as_u16()
     };
 
+    // A token file the daemon cannot open for writing, from an earlier start.
+    let data_dir = token_file.parent().unwrap().to_path_buf();
+    let chmod = |path: &std::path::Path, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(&token_file, "stale").unwrap();
+    chmod(&token_file, 0o444);
+
     let (daemon, log, rest) = start(None);
     assert!(
         log.contains(&format!(
@@ -299,6 +308,7 @@ fn a_default_keyless_serve_opens_its_shell_only_with_the_token() {
     let mode = std::fs::metadata(&token_file).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
     let token = std::fs::read_to_string(&token_file).unwrap();
+    assert_ne!(token, "stale");
 
     assert_eq!(upgrade(None), 401);
     assert_eq!(upgrade(Some("llmman.shell.wrong")), 401);
@@ -313,10 +323,33 @@ fn a_default_keyless_serve_opens_its_shell_only_with_the_token() {
     let stderr = format!("{log}\n{}", rest.iter().collect::<Vec<_>>().join("\n"));
     assert!(!stderr.contains(&token), "{stderr}");
 
-    let (_daemon, log, _) = start(Some("off"));
+    let (daemon, log, _) = start(Some("off"));
     assert!(
         log.contains("[llmman] shell: off (LLMMAN_SHELL is off)"),
         "{log}"
     );
     assert!(!token_file.exists());
+    drop(daemon);
+
+    // Root ignores permissions, so only another user can see a refusal.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    chmod(&data_dir, 0o555);
+    let (daemon, log, _) = start(None);
+    let status: serde_json::Value = client.get(&shell_url).send().unwrap().json().unwrap();
+    drop(daemon);
+    chmod(&data_dir, 0o755);
+    assert!(
+        log.contains("[llmman] shell: off (llmman serve could not save its shell token: "),
+        "{log}"
+    );
+    assert_eq!(status["enabled"], false);
+    assert!(
+        status["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("llmman serve could not save its shell token: "),
+        "{status}"
+    );
 }

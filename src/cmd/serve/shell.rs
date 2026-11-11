@@ -15,7 +15,8 @@
 //! The token is written 0600 to `shell-<port>.token` in llmman's data
 //! directory, and printed as a web UI link (`#shell-token=<token>`) when
 //! stderr is a terminal. The UI reads it from the link's fragment, which
-//! the browser never sends to the daemon.
+//! the browser never sends to the daemon. A token that cannot be saved,
+//! with no terminal to print the link to, turns the shell off.
 //!
 //! Protocol: binary frames carry terminal bytes both ways; the client's
 //! text frames are `{"resize":{"cols":N,"rows":N}}`; the daemon's one text
@@ -24,6 +25,7 @@
 
 use std::io::{IsTerminal as _, Read, Write};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::Context as _;
 
@@ -62,6 +64,9 @@ pub(super) struct Policy {
     /// on Windows).
     pub(super) command: Vec<String>,
     pub(super) token_digest: [u8; 32],
+    /// Set at startup when the token could not be saved and no terminal
+    /// shows the link: no client can learn it, so the shell is off.
+    pub(super) token_unsaved: OnceLock<String>,
 }
 
 impl Policy {
@@ -93,6 +98,7 @@ impl Policy {
                 _ => Vec::new(),
             },
             token_digest: super::auth::digest(token),
+            token_unsaved: OnceLock::new(),
         })
     }
 
@@ -105,7 +111,7 @@ impl Policy {
 
     /// Whether a page at `origin` (or a client with no page) may open one.
     fn admits(&self, origin: Option<&str>) -> Result<(), Refusal> {
-        if let Some(reason) = &self.disabled {
+        if let Some(reason) = self.disabled.as_ref().or(self.token_unsaved.get()) {
             return Err(Refusal::Disabled(reason.clone()));
         }
         let allowed = |origin: &str| {
@@ -184,10 +190,7 @@ pub(super) fn token_path() -> anyhow::Result<PathBuf> {
 /// daemon's stderr is `serve.log`, which other users may be able to read.
 pub(super) fn announce(policy: &Policy, token: &str, tls: bool) {
     if let Some(reason) = &policy.disabled {
-        // A token left by an earlier start opens nothing; it only misleads.
-        if let Ok(path) = token_path() {
-            let _ = std::fs::remove_file(path);
-        }
+        remove_old_token();
         eprintln!("[llmman] shell: off ({reason})");
         return;
     }
@@ -200,19 +203,37 @@ pub(super) fn announce(policy: &Policy, token: &str, tls: bool) {
         Ok(path)
     });
     let why = "bound to loopback; LLMMAN_SHELL=off removes it";
+    let terminal = std::io::stderr().is_terminal();
     match saved {
         Ok(path) => eprintln!(
             "[llmman] shell: on ({why}), its token is in {}",
             path.display()
         ),
-        Err(e) => eprintln!("[llmman] shell: on ({why}), but its token was not saved: {e:#}"),
+        Err(e) => {
+            remove_old_token();
+            if !terminal {
+                let reason = format!("llmman serve could not save its shell token: {e:#}");
+                eprintln!("[llmman] shell: off ({reason})");
+                let _ = policy.token_unsaved.set(reason);
+                return;
+            }
+            eprintln!("[llmman] shell: on ({why}), but its token was not saved: {e:#}");
+        }
     }
-    if std::io::stderr().is_terminal() {
+    if terminal {
         eprintln!(
             "[llmman] open the web UI with the shell: http{}://{}/#shell-token={token}",
             if tls { "s" } else { "" },
             crate::daemon::bind_addr()
         );
+    }
+}
+
+/// A token from an earlier start opens nothing: a client that reads it
+/// only gets a 401.
+fn remove_old_token() {
+    if let Ok(path) = token_path() {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -425,6 +446,7 @@ mod tests {
             origins: super::super::default_allowed_origins(),
             command: Vec::new(),
             token_digest: super::super::auth::digest("t"),
+            token_unsaved: OnceLock::new(),
         }
     }
 
@@ -498,6 +520,17 @@ mod tests {
             let refusal = p.admits(origin).err().unwrap();
             assert!(matches!(refusal, Refusal::Disabled(_)));
             assert_eq!(refusal.reason(), "LLMMAN_SHELL is off");
+        }
+    }
+
+    #[test]
+    fn an_unsaved_token_turns_the_shell_off_with_its_reason() {
+        let p = policy(None);
+        p.token_unsaved.set("could not save".into()).unwrap();
+        for origin in [None, Some("http://localhost")] {
+            let refusal = p.admits(origin).err().unwrap();
+            assert!(matches!(refusal, Refusal::Disabled(_)));
+            assert_eq!(refusal.reason(), "could not save");
         }
     }
 

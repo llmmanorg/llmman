@@ -108,17 +108,18 @@ way:
    llmman's data directory (`~/.local/share/llmman`,
    `%LOCALAPPDATA%\llmman` on Windows). An upgrade must offer it as the
    subprotocol `llmman.shell.<token>`, API keys or not; without it the
-   upgrade gets `401`. When its stderr is a terminal, `serve` prints a
-   link to the UI that carries the token in its fragment
-   (`http://127.0.0.1:17434/#shell-token=<token>`); a detached daemon
-   does not, since its log may be readable by other users. The page takes
-   the token from the fragment, which the browser never sends, keeps it
-   in local storage like the key, and takes it off the address. Without
-   one, *Shell* says how to get it; a token from an earlier start opens
-   nothing. Processes running as the same user can read the file, so the
-   token keeps out other users of the machine and anything that reaches
-   the port from elsewhere (a forwarded port, a container's or VM's route
-   to the host).
+   upgrade gets `401`. When its stderr is a terminal, `serve` prints a link
+   to the UI that carries the token in its fragment
+   (`http://127.0.0.1:17434/#shell-token=<token>`); a detached daemon does
+   not, since its log may be readable by other users. A daemon that cannot
+   save the token and has no terminal to print the link to turns the shell
+   off and says why, since no client could learn the token. The page takes
+   the token from the fragment, which the browser never sends, keeps it in
+   local storage like the key, and takes it off the address. Without one,
+   *Shell* says how to get it; a token from an earlier start opens nothing.
+   Processes running as the same user can read the file, so the token keeps
+   out other users of the machine and anything that reaches the port from
+   elsewhere (a forwarded port, a container's or VM's route to the host).
 3. **Same-site browsers only.** Browsers do not apply CORS to WebSockets,
    so a page on any site could otherwise open
    `ws://127.0.0.1:17434/llmman/shell` from a visitor's browser. The

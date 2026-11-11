@@ -101,6 +101,7 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
             origins: default_allowed_origins(),
             command: Vec::new(),
             token_digest: auth::digest(SHELL_TOKEN),
+            token_unsaved: Default::default(),
         },
         auth: auth::Policy::default(),
         peer_key: None,
