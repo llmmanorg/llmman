@@ -1,7 +1,8 @@
 //! Whole-file writes a reader never sees half done, writes only their
-//! owner can read, and the free space a download needs.
+//! owner can read, the free space a download needs, and the SHA-256 of a
+//! file's bytes.
 
-use std::io::Write as _;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -154,6 +155,40 @@ pub fn available_space(dir: &Path) -> Option<u64> {
     }
 }
 
+/// Copies `reader` into `writer` and returns the byte count and the
+/// lowercase hex SHA-256 of the bytes copied. Hashes without copying when
+/// `writer` is [`std::io::sink`].
+pub fn copy_hashing(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+) -> std::io::Result<(u64, String)> {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut size = 0u64;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        hasher.update(&buf[..n]);
+        writer.write_all(&buf[..n])?;
+        size += n as u64;
+    }
+    Ok((size, hex::encode(hasher.finalize())))
+}
+
+/// Lowercase hex SHA-256 of the file at `path`.
+pub fn sha256_of_file(path: &Path) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let (_, hex) = copy_hashing(&mut file, &mut std::io::sink())
+        .with_context(|| format!("hash {}", path.display()))?;
+    Ok(hex)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +221,46 @@ mod tests {
         assert!(err.contains(&crate::fmt::human_size(3 << 30)), "{err}");
         assert!(err.contains(&crate::fmt::human_size(1 << 30)), "{err}");
         assert!(err.contains("/models"), "{err}");
+    }
+
+    const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test]
+    fn copy_hashing_copies_every_byte_and_hashes_them() {
+        let mut copied = Vec::new();
+        let (size, hex) = copy_hashing(&mut &b"abc"[..], &mut copied).unwrap();
+        assert_eq!(
+            (size, hex.as_str(), copied.as_slice()),
+            (3, ABC_SHA256, &b"abc"[..])
+        );
+    }
+
+    #[test]
+    fn copy_hashing_retries_an_interrupted_read() {
+        struct InterruptedOnce<'a>(bool, &'a [u8]);
+        impl Read for InterruptedOnce<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !std::mem::replace(&mut self.0, true) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.1.read(buf)
+            }
+        }
+        let mut reader = InterruptedOnce(false, b"abc");
+        let (size, hex) = copy_hashing(&mut reader, &mut std::io::sink()).unwrap();
+        assert_eq!((size, hex.as_str()), (3, ABC_SHA256));
+    }
+
+    #[test]
+    fn sha256_of_file_hashes_the_file_and_names_a_missing_one() {
+        let dir = temp_dir("sha256");
+        let path = dir.join("f.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(sha256_of_file(&path).unwrap(), ABC_SHA256);
+        let missing = dir.join("missing.bin");
+        let err = format!("{:#}", sha256_of_file(&missing).unwrap_err());
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

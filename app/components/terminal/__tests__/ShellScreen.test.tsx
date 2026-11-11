@@ -62,6 +62,14 @@ test("a daemon older than the token: opens a shell without one", async () => {
   expect(open).toHaveBeenCalledWith(URL, undefined, undefined);
 });
 
+test("a daemon older than the token is not offered one left in storage", async () => {
+  mockShell = { enabled: true, endpoint: true };
+  mockToken = "stale";
+  render(<Shell />);
+  await screen.findByText("terminal");
+  expect(open).toHaveBeenCalledWith(URL, undefined, undefined);
+});
+
 test("a token is offered to the daemon that needs it", async () => {
   mockShell = { enabled: true, endpoint: true, tokenRequired: true };
   mockToken = "tok";

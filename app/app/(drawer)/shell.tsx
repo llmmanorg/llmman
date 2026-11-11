@@ -75,6 +75,8 @@ export default function Shell() {
     setSessionOf((o) => ({ url, session: next(o.url === url ? o.session : { state: "connecting" }) }));
 
   // Only the page's own daemon has a token: its shell link opened this page.
+  // And only a daemon that asks for one is offered it: an older one echoes
+  // no subprotocol, which a browser takes for a failed upgrade.
   const [pageToken, setPageToken] = useState(pageShellToken);
   useEffect(
     () =>
@@ -85,7 +87,7 @@ export default function Shell() {
       }),
     [],
   );
-  const token = url && url === pageUrl() ? pageToken : undefined;
+  const token = shell?.tokenRequired && url && url === pageUrl() ? pageToken : undefined;
   const connect = useCallback(() => openShellSocket(url, key.current ?? undefined, token), [url, token]);
 
   const restart = () => {
