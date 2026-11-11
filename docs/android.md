@@ -43,7 +43,10 @@ apps on the phone — Android's loopback is shared. So it runs with an API
 key ([api.md](api.md#authentication)) generated once per install into the
 app's private files: the WebView is handed it before the page loads, the
 Shell's `llmman` has it as `LLMMAN_API_KEY`, and any other app that
-connects to `127.0.0.1:17434` gets a `401`. There is no setting to expose
+connects to `127.0.0.1:17434` gets a `401`. The Shell's token
+([webui.md](webui.md#the-shells-guard-rails)) changes with each daemon
+start: the app reads it from the daemon's data directory and opens the UI
+with it in the address's fragment. There is no setting to expose
 the API or change the bind address.
 
 Model storage is the app's private data (`Android/data` is not used) and

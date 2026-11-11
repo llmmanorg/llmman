@@ -5,18 +5,29 @@
 //! only when the daemon is bound to loopback
 //! (`daemon::reachable_only_locally`); only with the daemon's API key
 //! when it has one (the `auth` module, which checks this route like every
-//! other — a browser presents the key as a subprotocol); only from an
-//! `Origin` the CORS layer would allow, minus host wildcards, checked
-//! here because browsers do not apply CORS to WebSockets; and not at all
-//! under `LLMMAN_SHELL=off`. Any other `LLMMAN_SHELL` value is the
-//! command to run instead of the login shell.
+//! other — a browser presents the key as a subprotocol); only with the
+//! token this start made, as the subprotocol `llmman.shell.<token>`, API
+//! keys or not; only from an `Origin` the CORS layer would allow, minus
+//! host wildcards, checked here because browsers do not apply CORS to
+//! WebSockets; and not at all under `LLMMAN_SHELL=off`. Any other
+//! `LLMMAN_SHELL` value is the command to run instead of the login shell.
+//!
+//! The token is written 0600 to `shell-<port>.token` in llmman's data
+//! directory, and printed as a web UI link (`#shell-token=<token>`) when
+//! stderr is a terminal. The UI reads it from the link's fragment, which
+//! the browser never sends to the daemon. A token that cannot be saved,
+//! with no terminal to print the link to, turns the shell off.
 //!
 //! Protocol: binary frames carry terminal bytes both ways; the client's
 //! text frames are `{"resize":{"cols":N,"rows":N}}`; the daemon's one text
 //! frame is `{"exit":CODE}` before it closes. A plain `GET` returns
-//! `{"enabled":bool,"reason":...}`.
+//! `{"enabled":bool,"reason":...,"token_required":true}`.
 
-use std::io::{Read, Write};
+use std::io::{IsTerminal as _, Read, Write};
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+use anyhow::Context as _;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -30,6 +41,18 @@ use tokio::time::Duration;
 
 use super::AppState;
 
+/// The subprotocol prefix the shell token comes under. Not the API key's:
+/// a browser on a keyed daemon offers both, and each check finds its own.
+pub(super) const TOKEN_PROTOCOL_PREFIX: &str = "llmman.shell.";
+
+/// URL-safe base64, which a subprotocol and a URL fragment carry as is.
+pub(super) fn new_token() -> anyhow::Result<String> {
+    use base64::Engine as _;
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("shell token: {e}"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
 /// Who may open a shell, fixed at startup.
 #[derive(Debug, Clone)]
 pub(super) struct Policy {
@@ -40,10 +63,14 @@ pub(super) struct Policy {
     /// Program and arguments; empty means the login shell (`%ComSpec%`
     /// on Windows).
     pub(super) command: Vec<String>,
+    pub(super) token_digest: [u8; 32],
+    /// Set at startup when the token could not be saved and no terminal
+    /// shows the link: no client can learn it, so the shell is off.
+    pub(super) token_unsaved: OnceLock<String>,
 }
 
 impl Policy {
-    pub(super) fn from_env() -> anyhow::Result<Self> {
+    pub(super) fn from_env(token: &str) -> anyhow::Result<Self> {
         let setting = ShellSetting::parse(std::env::var("LLMMAN_SHELL").ok().as_deref())
             .map_err(|e| anyhow::anyhow!("LLMMAN_SHELL: {e}"))?;
         let disabled = if setting == ShellSetting::Off {
@@ -70,12 +97,21 @@ impl Policy {
                 ShellSetting::Command(argv) => argv,
                 _ => Vec::new(),
             },
+            token_digest: super::auth::digest(token),
+            token_unsaved: OnceLock::new(),
+        })
+    }
+
+    fn presented_token(&self, headers: &HeaderMap) -> Option<String> {
+        super::auth::offered_ws_protocol_with(headers, TOKEN_PROTOCOL_PREFIX).filter(|protocol| {
+            let token = &protocol[TOKEN_PROTOCOL_PREFIX.len()..];
+            super::auth::digests_match(&super::auth::digest(token), &self.token_digest)
         })
     }
 
     /// Whether a page at `origin` (or a client with no page) may open one.
     fn admits(&self, origin: Option<&str>) -> Result<(), Refusal> {
-        if let Some(reason) = &self.disabled {
+        if let Some(reason) = self.disabled.as_ref().or(self.token_unsaved.get()) {
             return Err(Refusal::Disabled(reason.clone()));
         }
         let allowed = |origin: &str| {
@@ -141,11 +177,85 @@ impl Refusal {
     }
 }
 
+/// Where this start's token is kept: one file per port, so daemons on
+/// two ports do not overwrite each other's.
+pub(super) fn token_path() -> anyhow::Result<PathBuf> {
+    let bind = crate::daemon::bind_addr();
+    let port = bind.rsplit_once(':').map_or("", |(_, port)| port);
+    Ok(crate::data_root()?.join(format!("shell-{port}.token")))
+}
+
+/// Logs whether the shell is on, and saves the token when it is. The
+/// link carrying the token is printed only to a terminal: a detached
+/// daemon's stderr is `serve.log`, which other users may be able to read.
+pub(super) fn announce(policy: &Policy, token: &str, tls: bool) {
+    if let Some(reason) = &policy.disabled {
+        remove_old_token();
+        eprintln!("[llmman] shell: off ({reason})");
+        return;
+    }
+    let saved = token_path().and_then(|path| {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+        crate::fsutil::write_private(&path, token.as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(path)
+    });
+    let why = "bound to loopback; LLMMAN_SHELL=off removes it";
+    let terminal = std::io::stderr().is_terminal();
+    match saved {
+        Ok(path) => eprintln!(
+            "[llmman] shell: on ({why}), its token is in {}",
+            path.display()
+        ),
+        Err(e) => {
+            remove_old_token();
+            if !terminal {
+                let reason = format!("llmman serve could not save its shell token: {e:#}");
+                eprintln!("[llmman] shell: off ({reason})");
+                let _ = policy.token_unsaved.set(reason);
+                return;
+            }
+            eprintln!("[llmman] shell: on ({why}), but its token was not saved: {e:#}");
+        }
+    }
+    if terminal {
+        eprintln!(
+            "[llmman] open the web UI with the shell: http{}://{}/#shell-token={token}",
+            if tls { "s" } else { "" },
+            crate::daemon::bind_addr()
+        );
+    }
+}
+
+/// A token from an earlier start opens nothing: a client that reads it
+/// only gets a 401.
+fn remove_old_token() {
+    if let Ok(path) = token_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn token_refused() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        "the shell needs the token llmman serve made when it started: open the web UI link \
+         it printed, or offer the token from its shell-<port>.token file as the subprotocol \
+         llmman.shell.<token>",
+    )
+        .into_response()
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub(super) struct Status {
     pub(super) enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) reason: Option<String>,
+    /// Always true here. A daemon older than the token omits it, and the
+    /// UI then opens a shell without one.
+    #[serde(default)]
+    pub(super) token_required: bool,
 }
 
 /// `GET /llmman/shell`: an upgrade opens a shell, a plain GET reports
@@ -161,18 +271,17 @@ pub(super) async fn handle_shell(
         (None, reason) => Json(Status {
             enabled: reason.is_none(),
             reason,
+            token_required: true,
         })
         .into_response(),
         (Some(_), Some(reason)) => (StatusCode::FORBIDDEN, reason).into_response(),
         (Some(ws), None) => {
-            let command = state.0.shell.command.clone();
-            // A browser presents its API key as a subprotocol (see the
-            // `auth` module); the handshake fails unless it is echoed.
-            let ws = match super::auth::offered_ws_protocol(&headers) {
-                Some(protocol) => ws.protocols([protocol]),
-                None => ws,
+            let Some(protocol) = state.0.shell.presented_token(&headers) else {
+                return token_refused();
             };
-            ws.on_upgrade(|socket| async move {
+            let command = state.0.shell.command.clone();
+            // The handshake fails unless one offered subprotocol is echoed.
+            ws.protocols([protocol]).on_upgrade(|socket| async move {
                 if let Err(e) = run_session(socket, &command).await {
                     eprintln!("[llmman] shell session ended with an error: {e:#}");
                 }
@@ -336,7 +445,38 @@ mod tests {
             disabled: disabled.map(str::to_string),
             origins: super::super::default_allowed_origins(),
             command: Vec::new(),
+            token_digest: super::super::auth::digest("t"),
+            token_unsaved: OnceLock::new(),
         }
+    }
+
+    fn offering(protocols: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-websocket-protocol", protocols.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn a_new_token_is_random_and_fits_a_subprotocol_as_it_is() {
+        let (a, b) = (new_token().unwrap(), new_token().unwrap());
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 43, "32 bytes of unpadded base64");
+        assert!(a
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'));
+    }
+
+    #[test]
+    fn only_this_starts_token_is_presented() {
+        let p = policy(None);
+        assert_eq!(
+            p.presented_token(&offering("llmman.bearer.a2V5, llmman.shell.t")),
+            Some("llmman.shell.t".into())
+        );
+        assert_eq!(p.presented_token(&offering("llmman.shell.other")), None);
+        assert_eq!(p.presented_token(&offering("llmman.shell.")), None);
+        assert_eq!(p.presented_token(&offering("t, llmman.bearer.dA")), None);
+        assert_eq!(p.presented_token(&HeaderMap::new()), None);
     }
 
     #[test]
@@ -380,6 +520,17 @@ mod tests {
             let refusal = p.admits(origin).err().unwrap();
             assert!(matches!(refusal, Refusal::Disabled(_)));
             assert_eq!(refusal.reason(), "LLMMAN_SHELL is off");
+        }
+    }
+
+    #[test]
+    fn an_unsaved_token_turns_the_shell_off_with_its_reason() {
+        let p = policy(None);
+        p.token_unsaved.set("could not save".into()).unwrap();
+        for origin in [None, Some("http://localhost")] {
+            let refusal = p.admits(origin).err().unwrap();
+            assert!(matches!(refusal, Refusal::Disabled(_)));
+            assert_eq!(refusal.reason(), "could not save");
         }
     }
 

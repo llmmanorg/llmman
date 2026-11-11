@@ -269,8 +269,11 @@ if (!scripts.length) throw new Error("index.html: no scripts found");
 // none, the page's directory, as a relative URL would have it. Empty
 // segments are dropped: `//evil.example/c/x` must not make the base
 // `//evil.example/`, another site the page's scripts would then load from.
-// Nor may anything else lead off the page's origin.
-const headScript = `<script>(function(){var q=location.pathname,s=q.split("/").filter(function(x){return x}),r=${JSON.stringify(ROUTES)},n=/\\/$/.test(q)?0:1;r.forEach(function(t){if(t.length>=n&&t.length<=s.length&&t.every(function(x,j){return x==="*"||x===s[s.length-t.length+j]}))n=t.length});var h=document.head,b=document.createElement("base"),p="/"+s.slice(0,s.length-n).map(function(x){return x+"/"}).join("");if(new URL(p,location.href).origin!==location.origin)p="/";b.href=p;h.appendChild(b);${JSON.stringify(styles.map(ui))}.forEach(function(s){var l=document.createElement("link");l.rel="stylesheet";l.href=s;h.appendChild(l)})})()</script>`;
+// Nor may anything else lead off the page's origin. Last, a shell link's
+// fragment (`#shell-token=…`) comes off the address before the router
+// reads it, which would put it back; lib/page.web.ts takes it from
+// `globalThis.__llmmanShellLink`.
+const headScript = `<script>(function(){var q=location.pathname,s=q.split("/").filter(function(x){return x}),r=${JSON.stringify(ROUTES)},n=/\\/$/.test(q)?0:1;r.forEach(function(t){if(t.length>=n&&t.length<=s.length&&t.every(function(x,j){return x==="*"||x===s[s.length-t.length+j]}))n=t.length});var h=document.head,b=document.createElement("base"),p="/"+s.slice(0,s.length-n).map(function(x){return x+"/"}).join("");if(new URL(p,location.href).origin!==location.origin)p="/";b.href=p;h.appendChild(b);${JSON.stringify(styles.map(ui))}.forEach(function(s){var l=document.createElement("link");l.rel="stylesheet";l.href=s;h.appendChild(l)});if(/^#shell-token=/.test(location.hash)){globalThis.__llmmanShellLink=location.hash;history.replaceState(history.state,"",location.pathname+location.search)}})()</script>`;
 // Where the scripts were, in order, as the deferred scripts they were.
 const bodyScript = `<script>${JSON.stringify(scripts.map(ui))}.forEach(function(s){var e=document.createElement("script");e.src=s;e.async=false;document.body.appendChild(e)})</script>`;
 html = html
@@ -318,6 +321,28 @@ for (const [path, base] of [
     document: { head, createElement: (tagName) => ({ tagName }) },
   });
   if (got !== base) throw new Error(`index.html at ${path}: base ${got}, not ${base}`);
+}
+// A shell link's fragment leaves the address for the app; any other stays.
+for (const [hash, link, address] of [
+  ["#shell-token=abc", "#shell-token=abc", "/shell?x=1"],
+  ["#section", undefined, undefined],
+]) {
+  const context = {
+    location: {
+      pathname: "/shell",
+      search: "?x=1",
+      hash,
+      href: "http://127.0.0.1:17434/shell",
+      origin: "http://127.0.0.1:17434",
+    },
+    URL,
+    document: { head: { appendChild() {} }, createElement: (tagName) => ({ tagName }) },
+    history: { state: null, replaceState: (_s, _t, url) => (replaced = url) },
+  };
+  let replaced;
+  runInNewContext(headScript.replace(/^<script>|<\/script>$/g, ""), context);
+  if (context.__llmmanShellLink !== link || replaced !== address)
+    throw new Error(`index.html with ${hash}: took ${context.__llmmanShellLink}, address ${replaced}`);
 }
 await writeFile(join(out, "index.html"), html);
 

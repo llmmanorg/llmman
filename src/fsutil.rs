@@ -1,5 +1,6 @@
-//! Whole-file writes a reader never sees half done, the free space a
-//! download needs, and the SHA-256 of a file's bytes.
+//! Whole-file writes a reader never sees half done, writes only their
+//! owner can read, the free space a download needs, and the SHA-256 of a
+//! file's bytes.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -18,20 +19,49 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// the temp is synced before the rename.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut tmp = path.clone().into_os_string();
+    replace_through_temp(&path, bytes, 0o666, |file| match std::fs::metadata(&path) {
+        Ok(meta) => file.set_permissions(meta.permissions()),
+        Err(_) => Ok(()),
+    })
+}
+
+/// [`write_atomic`], but the new file is readable only by its owner on
+/// Unix, whatever the old one allowed. The rename needs only the
+/// directory to be writable, so it also replaces a file this process
+/// could not open for writing; a symlink at `path` is replaced, not
+/// written through.
+pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    replace_through_temp(path, bytes, 0o600, |_file| {
+        #[cfg(unix)]
+        _file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        Ok(())
+    })
+}
+
+/// The temp is created with `create_mode` on Unix (less the umask): a
+/// mode set afterwards would not reach a reader that opened it before.
+/// `prepare` runs on the temp before it holds anything.
+fn replace_through_temp(
+    path: &Path,
+    bytes: &[u8],
+    create_mode: u32,
+    prepare: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut tmp = path.to_path_buf().into_os_string();
     tmp.push(format!(
         ".{}.{}.tmp",
         std::process::id(),
         TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let written = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        if let Ok(meta) = std::fs::metadata(&path) {
-            file.set_permissions(meta.permissions())?;
-        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, create_mode);
+        #[cfg(not(unix))]
+        let _ = create_mode;
+        let mut file = options.open(&tmp)?;
+        prepare(&file)?;
         file.write_all(bytes)?;
         file.sync_all()
     })();
@@ -39,7 +69,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    std::fs::rename(&tmp, &path).inspect_err(|_| {
+    std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
 }
@@ -292,6 +322,71 @@ mod tests {
             std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_makes_a_new_file_and_an_existing_one_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir("private");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let new = dir.join("new");
+        write_private(&new, b"secret").unwrap();
+        assert_eq!(mode(&new), 0o600);
+        assert_eq!(std::fs::read(&new).unwrap(), b"secret");
+
+        let existing = dir.join("existing");
+        std::fs::write(&existing, b"a longer old secret").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&existing, b"new").unwrap();
+        assert_eq!(mode(&existing), 0o600);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_temp_has_its_create_mode_before_prepare_runs() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir("create-mode");
+        let mut seen = 0;
+        replace_through_temp(&dir.join("token"), b"x", 0o600, |file| {
+            seen = file.metadata()?.permissions().mode() & 0o777;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen & 0o077, 0, "group and others: {seen:o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_replaces_a_file_it_cannot_open_and_keeps_it_when_the_dir_refuses() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir("private-replace");
+        let path = dir.join("token");
+        let chmod = |p: &Path, mode| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        std::fs::write(&path, b"stale").unwrap();
+        chmod(&path, 0o444);
+        write_private(&path, b"fresh").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Root ignores permissions, so only another user can see a refusal.
+        if unsafe { libc::geteuid() } != 0 {
+            chmod(&dir, 0o555);
+            let refused = write_private(&path, b"newer");
+            chmod(&dir, 0o755);
+            assert!(refused.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temp left");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

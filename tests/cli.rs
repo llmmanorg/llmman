@@ -213,3 +213,143 @@ fn launch_claude_refuses_a_variant_with_a_forwarded_model() {
         "stderr: {stderr}"
     );
 }
+
+/// The client sends no `Origin` (not a browser). stderr is a pipe, so the
+/// token must not appear in it.
+#[cfg(unix)]
+#[test]
+fn a_default_keyless_serve_opens_its_shell_only_with_the_token() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let token_file = home
+        .path()
+        .join(format!(".local/share/llmman/shell-{port}.token"));
+    // The daemon, its stderr up to the shell line, and the rest of its stderr.
+    let start = |shell: Option<&str>| {
+        let mut cmd = llmman();
+        cmd.args(["serve", "--runtime", "path"])
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("LLMMAN_HOST", format!("127.0.0.1:{port}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Some(value) = shell {
+            cmd.env("LLMMAN_SHELL", value);
+        }
+        let mut daemon = Daemon(cmd.spawn().unwrap());
+        let stderr = daemon.0.stderr.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        // Drains to EOF, so the daemon never writes to a closed pipe.
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+        let mut log = Vec::new();
+        while !log.iter().any(|l: &String| l.contains("[llmman] shell:")) {
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(line) => log.push(line),
+                Err(_) => panic!("no shell line in {log:#?}"),
+            }
+        }
+        (daemon, log.join("\n"), rx)
+    };
+    let shell_url = format!("http://127.0.0.1:{port}/llmman/shell");
+    let client = reqwest::blocking::Client::new();
+    let upgrade = |protocol: Option<&str>| {
+        let mut req = client
+            .get(&shell_url)
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+        if let Some(protocol) = protocol {
+            req = req.header("sec-websocket-protocol", protocol);
+        }
+        req.send().unwrap().status().as_u16()
+    };
+
+    // A token file the daemon cannot open for writing, from an earlier start.
+    let data_dir = token_file.parent().unwrap().to_path_buf();
+    let chmod = |path: &std::path::Path, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(&token_file, "stale").unwrap();
+    chmod(&token_file, 0o444);
+
+    let (daemon, log, rest) = start(None);
+    assert!(
+        log.contains(&format!(
+            "[llmman] shell: on (bound to loopback; LLMMAN_SHELL=off removes it), its token is in {}",
+            token_file.display()
+        )),
+        "{log}"
+    );
+    let mode = std::fs::metadata(&token_file).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let token = std::fs::read_to_string(&token_file).unwrap();
+    assert_ne!(token, "stale");
+
+    assert_eq!(upgrade(None), 401);
+    assert_eq!(upgrade(Some("llmman.shell.wrong")), 401);
+    assert_eq!(upgrade(Some(&format!("llmman.shell.{token}"))), 101);
+    let status: serde_json::Value = client.get(&shell_url).send().unwrap().json().unwrap();
+    assert_eq!(
+        status,
+        serde_json::json!({ "enabled": true, "token_required": true })
+    );
+
+    drop(daemon);
+    let stderr = format!("{log}\n{}", rest.iter().collect::<Vec<_>>().join("\n"));
+    assert!(!stderr.contains(&token), "{stderr}");
+
+    let (daemon, log, _) = start(Some("off"));
+    assert!(
+        log.contains("[llmman] shell: off (LLMMAN_SHELL is off)"),
+        "{log}"
+    );
+    assert!(!token_file.exists());
+    drop(daemon);
+
+    // Root ignores permissions, so only another user can see a refusal.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    chmod(&data_dir, 0o555);
+    let (daemon, log, _) = start(None);
+    let status: serde_json::Value = client.get(&shell_url).send().unwrap().json().unwrap();
+    drop(daemon);
+    chmod(&data_dir, 0o755);
+    assert!(
+        log.contains("[llmman] shell: off (llmman serve could not save its shell token: "),
+        "{log}"
+    );
+    assert_eq!(status["enabled"], false);
+    assert!(
+        status["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("llmman serve could not save its shell token: "),
+        "{status}"
+    );
+}

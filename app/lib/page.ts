@@ -27,3 +27,12 @@ export const pageKeySource: KeySource | undefined = undefined;
 export function onPageKeyEntered(_fn: (key: string) => void): () => void {
   return () => {};
 }
+
+/** None on a phone: there is no page for a shell link to open. */
+export function pageShellToken(): string | undefined {
+  return undefined;
+}
+
+export function onPageShellToken(_fn: (token: string) => void): () => void {
+  return () => {};
+}

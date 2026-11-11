@@ -94,7 +94,7 @@ upgrade.
 ## The shell's guard rails
 
 A shell endpoint is only acceptable because the daemon is, by default,
-reachable only from the machine it runs on. Three checks keep it that
+reachable only from the machine it runs on. Four checks keep it that
 way:
 
 1. **Loopback only.** When `LLMMAN_HOST` binds beyond loopback
@@ -103,25 +103,46 @@ way:
    network behind an API key is a choice an operator can make; a shell
    is not, even behind one. On loopback, a daemon with keys requires one
    for the shell as for every other route.
-2. **Same-site browsers only.** Browsers do not apply CORS to WebSockets,
+2. **This start's token.** Each `llmman serve` start makes a random token
+   and writes it, readable only by its user, to `shell-<port>.token` in
+   llmman's data directory (`~/.local/share/llmman`,
+   `%LOCALAPPDATA%\llmman` on Windows). An upgrade must offer it as the
+   subprotocol `llmman.shell.<token>`, API keys or not; without it the
+   upgrade gets `401`. When its stderr is a terminal, `serve` prints a link
+   to the UI that carries the token in its fragment
+   (`http://127.0.0.1:17434/#shell-token=<token>`); a detached daemon does
+   not, since its log may be readable by other users. A daemon that cannot
+   save the token and has no terminal to print the link to turns the shell
+   off and says why, since no client could learn the token. The page takes
+   the token from the fragment, which the browser never sends, keeps it in
+   local storage like the key, and takes it off the address. Without one,
+   *Shell* says how to get it; a token from an earlier start opens nothing.
+   Processes running as the same user can read the file, so the token keeps
+   out other users of the machine and anything that reaches the port from
+   elsewhere (a forwarded port, a container's or VM's route to the host).
+3. **Same-site browsers only.** Browsers do not apply CORS to WebSockets,
    so a page on any site could otherwise open
    `ws://127.0.0.1:17434/llmman/shell` from a visitor's browser. The
    route checks the `Origin` header itself against the same patterns as
    the CORS layer — every localhost spelling plus `LLMMAN_ORIGINS`
    ([configuration.md](configuration.md)) — except patterns whose `*`
    covers the host (`*`, `https://*.example.com`), which are fine for CORS
-   and refused here. A request with no `Origin` (not a browser) is
-   allowed: it already had a shell to run from.
-3. **`LLMMAN_SHELL=off`** removes it entirely for an operator who wants
+   and refused here. A request with no `Origin` (not a browser) passes
+   this check; it still needs the token.
+4. **`LLMMAN_SHELL=off`** removes it entirely for an operator who wants
    the UI without it. Any other value is the program to run instead of
    the login shell, split like `LLMMAN_VLLM_ARGS`, so a quoted argument
    keeps its spaces (`LLMMAN_SHELL="tmux new -A -s llmman"`,
    `LLMMAN_SHELL="sh -c 'exec tmux new -A -s llmman'"`).
 
 `GET /llmman/shell` without a WebSocket upgrade always answers `200` with
-`{"enabled": true}` or `{"enabled": false, "reason": "…"}`; only the
-upgrade itself is refused with `403`. That is how the UI knows before it
-tries. The page is also served with `frame-ancestors 'none'`, so another
+`{"enabled": true, "token_required": true}` or `{"enabled": false,
+"reason": "…", "token_required": true}`; only the upgrade itself is
+refused, with `403`, or `401` without the token. That is how the UI knows
+before it tries. A daemon older than the token omits `token_required`,
+and the UI opens its shell without one. `serve` logs the same at startup:
+`[llmman] shell: on (bound to loopback; LLMMAN_SHELL=off removes it), its
+token is in <file>` or `[llmman] shell: off (<reason>)`. The page is also served with `frame-ancestors 'none'`, so another
 site cannot frame it and reach the shell through the trusted origin, and
 `base-uri 'self'`, so its base cannot move to another site.
 

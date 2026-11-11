@@ -36,6 +36,14 @@ export function keyStorageName(path: string): string {
   return `llmman.apiKey:${path}`;
 }
 
+export function shellTokenStorageName(path: string): string {
+  return `llmman.shellToken:${path}`;
+}
+
+export function shellTokenFromHash(hash: string): string | undefined {
+  return /^#?shell-token=([A-Za-z0-9_-]+)$/.exec(hash)?.[1];
+}
+
 /** The key stored for the page's base path, and no other: a daemon at `/` never lends its key to another. */
 export function readScopedKey(storage: Pick<Storage, "getItem">, path: string): string | undefined {
   return storage.getItem(keyStorageName(path))?.trim() || undefined;

@@ -81,18 +81,23 @@ impl Policy {
         let presented = digest(key.trim());
         let mut matched = false;
         for expected in &self.digests {
-            let mut diff = 0u8;
-            for (a, b) in presented.iter().zip(expected) {
-                diff |= a ^ b;
-            }
-            matched |= diff == 0;
+            matched |= digests_match(&presented, expected);
         }
         matched
     }
 }
 
-fn digest(key: &str) -> [u8; 32] {
+pub(super) fn digest(key: &str) -> [u8; 32] {
     Sha256::digest(key.as_bytes()).into()
+}
+
+/// Compares every byte, so timing says nothing about which one differed.
+pub(super) fn digests_match(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// The token of `Authorization: Bearer <token>`; the scheme is
@@ -107,16 +112,19 @@ pub(super) fn bearer(headers: &HeaderMap) -> Option<&str> {
     scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
 }
 
-/// The subprotocol a WebSocket client offered its key in, verbatim, for
-/// the handler to echo — the handshake fails otherwise.
+/// The subprotocol a WebSocket client offered its key in, verbatim.
 pub(super) fn offered_ws_protocol(headers: &HeaderMap) -> Option<String> {
+    offered_ws_protocol_with(headers, crate::auth::WS_PROTOCOL_PREFIX)
+}
+
+pub(super) fn offered_ws_protocol_with(headers: &HeaderMap, prefix: &str) -> Option<String> {
     headers
         .get_all("sec-websocket-protocol")
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
         .map(str::trim)
-        .find(|p| p.starts_with(crate::auth::WS_PROTOCOL_PREFIX))
+        .find(|p| p.starts_with(prefix))
         .map(str::to_string)
 }
 
@@ -151,7 +159,7 @@ pub(super) async fn require_key(
             admitted = true;
         }
     }
-    // Left in place: the shell handler echoes it.
+    // Left in place: the same header carries the shell token.
     if offered_ws_protocol(headers)
         .as_deref()
         .and_then(crate::auth::ws_protocol_key)

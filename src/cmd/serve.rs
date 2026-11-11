@@ -4711,7 +4711,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     }
     // Before the store is touched, so a bad value has no side effects.
     backend::check_extra_args_env()?;
-    let shell = shell::Policy::from_env()?;
+    let shell_token = shell::new_token()?;
+    let shell = shell::Policy::from_env(&shell_token)?;
     let llama_cpp_version = runtime::llama_cpp_pin(_args.llama_cpp_version.as_deref());
 
     // Settle `--runtime` and fetch its llama.cpp before anything binds,
@@ -4979,6 +4980,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         "llmman serve listening on http{}://{addr}",
         if tls.is_some() { "s" } else { "" }
     );
+    // After the bind: a second daemon that fails it leaves the first's token alone.
+    shell::announce(&state.0.shell, &shell_token, tls.is_some());
 
     // Background idle-unload reaper — see reap_idle_models's doc comment.
     tokio::spawn(reap_idle_models(state.clone()));

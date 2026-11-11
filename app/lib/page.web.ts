@@ -7,12 +7,20 @@
 import type { KeySource } from "@/api/client";
 import { showDialog } from "@/lib/dialog";
 import { createKeyPrompt } from "@/lib/keyPrompt";
-import { basePath, keyStorageName, pageServerUrl, readScopedKey } from "@/lib/pageBase";
+import {
+  basePath,
+  keyStorageName,
+  pageServerUrl,
+  readScopedKey,
+  shellTokenFromHash,
+  shellTokenStorageName,
+} from "@/lib/pageBase";
 
 // Fixed at load: the app's own navigation changes the page's address.
 const BASE_URI = typeof document === "undefined" ? "" : document.baseURI;
 const BASE = basePath(BASE_URI);
 const KEY_STORAGE = keyStorageName(BASE);
+const SHELL_TOKEN_STORAGE = shellTokenStorageName(BASE);
 
 const listeners = new Set<(key: string) => void>();
 
@@ -84,4 +92,54 @@ export const pageKeySource: KeySource | undefined = {
 export function onPageKeyEntered(fn: (key: string) => void): () => void {
   listeners.add(fn);
   return () => listeners.delete(fn);
+}
+
+const shellTokenListeners = new Set<(token: string) => void>();
+
+/** The shell token last taken when storage would not keep it: it holds for this page. */
+let unsavedShellToken: string | undefined;
+
+function storeShellToken(token: string): void {
+  try {
+    localStorage.setItem(SHELL_TOKEN_STORAGE, token);
+    unsavedShellToken = undefined;
+  } catch {
+    unsavedShellToken = token;
+  }
+  for (const l of shellTokenListeners) l(token);
+}
+
+/**
+ * Moves the token of a shell link (`#shell-token=<token>`) from the
+ * address into storage, so it stays out of the history and of links
+ * copied from the address bar. Runs on `hashchange`: a link to the page
+ * already open changes only the fragment.
+ */
+export function adoptShellToken(): void {
+  const token = shellTokenFromHash(location.hash);
+  if (!token) return;
+  history.replaceState(history.state, "", location.pathname + location.search);
+  storeShellToken(token);
+}
+
+if (typeof document !== "undefined") {
+  // A link that loaded the page: index.html's first script already took
+  // the fragment off the address (scripts/export-web.mjs).
+  const atLoad = shellTokenFromHash((globalThis as { __llmmanShellLink?: string }).__llmmanShellLink ?? "");
+  if (atLoad) storeShellToken(atLoad);
+  window.addEventListener("hashchange", adoptShellToken);
+}
+
+export function pageShellToken(): string | undefined {
+  if (unsavedShellToken) return unsavedShellToken;
+  try {
+    return localStorage.getItem(SHELL_TOKEN_STORAGE)?.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function onPageShellToken(fn: (token: string) => void): () => void {
+  shellTokenListeners.add(fn);
+  return () => shellTokenListeners.delete(fn);
 }

@@ -279,13 +279,29 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Loads the web UI with the shell token in the fragment. A page
+     * already open reloads where it is: `replaceState` adds the fragment
+     * without a navigation the reload could race, and throws on an error
+     * page, which loads the UI's root instead.
+     */
     private fun loadUi() {
         uiLoaded = true
         showStatus(getString(R.string.status_waiting))
+        val fragment = Daemon.shellToken(this)?.let { "#shell-token=$it" } ?: ""
         if (webView.url?.let { isOurOrigin(Uri.parse(it)) } == true) {
-            webView.reload()
+            if (fragment.isEmpty()) {
+                webView.reload()
+            } else {
+                webView.evaluateJavascript(
+                    "try { history.replaceState(history.state, '', location.pathname + location.search + " +
+                        "${jsString(fragment)}); location.reload() } " +
+                        "catch (e) { location.href = ${jsString(Daemon.BASE_URL + fragment)} }",
+                    null,
+                )
+            }
         } else {
-            webView.loadUrl(Daemon.BASE_URL)
+            webView.loadUrl(Daemon.BASE_URL + fragment)
         }
     }
 

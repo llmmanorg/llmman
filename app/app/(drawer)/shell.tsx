@@ -1,7 +1,8 @@
 // Shell: a terminal on the computer running llmman serve, over
 // `/llmman/shell`. The daemon decides
-// whether one may open (only on loopback, with its key; never under
-// LLMMAN_SHELL=off); this screen only asks and explains. One session at a
+// whether one may open (only on loopback, with its key and the token of
+// its current start; never under LLMMAN_SHELL=off); this screen only asks
+// and explains. One session at a
 // time: it lives as long as this screen, which the drawer keeps while you
 // go elsewhere, so coming back finds the same shell.
 
@@ -16,8 +17,19 @@ import { Terminal } from "@/components/terminal/Terminal";
 import { terminalColors } from "@/components/terminal/theme";
 import { Button } from "@/components/ui";
 import { useDaemon } from "@/lib/DaemonContext";
+import { onPageShellToken, pageShellToken, pageUrl } from "@/lib/page";
 import { useServers } from "@/lib/ServersContext";
 import { font, radius, spacing, useTheme } from "@/lib/theme";
+
+const NO_TOKEN_HELP =
+  Platform.OS === "web"
+    ? "llmman serve makes a new shell token each time it starts. Open the link it prints in its terminal, " +
+      "or add #shell-token= and the token from shell-<port>.token in llmman's data directory to this page's address."
+    : "The shell needs the token llmman serve makes each time it starts, which only a browser on the same " +
+      "computer can take from the link llmman serve prints.";
+
+const STALE_TOKEN_HELP =
+  "If llmman serve has restarted since its shell link was opened, open the new link: each start makes a new token.";
 
 type Session =
   | { state: "connecting" }
@@ -61,9 +73,26 @@ export default function Shell() {
   const session: Session = sessionOf.url === url ? sessionOf.session : { state: "connecting" };
   const setSession = (next: (s: Session) => Session) =>
     setSessionOf((o) => ({ url, session: next(o.url === url ? o.session : { state: "connecting" }) }));
-  const connect = useCallback(() => openShellSocket(url, key.current ?? undefined), [url]);
+
+  // Only the page's own daemon has a token: its shell link opened this page.
+  // And only a daemon that asks for one is offered it: an older one echoes
+  // no subprotocol, which a browser takes for a failed upgrade.
+  const [pageToken, setPageToken] = useState(pageShellToken);
+  useEffect(
+    () =>
+      onPageShellToken((token) => {
+        setPageToken(token);
+        setSessionOf({ url: "", session: { state: "connecting" } });
+        setGeneration((g) => g + 1);
+      }),
+    [],
+  );
+  const token = shell?.tokenRequired && url && url === pageUrl() ? pageToken : undefined;
+  const connect = useCallback(() => openShellSocket(url, key.current ?? undefined, token), [url, token]);
 
   const restart = () => {
+    // Another tab may have opened a newer shell link.
+    setPageToken(pageShellToken());
     setSession(() => ({ state: "connecting" }));
     setGeneration((g) => g + 1);
   };
@@ -76,6 +105,14 @@ export default function Shell() {
           title="The shell is not available"
           text={shell.reason || "llmman serve has the shell turned off."}
         />
+      </View>
+    );
+  }
+
+  if (shell.tokenRequired && !token) {
+    return (
+      <View style={[styles.fill, { backgroundColor: colors.background }]}>
+        <Overlay title="Open the shell link from llmman serve" text={NO_TOKEN_HELP} />
       </View>
     );
   }
@@ -101,14 +138,16 @@ export default function Shell() {
             onState={(st, reason) => {
               // Otherwise the drawer waits for the next 15 s poll.
               if (st === "closed") checkReachable();
-              setSession((s) =>
-                st === "attached"
-                  ? { state: "attached" }
-                  : // The exit frame comes first; its close adds nothing.
-                    s.state === "exited"
-                    ? s
-                    : { state: "closed", ...(reason ? { reason } : {}) },
-              );
+              setSession((s) => {
+                if (st === "attached") return { state: "attached" };
+                // The exit frame comes first; its close adds nothing.
+                if (s.state === "exited") return s;
+                // A browser is not told why an upgrade was refused; with a
+                // shell link opened, a stale token is the likely reason.
+                const why =
+                  reason ?? (shell.tokenRequired && s.state === "connecting" ? STALE_TOKEN_HELP : undefined);
+                return { state: "closed", ...(why ? { reason: why } : {}) };
+              });
             }}
             onSender={(fn) => {
               send.current = fn;

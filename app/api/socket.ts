@@ -1,6 +1,6 @@
 // The daemon's WebSocket (the shell) and how it carries the key: a phone
 // sends it as a header; a browser cannot set one on an upgrade, so it
-// offers the key as a subprotocol the daemon echoes.
+// offers the key as a subprotocol.
 
 import { Platform } from "react-native";
 
@@ -18,15 +18,20 @@ export function socketUrl(url: string, path: string): string {
 }
 
 /** A binary WebSocket to `target`, carrying `key` the way this platform can. */
-export function openKeyedSocket(target: string, key: string | undefined): WebSocket {
-  const ws =
-    Platform.OS === "web"
-      ? new WebSocket(target, key ? [keyProtocol(key)] : undefined)
-      : new (WebSocket as unknown as new (u: string, p: string[] | undefined, o: object) => WebSocket)(
-          target,
-          undefined,
-          key ? { headers: { Authorization: `Bearer ${key}` } } : {},
-        );
+export function openKeyedSocket(
+  target: string,
+  key: string | undefined,
+  protocols: string[] = [],
+): WebSocket {
+  const web = Platform.OS === "web";
+  const offered = web && key ? [keyProtocol(key), ...protocols] : protocols;
+  const ws = web
+    ? new WebSocket(target, offered.length ? offered : undefined)
+    : new (WebSocket as unknown as new (u: string, p: string[] | undefined, o: object) => WebSocket)(
+        target,
+        offered.length ? offered : undefined,
+        key ? { headers: { Authorization: `Bearer ${key}` } } : {},
+      );
   ws.binaryType = "arraybuffer";
   return ws;
 }
