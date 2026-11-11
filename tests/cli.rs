@@ -241,7 +241,7 @@ fn a_default_keyless_serve_opens_its_shell_only_with_the_token() {
         .port();
     let token_file = home
         .path()
-        .join(format!(".local/share/llmman/shell-{port}.token"));
+        .join(format!(".local/share/llmman/shell-127.0.0.1-{port}.token"));
     // The daemon, its stderr up to the shell line, and the rest of its stderr.
     let start = |shell: Option<&str>| {
         let mut cmd = llmman();

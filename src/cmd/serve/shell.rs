@@ -12,7 +12,7 @@
 //! WebSockets; and not at all under `LLMMAN_SHELL=off`. Any other
 //! `LLMMAN_SHELL` value is the command to run instead of the login shell.
 //!
-//! The token is written 0600 to `shell-<port>.token` in llmman's data
+//! The token is written 0600 to `shell-<host>-<port>.token` in llmman's data
 //! directory, and printed as a web UI link (`#shell-token=<token>`) when
 //! stderr is a terminal. The UI reads it from the link's fragment, which
 //! the browser never sends to the daemon. A token that cannot be saved,
@@ -177,12 +177,21 @@ impl Refusal {
     }
 }
 
-/// Where this start's token is kept: one file per port, so daemons on
-/// two ports do not overwrite each other's.
+/// Where this start's token is kept: one file per bind address, so
+/// daemons on two addresses do not overwrite each other's.
 pub(super) fn token_path() -> anyhow::Result<PathBuf> {
-    let bind = crate::daemon::bind_addr();
-    let port = bind.rsplit_once(':').map_or("", |(_, port)| port);
-    Ok(crate::data_root()?.join(format!("shell-{port}.token")))
+    Ok(crate::data_root()?.join(token_file_name(&crate::daemon::bind_addr())))
+}
+
+/// `shell-<host>-<port>.token`. An IPv6 host loses its brackets and its
+/// colons become `_`: Windows forbids `:` in file names.
+fn token_file_name(bind_addr: &str) -> String {
+    let (host, port) = bind_addr.rsplit_once(':').unwrap_or((bind_addr, ""));
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .replace(':', "_");
+    format!("shell-{host}-{port}.token")
 }
 
 /// Logs whether the shell is on, and saves the token when it is. The
@@ -241,7 +250,7 @@ fn token_refused() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         "the shell needs the token llmman serve made when it started: open the web UI link \
-         it printed, or offer the token from its shell-<port>.token file as the subprotocol \
+         it printed, or offer the token from its shell-<host>-<port>.token file as the subprotocol \
          llmman.shell.<token>",
     )
         .into_response()
@@ -454,6 +463,18 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("sec-websocket-protocol", protocols.parse().unwrap());
         headers
+    }
+
+    #[test]
+    fn each_bind_address_has_its_own_token_file() {
+        for (bind, name) in [
+            ("127.0.0.1:17434", "shell-127.0.0.1-17434.token"),
+            ("127.0.0.2:17434", "shell-127.0.0.2-17434.token"),
+            ("localhost:17434", "shell-localhost-17434.token"),
+            ("[::1]:17434", "shell-__1-17434.token"),
+        ] {
+            assert_eq!(token_file_name(bind), name, "{bind}");
+        }
     }
 
     #[test]
