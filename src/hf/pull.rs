@@ -704,4 +704,53 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[tokio::test]
+    async fn a_file_served_without_xet_is_hashed_and_counted_as_it_downloads() {
+        use sha2::Digest as _;
+        let body: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+        let hex = hex::encode(sha2::Sha256::digest(&body));
+        // No `x-xet-hash` header, so the file downloads over plain HTTP.
+        let headers = [
+            ("x-linked-etag", format!("\"{hex}\"")),
+            ("x-linked-size", body.len().to_string()),
+        ];
+        let served = body.clone();
+        let app = axum::Router::new().route(
+            "/o/r/resolve/c/model.gguf",
+            axum::routing::get(move || {
+                let (headers, served) = (headers.clone(), served.clone());
+                async move { (headers, served) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        oci::ensure_layout(dir.path()).unwrap();
+        let progress_key = "hf-pull-plain-http-download";
+        progress::reset(progress_key, "pulling");
+        let descriptor = download_layer(
+            &crate::hf::download_client().unwrap(),
+            &crate::hf::head_client().unwrap(),
+            &endpoint,
+            "o",
+            "r",
+            "c",
+            &lfs_file("model.gguf", body.len() as i64, None),
+            None,
+            dir.path(),
+            progress_key,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(descriptor.digest, format!("sha256:{hex}"));
+        let blob = dir.path().join("blobs").join("sha256").join(&hex);
+        assert_eq!(std::fs::read(blob).unwrap(), body);
+        let progress = progress::poll(progress_key);
+        let size = body.len() as i64;
+        assert_eq!((progress.completed, progress.total), (size, size));
+    }
 }
