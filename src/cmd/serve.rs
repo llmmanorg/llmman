@@ -4976,12 +4976,13 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
+    let addr = crate::daemon::bound_addr(listener.local_addr().context("listener address")?.port());
     eprintln!(
         "llmman serve listening on http{}://{addr}",
         if tls.is_some() { "s" } else { "" }
     );
     // After the bind: a second daemon that fails it leaves the first's token alone.
-    shell::announce(&state.0.shell, &shell_token, tls.is_some());
+    shell::announce(&state.0.shell, &shell_token, tls.is_some(), &addr);
 
     // Background idle-unload reaper — see reap_idle_models's doc comment.
     tokio::spawn(reap_idle_models(state.clone()));
