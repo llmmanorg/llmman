@@ -4,7 +4,7 @@ use super::common;
 use super::optimizer::{Addition, Optimizer};
 use super::{
     before_terminator, exec_with_env_removing, find_on_path, has_flag, has_forwarded_model_flag,
-    server,
+    server, HostedModel,
 };
 
 /// Inherited variables that point claude at another provider or credential.
@@ -49,9 +49,16 @@ pub(super) fn launch_claude(
     context_window: Option<u64>,
     extra_args: &[String],
     optimizer: Optimizer,
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     let bin = find_on_path("claude").ok_or_else(|| anyhow::anyhow!("claude is not installed"))?;
-    let added = optimizer.addition("claude")?;
+    let mut added = optimizer.addition("claude")?;
+    // Every model `--provider` serves is offered by claude's `/model`
+    // picker (see `model_picker`), folded into the one `--settings`
+    // argument there is room for: claude keeps only the last one.
+    if let Some(picker) = model_picker(hosted) {
+        added.args = with_model_picker(added.args, picker);
+    }
     let server = server();
     let session_model = session_model(model, extra_args);
     let window = claude_context_window(
@@ -177,6 +184,62 @@ fn claude_env<'a>(
         }
     }
     env
+}
+
+/// The `modelPicker` lineup for `hosted`: every model the provider
+/// serves, in the order the catalog lists them, under the id the
+/// provider knows them by. `replaceBuiltInOptions` leaves the picker
+/// these models and nothing else — the built-in rows would each resolve
+/// to the one model [`claude_env`] pins every alias to, so listing them
+/// beside the provider's would offer the same model several times.
+///
+/// The model id travels verbatim, and it is the reference the daemon
+/// routes on — the same one `--model` passes today — so a switch inside
+/// the session still reaches this provider. A claude too old to know the
+/// key ignores it, leaving the picker as it was.
+fn model_picker(hosted: Option<&[HostedModel]>) -> Option<serde_json::Value> {
+    let hosted = hosted?;
+    if hosted.is_empty() {
+        return None;
+    }
+    let options: Vec<serde_json::Value> = hosted
+        .iter()
+        .map(|m| serde_json::json!({ "model": m.reference, "label": m.id }))
+        .collect();
+    Some(serde_json::json!({
+        "options": options,
+        "replaceBuiltInOptions": true,
+    }))
+}
+
+/// `args` with `picker` added to the `--settings` argument: claude keeps
+/// only the last one, so a lineup that landed beside the optimizer's own
+/// settings would silently drop its hook. There the picker is one key of
+/// that object; with no settings yet, it is the argument.
+fn with_model_picker(args: Vec<String>, picker: serde_json::Value) -> Vec<String> {
+    let mut args = args;
+    let existing = args
+        .iter()
+        .position(|arg| arg == "--settings")
+        .map(|at| (at, args[at + 1].clone()));
+    match existing {
+        Some((at, json)) => {
+            let mut settings = serde_json::from_str::<serde_json::Value>(&json)
+                .ok()
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            settings["modelPicker"] = picker;
+            args[at + 1] = serde_json::to_string(&settings).expect("settings serialize");
+            args
+        }
+        None => {
+            let settings = serde_json::json!({ "modelPicker": picker });
+            let json = serde_json::to_string(&settings).expect("settings serialize");
+            let mut with = vec!["--settings".to_string(), json];
+            with.append(&mut args);
+            with
+        }
+    }
 }
 
 #[cfg(test)]

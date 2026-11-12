@@ -6,7 +6,8 @@ use anyhow::Context;
 
 use super::common::write_json_merged;
 use super::{
-    exec_with_env, find_on_path, server, thinking_choices, xdg_dir, Thinking, WINDOWS_PATH_EXTS,
+    exec_with_env, find_on_path, server, thinking_choices, xdg_dir, HostedModel, Thinking,
+    WINDOWS_PATH_EXTS,
 };
 
 /// opencode: a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
@@ -23,6 +24,7 @@ pub(super) fn launch_opencode(
     context_window: Option<u64>,
     max_output: Option<u32>,
     extra_args: &[String],
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
 
@@ -38,6 +40,7 @@ pub(super) fn launch_opencode(
         vision,
         context_window,
         max_output,
+        hosted,
     );
     if let Some(variant) = variant {
         write_opencode_variant(&opencode_state_dir()?, effective_model, variant)?;
@@ -154,9 +157,15 @@ fn opencode_output_reserve(context: u64) -> u64 {
     (context / 4).clamp(1, OPENCODE_OUTPUT_TOKEN_MAX)
 }
 
-/// The `OPENCODE_CONFIG_CONTENT` for `model` at `server`. Structs rather
+/// opencode's `OPENCODE_CONFIG_CONTENT` for `model` at `server`. Structs rather
 /// than `json!`, whose map sorts keys: opencode cycles variants in the
 /// order listed. No variants leaves the key out.
+///
+/// `hosted` is every model `--provider` serves (see [`HostedModel`]); with
+/// it, the config lists all of them, so opencode's own model picker can
+/// switch between them mid-session. The launched model keeps the variants,
+/// `--variant` options and window this launch resolved for it; each other
+/// model takes what the provider's catalog says about it.
 #[allow(clippy::too_many_arguments)]
 fn opencode_config(
     server: &str,
@@ -167,6 +176,7 @@ fn opencode_config(
     vision: bool,
     context_window: Option<u64>,
     max_output: Option<u32>,
+    hosted: Option<&[HostedModel]>,
 ) -> String {
     use serde::ser::{SerializeMap, Serializer};
 
@@ -199,7 +209,7 @@ fn opencode_config(
         name: &'static str,
         options: Options<'a>,
         #[serde(serialize_with = "entries")]
-        models: [(&'a str, Model<'a>); 1],
+        models: Vec<(&'a str, Model<'a>)>,
     }
     #[derive(serde::Serialize)]
     struct Options<'a> {
@@ -220,18 +230,24 @@ fn opencode_config(
         #[serde(skip_serializing_if = "Option::is_none")]
         attachment: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        limit: Option<Limit>,
+        limit: Option<&'a Limit>,
     }
-    #[derive(serde::Serialize)]
+    #[derive(Clone, Copy, serde::Serialize)]
     struct Modalities {
         input: &'static [&'static str],
         output: &'static [&'static str],
     }
-    /// opencode's schema requires both fields once `limit` is present.
-    #[derive(serde::Serialize)]
-    struct Limit {
-        context: u64,
-        output: u64,
+
+    /// One row of `provider.ollama.models`, owned so the whole list can
+    /// borrow from it after the loop that fills it.
+    struct Row<'a> {
+        /// The map key: the reference the daemon routes a request on.
+        reference: String,
+        /// What opencode shows beside it.
+        name: String,
+        variants: Vec<(&'a str, serde_json::Value)>,
+        options: Option<serde_json::Value>,
+        limit: Option<Limit>,
     }
 
     // Declare image input for a vision model so opencode will attach
@@ -246,12 +262,85 @@ fn opencode_config(
     // entirely for a 0 context (`session/overflow.ts`, `isOverflow`), so
     // a session never auto-compacts. Declared only when llmman knows the
     // window; otherwise the key stays out rather than assert a guess.
-    let limit = context_window.map(|context| Limit {
-        context,
-        // The catalog's own ceiling wherever there is one; derived
-        // only for a local model, which has no catalog to name one.
-        output: max_output.map_or_else(|| opencode_output_reserve(context), u64::from),
-    });
+    let limit = context_window.map(|context| model_limit(context, max_output));
+
+    // Each model's own thinking levels, read once so the rows below can
+    // borrow them (see `opencode_variants`): the list has to outlive the
+    // rows, so it is built here rather than inside the match arm.
+    let thinkings: Vec<Option<Thinking>> = hosted
+        .as_ref()
+        .map(|models| {
+            models
+                .iter()
+                .map(|m| m.thinking.clone().map(Thinking::Listed))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let rows: Vec<Row<'_>> = match &hosted {
+        // A local launch describes the one model it resolved.
+        None => vec![Row {
+            reference: model.to_string(),
+            name: model.to_string(),
+            variants: variants.to_vec(),
+            options: options.cloned(),
+            limit,
+        }],
+        Some(hosted) => {
+            let mut rows: Vec<Row<'_>> = Vec::with_capacity(hosted.len());
+            for (m, thinking) in hosted.iter().zip(&thinkings) {
+                let launched = m.reference == model;
+                rows.push(Row {
+                    reference: m.reference.clone(),
+                    name: m.id.clone(),
+                    variants: if launched {
+                        variants.to_vec()
+                    } else {
+                        opencode_variants(thinking.as_ref())
+                    },
+                    options: if launched { options.cloned() } else { None },
+                    limit: if launched {
+                        limit
+                    } else {
+                        m.context.map(|context| model_limit(context, m.output))
+                    },
+                });
+            }
+            // The launched model belongs in its own config even if the
+            // list somehow lacks it: opencode is started on it.
+            if !rows.iter().any(|row| row.reference == model) {
+                rows.insert(
+                    0,
+                    Row {
+                        reference: model.to_string(),
+                        name: model.to_string(),
+                        variants: variants.to_vec(),
+                        options: options.cloned(),
+                        limit,
+                    },
+                );
+            }
+            rows
+        }
+    };
+
+    let models: Vec<(&str, Model<'_>)> = rows
+        .iter()
+        .map(|row| {
+            let launched = row.reference == model;
+            (
+                row.reference.as_str(),
+                Model {
+                    name: &row.name,
+                    variants: &row.variants,
+                    options: row.options.as_ref(),
+                    modalities: launched.then_some(modalities).flatten(),
+                    attachment: (launched && vision).then_some(true),
+                    limit: row.limit.as_ref(),
+                },
+            )
+        })
+        .collect();
 
     let config = Config {
         schema: "https://opencode.ai/config.json",
@@ -266,22 +355,28 @@ fn opencode_config(
                     base_url: format!("{server}/v1"),
                     api_key,
                 },
-                models: [(
-                    model,
-                    Model {
-                        name: model,
-                        variants,
-                        options,
-                        modalities,
-                        attachment: vision.then_some(true),
-                        limit,
-                    },
-                )],
+                models,
             },
         },
         model: opencode_model_ref(model),
     };
     serde_json::to_string(&config).expect("opencode config serializes")
+}
+
+/// opencode's `limit` for a model with a known window: the catalog's own
+/// ceiling wherever there is one, derived where it names none.
+fn model_limit(context: u64, output: Option<u32>) -> Limit {
+    Limit {
+        context,
+        output: output.map_or_else(|| opencode_output_reserve(context), u64::from),
+    }
+}
+
+/// opencode's schema requires both fields once `limit` is present.
+#[derive(Clone, Copy, serde::Serialize)]
+struct Limit {
+    context: u64,
+    output: u64,
 }
 
 #[cfg(test)]
@@ -302,6 +397,7 @@ mod tests {
             &variants,
             None,
             false,
+            None,
             None,
             None,
         );
@@ -328,7 +424,7 @@ mod tests {
             .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
 
-        let bare = opencode_config("http://h", "m", "k", &[], None, false, None, None);
+        let bare = opencode_config("http://h", "m", "k", &[], None, false, None, None, None);
         assert!(!bare.contains("variants"), "{bare}");
     }
 
@@ -347,6 +443,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         let model = &config["provider"]["ollama"]["models"]["m"];
@@ -355,7 +452,9 @@ mod tests {
             serde_json::json!({ "reasoningEffort": "high" })
         );
 
-        let text = opencode_config("http://h", "m", "k", &variants, None, false, None, None);
+        let text = opencode_config(
+            "http://h", "m", "k", &variants, None, false, None, None, None,
+        );
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert!(config["provider"]["ollama"]["models"]["m"]["options"].is_null());
     }
@@ -409,7 +508,7 @@ mod tests {
 
     #[test]
     fn opencode_config_declares_image_input_only_for_a_vision_model() {
-        let text = opencode_config("http://h", "m", "k", &[], None, true, None, None);
+        let text = opencode_config("http://h", "m", "k", &[], None, true, None, None, None);
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         let model = &config["provider"]["ollama"]["models"]["m"];
         assert_eq!(
@@ -418,7 +517,7 @@ mod tests {
         );
         assert_eq!(model["attachment"], true);
 
-        let text_only = opencode_config("http://h", "m", "k", &[], None, false, None, None);
+        let text_only = opencode_config("http://h", "m", "k", &[], None, false, None, None, None);
         assert!(!text_only.contains("modalities"), "{text_only}");
         assert!(!text_only.contains("attachment"), "{text_only}");
     }
@@ -446,7 +545,17 @@ mod tests {
     /// to travel.
     #[test]
     fn opencode_config_declares_the_window_only_when_it_is_known() {
-        let text = opencode_config("http://h", "m", "k", &[], None, false, Some(8192), None);
+        let text = opencode_config(
+            "http://h",
+            "m",
+            "k",
+            &[],
+            None,
+            false,
+            Some(8192),
+            None,
+            None,
+        );
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         let limit = &config["provider"]["ollama"]["models"]["m"]["limit"];
         assert_eq!(limit["context"], 8192);
@@ -454,7 +563,7 @@ mod tests {
         assert_eq!(limit["output"], 2048);
 
         // No window: the key stays out and opencode keeps its defaults.
-        let unknown = opencode_config("http://h", "m", "k", &[], None, false, None, None);
+        let unknown = opencode_config("http://h", "m", "k", &[], None, false, None, None, None);
         assert!(!unknown.contains("limit"), "{unknown}");
     }
 
@@ -472,6 +581,7 @@ mod tests {
             false,
             Some(128_000),
             Some(8_192),
+            None,
         );
         let config: serde_json::Value = serde_json::from_str(&hosted).expect("valid JSON");
         let limit = &config["provider"]["ollama"]["models"]["m"]["limit"];
@@ -483,7 +593,17 @@ mod tests {
 
         // A local model has no catalog and no ceiling of its own, so the
         // derived reserve still stands.
-        let local = opencode_config("http://h", "m", "k", &[], None, false, Some(128_000), None);
+        let local = opencode_config(
+            "http://h",
+            "m",
+            "k",
+            &[],
+            None,
+            false,
+            Some(128_000),
+            None,
+            None,
+        );
         let config: serde_json::Value = serde_json::from_str(&local).expect("valid JSON");
         assert_eq!(
             config["provider"]["ollama"]["models"]["m"]["limit"]["output"],
@@ -501,6 +621,7 @@ mod tests {
             &[],
             None,
             false,
+            None,
             None,
             None,
         ))
