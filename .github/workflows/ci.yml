@@ -1185,6 +1185,8 @@ jobs:
       # carries the endpoint, and the key arrives in LLMMAN_API_KEY.
       - name: Install Docker Agent (e2e)
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -o pipefail
           # A digest per asset, checked before the binary is made
@@ -1213,9 +1215,13 @@ jobs:
             # `--speed-time`/`--speed-limit` rather than a flat
             # `--max-time`: a stalled transfer has to end for the retry
             # below to mean anything, but a slow one that is still making
-            # progress should be allowed to finish.
-            if ! curl -fsSL --connect-timeout 20 --speed-time 60 --speed-limit 1000 -o "$bin" \
-              "https://github.com/docker/docker-agent/releases/download/v$DOCKER_AGENT_VERSION/$asset"; then
+            # progress should be allowed to finish. github.com has answered
+            # 500 for 30s+, so fall back to the API path and back off longer.
+            if ! { curl -fsSL --connect-timeout 20 --speed-time 60 --speed-limit 1000 -o "$bin" \
+                     "https://github.com/docker/docker-agent/releases/download/v$DOCKER_AGENT_VERSION/$asset" \
+                   || { command -v gh >/dev/null 2>&1 \
+                        && gh release download "v$DOCKER_AGENT_VERSION" -R docker/docker-agent \
+                             -p "$asset" -O "$bin" --clobber; }; }; then
               echo "::warning::docker-agent download failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next"
             elif ! (cd "$bin_dir" && if command -v sha256sum >/dev/null 2>&1; then
                       echo "$digest  $(basename "$bin")" | sha256sum -c -
@@ -1238,7 +1244,7 @@ jobs:
               echo "::warning::docker-agent installed but \"docker-agent version\" failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next — output: $version_output"
             fi
             if [ "$attempt" -lt "$max_attempts" ]; then
-              sleep "$((2 ** (attempt - 1)))"
+              sleep "$((5 * 2 ** (attempt - 1)))"
             fi
           done
           echo "::error::docker-agent never produced a working binary on ${{ runner.os }} ${{ runner.arch }} after $max_attempts attempts"

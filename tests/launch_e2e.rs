@@ -3188,19 +3188,29 @@ fn assert_engine_listens_only_on_loopback(host: &str) {
         .unwrap_or_else(|e| panic!("engine is not listening on 127.0.0.1:{port}: {e}"));
     let ip = non_loopback_ipv4()
         .expect("no non-loopback IPv4 address to check the engine is not reachable on");
-    // Only a refusal shows nothing listens there; a timeout may be a firewall.
-    // An engine on every interface answers every connect; a lone success can
-    // be a TCP self-connect to this ephemeral-range port, so require three.
-    for _ in 0..3 {
-        match connect(ip) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return,
-            Err(e) => {
-                panic!("inconclusive: connecting to {ip}:{port} failed with {e}, not a refusal")
+    // A bare connect proves little: a TCP self-connect to this ephemeral
+    // port succeeds and echoes our request, and CI saw three connects to a
+    // loopback-bound vllm succeed. Only an HTTP reply means the engine
+    // answers here; a refusal means nothing does.
+    match connect(ip) {
+        Ok(mut stream) => {
+            let mut head = [0u8; 5];
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .and_then(|()| stream.write_all(b"GET /health HTTP/1.0\r\n\r\n"))
+                .and_then(|()| stream.read_exact(&mut head))
+                .unwrap_or_else(|e| panic!("inconclusive: no reply from {ip}:{port}: {e}"));
+            match &head {
+                b"HTTP/" => panic!(
+                    "engine answers on {ip}:{port}: an LLMMAN_*_ARGS --host overrode llmman's loopback"
+                ),
+                b"GET /" => {}
+                other => panic!("inconclusive: {ip}:{port} sent {other:?}, neither HTTP nor an echo"),
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+        Err(e) => panic!("inconclusive: connecting to {ip}:{port} failed with {e}, not a refusal"),
     }
-    panic!("engine answers on {ip}:{port}: an LLMMAN_*_ARGS --host overrode llmman's loopback");
 }
 
 /// This machine's address on its default route: the local end of a UDP
