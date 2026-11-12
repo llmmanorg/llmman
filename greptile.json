@@ -1,0 +1,36 @@
+{
+  "strictness": 3,
+  "commentTypes": [
+    "logic"
+  ],
+  "autoReview": [
+    "open"
+  ],
+  "triggerOnDrafts": false,
+  "excludeAuthors": [
+    "dependabot[bot]",
+    "renovate[bot]"
+  ],
+  "shouldUpdateDescription": false,
+  "updateSummaryOnly": false,
+  "fixWithAI": false,
+  "hideFooter": true,
+  "statusCheck": true,
+  "statusCommentsEnabled": false,
+  "includeIssuesTable": false,
+  "includeConfidenceScore": false,
+  "includeSequenceDiagram": false,
+  "summarySection": {
+    "included": false
+  },
+  "issuesTableSection": {
+    "included": false
+  },
+  "confidenceScoreSection": {
+    "included": false
+  },
+  "sequenceDiagramSection": {
+    "included": false
+  },
+  "instructions": "Only comment on important problems that should be fixed before merging: bugs, security issues, data loss, broken builds. Do not comment on style, nitpicks, or suggestions."
+}
