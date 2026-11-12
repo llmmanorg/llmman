@@ -1,5 +1,6 @@
 {
   "strictness": 3,
+  "effort": "base",
   "commentTypes": [
     "logic"
   ],
