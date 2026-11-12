@@ -9,12 +9,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt, TryStreamExt};
-use sha2::{Digest as _, Sha256};
 
 use super::api::{self, HfFile};
 use super::download::{self, FetchRequest};
 use super::oci::{self, Descriptor, ModelMeta};
 use super::progress;
+use crate::fsutil::HashingWriter;
 use crate::xet_fetch::{self, XetFileRef};
 
 /// Pulls `reference` (already stripped of any `hf://`/`huggingface://`
@@ -497,16 +497,14 @@ async fn download_layer(
                 }
                 None => {
                     let f = std::fs::File::create(&tmp_path)?;
-                    let mut writer = HashingProgressWriter {
-                        file: f,
-                        hasher: Sha256::new(),
-                        progress_key,
-                    };
+                    let mut writer = HashingWriter::with_progress(f, |n| {
+                        progress::add_completed(progress_key, n as i64)
+                    });
                     download::fetch_once(client, &req, &mut writer)
                         .await
                         .and_then(|_| {
-                            writer.file.flush()?;
-                            Ok(format!("sha256:{:x}", writer.hasher.finalize()))
+                            writer.flush()?;
+                            Ok(format!("sha256:{}", writer.finish().1))
                         })
                 }
             };
@@ -574,7 +572,7 @@ fn sanitize(s: &str) -> String {
 }
 
 /// `sha256:<hex>` of `path`'s content, for the one download path
-/// (`xet_fetch::download_to_path`) that bypasses [`HashingProgressWriter`].
+/// (`xet_fetch::download_to_path`) that bypasses [`HashingWriter`].
 /// Off the async runtime: a full read of a possibly hundreds-of-GB file.
 async fn sha256_of_file(path: &Path) -> Result<String> {
     let path = path.to_path_buf();
@@ -582,26 +580,6 @@ async fn sha256_of_file(path: &Path) -> Result<String> {
         .await
         .context("sha256 hashing task panicked")??;
     Ok(format!("sha256:{hex}"))
-}
-
-/// Writes to a local file while hashing every byte and reporting it to
-/// `progress`.
-struct HashingProgressWriter<'a> {
-    file: std::fs::File,
-    hasher: Sha256,
-    progress_key: &'a str,
-}
-
-impl Write for HashingProgressWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.file.write(buf)?;
-        self.hasher.update(&buf[..n]);
-        progress::add_completed(self.progress_key, n as i64);
-        Ok(n)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.file.flush()
-    }
 }
 
 #[cfg(test)]
