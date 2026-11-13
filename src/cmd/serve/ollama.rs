@@ -29,6 +29,7 @@ use super::{
     pull_serialized, release_model_lock, remote_status, unload_everywhere, AppError, AppState,
     LoadOptions, Target, Task,
 };
+use crate::fsutil::HashingWriter;
 use crate::metrics::{self, UnloadReason};
 use crate::storage::OciStore;
 
@@ -995,7 +996,6 @@ pub(super) async fn handle_blob_upload(
     UrlPath(digest): UrlPath<String>,
     body: Body,
 ) -> Result<StatusCode, AppError> {
-    use sha2::Digest as _;
     use tokio::io::AsyncWriteExt as _;
 
     let dest = staged_blob_path(&state, &digest)?;
@@ -1005,13 +1005,11 @@ pub(super) async fn handle_blob_upload(
     let dir = blob_staging_dir(&state);
     tokio::fs::create_dir_all(&dir).await?;
     let tmp = dir.join(staging_temp_name("tmp"));
-    let mut file = tokio::fs::File::create(&tmp).await?;
-    let mut hasher = sha2::Sha256::new();
+    let mut file = HashingWriter::new(tokio::fs::File::create(&tmp).await?);
     let mut stream = body.into_data_stream();
     let written = async {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("read upload body")?;
-            hasher.update(&chunk);
             file.write_all(&chunk).await?;
         }
         file.flush().await?;
@@ -1022,7 +1020,7 @@ pub(super) async fn handle_blob_upload(
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(e.into());
     }
-    let actual = format!("sha256:{}", hex::encode(hasher.finalize()));
+    let actual = format!("sha256:{}", file.finish().1);
     if !actual.eq_ignore_ascii_case(&digest) {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(AppError::status(

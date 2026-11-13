@@ -1,6 +1,6 @@
 //! Whole-file writes a reader never sees half done, writes only their
 //! owner can read, the free space a download needs, and the SHA-256 of a
-//! file's bytes.
+//! file or of what is written through a writer.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -162,10 +162,8 @@ pub fn copy_hashing(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> std::io::Result<(u64, String)> {
-    use sha2::Digest as _;
-    let mut hasher = sha2::Sha256::new();
+    let mut hashing_writer = HashingWriter::new(writer);
     let mut buf = vec![0u8; 1 << 20];
-    let mut size = 0u64;
     loop {
         let n = match reader.read(&mut buf) {
             Ok(0) => break,
@@ -173,11 +171,88 @@ pub fn copy_hashing(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
-        hasher.update(&buf[..n]);
-        writer.write_all(&buf[..n])?;
-        size += n as u64;
+        hashing_writer.write_all(&buf[..n])?;
     }
-    Ok((size, hex::encode(hasher.finalize())))
+    Ok(hashing_writer.finish())
+}
+
+/// Passes writes to `inner`, hashing the bytes `inner` accepts and reporting
+/// each accepted count to `on_written`.
+pub struct HashingWriter<W, F = fn(usize)> {
+    inner: W,
+    hasher: sha2::Sha256,
+    size: u64,
+    on_written: F,
+}
+
+impl<W> HashingWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self::with_progress(inner, |_| {})
+    }
+}
+
+impl<W, F: FnMut(usize)> HashingWriter<W, F> {
+    pub fn with_progress(inner: W, on_written: F) -> Self {
+        use sha2::Digest as _;
+        Self {
+            inner,
+            hasher: sha2::Sha256::new(),
+            size: 0,
+            on_written,
+        }
+    }
+
+    /// The byte count and lowercase hex SHA-256 of everything written.
+    pub fn finish(self) -> (u64, String) {
+        use sha2::Digest as _;
+        (self.size, hex::encode(self.hasher.finalize()))
+    }
+
+    fn record(&mut self, written: &[u8]) {
+        use sha2::Digest as _;
+        self.hasher.update(written);
+        self.size += written.len() as u64;
+        (self.on_written)(written.len());
+    }
+}
+
+impl<W: Write, F: FnMut(usize)> Write for HashingWriter<W, F> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.record(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W, F> tokio::io::AsyncWrite for HashingWriter<W, F>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    F: FnMut(usize) + Unpin,
+{
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let n = std::task::ready!(std::pin::Pin::new(&mut self.inner).poll_write(cx, buf))?;
+        self.record(&buf[..n]);
+        std::task::Poll::Ready(Ok(n))
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// Lowercase hex SHA-256 of the file at `path`.
@@ -252,6 +327,24 @@ mod tests {
     }
 
     #[test]
+    fn copy_hashing_returns_the_writers_error() {
+        struct DiskFull;
+        impl Write for DiskFull {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let err = copy_hashing(&mut &b"abc"[..], &mut DiskFull).unwrap_err();
+        assert_eq!(
+            (err.kind(), err.to_string()),
+            (std::io::ErrorKind::Other, "disk full".to_string())
+        );
+    }
+
+    #[test]
     fn sha256_of_file_hashes_the_file_and_names_a_missing_one() {
         let dir = temp_dir("sha256");
         let path = dir.join("f.bin");
@@ -260,6 +353,42 @@ mod tests {
         let missing = dir.join("missing.bin");
         let err = format!("{:#}", sha256_of_file(&missing).unwrap_err());
         assert!(err.contains(&missing.display().to_string()), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hashing_writer_hashes_and_reports_only_what_the_inner_writer_accepts() {
+        struct TwoBytesAtATime(Vec<u8>);
+        impl Write for TwoBytesAtATime {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(2);
+                self.0.extend_from_slice(&buf[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut inner = TwoBytesAtATime(Vec::new());
+        let mut reported = Vec::new();
+        let mut writer = HashingWriter::with_progress(&mut inner, |n| reported.push(n));
+        writer.write_all(b"abc").unwrap();
+        assert_eq!(writer.finish(), (3, ABC_SHA256.to_string()));
+        assert_eq!((inner.0.as_slice(), reported), (&b"abc"[..], vec![2, 1]));
+    }
+
+    #[tokio::test]
+    async fn hashing_writer_hashes_async_writes_and_flushes_them_through() {
+        use tokio::io::AsyncWriteExt as _;
+        let dir = temp_dir("hashing-writer");
+        let path = dir.join("f.bin");
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        let mut writer = HashingWriter::new(tokio::io::BufWriter::new(file));
+        writer.write_all(b"a").await.unwrap();
+        writer.write_all(b"bc").await.unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+        assert_eq!(writer.finish(), (3, ABC_SHA256.to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
