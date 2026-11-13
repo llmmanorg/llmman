@@ -179,8 +179,8 @@ impl Refusal {
 
 /// Where this start's token is kept: one file per bind address, so
 /// daemons on two addresses do not overwrite each other's.
-pub(super) fn token_path() -> anyhow::Result<PathBuf> {
-    Ok(crate::data_root()?.join(token_file_name(&crate::daemon::bind_addr())))
+fn token_path(bind_addr: &str) -> anyhow::Result<PathBuf> {
+    Ok(crate::data_root()?.join(token_file_name(bind_addr)))
 }
 
 /// `shell-<host>-<port>.token`. An IPv6 host loses its brackets and its
@@ -197,13 +197,13 @@ fn token_file_name(bind_addr: &str) -> String {
 /// Logs whether the shell is on, and saves the token when it is. The
 /// link carrying the token is printed only to a terminal: a detached
 /// daemon's stderr is `serve.log`, which other users may be able to read.
-pub(super) fn announce(policy: &Policy, token: &str, tls: bool) {
+pub(super) fn announce(policy: &Policy, token: &str, tls: bool, bind_addr: &str) {
     if let Some(reason) = &policy.disabled {
-        remove_old_token();
+        remove_old_token(bind_addr);
         eprintln!("[llmman] shell: off ({reason})");
         return;
     }
-    let saved = token_path().and_then(|path| {
+    let saved = token_path(bind_addr).and_then(|path| {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         }
@@ -219,7 +219,7 @@ pub(super) fn announce(policy: &Policy, token: &str, tls: bool) {
             path.display()
         ),
         Err(e) => {
-            remove_old_token();
+            remove_old_token(bind_addr);
             if !terminal {
                 let reason = format!("llmman serve could not save its shell token: {e:#}");
                 eprintln!("[llmman] shell: off ({reason})");
@@ -231,17 +231,16 @@ pub(super) fn announce(policy: &Policy, token: &str, tls: bool) {
     }
     if terminal {
         eprintln!(
-            "[llmman] open the web UI with the shell: http{}://{}/#shell-token={token}",
+            "[llmman] open the web UI with the shell: http{}://{bind_addr}/#shell-token={token}",
             if tls { "s" } else { "" },
-            crate::daemon::bind_addr()
         );
     }
 }
 
 /// A token from an earlier start opens nothing: a client that reads it
 /// only gets a 401.
-fn remove_old_token() {
-    if let Ok(path) = token_path() {
+fn remove_old_token(bind_addr: &str) {
+    if let Ok(path) = token_path(bind_addr) {
         let _ = std::fs::remove_file(path);
     }
 }
