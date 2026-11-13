@@ -58,6 +58,18 @@ impl ContainerManager {
     /// says why not, for the log. An explicit `--runtime docker|podman`
     /// skips this and lets the engine report its own errors.
     pub fn probe(self) -> Result<()> {
+        self.probe_with(true)
+    }
+
+    /// [`probe`](Self::probe) for a worker that runs the CPU image
+    /// ([`SPEECH_BACKEND`]) and passes no GPU through: the toolkit is not
+    /// required, so a host whose GPU probe skipped containers for
+    /// llama-server can still run that worker in one.
+    pub fn probe_cpu_only(self) -> Result<()> {
+        self.probe_with(false)
+    }
+
+    fn probe_with(self, require_gpu_toolkit: bool) -> Result<()> {
         let cli = self.binary();
         if crate::find_on_path(cli).is_none() {
             anyhow::bail!("{cli} is not on PATH");
@@ -73,14 +85,30 @@ impl ContainerManager {
             None => anyhow::bail!("{cli} info did not answer within {PROBE_TIMEOUT:?}"),
         }
         let wants_gpus = detect_backend().engine_args().iter().any(|a| a == "--gpus");
-        if wants_gpus && !nvidia_toolkit_present(self) {
-            anyhow::bail!(
-                "an NVIDIA GPU was detected but no NVIDIA Container Toolkit for {cli} \
-                 (`{cli} run --gpus all` would fail)"
-            );
-        }
-        Ok(())
+        gpu_gate(require_gpu_toolkit, wants_gpus, cli, || {
+            nvidia_toolkit_present(self)
+        })
     }
+}
+
+/// The toolkit rule of [`ContainerManager::probe`]: when the detected
+/// backend wants `--gpus` and the run would need it, the NVIDIA Container
+/// Toolkit must be present. A CPU-only run (`require_gpu_toolkit` false)
+/// passes whatever the host has; `toolkit_present` is only consulted when
+/// the rule applies.
+fn gpu_gate(
+    require_gpu_toolkit: bool,
+    wants_gpus: bool,
+    cli: &str,
+    toolkit_present: impl FnOnce() -> bool,
+) -> Result<()> {
+    if require_gpu_toolkit && wants_gpus && !toolkit_present() {
+        anyhow::bail!(
+            "an NVIDIA GPU was detected but no NVIDIA Container Toolkit for {cli} \
+             (`{cli} run --gpus all` would fail)"
+        );
+    }
+    Ok(())
 }
 
 /// How long [`ContainerManager::probe`] waits on `docker info`/`podman
@@ -669,7 +697,11 @@ const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// reachable systemd fails every `run` in crun), and `--runtime auto`
 /// must not settle on an engine every model load would then fail on.
 /// The engine's own error goes to stderr, like [`pull_image`]'s progress.
-pub fn verify_llama_server_runs(ociman: ContainerManager, version: Option<&str>) -> Result<()> {
+pub(crate) fn verify_llama_server_runs(
+    ociman: ContainerManager,
+    backend: GpuBackend,
+    version: Option<&str>,
+) -> Result<()> {
     let cli = ociman.binary();
     let name = format!(
         "llmman-verify-{}-{}",
@@ -679,7 +711,7 @@ pub fn verify_llama_server_runs(ociman: ContainerManager, version: Option<&str>)
             .map_or(0, |d| d.as_nanos())
     );
     let mut cmd = std::process::Command::new(cli);
-    cmd.args(verify_args(detect_backend(), version, &name))
+    cmd.args(verify_args(backend, version, &name))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
     match run_with_timeout(cmd, VERIFY_TIMEOUT).with_context(|| format!("run {cli} run"))? {
@@ -1286,6 +1318,27 @@ mod tests {
         assert_eq!(GpuBackend::Cuda13.image_tag(), "server-cuda13");
         assert_eq!(GpuBackend::Rocm.image_tag(), "server-rocm");
         assert_eq!(GpuBackend::Vulkan.image_tag(), "server-vulkan");
+    }
+
+    /// A GPU host without the toolkit refuses the engine for llama-server
+    /// and accepts it for the CPU-only worker; without a GPU, or with the
+    /// toolkit, both pass and the toolkit is not even looked for.
+    #[test]
+    fn the_cpu_only_probe_passes_where_the_toolkit_alone_refuses() {
+        let err = gpu_gate(true, true, "docker", || false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("NVIDIA Container Toolkit"), "{err}");
+        gpu_gate(false, true, "docker", || false).unwrap();
+        gpu_gate(true, true, "docker", || true).unwrap();
+        gpu_gate(true, false, "docker", || {
+            unreachable!("no GPU, no toolkit check")
+        })
+        .unwrap();
+        gpu_gate(false, false, "docker", || {
+            unreachable!("no GPU, no toolkit check")
+        })
+        .unwrap();
     }
 
     /// Whatever GPU this host has, the speech worker's image is the CPU
