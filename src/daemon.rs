@@ -342,48 +342,156 @@ fn stale_daemon() -> Option<DaemonIdentity> {
     }
 }
 
-/// The systemd unit managing `pid`, read off its cgroup — `None` when no
-/// unit does.
+/// The systemd unit managing `pid` — `None` when none does. Sitting in a
+/// unit's cgroup is not being the unit's process: `detach` changes the
+/// process group and not the cgroup, so a daemon llmman spawned inside a
+/// unit sits under it unknown to the manager. The manager is asked
+/// instead, for the unit holding the pid and the process that unit was
+/// started for — see [`owning_unit`] and [`managing_unit`].
 ///
-/// A unit's processes sit in a cgroup path whose last segment is the unit
-/// name (`.../user@1000.service/session.slice/sh.brew.llmman.service`);
-/// a process started from a shell sits in a `.scope` instead.
-///
-/// A unit this process is itself in does not count. `detach` changes the
-/// process group and not the cgroup, so a daemon llmman spawned from
-/// inside a unit inherits that unit's path without the manager knowing
-/// it exists — treating that as managed would both stop llmman replacing
-/// its own daemon and name a unit that does not control it.
-///
-/// Linux only: launchd keeps no equivalent file, so a Homebrew service
-/// on macOS is not recognised and still gets superseded.
+/// Linux only: launchd keeps no equivalent, so a Homebrew service on
+/// macOS is not recognised and still gets superseded.
 fn service_unit(pid: Option<u32>) -> Option<String> {
     if !cfg!(target_os = "linux") {
         return None;
     }
-    managing_unit(unit_of(pid?), unit_of(std::process::id()))
+    let pid = pid?;
+    let (object, user) = owning_unit(pid)?;
+    let unit = unit_id(&object, user)?;
+    managing_unit(pid, &unit, user, || main_pid(&object, user))
 }
 
-/// `daemon`'s unit, unless it is the one this process is in — see
-/// [`service_unit`] for why sharing it means nothing manages the daemon.
-fn managing_unit(daemon: Option<String>, ours: Option<String>) -> Option<String> {
-    daemon.filter(|unit| Some(unit) != ours.as_ref())
+/// Whether the unit holding the daemon is the unit running it, by what
+/// `main` reports as the process that unit was started for.
+fn managing_unit(
+    pid: u32,
+    unit: &str,
+    user: bool,
+    main: impl FnOnce() -> Option<u32>,
+) -> Option<String> {
+    // A scope holds processes its manager never started, a shell's among
+    // them, and no manager restarts one.
+    if !unit.ends_with(".service") {
+        return None;
+    }
+    // A per-user manager llmman could not ask holds this daemon, so it
+    // is not llmman's to stop — see [`owning_unit`] for why that is the
+    // system manager's answer for it.
+    if !user && unit.starts_with("user@") {
+        return Some(unit.to_string());
+    }
+    match main() {
+        // Started for another process, which makes this daemon one
+        // llmman spawned inside the unit rather than the unit's own.
+        Some(main) if main != pid => None,
+        _ => Some(unit.to_string()),
+    }
 }
 
-/// The unit in `pid`'s cgroup file, whoever put it there.
-fn unit_of(pid: u32) -> Option<String> {
-    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    unit_from_cgroup(&cgroup)
+/// The bus object of the unit holding `pid`, and whether this user's own
+/// manager named it. Asked for rather than read off the cgroup path,
+/// where the names below a unit are the payload's own once it has
+/// `Delegate=` and no segment is reliably a unit.
+///
+/// This user's manager is asked first, being the only one that knows its
+/// own units: the system manager answers for every process below a
+/// per-user manager with that manager's unit instead. A manager asked
+/// about a process outside its cgroup refuses the question rather than
+/// guessing, which is what keeps `sudo llmman` from reading root's own
+/// manager as having answered about another user's daemon.
+fn owning_unit(pid: u32) -> Option<(String, bool)> {
+    let pid = pid.to_string();
+    [true, false].into_iter().find_map(|user| {
+        let object = ask_manager(
+            user,
+            &[
+                "call",
+                SYSTEMD,
+                SYSTEMD_MANAGER,
+                "org.freedesktop.systemd1.Manager",
+                "GetUnitByPID",
+                "u",
+                &pid,
+            ],
+        )?;
+        Some((quoted(&object)?, user))
+    })
 }
 
-/// The unit name in a `/proc/<pid>/cgroup` body — see [`service_unit`].
-fn unit_from_cgroup(cgroup: &str) -> Option<String> {
-    cgroup
-        .lines()
-        .filter_map(|line| line.rsplit_once('/'))
-        .map(|(_, last)| last)
-        .find(|last| last.ends_with(".service"))
-        .map(str::to_string)
+/// The name of the unit at `object`, asked of the manager rather than
+/// decoded out of the object path, where systemd escapes every character
+/// outside `[A-Za-z0-9]` (`docker_2eservice`).
+fn unit_id(object: &str, user: bool) -> Option<String> {
+    let name = ask_manager(
+        user,
+        &[
+            "get-property",
+            SYSTEMD,
+            object,
+            "org.freedesktop.systemd1.Unit",
+            "Id",
+        ],
+    )?;
+    quoted(&name)
+}
+
+/// The process the unit at `object` was started for, `None` where its
+/// manager never identified one: a `Type=forking` unit with no
+/// `PIDFile=` answers `0` once a second process is left, measured on
+/// systemd 255. The unit is running the daemon either way, so that is
+/// not read as a process the daemon is not — see [`managing_unit`].
+///
+/// No deadline, as with this module's other process calls: a manager
+/// this unresponsive has already stopped managing.
+fn main_pid(object: &str, user: bool) -> Option<u32> {
+    let pid = ask_manager(
+        user,
+        &[
+            "get-property",
+            SYSTEMD,
+            object,
+            "org.freedesktop.systemd1.Service",
+            "MainPID",
+        ],
+    )?;
+    main_pid_from(&pid)
+}
+
+/// The pid in busctl's `u <pid>` line for a `MainPID`, `0` being no pid
+/// at all — see [`main_pid`].
+fn main_pid_from(body: &str) -> Option<u32> {
+    let pid = body.split_whitespace().nth(1)?.parse::<u32>().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+/// systemd's bus name and the manager object the calls above start from.
+const SYSTEMD: &str = "org.freedesktop.systemd1";
+const SYSTEMD_MANAGER: &str = "/org/freedesktop/systemd1";
+
+/// One read-only call on systemd's bus, to this user's manager or to the
+/// system one. `None` for anything but an answer: a manager holding no
+/// such process, or none there to ask, exits non-zero.
+///
+/// Only an object path a manager itself returned is ever passed back,
+/// never a name read off a cgroup, so nothing here can carry an option
+/// or a glob into the call.
+fn ask_manager(user: bool, args: &[&str]) -> Option<String> {
+    let mut call = Command::new("busctl");
+    if user {
+        call.arg("--user");
+    }
+    let out = call.args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The value in a busctl line for a string or an object path, both of
+/// which it prints quoted (`s "docker.service"`).
+fn quoted(body: &str) -> Option<String> {
+    let (_, value) = body.split_once('"')?;
+    let (value, _) = value.rsplit_once('"')?;
+    Some(value.to_string())
 }
 
 /// Best-effort stop of a stale daemon (see `stale_daemon`), then waits for
@@ -2565,71 +2673,176 @@ mod tests {
         }
     }
 
-    /// Real `/proc/<pid>/cgroup` bodies: a unit's processes end in the
-    /// unit name, a shell's in a `.scope` — see [`service_unit`] for why
-    /// the difference decides whether llmman may stop the daemon.
+    /// The decision [`service_unit`] rests on: what the manager holding
+    /// the daemon says about the unit holding it.
     #[test]
-    fn unit_from_cgroup_names_the_unit_and_only_a_unit() {
+    fn managing_unit_trusts_the_manager_holding_the_daemon() {
+        let brew = "sh.brew.llmman.service";
+        let managing =
+            |unit: &str, user: bool, main: Option<u32>| managing_unit(42, unit, user, || main);
+        // The process the unit was started for: the manager runs this
+        // daemon, under either manager.
+        assert_eq!(managing(brew, true, Some(42)).as_deref(), Some(brew));
         assert_eq!(
-            unit_from_cgroup(
-                "0::/user.slice/user-1000.slice/user@1000.service/session.slice/sh.brew.llmman.service\n"
-            )
-            .as_deref(),
-            Some("sh.brew.llmman.service")
+            managing("docker.service", false, Some(42)).as_deref(),
+            Some("docker.service")
         );
-        // Started from a shell: a scope, not a unit llmman must defer to.
+        // Started for something else, so llmman spawned this daemon
+        // inside the unit and may replace it.
+        assert_eq!(managing(brew, true, Some(7)), None);
+        assert_eq!(managing("docker.service", false, Some(7)), None);
+        // No process identified, the unit running the daemon all the
+        // same — see [`main_pid`].
+        assert_eq!(managing(brew, true, None).as_deref(), Some(brew));
+        // A scope holds what its manager never started, a shell's daemon
+        // among them, and nothing restarts one: not even asked about.
+        for unit in ["tmux-spawn-0e9dd425.scope", "session-2084.scope"] {
+            assert_eq!(
+                managing_unit(42, unit, true, || panic!("asked about {unit}")),
+                None
+            );
+        }
+        // The system manager's answer for anything a per-user manager
+        // holds, that manager having been asked first — see
+        // [`owning_unit`].
         assert_eq!(
-            unit_from_cgroup(
-                "0::/user.slice/user-1000.slice/user@1000.service/tmux-spawn-0e9dd425.scope\n"
-            ),
-            None
-        );
-        // cgroup v1 lists one line per controller; the unit is still the
-        // last segment of whichever line has it.
-        assert_eq!(
-            unit_from_cgroup(
-                "11:name=systemd:/user.slice/user@1000.service/sh.brew.llmman.service\n\
-                 2:cpu:/\n"
-            )
-            .as_deref(),
-            Some("sh.brew.llmman.service")
-        );
-        assert_eq!(unit_from_cgroup(""), None);
-        // The user manager itself is a `.service`, but a daemon under it
-        // sits deeper; a path ending there is the manager, not a daemon.
-        assert_eq!(
-            unit_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service\n").as_deref(),
+            managing_unit(42, "user@1000.service", false, || panic!("asked")).as_deref(),
             Some("user@1000.service")
         );
+        // Under the manager that holds it, a unit of that name is a unit
+        // like any other, judged by the process it was started for.
+        assert_eq!(
+            managing("user@2000.service", true, Some(42)).as_deref(),
+            Some("user@2000.service")
+        );
+        assert_eq!(managing("user@2000.service", true, Some(7)), None);
     }
 
-    /// The comparison [`service_unit`] rests on: a daemon sharing this
-    /// process's unit inherited it from `detach` rather than being
-    /// started by the manager, so it is llmman's to replace.
+    /// busctl's own output for the answers this reads, as systemd 255
+    /// prints them — see [`quoted`] and [`main_pid_from`].
     #[test]
-    fn managing_unit_ignores_a_unit_this_process_is_itself_in() {
-        let brew = || Some("sh.brew.llmman.service".to_string());
-        let ours = || Some("llmman-probe.service".to_string());
-        // Started by a manager llmman is not running under.
-        assert_eq!(managing_unit(brew(), None), brew());
-        assert_eq!(managing_unit(brew(), ours()), brew());
-        // Spawned by an llmman that was itself inside the unit.
-        assert_eq!(managing_unit(ours(), ours()), None);
-        // No unit either side: a plain shell's daemon.
-        assert_eq!(managing_unit(None, ours()), None);
-        assert_eq!(managing_unit(None, None), None);
+    fn quoted_values_and_main_pids_come_out_of_busctl_lines() {
+        assert_eq!(
+            quoted("o \"/org/freedesktop/systemd1/unit/docker_2eservice\"\n").as_deref(),
+            Some("/org/freedesktop/systemd1/unit/docker_2eservice")
+        );
+        assert_eq!(
+            quoted("s \"sh.brew.llmman.service\"\n").as_deref(),
+            Some("sh.brew.llmman.service")
+        );
+        // Unquoted, so not a value this reads.
+        assert_eq!(quoted("u 2608\n"), None);
+        assert_eq!(quoted(""), None);
+        assert_eq!(main_pid_from("u 2608\n"), Some(2608));
+        // No process identified, which is not a pid to compare.
+        assert_eq!(main_pid_from("u 0\n"), None);
+        assert_eq!(main_pid_from("u\n"), None);
+        assert_eq!(main_pid_from(""), None);
     }
 
-    /// The live reading half. Nothing is claimed for this process, both
-    /// because a test binary is not a unit's and because a unit this
-    /// process shares cannot be managing a daemon llmman spawned into it
-    /// — see [`service_unit`].
+    /// Nothing is claimed for this process, a child of the test harness
+    /// that no unit was started for, whether it sits in a shell's scope
+    /// or in the unit of a CI runner — see [`service_unit`].
     #[cfg(target_os = "linux")]
     #[test]
-    fn service_unit_claims_nothing_for_this_process_or_its_own_unit() {
+    fn service_unit_claims_nothing_for_this_process() {
         assert_eq!(service_unit(Some(std::process::id())), None);
         assert_eq!(service_unit(None), None);
-        // A pid that cannot exist has no cgroup file to read.
+        // A pid no manager can be holding.
         assert_eq!(service_unit(Some(u32::MAX)), None);
+    }
+
+    /// The refusal [`owning_unit`]'s doc comment rests its `sudo` case
+    /// on, live: a manager asked about a process outside its own cgroup
+    /// answers nothing at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_manager_holds_no_process_outside_its_own_cgroup() {
+        let holder = |user: bool, pid: u32| {
+            ask_manager(
+                user,
+                &[
+                    "call",
+                    SYSTEMD,
+                    SYSTEMD_MANAGER,
+                    "org.freedesktop.systemd1.Manager",
+                    "GetUnitByPID",
+                    "u",
+                    &pid.to_string(),
+                ],
+            )
+        };
+        // Pid 1 is the system manager's own process, so no per-user
+        // manager holds it, and no manager holds a pid that cannot be.
+        assert_eq!(holder(true, 1), None);
+        assert_eq!(holder(false, u32::MAX), None);
+    }
+
+    /// The live half, against the services this host is running: the
+    /// process a unit was started for is found to be managed, and by the
+    /// unit systemd names. Vacuous where there is no manager to ask, or
+    /// no busctl to ask it with — see [`owning_unit`].
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn service_unit_names_the_unit_a_running_service_was_started_for() {
+        let mut judged = 0;
+        for user in [true, false] {
+            for unit in running_services(user) {
+                // A per-user manager's own process sits in that
+                // manager's `init.scope`, the way pid 1 sits in the
+                // system manager's, and a process is asked about of the
+                // manager holding it — see [`owning_unit`]. So the unit
+                // that starts a manager is not the unit its own process
+                // comes back as.
+                if unit.starts_with("user@") {
+                    continue;
+                }
+                let Some(pid) = reported_main_pid(&unit, user) else {
+                    continue;
+                };
+                let named = service_unit(Some(pid));
+                // A unit that restarted between the two reads answers
+                // differently the second time; only a steady one is
+                // judged.
+                if reported_main_pid(&unit, user) == Some(pid) {
+                    assert_eq!(named.as_deref(), Some(unit.as_str()));
+                    judged += 1;
+                }
+            }
+        }
+        assert!(judged > 0 || owning_unit(std::process::id()).is_none());
+    }
+
+    /// The services a manager reports as running, for the live test to
+    /// have units this host really has.
+    #[cfg(target_os = "linux")]
+    fn running_services(user: bool) -> Vec<String> {
+        let mut args = if user { vec!["--user"] } else { vec![] };
+        args.extend([
+            "list-units",
+            "--type=service",
+            "--state=running",
+            "--no-legend",
+            "--plain",
+            "--no-pager",
+        ]);
+        let Ok(out) = Command::new("systemctl").args(args).output() else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+            .collect()
+    }
+
+    /// The main pid `systemctl` reports for a named unit, which is the
+    /// pid [`service_unit`] has to come back to that same unit from.
+    #[cfg(target_os = "linux")]
+    fn reported_main_pid(unit: &str, user: bool) -> Option<u32> {
+        let mut args = if user { vec!["--user"] } else { vec![] };
+        args.extend(["show", "-p", "MainPID", "--value", "--", unit]);
+        let out = Command::new("systemctl").args(args).output().ok()?;
+        let pid = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+        (pid > 0).then_some(pid)
     }
 }
