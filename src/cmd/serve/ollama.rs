@@ -19,7 +19,7 @@ use tokio::time::{sleep, Duration, Instant};
 
 use super::backend::*;
 use super::hybrid::send_with_hybrid_fallback;
-use super::openai::{effort_budget_for, effort_budget_tokens, EFFORT_BUDGET_MESSAGE};
+use super::openai::{effort_budget_for, effort_budget_tokens, thinking_for, EFFORT_BUDGET_MESSAGE};
 use super::refusal::wire_refusal;
 use super::sched::*;
 use super::stream::*;
@@ -439,6 +439,7 @@ pub(super) async fn handle_show(
             // Nothing local to inspect.
             capabilities: Vec::new(),
             template: None,
+            thinking: None,
         }));
     }
     // Resolve the same way handle_pull stored it — otherwise a bare name
@@ -490,6 +491,26 @@ pub(super) async fn handle_show(
     };
     let capabilities =
         crate::modelpack::model_capabilities(capabilities, gguf.as_ref(), template.as_deref());
+    // Only where `think` is resolved against it: llama-server's own template.
+    let thinking = template
+        .as_deref()
+        .zip(gguf.as_ref())
+        .filter(|(_, info)| {
+            capabilities
+                .iter()
+                .any(|c| c == crate::modelpack::CAPABILITY_THINKING)
+                && !ds4_serves_gguf(
+                    gguf_engine_from_env(),
+                    info.architecture(),
+                    false,
+                    false,
+                    ds4_server_on_path,
+                )
+        })
+        .and_then(|(template, _)| {
+            let controls = crate::chat_template::thinking_controls(template);
+            llama_thinking(&controls, &extra_args_from_env(LLAMA_ARGS_VAR), true).0
+        });
     Ok(Json(OllamaShowResponse {
         model_info: gguf
             .as_ref()
@@ -498,6 +519,7 @@ pub(super) async fn handle_show(
             .details(served_format(&store, &manifest)),
         capabilities,
         template,
+        thinking,
     }))
 }
 
@@ -1245,6 +1267,20 @@ fn empty_chat_chunk(model: String, done_reason: &str) -> OllamaChatChunk {
     }
 }
 
+/// Ollama's 400 for a `think` that is neither a boolean nor a string.
+fn check_think(think: &Option<serde_json::Value>) -> Result<(), AppError> {
+    match think {
+        None
+        | Some(
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::String(_),
+        ) => Ok(()),
+        Some(_) => Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            "think must be a boolean or string",
+        )),
+    }
+}
+
 pub(super) async fn handle_ollama_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1255,6 +1291,7 @@ pub(super) async fn handle_ollama_chat(
         req.model,
         req.messages.len()
     );
+    check_think(&req.think)?;
 
     // Empty messages are ollama's unload request when paired with
     // `keep_alive: 0`, and its load-only request on their own — the same
@@ -1323,16 +1360,17 @@ async fn ollama_chat_to(
     // response chunk's own `model` field below (which must keep echoing
     // back `model` as-is).
     let wire_model = backend_wire_model(state, &target, &model).await;
+    let think = resolve_think(&req.think, thinking_for(state, &target).await.as_ref());
     let mut oai = OAIChatRequest {
         model: wire_model,
         messages: req.messages.iter().map(ollama_message_to_oai).collect(),
         stream: true,
-        chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
+        chat_template_kwargs: think_to_chat_template_kwargs(&think),
         tools: req.tools.clone(),
         response_format: format_to_response_format(&req.format),
         ..options_to_oai(&req.options)
     };
-    apply_think_budget(state, &target, &req.think, &mut oai).await;
+    apply_think_budget(state, &target, &think, &mut oai).await;
     stream_ollama(
         req.stream,
         state.0.client.clone(),
@@ -1428,6 +1466,7 @@ pub(super) async fn handle_ollama_generate(
         req.model,
         req.prompt.len()
     );
+    check_think(&req.think)?;
 
     // Empty prompt + keep_alive:0 = unload request (ollama server/routes.go:354).
     // is_explicit_unload, not resolve_keep_alive: it still accepts every
@@ -1539,16 +1578,17 @@ async fn ollama_generate_to(
         .into_iter()
         .chain(std::iter::once(ollama_message_to_oai(&user)))
         .collect();
+    let think = resolve_think(&req.think, thinking_for(state, &target).await.as_ref());
     let mut oai = OAIChatRequest {
         model: wire_model,
         messages,
         stream: true,
-        chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
+        chat_template_kwargs: think_to_chat_template_kwargs(&think),
         tools: None,
         response_format: format_to_response_format(&req.format),
         ..options_to_oai(&req.options)
     };
-    apply_think_budget(state, &target, &req.think, &mut oai).await;
+    apply_think_budget(state, &target, &think, &mut oai).await;
     stream_ollama(
         req.stream,
         state.0.client.clone(),

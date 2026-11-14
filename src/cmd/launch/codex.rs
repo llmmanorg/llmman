@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use toml_edit::{value, DocumentMut, Item, Table};
 
+use super::common::write_if_changed;
+use super::optimizer::Optimizer;
 use super::{exec_with_env, find_on_path, server};
 
 /// codex: write the `llmman` profile overlay (`~/.codex/llmman.config.toml`,
@@ -16,7 +18,9 @@ pub(super) fn launch_codex(
     vision: bool,
     context_window: Option<u64>,
     extra_args: &[String],
+    optimizer: Optimizer,
 ) -> anyhow::Result<()> {
+    let added = optimizer.addition("codex")?;
     // Write codex config
     write_codex_config(model, vision, context_window, extra_args)?;
 
@@ -40,8 +44,47 @@ pub(super) fn launch_codex(
     // codex profile flag
     args.extend(["--profile".to_string(), "llmman".to_string()]);
     args.extend_from_slice(extra_args);
+    args.splice(0..0, added.args.iter().cloned());
 
+    if let Some(notice) = optimizer.notice("codex") {
+        eprintln!("{notice}");
+    }
     exec_with_env(&bin, &args, &[("OPENAI_API_KEY", api_key)])
+}
+
+const KEY: &str = "developer_instructions";
+
+/// The `-c` value that sets codex's `developer_instructions` to `text`.
+pub(super) fn developer_instructions(text: &str) -> String {
+    format!("{KEY}={}", toml_edit::Value::from(text))
+}
+
+/// Whether a `-c`/`--config` before `--` sets `developer_instructions`.
+fn sets_developer_instructions(extra_args: &[String]) -> bool {
+    let args = super::before_terminator(extra_args);
+    args.iter().enumerate().any(|(i, a)| {
+        let setting = match a.as_str() {
+            "-c" | "--config" => args.get(i + 1).map(String::as_str),
+            _ => a.strip_prefix("--config=").or(a.strip_prefix("-c=")),
+        };
+        setting.is_some_and(|s| s.split('=').next().is_some_and(|k| k.trim() == KEY))
+    })
+}
+
+/// What keeps `--optimizer cvmn` from working with codex: instructions of
+/// the caller's, which the override would replace.
+pub(super) fn cvmn_conflict(extra_args: &[String]) -> Option<&'static str> {
+    let configured = codex_dir().ok().is_some_and(|dir| {
+        ["config.toml", "llmman.config.toml"].iter().any(|name| {
+            std::fs::read_to_string(dir.join(name))
+                .ok()
+                .and_then(|text| text.parse::<DocumentMut>().ok())
+                .is_some_and(|doc| doc.contains_key(KEY))
+        })
+    });
+    (configured || sets_developer_instructions(extra_args)).then_some(
+        "developer_instructions of your own: llmman's would replace them.\nRemove them, or launch without --optimizer.",
+    )
 }
 
 /// Writes codex's `llmman` profile.
@@ -83,7 +126,7 @@ fn write_codex_config(
     let catalog_path = config_dir.join("llmman-model.json");
     let catalog = (!model.is_empty()).then(|| {
         let context_window = codex_context_window(context_window);
-        write_codex_file(
+        write_if_changed(
             &catalog_path,
             &codex_model_catalog(model, vision, context_window),
         )
@@ -102,7 +145,7 @@ fn write_codex_config(
             .filter(|_| !user_config_unreadable)
             .as_deref(),
     );
-    write_codex_file(&profile_path, &overlay)
+    write_if_changed(&profile_path, &overlay)
 }
 
 /// The overlay's keys that are llmman's; the rest of the file is codex's.
@@ -201,14 +244,6 @@ pub(super) fn codex_dir() -> anyhow::Result<PathBuf> {
     Ok(dirs::home_dir()
         .context("no home directory")?
         .join(".codex"))
-}
-
-/// Writes `contents` to `path` unless it already holds exactly that.
-fn write_codex_file(path: &Path, contents: &str) -> anyhow::Result<()> {
-    if std::fs::read_to_string(path).ok().as_deref() == Some(contents) {
-        return Ok(());
-    }
-    std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))
 }
 
 /// The catalog's `context_window` where `launch` resolved none at all;
@@ -515,7 +550,7 @@ model = \"gpt-5\"
         );
     }
 
-    /// An unchanged overlay is not rewritten (`write_codex_file`), so
+    /// An unchanged overlay is not rewritten (`write_if_changed`), so
     /// writing it twice must give the same text.
     #[test]
     fn overlay_is_stable() {
@@ -626,5 +661,39 @@ model = \"gpt-5\"
         assert_eq!(codex_context_window(Some(16384)), 16384);
         assert_eq!(codex_context_window(Some(1 << 20)), 1 << 20);
         assert_eq!(codex_context_window(None), CODEX_FALLBACK_CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn developer_instructions_of_the_callers_are_seen_before_a_second_terminator() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(sets_developer_instructions(&args(&[
+            "-c",
+            "developer_instructions=\"x\""
+        ])));
+        assert!(sets_developer_instructions(&args(&[
+            "--config=developer_instructions='x'"
+        ])));
+        // Text that only mentions the key is not a setting.
+        assert!(!sets_developer_instructions(&args(&[
+            "--cd",
+            "/w/developer_instructions-demo",
+            "exec",
+            "explain developer_instructions"
+        ])));
+        assert!(!sets_developer_instructions(&args(&["-c", "model=\"m\""])));
+        assert!(!sets_developer_instructions(&args(&[
+            "exec",
+            "--",
+            "-c",
+            "developer_instructions=x"
+        ])));
+    }
+
+    #[test]
+    fn the_override_for_developer_instructions_is_valid_toml_that_keeps_the_text() {
+        let text = "Be brief.\nQuote: \"a\" and \\ and 'b'";
+        let arg = developer_instructions(text);
+        let doc: DocumentMut = arg.parse().unwrap();
+        assert_eq!(doc["developer_instructions"].as_str(), Some(text));
     }
 }

@@ -102,7 +102,8 @@ pub struct LaunchArgs {
 
     /// What to launch with to make the session cheaper: none (the default)
     /// launches as is; tk compacts the output of the shell commands the
-    /// agent runs (claude only). See docs/optimizers.md.
+    /// agent runs (claude, opencode); cvmn asks for terse replies (claude,
+    /// codex, opencode). See docs/optimizers.md.
     #[arg(long, value_enum, value_name = "OPTIMIZER", default_value = "none")]
     pub optimizer: Optimizer,
 
@@ -1201,8 +1202,16 @@ fn launch(
             context_window,
             max_output,
             extra_args,
+            optimizer,
         ),
-        "codex" => codex::launch_codex(model, api_key, vision, context_window, extra_args),
+        "codex" => codex::launch_codex(
+            model,
+            api_key,
+            vision,
+            context_window,
+            extra_args,
+            optimizer,
+        ),
         "pi" => pi::launch_pi(model, reasons, vision, context_window, extra_args),
         "omp" => omp::launch_omp(model, reasons, vision, context_window, extra_args),
         "cline" => cline::launch_cline(model, extra_args),
@@ -2162,9 +2171,9 @@ mod tests {
         assert_eq!(args.extra_args, ["hi"]);
     }
 
-    /// `--optimizer` defaults to none, and takes none or tk.
+    /// `--optimizer` defaults to none, and takes none, tk or cvmn.
     #[test]
-    fn the_optimizer_defaults_to_none_and_takes_none_or_tk() {
+    fn the_optimizer_defaults_to_none_and_takes_none_tk_or_cvmn() {
         assert_eq!(launch_args(&["claude"]).optimizer, Optimizer::None);
         assert_eq!(
             launch_args(&["claude", "--optimizer", "none"]).optimizer,
@@ -2177,6 +2186,10 @@ mod tests {
         assert_eq!(
             launch_args(&["claude", "--optimizer=tk", "--", "-p", "hi"]).optimizer,
             Optimizer::Tk
+        );
+        assert_eq!(
+            launch_args(&["claude", "--optimizer", "cvmn"]).optimizer,
+            Optimizer::Cvmn
         );
         // The flag is not an alias for anything after `--`.
         let args = launch_args(&["claude", "--", "--optimizer", "tk"]);
@@ -2204,6 +2217,7 @@ mod tests {
         assert!(help.contains("--optimizer <OPTIMIZER>"), "{help}");
         assert!(help.contains("none"), "{help}");
         assert!(help.contains("tk"), "{help}");
+        assert!(help.contains("cvmn"), "{help}");
         assert!(help.contains("[default: none]"), "{help}");
     }
 
@@ -2212,7 +2226,6 @@ mod tests {
     #[test]
     fn tk_is_refused_for_other_integrations_before_anything_starts() {
         for name in [
-            "opencode",
             "codex",
             "aider",
             "goose",
@@ -2228,8 +2241,22 @@ mod tests {
                 err.contains(&format!("does not work with {canonical}")),
                 "{name}: {err}"
             );
-            assert!(err.contains("only claude can use it"), "{name}: {err}");
+            assert!(
+                err.contains("only claude, opencode can use it"),
+                "{name}: {err}"
+            );
         }
+    }
+
+    #[test]
+    fn cvmn_is_refused_for_other_integrations_before_anything_starts() {
+        let args = launch_args(&["aider", "--model", "m", "--optimizer", "cvmn"]);
+        let err = run(&args).unwrap_err().to_string();
+        assert!(err.contains("does not work with aider"), "{err}");
+        assert!(
+            err.contains("only claude, codex, opencode can use it"),
+            "{err}"
+        );
     }
 
     #[test]
