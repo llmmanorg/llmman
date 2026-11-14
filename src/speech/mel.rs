@@ -1235,36 +1235,58 @@ mod tests {
     }
 
     /// The cancel check is asked once per `CANCEL_CHECK_FRAMES` frames in
-    /// each pass; a check that says stop ends the call with `Cancelled`
-    /// before the output pass runs, and a check that never does leaves
-    /// the output untouched.
+    /// each pass: the statistics pass and the output pass when normalizing,
+    /// the single output pass otherwise. A check that returns true stops
+    /// the extraction with `Cancelled`, in whichever pass it fires, and a
+    /// check that never fires leaves the output untouched.
     #[test]
     fn a_cancel_check_stops_feature_extraction_between_frame_blocks() {
-        let cfg = MelConfig::default();
-        let extractor = FeatureExtractor::new(cfg.clone()).unwrap();
-        // 100 frames: the statistics pass alone asks four times.
-        let pcm: Vec<i16> = (0..100 * cfg.hop)
-            .map(|i| ((i as f64 * 0.37).sin() * 12000.0) as i16)
-            .collect();
-        let mut calls = 0;
-        let err = extractor
-            .features(&pcm, &mut || {
-                calls += 1;
-                calls == 2
-            })
-            .unwrap_err();
-        assert_eq!(err, MelError::Cancelled);
-        assert_eq!(calls, 2, "stopped at the second check");
+        let frames: usize = 100;
+        let checks_per_pass = frames.div_ceil(CANCEL_CHECK_FRAMES);
+        let pcm = |cfg: &MelConfig| -> Vec<i16> {
+            (0..frames * cfg.hop)
+                .map(|i| ((i as f64 * 0.37).sin() * 12000.0) as i16)
+                .collect()
+        };
+        let normalized = MelConfig::default();
+        let unnormalized = MelConfig {
+            normalize: Normalize::None,
+            ..MelConfig::default()
+        };
+        // (config, passes, the check that cancels, the pass it lands in)
+        let cases = [
+            (&normalized, 2, 2, "statistics pass"),
+            (
+                &normalized,
+                2,
+                checks_per_pass + 2,
+                "normalized output pass",
+            ),
+            (&unnormalized, 1, 2, "unnormalized output pass"),
+        ];
+        for (cfg, passes, stop_at, pass) in cases {
+            let extractor = FeatureExtractor::new(cfg.clone()).unwrap();
+            let pcm = pcm(cfg);
+            let mut calls = 0;
+            let err = extractor
+                .features(&pcm, &mut || {
+                    calls += 1;
+                    calls == stop_at
+                })
+                .unwrap_err();
+            assert_eq!(err, MelError::Cancelled, "{pass}");
+            assert_eq!(calls, stop_at, "stopped at check {stop_at} in the {pass}");
 
-        let mut calls = 0;
-        let out = extractor
-            .features(&pcm, &mut || {
-                calls += 1;
-                false
-            })
-            .unwrap();
-        assert_eq!(out, features(&pcm, &cfg).unwrap());
-        assert_eq!(calls, 2 * 100usize.div_ceil(CANCEL_CHECK_FRAMES));
+            let mut calls = 0;
+            let out = extractor
+                .features(&pcm, &mut || {
+                    calls += 1;
+                    false
+                })
+                .unwrap();
+            assert_eq!(out, features(&pcm, cfg).unwrap(), "{pass}");
+            assert_eq!(calls, passes * checks_per_pass, "{pass}");
+        }
     }
     #[test]
     fn features_are_bit_identical_across_runs() {
