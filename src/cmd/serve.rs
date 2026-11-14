@@ -89,6 +89,7 @@ use openai::{
 };
 use relay::proxy;
 pub use runtime::Runtime;
+use runtime::Workload;
 use sched::{
     begin_activity, default_keep_alive, reap_idle_models, refresh_activity, ActivityGuard,
 };
@@ -2434,8 +2435,12 @@ async fn resolve_target(
         let safetensors_engine = safetensors_engine_from_env();
         // May fetch llama.cpp if startup could not (runtime::Lazy).
         // Skipped for ds4, which uses neither llama.cpp nor a container.
+        // A speech model has its own answer: its container needs no GPU,
+        // so under `auto` it can run in one where llama-server cannot.
         let ociman = if ds4 {
             None
+        } else if speech {
+            state.0.runtime.ociman_for(Workload::CpuOnly).await?
         } else {
             state.0.runtime.ociman().await?
         };
@@ -2471,7 +2476,9 @@ async fn resolve_target(
                         ModelProcess::Container(ociman, Engine::Speech, child)
                     }
                     (GgufArm::Speech { .. }, _) => {
-                        let (child, tail) = spawn_mediagen_backend(model_ref, port, state).await?;
+                        let (child, tail) =
+                            spawn_mediagen_backend(model_ref, port, state, Workload::CpuOnly)
+                                .await?;
                         stderr_tail = Some(tail);
                         ModelProcess::Local(Engine::Speech, child, None)
                     }
@@ -2514,7 +2521,8 @@ async fn resolve_target(
                 ModelProcess::Container(ociman, Engine::LlamaServer, child)
             }
             (ModelPath::Diffusion(_), None) => {
-                let (child, tail) = spawn_mediagen_backend(model_ref, port, state).await?;
+                let (child, tail) =
+                    spawn_mediagen_backend(model_ref, port, state, Workload::General).await?;
                 stderr_tail = Some(tail);
                 oom_retryable = true;
                 ModelProcess::Local(Engine::LlamaServer, child, None)
@@ -4458,18 +4466,20 @@ async fn speech_backend(
 
 /// Spawns this binary as `model_ref`'s backend, `llmman serve MODEL --port
 /// PORT` (see `run`): the media backend of a diffusion model, the speech
-/// worker of a Canary GGUF.
+/// worker of a Canary GGUF. `workload` is whose runtime answer the child
+/// inherits (see `runtime::Workload`).
 async fn spawn_mediagen_backend(
     model_ref: &str,
     port: u16,
     state: &AppState,
+    workload: Workload,
 ) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
     let exe = std::env::current_exe().context("locating the llmman binary")?;
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.args(["serve", model_ref, "--port", &port.to_string()]);
     // Explicit, so the child lands on the same build as this daemon
     // rather than re-resolving `auto`/the default pin/LLMMAN_RUNTIME.
-    let runtime = state.0.runtime.resolve().await?.runtime();
+    let runtime = state.0.runtime.resolve_for(workload).await?.runtime();
     cmd.args(["--runtime", runtime.as_str()]);
     cmd.args([
         "--llama-cpp-version",
@@ -4649,6 +4659,34 @@ fn metrics_router(enabled: bool) -> Router<AppState> {
         .layer(middleware::from_fn(track_metrics))
 }
 
+/// What `--pull-only` still has to do once the runtime resolved: nothing
+/// for a local llama.cpp, whatever the model is; for a container engine,
+/// `classify` the model (its error, such as a model not yet in the store,
+/// surfaces here and nowhere earlier) and then pull that engine's image,
+/// or run the CPU-only resolution for a Canary GGUF, which pulls the CPU
+/// image. The matrix of runtimes and stored or unstored models is tested
+/// on this function.
+#[derive(Debug, PartialEq, Eq)]
+enum PullOnlyStep {
+    Done,
+    ResolveCpuOnly,
+    PullEngine(crate::container::ContainerEngine),
+}
+
+fn pull_only_step(
+    resolved: &runtime::Resolved,
+    classify: impl FnOnce() -> anyhow::Result<crate::container::ContainerEngine>,
+) -> anyhow::Result<PullOnlyStep> {
+    if resolved.ociman().is_none() {
+        return Ok(PullOnlyStep::Done);
+    }
+    Ok(match classify()? {
+        crate::container::ContainerEngine::Speech => PullOnlyStep::ResolveCpuOnly,
+        crate::container::ContainerEngine::LlamaServer => PullOnlyStep::Done,
+        engine => PullOnlyStep::PullEngine(engine),
+    })
+}
+
 /// Which image `--pull-only` warms up under a container runtime: the one
 /// `ensure_model` would run for `model` (read off its stored manifest),
 /// or llama-server's when no model is named — pulling both would cost a
@@ -4737,7 +4775,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             None
         }
     };
-    let runtime = runtime::Lazy::new(requested, llama_cpp_version.clone(), resolved);
+    let runtime = runtime::Lazy::new(requested, llama_cpp_version.clone(), resolved.clone());
 
     // Likewise uv and mlx-lm, with the same failure policy.
     if let Some(fallback) = installs_mlx {
@@ -4756,21 +4794,28 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     }
 
     if _args.pull_only {
-        // Resolved for certain: a failure returned above.
-        if let Some(ociman) = runtime.known().and_then(|r| r.ociman()) {
-            // resolve() pulled the llama.cpp image; a safetensors MODEL
-            // needs vLLM's (or SGLang's) too, a Canary GGUF the CPU one.
-            let engine = pull_only_engine(_args.model.as_deref())?;
-            let version = match engine {
-                crate::container::ContainerEngine::LlamaServer => None,
-                crate::container::ContainerEngine::Speech => Some(llama_cpp_version.as_deref()),
-                crate::container::ContainerEngine::Sglang => Some(_args.sglang_version.as_deref()),
-                crate::container::ContainerEngine::Vllm
-                | crate::container::ContainerEngine::VllmOmni => {
-                    Some(_args.vllm_version.as_deref())
-                }
-            };
-            if let Some(version) = version {
+        // Resolved for certain: a failure returned above. resolve() pulled
+        // the llama-server image when it picked a container engine; what
+        // is left depends on the model, see `pull_only_step`.
+        let resolved = resolved
+            .as_ref()
+            .expect("a pull-only failure returned above");
+        match pull_only_step(resolved, || pull_only_engine(_args.model.as_deref()))? {
+            PullOnlyStep::Done => {}
+            PullOnlyStep::ResolveCpuOnly => {
+                let pin = llama_cpp_version.clone();
+                tokio::task::spawn_blocking(move || {
+                    runtime::resolve_for(Workload::CpuOnly, requested, pin.as_deref())
+                })
+                .await
+                .context("resolve runtime task panicked")??;
+            }
+            PullOnlyStep::PullEngine(engine) => {
+                let ociman = resolved.ociman().expect("a container engine was picked");
+                let version = match engine {
+                    crate::container::ContainerEngine::Sglang => _args.sglang_version.as_deref(),
+                    _ => _args.vllm_version.as_deref(),
+                };
                 crate::container::pull_image(ociman, engine, version, _args.vllm_image.as_deref())?;
             }
         }
