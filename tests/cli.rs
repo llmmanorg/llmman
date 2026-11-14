@@ -214,24 +214,79 @@ fn launch_claude_refuses_a_variant_with_a_forwarded_model() {
     );
 }
 
+#[cfg(unix)]
+struct Daemon(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Starts `llmman serve` in a cleared environment. Returns the daemon, its
+/// stderr up to the shell line, and the rest of its stderr.
+#[cfg(unix)]
+fn serve_until_shell_line(
+    home: &std::path::Path,
+    host: &str,
+    shell: Option<&str>,
+) -> (Daemon, String, std::sync::mpsc::Receiver<String>) {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let mut cmd = llmman();
+    cmd.args(["serve", "--runtime", "path"])
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("LLMMAN_HOST", host)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(value) = shell {
+        cmd.env("LLMMAN_SHELL", value);
+    }
+    let mut daemon = Daemon(cmd.spawn().unwrap());
+    let stderr = daemon.0.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Drains to EOF, so the daemon never writes to a closed pipe.
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let mut log = Vec::new();
+    while !log.iter().any(|l: &String| l.contains("[llmman] shell:")) {
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(line) => log.push(line),
+            Err(_) => panic!("no shell line in {log:#?}"),
+        }
+    }
+    (daemon, log.join("\n"), rx)
+}
+
+#[cfg(unix)]
+fn shell_upgrade(shell_url: &str, protocol: Option<&str>) -> u16 {
+    let mut req = reqwest::blocking::Client::new()
+        .get(shell_url)
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+    if let Some(protocol) = protocol {
+        req = req.header("sec-websocket-protocol", protocol);
+    }
+    req.send().unwrap().status().as_u16()
+}
+
 /// The client sends no `Origin` (not a browser). stderr is a pipe, so the
 /// token must not appear in it.
 #[cfg(unix)]
 #[test]
 fn a_default_keyless_serve_opens_its_shell_only_with_the_token() {
-    use std::io::{BufRead, BufReader};
     use std::os::unix::fs::PermissionsExt as _;
-    use std::process::Stdio;
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    struct Daemon(std::process::Child);
-    impl Drop for Daemon {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
 
     let home = tempfile::tempdir().unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -242,51 +297,11 @@ fn a_default_keyless_serve_opens_its_shell_only_with_the_token() {
     let token_file = home
         .path()
         .join(format!(".local/share/llmman/shell-127.0.0.1-{port}.token"));
-    // The daemon, its stderr up to the shell line, and the rest of its stderr.
-    let start = |shell: Option<&str>| {
-        let mut cmd = llmman();
-        cmd.args(["serve", "--runtime", "path"])
-            .env_clear()
-            .env("HOME", home.path())
-            .env("PATH", "/usr/bin:/bin")
-            .env("LLMMAN_HOST", format!("127.0.0.1:{port}"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        if let Some(value) = shell {
-            cmd.env("LLMMAN_SHELL", value);
-        }
-        let mut daemon = Daemon(cmd.spawn().unwrap());
-        let stderr = daemon.0.stderr.take().unwrap();
-        let (tx, rx) = mpsc::channel();
-        // Drains to EOF, so the daemon never writes to a closed pipe.
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let _ = tx.send(line);
-            }
-        });
-        let mut log = Vec::new();
-        while !log.iter().any(|l: &String| l.contains("[llmman] shell:")) {
-            match rx.recv_timeout(Duration::from_secs(30)) {
-                Ok(line) => log.push(line),
-                Err(_) => panic!("no shell line in {log:#?}"),
-            }
-        }
-        (daemon, log.join("\n"), rx)
-    };
+    let host = format!("127.0.0.1:{port}");
+    let start = |shell| serve_until_shell_line(home.path(), &host, shell);
     let shell_url = format!("http://127.0.0.1:{port}/llmman/shell");
     let client = reqwest::blocking::Client::new();
-    let upgrade = |protocol: Option<&str>| {
-        let mut req = client
-            .get(&shell_url)
-            .header("connection", "upgrade")
-            .header("upgrade", "websocket")
-            .header("sec-websocket-version", "13")
-            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
-        if let Some(protocol) = protocol {
-            req = req.header("sec-websocket-protocol", protocol);
-        }
-        req.send().unwrap().status().as_u16()
-    };
+    let upgrade = |protocol| shell_upgrade(&shell_url, protocol);
 
     // A token file the daemon cannot open for writing, from an earlier start.
     let data_dir = token_file.parent().unwrap().to_path_buf();
@@ -351,5 +366,34 @@ fn a_default_keyless_serve_opens_its_shell_only_with_the_token() {
             .unwrap()
             .starts_with("llmman serve could not save its shell token: "),
         "{status}"
+    );
+}
+
+/// The OS picks the port for `LLMMAN_HOST=…:0`; the token file is named by
+/// it too.
+#[cfg(unix)]
+#[test]
+fn a_serve_on_port_0_reports_the_port_it_got() {
+    let home = tempfile::tempdir().unwrap();
+    let (_daemon, log, _) = serve_until_shell_line(home.path(), "127.0.0.1:0", None);
+    let port: u16 = log
+        .lines()
+        .find_map(|l| l.strip_prefix("llmman serve listening on http://127.0.0.1:"))
+        .unwrap_or_else(|| panic!("no listening line in {log}"))
+        .parse()
+        .unwrap();
+    assert_ne!(port, 0);
+    let token_file = home
+        .path()
+        .join(format!(".local/share/llmman/shell-127.0.0.1-{port}.token"));
+    assert!(
+        log.contains(&format!("its token is in {}", token_file.display())),
+        "{log}"
+    );
+    let token = std::fs::read_to_string(&token_file).unwrap();
+    let shell_url = format!("http://127.0.0.1:{port}/llmman/shell");
+    assert_eq!(
+        shell_upgrade(&shell_url, Some(&format!("llmman.shell.{token}"))),
+        101
     );
 }

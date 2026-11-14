@@ -19,6 +19,18 @@ pub const EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"
 /// takes too (see `cmd::serve::anthropic::portable_efforts`).
 pub const DEFAULT_EFFORT_LEVELS: &[&str] = &["low", "medium", "high"];
 
+/// The levels llmman applies to a switch-only template: on, with a token
+/// budget for `minimal` and `low` (`openai::effort_budget_tokens`).
+pub const BUDGETED_EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high"];
+
+/// Ollama's `model.Thinking`: the `think` values a model takes, and the
+/// one used when a request sends none or one it does not take.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Thinking {
+    pub values: Vec<serde_json::Value>,
+    pub default: serde_json::Value,
+}
+
 /// A chat template's thinking controls.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ThinkingControls {
@@ -32,6 +44,11 @@ pub struct ThinkingControls {
     /// The `reasoning_effort` levels it distinguishes, lowest first; empty
     /// when it reads none.
     pub efforts: Vec<&'static str>,
+    /// Thinking is on when a request says nothing (Gemma 4's is off).
+    pub default_on: bool,
+    /// The level the template uses without `reasoning_effort`:
+    /// `reasoning_effort|default('xhigh')`.
+    pub default_effort: Option<&'static str>,
 }
 
 impl ThinkingControls {
@@ -53,6 +70,39 @@ impl ThinkingControls {
     /// Thinks, but a `reasoning_effort` level only switches it on.
     pub fn thinks_without_levels(&self) -> bool {
         self.thinks && self.efforts.is_empty()
+    }
+
+    /// The `think` values `/api/show` reports: off, then the template's
+    /// levels, or [`BUDGETED_EFFORT_LEVELS`] if `budgeted` and it is
+    /// switch-only, else on. The default is what an omitted `think` does.
+    pub fn thinking(&self, budgeted: bool) -> Option<Thinking> {
+        if !self.thinks {
+            return None;
+        }
+        let levels: &[&str] = match (self.efforts.is_empty(), self.enable_thinking && budgeted) {
+            (false, _) => &self.efforts,
+            (true, true) => BUDGETED_EFFORT_LEVELS,
+            (true, false) => &[],
+        };
+        let mut values = vec![false.into()];
+        values.extend(levels.iter().map(|level| (*level).into()));
+        let default = match levels {
+            [] => {
+                values.push(true.into());
+                self.default_on.into()
+            }
+            _ if !self.default_on => false.into(),
+            _ => self
+                .default_effort
+                .filter(|level| levels.contains(level))
+                .unwrap_or(if levels.contains(&"medium") {
+                    "medium"
+                } else {
+                    levels[levels.len() - 1]
+                })
+                .into(),
+        };
+        Some(Thinking { values, default })
     }
 }
 
@@ -108,10 +158,35 @@ pub fn thinking_controls(template: &str) -> ThinkingControls {
     } else {
         Vec::new()
     };
+    // Thinking starts on unless the template reads the switch only to turn it on.
+    let squeezed: String = lower.split_whitespace().collect();
+    let default_on = !enable_thinking
+        || [
+            "enable_thinkingisfalse",
+            "enable_thinking==false",
+            "notenable_thinking",
+            "enable_thinkingisundefinedor",
+            "enable_thinkingisnotdefinedor",
+            "enable_thinking|default(true)",
+        ]
+        .iter()
+        .any(|test| squeezed.contains(test));
+    let default_effort = squeezed
+        .split_once("reasoning_effort|default(")
+        .and_then(|(_, rest)| {
+            rest.starts_with(['\'', '"']).then_some(())?;
+            let literal = quoted_literals(rest).next()?;
+            EFFORT_LEVELS
+                .iter()
+                .copied()
+                .find(|level| *level == literal)
+        });
     ThinkingControls {
         thinks,
         enable_thinking,
         efforts,
+        default_on,
+        default_effort,
     }
 }
 
@@ -288,6 +363,8 @@ mod tests {
                 thinks: true,
                 enable_thinking: true,
                 efforts: vec!["low", "medium", "xhigh"],
+                default_on: true,
+                default_effort: Some("xhigh"),
             }
         );
         assert_eq!(controls.choices(), ["none", "low", "medium", "xhigh"]);
@@ -362,6 +439,66 @@ mod tests {
         assert!(controls.enable_thinking && controls.efforts.is_empty());
         assert_eq!(controls.choices(), ["none", "thinking"]);
         assert!(controls.thinks_without_levels());
+    }
+
+    /// What `/api/show` reports: off, the levels or switch, and the default.
+    #[test]
+    fn thinking_reports_the_values_a_template_takes() {
+        use serde_json::json;
+        let thinking = |template: &str, budgeted| {
+            let t = thinking_controls(template).thinking(budgeted)?;
+            Some((json!(t.values), t.default))
+        };
+        // Named levels, defaulting to the template's own.
+        assert_eq!(
+            thinking(QWEN3_8, false),
+            Some((json!([false, "low", "medium", "xhigh"]), json!("xhigh")))
+        );
+        let gpt_oss = r#"{{- "Reasoning: " + reasoning_effort | default("medium") }}"#;
+        assert_eq!(
+            thinking(gpt_oss, true),
+            Some((json!([false, "low", "medium", "high"]), json!("medium")))
+        );
+        // A switch that only sees `false` starts on; Gemma 4's starts off.
+        let qwen3_5 = "{%- if enable_thinking is defined and enable_thinking is false %}<think></think>{%- endif %}";
+        let undefined =
+            "{%- if enable_thinking is not defined or enable_thinking %}<think>{%- endif %}";
+        assert_eq!(
+            thinking(undefined, false),
+            Some((json!([false, true]), json!(true)))
+        );
+        let gemma4 = "{%- set enable_thinking = enable_thinking | default(false) -%}{%- if enable_thinking -%}<|think|>{%- endif -%}";
+        assert_eq!(
+            thinking(qwen3_5, false),
+            Some((json!([false, true]), json!(true)))
+        );
+        assert_eq!(
+            thinking(gemma4, false),
+            Some((json!([false, true]), json!(false)))
+        );
+        // llmman bounds a switch's levels where it can: Qwen3.5 0.8B, #816.
+        assert_eq!(
+            thinking(qwen3_5, true),
+            Some((
+                json!([false, "minimal", "low", "medium", "high"]),
+                json!("medium")
+            ))
+        );
+        assert_eq!(
+            thinking(gemma4, true),
+            Some((
+                json!([false, "minimal", "low", "medium", "high"]),
+                json!(false)
+            ))
+        );
+        // Thinking nothing reads: always on, can be switched off.
+        let kimi =
+            "{%- if thinking is defined and thinking is false -%}<think></think>{%- endif -%}";
+        assert_eq!(
+            thinking(kimi, true),
+            Some((json!([false, true]), json!(true)))
+        );
+        assert_eq!(thinking("{{ messages }}", true), None);
     }
 
     /// Kimi K2.5, MiniMax M2.5: thinking with nothing a kwarg reads.

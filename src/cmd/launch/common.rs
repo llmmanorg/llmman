@@ -30,6 +30,18 @@ fn check_daemon_key_transport_to(
     Ok(())
 }
 
+/// Writes `contents` to `path`, and its directory, unless it already holds
+/// exactly that.
+pub(super) fn write_if_changed(path: &Path, contents: &str) -> anyhow::Result<()> {
+    if std::fs::read_to_string(path).ok().as_deref() == Some(contents) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))
+}
+
 pub(super) fn write_yaml_merged(
     path: &Path,
     label: &str,

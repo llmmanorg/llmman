@@ -107,9 +107,10 @@ way:
    and writes it, readable only by its user, to `shell-<host>-<port>.token`
    (`<host>` as `LLMMAN_HOST` spells it, so `shell-127.0.0.1-17434.token`
    by default; an IPv6 host loses its brackets and its colons become `_`,
-   so `[::1]` gives `shell-__1-17434.token`) in llmman's data directory
-   (`~/.local/share/llmman`, `%LOCALAPPDATA%\llmman` on Windows). An
-   upgrade must offer it as the subprotocol `llmman.shell.<token>`, API
+   so `[::1]` gives `shell-__1-17434.token`; `<port>` the one it listens
+   on, which the OS picks for `LLMMAN_HOST=127.0.0.1:0`) in llmman's data
+   directory (`~/.local/share/llmman`, `%LOCALAPPDATA%\llmman` on Windows).
+   An upgrade must offer it as the subprotocol `llmman.shell.<token>`, API
    keys or not; without it the upgrade gets `401`. When its stderr is a
    terminal, `serve` prints a link to the UI that carries the token in its
    fragment (`http://127.0.0.1:17434/#shell-token=<token>`); a detached

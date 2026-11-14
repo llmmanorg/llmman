@@ -163,6 +163,12 @@ pub fn bind_addr() -> String {
     format_host_port(host, *port)
 }
 
+/// [`bind_addr`] with the port the listener got, which differs from the
+/// configured one only when `LLMMAN_HOST` asks for port 0.
+pub fn bound_addr(port: u16) -> String {
+    format_host_port(&parsed_host().1, port)
+}
+
 /// The bare `host:port` a client should *connect* to — like `bind_addr`,
 /// but a wildcard host is rewritten to loopback first, since a client
 /// can't connect to "every interface".

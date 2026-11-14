@@ -206,6 +206,7 @@ pub(super) fn running_model_fixture(
         decision: false,
         effort_budget: false,
         effort_budget_message: true,
+        thinking: None,
         trained_ctx: None,
         retiring: Default::default(),
     }
@@ -234,6 +235,7 @@ pub(super) fn running_model_fixture_with_engine(
         decision: false,
         effort_budget: false,
         effort_budget_message: true,
+        thinking: None,
         trained_ctx: None,
         retiring: Default::default(),
     }

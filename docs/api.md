@@ -80,7 +80,12 @@ once per model.
 local model with one, `template`. They are `completion` (`embedding` for a
 pooling model, `decision` for a decision model), `vision` with a projector,
 `tools` when the chat template renders a request's `tools`, and `thinking`
-when it handles reasoning.
+when it handles reasoning. A llama-server model that thinks also gets Ollama's
+`thinking: {"values": [...], "default": ...}`: `false` plus the levels its
+template names (Qwen3.8: `low`, `medium`, `xhigh`), or `minimal`, `low`, `medium`
+and `high` for a switch-only template (Qwen3.5, Gemma 4). On `/api/chat` and
+`/api/generate` a `think` level outside `values` becomes the `default`, as in
+Ollama; a `think` that is not a boolean or string is a `400`.
 
 On `/api/chat` and `/api/generate`, `think: "minimal"` and `"low"` also
 get the thinking budget a local `/v1/chat/completions` gives those
