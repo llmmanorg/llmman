@@ -69,7 +69,10 @@ pub struct LaunchArgs {
     pub model: Option<String>,
 
     /// Serve --model from this provider (openai, anthropic, openrouter, …)
-    /// instead of locally. Requires --model. See `llmman providers`.
+    /// instead of locally; with no --model, the provider's first model.
+    /// claude, codex and opencode are given every model the provider
+    /// lists, to switch between inside the agent.
+    /// See `llmman providers`.
     #[arg(long, short = 'p', value_name = "PROVIDER")]
     pub provider: Option<String>,
 
@@ -237,7 +240,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     let context_window: Option<u64>;
     // The catalog's reply ceiling, for the arms that have a catalog.
     let mut max_output = None;
-    let (model, api_key) = match provider {
+    let (model, api_key, hosted) = match provider {
         Some(provider) => {
             check_provider_supported(name)?;
             // The daemon first, before --provider is validated: the
@@ -248,14 +251,16 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // is what forwards upstream.
             crate::daemon::ensure_server("")?;
             let per_request = !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
-            let hosted =
+            let resolved =
                 resolve_provider_model(provider, args.model.as_deref(), name, per_request)?;
-            thinking = hosted.thinking.map(Thinking::Listed);
+            thinking = resolved.thinking.map(Thinking::Listed);
             // Nothing local is loaded here, so the catalog's limits are
             // the only ones, and the ones the provider enforces.
-            context_window = hosted.context_window;
-            max_output = hosted.max_output;
-            (hosted.reference, hosted.api_key)
+            context_window = resolved.context_window;
+            max_output = resolved.max_output;
+            // Every model the provider serves, so the integration can
+            // offer them beside this one (see `HostedModel`).
+            (resolved.reference, resolved.api_key, Some(resolved.models))
         }
         None => {
             // resolve_ollama_api, not resolve: every integration this
@@ -320,6 +325,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                     (
                         crate::hybrid::pair_with_local(&model, &remote.reference)?,
                         remote.api_key,
+                        None,
                     )
                 }
                 None => {
@@ -327,7 +333,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                     // this is the only arm whose window is the local one
                     // alone.
                     context_window = local_window;
-                    (model, integration_key())
+                    (model, integration_key(), None)
                 }
             }
         }
@@ -344,6 +350,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         max_output,
         &args.extra_args,
         args.optimizer,
+        hosted.as_deref(),
     )
 }
 
@@ -658,6 +665,33 @@ struct ResolvedProvider {
     /// The most the catalog says it will emit in one reply (see
     /// [`crate::daemon::ProviderDetail::max_output`]).
     max_output: Option<u32>,
+    /// Every model the provider serves — the launched one first — so an
+    /// integration can list them for the session to switch between
+    /// (see [`HostedModel`]).
+    models: Vec<HostedModel>,
+}
+
+/// One model a `--provider` launch offers inside the integration, so the
+/// session can switch to it without relaunching.
+///
+/// The reference is what a request's `model` field has to carry for the
+/// daemon to route it upstream (see [`crate::providers::format_remote_ref`]):
+/// an integration's own model id would be read as a local one. The rest
+/// is what the catalog says about the model, to declare beside it.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct HostedModel {
+    /// `llmman.provider/<provider>/<id>`, the id the daemon routes on.
+    pub reference: String,
+    /// The id the provider knows it by, as its label in the agent.
+    pub id: String,
+    /// What the catalog says the model can hold (models.dev
+    /// `limit.context`), `None` where it publishes none.
+    pub context: Option<u64>,
+    /// The most the catalog says it will emit in one reply.
+    pub output: Option<u32>,
+    /// The thinking levels the catalog lists for it, as
+    /// [`Thinking::Listed`] would carry them.
+    pub thinking: Option<Vec<String>>,
 }
 
 /// Validates `--provider`/`--model` against the running daemon's catalog
@@ -686,16 +720,21 @@ fn resolve_provider_model(
     // Asked of the daemon, not models.dev: it routes the request, so it
     // is the authority on whether this provider exists — and on whether
     // *it* has the key, which this shell cannot see.
-    let model = model.map(str::trim).filter(|m| !m.is_empty());
+    let typed = model.map(str::trim).filter(|m| !m.is_empty());
     // Sent so a catalog that predates the model is refreshed, not warned about.
-    let entry = daemon::provider(provider, model)?;
+    let entry = daemon::provider(provider, typed)?;
 
-    let model = model.ok_or_else(|| {
-        anyhow::anyhow!(
-            "--provider {provider} also needs --model\n\n{}",
-            providers::example_models(&entry.name, &entry.model_ids())
-        )
-    })?;
+    // No `--model`: start on the provider's own first model rather than
+    // refuse the launch. Every model it serves travels to the
+    // integration anyway (see `HostedModel`), so the session can switch
+    // away from this one at once — which is what makes
+    // `llmman launch claude --provider ollama-cloud`, the command with
+    // no model in it, a launch rather than an error. A provider that
+    // lists none still gets the refusal, which names some.
+    let model = match typed {
+        Some(model) => model,
+        None => default_provider_model(provider, &entry)?,
+    };
 
     entry.warn_unlisted(model);
 
@@ -756,13 +795,62 @@ fn resolve_provider_model(
         (None, true) => anyhow::bail!("no API key for {} — {}", entry.name, entry.key_hint()),
     };
 
+    // The launched model first, with what this launch resolved for it,
+    // then every other model the catalog lists, in its own order: this
+    // list is what an integration offers for switching (see
+    // [`HostedModel`]), and the launched model belongs at the top of it.
+    let thinking = entry.thinking_levels(model);
+    let context_window = entry.context_window(model);
+    let max_output = entry.max_output(model);
+    let reference = providers::format_remote_ref(provider, model);
+    let mut models = vec![HostedModel {
+        reference: reference.clone(),
+        id: model.to_string(),
+        context: context_window,
+        output: max_output,
+        thinking: thinking.clone(),
+    }];
+    models.extend(
+        entry
+            .models
+            .iter()
+            .filter(|m| m.id != model)
+            .map(|m| HostedModel {
+                reference: providers::format_remote_ref(provider, &m.id),
+                id: m.id.clone(),
+                context: m.context,
+                output: m.output,
+                thinking: m.thinking.clone(),
+            }),
+    );
+
     Ok(ResolvedProvider {
-        reference: providers::format_remote_ref(provider, model),
+        reference,
         api_key: key,
-        thinking: entry.thinking_levels(model),
-        context_window: entry.context_window(model),
-        max_output: entry.max_output(model),
+        thinking,
+        context_window,
+        max_output,
+        models,
     })
+}
+
+/// The model a `--provider` launch that named none starts on: the
+/// provider's own first, said out loud so the choice is not a mystery —
+/// the model is only where the session begins, since every model the
+/// provider serves is listed for it to switch to (see [`HostedModel`]).
+/// A provider that lists none still gets the refusal that names some.
+fn default_provider_model<'a>(
+    provider: &str,
+    entry: &'a crate::daemon::ProviderDetail,
+) -> anyhow::Result<&'a str> {
+    let first = entry.model_ids().first().copied().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--provider {provider} also needs --model\n\n{}",
+            providers::example_models(&entry.name, &entry.model_ids())
+        )
+    })?;
+    eprintln!("[llmman] --provider {provider}: no --model; starting on {first}");
+    Ok(first)
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,6 +1249,8 @@ fn launch(
     max_output: Option<u32>,
     extra_args: &[String],
     optimizer: Optimizer,
+    // Every model `--provider` serves, or nothing for a local launch.
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     let name = name.to_lowercase();
     // Unknown levels are a guess: add the one asked for, don't refuse it.
@@ -1191,7 +1281,14 @@ fn launch(
             .and_then(Thinking::template)
             .is_some_and(|t| t.thinks);
     match name.as_str() {
-        "claude" => claude::launch_claude(model, api_key, context_window, extra_args, optimizer),
+        "claude" => claude::launch_claude(
+            model,
+            api_key,
+            context_window,
+            extra_args,
+            optimizer,
+            hosted,
+        ),
         "opencode" => opencode::launch_opencode(
             model,
             api_key,
@@ -1201,8 +1298,9 @@ fn launch(
             context_window,
             max_output,
             extra_args,
+            hosted,
         ),
-        "codex" => codex::launch_codex(model, api_key, vision, context_window, extra_args),
+        "codex" => codex::launch_codex(model, api_key, vision, context_window, extra_args, hosted),
         "pi" => pi::launch_pi(model, reasons, vision, context_window, extra_args),
         "omp" => omp::launch_omp(model, reasons, vision, context_window, extra_args),
         "cline" => cline::launch_cline(model, extra_args),

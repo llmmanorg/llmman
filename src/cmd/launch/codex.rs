@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use toml_edit::{value, DocumentMut, Item, Table};
 
-use super::{exec_with_env, find_on_path, server};
+use super::{exec_with_env, find_on_path, server, HostedModel};
 
 /// codex: write the `llmman` profile overlay (`~/.codex/llmman.config.toml`,
 /// a provider named `llmman` at our /v1 endpoint), then run codex with
@@ -16,9 +16,10 @@ pub(super) fn launch_codex(
     vision: bool,
     context_window: Option<u64>,
     extra_args: &[String],
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     // Write codex config
-    write_codex_config(model, vision, context_window, extra_args)?;
+    write_codex_config(model, vision, context_window, extra_args, hosted)?;
 
     // Regression: this used to pass a bare PathBuf::from("codex") straight
     // to exec_with_env instead of resolving it via find_on_path like every
@@ -62,6 +63,7 @@ fn write_codex_config(
     vision: bool,
     context_window: Option<u64>,
     extra_args: &[String],
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     let config_dir = codex_dir()?;
     std::fs::create_dir_all(&config_dir)?;
@@ -82,10 +84,9 @@ fn write_codex_config(
     // Without a model there is nothing to describe; codex keeps its defaults.
     let catalog_path = config_dir.join("llmman-model.json");
     let catalog = (!model.is_empty()).then(|| {
-        let context_window = codex_context_window(context_window);
         write_codex_file(
             &catalog_path,
-            &codex_model_catalog(model, vision, context_window),
+            &codex_model_catalog(&codex_catalog_models(model, vision, context_window, hosted)),
         )
         .map(|()| catalog_path.clone())
     });
@@ -223,34 +224,99 @@ fn codex_context_window(window: Option<u64>) -> u64 {
     window.unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
 }
 
-/// The `model_catalog_json` for `model`, declaring its image input in
-/// `input_modalities`. The other fields are ones codex requires, valued
-/// as ollama's `buildCodexModelEntry` does.
-fn codex_model_catalog(model: &str, vision: bool, context_window: u64) -> String {
-    let input: &[&str] = if vision {
-        &["text", "image"]
-    } else {
-        &["text"]
+/// One row of codex's `model_catalog_json`: what it needs to list a
+/// model in its `/model` picker.
+#[derive(Debug, PartialEq)]
+struct CodexCatalogModel {
+    /// The id codex selects with, and sends in a request's `model` field.
+    slug: String,
+    context_window: u64,
+    vision: bool,
+}
+
+/// What codex's catalog lists: every model `--provider` serves, so `/model`
+/// inside codex can switch between them, or — for a local launch — the one
+/// model this launch resolved.
+///
+/// The launched model keeps the window and image input this launch
+/// resolved for it (a catalog window, or a local one read off the loaded
+/// runner); the others take what the provider's catalog says, falling
+/// back on the same guess codex cannot do without, since its catalog
+/// cannot omit the window.
+fn codex_catalog_models(
+    model: &str,
+    vision: bool,
+    context_window: Option<u64>,
+    hosted: Option<&[HostedModel]>,
+) -> Vec<CodexCatalogModel> {
+    let Some(hosted) = hosted else {
+        return vec![CodexCatalogModel {
+            slug: model.to_string(),
+            context_window: codex_context_window(context_window),
+            vision,
+        }];
     };
-    let entry = serde_json::json!({
-        "slug": model,
-        "display_name": model,
-        "context_window": context_window,
-        "shell_type": "default",
-        "visibility": "list",
-        "supported_in_api": true,
-        "priority": 0,
-        "truncation_policy": { "mode": "bytes", "limit": 10000 },
-        "input_modalities": input,
-        "base_instructions": "",
-        "support_verbosity": true,
-        "default_verbosity": "low",
-        "supports_parallel_tool_calls": false,
-        "supports_reasoning_summaries": false,
-        "supported_reasoning_levels": [],
-        "experimental_supported_tools": [],
-    });
-    let catalog = serde_json::json!({ "models": [entry] });
+    let launched = |slug: &str| CodexCatalogModel {
+        slug: slug.to_string(),
+        context_window: codex_context_window(context_window),
+        vision,
+    };
+    let mut models: Vec<CodexCatalogModel> = hosted
+        .iter()
+        .map(|m| {
+            if m.reference == model {
+                return launched(&m.reference);
+            }
+            CodexCatalogModel {
+                slug: m.reference.clone(),
+                context_window: m.context.unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW),
+                // The catalog carries no image input, so only the model
+                // this launch resolved declares any.
+                vision: false,
+            }
+        })
+        .collect();
+    // The launched model belongs in its own catalog even if the list
+    // somehow lacks it: codex is started with `--model` naming it.
+    if !models.iter().any(|m| m.slug == model) {
+        models.insert(0, launched(model));
+    }
+    models
+}
+
+/// The `model_catalog_json` for `models`, declaring image input in
+/// `input_modalities` where a model has any. The other fields are ones
+/// codex requires, valued as ollama's `buildCodexModelEntry` does.
+fn codex_model_catalog(models: &[CodexCatalogModel]) -> String {
+    let entries: Vec<serde_json::Value> = models
+        .iter()
+        .map(|model| {
+            let input: &[&str] = if model.vision {
+                &["text", "image"]
+            } else {
+                &["text"]
+            };
+            serde_json::json!({
+                "slug": model.slug,
+                "display_name": model.slug,
+                "context_window": model.context_window,
+                "shell_type": "default",
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": 0,
+                "truncation_policy": { "mode": "bytes", "limit": 10000 },
+                "input_modalities": input,
+                "base_instructions": "",
+                "support_verbosity": true,
+                "default_verbosity": "low",
+                "supports_parallel_tool_calls": false,
+                "supports_reasoning_summaries": false,
+                "supported_reasoning_levels": [],
+                "experimental_supported_tools": [],
+            })
+        })
+        .collect();
+    let catalog = serde_json::json!({ "models": entries });
     serde_json::to_string_pretty(&catalog).expect("codex catalog serializes") + "\n"
 }
 
@@ -583,16 +649,21 @@ model = \"gpt-5\"
 
     #[test]
     fn codex_model_catalog_declares_image_input_only_for_a_vision_model() {
+        let entry = |slug: &str, vision: bool| CodexCatalogModel {
+            slug: slug.to_string(),
+            context_window: 32768,
+            vision,
+        };
         let catalog: serde_json::Value =
-            serde_json::from_str(&codex_model_catalog("m", true, 32768)).expect("valid JSON");
-        let entry = &catalog["models"][0];
+            serde_json::from_str(&codex_model_catalog(&[entry("m", true)])).expect("valid JSON");
+        let model_entry = &catalog["models"][0];
         assert_eq!(
-            entry["input_modalities"],
+            model_entry["input_modalities"],
             serde_json::json!(["text", "image"])
         );
-        assert_eq!(entry["slug"], "m");
-        assert_eq!(entry["display_name"], "m");
-        assert_eq!(entry["context_window"], 32768);
+        assert_eq!(model_entry["slug"], "m");
+        assert_eq!(model_entry["display_name"], "m");
+        assert_eq!(model_entry["context_window"], 32768);
         // Fields codex requires of an entry.
         for key in [
             "context_window",
@@ -605,14 +676,101 @@ model = \"gpt-5\"
             "supported_reasoning_levels",
             "experimental_supported_tools",
         ] {
-            assert!(entry.get(key).is_some(), "missing {key}");
+            assert!(model_entry.get(key).is_some(), "missing {key}");
         }
 
         let text_only: serde_json::Value =
-            serde_json::from_str(&codex_model_catalog("m", false, 32768)).expect("valid JSON");
+            serde_json::from_str(&codex_model_catalog(&[entry("m", false)])).expect("valid JSON");
         assert_eq!(
             text_only["models"][0]["input_modalities"],
             serde_json::json!(["text"])
+        );
+    }
+
+    /// A `--provider` launch lists every model the provider serves, so
+    /// codex's `/model` can switch between them without a relaunch: the
+    /// launched model first, with the window and image input this launch
+    /// resolved for it, and each other model with what its own catalog
+    /// entry says.
+    #[test]
+    fn codex_catalog_lists_every_model_the_provider_serves() {
+        let hosted = || {
+            vec![
+                HostedModel {
+                    reference: "llmman.provider/ollama-cloud/qwen3-coder".into(),
+                    id: "qwen3-coder".into(),
+                    context: Some(262_144),
+                    output: Some(8_192),
+                    thinking: None,
+                },
+                HostedModel {
+                    reference: "llmman.provider/ollama-cloud/llama-4-scout".into(),
+                    id: "llama-4-scout".into(),
+                    context: None,
+                    output: None,
+                    thinking: None,
+                },
+            ]
+        };
+        let models = codex_catalog_models(
+            "llmman.provider/ollama-cloud/qwen3-coder",
+            false,
+            None,
+            Some(&hosted()),
+        );
+        assert_eq!(
+            models,
+            vec![
+                CodexCatalogModel {
+                    slug: "llmman.provider/ollama-cloud/qwen3-coder".into(),
+                    // The launched model keeps the window the launch
+                    // resolved; codex's catalog cannot omit it.
+                    context_window: CODEX_FALLBACK_CONTEXT_WINDOW,
+                    vision: false,
+                },
+                CodexCatalogModel {
+                    slug: "llmman.provider/ollama-cloud/llama-4-scout".into(),
+                    context_window: CODEX_FALLBACK_CONTEXT_WINDOW,
+                    vision: false,
+                },
+            ]
+        );
+        let catalog: serde_json::Value =
+            serde_json::from_str(&codex_model_catalog(&models)).expect("valid JSON");
+        let listed: Vec<&str> = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["slug"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                "llmman.provider/ollama-cloud/qwen3-coder",
+                "llmman.provider/ollama-cloud/llama-4-scout"
+            ]
+        );
+        // A window the provider's catalog names travels as it is.
+        let with_window = codex_catalog_models(
+            "llmman.provider/ollama-cloud/qwen3-coder",
+            false,
+            Some(262_144),
+            Some(&hosted()),
+        );
+        assert_eq!(with_window[0].context_window, 262_144);
+        assert_eq!(with_window[1].context_window, CODEX_FALLBACK_CONTEXT_WINDOW);
+    }
+
+    /// A local launch's catalog is the one model it always was.
+    #[test]
+    fn codex_catalog_of_a_local_launch_lists_one_model() {
+        assert_eq!(
+            codex_catalog_models("m", true, Some(8_192), None),
+            vec![CodexCatalogModel {
+                slug: "m".into(),
+                context_window: 8_192,
+                vision: true,
+            }]
         );
     }
 
