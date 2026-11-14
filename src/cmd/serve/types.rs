@@ -179,6 +179,23 @@ pub(super) fn think_to_chat_template_kwargs(
     }
 }
 
+/// Ollama's `ResolveThinking`: a level the model does not take gets its
+/// default, not a template that may raise on it. Anything else, or a model
+/// with no known values, goes through.
+pub(super) fn resolve_think(
+    think: &Option<serde_json::Value>,
+    thinking: Option<&crate::chat_template::Thinking>,
+) -> Option<serde_json::Value> {
+    match (think, thinking) {
+        (Some(serde_json::Value::String(level)), Some(thinking))
+            if !thinking.values.contains(&serde_json::json!(level.trim())) =>
+        {
+            Some(thinking.default.clone())
+        }
+        _ => think.clone(),
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(super) struct OllamaChatChunk {
     pub(super) model: String,
@@ -313,6 +330,10 @@ pub(super) struct OllamaShowResponse {
     /// `crate::modelpack::chat_template`); absent when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) template: Option<String>,
+    /// Ollama's `api.ShowResponse.Thinking`, which clients read to offer a
+    /// model's levels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) thinking: Option<crate::chat_template::Thinking>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1114,6 +1135,28 @@ mod tests {
     /// `chat_template::EFFORT_LEVELS`) additionally maps to
     /// `reasoning_effort` — the jinja variable gpt-oss's, Qwen3.8's and
     /// DeepSeek-V4's own chat templates read.
+    #[test]
+    fn resolve_think_replaces_only_a_level_the_model_does_not_take() {
+        use serde_json::json;
+        let thinking = crate::chat_template::Thinking {
+            values: vec![json!(false), json!("low"), json!("medium")],
+            default: json!("medium"),
+        };
+        let resolve = |think: serde_json::Value, thinking| resolve_think(&Some(think), thinking);
+        assert_eq!(
+            resolve(json!("xhigh"), Some(&thinking)),
+            Some(json!("medium"))
+        );
+        assert_eq!(resolve(json!("low"), Some(&thinking)), Some(json!("low")));
+        assert_eq!(
+            resolve(json!(" low "), Some(&thinking)),
+            Some(json!(" low "))
+        );
+        assert_eq!(resolve(json!(true), Some(&thinking)), Some(json!(true)));
+        assert_eq!(resolve(json!("xhigh"), None), Some(json!("xhigh")));
+        assert_eq!(resolve_think(&None, Some(&thinking)), None);
+    }
+
     #[test]
     fn think_to_chat_template_kwargs_maps_booleans_and_reasoning_levels() {
         assert_eq!(
