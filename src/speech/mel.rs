@@ -255,6 +255,9 @@ pub enum MelError {
     /// A `MelConfig` field the pipeline cannot work with; the message
     /// names the constraint.
     InvalidConfig(&'static str),
+    /// The caller's cancel check returned true; the output was not
+    /// finished.
+    Cancelled,
 }
 
 impl std::fmt::Display for MelError {
@@ -264,6 +267,7 @@ impl std::fmt::Display for MelError {
                 "input yields fewer than two frames, which per-feature normalization needs",
             ),
             Self::InvalidConfig(what) => write!(f, "invalid mel config: {what}"),
+            Self::Cancelled => f.write_str("feature extraction was cancelled"),
         }
     }
 }
@@ -378,8 +382,14 @@ pub fn frame_count(len: usize, cfg: &MelConfig) -> usize {
 /// per-feature normalization gets fewer than two frames, that is fewer
 /// than `2 * hop` samples.
 pub fn features(pcm: &[i16], cfg: &MelConfig) -> Result<Vec<f32>, MelError> {
-    FeatureExtractor::new(cfg.clone())?.features(pcm)
+    FeatureExtractor::new(cfg.clone())?.features(pcm, &mut || false)
 }
+
+/// Frames between two calls of the cancel check in
+/// [`FeatureExtractor::features`]: 320 ms of audio at the default hop,
+/// about 40 ms of work in a debug build, so an abandoned request stops
+/// within that while the per-frame loop stays free of the call.
+pub const CANCEL_CHECK_FRAMES: usize = 32;
 
 /// A mel front end prepared for one [`MelConfig`]: the symmetric Hann
 /// window, the checked Slaney filterbank and the FFT twiddle table, built
@@ -417,12 +427,20 @@ impl FeatureExtractor {
         &self.cfg
     }
 
-    /// [`features`] over this extractor's config and tables.
+    /// [`features`] over this extractor's config and tables. `cancel` is
+    /// asked every [`CANCEL_CHECK_FRAMES`] frames of each pass; when it
+    /// returns true the work stops with `Cancelled`, so a client that
+    /// left does not hold a worker through a long clip.
     ///
     /// # Errors
     /// `TooShort` when per-feature normalization gets fewer than two
-    /// frames; the config errors were raised by [`FeatureExtractor::new`].
-    pub fn features(&self, pcm: &[i16]) -> Result<Vec<f32>, MelError> {
+    /// frames, `Cancelled` when `cancel` said so; the config errors were
+    /// raised by [`FeatureExtractor::new`].
+    pub fn features(
+        &self,
+        pcm: &[i16],
+        cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<f32>, MelError> {
         let cfg = &self.cfg;
         let frames = frame_count(pcm.len(), cfg);
         if cfg.normalize == Normalize::PerFeature && frames < 2 {
@@ -453,6 +471,9 @@ impl FeatureExtractor {
 
         if cfg.normalize == Normalize::None {
             for (t, dst) in out.chunks_exact_mut(cfg.n_mels).enumerate() {
+                if t % CANCEL_CHECK_FRAMES == 0 && cancel() {
+                    return Err(MelError::Cancelled);
+                }
                 for (d, &v) in dst.iter_mut().zip(framer.log_mel(t)) {
                     *d = v as f32;
                 }
@@ -464,6 +485,9 @@ impl FeatureExtractor {
         let mut mean = vec![0.0f64; cfg.n_mels];
         let mut m2 = vec![0.0f64; cfg.n_mels];
         for t in 0..frames {
+            if t % CANCEL_CHECK_FRAMES == 0 && cancel() {
+                return Err(MelError::Cancelled);
+            }
             let k = (t + 1) as f64;
             for ((mu, acc), &v) in mean.iter_mut().zip(&mut m2).zip(framer.log_mel(t)) {
                 let delta = v - *mu;
@@ -476,6 +500,9 @@ impl FeatureExtractor {
         }
         let std = m2;
         for (t, dst) in out.chunks_exact_mut(cfg.n_mels).enumerate() {
+            if t % CANCEL_CHECK_FRAMES == 0 && cancel() {
+                return Err(MelError::Cancelled);
+            }
             let row = framer.log_mel(t);
             for (((d, &v), &mu), &s) in dst.iter_mut().zip(row).zip(&mean).zip(&std) {
                 *d = ((v - mu) / s) as f32;
@@ -1172,8 +1199,8 @@ mod tests {
         for cfg in [MelConfig::default(), wide] {
             let extractor = FeatureExtractor::new(cfg.clone()).unwrap();
             assert_eq!(extractor.config(), &cfg);
-            let a = extractor.features(&pcm).unwrap();
-            let b = extractor.features(&pcm).unwrap();
+            let a = extractor.features(&pcm, &mut || false).unwrap();
+            let b = extractor.features(&pcm, &mut || false).unwrap();
             let c = features(&pcm, &cfg).unwrap();
             assert_eq!(a, b);
             assert_eq!(a, c);
@@ -1207,6 +1234,60 @@ mod tests {
         }
     }
 
+    /// The cancel check is asked once per `CANCEL_CHECK_FRAMES` frames in
+    /// each pass: the statistics pass and the output pass when normalizing,
+    /// the single output pass otherwise. A check that returns true stops
+    /// the extraction with `Cancelled`, in whichever pass it fires, and a
+    /// check that never fires leaves the output untouched.
+    #[test]
+    fn a_cancel_check_stops_feature_extraction_between_frame_blocks() {
+        let frames: usize = 100;
+        let checks_per_pass = frames.div_ceil(CANCEL_CHECK_FRAMES);
+        let pcm = |cfg: &MelConfig| -> Vec<i16> {
+            (0..frames * cfg.hop)
+                .map(|i| ((i as f64 * 0.37).sin() * 12000.0) as i16)
+                .collect()
+        };
+        let normalized = MelConfig::default();
+        let unnormalized = MelConfig {
+            normalize: Normalize::None,
+            ..MelConfig::default()
+        };
+        // (config, passes, the check that cancels, the pass it lands in)
+        let cases = [
+            (&normalized, 2, 2, "statistics pass"),
+            (
+                &normalized,
+                2,
+                checks_per_pass + 2,
+                "normalized output pass",
+            ),
+            (&unnormalized, 1, 2, "unnormalized output pass"),
+        ];
+        for (cfg, passes, stop_at, pass) in cases {
+            let extractor = FeatureExtractor::new(cfg.clone()).unwrap();
+            let pcm = pcm(cfg);
+            let mut calls = 0;
+            let err = extractor
+                .features(&pcm, &mut || {
+                    calls += 1;
+                    calls == stop_at
+                })
+                .unwrap_err();
+            assert_eq!(err, MelError::Cancelled, "{pass}");
+            assert_eq!(calls, stop_at, "stopped at check {stop_at} in the {pass}");
+
+            let mut calls = 0;
+            let out = extractor
+                .features(&pcm, &mut || {
+                    calls += 1;
+                    false
+                })
+                .unwrap();
+            assert_eq!(out, features(&pcm, cfg).unwrap(), "{pass}");
+            assert_eq!(calls, passes * checks_per_pass, "{pass}");
+        }
+    }
     #[test]
     fn features_are_bit_identical_across_runs() {
         let cfg = MelConfig::default();
