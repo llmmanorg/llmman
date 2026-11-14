@@ -3808,6 +3808,57 @@ async fn create_needs_exactly_one_of_from_or_files() {
     }
 }
 
+const ABC_DIGEST: &str = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+fn blob_upload_state(cache: &Path) -> AppState {
+    let mut inner = test_inner(cache.to_path_buf());
+    inner.cache_path = cache.to_path_buf();
+    AppState(Arc::new(inner))
+}
+
+fn chunked_body(chunks: &[&'static str]) -> Body {
+    let chunks: Vec<Result<&'static str, std::io::Error>> =
+        chunks.iter().map(|chunk| Ok(*chunk)).collect();
+    Body::from_stream(futures::stream::iter(chunks))
+}
+
+#[tokio::test]
+async fn blob_upload_stores_a_body_that_matches_its_digest() {
+    let cache = tempfile::tempdir().unwrap();
+    let resp = handle_blob_upload(
+        State(blob_upload_state(cache.path())),
+        UrlPath(ABC_DIGEST.to_string()),
+        chunked_body(&["a", "bc"]),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let staging = cache.path().join("blobs");
+    let stored = staging.join(ABC_DIGEST.trim_start_matches("sha256:"));
+    assert_eq!(std::fs::read(stored).unwrap(), b"abc");
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn blob_upload_refuses_a_body_that_does_not_match_and_keeps_nothing() {
+    let cache = tempfile::tempdir().unwrap();
+    let resp = handle_blob_upload(
+        State(blob_upload_state(cache.path())),
+        UrlPath(format!("sha256:{}", "0".repeat(64))),
+        chunked_body(&["a", "bc"]),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains(ABC_DIGEST), "{body}");
+    let staging = cache.path().join("blobs");
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+}
+
 /// Regression test for the Codex tool-type bug described on
 /// `filter_non_function_tools`'s own doc comment.
 #[test]
