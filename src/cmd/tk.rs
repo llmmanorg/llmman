@@ -24,6 +24,9 @@ enum TkCommand {
     /// for a Bash command `llmman tk` can compact, answers with it rewritten
     /// to run through `llmman tk`. Says nothing otherwise, and never fails.
     Hook,
+    /// Reads `{"command", "output", "exitCode"}` as JSON on stdin and prints
+    /// the output compacted when there is a filter for the command.
+    Compact,
     #[command(external_subcommand)]
     Run(Vec<OsString>),
 }
@@ -32,6 +35,10 @@ pub fn run(args: &TkArgs) -> anyhow::Result<()> {
     match &args.command {
         TkCommand::Hook => {
             crate::tk::hook::run();
+            Ok(())
+        }
+        TkCommand::Compact => {
+            crate::tk::hook::compact();
             Ok(())
         }
         // The command's own exit status is the result.
@@ -62,6 +69,7 @@ mod tests {
         };
         assert_eq!(argv, ["git", "diff", "--stat", "-U0", "--", "x"]);
         assert!(matches!(parse(&["hook"]).unwrap(), TkCommand::Hook));
+        assert!(matches!(parse(&["compact"]).unwrap(), TkCommand::Compact));
     }
 
     #[test]

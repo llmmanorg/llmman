@@ -6,10 +6,12 @@ something extra that makes the session cheaper to run.
 | Optimizer | What it does |
 |-----------|--------------|
 | `none` | The default. The integration is launched exactly as without the flag: same arguments, same environment, same files. |
-| `tk` | Compacts the output of the shell commands the agent runs, before the agent reads it. `claude` only. |
+| `tk` | Compacts the output of the shell commands the agent runs, before the agent reads it. `claude` and `opencode`. |
+| `cvmn` | Asks the model for terse replies: answer first, no filler, every technical fact kept. `claude`, `codex` and `opencode`. |
 
 ```sh
 llmman launch claude --model qwen3.8 --optimizer tk
+llmman launch codex --model qwen3.8 --optimizer cvmn
 ```
 
 llmman prints one line to stderr when an optimizer is on, and nothing for
@@ -17,6 +19,7 @@ llmman prints one line to stderr when an optimizer is on, and nothing for
 
 ```
 [llmman] claude: optimizer tk (command output compacted; LLMMAN_TK=off disables)
+[llmman] claude: optimizer cvmn (terse replies requested)
 ```
 
 ## `tk`
@@ -29,9 +32,9 @@ what it wrote. The exit status is the command's own.
 
 ### How it is wired in
 
-Claude Code can run a `PreToolUse` hook before a tool call and replace the
-tool's input. `llmman launch claude --optimizer tk` passes claude a
-`--settings` argument, as inline JSON, that registers one such hook for the
+**claude.** Claude Code can run a `PreToolUse` hook before a tool call and
+replace the tool's input. `llmman launch claude --optimizer tk` passes claude
+a `--settings` argument, as inline JSON, that registers one such hook for the
 Bash tool: `llmman tk hook`. Nothing is written to disk, and your
 `~/.claude`, project settings and `CLAUDE_CONFIG_DIR` are not touched. The
 settings apply to that session and are merged with yours.
@@ -58,6 +61,21 @@ tool call.
 The wrapped command runs the program found on `PATH`, not a shell function
 or alias of the same name.
 
+**opencode (2 or later).** opencode checks its permission rules against the
+command a hook has rewritten, and a hook cannot see those rules, so a rewrite
+could carry a command past a `deny` rule. The command is therefore left as
+the agent wrote it. `llmman launch opencode --optimizer tk` adds a small
+plugin, written to `llmman/tk/` in opencode's state directory and named in
+the `plugins` of the config llmman hands opencode. Its `execute.after` hook
+sends the finished shell call to `llmman tk compact`, and replaces what the
+model sees with the compacted text.
+
+That hook handles a call that is one plain command with a filter, by the same
+rules as the list above, and only one that exited 0: opencode gives both
+streams as one text, so a filter could not tell the error text it must keep
+from the rest. Failed commands, and any call for which a filter saves
+nothing, are as they were.
+
 `llmman tk <command> [args...]` also works on its own, for trying a filter.
 
 ### What is filtered
@@ -75,7 +93,7 @@ or alias of the same name.
 | `grep`, `rg` | Matches are grouped under their file, long lines cut. Only when every line is a `path:` of a file that exists; a search of one file is left as it is. |
 | `docker ps` | The COMMAND and CREATED columns and duplicate IPv6 port entries go. |
 
-A command that has no filter of its own is not rewritten by the hook. Run by
+A command that has no filter of its own is not touched by either hook. Run by
 hand, `llmman tk` gives it a generic clean-up: escape sequences and progress
 bar redraws removed, runs of identical lines folded into one with a count
 (`(x5)`), runs of blank lines folded, very long lines cut, and a long output
@@ -101,6 +119,10 @@ These run exactly as without `tk`, on the terminal's own streams:
 
 ### What it guarantees
 
+These hold for claude, where `llmman tk` runs the command. For opencode,
+only the first output cap and the filters apply: the output is read after
+the command ran.
+
 - The exit status is the command's. A signal is `128 + n`, as in a shell; a
   missing program is 127 and one that cannot run is 126.
 - A command that failed keeps its error text, within the bounds every output
@@ -122,7 +144,10 @@ These run exactly as without `tk`, on the terminal's own streams:
 
 ### Permissions
 
-Claude Code checks its permission rules against the command a hook returns,
+**opencode** is untouched by any of this: the command it asks permission for
+is the command the agent wrote, and the output is compacted only after it ran.
+
+**claude**: Claude Code checks its permission rules against the command a hook returns,
 not the one the agent wrote. So the hook does the following:
 
 - It reads the `permissions` of the user, project, project-local and managed
@@ -154,15 +179,18 @@ seen. If you rely on those, do not use `tk`.
 
 ### Limitations
 
-- Only `claude`. Any other integration is refused with `--optimizer tk`
-  before the daemon starts.
-- Only the Bash tool. Claude's built-in Read, Grep and Glob tools do not run
-  shell commands and are not affected, nor are commands started by the Monitor
-  tool.
+- Only `claude` and `opencode` 2 or later. Any other integration, and an
+  older opencode, is refused with `--optimizer tk` before the daemon starts.
+  codex has `PreToolUse` hooks too, but it runs a hook only after the user has
+  reviewed it with `/hooks`, and a rewrite needs the hook to approve the
+  command itself.
+- Only the shell tool. claude's built-in Read, Grep and Glob tools and
+  opencode's `read`, `grep` and `glob` do not run shell commands and are not
+  affected, nor are commands started by claude's Monitor tool.
 - Not with `--sandbox`: the sandbox does not have this machine's `llmman`.
 - Not on Windows.
-- Not with `--settings`, `--bare`, `--disallowedTools` or `--setting-sources`
-  after `--`. claude keeps only the last `--settings`, so the hook and yours
+- claude: not with `--settings`, `--bare`, `--disallowedTools` or
+  `--setting-sources` after `--`. claude keeps only the last `--settings`, so the hook and yours
   could not both apply; `--bare` skips hooks; deny rules from
   `--disallowedTools` cannot be seen by the hook; and the hook reads project
   settings files that `--setting-sources` can tell claude to skip. Put
@@ -171,6 +199,12 @@ seen. If you rely on those, do not use `tk`.
   flag.
 - One plain command per call. A chain such as `cd sub && cargo test` is left
   as it is.
+- opencode 2 runs a background server, and one that is already running does
+  not get llmman's config, so neither optimizer reaches it. Start opencode
+  with `--standalone` after `--`.
+- opencode: only a command that succeeded is compacted, and only after it ran
+  (it has run with its full output, and a command that never ends is not
+  helped).
 - When a filter cuts a diff or a list, the agent sees a marker, and the full
   output is one pipe away (`git diff | cat`).
 
@@ -182,3 +216,39 @@ a lot, a short `git status` hardly at all. No figure is claimed here. The
 output (a passing `cargo test`, `pytest`, `go test`, a `git status` with its
 hints, a repeated line) through the filters and asserts that each comes out
 smaller; `cargo test --lib noisy_fixtures_shrink` runs it.
+
+## `cvmn`
+
+Every token a model writes is paid for and read, and much of it is ceremony:
+a greeting, a restated question, a closing offer to help. `cvmn` adds one
+system prompt to the session that asks the model to answer first, drop the
+filler, and keep code, commands, paths, numbers and error text exactly as
+they are. It switches back to plain sentences for security warnings,
+irreversible actions, anything saved outside the chat (code, comments,
+commit messages, docs, pull requests) and questions put to you. The prompt is
+in `src/cmd/launch/cvmn.md`.
+
+The prompt is added next to the integration's own instructions, and your
+instruction files and settings are all kept:
+
+| Integration | How |
+|-------------|-----|
+| `claude` | `--append-system-prompt <prompt>` |
+| `codex` | `-c developer_instructions=<prompt>` |
+| `opencode` | the prompt is written to `llmman/cvmn.md` in opencode's state directory, and named in the `instructions` of the config llmman hands opencode, after yours |
+
+### Limitations
+
+- Only `claude`, `codex` and `opencode`. Any other integration is refused
+  with `--optimizer cvmn` before the daemon starts.
+- Not with `--sandbox`.
+- Not with instructions of your own that the prompt would replace:
+  `--append-system-prompt` or `--append-system-prompt-file` after `--` for
+  claude; `developer_instructions` in `~/.codex/config.toml`,
+  `~/.codex/llmman.config.toml` or a `-c` before `--` for codex. Put them in `CLAUDE.md` or `AGENTS.md`, or launch
+  without `--optimizer`.
+- opencode: see the note on its background server under `tk`.
+- It is a request, not a guarantee: a model may follow it loosely, and how
+  much it saves depends on the model and the task. No figure is claimed here.
+- It is not a `[launch.<integration>]` default in `llmman.conf`; type the
+  flag.

@@ -105,6 +105,18 @@ pub(super) fn optimizer_conflict(extra_args: &[String]) -> Option<&'static str> 
     }
 }
 
+/// What in `extra_args` keeps `--optimizer cvmn` from working with claude.
+pub(super) fn cvmn_conflict(extra_args: &[String]) -> Option<&'static str> {
+    let args = before_terminator(extra_args);
+    if has_flag(args, "--append-system-prompt", None)
+        || has_flag(args, "--append-system-prompt-file", None)
+    {
+        Some("--append-system-prompt after --: llmman's terse-reply prompt is appended the same way.\nPut your instructions in CLAUDE.md, or launch without --optimizer.")
+    } else {
+        None
+    }
+}
+
 /// The value for [`CLAUDE_MAX_CONTEXT_ENV`]: `launch`'s window for llmman's
 /// model, unless the caller set the variable.
 fn claude_context_window(
@@ -382,7 +394,11 @@ mod tests {
     #[test]
     fn tk_registers_its_hook_with_a_settings_argument_before_the_rest() {
         let added = Optimizer::Tk
-            .addition_with("claude", std::path::Path::new("/opt/llmman"))
+            .addition_with(
+                "claude",
+                std::path::Path::new("/opt/llmman"),
+                std::path::Path::new(""),
+            )
             .unwrap();
         let args = claude_args("local/model", &strings(&["-p", "hi"]));
         let env = claude_env("local/model", "secret", "http://h", None);
@@ -397,6 +413,26 @@ mod tests {
         assert_eq!(new_env, env);
         // Nothing of the caller's, or of llmman's key, is in the settings.
         assert!(!new_args[1].contains("secret"));
+    }
+
+    #[test]
+    fn cvmn_appends_its_prompt_before_the_rest() {
+        let added = Optimizer::Cvmn.addition("claude").unwrap();
+        let args = claude_args("local/model", &strings(&["-p", "hi"]));
+        let env = claude_env("local/model", "secret", "http://h", None);
+        let (new_args, new_env) = with_addition(args.clone(), env.clone(), &added);
+        assert_eq!(new_args[0], "--append-system-prompt");
+        assert_eq!(&new_args[2..], &args[..]);
+        assert_eq!(new_env, env);
+        assert!(!new_args[1].contains("secret"));
+    }
+
+    #[test]
+    fn a_system_prompt_conflicts_with_cvmn_only_before_a_second_terminator() {
+        assert!(cvmn_conflict(&strings(&["-p", "hi"])).is_none());
+        assert!(cvmn_conflict(&strings(&["--append-system-prompt-file=x"])).is_some());
+        assert!(cvmn_conflict(&strings(&["--system-prompt", "x"])).is_none());
+        assert!(cvmn_conflict(&strings(&["--", "--append-system-prompt"])).is_none());
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::common::write_json_merged;
+use super::optimizer::Optimizer;
 use super::{
     exec_with_env, find_on_path, server, thinking_choices, xdg_dir, Thinking, WINDOWS_PATH_EXTS,
 };
@@ -23,8 +24,10 @@ pub(super) fn launch_opencode(
     context_window: Option<u64>,
     max_output: Option<u32>,
     extra_args: &[String],
+    optimizer: Optimizer,
 ) -> anyhow::Result<()> {
     let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
+    let added = optimizer.addition("opencode")?;
 
     let effective_model = if model.is_empty() { "default" } else { model };
     let variants = opencode_variants(thinking);
@@ -39,11 +42,60 @@ pub(super) fn launch_opencode(
         context_window,
         max_output,
     );
+    let config = with_added_config(&config, added.config.as_ref());
     if let Some(variant) = variant {
         write_opencode_variant(&opencode_state_dir()?, effective_model, variant)?;
     }
 
+    if let Some(notice) = optimizer.notice("opencode") {
+        eprintln!("{notice}");
+    }
     exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
+}
+
+/// `config` (a JSON object) with the keys of `added` appended, so the order
+/// the rest of it was written in (the variants') is kept.
+fn with_added_config(config: &str, added: Option<&serde_json::Value>) -> String {
+    let Some(added) = added.and_then(serde_json::Value::as_object) else {
+        return config.to_string();
+    };
+    let mut out = config.trim_end().trim_end_matches('}').to_string();
+    for (key, value) in added {
+        out.push_str(&format!(
+            ",{}:{value}",
+            serde_json::Value::from(key.as_str())
+        ));
+    }
+    out.push('}');
+    out
+}
+
+/// Refuses an opencode before 2, which has not the plugins `tk` adds.
+pub(super) fn ensure_plugins() -> anyhow::Result<()> {
+    let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
+    let out = std::process::Command::new(&bin)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("run {} --version", bin.display()))?;
+    let version = String::from_utf8_lossy(&out.stdout);
+    anyhow::ensure!(
+        major_version(&version).is_some_and(|major| major >= 2),
+        "--optimizer tk needs opencode 2 or later, which has the plugin hook it uses; \
+         this is {}.\nUpgrade opencode, or launch without --optimizer.",
+        version.trim()
+    );
+    Ok(())
+}
+
+/// The major version in `opencode --version`'s output (`opencode v2.3.0`).
+fn major_version(output: &str) -> Option<u64> {
+    let version = output.trim().rsplit(' ').next()?;
+    version
+        .trim_start_matches('v')
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// opencode's state directory, where its `xdg-basedir` puts it.
@@ -579,5 +631,26 @@ mod tests {
         );
         assert!(opencode_variants(Some(&Thinking::Listed(Vec::new()))).is_empty());
         assert!(claude.template().is_none());
+    }
+
+    #[test]
+    fn added_config_is_appended_and_keeps_the_order_of_the_rest() {
+        let base = r#"{"variants":{"none":1,"low":2,"high":3},"model":"a"}"#;
+        let added = serde_json::json!({ "instructions": ["y.md"], "plugins": ["/p"] });
+        let merged = with_added_config(base, Some(&added));
+        assert_eq!(
+            merged,
+            r#"{"variants":{"none":1,"low":2,"high":3},"model":"a","instructions":["y.md"],"plugins":["/p"]}"#
+        );
+        assert_eq!(with_added_config(base, None), base);
+    }
+
+    #[test]
+    fn the_major_version_is_read_from_the_version_output() {
+        assert_eq!(major_version("opencode v2.3.0\n"), Some(2));
+        assert_eq!(major_version("1.18.29\n"), Some(1));
+        assert_eq!(major_version("v10.0.1"), Some(10));
+        assert_eq!(major_version(""), None);
+        assert_eq!(major_version("opencode dev"), None);
     }
 }
