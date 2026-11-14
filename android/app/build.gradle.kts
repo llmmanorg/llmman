@@ -180,17 +180,16 @@ val stageLlmman by tasks.registering {
     // With outputs alone Gradle would call this up-to-date while cargo had
     // rebuilt the binary underneath it; the inputs are what cargo wrote.
     inputs.file(out.resolve("llmman"))
-    inputs.files(fileTree(out.resolve("build")) { include("llmman-*/out/libllmman_shim.so") })
+    // build.rs writes the c-shared shim to its OUT_DIR. Cargo before 1.100
+    // named that build/llmman-<hash>/out; since, build/llmman/<hash>/out.
+    val shims = fileTree(out.resolve("build")) { include("**/out/libllmman_shim.so") }
+    inputs.files(shims)
     outputs.dir(dest)
     doLast {
         val destDir = dest.get().asFile.also { it.mkdirs() }
         out.resolve("llmman").copyTo(destDir.resolve("libllmman.so"), overwrite = true)
-        // build.rs writes the c-shared shim to its OUT_DIR, whose hash
-        // suffix is not knowable here; take the newest if several exist.
-        val shim = out.resolve("build").listFiles { f -> f.name.startsWith("llmman-") }
-            ?.map { it.resolve("out/libllmman_shim.so") }
-            ?.filter { it.isFile }
-            ?.maxByOrNull { it.lastModified() }
+        // The hash is not knowable here; take the newest if several exist.
+        val shim = shims.files.maxByOrNull { it.lastModified() }
             ?: error("libllmman_shim.so not found under $out/build — did the Go shim build?")
         shim.copyTo(destDir.resolve("libllmman_shim.so"), overwrite = true)
     }

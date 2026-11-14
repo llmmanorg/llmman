@@ -486,6 +486,31 @@ pub(super) fn llama_sets(extra: &[String], flag: &str, env: Option<&str>) -> boo
     }) || env.is_some_and(|env| std::env::var_os(env).is_some())
 }
 
+/// The `think` values llama-server takes for `controls`, and whether
+/// `minimal` and `low` get a budget (not with the user's `--reasoning-budget`
+/// in `extra` or, if `inherits_env`, the environment). A user's own
+/// template replaces the one `controls` read: no values.
+pub(super) fn llama_thinking(
+    controls: &crate::chat_template::ThinkingControls,
+    extra: &[String],
+    inherits_env: bool,
+) -> (Option<crate::chat_template::Thinking>, bool) {
+    let inherited = |var| inherits_env.then_some(var);
+    let user_template = ["--chat-template", "--chat-template-file"]
+        .iter()
+        .zip(["LLAMA_ARG_CHAT_TEMPLATE", "LLAMA_ARG_CHAT_TEMPLATE_FILE"])
+        .any(|(flag, env)| llama_sets(extra, flag, inherited(env)));
+    if user_template {
+        return (None, false);
+    }
+    let budgeted = !llama_sets(
+        extra,
+        "--reasoning-budget",
+        inherited("LLAMA_ARG_THINK_BUDGET"),
+    );
+    (controls.thinking(budgeted), budgeted)
+}
+
 /// llama-server's flags that size each slot's context, with their env vars.
 const LLAMA_SLOT_CONTEXT_FLAGS: &[(&str, &str)] = &[
     ("-c", "LLAMA_ARG_CTX_SIZE"),

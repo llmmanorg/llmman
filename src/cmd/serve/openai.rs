@@ -450,6 +450,16 @@ pub(super) async fn effort_budget_for(state: &AppState, target: &Target) -> Opti
     .flatten()
 }
 
+/// `RunningModel::thinking` of the model behind `target`.
+pub(super) async fn thinking_for(
+    state: &AppState,
+    target: &Target,
+) -> Option<crate::chat_template::Thinking> {
+    local_model(state, target, |m| m.thinking.clone())
+        .await
+        .flatten()
+}
+
 /// [`effort_budget_tokens`] for a `/v1/chat/completions` request. A
 /// caller's budget, or thinking switched off, is left alone; `message`
 /// adds [`EFFORT_BUDGET_MESSAGE`] unless the caller sent one.

@@ -4136,6 +4136,21 @@ async fn show_one_model(
     serde_json::from_slice(&body).unwrap()
 }
 
+/// [`show_one_model`] for a GGUF with these header `u32s` and chat `template`.
+async fn show_with_template(name: &str, u32s: &[(&str, u32)], template: &str) -> serde_json::Value {
+    let path =
+        crate::gguf::write_test_gguf_with_strings(u32s, &[("tokenizer.chat_template", template)]);
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    show_one_model(
+        name,
+        "application/vnd.docker.ai.gguf.v3",
+        "model.gguf",
+        &bytes,
+    )
+    .await
+}
+
 /// The whole `/api/show` wiring over a stored GGUF: the fields below are
 /// public API, and a handler that read the architecture into the wrong
 /// one would still pass the unit tests for the pieces.
@@ -4190,24 +4205,14 @@ async fn handle_show_reports_a_safetensors_model_as_safetensors() {
 /// off its pooling key and `decision` off its decision type.
 #[tokio::test]
 async fn handle_show_reports_what_the_chat_template_handles() {
-    let capabilities = |name: &'static str, u32s: &[(&str, u32)], template: &str| {
-        let path = crate::gguf::write_test_gguf_with_strings(
-            u32s,
-            &[("tokenizer.chat_template", template)],
-        );
-        let bytes = std::fs::read(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
-        async move {
-            let v = show_one_model(
-                name,
-                "application/vnd.docker.ai.gguf.v3",
-                "model.gguf",
-                &bytes,
-            )
-            .await;
-            (v["capabilities"].clone(), v["template"].clone())
-        }
-    };
+    async fn capabilities(
+        name: &str,
+        u32s: &[(&str, u32)],
+        template: &str,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let v = show_with_template(name, u32s, template).await;
+        (v["capabilities"].clone(), v["template"].clone())
+    }
     let template = "{%- if tools %}{{- tools | tojson }}{%- endif %}\
                     {%- if enable_thinking %}<think>{%- endif %}";
 
@@ -4238,6 +4243,42 @@ async fn handle_show_reports_what_the_chat_template_handles() {
     )
     .await;
     assert_eq!(v["capabilities"], serde_json::json!(["decision"]));
+}
+
+/// `thinking` is what a client reads to offer a model's levels (#816).
+#[tokio::test]
+async fn handle_show_reports_the_thinking_values_the_template_takes() {
+    async fn thinking(name: &str, template: &str) -> Option<serde_json::Value> {
+        show_with_template(name, &[], template)
+            .await
+            .get("thinking")
+            .cloned()
+    }
+    // Qwen3.5: a switch that starts on; llmman bounds the levels.
+    let qwen3_5 = "{%- if enable_thinking is defined and enable_thinking is false %}\
+                   <think></think>{%- endif %}";
+    assert_eq!(
+        thinking("showqwen35", qwen3_5).await,
+        Some(serde_json::json!({
+            "values": [false, "minimal", "low", "medium", "high"],
+            "default": "medium",
+        }))
+    );
+    // Levels the template names are the only ones.
+    let levels = "{%- if reasoning_effort not in ('low', 'medium', 'xhigh') %}\
+                  {{ raise_exception('think') }}{%- endif %}";
+    assert_eq!(
+        thinking("showlevels", levels).await,
+        Some(serde_json::json!({
+            "values": [false, "low", "medium", "xhigh"],
+            "default": "medium",
+        }))
+    );
+    // No thinking, no field.
+    assert_eq!(
+        thinking("showplainthink", "{{ messages[0].content }}").await,
+        None
+    );
 }
 
 /// `/api/tags` reads each model's format the way `/api/show` does,
@@ -7009,6 +7050,76 @@ async fn ollama_think_levels_get_a_thinking_budget_only_on_a_model_flagged_for_o
             sent.get("reasoning_budget_message").is_none(),
             "{route}: {sent}"
         );
+    }
+}
+
+/// `think` is resolved against the model's `thinking`: a level it does not
+/// take becomes its default; one it takes, and a switch, go through.
+#[tokio::test(flavor = "multi_thread")]
+async fn ollama_think_a_level_the_model_does_not_take_gets_its_default() {
+    for (route, input) in [("/api/chat", "messages"), ("/api/generate", "prompt")] {
+        let standin = RoleStandin::new(None);
+        let (base, state) = serve_over_state("qwen3:0.6b", standin.router.clone(), false).await;
+        change_loaded(&state, "qwen3:0.6b", |m| {
+            m.thinking = Some(crate::chat_template::Thinking {
+                values: vec![false.into(), "low".into(), "medium".into(), "xhigh".into()],
+                default: "medium".into(),
+            });
+        })
+        .await;
+        let body = |think: serde_json::Value| {
+            let mut body = serde_json::json!({ "model": "qwen3:0.6b", "stream": false });
+            body["think"] = think;
+            body[input] = if input == "messages" {
+                serde_json::json!([{ "role": "user", "content": "hi" }])
+            } else {
+                serde_json::json!("hi")
+            };
+            body
+        };
+        let kwargs = |think: serde_json::Value| {
+            let (base, standin, body) = (&base, &standin, body(think));
+            async move {
+                post_with(base, route, body, serde_json::json!({})).await;
+                let sent = standin.seen.lock().unwrap().last().unwrap().clone();
+                sent["chat_template_kwargs"].clone()
+            }
+        };
+        let on =
+            |level: &str| serde_json::json!({ "enable_thinking": true, "reasoning_effort": level });
+
+        assert_eq!(
+            kwargs(serde_json::json!("xhigh")).await,
+            on("xhigh"),
+            "{route}"
+        );
+        assert_eq!(
+            kwargs(serde_json::json!("high")).await,
+            on("medium"),
+            "{route}"
+        );
+        assert_eq!(kwargs(serde_json::json!("low")).await, on("low"), "{route}");
+        assert_eq!(
+            kwargs(serde_json::json!(false)).await,
+            serde_json::json!({ "enable_thinking": false }),
+            "{route}"
+        );
+
+        // Neither a boolean nor a string: refused before anything runs.
+        for think in [serde_json::json!(3), serde_json::json!({ "level": "low" })] {
+            let resp = stand_in_client()
+                .post(format!("{base}{route}"))
+                .json(&body(think))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{route}");
+            assert!(resp
+                .text()
+                .await
+                .unwrap()
+                .contains("think must be a boolean or string"));
+        }
     }
 }
 

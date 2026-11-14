@@ -517,6 +517,8 @@ mod tests {
             thinks: true,
             enable_thinking: true,
             efforts: vec![],
+            default_on: false,
+            default_effort: None,
         };
         assert_eq!(
             opencode_variants(Some(&Thinking::Template(gemma4.clone()))),
