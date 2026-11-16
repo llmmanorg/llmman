@@ -166,19 +166,15 @@ impl ModelFacts {
         ) {
             return None;
         }
-        let ctx_size = super::initial_ctx_size(
-            state.0.ctx_size,
-            state.0.ctx_size_explicit,
-            Some(trained),
-            embedding,
-        );
+        let (configured, explicit) = state.0.ctx_setting(embedding);
+        let ctx_size = super::initial_ctx_size(configured, explicit, Some(trained), embedding);
         let num_parallel = super::effective_num_parallel(ctx_size, state.0.num_parallel, embedding);
         let window = super::loaded_context_window(
             super::Engine::LlamaServer,
             ctx_size,
             Some(trained),
             num_parallel,
-            state.0.ctx_size_explicit,
+            explicit,
         )?;
         Some(window.min(trained))
     }

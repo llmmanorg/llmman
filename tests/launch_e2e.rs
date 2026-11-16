@@ -3067,6 +3067,7 @@ fn serve_with_engine(
         .stderr(Stdio::null())
         .status();
 
+    log_available_memory(&format!("before {engine}"));
     let host = format!("127.0.0.1:{}", free_loopback_port());
     let args = format!(
         "{} --host 0.0.0.0",
@@ -3137,8 +3138,18 @@ fn serve_with_engine(
     });
 
     terminate_daemon(&mut daemon);
+    log_available_memory(&format!("after {engine}"));
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
+    }
+}
+
+/// Logs `MemAvailable` (Linux): a runner out of memory dies without a failure to say so.
+#[cfg(unix)]
+fn log_available_memory(when: &str) {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    if let Some(line) = meminfo.lines().find(|l| l.starts_with("MemAvailable:")) {
+        eprintln!("[test] {when}: {line}");
     }
 }
 
@@ -3186,8 +3197,10 @@ fn assert_engine_listens_only_on_loopback(host: &str) {
     };
     connect(std::net::Ipv4Addr::LOCALHOST.into())
         .unwrap_or_else(|e| panic!("engine is not listening on 127.0.0.1:{port}: {e}"));
-    let ip = non_loopback_ipv4()
-        .expect("no non-loopback IPv4 address to check the engine is not reachable on");
+    let Some(ip) = non_loopback_ipv4() else {
+        eprintln!("[test] no non-loopback IPv4 address; skipping the reachability check");
+        return;
+    };
     // A bare connect proves little: a TCP self-connect to this ephemeral
     // port succeeds and echoes our request, and CI saw three connects to a
     // loopback-bound vllm succeed. Only an HTTP reply means the engine
@@ -3213,14 +3226,36 @@ fn assert_engine_listens_only_on_loopback(host: &str) {
     }
 }
 
-/// This machine's address on its default route: the local end of a UDP
-/// socket "connected" to a documentation address, which sends nothing.
+/// An up, non-loopback IPv4 address of this machine, if it has one.
 #[cfg(unix)]
 fn non_loopback_ipv4() -> Option<std::net::IpAddr> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("192.0.2.1:9").ok()?;
-    let ip = socket.local_addr().ok()?.ip();
-    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+    let mut list = std::ptr::null_mut();
+    // SAFETY: the list is only read until freed below.
+    assert_eq!(
+        unsafe { libc::getifaddrs(&mut list) },
+        0,
+        "getifaddrs failed"
+    );
+    let mut found = None;
+    let mut cur = list;
+    while let Some(ifa) = unsafe { cur.as_ref() } {
+        cur = ifa.ifa_next;
+        let up = ifa.ifa_flags & libc::IFF_UP as libc::c_uint != 0;
+        if !up
+            || ifa.ifa_addr.is_null()
+            || i32::from(unsafe { (*ifa.ifa_addr).sa_family }) != libc::AF_INET
+        {
+            continue;
+        }
+        let sin = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
+        let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+        if !ip.is_loopback() && !ip.is_unspecified() {
+            found = Some(ip.into());
+            break;
+        }
+    }
+    unsafe { libc::freeifaddrs(list) };
+    found
 }
 
 /// `llmman serve`'s `sglang` backend end to end, wherever CI installs
