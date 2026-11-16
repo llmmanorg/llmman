@@ -4320,21 +4320,6 @@ pub fn llama_libs(
     Ok((source, dir))
 }
 
-/// How the mediagen backend checks the identity of the libraries it
-/// loads. Strict only for llmman's own download of the tested release:
-/// a `bin` source pinned to the default release. A user-chosen release,
-/// `latest`, or a `path` build (which the pin never selects) is logged.
-fn identity_check_for(
-    source: Runtime,
-    pinned: Option<&str>,
-) -> crate::mediagen::ffi::IdentityCheck {
-    if source == Runtime::Bin && pinned == Some(crate::llama_release::default_release()) {
-        crate::mediagen::ffi::IdentityCheck::Strict(&crate::llama_release::PINNED_GGML)
-    } else {
-        crate::mediagen::ffi::IdentityCheck::Log
-    }
-}
-
 /// `llmman serve MODEL --port PORT`: the backend the daemon spawns in
 /// this binary (see [`spawn_mediagen_backend`]), with the same `/health`
 /// as llama-server. A diffusion model runs [`mediagen_backend`], a GGUF
@@ -4369,18 +4354,12 @@ async fn load_ggml_api(
     args: &ServeArgs,
 ) -> anyhow::Result<(&'static crate::mediagen::ffi::Api, PathBuf)> {
     let pinned = runtime::llama_cpp_pin(args.llama_cpp_version.as_deref());
-    // `identity_check_for` holds the rule. The daemon forwards its
-    // resolved runtime and pin (`spawn_mediagen_backend`), so a default
-    // daemon on its own download makes this child strict too.
     let runtime = args.runtime;
-    let (lib_dir, check) = tokio::task::spawn_blocking(move || {
-        let (source, lib_dir) = llama_libs(runtime, pinned.as_deref())?;
-        anyhow::Ok((lib_dir, identity_check_for(source, pinned.as_deref())))
+    let lib_dir = tokio::task::spawn_blocking(move || {
+        llama_libs(runtime, pinned.as_deref()).map(|(_, lib_dir)| lib_dir)
     })
     .await??;
-    let api = Box::leak(Box::new(crate::mediagen::ffi::Api::load_with(
-        &lib_dir, check,
-    )?));
+    let api = Box::leak(Box::new(crate::mediagen::ffi::Api::load(&lib_dir)?));
     Ok((api, lib_dir))
 }
 

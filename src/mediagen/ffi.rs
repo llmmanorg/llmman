@@ -12,8 +12,6 @@ use std::ptr::NonNull;
 use anyhow::{Context, Result};
 use libloading::Library;
 
-use crate::llama_release::{PinnedGgml, PINNED_GGML};
-
 pub type GgmlContext = c_void;
 pub type GgmlCgraph = c_void;
 pub type GgmlBackend = *mut c_void;
@@ -573,51 +571,6 @@ pub fn check_context_params(p: &LlamaContextParams) -> Result<()> {
     Ok(())
 }
 
-/// What [`Api::load_with`] does with the `ggml_version()` and
-/// `ggml_commit()` the libraries report.
-pub enum IdentityCheck {
-    /// Fail unless they match this pin; for the release llmman was tested
-    /// against.
-    Strict(&'static PinnedGgml),
-    /// Print them and go on; for a user-chosen release or `latest`.
-    Log,
-}
-
-/// The identity the libraries in `dir` report against `expected`: `None`
-/// is an absent symbol, the version must match exactly, the commit after
-/// a `-dirty` suffix is dropped must start with the pinned prefix.
-pub fn check_identity(
-    dir: &Path,
-    expected: &PinnedGgml,
-    version: Option<&str>,
-    commit: Option<&str>,
-) -> Result<()> {
-    let (Some(version), Some(commit)) = (version, commit) else {
-        let missing = if version.is_none() {
-            "ggml_version"
-        } else {
-            "ggml_commit"
-        };
-        anyhow::bail!(
-            "unsupported llama.cpp build (no {missing}) in {}",
-            dir.display()
-        );
-    };
-    let clean = commit.strip_suffix("-dirty").unwrap_or(commit);
-    if version != expected.version || clean.get(..expected.commit.len()) != Some(expected.commit) {
-        anyhow::bail!(
-            "the llama.cpp libraries in {} are ggml {version} {commit}, expected {} {} \
-             (release {}); an old build? remove it from PATH or pass --llama-cpp-version \
-             to use a release",
-            dir.display(),
-            expected.version,
-            expected.commit,
-            expected.tag
-        );
-    }
-    Ok(())
-}
-
 /// The string an optional `const char *` getter returns; `None` when the
 /// symbol is absent or it returns null.
 fn c_string(f: Option<unsafe extern "C" fn() -> *const c_char>) -> Option<String> {
@@ -629,20 +582,25 @@ fn c_string(f: Option<unsafe extern "C" fn() -> *const c_char>) -> Option<String
 }
 
 impl Api {
-    /// [`Api::load_with`] held to the release in `LLAMA_CPP_RELEASE`.
+    /// Loads `libggml-base`, `libggml` and `libllama` from `dir`, prints
+    /// the ggml version and commit they report, then loads the backend
+    /// modules found there (`libggml-cuda`, `libggml-metal`, …).
     pub fn load(dir: &Path) -> Result<Api> {
-        Api::load_with(dir, IdentityCheck::Strict(&PINNED_GGML))
-    }
-
-    /// Loads `libggml-base`, `libggml` and `libllama` from `dir`, checks
-    /// their identity per `check`, then loads the backend modules found
-    /// there (`libggml-cuda`, `libggml-metal`, …).
-    pub fn load_with(dir: &Path, check: IdentityCheck) -> Result<Api> {
         let mut libs = Vec::new();
         for stem in ["ggml-base", "ggml", "llama"] {
             libs.push(open(&dir.join(lib_name(stem)))?);
         }
-        let api = Api::bind_checked(dir, libs, check)?;
+        let api = Api::bind(libs)?;
+        eprintln!(
+            "[llmman] mediagen: llama.cpp libraries in {}: ggml {} {}",
+            dir.display(),
+            c_string(api.ggml_version)
+                .as_deref()
+                .unwrap_or("(no ggml_version)"),
+            c_string(api.ggml_commit)
+                .as_deref()
+                .unwrap_or("(no ggml_commit)")
+        );
         let cdir = std::ffi::CString::new(dir.to_string_lossy().as_bytes())
             .context("library directory path")?;
         unsafe {
@@ -650,26 +608,6 @@ impl Api {
             (api.llama_backend_init)();
         }
         Ok(api)
-    }
-
-    /// Checks the identity of `libs` per `check`, then binds the API. The
-    /// identity goes first so that a mismatched build which also lacks a
-    /// symbol is reported as the wrong build, not as the missing symbol.
-    fn bind_checked(dir: &Path, libs: Vec<Library>, check: IdentityCheck) -> Result<Api> {
-        let version = c_string(lookup(&libs, "ggml_version").ok());
-        let commit = c_string(lookup(&libs, "ggml_commit").ok());
-        match check {
-            IdentityCheck::Strict(expected) => {
-                check_identity(dir, expected, version.as_deref(), commit.as_deref())?
-            }
-            IdentityCheck::Log => eprintln!(
-                "[llmman] mediagen: llama.cpp libraries in {}: ggml {} {}",
-                dir.display(),
-                version.as_deref().unwrap_or("(no ggml_version)"),
-                commit.as_deref().unwrap_or("(no ggml_commit)")
-            ),
-        }
-        Api::bind(libs)
     }
 
     /// Everything the pipeline assumes about this llama.cpp that binding
@@ -746,98 +684,5 @@ mod tests {
         assert_eq!(t.strides(), [2, 6, 30, 30]);
         assert_eq!(t.dtype(), ty::F16);
         drop(raw);
-    }
-
-    use super::*;
-
-    const PIN: PinnedGgml = PinnedGgml {
-        tag: "b11669",
-        version: "0.27.0",
-        commit: "620d2225c",
-    };
-
-    fn check(version: Option<&str>, commit: Option<&str>) -> Result<()> {
-        check_identity(Path::new("/opt/llama"), &PIN, version, commit)
-    }
-
-    #[test]
-    fn check_identity_accepts_the_pinned_version_and_commit() {
-        check(Some("0.27.0"), Some("620d2225c")).unwrap();
-    }
-
-    #[test]
-    fn check_identity_ignores_a_dirty_suffix_on_the_commit() {
-        check(Some("0.27.0"), Some("620d2225c-dirty")).unwrap();
-    }
-
-    #[test]
-    fn check_identity_rejects_an_absent_version() {
-        let err = check(None, Some("620d2225c")).unwrap_err().to_string();
-        assert_eq!(
-            err,
-            "unsupported llama.cpp build (no ggml_version) in /opt/llama"
-        );
-    }
-
-    #[test]
-    fn check_identity_rejects_an_absent_commit() {
-        let err = check(Some("0.27.0"), None).unwrap_err().to_string();
-        assert_eq!(
-            err,
-            "unsupported llama.cpp build (no ggml_commit) in /opt/llama"
-        );
-    }
-
-    #[test]
-    fn check_identity_rejects_another_version() {
-        let err = check(Some("0.26.0"), Some("620d2225c"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("/opt/llama"), "{err}");
-        assert!(err.contains("ggml 0.26.0 620d2225c"), "{err}");
-        assert!(err.contains("expected 0.27.0 620d2225c"), "{err}");
-        assert!(
-            err.ends_with("pass --llama-cpp-version to use a release"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn check_identity_rejects_another_commit() {
-        let err = check(Some("0.27.0"), Some("abcdef012-dirty"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("/opt/llama"), "{err}");
-        assert!(err.contains("abcdef012-dirty"), "{err}");
-        assert!(err.contains("620d2225c"), "{err}");
-    }
-
-    #[test]
-    fn check_identity_rejects_a_commit_shorter_than_the_pin() {
-        let err = check(Some("0.27.0"), Some("620d222"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("ggml 0.27.0 620d222"), "{err}");
-    }
-
-    /// The test binary itself stands in for a build without ggml: it has
-    /// neither `ggml_version` nor `ggml_init`, and the strict check must
-    /// name the former before `bind` can fail on the latter.
-    #[cfg(unix)]
-    #[test]
-    fn bind_checked_reports_the_identity_before_a_missing_symbol() {
-        let this: Library = libloading::os::unix::Library::this().into();
-        let err = match Api::bind_checked(
-            Path::new("/opt/llama"),
-            vec![this],
-            IdentityCheck::Strict(&PIN),
-        ) {
-            Ok(_) => panic!("the test binary bound as a llama.cpp build"),
-            Err(e) => e.to_string(),
-        };
-        assert_eq!(
-            err,
-            "unsupported llama.cpp build (no ggml_version) in /opt/llama"
-        );
     }
 }
