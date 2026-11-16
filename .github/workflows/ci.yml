@@ -1345,8 +1345,8 @@ jobs:
       # ── llama-server (the inference backend `llmman serve` shells out to) ──
       # A prebuilt release straight from upstream llama.cpp, pinned so CI
       # doesn't silently pick up a build that changes behavior mid-flight;
-      # bump the repo-root LLAMA_CPP_RELEASE file deliberately when a
-      # newer one is needed — that one edit is enough, unlike the old
+      # bump the repo-root LLAMA_CPP_RELEASE file (Renovate does, see
+      # renovate.json) — that one edit is enough, unlike the old
       # per-matrix-entry hardcoded filenames it replaced. `matrix.llama-asset`
       # is just this OS/arch's release asset *suffix* (the Windows ones are
       # .zip, the other three .tar.gz — extracted differently per OS below,

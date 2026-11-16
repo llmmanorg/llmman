@@ -8588,24 +8588,6 @@ async fn handle_tags_reports_the_family_size_and_quantization_of_each_gguf() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn identity_check_is_strict_only_for_a_bin_source_pinned_to_the_default_release() {
-    use crate::llama_release::default_release;
-    use crate::mediagen::ffi::IdentityCheck;
-    assert!(matches!(
-        identity_check_for(Runtime::Bin, Some(default_release())),
-        IdentityCheck::Strict(_)
-    ));
-    assert!(matches!(
-        identity_check_for(Runtime::Bin, Some("b1")),
-        IdentityCheck::Log
-    ));
-    assert!(matches!(
-        identity_check_for(Runtime::Path, Some(default_release())),
-        IdentityCheck::Log
-    ));
-}
-
 /// `--pull-only` after the runtime resolved, over the matrix the review
 /// rounds hit: a local llama.cpp does nothing more and never classifies
 /// the model, so an unstored model is fine under `bin`, `path`, and

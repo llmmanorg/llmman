@@ -8,7 +8,31 @@
     "go.podman.io/common",
     "go.podman.io/image/v5"
   ],
+  "customDatasources": {
+    "llama-cpp-stable": {
+      "description": "The b<N> build named by nightly-tag.txt, the only asset of llama.cpp's newest semver release (b<N> builds are prereleases, so /latest is that release)",
+      "defaultRegistryUrlTemplate": "https://github.com/ggml-org/llama.cpp/releases/latest/download/nightly-tag.txt",
+      "format": "plain"
+    }
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "LLAMA_CPP_RELEASE: the b<N> build behind the newest llama.cpp semver release",
+      "managerFilePatterns": ["/^LLAMA_CPP_RELEASE$/"],
+      "matchStrings": ["^(?<currentValue>b\\d+)\\s*$"],
+      "depNameTemplate": "ggml-org/llama.cpp",
+      "datasourceTemplate": "custom.llama-cpp-stable",
+      "versioningTemplate": "regex:^b(?<major>\\d+)$"
+    }
+  ],
   "packageRules": [
+    {
+      "description": "Own PR; group:all's inherited groupSlug would merge it into the rest",
+      "matchDepNames": ["ggml-org/llama.cpp"],
+      "groupName": "llama.cpp",
+      "groupSlug": "llama-cpp"
+    },
     {
       "description": "reqwest 0.13 switches to platform TLS verifier; not validated on Android",
       "matchManagers": ["cargo"],
