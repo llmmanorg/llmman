@@ -131,5 +131,9 @@ export default function XTermView({
     focus.current?.();
   }, [visible]);
 
-  return <View ref={host} style={{ flex: 1, backgroundColor: colors.background, padding: 6 }} />;
+  return (
+    <View style={{ flex: 1, backgroundColor: colors.background, padding: 6 }}>
+      <View ref={host} style={{ flex: 1, minHeight: 0, minWidth: 0 }} />
+    </View>
+  );
 }
