@@ -4680,6 +4680,33 @@ async fn the_metrics_route_label_is_the_template_not_the_request_path() {
     assert!(!rendered.contains("abc123"), "{rendered}");
 }
 
+/// Three in flight on one slot means two are queued.
+#[tokio::test]
+async fn the_scrape_shows_requests_queued_behind_the_parallel_slots() {
+    let state = test_state();
+    let mut model = running_model_fixture(None, Duration::ZERO, 3);
+    model.parallel_slots = Some(1);
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .insert("queued-model:latest".into(), model);
+
+    let resp = handle_metrics(State(state)).await.into_response();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let scrape = String::from_utf8(body.to_vec()).unwrap();
+    for expected in [
+        "llmman_requests_in_flight{model=\"queued-model:latest\"} 3\n",
+        "llmman_requests_queued{model=\"queued-model:latest\"} 2\n",
+    ] {
+        assert!(scrape.contains(expected), "{expected} in:\n{scrape}");
+    }
+}
+
 /// Any localhost page is an allowed origin, so one that can reach the
 /// daemon could otherwise read a scrape out of a browser. What makes
 /// this true is `/metrics` being merged *after* `.layer(cors_layer())`

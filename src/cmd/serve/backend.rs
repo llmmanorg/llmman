@@ -550,6 +550,15 @@ pub(super) fn check_extra_args_env() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `extra` or, if `inherits_env`, the environment sets llama-server's
+/// slot count, overriding llmman's `--parallel`.
+pub(super) fn llama_sets_parallel(extra: &[String], inherits_env: bool) -> bool {
+    let env = inherits_env.then_some("LLAMA_ARG_N_PARALLEL");
+    ["-np", "--parallel"]
+        .iter()
+        .any(|flag| llama_sets(extra, flag, env))
+}
+
 /// Appends `extra` (a split `LLMMAN_*_ARGS`), then `--port port --host
 /// host`. vllm, sglang and ds4-server keep each flag's last value, so
 /// llmman's win however `extra` spells them (argparse takes abbreviations).
@@ -1620,6 +1629,17 @@ mod tests {
         ] {
             assert!(!sets(args), "{args:?}");
         }
+    }
+
+    #[test]
+    fn llama_sets_parallel_sees_either_spelling() {
+        let sets = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            llama_sets_parallel(&args, false)
+        };
+        assert!(sets(&["-np", "1"]));
+        assert!(sets(&["--parallel=1"]));
+        assert!(!sets(&["--jinja", "--ctx-size", "8192"]));
     }
 
     #[test]

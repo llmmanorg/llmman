@@ -335,7 +335,7 @@ connection the process makes, providers included.
 `/metrics` is a Prometheus scrape target, off by default because an
 open daemon has no authentication; with keys configured it requires one
 like every other route. `LLMMAN_METRICS=1 llmman serve` turns it on;
-the fifteen metric families and how to read them are in
+the seventeen metric families and how to read them are in
 [metrics.md](metrics.md).
 
 ## CORS

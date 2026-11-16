@@ -384,6 +384,9 @@ struct RunningModel {
     /// `ActivityGuard`'s doc comment for why a generation slower than its
     /// own `keep_alive` must not be killed mid-stream.
     in_flight: u32,
+    /// llama-server's slot count when llmman knows it, so `in_flight`
+    /// beyond it is queued. `None` otherwise.
+    parallel_slots: Option<u32>,
     /// The `"model"` field a request must carry to reach this model on
     /// its backend when that differs from the canonical reference — see
     /// `backend_wire_model`. `Some(<absolute model directory>)` for
@@ -2751,6 +2754,12 @@ async fn resolve_target(
         inherits_env.then_some("LLAMA_ARG_THINK_BUDGET_MESSAGE"),
     );
 
+    // Not diffusion (one generation at a time) or a user-set `--parallel`.
+    let parallel_slots = num_parallel.filter(|_| {
+        process.engine() == Engine::LlamaServer
+            && !matches!(model_path, ModelPath::Diffusion(_))
+            && !backend::llama_sets_parallel(&llama_extra_args, inherits_env)
+    });
     let mut mgr = state.0.manager.lock().await;
     mgr.running.insert(
         model_ref.to_string(),
@@ -2767,6 +2776,7 @@ async fn resolve_target(
             keep_alive: default_keep_alive(),
             // 1, not 0 — see this function's own doc comment.
             in_flight: 1,
+            parallel_slots,
             decision,
             effort_budget,
             effort_budget_message,
@@ -4242,6 +4252,10 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
                 // only notices a dead backend when a request arrives for
                 // that model, so `models_loaded` counts it until then.
                 up: m.process.is_alive(),
+                requests_in_flight: u64::from(m.in_flight),
+                requests_queued: m
+                    .parallel_slots
+                    .map(|slots| u64::from(m.in_flight.saturating_sub(slots))),
             })
             .collect();
         (mgr.running.len() as u64, mgr.pending_loads as u64, models)
