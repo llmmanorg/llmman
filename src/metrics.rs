@@ -396,6 +396,9 @@ pub(crate) struct ModelState {
     /// Whether the backend process is still alive right now
     /// (`ModelProcess::is_alive`), not whether llmman still lists it.
     pub(crate) up: bool,
+    pub(crate) requests_in_flight: u64,
+    /// `requests_in_flight` beyond the parallel slots; `None` if unknown.
+    pub(crate) requests_queued: Option<u64>,
 }
 
 /// The values [`Store`] cannot accumulate on its own: they are read from
@@ -477,6 +480,22 @@ fn header(out: &mut String, name: &str, kind: &str, help: &str) {
 fn gauge(out: &mut String, name: &str, help: &str, labels: &Labels, value: impl std::fmt::Display) {
     header(out, name, "gauge", help);
     out.push_str(&format!("{name}{} {value}\n", labels.braces()));
+}
+
+/// Emits a gauge family with a series per model in label order; `series`
+/// returns `None` to skip one.
+fn model_gauge(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    models: &[ModelState],
+    series: impl Fn(&ModelState) -> Option<(Labels, u64)>,
+) {
+    header(out, name, "gauge", help);
+    let samples: BTreeMap<Labels, u64> = models.iter().filter_map(series).collect();
+    for (labels, value) in &samples {
+        out.push_str(&format!("{name}{} {value}\n", labels.braces()));
+    }
 }
 
 /// Emits every accumulated series of one counter family, in key order.
@@ -597,22 +616,30 @@ fn render_from(store: &Store, snapshot: &Snapshot) -> String {
         snapshot.models_loading,
     );
 
-    header(
+    model_gauge(
         &mut out,
         "llmman_model_up",
-        "gauge",
         "1 while a loaded model's backend process is alive, 0 once it has exited and llmman has not yet noticed.",
+        &snapshot.models,
+        |m| Some((Labels::new(&[("model", &m.model), ("engine", m.engine)]), u64::from(m.up))),
     );
-    let mut model_up: BTreeMap<Labels, u8> = BTreeMap::new();
-    for model in &snapshot.models {
-        model_up.insert(
-            Labels::new(&[("model", &model.model), ("engine", model.engine)]),
-            u8::from(model.up),
-        );
-    }
-    for (labels, up) in &model_up {
-        out.push_str(&format!("llmman_model_up{} {up}\n", labels.braces()));
-    }
+    model_gauge(
+        &mut out,
+        "llmman_requests_in_flight",
+        "Requests a loaded model is serving or holding, including responses still being sent.",
+        &snapshot.models,
+        |m| Some((Labels::new(&[("model", &m.model)]), m.requests_in_flight)),
+    );
+    model_gauge(
+        &mut out,
+        "llmman_requests_queued",
+        "Estimated requests waiting for a free parallel slot; absent where llmman does not know the slot count.",
+        &snapshot.models,
+        |m| {
+            m.requests_queued
+                .map(|q| (Labels::new(&[("model", &m.model)]), q))
+        },
+    );
 
     counter(
         &mut out,
@@ -729,6 +756,8 @@ mod tests {
                 "llmman_models_loaded",
                 "llmman_models_loading",
                 "llmman_model_up",
+                "llmman_requests_in_flight",
+                "llmman_requests_queued",
                 "llmman_model_loads_total",
                 "llmman_model_load_duration_seconds",
                 "llmman_model_load_oom_retries_total",
@@ -878,6 +907,38 @@ mod tests {
         }
     }
 
+    /// No queue figure without a known slot count.
+    #[test]
+    fn a_waiting_request_reads_as_queued_only_when_the_slots_are_known() {
+        let mut snapshot = snapshot();
+        snapshot.models = vec![
+            ModelState {
+                model: "a:latest".into(),
+                engine: "llama-server",
+                up: true,
+                requests_in_flight: 2,
+                requests_queued: Some(1),
+            },
+            ModelState {
+                model: "b:latest".into(),
+                engine: "llama-server",
+                up: true,
+                requests_in_flight: 3,
+                requests_queued: None,
+            },
+        ];
+
+        let rendered = rendered(&store(), &snapshot);
+        for expected in [
+            "llmman_requests_in_flight{model=\"a:latest\"} 2\n",
+            "llmman_requests_in_flight{model=\"b:latest\"} 3\n",
+            "llmman_requests_queued{model=\"a:latest\"} 1\n",
+        ] {
+            assert!(rendered.contains(expected), "{expected} in:\n{rendered}");
+        }
+        assert!(!rendered.contains("llmman_requests_queued{model=\"b:latest\"}"));
+    }
+
     /// A backend that exited without llmman noticing is the one case no
     /// other metric here can show.
     #[test]
@@ -889,11 +950,15 @@ mod tests {
                 model: "a:latest".into(),
                 engine: "llama-server",
                 up: true,
+                requests_in_flight: 0,
+                requests_queued: None,
             },
             ModelState {
                 model: "b:latest".into(),
                 engine: "vllm",
                 up: false,
+                requests_in_flight: 0,
+                requests_queued: None,
             },
         ];
 
