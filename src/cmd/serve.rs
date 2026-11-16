@@ -67,9 +67,10 @@ use backend::{
 };
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
 use config::{
-    backend_ctx_size, container_cpu_limit, effective_num_parallel, embedding_model_ctx,
-    flash_attention_from_env, gguf_trained_ctx, initial_ctx_size, kv_cache_type_from_env,
-    looks_like_oom, max_loaded_models_from_env, max_queue_from_env, metrics_enabled_from_env,
+    backend_ctx_size, container_cpu_limit, effective_num_parallel,
+    embedding_context_length_from_env, embedding_model_ctx, flash_attention_from_env,
+    gguf_trained_ctx, initial_ctx_size, kv_cache_type_from_env, looks_like_oom,
+    max_loaded_models_from_env, max_queue_from_env, metrics_enabled_from_env,
     next_ctx_size_after_oom, num_parallel_from_env, sched_spread_from_env, supports_context_shift,
     threads_from_env_or_host, tls_from_env, whole_prompt_batch, MAX_CTX_SHRINK_ATTEMPTS,
 };
@@ -115,6 +116,7 @@ Environment Variables:
       LLMMAN_TLS_KEY                 PEM private key for LLMMAN_TLS_CERT
       LLMMAN_TLS_CA                  PEM bundle of extra roots to trust when reaching peers (and, for the CLI, the daemon)
       LLMMAN_CONTEXT_LENGTH          Context size for llama-server/vLLM/SGLang when set (default 262144 for llama-server)
+      LLMMAN_EMBEDDING_CONTEXT_LENGTH  Context size for embedding models, over LLMMAN_CONTEXT_LENGTH (0: trained context)
       LLMMAN_HYBRID_LOCAL_BYTES      Largest request a hybrid pair serves locally, in bytes (0 disables; default: from the context length)
       LLMMAN_KEEP_ALIVE              The duration that models stay loaded in memory (default \"5m\")
       LLMMAN_MAX_LOADED_MODELS       Maximum number of loaded models (default: unbounded)
@@ -269,6 +271,8 @@ struct Inner {
     // auto-shrinks the latter (mirrors Ollama's numCtxAuto gate): a
     // user's explicit choice isn't silently overridden.
     ctx_size_explicit: bool,
+    // See embedding_context_length_from_env's doc comment.
+    embedding_ctx_size: Option<u32>,
     // Largest request a hybrid pair serves locally (see
     // crate::hybrid::local_budget_bytes). Resolved once at startup, so
     // it is only the fallback for a pair whose local half is not loaded
@@ -323,6 +327,16 @@ struct Inner {
     // Presented to peers — see `aggregation`; `None` sends the hop alone.
     peer_key: Option<String>,
     client: Client,
+}
+
+impl Inner {
+    /// The `(ctx_size, explicit)` a load without a `num_ctx` starts from.
+    fn ctx_setting(&self, embedding: bool) -> (Option<u32>, bool) {
+        match self.embedding_ctx_size.filter(|_| embedding) {
+            Some(n) => (Some(n), true),
+            None => (self.ctx_size, self.ctx_size_explicit),
+        }
+    }
 }
 
 struct ModelManager {
@@ -2370,7 +2384,7 @@ async fn resolve_target(
     // A request's `num_ctx` is explicit, so never auto-shrunk below.
     let (ctx_configured, ctx_explicit) = match load_ctx {
         Some(num_ctx) => (Some(effective_ctx(num_ctx, trained_ctx)), true),
-        None => (state.0.ctx_size, state.0.ctx_size_explicit),
+        None => state.0.ctx_setting(embedding_ctx.is_some()),
     };
     let mut ctx_size = initial_ctx_size(
         ctx_configured,
@@ -4971,6 +4985,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         sglang_version: _args.sglang_version.clone(),
         ctx_size,
         ctx_size_explicit: ctx_size_explicit.is_some(),
+        embedding_ctx_size: embedding_context_length_from_env(),
         hybrid_local_bytes: crate::hybrid::local_budget_bytes(
             ctx_size,
             hybrid_local_bytes_env.as_deref(),

@@ -6821,16 +6821,19 @@ async fn an_unloaded_models_n_ctx_is_what_its_load_reports() {
         ("embedding", &[("llama.pooling_type", 1)], &[]),
         ("decision", &[], &[("llama.decision.type", "clef")]),
     ];
-    // (LLMMAN_CONTEXT_LENGTH, explicitly set, LLMMAN_NUM_PARALLEL), for the
-    // fixture's trained context of 4096.
+    // (LLMMAN_CONTEXT_LENGTH, explicitly set, LLMMAN_NUM_PARALLEL,
+    // LLMMAN_EMBEDDING_CONTEXT_LENGTH), for the fixture's trained context
+    // of 4096.
     let configs = [
-        (Some(DEFAULT_CTX_SIZE), false, None),
-        (Some(DEFAULT_CTX_SIZE), false, Some(4)),
-        (Some(2048), true, None),
-        (Some(65536), true, None),
-        (Some(0), true, None),
-        (Some(0), true, Some(2)),
-        (Some(2048), true, Some(4)),
+        (Some(DEFAULT_CTX_SIZE), false, None, None),
+        (Some(DEFAULT_CTX_SIZE), false, Some(4), None),
+        (Some(2048), true, None, None),
+        (Some(65536), true, None, None),
+        (Some(0), true, None, None),
+        (Some(0), true, Some(2), None),
+        (Some(2048), true, Some(4), None),
+        (Some(DEFAULT_CTX_SIZE), false, None, Some(512)),
+        (Some(DEFAULT_CTX_SIZE), false, Some(2), Some(0)),
     ];
     let cases = configs
         .into_iter()
@@ -6842,15 +6845,20 @@ async fn an_unloaded_models_n_ctx_is_what_its_load_reports() {
     // path blocks, and loads of one name queue behind each other.
     let tasks: Vec<_> = cases
         .map(
-            |(i, ((ctx_size, explicit, num_parallel), (kind, u32s, strings)))| {
+            |(
+                i,
+                ((ctx_size, explicit, num_parallel, embedding_ctx_size), (kind, u32s, strings)),
+            )| {
                 let case = format!(
-                    "{kind}: ctx_size {ctx_size:?} explicit {explicit} parallel {num_parallel:?}"
+                    "{kind}: ctx_size {ctx_size:?} explicit {explicit} parallel {num_parallel:?} \
+                     embedding {embedding_ctx_size:?}"
                 );
                 let name = format!("ctxparity{i}");
                 let state = fake.state_with(&name, u32s, strings, |inner| {
                     inner.ctx_size = ctx_size;
                     inner.ctx_size_explicit = explicit;
                     inner.num_parallel = num_parallel;
+                    inner.embedding_ctx_size = embedding_ctx_size;
                 });
                 tokio::spawn(async move {
                     let base = serve_router(state.clone()).await;
@@ -8283,27 +8291,40 @@ async fn v1_models_reports_the_context_an_unloaded_model_would_start_with() {
         image,
     );
 
-    // (LLMMAN_CONTEXT_LENGTH, explicitly set, LLMMAN_NUM_PARALLEL) ->
-    // (text, embedding), for the fixture's trained context of 4096.
+    // (LLMMAN_CONTEXT_LENGTH, explicitly set, LLMMAN_NUM_PARALLEL,
+    // LLMMAN_EMBEDDING_CONTEXT_LENGTH) -> (text, embedding), for the
+    // fixture's trained context of 4096.
     let cases = [
-        ((Some(DEFAULT_CTX_SIZE), false, None), (4096, 4096)),
-        ((Some(DEFAULT_CTX_SIZE), false, Some(4)), (4096, 4096)),
-        ((Some(2048), true, None), (2048, 2048)),
-        ((Some(65536), true, None), (4096, 4096)),
-        ((Some(0), true, None), (4096, 4096)),
+        ((Some(DEFAULT_CTX_SIZE), false, None, None), (4096, 4096)),
+        ((Some(DEFAULT_CTX_SIZE), false, Some(4), None), (4096, 4096)),
+        ((Some(2048), true, None, None), (2048, 2048)),
+        ((Some(65536), true, None, None), (4096, 4096)),
+        ((Some(0), true, None, None), (4096, 4096)),
         // 0 is the trained context split across the slots; an embedding
         // model's 0 becomes the trained context before the slots scale it.
-        ((Some(0), true, Some(2)), (2048, 4096)),
-        ((Some(2048), true, Some(4)), (2048, 2048)),
+        ((Some(0), true, Some(2), None), (2048, 4096)),
+        ((Some(2048), true, Some(4), None), (2048, 2048)),
+        // The embedding variable moves only embedding models.
+        (
+            (Some(DEFAULT_CTX_SIZE), false, None, Some(512)),
+            (4096, 512),
+        ),
+        ((Some(2048), true, None, Some(512)), (2048, 512)),
+        ((Some(2048), true, None, Some(65536)), (2048, 4096)),
+        ((Some(2048), true, None, Some(0)), (2048, 4096)),
     ];
-    for ((ctx_size, explicit, num_parallel), (text, embedding)) in cases {
+    for ((ctx_size, explicit, num_parallel, embedding_ctx), (text, embedding)) in cases {
         let mut inner = test_inner(dir.clone());
         inner.ctx_size = ctx_size;
         inner.ctx_size_explicit = explicit;
         inner.num_parallel = num_parallel;
+        inner.embedding_ctx_size = embedding_ctx;
         let base = serve_router(AppState(Arc::new(inner))).await;
         let (_, v) = get_json(&base, "/v1/models").await;
-        let case = format!("ctx_size {ctx_size:?} ({explicit}), num_parallel {num_parallel:?}");
+        let case = format!(
+            "ctx_size {ctx_size:?} ({explicit}), num_parallel {num_parallel:?}, \
+             embedding {embedding_ctx:?}"
+        );
         assert_eq!(listed(&v, "text")["meta"]["n_ctx"], text, "{case}");
         assert_eq!(listed(&v, "embed")["meta"]["n_ctx"], embedding, "{case}");
         assert_eq!(listed(&v, "image")["meta"].get("n_ctx"), None, "{case}");

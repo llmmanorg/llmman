@@ -1801,6 +1801,9 @@ jobs:
               # (see test_e2e.py); unset, vLLM asks for 0.9 of RAM.
               echo "VLLM_CPU_KVCACHE_SPACE=1"
               echo "SGLANG_USE_CPU_ENGINE=1"
+              # SGLang sizes its KV pool from free RAM (4-8 GB here), not
+              # LLMMAN_CONTEXT_LENGTH; the 16 GB runner died of it.
+              echo "LLMMAN_SGLANG_ARGS=--max-total-tokens 4096"
             } >> "$GITHUB_ENV"
           fi
 

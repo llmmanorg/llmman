@@ -76,6 +76,7 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
         sglang_version: None,
         ctx_size: None,
         ctx_size_explicit: false,
+        embedding_ctx_size: None,
         hybrid_local_bytes: None,
         hybrid_local_bytes_explicit: false,
         flash_attention: None,

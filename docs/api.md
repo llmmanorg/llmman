@@ -52,7 +52,7 @@ since llmman leaves templating to the backend.
 Of `options`, `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stop`,
 `num_predict`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`,
 `num_thread` and `num_ctx` apply. `num_ctx` is the window a llama-server
-model is loaded with, over `LLMMAN_CONTEXT_LENGTH` and cut to its trained
+model is loaded with, over `LLMMAN_CONTEXT_LENGTH` (`LLMMAN_EMBEDDING_CONTEXT_LENGTH` for an embedding model) and cut to its trained
 context. As in Ollama, a model loaded with another window is reloaded once
 its requests finish, and requests that arrive meanwhile wait. A request with
 no `num_ctx` uses whichever window is loaded. The `done`
@@ -121,7 +121,7 @@ size a model by (`meta.n_ctx_train` is OpenClaw's context window). A loaded
 llama-server's own are passed through, `meta.n_ctx` included. Before a model
 is loaded, `meta.n_ctx_train` comes from the GGUF header, `meta.n_ctx` is the
 per-slot context the llama-server a load starts would report (from
-`LLMMAN_CONTEXT_LENGTH` and `LLMMAN_NUM_PARALLEL`, never past `n_ctx_train`; a
+`LLMMAN_CONTEXT_LENGTH` (`LLMMAN_EMBEDDING_CONTEXT_LENGTH` for an embedding model) and `LLMMAN_NUM_PARALLEL`, never past `n_ctx_train`; a
 request's `num_ctx` or an out-of-memory retry can still change it), and
 `architecture.input_modalities` comes from what the model can do (`text`, plus
 `image` with a vision projector); a model that does not generate text has no
