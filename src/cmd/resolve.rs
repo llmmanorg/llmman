@@ -119,11 +119,15 @@ pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
             "another llmman process is pulling into this store; waiting for it to finish",
         )?)
     };
-    let notices = tokio::runtime::Runtime::new()
+    let mut notices = tokio::runtime::Runtime::new()
         .context("start tokio runtime")?
         .block_on(crate::cmd::serve::pull_checked(&store_path, &reference))
         .with_context(|| format!("pulling {reference}"))?;
     drop(pull_lock);
+    notices.extend(
+        crate::cmd::serve::verify_layers_stored(&store_path, &reference)
+            .with_context(|| format!("verify layers of {reference}"))?,
+    );
     for notice in notices {
         eprintln!("[llmman] {notice}");
     }

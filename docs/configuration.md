@@ -49,6 +49,7 @@ base_url = "http://inferencebox:8000/v1"
 
 [verify]
 default = "off"
+layers  = "off"                 # hash stored layers on a cold load
 
 [[verify.trust]]
 pattern = "docker.io/myorg/**"
@@ -288,6 +289,17 @@ same failure only costs the other two sections their aliases and keys.
 That asymmetry is deliberate: a trust policy llmman cannot read must not
 be mistaken for one that does not exist.
 
+`verify.layers` is a separate switch: `off` (the default), `warn`, or
+`enforce`. It decides whether a cold load re-hashes the stored manifest,
+its config blob and every stored layer blob and compares each SHA-256
+with the digest the manifest records. `default` and the trust
+rules do not turn it on, and it needs no keys: a signed model whose blob
+was overwritten on disk is exactly what it catches. `warn` logs a notice
+per mismatch and loads anyway; `enforce` fails the load. It runs once per
+cold load, not per request, and the cost is one sequential read and
+hash of every blob. Later config files override earlier ones, and
+`LLMMAN_VERIFY_LAYERS` overrides them all.
+
 See [verification.md](verification.md) for the format, what is checked,
 and the limitations.
 
@@ -457,6 +469,7 @@ setting may not behave identically.
 | `LLMMAN_VLLM_OMNI_GUARDRAILS` | When set (`1`/`true`/`yes`/`on`), a Diffusers-layout model served by vLLM-Omni keeps its safety guardrails on; llmman otherwise passes `--no-guardrails`. See [backends.md](backends.md#vllm-omni-diffusers-pipelines). |
 | `LLMMAN_TMPDIR` | Staging directory for `llama-server` release downloads, overriding the default `tmp` subdirectory of the install root. |
 | `LLMMAN_VERIFY` | Overrides the signature-verification mode (`off`, `warn`, or `enforce`) for every reference, ignoring what `[verify]` selected. Does *not* supply trusted keys — those still come from `llmman.conf`, so `enforce` with no configured keys fails every check rather than passing them. Intended for CI, which can demand `enforce` without editing config files. See [verification.md](verification.md). |
+| `LLMMAN_VERIFY_LAYERS` | Overrides `[verify] layers` (`off`, `warn`, or `enforce`): whether a cold load re-hashes the stored manifest and layer blobs against the digests the manifest records. Independent of `LLMMAN_VERIFY` and of the trust rules. Resolved once when the policy loads; an unparsable value is an error, not a downgrade to `off`. See [verification.md](verification.md#layer-verification-at-load). |
 | `LLMMAN_SIGN_PASSWORD` | Passphrase for the `--sign-key` private key used by `push`/`transfer`, when it is an encrypted PEM. Falls back to `COSIGN_PASSWORD`. Read by the CLI process, which does the signing itself; neither key nor passphrase reaches the daemon. |
 | `LLMMAN_NOHISTORY` | When set (to anything other than `0`/`false`/`no`/`off`), `llmman serve` stops recording prompts for `llmman log`. Otherwise each request to a generation route (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`) appends its time, route, model, `User-Agent` and the last user message's text — not the transcript or the reply — to `prompts.jsonl` beside the store (`~/.local/share/llmman/prompts.jsonl` by default), readable only by its owner. Delete the file to clear the history. |
 | `LLMMAN_NOUSAGE` | When set (to anything other than `0`/`false`/`no`/`off`), `llmman serve` stops recording token usage for `llmman usage`. Otherwise each reply that reports usage appends its time, route, serving model and provider, `User-Agent`, token counts and, for a priced provider model, the rate and cost in US dollars to `usage.jsonl` beside the store, readable only by its owner. No prompt text, so independent of `LLMMAN_NOHISTORY`; the `id` matches the `prompts.jsonl` entry when there is one. |

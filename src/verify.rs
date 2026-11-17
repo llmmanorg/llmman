@@ -34,6 +34,7 @@ use std::sync::OnceLock;
 use anyhow::{anyhow, bail, Context};
 
 use crate::config::VerifyConf;
+use crate::storage::oci::{Descriptor, OciStore};
 
 /// Longest accepted `pattern`. Nothing real comes close; the bound just
 /// keeps a pathological one uninteresting.
@@ -96,6 +97,14 @@ pub struct Policy {
     /// load, so an unparsable value fails there rather than being
     /// re-reported (or worse, ignored) on every decision.
     forced_mode: Option<Mode>,
+    /// `layers`: whether a cold load re-hashes the stored manifest and
+    /// layer blobs. Optional for the same "later files win" reason as
+    /// `default_mode`. The signature rules never set it: a signed model
+    /// whose blob was overwritten on disk is exactly what this catches.
+    layers_mode: Option<Mode>,
+    /// `LLMMAN_VERIFY_LAYERS`, overriding `layers_mode`; resolved once
+    /// at load like `forced_mode`.
+    forced_layers_mode: Option<Mode>,
     /// Ascending precedence: the *last* matching rule wins.
     rules: Vec<Rule>,
 }
@@ -115,6 +124,11 @@ impl Policy {
             .default
             .as_deref()
             .map(|s| Mode::parse(s).context("`default`"))
+            .transpose()?;
+        let layers_mode = conf
+            .layers
+            .as_deref()
+            .map(|s| Mode::parse(s).context("`layers`"))
             .transpose()?;
 
         let mut rules = Vec::with_capacity(conf.trust.len());
@@ -140,6 +154,8 @@ impl Policy {
         Ok(Policy {
             default_mode,
             forced_mode: None,
+            layers_mode,
+            forced_layers_mode: None,
             rules,
         })
     }
@@ -180,6 +196,28 @@ impl Policy {
         decision
     }
 
+    /// Fold a later (higher-priority) file into this one: its explicit
+    /// `default` and `layers` win, its rules append after ours so they
+    /// take precedence in [`Policy::decide`]. The environment overrides
+    /// are not file state and are left untouched.
+    fn merge(&mut self, later: Policy) {
+        if let Some(mode) = later.default_mode {
+            self.default_mode = Some(mode);
+        }
+        if let Some(mode) = later.layers_mode {
+            self.layers_mode = Some(mode);
+        }
+        self.rules.extend(later.rules);
+    }
+
+    /// The layer-hashing mode: `LLMMAN_VERIFY_LAYERS`, else the merged
+    /// `[verify] layers`, else `Off`.
+    fn layers_mode(&self) -> Mode {
+        self.forced_layers_mode
+            .or(self.layers_mode)
+            .unwrap_or_default()
+    }
+
     /// Load and merge every config file present, cached for the process.
     ///
     /// A file that cannot be read or parsed is fatal here, not skipped:
@@ -202,13 +240,18 @@ fn load_uncached() -> anyhow::Result<Policy> {
     for file in crate::config::files().map_err(|e| anyhow!("{e}"))? {
         let policy = Policy::from_conf(&file.conf.verify, &file.dir)
             .with_context(|| format!("read {}", file.path.display()))?;
-        if let Some(mode) = policy.default_mode {
-            merged.default_mode = Some(mode);
-        }
-        merged.rules.extend(policy.rules);
+        merged.merge(policy);
     }
     merged.forced_mode = mode_override()?;
+    merged.forced_layers_mode = layers_mode_override()?;
     Ok(merged)
+}
+
+/// The mode for hashing stored layers on a cold load: `LLMMAN_VERIFY_LAYERS`,
+/// else the merged `[verify] layers`, else `Off`. The signature
+/// `default` and trust rules play no part.
+pub fn layers_mode() -> anyhow::Result<Mode> {
+    Ok(Policy::load()?.layers_mode())
 }
 
 /// Rejects a pattern that cannot match anything. Patterns are compared
@@ -246,14 +289,27 @@ fn validate_pattern(pattern: &str) -> anyhow::Result<()> {
 /// downgrade to whatever the config files happened to say, which is the
 /// exact failure this whole module refuses elsewhere.
 fn mode_override() -> anyhow::Result<Option<Mode>> {
-    parse_mode_override(std::env::var("LLMMAN_VERIFY").ok().as_deref())
+    parse_override(
+        std::env::var("LLMMAN_VERIFY").ok().as_deref(),
+        "LLMMAN_VERIFY",
+    )
 }
 
-/// Split out so it is testable without touching the process environment.
-fn parse_mode_override(raw: Option<&str>) -> anyhow::Result<Option<Mode>> {
+/// `LLMMAN_VERIFY_LAYERS`, if set. Same reasoning as [`mode_override`]:
+/// a typo must fail the load, not downgrade it.
+fn layers_mode_override() -> anyhow::Result<Option<Mode>> {
+    parse_override(
+        std::env::var("LLMMAN_VERIFY_LAYERS").ok().as_deref(),
+        "LLMMAN_VERIFY_LAYERS",
+    )
+}
+
+/// Split out so it is testable without touching the process environment;
+/// `var_name` names the variable in the error.
+fn parse_override(raw: Option<&str>, var_name: &'static str) -> anyhow::Result<Option<Mode>> {
     match raw.map(str::trim) {
         None | Some("") => Ok(None),
-        Some(raw) => Mode::parse(raw).map(Some).context("LLMMAN_VERIFY"),
+        Some(raw) => Mode::parse(raw).map(Some).context(var_name),
     }
 }
 
@@ -647,6 +703,23 @@ fn digests_match(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
+/// Why the stored blob for `desc` does not hash to the digest it
+/// records, or `None` when it does. A malformed digest (`blob_path`
+/// refuses anything but `sha256:` and 64 hex digits) or an unreadable
+/// blob is a mismatch with its cause kept, not an error: the descriptor
+/// came from a blob this check exists to distrust.
+fn blob_mismatch(store: &OciStore, desc: &Descriptor) -> Option<String> {
+    let path = match store.blob_path(&desc.digest) {
+        Ok(path) => path,
+        Err(e) => return Some(format!("{e:#}")),
+    };
+    match crate::fsutil::sha256_of_file(&path) {
+        Ok(hex) if digests_match(&format!("sha256:{hex}"), &desc.digest) => None,
+        Ok(hex) => Some(format!("hashes to sha256:{hex}")),
+        Err(e) => Some(format!("{e:#}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pull-time enforcement
 // ---------------------------------------------------------------------------
@@ -778,6 +851,67 @@ pub fn all_configured_keys() -> anyhow::Result<Vec<PathBuf>> {
 /// Exposed for `Policy::decide` callers that already hold a reference.
 pub fn decide(reference: &str) -> anyhow::Result<Decision> {
     Ok(Policy::load()?.decide(reference))
+}
+
+// ---------------------------------------------------------------------------
+// Layer digests at load
+// ---------------------------------------------------------------------------
+
+/// Re-hashes the stored manifest, its config blob and every layer blob
+/// it lists under `reference`, comparing each SHA-256 with the digest
+/// the descriptor records. `mode` comes from [`layers_mode`]; callers
+/// resolve it first so `Off` never opens the store. `Warn` returns one
+/// notice per mismatch; `Enforce` fails on the first batch of
+/// mismatches. A blob that cannot be opened or whose digest is malformed
+/// counts as a mismatch, with the cause in the text: the backend would
+/// fail on it anyway, and a missing file is as much a change as a
+/// rewritten one. A manifest whose own bytes mismatch is reported alone:
+/// the descriptors it lists are not trusted, so they are not followed.
+///
+/// Nothing is removed from the store on failure, unlike `reject_stored`
+/// for a signature verdict: the blob may be the only copy the operator
+/// has, and the operator asked only to be told. No registry is consulted.
+pub fn verify_layers(
+    mode: Mode,
+    store: &OciStore,
+    reference: &str,
+    desc: &Descriptor,
+) -> anyhow::Result<Vec<String>> {
+    if mode == Mode::Off {
+        return Ok(Vec::new());
+    }
+    let mismatched: Vec<(Descriptor, String)> = match blob_mismatch(store, desc) {
+        Some(why) => vec![(desc.clone(), why)],
+        None => {
+            let manifest = store.read_manifest(&desc.digest)?;
+            std::iter::once(&manifest.config)
+                .chain(manifest.layers.iter())
+                .filter_map(|d| blob_mismatch(store, d).map(|why| (d.clone(), why)))
+                .collect()
+        }
+    };
+    if mismatched.is_empty() {
+        return Ok(Vec::new());
+    }
+    if mode == Mode::Enforce {
+        let list: Vec<String> = mismatched
+            .iter()
+            .map(|(d, why)| format!("{} ({}): {why}", d.digest, d.media_type))
+            .collect();
+        bail!(
+            "{reference}: stored layers do not match their recorded digests: {}",
+            list.join(", ")
+        );
+    }
+    Ok(mismatched
+        .iter()
+        .map(|(d, why)| {
+            format!(
+                "warning: {reference}: layer {} ({}) does not match its stored digest: {why}",
+                d.digest, d.media_type
+            )
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -1208,17 +1342,70 @@ mod tests {
     }
 
     #[test]
+    fn layers_mode_parses_merges_and_stays_apart_from_the_signature_policy() {
+        let dir = Path::new("/etc/llmman");
+        let warn = Policy::parse("layers = \"warn\"", dir).unwrap();
+        assert_eq!(warn.layers_mode, Some(Mode::Warn));
+
+        // Later file wins, and an explicit off can override an enforce.
+        let mut merged = Policy::default();
+        for text in ["layers = \"enforce\"", "layers = \"off\""] {
+            merged.merge(Policy::parse(text, dir).unwrap());
+        }
+        assert_eq!(merged.layers_mode, Some(Mode::Off));
+        assert_eq!(merged.layers_mode(), Mode::Off);
+
+        // A file that is silent on `layers` leaves the earlier answer.
+        merged.merge(Policy::parse("default = \"warn\"", dir).unwrap());
+        assert_eq!(merged.layers_mode(), Mode::Off);
+
+        // The environment beats the files.
+        merged.forced_layers_mode =
+            parse_override(Some("enforce"), "LLMMAN_VERIFY_LAYERS").unwrap();
+        assert_eq!(merged.layers_mode(), Mode::Enforce);
+
+        // Enforcing signatures does not switch layer hashing on.
+        let signed = Policy::parse(
+            "default = \"enforce\"\n[[trust]]\npattern = \"docker.io/org/**\"\nkeys = [\"k.pub\"]",
+            dir,
+        )
+        .unwrap();
+        assert_eq!(signed.default_mode, Some(Mode::Enforce));
+        assert_eq!(signed.layers_mode, None);
+        assert_eq!(signed.layers_mode.unwrap_or_default(), Mode::Off);
+
+        let err = Policy::parse("layers = \"bogus\"", dir).unwrap_err();
+        assert!(err.to_string().contains("`layers`"), "{err:#}");
+    }
+
+    #[test]
+    fn an_invalid_llmman_verify_layers_is_an_error_like_llmman_verify() {
+        let err = parse_override(Some("bogus"), "LLMMAN_VERIFY_LAYERS")
+            .expect_err("a typo must not be ignored");
+        assert!(err.to_string().contains("LLMMAN_VERIFY_LAYERS"), "{err:#}");
+        assert_eq!(parse_override(None, "LLMMAN_VERIFY_LAYERS").unwrap(), None);
+        assert_eq!(
+            parse_override(Some("  "), "LLMMAN_VERIFY_LAYERS").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_override(Some("enforce"), "LLMMAN_VERIFY_LAYERS").unwrap(),
+            Some(Mode::Enforce)
+        );
+    }
+
+    #[test]
     fn an_invalid_llmman_verify_is_an_error_not_a_silent_downgrade() {
         // Read inside the daemon, whose stderr nobody watches, so
         // warning and carrying on would turn a typo into a downgrade.
-        let err = parse_mode_override(Some("enfroce"))
+        let err = parse_override(Some("enfroce"), "LLMMAN_VERIFY")
             .expect_err("a typo'd LLMMAN_VERIFY must not be ignored");
         assert!(err.to_string().contains("LLMMAN_VERIFY"), "{err:#}");
 
-        assert_eq!(parse_mode_override(None).unwrap(), None);
-        assert_eq!(parse_mode_override(Some("  ")).unwrap(), None);
+        assert_eq!(parse_override(None, "LLMMAN_VERIFY").unwrap(), None);
+        assert_eq!(parse_override(Some("  "), "LLMMAN_VERIFY").unwrap(), None);
         assert_eq!(
-            parse_mode_override(Some("enforce")).unwrap(),
+            parse_override(Some("enforce"), "LLMMAN_VERIFY").unwrap(),
             Some(Mode::Enforce)
         );
     }
@@ -1336,5 +1523,244 @@ mod tests {
     fn short_digest_abbreviates_like_the_shim_does() {
         assert_eq!(short_digest("sha256:0123456789abcdef0123"), "0123456789ab");
         assert_eq!(short_digest("abc"), "abc");
+    }
+
+    // -----------------------------------------------------------------
+    // Layer digests at load
+    // -----------------------------------------------------------------
+
+    const GGUF_MEDIA_TYPE: &str = "application/vnd.docker.ai.gguf.v3";
+
+    /// A store holding one model: a config blob, one GGUF layer with the
+    /// bytes `GGUFaaaa`, and a tagged manifest. Returns the store, the
+    /// manifest descriptor and the layer descriptor.
+    /// A store in a fresh temp dir, removed when the test ends, as the
+    /// key tests above do with theirs.
+    struct TempStore {
+        store: OciStore,
+        dir: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for TempStore {
+        type Target = OciStore;
+        fn deref(&self) -> &OciStore {
+            &self.store
+        }
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn store_with_gguf_layer(name: &str) -> (TempStore, Descriptor, Descriptor) {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-verify-layers-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = OciStore::open(&dir).unwrap();
+        let config = store
+            .write_blob("application/vnd.cncf.model.config.v1+json", b"{}")
+            .unwrap();
+        let layer = store.write_blob(GGUF_MEDIA_TYPE, b"GGUFaaaa").unwrap();
+        let manifest = crate::storage::oci::Manifest {
+            schema_version: 2,
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            artifact_type: None,
+            config,
+            layers: vec![layer.clone()],
+            annotations: None,
+        };
+        let desc = store.write_manifest(&manifest).unwrap();
+        store.tag(desc.clone(), "example.com/ai/model:q4").unwrap();
+        let desc = store.find("example.com/ai/model:q4").unwrap();
+        (TempStore { store, dir }, desc, layer)
+    }
+
+    #[test]
+    fn an_untouched_store_passes_layer_verification_under_enforce() {
+        let (store, desc, _) = store_with_gguf_layer("clean");
+        let notices = verify_layers(Mode::Enforce, &store, "model:q4", &desc).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+    }
+
+    #[test]
+    fn a_same_size_overwrite_fails_the_load_under_enforce_and_deletes_nothing() {
+        let (store, desc, layer) = store_with_gguf_layer("tamper-enforce");
+        let path = store.blob_path(&layer.digest).unwrap();
+        std::fs::write(&path, b"GGUFbbbb").unwrap();
+
+        let err = verify_layers(Mode::Enforce, &store, "model:q4", &desc).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("model:q4"), "{msg}");
+        assert!(msg.contains(&layer.digest), "{msg}");
+        assert!(msg.contains(GGUF_MEDIA_TYPE), "{msg}");
+        assert!(path.is_file(), "the tampered blob must stay in the store");
+        assert!(
+            store.find("example.com/ai/model:q4").is_ok(),
+            "the reference must stay in the store"
+        );
+    }
+
+    #[test]
+    fn a_same_size_overwrite_is_one_notice_under_warn() {
+        let (store, desc, layer) = store_with_gguf_layer("tamper-warn");
+        let path = store.blob_path(&layer.digest).unwrap();
+        std::fs::write(&path, b"GGUFbbbb").unwrap();
+
+        let notices = verify_layers(Mode::Warn, &store, "model:q4", &desc).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].starts_with("warning: model:q4: layer "),
+            "{notices:?}"
+        );
+        assert!(notices[0].contains(&layer.digest), "{notices:?}");
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn a_missing_layer_blob_is_a_mismatch() {
+        let (store, desc, layer) = store_with_gguf_layer("missing");
+        std::fs::remove_file(store.blob_path(&layer.digest).unwrap()).unwrap();
+
+        let notices = verify_layers(Mode::Warn, &store, "model:q4", &desc).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains(&layer.digest), "{notices:?}");
+        // The I/O cause travels with the notice, not just "mismatch".
+        assert!(notices[0].contains("open "), "{notices:?}");
+        let err = verify_layers(Mode::Enforce, &store, "model:q4", &desc).unwrap_err();
+        assert!(err.to_string().contains(&layer.digest), "{err}");
+        assert!(err.to_string().contains("open "), "{err}");
+    }
+
+    #[test]
+    fn an_overwritten_config_blob_is_a_mismatch() {
+        let (store, desc, layer) = store_with_gguf_layer("config");
+        let config = store.read_manifest(&desc.digest).unwrap().config;
+        std::fs::write(store.blob_path(&config.digest).unwrap(), b"[]").unwrap();
+
+        let notices = verify_layers(Mode::Warn, &store, "model:q4", &desc).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains(&config.digest), "{notices:?}");
+        assert!(!notices[0].contains(&layer.digest), "{notices:?}");
+        let err = verify_layers(Mode::Enforce, &store, "model:q4", &desc).unwrap_err();
+        assert!(err.to_string().contains(&config.digest), "{err}");
+    }
+
+    #[test]
+    fn every_mismatch_is_reported_when_the_config_and_a_layer_both_changed() {
+        let (store, desc, layer) = store_with_gguf_layer("two");
+        let config = store.read_manifest(&desc.digest).unwrap().config;
+        std::fs::write(store.blob_path(&config.digest).unwrap(), b"[]").unwrap();
+        std::fs::write(store.blob_path(&layer.digest).unwrap(), b"GGUFbbbb").unwrap();
+
+        let notices = verify_layers(Mode::Warn, &store, "model:q4", &desc).unwrap();
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(
+            notices.iter().any(|n| n.contains(&config.digest)),
+            "{notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains(&layer.digest)),
+            "{notices:?}"
+        );
+        let err = verify_layers(Mode::Enforce, &store, "model:q4", &desc).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&config.digest), "{msg}");
+        assert!(msg.contains(&layer.digest), "{msg}");
+    }
+
+    #[test]
+    fn a_malformed_layer_digest_in_an_intact_manifest_is_a_mismatch_for_that_layer() {
+        // The manifest itself hashes correctly (it was written through the
+        // store), so its descriptors are followed; the malformed one must
+        // be reported with its cause rather than aborting the check.
+        let (store, desc, layer) = store_with_gguf_layer("malformed-layer");
+        let mut manifest = store.read_manifest(&desc.digest).unwrap();
+        manifest.layers.push(Descriptor {
+            media_type: GGUF_MEDIA_TYPE.into(),
+            digest: "sha256:/dev/zero".into(),
+            size: 0,
+            annotations: None,
+        });
+        let desc = store.write_manifest(&manifest).unwrap();
+
+        let notices = verify_layers(Mode::Warn, &store, "model:q4", &desc).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("invalid digest"), "{notices:?}");
+        assert!(!notices[0].contains(&layer.digest), "{notices:?}");
+        let err = verify_layers(Mode::Enforce, &store, "model:q4", &desc).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid digest"), "{msg}");
+        assert!(!msg.contains(&layer.digest), "{msg}");
+    }
+
+    /// Overwrites the manifest blob in place with a copy whose only layer
+    /// digest is `digest`, leaving the manifest's own descriptor stale.
+    fn rewrite_manifest_layer_digest(store: &OciStore, desc: &Descriptor, digest: &str) {
+        let mut manifest = store.read_manifest(&desc.digest).unwrap();
+        manifest.layers[0].digest = digest.to_string();
+        std::fs::write(
+            store.blob_path(&desc.digest).unwrap(),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_rewritten_manifest_with_an_absolute_layer_digest_stops_at_the_manifest() {
+        let (store, desc, layer) = store_with_gguf_layer("absolute");
+        rewrite_manifest_layer_digest(&store, &desc, "sha256:/dev/zero");
+
+        let notices = verify_layers(Mode::Warn, &store, "model:q4", &desc).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains(&desc.digest), "{notices:?}");
+        assert!(!notices[0].contains(&layer.digest), "{notices:?}");
+        let err = verify_layers(Mode::Enforce, &store, "model:q4", &desc).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&desc.digest), "{msg}");
+        assert!(!msg.contains("/dev/zero"), "{msg}");
+    }
+
+    #[test]
+    fn a_rewritten_manifest_with_a_traversing_layer_digest_stops_at_the_manifest() {
+        let (store, desc, _) = store_with_gguf_layer("traversal");
+        rewrite_manifest_layer_digest(&store, &desc, "sha256:../../../etc/shadow");
+
+        let notices = verify_layers(Mode::Warn, &store, "model:q4", &desc).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains(&desc.digest), "{notices:?}");
+        assert!(!notices[0].contains(".."), "{notices:?}");
+    }
+
+    #[test]
+    fn a_malformed_layer_digest_never_becomes_a_store_path() {
+        let (store, _, _) = store_with_gguf_layer("malformed");
+        for digest in [
+            "sha256:/dev/zero",
+            "sha256:../../../etc/shadow",
+            "sha512:0000000000000000000000000000000000000000000000000000000000000000",
+            "sha256:abc",
+            "sha256:zz00000000000000000000000000000000000000000000000000000000000000",
+            "nocolon",
+        ] {
+            assert!(store.blob_path(digest).is_err(), "{digest}");
+        }
+    }
+
+    #[test]
+    fn off_opens_nothing_and_returns_empty() {
+        let (store, desc, layer) = store_with_gguf_layer("off");
+        std::fs::remove_file(store.blob_path(&layer.digest).unwrap()).unwrap();
+        // The manifest blob goes too: a read of it would surface as Err.
+        std::fs::remove_file(store.blob_path(&desc.digest).unwrap()).unwrap();
+
+        let notices = verify_layers(Mode::Off, &store, "model:q4", &desc).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
     }
 }

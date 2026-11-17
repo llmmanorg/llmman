@@ -979,6 +979,28 @@ fn verify_stored(
     }
 }
 
+/// Re-hashes the stored manifest, config and layer blobs of `reference`
+/// under the `[verify] layers` mode (see `verify::verify_layers`). The
+/// mode is resolved first, so the default `off` opens no store; that
+/// also means every caller, `llmman resolve` of a cached HF model
+/// included, loads the policy here and an unparsable `LLMMAN_VERIFY` or
+/// `LLMMAN_VERIFY_LAYERS` fails there as it does in the daemon.
+/// Blocking: it reads every stored blob of the model, so run it
+/// off the async executor. Unlike `verify_stored`, a mismatch never
+/// removes the reference: the blob may be the operator's only copy.
+pub(crate) fn verify_layers_stored(
+    store_path: &std::path::Path,
+    reference: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mode = crate::verify::layers_mode()?;
+    if mode == crate::verify::Mode::Off {
+        return Ok(Vec::new());
+    }
+    let store = OciStore::open(store_path)?;
+    let desc = store.find(reference)?;
+    crate::verify::verify_layers(mode, &store, reference, &desc)
+}
+
 /// Drops a reference the policy refused, so a later pull cannot find it
 /// present and hand it out unchecked; blobs are left to the GC sweep. A
 /// failed removal is reported alongside the rejection rather than
@@ -2336,6 +2358,26 @@ async fn resolve_target(
             return Ok((key, Target::Local(port), guard));
         }
     }
+    // Layer digests, once per cold load: after every running-process
+    // reuse check above (a tag for content already loaded by digest
+    // must not re-hash the model) and ahead of every format arm below,
+    // so GGUF, safetensors trees, diffusion and Omni all pass through
+    // it. Off by default; an enforce mismatch fails the load with the
+    // reference and digests in the error.
+    {
+        let store_path = state.0.store_path.clone();
+        let model_ref_owned = model_ref.to_owned();
+        let notices = tokio::task::spawn_blocking(move || {
+            verify_layers_stored(&store_path, &model_ref_owned)
+        })
+        .await
+        .context("layer verification task panicked")?
+        .with_context(|| format!("verify layers of {model_ref}"))?;
+        for notice in notices {
+            eprintln!("[llmman] {notice}");
+        }
+    }
+
     let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
         .with_context(|| format!("resolve model {model_ref}"))?;
     let context_shift = supports_context_shift(model_ref);
