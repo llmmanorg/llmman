@@ -90,11 +90,6 @@ impl Encoder {
                 hp.enc_n_heads
             );
         }
-        if be.api.ggml_prec_set_acc.is_none() {
-            bail!(
-                "encoder: this llama.cpp release has no ggml_prec_set_acc; use the pinned release"
-            );
-        }
         check_conv_kernel(hp.enc_conv_kernel)?;
         if !hp.enc_d_model.is_multiple_of(2) {
             bail!(

@@ -313,6 +313,8 @@ pub struct LlamaContextParams {
     pub type_v: u32,
     /// Added mid-struct at b11669.
     pub moe_cache_size: usize,
+    /// Added mid-struct at b12359.
+    pub moe_cache_cpu_share: f32,
     pub abort_callback: *const c_void,
     pub abort_callback_data: *mut c_void,
     pub embeddings: bool,
@@ -418,7 +420,7 @@ api! {
     fn ggml_interpolate(ctx: *mut GgmlContext, a: TensorPtr, ne0: i64, ne1: i64, ne2: i64, ne3: i64, mode: u32) -> TensorPtr;
     fn ggml_timestep_embedding(ctx: *mut GgmlContext, timesteps: TensorPtr, dim: c_int, max_period: c_int) -> TensorPtr;
     fn ggml_flash_attn_ext(ctx: *mut GgmlContext, q: TensorPtr, k: TensorPtr, v: TensorPtr, mask: TensorPtr, scale: f32, max_bias: f32, logit_softcap: f32) -> TensorPtr;
-    fn ggml_flash_attn_ext_set_prec(a: TensorPtr, prec: c_int);
+    fn ggml_prec_set_acc(a: TensorPtr, prec: c_int) -> bool;
     fn ggml_soft_max_ext(ctx: *mut GgmlContext, a: TensorPtr, mask: TensorPtr, scale: f32, max_bias: f32) -> TensorPtr;
     // backend
     fn ggml_backend_load_all_from_path(dir: *const c_char);
@@ -486,8 +488,6 @@ api! {
     // library identity, ggml >= 2025-07-02
     fn ggml_version() -> *const c_char;
     fn ggml_commit() -> *const c_char;
-    // F32 accumulation hint for mul_mat / flash attention, only the speech encoder needs it
-    fn ggml_prec_set_acc(a: TensorPtr, prec: c_int) -> bool;
     // row writes into a KV cache, only the speech decoder needs it
     fn ggml_set_rows(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr, c: TensorPtr) -> TensorPtr;
 }

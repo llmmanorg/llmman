@@ -474,13 +474,9 @@ impl<'o> Graph<'o> {
     }
 
     /// Asks for F32 accumulation in the matmul (or flash attention) `t`
-    /// and returns it; ggml ignores the hint on any other op. A release
-    /// without `ggml_prec_set_acc` leaves `t` as it is: the speech encoder
-    /// checks for the symbol before it builds a graph.
+    /// and returns it; ggml ignores the hint on any other op.
     pub fn prec_f32(&'o self, t: Tensor<'o>) -> Tensor<'o> {
-        if let Some(set_acc) = self.ctx.api.ggml_prec_set_acc {
-            unsafe { set_acc(t.as_ptr(), ffi::GGML_PREC_F32) };
-        }
+        unsafe { (self.ctx.api.ggml_prec_set_acc)(t.as_ptr(), ffi::GGML_PREC_F32) };
         t
     }
 
