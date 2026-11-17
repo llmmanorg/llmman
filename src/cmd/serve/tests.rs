@@ -5257,6 +5257,7 @@ async fn generation_routes_accept_large_bodies_and_keep_the_32_mib_cap() {
             "/v1/completions",
             "/v1/messages",
             "/v1/responses",
+            "/v1/responses/input_tokens",
             "/api/chat",
             "/api/generate",
             "/gemini/m/v1beta/models/m:generateContent",
