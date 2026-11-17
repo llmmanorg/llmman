@@ -20,6 +20,18 @@
 //! diagnostic output (pull progress, extraction notes) goes to stderr,
 //! same as every other `llmman` subcommand, so stdout stays parseable.
 //!
+//! With `--dir`, the output is the whole model directory (every layer, docs
+//! included), as the Kubernetes CSI driver (`docs/kubernetes.md`) needs:
+//! ```json
+//! {"reference":"ghcr.io/org/model:tag","dir":"/abs/cache/<manifest hex>","digest":"sha256:...","format":"safetensors"}
+//! ```
+//! `format` is what [`crate::modelpack::resolve_model`] would serve it as, or
+//! `"unknown"`.
+//!
+//! The pull obeys the `[verify]` policy as `llmman pull` does (see
+//! `cmd::serve::pull_checked`). Concurrent `resolve`s take turns pulling, as
+//! two writing one `.part` file would corrupt it.
+//!
 //! On failure, nothing is printed to stdout, an error is printed to
 //! stderr, and the process exits non-zero — the same convention `main`
 //! already applies to every other subcommand's `Err`.
@@ -30,7 +42,7 @@ use anyhow::Context;
 use clap::Args;
 use serde::Serialize;
 
-use crate::modelpack::resolve_model;
+use crate::modelpack::{resolve_model, ModelFormat};
 use crate::storage::OciStore;
 
 #[derive(Args, Debug)]
@@ -48,6 +60,10 @@ pub struct ResolveArgs {
     /// store
     #[arg(long)]
     pub no_pull: bool,
+
+    /// Print the whole model directory (every layer) instead of the servable path
+    #[arg(long)]
+    pub dir: bool,
 }
 
 #[derive(Serialize)]
@@ -61,6 +77,14 @@ struct ResolveOutput<'a> {
     /// absent for `format: "safetensors"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     mmproj: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TreeOutput<'a> {
+    reference: &'a str,
+    dir: String,
+    digest: String,
+    format: &'static str,
 }
 
 pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
@@ -77,35 +101,44 @@ pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&cache_path)
         .with_context(|| format!("creating cache dir {}", cache_path.display()))?;
 
-    let already_present = OciStore::open(&store_path)
+    let pull_lock = if OciStore::open(&store_path)
         .and_then(|s| s.find(&reference))
-        .is_ok();
-    if !already_present {
+        .is_ok()
+    {
+        None
+    } else {
         if args.no_pull {
             anyhow::bail!(
                 "{reference} not found in local store ({}) and --no-pull was set",
                 store_path.display()
             );
         }
-        let layout_dir = store_path
-            .to_str()
-            .context("store path is not valid UTF-8")?;
-        tokio::runtime::Runtime::new()
-            .context("start tokio runtime")?
-            .block_on(async {
-                match crate::hf::classify(&reference).await {
-                    crate::hf::ClassifiedRef::Hf(hf_ref) => {
-                        crate::hf::pull::pull(&hf_ref, &store_path, &reference).await
-                    }
-                    crate::hf::ClassifiedRef::Source(src_ref) => {
-                        crate::sources::pull(&src_ref, &store_path, &reference).await
-                    }
-                    crate::hf::ClassifiedRef::Other(normalized) => {
-                        crate::ffi::pull(&normalized, layout_dir)
-                    }
-                }
-            })
-            .with_context(|| format!("pulling {reference}"))?;
+        // A waiter finds the model stored by then, and only verifies it.
+        Some(crate::managed::InstallLock::acquire_noting(
+            &store_path,
+            "another llmman process is pulling into this store; waiting for it to finish",
+        )?)
+    };
+    let notices = tokio::runtime::Runtime::new()
+        .context("start tokio runtime")?
+        .block_on(crate::cmd::serve::pull_checked(&store_path, &reference))
+        .with_context(|| format!("pulling {reference}"))?;
+    drop(pull_lock);
+    for notice in notices {
+        eprintln!("[llmman] {notice}");
+    }
+
+    if args.dir {
+        let tree = crate::modelpack::resolve_model_tree(&store_path, &cache_path, &reference)
+            .with_context(|| format!("resolving {reference}"))?;
+        let out = TreeOutput {
+            reference: &reference,
+            dir: tree.root.to_string_lossy().into_owned(),
+            digest: tree.digest,
+            format: tree.format.map_or("unknown", ModelFormat::as_str),
+        };
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
     }
 
     let resolved = resolve_model(&store_path, &cache_path, &reference)

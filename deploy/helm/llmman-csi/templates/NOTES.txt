@@ -1,0 +1,18 @@
+llmman-csi is installed as the CSI driver {{ .Values.driverName }}.
+
+A pod mounts a ModelPack artifact, read-only, with an inline volume:
+
+  volumes:
+    - name: model
+      csi:
+        driver: {{ .Values.driverName }}
+        volumeAttributes:
+          {{ .Values.driverName }}/reference: registry.example.com/models/qwen3-0.6b:latest
+
+Every node keeps the models it pulled in {{ .Values.storage.hostPath }}; nothing
+removes them. Private registries: set registryAuth (see values.yaml).
+
+Check the driver on a node:
+
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -o wide
+  kubectl get csinodes -o custom-columns=NODE:.metadata.name,DRIVERS:.spec.drivers[*].name

@@ -284,6 +284,14 @@ jobs:
           docker run --rm llmman-check --version
           rm packaging/llmman-amd64
 
+          # The CSI driver's image (csi/Dockerfile): the same binary, on the
+          # same base, so a glibc mismatch fails here too.
+          cp dist-docker/llmman csi/llmman-amd64
+          docker build csi -t llmman-csi-check --build-arg "VERSION=$(packaging/version.sh)"
+          docker run --rm --entrypoint llmman llmman-csi-check --version
+          docker run --rm llmman-csi-check --version
+          rm csi/llmman-amd64
+
       # ── Diagnostics: inspect the Go shim library on Windows ARM64 ───────────
       - name: Inspect shim library (Windows aarch64)
         if: always() && matrix.target == 'aarch64-pc-windows-msvc'
@@ -700,7 +708,7 @@ jobs:
           # The web UI's script names carry a content hash.
           grep -qE '^webui/_expo/static/js/web/entry-[0-9a-f]+\.js$' "$files" ||
             { echo "::error::the web UI's entry script is missing from the .crate"; exit 1; }
-          for never in '^packaging/' '^vllm-plugin/' '^app/' '^docs/' '^\.github/' '^fuzz/' '^go-shim/go-shim$'; do
+          for never in '^packaging/' '^vllm-plugin/' '^app/' '^docs/' '^\.github/' '^fuzz/' '^csi/' '^deploy/' '^go-shim/go-shim$'; do
             if grep -q "$never" "$files"; then
               echo "::error::.crate contains files matching $never:"; grep "$never" "$files"; exit 1
             fi
@@ -764,6 +772,98 @@ jobs:
       - name: go test (podman backend)
         working-directory: go-shim
         run: go test -tags "$PODMAN_TAGS" ./...
+
+  # --------------------------------------------------------------------------
+  # Kubernetes CSI driver (csi/, docs/kubernetes.md): its own Go module, not
+  # linked into the Rust binary, so it is checked here and not by the build
+  # jobs. The Helm chart (deploy/helm/llmman-csi) is rendered with the value
+  # sets that switch its optional parts on.
+  # --------------------------------------------------------------------------
+  csi:
+    name: Lint + test (csi, Helm chart)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Same pin as lint-packaging's.
+      GOLANGCI_LINT_VERSION: v2.15.0
+    steps:
+      # persist-credentials: false because `go test` runs the PR's own code.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: csi/go.mod
+          cache-dependency-path: csi/go.sum
+
+      - name: gofmt --check
+        working-directory: csi
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would reformat these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: golangci-lint (production code)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          working-directory: csi
+          args: --tests=false --timeout=10m
+
+      - name: golangci-lint (including tests)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          working-directory: csi
+          args: --timeout=10m
+
+      - name: go test
+        working-directory: csi
+        run: go test -race ./...
+
+      # The mount tests need CAP_SYS_ADMIN and skip without it, so the run
+      # above only exercises the rest. As root they make real read-only
+      # overlay mounts, and check that a read-write bind of one cannot write.
+      - name: go test (as root, real mounts)
+        working-directory: csi
+        run: |
+          set -euo pipefail
+          sudo env "PATH=$PATH" "GOCACHE=$RUNNER_TEMP/go-build-root" "GOMODCACHE=$(go env GOMODCACHE)" \
+            go test -count=1 -v -run 'SystemMounter|Remounts' ./internal/driver | tee "$RUNNER_TEMP/mount-tests.txt"
+          # a skipped mount test would pass without testing anything
+          ! grep -q -- '--- SKIP' "$RUNNER_TEMP/mount-tests.txt"
+
+      - name: helm lint and template
+        run: |
+          set -euo pipefail
+          chart=deploy/helm/llmman-csi
+          helm lint "$chart"
+          helm template t "$chart" --namespace n > /dev/null
+          cat > "$RUNNER_TEMP/values.yaml" <<'EOF'
+          driverName: llmman.csi.llmman.org
+          kubeletDir: /var/lib/rancher/k3s/agent/kubelet
+          hostNetwork: true
+          registryAuth:
+            dockerConfigJson: '{"auths": {"registry.example.com": {"auth": "dTpw"}}}'
+          llmman:
+            config: |
+              [verify]
+              default = "off"
+            keys:
+              models.pub: |
+                -----BEGIN PUBLIC KEY-----
+                -----END PUBLIC KEY-----
+          env:
+            - name: HF_TOKEN
+              value: x
+          EOF
+          helm lint "$chart" -f "$RUNNER_TEMP/values.yaml"
+          helm template t "$chart" --namespace n -f "$RUNNER_TEMP/values.yaml" > /dev/null
 
   # --------------------------------------------------------------------------
   # Web UI: webui/ is the committed web export of app/ (docs/webui.md), so
@@ -2100,7 +2200,7 @@ jobs:
     name: Release
     # Everything must be green first. e2e only runs on the same push event
     # this job fires on, so this never waits on a run that will not happen.
-    needs: [tag, build, build-windows-arm, android, lint-packaging, lint-rust, webui, e2e]
+    needs: [tag, build, build-windows-arm, android, lint-packaging, lint-rust, csi, webui, e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -2367,6 +2467,64 @@ jobs:
           tags=(-t "$image:$TAG")
           if [ "$TAG" = server ]; then tags+=(-t "$image:latest"); fi
           docker buildx imagetools create "${tags[@]}" "$image:$TAG-$VERSION"
+
+  # The CSI driver's image (csi/Dockerfile): the release's llmman binaries and
+  # the driver in one image, docker.io/ai/llmman-csi, tagged like the others.
+  publish-csi-image:
+    name: Publish llmman-csi image
+    needs: [release]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # one publisher at a time, so an older run cannot move `latest` back
+    concurrency:
+      group: publish-csi-image
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: llmman-docker-*-unknown-linux-gnu*
+
+      - name: Lay out the build context
+        run: |
+          set -euo pipefail
+          for pair in x86_64:amd64 aarch64:arm64; do
+            src=(dist/llmman-docker-"${pair%%:*}"-unknown-linux-gnu*/llmman)
+            install -m 755 "${src[0]}" "csi/llmman-${pair##*:}"
+          done
+
+      - name: Log in to Docker Hub
+        env:
+          DOCKER_HUB_USER: ${{ vars.DOCKER_HUB_USER }}
+          DOCKER_HUB_PAT: ${{ secrets.DOCKER_HUB_PAT }}
+        run: printf '%s' "$DOCKER_HUB_PAT" | docker login docker.io --username "$DOCKER_HUB_USER" --password-stdin
+
+      # The versioned tag first, then the floating one unless a newer release
+      # exists, as publish-images does.
+      - name: Build and push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          image=docker.io/ai/llmman-csi
+          docker buildx create --use
+          docker buildx build csi --push --provenance=false --sbom=false \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "VERSION=$VERSION" \
+            --build-arg "REVISION=$GITHUB_SHA" \
+            -t "$image:$VERSION"
+          newest="$(gh release list --limit 10 --json tagName -q '.[].tagName' | grep '^v' | sort -V | tail -1)"
+          if [ "$newest" != "v$VERSION" ]; then
+            echo "::notice::$newest is newer; leaving the floating tag to it"
+            exit 0
+          fi
+          docker buildx imagetools create -t "$image:latest" "$image:$VERSION"
 
   # --------------------------------------------------------------------------
   # crates.io: the `llmman` crate at the same version, on every commit to

@@ -1,0 +1,28 @@
+# llama.cpp's llama-server serving a GGUF artifact. The volume holds every
+# file of the artifact at the path it was packaged with, so -m names the
+# GGUF file in it (and --mmproj the projector of a multimodal model).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llama-cpp
+spec:
+  containers:
+    - name: llama-server
+      image: ghcr.io/ggml-org/llama.cpp:server
+      args:
+        - -m
+        - /model/qwen3-0.6b-q8_0.gguf
+        - --host=0.0.0.0
+        - --port=8080
+      ports:
+        - containerPort: 8080
+      volumeMounts:
+        - name: model
+          mountPath: /model
+          readOnly: true
+  volumes:
+    - name: model
+      csi:
+        driver: model.csi.modelpack.org
+        volumeAttributes:
+          model.csi.modelpack.org/reference: "registry.example.com/models/qwen3-0.6b-gguf:q8_0"

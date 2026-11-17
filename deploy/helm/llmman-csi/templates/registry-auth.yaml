@@ -1,0 +1,12 @@
+{{- if and .Values.registryAuth.dockerConfigJson (not .Values.registryAuth.existingSecret) }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "llmman-csi.registrySecret" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "llmman-csi.labels" . | nindent 4 }}
+type: kubernetes.io/dockerconfigjson
+stringData:
+  .dockerconfigjson: {{ .Values.registryAuth.dockerConfigJson | quote }}
+{{- end }}
