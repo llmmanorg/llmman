@@ -58,22 +58,22 @@ import (
 // 401 on push).
 func dockerCredentials(host string) (string, string, error) {
 	cfg := dockercliconfig.LoadDefaultConfigFile(io.Discard)
-	for _, lookup := range dockerHubCredentialKeys(host) {
+	lookups := dockerHubCredentialKeys(host)
+	hub := len(lookups) > 1 // only Hub lookups can resolve to an OAuth entry
+	for _, lookup := range lookups {
 		store := cfg.GetCredentialsStore(lookup)
 		creds, err := getCredentialsWithTimeout(store, lookup)
 		if err != nil {
 			continue // not found under this key — try the next one
 		}
-		if creds.Username == "" && creds.Password == "" && creds.IdentityToken == "" {
+		user, secret := credentialPair(creds)
+		if user == "" && secret == "" {
 			continue
 		}
-		if isDockerOAuthTokenKey(creds.ServerAddress) {
+		if hub && isDockerOAuthSecret(store, secret) {
 			continue
 		}
-		if creds.IdentityToken != "" {
-			return "", creds.IdentityToken, nil
-		}
-		return creds.Username, creds.Password, nil
+		return user, secret, nil
 	}
 	return "", "", nil // not an error — just not found under any key
 }
@@ -216,14 +216,32 @@ func dockerHubCredentialKeys(host string) []string {
 // credentials under.
 const dockerIndexServer = "https://index.docker.io/v1/"
 
-// isDockerOAuthTokenKey reports whether key is one of the entries
-// `docker login`'s web-based flow keeps beside the Hub PAT it stores under
-// dockerIndexServer: the OAuth access token (a JWT that expires) and the
-// refresh token. Neither is a registry credential — auth.docker.io answers
-// 401 to both — yet docker/cli's file store resolves "index.docker.io" to
-// whichever of the three map iteration reaches first.
-func isDockerOAuthTokenKey(key string) bool {
-	return key == dockerIndexServer+"access-token" || key == dockerIndexServer+"refresh-token"
+// credentialPair returns the username and secret to authenticate with: an
+// identity token takes the place of the password.
+func credentialPair(creds clitypes.AuthConfig) (user, secret string) {
+	if creds.IdentityToken != "" {
+		return "", creds.IdentityToken
+	}
+	return creds.Username, creds.Password
+}
+
+// isDockerOAuthSecret reports whether secret is the OAuth access or refresh
+// token Docker Desktop's sign-in stores beside the Hub PAT. Hub rejects both
+// as registry credentials, yet the fuzzy "index.docker.io" lookup can resolve
+// to either. Native helpers echo the lookup name as ServerAddress rather than
+// the matched entry's key, so the entry is only recognisable by its secret.
+// store must be the one that returned the candidate.
+func isDockerOAuthSecret(store credentials.Store, secret string) bool {
+	if secret == "" {
+		return false
+	}
+	for _, key := range []string{dockerIndexServer + "access-token", dockerIndexServer + "refresh-token"} {
+		creds, err := getCredentialsWithTimeout(store, key)
+		if _, s := credentialPair(creds); err == nil && s == secret {
+			return true
+		}
+	}
+	return false
 }
 
 func newResolver(ctx context.Context) remotes.Resolver {
