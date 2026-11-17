@@ -4,8 +4,10 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -19,8 +21,8 @@ import (
 //
 // A t.TempDir() keeps each test off the developer's real
 // ~/.docker/config.json. No credsStore/credHelpers are configured in
-// that fresh directory, so docker/cli falls back to its plain-file store
-// and the "auths" map is inspectable on disk.
+// that directory, so docker/cli uses its plain-file store and the
+// "auths" map is inspectable on disk.
 
 // isolatedDockerConfigDir points docker/cli at a throwaway config dir
 // for the duration of one test. SetDir rather than t.Setenv("DOCKER_CONFIG"):
@@ -30,6 +32,13 @@ import (
 func isolatedDockerConfigDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
+	// With no auth in config.json docker/cli substitutes the platform's
+	// credential store, i.e. the developer's real keychain. Any auth entry
+	// keeps it on the plain-file store.
+	seed := []byte(`{"auths":{"seed.invalid":{}}}`)
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), seed, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	prev := dockercliconfig.Dir()
 	dockercliconfig.SetDir(dir)
 	t.Cleanup(func() { dockercliconfig.SetDir(prev) })
@@ -177,6 +186,50 @@ func TestDockerHubCredentialsSkipOAuthTokens(t *testing.T) {
 	for range 50 {
 		if user, pass, err := dockerCredentials("registry-1.docker.io"); err != nil || user != "" || pass != "" {
 			t.Fatalf("dockerCredentials(registry-1.docker.io) with only OAuth tokens stored = (%q, %q, %v), want empty", user, pass, err)
+		}
+	}
+}
+
+// TestDockerHubCredentialsSkipOAuthTokensFromNativeHelper: like
+// docker-credential-osxkeychain, the fake helper matches "index.docker.io" to
+// an OAuth entry by host and echoes the lookup name back as ServerURL, so only
+// the secret identifies it.
+func TestDockerHubCredentialsSkipOAuthTokensFromNativeHelper(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake credential helper is a shell script")
+	}
+	bin := t.TempDir()
+	helper := `#!/bin/sh
+[ "$1" = get ] || exit 1
+read -r server
+case "$server" in
+  index.docker.io|https://index.docker.io/v1/access-token) secret=expired.jwt.token ;;
+  https://index.docker.io/v1/refresh-token) secret=refresh..client ;;
+  *) echo "credentials not found in native keychain"; exit 1 ;;
+esac
+printf '{"ServerURL":"%s","Username":"hubuser","Secret":"%s"}' "$server" "$secret"
+`
+	if err := os.WriteFile(filepath.Join(bin, "docker-credential-fake"), []byte(helper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// credHelpers puts only "index.docker.io" on the helper, so the OAuth keys
+	// must be looked up in the store that returned the candidate.
+	for _, config := range []string{`{"credsStore":"fake"}`, `{"credHelpers":{"index.docker.io":"fake"}}`} {
+		dir := isolatedDockerConfigDir(t)
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(config), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// Positive control: the helper must actually return the token.
+		got, err := dockercliconfig.LoadDefaultConfigFile(io.Discard).GetCredentialsStore("index.docker.io").Get("index.docker.io")
+		if err != nil || got.Password != "expired.jwt.token" {
+			t.Fatalf("%s: helper lookup = (%q, %v), want the access token", config, got.Password, err)
+		}
+		for _, host := range []string{"registry-1.docker.io", "index.docker.io", "docker.io"} {
+			if user, pass, err := dockerCredentials(host); err != nil || user != "" || pass != "" {
+				t.Fatalf("%s: dockerCredentials(%q) with only OAuth tokens stored = (%q, %q, %v), want empty", config, host, user, pass, err)
+			}
 		}
 	}
 }
