@@ -87,7 +87,7 @@ use openai::{
     handle_openai_chat, handle_openai_completions, handle_openai_embeddings, handle_openai_images,
     handle_openai_models, handle_openai_speech, handle_openai_systemone,
     handle_openai_transcriptions, handle_openai_video_get, handle_openai_videos, handle_tts,
-    local_engine, SYSTEMONE_BODY_LIMIT_BYTES, TRANSCRIPTION_BODY_LIMIT_BYTES,
+    local_engine, TRANSCRIPTION_BODY_LIMIT_BYTES,
 };
 use relay::proxy;
 pub use runtime::Runtime;
@@ -4534,6 +4534,9 @@ async fn spawn_mediagen_backend(
     Ok((child, tail))
 }
 
+/// Allows base64 images and long prompts while keeping request memory bounded.
+const GENERATION_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
 /// The daemon's routes and the layers over them, split out of
 /// [`serve_async`] so `the_scrape_endpoint_is_outside_the_cors_layer` can
 /// assert against the real router instead of a copy of this layering.
@@ -4562,12 +4565,10 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .merge(ollama_router())
         // OpenAI API
         .route("/v1/models", get(handle_openai_models))
-        .route("/v1/chat/completions", post(handle_openai_chat))
-        .route("/v1/completions", post(handle_openai_completions))
         .route("/v1/embeddings", post(handle_openai_embeddings))
         .route(
             "/v1/systemone",
-            post(handle_openai_systemone).layer(DefaultBodyLimit::max(SYSTEMONE_BODY_LIMIT_BYTES)),
+            post(handle_openai_systemone).layer(DefaultBodyLimit::max(GENERATION_BODY_LIMIT_BYTES)),
         )
         .route(
             "/v1/audio/transcriptions",
@@ -4577,7 +4578,6 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
             "/audio/transcriptions",
             upload_route(handle_openai_transcriptions),
         )
-        .route("/v1/responses", post(responses::handle_openai_responses))
         .route(
             "/v1/responses/input_tokens",
             post(responses::handle_openai_responses_input_tokens),
@@ -4592,13 +4592,7 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         // reference clip, raw PCM, streaming (a clip arrives as multipart)
         .route("/tts", upload_route(handle_tts))
         // Live transcription and spoken conversation, over a WebSocket
-        .route(realtime::REALTIME_ROUTE, get(realtime::handle_realtime))
-        // Native Gemini compatibility. The public route accepts a model in
-        // Gemini's normal API path; the AGY route pins AGY's auxiliary calls
-        // to the model chosen by `llmman launch agy`.
-        .route("/gemini/:model/*gemini_path", post(handle_pinned_gemini))
-        // Anthropic API
-        .route("/v1/messages", post(anthropic::handle_anthropic_messages));
+        .route(realtime::REALTIME_ROUTE, get(realtime::handle_realtime));
 
     // Applied only when the operator asked for metrics. Nothing can read
     // the store while the endpoint is absent — enabling it needs a
@@ -4615,15 +4609,35 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
     // Innermost, so `track_metrics` times its body read as the handler's
     // and CORS answers preflights before it.
     // `record_usage` inside `record_prompt`, to read the prompt's id.
-    let app = app
-        .layer(middleware::from_fn_with_state(
-            app_state.clone(),
-            usage::record_usage,
-        ))
-        .layer(middleware::from_fn_with_state(
-            app_state.clone(),
-            record_prompt,
-        ));
+    let log_requests = |router: Router<AppState>| {
+        router
+            .layer(middleware::from_fn_with_state(
+                app_state.clone(),
+                usage::record_usage,
+            ))
+            .layer(middleware::from_fn_with_state(
+                app_state.clone(),
+                record_prompt,
+            ))
+    };
+    let generation = Router::new()
+        .route("/v1/chat/completions", post(handle_openai_chat))
+        .route("/v1/completions", post(handle_openai_completions))
+        .route("/v1/messages", post(anthropic::handle_anthropic_messages))
+        .route("/v1/responses", post(responses::handle_openai_responses))
+        // Native Gemini compatibility. The public route accepts a model in
+        // Gemini's normal API path; the AGY route pins AGY's auxiliary calls
+        // to the model chosen by `llmman launch agy`.
+        .route("/gemini/:model/*gemini_path", post(handle_pinned_gemini))
+        .merge(
+            Router::new()
+                .route("/api/chat", post(handle_ollama_chat))
+                .route("/api/generate", post(handle_ollama_generate))
+                .layer(middleware::from_fn(accept_any_content_type)),
+        );
+    // Outside logging: record_prompt reads the body before the handler.
+    let app = log_requests(app)
+        .merge(log_requests(generation).layer(DefaultBodyLimit::max(GENERATION_BODY_LIMIT_BYTES)));
 
     let app = if metrics_enabled {
         app.layer(middleware::from_fn(track_metrics))
@@ -4660,8 +4674,6 @@ fn ollama_router() -> Router<AppState> {
                 .post(handle_blob_upload)
                 .layer(DefaultBodyLimit::disable()),
         )
-        .route("/api/chat", post(handle_ollama_chat))
-        .route("/api/generate", post(handle_ollama_generate))
         .route("/api/embed", post(handle_embed))
         .route("/api/embeddings", post(handle_embeddings))
         .layer(middleware::from_fn(accept_any_content_type))

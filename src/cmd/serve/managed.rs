@@ -18,14 +18,13 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{auth, AppError};
+use super::{auth, AppError, GENERATION_BODY_LIMIT_BYTES};
 
 const CONNECTION_KEY: &str = "x-api-key";
 const UPSTREAM_IP: &str = "x-llmman-upstream-ip";
 const CAPABILITY: &str = "codex-oauth-forwarding-v2";
 const CLAUDE_CAPABILITY: &str = "claude-oauth-forwarding-v2";
 const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
-const BODY_LIMIT: usize = 32 * 1024 * 1024;
 const ERROR_LIMIT: usize = 1024 * 1024;
 /// Upstream transports kept warm, one per (profile, pinned IP). The
 /// supervisor pins a handful of resolved addresses, so this is a leak
@@ -155,7 +154,7 @@ fn router(state: ManagedState) -> Router {
         .route("/api/codex/responses/compact", post(compact))
         .route("/api/anthropic/messages", post(messages))
         .route("/api/anthropic/messages/count_tokens", post(count_tokens))
-        .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(DefaultBodyLimit::max(GENERATION_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_connection,
