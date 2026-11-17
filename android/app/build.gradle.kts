@@ -20,8 +20,11 @@ fun versionCodeOf(version: String): Int {
     return major * 100_000_000 + minor * 1_000_000 + patch
 }
 
-// llama.cpp is pinned by the same file the daemon's `--runtime bin` uses.
-val llamaCppRelease: String = repoRoot.resolve("LLAMA_CPP_RELEASE").readText().trim()
+// llama.cpp is pinned by the same file the daemon's `--runtime bin` uses (an
+// image tag; packaging/llama-build.sh gives the b<N> release behind it).
+val llamaCppRelease: String = providers
+    .exec { commandLine("bash", repoRoot.resolve("packaging/llama-build.sh").path) }
+    .standardOutput.asText.get().trim()
 val llamaCppTarballName = "llama-$llamaCppRelease-bin-android-arm64.tar.gz"
 val llamaCppTarball: Provider<RegularFile> =
     layout.buildDirectory.file("llama.cpp/$llamaCppTarballName")

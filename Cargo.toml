@@ -56,6 +56,11 @@ dirs       = "5"
 tar        = "0.4"
 # `ws` for the web UI's terminal (`/llmman/shell`, src/cmd/serve/shell.rs).
 axum       = { version = "0.7", features = ["ws"] }
+# The client half of `/v1/realtime` (src/cmd/serve/realtime.rs), at the version
+# axum's `ws` feature pins. `rustls-tls-native-roots` only enables `wss://`; the
+# roots are `webpki-roots` (as reqwest's) plus `LLMMAN_TLS_CA`, as a connector.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+webpki-roots = "1"
 # TLS termination for `llmman serve` (LLMMAN_TLS_CERT/LLMMAN_TLS_KEY).
 # `no-provider`: rustls's ring and aws-lc-rs providers are both already
 # in the tree (reqwest's and the AWS SDK's); serve installs ring itself
@@ -126,9 +131,6 @@ fuzzing = []
 
 [dev-dependencies]
 tempfile = "3"
-# A WebSocket client for the `/llmman/shell` tests; the same crate axum's
-# `ws` feature already builds, at the version it pins.
-tokio-tungstenite = "0.24"
 # Shared-listener and pinned-upstream TLS tests generate short-lived identities
 # instead of storing a private key in the repository.
 rcgen = "0.14"

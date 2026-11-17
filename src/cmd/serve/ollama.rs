@@ -126,6 +126,11 @@ pub(super) struct ModelFacts {
     capabilities: Vec<String>,
     /// The GGUF's `general.architecture`, if it has one.
     architecture: Option<String>,
+    /// What the projector takes in and gives out; `None` without a readable one.
+    projector: Option<crate::gguf::ProjectorCaps>,
+    /// A projector that generates audio on a model without one is text to
+    /// speech only.
+    has_chat_template: bool,
 }
 
 impl ModelFacts {
@@ -179,9 +184,10 @@ impl ModelFacts {
         Some(window.min(trained))
     }
 
-    /// `architecture.input_modalities` as llama-server reports it: `text`,
-    /// plus `image` with vision. `None` for a model that does not generate
-    /// text (embedding, media, decision).
+    /// `architecture.input_modalities` as llama-server reports it before a
+    /// load: `text`, plus `image` with vision and `audio` with an audio
+    /// encoder (video is left to a loaded model). `None` for a model that does
+    /// not generate text (embedding, media, decision).
     pub(super) fn input_modalities(&self) -> Option<Vec<&'static str>> {
         let has = |c: &str| self.capabilities.iter().any(|have| have == c);
         has(crate::modelpack::CAPABILITY_COMPLETION).then(|| {
@@ -189,8 +195,26 @@ impl ModelFacts {
             if has(crate::modelpack::CAPABILITY_VISION) {
                 modalities.push("image");
             }
+            if self.projector.is_some_and(|p| p.audio) {
+                modalities.push("audio");
+            }
             modalities
         })
+    }
+
+    /// `architecture.output_modalities`: `text`, plus `audio` when the projector
+    /// generates speech; `audio` alone for text to speech without a chat
+    /// template.
+    pub(super) fn output_modalities(&self) -> Vec<&'static str> {
+        let gen_audio = self.projector.is_some_and(|p| p.gen_audio);
+        let mut modalities = Vec::new();
+        if !gen_audio || self.has_chat_template {
+            modalities.push("text");
+        }
+        if gen_audio {
+            modalities.push("audio");
+        }
+        modalities
     }
 }
 
@@ -221,12 +245,16 @@ pub(super) fn listed_model_facts(
                 return Arc::default();
             };
             let gguf = crate::modelpack::gguf_info(store_path, cache_path, &manifest);
+            let projector = crate::modelpack::projector_info(store_path, cache_path, &manifest);
             let facts = Arc::new(ModelFacts {
                 format: served_format(store, &manifest),
                 header: HeaderDetails::read(gguf.as_ref(), &manifest),
                 context_length: gguf.as_ref().and_then(crate::gguf::Info::context_length),
                 capabilities: crate::modelpack::model_capabilities(
-                    crate::modelpack::capabilities(store, &manifest),
+                    crate::modelpack::with_projector_caps(
+                        crate::modelpack::capabilities(store, &manifest),
+                        projector.as_ref(),
+                    ),
                     gguf.as_ref(),
                     None,
                 ),
@@ -234,8 +262,15 @@ pub(super) fn listed_model_facts(
                     .as_ref()
                     .and_then(|info| info.architecture())
                     .map(str::to_string),
+                projector: projector.as_ref().map(crate::gguf::Info::projector_caps),
+                has_chat_template: gguf
+                    .as_ref()
+                    .is_some_and(|info| info.str("tokenizer.chat_template").is_some()),
             });
-            if gguf.is_some() {
+            // Not cached while a tar-layer projector is unextracted.
+            let projector_pending =
+                projector.is_none() && crate::modelpack::has_projector_layer(&manifest);
+            if gguf.is_some() && !projector_pending {
                 MODEL_FACTS
                     .lock()
                     .unwrap()
@@ -463,18 +498,22 @@ pub(super) async fn handle_show(
     let capabilities = crate::modelpack::capabilities(&store, &manifest);
     // Off the worker: parsing a GGUF header is 30-50ms of blocking reads
     // on this host's models, and every /api/show pays it.
-    let gguf = {
+    let (gguf, projector) = {
         let (store_path, cache_path, manifest) = (
             state.0.store_path.clone(),
             state.0.cache_path.clone(),
             manifest.clone(),
         );
         tokio::task::spawn_blocking(move || {
-            crate::modelpack::gguf_info(&store_path, &cache_path, &manifest)
+            (
+                crate::modelpack::gguf_info(&store_path, &cache_path, &manifest),
+                crate::modelpack::projector_info(&store_path, &cache_path, &manifest),
+            )
         })
         .await
         .map_err(|e| AppError::from(anyhow::anyhow!("reading GGUF metadata: {e}")))?
     };
+    let capabilities = crate::modelpack::with_projector_caps(capabilities, projector.as_ref());
     // Read from the header already in hand rather than reading it twice;
     // a checkout-layout model has no header and takes the longer route.
     let template = match &gguf {
@@ -2022,6 +2061,53 @@ mod tests {
             capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
             ..ModelFacts::default()
         }
+    }
+
+    fn speaking(projector: crate::gguf::ProjectorCaps, has_chat_template: bool) -> ModelFacts {
+        ModelFacts {
+            projector: Some(projector),
+            has_chat_template,
+            ..facts_with(&["completion"])
+        }
+    }
+
+    /// What llama-server's router reports before a load, from the projector's
+    /// header and the chat template.
+    #[test]
+    fn modalities_follow_the_projector_and_the_chat_template() {
+        use crate::gguf::ProjectorCaps;
+        let omni = ModelFacts {
+            capabilities: vec!["completion".into(), "vision".into()],
+            ..speaking(
+                ProjectorCaps {
+                    vision: true,
+                    audio: true,
+                    gen_audio: true,
+                },
+                true,
+            )
+        };
+        assert_eq!(omni.input_modalities().unwrap(), ["text", "image", "audio"]);
+        assert_eq!(omni.output_modalities(), ["text", "audio"]);
+
+        let tts = speaking(
+            ProjectorCaps {
+                gen_audio: true,
+                ..ProjectorCaps::default()
+            },
+            false,
+        );
+        assert_eq!(tts.input_modalities().unwrap(), ["text"]);
+        assert_eq!(tts.output_modalities(), ["audio"]);
+
+        // A text model, with or without a projector, only writes text.
+        assert_eq!(facts_with(&["completion"]).output_modalities(), ["text"]);
+        assert_eq!(
+            speaking(ProjectorCaps::default(), true).output_modalities(),
+            ["text"]
+        );
+        // No text in, none out: an embedding model lists neither.
+        assert!(facts_with(&["embedding"]).input_modalities().is_none());
     }
 
     /// ds4-server picks its own window, so a GGUF sent there has none; an

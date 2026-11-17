@@ -98,10 +98,8 @@ pub(super) fn from_responses_request(req: &Value) -> anyhow::Result<Value> {
     }
 
     match req.get("input") {
-        Some(Value::String(prompt)) => {
-            if !prompt.is_empty() {
-                messages.push(json!({ "role": "user", "content": prompt }));
-            }
+        Some(Value::String(prompt)) if !prompt.is_empty() => {
+            messages.push(json!({ "role": "user", "content": prompt }));
         }
         Some(Value::Array(items)) => {
             for (i, item) in items.iter().enumerate() {

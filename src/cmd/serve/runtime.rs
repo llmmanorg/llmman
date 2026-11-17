@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn pin_defaults_to_the_ci_release_and_latest_unpins() {
         let default = crate::llama_release::default_release();
-        assert!(default.starts_with('b'), "{default}");
+        assert!(default.starts_with('v'), "{default}");
         assert_eq!(llama_cpp_pin(None).as_deref(), Some(default));
         assert_eq!(llama_cpp_pin(Some("latest")), None);
         assert_eq!(llama_cpp_pin(Some("b9994")).as_deref(), Some("b9994"));

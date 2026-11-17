@@ -352,10 +352,9 @@ pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) 
 
     let mut caps = vec![CAPABILITY_COMPLETION.to_string()];
 
-    let has_mmproj = gguf_layers(manifest).is_some_and(|(_, mmproj)| mmproj.is_some());
     let config_says_image = config_types("inputTypes").iter().any(|t| t == "image");
 
-    if has_mmproj || config_says_image {
+    if has_projector_layer(manifest) || config_says_image {
         caps.push(CAPABILITY_VISION.to_string());
     }
     caps
@@ -399,6 +398,36 @@ pub fn model_capabilities(
     caps
 }
 
+/// `caps` (from [`capabilities`]) as the projector's own header says: without
+/// `"vision"` when it reads no images ([`capabilities`] takes any projector for
+/// vision), and with `"audio"` when it reads audio. `None` (no readable header)
+/// leaves `caps` as they are.
+pub fn with_projector_caps(
+    mut caps: Vec<String>,
+    projector: Option<&crate::gguf::Info>,
+) -> Vec<String> {
+    let Some(projector) = projector.map(crate::gguf::Info::projector_caps) else {
+        return caps;
+    };
+    if !projector.vision {
+        caps.retain(|c| c != CAPABILITY_VISION);
+    }
+    if projector.audio && !caps.iter().any(|c| c == CAPABILITY_AUDIO) {
+        let at = caps
+            .iter()
+            .position(|c| c == CAPABILITY_VISION)
+            .or_else(|| caps.iter().position(|c| c == CAPABILITY_COMPLETION))
+            .map_or(caps.len(), |i| i + 1);
+        caps.insert(at, CAPABILITY_AUDIO.to_string());
+    }
+    caps
+}
+
+/// Whether the manifest holds a companion mmproj layer, extracted or not.
+pub fn has_projector_layer(manifest: &crate::storage::oci::Manifest) -> bool {
+    gguf_layers(manifest).is_some_and(|(_, mmproj)| mmproj.is_some())
+}
+
 /// How many primary GGUF layers the manifest holds. More than one is a
 /// `gguf-split` set, whose tensors are spread across the shards, so no
 /// single header's tensor list describes the whole model.
@@ -433,6 +462,23 @@ pub fn gguf_info(
         .ok()
         .filter(|p| blob_is_gguf(p))
         .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))?;
+    crate::gguf::read_info(&path).ok()
+}
+
+/// The GGUF header of the companion mmproj layer, read like [`gguf_info`].
+/// `None` without a projector, for one in a tar layer not extracted yet, or
+/// for a header that will not parse.
+pub fn projector_info(
+    store_path: &Path,
+    cache_path: &Path,
+    manifest: &crate::storage::oci::Manifest,
+) -> Option<crate::gguf::Info> {
+    let (_, projector) = gguf_layers(manifest)?;
+    let projector = projector?;
+    let path = raw_blob_path(store_path, projector)
+        .ok()
+        .filter(|p| blob_is_gguf(p))
+        .or_else(|| cached_gguf(cache_path, digest_hex(&projector.digest).ok()?))?;
     crate::gguf::read_info(&path).ok()
 }
 
@@ -1125,6 +1171,46 @@ mod tests {
         );
     }
 
+    /// A projector's header with the given `clip.has_<flag>_encoder` flags.
+    fn projector_header(flags: &[&str]) -> crate::gguf::Info {
+        let mut info = crate::gguf::Info::default();
+        for flag in flags {
+            info.metadata.insert(
+                format!("clip.has_{flag}_encoder"),
+                crate::gguf::Value::Bool(true),
+            );
+        }
+        info
+    }
+
+    /// A speech-only projector (Soprano) is not vision; LFM3-Omni's is; one that
+    /// only hears is audio. An unreadable header changes nothing.
+    #[test]
+    fn with_projector_caps_follows_the_projectors_own_header() {
+        let caps = || vec!["completion".to_string(), "vision".to_string()];
+        assert_eq!(
+            with_projector_caps(caps(), Some(&projector_header(&["gen_audio"]))),
+            ["completion"]
+        );
+        assert_eq!(
+            with_projector_caps(caps(), Some(&projector_header(&["audio"]))),
+            ["completion", "audio"]
+        );
+        assert_eq!(
+            with_projector_caps(
+                caps(),
+                Some(&projector_header(&["vision", "audio", "gen_audio"]))
+            ),
+            ["completion", "vision", "audio"]
+        );
+        assert_eq!(with_projector_caps(caps(), None), ["completion", "vision"]);
+        // Nothing to take away from a model that never had it.
+        assert_eq!(
+            with_projector_caps(vec!["completion".into()], Some(&projector_header(&[]))),
+            ["completion"]
+        );
+    }
+
     #[test]
     fn capabilities_adds_vision_when_a_companion_mmproj_layer_is_present() {
         // Mirrors ollama's projectorCapabilities: any projector ⇒ vision.
@@ -1133,12 +1219,14 @@ mod tests {
             descriptor("sha256:b", "model.Q4_K_M.gguf"),
         ]);
         assert_eq!(capabilities(&store, &m), vec!["completion", "vision"]);
+        assert!(has_projector_layer(&m));
     }
 
     #[test]
     fn capabilities_a_lone_mmproj_named_gguf_is_the_model_not_a_projector() {
         let (store, m) = manifest_with(vec![descriptor("sha256:a", "mmproj-only.gguf")]);
         assert_eq!(capabilities(&store, &m), vec!["completion"]);
+        assert!(!has_projector_layer(&m));
     }
 
     #[test]
