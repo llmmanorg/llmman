@@ -1071,9 +1071,6 @@ pub(super) async fn handle_openai_embeddings(
 
 // -- Decision models (/v1/systemone) -------------------------------------------
 
-/// Images ride in the body as base64, past axum's 2 MiB default. Ollama's cap.
-pub(super) const SYSTEMONE_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
-
 const SYSTEMONE_ROUTE: &str = "/v1/systemone";
 
 /// A JSON object whose members pass through as written, in order: Clef

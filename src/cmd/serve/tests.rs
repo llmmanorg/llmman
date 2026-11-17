@@ -5239,6 +5239,68 @@ async fn record_prompt_logs_generation_requests_and_hands_the_body_on() {
     assert_eq!(entries[2].client.as_deref(), Some("test-agent/1"));
 }
 
+/// Exercise the real router, including the logger that reads before handlers.
+#[tokio::test]
+async fn generation_routes_accept_large_bodies_and_keep_the_32_mib_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    // Malformed JSON reaches parsing only if body extraction succeeds.
+    let body = Bytes::from(vec![b' '; GENERATION_BODY_LIMIT_BYTES + 1]);
+    let client = Client::new();
+    for logging in [false, true] {
+        let mut inner = test_inner(dir.path().to_path_buf());
+        if logging {
+            inner.prompt_log = Some(dir.path().join("prompts.jsonl"));
+        }
+        let url = serve_router(AppState(Arc::new(inner))).await;
+        for route in [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/messages",
+            "/v1/responses",
+            "/api/chat",
+            "/api/generate",
+            "/gemini/m/v1beta/models/m:generateContent",
+        ] {
+            for (size, too_large) in [
+                (GENERATION_BODY_LIMIT_BYTES, false),
+                (GENERATION_BODY_LIMIT_BYTES + 1, true),
+            ] {
+                // Stream without Content-Length so rejection follows the upload;
+                // early rejection can reset a still-uploading Windows client.
+                let bytes = body.slice(..size);
+                let response = client
+                    .post(format!("{url}{route}"))
+                    .header("content-type", "application/json")
+                    .body(reqwest::Body::wrap_stream(futures::stream::once(async {
+                        Ok::<_, std::io::Error>(bytes)
+                    })))
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                // Spaces are not JSON, so an accepted body still fails in the
+                // handler (400 or 500, depending on the route). It must not
+                // be the limit's 413. One byte over the limit must be.
+                assert_eq!(
+                    status == StatusCode::PAYLOAD_TOO_LARGE,
+                    too_large,
+                    "{route}, logging={logging}, size={size}, status={status}"
+                );
+            }
+        }
+        let response = client
+            .post(format!("{url}/api/show"))
+            .header("content-type", "application/json")
+            .body(reqwest::Body::wrap_stream(futures::stream::once(async {
+                Ok::<_, std::io::Error>(Bytes::from(vec![b' '; 3 * 1024 * 1024]))
+            })))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}
+
 /// An over-limit body is refused as the extractor would refuse it.
 /// The limit is lowered to 64 bytes rather than exceeding the 2 MB
 /// default: a 413 sent while the client still has megabytes to send
