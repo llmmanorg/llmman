@@ -4578,10 +4578,6 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
             "/audio/transcriptions",
             upload_route(handle_openai_transcriptions),
         )
-        .route(
-            "/v1/responses/input_tokens",
-            post(responses::handle_openai_responses_input_tokens),
-        )
         // OpenAI media generation (crate::mediagen::server)
         .route("/v1/images/generations", post(handle_openai_images))
         .route("/v1/videos", post(handle_openai_videos))
@@ -4625,6 +4621,10 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .route("/v1/completions", post(handle_openai_completions))
         .route("/v1/messages", post(anthropic::handle_anthropic_messages))
         .route("/v1/responses", post(responses::handle_openai_responses))
+        .route(
+            "/v1/responses/input_tokens",
+            post(responses::handle_openai_responses_input_tokens),
+        )
         // Native Gemini compatibility. The public route accepts a model in
         // Gemini's normal API path; the AGY route pins AGY's auxiliary calls
         // to the model chosen by `llmman launch agy`.
