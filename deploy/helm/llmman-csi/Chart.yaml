@@ -1,0 +1,21 @@
+apiVersion: v2
+name: llmman-csi
+description: >-
+  CSI node driver that mounts ModelPack model artifacts (vLLM, SGLang,
+  llama.cpp and other servers' model directories) into pods, pulled with
+  llmman.
+type: application
+version: 0.1.0
+# The default image tag. CI publishes every commit as 0.1.<commit count>
+# (packaging/version.sh); pin one with --set image.tag=...
+appVersion: latest
+# Inline ephemeral CSI volumes are GA from 1.25.
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/llmmanorg/llmman
+sources:
+  - https://github.com/llmmanorg/llmman
+keywords:
+  - csi
+  - modelpack
+  - llm
+  - oci

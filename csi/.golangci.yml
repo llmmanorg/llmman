@@ -1,0 +1,17 @@
+# Static analysis for csi/, the same linters go-shim/.golangci.yml runs (see
+# there for why `unused` and no `errcheck`). The CI `lint-csi` job runs:
+#
+#   golangci-lint run
+#   golangci-lint run --tests=false
+#
+# The second is the one that catches dead code: a func whose only caller is
+# its own test counts as used when tests are included.
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - unused
+    - govet
+    - staticcheck
+    - ineffassign

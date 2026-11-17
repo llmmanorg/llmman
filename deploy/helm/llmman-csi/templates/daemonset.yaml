@@ -1,0 +1,187 @@
+{{- $fullname := include "llmman-csi.fullname" . -}}
+{{- $kubeletDir := trimSuffix "/" .Values.kubeletDir -}}
+{{- $pluginDir := include "llmman-csi.pluginDir" . -}}
+{{- $registrySecret := include "llmman-csi.registrySecret" . -}}
+{{- $llmmanConfig := or .Values.llmman.config .Values.llmman.keys -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "llmman-csi.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "llmman-csi.selectorLabels" . | nindent 6 }}
+  {{- with .Values.updateStrategy }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "llmman-csi.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if or $llmmanConfig .Values.podAnnotations }}
+      annotations:
+        {{- if $llmmanConfig }}
+        checksum/llmman-config: {{ include (print $.Template.BasePath "/llmman-config.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+    spec:
+      priorityClassName: {{ .Values.priorityClassName }}
+      # The plugin never talks to the Kubernetes API.
+      automountServiceAccountToken: false
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: node-driver-registrar
+          image: "{{ .Values.registrar.image.repository }}:{{ .Values.registrar.image.tag }}"
+          imagePullPolicy: {{ .Values.registrar.image.pullPolicy }}
+          args:
+            - --v=2
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ $pluginDir }}/csi.sock
+          livenessProbe:
+            exec:
+              command:
+                - /csi-node-driver-registrar
+                - --kubelet-registration-path={{ $pluginDir }}/csi.sock
+                - --mode=kubelet-registration-probe
+            initialDelaySeconds: 30
+            timeoutSeconds: 15
+          {{- with .Values.registrar.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: llmman-csi
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/llmman-csi"]
+          args:
+            - --endpoint=unix:///csi/csi.sock
+            - --node-id=$(NODE_NAME)
+            - --driver-name={{ .Values.driverName }}
+            - --kubelet-dir={{ $kubeletDir }}
+            - --pull-timeout={{ .Values.pullTimeout }}
+            - --log-level={{ .Values.logLevel }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # llmman's store and its cache sit side by side on the hostPath, so
+            # the unpacked files are hardlinks of the pulled blobs.
+            - name: LLMMAN_MODELS
+              value: {{ .Values.storage.hostPath }}/store
+            - name: HOME
+              value: {{ .Values.storage.hostPath }}/home
+            {{- if $registrySecret }}
+            - name: DOCKER_CONFIG
+              value: /etc/llmman-csi/docker
+            {{- end }}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # Mounting under a pod's directory needs CAP_SYS_ADMIN, and the
+          # mount to reach the host needs Bidirectional propagation, which
+          # needs a privileged container.
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          livenessProbe:
+            exec:
+              command: ["stat", "/csi/csi.sock"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: pods-mount-dir
+              mountPath: {{ $kubeletDir }}/pods
+              mountPropagation: Bidirectional
+            - name: model-store
+              mountPath: {{ .Values.storage.hostPath }}
+            {{- if $registrySecret }}
+            - name: registry-auth
+              mountPath: /etc/llmman-csi/docker
+              readOnly: true
+            {{- end }}
+            {{- if $llmmanConfig }}
+            - name: llmman-config
+              mountPath: /etc/llmman
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: {{ $pluginDir }}
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: {{ $kubeletDir }}/plugins_registry
+            type: Directory
+        - name: pods-mount-dir
+          hostPath:
+            path: {{ $kubeletDir }}/pods
+            type: Directory
+        - name: model-store
+          hostPath:
+            path: {{ .Values.storage.hostPath }}
+            type: DirectoryOrCreate
+        {{- if $registrySecret }}
+        - name: registry-auth
+          secret:
+            secretName: {{ $registrySecret }}
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+        {{- end }}
+        {{- if $llmmanConfig }}
+        - name: llmman-config
+          configMap:
+            name: {{ $fullname }}-llmman
+            items:
+              {{- if .Values.llmman.config }}
+              - key: llmman.conf
+                path: llmman.conf
+              {{- end }}
+              {{- range $name, $_ := .Values.llmman.keys }}
+              - key: {{ printf "key-%s" $name | quote }}
+                path: {{ printf "keys/%s" $name | quote }}
+              {{- end }}
+        {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

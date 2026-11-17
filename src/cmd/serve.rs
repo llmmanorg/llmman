@@ -862,80 +862,86 @@ fn ffi_pull_ref<'a>(progress_key: &'a str, classified: &str) -> &'a str {
 /// registry as something signed; see `cmd::transfer`.
 fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<Vec<String>> {
     let lock = model_lock(model);
-    let result = (|| {
+    let result = {
         let _guard = lock.blocking_lock();
-        let existing = OciStore::open(store_path).and_then(|s| s.find(model)).ok();
-        // In the store is not the same as trusted: it may predate the
-        // policy, or have come in under `warn`. Classification first so
-        // a malformed llmman.conf can't break a cached non-OCI model no
-        // policy could apply to; then an in-memory policy lookup, which
-        // returns immediately when nothing is configured.
-        if let Some(desc) = existing {
-            if !crate::verify::is_registry_reference(model) {
-                return Ok(Vec::new());
-            }
-            if !crate::verify::is_enabled_for(model)? {
-                return Ok(Vec::new());
-            }
-            return verify_stored(store_path, model, &desc.digest);
-        }
-        let layout_dir = store_path
-            .to_str()
-            .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
         // Safe from a spawn_blocking'd OS thread: this reuses the
         // current (already-running) tokio runtime rather than trying to
         // start a second, nested one.
-        tokio::runtime::Handle::current().block_on(async {
-            match crate::hf::classify(model).await {
-                crate::hf::ClassifiedRef::Hf(reference) => {
-                    // classify routes by a live /v2/ probe, which fails
-                    // *open* into this branch — and this branch applies
-                    // no policy. So a reference the policy covers must
-                    // not be pulled here just because the probe could
-                    // not reach the registry.
-                    if crate::verify::is_registry_reference(model)
-                        && crate::verify::is_enabled_for(model)?
-                    {
-                        return Err(anyhow!(concat!(
-                            "is covered by a signature policy but could not be confirmed ",
-                            "to be an OCI registry (the /v2/ probe failed); refusing to ",
-                            "pull it as a HuggingFace repository unchecked",
-                        ))
-                        .context(model.to_string()));
-                    }
-                    crate::hf::pull::pull(&reference, store_path, model)
-                        .await
-                        .map(|()| Vec::new())
-                }
-                crate::hf::ClassifiedRef::Source(reference) => {
-                    crate::sources::pull(&reference, store_path, model)
-                        .await
-                        .map(|()| Vec::new())
-                }
-                crate::hf::ClassifiedRef::Other(normalized) => {
-                    // Checked before a single layer is fetched, so a
-                    // model the policy will reject costs one manifest
-                    // lookup instead of a multi-gigabyte download...
-                    let guard = crate::verify::PullGuard::check(&normalized)?;
-                    crate::ffi::pull(ffi_pull_ref(model, &normalized), layout_dir)?;
-                    // ...and confirmed afterwards against what actually
-                    // landed, so a tag repointed mid-pull can't slip
-                    // past the check that just passed.
-                    let stored = OciStore::open(store_path)?.find(&normalized)?;
-                    match guard.confirm(&stored.digest) {
-                        // Relayed to the client rather than logged here:
-                        // this runs in the daemon, whose stderr is a log
-                        // file nobody is watching. See verify::Verdict.
-                        Ok(notices) => Ok(notices),
-                        Err(e) => Err(reject_stored(store_path, &normalized, e)),
-                    }
-                }
-            }
-        })
-    })();
+        tokio::runtime::Handle::current().block_on(pull_checked(store_path, model))
+    };
     drop(lock);
     release_model_lock(model);
     result
+}
+
+/// [`pull_serialized`] without the in-process lock, so `llmman resolve`
+/// enforces `[verify]` as `llmman pull` does. Returns the verdicts' notices.
+pub(crate) async fn pull_checked(
+    store_path: &std::path::Path,
+    model: &str,
+) -> anyhow::Result<Vec<String>> {
+    let existing = OciStore::open(store_path).and_then(|s| s.find(model)).ok();
+    // In the store is not the same as trusted: it may predate the
+    // policy, or have come in under `warn`. Classification first so
+    // a malformed llmman.conf can't break a cached non-OCI model no
+    // policy could apply to; then an in-memory policy lookup, which
+    // returns immediately when nothing is configured.
+    if let Some(desc) = existing {
+        if !crate::verify::is_registry_reference(model) {
+            return Ok(Vec::new());
+        }
+        if !crate::verify::is_enabled_for(model)? {
+            return Ok(Vec::new());
+        }
+        return verify_stored(store_path, model, &desc.digest);
+    }
+    let layout_dir = store_path
+        .to_str()
+        .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
+    match crate::hf::classify(model).await {
+        crate::hf::ClassifiedRef::Hf(reference) => {
+            // classify routes by a live /v2/ probe, which fails
+            // *open* into this branch — and this branch applies
+            // no policy. So a reference the policy covers must
+            // not be pulled here just because the probe could
+            // not reach the registry.
+            if crate::verify::is_registry_reference(model) && crate::verify::is_enabled_for(model)?
+            {
+                return Err(anyhow!(concat!(
+                    "is covered by a signature policy but could not be confirmed ",
+                    "to be an OCI registry (the /v2/ probe failed); refusing to ",
+                    "pull it as a HuggingFace repository unchecked",
+                ))
+                .context(model.to_string()));
+            }
+            crate::hf::pull::pull(&reference, store_path, model)
+                .await
+                .map(|()| Vec::new())
+        }
+        crate::hf::ClassifiedRef::Source(reference) => {
+            crate::sources::pull(&reference, store_path, model)
+                .await
+                .map(|()| Vec::new())
+        }
+        crate::hf::ClassifiedRef::Other(normalized) => {
+            // Checked before a single layer is fetched, so a
+            // model the policy will reject costs one manifest
+            // lookup instead of a multi-gigabyte download...
+            let guard = crate::verify::PullGuard::check(&normalized)?;
+            crate::ffi::pull(ffi_pull_ref(model, &normalized), layout_dir)?;
+            // ...and confirmed afterwards against what actually
+            // landed, so a tag repointed mid-pull can't slip
+            // past the check that just passed.
+            let stored = OciStore::open(store_path)?.find(&normalized)?;
+            match guard.confirm(&stored.digest) {
+                // Relayed to the client rather than logged here:
+                // this runs in the daemon, whose stderr is a log
+                // file nobody is watching. See verify::Verdict.
+                Ok(notices) => Ok(notices),
+                Err(e) => Err(reject_stored(store_path, &normalized, e)),
+            }
+        }
+    }
 }
 
 /// A failed on-demand pull as the caller sees it: a 404 when the source says

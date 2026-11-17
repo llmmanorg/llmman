@@ -1,0 +1,90 @@
+# The CSI driver name: the `csi.driver` of the volumes and the name of the
+# CSIDriver object. The default is ModelPack's own (modelpack/model-csi-driver),
+# so manifests written for that driver work unchanged. The volume attribute
+# `<driverName>/reference` names the artifact; `model.csi.modelpack.org/reference`
+# is honoured under any name.
+driverName: model.csi.modelpack.org
+
+image:
+  # One image holds llmman-csi and the llmman binary it runs (csi/Dockerfile).
+  repository: docker.io/ai/llmman-csi
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+registrar:
+  image:
+    repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
+    tag: v2.18.0
+    pullPolicy: IfNotPresent
+  resources: {}
+
+# The kubelet's root directory (its --root-dir). Change it only if it is not
+# the default.
+kubeletDir: /var/lib/kubelet
+
+storage:
+  # Where each node keeps the models it has pulled: llmman's OCI store
+  # (<hostPath>/store) and the unpacked model directories pods mount
+  # (<hostPath>/cache). Size it for the models you run: nothing prunes it.
+  hostPath: /var/lib/llmman-csi
+
+# Run on the node's network instead of the pod network: for a registry on the
+# node's loopback (llmman speaks plain HTTP only to localhost and 127.0.0.1)
+# or node-local DNS.
+hostNetwork: false
+
+# The longest one pull and unpack may take. Pods wait for it.
+pullTimeout: 1h
+logLevel: info
+
+# Credentials for private registries, in Docker's config.json format: what
+# `docker login` or `llmman login` writes. Either name an existing Secret of
+# type kubernetes.io/dockerconfigjson in the release namespace, or give the
+# JSON and the chart creates one.
+registryAuth:
+  existingSecret: ""
+  dockerConfigJson: ""
+
+# llmman's own configuration (llmman.conf), mounted at /etc/llmman: the
+# signature trust policy for pulls ([verify]), short-name aliases, registry
+# mirrors. Public keys named by relative paths in it go in `keys`; each is
+# written to /etc/llmman/keys/<name>.
+#
+# llmman:
+#   config: |
+#     [verify]
+#     default = "off"
+#     [[verify.trust]]
+#     pattern = "registry.example.com/models/**"
+#     keys    = ["keys/models.pub"]
+#     mode    = "enforce"
+#   keys:
+#     models.pub: |
+#       -----BEGIN PUBLIC KEY-----
+#       ...
+llmman:
+  config: ""
+  keys: {}
+
+# Extra environment for llmman-csi and the llmman it runs, for example a
+# HuggingFace token for hf.co/ references:
+#
+# env:
+#   - name: HF_TOKEN
+#     valueFrom:
+#       secretKeyRef: {name: hf-token, key: token}
+env: []
+
+resources: {}
+
+# On every node by default, GPU nodes' taints included.
+tolerations:
+  - operator: Exists
+nodeSelector: {}
+affinity: {}
+priorityClassName: system-node-critical
+podAnnotations: {}
+podLabels: {}
+updateStrategy: {}

@@ -212,6 +212,26 @@ A `[verify]` trust policy turns that into an automatic check on every
 there is nothing to check against until you have said whom you trust.
 See [docs/verification.md](docs/verification.md).
 
+### Mount a model in Kubernetes
+
+`llmman-csi` is a CSI driver that mounts a ModelPack artifact into a pod,
+read-only, as the whole model directory, so vLLM, SGLang or llama.cpp can
+read it from a path. It takes the same `model.csi.modelpack.org` volume as
+[modelpack/model-csi-driver](https://github.com/modelpack/model-csi-driver)
+and pulls each model once per node, under the same signature policy:
+
+```yaml
+volumes:
+  - name: model
+    csi:
+      driver: model.csi.modelpack.org
+      volumeAttributes:
+        model.csi.modelpack.org/reference: "registry.example.com/models/qwen3-0.6b:latest"
+```
+
+See [docs/kubernetes.md](docs/kubernetes.md) for the Helm chart, registry
+credentials and what it does not do.
+
 ### Compared with Ollama
 
 Ollama stores models in its own blob layout behind its own registry
@@ -461,6 +481,7 @@ in [docs/sandbox.md](docs/sandbox.md).
 | [docs/android.md](docs/android.md) | The Android app: install, what runs on the phone, building the APK |
 | [docs/backends.md](docs/backends.md) | llama.cpp, vLLM, SGLang, MLX, containers, and building from source |
 | [docs/compose.md](docs/compose.md) | Compose deployment behind a gateway, with persistent model storage |
+| [docs/kubernetes.md](docs/kubernetes.md) | The CSI driver that mounts ModelPack models into pods, and its Helm chart |
 | [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, registry mirrors, environment variables, store layout |
 | [docs/providers.md](docs/providers.md) | Hosted providers, API keys, and which integrations can use them |
 | [docs/sandbox.md](docs/sandbox.md) | `launch --sandbox`: what each sandbox shares and how it reaches the daemon |

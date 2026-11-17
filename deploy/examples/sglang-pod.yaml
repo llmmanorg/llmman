@@ -1,0 +1,29 @@
+# SGLang serving the same kind of artifact.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sglang
+spec:
+  containers:
+    - name: sglang
+      image: lmsysorg/sglang:latest
+      command: ["python3", "-m", "sglang.launch_server"]
+      args:
+        - --model-path=/model
+        - --host=0.0.0.0
+        - --port=30000
+      ports:
+        - containerPort: 30000
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+      volumeMounts:
+        - name: model
+          mountPath: /model
+          readOnly: true
+  volumes:
+    - name: model
+      csi:
+        driver: model.csi.modelpack.org
+        volumeAttributes:
+          model.csi.modelpack.org/reference: "registry.example.com/models/qwen3-0.6b:latest"

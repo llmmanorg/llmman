@@ -1,0 +1,21 @@
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: {{ .Values.driverName }}
+  labels:
+    {{- include "llmman-csi.labels" . | nindent 4 }}
+spec:
+  # Nothing to attach: the model is unpacked on the node that mounts it.
+  attachRequired: false
+  # The pod's name, namespace and uid arrive in each publish's volume context
+  # (the driver logs them).
+  podInfoOnMount: true
+  # `csi:` volumes in a pod spec, and pre-provisioned PersistentVolumes.
+  volumeLifecycleModes:
+    - Ephemeral
+    - Persistent
+  # The model files are read-only and shared by every pod that names them:
+  # the kubelet must never chown or chmod them for a pod's fsGroup.
+  fsGroupPolicy: None
+  storageCapacity: false
+  requiresRepublish: false

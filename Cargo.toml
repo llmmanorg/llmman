@@ -25,6 +25,8 @@ exclude = [
 	"packaging/",
 	"docs/",
 	".github/",
+	"csi/",
+	"deploy/",
 ]
 
 [lib]
@@ -85,6 +87,9 @@ bytes      = "1"
 indicatif  = "0.18"
 console    = { version = "0.16", default-features = false, features = ["std"] }
 flate2     = "1"
+# `+zstd` ModelPack layers (src/modelpack.rs). libzstd rather than a pure-Rust
+# decoder: it reads every frame of a stream, skippable frames included.
+zstd       = { version = "0.14", default-features = false }
 zip        = { version = "9", default-features = false, features = ["deflate"] }
 libloading = "0.8"
 multer     = "3"

@@ -26,3 +26,13 @@ reference; this is the one-line summary of each subcommand.
 | `login`   | Log in to a container registry or HuggingFace |
 | `logout`  | Log out from a container registry or HuggingFace |
 | `config`  | Read and write `llmman.conf` settings (aliases, API keys, trust policy, aggregation peers) |
+
+`resolve` is not listed above because `--help` hides it: it is the hook other
+programs call. `llmman resolve REFERENCE` pulls the reference if needed (under
+the `[verify]` policy, as `pull`) and prints one line of JSON with the path to
+serve (`path`, `format`, and for a GGUF with a projector `mmproj`); the
+`vllm-llmman` plugin uses it. `llmman resolve --dir REFERENCE` prints
+`{"reference", "dir", "digest", "format"}` instead, where `dir` is the whole
+model directory, every layer of the artifact at its packaged path: what
+[`llmman-csi`](kubernetes.md) mounts into pods. Both take `--cache DIR` and
+`--no-pull`.
