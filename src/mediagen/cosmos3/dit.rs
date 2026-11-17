@@ -178,8 +178,7 @@ pub fn sdpa_gqa<'g>(
         let v3 = g.permute(g.reshape_3d(g.cont(v), hd, n_kv, tk), 0, 2, 1, 3);
         let k3 = g.cast(k3, ffi::ty::F16);
         let v3 = g.cast(v3, ffi::ty::F16);
-        let cur = g.flash_attn_ext(q3, k3, v3, None, scale, 0.0, 0.0);
-        unsafe { (g.api().ggml_flash_attn_ext_set_prec)(cur.as_ptr(), ffi::GGML_PREC_F32) };
+        let cur = g.prec_f32(g.flash_attn_ext(q3, k3, v3, None, scale, 0.0, 0.0));
         g.reshape_2d(cur, hd * n_heads, tq)
     } else {
         let v3 = g.cont(g.permute(g.reshape_3d(g.cont(v), hd, n_kv, tk), 1, 2, 0, 3));

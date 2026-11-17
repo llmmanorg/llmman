@@ -90,8 +90,13 @@ jobs:
   #
   # Tests run on all five targets: the crate links the Go shim via CGO
   # everywhere and toolchain breakage has been per-platform. fmt and the
-  # fuzz checks are platform-independent and run once (check-fmt leg).
-  # Clippy runs everywhere: it only sees that target's `#[cfg]` arms.
+  # fuzz checks are platform-independent: the lint-rust job runs them once,
+  # in parallel with these legs. Clippy runs everywhere: it only sees that
+  # target's `#[cfg]` arms.
+  #
+  # PRs (#827, aim: 5 minutes) use the dev profile without debug info and
+  # clippy on x86_64 Linux only; main uses --release on every target, then
+  # warms the dev cache for PRs.
   # --------------------------------------------------------------------------
   build:
     name: Build + test (${{ matrix.target }})
@@ -99,8 +104,10 @@ jobs:
     # Bounds a wedged runner (CI 33613527281 stalled 46 min); legs are
     # far shorter warm.
     timeout-minutes: 60
-    env:
+    env: &build-env
       RUSTFLAGS: ${{ matrix.rustflags }}
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      PROFILE_FLAG: ${{ github.event_name != 'pull_request' && '--release' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -110,7 +117,6 @@ jobs:
             runner: ubuntu-24.04
             go-os: linux
             binary: llmman
-            check-fmt: true
 
           # ── Linux aarch64 ─────────────────────────────────────────────────
           - target: aarch64-unknown-linux-gnu
@@ -137,21 +143,7 @@ jobs:
             msvc-arch: amd64
             rustflags: ""
 
-          # ── Windows aarch64 ───────────────────────────────────────────────
-          # ARM64 uses the MSVC-native link.exe (put first in PATH by
-          # ilammy/msvc-dev-cmd) rather than lld-link: the lld-link in
-          # C:\Program Files\LLVM\bin on the ARM64 runner is an x86_64
-          # binary running under emulation; it opens ARM64 archives but
-          # silently ignores ARM64 COFF objects (machine type mismatch),
-          # reporting every CGO export as an undefined symbol.
-          - target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
-            go-os: windows
-            binary: llmman.exe
-            msvc-arch: arm64
-            rustflags: ""
-
-    steps:
+    steps: &build-steps
       # fetch-depth: 0 — packaging/version.sh needs the full commit count.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -178,12 +170,11 @@ jobs:
           cache-dependency-path: go-shim/go.sum
 
       # ── Rust toolchain ────────────────────────────────────────────────────
-      # rustfmt only on the check-fmt leg; an empty extra component is fine.
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.target }}
-          components: clippy${{ matrix.check-fmt && ', rustfmt' || '' }}
+          components: clippy
 
       # The version step changes Cargo.lock every commit, so rust-cache
       # never gets an exact key hit; its prefix fallback still restores
@@ -219,8 +210,9 @@ jobs:
           Write-Host "=== lld-link ===" ; where.exe lld-link 2>&1 ; (Get-Command lld-link -ErrorAction SilentlyContinue)?.Source
           Write-Host "=== link ===" ; where.exe link 2>&1 | Select-Object -First 1
 
-      # ── Build (Docker backend, default) ───────────────────────────────────
+      # Release artefacts: main only (nothing on a PR consumes them, #827).
       - name: Build (docker backend)
+        if: github.event_name != 'pull_request'
         run: cargo build --release --target ${{ matrix.target }}
 
       # Both builds share an output path (same package, same triple, only
@@ -228,6 +220,7 @@ jobs:
       # one — which shipped every non-Windows release asset as a podman
       # binary labelled as docker. Copy it out of reach first.
       - name: Stage docker binary
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           mkdir -p dist-docker
@@ -236,7 +229,7 @@ jobs:
       # ── Build (Podman backend) ────────────────────────────────────────────
       # Skipped on Windows: containers/image has no Windows support.
       - name: Build (podman backend)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && github.event_name != 'pull_request'
         run: cargo build --release --target ${{ matrix.target }} --no-default-features --features podman
 
       # Fail rather than ship a mislabelled binary if those paths ever
@@ -245,6 +238,7 @@ jobs:
       # artifact itself rather than the flags meant to build it.
       # grep -a, not strings(1): Git Bash on Windows ships no strings.
       - name: Verify staged binary is the docker backend
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           bin="dist-docker/${{ matrix.binary }}"
@@ -264,12 +258,19 @@ jobs:
       # variant is built (the others differ in base tag alone, and run to
       # 7 GiB), but every base publish-images needs must exist.
       - name: Build and run the container image
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"
+          # ghcr can lag a fresh llama.cpp bump ("manifest unknown", #824).
           for tag in server server-cuda server-cuda13 server-rocm server-vulkan; do
-            docker manifest inspect "ghcr.io/ggml-org/llama.cpp:$tag-$LLAMA_CPP_RELEASE" >/dev/null
+            ref="ghcr.io/ggml-org/llama.cpp:$tag-$LLAMA_CPP_RELEASE"
+            for attempt in 1 2 3 4 5 6; do
+              [ "$attempt" -eq 1 ] || sleep 60
+              docker manifest inspect "$ref" >/dev/null && continue 2
+            done
+            echo "::error::$ref is not published"
+            exit 1
           done
           cp dist-docker/llmman packaging/llmman-amd64
           docker build packaging -t llmman-check \
@@ -299,14 +300,105 @@ jobs:
 
       # ── Upload artefacts ──────────────────────────────────────────────────
       - name: Upload binary (docker)
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/upload-artifact-retry
         with:
           name: llmman-docker-${{ matrix.target }}
           path: dist-docker/${{ matrix.binary }}
 
       # ── Lint + unit tests ─────────────────────────────────────────────────
+      # -D warnings: the tree is clippy-clean, so anything new is a
+      # regression. --all-targets covers tests/ too. Default (docker)
+      # feature only: `podman` gates a handful of `ffi` items, and its Go
+      # archive would roughly double this step.
+      - name: cargo clippy
+        if: github.event_name != 'pull_request' || matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo clippy ${{ env.PROFILE_FLAG }} --target ${{ matrix.target }} --all-targets -- -D warnings
+
+      - name: cargo test --lib --bins
+        run: cargo test ${{ env.PROFILE_FLAG }} --target ${{ matrix.target }} --lib --bins
+
+      # The mediagen doctests pin the tensor ownership model: four
+      # `compile_fail` blocks that must stay uncompilable and two that
+      # must compile. They need no llama.cpp library, so every target
+      # runs them against the library the step above built.
+      - name: cargo test --doc
+        run: cargo test ${{ env.PROFILE_FLAG }} --target ${{ matrix.target }} --doc
+
+      # main only: caches the dev profile's dependencies for PRs.
+      - name: Warm the dev profile for PRs
+        if: github.event_name != 'pull_request'
+        run: |
+          cargo clippy --target ${{ matrix.target }} --all-targets -- -D warnings
+          cargo test --target ${{ matrix.target }} --lib --bins --no-run
+
+  # aarch64 Windows, the slowest runner, is main-only (x86_64 Windows covers
+  # the MSVC link path on PRs). A job-level `if` cannot read `matrix`, so
+  # it is its own job, sharing `build`'s env and steps by alias.
+  build-windows-arm:
+    name: Build + test (${{ matrix.target }})
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env: *build-env
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Windows aarch64 ───────────────────────────────────────────────
+          # ARM64 uses the MSVC-native link.exe (put first in PATH by
+          # ilammy/msvc-dev-cmd) rather than lld-link: the lld-link in
+          # C:\Program Files\LLVM\bin on the ARM64 runner is an x86_64
+          # binary running under emulation; it opens ARM64 archives but
+          # silently ignores ARM64 COFF objects (machine type mismatch),
+          # reporting every CGO export as an undefined symbol.
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            go-os: windows
+            binary: llmman.exe
+            msvc-arch: arm64
+            rustflags: ""
+    steps: *build-steps
+
+  # --------------------------------------------------------------------------
+  # rustfmt and the fuzz-crate checks, once, in parallel with `build`.
+  # --------------------------------------------------------------------------
+  lint-rust:
+    name: Lint (rustfmt, fuzz crate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go-shim/go.mod
+          cache-dependency-path: go-shim/go.sum
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: lint-rust
+          workspaces: |
+            .
+            fuzz
+
+      - name: Install build dependencies (Linux)
+        uses: ./.github/actions/apt-install
+        with:
+          packages: gcc
+
       - name: cargo fmt --check
-        if: matrix.check-fmt
         run: cargo fmt --all -- --check
 
       # `fuzzing` gates the fuzz_check_* wrappers in src/shortnames.rs
@@ -316,40 +408,22 @@ jobs:
       # compiles the feature, it does not run cargo-fuzz (needs nightly;
       # actual fuzzing runs nightly in fuzz-nightly.yml).
       - name: cargo clippy --features fuzzing
-        if: matrix.check-fmt
         run: cargo clippy --features fuzzing --lib -- -D warnings
 
       # fuzz/ is its own crate (cargo-fuzz convention), so the workspace
       # clippy/test steps never touch it. A plain check catches it going
       # stale against src/shortnames.rs without cargo-fuzz or nightly.
       - name: cargo check fuzz/
-        if: matrix.check-fmt
         run: cargo check --manifest-path fuzz/Cargo.toml
 
-      # -D warnings: the tree is clippy-clean, so anything new is a
-      # regression. --all-targets covers tests/ too. Default (docker)
-      # feature only: `podman` gates a handful of `ffi` items, and its Go
-      # archive would roughly double this step.
-      - name: cargo clippy
-        run: cargo clippy --release --target ${{ matrix.target }} --all-targets -- -D warnings
-
-      - name: cargo test --lib --bins
-        run: cargo test --release --target ${{ matrix.target }} --lib --bins
-
-      # The mediagen doctests pin the tensor ownership model: four
-      # `compile_fail` blocks that must stay uncompilable and two that
-      # must compile. They need no llama.cpp library, so every target
-      # runs them against the release library the step above built.
-      - name: cargo test --doc
-        run: cargo test --release --target ${{ matrix.target }} --doc
 
   # --------------------------------------------------------------------------
   # Android app (android/, docs/android.md): the web UI in a WebView over
   # an embedded `llmman serve`, cross-compiled for aarch64-linux-android
   # and bundled with llama.cpp's own Android release (the LLAMA_CPP_RELEASE
   # pin). Gradle drives both (`cargo ndk`, the tarball fetch), so this is
-  # one `assembleRelease`. Runs on PRs so a broken NDK cross-compile or
-  # Gradle project fails before release; the APK is a release asset.
+  # one `assembleRelease`. Main only (~8 minutes, #827); the APK is a
+  # release asset.
   #
   # Signing: with the LLMMAN_ANDROID_* secrets the APK is release-signed;
   # without them (PRs from forks, local builds) it is debug-signed, which
@@ -357,6 +431,7 @@ jobs:
   # --------------------------------------------------------------------------
   android:
     name: Build Android app
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -2025,7 +2100,7 @@ jobs:
     name: Release
     # Everything must be green first. e2e only runs on the same push event
     # this job fires on, so this never waits on a run that will not happen.
-    needs: [tag, build, android, lint-packaging, webui, e2e]
+    needs: [tag, build, build-windows-arm, android, lint-packaging, lint-rust, webui, e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
