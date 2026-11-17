@@ -59,7 +59,10 @@ rebuilt), one installer at a time across processes (`<tool>/.lock`), and
 earlier versions deleted once a new one completes. The pins are the
 repo-root `LLAMA_CPP_RELEASE`, `UV_RELEASE`, `MLX_LM_RELEASE` and
 `PYTHON_RELEASE` files, which CI tests against. Renovate bumps
-`LLAMA_CPP_RELEASE` for each new llama.cpp release; the others are by hand.
+`LLAMA_CPP_RELEASE` for each new llama.cpp major release (v1.1.0, v2.0.0, ...)
+to its `server` image tag, from which `packaging/llama-build.sh` finds the
+`b<N>` build with the binaries; the others are by hand. ZONOS3 needs `b12425` or later: ask for it with `--llama-cpp-version`
+under `bin`.
 
 If that fetch fails, the daemon still starts: the failure is a warning,
 and the first model load that needs llama.cpp retries it and, failing

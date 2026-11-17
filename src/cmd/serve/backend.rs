@@ -1052,7 +1052,7 @@ const DEFAULT_LOAD_TIMEOUT: Duration = Duration::from_secs(1200);
 
 /// `None` = wait forever, from an `LLMMAN_LOAD_TIMEOUT` of 0 or
 /// negative (mirrors Ollama's `OLLAMA_LOAD_TIMEOUT`).
-fn load_timeout_from_env() -> Option<Duration> {
+pub(super) fn load_timeout_from_env() -> Option<Duration> {
     match std::env::var("LLMMAN_LOAD_TIMEOUT") {
         Ok(v) => parse_load_timeout(&v).unwrap_or(Some(DEFAULT_LOAD_TIMEOUT)),
         Err(_) => Some(DEFAULT_LOAD_TIMEOUT),

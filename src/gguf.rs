@@ -187,6 +187,27 @@ impl Info {
         let arch = self.architecture()?;
         self.u64(&format!("{arch}.block_count"))
     }
+
+    /// What this projector (`--mmproj`) GGUF takes in and gives out, from the
+    /// `clip.has_*_encoder` keys llama.cpp's `mtmd_get_cap_from_file` reads;
+    /// absent is `false`, as there.
+    pub fn projector_caps(&self) -> ProjectorCaps {
+        let flag = |key: &str| self.metadata.get(key).and_then(Value::as_bool) == Some(true);
+        ProjectorCaps {
+            vision: flag("clip.has_vision_encoder"),
+            audio: flag("clip.has_audio_encoder"),
+            gen_audio: flag("clip.has_gen_audio_encoder"),
+        }
+    }
+}
+
+/// See [`Info::projector_caps`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProjectorCaps {
+    pub vision: bool,
+    pub audio: bool,
+    /// Generates audio: text to speech, spoken answers.
+    pub gen_audio: bool,
 }
 
 struct Reader<R> {
@@ -712,6 +733,53 @@ mod tests {
         assert!(info(&[("general.architecture", "canary")]).is_speech());
         assert!(!info(&[("general.architecture", "llama")]).is_speech());
         assert!(!info(&[]).is_speech());
+    }
+
+    #[test]
+    fn projector_caps_read_the_three_clip_encoder_flags() {
+        let info = |flags: &[(&str, bool)]| Info {
+            metadata: flags
+                .iter()
+                .map(|(key, on)| (key.to_string(), Value::Bool(*on)))
+                .collect(),
+            ..Info::default()
+        };
+        // LFM3-Omni: sees, hears and speaks.
+        assert_eq!(
+            info(&[
+                ("clip.has_vision_encoder", true),
+                ("clip.has_audio_encoder", true),
+                ("clip.has_gen_audio_encoder", true),
+            ])
+            .projector_caps(),
+            ProjectorCaps {
+                vision: true,
+                audio: true,
+                gen_audio: true
+            }
+        );
+        // Soprano: speaks, nothing else; a flag that is off is as good as absent.
+        let tts = info(&[
+            ("clip.has_gen_audio_encoder", true),
+            ("clip.has_vision_encoder", false),
+        ])
+        .projector_caps();
+        assert_eq!(
+            tts,
+            ProjectorCaps {
+                vision: false,
+                audio: false,
+                gen_audio: true
+            }
+        );
+        assert_eq!(info(&[]).projector_caps(), ProjectorCaps::default());
+        // Only a bool counts: a string `true` is not a flag.
+        let mut odd = Info::default();
+        odd.metadata.insert(
+            "clip.has_vision_encoder".into(),
+            Value::String("true".into()),
+        );
+        assert_eq!(odd.projector_caps(), ProjectorCaps::default());
     }
 
     /// Regression test: two tensors whose declared dimensions each

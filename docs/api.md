@@ -7,7 +7,7 @@ Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
 | API | Endpoints |
 |-----|-----------|
 | Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/pull`, `/api/push`, `/api/copy`, `/api/create`, `/api/blobs/{digest}`, `/api/ps`, `/api/delete`, `/api/version` |
-| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`), `/v1/systemone` (llama-server's own API for decision models) |
+| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`), `/v1/audio/speech`, `/tts` (llama-server's own text to speech), `/v1/realtime` (WebSocket), `/v1/systemone` (llama-server's own API for decision models) |
 | Anthropic | `/v1/messages` |
 | llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/providers/{id}/key`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/shell` |
 | Web UI | `/`, `/ui/*` and, for a browser, any other path outside the prefixes above (`/models`, `/c/<id>`) — see [webui.md](webui.md) |
@@ -78,9 +78,9 @@ once per model.
 `high`, `xhigh`, `max`), forwarded as llama-server's
 `chat_template_kwargs`. `/api/show` returns `capabilities` and, for a
 local model with one, `template`. They are `completion` (`embedding` for a
-pooling model, `decision` for a decision model), `vision` with a projector,
-`tools` when the chat template renders a request's `tools`, and `thinking`
-when it handles reasoning. A llama-server model that thinks also gets Ollama's
+pooling model, `decision` for a decision model), `vision` or `audio` with a projector
+that has that encoder, `tools` when the chat template renders a request's
+`tools`, and `thinking` when it handles reasoning. A llama-server model that thinks also gets Ollama's
 `thinking: {"values": [...], "default": ...}`: `false` plus the levels its
 template names (Qwen3.8: `low`, `medium`, `xhigh`), or `minimal`, `low`, `medium`
 and `high` for a switch-only template (Qwen3.5, Gemma 4). On `/api/chat` and
@@ -123,9 +123,13 @@ is loaded, `meta.n_ctx_train` comes from the GGUF header, `meta.n_ctx` is the
 per-slot context the llama-server a load starts would report (from
 `LLMMAN_CONTEXT_LENGTH` (`LLMMAN_EMBEDDING_CONTEXT_LENGTH` for an embedding model) and `LLMMAN_NUM_PARALLEL`, never past `n_ctx_train`; a
 request's `num_ctx` or an out-of-memory retry can still change it), and
-`architecture.input_modalities` comes from what the model can do (`text`, plus
-`image` with a vision projector); a model that does not generate text has no
-`architecture`. `meta.n_ctx` is left out for a model llama-server does not
+`architecture.input_modalities` and `output_modalities` come from what the
+model can do, as llama-server reports it before a load: `text`, plus `image`
+or `audio` when the projector (`--mmproj`) has a vision or audio encoder; out,
+`text`, plus `audio` when it generates speech, or `audio` alone for text to
+speech without a chat template (Soprano, Qwen3-TTS). A loaded model's own list
+is passed through. A model that does not generate text has no `architecture`.
+`meta.n_ctx` is left out for a model llama-server does not
 serve (media, or a GGUF that goes to ds4-server), and when `LLMMAN_LLAMA_ARGS`
 or a `LLAMA_ARG_*` variable sets llama-server's context size, slots or KV
 unification itself.
@@ -186,6 +190,23 @@ audio support (an `--mmproj` projector, supplied when the model image
 carries one). Bodies up to 200 MiB are accepted. A llama-server is given
 a transcription `prompt` if the request has none (not for LFM2 models,
 which have their own).
+
+`/v1/audio/speech` and `/tts` are pass-throughs to the text-to-speech models
+llama-server serves: LFM3-Omni, LFM3-Audio, Soprano, Qwen3-TTS, Chatterbox,
+ZONOS3 (llama.cpp `b12425` or later), Drama 3 and the rest of
+[ggml-org's TTS collection](https://huggingface.co/collections/ggml-org/tts-models).
+`/tts` is llama-server's own route and takes more: `voice`, `lang`,
+`n_predict`, `stream`, raw PCM (`response_format`: `pcm16`) and a reference
+clip to clone a voice from, as `speaker_ref_b64` in JSON or a `speaker_ref`
+upload in a `multipart/form-data` request (routed by its `model` field, up to
+200 MiB). Neither goes to a provider.
+
+`/v1/realtime?model=<model>` is llama-server's realtime WebSocket, relayed to
+the model's llama-server once loaded: live transcription (`&intent=transcription`)
+and a spoken conversation with LFM3-Omni or LFM3-Audio. Events pass through
+unread, but for the `model` of a `session.*` event, which is the one the request
+named. Only a model served here or by a peer has the route. A page on an origin
+`LLMMAN_ORIGINS` does not allow is refused, here and on `/tts` and transcription.
 
 `/v1/systemone` answers typed questions about a `state` with a decision model
 (a GGUF with a `<arch>.decision.type`, such as Clef), with a probability for

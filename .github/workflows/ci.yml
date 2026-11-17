@@ -24,8 +24,10 @@ env:
   # The llama.cpp release is the repo-root LLAMA_CPP_RELEASE file (also
   # the llmman binary's default pin, src/llama_release.rs); steps read it
   # with `LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"`
-  # since a workflow-level env can't read a file. It must be a build
-  # upstream published server-*-b<N> images for (the build job checks).
+  # since a workflow-level env can't read a file. It is the ghcr image tag
+  # of a llama.cpp major release, v<X.Y.Z> or v<X.Y.Z>-b<N>-<sha> (the build
+  # job checks all five server images exist); packaging/llama-build.sh gives
+  # the b<N> release with the binaries.
   #
   # vLLM version the e2e job's "Install vLLM (e2e)" step installs, for
   # vllm-plugin/tests/test_e2e.py's real `vllm serve` test. Moves with
@@ -496,7 +498,7 @@ jobs:
 
       # ── Packaging ────────────────────────────────────────────────────────
       - name: shellcheck
-        run: shellcheck packaging/version.sh packaging/render.sh packaging/release-tag.sh
+        run: shellcheck packaging/version.sh packaging/render.sh packaging/release-tag.sh packaging/llama-build.sh
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -1358,8 +1360,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"
-          asset="llama-${LLAMA_CPP_RELEASE}-bin-${{ matrix.llama-asset }}"
+          build="$(packaging/llama-build.sh)"
+          asset="llama-${build}-bin-${{ matrix.llama-asset }}"
           # $HOME, not $RUNNER_TEMP: on Windows the latter is a native
           # `D:\a\_temp`-style path, and Git Bash's tar.exe (bsdtar) reads
           # the drive letter's colon as its own old rmt "host:path" remote-
@@ -1386,7 +1388,7 @@ jobs:
           # CDN blip while still eventually giving up if the asset is
           # genuinely gone.
           curl -fsSL --retry 16 --retry-all-errors -o "$archive" \
-            "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE}/${asset}"
+            "https://github.com/ggml-org/llama.cpp/releases/download/${build}/${asset}"
           dir="$HOME/llama-cpp"
           mkdir -p "$dir"
           # Windows needs Expand-Archive, not tar -xf: confirmed against a

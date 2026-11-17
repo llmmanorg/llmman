@@ -38,13 +38,22 @@ use crate::hostgpu::HostGpu;
 
 const REPO_API: &str = "https://api.github.com/repos/ggml-org/llama.cpp";
 
-/// The default `--llama-cpp-version`: the `b<N>` release
-/// [`ensure_llama_server`] downloads and the image tag suffix
-/// `crate::container` runs. From the repo-root `LLAMA_CPP_RELEASE` file,
-/// which CI also installs and bases the `ai/llmman` images on, so what
-/// ships is what was tested. The single place to bump.
+/// The default `--llama-cpp-version`: the image tag suffix `crate::container`
+/// runs, and (via [`build_tag`]) the release [`ensure_llama_server`]
+/// downloads. From the repo-root `LLAMA_CPP_RELEASE` file, which CI also
+/// installs and bases the `ai/llmman` images on. The single place to bump.
 pub fn default_release() -> &'static str {
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/LLAMA_CPP_RELEASE")).trim()
+}
+
+/// The release to download for `pin`. An image tag like
+/// `v1.0.0-b12359-b1b770d` names the `b<N>` build it was made from (as
+/// `packaging/llama-build.sh` does); any other pin, such as `v1.1.0`, is its
+/// own release tag, which `resolve_release` follows to its build.
+fn build_tag(pin: &str) -> &str {
+    pin.strip_prefix('v')
+        .and_then(|_| pin.split('-').nth(1))
+        .unwrap_or(pin)
 }
 
 // ---------------------------------------------------------------------------
@@ -774,6 +783,7 @@ pub struct Resolved {
 /// Blocking (network + disk I/O) — callers on an async runtime must run
 /// this via `tokio::task::spawn_blocking` (see `cmd::serve::runtime::resolve`).
 pub fn ensure_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
+    let pinned_version = pinned_version.map(build_tag);
     let query = asset_query();
     let bin_name = if cfg!(target_os = "windows") {
         "llama-server.exe"
@@ -1073,7 +1083,7 @@ mod tests {
     /// A release of the pinned llama.cpp build carrying `names`.
     fn pinned_release(names: impl IntoIterator<Item = String>) -> Release {
         Release {
-            tag_name: default_release().into(),
+            tag_name: build_tag(default_release()).into(),
             assets: names
                 .into_iter()
                 .map(|name| Asset {
@@ -1088,7 +1098,16 @@ mod tests {
 
     /// The pinned build's `llama-<tag>-bin-<suffix>` asset name.
     fn pinned_asset(suffix: &str) -> String {
-        format!("llama-{}-bin-{suffix}", default_release())
+        format!("llama-{}-bin-{suffix}", build_tag(default_release()))
+    }
+
+    #[test]
+    fn a_major_release_pin_downloads_the_build_it_names() {
+        assert_eq!(build_tag("v1.0.0-b12359-b1b770d"), "b12359");
+        for own in ["b12359", "v1.1.0", "latest"] {
+            assert_eq!(build_tag(own), own);
+        }
+        assert!(build_tag(default_release()).starts_with('b'));
     }
 
     #[test]

@@ -8,22 +8,17 @@
     "go.podman.io/common",
     "go.podman.io/image/v5"
   ],
-  "customDatasources": {
-    "llama-cpp-stable": {
-      "description": "The b<N> build named by nightly-tag.txt, the only asset of llama.cpp's newest semver release (b<N> builds are prereleases, so /latest is that release)",
-      "defaultRegistryUrlTemplate": "https://github.com/ggml-org/llama.cpp/releases/latest/download/nightly-tag.txt",
-      "format": "plain"
-    }
-  },
   "customManagers": [
     {
       "customType": "regex",
-      "description": "LLAMA_CPP_RELEASE: the b<N> build behind the newest llama.cpp semver release",
+      "description": "LLAMA_CPP_RELEASE: the newest llama.cpp major release with a server image on ghcr.io (v<X.Y.Z>, or v<X.Y.Z>-b<N>-<sha> as upstream sometimes tags it)",
       "managerFilePatterns": ["/^LLAMA_CPP_RELEASE$/"],
-      "matchStrings": ["^(?<currentValue>b\\d+)\\s*$"],
+      "matchStrings": ["^(?<currentValue>v\\d+\\.\\d+\\.\\d+(?:-b\\d+-[0-9a-f]+)?)\\s*$"],
       "depNameTemplate": "ggml-org/llama.cpp",
-      "datasourceTemplate": "custom.llama-cpp-stable",
-      "versioningTemplate": "regex:^b(?<major>\\d+)$"
+      "packageNameTemplate": "ghcr.io/ggml-org/llama.cpp",
+      "datasourceTemplate": "docker",
+      "extractVersionTemplate": "^server-(?<version>v\\d+\\.\\d+\\.\\d+(?:-b\\d+-[0-9a-f]+)?)$",
+      "versioningTemplate": "regex:^v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(?:-b\\d+-[0-9a-f]+)?$"
     }
   ],
   "packageRules": [
@@ -64,7 +59,7 @@
       "allowedVersions": "<0.9.0"
     },
     {
-      "description": "tokio-tungstenite 0.25+ changed Message payloads (Vec<u8> -> Payload/Bytes); test client must match axum 0.7's ws pin (0.24)",
+      "description": "tokio-tungstenite 0.25+ changed Message payloads (Vec<u8> -> Payload/Bytes); the /v1/realtime relay and test client must match axum 0.7's ws pin (0.24)",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["tokio-tungstenite"],
       "allowedVersions": "<0.25.0"

@@ -2,8 +2,8 @@ use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
 use super::hybrid::{request_pin, resolve_hybrid_side, with_hybrid_fallback};
 use super::openai::{
-    apply_default_repeat_penalty, decode_f32s, encode_f32s, DEFAULT_TRANSCRIPTION_PROMPT,
-    EFFORT_BUDGET_MESSAGE,
+    apply_default_repeat_penalty, decode_f32s, encode_f32s, handle_tts,
+    DEFAULT_TRANSCRIPTION_PROMPT, EFFORT_BUDGET_MESSAGE,
 };
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::responses::{
@@ -1390,6 +1390,86 @@ async fn a_transcription_pair_takes_its_local_half_whatever_its_size() {
         Some(crate::hybrid::Side::Cloud),
         "an explicit cloud pin is still refused by that handler"
     );
+}
+
+/// A multipart `/tts` is routed by its `model` form field like a
+/// transcription: without one, or with a provider's, it is a 400.
+#[tokio::test]
+async fn a_multipart_tts_request_needs_a_local_model() {
+    let form = |model: Option<&str>| {
+        let field = |name: &str, value: &str| {
+            format!("--B\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+        };
+        let mut body = String::new();
+        if let Some(model) = model {
+            body.push_str(&field("model", model));
+        }
+        body.push_str(&field("input", "hello"));
+        body.push_str("--B--\r\n");
+        Bytes::from(body)
+    };
+    let headers = headers_with(&[("content-type", "multipart/form-data; boundary=B")]);
+    for (model, expected) in [
+        (None, "missing a required \"model\" form field"),
+        (Some(HOSTED), "does not route /tts to a provider"),
+    ] {
+        let response = handle_tts(State(test_state()), headers.clone(), form(model))
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(error.contains(expected), "{body}");
+    }
+}
+
+/// A JSON `/tts` naming a provider's model is a 400 too, before any credential
+/// is looked up.
+#[tokio::test]
+async fn a_json_tts_request_for_a_provider_model_is_a_400() {
+    let headers = headers_with(&[("content-type", "application/json")]);
+    let body = Bytes::from(format!(r#"{{"model":"{HOSTED}","input":"hello"}}"#));
+    let response = handle_tts(State(test_state()), headers, body)
+        .await
+        .unwrap_or_else(IntoResponse::into_response);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A page on another site can send a form or `text/plain` body without a
+/// preflight; neither reaches a model, and the body is not even read.
+#[tokio::test]
+async fn a_cross_site_upload_is_refused() {
+    let url = serve_router(test_state()).await;
+    for path in ["/tts", "/v1/audio/transcriptions", "/audio/transcriptions"] {
+        for content_type in ["multipart/form-data; boundary=B", "text/plain"] {
+            let resp = Client::new()
+                .post(format!("{url}{path}"))
+                .header("content-type", content_type)
+                .header("origin", "https://evil.example")
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{path} {content_type}"
+            );
+        }
+    }
+}
+
+/// Malformed JSON is the client's error.
+#[tokio::test]
+async fn a_malformed_tts_body_is_a_400() {
+    let headers = headers_with(&[("content-type", "application/json")]);
+    let response = handle_tts(State(test_state()), headers, Bytes::from("{"))
+        .await
+        .unwrap_or_else(IntoResponse::into_response);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 /// An unreadable pin is a 400, not a guess. See `hybrid::parse_pin`.

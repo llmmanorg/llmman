@@ -43,6 +43,7 @@ mod managed;
 mod messages;
 mod ollama;
 mod openai;
+mod realtime;
 mod refusal;
 mod relay;
 mod responses;
@@ -85,8 +86,8 @@ use ollama::{
 use openai::{
     handle_openai_chat, handle_openai_completions, handle_openai_embeddings, handle_openai_images,
     handle_openai_models, handle_openai_speech, handle_openai_systemone,
-    handle_openai_transcriptions, handle_openai_video_get, handle_openai_videos, local_engine,
-    SYSTEMONE_BODY_LIMIT_BYTES, TRANSCRIPTION_BODY_LIMIT_BYTES,
+    handle_openai_transcriptions, handle_openai_video_get, handle_openai_videos, handle_tts,
+    local_engine, SYSTEMONE_BODY_LIMIT_BYTES, TRANSCRIPTION_BODY_LIMIT_BYTES,
 };
 use relay::proxy;
 pub use runtime::Runtime;
@@ -4171,17 +4172,38 @@ async fn record_prompt(State(state): State<AppState>, req: Request, next: Next) 
 /// outright, since `/api/blobs` reads a raw body and `/api/pull` or
 /// `/api/create` would otherwise be drivable from any page.
 async fn accept_any_content_type(mut req: Request, next: Next) -> Response {
+    if forged_cross_site(req.headers()) {
+        return cross_site_refused().into_response();
+    }
     if !has_json_content_type(req.headers()) {
-        if foreign_origin(req.headers()) {
-            let body = serde_json::json!({ "error": "cross-site request refused" });
-            return (StatusCode::FORBIDDEN, Json(body)).into_response();
-        }
         req.headers_mut().insert(
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("application/json"),
         );
     }
     next.run(req).await
+}
+
+/// The 403 for a request from a page `cors_layer` wouldn't allow.
+fn cross_site_refused() -> AppError {
+    AppError::status(StatusCode::FORBIDDEN, "cross-site request refused")
+}
+
+/// A POST route that takes an upload (up to [`TRANSCRIPTION_BODY_LIMIT_BYTES`]).
+/// A forged cross-site request is refused before its body is buffered.
+fn upload_route<H, T>(handler: H) -> axum::routing::MethodRouter<AppState>
+where
+    H: axum::handler::Handler<T, AppState>,
+    T: 'static,
+{
+    post(handler)
+        .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES))
+        .layer(middleware::from_fn(|req: Request, next: Next| async move {
+            if forged_cross_site(req.headers()) {
+                return cross_site_refused().into_response();
+            }
+            next.run(req).await
+        }))
 }
 
 fn has_json_content_type(headers: &HeaderMap) -> bool {
@@ -4549,13 +4571,11 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         )
         .route(
             "/v1/audio/transcriptions",
-            post(handle_openai_transcriptions)
-                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
+            upload_route(handle_openai_transcriptions),
         )
         .route(
             "/audio/transcriptions",
-            post(handle_openai_transcriptions)
-                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
+            upload_route(handle_openai_transcriptions),
         )
         .route("/v1/responses", post(responses::handle_openai_responses))
         .route(
@@ -4568,6 +4588,11 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .route("/v1/videos/:id", get(handle_openai_video_get))
         .route("/v1/videos/:id/content", get(handle_openai_video_get))
         .route("/v1/audio/speech", post(handle_openai_speech))
+        // llama-server's own text to speech: voices, voice cloning from a
+        // reference clip, raw PCM, streaming (a clip arrives as multipart)
+        .route("/tts", upload_route(handle_tts))
+        // Live transcription and spoken conversation, over a WebSocket
+        .route(realtime::REALTIME_ROUTE, get(realtime::handle_realtime))
         // Native Gemini compatibility. The public route accepts a model in
         // Gemini's normal API path; the AGY route pins AGY's auxiliary calls
         // to the model chosen by `llmman launch agy`.
