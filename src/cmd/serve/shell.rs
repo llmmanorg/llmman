@@ -6,7 +6,7 @@
 //! (`daemon::reachable_only_locally`); only with the daemon's API key
 //! when it has one (the `auth` module, which checks this route like every
 //! other — a browser presents the key as a subprotocol); only with the
-//! token this start made, as the subprotocol `llmman.shell.<token>`, API
+//! token the daemon saved, as the subprotocol `llmman.shell.<token>`, API
 //! keys or not; only from an `Origin` the CORS layer would allow, minus
 //! host wildcards, checked here because browsers do not apply CORS to
 //! WebSockets; and not at all under `LLMMAN_SHELL=off`. Any other
@@ -44,6 +44,33 @@ use super::AppState;
 /// The subprotocol prefix the shell token comes under. Not the API key's:
 /// a browser on a keyed daemon offers both, and each check finds its own.
 pub(super) const TOKEN_PROTOCOL_PREFIX: &str = "llmman.shell.";
+
+/// The saved token for `bind_addr` if valid, else a new one, so a restart
+/// keeps the page's token working.
+pub(super) fn token_for(bind_addr: &str) -> anyhow::Result<String> {
+    token_path(bind_addr)
+        .ok()
+        .and_then(|path| saved_token(&path))
+        .map_or_else(new_token, Ok)
+}
+
+/// From a regular, owner-only (Unix) file holding a well-formed token.
+fn saved_token(path: &std::path::Path) -> Option<String> {
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file())
+        || crate::config::owner_readable_only(path).is_err()
+    {
+        return None;
+    }
+    let token = std::fs::read_to_string(path).ok()?.trim().to_string();
+    is_token(&token).then_some(token)
+}
+
+/// 32 bytes of unpadded URL-safe base64, as [`new_token`] makes.
+fn is_token(s: &str) -> bool {
+    s.len() == 43
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
 
 /// URL-safe base64, which a subprotocol and a URL fragment carry as is.
 pub(super) fn new_token() -> anyhow::Result<String> {
@@ -177,8 +204,7 @@ impl Refusal {
     }
 }
 
-/// Where this start's token is kept: one file per bind address, so
-/// daemons on two addresses do not overwrite each other's.
+/// Where the token is kept: one file per bind address.
 fn token_path(bind_addr: &str) -> anyhow::Result<PathBuf> {
     Ok(crate::data_root()?.join(token_file_name(bind_addr)))
 }
@@ -237,18 +263,24 @@ pub(super) fn announce(policy: &Policy, token: &str, tls: bool, bind_addr: &str)
     }
 }
 
-/// A token from an earlier start opens nothing: a client that reads it
-/// only gets a 401.
+/// Drops the saved token. A failure is reported: the next start would reuse it.
 fn remove_old_token(bind_addr: &str) {
-    if let Ok(path) = token_path(bind_addr) {
-        let _ = std::fs::remove_file(path);
+    let Ok(path) = token_path(bind_addr) else {
+        return;
+    };
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => eprintln!(
+            "[llmman] shell: could not remove {}: {e}; delete it before re-enabling the shell",
+            path.display()
+        ),
+        _ => {}
     }
 }
 
 fn token_refused() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        "the shell needs the token llmman serve made when it started: open the web UI link \
+        "the shell needs the token llmman serve saved: open the web UI link \
          it printed, or offer the token from its shell-<host>-<port>.token file as the subprotocol \
          llmman.shell.<token>",
     )
@@ -480,14 +512,38 @@ mod tests {
     fn a_new_token_is_random_and_fits_a_subprotocol_as_it_is() {
         let (a, b) = (new_token().unwrap(), new_token().unwrap());
         assert_ne!(a, b);
-        assert_eq!(a.len(), 43, "32 bytes of unpadded base64");
-        assert!(a
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'));
+        assert!(is_token(&a) && is_token(&b));
+        assert!(!is_token("short") && !is_token(&format!("{a}=")) && !is_token(&"+".repeat(43)));
     }
 
     #[test]
-    fn only_this_starts_token_is_presented() {
+    fn a_restart_reuses_a_valid_saved_token_until_it_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        assert_eq!(saved_token(&path), None, "missing");
+        let token = new_token().unwrap();
+        crate::fsutil::write_private(&path, token.as_bytes()).unwrap();
+        assert_eq!(saved_token(&path), Some(token));
+        crate::fsutil::write_private(&path, b"not a token").unwrap();
+        assert_eq!(saved_token(&path), None, "malformed");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(saved_token(&path), None, "not a file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_token_others_can_read_is_not_reused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        crate::fsutil::write_private(&path, new_token().unwrap().as_bytes()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(saved_token(&path), None);
+    }
+
+    #[test]
+    fn only_the_daemons_token_is_presented() {
         let p = policy(None);
         assert_eq!(
             p.presented_token(&offering("llmman.bearer.a2V5, llmman.shell.t")),
