@@ -23,13 +23,13 @@ import { font, radius, spacing, useTheme } from "@/lib/theme";
 
 const NO_TOKEN_HELP =
   Platform.OS === "web"
-    ? "llmman serve makes a new shell token each time it starts. Open the link it prints in its terminal, " +
+    ? "llmman serve keeps a shell token in its data directory. Open the link it prints in its terminal, " +
       "or add #shell-token= and the token from shell-<host>-<port>.token in llmman's data directory to this page's address."
-    : "The shell needs the token llmman serve makes each time it starts, which only a browser on the same " +
+    : "The shell needs the token llmman serve keeps in its data directory, which only a browser on the same " +
       "computer can take from the link llmman serve prints.";
 
 const STALE_TOKEN_HELP =
-  "If llmman serve has restarted since its shell link was opened, open the new link: each start makes a new token.";
+  "If the shell token file was deleted since this page got its token, open llmman serve's new link, or add #shell-token= and the token from that file to this page's address.";
 
 type Session =
   | { state: "connecting" }

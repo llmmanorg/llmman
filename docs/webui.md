@@ -103,8 +103,9 @@ way:
    network behind an API key is a choice an operator can make; a shell
    is not, even behind one. On loopback, a daemon with keys requires one
    for the shell as for every other route.
-2. **This start's token.** Each `llmman serve` start makes a random token
-   and writes it, readable only by its user, to `shell-<host>-<port>.token`
+2. **The daemon's token.** `llmman serve` makes a random token the first
+   time it starts on an address and writes it, readable only by its user,
+   to `shell-<host>-<port>.token`
    (`<host>` as `LLMMAN_HOST` spells it, so `shell-127.0.0.1-17434.token`
    by default; an IPv6 host loses its brackets and its colons become `_`,
    so `[::1]` gives `shell-__1-17434.token`; `<port>` the one it listens
@@ -119,9 +120,11 @@ way:
    turns the shell off and says why, since no client could learn the token.
    The page takes the token from the fragment, which the browser never
    sends, keeps it in local storage like the key, and takes it off the
-   address. Without one, *Shell* says how to get it; a token from an
-   earlier start opens nothing. Processes running as the same user can read
-   the file, so the token keeps out other users of the machine and anything
+   address. Without one, *Shell* says how to get it. A restart reuses the
+   saved token, so a page that has it keeps working, unless the file is
+   gone, malformed or (on Unix) readable by others. Turning the shell off
+   deletes it; delete it yourself to get a new one. Processes running as
+   the same user can read the file, so the token keeps out other users of the machine and anything
    that reaches the port from elsewhere (a forwarded port, a container's or
    VM's route to the host).
 3. **Same-site browsers only.** Browsers do not apply CORS to WebSockets,

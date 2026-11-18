@@ -4798,7 +4798,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     }
     // Before the store is touched, so a bad value has no side effects.
     backend::check_extra_args_env()?;
-    let shell_token = shell::new_token()?;
+    let shell_token = shell::token_for(&crate::daemon::bind_addr())?;
     let shell = shell::Policy::from_env(&shell_token)?;
     let llama_cpp_version = runtime::llama_cpp_pin(_args.llama_cpp_version.as_deref());
 

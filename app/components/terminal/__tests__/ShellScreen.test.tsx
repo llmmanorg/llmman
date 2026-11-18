@@ -85,7 +85,7 @@ test("refused before attaching: a stale-token hint, and a new shell takes the ne
   await screen.findByText("terminal");
   expect(open).toHaveBeenLastCalledWith(URL, undefined, "old");
   act(() => mockTerminal!.onState("closed"));
-  expect(screen.getByText(/each start makes a new token/)).toBeTruthy();
+  expect(screen.getByText(/token file was deleted/)).toBeTruthy();
 
   mockToken = "new";
   fireEvent.press(screen.getByText("Open a new shell"));
