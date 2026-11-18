@@ -218,7 +218,8 @@ answered by `session.updated`, `input_audio_buffer.committed`,
 `input_audio_buffer.cleared` and `error`. Audio is base64 PCM16 at 16000 Hz,
 the only rate accepted; a session buffers at most 30 s before a commit, and a
 worker holds at most four sessions open, a fifth gets an error event and is
-closed.
+closed. A session with no client event for 60 s is closed the same way, and
+pings do not count.
 
 `/v1/systemone` answers typed questions about a `state` with a decision model
 (a GGUF with a `<arch>.decision.type`, such as Clef), with a probability for
