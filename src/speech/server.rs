@@ -1799,9 +1799,10 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/realtime"))
             .await
             .unwrap();
-        ws.send(WsMessage::Text("x".repeat(QUEUE_BYTES + 1)))
-            .await
-            .unwrap();
+        // The server may close the connection while this frame is still
+        // being written, so the send itself can fail with a reset; that
+        // is the refusal, and the handler's verdict below is the check.
+        let _ = ws.send(WsMessage::Text("x".repeat(QUEUE_BYTES + 1))).await;
         let what = tokio::time::timeout(std::time::Duration::from_secs(5), outcome.recv())
             .await
             .expect("the handler did not finish within the deadline")
