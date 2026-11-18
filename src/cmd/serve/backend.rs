@@ -212,9 +212,31 @@ pub(super) fn use_mlx_for_safetensors() -> bool {
     cfg!(target_os = "macos") && safetensors_engine_from_env() == SafetensorsEngine::Auto
 }
 
+/// A free port, never one of the last [`RECENT_PORTS`] handed out: the
+/// listener is dropped before the backend binds, so concurrent loads could
+/// otherwise share one.
 pub(super) fn find_free_port() -> anyhow::Result<u16> {
-    let l = TcpListener::bind("127.0.0.1:0")?;
-    Ok(l.local_addr()?.port())
+    static RECENT: StdMutex<VecDeque<u16>> = StdMutex::new(VecDeque::new());
+    for _ in 0..1024 {
+        let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        if claim_port(&mut RECENT.lock().unwrap_or_else(|e| e.into_inner()), port) {
+            return Ok(port);
+        }
+    }
+    anyhow::bail!("no free port that was not just handed out")
+}
+
+const RECENT_PORTS: usize = 256;
+
+fn claim_port(recent: &mut VecDeque<u16>, port: u16) -> bool {
+    if recent.contains(&port) {
+        return false;
+    }
+    if recent.len() == RECENT_PORTS {
+        recent.pop_front();
+    }
+    recent.push_back(port);
+    true
 }
 
 /// Shared handle onto the last few lines a spawned inference backend wrote
@@ -1238,6 +1260,17 @@ pub(super) async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<S
 mod tests {
     use super::*;
     use std::sync::PoisonError;
+
+    #[test]
+    fn a_port_just_handed_out_is_refused_until_it_ages_out() {
+        let mut recent = VecDeque::new();
+        assert!(claim_port(&mut recent, 4000));
+        assert!(!claim_port(&mut recent, 4000));
+        for port in 5000..5000 + RECENT_PORTS as u16 {
+            assert!(claim_port(&mut recent, port));
+        }
+        assert!(claim_port(&mut recent, 4000));
+    }
 
     /// Held by every test that sets or reads an `LLMMAN_*_ARGS` variable,
     /// since the environment is process-wide.
