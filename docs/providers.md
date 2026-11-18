@@ -199,7 +199,7 @@ installed:
 | `qwen` | Qwen Code | yes |
 | `dsh` | DeepSeek Harness | yes |
 | `goose` | Block goose | yes |
-| `goose-desktop` | Block goose Desktop (requires `--model`) | yes |
+| `goose-desktop` | Block goose Desktop (requires `--model`, or `OPENAI_TRANSCRIPTION_MODEL` for dictation only) | yes |
 | `grok` | Grok Build (requires `--model`) | no: its fetched model catalog cannot represent llmman's hosted-provider routing reference |
 | `docker-agent` | Docker Agent (requires `--model`) | yes |
 | `vibe` | Mistral Vibe CLI | yes |

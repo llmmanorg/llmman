@@ -13,6 +13,27 @@ use super::goose::goose_env;
 use super::sandbox;
 use super::{accepts_prompt, env_dir, exec_with_env, find_on_path, find_on_path_unless, server};
 
+/// What goose's OpenAI dictation provider reads its speech model from.
+pub(super) const TRANSCRIPTION_MODEL_ENV: &str = "OPENAI_TRANSCRIPTION_MODEL";
+
+/// [`goose_env`]'s environment, or without a `model` (dictation only, see
+/// `check_model_flag`) just the endpoint and key, leaving goose's chat
+/// provider to the user. `speech_model` is forwarded for a sandbox that
+/// drops the inherited environment.
+pub(super) fn goose_desktop_env<'a>(
+    model: &'a str,
+    api_key: &'a str,
+    host: &'a str,
+    speech_model: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    if !model.is_empty() {
+        return goose_env(model, api_key, host);
+    }
+    let mut env = vec![("OPENAI_API_KEY", api_key), ("OPENAI_HOST", host)];
+    env.extend(speech_model.map(|m| (TRANSCRIPTION_MODEL_ENV, m)));
+    env
+}
+
 /// goose-desktop: [`super::goose::launch_goose`]'s environment, pointed at the desktop
 /// app. Configured through the environment alone, so nothing is written
 /// and a `goose configure` provider survives the launch.
@@ -65,7 +86,13 @@ pub(super) fn launch_goose_desktop(
         }
     }
     let host = server();
-    exec_with_env(&bin, extra_args, &goose_env(model, api_key, &host))
+    let speech = std::env::var(TRANSCRIPTION_MODEL_ENV).ok();
+    let speech = speech.as_deref().filter(|_| sandbox::active());
+    exec_with_env(
+        &bin,
+        extra_args,
+        &goose_desktop_env(model, api_key, &host, speech),
+    )
 }
 
 /// What a probe for a running Goose Desktop found.
@@ -639,6 +666,25 @@ mod tests {
         // so a `/v1` here would request /v1/v1/chat/completions.
         assert_eq!(get("OPENAI_HOST"), Some(host));
         assert_eq!(get("OPENAI_BASE_PATH"), Some("v1/chat/completions"));
+    }
+
+    #[test]
+    fn goose_desktop_env_with_and_without_a_model() {
+        let host = "http://127.0.0.1:17434";
+        for speech in [None, Some("speech")] {
+            assert_eq!(
+                goose_desktop_env("m", "k", host, speech),
+                goose_env("m", "k", host)
+            );
+        }
+        assert_eq!(
+            goose_desktop_env("", "k", host, None),
+            [("OPENAI_API_KEY", "k"), ("OPENAI_HOST", host)]
+        );
+        assert_eq!(
+            goose_desktop_env("", "k", host, Some("speech"))[2],
+            ("OPENAI_TRANSCRIPTION_MODEL", "speech")
+        );
     }
 
     /// `Goose.exe` and the CLI's `goose.exe` are one name to Windows, so

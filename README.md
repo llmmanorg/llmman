@@ -398,6 +398,21 @@ installer: add the unpacked folder to `PATH` and its `Goose.exe` is found
 there, told apart from the `goose` CLI — the same name to Windows — by the
 Electron files beside it.
 
+`goose-desktop` also runs without `--model` for dictation only: set
+`OPENAI_TRANSCRIPTION_MODEL` to a speech model and goose's microphone button
+posts to llmman's `/v1/audio/transcriptions`. goose gets only `OPENAI_HOST` and
+`OPENAI_API_KEY`, so its chat provider stays your choice in its settings.
+
+```sh
+OPENAI_TRANSCRIPTION_MODEL=hf.co/ggml-org/Voxtral-Mini-3B-2507-GGUF:Q4_K_M \
+  llmman launch goose-desktop
+```
+
+The launch does not pull the speech model, so `llmman pull` it first or the
+first dictation waits for the download. `OPENAI_HOST` is also goose's OpenAI
+chat provider's host, so choosing "OpenAI" for chat sends it to llmman too.
+`--provider` still needs `--model`.
+
 Docker Agent is found on `PATH` or in `~/.docker/cli-plugins`, where Docker
 Desktop and `brew install docker-agent` put it. llmman generates its own
 agent file under `~/.config/llmman/launch/docker-agent/` and passes it to

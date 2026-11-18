@@ -178,7 +178,14 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     }
 
     // Before either arm starts the daemon; see `check_model_flag`.
-    check_model_flag(name, args.model.as_deref(), provider, &args.extra_args)?;
+    let speech = std::env::var(goose_desktop::TRANSCRIPTION_MODEL_ENV).ok();
+    check_model_flag(
+        name,
+        args.model.as_deref(),
+        provider,
+        speech.as_deref(),
+        &args.extra_args,
+    )?;
     if name.eq_ignore_ascii_case("copilot")
         || name.eq_ignore_ascii_case("copilot-cli")
         || name.eq_ignore_ascii_case("droid")
@@ -412,6 +419,7 @@ fn integration_key() -> String {
 /// goose-desktop keeps the same environment, so llmman still owns the
 /// provider and endpoint; only the model name would fall back to
 /// `goose configure`'s, and the daemon would be asked for that one.
+/// It alone may skip `--model`, for dictation: see `check_model_flag`.
 /// Grok Build and Cline have hosted defaults of their own; without an
 /// explicit local model they would send those ids to llmman's endpoint
 /// instead.
@@ -482,19 +490,36 @@ const MODEL_FLAG_FORWARDED: &[&str] = &[
 /// win for the integrations in `MODEL_FLAG_FORWARDED`, but `run`
 /// resolves the top-level one and, locally, preloads it, so that gets
 /// said.
+///
+/// goose-desktop alone may skip `--model` when `speech_model`
+/// (`OPENAI_TRANSCRIPTION_MODEL`) is set: it then launches for dictation
+/// only. `--provider` still needs `--model`.
 fn check_model_flag(
     integration: &str,
     model: Option<&str>,
     provider: Option<&str>,
+    speech_model: Option<&str>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let name = integration.to_lowercase();
     let model = model.map(str::trim).filter(|m| !m.is_empty());
     let Some(model) = model else {
         if MODEL_REQUIRED.contains(&name.as_str()) {
+            let dictation = name == "goose-desktop" && provider.is_none();
+            if dictation && speech_model.is_some_and(|s| !s.trim().is_empty()) {
+                return Ok(());
+            }
             let with_provider = provider.map_or(String::new(), |p| format!(" --provider {p}"));
+            let or_dictate = if dictation {
+                format!(
+                    ", or set {}=<speech model> for dictation only",
+                    goose_desktop::TRANSCRIPTION_MODEL_ENV
+                )
+            } else {
+                String::new()
+            };
             anyhow::bail!(
-                "{name} needs a model: llmman launch {name}{with_provider} --model <model>"
+                "{name} needs a model: llmman launch {name}{with_provider} --model <model>{or_dictate}"
             );
         }
         // No resolved model for a forwarded one to win over.
@@ -1710,19 +1735,19 @@ mod tests {
         let none: Vec<String> = vec![];
         for id in MODEL_REQUIRED {
             assert!(integration(id).is_some(), "{id} is not an integration");
-            assert!(check_model_flag(id, None, None, &none).is_err());
-            assert!(check_model_flag(id, Some(" "), None, &none).is_err());
-            assert!(check_model_flag(&id.to_uppercase(), None, None, &none).is_err());
-            let err = check_model_flag(id, None, Some("openrouter"), &none).unwrap_err();
+            assert!(check_model_flag(id, None, None, None, &none).is_err());
+            assert!(check_model_flag(id, Some(" "), None, None, &none).is_err());
+            assert!(check_model_flag(&id.to_uppercase(), None, None, None, &none).is_err());
+            let err = check_model_flag(id, None, Some("openrouter"), None, &none).unwrap_err();
             assert!(
                 err.to_string().contains("--provider openrouter --model"),
                 "{err}"
             );
-            assert!(check_model_flag(id, Some("m"), None, &none).is_ok());
+            assert!(check_model_flag(id, Some("m"), None, None, &none).is_ok());
             let forwarded = vec!["--model".to_string(), "theirs".to_string()];
-            assert!(check_model_flag(id, Some("m"), None, &forwarded).is_ok());
+            assert!(check_model_flag(id, Some("m"), None, None, &forwarded).is_ok());
         }
-        assert!(check_model_flag("claude", None, None, &none).is_ok());
+        assert!(check_model_flag("claude", None, None, None, &none).is_ok());
         // The "yours wins" warning is only claimed for launchers that
         // actually yield to it; dsh has no `--model` flag to yield to.
         for id in MODEL_FLAG_FORWARDED {
@@ -1817,7 +1842,33 @@ mod tests {
         assert!(!CONFIGURED_BY_FILE.contains(&"goose-desktop"));
         // It has no --model of its own to yield to.
         assert!(!MODEL_FLAG_FORWARDED.contains(&"goose-desktop"));
+        // Needs a model, bar the dictation-only launch below.
         assert!(MODEL_REQUIRED.contains(&"goose-desktop"));
+    }
+
+    #[test]
+    fn goose_desktop_launches_without_a_model_only_for_dictation() {
+        let none: Vec<String> = vec![];
+        let speech = Some("hf.co/ggml-org/Voxtral-Mini-3B-2507-GGUF:Q4_K_M");
+        for id in ["goose-desktop", "GOOSE-DESKTOP"] {
+            assert!(check_model_flag(id, None, None, speech, &none).is_ok());
+            assert!(check_model_flag(id, Some("m"), None, speech, &none).is_ok());
+            for blank in [None, Some(""), Some(" \t\n")] {
+                let err = check_model_flag(id, None, None, blank, &none).unwrap_err();
+                assert!(err
+                    .to_string()
+                    .contains("--model <model>, or set OPENAI_TRANSCRIPTION_MODEL="));
+            }
+            let err = check_model_flag(id, None, Some("openrouter"), speech, &none).unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("--provider openrouter --model <model>"));
+            assert!(!err.to_string().contains("OPENAI_TRANSCRIPTION_MODEL"));
+        }
+        // No other integration, the goose CLI included, is let off.
+        for id in MODEL_REQUIRED.iter().filter(|id| **id != "goose-desktop") {
+            assert!(check_model_flag(id, None, None, speech, &none).is_err());
+        }
     }
 
     #[test]
