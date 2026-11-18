@@ -126,9 +126,10 @@ subject = "https://github.com/myorg/models/.github/workflows/sign.yml@refs/heads
 mode    = "enforce"
 ```
 
-`issuer` and `subject` are compared exactly; either may be left out, and
-the one given must still match. A rule sets `keys` or an identity, not
-both. An identity rule without a `trusted_root` is a broken
+`issuer` and `subject` are compared exactly and both are required: an
+issuer alone would accept every identity that issuer signs for, and a
+subject alone the same name from any issuer. A rule sets `keys` or an
+identity, not both. An identity rule without a `trusted_root` is a broken
 configuration, never an unsigned model: under `enforce` the pull is
 refused, under `warn` it proceeds with a warning naming `trusted_root`,
 and in neither mode is the model reported as "not signed".

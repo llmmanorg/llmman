@@ -366,6 +366,16 @@ fn validate_identity(entry: &crate::config::TrustConf) -> anyhow::Result<()> {
             );
         }
     }
+    // One half alone is too wide: an issuer without a subject accepts
+    // every identity that issuer signs for, a subject without an issuer
+    // accepts the same name from any issuer.
+    if has_identity && (entry.issuer.is_none() || entry.subject.is_none()) {
+        bail!(
+            "[[verify.trust]] pattern {:?} names an identity: both `issuer` and `subject` \
+             are required",
+            entry.pattern
+        );
+    }
     Ok(())
 }
 
@@ -1513,11 +1523,24 @@ mod tests {
             outside.trusted_root.as_deref(),
             Some(Path::new("/etc/llmman/sigstore/root.json"))
         );
-        // Subject alone is an identity as well.
-        let p = policy("[[trust]]\npattern=\"docker.io/a/b\"\nsubject=\"me@example.com\"\n");
-        let only_subject = p.decide("docker.io/a/b:v1");
-        assert!(only_subject.has_identity());
-        assert_eq!(only_subject.trusted_root, None);
+    }
+
+    /// One half alone is too wide: an issuer without a subject would
+    /// accept every identity that issuer signs for, and a subject
+    /// without an issuer the same name from any issuer.
+    #[test]
+    fn an_identity_needs_both_issuer_and_subject() {
+        for half in ["issuer=\"https://issuer\"", "subject=\"me@example.com\""] {
+            let err = Policy::parse(
+                &format!("[[trust]]\npattern=\"a/b\"\n{half}\n"),
+                Path::new("/x"),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("both `issuer` and `subject`"),
+                "{half}: {err:#}"
+            );
+        }
     }
 
     #[test]

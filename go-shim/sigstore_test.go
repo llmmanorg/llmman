@@ -972,19 +972,27 @@ func TestVerifySignatureLayerKeylessAcceptsMatchingIdentity(t *testing.T) {
 	for _, tc := range []struct {
 		name            string
 		issuer, subject string
+		wantErr         string
 	}{
-		{"issuer and subject", keylessIssuer, keylessSubject},
-		{"issuer only", keylessIssuer, ""},
-		{"subject only", "", keylessSubject},
+		{"issuer and subject", keylessIssuer, keylessSubject, ""},
+		// One half alone is refused: the shim does not widen the
+		// check even if a caller hands it a partial identity.
+		{"issuer only", keylessIssuer, "", "both an issuer and a subject"},
+		{"subject only", "", keylessSubject, "both an issuer and a subject"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			identity := &identityPolicy{Issuer: tc.issuer, Subject: tc.subject, TrustedRoot: f.trustedRootFile(t)}
 			match, err := verifySignatureLayer(payload, annotations, keylessRef, digest.Digest(targetA), verifyPolicy{identity: identity}, "")
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("verifySignatureLayer: %v", err)
 			}
-			// The signer label names the certificate, not the rule: an
-			// unset half of the rule is still reported from the leaf.
+			// The signer label names the certificate.
 			if want := keylessIssuer + " " + keylessSubject; match.Signer != want {
 				t.Errorf("match.Signer = %q, want %q", match.Signer, want)
 			}

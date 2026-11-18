@@ -702,7 +702,13 @@ func verifyKeyless(payload, rawSig []byte, b64sig string, annotations map[string
 	if err != nil {
 		return nil, err
 	}
-	if rule.Issuer != "" && issuer != rule.Issuer {
+	// Both halves are required: the Rust side refuses a rule with one,
+	// and the shim refuses an identity that arrives without one so a
+	// different caller cannot widen the check.
+	if rule.Issuer == "" || rule.Subject == "" {
+		return nil, errors.New("identity rule needs both an issuer and a subject")
+	}
+	if issuer != rule.Issuer {
 		return nil, fmt.Errorf("certificate issuer %q is not %q", issuer, rule.Issuer)
 	}
 	sans := cryptoutils.GetSubjectAlternateNames(leaf)
