@@ -94,7 +94,11 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
         peers: Vec::new(),
         memory: 0,
         store_path,
-        cache_path: std::env::temp_dir(),
+        cache_path: {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::env::temp_dir().join(format!("llmman-test-cache-{}-{n}", std::process::id()))
+        },
         prompt_log: None,
         usage_log: None,
         shell: shell::Policy {

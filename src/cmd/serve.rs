@@ -4887,16 +4887,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // Gated by the same LLMMAN_NOPRUNE escape hatch as `rm`.
     if !crate::storage::gc::noprune_from_env() {
         if let Ok(store) = OciStore::open(&store_path) {
-            if let Ok(live) = crate::storage::gc::referenced_digests(&store) {
-                let grace = crate::storage::gc::GC_GRACE_PERIOD;
-                if let Err(e) = crate::storage::gc::prune_blobs_and_cache(
-                    &store_path,
-                    &cache_path,
-                    &live,
-                    grace,
-                ) {
-                    eprintln!("[llmman] GC sweep failed: {e:#}");
-                }
+            if let Err(e) = crate::storage::gc::sweep(&store, &cache_path) {
+                eprintln!("[llmman] GC sweep failed: {e:#}");
             }
         }
     }

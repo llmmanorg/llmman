@@ -179,7 +179,6 @@ impl OciStore {
         Ok(Self { root })
     }
 
-    #[allow(dead_code)]
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -349,7 +348,14 @@ impl OciStore {
         let hex = hex::encode(Sha256::digest(data));
         let digest = format!("sha256:{}", hex);
         let path = self.root.join("blobs").join("sha256").join(&hex);
-        if !path.exists() {
+        if path.exists() {
+            // Reused: refresh its age so a concurrent sweep's grace window
+            // covers it until this build's tag lands.
+            let _ = fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        } else {
             let tmp = path.with_extension("tmp");
             fs::write(&tmp, data)?;
             fs::rename(tmp, &path)?;
@@ -1500,6 +1506,39 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn rewriting_an_existing_blob_refreshes_its_age() {
+        let dir = temp_store_dir("blob-reuse");
+        let store = OciStore::open(&dir).unwrap();
+        let desc = store
+            .write_blob("application/octet-stream", b"layer")
+            .unwrap();
+        let path = store.blob_path(&desc.digest).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        let touch = |t| {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(t)
+                .unwrap()
+        };
+        touch(old);
+
+        store
+            .write_blob("application/octet-stream", b"layer")
+            .unwrap();
+
+        let age = fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap();
+        assert!(age < std::time::Duration::from_secs(60), "{age:?}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

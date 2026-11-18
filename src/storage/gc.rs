@@ -475,7 +475,43 @@ fn is_cache_copy_temp_name(name: &str) -> bool {
         && counter.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Skips both the post-`rm` and startup GC sweeps when `LLMMAN_NOPRUNE` is
+/// Sweeps what no surviving tag references, within [`GC_GRACE_PERIOD`].
+pub fn sweep(store: &OciStore, cache_path: &Path) -> anyhow::Result<(GcStats, GcStats)> {
+    let live = referenced_digests(store)?;
+    prune_blobs_and_cache(store.root(), cache_path, &live, GC_GRACE_PERIOD)
+}
+
+/// Runs `retag`, which re-points `reference`, then sweeps if that replaced
+/// other content: nothing else a tag write does orphans a blob. The tag has
+/// landed by then, so a failed sweep is logged, not returned.
+pub fn after_retag<T>(
+    store: &OciStore,
+    cache_path: &Path,
+    reference: &str,
+    retag: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if noprune_from_env() {
+        return retag();
+    }
+    let digest = |store: &OciStore| store.find(reference).ok().map(|d| d.digest);
+    let before = digest(store);
+    let out = retag()?;
+    if before.is_some() && digest(store) != before {
+        match sweep(store, cache_path) {
+            Ok((blobs, cache)) if blobs.count + cache.count > 0 => eprintln!(
+                "[llmman] freed {} replacing {reference} ({} blobs, {} cache entries)",
+                crate::fmt::human_size(blobs.bytes + cache.bytes),
+                blobs.count,
+                cache.count
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("[llmman] GC sweep after replacing {reference} failed: {e:#}"),
+        }
+    }
+    Ok(out)
+}
+
+/// Skips the post-`rm`, post-retag and startup GC sweeps when `LLMMAN_NOPRUNE` is
 /// set to anything other than an explicit falsy value — an escape hatch
 /// for shared/read-mostly stores or scripts that `rm` in a loop and would
 /// rather prune once at the end themselves. Read fresh at each call site,
@@ -894,6 +930,94 @@ mod tests {
                 .count,
             0
         );
+    }
+
+    #[cfg(unix)]
+    fn blob(store: &OciStore, digest: &str) -> std::path::PathBuf {
+        let hex = digest.strip_prefix("sha256:").unwrap();
+        store.root().join("blobs").join("sha256").join(hex)
+    }
+
+    /// A one-layer model in `store`, its blobs backdated past the grace window.
+    #[cfg(unix)]
+    fn aged_model(store: &OciStore, layer: &[u8]) -> crate::storage::oci::Descriptor {
+        let cfg = store
+            .write_blob(
+                "application/vnd.cncf.model.config.v1+json",
+                &[b"config-", layer].concat(),
+            )
+            .unwrap();
+        let layer = store.write_blob("application/octet-stream", layer).unwrap();
+        let layer_digest = layer.digest.clone();
+        let manifest = crate::storage::oci::Manifest {
+            schema_version: 2,
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            artifact_type: None,
+            config: cfg,
+            layers: vec![layer],
+            annotations: None,
+        };
+        let desc = store.write_manifest(&manifest).unwrap();
+        let old = SystemTime::now() - GC_GRACE_PERIOD - Duration::from_secs(60);
+        for digest in [&layer_digest, &desc.digest, &manifest.config.digest] {
+            filetime_set(&blob(store, digest), old);
+        }
+        desc
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_retag_to_other_content_reclaims_what_only_the_old_content_held() {
+        let root = temp_dir("after-retag");
+        let cache = root.join("cache");
+        let store = OciStore::open(root.join("store")).unwrap();
+        let reference = "docker.io/ai/m:latest";
+        let old = aged_model(&store, b"old");
+        store.tag(old.clone(), reference).unwrap();
+        let old_manifest = store.read_manifest(&old.digest).unwrap();
+        let old_layer = old_manifest.layers[0].digest.clone();
+        let old_cache = cache.join(old_layer.strip_prefix("sha256:").unwrap());
+        std::fs::create_dir_all(&old_cache).unwrap();
+        filetime_set(
+            &old_cache,
+            SystemTime::now() - GC_GRACE_PERIOD - Duration::from_secs(60),
+        );
+        let shared = aged_model(&store, b"shared");
+        store.tag(shared, "docker.io/ai/other:latest").unwrap();
+
+        let new = aged_model(&store, b"new");
+        after_retag(&store, &cache, reference, || store.tag(new, reference)).unwrap();
+
+        for gone in [&old.digest, &old_layer, &old_manifest.config.digest] {
+            assert!(!blob(&store, gone).exists(), "{gone}");
+        }
+        assert!(!old_cache.exists());
+        let live = referenced_digests(&store).unwrap();
+        assert_eq!(live.len(), 6);
+        assert!(live.iter().all(|d| blob(&store, d).exists()));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_tag_or_the_same_content_sweeps_nothing() {
+        let root = temp_dir("after-retag-noop");
+        let store = OciStore::open(&root).unwrap();
+        let orphan = aged_model(&store, b"orphan");
+        let desc = aged_model(&store, b"kept");
+        let reference = "docker.io/ai/m:latest";
+
+        after_retag(&store, &root.join("cache"), reference, || {
+            store.tag(desc.clone(), reference)
+        })
+        .unwrap();
+        after_retag(&store, &root.join("cache"), reference, || {
+            store.tag(desc.clone(), reference)
+        })
+        .unwrap();
+
+        assert!(blob(&store, &orphan.digest).exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Minimal mtime-backdating helper — mirrors the one in
