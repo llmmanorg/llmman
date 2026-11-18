@@ -51,6 +51,11 @@ pub const MAX_SESSIONS: usize = 4;
 /// so a commit never splits.
 pub const BUFFER_SAMPLES: usize = CLIP_SECONDS * SAMPLE_RATE;
 
+/// Seconds a realtime session may go without a client event before the
+/// worker closes it, so idle connections cannot hold the
+/// [`MAX_SESSIONS`] slots. Pings and pongs do not count as events.
+pub const IDLE_SECONDS: u64 = 60;
+
 /// Room `max_body` leaves above `max_file` for the multipart framing and
 /// the other fields.
 const FRAMING_ALLOWANCE: usize = 64 << 10;
@@ -434,6 +439,8 @@ pub struct Server {
     /// its whole life. Separate from `inflight`: a session never queues
     /// behind the one-shot route's admission, it is refused at once.
     sessions: Arc<Semaphore>,
+    /// How long a session may stay silent; [`IDLE_SECONDS`] outside tests.
+    idle: std::time::Duration,
 }
 
 type Shared = Arc<Server>;
@@ -926,6 +933,41 @@ fn session_id() -> String {
 /// meanwhile are queued and handled after it. The permit is shared with
 /// each commit's blocking task, so it is released when this future ends
 /// and no commit of it is still queued for the worker lock.
+/// What the session loop got from the socket.
+enum Received {
+    /// A JSON text frame; `last_event` was reset.
+    Text(String),
+    /// A binary frame, which the protocol has no use for.
+    Binary,
+    /// No event arrived within `idle` of the last one.
+    Idle,
+    /// The client closed or the socket failed.
+    Gone,
+}
+
+/// The next client event, or why there is none. Pings and pongs are
+/// swallowed and do not count as activity, so a client that only keeps
+/// the connection alive still runs into the idle limit.
+async fn recv_event(
+    socket: &mut WebSocket,
+    idle: std::time::Duration,
+    last_event: &mut std::time::Instant,
+) -> Received {
+    loop {
+        let left = idle.saturating_sub(last_event.elapsed());
+        match tokio::time::timeout(left, socket.recv()).await {
+            Err(_) => return Received::Idle,
+            Ok(Some(Ok(Message::Text(text)))) => {
+                *last_event = std::time::Instant::now();
+                return Received::Text(text);
+            }
+            Ok(Some(Ok(Message::Binary(_)))) => return Received::Binary,
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+            Ok(Some(Ok(Message::Close(_))) | Some(Err(_)) | None) => return Received::Gone,
+        }
+    }
+}
+
 async fn run_realtime(s: Shared, mut socket: WebSocket) {
     let Some(permit) = admit(&mut socket, &s.sessions).await else {
         return;
@@ -949,20 +991,30 @@ async fn run_realtime(s: Shared, mut socket: WebSocket) {
     }
     let mut previous_item: Option<String> = None;
     let mut queued: VecDeque<String> = VecDeque::new();
+    let mut last_event = std::time::Instant::now();
     loop {
         let text = match queued.pop_front() {
             Some(text) => text,
-            None => match socket.recv().await {
-                Some(Ok(Message::Text(text))) => text,
-                Some(Ok(Message::Binary(_))) => {
+            None => match recv_event(&mut socket, s.idle, &mut last_event).await {
+                Received::Text(text) => text,
+                Received::Binary => {
                     let e = Error::Invalid("events are JSON text frames, not binary".into());
                     if send_error(&mut socket, &e).await.is_err() {
                         return;
                     }
                     continue;
                 }
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                Received::Idle => {
+                    let e = Error::Invalid(format!(
+                        "no client event for {} s, closing the session",
+                        s.idle.as_secs()
+                    ));
+                    if send_error(&mut socket, &e).await.is_ok() {
+                        let _ = socket.send(Message::Close(None)).await;
+                    }
+                    return;
+                }
+                Received::Gone => return,
             },
         };
         let outcome = match ClientEvent::parse(&text, session.room()) {
@@ -1078,6 +1130,7 @@ pub fn router(worker: Worker, model_name: String, model_path: String) -> Router 
         inflight: Arc::new(Semaphore::new(limits.max_inflight)),
         model: model_name.clone(),
         sessions: Arc::new(Semaphore::new(MAX_SESSIONS)),
+        idle: std::time::Duration::from_secs(IDLE_SECONDS),
     });
     Router::new()
         .route(
@@ -1526,6 +1579,58 @@ mod tests {
     /// A served `/v1/realtime` whose commit waits for a worker lock the
     /// test holds: the client leaves, the handler ends, and the session
     /// permit stays taken until the lock is free and the blocking task
+    /// A silent client is told so and closed once `idle` passes, and a
+    /// ping in between does not count as activity.
+    #[tokio::test]
+    async fn a_silent_session_is_closed_after_the_idle_limit() {
+        use futures::{SinkExt, StreamExt};
+        use std::time::Duration;
+
+        let idle = Duration::from_millis(200);
+        let app = Router::new().route(
+            "/v1/realtime",
+            get(move |ws: WebSocketUpgrade| async move {
+                capped(ws).on_upgrade(move |mut socket| async move {
+                    let mut last = std::time::Instant::now();
+                    let got = recv_event(&mut socket, idle, &mut last).await;
+                    let text = match got {
+                        Received::Idle => "idle",
+                        Received::Text(_) => "text",
+                        Received::Binary => "binary",
+                        Received::Gone => "gone",
+                    };
+                    let _ = socket.send(Message::Text(text.to_string())).await;
+                    let _ = socket.send(Message::Close(None)).await;
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/realtime"))
+            .await
+            .unwrap();
+        tokio::time::sleep(idle / 2).await;
+        ws.send(tokio_tungstenite::tungstenite::Message::Ping(vec![]))
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let verdict = loop {
+            match ws.next().await {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => break t,
+                Some(Ok(_)) => continue,
+                other => panic!("socket ended before a verdict: {other:?}"),
+            }
+        };
+        assert_eq!(verdict, "idle");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the idle limit fired late: {:?}",
+            started.elapsed()
+        );
+    }
+
     /// exits, so a cap of one still refuses a second session meanwhile.
     #[tokio::test]
     async fn a_disconnected_commit_keeps_its_session_slot_until_the_lock_frees() {
