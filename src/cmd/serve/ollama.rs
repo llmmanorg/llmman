@@ -1292,7 +1292,7 @@ fn create_from_staged_blobs(
         }
         let store = OciStore::open(store_path)?;
         let desc = crate::storage::gc::after_retag(&store, cache_path, model, || {
-            store.build(&tmp, model, &HashMap::new())
+            store.build(&tmp, model, &HashMap::new(), false)
         })?;
         statuses.push(format!("writing manifest {}", desc.digest));
         Ok((desc.digest, statuses))

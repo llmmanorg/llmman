@@ -309,8 +309,17 @@ pub fn write_blob_from_file(
     } else {
         let mut out = std::fs::File::create(&tmp)?;
         let copied = crate::fsutil::copy_hashing(&mut source, &mut out)
-            .with_context(|| format!("copy {} into the blob store", path.display()))?;
-        (copied, tmp.clone())
+            .with_context(|| format!("copy {} into the blob store", path.display()));
+        // Closed before the remove below: Windows refuses to delete an
+        // open file.
+        drop(out);
+        match copied {
+            Ok(copied) => (copied, tmp.clone()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        }
     };
     drop(source);
     let digest = format!("sha256:{hex}");
@@ -320,7 +329,14 @@ pub fn write_blob_from_file(
     // holds exactly these bytes. Renaming (never writing to `dest`
     // directly) is what keeps a concurrent writer of the same digest
     // from ever seeing a half-written blob at its final path.
-    if !dest.exists() {
+    if dest.exists() {
+        // Reused: refresh its age so a concurrent sweep's grace window
+        // covers it until the caller's manifest or tag lands.
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dest)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    } else {
         match std::fs::rename(&staged, &dest) {
             Ok(()) => {}
             // A sibling won the race and published the identical blob
@@ -538,6 +554,25 @@ mod tests {
         assert!(!staged2.exists(), "consume=true must move, not copy");
         assert_eq!(read_blob(&dir, &moved2.digest).unwrap(), b"other weights");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A directory opens on Unix but fails to read, which is a copy that
+    /// dies after the staging file exists.
+    #[cfg(unix)]
+    #[test]
+    fn write_blob_from_file_leaves_no_staging_file_when_the_copy_fails() {
+        let dir = tempfile();
+        let src = dir.join("not-a-file");
+        std::fs::create_dir_all(&src).unwrap();
+
+        write_blob_from_file(&dir, MEDIA_TYPE_MODEL_WEIGHT_RAW, &src, false).unwrap_err();
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.join("blobs").join("sha256"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

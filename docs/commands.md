@@ -16,7 +16,7 @@ reference; this is the one-line summary of each subcommand.
 | `usage`   | Show the tokens and cost of what `serve` has served, per model, provider, client, day or route |
 | `providers` | List the hosted providers `--provider` can route to |
 | `stop`    | Stop (unload) a running model |
-| `build`   | Package model files into a local OCI image |
+| `build`   | Package model files into a local OCI image; `--raw` stores each file without a tar wrapper, so the layer digest is the file's SHA-256 |
 | `push`    | Push a local image to a registry |
 | `transfer` | Transfer an image directly from one location to another (e.g. HuggingFace to an OCI registry) |
 | `cp`      | Copy a local image to a new reference |

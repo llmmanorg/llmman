@@ -288,7 +288,8 @@ llmman run hf.co/antirez/qwen3.8-flash-next-gguf:Q2 "hello"
 `llmman pull` skips files with `imatrix` in their name, which includes
 the DeepSeek V4 Flash builds ds4 recommends. Download one with ds4's
 `./download_model.sh ds4f-q2`, move the file into a directory of its own,
-and package it with `llmman build -t ds4f:q2 <dir>`.
+and package it with `llmman build -t ds4f:q2 <dir>` (add `--raw` to store
+the file without a tar wrapper).
 
 llmman runs `ds4-server -m <gguf> --chdir <dir> ... --port <port> --host
 127.0.0.1`, where `<dir>` is the directory of the binary `PATH`'s

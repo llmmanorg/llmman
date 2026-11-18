@@ -369,35 +369,22 @@ impl OciStore {
     }
 
     /// Write a large file as a blob, streaming to avoid buffering the whole file.
-    #[allow(dead_code)]
+    ///
+    /// Delegates to the layout-level writer the pull path uses: the file
+    /// is copied and hashed in one pass into a uniquely named temp file,
+    /// then renamed into place, and a blob that already exists has its
+    /// age refreshed so a concurrent sweep's grace window covers it.
     pub fn write_blob_file(
         &self,
         media_type: &str,
         path: impl AsRef<Path>,
     ) -> anyhow::Result<Descriptor> {
-        let path = path.as_ref();
-        let tmp = self
-            .root
-            .join("blobs")
-            .join("sha256")
-            .join(format!("tmp-{}", std::process::id()));
-        let (size, hex) = {
-            let mut src =
-                fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-            let mut dst = fs::File::create(&tmp)?;
-            crate::fsutil::copy_hashing(&mut src, &mut dst)?
-        };
-        let digest = format!("sha256:{}", hex);
-        let dest = self.root.join("blobs").join("sha256").join(&hex);
-        if dest.exists() {
-            fs::remove_file(&tmp)?;
-        } else {
-            fs::rename(tmp, &dest)?;
-        }
+        let desc =
+            crate::hf::oci::write_blob_from_file(&self.root, media_type, path.as_ref(), false)?;
         Ok(Descriptor {
-            media_type: media_type.into(),
-            digest,
-            size,
+            media_type: desc.media_type,
+            digest: desc.digest,
+            size: u64::try_from(desc.size).context("blob size is negative")?,
             annotations: None,
         })
     }
@@ -575,12 +562,16 @@ impl OciStore {
     /// extension (mirroring [`crate::sources::classify_file`], the
     /// equivalent classifier used when pulling from HuggingFace/cloud
     /// sources), with `org.cncf.model.filepath` recording its path.
+    /// With `raw`, each file is instead stored whole as a `*.v1.raw`
+    /// layer classified by [`crate::sources::classify_file`], so the layer
+    /// digest is the file's own SHA-256, as the pull path produces.
     /// Returns the manifest descriptor.
     pub fn build(
         &self,
         src_dir: impl AsRef<Path>,
         reference: &str,
         labels: &std::collections::HashMap<String, String>,
+        raw: bool,
     ) -> anyhow::Result<Descriptor> {
         use walkdir::WalkDir;
 
@@ -597,7 +588,8 @@ impl OciStore {
         let mut layers: Vec<Descriptor> = Vec::new();
         let mut format: Option<&'static str> = None;
 
-        // One layer per file (uncompressed tar, filename preserved via annotations)
+        // One layer per file (uncompressed tar, or the file itself with raw;
+        // filename preserved via annotations)
         for entry in WalkDir::new(&canonical_src).follow_links(true) {
             let entry = entry?;
 
@@ -631,8 +623,15 @@ impl OciStore {
                 .to_string_lossy()
                 .replace('\\', "/");
 
-            let media_type = classify_model_layer(&rel);
-            if media_type == WEIGHT_TAR_MEDIA_TYPE {
+            let (media_type, weight_type) = if raw {
+                (
+                    crate::sources::classify_file(&rel),
+                    crate::hf::oci::MEDIA_TYPE_MODEL_WEIGHT_RAW,
+                )
+            } else {
+                (classify_model_layer(&rel), WEIGHT_TAR_MEDIA_TYPE)
+            };
+            if media_type == weight_type {
                 let lower = rel.to_lowercase();
                 if lower.ends_with(".gguf") || lower.ends_with(".ggml") {
                     format = Some("gguf");
@@ -641,9 +640,13 @@ impl OciStore {
                 }
             }
 
-            // Build a minimal tar with a single entry
-            let tar_data = make_single_file_tar(&canonical_entry, &rel)?;
-            let mut desc = self.write_blob(media_type, &tar_data)?;
+            let mut desc = if raw {
+                self.write_blob_file(media_type, &canonical_entry)?
+            } else {
+                // Build a minimal tar with a single entry
+                let tar_data = make_single_file_tar(&canonical_entry, &rel)?;
+                self.write_blob(media_type, &tar_data)?
+            };
             desc.annotations = Some({
                 let mut m = std::collections::HashMap::new();
                 m.insert("org.cncf.model.filepath".into(), rel.clone());
@@ -657,9 +660,10 @@ impl OciStore {
             return Err(anyhow!("no files found in {}", src_dir.display()));
         }
 
-        // `application/vnd.cncf.model.config.v1+json` config. Since every
-        // layer above is an uncompressed tar, each layer's DiffID (hash of
-        // its uncompressed content) is simply its own digest.
+        // `application/vnd.cncf.model.config.v1+json` config. Every layer
+        // above is uncompressed (a tar, or the file itself with `raw`), so
+        // each layer's DiffID (hash of its uncompressed content) is simply
+        // its own digest.
         let cncf_config = CncfModelConfig {
             descriptor: CncfConfigDescriptor {
                 created_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -1543,6 +1547,106 @@ mod tests {
             .elapsed()
             .unwrap();
         assert!(age < std::time::Duration::from_secs(60), "{age:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rewriting_an_existing_blob_file_refreshes_its_age() {
+        let dir = temp_store_dir("blob-file-reuse");
+        let store = OciStore::open(&dir).unwrap();
+        let src = dir.join("layer.bin");
+        fs::write(&src, b"layer file").unwrap();
+        let first = store
+            .write_blob_file("application/octet-stream", &src)
+            .unwrap();
+        assert_eq!(first.size, 10);
+        assert_eq!(
+            first.digest,
+            format!("sha256:{}", hex::encode(Sha256::digest(b"layer file")))
+        );
+        let path = store.blob_path(&first.digest).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"layer file");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let second = store
+            .write_blob_file("application/octet-stream", &src)
+            .unwrap();
+
+        assert_eq!(second.digest, first.digest);
+        assert_eq!(second.size, first.size);
+        let age = fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap();
+        assert!(age < std::time::Duration::from_secs(60), "{age:?}");
+        let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn build_wraps_each_file_in_its_own_tar_layer() {
+        let dir = temp_store_dir("build-tar");
+        let store = OciStore::open(&dir).unwrap();
+        let context = dir.join("context");
+        fs::create_dir_all(context.join("sub")).unwrap();
+        fs::write(
+            context.join("sub").join("model.Q4.gguf"),
+            b"GGUF\x03\0\0\0body",
+        )
+        .unwrap();
+        let labels: std::collections::HashMap<String, String> =
+            [("org.example.team".to_string(), "canary".to_string())].into();
+
+        let desc = store
+            .build(&context, "example.invalid/tar:v1", &labels, false)
+            .unwrap();
+
+        let manifest = store.read_manifest(&desc.digest).unwrap();
+        assert_eq!(manifest.layers.len(), 1);
+        let layer = &manifest.layers[0];
+        assert_eq!(layer.media_type, WEIGHT_TAR_MEDIA_TYPE);
+        assert!(layer.media_type.ends_with(".tar"), "{}", layer.media_type);
+        let ann = layer.annotations.as_ref().unwrap();
+        assert_eq!(ann["org.cncf.model.filepath"], "sub/model.Q4.gguf");
+        assert_eq!(ann["org.opencontainers.image.title"], "sub/model.Q4.gguf");
+
+        let blob = store.read_blob(&layer.digest).unwrap();
+        let mut archive = tar::Archive::new(blob.as_slice());
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().unwrap().unwrap();
+        assert_eq!(
+            entry.path().unwrap().to_string_lossy().replace('\\', "/"),
+            "sub/model.Q4.gguf"
+        );
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut body).unwrap();
+        assert_eq!(body, b"GGUF\x03\0\0\0body");
+        assert!(entries.next().is_none(), "more than one tar entry");
+
+        let config: CncfModelConfig =
+            serde_json::from_slice(&store.read_blob(&manifest.config.digest).unwrap()).unwrap();
+        assert_eq!(config.modelfs.fs_type, "layers");
+        let digests: Vec<String> = manifest.layers.iter().map(|l| l.digest.clone()).collect();
+        assert_eq!(config.modelfs.diff_ids, digests);
+        assert_eq!(config.config.format.as_deref(), Some("gguf"));
+        assert_eq!(manifest.annotations.as_ref(), Some(&labels));
+        assert_eq!(
+            store.find("example.invalid/tar:v1").unwrap().digest,
+            desc.digest
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
