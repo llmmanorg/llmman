@@ -119,17 +119,30 @@ pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
             "another llmman process is pulling into this store; waiting for it to finish",
         )?)
     };
-    let notices = tokio::runtime::Runtime::new()
+    let mut notices = tokio::runtime::Runtime::new()
         .context("start tokio runtime")?
         .block_on(crate::cmd::serve::pull_checked(&store_path, &reference))
         .with_context(|| format!("pulling {reference}"))?;
     drop(pull_lock);
+    // The one resolution of this reference: the layer check and the
+    // load below both use `desc`, so a tag repointed in between cannot
+    // hand the load a manifest nobody checked. A failed find fails
+    // here as `resolve_model` would, which finds by the same reference.
+    // `load_ref` is `reference` pinned to that manifest; `reference`
+    // stays the spelling printed back. See `verify_layers_found`.
+    let desc = OciStore::open(&store_path)?
+        .find(&reference)
+        .with_context(|| format!("model not found in store: {reference}"))?;
+    let (load_ref, layer_notices) =
+        crate::cmd::serve::verify_layers_found(&store_path, &reference, &desc)
+            .with_context(|| format!("verify layers of {reference}"))?;
+    notices.extend(layer_notices);
     for notice in notices {
         eprintln!("[llmman] {notice}");
     }
 
     if args.dir {
-        let tree = crate::modelpack::resolve_model_tree(&store_path, &cache_path, &reference)
+        let tree = crate::modelpack::resolve_model_tree(&store_path, &cache_path, &load_ref)
             .with_context(|| format!("resolving {reference}"))?;
         let out = TreeOutput {
             reference: &reference,
@@ -141,7 +154,7 @@ pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let resolved = resolve_model(&store_path, &cache_path, &reference)
+    let resolved = resolve_model(&store_path, &cache_path, &load_ref)
         .with_context(|| format!("resolving {reference}"))?;
 
     let out = ResolveOutput {

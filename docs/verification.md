@@ -152,6 +152,7 @@ makes that safe.
 | `resolve` (the vLLM plugin, `llmman-csi`) | The same as `pull`, to a model it pulls and to one already in the store. |
 | `transfer` from an OCI registry | Source checked under the same policy as `pull`: re-publishing an unverified model under your own name is how a supply-chain problem propagates, and a transfer that skipped the check would launder one past a policy `pull` enforces. |
 | `push --sign-key` / `transfer --sign-key` | Signs the digest that was actually pushed, never one re-resolved from the destination tag afterwards. |
+| A cold load under `[verify] layers` | The stored manifest, its config blob and every stored layer blob are re-hashed and compared with the digests the manifest records. `warn` logs a notice per mismatch; `enforce` fails the load. Off by default; the signature policy never turns it on. See below. |
 | `verify` | Always checks and always reports, whatever the policy says — it is the diagnostic, so its exit status reflects the signature, not the policy. |
 
 Signing twice with different keys **appends**, so key rotation works:
@@ -159,9 +160,61 @@ publish under the new key while the old one is still trusted, then
 withdraw the old key from the policy. Re-signing with a key that already
 signed a digest is a no-op.
 
+## Layer verification at load
+
+Signature verification binds a manifest digest to a key. It says nothing
+about whether the bytes under `blobs/sha256/` still match that manifest:
+a layer's SHA-256 is checked once, while it is downloaded, and from then
+on the file is trusted by name. `[verify] layers = "warn"` or `"enforce"`
+(or `LLMMAN_VERIFY_LAYERS`) adds a second check on every cold load of
+`llmman serve` and on `llmman resolve`: the stored manifest, its config
+blob and each stored layer blob are hashed again and compared with the
+digest the manifest records. A blob that is
+missing, cannot be read, or carries a malformed digest counts as a
+mismatch, with the cause in the notice; a manifest whose own bytes
+mismatch is reported alone, since the layer list it carries is not
+trusted. The manifest is resolved once per load: the running-model
+check, the layer check and the load all use that one descriptor, and
+the load opens it pinned by digest, so a tag repointed in between is
+not found rather than loaded unchecked; a model stored under an
+absolute path or a URI cannot carry a digest and is loaded by name, so
+that guarantee does not extend to it. Each blob is opened without
+following symlinks and must be a regular file, checked on the open
+handle, so a blob replaced by a symlink, a directory, a FIFO or a
+device is a mismatch rather than something followed or read.
+
+Under `warn` each mismatch logs a notice naming the reference, the digest
+and the media type, and the load proceeds. Under `enforce` the load fails
+with an error listing every mismatched digest. Either way nothing is
+deleted and no registry is contacted: the blob may be the operator's only
+copy, and the operator asked to be told, not to have it removed. This is
+deliberately unlike a failed signature check under `enforce`, which
+removes the reference.
+
+The check is independent of `default` and the trust rules, needs no keys,
+and applies to every model in the store whatever its origin, including
+ones pulled from HuggingFace or a local path. It runs once per cold load,
+not per request. The cost is one sequential read and hash of every
+blob, once per cold load.
+
 ## Limitations
 
 These are real and worth stating plainly.
+
+- **Layers are checked in the store, not where they are served from.**
+  The check hashes the blobs under `blobs/sha256/`. Several layer kinds
+  are served from a copy under the cache directory instead: a GGUF that
+  arrived inside a tar, a projector, and any layer with a file path
+  annotation. That copy is a hardlink when the cache shares a filesystem
+  with the store and a real copy otherwise, and an existing copy is
+  reused on a size match alone. The manifest records no digest for it,
+  so a cache copy is not re-hashed.
+
+- **A write after the check is not detected.** Layer verification hashes
+  a blob before the backend opens it; a change made after that point, or
+  while the model is being served, goes unnoticed until the next cold
+  load. Kernel-enforced read-time integrity (fs-verity) could close that
+  gap later.
 
 - **Keyless signing (Fulcio / Rekor) is not supported.** llmman does
   key-based verification only. Keyless brings a much larger dependency

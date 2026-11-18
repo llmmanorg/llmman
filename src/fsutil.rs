@@ -255,13 +255,16 @@ where
     }
 }
 
+/// Lowercase hex SHA-256 of everything `reader` yields.
+pub fn sha256_of_reader(reader: &mut impl Read) -> std::io::Result<String> {
+    copy_hashing(reader, &mut std::io::sink()).map(|(_, hex)| hex)
+}
+
 /// Lowercase hex SHA-256 of the file at `path`.
 pub fn sha256_of_file(path: &Path) -> anyhow::Result<String> {
     use anyhow::Context as _;
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let (_, hex) = copy_hashing(&mut file, &mut std::io::sink())
-        .with_context(|| format!("hash {}", path.display()))?;
-    Ok(hex)
+    sha256_of_reader(&mut file).with_context(|| format!("hash {}", path.display()))
 }
 
 #[cfg(test)]

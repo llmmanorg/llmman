@@ -338,7 +338,7 @@ impl OciStore {
     // Blobs
     // ------------------------------------------------------------------
 
-    fn blob_path(&self, digest: &str) -> anyhow::Result<PathBuf> {
+    pub(crate) fn blob_path(&self, digest: &str) -> anyhow::Result<PathBuf> {
         let (algo, hex) = split_digest(digest)?;
         Ok(self.root.join("blobs").join(algo).join(hex))
     }
@@ -1115,15 +1115,20 @@ pub fn default_tag(reference: &str) -> String {
     }
 }
 
-fn split_digest(digest: &str) -> anyhow::Result<(&str, &str)> {
-    let mut parts = digest.splitn(2, ':');
-    let algo = parts
-        .next()
-        .ok_or_else(|| anyhow!("invalid digest: {}", digest))?;
-    let hex = parts
-        .next()
-        .ok_or_else(|| anyhow!("invalid digest: {}", digest))?;
-    Ok((algo, hex))
+/// Splits `algo:hex` and accepts only the shape this store writes:
+/// `sha256` and 64 ASCII hex digits. The hex becomes a path component
+/// under `blobs/`, and digests arrive from manifests that are themselves
+/// blobs, so anything else (`/dev/zero`, `..`) is refused here rather
+/// than joined onto the store root.
+pub(crate) fn split_digest(digest: &str) -> anyhow::Result<(&str, &str)> {
+    match digest.split_once(':') {
+        Some((algo @ "sha256", hex))
+            if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            Ok((algo, hex))
+        }
+        _ => Err(anyhow!("invalid digest: {}", digest)),
+    }
 }
 
 pub fn tag_from_ref(reference: &str) -> &str {

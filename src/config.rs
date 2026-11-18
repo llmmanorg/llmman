@@ -22,6 +22,7 @@
 //!
 //! [verify]                             # crate::verify
 //! default = "off"
+//! layers  = "off"                      # hash stored layers on a cold load
 //!
 //! [[verify.trust]]
 //! pattern = "docker.io/myorg/**"
@@ -351,6 +352,11 @@ pub struct VerifyConf {
     /// Mode for references no rule matches.
     #[serde(default)]
     pub default: Option<String>,
+    /// Mode for hashing the stored manifest and layer blobs on a cold
+    /// load. Independent of `default` and the trust rules: those speak
+    /// about signatures, this about the bytes already on disk.
+    #[serde(default)]
+    pub layers: Option<String>,
     /// `[[verify.trust]]` entries, in the order they appear.
     #[serde(default)]
     pub trust: Vec<TrustConf>,
@@ -1370,6 +1376,7 @@ ps = "off""#,
         assert!(parse("[providers.openai]\napi_kye = \"x\"").is_err());
         assert!(parse("[alias]\nx = \"y\"").is_err());
         assert!(parse("[verify]\ndefualt = \"off\"").is_err());
+        assert!(parse("[verify]\nlayres = \"off\"").is_err());
         assert!(parse("[[verify.trust]]\npattern = \"a/b\"\nkyes = []").is_err());
         assert!(parse("[registry.\"docker.io\"]\nmirrors = \"m\"").is_err());
         assert!(parse("[registries.\"docker.io\"]\nmirror = \"m\"").is_err());

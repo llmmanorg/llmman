@@ -979,6 +979,43 @@ fn verify_stored(
     }
 }
 
+/// Re-hashes the stored manifest, config and layer blobs of `desc`,
+/// the descriptor the caller resolved for `reference`, under the
+/// `[verify] layers` mode (see `verify::verify_layers`). The caller
+/// does the one `OciStore::find`; this function never finds again, so
+/// the manifest checked here is the manifest the load then opens. The
+/// mode is resolved first, so every caller, `llmman resolve` of a
+/// cached HF model included, loads the policy here and an unparsable
+/// `LLMMAN_VERIFY` or `LLMMAN_VERIFY_LAYERS` fails there as it does in
+/// the daemon. Blocking: it reads every stored blob of the model, so
+/// run it off the async executor. Unlike `verify_stored`, a mismatch
+/// never removes the reference: the blob may be the operator's only copy.
+///
+/// Returns the reference the caller must load alongside the notices:
+/// `reference` pinned to `desc`'s digest (see `verify::pinned_reference`),
+/// under `off` as well, so the load cannot resolve a tag repointed since
+/// the find. An absolute path or a URI cannot carry a digest
+/// (`split_ref_digest`), so it comes back as given and is loaded by
+/// name: a pointer rewritten between the find and the load is not
+/// caught for that reference class. `modelpack::resolve_model` and
+/// `resolve_model_tree` use their reference only for `OciStore::find`
+/// and error text, so the pinned spelling changes which manifest they
+/// load and nothing else.
+pub(crate) fn verify_layers_found(
+    store_path: &std::path::Path,
+    reference: &str,
+    desc: &crate::storage::oci::Descriptor,
+) -> anyhow::Result<(String, Vec<String>)> {
+    let mode = crate::verify::layers_mode()?;
+    let notices = if mode == crate::verify::Mode::Off {
+        Vec::new()
+    } else {
+        let store = OciStore::open(store_path)?;
+        crate::verify::verify_layers(mode, &store, reference, desc)?
+    };
+    Ok((crate::verify::pinned_reference(reference, desc), notices))
+}
+
 /// Drops a reference the policy refused, so a later pull cannot find it
 /// present and hand it out unchecked; blobs are left to the GC sweep. A
 /// failed removal is reported alongside the rejection rather than
@@ -2313,30 +2350,56 @@ async fn resolve_target(
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
-    // Best-effort — used to populate `llmman ps`'s ID/SIZE columns and
-    // for the check right below; `resolve_model` after them establishes
-    // the model exists, so a failure here (e.g. a race with a concurrent
-    // `rm`) just means those columns show as empty/zero rather than
-    // failing the whole request.
-    let (digest, size) = OciStore::open(&state.0.store_path)
-        .and_then(|s| {
-            s.find(model_ref).map(|d| {
-                let size = s.total_size(&d);
-                (d.digest, size)
-            })
-        })
-        .unwrap_or_default();
+    // The one resolution of this load. The descriptor feeds the
+    // running-digest check, `llmman ps`'s ID/SIZE columns, the layer
+    // check and, through `load_ref`, `resolve_model` and the worker
+    // spawns, so a tag repointed by a concurrent pull or `rm` between
+    // any two of them cannot hand the load a manifest nobody checked.
+    // A failed find fails the load: `resolve_model` finds by the same
+    // reference and would have failed with "model not found in store".
+    let desc = OciStore::open(&state.0.store_path)?
+        .find(model_ref)
+        .with_context(|| format!("model not found in store: {model_ref}"))?;
     // The content may be running already under a key this spelling does
     // not resolve to; see `check_running_by_digest`'s doc comment for the
     // order that produces one.
-    if !digest.is_empty() {
-        if let Some((key, port, guard)) =
-            check_running_by_digest(state, model_ref, &digest, opts.ctx).await
-        {
-            return Ok((key, Target::Local(port), guard));
-        }
+    if let Some((key, port, guard)) =
+        check_running_by_digest(state, model_ref, &desc.digest, opts.ctx).await
+    {
+        return Ok((key, Target::Local(port), guard));
     }
-    let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
+    // Layer digests, once per cold load: after every running-process
+    // reuse check above (a tag for content already loaded by digest
+    // must not re-hash the model) and ahead of every format arm below,
+    // so GGUF, safetensors trees, diffusion and Omni all pass through
+    // it. Off by default; an enforce mismatch fails the load with the
+    // reference and digests in the error. It checks `desc`, found once
+    // above, and `resolve_model` loads that same manifest through
+    // `load_ref`; `model_ref` stays the spelling for the running-process
+    // keys and logs.
+    let load_ref = {
+        let store_path = state.0.store_path.clone();
+        let model_ref_owned = model_ref.to_owned();
+        let desc = desc.clone();
+        let (load_ref, notices) = tokio::task::spawn_blocking(move || {
+            verify_layers_found(&store_path, &model_ref_owned, &desc)
+        })
+        .await
+        .context("layer verification task panicked")?
+        .with_context(|| format!("verify layers of {model_ref}"))?;
+        for notice in notices {
+            eprintln!("[llmman] {notice}");
+        }
+        load_ref
+    };
+    // Read the manifest for the size only now: `total_size` is a plain
+    // read, so before the layer check a FIFO or a link to `/dev/zero`
+    // at the manifest's blob path would stall the load instead of
+    // being reported as a mismatch.
+    let size = OciStore::open(&state.0.store_path)?.total_size(&desc);
+    let digest = desc.digest;
+
+    let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, &load_ref)
         .with_context(|| format!("resolve model {model_ref}"))?;
     let context_shift = supports_context_shift(model_ref);
     // One header read feeds initial_ctx_size, embedding_model_ctx and
@@ -2484,12 +2547,13 @@ async fn resolve_target(
                     // A Canary GGUF runs in this binary's speech worker,
                     // spawned the way the media backend is but from the
                     // CPU image (see SPEECH_BACKEND). Not OOM-retryable
-                    // either.
+                    // either. The worker re-resolves its reference, so it
+                    // gets `load_ref`, the manifest verified above.
                     (GgufArm::Speech { container: true }, Some(ociman)) => {
                         let mut child = crate::container::spawn_mediagen(
                             ociman,
                             crate::container::SPEECH_BACKEND,
-                            model_ref,
+                            &load_ref,
                             &state.0.store_path,
                             &state.0.cache_path,
                             state.0.llama_cpp_version.as_deref(),
@@ -2501,7 +2565,7 @@ async fn resolve_target(
                     }
                     (GgufArm::Speech { .. }, _) => {
                         let (child, tail) =
-                            spawn_mediagen_backend(model_ref, port, state, Workload::CpuOnly)
+                            spawn_mediagen_backend(&load_ref, port, state, Workload::CpuOnly)
                                 .await?;
                         stderr_tail = Some(tail);
                         ModelProcess::Local(Engine::Speech, child, None)
@@ -2528,12 +2592,14 @@ async fn resolve_target(
                     }
                 }
             }
-            // diffusion models run in this binary (see mediagen_backend)
+            // diffusion models run in this binary (see mediagen_backend).
+            // The worker re-resolves its reference, so it gets `load_ref`:
+            // the manifest verified above, not a tag that may have moved.
             (ModelPath::Diffusion(_), Some(ociman)) => {
                 let mut child = crate::container::spawn_mediagen(
                     ociman,
                     crate::container::detect_backend(),
-                    model_ref,
+                    &load_ref,
                     &state.0.store_path,
                     &state.0.cache_path,
                     state.0.llama_cpp_version.as_deref(),
@@ -2546,7 +2612,7 @@ async fn resolve_target(
             }
             (ModelPath::Diffusion(_), None) => {
                 let (child, tail) =
-                    spawn_mediagen_backend(model_ref, port, state, Workload::General).await?;
+                    spawn_mediagen_backend(&load_ref, port, state, Workload::General).await?;
                 stderr_tail = Some(tail);
                 oom_retryable = true;
                 ModelProcess::Local(Engine::LlamaServer, child, None)
@@ -4499,6 +4565,19 @@ async fn speech_backend(
     crate::mediagen::http::serve("speech", router, (args.host, port).into()).await
 }
 
+/// The `serve MODEL --port PORT` head of a worker's argv. `model_ref`
+/// is passed through verbatim: the child resolves it on its own, so
+/// the caller hands it the digest-pinned spelling `verify_layers_found`
+/// returned and the worker loads the manifest that was verified.
+fn mediagen_backend_args(model_ref: &str, port: u16) -> [String; 4] {
+    [
+        "serve".into(),
+        model_ref.into(),
+        "--port".into(),
+        port.to_string(),
+    ]
+}
+
 /// Spawns this binary as `model_ref`'s backend, `llmman serve MODEL --port
 /// PORT` (see `run`): the media backend of a diffusion model, the speech
 /// worker of a Canary GGUF. `workload` is whose runtime answer the child
@@ -4511,7 +4590,7 @@ async fn spawn_mediagen_backend(
 ) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
     let exe = std::env::current_exe().context("locating the llmman binary")?;
     let mut cmd = tokio::process::Command::new(&exe);
-    cmd.args(["serve", model_ref, "--port", &port.to_string()]);
+    cmd.args(mediagen_backend_args(model_ref, port));
     // Explicit, so the child lands on the same build as this daemon
     // rather than re-resolving `auto`/the default pin/LLMMAN_RUNTIME.
     let runtime = state.0.runtime.resolve_for(workload).await?.runtime();

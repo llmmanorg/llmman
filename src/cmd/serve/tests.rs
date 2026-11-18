@@ -20,6 +20,19 @@ use super::test_support::{
 };
 use super::*;
 
+/// The diffusion and speech workers re-resolve the reference they are
+/// handed, so `resolve_target` passes them the digest-pinned spelling
+/// `verify_layers_found` returned; the argv must carry it untouched,
+/// or a tag repointed after the parent's check would load unverified.
+#[test]
+fn mediagen_worker_argv_carries_the_pinned_reference_verbatim() {
+    let pinned = "example.com/ai/model:q4@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert_eq!(
+        mediagen_backend_args(pinned, 8_123),
+        ["serve", pinned, "--port", "8123"]
+    );
+}
+
 #[test]
 fn detached_serve_forwards_configuration_without_detaching_the_child() {
     let args = ServeArgs {

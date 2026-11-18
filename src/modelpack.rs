@@ -109,14 +109,11 @@ impl ModelPath {
     }
 }
 
-/// Splits an OCI digest ("sha256:abcd...") down to just its hex portion,
-/// which is what the blob store's on-disk layout uses as the filename.
+/// The hex portion of an OCI digest ("sha256:abcd..."), which is what
+/// the blob store's on-disk layout uses as the filename. One parser
+/// with the store: `split_digest` accepts only what the store writes.
 fn digest_hex(digest: &str) -> anyhow::Result<&str> {
-    digest
-        .split_once(':')
-        .map(|(_, hex)| hex)
-        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
-        .ok_or_else(|| anyhow!("malformed digest: {digest}"))
+    crate::storage::oci::split_digest(digest).map(|(_, hex)| hex)
 }
 
 fn layer_filepath(l: &crate::storage::oci::Descriptor) -> Option<&str> {
