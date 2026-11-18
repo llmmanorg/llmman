@@ -4696,6 +4696,245 @@ fn speech_worker_transcribes_the_fixture() {
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{reply}");
 }
 
+/// The speech worker's `/v1/realtime` end to end, spawned and loaded as
+/// [`speech_worker_transcribes_the_fixture`] does. The one-shot route's
+/// text is taken first; then a WebSocket session gets `session.created`
+/// advertising 16000 Hz, is fed `fleurs-en.wav` as PCM16 in 100 ms
+/// `input_audio_buffer.append` frames and committed, and the
+/// `conversation.item.input_audio_transcription.completed` transcript must
+/// equal the one-shot text and `transcript.json`'s. A second session opened
+/// while that commit decodes is admitted and its own commit waits for the
+/// worker lock instead of erroring: it comes back with the same text. Run
+/// with `cargo test --release --test launch_e2e speech_worker_ --
+/// --ignored --nocapture`.
+#[test]
+#[ignore]
+#[cfg(unix)]
+fn speech_worker_realtime_transcribes_the_fixture() {
+    use std::os::unix::process::CommandExt;
+
+    const MODEL_REF: &str = CANARY_MODEL_REF;
+    const EXPECTED: &str = CANARY_TRANSCRIPT;
+    /// 100 ms of 16 kHz PCM16 per append frame.
+    const FRAME_SAMPLES: usize = 1600;
+
+    let _guard = lock_serial();
+
+    let env_dir = |key: &str| {
+        std::env::var_os(key)
+            .map(PathBuf::from)
+            .filter(|d| !d.as_os_str().is_empty())
+    };
+    let Some(gguf_dir) = env_dir("LLMMAN_CANARY_GGUF_DIR") else {
+        eprintln!("skipping: LLMMAN_CANARY_GGUF_DIR is not set");
+        return;
+    };
+    let Some(ref_dir) = env_dir("LLMMAN_CANARY_REF_DIR") else {
+        eprintln!("skipping: LLMMAN_CANARY_REF_DIR is not set");
+        return;
+    };
+    if llama_libs_on_path().is_none() {
+        return;
+    }
+    let wav = std::fs::read(ref_dir.join("fleurs-en.wav")).unwrap();
+    let samples = llmman::speech::wav::parse(&wav, usize::MAX).expect("the fixture is a PCM16 WAV");
+    let store_dir = seed_canary_store(&gguf_dir);
+
+    let port = free_loopback_port();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let home = fresh_home("speech-realtime-home");
+    let mut cmd = Command::new(llmman_bin());
+    cmd.args([
+        "serve",
+        MODEL_REF,
+        "--port",
+        &port.to_string(),
+        "--runtime",
+        "path",
+    ])
+    .env("HOME", &home)
+    .env("LLMMAN_MODELS", &store_dir)
+    .stdin(Stdio::null())
+    .stdout(Stdio::inherit())
+    .stderr(Stdio::inherit())
+    .process_group(0);
+    let started = Instant::now();
+    let mut child = cmd.spawn().expect("spawn the speech worker");
+
+    struct Reap(Option<std::process::Child>, PathBuf, PathBuf);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                kill_process_tree(&mut child);
+            }
+            let _ = std::fs::remove_dir_all(&self.1);
+            let _ = std::fs::remove_dir_all(&self.2);
+        }
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap();
+    let deadline = started + Duration::from_secs(300);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            let _ = std::fs::remove_dir_all(&store_dir);
+            panic!("the speech worker exited before /health answered: {status}");
+        }
+        if client
+            .get(format!("{base}/health"))
+            .send()
+            .is_ok_and(|r| r.status().is_success())
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            kill_process_tree(&mut child);
+            let _ = std::fs::remove_dir_all(&store_dir);
+            panic!("the speech worker did not answer /health within 300s");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _reap = Reap(Some(child), store_dir.clone(), home.clone());
+    eprintln!("== worker loaded in {:.2?}", started.elapsed());
+
+    let t = Instant::now();
+    let (status, reply) = post_transcription(
+        &client,
+        &base,
+        &[
+            ("file", Some("fleurs-en.wav"), &wav),
+            ("model", None, MODEL_REF.as_bytes()),
+            ("language", None, b"en"),
+        ],
+    );
+    eprintln!("== one-shot: {status} in {:.2?}: {reply}", t.elapsed());
+    assert_eq!(status, reqwest::StatusCode::OK, "{reply}");
+    let one_shot = reply["text"].as_str().expect("a text").to_string();
+    assert_eq!(one_shot, EXPECTED);
+
+    let ws_url = format!("ws://127.0.0.1:{port}/v1/realtime");
+    let (first, second) = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut first = RealtimeClient::connect(&ws_url).await;
+        let t = Instant::now();
+        first.send_fixture(&samples, FRAME_SAMPLES).await;
+        // Opened while the first commit decodes: admitted at once, its
+        // commit queues behind the worker lock.
+        let mut second = RealtimeClient::connect(&ws_url).await;
+        second.send_fixture(&samples, FRAME_SAMPLES).await;
+        let first_text = first.read_transcript("item_0").await;
+        eprintln!(
+            "== first session transcript in {:.2?}: {first_text}",
+            t.elapsed()
+        );
+        let second_text = second.read_transcript("item_0").await;
+        eprintln!(
+            "== second session transcript in {:.2?}: {second_text}",
+            t.elapsed()
+        );
+        (first_text, second_text)
+    });
+    assert_eq!(first, one_shot);
+    assert_eq!(first, EXPECTED);
+    assert_eq!(second, one_shot);
+}
+
+/// A `/v1/realtime` client of the test above, past `session.created`.
+#[cfg(unix)]
+struct RealtimeClient {
+    ws: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+}
+
+#[cfg(unix)]
+impl RealtimeClient {
+    /// Connects and reads `session.created`, which must advertise
+    /// `audio/pcm` at 16000 Hz.
+    async fn connect(url: &str) -> Self {
+        let (ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect to /v1/realtime");
+        let mut client = RealtimeClient { ws };
+        let created = client.next_event().await;
+        assert_eq!(created["type"], "session.created", "{created}");
+        let format = &created["session"]["audio"]["input"]["format"];
+        assert_eq!(format["type"], "audio/pcm", "{created}");
+        assert_eq!(format["rate"], 16000, "{created}");
+        client
+    }
+
+    /// Sends one client event as a Text frame.
+    async fn send(&mut self, event: serde_json::Value) {
+        use futures::SinkExt as _;
+        self.ws
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                event.to_string(),
+            ))
+            .await
+            .expect("send a client event");
+    }
+
+    /// `samples` as `input_audio_buffer.append` frames of `frame` samples
+    /// each, then `input_audio_buffer.commit`.
+    async fn send_fixture(&mut self, samples: &[i16], frame: usize) {
+        use base64::Engine as _;
+        for chunk in samples.chunks(frame) {
+            let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_le_bytes()).collect();
+            self.send(serde_json::json!({
+                "type": "input_audio_buffer.append",
+                "audio": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }))
+            .await;
+        }
+        self.send(serde_json::json!({"type": "input_audio_buffer.commit"}))
+            .await;
+    }
+
+    /// The next Text frame as JSON; a close, error or end of stream fails.
+    async fn next_event(&mut self) -> serde_json::Value {
+        use futures::StreamExt as _;
+        use tokio_tungstenite::tungstenite::Message;
+        let deadline = tokio::time::sleep(Duration::from_secs(120));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => panic!("no server event within 120s"),
+                frame = self.ws.next() => match frame {
+                    Some(Ok(Message::Text(text))) => {
+                        return serde_json::from_str(&text).expect("a JSON server event");
+                    }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    other => panic!("the session ended before the event: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// Reads `input_audio_buffer.committed` for `item` then the completed
+    /// transcription of it.
+    async fn read_transcript(&mut self, item: &str) -> String {
+        let committed = self.next_event().await;
+        assert_eq!(
+            committed["type"], "input_audio_buffer.committed",
+            "{committed}"
+        );
+        assert_eq!(committed["item_id"], item, "{committed}");
+        let completed = self.next_event().await;
+        assert_eq!(
+            completed["type"], "conversation.item.input_audio_transcription.completed",
+            "{completed}"
+        );
+        assert_eq!(completed["item_id"], item, "{completed}");
+        completed["transcript"]
+            .as_str()
+            .expect("a transcript")
+            .to_string()
+    }
+}
+
 /// A PCM16 mono 16 kHz WAV of `samples`: the 44-byte header and the data.
 #[cfg(unix)]
 fn pcm16_wav(samples: &[i16]) -> Vec<u8> {
