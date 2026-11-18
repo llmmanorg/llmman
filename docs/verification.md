@@ -173,13 +173,15 @@ digest the manifest records. A blob that is
 missing, cannot be read, or carries a malformed digest counts as a
 mismatch, with the cause in the notice; a manifest whose own bytes
 mismatch is reported alone, since the layer list it carries is not
-trusted. The manifest resolved for the check is the one the load then
-opens, pinned by digest, so a tag repointed in between is not found
-rather than loaded unchecked; a model stored under an absolute path or
-a URI cannot carry a digest and is loaded by name, so that guarantee
-does not extend to it. Only a regular file is hashed, so a
-blob replaced by a symlink, a directory or a device is a mismatch
-rather than something followed.
+trusted. The manifest is resolved once per load: the running-model
+check, the layer check and the load all use that one descriptor, and
+the load opens it pinned by digest, so a tag repointed in between is
+not found rather than loaded unchecked; a model stored under an
+absolute path or a URI cannot carry a digest and is loaded by name, so
+that guarantee does not extend to it. Each blob is opened without
+following symlinks and must be a regular file, checked on the open
+handle, so a blob replaced by a symlink, a directory, a FIFO or a
+device is a mismatch rather than something followed or read.
 
 Under `warn` each mismatch logs a notice naming the reference, the digest
 and the media type, and the load proceeds. Under `enforce` the load fails

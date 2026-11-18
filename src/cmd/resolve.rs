@@ -124,11 +124,17 @@ pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
         .block_on(crate::cmd::serve::pull_checked(&store_path, &reference))
         .with_context(|| format!("pulling {reference}"))?;
     drop(pull_lock);
-    // `load_ref` pins the manifest the layer check hashed, so the load
-    // below cannot pick up a tag repointed since; `reference` stays the
-    // spelling printed back. See `verify_layers_stored`.
+    // The one resolution of this reference: the layer check and the
+    // load below both use `desc`, so a tag repointed in between cannot
+    // hand the load a manifest nobody checked. A failed find fails
+    // here as `resolve_model` would, which finds by the same reference.
+    // `load_ref` is `reference` pinned to that manifest; `reference`
+    // stays the spelling printed back. See `verify_layers_found`.
+    let desc = OciStore::open(&store_path)?
+        .find(&reference)
+        .with_context(|| format!("model not found in store: {reference}"))?;
     let (load_ref, layer_notices) =
-        crate::cmd::serve::verify_layers_stored(&store_path, &reference)
+        crate::cmd::serve::verify_layers_found(&store_path, &reference, &desc)
             .with_context(|| format!("verify layers of {reference}"))?;
     notices.extend(layer_notices);
     for notice in notices {

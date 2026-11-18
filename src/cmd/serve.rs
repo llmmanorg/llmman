@@ -979,39 +979,41 @@ fn verify_stored(
     }
 }
 
-/// Re-hashes the stored manifest, config and layer blobs of `reference`
-/// under the `[verify] layers` mode (see `verify::verify_layers`). The
-/// mode is resolved first, so the default `off` opens no store; that
-/// also means every caller, `llmman resolve` of a cached HF model
-/// included, loads the policy here and an unparsable `LLMMAN_VERIFY` or
-/// `LLMMAN_VERIFY_LAYERS` fails there as it does in the daemon.
-/// Blocking: it reads every stored blob of the model, so run it
-/// off the async executor. Unlike `verify_stored`, a mismatch never
-/// removes the reference: the blob may be the operator's only copy.
+/// Re-hashes the stored manifest, config and layer blobs of `desc`,
+/// the descriptor the caller resolved for `reference`, under the
+/// `[verify] layers` mode (see `verify::verify_layers`). The caller
+/// does the one `OciStore::find`; this function never finds again, so
+/// the manifest checked here is the manifest the load then opens. The
+/// mode is resolved first, so every caller, `llmman resolve` of a
+/// cached HF model included, loads the policy here and an unparsable
+/// `LLMMAN_VERIFY` or `LLMMAN_VERIFY_LAYERS` fails there as it does in
+/// the daemon. Blocking: it reads every stored blob of the model, so
+/// run it off the async executor. Unlike `verify_stored`, a mismatch
+/// never removes the reference: the blob may be the operator's only copy.
 ///
 /// Returns the reference the caller must load alongside the notices:
-/// `reference` pinned to the manifest digest that was checked (see
-/// `verify::pinned_reference`), so the load cannot resolve a tag
-/// repointed since. An absolute path or a URI cannot carry a digest
+/// `reference` pinned to `desc`'s digest (see `verify::pinned_reference`),
+/// under `off` as well, so the load cannot resolve a tag repointed since
+/// the find. An absolute path or a URI cannot carry a digest
 /// (`split_ref_digest`), so it comes back as given and is loaded by
-/// name: the check and the load are two `find`s, and a pointer
-/// rewritten in between is not caught for that reference class. Under
-/// `off` the reference comes back unchanged and no store is opened. `modelpack::resolve_model` and
+/// name: a pointer rewritten between the find and the load is not
+/// caught for that reference class. `modelpack::resolve_model` and
 /// `resolve_model_tree` use their reference only for `OciStore::find`
 /// and error text, so the pinned spelling changes which manifest they
 /// load and nothing else.
-pub(crate) fn verify_layers_stored(
+pub(crate) fn verify_layers_found(
     store_path: &std::path::Path,
     reference: &str,
+    desc: &crate::storage::oci::Descriptor,
 ) -> anyhow::Result<(String, Vec<String>)> {
     let mode = crate::verify::layers_mode()?;
-    if mode == crate::verify::Mode::Off {
-        return Ok((reference.to_owned(), Vec::new()));
-    }
-    let store = OciStore::open(store_path)?;
-    let desc = store.find(reference)?;
-    let notices = crate::verify::verify_layers(mode, &store, reference, &desc)?;
-    Ok((crate::verify::pinned_reference(reference, &desc), notices))
+    let notices = if mode == crate::verify::Mode::Off {
+        Vec::new()
+    } else {
+        let store = OciStore::open(store_path)?;
+        crate::verify::verify_layers(mode, &store, reference, desc)?
+    };
+    Ok((crate::verify::pinned_reference(reference, desc), notices))
 }
 
 /// Drops a reference the policy refused, so a later pull cannot find it
@@ -2348,42 +2350,39 @@ async fn resolve_target(
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
-    // Best-effort — used to populate `llmman ps`'s ID/SIZE columns and
-    // for the check right below; `resolve_model` after them establishes
-    // the model exists, so a failure here (e.g. a race with a concurrent
-    // `rm`) just means those columns show as empty/zero rather than
-    // failing the whole request.
-    let (digest, size) = OciStore::open(&state.0.store_path)
-        .and_then(|s| {
-            s.find(model_ref).map(|d| {
-                let size = s.total_size(&d);
-                (d.digest, size)
-            })
-        })
-        .unwrap_or_default();
+    // The one resolution of this load. The descriptor feeds the
+    // running-digest check, `llmman ps`'s ID/SIZE columns, the layer
+    // check and, through `load_ref`, `resolve_model` and the worker
+    // spawns, so a tag repointed by a concurrent pull or `rm` between
+    // any two of them cannot hand the load a manifest nobody checked.
+    // A failed find fails the load: `resolve_model` finds by the same
+    // reference and would have failed with "model not found in store".
+    let desc = OciStore::open(&state.0.store_path)?
+        .find(model_ref)
+        .with_context(|| format!("model not found in store: {model_ref}"))?;
     // The content may be running already under a key this spelling does
     // not resolve to; see `check_running_by_digest`'s doc comment for the
     // order that produces one.
-    if !digest.is_empty() {
-        if let Some((key, port, guard)) =
-            check_running_by_digest(state, model_ref, &digest, opts.ctx).await
-        {
-            return Ok((key, Target::Local(port), guard));
-        }
+    if let Some((key, port, guard)) =
+        check_running_by_digest(state, model_ref, &desc.digest, opts.ctx).await
+    {
+        return Ok((key, Target::Local(port), guard));
     }
     // Layer digests, once per cold load: after every running-process
     // reuse check above (a tag for content already loaded by digest
     // must not re-hash the model) and ahead of every format arm below,
     // so GGUF, safetensors trees, diffusion and Omni all pass through
     // it. Off by default; an enforce mismatch fails the load with the
-    // reference and digests in the error. The manifest it checked is
-    // the one `resolve_model` loads, through `load_ref`; `model_ref`
-    // stays the spelling for the running-process keys and logs.
+    // reference and digests in the error. It checks `desc`, found once
+    // above, and `resolve_model` loads that same manifest through
+    // `load_ref`; `model_ref` stays the spelling for the running-process
+    // keys and logs.
     let load_ref = {
         let store_path = state.0.store_path.clone();
         let model_ref_owned = model_ref.to_owned();
+        let desc = desc.clone();
         let (load_ref, notices) = tokio::task::spawn_blocking(move || {
-            verify_layers_stored(&store_path, &model_ref_owned)
+            verify_layers_found(&store_path, &model_ref_owned, &desc)
         })
         .await
         .context("layer verification task panicked")?
@@ -2393,6 +2392,12 @@ async fn resolve_target(
         }
         load_ref
     };
+    // Read the manifest for the size only now: `total_size` is a plain
+    // read, so before the layer check a FIFO or a link to `/dev/zero`
+    // at the manifest's blob path would stall the load instead of
+    // being reported as a mismatch.
+    let size = OciStore::open(&state.0.store_path)?.total_size(&desc);
+    let digest = desc.digest;
 
     let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, &load_ref)
         .with_context(|| format!("resolve model {model_ref}"))?;
@@ -4562,7 +4567,7 @@ async fn speech_backend(
 
 /// The `serve MODEL --port PORT` head of a worker's argv. `model_ref`
 /// is passed through verbatim: the child resolves it on its own, so
-/// the caller hands it the digest-pinned spelling `verify_layers_stored`
+/// the caller hands it the digest-pinned spelling `verify_layers_found`
 /// returned and the worker loads the manifest that was verified.
 fn mediagen_backend_args(model_ref: &str, port: u16) -> [String; 4] {
     [

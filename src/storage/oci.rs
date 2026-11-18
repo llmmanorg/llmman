@@ -1114,7 +1114,7 @@ pub fn default_tag(reference: &str) -> String {
 /// under `blobs/`, and digests arrive from manifests that are themselves
 /// blobs, so anything else (`/dev/zero`, `..`) is refused here rather
 /// than joined onto the store root.
-fn split_digest(digest: &str) -> anyhow::Result<(&str, &str)> {
+pub(crate) fn split_digest(digest: &str) -> anyhow::Result<(&str, &str)> {
     match digest.split_once(':') {
         Some((algo @ "sha256", hex))
             if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) =>

@@ -711,28 +711,84 @@ fn digests_match(a: &str, b: &str) -> bool {
 ///
 /// Only a regular file is hashed. The store writes nothing else under
 /// `blobs/`, so a symlink (to `/dev/zero`, to another blob), a
-/// directory or a device there is a replacement, reported as such
-/// rather than followed: a symlink to a blob with the right bytes
-/// would hash clean while the backend opens whatever it points at by
-/// then. `symlink_metadata` does not follow links. The file is still
-/// opened separately, so a swap between that call and the open is not
-/// caught; the gap is a few microseconds and the same race as any
-/// write after the check (see docs/verification.md, Limitations).
+/// directory, a FIFO or a device there is a replacement, reported as
+/// such rather than followed or read: a symlink to a blob with the
+/// right bytes would hash clean while the backend opens whatever it
+/// points at by then, and a FIFO or `/dev/zero` would block the load.
+/// The blob is opened first and the file type read from the open
+/// handle, so there is no window between a check by path and the
+/// open; `open_blob` refuses to follow a symlink on unix (`O_NOFOLLOW`)
+/// and does not block on a FIFO (`O_NONBLOCK`), and on Windows opens
+/// the reparse point itself (`FILE_FLAG_OPEN_REPARSE_POINT`), whose
+/// handle reports a symlink and is refused here. On any other platform
+/// the open follows a symlink, and the handle's type is the target's,
+/// so a symlink to a regular file hashes as that file there.
 fn blob_mismatch(store: &OciStore, desc: &Descriptor) -> Option<String> {
     let path = match store.blob_path(&desc.digest) {
         Ok(path) => path,
         Err(e) => return Some(format!("{e:#}")),
     };
-    match std::fs::symlink_metadata(&path) {
+    let mut file = match open_blob(&path) {
+        Ok(file) => file,
+        // Refused already; the stat only names the cause for the
+        // notice (a symlink is `ELOOP`, a directory on Windows a
+        // permission error) and is not what decided it.
+        Err(e) => {
+            return Some(match std::fs::symlink_metadata(&path) {
+                Ok(meta) if !meta.file_type().is_file() => {
+                    format!("{} is not a regular file: {e}", path.display())
+                }
+                _ => format!("open {}: {e}", path.display()),
+            })
+        }
+    };
+    match file.metadata() {
         Ok(meta) if meta.file_type().is_file() => {}
         Ok(_) => return Some(format!("{} is not a regular file", path.display())),
-        Err(e) => return Some(format!("open {}: {e}", path.display())),
+        Err(e) => return Some(format!("stat {}: {e}", path.display())),
     }
-    match crate::fsutil::sha256_of_file(&path) {
+    match crate::fsutil::sha256_of_reader(&mut file) {
         Ok(hex) if digests_match(&format!("sha256:{hex}"), &desc.digest) => None,
         Ok(hex) => Some(format!("hashes to sha256:{hex}")),
-        Err(e) => Some(format!("{e:#}")),
+        Err(e) => Some(format!("hash {}: {e}", path.display())),
     }
+}
+
+/// Opens a stored blob for hashing. On unix the final path component
+/// is not followed if it is a symlink (`open(2)` fails with `ELOOP`)
+/// and a FIFO opens at once instead of waiting for a writer; the
+/// `O_NONBLOCK` is a no-op for reads from a regular file. The caller
+/// checks the handle's file type before reading, so a FIFO is reported
+/// rather than read.
+#[cfg(unix)]
+fn open_blob(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// On Windows the final path component is opened as itself when it is
+/// a reparse point (a symlink or junction), so the handle's metadata is
+/// the link's rather than the target's and the caller's file type check
+/// refuses it. A symlink to a directory opens too and is refused the
+/// same way.
+#[cfg(windows)]
+fn open_blob(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    // `FILE_FLAG_OPEN_REPARSE_POINT` from `CreateFileW`; spelled here so
+    // the crate does not depend on `windows-sys` for one constant.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_blob(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1683,6 +1739,32 @@ mod tests {
         assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
     }
 
+    /// Creating a symlink needs `SeCreateSymbolicLinkPrivilege` or
+    /// developer mode; when the runner has neither the test returns
+    /// early, and the shared file type check is covered by the unix test
+    /// and the directory test below.
+    #[test]
+    #[cfg(windows)]
+    fn a_blob_replaced_by_a_symlink_to_the_right_bytes_is_a_mismatch_on_windows() {
+        let (store, desc, layer) = store_with_gguf_layer("symlink");
+        let path = store.blob_path(&layer.digest).unwrap();
+        let target = store.dir.join("elsewhere.gguf");
+        std::fs::rename(&path, &target).unwrap();
+        if let Err(e) = std::os::windows::fs::symlink_file(&target, &path) {
+            eprintln!("skipping: cannot create a symlink on this runner: {e}");
+            return;
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"GGUFaaaa");
+
+        let notices = verify_layers(Mode::Warn, &store, "model:q4", &desc).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains(&layer.digest), "{notices:?}");
+        assert!(notices[0].contains("regular file"), "{notices:?}");
+        let err = verify_layers(Mode::Enforce, &store, "model:q4", &desc).unwrap_err();
+        assert!(err.to_string().contains("regular file"), "{err}");
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
     #[test]
     fn a_blob_replaced_by_a_directory_is_a_mismatch() {
         let (store, desc, layer) = store_with_gguf_layer("directory");
@@ -1690,6 +1772,30 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
 
+        let notices = verify_layers(Mode::Warn, &store, "model:q4", &desc).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains(&layer.digest), "{notices:?}");
+        assert!(notices[0].contains("regular file"), "{notices:?}");
+        let err = verify_layers(Mode::Enforce, &store, "model:q4", &desc).unwrap_err();
+        assert!(err.to_string().contains("regular file"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_blob_replaced_by_a_fifo_is_a_mismatch_and_is_not_read() {
+        let (store, desc, layer) = store_with_gguf_layer("fifo");
+        let path = store.blob_path(&layer.digest).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated string for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        {
+            use std::os::unix::fs::FileTypeExt as _;
+            assert!(path.symlink_metadata().unwrap().file_type().is_fifo());
+        }
+
+        // No writer ever opens the FIFO: a blocking open or read hangs
+        // the test, so returning at all is the assertion.
         let notices = verify_layers(Mode::Warn, &store, "model:q4", &desc).unwrap();
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].contains(&layer.digest), "{notices:?}");
@@ -1750,7 +1856,7 @@ mod tests {
 
     #[test]
     fn an_opaque_reference_is_not_pinned_and_loads_by_name() {
-        // `verify_layers_stored` does `find`, `verify_layers`, then
+        // The callers `find` once, then `verify_layers` and
         // `pinned_reference`, and the resolvers `find` the result again.
         // For a path or URI the result is the same name, so a pointer
         // rewritten in between is what the second `find` returns: the

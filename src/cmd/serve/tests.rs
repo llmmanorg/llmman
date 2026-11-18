@@ -22,7 +22,7 @@ use super::*;
 
 /// The diffusion and speech workers re-resolve the reference they are
 /// handed, so `resolve_target` passes them the digest-pinned spelling
-/// `verify_layers_stored` returned; the argv must carry it untouched,
+/// `verify_layers_found` returned; the argv must carry it untouched,
 /// or a tag repointed after the parent's check would load unverified.
 #[test]
 fn mediagen_worker_argv_carries_the_pinned_reference_verbatim() {
