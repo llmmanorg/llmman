@@ -43,7 +43,9 @@ pub fn run(args: &BuildArgs) -> anyhow::Result<()> {
     let context_dir = dunce::canonicalize(&args.context_dir)
         .with_context(|| format!("context dir: {}", args.context_dir.display()))?;
 
-    let desc = store.build(&context_dir, &tag, &labels)?;
+    let desc = crate::storage::gc::after_retag(&store, &crate::default_cache()?, &tag, || {
+        store.build(&context_dir, &tag, &labels)
+    })?;
     println!("Built {} ({})", args.tag, desc.digest);
     Ok(())
 }

@@ -971,9 +971,26 @@ pub(super) async fn handle_copy(
             format!("model '{}' not found", req.source),
         ));
     }
-    let digest = crate::cmd::cp::copy(&store, &source, &destination)?;
+    let digest = copy_blocking(&state, source, destination.clone()).await?;
     evict_if_retagged(&state, &destination, &digest).await;
     Ok(StatusCode::OK)
+}
+
+/// [`crate::cmd::cp::copy`] off the request workers: replacing a tag sweeps
+/// the store.
+async fn copy_blocking(
+    state: &AppState,
+    source: String,
+    destination: String,
+) -> Result<String, AppError> {
+    let (store_path, cache_path) = (state.0.store_path.clone(), state.0.cache_path.clone());
+    tokio::task::spawn_blocking(move || {
+        let store = OciStore::open(store_path)?;
+        crate::cmd::cp::copy(&store, &cache_path, &source, &destination)
+    })
+    .await
+    .context("copy task panicked")?
+    .map_err(AppError::from)
 }
 
 /// Drops a loaded model whose tag `/api/copy` or `/api/create` just
@@ -1167,7 +1184,7 @@ pub(super) async fn handle_create(
                     format!("model '{from}' not found"),
                 ));
             }
-            let digest = crate::cmd::cp::copy(&store, &source, model)?;
+            let digest = copy_blocking(&state, source.clone(), model.to_string()).await?;
             evict_if_retagged(&state, model, &digest).await;
             vec![format!("using existing layer {source}")]
         }
@@ -1181,10 +1198,11 @@ pub(super) async fn handle_create(
                 .map(|(name, digest)| Ok((name.clone(), staged_file(&state, name, digest)?)))
                 .collect::<Result<Vec<_>, AppError>>()?;
             let store_path = state.0.store_path.clone();
+            let cache_path = state.0.cache_path.clone();
             let staging = blob_staging_dir(&state);
             let model_owned = model.to_string();
             let (digest, statuses) = tokio::task::spawn_blocking(move || {
-                create_from_staged_blobs(&store_path, &staging, &model_owned, &staged)
+                create_from_staged_blobs(&store_path, &cache_path, &staging, &model_owned, &staged)
             })
             .await
             .context("create task panicked")??;
@@ -1245,6 +1263,7 @@ fn staged_file(state: &AppState, name: &str, digest: &str) -> Result<PathBuf, Ap
 /// on it as `llmman build <dir>` would.
 fn create_from_staged_blobs(
     store_path: &Path,
+    cache_path: &Path,
     staging: &Path,
     model: &str,
     files: &[(String, PathBuf)],
@@ -1272,7 +1291,9 @@ fn create_from_staged_blobs(
             statuses.push(format!("using sha256:{digest} as {name}"));
         }
         let store = OciStore::open(store_path)?;
-        let desc = store.build(&tmp, model, &HashMap::new())?;
+        let desc = crate::storage::gc::after_retag(&store, cache_path, model, || {
+            store.build(&tmp, model, &HashMap::new())
+        })?;
         statuses.push(format!("writing manifest {}", desc.digest));
         Ok((desc.digest, statuses))
     })();

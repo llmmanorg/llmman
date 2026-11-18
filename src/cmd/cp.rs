@@ -29,14 +29,20 @@ pub fn run(args: &CpArgs) -> anyhow::Result<()> {
 
     let store_root = crate::default_store()?;
     let store = OciStore::open(&store_root)?;
-    copy(&store, &source, &destination)?;
+    copy(&store, &crate::default_cache()?, &source, &destination)?;
     println!("copied '{}' to '{}'", args.source, args.destination);
     Ok(())
 }
 
 /// Points `destination` at the content `source` names (both already
 /// resolved) and returns its digest. Shared by `llmman cp` and `/api/copy`.
-pub fn copy(store: &OciStore, source: &str, destination: &str) -> anyhow::Result<String> {
+/// A destination that held other content is swept of what that left behind.
+pub fn copy(
+    store: &OciStore,
+    cache_path: &std::path::Path,
+    source: &str,
+    destination: &str,
+) -> anyhow::Result<String> {
     let desc = store.find(source)?;
     // A destination spelled as a digest names content, and the store
     // answers such a reference by content (see `OciStore::find`): a
@@ -45,7 +51,9 @@ pub fn copy(store: &OciStore, source: &str, destination: &str) -> anyhow::Result
     // it holds, so it is refused.
     check_digest_destination(destination, &desc.digest)?;
     let digest = desc.digest.clone();
-    store.tag(desc, destination)?;
+    crate::storage::gc::after_retag(store, cache_path, destination, || {
+        store.tag(desc, destination)
+    })?;
     Ok(digest)
 }
 
