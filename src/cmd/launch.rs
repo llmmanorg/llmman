@@ -49,6 +49,7 @@ mod optimizer;
 mod pi;
 mod qwen;
 mod sandbox;
+mod vibe;
 
 pub use optimizer::Optimizer;
 pub use sandbox::Sandbox;
@@ -600,7 +601,7 @@ const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes", "cline", "pi"];
 fn declares_context_window(integration: &str) -> bool {
     matches!(
         integration.to_lowercase().as_str(),
-        "claude" | "opencode" | "codex" | "pi" | "omp" | "kimi" | "openclaw"
+        "claude" | "opencode" | "codex" | "pi" | "omp" | "kimi" | "openclaw" | "vibe"
     )
 }
 
@@ -877,6 +878,11 @@ const INTEGRATIONS: &[Integration] = &[
         description: "Docker Agent",
         binary: "docker-agent",
     },
+    Integration {
+        name: "vibe",
+        description: "Mistral Vibe CLI",
+        binary: "vibe",
+    },
 ];
 
 /// The registered name for a launch name (any case, or an alias): what
@@ -1042,6 +1048,7 @@ const VARIANT_UNSUPPORTED: &[(&str, &str)] = &[
     ("goose", "it sends effort only for OpenAI's models"),
     ("goose-desktop", "it sends effort only for OpenAI's models"),
     ("docker-agent", "it ignores thinking_budget here"),
+    ("vibe", "llmman does not set its thinking yet"),
 ];
 
 const LOW_TO_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
@@ -1229,6 +1236,7 @@ fn launch(
         "goose-desktop" => goose_desktop::launch_goose_desktop(model, api_key, extra_args),
         "grok" => grok::launch_grok(model, api_key, listed.as_ref(), extra_args),
         "docker-agent" => docker_agent::launch_docker_agent(model, api_key, extra_args),
+        "vibe" => vibe::launch_vibe(model, api_key, context_window, extra_args),
         other => Err(unknown_integration(other)),
     }
 }
@@ -1302,6 +1310,9 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
         ],
         "droid" => vec![Dir(droid::droid_home()?)],
         "kimi" => vec![Dir(home.join(".kimi"))],
+        "vibe" => vec![Dir(
+            env_dir("VIBE_HOME").unwrap_or_else(|| home.join(".vibe"))
+        )],
         "gemini" => vec![Dir(home.join(".gemini"))],
         "agy" => vec![Dir(agy::agy_settings_dir()?)],
         "hermes" => vec![Dir(hermes::hermes_home()?)],
@@ -1472,6 +1483,12 @@ fn served_context_window(env: Option<u32>, trained: Option<u64>) -> Option<u64> 
 
 fn exec_with_env(bin: &Path, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
     exec_with_env_removing(bin, args, extra_env, &[])
+}
+
+/// [`exec_with_env`] for a computed environment.
+fn exec_with_owned_env(bin: &Path, args: &[String], env: &[(&str, String)]) -> anyhow::Result<()> {
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    exec_with_env(bin, args, &env)
 }
 
 fn exec_with_env_removing(

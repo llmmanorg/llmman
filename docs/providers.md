@@ -202,6 +202,7 @@ installed:
 | `goose-desktop` | Block goose Desktop (requires `--model`) | yes |
 | `grok` | Grok Build (requires `--model`) | no: its fetched model catalog cannot represent llmman's hosted-provider routing reference |
 | `docker-agent` | Docker Agent (requires `--model`) | yes |
+| `vibe` | Mistral Vibe CLI | yes |
 | `hermes` | Hermes Agent | yes, but the daemon holds the key (below) |
 | `agy` | Antigravity CLI (requires `--model`) | yes |
 | `gemini` | Gemini CLI | no: llmman cannot confirm the key would come here rather than go to Google |
@@ -268,7 +269,7 @@ such as one models.dev does not list yet, takes any effort level.
 
 `thinking` goes to all but opencode as `medium`, which llmman serves as
 thinking on. `kimi`, `openclaw`, `gemini`, `agy`, `goose`,
-`goose-desktop` and `docker-agent` cannot carry a variant here, so they
+`goose-desktop`, `docker-agent` and `vibe` cannot carry a variant here, so they
 refuse one.
 
 ## Wire formats

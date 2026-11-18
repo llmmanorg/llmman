@@ -7,7 +7,7 @@
 //! `llama-server` backing it, and the real third-party CLI under test
 //! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `copilot`, `droid`, `cline`,
 //! `grok`, `qwen`, `hermes`,
-//! `openclaw`, `dsh`, `goose`) — not mocks. The one exception is
+//! `openclaw`, `dsh`, `goose`, `vibe`) — not mocks. The one exception is
 //! [`launch_goose_desktop_env`]: Goose Desktop is a GUI with no headless
 //! mode, so it stubs its binary.
 //! That's the only way this actually verifies anything: every one of the
@@ -894,6 +894,7 @@ fn launch_command(
         .env("GROK_HOME", home.join(".grok"))
         .env("CLINE_DIR", home.join(".cline"))
         .env("COPILOT_HOME", home.join(".copilot"))
+        .env("VIBE_HOME", home.join(".vibe"))
         .env("PI_CODING_AGENT_DIR", home.join(".pi").join("agent"))
         // goose asks before each tool call otherwise, and a headless run
         // has nobody to answer. Granted here, not by `launch goose`:
@@ -2352,6 +2353,24 @@ fn launch_goose_with_model() {
         &["run", "-t", PROMPT, "--no-session"],
         goose_request_failed,
     );
+}
+
+#[test]
+fn launch_vibe_with_model() {
+    eprintln!("[test] launch_vibe_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_vibe_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("vibe") {
+        eprintln!("skipping: vibe not on PATH — https://github.com/mistralai/mistral-vibe");
+        return;
+    }
+
+    // `-p`: vibe's headless mode, one prompt in, reply out.
+    launch_and_assert("vibe", &["-p", PROMPT]);
 }
 
 /// goose exits 0 even when no request reached a model — verified against
