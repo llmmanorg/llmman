@@ -124,16 +124,19 @@ pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
         .block_on(crate::cmd::serve::pull_checked(&store_path, &reference))
         .with_context(|| format!("pulling {reference}"))?;
     drop(pull_lock);
-    notices.extend(
+    // `load_ref` pins the manifest the layer check hashed, so the load
+    // below cannot pick up a tag repointed since; `reference` stays the
+    // spelling printed back. See `verify_layers_stored`.
+    let (load_ref, layer_notices) =
         crate::cmd::serve::verify_layers_stored(&store_path, &reference)
-            .with_context(|| format!("verify layers of {reference}"))?,
-    );
+            .with_context(|| format!("verify layers of {reference}"))?;
+    notices.extend(layer_notices);
     for notice in notices {
         eprintln!("[llmman] {notice}");
     }
 
     if args.dir {
-        let tree = crate::modelpack::resolve_model_tree(&store_path, &cache_path, &reference)
+        let tree = crate::modelpack::resolve_model_tree(&store_path, &cache_path, &load_ref)
             .with_context(|| format!("resolving {reference}"))?;
         let out = TreeOutput {
             reference: &reference,
@@ -145,7 +148,7 @@ pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let resolved = resolve_model(&store_path, &cache_path, &reference)
+    let resolved = resolve_model(&store_path, &cache_path, &load_ref)
         .with_context(|| format!("resolving {reference}"))?;
 
     let out = ResolveOutput {

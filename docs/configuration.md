@@ -295,7 +295,11 @@ its config blob and every stored layer blob and compares each SHA-256
 with the digest the manifest records. `default` and the trust
 rules do not turn it on, and it needs no keys: a signed model whose blob
 was overwritten on disk is exactly what it catches. `warn` logs a notice
-per mismatch and loads anyway; `enforce` fails the load. It runs once per
+per mismatch and loads anyway; `enforce` fails the load. The manifest
+resolved for the check is the one the load opens, pinned by digest
+(a model stored under an absolute path or a URI cannot carry a digest and
+is loaded by name instead), and only regular files are hashed: a blob replaced by a symlink or a
+directory is a mismatch. It runs once per
 cold load, not per request, and the cost is one sequential read and
 hash of every blob. Later config files override earlier ones, and
 `LLMMAN_VERIFY_LAYERS` overrides them all.

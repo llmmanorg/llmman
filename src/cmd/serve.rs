@@ -988,17 +988,30 @@ fn verify_stored(
 /// Blocking: it reads every stored blob of the model, so run it
 /// off the async executor. Unlike `verify_stored`, a mismatch never
 /// removes the reference: the blob may be the operator's only copy.
+///
+/// Returns the reference the caller must load alongside the notices:
+/// `reference` pinned to the manifest digest that was checked (see
+/// `verify::pinned_reference`), so the load cannot resolve a tag
+/// repointed since. An absolute path or a URI cannot carry a digest
+/// (`split_ref_digest`), so it comes back as given and is loaded by
+/// name: the check and the load are two `find`s, and a pointer
+/// rewritten in between is not caught for that reference class. Under
+/// `off` the reference comes back unchanged and no store is opened. `modelpack::resolve_model` and
+/// `resolve_model_tree` use their reference only for `OciStore::find`
+/// and error text, so the pinned spelling changes which manifest they
+/// load and nothing else.
 pub(crate) fn verify_layers_stored(
     store_path: &std::path::Path,
     reference: &str,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<(String, Vec<String>)> {
     let mode = crate::verify::layers_mode()?;
     if mode == crate::verify::Mode::Off {
-        return Ok(Vec::new());
+        return Ok((reference.to_owned(), Vec::new()));
     }
     let store = OciStore::open(store_path)?;
     let desc = store.find(reference)?;
-    crate::verify::verify_layers(mode, &store, reference, &desc)
+    let notices = crate::verify::verify_layers(mode, &store, reference, &desc)?;
+    Ok((crate::verify::pinned_reference(reference, &desc), notices))
 }
 
 /// Drops a reference the policy refused, so a later pull cannot find it
@@ -2363,11 +2376,13 @@ async fn resolve_target(
     // must not re-hash the model) and ahead of every format arm below,
     // so GGUF, safetensors trees, diffusion and Omni all pass through
     // it. Off by default; an enforce mismatch fails the load with the
-    // reference and digests in the error.
-    {
+    // reference and digests in the error. The manifest it checked is
+    // the one `resolve_model` loads, through `load_ref`; `model_ref`
+    // stays the spelling for the running-process keys and logs.
+    let load_ref = {
         let store_path = state.0.store_path.clone();
         let model_ref_owned = model_ref.to_owned();
-        let notices = tokio::task::spawn_blocking(move || {
+        let (load_ref, notices) = tokio::task::spawn_blocking(move || {
             verify_layers_stored(&store_path, &model_ref_owned)
         })
         .await
@@ -2376,9 +2391,10 @@ async fn resolve_target(
         for notice in notices {
             eprintln!("[llmman] {notice}");
         }
-    }
+        load_ref
+    };
 
-    let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
+    let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, &load_ref)
         .with_context(|| format!("resolve model {model_ref}"))?;
     let context_shift = supports_context_shift(model_ref);
     // One header read feeds initial_ctx_size, embedding_model_ctx and
@@ -2526,12 +2542,13 @@ async fn resolve_target(
                     // A Canary GGUF runs in this binary's speech worker,
                     // spawned the way the media backend is but from the
                     // CPU image (see SPEECH_BACKEND). Not OOM-retryable
-                    // either.
+                    // either. The worker re-resolves its reference, so it
+                    // gets `load_ref`, the manifest verified above.
                     (GgufArm::Speech { container: true }, Some(ociman)) => {
                         let mut child = crate::container::spawn_mediagen(
                             ociman,
                             crate::container::SPEECH_BACKEND,
-                            model_ref,
+                            &load_ref,
                             &state.0.store_path,
                             &state.0.cache_path,
                             state.0.llama_cpp_version.as_deref(),
@@ -2543,7 +2560,7 @@ async fn resolve_target(
                     }
                     (GgufArm::Speech { .. }, _) => {
                         let (child, tail) =
-                            spawn_mediagen_backend(model_ref, port, state, Workload::CpuOnly)
+                            spawn_mediagen_backend(&load_ref, port, state, Workload::CpuOnly)
                                 .await?;
                         stderr_tail = Some(tail);
                         ModelProcess::Local(Engine::Speech, child, None)
@@ -2570,12 +2587,14 @@ async fn resolve_target(
                     }
                 }
             }
-            // diffusion models run in this binary (see mediagen_backend)
+            // diffusion models run in this binary (see mediagen_backend).
+            // The worker re-resolves its reference, so it gets `load_ref`:
+            // the manifest verified above, not a tag that may have moved.
             (ModelPath::Diffusion(_), Some(ociman)) => {
                 let mut child = crate::container::spawn_mediagen(
                     ociman,
                     crate::container::detect_backend(),
-                    model_ref,
+                    &load_ref,
                     &state.0.store_path,
                     &state.0.cache_path,
                     state.0.llama_cpp_version.as_deref(),
@@ -2588,7 +2607,7 @@ async fn resolve_target(
             }
             (ModelPath::Diffusion(_), None) => {
                 let (child, tail) =
-                    spawn_mediagen_backend(model_ref, port, state, Workload::General).await?;
+                    spawn_mediagen_backend(&load_ref, port, state, Workload::General).await?;
                 stderr_tail = Some(tail);
                 oom_retryable = true;
                 ModelProcess::Local(Engine::LlamaServer, child, None)
@@ -4541,6 +4560,19 @@ async fn speech_backend(
     crate::mediagen::http::serve("speech", router, (args.host, port).into()).await
 }
 
+/// The `serve MODEL --port PORT` head of a worker's argv. `model_ref`
+/// is passed through verbatim: the child resolves it on its own, so
+/// the caller hands it the digest-pinned spelling `verify_layers_stored`
+/// returned and the worker loads the manifest that was verified.
+fn mediagen_backend_args(model_ref: &str, port: u16) -> [String; 4] {
+    [
+        "serve".into(),
+        model_ref.into(),
+        "--port".into(),
+        port.to_string(),
+    ]
+}
+
 /// Spawns this binary as `model_ref`'s backend, `llmman serve MODEL --port
 /// PORT` (see `run`): the media backend of a diffusion model, the speech
 /// worker of a Canary GGUF. `workload` is whose runtime answer the child
@@ -4553,7 +4585,7 @@ async fn spawn_mediagen_backend(
 ) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
     let exe = std::env::current_exe().context("locating the llmman binary")?;
     let mut cmd = tokio::process::Command::new(&exe);
-    cmd.args(["serve", model_ref, "--port", &port.to_string()]);
+    cmd.args(mediagen_backend_args(model_ref, port));
     // Explicit, so the child lands on the same build as this daemon
     // rather than re-resolving `auto`/the default pin/LLMMAN_RUNTIME.
     let runtime = state.0.runtime.resolve_for(workload).await?.runtime();

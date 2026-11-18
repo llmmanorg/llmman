@@ -708,11 +708,26 @@ fn digests_match(a: &str, b: &str) -> bool {
 /// refuses anything but `sha256:` and 64 hex digits) or an unreadable
 /// blob is a mismatch with its cause kept, not an error: the descriptor
 /// came from a blob this check exists to distrust.
+///
+/// Only a regular file is hashed. The store writes nothing else under
+/// `blobs/`, so a symlink (to `/dev/zero`, to another blob), a
+/// directory or a device there is a replacement, reported as such
+/// rather than followed: a symlink to a blob with the right bytes
+/// would hash clean while the backend opens whatever it points at by
+/// then. `symlink_metadata` does not follow links. The file is still
+/// opened separately, so a swap between that call and the open is not
+/// caught; the gap is a few microseconds and the same race as any
+/// write after the check (see docs/verification.md, Limitations).
 fn blob_mismatch(store: &OciStore, desc: &Descriptor) -> Option<String> {
     let path = match store.blob_path(&desc.digest) {
         Ok(path) => path,
         Err(e) => return Some(format!("{e:#}")),
     };
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Some(format!("{} is not a regular file", path.display())),
+        Err(e) => return Some(format!("open {}: {e}", path.display())),
+    }
     match crate::fsutil::sha256_of_file(&path) {
         Ok(hex) if digests_match(&format!("sha256:{hex}"), &desc.digest) => None,
         Ok(hex) => Some(format!("hashes to sha256:{hex}")),
@@ -912,6 +927,30 @@ pub fn verify_layers(
             )
         })
         .collect())
+}
+
+/// `reference` pinned to the manifest `desc` names: `<name>@<digest>`,
+/// with any digest the reference already carried replaced. A caller
+/// that verified `desc` loads through this spelling, and
+/// `OciStore::find` returns a descriptor for it only when the stored
+/// digest matches, so a tag repointed between the check and the load
+/// (or a store written by another process in between) is "not found"
+/// rather than loaded unverified.
+///
+/// An absolute path or a URI is returned unchanged: `split_ref_digest`
+/// treats an `@` in such a name as part of the name, so appending a
+/// digest would make the store look up a reference it does not hold.
+/// Such a reference is therefore loaded by name, not by digest: if its
+/// pointer is rewritten between the check and the load, the load opens
+/// whatever it now names. Only registry-style references are pinned.
+pub fn pinned_reference(reference: &str, desc: &Descriptor) -> String {
+    let (name, _) = crate::storage::split_ref_digest(reference);
+    let pinned = format!("{name}@{}", desc.digest);
+    if crate::storage::split_ref_digest(&pinned).1 == Some(desc.digest.as_str()) {
+        pinned
+    } else {
+        reference.to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -1621,6 +1660,120 @@ mod tests {
         );
         assert!(notices[0].contains(&layer.digest), "{notices:?}");
         assert!(path.is_file());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_blob_replaced_by_a_symlink_to_the_right_bytes_is_a_mismatch() {
+        let (store, desc, layer) = store_with_gguf_layer("symlink");
+        let path = store.blob_path(&layer.digest).unwrap();
+        let target = store.dir.join("elsewhere.gguf");
+        std::fs::rename(&path, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"GGUFaaaa");
+
+        let notices = verify_layers(Mode::Warn, &store, "model:q4", &desc).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains(&layer.digest), "{notices:?}");
+        assert!(notices[0].contains("regular file"), "{notices:?}");
+        let err = verify_layers(Mode::Enforce, &store, "model:q4", &desc).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&layer.digest), "{msg}");
+        assert!(msg.contains("regular file"), "{msg}");
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn a_blob_replaced_by_a_directory_is_a_mismatch() {
+        let (store, desc, layer) = store_with_gguf_layer("directory");
+        let path = store.blob_path(&layer.digest).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let notices = verify_layers(Mode::Warn, &store, "model:q4", &desc).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains(&layer.digest), "{notices:?}");
+        assert!(notices[0].contains("regular file"), "{notices:?}");
+        let err = verify_layers(Mode::Enforce, &store, "model:q4", &desc).unwrap_err();
+        assert!(err.to_string().contains("regular file"), "{err}");
+    }
+
+    #[test]
+    fn pinned_reference_names_the_verified_digest_and_the_store_honours_it() {
+        let (store, desc, _) = store_with_gguf_layer("pinned");
+        let digest = desc.digest.clone();
+        assert_eq!(
+            pinned_reference("example.com/ai/model:q4", &desc),
+            format!("example.com/ai/model:q4@{digest}")
+        );
+        // A digest already in the reference is replaced, not stacked.
+        assert_eq!(
+            pinned_reference("example.com/ai/model@sha256:0000", &desc),
+            format!("example.com/ai/model@{digest}")
+        );
+        assert_eq!(
+            pinned_reference("example.com/ai/model:q4@sha256:0000", &desc),
+            format!("example.com/ai/model:q4@{digest}")
+        );
+        // A `/` after the `@` is not a digest separator, and a path or
+        // URI cannot carry a digest at all, so it is left alone.
+        assert_eq!(
+            pinned_reference("example.com/ai/m@x/model:q4", &desc),
+            format!("example.com/ai/m@x/model:q4@{digest}")
+        );
+        assert_eq!(
+            pinned_reference("/models/model.gguf", &desc),
+            "/models/model.gguf"
+        );
+        assert_eq!(
+            pinned_reference("s3://bucket/model", &desc),
+            "s3://bucket/model"
+        );
+
+        // The store resolves the pinned spelling to the same manifest...
+        let pinned = pinned_reference("example.com/ai/model:q4", &desc);
+        assert_eq!(store.find(&pinned).unwrap().digest, digest);
+        // ...and refuses it once the tag points elsewhere.
+        let other = store
+            .write_blob("application/vnd.oci.image.manifest.v1+json", b"{}")
+            .unwrap();
+        store.tag(other, "example.com/ai/model:q4").unwrap();
+        assert_ne!(
+            store.find("example.com/ai/model:q4").unwrap().digest,
+            digest
+        );
+        assert!(
+            store.find(&pinned).is_err(),
+            "a repointed tag must not resolve"
+        );
+    }
+
+    #[test]
+    fn an_opaque_reference_is_not_pinned_and_loads_by_name() {
+        // `verify_layers_stored` does `find`, `verify_layers`, then
+        // `pinned_reference`, and the resolvers `find` the result again.
+        // For a path or URI the result is the same name, so a pointer
+        // rewritten in between is what the second `find` returns: the
+        // documented limit of the pinning, asserted so it does not change
+        // silently.
+        let (store, desc, _) = store_with_gguf_layer("opaque");
+        let digest = desc.digest.clone();
+        store.tag(desc.clone(), "/models/model.gguf").unwrap();
+        let desc = store.find("/models/model.gguf").unwrap();
+        assert_eq!(desc.digest, digest);
+        verify_layers(Mode::Enforce, &store, "/models/model.gguf", &desc).unwrap();
+        let pinned = pinned_reference("/models/model.gguf", &desc);
+        assert_eq!(pinned, "/models/model.gguf");
+
+        let other = store
+            .write_blob("application/vnd.oci.image.manifest.v1+json", b"{}")
+            .unwrap();
+        store.tag(other.clone(), "/models/model.gguf").unwrap();
+        assert_eq!(
+            store.find(&pinned).unwrap().digest,
+            other.digest,
+            "an opaque reference resolves to whatever it now names"
+        );
     }
 
     #[test]
