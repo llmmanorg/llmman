@@ -134,6 +134,7 @@ const PASSTHROUGH_ENV: &[&str] = &[
     "PI_CODING_AGENT_DIR",
     "PI_CONFIG_DIR",
     "QWEN_HOME",
+    "VIBE_HOME",
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",

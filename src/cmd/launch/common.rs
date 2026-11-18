@@ -30,6 +30,56 @@ fn check_daemon_key_transport_to(
     Ok(())
 }
 
+/// `NO_PROXY`/`no_proxy` for a child handed the daemon's key over loopback,
+/// so an inherited proxy never sees it. Inherited entries are kept.
+pub(super) fn daemon_no_proxy_env(server: &str) -> Vec<(&'static str, String)> {
+    if !crate::daemon::connects_over_loopback() {
+        return Vec::new();
+    }
+    no_proxy_env(
+        server,
+        std::env::var("NO_PROXY").ok().as_deref(),
+        std::env::var("no_proxy").ok().as_deref(),
+    )
+}
+
+/// Tools read either spelling, so both get the host; a spelling that is
+/// unset or empty inherits the other's entries.
+fn no_proxy_env(
+    server: &str,
+    upper: Option<&str>,
+    lower: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let Some(host) = reqwest::Url::parse(server).ok().and_then(|url| {
+        url.host_str()
+            .map(|h| h.trim_matches(['[', ']']).to_string())
+    }) else {
+        return Vec::new();
+    };
+    [("NO_PROXY", upper, lower), ("no_proxy", lower, upper)]
+        .into_iter()
+        .map(|(name, own, other)| {
+            let inherited = [own, other]
+                .into_iter()
+                .flatten()
+                .map(|list| list.trim().trim_end_matches(','))
+                .find(|list| !list.is_empty());
+            let value = match inherited {
+                Some(list)
+                    if list
+                        .split(',')
+                        .any(|e| e.trim().eq_ignore_ascii_case(&host)) =>
+                {
+                    list.to_string()
+                }
+                Some(list) => format!("{list},{host}"),
+                None => host.clone(),
+            };
+            (name, value)
+        })
+        .collect()
+}
+
 /// Writes `contents` to `path`, and its directory, unless it already holds
 /// exactly that.
 pub(super) fn write_if_changed(path: &Path, contents: &str) -> anyhow::Result<()> {
@@ -358,6 +408,53 @@ pub(super) fn provider_models_merged(
 mod tests {
     use super::super::{pair_context_window, served_context_window};
     use super::*;
+
+    #[test]
+    fn no_proxy_adds_the_daemon_host_to_what_is_inherited() {
+        let server = "http://127.0.0.1:17434";
+        for (upper, lower, want_upper, want_lower) in [
+            (None, None, "127.0.0.1", "127.0.0.1"),
+            (Some("a.test"), None, "a.test,127.0.0.1", "a.test,127.0.0.1"),
+            (None, Some("b.test"), "b.test,127.0.0.1", "b.test,127.0.0.1"),
+            (
+                Some("a.test,"),
+                Some("b.test"),
+                "a.test,127.0.0.1",
+                "b.test,127.0.0.1",
+            ),
+            (Some(""), Some(" "), "127.0.0.1", "127.0.0.1"),
+            (
+                Some("a.test"),
+                Some(""),
+                "a.test,127.0.0.1",
+                "a.test,127.0.0.1",
+            ),
+            (
+                Some("a.test, 127.0.0.1"),
+                None,
+                "a.test, 127.0.0.1",
+                "a.test, 127.0.0.1",
+            ),
+        ] {
+            assert_eq!(
+                no_proxy_env(server, upper, lower),
+                [
+                    ("NO_PROXY", want_upper.to_string()),
+                    ("no_proxy", want_lower.to_string())
+                ],
+                "{upper:?} {lower:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_proxy_names_the_host_without_brackets_or_port() {
+        let env = no_proxy_env("http://[::1]:17434", Some("a.test"), None);
+        assert_eq!(env[0], ("NO_PROXY", "a.test,::1".to_string()));
+        let env = no_proxy_env("http://host.docker.internal:17434", None, None);
+        assert_eq!(env[1], ("no_proxy", "host.docker.internal".to_string()));
+        assert!(no_proxy_env("not a url", None, None).is_empty());
+    }
 
     #[test]
     fn a_real_daemon_key_never_crosses_remote_cleartext() {
