@@ -65,16 +65,25 @@ pub fn endpoint() -> String {
     endpoint_from(|var| std::env::var_os(var))
 }
 
-/// [`endpoint`] with the environment injected. A value that is not
-/// valid Unicode counts as unset, as with `std::env::var`; an empty
-/// value counts as unset too.
+/// [`endpoint`] with the environment injected.
 fn endpoint_from(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> String {
-    env("HF_ENDPOINT")
-        .and_then(|v| v.into_string().ok())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "https://huggingface.co".to_string())
-        .trim_end_matches('/')
-        .to_string()
+    endpoint_override(env, &["HF_ENDPOINT"]).unwrap_or_else(|| "https://huggingface.co".to_string())
+}
+
+/// The first of `vars` that is set, without trailing slashes. A value
+/// that is not valid Unicode counts as unset, as with `std::env::var`;
+/// an empty value counts as unset too, so the next variable is tried.
+fn endpoint_override(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    vars: &[&str],
+) -> Option<String> {
+    vars.iter()
+        .find_map(|var| {
+            env(var)
+                .and_then(|v| v.into_string().ok())
+                .filter(|v| !v.is_empty())
+        })
+        .map(|v| v.trim_end_matches('/').to_string())
 }
 
 /// The process environment and home directory, in the form the `*_from`
@@ -476,17 +485,15 @@ pub async fn classify(reference: &str) -> ClassifiedRef {
 /// The HuggingFace API base URL for `host` — mirrors `hfEndpoint`,
 /// honoring `MODEL_ENDPOINT`/`HF_ENDPOINT` env var overrides.
 pub fn hf_endpoint(host: &str) -> String {
-    for var in ["MODEL_ENDPOINT", "HF_ENDPOINT"] {
-        if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() {
-                return format!("{}/", v.trim_end_matches('/'));
-            }
-        }
-    }
-    if host == "hf.co" {
-        "https://huggingface.co/".to_string()
-    } else {
-        format!("https://{host}/")
+    hf_endpoint_from(|var| std::env::var_os(var), host)
+}
+
+/// [`hf_endpoint`] with the environment injected.
+fn hf_endpoint_from(env: impl Fn(&str) -> Option<std::ffi::OsString>, host: &str) -> String {
+    match endpoint_override(env, &["MODEL_ENDPOINT", "HF_ENDPOINT"]) {
+        Some(base) => format!("{base}/"),
+        None if host == "hf.co" => "https://huggingface.co/".to_string(),
+        None => format!("https://{host}/"),
     }
 }
 
@@ -925,11 +932,63 @@ mod tests {
 
     #[test]
     fn hf_endpoint_defaults_hf_co_to_the_canonical_huggingface_domain() {
-        assert_eq!(hf_endpoint("hf.co"), "https://huggingface.co/");
+        assert_eq!(
+            hf_endpoint_from(|_| None, "hf.co"),
+            "https://huggingface.co/"
+        );
     }
 
     #[test]
     fn hf_endpoint_uses_the_host_verbatim_otherwise() {
-        assert_eq!(hf_endpoint("modelscope.cn"), "https://modelscope.cn/");
+        assert_eq!(
+            hf_endpoint_from(|_| None, "modelscope.cn"),
+            "https://modelscope.cn/"
+        );
+    }
+
+    #[test]
+    fn hf_endpoint_prefers_model_endpoint_then_hf_endpoint_with_one_trailing_slash() {
+        let env = |model: Option<&'static str>, hf: Option<&'static str>| {
+            move |var: &str| match var {
+                "MODEL_ENDPOINT" => model.map(std::ffi::OsString::from),
+                "HF_ENDPOINT" => hf.map(std::ffi::OsString::from),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            hf_endpoint_from(
+                env(Some("https://model.example//"), Some("https://hf.example")),
+                "hf.co"
+            ),
+            "https://model.example/"
+        );
+        assert_eq!(
+            hf_endpoint_from(env(Some(""), Some("https://hf.example")), "modelscope.cn"),
+            "https://hf.example/"
+        );
+        assert_eq!(
+            hf_endpoint_from(env(None, Some("https://hf.example/")), "modelscope.cn"),
+            "https://hf.example/"
+        );
+        assert_eq!(
+            hf_endpoint_from(env(Some(""), Some("")), "hf.co"),
+            "https://huggingface.co/"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hf_endpoint_from_skips_a_non_unicode_model_endpoint() {
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = std::ffi::OsString::from_vec(vec![0xff]);
+        let endpoint = hf_endpoint_from(
+            |var| match var {
+                "MODEL_ENDPOINT" => Some(invalid.clone()),
+                "HF_ENDPOINT" => Some("https://hf.example".into()),
+                _ => None,
+            },
+            "hf.co",
+        );
+        assert_eq!(endpoint, "https://hf.example/");
     }
 }
