@@ -48,12 +48,19 @@ api_key = "sk-or-..."
 base_url = "http://inferencebox:8000/v1"
 
 [verify]
-default = "off"
-layers  = "off"                 # hash stored layers on a cold load
+default      = "off"
+layers       = "off"               # hash stored layers on a cold load
+trusted_root = "sigstore/trusted_root.json"   # for keyless rules, relative to this file
 
 [[verify.trust]]
 pattern = "docker.io/myorg/**"
 keys    = ["keys/myorg.pub"]   # relative to this file's directory
+mode    = "enforce"
+
+[[verify.trust]]
+pattern = "docker.io/myorg/ci/**"  # keyless: an identity instead of keys
+issuer  = "https://token.actions.githubusercontent.com"
+subject = "https://github.com/myorg/models/.github/workflows/sign.yml@refs/heads/main"
 mode    = "enforce"
 
 [[verify.trust]]
@@ -294,6 +301,22 @@ verification, rather than a silent downgrade to `off` — even though the
 same failure only costs the other two sections their aliases and keys.
 That asymmetry is deliberate: a trust policy llmman cannot read must not
 be mistaken for one that does not exist.
+
+A `[[verify.trust]]` rule trusts either `keys` or a keyless identity,
+`issuer` and `subject`, which are compared exactly against the OIDC
+issuer and a subject alternative name of the Fulcio certificate the
+signature carries. Either of the two may be omitted; at least one must
+be set for the rule to be keyless. A rule that sets `keys` together
+with `issuer` or `subject` is rejected when the file is read, with the
+same fatal outcome as a malformed file. Keyless rules need
+`verify.trusted_root`, a Sigstore TrustedRoot JSON holding the Fulcio
+roots and the Rekor log keys; a relative path resolves against the
+directory of the file that sets it, like `keys`, and a later file's
+value replaces an earlier one. A keyless rule matching a pull with no
+`trusted_root` configured is a broken configuration, never an unsigned
+model: under `enforce` the pull is refused, under `warn` it proceeds
+with a warning naming `trusted_root`, and the model is never reported
+as "not signed".
 
 `verify.layers` is a separate switch: `off` (the default), `warn`, or
 `enforce`. It decides whether a cold load re-hashes the stored manifest,

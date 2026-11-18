@@ -1,18 +1,32 @@
 package main
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
 	digest "github.com/opencontainers/go-digest"
+	"github.com/sigstore/fulcio/pkg/certificate"
+	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	"github.com/sigstore/sigstore/pkg/signature"
 )
 
@@ -190,12 +204,43 @@ func ecdsaSignerVerifier(t *testing.T) (signature.Signer, trustedKey) {
 	return sv, trustedKey{path: "test-ecdsa.pub", verifier: sv}
 }
 
+// sigAnnotations is the annotation map of a key-signed layer: only the
+// signature, as cosign writes for `cosign sign --key`.
+func sigAnnotations(b64sig string) map[string]string {
+	return map[string]string{cosignSignatureAnnotation: b64sig}
+}
+
+func keysOnly(keys []trustedKey) verifyPolicy {
+	return verifyPolicy{keys: keys}
+}
+
+func TestVerifySignatureLayerIdentityRuleNeedsItsTrustedRoot(t *testing.T) {
+	signer, key := ecdsaSignerVerifier(t)
+	const ref = "docker.io/org/model:v1"
+	payload, b64 := signedPayload(t, signer, ref, targetA)
+	identity := &identityPolicy{Issuer: "https://issuer", Subject: "me@example.com", TrustedRoot: filepath.Join(t.TempDir(), "missing.json")}
+
+	_, err := verifySignatureLayer(payload, sigAnnotations(b64), ref, digest.Digest(targetA), verifyPolicy{identity: identity}, "")
+	if err == nil || !strings.Contains(err.Error(), "read trusted root") {
+		t.Fatalf("identity-only policy with a missing trusted root: err = %v, want read trusted root", err)
+	}
+
+	// A key alongside the identity still accepts and labels the signer.
+	match, err := verifySignatureLayer(payload, sigAnnotations(b64), ref, digest.Digest(targetA), verifyPolicy{keys: []trustedKey{key}, identity: identity}, "")
+	if err != nil {
+		t.Fatalf("key beside identity: %v", err)
+	}
+	if match.Signer != key.path {
+		t.Errorf("match.Signer = %q, want %q", match.Signer, key.path)
+	}
+}
+
 func TestVerifySignatureLayerAcceptsAGoodSignature(t *testing.T) {
 	signer, key := ecdsaSignerVerifier(t)
 	const ref = "docker.io/org/model:v1"
 	payload, b64 := signedPayload(t, signer, ref, targetA)
 
-	match, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetA), []trustedKey{key}, "")
+	match, err := verifySignatureLayer(payload, sigAnnotations(b64), ref, digest.Digest(targetA), keysOnly([]trustedKey{key}), "")
 	if err != nil {
 		t.Fatalf("verifySignatureLayer: %v", err)
 	}
@@ -226,7 +271,7 @@ func TestVerifySignatureLayerAcceptsEd25519(t *testing.T) {
 
 	const ref = "docker.io/org/model:v1"
 	payload, b64 := signedPayload(t, signer, ref, targetA)
-	if _, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetA), []trustedKey{{path: "ed25519.pub", verifier: verifier}}, ""); err != nil {
+	if _, err := verifySignatureLayer(payload, sigAnnotations(b64), ref, digest.Digest(targetA), keysOnly([]trustedKey{{path: "ed25519.pub", verifier: verifier}}), ""); err != nil {
 		t.Fatalf("verifySignatureLayer: %v", err)
 	}
 }
@@ -237,7 +282,7 @@ func TestVerifySignatureLayerRejectsUntrustedKey(t *testing.T) {
 	const ref = "docker.io/org/model:v1"
 	payload, b64 := signedPayload(t, signer, ref, targetA)
 
-	_, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetA), []trustedKey{stranger}, "")
+	_, err := verifySignatureLayer(payload, sigAnnotations(b64), ref, digest.Digest(targetA), keysOnly([]trustedKey{stranger}), "")
 	if err == nil {
 		t.Fatal("a signature by an untrusted key was accepted")
 	}
@@ -254,7 +299,7 @@ func TestVerifySignatureLayerRejectsWrongDigest(t *testing.T) {
 	const ref = "docker.io/org/model:v1"
 	payload, b64 := signedPayload(t, signer, ref, targetA)
 
-	_, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetB), []trustedKey{key}, "")
+	_, err := verifySignatureLayer(payload, sigAnnotations(b64), ref, digest.Digest(targetB), keysOnly([]trustedKey{key}), "")
 	if err == nil {
 		t.Fatal("a signature over a different manifest was accepted")
 	}
@@ -271,7 +316,7 @@ func TestVerifySignatureLayerAcceptsRelocatedRepositoryUnderClaims(t *testing.T)
 	signer, key := ecdsaSignerVerifier(t)
 	payload, b64 := signedPayload(t, signer, "docker.io/myorg/name:v1", targetA)
 
-	match, err := verifySignatureLayer(payload, b64, "mirror.corp/myorg/name:v1", digest.Digest(targetA), []trustedKey{key}, "docker.io/myorg/**")
+	match, err := verifySignatureLayer(payload, sigAnnotations(b64), "mirror.corp/myorg/name:v1", digest.Digest(targetA), keysOnly([]trustedKey{key}), "docker.io/myorg/**")
 	if err != nil {
 		t.Fatalf("relocated copy under matching claims: %v", err)
 	}
@@ -291,7 +336,7 @@ func TestVerifySignatureLayerRefusesRelocatedRepositoryOutsideClaims(t *testing.
 		// refusal names the glob that did the refusing instead.
 		"docker.io/other/**": `which does not match claims "docker.io/other/**"`,
 	} {
-		_, err := verifySignatureLayer(payload, b64, "mirror.corp/myorg/name:v1", digest.Digest(targetA), []trustedKey{key}, claims)
+		_, err := verifySignatureLayer(payload, sigAnnotations(b64), "mirror.corp/myorg/name:v1", digest.Digest(targetA), keysOnly([]trustedKey{key}), claims)
 		if err == nil {
 			t.Fatalf("claims %q: a relocated copy was accepted", claims)
 		}
@@ -334,7 +379,7 @@ func TestVerifySignatureLayerRefusesOversizedIdentityPromptly(t *testing.T) {
 	}
 
 	start := time.Now()
-	_, err = verifySignatureLayer(payload, base64.StdEncoding.EncodeToString([]byte("not a signature")), "mirror.corp/myorg/name:v1", digest.Digest(targetA), []trustedKey{key}, claims)
+	_, err = verifySignatureLayer(payload, sigAnnotations(base64.StdEncoding.EncodeToString([]byte("not a signature"))), "mirror.corp/myorg/name:v1", digest.Digest(targetA), keysOnly([]trustedKey{key}), claims)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("an oversized identity was accepted")
@@ -355,7 +400,7 @@ func TestVerifySignatureLayerRejectsTransplantedSignature(t *testing.T) {
 	signer, key := ecdsaSignerVerifier(t)
 	payload, b64 := signedPayload(t, signer, "docker.io/org/model:v1", targetA)
 
-	_, err := verifySignatureLayer(payload, b64, "docker.io/attacker/model:v1", digest.Digest(targetA), []trustedKey{key}, "")
+	_, err := verifySignatureLayer(payload, sigAnnotations(b64), "docker.io/attacker/model:v1", digest.Digest(targetA), keysOnly([]trustedKey{key}), "")
 	if err == nil {
 		t.Fatal("a signature copied into another repository was accepted")
 	}
@@ -376,7 +421,7 @@ func TestVerifySignatureLayerRejectsTamperedPayload(t *testing.T) {
 	if string(tampered) == string(payload) {
 		t.Fatal("test payload did not contain the digest to tamper with")
 	}
-	_, err := verifySignatureLayer(tampered, b64, ref, digest.Digest(targetB), []trustedKey{key}, "")
+	_, err := verifySignatureLayer(tampered, sigAnnotations(b64), ref, digest.Digest(targetB), keysOnly([]trustedKey{key}), "")
 	if err == nil {
 		t.Fatal("a tampered payload was accepted")
 	}
@@ -405,7 +450,7 @@ func TestVerifySignatureLayerRejectsWrongPayloadType(t *testing.T) {
 	}
 	b64 := base64.StdEncoding.EncodeToString(raw)
 
-	if _, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetA), []trustedKey{key}, ""); err == nil {
+	if _, err := verifySignatureLayer(payload, sigAnnotations(b64), ref, digest.Digest(targetA), keysOnly([]trustedKey{key}), ""); err == nil {
 		t.Fatal("a payload of an unrelated signature type was accepted")
 	}
 }
@@ -414,13 +459,13 @@ func TestVerifySignatureLayerRejectsMalformedInput(t *testing.T) {
 	_, key := ecdsaSignerVerifier(t)
 	keys := []trustedKey{key}
 
-	if _, err := verifySignatureLayer([]byte("{}"), "", "docker.io/org/model", digest.Digest(targetA), keys, ""); err == nil {
+	if _, err := verifySignatureLayer([]byte("{}"), sigAnnotations(""), "docker.io/org/model", digest.Digest(targetA), keysOnly(keys), ""); err == nil {
 		t.Error("a layer with no signature annotation was accepted")
 	}
-	if _, err := verifySignatureLayer([]byte("{}"), "!!!not base64!!!", "docker.io/org/model", digest.Digest(targetA), keys, ""); err == nil {
+	if _, err := verifySignatureLayer([]byte("{}"), sigAnnotations("!!!not base64!!!"), "docker.io/org/model", digest.Digest(targetA), keysOnly(keys), ""); err == nil {
 		t.Error("a non-base64 signature was accepted")
 	}
-	if _, err := verifySignatureLayer([]byte("not json"), base64.StdEncoding.EncodeToString([]byte("sig")), "docker.io/org/model", digest.Digest(targetA), keys, ""); err == nil {
+	if _, err := verifySignatureLayer([]byte("not json"), sigAnnotations(base64.StdEncoding.EncodeToString([]byte("sig"))), "docker.io/org/model", digest.Digest(targetA), keysOnly(keys), ""); err == nil {
 		t.Error("a non-JSON payload was accepted")
 	}
 }
@@ -494,4 +539,701 @@ func TestTransferResultJSON(t *testing.T) {
 	if got := transferResultJSON(true, ""); got != `{"changed":true}` {
 		t.Errorf("transferResultJSON = %s", got)
 	}
+}
+
+// sigstoreFixture is an in-test Sigstore, modelled on sigstore-go's
+// pkg/testing/ca: one ECDSA P-256 root that issues signing certificates
+// directly, or through one intermediate after withIntermediate (the
+// shape public Fulcio has), and one Rekor log key. It is what a
+// TrustedRoot file and a keyless signature layer are both derived from,
+// so the two agree by construction and each refusal case breaks exactly
+// one thing.
+type sigstoreFixture struct {
+	root    *x509.Certificate
+	rootKey *ecdsa.PrivateKey
+	// intermediate, when set, is the CA that issues leaves in the
+	// root's place; it is listed before the root in the trusted root's
+	// certChain and carried in the chain annotation of every layer.
+	intermediate    *x509.Certificate
+	intermediateKey *ecdsa.PrivateKey
+	rekorKey        *ecdsa.PrivateKey
+	// logID is hex(sha256(DER SPKI of rekorKey)), the name a bundle
+	// gives its log and the key the trusted root is looked up by.
+	logID string
+	// integrated is the signing time every bundle and certificate in a
+	// test is anchored to, one second resolution like Rekor's.
+	integrated time.Time
+}
+
+func newSigstoreFixture(t *testing.T) *sigstoreFixture {
+	t.Helper()
+	now := time.Now().Truncate(time.Second)
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate root key: %v", err)
+	}
+	rootTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "sigstore", Organization: []string{"sigstore.dev"}},
+		NotBefore:             now.Add(-5 * time.Hour),
+		NotAfter:              now.Add(5 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, &rootKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	root, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		t.Fatalf("parse root: %v", err)
+	}
+	rekorKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate rekor key: %v", err)
+	}
+	spki, err := x509.MarshalPKIXPublicKey(&rekorKey.PublicKey)
+	if err != nil {
+		t.Fatalf("marshal rekor key: %v", err)
+	}
+	keyID := sha256.Sum256(spki)
+	return &sigstoreFixture{
+		root:       root,
+		rootKey:    rootKey,
+		rekorKey:   rekorKey,
+		logID:      hex.EncodeToString(keyID[:]),
+		integrated: now,
+	}
+}
+
+// withIntermediate adds an intermediate CA issued by the root, with
+// path length zero and no EKU like Fulcio's, and makes it the issuer of
+// every leaf from here on.
+func (f *sigstoreFixture) withIntermediate(t *testing.T) *sigstoreFixture {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate intermediate key: %v", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(3),
+		Subject:               pkix.Name{CommonName: "sigstore-intermediate", Organization: []string{"sigstore.dev"}},
+		NotBefore:             f.root.NotBefore,
+		NotAfter:              f.root.NotAfter,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            0,
+		MaxPathLenZero:        true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, f.root, &key.PublicKey, f.rootKey)
+	if err != nil {
+		t.Fatalf("create intermediate: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse intermediate: %v", err)
+	}
+	f.intermediate, f.intermediateKey = cert, key
+	return f
+}
+
+// issuer is the CA leaves are issued by: the intermediate when there
+// is one, else the root.
+func (f *sigstoreFixture) issuer() (*x509.Certificate, *ecdsa.PrivateKey) {
+	if f.intermediate != nil {
+		return f.intermediate, f.intermediateKey
+	}
+	return f.root, f.rootKey
+}
+
+// leaf issues a short-lived signing certificate the way Fulcio does: the
+// code-signing EKU, the OIDC issuer in the non-critical extension
+// 1.3.6.1.4.1.57264.1.8 as a DER UTF8String, and the identity as an
+// email SAN. Validity is [notBefore, notAfter] so a test can place the
+// integrated time outside it.
+func (f *sigstoreFixture) leaf(t *testing.T, issuer, email string, notBefore, notAfter time.Time) (*x509.Certificate, signature.Signer) {
+	t.Helper()
+	return f.issue(t, f.leafTemplate(t, issuer, email, notBefore, notAfter))
+}
+
+// leafTemplate is the certificate leaf issues, before signing, so a test
+// can alter one field (the EKU, say) and pass it to issue.
+func (f *sigstoreFixture) leafTemplate(t *testing.T, issuer, email string, notBefore, notAfter time.Time) *x509.Certificate {
+	t.Helper()
+	issuerDER, err := asn1.MarshalWithParams(issuer, "utf8")
+	if err != nil {
+		t.Fatalf("marshal issuer: %v", err)
+	}
+	return &x509.Certificate{
+		SerialNumber:    big.NewInt(2),
+		NotBefore:       notBefore,
+		NotAfter:        notAfter,
+		KeyUsage:        x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:     []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning},
+		EmailAddresses:  []string{email},
+		ExtraExtensions: []pkix.Extension{{Id: certificate.OIDIssuerV2, Value: issuerDER}},
+	}
+}
+
+// issue signs template with the fixture's issuing CA over a fresh P-256
+// key and returns the certificate with a signer holding that key.
+func (f *sigstoreFixture) issue(t *testing.T, template *x509.Certificate) (*x509.Certificate, signature.Signer) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate leaf key: %v", err)
+	}
+	parent, parentKey := f.issuer()
+	der, err := x509.CreateCertificate(rand.Reader, template, parent, &key.PublicKey, parentKey)
+	if err != nil {
+		t.Fatalf("create leaf: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+	signer, err := signature.LoadECDSASignerVerifier(key, crypto.SHA256)
+	if err != nil {
+		t.Fatalf("load leaf signer: %v", err)
+	}
+	return cert, signer
+}
+
+// bundle is the dev.sigstore.cosign/bundle annotation for a signature
+// b64sig by cert over payload, logged at f.integrated: a hashedrekord
+// body naming the three, and a signed entry timestamp by the Rekor key
+// over the RFC 8785 form of {body, integratedTime, logIndex, logID}.
+func (f *sigstoreFixture) bundle(t *testing.T, b64sig string, cert *x509.Certificate, payload []byte) string {
+	t.Helper()
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	payloadDigest := sha256.Sum256(payload)
+	var body hashedRekordBody
+	body.APIVersion = "0.0.1"
+	body.Kind = "hashedrekord"
+	body.Spec.Data.Hash.Algorithm = "sha256"
+	body.Spec.Data.Hash.Value = hex.EncodeToString(payloadDigest[:])
+	body.Spec.Signature.Content = b64sig
+	body.Spec.Signature.PublicKey.Content = base64.StdEncoding.EncodeToString(certPEM)
+	bodyJSON, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+	rekorPayload := rekorPayload{
+		Body:           base64.StdEncoding.EncodeToString(bodyJSON),
+		IntegratedTime: f.integrated.Unix(),
+		LogIndex:       42,
+		LogID:          f.logID,
+	}
+	payloadJSON, err := json.Marshal(rekorPayload)
+	if err != nil {
+		t.Fatalf("marshal rekor payload: %v", err)
+	}
+	canonical, err := jsoncanonicalizer.Transform(payloadJSON)
+	if err != nil {
+		t.Fatalf("canonicalize rekor payload: %v", err)
+	}
+	setDigest := sha256.Sum256(canonical)
+	set, err := ecdsa.SignASN1(rand.Reader, f.rekorKey, setDigest[:])
+	if err != nil {
+		t.Fatalf("sign set: %v", err)
+	}
+	out, err := json.Marshal(rekorBundle{SignedEntryTimestamp: set, Payload: rekorPayload})
+	if err != nil {
+		t.Fatalf("marshal bundle: %v", err)
+	}
+	return string(out)
+}
+
+// trustedRootFile writes a Sigstore TrustedRoot (protojson field names,
+// bytes as base64) listing f.root as the one certificate authority,
+// with the intermediate before it in certChain when there is one, valid
+// for five hours either side of the integrated time, and the Rekor key
+// as the one transparency log, and returns its path.
+func (f *sigstoreFixture) trustedRootFile(t *testing.T) string {
+	t.Helper()
+	return writeTrustedRoot(t, f.trustedRootDoc(t))
+}
+
+// trustedRootDoc is the TrustedRoot trustedRootFile writes, before
+// marshalling, so a test can add a log or move a validity window.
+func (f *sigstoreFixture) trustedRootDoc(t *testing.T) map[string]any {
+	t.Helper()
+	spki, err := x509.MarshalPKIXPublicKey(&f.rekorKey.PublicKey)
+	if err != nil {
+		t.Fatalf("marshal rekor key: %v", err)
+	}
+	keyID, err := hex.DecodeString(f.logID)
+	if err != nil {
+		t.Fatalf("decode log id: %v", err)
+	}
+	// Leaf-to-root order, as the public root lists Fulcio's chain.
+	var chain []map[string]any
+	if f.intermediate != nil {
+		chain = append(chain, map[string]any{"rawBytes": base64.StdEncoding.EncodeToString(f.intermediate.Raw)})
+	}
+	chain = append(chain, map[string]any{"rawBytes": base64.StdEncoding.EncodeToString(f.root.Raw)})
+	doc := map[string]any{
+		"mediaType": "application/vnd.dev.sigstore.trustedroot+json;version=0.1",
+		"certificateAuthorities": []map[string]any{{
+			"subject": map[string]any{"organization": "sigstore.dev", "commonName": "sigstore"},
+			"uri":     "https://fulcio.test",
+			"certChain": map[string]any{
+				"certificates": chain,
+			},
+			"validFor": map[string]any{
+				"start": f.integrated.Add(-5 * time.Hour).UTC().Format(time.RFC3339),
+				"end":   f.integrated.Add(5 * time.Hour).UTC().Format(time.RFC3339),
+			},
+		}},
+		"tlogs": []map[string]any{{
+			"baseUrl":       "https://rekor.test",
+			"hashAlgorithm": "SHA2_256",
+			"publicKey": map[string]any{
+				"rawBytes":   base64.StdEncoding.EncodeToString(spki),
+				"keyDetails": "PKIX_ECDSA_P256_SHA_256",
+				"validFor":   map[string]any{"start": f.integrated.Add(-5 * time.Hour).UTC().Format(time.RFC3339)},
+			},
+			"logId": map[string]any{"keyId": base64.StdEncoding.EncodeToString(keyID)},
+		}},
+	}
+	return doc
+}
+
+// writeTrustedRoot marshals doc to a file and returns its path.
+func writeTrustedRoot(t *testing.T, doc map[string]any) string {
+	t.Helper()
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal trusted root: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "trusted_root.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write trusted root: %v", err)
+	}
+	return path
+}
+
+// keylessAnnotations is the annotation map cosign writes for a keyless
+// signature layer: the signature, the certificate and the Rekor bundle,
+// plus the chain annotation holding the intermediate when the fixture
+// has one. The chain is left out when the leaf is issued by the root.
+func (f *sigstoreFixture) keylessAnnotations(b64sig string, cert *x509.Certificate, bundle string) map[string]string {
+	out := map[string]string{
+		cosignSignatureAnnotation:   b64sig,
+		cosignCertificateAnnotation: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})),
+		cosignBundleAnnotation:      bundle,
+	}
+	if f.intermediate != nil {
+		out[cosignChainAnnotation] = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: f.intermediate.Raw}))
+	}
+	return out
+}
+
+const (
+	keylessIssuer  = "https://token.actions.githubusercontent.com"
+	keylessSubject = "signer@example.com"
+	keylessRef     = "docker.io/org/model:v1"
+)
+
+// keylessLayer is one well-formed keyless signature layer over
+// keylessRef/targetA from the fixture, with its leaf valid for ten
+// minutes around the integrated time.
+func keylessLayer(t *testing.T, f *sigstoreFixture) ([]byte, map[string]string) {
+	t.Helper()
+	cert, signer := f.leaf(t, keylessIssuer, keylessSubject, f.integrated.Add(-time.Minute), f.integrated.Add(10*time.Minute))
+	payload, b64 := signedPayload(t, signer, keylessRef, targetA)
+	return payload, f.keylessAnnotations(b64, cert, f.bundle(t, b64, cert, payload))
+}
+
+// A leaf issued by an intermediate, which is what public Fulcio does:
+// the chain annotation carries the intermediate, and the trusted root
+// may list it too (as the public root does) or leave it to the layer.
+func TestVerifySignatureLayerKeylessAcceptsIntermediateIssuedLeaf(t *testing.T) {
+	f := newSigstoreFixture(t).withIntermediate(t)
+	payload, annotations := keylessLayer(t, f)
+	if annotations[cosignChainAnnotation] == "" {
+		t.Fatal("fixture layer carries no chain annotation")
+	}
+	rootOnly := f.trustedRootDoc(t)
+	rootOnly["certificateAuthorities"].([]map[string]any)[0]["certChain"] = map[string]any{
+		"certificates": []map[string]any{{"rawBytes": base64.StdEncoding.EncodeToString(f.root.Raw)}},
+	}
+	for _, tc := range []struct {
+		name string
+		root string
+	}{
+		{"intermediate in trusted root and chain annotation", f.trustedRootFile(t)},
+		{"intermediate in the chain annotation only", writeTrustedRoot(t, rootOnly)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			identity := &identityPolicy{Issuer: keylessIssuer, Subject: keylessSubject, TrustedRoot: tc.root}
+			match, err := verifySignatureLayer(payload, annotations, keylessRef, digest.Digest(targetA), verifyPolicy{identity: identity}, "")
+			if err != nil {
+				t.Fatalf("verifySignatureLayer: %v", err)
+			}
+			if want := keylessIssuer + " " + keylessSubject; match.Signer != want {
+				t.Errorf("match.Signer = %q, want %q", match.Signer, want)
+			}
+		})
+	}
+
+	// Without the chain annotation the intermediate must come from the
+	// trusted root; a root-only file then has nothing to bridge the gap.
+	bare := map[string]string{}
+	for k, v := range annotations {
+		if k != cosignChainAnnotation {
+			bare[k] = v
+		}
+	}
+	identity := &identityPolicy{Issuer: keylessIssuer, Subject: keylessSubject, TrustedRoot: writeTrustedRoot(t, rootOnly)}
+	if _, err := verifySignatureLayer(payload, bare, keylessRef, digest.Digest(targetA), verifyPolicy{identity: identity}, ""); err == nil || !strings.Contains(err.Error(), "does not chain to a trusted root") {
+		t.Fatalf("no intermediate anywhere: err = %v, want does not chain", err)
+	}
+}
+
+// A workflow identity is a URI SAN, not an email: the subject is
+// matched against every SAN kind cryptoutils reports.
+func TestVerifySignatureLayerKeylessAcceptsURISubject(t *testing.T) {
+	f := newSigstoreFixture(t)
+	const workflow = "https://github.com/org/models/.github/workflows/sign.yml@refs/heads/main"
+	u, err := url.Parse(workflow)
+	if err != nil {
+		t.Fatalf("parse workflow URI: %v", err)
+	}
+	template := f.leafTemplate(t, keylessIssuer, "", f.integrated.Add(-time.Minute), f.integrated.Add(10*time.Minute))
+	template.EmailAddresses = nil
+	template.URIs = []*url.URL{u}
+	cert, signer := f.issue(t, template)
+	payload, b64 := signedPayload(t, signer, keylessRef, targetA)
+	annotations := f.keylessAnnotations(b64, cert, f.bundle(t, b64, cert, payload))
+
+	identity := &identityPolicy{Issuer: keylessIssuer, Subject: workflow, TrustedRoot: f.trustedRootFile(t)}
+	match, err := verifySignatureLayer(payload, annotations, keylessRef, digest.Digest(targetA), verifyPolicy{identity: identity}, "")
+	if err != nil {
+		t.Fatalf("URI SAN subject: %v", err)
+	}
+	if want := keylessIssuer + " " + workflow; match.Signer != want {
+		t.Errorf("match.Signer = %q, want %q", match.Signer, want)
+	}
+	identity = &identityPolicy{Issuer: keylessIssuer, Subject: "https://github.com/other/models/.github/workflows/sign.yml@refs/heads/main", TrustedRoot: f.trustedRootFile(t)}
+	if _, err := verifySignatureLayer(payload, annotations, keylessRef, digest.Digest(targetA), verifyPolicy{identity: identity}, ""); err == nil || !strings.Contains(err.Error(), "do not include") {
+		t.Fatalf("other workflow URI: err = %v, want do not include", err)
+	}
+}
+
+// certificateIssuer reads the Fulcio issuer from 1.3.6.1.4.1.57264.1.8
+// (DER UTF8String) first and falls back to the raw-bytes 1.3.6.1.4.1.57264.1.1
+// that preceded it; a malformed .1.8 is refused rather than skipped.
+func TestCertificateIssuer(t *testing.T) {
+	f := newSigstoreFixture(t)
+	v2, err := asn1.MarshalWithParams("https://v2.issuer", "utf8")
+	if err != nil {
+		t.Fatalf("marshal issuer: %v", err)
+	}
+	v2ext := pkix.Extension{Id: certificate.OIDIssuerV2, Value: v2}
+	v1ext := pkix.Extension{Id: certificate.OIDIssuer, Value: []byte("https://v1.issuer")} //nolint:staticcheck // the deprecated OID is the one under test
+	malformed := pkix.Extension{Id: certificate.OIDIssuerV2, Value: []byte("https://not.der")}
+	for _, tc := range []struct {
+		name    string
+		exts    []pkix.Extension
+		want    string
+		wantErr string
+	}{
+		{".1.8 alone", []pkix.Extension{v2ext}, "https://v2.issuer", ""},
+		{".1.1 alone", []pkix.Extension{v1ext}, "https://v1.issuer", ""},
+		{".1.8 takes precedence over .1.1", []pkix.Extension{v1ext, v2ext}, "https://v2.issuer", ""},
+		{"malformed .1.8 is an error even beside .1.1", []pkix.Extension{v1ext, malformed}, "", "certificate issuer extension"},
+		{"neither", nil, "", "no Fulcio issuer extension"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			template := f.leafTemplate(t, "unused", keylessSubject, f.integrated.Add(-time.Minute), f.integrated.Add(10*time.Minute))
+			template.ExtraExtensions = tc.exts
+			cert, _ := f.issue(t, template)
+			got, err := certificateIssuer(cert)
+			switch {
+			case tc.wantErr != "":
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tc.wantErr)
+				}
+			case err != nil:
+				t.Fatalf("certificateIssuer: %v", err)
+			case got != tc.want:
+				t.Errorf("certificateIssuer = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestVerifySignatureLayerKeylessAcceptsMatchingIdentity(t *testing.T) {
+	f := newSigstoreFixture(t)
+	payload, annotations := keylessLayer(t, f)
+	for _, tc := range []struct {
+		name            string
+		issuer, subject string
+	}{
+		{"issuer and subject", keylessIssuer, keylessSubject},
+		{"issuer only", keylessIssuer, ""},
+		{"subject only", "", keylessSubject},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			identity := &identityPolicy{Issuer: tc.issuer, Subject: tc.subject, TrustedRoot: f.trustedRootFile(t)}
+			match, err := verifySignatureLayer(payload, annotations, keylessRef, digest.Digest(targetA), verifyPolicy{identity: identity}, "")
+			if err != nil {
+				t.Fatalf("verifySignatureLayer: %v", err)
+			}
+			// The signer label names the certificate, not the rule: an
+			// unset half of the rule is still reported from the leaf.
+			if want := keylessIssuer + " " + keylessSubject; match.Signer != want {
+				t.Errorf("match.Signer = %q, want %q", match.Signer, want)
+			}
+			if match.KeyPath != "" {
+				t.Errorf("match.KeyPath = %q, want empty for an identity match", match.KeyPath)
+			}
+			if match.Identity != "docker.io/org/model" {
+				t.Errorf("match.Identity = %q, want the repository", match.Identity)
+			}
+		})
+	}
+}
+
+func TestVerifySignatureLayerKeylessRefusals(t *testing.T) {
+	f := newSigstoreFixture(t)
+	goodPayload, good := keylessLayer(t, f)
+	rule := func(issuer, subject string) *identityPolicy {
+		return &identityPolicy{Issuer: issuer, Subject: subject, TrustedRoot: f.trustedRootFile(t)}
+	}
+	// with returns a copy of good with one annotation replaced.
+	with := func(name, value string) map[string]string {
+		out := map[string]string{}
+		for k, v := range good {
+			out[k] = v
+		}
+		out[name] = value
+		return out
+	}
+
+	// A leaf whose validity starts after the integrated time; the
+	// signature itself is sound, only the moment of signing is outside
+	// the certificate's life.
+	lateCert, lateSigner := f.leaf(t, keylessIssuer, keylessSubject, f.integrated.Add(time.Hour), f.integrated.Add(2*time.Hour))
+	latePayload, lateB64 := signedPayload(t, lateSigner, keylessRef, targetA)
+	late := f.keylessAnnotations(lateB64, lateCert, f.bundle(t, lateB64, lateCert, latePayload))
+
+	// A leaf that expired an hour before the integrated time.
+	expiredCert, expiredSigner := f.leaf(t, keylessIssuer, keylessSubject, f.integrated.Add(-2*time.Hour), f.integrated.Add(-time.Hour))
+	expiredPayload, expiredB64 := signedPayload(t, expiredSigner, keylessRef, targetA)
+	expired := f.keylessAnnotations(expiredB64, expiredCert, f.bundle(t, expiredB64, expiredCert, expiredPayload))
+
+	// A SET with one byte flipped.
+	var tampered rekorBundle
+	if err := json.Unmarshal([]byte(good[cosignBundleAnnotation]), &tampered); err != nil {
+		t.Fatalf("parse bundle: %v", err)
+	}
+	tampered.SignedEntryTimestamp[len(tampered.SignedEntryTimestamp)-1] ^= 0x01
+	tamperedJSON, err := json.Marshal(tampered)
+	if err != nil {
+		t.Fatalf("marshal bundle: %v", err)
+	}
+
+	// A log entry about some other signature by the same certificate,
+	// and one about this signature over some other payload.
+	goodCert, err := cryptoutils.UnmarshalCertificatesFromPEM([]byte(good[cosignCertificateAnnotation]))
+	if err != nil || len(goodCert) != 1 {
+		t.Fatalf("parse good certificate: %v (%d certs)", err, len(goodCert))
+	}
+	otherSig := base64.StdEncoding.EncodeToString([]byte("not the signature"))
+	otherPayload := append([]byte(nil), goodPayload...)
+	otherPayload[len(otherPayload)-1] ^= 0x01
+
+	// A second root-issued certificate with the same identity: logged in
+	// place of the layer certificate, and used to sign a payload that is
+	// then presented under the good certificate with an honest bundle,
+	// so every check before the final signature check passes.
+	otherCert, otherSigner := f.leaf(t, keylessIssuer, keylessSubject, f.integrated.Add(-time.Minute), f.integrated.Add(10*time.Minute))
+	foreignPayload, foreignB64 := signedPayload(t, otherSigner, keylessRef, targetA)
+	foreign := f.keylessAnnotations(foreignB64, goodCert[0], f.bundle(t, foreignB64, goodCert[0], foreignPayload))
+
+	// A root-issued leaf with only the server-auth EKU; sound in every
+	// other respect.
+	serverTemplate := f.leafTemplate(t, keylessIssuer, keylessSubject, f.integrated.Add(-time.Minute), f.integrated.Add(10*time.Minute))
+	serverTemplate.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	serverCert, serverSigner := f.issue(t, serverTemplate)
+	serverPayload, serverB64 := signedPayload(t, serverSigner, keylessRef, targetA)
+	server := f.keylessAnnotations(serverB64, serverCert, f.bundle(t, serverB64, serverCert, serverPayload))
+
+	for _, tc := range []struct {
+		name        string
+		payload     []byte
+		annotations map[string]string
+		identity    *identityPolicy
+		want        string
+	}{
+		{"wrong issuer", goodPayload, good, rule("https://other.issuer", keylessSubject), "certificate issuer"},
+		{"wrong subject", goodPayload, good, rule(keylessIssuer, "other@example.com"), "do not include"},
+		{"leaf not yet valid at the integrated time", latePayload, late, rule(keylessIssuer, keylessSubject), "does not chain to a trusted root"},
+		{"leaf expired before the integrated time", expiredPayload, expired, rule(keylessIssuer, keylessSubject), "does not chain to a trusted root"},
+		{"tampered signed entry timestamp", goodPayload, with(cosignBundleAnnotation, string(tamperedJSON)), rule(keylessIssuer, keylessSubject), "signed entry timestamp does not verify"},
+		{"body signature is another signature", goodPayload, with(cosignBundleAnnotation, f.bundle(t, otherSig, goodCert[0], goodPayload)), rule(keylessIssuer, keylessSubject), "body signature is not the layer signature"},
+		{"body hash is another payload", goodPayload, with(cosignBundleAnnotation, f.bundle(t, good[cosignSignatureAnnotation], goodCert[0], otherPayload)), rule(keylessIssuer, keylessSubject), "body hash is not the payload"},
+		// Signature and payload untouched; only the logged certificate differs.
+		{"body certificate is another certificate", goodPayload, with(cosignBundleAnnotation, f.bundle(t, good[cosignSignatureAnnotation], otherCert, goodPayload)), rule(keylessIssuer, keylessSubject), "body certificate is not the layer certificate"},
+		{"leaf without the code-signing EKU", serverPayload, server, rule(keylessIssuer, keylessSubject), "does not chain to a trusted root"},
+		{"signature by another key", foreignPayload, foreign, rule(keylessIssuer, keylessSubject), "does not verify under the certificate key"},
+		{"missing bundle", goodPayload, with(cosignBundleAnnotation, ""), rule(keylessIssuer, keylessSubject), "has no " + cosignBundleAnnotation},
+		{"missing certificate", goodPayload, with(cosignCertificateAnnotation, ""), rule(keylessIssuer, keylessSubject), "has no " + cosignCertificateAnnotation},
+		{"missing trusted root", goodPayload, good, &identityPolicy{Issuer: keylessIssuer, Subject: keylessSubject, TrustedRoot: filepath.Join(t.TempDir(), "missing.json")}, "read trusted root"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := verifySignatureLayer(tc.payload, tc.annotations, keylessRef, digest.Digest(targetA), verifyPolicy{identity: tc.identity}, "")
+			if err == nil {
+				t.Fatal("verified, want refusal")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want %q", err, tc.want)
+			}
+			// Every refusal here is a hard error about the signature or
+			// the configuration, never the "no key accepted" wording a
+			// caller reads as unsigned.
+			if strings.Contains(err.Error(), "no trusted key accepted") {
+				t.Errorf("err = %v reads as unsigned", err)
+			}
+		})
+	}
+}
+
+// A self-signed certificate in the chain annotation is not a root: only
+// the trusted root file anchors a chain, so a registry serving its own
+// CA alongside a leaf it issued is refused.
+func TestVerifySignatureLayerKeylessIgnoresSelfSignedChainEntry(t *testing.T) {
+	f := newSigstoreFixture(t)
+	rogue := newSigstoreFixture(t)
+	rogue.integrated = f.integrated
+	rogue.rekorKey, rogue.logID = f.rekorKey, f.logID
+	cert, signer := rogue.leaf(t, keylessIssuer, keylessSubject, f.integrated.Add(-time.Minute), f.integrated.Add(10*time.Minute))
+	payload, b64 := signedPayload(t, signer, keylessRef, targetA)
+	annotations := rogue.keylessAnnotations(b64, cert, rogue.bundle(t, b64, cert, payload))
+	annotations[cosignChainAnnotation] = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rogue.root.Raw}))
+
+	identity := &identityPolicy{Issuer: keylessIssuer, Subject: keylessSubject, TrustedRoot: f.trustedRootFile(t)}
+	_, err := verifySignatureLayer(payload, annotations, keylessRef, digest.Digest(targetA), verifyPolicy{identity: identity}, "")
+	if err == nil || !strings.Contains(err.Error(), "does not chain to a trusted root") {
+		t.Fatalf("rogue root in chain: err = %v, want does not chain", err)
+	}
+}
+
+// The public Sigstore TrustedRoot lists rekor.sigstore.dev with an ECDSA
+// P-256 key and log2025-1.rekor.sigstore.dev with an Ed25519 key. A
+// root with both must parse, and a bundle naming the ECDSA log must
+// still verify; the Ed25519 key only matters to a bundle that names it.
+func TestParseTrustedRootKeepsNonECDSALogKeys(t *testing.T) {
+	f := newSigstoreFixture(t)
+	edPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519 key: %v", err)
+	}
+	edSPKI, err := x509.MarshalPKIXPublicKey(edPub)
+	if err != nil {
+		t.Fatalf("marshal ed25519 key: %v", err)
+	}
+	edID := sha256.Sum256(edSPKI)
+	doc := f.trustedRootDoc(t)
+	doc["tlogs"] = append(doc["tlogs"].([]map[string]any), map[string]any{
+		"baseUrl":       "https://log2025-1.rekor.test",
+		"hashAlgorithm": "SHA2_256",
+		"publicKey": map[string]any{
+			"rawBytes":   base64.StdEncoding.EncodeToString(edSPKI),
+			"keyDetails": "PKIX_ED25519",
+			"validFor":   map[string]any{"start": f.integrated.Add(-time.Hour).UTC().Format(time.RFC3339)},
+		},
+		"logId": map[string]any{"keyId": base64.StdEncoding.EncodeToString(edID[:])},
+	})
+	path := writeTrustedRoot(t, doc)
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read trusted root: %v", err)
+	}
+	root, err := parseTrustedRoot(raw)
+	if err != nil {
+		t.Fatalf("parseTrustedRoot: %v", err)
+	}
+	if len(root.logKeys) != 2 {
+		t.Fatalf("parsed %d log keys, want 2", len(root.logKeys))
+	}
+	if _, ok := root.logKeys[hex.EncodeToString(edID[:])].key.(ed25519.PublicKey); !ok {
+		t.Errorf("ed25519 log key not kept as ed25519.PublicKey")
+	}
+
+	payload, annotations := keylessLayer(t, f)
+	identity := &identityPolicy{Issuer: keylessIssuer, Subject: keylessSubject, TrustedRoot: path}
+	if _, err := verifySignatureLayer(payload, annotations, keylessRef, digest.Digest(targetA), verifyPolicy{identity: identity}, ""); err != nil {
+		t.Fatalf("bundle naming the ECDSA log beside an Ed25519 log: %v", err)
+	}
+}
+
+// A SET is only the log's word while its key was in use: tlogs[]
+// .publicKey.validFor bounds the integrated times the key vouches for,
+// the same way certificateAuthorities[].validFor bounds the issuers.
+func TestVerifyKeylessHonoursLogKeyValidFor(t *testing.T) {
+	f := newSigstoreFixture(t)
+	payload, annotations := keylessLayer(t, f)
+	stamp := func(d time.Duration) string { return f.integrated.Add(d).UTC().Format(time.RFC3339) }
+	for _, tc := range []struct {
+		name     string
+		validFor map[string]any
+		wantErr  string
+	}{
+		{"inside the window", map[string]any{"start": stamp(-time.Hour), "end": stamp(time.Hour)}, ""},
+		{"no end", map[string]any{"start": stamp(-time.Hour)}, ""},
+		{"before start", map[string]any{"start": stamp(time.Hour)}, "outside the validity window"},
+		{"after end", map[string]any{"start": stamp(-2 * time.Hour), "end": stamp(-time.Hour)}, "outside the validity window"},
+		{"no start", map[string]any{"end": stamp(time.Hour)}, "no publicKey.validFor.start"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := f.trustedRootDoc(t)
+			doc["tlogs"].([]map[string]any)[0]["publicKey"].(map[string]any)["validFor"] = tc.validFor
+			identity := &identityPolicy{Issuer: keylessIssuer, Subject: keylessSubject, TrustedRoot: writeTrustedRoot(t, doc)}
+			_, err := verifySignatureLayer(payload, annotations, keylessRef, digest.Digest(targetA), verifyPolicy{identity: identity}, "")
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("err = %v, want verified", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("err = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// A trusted root that cannot be read is a configuration failure, so
+// verifySignatures returns it as an error (which the Rust side maps to
+// an indeterminate verdict) rather than a report that reads as
+// "unsigned" and would have a cached copy rejected over it. It is
+// checked before any registry access, hence no registry in this test.
+func TestVerifySignaturesRefusesUnreadableTrustedRoot(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, want string
+	}{
+		{"missing", filepath.Join(t.TempDir(), "missing.json"), "read trusted root"},
+		{"malformed", writeFile(t, "trusted_root.json", "{not json"), "parse trusted root"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			identity := &identityPolicy{Issuer: keylessIssuer, Subject: keylessSubject, TrustedRoot: tc.path}
+			report, err := verifySignatures(context.Background(), keylessRef, digest.Digest(targetA), nil, identity, "")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("report = %+v, err = %v, want error containing %q", report, err, tc.want)
+			}
+		})
+	}
+}
+
+// writeFile writes content to name under a fresh temp dir and returns the path.
+func writeFile(t *testing.T, name, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+	return path
 }
