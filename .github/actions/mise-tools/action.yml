@@ -1,0 +1,70 @@
+name: Install and smoke-check mise tools
+description: >
+  Installs the npm CLIs listed in .mise.toml via jdx/mise-action (v5.2.5)
+  and verifies every executable mise shims for them launches (<bin> --version).
+  Callers must run actions/checkout and
+  actions/setup-node (with node-version: 22) first and set MISE_DATA_DIR job-wide.
+
+runs:
+  using: composite
+  steps:
+    - name: Install mise tools
+      # v5 extracts mise.exe with PowerShell Expand-Archive on Windows,
+      # so no `unzip` binary and no PATH prepend are needed.
+      uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      with:
+        version: "2026.10.11"
+        persist_github_token: "false"  # default github.token stays inside this action (v5.2.5 exports it only when persist_github_token is true)
+        # mise's isolated node_modules links don't survive the cache tar round-trip on
+        # Windows: restored installs fail with ERR_MODULE_NOT_FOUND, cold ones pass.
+        # Linux/macOS keep the cache because symlinks survive tar there.
+        cache: ${{ runner.os != 'Windows' }}
+      env:
+        MISE_DATA_DIR: ${{ env.MISE_DATA_DIR }}
+        # The action downloads mise under os.tmpdir() (TEMP/TMP on Windows: C:\…\Temp)
+        # then renames it into MISE_DATA_DIR. On windows-2025 the workspace is on D:,
+        # so the rename fails with EXDEV. runner.temp is on the workspace drive on every
+        # runner. Node ignores TEMP/TMP outside Windows.
+        TEMP: ${{ runner.temp }}
+        TMP: ${{ runner.temp }}
+
+    - name: Smoke-check mise tools
+      shell: bash
+      run: |
+        : "${MISE_DATA_DIR:?MISE_DATA_DIR must be set job-wide (see the mise-tools action description)}"
+        # mise writes one shim per executable of every installed tool. Windows adds an
+        # extension (<bin>.exe, or <bin> plus <bin>.cmd in file mode); the glob skips
+        # dotfile metadata such as .mode and .version.
+        bins=" "
+        count=0
+        for shim in "$MISE_DATA_DIR/shims"/*; do
+          [ -f "$shim" ] || continue
+          bin=${shim##*/}
+          bin=${bin%.exe}
+          bin=${bin%.cmd}
+          case $bins in *" $bin "*) continue ;; esac
+          bins="$bins$bin "
+          count=$((count + 1))
+        done
+        # mise only warns when it cannot list a tool's bins, so check no tool lost its shims.
+        if ! tools=$(mise ls --current --no-header); then
+          echo "::error::mise ls --current failed"
+          exit 1
+        fi
+        expected=$(printf '%s\n' "$tools" | grep -c . || true)
+        if [ "$count" -lt "$expected" ]; then
+          echo "::error::$MISE_DATA_DIR/shims has $count executables but mise ls --current lists $expected tools:$bins"
+          exit 1
+        fi
+        for bin in $bins; do
+          if ! resolved=$(command -v "$bin"); then
+            echo "::error::$bin is not on PATH"
+            exit 1
+          fi
+          output=$("$bin" --version 2>&1) && code=0 || code=$?
+          if [ "$code" -ne 0 ]; then
+            echo "::error::$bin --version failed (exit $code): $output"
+            exit 1
+          fi
+          echo "$bin ($resolved): $output"
+        done
