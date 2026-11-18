@@ -35,6 +35,7 @@ extern "C" {
         reference: *const c_char,
         digest: *const c_char,
         keys_json: *const c_char,
+        claims: *const c_char,
     ) -> *mut c_char;
     fn llmman_sign(
         reference: *const c_char,
@@ -372,14 +373,23 @@ pub struct VerifyReport {
 
 /// Check the signatures published for `reference` against the PEM public
 /// keys at `keys`. `digest` may be `""` to resolve `reference` first.
+/// `claims` is the glob the signature's claimed repository must match,
+/// or `""` to require it to equal the pulled repository.
 ///
 /// "Not verified" comes back as `Ok` with `verified` false; `Err` means
 /// no answer could be reached. `crate::verify` decides what each means.
-pub fn verify(reference: &str, digest: &str, keys: &[String]) -> anyhow::Result<VerifyReport> {
+pub fn verify(
+    reference: &str,
+    digest: &str,
+    keys: &[String],
+    claims: &str,
+) -> anyhow::Result<VerifyReport> {
     let r = cstr(reference)?;
     let d = cstr(digest)?;
     let k = cstr(&serde_json::to_string(keys).context("encode trusted key list")?)?;
-    let data = registry_call(|| unsafe { llmman_verify(r.as_ptr(), d.as_ptr(), k.as_ptr()) })?;
+    let c = cstr(claims)?;
+    let data =
+        registry_call(|| unsafe { llmman_verify(r.as_ptr(), d.as_ptr(), k.as_ptr(), c.as_ptr()) })?;
     serde_json::from_str(&data).context("decode verification report")
 }
 

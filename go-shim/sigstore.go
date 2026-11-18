@@ -103,6 +103,14 @@ const (
 	maxSignatureBytes         = 1 << 16 // 64 KiB per layer
 	maxSignatureArtifactBytes = 1 << 22 // 4 MiB for config + every layer
 	maxSignatureCount         = 64
+	// distribution/reference's RepositoryNameTotalLengthMax, applied to
+	// the path after the host (reference.go: `len(repo.path) >
+	// RepositoryNameTotalLengthMax`), never to host[:port]/path as a whole.
+	maxClaimedRepositoryPathBytes = 255
+	// A DNS name is at most 253 characters in text form (RFC 1035
+	// section 2.3.4) and a port at most ":65535"; the reference grammar
+	// sets no bound of its own on the domain.
+	maxClaimedRepositoryHostBytes = 253 + len(":65535")
 )
 
 // simpleSigningPayload is the JSON document that gets signed — the
@@ -206,11 +214,33 @@ func signatureTagFor(ref string, target digest.Digest) string {
 // reachable under many tags, and the digest binding makes that safe —
 // a tag can only move to some other digest, which has its own signature.
 // An empty claim is rejected; it asserts nothing about where it belongs.
-func identityMatchesRepository(claimed, ref string) bool {
+//
+// A non-empty claims glob (the trust rule's `claims`) replaces equality:
+// the claimed repository, canonicalised, must match it. The pattern
+// itself is never canonicalised, since normalising it would strip its
+// host and widen what it accepts.
+//
+// The claimed repository is registry-controlled data read before any
+// key is consulted, and globMatch is quadratic in the text per single
+// star. Capping the host and the path separately, at what DNS and the
+// reference grammar already bound (maxClaimedRepositoryHostBytes,
+// maxClaimedRepositoryPathBytes), keeps a hostile payload from stalling
+// verification for minutes per layer without refusing a name both
+// reference parsers accept. Equality is linear and keeps accepting any
+// length, so the default path is unchanged.
+func identityMatchesRepository(claimed, ref, claims string) bool {
 	if strings.TrimSpace(claimed) == "" {
 		return false
 	}
-	return canonicalRepository(repositoryOf(claimed)) == canonicalRepository(repositoryOf(ref))
+	repo := canonicalRepository(repositoryOf(claimed))
+	if claims != "" {
+		host, path, _ := strings.Cut(repo, "/")
+		if len(host) > maxClaimedRepositoryHostBytes || len(path) > maxClaimedRepositoryPathBytes {
+			return false
+		}
+		return globMatch(claims, repo)
+	}
+	return repo == canonicalRepository(repositoryOf(ref))
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +308,7 @@ type verifyReport struct {
 // only buys a cheaper error message. The signature is verified against
 // the literal blob bytes, never a re-marshalling of the parsed struct,
 // which would normalize away whitespace the signer covered.
-func verifySignatureLayer(payload []byte, b64sig, ref string, target digest.Digest, keys []trustedKey) (*signatureMatch, error) {
+func verifySignatureLayer(payload []byte, b64sig, ref string, target digest.Digest, keys []trustedKey, claims string) (*signatureMatch, error) {
 	if b64sig == "" {
 		return nil, fmt.Errorf("layer has no %s annotation", cosignSignatureAnnotation)
 	}
@@ -297,7 +327,13 @@ func verifySignatureLayer(payload []byte, b64sig, ref string, target digest.Dige
 	if ssp.Critical.Image.DockerManifestDigest != target.String() {
 		return nil, fmt.Errorf("payload signs %s, not %s", ssp.Critical.Image.DockerManifestDigest, target)
 	}
-	if !identityMatchesRepository(ssp.Critical.Identity.DockerReference, ref) {
+	if !identityMatchesRepository(ssp.Critical.Identity.DockerReference, ref, claims) {
+		// With claims set the pulled repository was not consulted, so
+		// the message names the glob that actually refused it.
+		if claims != "" {
+			return nil, fmt.Errorf("payload claims identity %q, which does not match claims %q",
+				ssp.Critical.Identity.DockerReference, claims)
+		}
 		return nil, fmt.Errorf("payload claims identity %q, which is not %s",
 			ssp.Critical.Identity.DockerReference, repositoryOf(ref))
 	}
@@ -427,7 +463,10 @@ func isNotFoundError(err error) bool {
 // different words: nothing signed, signed by a stranger, or registry
 // unreachable. Only the last is an error return — "this model is
 // unsigned" is an answer, not a failure to produce one.
-func verifySignatures(ctx context.Context, ref string, target digest.Digest, keyPaths []string) (*verifyReport, error) {
+//
+// claims is the glob a signature's claimed repository must match, or ""
+// to require it to equal the pulled repository.
+func verifySignatures(ctx context.Context, ref string, target digest.Digest, keyPaths []string, claims string) (*verifyReport, error) {
 	if len(keyPaths) == 0 {
 		return nil, errors.New("no trusted public keys configured")
 	}
@@ -435,12 +474,12 @@ func verifySignatures(ctx context.Context, ref string, target digest.Digest, key
 	if err != nil {
 		return nil, err
 	}
-	return verifyAgainst(ctx, ref, target, keys)
+	return verifyAgainst(ctx, ref, target, keys, claims)
 }
 
 // verifyAgainst is verifySignatures with the keys already loaded, so
 // signManifest can ask the same question about its own key.
-func verifyAgainst(ctx context.Context, ref string, target digest.Digest, keys []trustedKey) (*verifyReport, error) {
+func verifyAgainst(ctx context.Context, ref string, target digest.Digest, keys []trustedKey, claims string) (*verifyReport, error) {
 	report := &verifyReport{
 		Reference: ref,
 		Digest:    target.String(),
@@ -474,7 +513,7 @@ func verifyAgainst(ctx context.Context, ref string, target digest.Digest, keys [
 			rejections = append(rejections, fmt.Sprintf("%s: read payload: %v", shortDigest(layer.Digest), err))
 			continue
 		}
-		match, err := verifySignatureLayer(payload, layer.Annotations[cosignSignatureAnnotation], ref, target, keys)
+		match, err := verifySignatureLayer(payload, layer.Annotations[cosignSignatureAnnotation], ref, target, keys, claims)
 		if err != nil {
 			rejections = append(rejections, fmt.Sprintf("%s: %v", shortDigest(layer.Digest), err))
 			continue
@@ -625,7 +664,7 @@ func signManifest(ctx context.Context, ref string, target digest.Digest, keyPath
 		// success, silently losing the signature this loop exists to
 		// protect. A false verdict here covers both "overwritten" and
 		// "deleted", and both want the same retry.
-		landed, err := verifyAgainst(ctx, ref, target, self)
+		landed, err := verifyAgainst(ctx, ref, target, self, "")
 		if err != nil {
 			return fmt.Errorf("confirm published signature: %w", err)
 		}
@@ -686,7 +725,7 @@ func appendSignature(
 		if err != nil {
 			return false, fmt.Errorf("read existing signature payload %s: %w", layer.Digest, err)
 		}
-		if _, err := verifySignatureLayer(blob, layer.Annotations[cosignSignatureAnnotation], ref, target, self); err == nil {
+		if _, err := verifySignatureLayer(blob, layer.Annotations[cosignSignatureAnnotation], ref, target, self, ""); err == nil {
 			return false, nil // this key already signed this digest
 		}
 		if _, err := writeBlob(staging, layer.MediaType, blob); err != nil {
@@ -742,7 +781,9 @@ func staticPassFunc(password []byte) func(bool) ([]byte, error) {
 // ---------------------------------------------------------------------------
 
 // llmman_verify checks a manifest's signatures against trusted PEM
-// public keys (cKeysJSON, a JSON array of paths).
+// public keys (cKeysJSON, a JSON array of paths). cClaims is the trust
+// rule's claims glob, or "" to require the signature's claimed
+// repository to equal the pulled one.
 //
 // cDigest may be empty to resolve ref first; passing a known digest
 // saves a round trip and removes the window in which a tag could move
@@ -752,7 +793,7 @@ func staticPassFunc(password []byte) func(bool) ([]byte, error) {
 // was reached. The caller's policy decides what each means.
 //
 //export llmman_verify
-func llmman_verify(cRef, cDigest, cKeysJSON *C.char) *C.char {
+func llmman_verify(cRef, cDigest, cKeysJSON, cClaims *C.char) *C.char {
 	ref := C.GoString(cRef)
 	ctx := withoutMirrors(context.Background())
 
@@ -767,7 +808,7 @@ func llmman_verify(cRef, cDigest, cKeysJSON *C.char) *C.char {
 	if err != nil {
 		return errResp(err)
 	}
-	report, err := verifySignatures(ctx, ref, target, keyPaths)
+	report, err := verifySignatures(ctx, ref, target, keyPaths, C.GoString(cClaims))
 	if err != nil {
 		return errResp(err)
 	}
