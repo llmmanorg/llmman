@@ -74,6 +74,10 @@ env:
   # integration contract under test. The macOS GitHub runner kills 3.0.62;
   # that failure is runner-specific, not a general macOS release failure.
   CLINE_CLI_VERSION: "2.18.0"
+  # Codex CLI for launch_e2e. Pinned: a release's `latest` wrapper lands
+  # minutes before its platform packages, and an install in between fails
+  # with "Missing optional dependency".
+  CODEX_CLI_VERSION: "0.170.0"
   # Docker Agent release used by launch_e2e's real `launch docker-agent`
   # test. Pinned because the agent-file contract launch_docker_agent
   # writes is what that test verifies; bump deliberately and rerun the
@@ -1204,7 +1208,7 @@ jobs:
 
           install_cli "@anthropic-ai/claude-code" "@anthropic-ai/claude-code" "claude"
           install_cli "opencode-ai" "opencode-ai" "opencode"
-          install_cli "@openai/codex" "@openai/codex" "codex"
+          install_cli "@openai/codex@${CODEX_CLI_VERSION}" "@openai/codex" "codex"
           # Pinned: the standalone CLI's BYOK environment and `-p` mode are
           # exercised against this release by tests/launch_e2e.rs.
           install_cli "@github/copilot@1.0.91" "@github/copilot" "copilot"
