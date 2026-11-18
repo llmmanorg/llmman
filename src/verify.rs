@@ -84,6 +84,9 @@ struct Rule {
     pattern: String,
     keys: Vec<PathBuf>,
     mode: Mode,
+    /// Glob over the signature's claimed repository; `None` keeps the
+    /// shim's exact equality with the pulled repository.
+    claims: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -113,6 +116,7 @@ pub struct Policy {
 pub struct Decision {
     pub mode: Mode,
     pub keys: Vec<PathBuf>,
+    pub claims: Option<String>,
 }
 
 impl Policy {
@@ -133,7 +137,10 @@ impl Policy {
 
         let mut rules = Vec::with_capacity(conf.trust.len());
         for entry in &conf.trust {
-            validate_pattern(&entry.pattern)?;
+            validate_pattern("pattern", &entry.pattern)?;
+            if let Some(claims) = &entry.claims {
+                validate_pattern("claims", claims)?;
+            }
             let mode = match entry.mode.as_deref() {
                 Some(s) => Mode::parse(s)
                     .with_context(|| format!("[[verify.trust]] pattern {:?}", entry.pattern))?,
@@ -149,6 +156,7 @@ impl Policy {
                     .map(|k| resolve_key_path(k, dir))
                     .collect(),
                 mode,
+                claims: entry.claims.clone(),
             });
         }
         Ok(Policy {
@@ -184,10 +192,12 @@ impl Policy {
             Some(rule) => Decision {
                 mode: rule.mode,
                 keys: rule.keys.clone(),
+                claims: rule.claims.clone(),
             },
             None => Decision {
                 mode: self.default_mode.unwrap_or_default(),
                 keys: Vec::new(),
+                claims: None,
             },
         };
         if let Some(forced) = self.forced_mode {
@@ -254,27 +264,29 @@ pub fn layers_mode() -> anyhow::Result<Mode> {
     Ok(Policy::load()?.layers_mode())
 }
 
-/// Rejects a pattern that cannot match anything. Patterns are compared
-/// against the repository, so one carrying a tag or digest would simply
-/// never fire — silently leaving a rule the author believes is enforcing
-/// something. Same reasoning as rejecting an unknown `mode`.
-fn validate_pattern(pattern: &str) -> anyhow::Result<()> {
+/// Rejects a glob that cannot match anything. `field` names the
+/// `[[verify.trust]]` key being checked (`pattern` or `claims`) so the
+/// error points at the right line. Globs are compared against the
+/// repository, so one carrying a tag or digest would simply never fire,
+/// silently leaving a rule the author believes is enforcing something.
+/// Same reasoning as rejecting an unknown `mode`.
+fn validate_pattern(field: &str, pattern: &str) -> anyhow::Result<()> {
     if pattern.is_empty() {
-        bail!("a [[verify.trust]] entry has an empty `pattern`");
+        bail!("a [[verify.trust]] entry has an empty `{field}`");
     }
     if pattern.len() > MAX_PATTERN_LEN {
-        bail!("[[verify.trust]] pattern is longer than {MAX_PATTERN_LEN} bytes: {pattern:?}");
+        bail!("[[verify.trust]] {field} is longer than {MAX_PATTERN_LEN} bytes: {pattern:?}");
     }
     if pattern.contains('@') {
         bail!(
-            "[[verify.trust]] pattern {pattern:?} contains a digest; patterns match the \
+            "[[verify.trust]] {field} {pattern:?} contains a digest; globs match the \
              repository only"
         );
     }
     let last = pattern.rsplit('/').next().unwrap_or(pattern);
     if last.contains(':') {
         bail!(
-            "[[verify.trust]] pattern {pattern:?} contains a tag; patterns match the \
+            "[[verify.trust]] {field} {pattern:?} contains a tag; globs match the \
              repository only"
         );
     }
@@ -598,7 +610,14 @@ fn check_with(
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
 
-    let report = match crate::ffi::verify(reference, digest.unwrap_or(""), &keys) {
+    // An unset `claims` crosses the FFI as the empty string, the same
+    // convention `digest` uses; the shim then requires identity equality.
+    let report = match crate::ffi::verify(
+        reference,
+        digest.unwrap_or(""),
+        &keys,
+        decision.claims.as_deref().unwrap_or(""),
+    ) {
         Ok(report) => report,
         // No answer could be reached (unreadable key, unreachable
         // registry). Under `enforce` that is indistinguishable from
@@ -1326,11 +1345,47 @@ mod tests {
             "docker.io/org/model:v1",
             "docker.io/org/model@sha256:abc",
         ] {
-            assert!(validate_pattern(pattern).is_err(), "accepted {pattern:?}");
+            assert!(
+                validate_pattern("pattern", pattern).is_err(),
+                "accepted {pattern:?}"
+            );
         }
-        assert!(validate_pattern(&"a".repeat(MAX_PATTERN_LEN + 1)).is_err());
+        assert!(validate_pattern("pattern", &"a".repeat(MAX_PATTERN_LEN + 1)).is_err());
         // A port is not a tag.
-        assert!(validate_pattern("registry.example.com:5000/org/*").is_ok());
+        assert!(validate_pattern("pattern", "registry.example.com:5000/org/*").is_ok());
+    }
+
+    /// `claims` is a glob like `pattern` and is held to the same rules.
+    /// An empty one is an error rather than "unset": the shim reads an
+    /// empty string as "no claims", so letting it through would turn an
+    /// author's typo into exact equality without a word.
+    #[test]
+    fn an_unusable_claims_glob_is_rejected_and_the_error_names_claims() {
+        for claims in ["\"\"", &format!("{:?}", "a".repeat(MAX_PATTERN_LEN + 1))] {
+            let err = Policy::parse(
+                &format!("[[trust]]\npattern=\"a/b\"\nclaims={claims}\n"),
+                Path::new("/x"),
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("claims"), "{err:#}");
+            assert!(!msg.contains("pattern"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn decide_carries_the_winning_rules_claims() {
+        let p = policy(
+            "[[trust]]\npattern=\"mirror.corp/**\"\nkeys=[\"k.pub\"]\n\
+             claims=\"docker.io/myorg/**\"\n",
+        );
+        let decision = p.decide("mirror.corp/myorg/name:v1");
+        assert_eq!(decision.claims.as_deref(), Some("docker.io/myorg/**"));
+        // Outside every pattern the default applies, and the default has
+        // no claims to make.
+        let outside = p.decide("quay.io/myorg/name:v1");
+        assert_eq!(outside.claims, None);
+        assert!(outside.keys.is_empty());
     }
 
     #[test]
@@ -1350,6 +1405,7 @@ mod tests {
         let decision = Decision {
             mode: Mode::Off,
             keys: vec![PathBuf::from("/k.pub")],
+            claims: None,
         };
         let verdict = check_with("docker.io/org/model:v1", None, &decision).unwrap();
         assert_eq!(verdict.outcome, Outcome::Skipped);
@@ -1361,6 +1417,7 @@ mod tests {
         let decision = Decision {
             mode: Mode::Enforce,
             keys: vec![],
+            claims: None,
         };
         let err = check_with("docker.io/org/model:v1", None, &decision).unwrap_err();
         assert!(
@@ -1374,6 +1431,7 @@ mod tests {
         let decision = Decision {
             mode: Mode::Warn,
             keys: vec![],
+            claims: None,
         };
         let verdict = check_with("docker.io/org/model:v1", None, &decision).unwrap();
         assert_eq!(verdict.outcome, Outcome::Unverified);

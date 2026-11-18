@@ -29,6 +29,12 @@
 //! keys    = ["keys/myorg.pub"]         # relative to this file's directory
 //! mode    = "enforce"
 //!
+//! [[verify.trust]]
+//! pattern = "mirror.corp/**"           # pulled reference selects the rule
+//! claims  = "docker.io/myorg/**"       # repository the signature may name
+//! keys    = ["keys/myorg.pub"]
+//! mode    = "enforce"
+//!
 //! [aggregation]                        # cmd::serve::aggregation
 //! peers = "asahi,spark:17434"
 //! api_key = "..."                      # presented to peers; defaults to the first auth key
@@ -371,6 +377,10 @@ pub struct TrustConf {
     pub keys: Vec<String>,
     #[serde(default)]
     pub mode: Option<String>,
+    /// Glob the signature's claimed repository must match, in place of
+    /// equality with the pulled one. Same grammar as `pattern`.
+    #[serde(default)]
+    pub claims: Option<String>,
 }
 
 impl Conf {
@@ -1285,6 +1295,7 @@ ps = "off""#,
             pattern = "docker.io/myorg/**"
             keys    = ["keys/myorg.pub"]
             mode    = "enforce"
+            claims  = "docker.io/myorg/**"
 
             [aggregation]
             peers = "asahi,spark:17434"
@@ -1309,6 +1320,10 @@ ps = "off""#,
         assert_eq!(c.verify.default.as_deref(), Some("warn"));
         assert_eq!(c.verify.trust.len(), 1);
         assert_eq!(c.verify.trust[0].mode.as_deref(), Some("enforce"));
+        assert_eq!(
+            c.verify.trust[0].claims.as_deref(),
+            Some("docker.io/myorg/**")
+        );
     }
 
     /// A file that sets one section must not need the other two.
@@ -1378,6 +1393,7 @@ ps = "off""#,
         assert!(parse("[verify]\ndefualt = \"off\"").is_err());
         assert!(parse("[verify]\nlayres = \"off\"").is_err());
         assert!(parse("[[verify.trust]]\npattern = \"a/b\"\nkyes = []").is_err());
+        assert!(parse("[[verify.trust]]\npattern = \"a/b\"\nclaim = \"c/d\"").is_err());
         assert!(parse("[registry.\"docker.io\"]\nmirrors = \"m\"").is_err());
         assert!(parse("[registries.\"docker.io\"]\nmirror = \"m\"").is_err());
         assert!(parse("api_key = \"x\"").is_err());

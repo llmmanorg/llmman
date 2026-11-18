@@ -94,6 +94,14 @@ mode    = "warn"
 pattern = "docker.io/ai/*"
 keys    = ["~/.config/llmman/keys/docker-ai.pub"]
 mode    = "warn"
+
+[[verify.trust]]
+# A relocated copy of docker.io/myorg/**: the pulled reference selects the
+# rule, `claims` says which repository the signature may name.
+pattern = "mirror.corp/**"
+claims  = "docker.io/myorg/**"
+keys    = ["keys/myorg.pub"]
+mode    = "enforce"
 ```
 
 | Mode | Effect on `pull` |
@@ -109,6 +117,13 @@ trust is about who publishes a model and tags move. `*` matches within one
 path segment; `**` crosses them. So `docker.io/myorg/*` covers
 `docker.io/myorg/model` but not `docker.io/myorg/team/model`, and
 `docker.io/myorg/**` covers both.
+
+The optional `claims` on a rule is a glob with the same grammar, matched
+against the repository the signature itself names rather than the pulled
+reference. In the last rule above, pulling `mirror.corp/myorg/name` selects
+the rule by `pattern`, and a signature naming `docker.io/myorg/name` is
+accepted because that identity matches `claims`. With `claims` unset the
+signed repository must equal the pulled one exactly.
 
 `LLMMAN_VERIFY=off|warn|enforce` overrides the mode — but not the keys —
 for every reference, which is the useful knob in CI: a pipeline can demand
@@ -129,14 +144,23 @@ For each published signature, all four of these must hold:
 
 1. The payload is a cosign simple-signing document (`critical.type`).
 2. It names **this** manifest digest, not some other one in the repository.
-3. Its claimed `docker-reference` is **this** repository.
+3. Its claimed `docker-reference` is **this** repository, by default. Under
+   a rule with `claims`, the claimed repository must match the `claims`
+   glob instead, while the pulled reference must match `pattern`.
 4. A trusted key's signature covers the exact payload bytes.
 
 Check 3 is not decoration. A signature is bound to a digest, not to a
 location, so an attacker who wants their repository to look endorsed can
 copy a legitimately signed model *and* its signature into it — the
-cryptography still checks out. Comparing the claimed identity is what
-pins a signature to where it was meant to live.
+cryptography still checks out. Comparing the claimed identity to the
+pulled repository is what pins a signature to where it was meant to live.
+
+`claims` loosens that pin on purpose. The signed repository is then not
+related to the pulled one: any repository matching `claims` may
+authenticate any reference matching `pattern`. Scope `pattern` to the
+repositories the relocated copies actually live in, and `claims` to the
+repositories whose signatures they may carry, rather than to a whole
+host.
 
 Repositories are compared, not full references: one digest is
 legitimately reachable under many tags, and the digest binding is what
@@ -241,13 +265,20 @@ These are real and worth stating plainly.
   signed this digest" and nothing about when, or whether the key was later
   revoked.
 
-- **A mirrored or relocated repository cannot verify.** The claimed-identity
-  check compares repositories, so a model re-hosted at
-  `mirror.corp/original/name` will not match a signature naming
-  `original/name`. That is the check working as intended — it is what stops
-  a signature being copied into someone else's repository — but it means a
-  pull-through mirror needs its own signatures today. A per-rule identity
-  override would close this and is not implemented.
+- **A relocated repository verifies only through `claims`.** The
+  claimed-identity check compares repositories, so a model re-hosted at
+  `mirror.corp/myorg/name` will not match a signature naming
+  `docker.io/myorg/name` unless the matching `[[verify.trust]]` rule sets
+  `claims` to a glob the signed repository satisfies. The claimed repository
+  is canonicalised before matching, so `docker.io/myorg/**` also covers the
+  `index.docker.io/myorg/name` identity cosign writes. `pattern` still
+  selects the rule by the pulled reference, and `claims` unset keeps exact
+  equality. The signature artifact is looked up under the pulled
+  repository's `sha256-<hex>.sig` tag, so a relocated copy verifies only if
+  that tag was copied alongside the manifest. When the reference does not
+  change, because a pull of `docker.io/...` is merely served by another
+  host, registry mirrors (`[registries."<host>"]` `mirrors`) are the
+  mechanism and `claims` is not needed.
 
 - **Signing happens in the CLI, never in the daemon.** `llmman push
   --sign-key` has the daemon report which digest it pushed and then signs

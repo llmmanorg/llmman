@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{bail, Context};
 use clap::Args;
 
@@ -38,20 +40,25 @@ pub fn run(args: &VerifyArgs) -> anyhow::Result<()> {
     crate::shortnames::validate_reference(&args.reference)?;
     let reference = crate::shortnames::resolve(&args.reference)?;
 
-    let keys: Vec<String> = if !args.keys.is_empty() {
-        args.keys.clone()
+    // Explicit --key overrides only the keys; the matching rule's
+    // `claims` still applies, so this agrees with what `pull` accepts
+    // for a relocated repository.
+    let (keys, claims): (Vec<String>, String) = if !args.keys.is_empty() {
+        let claims = crate::verify::decide(&reference)?
+            .claims
+            .unwrap_or_default();
+        (args.keys.clone(), claims)
     } else {
-        // Whatever the policy selects for this reference; failing that,
-        // every key it names anywhere. An explicit ask deserves a real
-        // attempt — "here are the keys I know about, none signed it" is
-        // more useful than "no rule matched".
-        let mut keys = crate::verify::decide(&reference)?.keys;
-        if keys.is_empty() {
-            keys = crate::verify::all_configured_keys()?;
-        }
-        keys.iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect()
+        let (keys, claims) = from_policy(
+            crate::verify::decide(&reference)?,
+            crate::verify::all_configured_keys,
+        )?;
+        (
+            keys.iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            claims,
+        )
     };
     if keys.is_empty() {
         bail!(
@@ -60,8 +67,8 @@ pub fn run(args: &VerifyArgs) -> anyhow::Result<()> {
         );
     }
 
-    let report =
-        ffi::verify(&reference, "", &keys).with_context(|| format!("verify {reference}"))?;
+    let report = ffi::verify(&reference, "", &keys, &claims)
+        .with_context(|| format!("verify {reference}"))?;
 
     if args.json {
         println!(
@@ -79,6 +86,25 @@ pub fn run(args: &VerifyArgs) -> anyhow::Result<()> {
     } else {
         bail!("{reference} is not signed by a trusted key")
     }
+}
+
+/// Keys and claims for a reference the policy was asked about: whatever
+/// the matching rule selects; failing that, every key the policy names
+/// anywhere (`all_keys`). An explicit ask deserves a real attempt — "here
+/// are the keys I know about, none signed it" is more useful than "no
+/// rule matched". The rule's `claims` applies either way, so the
+/// fallback keys are held to the identity the rule names.
+fn from_policy(
+    decision: crate::verify::Decision,
+    all_keys: impl FnOnce() -> anyhow::Result<Vec<PathBuf>>,
+) -> anyhow::Result<(Vec<PathBuf>, String)> {
+    let claims = decision.claims.unwrap_or_default();
+    let keys = if decision.keys.is_empty() {
+        all_keys()?
+    } else {
+        decision.keys
+    };
+    Ok((keys, claims))
 }
 
 fn print_human(report: &ffi::VerifyReport) {
@@ -138,5 +164,33 @@ impl<'a> From<&'a ffi::VerifyReport> for JsonReport<'a> {
                 .collect(),
             reason: &r.reason,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::verify::{Decision, Mode};
+
+    #[test]
+    fn from_policy_keeps_claims_when_falling_back_to_all_keys() {
+        let decision = Decision {
+            mode: Mode::Warn,
+            keys: vec![],
+            claims: Some("docker.io/myorg/**".into()),
+        };
+        let (keys, claims) = from_policy(decision, || Ok(vec![PathBuf::from("/k.pub")])).unwrap();
+        assert_eq!(keys, vec![PathBuf::from("/k.pub")]);
+        assert_eq!(claims, "docker.io/myorg/**");
+
+        // A rule with keys uses them and never consults the fallback.
+        let decision = Decision {
+            mode: Mode::Warn,
+            keys: vec![PathBuf::from("/rule.pub")],
+            claims: None,
+        };
+        let (keys, claims) = from_policy(decision, || panic!("fallback consulted")).unwrap();
+        assert_eq!(keys, vec![PathBuf::from("/rule.pub")]);
+        assert_eq!(claims, "");
     }
 }

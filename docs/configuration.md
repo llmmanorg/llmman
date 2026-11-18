@@ -56,6 +56,12 @@ pattern = "docker.io/myorg/**"
 keys    = ["keys/myorg.pub"]   # relative to this file's directory
 mode    = "enforce"
 
+[[verify.trust]]
+pattern = "mirror.corp/**"         # pulled reference selects the rule
+claims  = "docker.io/myorg/**"     # repository the signature may name
+keys    = ["keys/myorg.pub"]
+mode    = "enforce"
+
 [aggregation]
 peers = "asahi, spark:17434"
 

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	digest "github.com/opencontainers/go-digest"
 	"github.com/sigstore/sigstore/pkg/signature"
@@ -106,26 +107,51 @@ func TestIdentityMatchesRepository(t *testing.T) {
 		name    string
 		claimed string
 		ref     string
+		claims  string
 		want    bool
 	}{
-		{"same repo", "docker.io/org/model", "docker.io/org/model:v1", true},
-		{"claimed carries a tag", "docker.io/org/model:v9", "docker.io/org/model:v1", true},
-		{"claimed carries a digest", "docker.io/org/model@" + targetB, "docker.io/org/model:v1", true},
-		{"docker hub spelling differs", "index.docker.io/ai/gemma4", "docker.io/ai/gemma4:latest", true},
+		{"same repo", "docker.io/org/model", "docker.io/org/model:v1", "", true},
+		{"claimed carries a tag", "docker.io/org/model:v9", "docker.io/org/model:v1", "", true},
+		{"claimed carries a digest", "docker.io/org/model@" + targetB, "docker.io/org/model:v1", "", true},
+		{"docker hub spelling differs", "index.docker.io/ai/gemma4", "docker.io/ai/gemma4:latest", "", true},
 
 		// The copy attack this check exists to stop: a legitimately
 		// signed model, moved wholesale into someone else's repository.
-		{"different repo", "docker.io/org/model", "docker.io/attacker/model:v1", false},
-		{"different host", "docker.io/org/model", "quay.io/org/model:v1", false},
-		{"different namespace", "docker.io/org/model", "docker.io/other/model:v1", false},
+		{"different repo", "docker.io/org/model", "docker.io/attacker/model:v1", "", false},
+		{"different host", "docker.io/org/model", "quay.io/org/model:v1", "", false},
+		{"different namespace", "docker.io/org/model", "docker.io/other/model:v1", "", false},
 		// A payload that asserts nothing about where it belongs is not
 		// a lenient old-cosign variant, it is unusable.
-		{"empty claim", "", "docker.io/org/model:v1", false},
-		{"blank claim", "   ", "docker.io/org/model:v1", false},
+		{"empty claim", "", "docker.io/org/model:v1", "", false},
+		{"blank claim", "   ", "docker.io/org/model:v1", "", false},
+
+		// With a claims glob the pulled reference no longer matters;
+		// the claimed repository, canonicalised, must match the glob.
+		{"claims accepts a relocated copy", "docker.io/myorg/name", "mirror.corp/myorg/name:v1", "docker.io/myorg/**", true},
+		{"claims sees the canonical claimed spelling", "index.docker.io/myorg/name", "mirror.corp/myorg/name:v1", "docker.io/myorg/**", true},
+		{"claims strips the claimed tag", "docker.io/myorg/name:v9", "mirror.corp/myorg/name:v1", "docker.io/myorg/**", true},
+		{"claims rejects another namespace", "docker.io/myorg/name", "mirror.corp/myorg/name:v1", "docker.io/other/**", false},
+		{"claims is not canonicalised", "docker.io/myorg/name", "mirror.corp/myorg/name:v1", "myorg/**", false},
+		{"claims single star stays in one segment", "docker.io/myorg/sub/name", "mirror.corp/myorg/name:v1", "docker.io/myorg/*", false},
+		{"claims ignores an equal pulled repo", "docker.io/org/model", "docker.io/org/model:v1", "docker.io/other/**", false},
+		{"claims still rejects an empty claim", "", "mirror.corp/myorg/name:v1", "**", false},
+
+		// The claimed repository is sized by the registry; the glob is
+		// quadratic in it per single star, so host and path are each
+		// capped before it reaches the matcher. The path cap is the one
+		// distribution/reference applies (255 bytes after the host, the
+		// host excluded), so a name both reference parsers accept is
+		// never refused here.
+		{"claims accepts a 255-byte path", "docker.io/" + strings.Repeat("a", 255-len("myorg/")) + "/myorg", "mirror.corp/myorg/name:v1", "docker.io/**/myorg", true},
+		{"claims accepts a 255-byte path behind a host", "docker.io/myorg/" + strings.Repeat("a", 255-len("myorg/")), "mirror.corp/myorg/name:v1", "docker.io/myorg/**", true},
+		{"claims refuses a 256-byte path", "docker.io/myorg/" + strings.Repeat("a", 256-len("myorg/")), "mirror.corp/myorg/name:v1", "docker.io/myorg/**", false},
+		{"claims accepts a 259-byte host", strings.Repeat("h", 253) + ":65535/myorg/name", "mirror.corp/myorg/name:v1", "**/myorg/name", true},
+		{"claims refuses a 260-byte host", strings.Repeat("h", 254) + ":65535/myorg/name", "mirror.corp/myorg/name:v1", "**/myorg/name", false},
+		{"equality accepts a 256-byte path", "docker.io/myorg/" + strings.Repeat("a", 256-len("myorg/")), "docker.io/myorg/" + strings.Repeat("a", 256-len("myorg/")) + ":v1", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := identityMatchesRepository(tc.claimed, tc.ref); got != tc.want {
-				t.Errorf("identityMatchesRepository(%q, %q) = %v, want %v", tc.claimed, tc.ref, got, tc.want)
+			if got := identityMatchesRepository(tc.claimed, tc.ref, tc.claims); got != tc.want {
+				t.Errorf("identityMatchesRepository(%q, %q, %q) = %v, want %v", tc.claimed, tc.ref, tc.claims, got, tc.want)
 			}
 		})
 	}
@@ -169,7 +195,7 @@ func TestVerifySignatureLayerAcceptsAGoodSignature(t *testing.T) {
 	const ref = "docker.io/org/model:v1"
 	payload, b64 := signedPayload(t, signer, ref, targetA)
 
-	match, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetA), []trustedKey{key})
+	match, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetA), []trustedKey{key}, "")
 	if err != nil {
 		t.Fatalf("verifySignatureLayer: %v", err)
 	}
@@ -200,7 +226,7 @@ func TestVerifySignatureLayerAcceptsEd25519(t *testing.T) {
 
 	const ref = "docker.io/org/model:v1"
 	payload, b64 := signedPayload(t, signer, ref, targetA)
-	if _, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetA), []trustedKey{{path: "ed25519.pub", verifier: verifier}}); err != nil {
+	if _, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetA), []trustedKey{{path: "ed25519.pub", verifier: verifier}}, ""); err != nil {
 		t.Fatalf("verifySignatureLayer: %v", err)
 	}
 }
@@ -211,7 +237,7 @@ func TestVerifySignatureLayerRejectsUntrustedKey(t *testing.T) {
 	const ref = "docker.io/org/model:v1"
 	payload, b64 := signedPayload(t, signer, ref, targetA)
 
-	_, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetA), []trustedKey{stranger})
+	_, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetA), []trustedKey{stranger}, "")
 	if err == nil {
 		t.Fatal("a signature by an untrusted key was accepted")
 	}
@@ -228,12 +254,96 @@ func TestVerifySignatureLayerRejectsWrongDigest(t *testing.T) {
 	const ref = "docker.io/org/model:v1"
 	payload, b64 := signedPayload(t, signer, ref, targetA)
 
-	_, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetB), []trustedKey{key})
+	_, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetB), []trustedKey{key}, "")
 	if err == nil {
 		t.Fatal("a signature over a different manifest was accepted")
 	}
 	if !strings.Contains(err.Error(), "payload signs") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestVerifySignatureLayerAcceptsRelocatedRepositoryUnderClaims(t *testing.T) {
+	// A model signed as docker.io/myorg/name and copied, signature and
+	// all, to mirror.corp/myorg/name. The trust rule's claims glob names
+	// the original repository, so the signature verifies and reports the
+	// identity it was signed under.
+	signer, key := ecdsaSignerVerifier(t)
+	payload, b64 := signedPayload(t, signer, "docker.io/myorg/name:v1", targetA)
+
+	match, err := verifySignatureLayer(payload, b64, "mirror.corp/myorg/name:v1", digest.Digest(targetA), []trustedKey{key}, "docker.io/myorg/**")
+	if err != nil {
+		t.Fatalf("relocated copy under matching claims: %v", err)
+	}
+	if match.Identity != "docker.io/myorg/name" {
+		t.Errorf("identity = %q, want docker.io/myorg/name", match.Identity)
+	}
+}
+
+func TestVerifySignatureLayerRefusesRelocatedRepositoryOutsideClaims(t *testing.T) {
+	signer, key := ecdsaSignerVerifier(t)
+	payload, b64 := signedPayload(t, signer, "docker.io/myorg/name:v1", targetA)
+
+	for claims, want := range map[string]string{
+		// Equality names the pulled repository the identity was held to.
+		"": `which is not mirror.corp/myorg/name`,
+		// Under claims the pulled repository was not consulted, so the
+		// refusal names the glob that did the refusing instead.
+		"docker.io/other/**": `which does not match claims "docker.io/other/**"`,
+	} {
+		_, err := verifySignatureLayer(payload, b64, "mirror.corp/myorg/name:v1", digest.Digest(targetA), []trustedKey{key}, claims)
+		if err == nil {
+			t.Fatalf("claims %q: a relocated copy was accepted", claims)
+		}
+		if !strings.Contains(err.Error(), "claims identity") || !strings.HasSuffix(err.Error(), want) {
+			t.Errorf("claims %q: unexpected error: %v", claims, err)
+		}
+	}
+}
+
+func TestVerifySignatureLayerRefusesOversizedIdentityPromptly(t *testing.T) {
+	// An unsigned payload can carry a docker-reference that fills the
+	// 64 KiB layer cap; against a claims glob with two single stars
+	// globMatch is quadratic in it and would take minutes unless the
+	// identity is capped first. The verifier is never even consulted.
+	//
+	// The identity must defeat the glob at its very end: an `ab...ab`
+	// text matches `*a*b` on the first branch tried and returns at once,
+	// so only a trailing byte neither star can hand to `b` forces every
+	// split to be visited. Uncapped, that run exceeds 20 s.
+	_, key := ecdsaSignerVerifier(t)
+	const claims = "docker.io/myorg/*a*b"
+	var doc simpleSigningPayload
+	doc.Critical.Image.DockerManifestDigest = targetA
+	doc.Critical.Type = cosignSignatureType
+	// Size the identity so the whole payload sits just under the layer
+	// cap: the largest text a registry can get past readBlob.
+	empty, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	prefix := "docker.io/myorg/"
+	room := (maxSignatureBytes - 1 - len(empty) - len(prefix) - len("c")) / len("ab")
+	doc.Critical.Identity.DockerReference = prefix + strings.Repeat("ab", room) + "c"
+	payload, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if len(payload) >= maxSignatureBytes || len(payload) < maxSignatureBytes-4 {
+		t.Fatalf("payload is %d bytes, want just under %d", len(payload), maxSignatureBytes)
+	}
+
+	start := time.Now()
+	_, err = verifySignatureLayer(payload, base64.StdEncoding.EncodeToString([]byte("not a signature")), "mirror.corp/myorg/name:v1", digest.Digest(targetA), []trustedKey{key}, claims)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("an oversized identity was accepted")
+	}
+	if !strings.Contains(err.Error(), "claims identity") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if elapsed > time.Second {
+		t.Errorf("refusal took %v, want well under a second", elapsed)
 	}
 }
 
@@ -245,7 +355,7 @@ func TestVerifySignatureLayerRejectsTransplantedSignature(t *testing.T) {
 	signer, key := ecdsaSignerVerifier(t)
 	payload, b64 := signedPayload(t, signer, "docker.io/org/model:v1", targetA)
 
-	_, err := verifySignatureLayer(payload, b64, "docker.io/attacker/model:v1", digest.Digest(targetA), []trustedKey{key})
+	_, err := verifySignatureLayer(payload, b64, "docker.io/attacker/model:v1", digest.Digest(targetA), []trustedKey{key}, "")
 	if err == nil {
 		t.Fatal("a signature copied into another repository was accepted")
 	}
@@ -266,7 +376,7 @@ func TestVerifySignatureLayerRejectsTamperedPayload(t *testing.T) {
 	if string(tampered) == string(payload) {
 		t.Fatal("test payload did not contain the digest to tamper with")
 	}
-	_, err := verifySignatureLayer(tampered, b64, ref, digest.Digest(targetB), []trustedKey{key})
+	_, err := verifySignatureLayer(tampered, b64, ref, digest.Digest(targetB), []trustedKey{key}, "")
 	if err == nil {
 		t.Fatal("a tampered payload was accepted")
 	}
@@ -295,7 +405,7 @@ func TestVerifySignatureLayerRejectsWrongPayloadType(t *testing.T) {
 	}
 	b64 := base64.StdEncoding.EncodeToString(raw)
 
-	if _, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetA), []trustedKey{key}); err == nil {
+	if _, err := verifySignatureLayer(payload, b64, ref, digest.Digest(targetA), []trustedKey{key}, ""); err == nil {
 		t.Fatal("a payload of an unrelated signature type was accepted")
 	}
 }
@@ -304,13 +414,13 @@ func TestVerifySignatureLayerRejectsMalformedInput(t *testing.T) {
 	_, key := ecdsaSignerVerifier(t)
 	keys := []trustedKey{key}
 
-	if _, err := verifySignatureLayer([]byte("{}"), "", "docker.io/org/model", digest.Digest(targetA), keys); err == nil {
+	if _, err := verifySignatureLayer([]byte("{}"), "", "docker.io/org/model", digest.Digest(targetA), keys, ""); err == nil {
 		t.Error("a layer with no signature annotation was accepted")
 	}
-	if _, err := verifySignatureLayer([]byte("{}"), "!!!not base64!!!", "docker.io/org/model", digest.Digest(targetA), keys); err == nil {
+	if _, err := verifySignatureLayer([]byte("{}"), "!!!not base64!!!", "docker.io/org/model", digest.Digest(targetA), keys, ""); err == nil {
 		t.Error("a non-base64 signature was accepted")
 	}
-	if _, err := verifySignatureLayer([]byte("not json"), base64.StdEncoding.EncodeToString([]byte("sig")), "docker.io/org/model", digest.Digest(targetA), keys); err == nil {
+	if _, err := verifySignatureLayer([]byte("not json"), base64.StdEncoding.EncodeToString([]byte("sig")), "docker.io/org/model", digest.Digest(targetA), keys, ""); err == nil {
 		t.Error("a non-JSON payload was accepted")
 	}
 }
