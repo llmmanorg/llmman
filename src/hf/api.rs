@@ -146,6 +146,13 @@ impl ModelInfo {
         )
     }
 
+    /// The commit sha the Hub reported, or `""` when it reported none.
+    /// This is what gets recorded as the source revision; URLs use
+    /// [`Self::commit`], which falls back to the "main" branch.
+    pub fn sha(&self) -> &str {
+        &self.sha
+    }
+
     /// The commit SHA to pin resolve URLs to, falling back to "main".
     pub fn commit(&self) -> &str {
         if self.sha.is_empty() {

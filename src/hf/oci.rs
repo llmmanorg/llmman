@@ -95,6 +95,10 @@ pub const ANNOTATION_FILEPATH: &str = "org.cncf.model.filepath";
 struct ModelDescriptor {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     licenses: Vec<String>,
+    /// The source control revision the weights were taken from (the Hub
+    /// commit sha for a HuggingFace pull); CNCF model-spec `descriptor.revision`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    revision: String,
 }
 
 #[derive(Serialize)]
@@ -152,21 +156,30 @@ pub struct ModelMeta {
 /// Layers without it are the model itself (plus mmproj / license).
 pub const ANNOTATION_ROLE: &str = "org.llmman.role";
 
+/// Manifest annotation carrying the same source revision as the config's
+/// `descriptor.revision`, so `llmman show` surfaces it without reading
+/// the config blob.
+pub const ANNOTATION_REVISION: &str = "org.llmman.revision";
+
 /// Builds a conformant CNCF model-spec config blob and manifest
 /// referencing `layers`, writing each into `layout_dir`, and returns the
 /// manifest's descriptor. `filepath_annotation` sets the manifest-level
 /// `org.cncf.model.filepath` annotation for the single-weight-file case
-/// (GGUF); pass `""` for the multi-layer safetensors case.
+/// (GGUF); pass `""` for the multi-layer safetensors case. `commit` is
+/// the source revision recorded as `descriptor.revision` and the
+/// `org.llmman.revision` annotation; pass `""` when the source has none.
 pub fn build_cncf_manifest(
     layout_dir: &Path,
     meta: &ModelMeta,
     model_repo: &str,
     filepath_annotation: &str,
+    commit: &str,
     layers: Vec<Descriptor>,
 ) -> Result<Descriptor> {
     let model = Model {
         descriptor: ModelDescriptor {
             licenses: meta.licenses.clone(),
+            revision: commit.to_string(),
         },
         modelfs: ModelFS {
             kind: "layers".to_string(),
@@ -198,6 +211,9 @@ pub fn build_cncf_manifest(
             ANNOTATION_FILEPATH.to_string(),
             filepath_annotation.to_string(),
         );
+    }
+    if !commit.is_empty() {
+        annotations.insert(ANNOTATION_REVISION.to_string(), commit.to_string());
     }
     let manifest = Manifest {
         schema_version: 2,
@@ -481,6 +497,20 @@ pub fn report_cached(layout_dir: &Path, reference: &str) -> bool {
     }
 }
 
+/// The stored manifest and config blob of `reference` in `layout_dir`.
+#[cfg(test)]
+pub(crate) fn read_manifest_and_config(
+    layout_dir: &Path,
+    reference: &str,
+) -> (Manifest, serde_json::Value) {
+    let desc = read_manifest_ref(layout_dir, reference).unwrap();
+    let manifest: Manifest =
+        serde_json::from_slice(&read_blob(layout_dir, &desc.digest).unwrap()).unwrap();
+    let config: serde_json::Value =
+        serde_json::from_slice(&read_blob(layout_dir, &manifest.config.digest).unwrap()).unwrap();
+    (manifest, config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,6 +689,7 @@ mod tests {
             },
             "owner/repo",
             "model.gguf",
+            "",
             vec![layer],
         )
         .unwrap();
@@ -667,6 +698,47 @@ mod tests {
             cached_layer_name(&dir, "owner/repo:tag").as_deref(),
             Some("model.gguf")
         );
+    }
+
+    fn manifest_and_config(dir: &Path, commit: &str) -> (Manifest, serde_json::Value) {
+        let layer = write_blob(dir, MEDIA_TYPE_MODEL_WEIGHT_RAW, b"weights").unwrap();
+        let desc = build_cncf_manifest(
+            dir,
+            &ModelMeta {
+                format: "gguf".to_string(),
+                ..Default::default()
+            },
+            "owner/repo",
+            "model.gguf",
+            commit,
+            vec![layer],
+        )
+        .unwrap();
+        write_manifest_ref(dir, "owner/repo:tag", desc).unwrap();
+        read_manifest_and_config(dir, "owner/repo:tag")
+    }
+
+    #[test]
+    fn build_cncf_manifest_records_the_commit_in_config_and_annotation() {
+        let dir = tempfile();
+        ensure_layout(&dir).unwrap();
+        let commit = "7ae557604adf67be50417f59c2c2f167def9a775";
+
+        let (manifest, config) = manifest_and_config(&dir, commit);
+        assert_eq!(config["descriptor"]["revision"], commit);
+        assert_eq!(
+            manifest.annotations.as_ref().unwrap()[ANNOTATION_REVISION],
+            commit
+        );
+
+        let (manifest, config) = manifest_and_config(&dir, "");
+        assert!(config["descriptor"].get("revision").is_none());
+        assert!(!manifest
+            .annotations
+            .as_ref()
+            .unwrap()
+            .contains_key(ANNOTATION_REVISION));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn tempfile() -> PathBuf {

@@ -422,6 +422,11 @@ set to a nonblank value in the daemon's environment and both processes
 resolve the same token file (`HF_TOKEN_PATH`, else `HF_HOME`, else
 `XDG_CACHE_HOME`, else the home directory).
 
+A new Hugging Face pull records the commit the Hub reports, when it
+reports one, in the model config `descriptor.revision` field and in the
+manifest annotation `org.llmman.revision`, which `llmman show` prints
+under Labels. A model pulled before this was recorded is not backfilled.
+
 ## Environment variables
 
 Daemon-wide settings, set before `llmman serve` starts. llmman is a very

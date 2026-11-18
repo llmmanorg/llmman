@@ -22,6 +22,18 @@ use crate::xet_fetch::{self, XetFileRef};
 /// original ref the daemon's `/api/pull` handler was given, for
 /// `progress::poll` — see that module's own doc comment.
 pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Result<()> {
+    pull_from(reference, layout_dir, progress_key, super::hf_endpoint).await
+}
+
+/// [`pull`] with the Hub resolved by `endpoint(host)` instead of the
+/// environment, so a test can point a pull at a local mock hub without
+/// touching the process-wide `MODEL_ENDPOINT`/`HF_ENDPOINT`.
+async fn pull_from(
+    reference: &str,
+    layout_dir: &Path,
+    progress_key: &str,
+    endpoint: impl FnOnce(&str) -> String,
+) -> Result<()> {
     let _guard = progress::DoneGuard(progress_key);
     let (host, owner, repo, tag) = api::parse_hf_ref(reference)?;
 
@@ -30,7 +42,7 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
         return Ok(());
     }
 
-    let endpoint = super::hf_endpoint(&host);
+    let endpoint = endpoint(&host);
     let token = super::token();
     let api_client = super::api_client()?;
     let dl_client = super::download_client()?;
@@ -40,6 +52,9 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
     let info =
         api::fetch_model_info(&api_client, &endpoint, &owner, &repo, token.as_deref()).await?;
     let commit = info.commit().to_string();
+    // The recorded revision is the raw sha: "" when the Hub gives none,
+    // never the "main" branch name the URLs fall back to.
+    let revision = info.sha().to_string();
     let mut meta = ModelMeta {
         licenses: info.license().into_iter().collect(),
         ..Default::default()
@@ -180,6 +195,7 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
                 &meta,
                 &format!("{owner}/{repo}"),
                 &filepath_annotation,
+                &revision,
                 layers,
             )?
         }
@@ -245,7 +261,14 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
                 let class = api::diffusers_pipeline_class(layout_dir, &layers);
                 meta.diffusion_outputs = api::diffusers_outputs(class.as_deref());
             }
-            oci::build_cncf_manifest(layout_dir, &meta, &format!("{owner}/{repo}"), "", layers)?
+            oci::build_cncf_manifest(
+                layout_dir,
+                &meta,
+                &format!("{owner}/{repo}"),
+                "",
+                &revision,
+                layers,
+            )?
         }
     };
 
@@ -703,6 +726,88 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    const SHA: &str = "7ae557604adf67be50417f59c2c2f167def9a775";
+    const WEIGHTS: &[u8] = b"not really a gguf";
+
+    /// A Hub serving one GGUF repository `o/r` at `SHA`: the model info,
+    /// the tree at `SHA`, and the one file.
+    async fn mock_hub() -> String {
+        mock_hub_at(format!("{{\"sha\":\"{SHA}\"}}"), SHA).await
+    }
+
+    /// A Hub whose `/api/models/o/r` answers `model`, serving the tree
+    /// and the one file at `revision` (the sha, or "main" when the model
+    /// info carries none).
+    async fn mock_hub_at(model: String, revision: &str) -> String {
+        let tree = || async {
+            format!(
+                "[{{\"type\":\"file\",\"path\":\"model.gguf\",\"size\":{}}}]",
+                WEIGHTS.len()
+            )
+        };
+        let app = axum::Router::new()
+            .route(
+                "/api/models/o/r",
+                axum::routing::get(move || async move { model }),
+            )
+            .route(
+                &format!("/api/models/o/r/tree/{revision}"),
+                axum::routing::get(tree),
+            )
+            .route(
+                &format!("/o/r/resolve/{revision}/model.gguf"),
+                axum::routing::get(|| async { WEIGHTS }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        endpoint
+    }
+
+    #[tokio::test]
+    async fn a_plain_pull_records_the_hub_sha_as_the_revision() {
+        let endpoint = mock_hub().await;
+        let dir = tempfile::tempdir().unwrap();
+        pull_from(
+            "hf.co/o/r:latest",
+            dir.path(),
+            "hf-pull-plain-revision",
+            |_| endpoint.clone(),
+        )
+        .await
+        .unwrap();
+
+        let (manifest, config) = oci::read_manifest_and_config(dir.path(), "hf.co/o/r:latest");
+        assert_eq!(
+            manifest.annotations.as_ref().unwrap()[oci::ANNOTATION_REVISION],
+            SHA
+        );
+        assert_eq!(config["descriptor"]["revision"], SHA);
+    }
+
+    #[tokio::test]
+    async fn a_pull_from_a_hub_without_a_sha_records_no_revision() {
+        // The URLs fall back to the "main" branch; the recorded revision
+        // must not, since a branch name does not identify the weights.
+        let endpoint = mock_hub_at("{}".to_string(), "main").await;
+        let dir = tempfile::tempdir().unwrap();
+        pull_from(
+            "hf.co/o/r:latest",
+            dir.path(),
+            "hf-pull-no-sha-revision",
+            |_| endpoint.clone(),
+        )
+        .await
+        .unwrap();
+
+        let (manifest, config) = oci::read_manifest_and_config(dir.path(), "hf.co/o/r:latest");
+        assert!(manifest
+            .annotations
+            .as_ref()
+            .is_none_or(|a| !a.contains_key(oci::ANNOTATION_REVISION)));
+        assert!(config["descriptor"].get("revision").is_none());
     }
 
     #[tokio::test]

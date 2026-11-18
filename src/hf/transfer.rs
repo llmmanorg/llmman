@@ -106,6 +106,9 @@ mod docker {
         let info =
             api::fetch_model_info(&api_client, &endpoint, &owner, &repo, token.as_deref()).await?;
         let commit = info.commit().to_string();
+        // The recorded revision is the raw sha: "" when the Hub gives none,
+        // never the "main" branch name the URLs fall back to.
+        let revision = info.sha().to_string();
         let mut meta = ModelMeta {
             licenses: info.license().into_iter().collect(),
             ..Default::default()
@@ -281,6 +284,7 @@ mod docker {
             &meta,
             &format!("{owner}/{repo}"),
             &filepath_annotation,
+            &revision,
             layers,
             &mut changed,
         )
@@ -456,6 +460,7 @@ mod docker {
         meta: &ModelMeta,
         model_repo: &str,
         filepath_annotation: &str,
+        commit: &str,
         layers: Vec<Descriptor>,
         changed: &mut bool,
     ) -> Result<String> {
@@ -466,7 +471,7 @@ mod docker {
         ));
         std::fs::create_dir_all(&tmp)?;
         let manifest_desc =
-            oci::build_cncf_manifest(&tmp, meta, model_repo, filepath_annotation, layers)?;
+            oci::build_cncf_manifest(&tmp, meta, model_repo, filepath_annotation, commit, layers)?;
         let manifest_data = oci::read_blob(&tmp, &manifest_desc.digest)?;
         let config_digest = {
             let m: oci::Manifest = serde_json::from_slice(&manifest_data)?;
