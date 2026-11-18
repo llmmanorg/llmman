@@ -701,6 +701,7 @@ pub(crate) fn verify_llama_server_runs(
     ociman: ContainerManager,
     backend: GpuBackend,
     version: Option<&str>,
+    hardened: bool,
 ) -> Result<()> {
     let cli = ociman.binary();
     let name = format!(
@@ -711,12 +712,23 @@ pub(crate) fn verify_llama_server_runs(
             .map_or(0, |d| d.as_nanos())
     );
     let mut cmd = std::process::Command::new(cli);
-    cmd.args(verify_args(backend, version, &name))
+    cmd.args(verify_args(backend, version, &name, hardened))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
+    let engine_args = backend.engine_args();
+    let suffix = if hardened {
+        format!(
+            "; {}",
+            hardened_note(!passes_gpus(&engine_args), LLAMA_TMPFS)
+        )
+    } else {
+        String::new()
+    };
     match run_with_timeout(cmd, VERIFY_TIMEOUT).with_context(|| format!("run {cli} run"))? {
         Some(status) if status.success() => Ok(()),
-        Some(status) => anyhow::bail!("{cli} could not start a llama.cpp container ({status})"),
+        Some(status) => {
+            anyhow::bail!("{cli} could not start a llama.cpp container ({status}){suffix}")
+        }
         None => {
             // Killing the attached CLI leaves its container running; --rm
             // only acts once the container exits.
@@ -726,14 +738,21 @@ pub(crate) fn verify_llama_server_runs(
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
             let _ = run_with_timeout(rm, PROBE_TIMEOUT);
-            anyhow::bail!("{cli} did not start a llama.cpp container within {VERIFY_TIMEOUT:?}")
+            anyhow::bail!(
+                "{cli} did not start a llama.cpp container within {VERIFY_TIMEOUT:?}{suffix}"
+            )
         }
     }
 }
 
-/// The GPU passthrough and GPU-visibility environment match what [`spawn`]
-/// serves with.
-fn verify_args(backend: GpuBackend, version: Option<&str>, name: &str) -> Vec<String> {
+/// The GPU passthrough, GPU-visibility environment and `hardened` flags
+/// match what [`spawn`] serves with.
+fn verify_args(
+    backend: GpuBackend,
+    version: Option<&str>,
+    name: &str,
+    hardened: bool,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
         "--rm".into(),
@@ -741,7 +760,11 @@ fn verify_args(backend: GpuBackend, version: Option<&str>, name: &str) -> Vec<St
         "--name".into(),
         name.into(),
     ];
-    args.extend(backend.engine_args());
+    let engine_args = backend.engine_args();
+    if hardened {
+        args.extend(hardened_args(!passes_gpus(&engine_args), LLAMA_TMPFS));
+    }
+    args.extend(engine_args);
     args.extend(forwarded_env_args(&[]));
     args.push(backend.image_ref(version));
     args.push("--version".into());
@@ -810,6 +833,10 @@ pub struct LlamaOptions<'a> {
     /// Snapshotted at startup together with `threads`, so the two
     /// always agree.
     pub cpus: Option<f64>,
+
+    /// `--hardened`: [`hardened_args`] on the container (no effect on a
+    /// local child).
+    pub hardened: bool,
 
     /// The split `LLMMAN_LLAMA_ARGS`, after every flag above.
     pub extra_args: &'a [String],
@@ -896,9 +923,17 @@ fn llama_run_args(
         batch_size,
         threads,
         cpus,
+        hardened,
         extra_args,
     } = opts;
-    let mut args = run_args(backend.engine_args(), port, passthrough_vars, cpus);
+    let mut args = run_args(
+        backend.engine_args(),
+        port,
+        passthrough_vars,
+        cpus,
+        hardened,
+        LLAMA_TMPFS,
+    );
     args.push("-v".into());
     args.push(format!("{model_dir}:/models:ro"));
     if let Some((dir, _)) = mmproj {
@@ -982,11 +1017,17 @@ fn llama_run_args(
 /// (no limit binds) adds nothing. It is a CFS quota even when the
 /// daemon's limit is an affinity mask: the budget is what matters, and
 /// it is the one form both engines share.
+///
+/// `hardened`: [`hardened_args`] with `tmpfs`, between the prefix and
+/// `engine_args` so an engine's own `--cap-add`/`--security-opt` lands
+/// after the drop. `false` adds nothing.
 fn run_args(
     engine_args: Vec<String>,
     port: u16,
     passthrough_vars: &[&str],
     cpus: Option<f64>,
+    hardened: bool,
+    tmpfs: &[&str],
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -1000,8 +1041,104 @@ fn run_args(
         args.push("--cpus".into());
         args.push(n.to_string());
     }
+    if hardened {
+        args.extend(hardened_args(!passes_gpus(&engine_args), tmpfs));
+    }
     args.extend(engine_args);
     args.extend(forwarded_env_args(passthrough_vars));
+    args
+}
+
+/// The writable paths a hardened `llama-server` container needs.
+const LLAMA_TMPFS: &[&str] = &["/tmp"];
+
+/// The writable paths a hardened vLLM or SGLang container needs: the
+/// vLLM cache root and RPC sockets (`/root/.cache`, `/tmp`), Triton's
+/// kernel cache (`/root/.triton`) and vLLM's usage-stats file
+/// (`/root/.config`). The last two go beyond the task's `/tmp` and
+/// `/root/.cache`: Triton and vLLM's usage reporter write them on a
+/// read-only rootfs and would abort the first request otherwise.
+const ENGINE_TMPFS: &[&str] = &["/tmp", "/root/.cache", "/root/.triton", "/root/.config"];
+
+/// Whether `engine_args` passes a GPU through with `--gpus` (the NVIDIA
+/// toolkit path).
+fn passes_gpus(engine_args: &[String]) -> bool {
+    engine_args.iter().any(|a| a == "--gpus")
+}
+
+/// The suffix a failure under `--hardened` carries, so a container that
+/// exits only because of the flags (a store written with umask 077 is
+/// unreadable once `--cap-drop all` removes CAP_DAC_OVERRIDE from the
+/// container's root) names them: `read_only` and `tmpfs` as the
+/// [`hardened_args`] the container was run with.
+pub(crate) fn hardened_note(read_only: bool, tmpfs: &[&str]) -> String {
+    format!(
+        "started with --hardened: {}",
+        hardened_args(read_only, tmpfs).join(" ")
+    )
+}
+
+/// Which hardened container a [`spawn_hardened_note`] describes: the
+/// vLLM family ([`spawn_engine`]) mounts [`ENGINE_TMPFS`] and follows the
+/// host backend's `--gpus`; a llama.cpp container ([`spawn`], or
+/// [`spawn_mediagen`] with the detected backend) mounts [`LLAMA_TMPFS`]
+/// and follows the same probe; the speech worker ([`spawn_mediagen`]
+/// with [`SPEECH_BACKEND`]) never passes a GPU, so it is read-only on
+/// every host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HardenedSpawn {
+    LlamaServer,
+    Speech,
+    VllmFamily,
+}
+
+impl HardenedSpawn {
+    /// [`hardened_note`] with the flags [`run_args`] applied for this
+    /// container on a host whose probe returned `host`.
+    fn note(self, host: GpuBackend) -> String {
+        match self {
+            Self::VllmFamily => {
+                let engine_args = VllmBackend::from_gpu(host).engine_args();
+                hardened_note(!passes_gpus(&engine_args), ENGINE_TMPFS)
+            }
+            Self::LlamaServer => hardened_note(!passes_gpus(&host.engine_args()), LLAMA_TMPFS),
+            Self::Speech => hardened_note(!passes_gpus(&SPEECH_BACKEND.engine_args()), LLAMA_TMPFS),
+        }
+    }
+}
+
+/// [`hardened_note`] for a container started on this host, naming the
+/// flags `spawn` was run with: `--read-only` follows the backend the
+/// container was given at spawn time, not only the host probe.
+pub(crate) fn spawn_hardened_note(spawn: HardenedSpawn) -> String {
+    spawn.note(detect_backend())
+}
+
+/// `--hardened`'s `run` flags: every capability dropped, no privilege
+/// gain through setuid binaries, and (`read_only`) a read-only rootfs
+/// with a tmpfs on each of `tmpfs`. Each tmpfs gets `exec`: docker and
+/// podman both mount `--tmpfs` `noexec` by default, and vLLM's
+/// inductor and Triton load compiled `.so` files out of their caches.
+///
+/// `read_only` is off for a container that passes `--gpus`: crun before
+/// 1.26 applies the read-only remount before the NVIDIA toolkit's
+/// createContainer hooks write `/etc` and `/usr/lib64`
+/// (NVIDIA/nvidia-container-toolkit#2131, containers/crun#1924).
+pub(crate) fn hardened_args(read_only: bool, tmpfs: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "--cap-drop".into(),
+        "all".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+    ];
+    if read_only {
+        args.push("--read-only".into());
+    }
+    args.extend(
+        tmpfs
+            .iter()
+            .flat_map(|path| ["--tmpfs".to_string(), format!("{path}:exec")]),
+    );
     args
 }
 
@@ -1050,6 +1187,7 @@ pub fn spawn_engine(
     vllm_image: Option<&str>,
     port: u16,
     cpus: Option<f64>,
+    hardened: bool,
     serve_args: impl FnOnce(&str, &str) -> Vec<String>,
 ) -> Result<tokio::process::Child> {
     let backend = VllmBackend::detect();
@@ -1071,7 +1209,14 @@ pub fn spawn_engine(
         })
         .collect();
     let vars: Vec<&str> = vars.iter().map(String::as_str).collect();
-    let prefix = run_args(backend.engine_args(), port, &vars, cpus);
+    let prefix = run_args(
+        backend.engine_args(),
+        port,
+        &vars,
+        cpus,
+        hardened,
+        ENGINE_TMPFS,
+    );
     run(
         ociman,
         engine_run_args(prefix, image, launcher, &model_dir, serve_args),
@@ -1142,6 +1287,7 @@ pub(crate) fn spawn_mediagen(
     llama_cpp_version: Option<&str>,
     port: u16,
     cpus: Option<f64>,
+    hardened: bool,
 ) -> Result<tokio::process::Child> {
     let image = backend.image_ref(llama_cpp_version);
     eprintln!(
@@ -1157,12 +1303,44 @@ pub(crate) fn spawn_mediagen(
             .with_context(|| format!("{} is not valid UTF-8", p.display()))
     };
     let (exe, store, cache) = (utf8(&exe)?, utf8(store_path)?, utf8(cache_path)?);
+    let args = mediagen_run_args(
+        backend, image, &exe, &store, &cache, model_ref, port, cpus, hardened,
+    );
+    run(ociman, args)
+}
+
+/// [`spawn_mediagen`]'s full argv, split out so the worker's mounts, env
+/// and `--hardened` block are testable without an engine. Hardened, the
+/// worker also gets `LLMMAN_NOHISTORY=1` as a guard only: the worker runs
+/// `model_backend`, not `serve_async`, so it never writes `prompts.jsonl`
+/// today; the pair keeps that true should it ever log prompts, since its
+/// store is mounted read-only. The value-less [`forwarded_env_args`]
+/// cannot carry it.
+#[allow(clippy::too_many_arguments)]
+fn mediagen_run_args(
+    backend: GpuBackend,
+    image: String,
+    exe: &str,
+    store: &str,
+    cache: &str,
+    model_ref: &str,
+    port: u16,
+    cpus: Option<f64>,
+    hardened: bool,
+) -> Vec<String> {
     let passthrough = [
         crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS,
         crate::cmd::serve::MEDIAGEN_ENV_PASSTHROUGH_VARS,
     ]
     .concat();
-    let mut args = run_args(backend.engine_args(), port, &passthrough, cpus);
+    let mut args = run_args(
+        backend.engine_args(),
+        port,
+        &passthrough,
+        cpus,
+        hardened,
+        LLAMA_TMPFS,
+    );
     args.extend([
         "-v".into(),
         format!("{exe}:/usr/local/bin/llmman:ro"),
@@ -1174,6 +1352,11 @@ pub(crate) fn spawn_mediagen(
         format!("LLMMAN_MODELS={store}"),
         "-e".into(),
         "PATH=/app:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+    ]);
+    if hardened {
+        args.extend(["-e".into(), "LLMMAN_NOHISTORY=1".into()]);
+    }
+    args.extend([
         "--entrypoint".into(),
         "/usr/local/bin/llmman".into(),
         image,
@@ -1187,7 +1370,7 @@ pub(crate) fn spawn_mediagen(
         "--runtime".into(),
         "path".into(),
     ]);
-    run(ociman, args)
+    args
 }
 
 /// Gracefully stops a container started by [`spawn`] by sending SIGTERM to
@@ -1657,7 +1840,14 @@ mod tests {
     fn sglang_run_args_launch_the_module_after_the_image_and_flags_after_that() {
         let (launcher, _) = ContainerEngine::Sglang.launcher().unwrap();
         let args = engine_run_args(
-            run_args(VllmBackend::Cuda13.engine_args(), 30000, &[], None),
+            run_args(
+                VllmBackend::Cuda13.engine_args(),
+                30000,
+                &[],
+                None,
+                false,
+                &[],
+            ),
             "docker.io/lmsysorg/sglang:latest".into(),
             launcher,
             "/cache/abc/model",
@@ -1720,7 +1910,14 @@ mod tests {
     fn vllm_run_args_put_the_mount_and_entrypoint_before_the_image_and_serve_after() {
         let (launcher, _) = ContainerEngine::Vllm.launcher().unwrap();
         let args = engine_run_args(
-            run_args(VllmBackend::Cuda13.engine_args(), 8000, &[], None),
+            run_args(
+                VllmBackend::Cuda13.engine_args(),
+                8000,
+                &[],
+                None,
+                false,
+                &[],
+            ),
             "docker.io/vllm/vllm-openai:latest-x86_64".into(),
             launcher,
             "/cache/abc/model",
@@ -1764,13 +1961,13 @@ mod tests {
     fn run_args_forward_only_the_requested_passthrough_vars() {
         const VAR: &str = "LLMMAN_TEST_RUN_ARGS_PASSTHROUGH";
         std::env::set_var(VAR, "1");
-        let args = run_args(vec![], 8080, &[], None);
+        let args = run_args(vec![], 8080, &[], None, false, &[]);
         assert_eq!(
             &args[..6],
             &["run", "--rm", "--init", "-t", "-p", "127.0.0.1:8080:8080"]
         );
         assert!(!args.contains(&VAR.to_string()), "{args:?}");
-        let args = run_args(vec![], 8080, &[VAR], None);
+        let args = run_args(vec![], 8080, &[VAR], None, false, &[]);
         assert!(args.windows(2).any(|w| w == ["-e", VAR]), "{args:?}");
         // The value stays out of argv (it may be a secret).
         assert!(!args.iter().any(|a| a.starts_with(&format!("{VAR}="))));
@@ -1785,7 +1982,7 @@ mod tests {
                 "ghcr.io/ggml-org/llama.cpp:server-cuda13-b9994",
             ),
         ] {
-            let args = verify_args(backend, Some("b9994"), "llmman-verify-1");
+            let args = verify_args(backend, Some("b9994"), "llmman-verify-1", false);
             assert_eq!(
                 &args[..5],
                 ["run", "--rm", "--init", "--name", "llmman-verify-1"]
@@ -1798,17 +1995,325 @@ mod tests {
         }
     }
 
+    /// `args[prefix_len..]` starts with [`hardened_args`] for `tmpfs`
+    /// and continues with `engine_args`.
+    fn assert_hardened_between(
+        args: &[String],
+        prefix_len: usize,
+        read_only: bool,
+        tmpfs: &[&str],
+        engine_args: &[String],
+    ) {
+        let mut expected = hardened_args(read_only, tmpfs);
+        expected.extend(engine_args.iter().cloned());
+        assert_eq!(
+            &args[prefix_len..prefix_len + expected.len()],
+            expected.as_slice(),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn hardened_note_names_the_switch_and_its_flags() {
+        assert_eq!(
+            hardened_note(true, LLAMA_TMPFS),
+            "started with --hardened: --cap-drop all --security-opt no-new-privileges --read-only --tmpfs /tmp:exec"
+        );
+        assert_eq!(
+            hardened_note(false, LLAMA_TMPFS),
+            "started with --hardened: --cap-drop all --security-opt no-new-privileges --tmpfs /tmp:exec"
+        );
+    }
+
+    #[test]
+    fn speech_worker_note_is_read_only_on_a_gpu_host() {
+        for host in [GpuBackend::Cuda13, GpuBackend::Vulkan] {
+            let speech = HardenedSpawn::Speech.note(host);
+            assert!(speech.contains("--read-only"), "{host:?}: {speech}");
+            assert_eq!(speech, hardened_note(true, LLAMA_TMPFS));
+            let llama = HardenedSpawn::LlamaServer.note(host);
+            assert_eq!(
+                llama.contains("--read-only"),
+                !passes_gpus(&host.engine_args()),
+                "{host:?}: {llama}"
+            );
+            let vllm = HardenedSpawn::VllmFamily.note(host);
+            assert!(vllm.contains("/root/.triton:exec"), "{host:?}: {vllm}");
+        }
+    }
+
+    #[test]
+    fn hardened_args_drop_caps_and_mount_each_tmpfs() {
+        assert_eq!(
+            hardened_args(true, &["/tmp", "/root/.cache"]),
+            [
+                "--cap-drop",
+                "all",
+                "--security-opt",
+                "no-new-privileges",
+                "--read-only",
+                "--tmpfs",
+                "/tmp:exec",
+                "--tmpfs",
+                "/root/.cache:exec",
+            ]
+        );
+        let gpu = hardened_args(false, &["/tmp"]);
+        assert!(!gpu.contains(&"--read-only".to_string()), "{gpu:?}");
+        assert_eq!(
+            &gpu[..4],
+            ["--cap-drop", "all", "--security-opt", "no-new-privileges"]
+        );
+        assert_eq!(&gpu[4..], ["--tmpfs", "/tmp:exec"]);
+    }
+
+    #[test]
+    fn hardened_llama_container_is_read_only_on_cpu_but_not_behind_gpus() {
+        let opts = |hardened| LlamaOptions {
+            port: 8080,
+            ctx_size: None,
+            flash_attention: None,
+            kv_cache_type: None,
+            context_shift: true,
+            split_mode: None,
+            num_parallel: None,
+            embeddings: false,
+            batch_size: None,
+            threads: None,
+            cpus: Some(2.0),
+            hardened,
+            extra_args: &[],
+        };
+        let argv = |backend: GpuBackend, hardened| {
+            llama_run_args(
+                backend,
+                backend.image_ref(None),
+                "/cache/blobs",
+                "sha256-abc",
+                None,
+                &[],
+                opts(hardened),
+            )
+        };
+        // `run --rm --init -t -p ADDR --cpus 2`, then the hardened block.
+        let args = argv(GpuBackend::Cpu, true);
+        assert_hardened_between(&args, 8, true, LLAMA_TMPFS, &GpuBackend::Cpu.engine_args());
+        let image = args.iter().position(|a| a.starts_with("ghcr.io/")).unwrap();
+        assert!(
+            args[..image].contains(&"--read-only".to_string()),
+            "{args:?}"
+        );
+        let args = argv(GpuBackend::Cuda13, true);
+        assert_hardened_between(
+            &args,
+            8,
+            false,
+            LLAMA_TMPFS,
+            &GpuBackend::Cuda13.engine_args(),
+        );
+        assert!(!args.contains(&"--read-only".to_string()), "{args:?}");
+        assert!(
+            args.windows(2).any(|w| w == ["--cap-drop", "all"]),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--tmpfs", "/tmp:exec"]),
+            "{args:?}"
+        );
+        assert!(args.windows(2).any(|w| w == ["--gpus", "all"]), "{args:?}");
+        // Off: nothing of the block appears.
+        let args = argv(GpuBackend::Cpu, false);
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--cap-drop" || a == "--read-only" || a == "--tmpfs"),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn hardened_engine_containers_keep_their_own_grants_after_the_drop() {
+        let serve =
+            |dir: &str, host: &str| vec!["serve".into(), dir.into(), "--host".into(), host.into()];
+        let (vllm, _) = ContainerEngine::Vllm.launcher().unwrap();
+        let (sglang, _) = ContainerEngine::Sglang.launcher().unwrap();
+        for (backend, launcher, read_only) in [
+            (VllmBackend::Cpu, vllm, true),
+            (VllmBackend::Cuda13, vllm, false),
+            (VllmBackend::Cuda13, sglang, false),
+        ] {
+            let engine_args = backend.engine_args();
+            let args = engine_run_args(
+                run_args(engine_args.clone(), 8000, &[], None, true, ENGINE_TMPFS),
+                "image:tag".into(),
+                launcher,
+                "/cache/abc/model",
+                serve,
+            );
+            // `run --rm --init -t -p ADDR`, then the hardened block, then the engine's own flags.
+            assert_hardened_between(&args, 6, read_only, ENGINE_TMPFS, &engine_args);
+            assert_eq!(
+                args.contains(&"--read-only".to_string()),
+                read_only,
+                "{args:?}"
+            );
+            assert_eq!(
+                args.iter().filter(|a| *a == "--tmpfs").count(),
+                ENGINE_TMPFS.len()
+            );
+            assert!(args.contains(&"--ipc=host".to_string()), "{args:?}");
+            let image = args.iter().position(|a| a == "image:tag").unwrap();
+            assert_eq!(&args[image - 2..image - 1], &["--entrypoint"]);
+        }
+        // vLLM CPU: `--cap-add SYS_NICE` and the seccomp opt-out come after `--cap-drop all`.
+        let args = run_args(
+            VllmBackend::Cpu.engine_args(),
+            8000,
+            &[],
+            None,
+            true,
+            ENGINE_TMPFS,
+        );
+        let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+        assert!(at("--cap-drop") < at("--cap-add"), "{args:?}");
+        assert_eq!(args[at("--cap-add") + 1], "SYS_NICE");
+        assert!(args.contains(&"seccomp=unconfined".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn hardened_verify_runs_with_the_same_block_as_spawn() {
+        for (backend, read_only) in [(GpuBackend::Cpu, true), (GpuBackend::Cuda13, false)] {
+            let args = verify_args(backend, Some("b9994"), "llmman-verify-1", true);
+            assert_eq!(
+                &args[..5],
+                ["run", "--rm", "--init", "--name", "llmman-verify-1"]
+            );
+            assert_hardened_between(&args, 5, read_only, LLAMA_TMPFS, &backend.engine_args());
+            let at = args
+                .iter()
+                .position(|a| a == &backend.image_ref(Some("b9994")))
+                .unwrap();
+            assert_eq!(&args[at + 1..], ["--version"]);
+        }
+    }
+
+    fn worker_args(backend: GpuBackend, hardened: bool) -> Vec<String> {
+        mediagen_run_args(
+            backend,
+            backend.image_ref(Some("b9994")),
+            "/usr/bin/llmman",
+            "/store",
+            "/cache",
+            "a-model",
+            8090,
+            None,
+            hardened,
+        )
+    }
+
+    #[test]
+    fn worker_run_args_mount_the_binary_store_and_cache_read_only_then_serve() {
+        // The media worker (CPU and CUDA) and the speech worker share
+        // this shape; the off case carries no hardened flag and no
+        // LLMMAN_NOHISTORY.
+        for backend in [GpuBackend::Cpu, GpuBackend::Cuda12, SPEECH_BACKEND] {
+            let args = worker_args(backend, false);
+            let engine_args = backend.engine_args();
+            assert_eq!(
+                &args[..6],
+                ["run", "--rm", "--init", "-t", "-p", "127.0.0.1:8090:8090"]
+            );
+            assert_eq!(&args[6..6 + engine_args.len()], engine_args.as_slice());
+            for flag in ["--cap-drop", "--read-only", "--tmpfs", "LLMMAN_NOHISTORY=1"] {
+                assert!(!args.contains(&flag.to_string()), "{backend:?}: {args:?}");
+            }
+            let image = backend.image_ref(Some("b9994"));
+            let at = args.iter().position(|a| a == &image).unwrap();
+            assert_eq!(
+                &args[at - 12..at],
+                [
+                    "-v",
+                    "/usr/bin/llmman:/usr/local/bin/llmman:ro",
+                    "-v",
+                    "/store:/store:ro",
+                    "-v",
+                    "/cache:/cache:ro",
+                    "-e",
+                    "LLMMAN_MODELS=/store",
+                    "-e",
+                    "PATH=/app:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    "--entrypoint",
+                    "/usr/local/bin/llmman",
+                ]
+            );
+            assert_eq!(
+                &args[at + 1..],
+                [
+                    "serve",
+                    "a-model",
+                    "--port",
+                    "8090",
+                    "--host",
+                    "0.0.0.0",
+                    "--runtime",
+                    "path"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn hardened_workers_drop_caps_and_switch_the_prompt_log_off() {
+        for (backend, read_only) in [
+            (GpuBackend::Cpu, true),
+            (GpuBackend::Cuda12, false),
+            (SPEECH_BACKEND, true),
+        ] {
+            let args = worker_args(backend, true);
+            assert_hardened_between(&args, 6, read_only, LLAMA_TMPFS, &backend.engine_args());
+            let image = backend.image_ref(Some("b9994"));
+            let at = args.iter().position(|a| a == &image).unwrap();
+            assert_eq!(
+                &args[at - 4..at],
+                [
+                    "-e",
+                    "LLMMAN_NOHISTORY=1",
+                    "--entrypoint",
+                    "/usr/local/bin/llmman"
+                ],
+                "{backend:?}: {args:?}"
+            );
+            // Only the hardened flags and the env pair differ from the
+            // off case.
+            let mut off = worker_args(backend, false);
+            off.splice(6..6, hardened_args(read_only, LLAMA_TMPFS));
+            let entry = off.iter().position(|a| a == "--entrypoint").unwrap();
+            off.splice(
+                entry..entry,
+                ["-e".to_string(), "LLMMAN_NOHISTORY=1".to_string()],
+            );
+            assert_eq!(args, off, "{backend:?}");
+        }
+    }
+
     #[test]
     fn cpus_is_forwarded_as_a_run_flag_only_when_a_limit_binds() {
-        let args = run_args(vec![], 8080, &[], None);
+        let args = run_args(vec![], 8080, &[], None, false, &[]);
         assert!(!args.contains(&"--cpus".to_string()), "{args:?}");
-        let args = run_args(vec!["--gpus".into(), "all".into()], 8080, &[], Some(2.0));
+        let args = run_args(
+            vec!["--gpus".into(), "all".into()],
+            8080,
+            &[],
+            Some(2.0),
+            false,
+            &[],
+        );
         let cpus = args.iter().position(|a| a == "--cpus").unwrap();
         assert_eq!(args[cpus + 1], "2");
         // A `run` flag: before the engine args, image and engine argv.
         assert!(cpus < args.iter().position(|a| a == "--gpus").unwrap());
         // A fractional cgroup quota is kept, not rounded to a whole CPU.
-        let args = run_args(vec![], 8080, &[], Some(0.5));
+        let args = run_args(vec![], 8080, &[], Some(0.5), false, &[]);
         assert!(args.windows(2).any(|w| w == ["--cpus", "0.5"]), "{args:?}");
     }
 
@@ -1826,6 +2331,7 @@ mod tests {
             batch_size: None,
             threads,
             cpus,
+            hardened: false,
             extra_args: &[],
         };
         let image = "ghcr.io/ggml-org/llama.cpp:server";
@@ -1867,6 +2373,7 @@ mod tests {
             batch_size: None,
             threads: Some(2),
             cpus: None,
+            hardened: false,
             extra_args: &["--slot-prompt-similarity".into(), "0.5".into()],
         };
         let args = llama_run_args(
@@ -1888,7 +2395,14 @@ mod tests {
     fn vllm_containers_get_cpus_too() {
         let (launcher, _) = ContainerEngine::Vllm.launcher().unwrap();
         let args = engine_run_args(
-            run_args(VllmBackend::Cpu.engine_args(), 8000, &[], Some(3.0)),
+            run_args(
+                VllmBackend::Cpu.engine_args(),
+                8000,
+                &[],
+                Some(3.0),
+                false,
+                &[],
+            ),
             "docker.io/vllm/vllm-openai-cpu:latest-x86_64".into(),
             launcher,
             "/cache/abc/model",

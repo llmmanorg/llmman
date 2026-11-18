@@ -39,6 +39,7 @@ fn detached_serve_forwards_configuration_without_detaching_the_child() {
         model: Some("docker.io/ai/model:latest".into()),
         detach: true,
         runtime: Runtime::Path,
+        hardened: false,
         llama_cpp_version: Some("b1234".into()),
         vllm_version: None,
         vllm_image: Some("example/vllm:1".into()),
@@ -60,6 +61,40 @@ fn detached_serve_forwards_configuration_without_detaching_the_child() {
             "v0.5",
         ]
     );
+}
+
+/// `--hardened` is off unless asked for, by flag or `LLMMAN_HARDENED`
+/// in the opt-in spellings every other LLMMAN_* switch takes, and a
+/// detached daemon gets it forwarded like `--runtime`.
+#[test]
+fn hardened_is_off_by_default_and_forwarded_to_the_detached_child() {
+    #[derive(clap::Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: ServeArgs,
+    }
+    let parse = |argv: &[&str]| {
+        <Cli as clap::Parser>::try_parse_from(["serve"].iter().chain(argv))
+            .map(|c| c.args)
+            .expect("serve args parse")
+    };
+    let off = parse(&[]);
+    assert!(!off.hardened);
+    assert!(!test_state().0.hardened);
+    assert!(!off.detached_child_args().contains(&"--hardened"));
+    let on = parse(&["--hardened"]);
+    assert!(on.hardened);
+    assert_eq!(
+        on.detached_child_args(),
+        ["--runtime", "auto", "--hardened"]
+    );
+    // The variable reads like `LLMMAN_NOHISTORY`: `yes` is on, `off`
+    // and a blank are off, unlike clap's own truthy set.
+    for (value, expected) in [("1", true), ("yes", true), ("Off", false), ("", false)] {
+        std::env::set_var("LLMMAN_HARDENED", value);
+        assert_eq!(parse(&[]).hardened, expected, "LLMMAN_HARDENED={value:?}");
+    }
+    std::env::remove_var("LLMMAN_HARDENED");
 }
 
 // -- pull/push progress relay -------------------------------------------
@@ -6894,6 +6929,7 @@ impl FakeLlamaServer {
         inner.runtime = runtime::Lazy::new(
             runtime::Runtime::Path,
             None,
+            false,
             Some(runtime::Resolved::Local {
                 source: runtime::Runtime::Path,
                 bin: self.bin.clone(),

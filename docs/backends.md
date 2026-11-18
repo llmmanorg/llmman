@@ -77,6 +77,62 @@ with their own progress, then exits — run it once before starting a
 detached daemon. With a container runtime and a safetensors `MODEL`
 argument it pulls the vLLM image as well.
 
+### `--hardened`
+
+`llmman serve --hardened` (or `LLMMAN_HARDENED`, which takes the same
+spellings as the other `LLMMAN_*` switches) tightens every container the
+daemon starts. It is off by default, and applies only under `--runtime
+docker` or `podman`: under `bin` or `path` there is no container, and the
+daemon logs a warning that the switch has no effect. Each container run
+gets, before the engine's own flags:
+
+- `--cap-drop all` and `--security-opt no-new-privileges`;
+- `--read-only`, except for a container that passes `--gpus` (see below);
+- one `--tmpfs <path>:exec` per path the engine writes to. The `:exec`
+  suffix is needed on both docker and podman, since both mount a `--tmpfs`
+  `noexec` by default and vLLM's Triton and inductor caches load the `.so`
+  files they compile there.
+
+The tmpfs paths per engine:
+
+| Container | tmpfs | Also |
+|-----------|-------|------|
+| `llama-server` | `/tmp` | |
+| vLLM, SGLang | `/tmp`, `/root/.cache`, `/root/.triton`, `/root/.config` | `--ipc=host` stays; the vLLM CPU image keeps `--cap-add SYS_NICE` and `--security-opt seccomp=unconfined` after the drop |
+| llmman media and speech workers | `/tmp` | `LLMMAN_NOHISTORY=1` as a guard: the worker never writes `prompts.jsonl` today, and the variable keeps it that way beside its read-only store |
+
+`/root/.triton` and `/root/.config` go beyond `/tmp` and `/root/.cache`
+because Triton's kernel cache and vLLM's usage reporter write there on
+first request, and a read-only rootfs would abort it. The verify run that
+checks an image's `--version` before serving gets the same block. With
+the switch off the argv is unchanged byte for byte.
+
+Vulkan and ROCm llama-server containers get only `/tmp` writable, so the shader caches
+those drivers keep under `~/.cache` are disabled; they rebuild in memory
+per start.
+
+**NVIDIA:** `--read-only` is skipped for a backend that passes `--gpus`
+(CUDA, and Vulkan when `/dev/nvidiactl` exists, which adds `--gpus all`
+for NVIDIA's Vulkan ICD). crun before 1.26 applies the read-only remount
+before the NVIDIA Container Toolkit's `createContainer` hooks write `/etc`
+and `/usr/lib64`, so the hooks fail and the container never starts
+(NVIDIA/nvidia-container-toolkit#2131, containers/crun#1924). `--cap-drop
+all`, `no-new-privileges` and the tmpfs mounts still apply to those
+containers.
+
+**Store permissions:** with every capability dropped, root in the
+container no longer bypasses file modes, so under rootful docker the
+store and cache must be readable by another uid; rootless podman maps the
+container's root to your own uid and is unaffected. The store is written
+with the daemon's umask: the container's root normally reads a `0700`
+directory or `0600` blob through `CAP_DAC_OVERRIDE`, which `--cap-drop
+all` removes, so a store written under umask `077` fails to load with
+`Permission denied` on `/models/<blob>`. The `--version` verify run
+mounts nothing and passes; the failure shows at first load, and the crash
+error then ends with `started with --hardened:` and the flags added, so it
+is not read as the engine's own. Loosen the store (`chmod -R go+rX`) or
+serve without the switch.
+
 ## llama.cpp
 
 The release is pinned: unless `--llama-cpp-version <tag>` says otherwise,
@@ -166,7 +222,9 @@ with `--vllm-version`; Diffusers models keep `vllm/vllm-omni`.
 `llmman serve --runtime docker --pull-only <model>` pulls the image an
 already-pulled model needs (without a model, the llama.cpp image).
 `CUDA_VISIBLE_DEVICES` and friends plus every `VLLM_*` variable are
-forwarded into the container.
+forwarded into the container, which runs with `--ipc=host`; the CPU image
+also gets `--cap-add SYS_NICE` and `--security-opt seccomp=unconfined`
+for its NUMA thread binding. Both survive [`--hardened`](#--hardened).
 
 ### vLLM-Omni (Diffusers pipelines)
 
@@ -262,7 +320,8 @@ With `--runtime docker` (or `podman`) and `LLMMAN_SAFETENSORS_ENGINE=sglang`,
 `llmman serve --runtime docker --pull-only <model>` pulls it for a pulled
 safetensors model when the variable is set. `CUDA_VISIBLE_DEVICES` and
 friends plus every `SGLANG_*` variable are forwarded into the container,
-which runs with `--ipc=host` like vLLM's.
+which runs with `--ipc=host` like vLLM's, under [`--hardened`](#--hardened)
+too.
 
 ## ds4
 

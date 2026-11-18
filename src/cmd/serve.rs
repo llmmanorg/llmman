@@ -144,6 +144,7 @@ Environment Variables:
       LLMMAN_FLASH_ATTENTION         Enable flash attention
       LLMMAN_KV_CACHE_TYPE           Quantization type for the K/V cache (default: f16)
       LLMMAN_RUNTIME                 Where the inference engine comes from: auto (default), docker, podman, bin or path — same as --runtime
+      LLMMAN_HARDENED                Run the engine containers read-only with every capability dropped (docker/podman only; default: off), same as --hardened
       LLMMAN_LLM_LIBRARY             Set backend (cpu/cuda/cuda13/rocm/opencl/vulkan/metal) to bypass GPU autodetection
       LLMMAN_IGPU_ENABLE             Enable integrated GPUs
       LLMMAN_LOAD_TIMEOUT            How long to allow model loads to stall before giving up (default \"20m\")
@@ -178,6 +179,16 @@ pub struct ServeArgs {
     /// `vllm`/`sglang` come from PATH.
     #[arg(long, value_enum, default_value = "auto", env = "LLMMAN_RUNTIME")]
     pub runtime: Runtime,
+
+    /// Harden the engine containers (`--runtime docker`/`podman` only):
+    /// read-only rootfs with a tmpfs per engine scratch path, every
+    /// capability dropped and no new privileges; see `container::
+    /// hardened_args`. Under `bin`/`path` there is no container and the
+    /// switch has no effect. `LLMMAN_HARDENED` takes the same spellings
+    /// as the other LLMMAN_* switches ([`crate::env_flag_set`]: anything
+    /// but blank, `0`, `false`, `no` or `off` turns it on).
+    #[arg(long, env = "LLMMAN_HARDENED", value_parser = env_flag_value)]
+    pub hardened: bool,
 
     /// The llama.cpp release to run, as a `b<N>` tag: the GitHub release
     /// `bin` downloads and the `-b<N>` image tag suffix the container
@@ -244,6 +255,14 @@ pub struct ServeArgs {
 #[derive(Clone)]
 struct AppState(Arc<Inner>);
 
+/// `LLMMAN_HARDENED`'s clap parser: [`crate::parse_env_flag`]'s accepted
+/// spellings, so the variable reads like `LLMMAN_NOHISTORY` and the
+/// other `LLMMAN_*` switches rather than clap's own truthy set. The
+/// flag's implicit `true` and `false` parse the same way.
+fn env_flag_value(value: &str) -> Result<bool, std::convert::Infallible> {
+    Ok(crate::parse_env_flag(Some(value)))
+}
+
 struct Inner {
     manager: Mutex<ModelManager>,
     // This daemon's own executable path, canonicalized at startup (while
@@ -307,6 +326,9 @@ struct Inner {
     // `--cpus`. Snapshotted with `threads` so a later cgroup change
     // cannot leave the two disagreeing.
     cpu_limit: Option<f64>,
+    // `--hardened`: passed to every container spawn (see
+    // `container::hardened_args`); nothing under `bin`/`path`.
+    hardened: bool,
     // See max_queue_from_env's doc comment; enforced by try_admit.
     max_queue: usize,
     // See max_loaded_models_from_env's doc comment.
@@ -2510,6 +2532,7 @@ async fn resolve_target(
             // full precedence chain this `.or` implements.
             threads: opts.threads.or(state.0.threads),
             cpus: state.0.cpu_limit,
+            hardened: state.0.hardened,
             extra_args: &llama_extra_args,
         };
         // Every piped child gets an output tail for crash reasons; only
@@ -2559,6 +2582,7 @@ async fn resolve_target(
                             state.0.llama_cpp_version.as_deref(),
                             port,
                             state.0.cpu_limit,
+                            state.0.hardened,
                         )?;
                         stderr_tail = Some(tail_child_output(&mut child));
                         ModelProcess::Container(ociman, Engine::Speech, child)
@@ -2605,6 +2629,7 @@ async fn resolve_target(
                     state.0.llama_cpp_version.as_deref(),
                     port,
                     state.0.cpu_limit,
+                    state.0.hardened,
                 )?;
                 stderr_tail = Some(tail_child_output(&mut child));
                 oom_retryable = true;
@@ -2643,6 +2668,7 @@ async fn resolve_target(
                     state.0.vllm_image.as_deref(),
                     port,
                     state.0.cpu_limit,
+                    state.0.hardened,
                     |model_dir, host| {
                         if sglang {
                             sglang_serve_args_from_env(
@@ -2678,6 +2704,7 @@ async fn resolve_target(
                     None,
                     port,
                     state.0.cpu_limit,
+                    state.0.hardened,
                     |model_dir, host| {
                         vllm_omni_serve_args_from_env(model_dir, host, port, model_ref)
                     },
@@ -2719,6 +2746,23 @@ async fn resolve_target(
             Err(e) => {
                 let looks_oom = oom_retryable && looks_like_oom(&e.to_string());
                 if !looks_oom {
+                    // A container that only fails under `--hardened` (a
+                    // store written with umask 077 behind `--cap-drop
+                    // all`) must name the flags, or the crash reads as
+                    // the engine's own.
+                    if let (true, ModelProcess::Container(_, engine, _)) =
+                        (state.0.hardened, &process)
+                    {
+                        let spawn = match engine {
+                            Engine::Vllm | Engine::VllmOmni | Engine::Sglang => {
+                                crate::container::HardenedSpawn::VllmFamily
+                            }
+                            Engine::Speech => crate::container::HardenedSpawn::Speech,
+                            _ => crate::container::HardenedSpawn::LlamaServer,
+                        };
+                        let note = crate::container::spawn_hardened_note(spawn);
+                        return Err(anyhow!("{e:#}; {note}").into());
+                    }
                     return Err(e.into());
                 }
                 // See ModelProcess::stop_and_wait's own doc comment.
@@ -4396,6 +4440,9 @@ impl ServeArgs {
     /// The child is an ordinary foreground `serve`, never another `--detach`.
     fn detached_child_args(&self) -> Vec<&str> {
         let mut args = vec!["--runtime", self.runtime.as_str()];
+        if self.hardened {
+            args.push("--hardened");
+        }
         for (flag, value) in [
             ("--llama-cpp-version", self.llama_cpp_version.as_deref()),
             ("--vllm-version", self.vllm_version.as_deref()),
@@ -4889,7 +4936,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // retries (runtime::Lazy).
     let resolved = {
         let pin = llama_cpp_version.clone();
-        tokio::task::spawn_blocking(move || runtime::resolve(requested, pin.as_deref()))
+        let hardened = _args.hardened;
+        tokio::task::spawn_blocking(move || runtime::resolve(requested, pin.as_deref(), hardened))
             .await
             .context("resolve runtime task panicked")?
     };
@@ -4904,7 +4952,12 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             None
         }
     };
-    let runtime = runtime::Lazy::new(requested, llama_cpp_version.clone(), resolved.clone());
+    let runtime = runtime::Lazy::new(
+        requested,
+        llama_cpp_version.clone(),
+        _args.hardened,
+        resolved.clone(),
+    );
 
     // Likewise uv and mlx-lm, with the same failure policy.
     if let Some(fallback) = installs_mlx {
@@ -4933,8 +4986,9 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             PullOnlyStep::Done => {}
             PullOnlyStep::ResolveCpuOnly => {
                 let pin = llama_cpp_version.clone();
+                let hardened = _args.hardened;
                 tokio::task::spawn_blocking(move || {
-                    runtime::resolve_for(Workload::CpuOnly, requested, pin.as_deref())
+                    runtime::resolve_for(Workload::CpuOnly, requested, pin.as_deref(), hardened)
                 })
                 .await
                 .context("resolve runtime task panicked")??;
@@ -5013,6 +5067,19 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     }
     if let (Some(n), Some(_)) = (cpu_limit, runtime.known().and_then(|r| r.ociman())) {
         eprintln!("[llmman] backend container gets --cpus {n} (this daemon's own CPU limit)");
+    }
+    // Reported against the resolved runtime: `auto` may have settled on
+    // `bin`/`path`, where there is no container for the switch to harden.
+    if let (true, Some(resolved)) = (_args.hardened, runtime.known()) {
+        match resolved.ociman() {
+            Some(_) => eprintln!(
+                "[llmman] backend containers run hardened (read-only rootfs except behind --gpus, all capabilities dropped, no new privileges)"
+            ),
+            None => eprintln!(
+                "[llmman] warning: --hardened has no effect under --runtime {}: the engine runs on the host, not in a container",
+                resolved.runtime().as_str()
+            ),
+        }
     }
 
     // Logged at startup so a typo is reported before the first request.
@@ -5107,6 +5174,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         num_parallel: num_parallel_from_env(),
         threads,
         cpu_limit,
+        hardened: _args.hardened,
         max_queue: max_queue_from_env(),
         max_loaded_models: max_loaded_models_from_env(),
         peers,

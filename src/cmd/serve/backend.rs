@@ -299,8 +299,10 @@ pub(super) async fn spawn_llama_server(
         embeddings,
         batch_size,
         threads,
-        // A local child shares the daemon's cgroup already.
+        // A local child shares the daemon's cgroup already, and
+        // `hardened` is a container `run` flag.
         cpus: _,
+        hardened: _,
         extra_args,
     } = opts;
     let mut cmd = tokio::process::Command::new(bin);
