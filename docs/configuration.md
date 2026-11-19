@@ -305,8 +305,8 @@ be mistaken for one that does not exist.
 A `[[verify.trust]]` rule trusts either `keys` or a keyless identity,
 `issuer` and `subject`, which are compared exactly against the OIDC
 issuer and a subject alternative name of the Fulcio certificate the
-signature carries. Either of the two may be omitted; at least one must
-be set for the rule to be keyless. A rule that sets `keys` together
+signature carries. Both are required: a rule setting one without the
+other is rejected when the file is read. A rule that sets `keys` together
 with `issuer` or `subject` is rejected when the file is read, with the
 same fatal outcome as a malformed file. Keyless rules need
 `verify.trusted_root`, a Sigstore TrustedRoot JSON holding the Fulcio

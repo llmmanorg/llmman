@@ -65,7 +65,9 @@ Verified:   yes
 
 `llmman verify` exits non-zero when a model is unsigned or signed by an
 untrusted key, so it drops straight into a pipeline. `--json` prints the
-full report.
+full report. With `--key` only the given keys are checked: the keys and
+the keyless identity a matching `[[verify.trust]]` rule names are set
+aside for that run, and only the rule's `claims` still applies.
 
 ## Enforcing it on pull
 
@@ -110,9 +112,12 @@ mode    = "enforce"
 A rule may name a signing identity instead of keys. The signature is then
 one a Fulcio certificate made (`cosign sign` without `--key`), and the
 layer carries that certificate, its chain and a Rekor bundle in the three
-`dev.sigstore.cosign/*` annotations above. The roots the certificate and
-the bundle are checked against come from a Sigstore TrustedRoot file
-named once under `[verify]`:
+`dev.sigstore.cosign/*` annotations above. cosign v3 publishes a Sigstore
+bundle by default rather than this layout; to publish what llmman reads,
+pass `--new-bundle-format=false` to `cosign sign` (the flag is marked
+deprecated there, and reading the bundle format is a second PR). The
+roots the certificate and the bundle are checked against come from a
+Sigstore TrustedRoot file named once under `[verify]`:
 
 ```toml
 [verify]
@@ -138,14 +143,19 @@ Everything is checked offline, in the order the Sigstore client
 specification gives:
 
 1. The bundle's signed entry timestamp verifies under the log key the
-   trusted root holds for the bundle's `logID`. Only then is its
-   `integratedTime` believed as the moment of signing.
+   trusted root holds for the bundle's `logID`, with the hash that log's
+   `keyDetails` declares. Only then is its `integratedTime` believed as
+   the moment of signing. A trusted root with no `tlogs`, like one with
+   no `certificateAuthorities`, is a configuration error.
 2. The certificate chains to a Fulcio root from the trusted root, valid at
-   that moment, with the code-signing extended key usage. The chain
-   annotation supplies intermediates only; a self-signed certificate the
-   registry serves is never a root.
+   that moment, with the `digitalSignature` key usage and the code-signing
+   extended key usage, both required explicitly. The chain annotation
+   supplies intermediates only; a self-signed certificate the registry
+   serves is never a root.
 3. The certificate's OIDC issuer extension equals `issuer` and one of its
-   subject alternative names equals `subject`.
+   subject alternative names equals `subject`: an email, a URI, a DNS or
+   IP name, or the otherName (`1.3.6.1.4.1.57264.1.7`) Fulcio writes a
+   username identity as.
 4. The logged `hashedrekord` entry names this layer's signature, this
    certificate and the SHA-256 of this payload, so the timestamp vouches
    for this signature and not another one by the same signer.

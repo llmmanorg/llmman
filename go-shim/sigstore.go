@@ -52,8 +52,12 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -61,6 +65,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -68,6 +73,7 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sigstore/fulcio/pkg/certificate"
+	protocommon "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
 	trustroot "github.com/sigstore/protobuf-specs/gen/pb-go/trustroot/v1"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	"github.com/sigstore/sigstore/pkg/signature"
@@ -330,14 +336,56 @@ type trustedRoot struct {
 }
 
 // transparencyLog is one tlogs[] entry: the key that signs the log's
-// entries and the window it was in use, validFor.start and validFor.end
-// (either may be zero, meaning unbounded). The key is kept as parsed,
-// whatever its algorithm, so a root listing a log this build cannot
-// check is still usable for the logs it can; the bundle's logID decides
-// which key is dispatched on.
+// entries, the hash its publicKey.keyDetails pairs with that key, and
+// the window it was in use, validFor.start and validFor.end (either may
+// be zero, meaning unbounded). A log whose keyDetails this build cannot
+// check is kept with a zero hash and refused only when a bundle names
+// it, so a root listing such a log is still usable for the logs it can
+// check; the bundle's logID decides which key is dispatched on.
 type transparencyLog struct {
 	key        crypto.PublicKey
+	hash       crypto.Hash
+	keyDetails protocommon.PublicKeyDetails
 	start, end time.Time
+}
+
+// logKeyHash returns the hash a tlogs[].publicKey.keyDetails value
+// pairs with its key, after checking the parsed key is of the family
+// the value names, and ok=false for a value this build does not verify
+// SETs under. The supported set is the one sigstore-go's TrustedRoot
+// loader accepts, minus the deprecated PKCS#1 RSA form; the hash of the
+// ECDSA and RSA variants is the one in the name. Ed25519 fixes its own
+// hash, so the value recorded for it is not consulted.
+func logKeyHash(details protocommon.PublicKeyDetails, key crypto.PublicKey) (hash crypto.Hash, ok bool) {
+	var ecdsaKey, rsaKey, ed25519Key bool
+	switch details {
+	case protocommon.PublicKeyDetails_PKIX_ECDSA_P256_SHA_256:
+		hash, ecdsaKey = crypto.SHA256, true
+	case protocommon.PublicKeyDetails_PKIX_ECDSA_P384_SHA_384:
+		hash, ecdsaKey = crypto.SHA384, true
+	case protocommon.PublicKeyDetails_PKIX_ECDSA_P521_SHA_512:
+		hash, ecdsaKey = crypto.SHA512, true
+	case protocommon.PublicKeyDetails_PKIX_RSA_PKCS1V15_2048_SHA256,
+		protocommon.PublicKeyDetails_PKIX_RSA_PKCS1V15_3072_SHA256,
+		protocommon.PublicKeyDetails_PKIX_RSA_PKCS1V15_4096_SHA256:
+		hash, rsaKey = crypto.SHA256, true
+	case protocommon.PublicKeyDetails_PKIX_ED25519:
+		hash, ed25519Key = crypto.SHA512, true
+	default:
+		return 0, false
+	}
+	switch key.(type) {
+	case *ecdsa.PublicKey:
+		ok = ecdsaKey
+	case *rsa.PublicKey:
+		ok = rsaKey
+	case ed25519.PublicKey:
+		ok = ed25519Key
+	}
+	if !ok {
+		return 0, false
+	}
+	return hash, true
 }
 
 // covers reports whether the log key was in use at the given time,
@@ -433,14 +481,24 @@ func parseTrustedRoot(raw []byte) (*trustedRoot, error) {
 		if v == nil || v.GetStart() == nil {
 			return nil, fmt.Errorf("tlogs[%d] has no publicKey.validFor.start", i)
 		}
-		log := transparencyLog{key: pub, start: v.GetStart().AsTime()}
+		log := transparencyLog{key: pub, keyDetails: tl.GetPublicKey().GetKeyDetails(), start: v.GetStart().AsTime()}
 		if v.GetEnd() != nil {
 			log.end = v.GetEnd().AsTime()
 		}
+		if hash, ok := logKeyHash(log.keyDetails, pub); ok {
+			log.hash = hash
+		}
 		root.logKeys[hex.EncodeToString(keyID)] = log
 	}
+	// Both lists are needed: with no authority nothing anchors a
+	// certificate, with no log nothing anchors a signing time, and a
+	// root missing either is a configuration mistake rather than a
+	// reason to call every model unsigned.
 	if len(root.authorities) == 0 {
 		return nil, errors.New("no certificate authorities")
+	}
+	if len(root.logKeys) == 0 {
+		return nil, errors.New("no transparency logs")
 	}
 	return root, nil
 }
@@ -600,14 +658,17 @@ func verifySignatureLayer(payload []byte, annotations map[string]string, ref str
 // establishing what the next one relies on:
 //
 //  1. The Rekor bundle's signed entry timestamp verifies under the log
-//     key the trusted root holds for its logID. Only then is the
-//     bundle's integratedTime believed as the moment of signing.
+//     key the trusted root holds for its logID, with the hash that
+//     log's keyDetails declares. Only then is the bundle's
+//     integratedTime believed as the moment of signing.
 //  2. The certificate chains to a Fulcio root from the trusted root at
-//     that moment, with the code-signing extended key usage. The chain
-//     annotation only supplies intermediates: a self-signed certificate
-//     the registry serves is not a root.
-//  3. The certificate's OIDC issuer and subject alternative names match
-//     the rule.
+//     that moment, with the digitalSignature key usage and the
+//     code-signing extended key usage, both required explicitly. The
+//     chain annotation only supplies intermediates: a self-signed
+//     certificate the registry serves is not a root.
+//  3. The certificate's OIDC issuer extension equals the rule's issuer
+//     and one subject alternative name (email, URI, DNS or IP name, or
+//     the Fulcio otherName) equals the rule's subject.
 //  4. The logged hashedrekord entry names this layer's signature, this
 //     certificate and the hash of this payload, so the timestamp vouches
 //     for this signature and not some other one by the same signer.
@@ -646,10 +707,13 @@ func verifyKeyless(payload, rawSig []byte, b64sig string, annotations map[string
 	if !log.covers(integrated) {
 		return nil, fmt.Errorf("bundle integrated time %s is outside the validity window of log %q's key", integrated.UTC().Format(time.RFC3339), bundle.Payload.LogID)
 	}
-	// LoadVerifier dispatches on the key type (ECDSA, Ed25519, RSA) the
-	// way sigstore-go's SET check does; the hash only applies to the
-	// algorithms that take one.
-	logVerifier, err := signature.LoadVerifier(log.key, crypto.SHA256)
+	// The hash comes from the root's keyDetails for this log, not from
+	// an assumption about Rekor; LoadVerifier dispatches on the key type
+	// (ECDSA, Ed25519, RSA) the way sigstore-go's SET check does.
+	if log.hash == 0 {
+		return nil, fmt.Errorf("log %q key details %s are not supported for verifying a signed entry timestamp", bundle.Payload.LogID, log.keyDetails)
+	}
+	logVerifier, err := signature.LoadVerifier(log.key, log.hash)
 	if err != nil {
 		return nil, fmt.Errorf("log %q key: %w", bundle.Payload.LogID, err)
 	}
@@ -678,6 +742,16 @@ func verifyKeyless(payload, rawSig []byte, b64sig string, annotations map[string
 		return nil, fmt.Errorf("certificate annotation holds %d certificates, want 1", len(leaves))
 	}
 	leaf := leaves[0]
+	// Go reads only DNS, email, IP and URI names out of a SAN extension,
+	// so a certificate whose SAN holds just the otherName Fulcio writes a
+	// username identity as is left with a critical extension Go calls
+	// unhandled, and Verify would refuse it. The otherName is decoded
+	// below (GetSubjectAlternateNames), so that one OID is handled here;
+	// any other critical extension still fails Verify. cosign and
+	// sigstore-go do the same before their chain check.
+	leaf.UnhandledCriticalExtensions = slices.DeleteFunc(leaf.UnhandledCriticalExtensions, func(oid asn1.ObjectIdentifier) bool {
+		return oid.Equal(cryptoutils.SANOID)
+	})
 	roots, intermediates := root.pools(integrated)
 	if chainPEM := annotations[cosignChainAnnotation]; chainPEM != "" {
 		chain, err := cryptoutils.UnmarshalCertificatesFromPEMLimited([]byte(chainPEM), maxChainCertificates)
@@ -696,6 +770,16 @@ func verifyKeyless(payload, rawSig []byte, b64sig string, annotations map[string
 	}); err != nil {
 		return nil, fmt.Errorf("certificate does not chain to a trusted root at %s: %w", integrated.UTC().Format(time.RFC3339), err)
 	}
+	// Verify's KeyUsages accepts a leaf with no EKU at all and never
+	// looks at the key usage bits, so both of Fulcio's are demanded here:
+	// a certificate not issued for signing code is not a signing
+	// identity, whatever chain it hangs off.
+	if leaf.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		return nil, errors.New("certificate key usage lacks digitalSignature")
+	}
+	if !slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageCodeSigning) {
+		return nil, errors.New("certificate extended key usage lacks codeSigning")
+	}
 
 	// 3. Identity.
 	issuer, err := certificateIssuer(leaf)
@@ -711,21 +795,15 @@ func verifyKeyless(payload, rawSig []byte, b64sig string, annotations map[string
 	if issuer != rule.Issuer {
 		return nil, fmt.Errorf("certificate issuer %q is not %q", issuer, rule.Issuer)
 	}
+	// Every SAN form Fulcio issues is a candidate: email, URI, DNS and
+	// IP names from the SAN extension, plus the otherName
+	// (1.3.6.1.4.1.57264.1.7) a username identity is written as, which
+	// GetSubjectAlternateNames decodes alongside them.
 	sans := cryptoutils.GetSubjectAlternateNames(leaf)
-	subject := ""
-	if rule.Subject != "" {
-		for _, san := range sans {
-			if san == rule.Subject {
-				subject = san
-				break
-			}
-		}
-		if subject == "" {
-			return nil, fmt.Errorf("certificate subjects %q do not include %q", sans, rule.Subject)
-		}
-	} else if len(sans) > 0 {
-		subject = sans[0]
+	if !slices.Contains(sans, rule.Subject) {
+		return nil, fmt.Errorf("certificate subjects %q do not include %q", sans, rule.Subject)
 	}
+	subject := rule.Subject
 
 	// 4. The log entry is about this signature.
 	bodyJSON, err := base64.StdEncoding.DecodeString(bundle.Payload.Body)

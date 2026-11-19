@@ -1071,6 +1071,21 @@ func TestVerifySignatureLayerKeylessRefusals(t *testing.T) {
 	serverPayload, serverB64 := signedPayload(t, serverSigner, keylessRef, targetA)
 	server := f.keylessAnnotations(serverB64, serverCert, f.bundle(t, serverB64, serverCert, serverPayload))
 
+	// A root-issued leaf with no EKU at all, which x509.Verify's
+	// KeyUsages accepts, and one with codeSigning but a key usage of
+	// keyEncipherment only. Both are sound in every other respect.
+	noEKUTemplate := f.leafTemplate(t, keylessIssuer, keylessSubject, f.integrated.Add(-time.Minute), f.integrated.Add(10*time.Minute))
+	noEKUTemplate.ExtKeyUsage = nil
+	noEKUCert, noEKUSigner := f.issue(t, noEKUTemplate)
+	noEKUPayload, noEKUB64 := signedPayload(t, noEKUSigner, keylessRef, targetA)
+	noEKU := f.keylessAnnotations(noEKUB64, noEKUCert, f.bundle(t, noEKUB64, noEKUCert, noEKUPayload))
+
+	noSignTemplate := f.leafTemplate(t, keylessIssuer, keylessSubject, f.integrated.Add(-time.Minute), f.integrated.Add(10*time.Minute))
+	noSignTemplate.KeyUsage = x509.KeyUsageKeyEncipherment
+	noSignCert, noSignSigner := f.issue(t, noSignTemplate)
+	noSignPayload, noSignB64 := signedPayload(t, noSignSigner, keylessRef, targetA)
+	noSign := f.keylessAnnotations(noSignB64, noSignCert, f.bundle(t, noSignB64, noSignCert, noSignPayload))
+
 	for _, tc := range []struct {
 		name        string
 		payload     []byte
@@ -1088,6 +1103,8 @@ func TestVerifySignatureLayerKeylessRefusals(t *testing.T) {
 		// Signature and payload untouched; only the logged certificate differs.
 		{"body certificate is another certificate", goodPayload, with(cosignBundleAnnotation, f.bundle(t, good[cosignSignatureAnnotation], otherCert, goodPayload)), rule(keylessIssuer, keylessSubject), "body certificate is not the layer certificate"},
 		{"leaf without the code-signing EKU", serverPayload, server, rule(keylessIssuer, keylessSubject), "does not chain to a trusted root"},
+		{"leaf with no EKU", noEKUPayload, noEKU, rule(keylessIssuer, keylessSubject), "extended key usage lacks codeSigning"},
+		{"leaf without the digitalSignature key usage", noSignPayload, noSign, rule(keylessIssuer, keylessSubject), "key usage lacks digitalSignature"},
 		{"signature by another key", foreignPayload, foreign, rule(keylessIssuer, keylessSubject), "does not verify under the certificate key"},
 		{"missing bundle", goodPayload, with(cosignBundleAnnotation, ""), rule(keylessIssuer, keylessSubject), "has no " + cosignBundleAnnotation},
 		{"missing certificate", goodPayload, with(cosignCertificateAnnotation, ""), rule(keylessIssuer, keylessSubject), "has no " + cosignCertificateAnnotation},
@@ -1178,6 +1195,86 @@ func TestParseTrustedRootKeepsNonECDSALogKeys(t *testing.T) {
 	identity := &identityPolicy{Issuer: keylessIssuer, Subject: keylessSubject, TrustedRoot: path}
 	if _, err := verifySignatureLayer(payload, annotations, keylessRef, digest.Digest(targetA), verifyPolicy{identity: identity}, ""); err != nil {
 		t.Fatalf("bundle naming the ECDSA log beside an Ed25519 log: %v", err)
+	}
+}
+
+// A TrustedRoot needs both lists: certificate authorities to anchor
+// the certificate and transparency logs to anchor the signing time.
+// Missing either is a configuration error, never an unsigned model.
+func TestParseTrustedRootNeedsAuthoritiesAndLogs(t *testing.T) {
+	f := newSigstoreFixture(t)
+	for _, tc := range []struct{ drop, want string }{
+		{"tlogs", "no transparency logs"},
+		{"certificateAuthorities", "no certificate authorities"},
+	} {
+		t.Run("no "+tc.drop, func(t *testing.T) {
+			doc := f.trustedRootDoc(t)
+			delete(doc, tc.drop)
+			raw, err := json.Marshal(doc)
+			if err != nil {
+				t.Fatalf("marshal trusted root: %v", err)
+			}
+			_, err = parseTrustedRoot(raw)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// The hash a SET is checked under comes from the log's keyDetails, not
+// from an assumption about Rekor. The fixture's log declares
+// PKIX_ECDSA_P256_SHA_256 and verifies; a value this build does not
+// verify under, or one naming another key family than the key parsed,
+// is refused with the value in the error, and only when a bundle names
+// that log.
+func TestVerifyKeylessUsesLogKeyDetails(t *testing.T) {
+	f := newSigstoreFixture(t)
+	payload, annotations := keylessLayer(t, f)
+	for _, tc := range []struct{ keyDetails, wantErr string }{
+		{"PKIX_ECDSA_P256_SHA_256", ""},
+		{"PKIX_ECDSA_P256_HMAC_SHA_256", "key details PKIX_ECDSA_P256_HMAC_SHA_256 are not supported"},
+		{"PKIX_ED25519", "key details PKIX_ED25519 are not supported"},
+	} {
+		t.Run(tc.keyDetails, func(t *testing.T) {
+			doc := f.trustedRootDoc(t)
+			doc["tlogs"].([]map[string]any)[0]["publicKey"].(map[string]any)["keyDetails"] = tc.keyDetails
+			identity := &identityPolicy{Issuer: keylessIssuer, Subject: keylessSubject, TrustedRoot: writeTrustedRoot(t, doc)}
+			_, err := verifySignatureLayer(payload, annotations, keylessRef, digest.Digest(targetA), verifyPolicy{identity: identity}, "")
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("err = %v, want verified", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("err = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// A Fulcio username identity is written as the otherName SAN
+// 1.3.6.1.4.1.57264.1.7 rather than an email or URI, and matches
+// `subject` the same way.
+func TestVerifySignatureLayerKeylessAcceptsOtherNameSubject(t *testing.T) {
+	f := newSigstoreFixture(t)
+	const username = "signer!example.com"
+	template := f.leafTemplate(t, keylessIssuer, "", f.integrated.Add(-time.Minute), f.integrated.Add(10*time.Minute))
+	template.EmailAddresses = nil
+	ext, err := cryptoutils.MarshalOtherNameSAN(username, true)
+	if err != nil {
+		t.Fatalf("marshal otherName SAN: %v", err)
+	}
+	template.ExtraExtensions = append(template.ExtraExtensions, *ext)
+	cert, signer := f.issue(t, template)
+	payload, b64 := signedPayload(t, signer, keylessRef, targetA)
+	annotations := f.keylessAnnotations(b64, cert, f.bundle(t, b64, cert, payload))
+
+	identity := &identityPolicy{Issuer: keylessIssuer, Subject: username, TrustedRoot: f.trustedRootFile(t)}
+	m, err := verifySignatureLayer(payload, annotations, keylessRef, digest.Digest(targetA), verifyPolicy{identity: identity}, "")
+	if err != nil {
+		t.Fatalf("otherName subject: %v", err)
+	}
+	if want := keylessIssuer + " " + username; m.Signer != want {
+		t.Errorf("Signer = %q, want %q", m.Signer, want)
 	}
 }
 

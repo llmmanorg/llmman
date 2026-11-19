@@ -11,8 +11,10 @@ pub struct VerifyArgs {
     #[arg(value_name = "REFERENCE")]
     pub reference: String,
 
-    /// PEM public key to trust, repeatable. Overrides whatever
-    /// the `[verify]` policy would have selected for this reference.
+    /// PEM public key to trust, repeatable. Only these keys are
+    /// checked: the keys and the keyless identity the `[verify]`
+    /// policy would have selected for this reference are set aside.
+    /// The matching rule's `claims` still applies.
     #[arg(long = "key", value_name = "PATH")]
     pub keys: Vec<String>,
 
@@ -40,14 +42,7 @@ pub fn run(args: &VerifyArgs) -> anyhow::Result<()> {
     crate::shortnames::validate_reference(&args.reference)?;
     let reference = crate::shortnames::resolve(&args.reference)?;
 
-    // Explicit --key adds to the matching rule rather than replacing
-    // it: the rule's `claims` still applies, so this agrees with what
-    // `pull` accepts for a relocated repository, and the rule's
-    // identity is tried as a second acceptor after the keys
-    // (verifySignatureLayer tries keys first, then the identity). With
-    // --key the identity is only sent when a `trusted_root` backs it:
-    // the user supplied the key to check against, so a missing root
-    // drops the identity instead of refusing the whole check.
+    // See `select_trust` for how explicit keys replace the rule's acceptors.
     let decision = crate::verify::decide(&reference)?;
     let (keys, claims, identity) =
         select_trust(&args.keys, decision, crate::verify::all_configured_keys)?;
@@ -94,10 +89,9 @@ pub fn run(args: &VerifyArgs) -> anyhow::Result<()> {
 }
 
 /// Keys, claims and identity to check a reference against. With
-/// explicit keys, those keys plus the matching rule's `claims` and its
-/// identity, the latter only when a `trusted_root` backs it: without
-/// one the shim could not check it, and the user asked about the keys.
-/// Otherwise whatever the matching rule selects; failing that, every
+/// explicit keys, those keys alone plus the matching rule's `claims`;
+/// the rule's identity is dropped, since the user asked about the
+/// keys. Otherwise whatever the matching rule selects; failing that, every
 /// key the policy names anywhere (`all_keys`). An explicit ask deserves
 /// a real attempt: "here are the keys I know about, none signed it" is
 /// more useful than "no rule matched". The rule's `claims` applies
@@ -114,10 +108,7 @@ fn select_trust(
 ) -> anyhow::Result<(Vec<PathBuf>, String, Option<ffi::Identity>)> {
     if !explicit_keys.is_empty() {
         let keys = explicit_keys.iter().map(PathBuf::from).collect();
-        let identity = decision
-            .identity()
-            .filter(|identity| identity.trusted_root.is_some());
-        return Ok((keys, decision.claims.unwrap_or_default(), identity));
+        return Ok((keys, decision.claims.unwrap_or_default(), None));
     }
     let identity = decision.identity();
     let claims = decision.claims.unwrap_or_default();
@@ -254,50 +245,28 @@ mod tests {
     }
 
     #[test]
-    fn select_trust_with_explicit_keys_keeps_a_backed_identity_as_second_acceptor() {
-        let decision = Decision {
-            mode: Mode::Enforce,
-            keys: vec![],
-            claims: Some("docker.io/myorg/**".into()),
-            issuer: Some("https://issuer".into()),
-            subject: Some("me@example.com".into()),
-            trusted_root: Some(PathBuf::from("/etc/llmman/root.json")),
-        };
-        let (keys, claims, identity) = select_trust(&["/other.pub".to_string()], decision, || {
-            panic!("fallback consulted")
-        })
-        .unwrap();
-        assert_eq!(keys, vec![PathBuf::from("/other.pub")]);
-        assert_eq!(claims, "docker.io/myorg/**");
-        assert_eq!(
-            identity,
-            Some(ffi::Identity {
+    fn select_trust_with_explicit_keys_checks_only_those_keys() {
+        // The rule's identity is dropped whether or not a trusted root
+        // backs it, so `run` never bails on a missing root here and the
+        // shim is never asked to accept a certificate the user did not
+        // mention. Only `claims` carries over.
+        for trusted_root in [Some(PathBuf::from("/etc/llmman/root.json")), None] {
+            let decision = Decision {
+                mode: Mode::Enforce,
+                keys: vec![PathBuf::from("/rule.pub")],
+                claims: Some("docker.io/myorg/**".into()),
                 issuer: Some("https://issuer".into()),
                 subject: Some("me@example.com".into()),
-                trusted_root: Some("/etc/llmman/root.json".into()),
-            })
-        );
-    }
-
-    #[test]
-    fn select_trust_with_explicit_keys_drops_an_identity_without_a_trusted_root() {
-        // The user supplied the key to check against; a rule identity
-        // the shim could not anchor is left out rather than refusing
-        // the check, so `run` never bails on the missing root here.
-        let decision = Decision {
-            mode: Mode::Enforce,
-            keys: vec![],
-            claims: Some("docker.io/myorg/**".into()),
-            issuer: Some("https://issuer".into()),
-            subject: Some("me@example.com".into()),
-            trusted_root: None,
-        };
-        let (keys, claims, identity) = select_trust(&["/other.pub".to_string()], decision, || {
-            panic!("fallback consulted")
-        })
-        .unwrap();
-        assert_eq!(keys, vec![PathBuf::from("/other.pub")]);
-        assert_eq!(claims, "docker.io/myorg/**");
-        assert_eq!(identity, None);
+                trusted_root,
+            };
+            let (keys, claims, identity) =
+                select_trust(&["/other.pub".to_string()], decision, || {
+                    panic!("fallback consulted")
+                })
+                .unwrap();
+            assert_eq!(keys, vec![PathBuf::from("/other.pub")]);
+            assert_eq!(claims, "docker.io/myorg/**");
+            assert_eq!(identity, None);
+        }
     }
 }
