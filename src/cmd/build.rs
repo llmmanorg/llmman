@@ -19,6 +19,10 @@ pub struct BuildArgs {
     /// Key=value labels to embed in the image config
     #[arg(short, long, value_name = "KEY=VALUE")]
     pub label: Vec<String>,
+
+    /// Store each file whole as a raw layer instead of wrapping it in a tar
+    #[arg(long)]
+    pub raw: bool,
 }
 
 pub fn run(args: &BuildArgs) -> anyhow::Result<()> {
@@ -44,7 +48,7 @@ pub fn run(args: &BuildArgs) -> anyhow::Result<()> {
         .with_context(|| format!("context dir: {}", args.context_dir.display()))?;
 
     let desc = crate::storage::gc::after_retag(&store, &crate::default_cache()?, &tag, || {
-        store.build(&context_dir, &tag, &labels)
+        store.build(&context_dir, &tag, &labels, args.raw)
     })?;
     println!("Built {} ({})", args.tag, desc.digest);
     Ok(())
@@ -63,6 +67,7 @@ mod tests {
             tag: "hf.co//foo".into(),
             context_dir: std::path::PathBuf::from("/nonexistent"),
             label: Vec::new(),
+            raw: false,
         };
         let err = run(&args).expect_err("invalid tag must error");
         assert!(

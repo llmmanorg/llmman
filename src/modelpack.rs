@@ -1873,7 +1873,12 @@ mod tests {
         std::fs::write(src.path().join("README.md"), b"# docs").unwrap();
         let (store, _) = manifest_with(vec![]);
         store
-            .build(src.path(), "example.invalid/m:v1", &Default::default())
+            .build(
+                src.path(),
+                "example.invalid/m:v1",
+                &Default::default(),
+                false,
+            )
             .unwrap();
         let cache = store.root().join("cache");
 
@@ -2157,6 +2162,70 @@ mod tests {
             panic!("not a gguf model");
         };
         assert_eq!(again, path);
+    }
+
+    #[test]
+    fn build_raw_stores_each_file_whole_and_resolves_the_gguf() {
+        use sha2::Digest as _;
+        let gguf = [b"GGUF".as_slice(), &[3, 0, 0, 0], b"raw model"].concat();
+        let (store, _) = manifest_with(vec![]);
+        let context = store.root().join("context");
+        std::fs::create_dir_all(&context).unwrap();
+        std::fs::write(context.join("model.gguf"), &gguf).unwrap();
+        std::fs::write(context.join("config.json"), b"{}").unwrap();
+
+        let desc = store
+            .build(
+                &context,
+                "example.invalid/raw:v1",
+                &std::collections::HashMap::new(),
+                true,
+            )
+            .unwrap();
+
+        let m = store.read_manifest(&desc.digest).unwrap();
+        let mut media_types: Vec<&str> = m.layers.iter().map(|l| l.media_type.as_str()).collect();
+        media_types.sort_unstable();
+        assert_eq!(
+            media_types,
+            vec![
+                crate::hf::oci::MEDIA_TYPE_MODEL_WEIGHT_CONFIG_RAW,
+                crate::hf::oci::MEDIA_TYPE_MODEL_WEIGHT_RAW,
+            ]
+        );
+        let weight = m
+            .layers
+            .iter()
+            .find(|l| l.media_type == crate::hf::oci::MEDIA_TYPE_MODEL_WEIGHT_RAW)
+            .unwrap();
+        assert_eq!(
+            weight.digest,
+            format!("sha256:{}", hex::encode(sha2::Sha256::digest(&gguf)))
+        );
+        assert_eq!(weight.size, gguf.len() as u64);
+        assert_eq!(
+            weight.annotations.as_ref().unwrap()["org.cncf.model.filepath"],
+            "model.gguf"
+        );
+
+        let config: crate::storage::oci::CncfModelConfig =
+            serde_json::from_slice(&store.read_blob(&m.config.digest).unwrap()).unwrap();
+        assert_eq!(config.config.format.as_deref(), Some("gguf"));
+        assert_eq!(manifest_format(&m), Some(ModelFormat::Gguf));
+        let digests: Vec<String> = m.layers.iter().map(|l| l.digest.clone()).collect();
+        assert_eq!(
+            config.modelfs.diff_ids, digests,
+            "diffIds follow layer order"
+        );
+        assert_eq!(config.modelfs.fs_type, "layers");
+
+        let cache = store.root().join("cache");
+        let ModelPath::Gguf(path, None) =
+            resolve_model(store.root(), &cache, "example.invalid/raw:v1").unwrap()
+        else {
+            panic!("not a gguf model without a projector");
+        };
+        assert_eq!(std::fs::read(&path).unwrap(), gguf);
     }
 
     #[test]
