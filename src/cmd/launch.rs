@@ -40,6 +40,7 @@ mod gemini;
 mod goose;
 mod goose_desktop;
 mod grok;
+mod hdrm;
 mod hermes;
 mod kimi;
 mod omp;
@@ -104,7 +105,8 @@ pub struct LaunchArgs {
     /// What to launch with to make the session cheaper: none (the default)
     /// launches as is; tk compacts the output of the shell commands the
     /// agent runs (claude, opencode); cvmn asks for terse replies (claude,
-    /// codex, opencode). See docs/optimizers.md.
+    /// codex, opencode); hdrm compresses what the agent sends the model
+    /// (claude, codex, opencode). See docs/optimizers.md.
     #[arg(long, value_enum, value_name = "OPTIMIZER", default_value = "none")]
     pub optimizer: Optimizer,
 
@@ -342,7 +344,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         }
     };
 
-    launch(
+    let launched = launch(
         name,
         &model,
         &api_key,
@@ -353,7 +355,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         max_output,
         &args.extra_args,
         args.optimizer,
-    )
+    );
+    hdrm::stop();
+    launched
 }
 
 /// `args` with `[launch.<name>]` from llmman.conf filled in for the flags
@@ -1522,7 +1526,9 @@ fn exec_with_env_removing(
     extra_env: &[(&str, &str)],
     remove_env: &[&str],
 ) -> anyhow::Result<()> {
-    std::process::exit(run_with_env_removing(bin, args, extra_env, remove_env)?);
+    let code = run_with_env_removing(bin, args, extra_env, remove_env);
+    hdrm::stop();
+    std::process::exit(code?);
 }
 
 /// Runs the integration — in the `--sandbox`, when there is one — and
@@ -2239,9 +2245,9 @@ mod tests {
         assert_eq!(args.extra_args, ["hi"]);
     }
 
-    /// `--optimizer` defaults to none, and takes none, tk or cvmn.
+    /// `--optimizer` defaults to none, and takes none, tk, cvmn or hdrm.
     #[test]
-    fn the_optimizer_defaults_to_none_and_takes_none_tk_or_cvmn() {
+    fn the_optimizer_defaults_to_none_and_takes_none_tk_cvmn_or_hdrm() {
         assert_eq!(launch_args(&["claude"]).optimizer, Optimizer::None);
         assert_eq!(
             launch_args(&["claude", "--optimizer", "none"]).optimizer,
@@ -2258,6 +2264,10 @@ mod tests {
         assert_eq!(
             launch_args(&["claude", "--optimizer", "cvmn"]).optimizer,
             Optimizer::Cvmn
+        );
+        assert_eq!(
+            launch_args(&["claude", "--optimizer", "hdrm"]).optimizer,
+            Optimizer::Hdrm
         );
         // The flag is not an alias for anything after `--`.
         let args = launch_args(&["claude", "--", "--optimizer", "tk"]);
@@ -2286,6 +2296,7 @@ mod tests {
         assert!(help.contains("none"), "{help}");
         assert!(help.contains("tk"), "{help}");
         assert!(help.contains("cvmn"), "{help}");
+        assert!(help.contains("hdrm"), "{help}");
         assert!(help.contains("[default: none]"), "{help}");
     }
 

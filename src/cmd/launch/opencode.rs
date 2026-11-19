@@ -33,7 +33,7 @@ pub(super) fn launch_opencode(
     let variants = opencode_variants(thinking);
     let options = variant.and_then(|v| variants.iter().find(|(name, _)| *name == v));
     let config = opencode_config(
-        &server(),
+        added.server.as_deref().unwrap_or(&server()),
         effective_model,
         api_key,
         &variants,

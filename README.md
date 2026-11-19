@@ -355,7 +355,9 @@ flags you type still win. See [launch defaults](docs/configuration.md#launch-def
 runs (`git status`, `cargo test`, ...) before the agent reads it, preserving
 exit codes and keeping error text; `--optimizer cvmn` (`claude`, `codex`,
 `opencode`) asks the model for terse replies: answer first, no filler, code and
-errors verbatim. `--optimizer none` is the default and changes nothing. See
+errors verbatim; `--optimizer hdrm` (`claude`, `codex`, `opencode`) compresses
+what the agent sends the model (tool output, logs, history) with a local proxy
+that lives as long as the session. `--optimizer none` is the default and changes nothing. See
 [docs/optimizers.md](docs/optimizers.md).
 
 ```
@@ -500,6 +502,6 @@ in [docs/sandbox.md](docs/sandbox.md).
 | [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, registry mirrors, environment variables, store layout |
 | [docs/providers.md](docs/providers.md) | Hosted providers, API keys, and which integrations can use them |
 | [docs/sandbox.md](docs/sandbox.md) | `launch --sandbox`: what each sandbox shares and how it reaches the daemon |
-| [docs/optimizers.md](docs/optimizers.md) | `launch --optimizer`: what `none`, `tk` and `cvmn` do, what `tk` filters, and their limits |
+| [docs/optimizers.md](docs/optimizers.md) | `launch --optimizer`: what `none`, `tk`, `cvmn` and `hdrm` do, what `tk` filters, and their limits |
 | [docs/verification.md](docs/verification.md) | Signing models and pull-time trust policy |
 | [docs/metrics.md](docs/metrics.md) | The Prometheus `/metrics` families |

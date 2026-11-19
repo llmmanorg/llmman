@@ -8,10 +8,12 @@ something extra that makes the session cheaper to run.
 | `none` | The default. The integration is launched exactly as without the flag: same arguments, same environment, same files. |
 | `tk` | Compacts the output of the shell commands the agent runs, before the agent reads it. `claude` and `opencode`. |
 | `cvmn` | Asks the model for terse replies: answer first, no filler, every technical fact kept. `claude`, `codex` and `opencode`. |
+| `hdrm` | Compresses what the agent sends the model (tool output, logs, conversation history) with a local proxy. `claude`, `codex` and `opencode`. |
 
 ```sh
 llmman launch claude --model qwen3.8 --optimizer tk
 llmman launch codex --model qwen3.8 --optimizer cvmn
+llmman launch opencode --model qwen3.8 --optimizer hdrm
 ```
 
 llmman prints one line to stderr when an optimizer is on, and nothing for
@@ -20,6 +22,7 @@ llmman prints one line to stderr when an optimizer is on, and nothing for
 ```
 [llmman] claude: optimizer tk (command output compacted; LLMMAN_TK=off disables)
 [llmman] claude: optimizer cvmn (terse replies requested)
+[llmman] claude: optimizer hdrm (requests compressed by a local proxy)
 ```
 
 ## `tk`
@@ -252,3 +255,32 @@ instruction files and settings are all kept:
   much it saves depends on the model and the task. No figure is claimed here.
 - It is not a `[launch.<integration>]` default in `llmman.conf`; type the
   flag.
+
+## `hdrm`
+
+Most of what an agent sends the model each turn is not new: tool output, logs
+and files it already read, and the history. `hdrm` starts a compressing proxy
+on a free loopback port, points the integration at it, and points it at
+llmman's server. Requests reach the model smaller; answers come back as they
+were. Compression runs on this machine.
+
+The proxy starts once the model is ready and stops when the integration
+exits. Its output is in `hdrm.log`, next to `serve.log`.
+
+| Integration | How |
+|-------------|-----|
+| `claude` | `ANTHROPIC_BASE_URL` is the proxy's URL |
+| `codex` | `-c model_providers.llmman.base_url=<proxy>/v1`, so overlapping launches do not share a proxy |
+| `opencode` | the provider's `baseURL` in the config llmman hands opencode |
+
+### Limitations
+
+- Only `claude`, `codex` and `opencode`; others are refused before the daemon
+  starts.
+- The `hdrm` program must be installed and on `PATH`.
+- Not with `--sandbox`.
+- Startup can take up to a minute; after two minutes the launch is refused
+  with the log's path.
+- If llmman is killed with SIGKILL the proxy keeps running; stop it by hand.
+- It is not a `[launch.<integration>]` default; type the flag.
+- Savings depend on the session. No figure is claimed here.

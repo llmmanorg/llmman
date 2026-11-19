@@ -52,7 +52,7 @@ pub(super) fn launch_claude(
 ) -> anyhow::Result<()> {
     let bin = find_on_path("claude").ok_or_else(|| anyhow::anyhow!("claude is not installed"))?;
     let added = optimizer.addition("claude")?;
-    let server = server();
+    let server = added.server.clone().unwrap_or_else(server);
     let session_model = session_model(model, extra_args);
     let window = claude_context_window(
         context_window,
