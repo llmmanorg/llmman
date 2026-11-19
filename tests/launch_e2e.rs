@@ -4513,10 +4513,9 @@ fn speech_worker_transcribes_the_fixture() {
     .stdout(Stdio::inherit())
     .stderr(Stdio::inherit())
     .process_group(0);
-    let started = Instant::now();
-    let mut child = cmd.spawn().expect("spawn the speech worker");
-
-    // Killed on every exit path, a panic included.
+    // Killed and cleaned on every exit path, a panic or a failed spawn
+    // included: created before the spawn, the child registered right
+    // after it.
     struct Reap(Option<std::process::Child>, PathBuf, PathBuf);
     impl Drop for Reap {
         fn drop(&mut self) {
@@ -4527,6 +4526,10 @@ fn speech_worker_transcribes_the_fixture() {
             let _ = std::fs::remove_dir_all(&self.2);
         }
     }
+    let mut reap = Reap(None, store_dir.clone(), home.clone());
+    let started = Instant::now();
+    reap.0 = Some(cmd.spawn().expect("spawn the speech worker"));
+    let child = reap.0.as_mut().unwrap();
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -4535,7 +4538,6 @@ fn speech_worker_transcribes_the_fixture() {
     let deadline = started + Duration::from_secs(300);
     loop {
         if let Ok(Some(status)) = child.try_wait() {
-            let _ = std::fs::remove_dir_all(&store_dir);
             panic!("the speech worker exited before /health answered: {status}");
         }
         if client
@@ -4546,13 +4548,10 @@ fn speech_worker_transcribes_the_fixture() {
             break;
         }
         if Instant::now() > deadline {
-            kill_process_tree(&mut child);
-            let _ = std::fs::remove_dir_all(&store_dir);
             panic!("the speech worker did not answer /health within 300s");
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let _reap = Reap(Some(child), store_dir.clone(), home.clone());
     eprintln!("== worker loaded in {:.2?}", started.elapsed());
 
     let post = |parts: &[(&str, Option<&str>, &[u8])]| post_transcription(&client, &base, parts);
@@ -4710,11 +4709,11 @@ fn speech_worker_transcribes_the_fixture() {
 /// advertising 16000 Hz, is fed `fleurs-en.wav` as PCM16 in 100 ms
 /// `input_audio_buffer.append` frames and committed, and the
 /// `conversation.item.input_audio_transcription.completed` transcript must
-/// equal the one-shot text and `transcript.json`'s. A second session opened
-/// while that commit decodes is admitted and its own commit waits for the
-/// worker lock instead of erroring: it comes back with the same text. Run
-/// with `cargo test --release --test launch_e2e speech_worker_ --
-/// --ignored --nocapture`.
+/// equal the one-shot text and `transcript.json`'s. A second session,
+/// opened and committed while the first is in flight, must read the same
+/// text: a two-session transcript check, which shows both are served and
+/// not whether the second waited for the worker lock. Run with `cargo test
+/// --release --test launch_e2e speech_worker_ -- --ignored --nocapture`.
 #[test]
 #[ignore]
 #[cfg(unix)]
@@ -4767,9 +4766,9 @@ fn speech_worker_realtime_transcribes_the_fixture() {
     .stdout(Stdio::inherit())
     .stderr(Stdio::inherit())
     .process_group(0);
-    let started = Instant::now();
-    let mut child = cmd.spawn().expect("spawn the speech worker");
-
+    // As in `speech_worker_transcribes_the_fixture`: the guard exists
+    // before the spawn, so a failed spawn or an early exit still cleans
+    // the store and HOME.
     struct Reap(Option<std::process::Child>, PathBuf, PathBuf);
     impl Drop for Reap {
         fn drop(&mut self) {
@@ -4780,6 +4779,10 @@ fn speech_worker_realtime_transcribes_the_fixture() {
             let _ = std::fs::remove_dir_all(&self.2);
         }
     }
+    let mut reap = Reap(None, store_dir.clone(), home.clone());
+    let started = Instant::now();
+    reap.0 = Some(cmd.spawn().expect("spawn the speech worker"));
+    let child = reap.0.as_mut().unwrap();
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -4788,7 +4791,6 @@ fn speech_worker_realtime_transcribes_the_fixture() {
     let deadline = started + Duration::from_secs(300);
     loop {
         if let Ok(Some(status)) = child.try_wait() {
-            let _ = std::fs::remove_dir_all(&store_dir);
             panic!("the speech worker exited before /health answered: {status}");
         }
         if client
@@ -4799,13 +4801,10 @@ fn speech_worker_realtime_transcribes_the_fixture() {
             break;
         }
         if Instant::now() > deadline {
-            kill_process_tree(&mut child);
-            let _ = std::fs::remove_dir_all(&store_dir);
             panic!("the speech worker did not answer /health within 300s");
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let _reap = Reap(Some(child), store_dir.clone(), home.clone());
     eprintln!("== worker loaded in {:.2?}", started.elapsed());
 
     let t = Instant::now();
@@ -4828,8 +4827,8 @@ fn speech_worker_realtime_transcribes_the_fixture() {
         let mut first = RealtimeClient::connect(&ws_url).await;
         let t = Instant::now();
         first.send_fixture(&samples, FRAME_SAMPLES).await;
-        // Opened while the first commit decodes: admitted at once, its
-        // commit queues behind the worker lock.
+        // Opened while the first commit is in flight; both transcripts
+        // are checked, the order they are served in is not.
         let mut second = RealtimeClient::connect(&ws_url).await;
         second.send_fixture(&samples, FRAME_SAMPLES).await;
         let first_text = first.read_transcript("item_0").await;

@@ -219,7 +219,10 @@ answered by `session.updated`, `input_audio_buffer.committed`,
 the only rate accepted; a session buffers at most 30 s before a commit, and a
 worker holds at most four sessions open, a fifth gets an error event and is
 closed. A session with no client event for 60 s is closed the same way, and
-pings do not count.
+pings do not count; a session whose commit is still running is not closed as
+idle until the commit finishes, and the 60 s start over from its reply. A
+session whose client stops reading is dropped once a server event waits 10 s to
+be written.
 
 `/v1/systemone` answers typed questions about a `state` with a decision model
 (a GGUF with a `<arch>.decision.type`, such as Clef), with a probability for
