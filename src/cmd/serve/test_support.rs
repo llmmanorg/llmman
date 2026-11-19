@@ -69,7 +69,7 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
         }),
         exe: None,
         // `path`, so a resolve could never download.
-        runtime: runtime::Lazy::new(Runtime::Path, None, false, None),
+        runtime: runtime::Lazy::new(Runtime::Path, None, true, None),
         llama_cpp_version: None,
         vllm_version: None,
         vllm_image: None,
@@ -85,7 +85,7 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
         num_parallel: None,
         threads: None,
         cpu_limit: None,
-        hardened: false,
+        hardened: true,
         // usize::MAX, not 0 — 0 now means "admit almost nothing"
         // (see try_admit_against's doc comment), and no test here
         // calls ensure_model (the only caller of try_admit) directly

@@ -330,7 +330,7 @@ impl Lazy {
 /// release build, pinned to `llama_cpp_version`; `None` is upstream's
 /// floating latest), so the result is known to work before the listener
 /// binds and `--pull-only` has nothing left to do. `hardened` is the
-/// daemon's `--hardened`: the verify run under `auto` starts the image
+/// daemon's setting (on unless `--no-hardened`): the verify run under `auto` starts the image
 /// with the same `container::hardened_args` block the real spawn will.
 /// Under `auto` each failing step is logged and the next tried; off
 /// Linux the container steps are skipped. Blocking; call from `spawn_blocking`.
@@ -389,7 +389,7 @@ pub fn resolve_local(
             m.binary()
         );
     }
-    // No container, so `--hardened` has nothing to carry.
+    // No container, so there is no hardened block to carry.
     match resolve_with(Workload::General, runtime, llama_cpp_version, false, true)? {
         Resolved::Local { source, bin } => Ok((source, bin)),
         Resolved::Container(_) => unreachable!("bin and path resolve to a local binary"),
@@ -481,6 +481,9 @@ fn try_one(
                     Workload::CpuOnly => ociman.probe_cpu_only()?,
                 }
             }
+            prime_docker_identity(candidate, explicit, hardened, || {
+                crate::container::identity::docker_is_rootless();
+            });
             // Under `auto` both answers check that the engine can start
             // the image it just pulled: an engine that answers `info` but
             // cannot run a container (rootless without systemd, say) must
@@ -525,6 +528,18 @@ fn try_one(
                 bin,
             })
         }
+    }
+}
+
+/// Settles the rootless question of the first hardened spawn here, on
+/// the blocking resolve path, for an explicit `--runtime docker` on
+/// Linux: `probe` skipped [`ContainerManager::probe`], which primes it
+/// under `auto`, and the spawns run on the async request path where a
+/// `docker info` waiting out `PROBE_TIMEOUT` would stall the runtime.
+/// Nothing runs under `--no-hardened`: no spawn reads the answer then.
+fn prime_docker_identity(candidate: Runtime, explicit: bool, hardened: bool, probe: impl FnOnce()) {
+    if hardened && explicit && candidate == Runtime::Docker && cfg!(target_os = "linux") {
+        probe();
     }
 }
 
@@ -708,6 +723,24 @@ mod tests {
         assert_eq!(*tried.borrow(), [Runtime::Docker]);
     }
 
+    /// An explicit `--runtime docker` primes the rootless answer while
+    /// still on the blocking resolve path; `auto` gets it from the
+    /// engine probe, podman never asks, and `--no-hardened` skips it.
+    #[test]
+    fn explicit_docker_primes_the_rootless_answer_before_any_spawn() {
+        let probed = |candidate, explicit, hardened| {
+            let hit = std::cell::Cell::new(false);
+            prime_docker_identity(candidate, explicit, hardened, || hit.set(true));
+            hit.get()
+        };
+        let linux = cfg!(target_os = "linux");
+        assert_eq!(probed(Runtime::Docker, true, true), linux);
+        assert!(!probed(Runtime::Docker, true, false));
+        assert!(!probed(Runtime::Docker, false, true));
+        assert!(!probed(Runtime::Podman, true, true));
+        assert!(!probed(Runtime::Bin, true, true));
+    }
+
     /// An explicit runtime has one candidate and its own error; `auto`
     /// with nothing usable names every step it tried.
     #[test]
@@ -739,7 +772,7 @@ mod tests {
         let lazy = Lazy::new(
             Runtime::Path,
             None,
-            false,
+            true,
             Some(Resolved::Local {
                 source: Runtime::Path,
                 bin: PathBuf::from("/usr/bin/llama-server"),
@@ -764,7 +797,7 @@ mod tests {
         }
         // Refused before any docker/podman binary is looked for, so this
         // is deterministic on a macOS/Windows developer machine too.
-        let err = resolve(Runtime::Docker, None, false)
+        let err = resolve(Runtime::Docker, None, true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("only supported on Linux"), "{err}");
@@ -795,7 +828,7 @@ mod tests {
             bin: PathBuf::from("/nonexistent/llama-server"),
         };
         // A resolve would fail on this path, proving none is made.
-        let lazy = Lazy::new(Runtime::Bin, Some("b0".into()), false, Some(startup));
+        let lazy = Lazy::new(Runtime::Bin, Some("b0".into()), true, Some(startup));
         assert_eq!(lazy.known().unwrap().runtime(), Runtime::Path);
         assert_eq!(lazy.ociman().await.unwrap(), None);
         assert_eq!(
@@ -807,12 +840,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn lazy_answers_ociman_without_fetching_under_a_local_runtime() {
         for requested in [Runtime::Bin, Runtime::Path] {
-            let lazy = Lazy::new(requested, Some("b0".into()), false, None);
+            let lazy = Lazy::new(requested, Some("b0".into()), true, None);
             assert_eq!(lazy.ociman().await.unwrap(), None);
             assert!(lazy.known().is_none(), "{requested:?}");
         }
         if !cfg!(target_os = "linux") {
-            let lazy = Lazy::new(Runtime::Auto, Some("b0".into()), false, None);
+            let lazy = Lazy::new(Runtime::Auto, Some("b0".into()), true, None);
             assert_eq!(lazy.ociman().await.unwrap(), None);
             assert!(lazy.known().is_none());
         }
@@ -824,7 +857,7 @@ mod tests {
             return;
         }
         // Refused before any probe off Linux, so deterministic.
-        let lazy = Lazy::new(Runtime::Docker, None, false, None);
+        let lazy = Lazy::new(Runtime::Docker, None, true, None);
         let err = lazy.ociman().await.unwrap_err().to_string();
         assert!(err.contains("could not be set up"), "{err}");
         assert!(lazy.known().is_none(), "a failure must not be remembered");
@@ -836,7 +869,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn lazy_set_replaces_the_resolution() {
-        let lazy = Lazy::new(Runtime::Path, None, false, None);
+        let lazy = Lazy::new(Runtime::Path, None, true, None);
         lazy.set(Resolved::Container(ContainerManager::Docker));
         assert_eq!(lazy.ociman().await.unwrap(), Some(ContainerManager::Docker));
         lazy.set(Resolved::Local {

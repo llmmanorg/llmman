@@ -39,7 +39,7 @@ fn detached_serve_forwards_configuration_without_detaching_the_child() {
         model: Some("docker.io/ai/model:latest".into()),
         detach: true,
         runtime: Runtime::Path,
-        hardened: false,
+        no_hardened: false,
         llama_cpp_version: Some("b1234".into()),
         vllm_version: None,
         vllm_image: Some("example/vllm:1".into()),
@@ -63,11 +63,10 @@ fn detached_serve_forwards_configuration_without_detaching_the_child() {
     );
 }
 
-/// `--hardened` is off unless asked for, by flag or `LLMMAN_HARDENED`
-/// in the opt-in spellings every other LLMMAN_* switch takes, and a
-/// detached daemon gets it forwarded like `--runtime`.
+/// Hardening is on unless `--no-hardened` asks otherwise, and a detached
+/// daemon gets the opt-out forwarded like `--runtime`.
 #[test]
-fn hardened_is_off_by_default_and_forwarded_to_the_detached_child() {
+fn hardened_is_on_by_default_and_the_opt_out_reaches_the_detached_child() {
     #[derive(clap::Parser)]
     struct Cli {
         #[command(flatten)]
@@ -78,23 +77,39 @@ fn hardened_is_off_by_default_and_forwarded_to_the_detached_child() {
             .map(|c| c.args)
             .expect("serve args parse")
     };
-    let off = parse(&[]);
-    assert!(!off.hardened);
-    assert!(!test_state().0.hardened);
-    assert!(!off.detached_child_args().contains(&"--hardened"));
-    let on = parse(&["--hardened"]);
-    assert!(on.hardened);
+    let on = parse(&[]);
+    assert!(!on.no_hardened);
+    assert!(test_state().0.hardened);
+    assert_eq!(on.detached_child_args(), ["--runtime", "auto"]);
+    let off = parse(&["--no-hardened"]);
+    assert!(off.no_hardened);
     assert_eq!(
-        on.detached_child_args(),
-        ["--runtime", "auto", "--hardened"]
+        off.detached_child_args(),
+        ["--runtime", "auto", "--no-hardened"]
     );
-    // The variable reads like `LLMMAN_NOHISTORY`: `yes` is on, `off`
-    // and a blank are off, unlike clap's own truthy set.
-    for (value, expected) in [("1", true), ("yes", true), ("Off", false), ("", false)] {
-        std::env::set_var("LLMMAN_HARDENED", value);
-        assert_eq!(parse(&[]).hardened, expected, "LLMMAN_HARDENED={value:?}");
+}
+
+/// `LLMMAN_NO_HARDENED` reads like `LLMMAN_NOHISTORY` (`yes` is set,
+/// `off` and a blank are not), and either it or the flag turns the
+/// hardening off. The value is injected: no process environment.
+#[test]
+fn hardened_from_turns_off_on_the_flag_or_the_variable() {
+    for (no_hardened, env, expected) in [
+        (false, None, true),
+        (false, Some(""), true),
+        (false, Some("0"), true),
+        (false, Some("Off"), true),
+        (false, Some("1"), false),
+        (false, Some("yes"), false),
+        (true, None, false),
+        (true, Some("0"), false),
+    ] {
+        assert_eq!(
+            hardened_from(no_hardened, env),
+            expected,
+            "--no-hardened={no_hardened} LLMMAN_NO_HARDENED={env:?}"
+        );
     }
-    std::env::remove_var("LLMMAN_HARDENED");
 }
 
 // -- pull/push progress relay -------------------------------------------
@@ -6929,7 +6944,7 @@ impl FakeLlamaServer {
         inner.runtime = runtime::Lazy::new(
             runtime::Runtime::Path,
             None,
-            false,
+            true,
             Some(runtime::Resolved::Local {
                 source: runtime::Runtime::Path,
                 bin: self.bin.clone(),
