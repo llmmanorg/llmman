@@ -39,6 +39,10 @@ pub const GC_GRACE_PERIOD: Duration = Duration::from_secs(60 * 60);
 pub struct GcStats {
     pub count: usize,
     pub bytes: u64,
+    /// Unreferenced blobs left because they are younger than the grace
+    /// window, so `rm` can say why they still take up space.
+    pub kept_count: usize,
+    pub kept_bytes: u64,
 }
 
 #[cfg(unix)]
@@ -314,6 +318,10 @@ fn prune_blobs_with_account(
             continue;
         }
         if !is_older_than(&path, grace) {
+            // Not account.size: remember_retained_blobs already counted
+            // this file as retained, so that would report 0.
+            stats.kept_count += 1;
+            stats.kept_bytes += std::fs::symlink_metadata(&path).map_or(0, |m| m.len());
             continue;
         }
         let size = account.size(&path);
@@ -549,6 +557,7 @@ mod tests {
 
         let stats = prune_blobs(&root, &live, Duration::ZERO).unwrap();
         assert_eq!(stats.count, 1);
+        assert_eq!(stats.kept_count, 0, "a zero grace window keeps nothing");
         assert!(blobs.join("aaaa").exists(), "referenced blob must survive");
         assert!(!blobs.join("bbbb").exists(), "orphan blob must be removed");
         assert!(
@@ -582,11 +591,41 @@ mod tests {
         let stats = prune_blobs(&root, &live, GC_GRACE_PERIOD).unwrap();
 
         assert_eq!(stats.count, 1);
+        assert_eq!(stats.bytes, b"long-abandoned orphan".len() as u64);
+        assert_eq!(stats.kept_count, 1, "the fresh blob is reported as kept");
+        assert_eq!(
+            stats.kept_bytes,
+            b"just written by an in-flight pull".len() as u64
+        );
         assert!(
             fresh.exists(),
             "a fresh unreferenced blob must survive — it may be a live pull's untagged layer"
         );
         assert!(!stale.exists(), "a stale unreferenced blob must be swept");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `rm` reports kept blobs as space the grace window holds back, so
+    /// only unreferenced ones count: a fresh blob a tag still uses, or a
+    /// fresh temp write, would never have been freed anyway.
+    #[test]
+    fn prune_blobs_counts_only_unreferenced_fresh_blobs_as_kept() {
+        let root = temp_dir("prune-blobs-kept");
+        let blobs = root.join("blobs").join("sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join("eeee"), b"fresh and referenced").unwrap();
+        std::fs::write(blobs.join("ffff"), b"fresh orphan").unwrap();
+        std::fs::write(blobs.join("tmp-456"), b"in-progress write").unwrap();
+
+        let mut live = HashSet::new();
+        live.insert("sha256:eeee".to_string());
+
+        let stats = prune_blobs(&root, &live, GC_GRACE_PERIOD).unwrap();
+
+        assert_eq!(stats.count, 0);
+        assert_eq!(stats.kept_count, 1);
+        assert_eq!(stats.kept_bytes, b"fresh orphan".len() as u64);
 
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -73,6 +73,13 @@ pub fn run(args: &RmArgs) -> anyhow::Result<()> {
                 cache_stats.count
             );
         }
+        if blob_stats.kept_count > 0 {
+            println!(
+                "Kept {} ({} blobs) pulled less than an hour ago, freed by a later rm or serve restart",
+                crate::fmt::human_size(blob_stats.kept_bytes),
+                blob_stats.kept_count
+            );
+        }
     }
 
     if any_err {
