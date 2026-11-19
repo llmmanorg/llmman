@@ -54,9 +54,19 @@ pub(super) fn launch_codex(
 
 const KEY: &str = "developer_instructions";
 
+/// The `-c` value that sets codex's config `key` to the string `text`.
+fn config_override(key: &str, text: &str) -> String {
+    format!("{key}={}", toml_edit::Value::from(text))
+}
+
 /// The `-c` value that sets codex's `developer_instructions` to `text`.
 pub(super) fn developer_instructions(text: &str) -> String {
-    format!("{KEY}={}", toml_edit::Value::from(text))
+    config_override(KEY, text)
+}
+
+/// The `-c` value that points the `llmman` provider at `server`.
+pub(super) fn server_override(server: &str) -> String {
+    config_override("model_providers.llmman.base_url", &format!("{server}/v1"))
 }
 
 /// Whether a `-c`/`--config` before `--` sets `developer_instructions`.

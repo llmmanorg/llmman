@@ -12,7 +12,7 @@ use anyhow::Context;
 use clap::ValueEnum;
 
 use super::common::write_if_changed;
-use super::{claude, codex, opencode};
+use super::{claude, codex, hdrm, opencode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum Optimizer {
@@ -24,6 +24,8 @@ pub enum Optimizer {
     Tk,
     /// Ask the model for terse replies (claude, codex and opencode)
     Cvmn,
+    /// Compress what the agent sends the model (claude, codex and opencode)
+    Hdrm,
 }
 
 /// What an optimizer adds to a launch.
@@ -35,6 +37,8 @@ pub(super) struct Addition {
     pub env: Vec<(String, String)>,
     /// Top-level keys added to the config llmman hands opencode.
     pub config: Option<serde_json::Value>,
+    /// Where the integration reaches the model server, in place of llmman's.
+    pub server: Option<String>,
 }
 
 /// The integrations `tk` works with. codex is left out: its hooks need a
@@ -43,6 +47,9 @@ const TK_INTEGRATIONS: &[&str] = &["claude", "opencode"];
 
 /// The integrations `cvmn` works with.
 const CVMN_INTEGRATIONS: &[&str] = &["claude", "codex", "opencode"];
+
+/// The integrations `hdrm` works with.
+const HDRM_INTEGRATIONS: &[&str] = &["claude", "codex", "opencode"];
 
 const CVMN_PROMPT: &str = include_str!("cvmn.md");
 
@@ -56,6 +63,7 @@ impl Optimizer {
             Optimizer::None => "none",
             Optimizer::Tk => "tk",
             Optimizer::Cvmn => "cvmn",
+            Optimizer::Hdrm => "hdrm",
         }
     }
 
@@ -65,6 +73,7 @@ impl Optimizer {
             Optimizer::None => &[],
             Optimizer::Tk => TK_INTEGRATIONS,
             Optimizer::Cvmn => CVMN_INTEGRATIONS,
+            Optimizer::Hdrm => HDRM_INTEGRATIONS,
         }
     }
 
@@ -105,6 +114,9 @@ impl Optimizer {
                 opencode::ensure_plugins()?;
             }
         }
+        if self == Optimizer::Hdrm {
+            hdrm::ensure_installed()?;
+        }
         Ok(())
     }
 
@@ -125,6 +137,20 @@ impl Optimizer {
     pub(super) fn addition(self, integration: &str) -> anyhow::Result<Addition> {
         if self == Optimizer::None {
             return Ok(Addition::default());
+        }
+        if self == Optimizer::Hdrm {
+            let url = hdrm::start(&super::server())?;
+            // codex's profile file is shared by every launch; a `-c` is not.
+            return Ok(match integration {
+                "codex" => Addition {
+                    args: vec!["-c".into(), codex::server_override(&url)],
+                    ..Addition::default()
+                },
+                _ => Addition {
+                    server: Some(url),
+                    ..Addition::default()
+                },
+            });
         }
         let exe = match self {
             Optimizer::Tk => {
@@ -201,6 +227,9 @@ impl Optimizer {
             Optimizer::Cvmn => Some(format!(
                 "[llmman] {integration}: optimizer cvmn (terse replies requested)"
             )),
+            Optimizer::Hdrm => Some(format!(
+                "[llmman] {integration}: optimizer hdrm (requests compressed by a local proxy)"
+            )),
         }
     }
 }
@@ -221,12 +250,12 @@ mod tests {
     use clap::ValueEnum;
 
     #[test]
-    fn the_choices_are_spelled_none_tk_and_cvmn() {
+    fn the_choices_are_spelled_none_tk_cvmn_and_hdrm() {
         let names: Vec<String> = Optimizer::value_variants()
             .iter()
             .map(|o| o.to_possible_value().unwrap().get_name().to_string())
             .collect();
-        assert_eq!(names, ["none", "tk", "cvmn"]);
+        assert_eq!(names, ["none", "tk", "cvmn", "hdrm"]);
         assert_eq!(Optimizer::default(), Optimizer::None);
         for o in Optimizer::value_variants() {
             assert_eq!(o.to_possible_value().unwrap().get_name(), o.name());
@@ -456,6 +485,57 @@ mod tests {
         assert_eq!(
             Optimizer::Cvmn.notice("claude").as_deref(),
             Some("[llmman] claude: optimizer cvmn (terse replies requested)")
+        );
+    }
+
+    #[test]
+    fn hdrm_names_the_integration_and_the_ones_that_work() {
+        assert_eq!(HDRM_INTEGRATIONS, ["claude", "codex", "opencode"]);
+        for name in ["aider", "goose", "docker-agent"] {
+            let err = Optimizer::Hdrm
+                .check(name, false, &[])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("does not work with {name}")), "{err}");
+            assert!(
+                err.contains("only claude, codex, opencode can use it"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn hdrm_is_refused_in_a_sandbox() {
+        let err = Optimizer::Hdrm
+            .check("claude", true, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--sandbox"), "{err}");
+    }
+
+    #[test]
+    fn hdrm_needs_a_proxy_to_start() {
+        assert!(Optimizer::Hdrm
+            .addition_with("claude", Path::new(""), Path::new(""))
+            .is_err());
+    }
+
+    #[test]
+    fn hdrm_points_codex_at_the_proxy_with_a_config_override() {
+        let doc: toml_edit::DocumentMut = codex::server_override("http://127.0.0.1:9")
+            .parse()
+            .unwrap();
+        assert_eq!(
+            doc["model_providers"]["llmman"]["base_url"].as_str(),
+            Some("http://127.0.0.1:9/v1")
+        );
+    }
+
+    #[test]
+    fn the_notice_says_hdrm_is_on() {
+        assert_eq!(
+            Optimizer::Hdrm.notice("codex").as_deref(),
+            Some("[llmman] codex: optimizer hdrm (requests compressed by a local proxy)")
         );
     }
 }
