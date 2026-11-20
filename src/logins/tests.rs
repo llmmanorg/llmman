@@ -1516,8 +1516,10 @@ fn a_google_service_account_login_keeps_the_path_and_checks_the_type() {
         .login("google-vertex", &method("service-account"), &no_input)
         .unwrap_err();
     assert!(err.to_string().contains("--file"), "{err}");
-    let mut missing = opts.clone_for_test();
-    missing.file = Some(dir.path().join("nope.json").to_string_lossy().into_owned());
+    let missing = Options {
+        file: Some(dir.path().join("nope.json").to_string_lossy().into_owned()),
+        ..opts
+    };
     assert!(rig.login("google-vertex", &missing, &no_input).is_err());
 
     rig.login(
@@ -1533,19 +1535,6 @@ fn a_google_service_account_login_keeps_the_path_and_checks_the_type() {
         (chain.project.as_deref(), chain.credentials_file.as_deref()),
         (Some("p2"), None)
     );
-}
-
-impl Options {
-    fn clone_for_test(&self) -> Options {
-        Options {
-            method: self.method.clone(),
-            token: self.token.clone(),
-            command: self.command.clone(),
-            file: self.file.clone(),
-            copy: self.copy,
-            params: self.params.clone(),
-        }
-    }
 }
 
 #[test]

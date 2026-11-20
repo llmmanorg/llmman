@@ -695,7 +695,6 @@ Every forwarding request must come from a loopback connection and supply all of:
 ```text
 X-Api-Key: <configured daemon API key>
 Authorization: Bearer <current provider OAuth access token>
-X-LLMMan-Upstream-IP: <policy-authorized public IP for the provider>
 ```
 
 The daemon key is checked separately and removed before forwarding. An OAuth
@@ -719,12 +718,10 @@ are rejected before contacting a provider. Request bodies are bounded to 32 MiB.
 Encoded request bodies are rejected with 415; absent or case-insensitive
 `identity` content coding is accepted and removed before JSON is reserialized.
 
-The supervisor resolves the fixed provider hostname, authorizes a particular
-IP against its network policy, and supplies that numeric address in
-`X-LLMMan-Upstream-IP`. llmman pins the connection to it while verifying the
-provider's TLS hostname. There is no DNS fallback or caller-controlled URL.
-Special-use addresses, including private networks, loopback, and IPv6 6to4,
-are rejected. Redirects and environment proxy/CA overrides are not used.
+llmman resolves the fixed provider hostname with the system resolver and
+verifies its TLS hostname; egress policy is the network layer's. A legacy
+`X-LLMMan-Upstream-IP` header is ignored. There is no caller-controlled URL.
+Redirects and environment proxy/CA overrides are not used.
 
 Provider extension headers pass through in both directions, including repeated
 values. Hop-by-hop headers, fields named by `Connection`, `Host`, internal
