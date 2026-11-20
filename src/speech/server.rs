@@ -899,9 +899,22 @@ fn queue_event(
 }
 
 /// GET /v1/realtime: the WebSocket transcription session. The daemon's
-/// relay dials it without the `model` query, so none is read.
-async fn realtime(State(s): State<Shared>, ws: WebSocketUpgrade) -> Response {
+/// relay dials it without the `model` query, so none is read, and a
+/// request carrying an `Origin` is refused with 403 before the upgrade
+/// ([`direct_hit`]).
+async fn realtime(State(s): State<Shared>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    if direct_hit(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     capped(ws).on_upgrade(move |socket| run_realtime(s, socket))
+}
+
+/// Whether a request reached the worker port from a browser: the worker
+/// is only reached by the daemon's relay, which sends no `Origin` and
+/// applies the origin policy itself, so an `Origin` here means a page
+/// hit the worker directly.
+fn direct_hit(headers: &HeaderMap) -> bool {
+    headers.contains_key(header::ORIGIN)
 }
 
 /// Caps a frame and a message at [`QUEUE_BYTES`], so no text larger than
@@ -1615,9 +1628,7 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let addr = serve(app).await;
 
         let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
         sock.write_all(b"POST /slow HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n")
@@ -1647,6 +1658,25 @@ mod tests {
             socket,
             write: std::time::Duration::from_secs(5),
         }
+    }
+
+    /// Serves `app` on a loopback port and returns its address.
+    async fn serve(app: Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// A WebSocket client connected to `/v1/realtime` on `addr`.
+    async fn connect(
+        addr: std::net::SocketAddr,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/realtime"))
+            .await
+            .unwrap();
+        ws
     }
 
     /// What [`recv_event`] returned, as the text frame a test reads.
@@ -1683,6 +1713,47 @@ mod tests {
             .expect("no text frame within the deadline")
     }
 
+    /// The worker is only reached by the daemon's relay, which sends no
+    /// `Origin`: a request with one is refused before the upgrade with
+    /// 403, and one without upgrades.
+    #[tokio::test]
+    async fn an_origin_header_is_refused_before_the_upgrade() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+        let app = Router::new().route(
+            "/v1/realtime",
+            get(|headers: HeaderMap, ws: WebSocketUpgrade| async move {
+                if direct_hit(&headers) {
+                    return StatusCode::FORBIDDEN.into_response();
+                }
+                capped(ws).on_upgrade(|socket| async move {
+                    let _ = conn(socket).send(json!({"type": "upgraded"})).await;
+                })
+            }),
+        );
+        let addr = serve(app).await;
+
+        let mut request = format!("ws://{addr}/v1/realtime")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, "http://evil.example".parse().unwrap());
+        let err = tokio_tungstenite::connect_async(request)
+            .await
+            .expect_err("a request with an Origin upgraded");
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            }
+            other => panic!("expected an HTTP refusal, got {other:?}"),
+        }
+
+        let mut ws = connect(addr).await;
+        let event: Value = serde_json::from_str(&next_text(&mut ws).await).unwrap();
+        assert_eq!(event["type"], "upgraded", "{event}");
+    }
+
     /// A silent client is told so and closed once `idle` passes from the
     /// session start, and a ping in between does not push that deadline:
     /// the verdict arrives before the deadline a ping reset would set.
@@ -1703,13 +1774,9 @@ mod tests {
                 })
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let addr = serve(app).await;
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/realtime"))
-            .await
-            .unwrap();
+        let mut ws = connect(addr).await;
         let started = std::time::Instant::now();
         tokio::time::sleep(idle / 2).await;
         ws.send(tokio_tungstenite::tungstenite::Message::Ping(vec![]))
@@ -1757,16 +1824,22 @@ mod tests {
                 }),
             )
         };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let addr = serve(app).await;
 
         // The first client connects and never reads.
-        let (stalled, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/realtime"))
-            .await
-            .unwrap();
+        let stalled = connect(addr).await;
         let started = std::time::Instant::now();
         let deadline = started + Duration::from_secs(10);
+        // The permit is taken after the upgrade, so wait for the
+        // admission before waiting for the slot to come back.
+        while sessions.available_permits() == 1 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            sessions.available_permits(),
+            0,
+            "the first client was not admitted"
+        );
         while sessions.available_permits() == 0 && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1777,9 +1850,7 @@ mod tests {
         );
         // A second client is admitted while the first still holds its
         // end of the stalled socket.
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/realtime"))
-            .await
-            .unwrap();
+        let mut ws = connect(addr).await;
         let event: Value = serde_json::from_str(&next_text(&mut ws).await).unwrap();
         assert_eq!(event["type"], "test.reply", "{event}");
         drop(stalled);
@@ -1827,9 +1898,7 @@ mod tests {
                 }),
             )
         };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let addr = serve(app).await;
 
         // A thread holds the worker lock, as a running decode would,
         // until the test lets it go.
@@ -1844,9 +1913,7 @@ mod tests {
             })
         };
         is_locked.recv().unwrap();
-        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/realtime"))
-            .await
-            .unwrap();
+        let ws = connect(addr).await;
         tokio::time::timeout(Duration::from_secs(5), was_started.recv())
             .await
             .expect("the commit did not reach the worker lock")
@@ -1898,13 +1965,9 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let addr = serve(app).await;
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/realtime"))
-            .await
-            .unwrap();
+        let mut ws = connect(addr).await;
         let first = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
             .await
             .expect("no frame within the deadline")
@@ -1950,13 +2013,9 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let addr = serve(app).await;
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/realtime"))
-            .await
-            .unwrap();
+        let mut ws = connect(addr).await;
         // The server may close the connection while this frame is still
         // being written, so the send itself can fail with a reset; that
         // is the refusal, and the handler's verdict below is the check.

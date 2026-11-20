@@ -4464,8 +4464,6 @@ fn post_transcription(
 #[ignore]
 #[cfg(unix)]
 fn speech_worker_transcribes_the_fixture() {
-    use std::os::unix::process::CommandExt;
-
     const MODEL_REF: &str = CANARY_MODEL_REF;
     const EXPECTED: &str = CANARY_TRANSCRIPT;
 
@@ -4493,68 +4491,10 @@ fn speech_worker_transcribes_the_fixture() {
     let wav = std::fs::read(ref_dir.join("fleurs-en.wav")).unwrap();
     let store_dir = seed_canary_store(&gguf_dir);
 
-    // Bound once for a free number, then released for the worker.
-    let port = free_loopback_port();
-    let base = format!("http://127.0.0.1:{port}");
+    let worker = spawn_speech_worker(store_dir, "speech-home");
+    let (client, base, port) = (&worker.client, &worker.base, worker.port);
 
-    let home = fresh_home("speech-home");
-    let mut cmd = Command::new(llmman_bin());
-    cmd.args([
-        "serve",
-        MODEL_REF,
-        "--port",
-        &port.to_string(),
-        "--runtime",
-        "path",
-    ])
-    .env("HOME", &home)
-    .env("LLMMAN_MODELS", &store_dir)
-    .stdin(Stdio::null())
-    .stdout(Stdio::inherit())
-    .stderr(Stdio::inherit())
-    .process_group(0);
-    // Killed and cleaned on every exit path, a panic or a failed spawn
-    // included: created before the spawn, the child registered right
-    // after it.
-    struct Reap(Option<std::process::Child>, PathBuf, PathBuf);
-    impl Drop for Reap {
-        fn drop(&mut self) {
-            if let Some(mut child) = self.0.take() {
-                kill_process_tree(&mut child);
-            }
-            let _ = std::fs::remove_dir_all(&self.1);
-            let _ = std::fs::remove_dir_all(&self.2);
-        }
-    }
-    let mut reap = Reap(None, store_dir.clone(), home.clone());
-    let started = Instant::now();
-    reap.0 = Some(cmd.spawn().expect("spawn the speech worker"));
-    let child = reap.0.as_mut().unwrap();
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .unwrap();
-    let deadline = started + Duration::from_secs(300);
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("the speech worker exited before /health answered: {status}");
-        }
-        if client
-            .get(format!("{base}/health"))
-            .send()
-            .is_ok_and(|r| r.status().is_success())
-        {
-            break;
-        }
-        if Instant::now() > deadline {
-            panic!("the speech worker did not answer /health within 300s");
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    eprintln!("== worker loaded in {:.2?}", started.elapsed());
-
-    let post = |parts: &[(&str, Option<&str>, &[u8])]| post_transcription(&client, &base, parts);
+    let post = |parts: &[(&str, Option<&str>, &[u8])]| post_transcription(client, base, parts);
 
     let t = Instant::now();
     let (status, reply) = post(&[
@@ -4718,8 +4658,6 @@ fn speech_worker_transcribes_the_fixture() {
 #[ignore]
 #[cfg(unix)]
 fn speech_worker_realtime_transcribes_the_fixture() {
-    use std::os::unix::process::CommandExt;
-
     const MODEL_REF: &str = CANARY_MODEL_REF;
     const EXPECTED: &str = CANARY_TRANSCRIPT;
     /// 100 ms of 16 kHz PCM16 per append frame.
@@ -4747,70 +4685,13 @@ fn speech_worker_realtime_transcribes_the_fixture() {
     let samples = llmman::speech::wav::parse(&wav, usize::MAX).expect("the fixture is a PCM16 WAV");
     let store_dir = seed_canary_store(&gguf_dir);
 
-    let port = free_loopback_port();
-    let base = format!("http://127.0.0.1:{port}");
-
-    let home = fresh_home("speech-realtime-home");
-    let mut cmd = Command::new(llmman_bin());
-    cmd.args([
-        "serve",
-        MODEL_REF,
-        "--port",
-        &port.to_string(),
-        "--runtime",
-        "path",
-    ])
-    .env("HOME", &home)
-    .env("LLMMAN_MODELS", &store_dir)
-    .stdin(Stdio::null())
-    .stdout(Stdio::inherit())
-    .stderr(Stdio::inherit())
-    .process_group(0);
-    // As in `speech_worker_transcribes_the_fixture`: the guard exists
-    // before the spawn, so a failed spawn or an early exit still cleans
-    // the store and HOME.
-    struct Reap(Option<std::process::Child>, PathBuf, PathBuf);
-    impl Drop for Reap {
-        fn drop(&mut self) {
-            if let Some(mut child) = self.0.take() {
-                kill_process_tree(&mut child);
-            }
-            let _ = std::fs::remove_dir_all(&self.1);
-            let _ = std::fs::remove_dir_all(&self.2);
-        }
-    }
-    let mut reap = Reap(None, store_dir.clone(), home.clone());
-    let started = Instant::now();
-    reap.0 = Some(cmd.spawn().expect("spawn the speech worker"));
-    let child = reap.0.as_mut().unwrap();
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .unwrap();
-    let deadline = started + Duration::from_secs(300);
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("the speech worker exited before /health answered: {status}");
-        }
-        if client
-            .get(format!("{base}/health"))
-            .send()
-            .is_ok_and(|r| r.status().is_success())
-        {
-            break;
-        }
-        if Instant::now() > deadline {
-            panic!("the speech worker did not answer /health within 300s");
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    eprintln!("== worker loaded in {:.2?}", started.elapsed());
+    let worker = spawn_speech_worker(store_dir, "speech-realtime-home");
+    let (client, base, port) = (&worker.client, &worker.base, worker.port);
 
     let t = Instant::now();
     let (status, reply) = post_transcription(
-        &client,
-        &base,
+        client,
+        base,
         &[
             ("file", Some("fleurs-en.wav"), &wav),
             ("model", None, MODEL_REF.as_bytes()),
@@ -4846,6 +4727,96 @@ fn speech_worker_realtime_transcribes_the_fixture() {
     assert_eq!(first, one_shot);
     assert_eq!(first, EXPECTED);
     assert_eq!(second, one_shot);
+}
+
+/// A spawned speech worker, killed with its store and HOME on drop:
+/// created before the spawn, the child registered right after it, so a
+/// panic or a failed spawn still cleans up.
+#[cfg(unix)]
+struct SpeechWorker {
+    child: Option<std::process::Child>,
+    store_dir: PathBuf,
+    home: PathBuf,
+    port: u16,
+    /// `http://127.0.0.1:{port}`.
+    base: String,
+    /// The client that polled `/health`, with a 120 s timeout.
+    client: reqwest::blocking::Client,
+}
+
+#[cfg(unix)]
+impl Drop for SpeechWorker {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            kill_process_tree(&mut child);
+        }
+        let _ = std::fs::remove_dir_all(&self.store_dir);
+        let _ = std::fs::remove_dir_all(&self.home);
+    }
+}
+
+/// Spawns `llmman serve docker.io/ai/canary:latest --port PORT --runtime
+/// path` over `store_dir` with a fresh HOME named `home`, polls `/health`
+/// until the model is loaded.
+#[cfg(unix)]
+fn spawn_speech_worker(store_dir: PathBuf, home: &str) -> SpeechWorker {
+    use std::os::unix::process::CommandExt;
+
+    // Built first: nothing exists to leak if it panics.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap();
+    // Bound once for a free number, then released for the worker.
+    let port = free_loopback_port();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let home = fresh_home(home);
+    let mut cmd = Command::new(llmman_bin());
+    cmd.args([
+        "serve",
+        CANARY_MODEL_REF,
+        "--port",
+        &port.to_string(),
+        "--runtime",
+        "path",
+    ])
+    .env("HOME", &home)
+    .env("LLMMAN_MODELS", &store_dir)
+    .stdin(Stdio::null())
+    .stdout(Stdio::inherit())
+    .stderr(Stdio::inherit())
+    .process_group(0);
+    let mut worker = SpeechWorker {
+        child: None,
+        store_dir,
+        home,
+        port,
+        base,
+        client,
+    };
+    let started = Instant::now();
+    worker.child = Some(cmd.spawn().expect("spawn the speech worker"));
+    let (child, client, base) = (worker.child.as_mut().unwrap(), &worker.client, &worker.base);
+    let deadline = started + Duration::from_secs(300);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("the speech worker exited before /health answered: {status}");
+        }
+        if client
+            .get(format!("{base}/health"))
+            .send()
+            .is_ok_and(|r| r.status().is_success())
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("the speech worker did not answer /health within 300s");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    eprintln!("== worker loaded in {:.2?}", started.elapsed());
+    worker
 }
 
 /// A `/v1/realtime` client of the test above, past `session.created`.
