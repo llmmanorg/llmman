@@ -144,6 +144,7 @@ Environment Variables:
       LLMMAN_FLASH_ATTENTION         Enable flash attention
       LLMMAN_KV_CACHE_TYPE           Quantization type for the K/V cache (default: f16)
       LLMMAN_RUNTIME                 Where the inference engine comes from: auto (default), docker, podman, bin or path — same as --runtime
+      LLMMAN_NO_HARDENED             Run the engine containers without the hardened flags (read-only rootfs, every capability dropped), same as --no-hardened
       LLMMAN_LLM_LIBRARY             Set backend (cpu/cuda/cuda13/rocm/opencl/vulkan/metal) to bypass GPU autodetection
       LLMMAN_IGPU_ENABLE             Enable integrated GPUs
       LLMMAN_LOAD_TIMEOUT            How long to allow model loads to stall before giving up (default \"20m\")
@@ -178,6 +179,17 @@ pub struct ServeArgs {
     /// `vllm`/`sglang` come from PATH.
     #[arg(long, value_enum, default_value = "auto", env = "LLMMAN_RUNTIME")]
     pub runtime: Runtime,
+
+    /// Run the engine containers without the hardened flags they get by
+    /// default (`--runtime docker`/`podman` only): read-only rootfs with
+    /// a tmpfs per engine scratch path, every capability dropped and no
+    /// new privileges; see `container::hardened_args`. Under `bin`/`path`
+    /// there is no container and neither setting has an effect.
+    /// `LLMMAN_NO_HARDENED` is the same switch as an environment
+    /// variable, read once at startup like `LLMMAN_NOHISTORY` (see
+    /// [`hardened_from`]).
+    #[arg(long)]
+    pub no_hardened: bool,
 
     /// The llama.cpp release to run, as a `b<N>` tag: the GitHub release
     /// `bin` downloads and the `-b<N>` image tag suffix the container
@@ -244,6 +256,16 @@ pub struct ServeArgs {
 #[derive(Clone)]
 struct AppState(Arc<Inner>);
 
+/// Whether the engine containers run hardened: on unless `--no-hardened`
+/// (`no_hardened`) or `LLMMAN_NO_HARDENED` (`env`, its value, in the
+/// spellings [`crate::parse_env_flag`] accepts) turns it off. `env` is
+/// injected so the table test needs no process environment; the daemon
+/// passes `LLMMAN_NO_HARDENED` once at startup, like
+/// `promptlog::enabled_from_env` does for `LLMMAN_NOHISTORY`.
+pub(crate) fn hardened_from(no_hardened: bool, env: Option<&str>) -> bool {
+    !(no_hardened || crate::parse_env_flag(env))
+}
+
 struct Inner {
     manager: Mutex<ModelManager>,
     // This daemon's own executable path, canonicalized at startup (while
@@ -307,6 +329,10 @@ struct Inner {
     // `--cpus`. Snapshotted with `threads` so a later cgroup change
     // cannot leave the two disagreeing.
     cpu_limit: Option<f64>,
+    // On unless `--no-hardened`/`LLMMAN_NO_HARDENED`: passed to every
+    // container spawn (see `container::hardened_args`); nothing under
+    // `bin`/`path`.
+    hardened: bool,
     // See max_queue_from_env's doc comment; enforced by try_admit.
     max_queue: usize,
     // See max_loaded_models_from_env's doc comment.
@@ -2510,6 +2536,7 @@ async fn resolve_target(
             // full precedence chain this `.or` implements.
             threads: opts.threads.or(state.0.threads),
             cpus: state.0.cpu_limit,
+            hardened: state.0.hardened,
             extra_args: &llama_extra_args,
         };
         // Every piped child gets an output tail for crash reasons; only
@@ -2559,6 +2586,7 @@ async fn resolve_target(
                             state.0.llama_cpp_version.as_deref(),
                             port,
                             state.0.cpu_limit,
+                            state.0.hardened,
                         )?;
                         stderr_tail = Some(tail_child_output(&mut child));
                         ModelProcess::Container(ociman, Engine::Speech, child)
@@ -2605,6 +2633,7 @@ async fn resolve_target(
                     state.0.llama_cpp_version.as_deref(),
                     port,
                     state.0.cpu_limit,
+                    state.0.hardened,
                 )?;
                 stderr_tail = Some(tail_child_output(&mut child));
                 oom_retryable = true;
@@ -2643,6 +2672,7 @@ async fn resolve_target(
                     state.0.vllm_image.as_deref(),
                     port,
                     state.0.cpu_limit,
+                    state.0.hardened,
                     |model_dir, host| {
                         if sglang {
                             sglang_serve_args_from_env(
@@ -2678,6 +2708,7 @@ async fn resolve_target(
                     None,
                     port,
                     state.0.cpu_limit,
+                    state.0.hardened,
                     |model_dir, host| {
                         vllm_omni_serve_args_from_env(model_dir, host, port, model_ref)
                     },
@@ -2719,6 +2750,34 @@ async fn resolve_target(
             Err(e) => {
                 let looks_oom = oom_retryable && looks_like_oom(&e.to_string());
                 if !looks_oom {
+                    // A container that only fails hardened (a store
+                    // written with umask 077 behind `--cap-drop all`)
+                    // must name the flags and `--no-hardened`, or the
+                    // crash reads as the engine's own.
+                    if let (true, ModelProcess::Container(ociman, engine, _)) =
+                        (state.0.hardened, &process)
+                    {
+                        use crate::container::HardenedSpawn;
+                        let spawn = match engine {
+                            Engine::Vllm | Engine::VllmOmni => HardenedSpawn::Vllm,
+                            Engine::Sglang => HardenedSpawn::Sglang,
+                            Engine::Speech => HardenedSpawn::Speech,
+                            _ => HardenedSpawn::LlamaServer,
+                        };
+                        // The directory each spawn mounted and resolved
+                        // its `--user` against: the GGUF's parent for
+                        // llama-server, the extracted model directory
+                        // for an engine, the store for a mediagen worker.
+                        let mounted: &std::path::Path = match &model_path {
+                            ModelPath::Gguf(path, _) if spawn != HardenedSpawn::Speech => {
+                                path.parent().unwrap_or(&state.0.store_path)
+                            }
+                            ModelPath::SafeTensors(dir) | ModelPath::Omni(dir) => dir,
+                            ModelPath::Gguf(..) | ModelPath::Diffusion(_) => &state.0.store_path,
+                        };
+                        let note = crate::container::spawn_hardened_note(spawn, *ociman, mounted);
+                        return Err(anyhow!("{e:#}; {note}").into());
+                    }
                     return Err(e.into());
                 }
                 // See ModelProcess::stop_and_wait's own doc comment.
@@ -4396,6 +4455,9 @@ impl ServeArgs {
     /// The child is an ordinary foreground `serve`, never another `--detach`.
     fn detached_child_args(&self) -> Vec<&str> {
         let mut args = vec!["--runtime", self.runtime.as_str()];
+        if self.no_hardened {
+            args.push("--no-hardened");
+        }
         for (flag, value) in [
             ("--llama-cpp-version", self.llama_cpp_version.as_deref()),
             ("--vllm-version", self.vllm_version.as_deref()),
@@ -4887,9 +4949,13 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // `--pull-only` is this step alone. A failure is fatal only there:
     // otherwise the daemon starts and the first load that needs llama.cpp
     // retries (runtime::Lazy).
+    let hardened = hardened_from(
+        _args.no_hardened,
+        std::env::var("LLMMAN_NO_HARDENED").ok().as_deref(),
+    );
     let resolved = {
         let pin = llama_cpp_version.clone();
-        tokio::task::spawn_blocking(move || runtime::resolve(requested, pin.as_deref()))
+        tokio::task::spawn_blocking(move || runtime::resolve(requested, pin.as_deref(), hardened))
             .await
             .context("resolve runtime task panicked")?
     };
@@ -4904,7 +4970,12 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             None
         }
     };
-    let runtime = runtime::Lazy::new(requested, llama_cpp_version.clone(), resolved.clone());
+    let runtime = runtime::Lazy::new(
+        requested,
+        llama_cpp_version.clone(),
+        hardened,
+        resolved.clone(),
+    );
 
     // Likewise uv and mlx-lm, with the same failure policy.
     if let Some(fallback) = installs_mlx {
@@ -4934,7 +5005,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             PullOnlyStep::ResolveCpuOnly => {
                 let pin = llama_cpp_version.clone();
                 tokio::task::spawn_blocking(move || {
-                    runtime::resolve_for(Workload::CpuOnly, requested, pin.as_deref())
+                    runtime::resolve_for(Workload::CpuOnly, requested, pin.as_deref(), hardened)
                 })
                 .await
                 .context("resolve runtime task panicked")??;
@@ -5013,6 +5084,25 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     }
     if let (Some(n), Some(_)) = (cpu_limit, runtime.known().and_then(|r| r.ociman())) {
         eprintln!("[llmman] backend container gets --cpus {n} (this daemon's own CPU limit)");
+    }
+    // Reported against the resolved runtime: `auto` may have settled on
+    // `bin`/`path`, where there is no container to harden, so a
+    // `--no-hardened` there is noise worth a warning while the default
+    // needs none.
+    if let Some(resolved) = runtime.known() {
+        match (resolved.ociman(), hardened) {
+            (Some(_), true) => eprintln!(
+                "[llmman] backend containers run hardened (read-only rootfs except behind --gpus, all capabilities dropped, no new privileges)"
+            ),
+            (Some(_), false) => eprintln!(
+                "[llmman] warning: backend containers run without the hardened flags (--no-hardened)"
+            ),
+            (None, true) => {}
+            (None, false) => eprintln!(
+                "[llmman] warning: --no-hardened has no effect under --runtime {}: the engine runs on the host, not in a container",
+                resolved.runtime().as_str()
+            ),
+        }
     }
 
     // Logged at startup so a typo is reported before the first request.
@@ -5107,6 +5197,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         num_parallel: num_parallel_from_env(),
         threads,
         cpu_limit,
+        hardened,
         max_queue: max_queue_from_env(),
         max_loaded_models: max_loaded_models_from_env(),
         peers,

@@ -128,7 +128,7 @@ pub fn env_flag_set(name: &str) -> bool {
     parse_env_flag(std::env::var(name).ok().as_deref())
 }
 
-fn parse_env_flag(value: Option<&str>) -> bool {
+pub(crate) fn parse_env_flag(value: Option<&str>) -> bool {
     let Some(v) = value else { return false };
     let v = v.trim();
     if v.is_empty() {
