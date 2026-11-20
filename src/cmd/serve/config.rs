@@ -885,4 +885,17 @@ mod tests {
             assert!(!looks_like_oom(msg), "unexpected OOM match for {msg:?}");
         }
     }
+
+    #[test]
+    fn looks_like_oom_does_not_flag_a_described_exit_status() {
+        // The OOM retry greps the load error, which carries these.
+        let codes = crate::exit_status::NTSTATUS
+            .iter()
+            .map(|&(code, ..)| code as i32)
+            .chain([126, 127]);
+        for code in codes {
+            let text = crate::exit_status::describe_code(code);
+            assert!(!looks_like_oom(&text), "{text:?} reads as OOM");
+        }
+    }
 }

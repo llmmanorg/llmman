@@ -1143,11 +1143,21 @@ pub(super) async fn wait_for_ready(
                 let lines = t.lock().ok()?;
                 (!lines.is_empty()).then(|| lines.iter().cloned().collect::<Vec<_>>().join(" | "))
             });
+            let status = process
+                .exit_status()
+                .map(|s| crate::exit_status::describe(&s));
+            // Logged too: a client of the daemon only sees the error.
+            if let Some(status) = &status {
+                eprintln!("[llmman] inference server on port {port} exited: {status}");
+            }
+            let status = status.map(|s| format!(" ({s})")).unwrap_or_default();
             return Err(match detail {
                 Some(detail) => anyhow!(
-                    "inference server on port {port} exited before becoming ready: {detail}"
+                    "inference server on port {port} exited before becoming ready{status}: {detail}"
                 ),
-                None => anyhow!("inference server on port {port} exited before becoming ready"),
+                None => {
+                    anyhow!("inference server on port {port} exited before becoming ready{status}")
+                }
             });
         }
         // Bound the request by HEALTH_TIMEOUT, not the full remaining
@@ -1299,6 +1309,28 @@ mod tests {
                 None => std::env::remove_var(self.var),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn wait_for_ready_reports_the_exit_status_of_a_child_that_died() {
+        let (shell, flag) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+        let child = tokio::process::Command::new(shell)
+            .args([flag, "exit 3"])
+            .spawn()
+            .unwrap();
+        let mut process = ModelProcess::Local(Engine::LlamaServer, child, None);
+        let err = wait_for_ready(&Client::new(), 1, &mut process, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "inference server on port 1 exited before becoming ready (exit code 3)"
+        );
     }
 
     #[test]

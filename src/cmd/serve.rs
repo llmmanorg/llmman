@@ -658,11 +658,19 @@ impl ModelProcess {
     /// `Ok(None)` (still running) is the overwhelmingly common case this
     /// needs to stay cheap for.
     fn is_alive(&mut self) -> bool {
-        let child = match self {
-            ModelProcess::Local(_, child, _) => child,
-            ModelProcess::Container(_, _, child) => child,
-        };
-        matches!(child.try_wait(), Ok(None))
+        matches!(self.child_mut().try_wait(), Ok(None))
+    }
+
+    /// How the child exited, if it has. tokio caches the status, so this
+    /// still works after [`Self::is_alive`] has reaped it.
+    fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child_mut().try_wait().ok().flatten()
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        match self {
+            ModelProcess::Local(_, child, _) | ModelProcess::Container(_, _, child) => child,
+        }
     }
 
     /// Stops this process and waits for it to actually exit, unlike this
@@ -690,11 +698,7 @@ impl ModelProcess {
         // `Child::kill` sends SIGKILL and awaits the exit itself — after
         // an already-successful graceful stop above, this is a no-op
         // beyond confirming the process is actually gone.
-        let child = match self {
-            ModelProcess::Local(_, child, _) => child,
-            ModelProcess::Container(_, _, child) => child,
-        };
-        let _ = child.kill().await;
+        let _ = self.child_mut().kill().await;
     }
 }
 
