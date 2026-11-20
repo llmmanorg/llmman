@@ -8329,6 +8329,66 @@ async fn a_speech_worker_gets_the_transcription_as_sent() {
     }
 }
 
+/// A loaded Canary model's realtime target is its worker: the relay dials
+/// the worker's port and the `session.created` frame the worker sends
+/// reaches the client with the model as the client named it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_speech_workers_realtime_session_is_relayed_from_its_port() {
+    use axum::extract::ws::{Message as AxumMessage, WebSocketUpgrade};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let app = Router::new()
+        .route("/props", get(|| async { Json(serde_json::json!({})) }))
+        .route(
+            "/v1/realtime",
+            get(|ws: WebSocketUpgrade| async move {
+                ws.on_upgrade(|mut socket| async move {
+                    let created = serde_json::json!({
+                        "type": "session.created",
+                        "session": { "model": "/models/canary.gguf" },
+                    });
+                    socket
+                        .send(AxumMessage::Text(created.to_string()))
+                        .await
+                        .unwrap();
+                })
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let state = test_state();
+    mark_loaded(&state, "canary", Engine::Speech, port).await;
+    let base = serve_router(state).await;
+    let ws_url = format!(
+        "{}/v1/realtime?model=canary",
+        base.replace("http://", "ws://")
+    );
+    let request = ws_url.into_client_request().unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+    let deadline = tokio::time::sleep(Duration::from_secs(30));
+    tokio::pin!(deadline);
+    let created = loop {
+        tokio::select! {
+            _ = &mut deadline => panic!("no session.created from the worker"),
+            frame = ws.next() => match frame {
+                Some(Ok(WsMessage::Text(text))) => {
+                    break serde_json::from_str::<serde_json::Value>(&text).unwrap();
+                }
+                Some(Ok(WsMessage::Close(frame))) => panic!("closed before session.created: {frame:?}"),
+                Some(Ok(_)) => {}
+                Some(Err(e)) => panic!("socket error: {e}"),
+                None => panic!("socket ended before session.created"),
+            }
+        }
+    };
+    assert_eq!(created["type"], "session.created");
+    assert_eq!(created["session"]["model"], "canary");
+}
+
 /// The worker's reply is the client's, status and body alike: a 415 for
 /// audio it cannot read is not turned into a 500 (llmmanorg/llmman#687).
 #[tokio::test(flavor = "multi_thread")]

@@ -208,6 +208,22 @@ unread, but for the `model` of a `session.*` event, which is the one the request
 named. Only a model served here or by a peer has the route. A page on an origin
 `LLMMAN_ORIGINS` does not allow is refused, here and on `/tts` and transcription.
 
+A Canary speech model answers `/v1/realtime` itself with a transcription
+session: `session.created` first, then `session.update` (`audio.input.format.rate`,
+`audio.input.format.type`, `audio/pcm` when present, and
+`audio.input.transcription.language`, `en` when empty), `input_audio_buffer.append`,
+`input_audio_buffer.commit` and `input_audio_buffer.clear` from the client,
+answered by `session.updated`, `input_audio_buffer.committed`,
+`conversation.item.input_audio_transcription.completed`,
+`input_audio_buffer.cleared` and `error`. Audio is base64 PCM16 at 16000 Hz,
+the only rate accepted; a session buffers at most 30 s before a commit, and a
+worker holds at most four sessions open, a fifth gets an error event and is
+closed. A session with no client event for 60 s is closed the same way, and
+pings do not count; a session whose commit is still running is not closed as
+idle until the commit finishes, and the 60 s start over from its reply. A
+session whose client stops reading is dropped once a server event waits 10 s to
+be written.
+
 `/v1/systemone` answers typed questions about a `state` with a decision model
 (a GGUF with a `<arch>.decision.type`, such as Clef), with a probability for
 each answer; `llmman run MODEL --ask ...` is its client. It is
