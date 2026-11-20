@@ -422,7 +422,11 @@ async fn remote_responses_falls_back_only_on_a_missing_or_broken_route() {
             model: "mock-model".into(),
             max_output: None,
             cost: None,
-            api_key: Some("sk-test".into()),
+            credential: Some(crate::credentials::Resolved::from_key(
+                "sk-test".into(),
+                "test",
+            )),
+            auth: Default::default(),
             session: None,
         }));
         let (status, headers, body) = call_remote_responses_target(target, true).await;
@@ -728,7 +732,11 @@ async fn max_tokens_is_clamped_to_the_catalogs_ceiling_for_an_anthropic_provider
         model: "mock-model".into(),
         max_output: Some(64_000),
         cost: None,
-        api_key: Some("sk-test".into()),
+        credential: Some(crate::credentials::Resolved::from_key(
+            "sk-test".into(),
+            "test",
+        )),
+        auth: Default::default(),
         session: None,
     }));
     let send = |target: &Target, req: serde_json::Value| {
@@ -772,7 +780,11 @@ async fn a_thinking_level_reaches_each_claude_in_its_own_form() {
             model: model.into(),
             max_output: Some(64_000),
             cost: None,
-            api_key: Some("sk-test".into()),
+            credential: Some(crate::credentials::Resolved::from_key(
+                "sk-test".into(),
+                "test",
+            )),
+            auth: Default::default(),
             session: None,
         }));
         let req = serde_json::json!({
@@ -909,7 +921,8 @@ fn remote(provider: &str, model: &str, wire: Wire) -> RemoteTarget {
         model: model.into(),
         max_output: None,
         cost: None,
-        api_key: Some("k".into()),
+        credential: Some(crate::credentials::Resolved::from_key("k".into(), "test")),
+        auth: Default::default(),
         session: None,
     }
 }
@@ -1817,7 +1830,8 @@ async fn a_local_refusal_is_retried_on_the_hosted_half_unless_pinned() {
                     model: "claude".into(),
                     max_output: None,
                     cost: None,
-                    api_key: Some("k".into()),
+                    credential: Some(crate::credentials::Resolved::from_key("k".into(), "test")),
+                    auth: Default::default(),
                     session: None,
                 }))
             } else {
@@ -2168,7 +2182,8 @@ fn a_keyless_remote_target_sends_no_credential_header() {
             model: "m".into(),
             max_output: None,
             cost: None,
-            api_key: None,
+            credential: None,
+            auth: Default::default(),
             session: None,
         }))
     };
@@ -6185,7 +6200,8 @@ async fn the_usage_ledger_prices_a_provider_reply_and_skips_the_rest() {
             model: "anthropic/claude-sonnet-4".into(),
             max_output: None,
             cost: Some(cost),
-            api_key: None,
+            credential: None,
+            auth: Default::default(),
             session: None,
         }));
         usage::note_target(

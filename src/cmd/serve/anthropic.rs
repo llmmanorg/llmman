@@ -1290,11 +1290,38 @@ pub(super) async fn relay_anthropic_messages(
             passthrough.insert(name, value.clone());
         }
     }
+    // The credential's own betas (a subscription login's OAuth one) are
+    // required for it to authenticate: the caller's list adds to them.
+    if let (Some(caller), Target::Remote(remote)) = (headers.get("anthropic-beta"), target) {
+        let required: Vec<&str> = remote
+            .credential
+            .iter()
+            .flat_map(|c| &c.headers)
+            .filter(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        if !required.is_empty() {
+            let mut merged = caller.to_str().unwrap_or_default().trim().to_string();
+            for beta in required.iter().flat_map(|v| v.split(',')).map(str::trim) {
+                if !merged.split(',').any(|b| b.trim() == beta) {
+                    if !merged.is_empty() {
+                        merged.push(',');
+                    }
+                    merged.push_str(beta);
+                }
+            }
+            if let Ok(value) = merged.parse() {
+                passthrough.insert("anthropic-beta", value);
+            }
+        }
+    }
     let resp = target
-        .authorize(client.post(target.url(MESSAGES_ROUTE)))
-        .headers(passthrough)
-        .json(&body)
-        .send()
+        .send(
+            target
+                .authorize(client.post(target.url(MESSAGES_ROUTE)))
+                .headers(passthrough)
+                .json(&body),
+        )
         .await
         .with_context(|| format!("proxy request to {}", target.describe()))?;
     if streaming {

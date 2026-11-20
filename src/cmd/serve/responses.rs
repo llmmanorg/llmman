@@ -1170,8 +1170,8 @@ pub(super) async fn remote_responses(
         if let Some(ct) = headers.get("content-type") {
             native = native.header("content-type", ct);
         }
-        let resp = native
-            .send()
+        let resp = target
+            .send(native)
             .await
             .with_context(|| format!("proxy request to {}", target.describe()))?;
         let status = resp.status();

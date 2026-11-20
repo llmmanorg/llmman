@@ -1789,7 +1789,25 @@ pub struct ProviderSummary {
     /// `Provider::key_optional`); absent from an older daemon means no.
     #[serde(default)]
     pub key_optional: bool,
+    /// What the daemon would spend, from `credential` in
+    /// `GET /llmman/providers`; absent when it holds none, and from an
+    /// older daemon.
+    #[serde(default)]
+    pub credential: Option<CredentialStatus>,
     pub models: usize,
+}
+
+/// Wire shape of `credential` in `GET /llmman/providers` — see
+/// `crate::credentials::Status`. Never a secret.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CredentialStatus {
+    /// `env`, `config`, `api_key`, `oauth`, `token`, `command`, `file` or
+    /// `cli_login`.
+    pub kind: String,
+    /// `ready`, `refresh` or `expired`.
+    pub state: String,
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

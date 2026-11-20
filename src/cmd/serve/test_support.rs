@@ -19,7 +19,11 @@ pub(super) fn remote_target_on(base_url: &str, wire: Wire) -> Target {
         model: "mock-model".into(),
         max_output: None,
         cost: None,
-        api_key: Some("sk-test".into()),
+        credential: Some(crate::credentials::Resolved::from_key(
+            "sk-test".into(),
+            "test",
+        )),
+        auth: Default::default(),
         session: None,
     }))
 }

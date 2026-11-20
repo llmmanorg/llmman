@@ -236,7 +236,10 @@ which is models.dev's naming rather than llmman's.
 
 The environment wins where both have a key, as it does for `aws` and
 `gh`: the file is the standing answer and an `export` is the deliberate,
-this-session-only override. An id that is not a bare TOML key must be
+this-session-only override. A login stored by `llmman login --provider`
+(see [providers.md](providers.md#logging-in)) sits between them: it
+outranks the file, so `llmman logout --provider <id>` is what makes the
+file's key apply again. An id that is not a bare TOML key must be
 quoted — `[providers."wafer.ai"]` — since `[providers.wafer.ai]` is two
 nested tables. Setting `api_key = ""` blanks out a key `/etc` supplied.
 
@@ -252,6 +255,97 @@ travels per request in an `Authorization` header. A key found by
 `llmman serve` is the fallback for a request that presents none, and is
 only spent for a daemon bound to loopback. `llmman providers` reports
 which of the two has a usable key.
+
+### Provider auth, headers and per-account URLs
+
+Any `[providers.<id>]` — a catalog provider's or one you define — may say
+how its credential is attached and where else it can come from:
+
+```toml
+[providers.azure]
+auth_header = "api-key"                  # `auth` = bearer | x-api-key | header | query
+vars        = { AZURE_RESOURCE_NAME = "my-resource" }
+query       = { api-version = "v1" }
+headers     = { X-Team = "ml" }
+
+[providers.groq]
+api_key_command = "pass show groq"       # or: api_key_file = "~/.secrets/groq"
+```
+
+| Field | Meaning |
+|-------|---------|
+| `auth` | `bearer`, `x-api-key`, `header` or `query`. Absent: the wire's own (`bearer` for `openai`, `x-api-key` for `anthropic`) — what llmman has always sent. |
+| `auth_header` / `auth_query` | The header's or parameter's name. Either alone implies `auth`; with `bearer` or `x-api-key` they are a contradiction and rejected. |
+| `headers` | Extra request headers. `Host`, `Content-Length` and other framing headers are rejected, and values are never printed. Held to the standard of a key: ignored in a group- or world-readable file, and sent only where the daemon's own key may go. |
+| `query` | Extra query parameters, held to the same standard as `headers`. |
+| `vars` | Values for `${VAR}` in a catalog provider's base URL (the environment wins). A value that does not fit where it lands is not used. |
+| `api_key_command` | A shell command whose first line of output is the key, run when needed and cached for five minutes. |
+| `api_key_file` | A file whose first line is the key; it must be owner-only. |
+
+Tables merge field by field across files, later winning; `headers`,
+`query` and `vars` merge by name. The credential-chain tables below merge as
+described there. A file with an `api_key_command` or
+`api_key_file` is held to the standard of a file with a key: on Unix a
+group- or world-readable one is ignored for these with a warning, since a
+command anyone can write is a command anyone can choose, and
+`llmman config set` makes the file owner-only. The order of credentials
+is: the provider's environment variable, a stored login, `api_key`, then
+`api_key_command` / `api_key_file`.
+
+Unlike `wire`, `api_key_env` and `name`, these may be set without a
+`base_url`: they adjust the catalog provider, they do not define one.
+
+### Cloud credential chains
+
+A provider with no key can stand behind a chain: one of the tables below,
+at most one per provider. They are how a provider models.dev does not list
+gets one, and how a built-in one (`amazon-bedrock`, `google-vertex`,
+`azure`, `databricks`, `watsonx`, `sap-ai-core`) is told which profile,
+file, tenant or token endpoint to use. A chain is the *last* credential a
+request looks for — after the provider's variable, a stored login, `api_key`
+and `api_key_command` / `api_key_file` — and writing its table says "try
+it" even where nothing on the machine hints that it will work. See
+[providers.md](providers.md#cloud-credentials) for what each does.
+
+```toml
+[providers.amazon-bedrock]
+aws = { profile = "work", region = "us-west-2" }     # service = "bedrock" is the default
+
+[providers.google-vertex]
+gcp = { project = "my-project", location = "us-central1", credentials_file = "~/keys/vertex.json" }
+
+[providers.azure]
+azure = { tenant_id = "...", client_id = "...", client_secret_env = "AZURE_CLIENT_SECRET" }
+
+[providers.my-gateway]
+base_url = "https://gateway.example/v1"
+oauth2   = { token_url = "https://idp.example/oauth/token", client_id = "llmman",
+             client_secret_file = "~/.secrets/gw", scope = "inference", client_auth = "basic" }
+```
+
+| Table | Fields |
+|-------|--------|
+| `aws` | `profile` (that profile alone, instead of the chain), `region`, `service` (the SigV4 signing name; `bedrock`, or `bedrock-mantle` for the Mantle endpoint). |
+| `gcp` | `credentials_file` (a service-account or `authorized_user` file), `project`, `location`. |
+| `azure` | `tenant_id`, `client_id`, one of `client_secret` / `client_secret_env` / `client_secret_file`, `federated_token_file`, `managed_identity` (bool), `cli` (bool), `scope` (default `https://cognitiveservices.azure.com/.default`), `authority_host`. |
+| `oauth2` | OAuth 2.0 client credentials: `token_url` (https; may hold `${VAR}`), `client_id` / `client_id_env`, one of `client_secret` / `client_secret_env` / `client_secret_file`, `client_auth` (`body` or `basic`), `scope`, `audience`, `resource`, `params` (extra form fields). |
+| `jwt_bearer` | RFC 7523: `token_url`, `issuer` (or `client_id`), `subject`, `audience` (the assertion's `aud`; the token URL if unset), `scope`, `key_file` (a PEM private key, owner-only), `key_id`, `algorithm` (`RS256` or `ES256`), `lifetime_secs`. |
+| `ibm_iam` | IBM Cloud IAM (watsonx): `client_secret` / `_env` / `_file` for the IBM Cloud API key, `token_url` (default `https://iam.cloud.ibm.com/identity/token`). |
+
+Across files a later table of the same kind overlays the earlier field by
+field (the secret's three spellings replace each other as a group); a table
+of another kind replaces it. A secret written in a table is held to the
+standard of an `api_key`: the file must be owner-only.
+
+### Stored logins
+
+`llmman login --provider` keeps credentials in
+`~/.config/llmman/credentials.json`, not in `llmman.conf` — it is rewritten
+on every token refresh, which a file people edit by hand should not be. The
+same rule applies as for a key: on Unix it must be `0600` or it is ignored
+with a warning. A login for a cloud chain stores the selection (a profile, a
+file's path, a tenant and client secret) and never a token. See
+[providers.md](providers.md#where-logins-are-kept).
 
 ### Your own provider endpoints
 
