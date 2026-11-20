@@ -87,6 +87,10 @@ struct Rule {
     /// Glob over the signature's claimed repository; `None` keeps the
     /// shim's exact equality with the pulled repository.
     claims: Option<String>,
+    /// Keyless: the OIDC issuer the signing certificate must name.
+    issuer: Option<String>,
+    /// Keyless: the SAN the signing certificate must carry.
+    subject: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +114,10 @@ pub struct Policy {
     forced_layers_mode: Option<Mode>,
     /// Ascending precedence: the *last* matching rule wins.
     rules: Vec<Rule>,
+    /// `trusted_root`: the Sigstore TrustedRoot keyless rules are
+    /// checked against, already resolved against its file's directory.
+    /// Optional for the same "later files win" reason as `default_mode`.
+    trusted_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +125,33 @@ pub struct Decision {
     pub mode: Mode,
     pub keys: Vec<PathBuf>,
     pub claims: Option<String>,
+    /// Keyless identity, exclusive with `keys`: a rule names one or the
+    /// other.
+    pub issuer: Option<String>,
+    pub subject: Option<String>,
+    /// Policy-wide, copied into every decision so the verifier has it
+    /// next to the identity it applies to.
+    pub trusted_root: Option<PathBuf>,
+}
+
+impl Decision {
+    /// A keyless rule: at least one of `issuer` and `subject` is set.
+    pub fn has_identity(&self) -> bool {
+        self.issuer.is_some() || self.subject.is_some()
+    }
+
+    /// The keyless rule as the shim reads it, or `None` for a key-only
+    /// decision.
+    pub fn identity(&self) -> Option<crate::ffi::Identity> {
+        self.has_identity().then(|| crate::ffi::Identity {
+            issuer: self.issuer.clone(),
+            subject: self.subject.clone(),
+            trusted_root: self
+                .trusted_root
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        })
+    }
 }
 
 impl Policy {
@@ -141,6 +176,7 @@ impl Policy {
             if let Some(claims) = &entry.claims {
                 validate_pattern("claims", claims)?;
             }
+            validate_identity(entry)?;
             let mode = match entry.mode.as_deref() {
                 Some(s) => Mode::parse(s)
                     .with_context(|| format!("[[verify.trust]] pattern {:?}", entry.pattern))?,
@@ -157,6 +193,8 @@ impl Policy {
                     .collect(),
                 mode,
                 claims: entry.claims.clone(),
+                issuer: entry.issuer.clone(),
+                subject: entry.subject.clone(),
             });
         }
         Ok(Policy {
@@ -165,6 +203,10 @@ impl Policy {
             layers_mode,
             forced_layers_mode: None,
             rules,
+            trusted_root: conf
+                .trusted_root
+                .as_deref()
+                .map(|raw| resolve_key_path(raw, dir)),
         })
     }
 
@@ -193,11 +235,17 @@ impl Policy {
                 mode: rule.mode,
                 keys: rule.keys.clone(),
                 claims: rule.claims.clone(),
+                issuer: rule.issuer.clone(),
+                subject: rule.subject.clone(),
+                trusted_root: self.trusted_root.clone(),
             },
             None => Decision {
                 mode: self.default_mode.unwrap_or_default(),
                 keys: Vec::new(),
                 claims: None,
+                issuer: None,
+                subject: None,
+                trusted_root: self.trusted_root.clone(),
             },
         };
         if let Some(forced) = self.forced_mode {
@@ -207,7 +255,7 @@ impl Policy {
     }
 
     /// Fold a later (higher-priority) file into this one: its explicit
-    /// `default` and `layers` win, its rules append after ours so they
+    /// `default`, `layers` and `trusted_root` win, its rules append after ours so they
     /// take precedence in [`Policy::decide`]. The environment overrides
     /// are not file state and are left untouched.
     fn merge(&mut self, later: Policy) {
@@ -216,6 +264,9 @@ impl Policy {
         }
         if let Some(mode) = later.layers_mode {
             self.layers_mode = Some(mode);
+        }
+        if let Some(root) = later.trusted_root {
+            self.trusted_root = Some(root);
         }
         self.rules.extend(later.rules);
     }
@@ -288,6 +339,41 @@ fn validate_pattern(field: &str, pattern: &str) -> anyhow::Result<()> {
         bail!(
             "[[verify.trust]] {field} {pattern:?} contains a tag; globs match the \
              repository only"
+        );
+    }
+    Ok(())
+}
+
+/// A rule trusts either public keys or a keyless identity (`issuer`,
+/// `subject`), never both: the two are checked by different machinery
+/// and a rule naming both would leave open whether one match suffices
+/// or both are required. Refused at load, like an unknown `mode`, so
+/// the author learns of it before a pull is let through.
+fn validate_identity(entry: &crate::config::TrustConf) -> anyhow::Result<()> {
+    let has_identity = entry.issuer.is_some() || entry.subject.is_some();
+    if has_identity && !entry.keys.is_empty() {
+        bail!(
+            "[[verify.trust]] pattern {:?} sets both `keys` and an identity (`issuer` or \
+             `subject`); a rule trusts one or the other",
+            entry.pattern
+        );
+    }
+    for (field, value) in [("issuer", &entry.issuer), ("subject", &entry.subject)] {
+        if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+            bail!(
+                "[[verify.trust]] pattern {:?} has an empty `{field}`",
+                entry.pattern
+            );
+        }
+    }
+    // One half alone is too wide: an issuer without a subject accepts
+    // every identity that issuer signs for, a subject without an issuer
+    // accepts the same name from any issuer.
+    if has_identity && (entry.issuer.is_none() || entry.subject.is_none()) {
+        bail!(
+            "[[verify.trust]] pattern {:?} names an identity: both `issuer` and `subject` \
+             are required",
+            entry.pattern
         );
     }
     Ok(())
@@ -586,13 +672,30 @@ fn check_with(
     if decision.mode == Mode::Off {
         return Ok(Verdict::new(Outcome::Skipped, decision.mode));
     }
-    if decision.keys.is_empty() {
+    if decision.keys.is_empty() && !decision.has_identity() {
         // `LLMMAN_VERIFY=warn|enforce` with no policy file, or a rule
         // naming no keys. Nothing to check against.
         let msg = format!(
             "verification is set to {} for {reference}, but no trusted public keys are configured for it \
              (add a [[verify.trust]] rule with `keys` to llmman.conf)",
             decision.mode
+        );
+        if decision.mode == Mode::Enforce {
+            return Err(anyhow!(Indeterminate(anyhow!(msg))));
+        }
+        return Ok(Verdict::with(
+            Outcome::Unverified,
+            decision.mode,
+            format!("warning: {msg}"),
+        ));
+    }
+    if decision.has_identity() && decision.trusted_root.is_none() {
+        // A keyless rule with nothing to anchor the certificate chain or
+        // the log entry to. This is a broken configuration, not an
+        // unsigned model, so it is never reported as "not signed".
+        let msg = format!(
+            "cannot verify {reference}: the matching [[verify.trust]] rule names an identity \
+             but no `trusted_root` is configured under [verify]"
         );
         if decision.mode == Mode::Enforce {
             return Err(anyhow!(Indeterminate(anyhow!(msg))));
@@ -617,6 +720,7 @@ fn check_with(
         digest.unwrap_or(""),
         &keys,
         decision.claims.as_deref().unwrap_or(""),
+        decision.identity().as_ref(),
     ) {
         Ok(report) => report,
         // No answer could be reached (unreadable key, unreachable
@@ -635,7 +739,7 @@ fn check_with(
     };
 
     if report.verified {
-        let signers: Vec<&str> = report.matches.iter().map(|m| m.key_path.as_str()).collect();
+        let signers: Vec<&str> = report.matches.iter().map(|m| m.signer.as_str()).collect();
         let mut verdict = Verdict::with(
             Outcome::Verified,
             decision.mode,
@@ -1389,6 +1493,93 @@ mod tests {
     }
 
     #[test]
+    fn an_identity_rule_without_keys_is_valid_and_decide_carries_it() {
+        let p = policy(
+            "trusted_root = \"sigstore/root.json\"\n\
+             [[trust]]\npattern=\"ghcr.io/org/**\"\n\
+             issuer=\"https://token.actions.githubusercontent.com\"\n\
+             subject=\"https://github.com/org/models/.github/workflows/sign.yml@refs/heads/main\"\n",
+        );
+        let decision = p.decide("ghcr.io/org/model:v1");
+        assert!(decision.keys.is_empty());
+        assert!(decision.has_identity());
+        assert_eq!(
+            decision.issuer.as_deref(),
+            Some("https://token.actions.githubusercontent.com")
+        );
+        assert_eq!(
+            decision.subject.as_deref(),
+            Some("https://github.com/org/models/.github/workflows/sign.yml@refs/heads/main")
+        );
+        // Relative like `keys`, against the file's own directory.
+        assert_eq!(
+            decision.trusted_root.as_deref(),
+            Some(Path::new("/etc/llmman/sigstore/root.json"))
+        );
+        // The root is policy-wide: a reference no rule matches gets it too.
+        let outside = p.decide("quay.io/other/model:v1");
+        assert!(!outside.has_identity());
+        assert_eq!(
+            outside.trusted_root.as_deref(),
+            Some(Path::new("/etc/llmman/sigstore/root.json"))
+        );
+    }
+
+    /// One half alone is too wide: an issuer without a subject would
+    /// accept every identity that issuer signs for, and a subject
+    /// without an issuer the same name from any issuer.
+    #[test]
+    fn an_identity_needs_both_issuer_and_subject() {
+        for half in ["issuer=\"https://issuer\"", "subject=\"me@example.com\""] {
+            let err = Policy::parse(
+                &format!("[[trust]]\npattern=\"a/b\"\n{half}\n"),
+                Path::new("/x"),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("both `issuer` and `subject`"),
+                "{half}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn keys_and_an_identity_on_one_rule_is_a_config_error() {
+        for identity in ["issuer=\"https://issuer\"", "subject=\"me@example.com\""] {
+            let err = Policy::parse(
+                &format!("[[trust]]\npattern=\"a/b\"\nkeys=[\"k.pub\"]\n{identity}\n"),
+                Path::new("/x"),
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("both `keys` and an identity"), "{err:#}");
+            assert!(msg.contains("\"a/b\""), "{err:#}");
+        }
+        let err = Policy::parse(
+            "[[trust]]\npattern=\"a/b\"\nissuer=\" \"\n",
+            Path::new("/x"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("empty `issuer`"), "{err:#}");
+    }
+
+    #[test]
+    fn a_later_files_trusted_root_wins_and_a_silent_one_keeps_it() {
+        let mut merged = Policy::default();
+        merged.merge(Policy::parse("trusted_root = \"a.json\"", Path::new("/one")).unwrap());
+        merged.merge(Policy::parse("trusted_root = \"/abs/b.json\"", Path::new("/two")).unwrap());
+        assert_eq!(
+            merged.trusted_root.as_deref(),
+            Some(Path::new("/abs/b.json"))
+        );
+        merged.merge(Policy::parse("default = \"warn\"", Path::new("/three")).unwrap());
+        assert_eq!(
+            merged.trusted_root.as_deref(),
+            Some(Path::new("/abs/b.json"))
+        );
+    }
+
+    #[test]
     fn an_unknown_mode_is_rejected_rather_than_defaulted() {
         assert!(Policy::parse(
             "[[trust]]\npattern=\"a/b\"\nmode=\"enfroce\"\n",
@@ -1406,6 +1597,9 @@ mod tests {
             mode: Mode::Off,
             keys: vec![PathBuf::from("/k.pub")],
             claims: None,
+            issuer: None,
+            subject: None,
+            trusted_root: None,
         };
         let verdict = check_with("docker.io/org/model:v1", None, &decision).unwrap();
         assert_eq!(verdict.outcome, Outcome::Skipped);
@@ -1418,6 +1612,9 @@ mod tests {
             mode: Mode::Enforce,
             keys: vec![],
             claims: None,
+            issuer: None,
+            subject: None,
+            trusted_root: None,
         };
         let err = check_with("docker.io/org/model:v1", None, &decision).unwrap_err();
         assert!(
@@ -1432,12 +1629,38 @@ mod tests {
             mode: Mode::Warn,
             keys: vec![],
             claims: None,
+            issuer: None,
+            subject: None,
+            trusted_root: None,
         };
         let verdict = check_with("docker.io/org/model:v1", None, &decision).unwrap();
         assert_eq!(verdict.outcome, Outcome::Unverified);
         // `warn` must produce something the caller can actually show.
         assert_eq!(verdict.notices.len(), 1);
         assert!(verdict.notices[0].contains("no trusted public keys"));
+    }
+
+    #[test]
+    fn an_identity_without_a_trusted_root_is_indeterminate_not_unsigned() {
+        let mut decision = Decision {
+            mode: Mode::Enforce,
+            keys: vec![],
+            claims: None,
+            issuer: Some("https://issuer".into()),
+            subject: None,
+            trusted_root: None,
+        };
+        let err = check_with("docker.io/org/model:v1", None, &decision).unwrap_err();
+        assert!(is_indeterminate(&err), "{err:#}");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("trusted_root"), "{msg}");
+        assert!(!msg.contains("no trusted public keys"), "{msg}");
+        assert!(!msg.contains("not signed"), "{msg}");
+
+        decision.mode = Mode::Warn;
+        let verdict = check_with("docker.io/org/model:v1", None, &decision).unwrap();
+        assert_eq!(verdict.outcome, Outcome::Unverified);
+        assert!(verdict.notices[0].contains("trusted_root"));
     }
 
     // -- PullGuard -------------------------------------------------------

@@ -181,7 +181,7 @@ func TestSignAndVerifyRoundTripAgainstARealRegistry(t *testing.T) {
 	// Unsigned to begin with: a repository with no signature artifact is
 	// a well-formed "no" (report.Verified false), not an error. Callers
 	// need that distinction to tell "unsigned" from "registry down".
-	report, err := verifySignatures(ctx, ref, target, []string{pubPath}, "")
+	report, err := verifySignatures(ctx, ref, target, []string{pubPath}, nil, "")
 	if err != nil {
 		t.Fatalf("verify before signing: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestSignAndVerifyRoundTripAgainstARealRegistry(t *testing.T) {
 		t.Fatalf("sign: %v", err)
 	}
 
-	report, err = verifySignatures(ctx, ref, target, []string{pubPath}, "")
+	report, err = verifySignatures(ctx, ref, target, []string{pubPath}, nil, "")
 	if err != nil {
 		t.Fatalf("verify after signing: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestVerifyRejectsAStrangersKeyOverTheWire(t *testing.T) {
 		t.Fatalf("sign: %v", err)
 	}
 
-	report, err := verifySignatures(ctx, ref, target, []string{strangerPub}, "")
+	report, err := verifySignatures(ctx, ref, target, []string{strangerPub}, nil, "")
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestSigningTwiceAppendsRatherThanReplaces(t *testing.T) {
 	}
 
 	for _, key := range []string{pubA, pubB} {
-		report, err := verifySignatures(ctx, ref, target, []string{key}, "")
+		report, err := verifySignatures(ctx, ref, target, []string{key}, nil, "")
 		if err != nil {
 			t.Fatalf("verify with %s: %v", key, err)
 		}
@@ -294,7 +294,7 @@ func TestSigningIsIdempotent(t *testing.T) {
 			t.Fatalf("sign %d: %v", i, err)
 		}
 	}
-	report, err := verifySignatures(ctx, ref, target, []string{pubPath}, "")
+	report, err := verifySignatures(ctx, ref, target, []string{pubPath}, nil, "")
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -501,7 +501,7 @@ func TestSignRefusesToOverwriteASignatureItCouldNotRead(t *testing.T) {
 	failManifestReads.Store(false)
 
 	// A's signature is still there.
-	report, err := verifySignatures(ctx, ref, target, []string{pubA}, "")
+	report, err := verifySignatures(ctx, ref, target, []string{pubA}, nil, "")
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -554,7 +554,7 @@ func TestVerifyRejectsAnOversizedSignatureArtifact(t *testing.T) {
 
 	keys := t.TempDir()
 	_, pub := writeKeyPair(t, keys, "signer")
-	if _, err := verifySignatures(ctx, ref, target, []string{pub}, ""); err == nil {
+	if _, err := verifySignatures(ctx, ref, target, []string{pub}, nil, ""); err == nil {
 		t.Fatal("an oversized signature artifact was accepted for download")
 	}
 }
@@ -588,7 +588,7 @@ func TestConfirmationRequiresThisKeysOwnSignature(t *testing.T) {
 		t.Fatalf("load B: %v", err)
 	}
 
-	landedForA, err := verifyAgainst(ctx, ref, target, a, "")
+	landedForA, err := verifyAgainst(ctx, ref, target, verifyPolicy{keys: a}, "")
 	if err != nil {
 		t.Fatalf("verifyAgainst A: %v", err)
 	}
@@ -596,7 +596,7 @@ func TestConfirmationRequiresThisKeysOwnSignature(t *testing.T) {
 		t.Error("A's own signature did not confirm")
 	}
 
-	landedForB, err := verifyAgainst(ctx, ref, target, b, "")
+	landedForB, err := verifyAgainst(ctx, ref, target, verifyPolicy{keys: b}, "")
 	if err != nil {
 		t.Fatalf("verifyAgainst B: %v", err)
 	}
@@ -632,7 +632,7 @@ func TestSigningRecoversFromAnOverwrittenTag(t *testing.T) {
 		t.Fatalf("simulate B overwriting: %v", err)
 	}
 	for _, key := range []string{pubA, pubB} {
-		report, err := verifySignatures(ctx, ref, target, []string{key}, "")
+		report, err := verifySignatures(ctx, ref, target, []string{key}, nil, "")
 		if err != nil {
 			t.Fatalf("verify %s: %v", key, err)
 		}
@@ -646,7 +646,7 @@ func TestSigningRecoversFromAnOverwrittenTag(t *testing.T) {
 		t.Fatalf("re-sign with A: %v", err)
 	}
 	for _, key := range []string{pubA, pubB} {
-		report, err := verifySignatures(ctx, ref, target, []string{key}, "")
+		report, err := verifySignatures(ctx, ref, target, []string{key}, nil, "")
 		if err != nil {
 			t.Fatalf("verify %s: %v", key, err)
 		}
@@ -774,7 +774,7 @@ func TestSignDetectsAnEqualCountOverwriteBetweenPushAndConfirm(t *testing.T) {
 	// A reported success, so A's signature must actually be there. The
 	// count-based check returned success here with A's signature lost.
 	for _, key := range []string{pubA, pubB} {
-		report, err := verifySignatures(ctx, ref, target, []string{key}, "")
+		report, err := verifySignatures(ctx, ref, target, []string{key}, nil, "")
 		if err != nil {
 			t.Fatalf("verify %s: %v", key, err)
 		}
@@ -812,7 +812,7 @@ func TestVerifyReportsAFailingRegistryAsAnErrorNotAsUnsigned(t *testing.T) {
 	}
 
 	failManifestReads.Store(true)
-	report, err := verifySignatures(ctx, ref, target, []string{pub}, "")
+	report, err := verifySignatures(ctx, ref, target, []string{pub}, nil, "")
 	if err == nil {
 		t.Fatalf("a failing registry produced a report instead of an error: %+v", report)
 	}

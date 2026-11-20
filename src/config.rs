@@ -366,6 +366,11 @@ pub struct VerifyConf {
     /// `[[verify.trust]]` entries, in the order they appear.
     #[serde(default)]
     pub trust: Vec<TrustConf>,
+    /// Sigstore TrustedRoot JSON (Fulcio roots and Rekor log keys) that
+    /// keyless rules, those with `issuer` or `subject`, are checked
+    /// against. Relative to this file's directory, like `keys`.
+    #[serde(default)]
+    pub trusted_root: Option<String>,
 }
 
 /// One `[[verify.trust]]` entry.
@@ -381,6 +386,14 @@ pub struct TrustConf {
     /// equality with the pulled one. Same grammar as `pattern`.
     #[serde(default)]
     pub claims: Option<String>,
+    /// Keyless rule: the OIDC issuer the signing certificate must name.
+    /// Exclusive with `keys`.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// Keyless rule: the identity (a certificate SAN) that must have
+    /// signed. Exclusive with `keys`.
+    #[serde(default)]
+    pub subject: Option<String>,
 }
 
 impl Conf {
@@ -1290,12 +1303,19 @@ ps = "off""#,
 
             [verify]
             default = "warn"
+            trusted_root = "sigstore/trusted_root.json"
 
             [[verify.trust]]
             pattern = "docker.io/myorg/**"
             keys    = ["keys/myorg.pub"]
             mode    = "enforce"
             claims  = "docker.io/myorg/**"
+
+            [[verify.trust]]
+            pattern = "ghcr.io/myorg/**"
+            issuer  = "https://token.actions.githubusercontent.com"
+            subject = "https://github.com/myorg/models/.github/workflows/sign.yml@refs/heads/main"
+            mode    = "enforce"
 
             [aggregation]
             peers = "asahi,spark:17434"
@@ -1318,11 +1338,26 @@ ps = "off""#,
             Some("sk-or-abc")
         );
         assert_eq!(c.verify.default.as_deref(), Some("warn"));
-        assert_eq!(c.verify.trust.len(), 1);
+        assert_eq!(
+            c.verify.trusted_root.as_deref(),
+            Some("sigstore/trusted_root.json")
+        );
+        assert_eq!(c.verify.trust.len(), 2);
         assert_eq!(c.verify.trust[0].mode.as_deref(), Some("enforce"));
         assert_eq!(
             c.verify.trust[0].claims.as_deref(),
             Some("docker.io/myorg/**")
+        );
+        assert!(c.verify.trust[0].issuer.is_none());
+        assert!(c.verify.trust[0].subject.is_none());
+        assert!(c.verify.trust[1].keys.is_empty());
+        assert_eq!(
+            c.verify.trust[1].issuer.as_deref(),
+            Some("https://token.actions.githubusercontent.com")
+        );
+        assert_eq!(
+            c.verify.trust[1].subject.as_deref(),
+            Some("https://github.com/myorg/models/.github/workflows/sign.yml@refs/heads/main")
         );
     }
 
