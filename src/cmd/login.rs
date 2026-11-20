@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 
 use clap::Args;
 
-use crate::{ffi, hf, oauth};
+use crate::{ffi, hf, logins, oauth};
 
 #[derive(Args, Debug)]
 pub struct LoginArgs {
@@ -21,9 +21,46 @@ pub struct LoginArgs {
     #[arg(short, long)]
     pub password: Option<String>,
 
-    /// HuggingFace access token, prompted for if omitted (ignored for registry logins)
+    /// HuggingFace access token, prompted for if omitted (ignored for registry
+    /// logins). With --provider, the API key or token to store; prompted for
+    /// (not echoed) if omitted, which keeps it out of the process list.
     #[arg(short, long)]
     pub token: Option<String>,
+
+    /// Log in to a hosted provider (an id from `llmman providers`) instead of
+    /// a registry: a ChatGPT, GitHub Copilot or SuperGrok subscription,
+    /// OpenRouter, Poe, DigitalOcean, Chutes, GitLab, Snowflake or MiniMax in
+    /// the browser, a Claude token, a cloud's credentials (AWS, Google
+    /// Vertex, Azure, Databricks, SAP AI Core, watsonx), or a key for any
+    /// provider.
+    #[arg(long, value_name = "ID", conflicts_with_all = ["server", "username", "password"])]
+    pub provider: Option<String>,
+
+    /// How to log in to --provider: the provider's own (see `llmman login
+    /// --provider <id> --method ?`), or `key`, `command`, `token-file`.
+    #[arg(long, value_name = "METHOD", requires = "provider")]
+    pub method: Option<String>,
+
+    /// With `--method command`: the command whose output is the key.
+    #[arg(long, value_name = "COMMAND", requires = "provider")]
+    pub command: Option<String>,
+
+    /// With `--method token-file`: a file (owner-only) holding the key.
+    #[arg(long, value_name = "PATH", requires = "provider")]
+    pub file: Option<String>,
+
+    /// With `--method import-claude` or `import-codex`: move the other CLI's
+    /// login into llmman instead of reading its file on each request. Its
+    /// refresh token rotates when used, so that CLI may be logged out.
+    #[arg(long, requires = "provider")]
+    pub copy: bool,
+
+    /// With --provider: a setting the method needs besides a secret, as
+    /// `KEY=VALUE`, repeatable — `--param profile=work`, `--param
+    /// tenant_id=...`, `--param instance_url=https://gitlab.example.com`.
+    /// `--method ?` lists the methods; `docs/providers.md` lists the keys.
+    #[arg(long = "param", value_name = "KEY=VALUE", requires = "provider")]
+    pub params: Vec<String>,
 }
 
 /// Mirrors `docker login`'s own decision rule (`cli/command/registry/
@@ -34,6 +71,9 @@ pub struct LoginArgs {
 /// explicit request for the plain credential flow instead. Any other
 /// registry always goes straight to username/password, same as before.
 pub fn run(args: &LoginArgs) -> anyhow::Result<()> {
+    if let Some(provider) = &args.provider {
+        return run_provider(provider, args);
+    }
     let server = args
         .server
         .clone()
@@ -104,4 +144,61 @@ fn read_line_stdin() -> anyhow::Result<String> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+/// `llmman login --provider <id>`: see [`crate::logins`].
+fn run_provider(provider: &str, args: &LoginArgs) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !provider.is_empty() && !provider.contains('/'),
+        "{provider:?} is not a provider id"
+    );
+    if args.method.as_deref() == Some("?") {
+        println!("Login methods for {provider} (the first is the default):");
+        for m in logins::methods(provider) {
+            println!("  {:<14} {}", m.name, m.summary);
+        }
+        println!("Also, for a provider whose credential is minted at a token endpoint:");
+        for m in logins::ADVANCED {
+            println!("  {:<14} {}", m.name, m.summary);
+        }
+        return Ok(());
+    }
+    check_known(provider)?;
+    let mut params = Vec::new();
+    for pair in &args.params {
+        let (key, value) = pair
+            .split_once('=')
+            .filter(|(k, _)| !k.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("--param takes KEY=VALUE, not {pair:?}"))?;
+        params.push((key.trim().to_string(), value.trim().to_string()));
+    }
+    logins::login(
+        provider,
+        &logins::Options {
+            method: args.method.clone(),
+            token: args.token.clone(),
+            command: args.command.clone(),
+            file: args.file.clone(),
+            copy: args.copy,
+            params,
+        },
+    )
+}
+
+/// Refuses an id the catalog does not have, with its near-matches, so a
+/// typo does not store a login nothing will ever read. An unreachable
+/// catalog is not a reason to refuse: the id is taken on trust.
+fn check_known(provider: &str) -> anyhow::Result<()> {
+    match crate::providers::catalog() {
+        Ok(catalog) if catalog.get(provider).is_none() && logins::profile(provider).is_none() => {
+            Err(crate::providers::unknown_provider_error(provider, &catalog))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => {
+            eprintln!(
+                "[llmman] warning: could not check {provider:?} against the provider list ({e:#})"
+            );
+            Ok(())
+        }
+    }
 }

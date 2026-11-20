@@ -121,6 +121,16 @@ hf-xet = "=1.6.0"
 # latter alone, so there is exactly one TLS stack in the binary.
 aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+# SigV4 request signing for Bedrock (src/aws.rs) and the types the SDK's credential
+# chain hands back. Both are already compiled for the S3 source above.
+aws-sigv4  = "1"
+aws-credential-types = "1"
+aws-runtime = "1"
+aws-smithy-runtime-api = "1"
+aws-types  = "1"
+# RS256/ES256 signing of the JWTs that service-account and jwt-bearer logins
+# send (src/jwt.rs); rustls's own provider, so no new crypto stack.
+ring       = "0.17"
 
 [target.'cfg(windows)'.dependencies]
 same-file = "1"
@@ -136,6 +146,9 @@ fuzzing = []
 
 [dev-dependencies]
 tempfile = "3"
+# The AWS credential providers' scripted HTTP client in src/aws.rs tests.
+aws-smithy-async = "1"
+aws-smithy-types = "1"
 # Shared-listener and pinned-upstream TLS tests generate short-lived identities
 # instead of storing a private key in the repository.
 rcgen = "0.14"

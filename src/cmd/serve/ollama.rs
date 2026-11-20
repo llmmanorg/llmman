@@ -1839,13 +1839,14 @@ async fn post_embeddings(
     text: &str,
 ) -> Result<(Vec<f32>, u64), (StatusCode, String)> {
     let resp = target
-        .authorize(
-            client
-                .post(target.url("/v1/embeddings"))
-                .timeout(EMBEDDINGS_TIMEOUT)
-                .json(&serde_json::json!({ "model": wire_model, "input": text })),
+        .send(
+            target.authorize(
+                client
+                    .post(target.url("/v1/embeddings"))
+                    .timeout(EMBEDDINGS_TIMEOUT)
+                    .json(&serde_json::json!({ "model": wire_model, "input": text })),
+            ),
         )
-        .send()
         .await
         .map_err(|e| {
             (

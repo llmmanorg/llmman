@@ -258,6 +258,37 @@ no price), including `cache_read`/`cache_write`/`reasoning` where it publishes t
 `launch --provider` are all clients of it, so the catalog is fetched and
 cached in one process: the one that forwards the request upstream.
 
+Each provider also reports what credential the daemon would spend, and
+never the secret:
+
+```json
+{ "id": "openai-chatgpt", "name": "OpenAI (ChatGPT subscription)",
+  "base_url": "https://chatgpt.com/backend-api/codex", "wire": "openai",
+  "key_set": true, "key_usable": true, "key_optional": false,
+  "credential": { "kind": "oauth", "state": "ready", "expires_at_ms": 1790000000000 },
+  "auth": "default", "models": 21 }
+```
+
+`credential.kind` is `env` or `config` (a key in the daemon's environment
+or `llmman.conf`), `api_key`, `oauth`, `token`, `command`, `file` or
+`cli_login` (a stored [login](providers.md#logging-in)), or, for a
+[cloud credential chain](providers.md#cloud-credentials), `aws_sigv4`,
+`adc` (Google Application Default Credentials), `entra`,
+`client_credentials`, `jwt_bearer` or `ibm_iam`. For a chain `ready` means
+only that the machine says the chain is there (an environment variable, a
+profile, a credentials file, a stored selection): nothing is asked of AWS,
+Google or Azure to report it, so a chain that will fail when asked is still
+`ready` until a request finds out. `expires_at_ms` is then the expiry of the
+token in hand, when there is one. `credential.state`
+is `ready`; `refresh` (an OAuth access token that has lapsed and is renewed
+by the next request); or `expired` (it cannot be renewed: log in again —
+`key_set` and `key_usable` are then `false`). `expires_at_ms` is present for
+a credential that expires. `credential` is absent when the daemon has none.
+`key_set` means "has a credential of any kind" and equals what it always did
+for a provider keyed only by variable or file. `auth` is how a credential is
+attached: `default` (the wire's own), `bearer`, `x-api-key`, `header` or
+`query`. Older clients ignore both fields.
+
 A provider [defined in `llmman.conf`](providers.md#your-own-endpoints)
 appears alongside the catalog ones with `key_optional: true`, no
 `key_env` unless the file names one, and — on `/llmman/providers/{id}`

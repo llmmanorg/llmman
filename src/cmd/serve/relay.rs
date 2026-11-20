@@ -77,8 +77,8 @@ async fn post_proxied(
     if let Some(ct) = headers.get("content-type") {
         req = req.header("content-type", ct);
     }
-    Ok(req
-        .send()
+    Ok(target
+        .send(req)
         .await
         .with_context(|| format!("proxy request to {}", target.describe()))?)
 }

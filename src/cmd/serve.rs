@@ -1744,10 +1744,13 @@ struct RemoteTarget {
     max_output: Option<u32>,
     /// The catalog's price, for the usage ledger.
     cost: Option<crate::providers::Cost>,
-    /// API key for this request, or `None` for a provider that takes
-    /// none (see `Provider::key_optional`). See [`resolve_remote_target`]
-    /// for where it comes from.
-    api_key: Option<String>,
+    /// The credential for this request, or `None` for a provider that
+    /// takes none (see `Provider::key_optional`). See
+    /// [`resolve_remote_target`] for where it comes from.
+    credential: Option<crate::credentials::Resolved>,
+    /// How it is attached, and what else the provider wants sent
+    /// ([`crate::authscheme`]).
+    auth: crate::authscheme::Auth,
     /// The caller's own `x-opencode-session` if it sent one. Populated only
     /// for an opencode-go target (via [`RemoteTarget::adopt_session`]) and
     /// `None` otherwise. When `None` for opencode-go, a stable daemon-wide
@@ -1790,7 +1793,7 @@ impl std::fmt::Debug for RemoteTarget {
             .field("base_url", &self.base_url)
             .field("wire", &self.wire)
             .field("model", &self.model)
-            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("credential", &self.credential)
             .field("session", &self.session.as_ref().map(|_| "<redacted>"))
             .finish()
     }
@@ -1825,17 +1828,13 @@ impl Target {
             Self::Local(_) => req,
             Self::Peer(peer) => aggregation::hop(req, peer.api_key.as_deref()),
             Self::Remote(remote) => {
-                let req = match (remote.wire, remote.api_key.as_deref()) {
-                    (Wire::OpenAi, Some(key)) => req.bearer_auth(key),
-                    (Wire::OpenAi, None) => req,
-                    (Wire::Anthropic, key) => {
-                        let req = req.header("anthropic-version", anthropic::VERSION);
-                        match key {
-                            Some(key) => req.header("x-api-key", key),
-                            None => req,
-                        }
-                    }
+                let req = match remote.wire {
+                    Wire::OpenAi => req,
+                    Wire::Anthropic => req.header("anthropic-version", anthropic::VERSION),
                 };
+                let req = remote
+                    .auth
+                    .apply(remote.wire, req, remote.credential.as_ref());
                 if remote.sends_opencode_session() {
                     req.header(
                         OPENCODE_SESSION_HEADER,
@@ -1847,6 +1846,18 @@ impl Target {
                 }
             }
         }
+    }
+
+    /// Sends `req`, which [`Target::authorize`] was applied to. A credential
+    /// that signs its requests (AWS SigV4) signs this one here, once its
+    /// URL, headers and body are final, because the signature covers
+    /// exactly the bytes that go out; every other target sends as before.
+    async fn send(&self, req: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
+        let signer = match self {
+            Self::Remote(remote) => remote.credential.as_ref().and_then(|c| c.signer.clone()),
+            _ => None,
+        };
+        crate::authscheme::send(req, signer.as_deref()).await
     }
 
     fn is_remote(&self) -> bool {
@@ -2006,14 +2017,36 @@ async fn catalog_blocking(
         .map_err(|e| AppError(e, StatusCode::BAD_GATEWAY))
 }
 
+/// The credential the daemon itself would spend on `provider`, resolved
+/// off the runtime: an OAuth login may be refreshed and a key command run.
+/// A login that can no longer be used is a 401 saying to log in again;
+/// anything else a 500, since the cause is this daemon's own setup.
+async fn provider_credential(
+    provider: &crate::providers::Provider,
+) -> Result<Option<crate::credentials::Resolved>, AppError> {
+    let provider = provider.clone();
+    tokio::task::spawn_blocking(move || provider.credential())
+        .await
+        .context("credential task panicked")?
+        .map_err(|e| {
+            let status = if e.is::<crate::credentials::ReloginRequired>() {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            AppError(e, status)
+        })
+}
+
 /// Resolves a [`crate::providers::REMOTE_PREFIX`] reference into a
 /// [`Target::Remote`], or `None` for any ordinary local reference.
 ///
-/// The API key is the caller's own (see [`client_api_key`]) when it sent
-/// one, else the provider's variable from this daemon's environment — so
-/// both `llmman launch --provider`, which puts the real key in the
-/// integration's requests, and a daemon started with the key already
-/// exported work.
+/// The credential is the caller's own key (see [`client_api_key`]) when it
+/// sent one, else this daemon's own ([`crate::providers::Provider::credential`]:
+/// the provider's variable, a stored login, `llmman.conf`) — so both
+/// `llmman launch --provider`, which puts the real key in the integration's
+/// requests, and a daemon started with the key already exported or logged
+/// in work.
 async fn resolve_remote_target(
     state: &AppState,
     model_ref: &str,
@@ -2038,9 +2071,13 @@ async fn resolve_remote_target(
     // network can reach, or a browser acting for another site. That is a
     // blast-radius bound, not authentication — see `daemon_key_spendable`.
     let trusted = daemon_key_spendable(state, headers);
-    let own_key = || trusted.then(|| provider.api_key()).flatten();
-    let api_key = match client_api_key(headers).or_else(own_key) {
-        Some(key) => Some(key),
+    let credential = match client_api_key(headers) {
+        Some(key) => Some(crate::credentials::Resolved::from_key(key, "request")),
+        None if trusted => provider_credential(provider).await?,
+        None => None,
+    };
+    let credential = match credential {
+        Some(credential) => Some(credential),
         // A configured provider that takes no key goes up bare.
         None if provider.key_optional => None,
         None => {
@@ -2054,8 +2091,14 @@ async fn resolve_remote_target(
                             .to_string()
                     } else if trusted {
                         format!(
-                            ", or give llmman serve a key of its own: {}",
-                            crate::providers::key_hint(&provider.id, provider.key_env.as_deref())
+                            ", or give llmman serve a key of its own: {}{}",
+                            crate::providers::key_hint(&provider.id, provider.key_env.as_deref()),
+                            // A provider with no variable already got it from
+                            // `key_hint`.
+                            crate::providers::login_hint(&provider.id)
+                                .filter(|_| provider.key_env.is_some())
+                                .map(|h| format!(", or {h}"))
+                                .unwrap_or_default()
                         )
                     } else {
                         ". llmman serve is not bound to loopback, so its own environment is \
@@ -2071,23 +2114,31 @@ async fn resolve_remote_target(
     let listed = provider.models.iter().find(|m| m.id == model);
     let mut target = RemoteTarget {
         provider: provider_id,
-        base_url: provider.base_url.clone(),
+        base_url: credential
+            .as_ref()
+            .map_or_else(|| provider.base_url.clone(), |c| provider.base_url_for(c)),
         wire: provider.wire,
         max_output: listed.and_then(|m| m.max_output),
         cost: listed.and_then(|m| m.cost.clone()),
-        model,
-        api_key,
+        model: provider.wire_model(&model),
+        credential,
+        auth: if trusted {
+            provider.auth.clone()
+        } else {
+            provider.auth.scheme_only()
+        },
         session: None,
     };
     target.adopt_session(headers);
-    // No key on this line: it is the one piece of a remote target that
-    // must never reach a log file.
+    // Only the kind of credential on this line: the credential is the one
+    // piece of a remote target that must never reach a log file.
     eprintln!(
-        "[llmman] routing {} to provider {} ({}, {} wire)",
+        "[llmman] routing {} to provider {} ({}, {} wire, credential: {})",
         target.model,
         target.provider,
         target.base_url,
-        target.wire.as_str()
+        target.wire.as_str(),
+        target.credential.as_ref().map_or("none", |c| c.kind)
     );
     Ok(Some(Target::Remote(Arc::new(target))))
 }
@@ -3256,8 +3307,7 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
 ) -> Result<ChatUpstream, AppError> {
     let Target::Remote(remote) = target else {
         let resp = target
-            .authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)).json(req))
-            .send()
+            .send(target.authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)).json(req)))
             .await
             .with_context(|| format!("send to {}", target.describe()))?;
         let upstream = ChatUpstream::relay(resp);
@@ -3271,8 +3321,7 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
     provider_compat(remote, &mut req);
     if remote.wire == Wire::OpenAi {
         let resp = target
-            .authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)).json(&req))
-            .send()
+            .send(target.authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)).json(&req)))
             .await
             .with_context(|| format!("send to {}", target.describe()))?;
         return Ok(ChatUpstream::relay(resp));
@@ -3302,9 +3351,8 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
     if anthropic::manual_thinking(&messages_req) {
         upstream = upstream.header("anthropic-beta", anthropic::INTERLEAVED_THINKING_BETA);
     }
-    let resp = upstream
-        .json(&messages_req)
-        .send()
+    let resp = target
+        .send(upstream.json(&messages_req))
         .await
         .with_context(|| format!("send to {}", target.describe()))?;
     if !resp.status().is_success() {
@@ -3383,10 +3431,12 @@ async fn retry_merging_roles<T: Serialize + ?Sized>(
     let sent = serde_json::to_vec(req).context("serialize chat request")?;
     if let Some(merged) = openai::merged_after_refusal(target, status, &reply, &sent) {
         let resp = target
-            .authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(merged)
-            .send()
+            .send(
+                target
+                    .authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)))
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(merged),
+            )
             .await
             .with_context(|| format!("send to {}", target.describe()))?;
         return Ok(ChatUpstream::relay(resp));
@@ -3693,8 +3743,9 @@ struct ProviderSummary {
     /// What is spoken at `base_url`: `openai` or `anthropic` (see
     /// [`crate::providers::Wire`]).
     wire: &'static str,
-    /// Whether this daemon holds a key for it, in its environment or its
-    /// `llmman.conf`.
+    /// Whether this daemon holds a credential for it: a key in its
+    /// environment or `llmman.conf`, a stored login, or a key command or
+    /// file.
     key_set: bool,
     /// Whether it would actually spend it for a request that presents no
     /// key of its own — `key_set` plus this daemon's own bind check, which
@@ -3705,6 +3756,13 @@ struct ProviderSummary {
     /// Whether a keyless request is forwarded anyway (see
     /// `Provider::key_optional`).
     key_optional: bool,
+    /// What the daemon would spend and whether it works; absent when it
+    /// holds none. No secret, ever.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential: Option<crate::credentials::Status>,
+    /// How a credential is attached: `default` (the wire's own), `bearer`,
+    /// `x-api-key`, `header` or `query`.
+    auth: &'static str,
     models: usize,
 }
 
@@ -3716,9 +3774,11 @@ impl ProviderSummary {
             base_url: p.base_url.clone(),
             key_env: p.key_env.clone(),
             wire: p.wire.as_str(),
-            key_set: p.api_key().is_some(),
+            key_set: p.has_credential(),
             key_usable: daemon_key_usable(state, p),
             key_optional: p.key_optional,
+            credential: p.credential_status(),
+            auth: p.auth.scheme.as_str(),
             models: p.models.len(),
         }
     }
@@ -3729,7 +3789,7 @@ impl ProviderSummary {
 /// (see `daemon_key_spendable`), minus the per-request cross-site check
 /// no CLI can trip.
 fn daemon_key_usable(state: &AppState, provider: &crate::providers::Provider) -> bool {
-    provider.api_key().is_some() && daemon_key_spendable(state, None)
+    provider.has_credential() && daemon_key_spendable(state, None)
 }
 
 /// `GET /llmman/providers`.
@@ -3754,6 +3814,11 @@ struct ProviderResponse {
     key_usable: bool,
     /// See [`ProviderSummary::key_optional`].
     key_optional: bool,
+    /// See [`ProviderSummary::credential`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential: Option<crate::credentials::Status>,
+    /// See [`ProviderSummary::auth`].
+    auth: &'static str,
     models: Vec<ProviderModelResponse>,
 }
 
@@ -3800,9 +3865,11 @@ impl ProviderResponse {
             base_url: p.base_url.clone(),
             key_env: p.key_env.clone(),
             wire: p.wire.as_str(),
-            key_set: p.api_key().is_some(),
+            key_set: p.has_credential(),
             key_usable: daemon_key_usable(state, p),
             key_optional: p.key_optional,
+            credential: p.credential_status(),
+            auth: p.auth.scheme.as_str(),
             models: p
                 .models
                 .iter()
@@ -4042,15 +4109,26 @@ async fn configured_provider_models(
         return Vec::new();
     }
     let url = provider.url("/v1/models");
-    let mut req = state.0.client.get(&url).timeout(CONFIGURED_MODELS_TIMEOUT);
-    if daemon_key_usable(state, provider) {
-        if let Some(key) = provider.api_key() {
-            req = req.bearer_auth(key);
-        }
-    }
-    let listed = async {
-        let resp = req.send().await?.error_for_status()?;
-        resp.json::<ModelsResponse>().await
+    let req = state.0.client.get(&url).timeout(CONFIGURED_MODELS_TIMEOUT);
+    // A credential that cannot be resolved is a listing without one.
+    let credential = if daemon_key_usable(state, provider) {
+        provider_credential(provider).await.ok().flatten()
+    } else {
+        None
+    };
+    let auth = if daemon_key_spendable(state, None) {
+        provider.auth.clone()
+    } else {
+        provider.auth.scheme_only()
+    };
+    let req = auth.apply(provider.wire, req, credential.as_ref());
+    let signer = credential.as_ref().and_then(|c| c.signer.clone());
+    let listed: anyhow::Result<ModelsResponse> = async {
+        let resp = crate::authscheme::send(req, signer.as_deref())
+            .await?
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?;
+        Ok(resp.json::<ModelsResponse>().await?)
     }
     .await;
     match listed {
@@ -5161,6 +5239,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
 
     // Outbound: peers and providers. `LLMMAN_TLS_CA` is trusted for both.
     let client = crate::auth::trusted_client()?
+        .redirect(crate::authscheme::same_origin_redirects())
         .build()
         .context("build http client")?;
 
@@ -5360,6 +5439,9 @@ async fn shutdown_signal() {
     }
     eprintln!("llmman serve shutting down");
 }
+
+#[cfg(test)]
+mod credential_tests;
 
 #[cfg(test)]
 mod test_support;

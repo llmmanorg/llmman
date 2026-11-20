@@ -134,7 +134,7 @@ fn run_with_timeout(
 
 /// [`run_with_timeout`] for an already spawned `child`, whose pipes the
 /// caller drains afterwards.
-fn wait_with_timeout(
+pub(crate) fn wait_with_timeout(
     child: &mut std::process::Child,
     timeout: std::time::Duration,
 ) -> Result<Option<std::process::ExitStatus>> {

@@ -41,10 +41,16 @@ pub fn run(args: &ProvidersArgs) -> anyhow::Result<()> {
         .max()
         .unwrap_or(7)
         .max(7);
+    let status_w = shown
+        .iter()
+        .map(|p| key_status(p).len())
+        .max()
+        .unwrap_or(14)
+        .max(14);
 
     writeln!(
         out,
-        "{:<id_w$}    {:<name_w$}    {:<key_w$}    {:<14}    MODELS",
+        "{:<id_w$}    {:<name_w$}    {:<key_w$}    {:<status_w$}    MODELS",
         "PROVIDER",
         "NAME",
         "API KEY",
@@ -52,11 +58,12 @@ pub fn run(args: &ProvidersArgs) -> anyhow::Result<()> {
         id_w = id_w,
         name_w = name_w,
         key_w = key_w,
+        status_w = status_w,
     )?;
     for p in &shown {
         writeln!(
             out,
-            "{:<id_w$}    {:<name_w$}    {:<key_w$}    {:<14}    {}",
+            "{:<id_w$}    {:<name_w$}    {:<key_w$}    {:<status_w$}    {}",
             p.id,
             p.name,
             key_env(p),
@@ -65,6 +72,7 @@ pub fn run(args: &ProvidersArgs) -> anyhow::Result<()> {
             id_w = id_w,
             name_w = name_w,
             key_w = key_w,
+            status_w = status_w,
         )?;
     }
 
@@ -100,13 +108,23 @@ fn model_count(provider: &ProviderSummary) -> String {
 /// in cmd::serve) — a state of its own, since what needs fixing there is
 /// the bind, not the key. "none needed" is a keyless provider: nothing
 /// to act on.
-fn key_status(provider: &ProviderSummary) -> &'static str {
-    match (provider.key_usable, provider.key_here(), provider.key_set) {
+fn key_status(provider: &ProviderSummary) -> String {
+    let base = match (provider.key_usable, provider.key_here(), provider.key_set) {
         (true, _, _) => "set",
         (false, true, _) => "set (client)",
         (false, false, true) => "set (withheld)",
         (false, false, false) if provider.key_optional => "none needed",
         (false, false, false) => "unset",
+    };
+    // A key in the environment or `llmman.conf` is just "set", as it has
+    // always been; a login or key command names what it is.
+    match provider.credential.as_ref() {
+        Some(c) if c.state == "expired" => format!("expired ({})", c.kind),
+        Some(c) if !matches!(c.kind.as_str(), "env" | "config") => match base {
+            "set" => format!("set ({})", c.kind),
+            other => format!("{} [{}]", other, c.kind),
+        },
+        _ => base.to_string(),
     }
 }
 
@@ -122,6 +140,7 @@ mod tests {
             key_set: false,
             key_usable: false,
             key_optional: false,
+            credential: None,
             models: 0,
         }
     }

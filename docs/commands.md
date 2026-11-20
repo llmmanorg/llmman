@@ -23,8 +23,8 @@ reference; this is the one-line summary of each subcommand.
 | `rm`      | Remove a local image |
 | `show`    | Show a local model's architecture, parameters, license, and template |
 | `verify`  | Check a registry model's signatures against trusted public keys |
-| `login`   | Log in to a container registry or HuggingFace |
-| `logout`  | Log out from a container registry or HuggingFace |
+| `login`   | Log in to a container registry, HuggingFace, or (`--provider`) a [hosted provider](providers.md#logging-in); `--param KEY=VALUE` passes a method its settings |
+| `logout`  | Log out from a container registry, HuggingFace, or (`--provider`) a hosted provider |
 | `config`  | Read and write `llmman.conf` settings (aliases, API keys, trust policy, aggregation peers) |
 
 `resolve` is not listed above because `--help` hides it: it is the hook other
