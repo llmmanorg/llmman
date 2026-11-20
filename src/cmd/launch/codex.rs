@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use toml_edit::{value, DocumentMut, Item, Table};
 
+use super::common::write_if_changed;
+use super::optimizer::Optimizer;
 use super::{exec_with_env, find_on_path, server, HostedModel};
 
 /// codex: write the `llmman` profile overlay (`~/.codex/llmman.config.toml`,
@@ -16,8 +18,10 @@ pub(super) fn launch_codex(
     vision: bool,
     context_window: Option<u64>,
     extra_args: &[String],
+    optimizer: Optimizer,
     hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
+    let added = optimizer.addition("codex")?;
     // Write codex config
     write_codex_config(model, vision, context_window, extra_args, hosted)?;
 
@@ -41,8 +45,57 @@ pub(super) fn launch_codex(
     // codex profile flag
     args.extend(["--profile".to_string(), "llmman".to_string()]);
     args.extend_from_slice(extra_args);
+    args.splice(0..0, added.args.iter().cloned());
 
+    if let Some(notice) = optimizer.notice("codex") {
+        eprintln!("{notice}");
+    }
     exec_with_env(&bin, &args, &[("OPENAI_API_KEY", api_key)])
+}
+
+const KEY: &str = "developer_instructions";
+
+/// The `-c` value that sets codex's config `key` to the string `text`.
+fn config_override(key: &str, text: &str) -> String {
+    format!("{key}={}", toml_edit::Value::from(text))
+}
+
+/// The `-c` value that sets codex's `developer_instructions` to `text`.
+pub(super) fn developer_instructions(text: &str) -> String {
+    config_override(KEY, text)
+}
+
+/// The `-c` value that points the `llmman` provider at `server`.
+pub(super) fn server_override(server: &str) -> String {
+    config_override("model_providers.llmman.base_url", &format!("{server}/v1"))
+}
+
+/// Whether a `-c`/`--config` before `--` sets `developer_instructions`.
+fn sets_developer_instructions(extra_args: &[String]) -> bool {
+    let args = super::before_terminator(extra_args);
+    args.iter().enumerate().any(|(i, a)| {
+        let setting = match a.as_str() {
+            "-c" | "--config" => args.get(i + 1).map(String::as_str),
+            _ => a.strip_prefix("--config=").or(a.strip_prefix("-c=")),
+        };
+        setting.is_some_and(|s| s.split('=').next().is_some_and(|k| k.trim() == KEY))
+    })
+}
+
+/// What keeps `--optimizer cvmn` from working with codex: instructions of
+/// the caller's, which the override would replace.
+pub(super) fn cvmn_conflict(extra_args: &[String]) -> Option<&'static str> {
+    let configured = codex_dir().ok().is_some_and(|dir| {
+        ["config.toml", "llmman.config.toml"].iter().any(|name| {
+            std::fs::read_to_string(dir.join(name))
+                .ok()
+                .and_then(|text| text.parse::<DocumentMut>().ok())
+                .is_some_and(|doc| doc.contains_key(KEY))
+        })
+    });
+    (configured || sets_developer_instructions(extra_args)).then_some(
+        "developer_instructions of your own: llmman's would replace them.\nRemove them, or launch without --optimizer.",
+    )
 }
 
 /// Writes codex's `llmman` profile.
@@ -84,7 +137,7 @@ fn write_codex_config(
     // Without a model there is nothing to describe; codex keeps its defaults.
     let catalog_path = config_dir.join("llmman-model.json");
     let catalog = (!model.is_empty()).then(|| {
-        write_codex_file(
+        write_if_changed(
             &catalog_path,
             &codex_model_catalog(&codex_catalog_models(model, vision, context_window, hosted)),
         )
@@ -103,7 +156,7 @@ fn write_codex_config(
             .filter(|_| !user_config_unreadable)
             .as_deref(),
     );
-    write_codex_file(&profile_path, &overlay)
+    write_if_changed(&profile_path, &overlay)
 }
 
 /// The overlay's keys that are llmman's; the rest of the file is codex's.
@@ -204,14 +257,6 @@ pub(super) fn codex_dir() -> anyhow::Result<PathBuf> {
         .join(".codex"))
 }
 
-/// Writes `contents` to `path` unless it already holds exactly that.
-fn write_codex_file(path: &Path, contents: &str) -> anyhow::Result<()> {
-    if std::fs::read_to_string(path).ok().as_deref() == Some(contents) {
-        return Ok(());
-    }
-    std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))
-}
-
 /// The catalog's `context_window` where `launch` resolved none at all;
 /// ollama's fallback too.
 pub(super) const CODEX_FALLBACK_CONTEXT_WINDOW: u64 = 128_000;
@@ -230,6 +275,9 @@ fn codex_context_window(window: Option<u64>) -> u64 {
 struct CodexCatalogModel {
     /// The id codex selects with, and sends in a request's `model` field.
     slug: String,
+    /// What codex shows beside it: the plain model id, not the
+    /// reference it selects with.
+    display_name: String,
     context_window: u64,
     vision: bool,
 }
@@ -238,55 +286,68 @@ struct CodexCatalogModel {
 /// inside codex can switch between them, or — for a local launch — the one
 /// model this launch resolved.
 ///
-/// The launched model keeps the window and image input this launch
-/// resolved for it (a catalog window, or a local one read off the loaded
-/// runner); the others take what the provider's catalog says, falling
-/// back on the same guess codex cannot do without, since its catalog
-/// cannot omit the window.
+/// One path builds every entry from the shared hosted list (a local
+/// launch has no list, so the launched model is the whole catalog).
+/// Each entry carries the window and image input of its own row: the
+/// launched model keeps what this launch resolved for it (a catalog
+/// window, or a local one read off the loaded runner), every other
+/// model what the provider's catalog says, falling back on the same
+/// guess codex cannot do without, since its catalog cannot omit the
+/// window. Each entry is shown under its plain model id, not the
+/// reference codex selects with.
 fn codex_catalog_models(
     model: &str,
     vision: bool,
     context_window: Option<u64>,
     hosted: Option<&[HostedModel]>,
 ) -> Vec<CodexCatalogModel> {
-    let Some(hosted) = hosted else {
-        return vec![CodexCatalogModel {
-            slug: model.to_string(),
-            context_window: codex_context_window(context_window),
-            vision,
-        }];
-    };
-    let launched = |slug: &str| CodexCatalogModel {
-        slug: slug.to_string(),
-        context_window: codex_context_window(context_window),
-        vision,
-    };
     let mut models: Vec<CodexCatalogModel> = hosted
+        .unwrap_or_default()
         .iter()
         .map(|m| {
-            if m.reference == model {
-                return launched(&m.reference);
-            }
+            let launched = m.reference == model;
             CodexCatalogModel {
                 slug: m.reference.clone(),
-                context_window: m.context.unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW),
-                // The catalog carries no image input, so only the model
-                // this launch resolved declares any.
-                vision: false,
+                display_name: m.id.clone(),
+                context_window: if launched {
+                    codex_context_window(context_window)
+                } else {
+                    m.context.unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
+                },
+                // What the provider's catalog says about this model
+                // (see `HostedModel::vision`); unknown reads as no
+                // image input rather than a guess.
+                vision: if launched {
+                    vision
+                } else {
+                    m.vision.unwrap_or(false)
+                },
             }
         })
         .collect();
     // The launched model belongs in its own catalog even if the list
     // somehow lacks it: codex is started with `--model` naming it.
+    // No catalog row names a plainer id for it, so the reference is
+    // its display name, as a local launch's model is.
     if !models.iter().any(|m| m.slug == model) {
-        models.insert(0, launched(model));
+        models.insert(
+            0,
+            CodexCatalogModel {
+                slug: model.to_string(),
+                display_name: model.to_string(),
+                context_window: codex_context_window(context_window),
+                vision,
+            },
+        );
     }
     models
 }
 
 /// The `model_catalog_json` for `models`, declaring image input in
-/// `input_modalities` where a model has any. The other fields are ones
-/// codex requires, valued as ollama's `buildCodexModelEntry` does.
+/// `input_modalities` where a model has any, and showing each under
+/// its plain model id in `display_name` rather than the reference
+/// codex selects with. The other fields are ones codex requires,
+/// valued as ollama's `buildCodexModelEntry` does.
 fn codex_model_catalog(models: &[CodexCatalogModel]) -> String {
     let entries: Vec<serde_json::Value> = models
         .iter()
@@ -298,7 +359,7 @@ fn codex_model_catalog(models: &[CodexCatalogModel]) -> String {
             };
             serde_json::json!({
                 "slug": model.slug,
-                "display_name": model.slug,
+                "display_name": model.display_name,
                 "context_window": model.context_window,
                 "shell_type": "default",
                 "visibility": "list",
@@ -581,7 +642,7 @@ model = \"gpt-5\"
         );
     }
 
-    /// An unchanged overlay is not rewritten (`write_codex_file`), so
+    /// An unchanged overlay is not rewritten (`write_if_changed`), so
     /// writing it twice must give the same text.
     #[test]
     fn overlay_is_stable() {
@@ -649,19 +710,24 @@ model = \"gpt-5\"
 
     #[test]
     fn codex_model_catalog_declares_image_input_only_for_a_vision_model() {
-        let entry = |slug: &str, vision: bool| CodexCatalogModel {
+        let entry = |slug: &str, display_name: &str, vision: bool| CodexCatalogModel {
             slug: slug.to_string(),
+            display_name: display_name.to_string(),
             context_window: 32768,
             vision,
         };
-        let catalog: serde_json::Value =
-            serde_json::from_str(&codex_model_catalog(&[entry("m", true)])).expect("valid JSON");
+        let catalog: serde_json::Value = serde_json::from_str(&codex_model_catalog(&[entry(
+            "llmman.provider/p/m",
+            "m",
+            true,
+        )]))
+        .expect("valid JSON");
         let model_entry = &catalog["models"][0];
         assert_eq!(
             model_entry["input_modalities"],
             serde_json::json!(["text", "image"])
         );
-        assert_eq!(model_entry["slug"], "m");
+        assert_eq!(model_entry["slug"], "llmman.provider/p/m");
         assert_eq!(model_entry["display_name"], "m");
         assert_eq!(model_entry["context_window"], 32768);
         // Fields codex requires of an entry.
@@ -679,12 +745,34 @@ model = \"gpt-5\"
             assert!(model_entry.get(key).is_some(), "missing {key}");
         }
 
-        let text_only: serde_json::Value =
-            serde_json::from_str(&codex_model_catalog(&[entry("m", false)])).expect("valid JSON");
+        let text_only: serde_json::Value = serde_json::from_str(&codex_model_catalog(&[entry(
+            "llmman.provider/p/m",
+            "m",
+            false,
+        )]))
+        .expect("valid JSON");
         assert_eq!(
             text_only["models"][0]["input_modalities"],
             serde_json::json!(["text"])
         );
+    }
+
+    /// `display_name` is the plain model id, not the reference codex
+    /// selects with: the picker shows `m`, the request still carries
+    /// `llmman.provider/p/m`.
+    #[test]
+    fn codex_model_catalog_names_the_plain_id_not_the_reference() {
+        let models = vec![CodexCatalogModel {
+            slug: "llmman.provider/ollama-cloud/qwen3-coder".into(),
+            display_name: "qwen3-coder".into(),
+            context_window: 262_144,
+            vision: false,
+        }];
+        let catalog: serde_json::Value =
+            serde_json::from_str(&codex_model_catalog(&models)).expect("valid JSON");
+        let entry = &catalog["models"][0];
+        assert_eq!(entry["slug"], "llmman.provider/ollama-cloud/qwen3-coder");
+        assert_eq!(entry["display_name"], "qwen3-coder");
     }
 
     /// A `--provider` launch lists every model the provider serves, so
@@ -702,6 +790,7 @@ model = \"gpt-5\"
                     context: Some(262_144),
                     output: Some(8_192),
                     thinking: None,
+                    vision: Some(false),
                 },
                 HostedModel {
                     reference: "llmman.provider/ollama-cloud/llama-4-scout".into(),
@@ -709,6 +798,7 @@ model = \"gpt-5\"
                     context: None,
                     output: None,
                     thinking: None,
+                    vision: Some(true),
                 },
             ]
         };
@@ -723,6 +813,7 @@ model = \"gpt-5\"
             vec![
                 CodexCatalogModel {
                     slug: "llmman.provider/ollama-cloud/qwen3-coder".into(),
+                    display_name: "qwen3-coder".into(),
                     // The launched model keeps the window the launch
                     // resolved; codex's catalog cannot omit it.
                     context_window: CODEX_FALLBACK_CONTEXT_WINDOW,
@@ -730,8 +821,11 @@ model = \"gpt-5\"
                 },
                 CodexCatalogModel {
                     slug: "llmman.provider/ollama-cloud/llama-4-scout".into(),
+                    display_name: "llama-4-scout".into(),
                     context_window: CODEX_FALLBACK_CONTEXT_WINDOW,
-                    vision: false,
+                    // A vision model the catalog names declares image
+                    // input even though it is not the launched one.
+                    vision: true,
                 },
             ]
         );
@@ -768,9 +862,111 @@ model = \"gpt-5\"
             codex_catalog_models("m", true, Some(8_192), None),
             vec![CodexCatalogModel {
                 slug: "m".into(),
+                display_name: "m".into(),
                 context_window: 8_192,
                 vision: true,
             }]
+        );
+    }
+
+    /// The dedup: launched and other entries come out of the one path,
+    /// differing only in their own values — the launched model keeps
+    /// the window and image input this launch resolved for it even
+    /// where its catalog row says otherwise, and even when it is not
+    /// first in the list; every other entry keeps what its own row
+    /// says; every entry is shown under its plain id.
+    #[test]
+    fn codex_catalog_builds_launched_and_other_entries_the_same_way() {
+        let hosted = vec![
+            HostedModel {
+                reference: "llmman.provider/p/other".into(),
+                id: "other".into(),
+                context: Some(4_096),
+                output: Some(1_024),
+                thinking: None,
+                vision: Some(true),
+            },
+            HostedModel {
+                reference: "llmman.provider/p/launched".into(),
+                id: "launched".into(),
+                context: Some(1_000),
+                output: None,
+                thinking: None,
+                vision: Some(true),
+            },
+        ];
+        let models = codex_catalog_models(
+            "llmman.provider/p/launched",
+            false,
+            Some(262_144),
+            Some(&hosted),
+        );
+        assert_eq!(
+            models,
+            vec![
+                CodexCatalogModel {
+                    slug: "llmman.provider/p/other".into(),
+                    display_name: "other".into(),
+                    context_window: 4_096,
+                    vision: true,
+                },
+                CodexCatalogModel {
+                    slug: "llmman.provider/p/launched".into(),
+                    display_name: "launched".into(),
+                    // The launch's window and image input, not the
+                    // catalog row's 1_000 / vision.
+                    context_window: 262_144,
+                    vision: false,
+                },
+            ]
+        );
+        // The catalog JSON carries the same split: slug selects,
+        // display_name shows the plain id.
+        let catalog: serde_json::Value =
+            serde_json::from_str(&codex_model_catalog(&models)).expect("valid JSON");
+        let entries = catalog["models"].as_array().unwrap();
+        assert_eq!(entries[0]["slug"], "llmman.provider/p/other");
+        assert_eq!(entries[0]["display_name"], "other");
+        assert_eq!(entries[1]["slug"], "llmman.provider/p/launched");
+        assert_eq!(entries[1]["display_name"], "launched");
+    }
+
+    /// A list that somehow lacks the launched model gains it first,
+    /// with the window and image input this launch resolved for it —
+    /// and, with no catalog row to name a plainer id, the reference
+    /// as its display name.
+    #[test]
+    fn codex_catalog_inserts_a_missing_launched_model_first() {
+        let hosted = vec![HostedModel {
+            reference: "llmman.provider/p/other".into(),
+            id: "other".into(),
+            context: Some(4_096),
+            output: None,
+            thinking: None,
+            vision: Some(false),
+        }];
+        let models = codex_catalog_models(
+            "llmman.provider/p/launched",
+            true,
+            Some(8_192),
+            Some(&hosted),
+        );
+        assert_eq!(
+            models,
+            vec![
+                CodexCatalogModel {
+                    slug: "llmman.provider/p/launched".into(),
+                    display_name: "llmman.provider/p/launched".into(),
+                    context_window: 8_192,
+                    vision: true,
+                },
+                CodexCatalogModel {
+                    slug: "llmman.provider/p/other".into(),
+                    display_name: "other".into(),
+                    context_window: 4_096,
+                    vision: false,
+                },
+            ]
         );
     }
 
@@ -784,5 +980,39 @@ model = \"gpt-5\"
         assert_eq!(codex_context_window(Some(16384)), 16384);
         assert_eq!(codex_context_window(Some(1 << 20)), 1 << 20);
         assert_eq!(codex_context_window(None), CODEX_FALLBACK_CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn developer_instructions_of_the_callers_are_seen_before_a_second_terminator() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(sets_developer_instructions(&args(&[
+            "-c",
+            "developer_instructions=\"x\""
+        ])));
+        assert!(sets_developer_instructions(&args(&[
+            "--config=developer_instructions='x'"
+        ])));
+        // Text that only mentions the key is not a setting.
+        assert!(!sets_developer_instructions(&args(&[
+            "--cd",
+            "/w/developer_instructions-demo",
+            "exec",
+            "explain developer_instructions"
+        ])));
+        assert!(!sets_developer_instructions(&args(&["-c", "model=\"m\""])));
+        assert!(!sets_developer_instructions(&args(&[
+            "exec",
+            "--",
+            "-c",
+            "developer_instructions=x"
+        ])));
+    }
+
+    #[test]
+    fn the_override_for_developer_instructions_is_valid_toml_that_keeps_the_text() {
+        let text = "Be brief.\nQuote: \"a\" and \\ and 'b'";
+        let arg = developer_instructions(text);
+        let doc: DocumentMut = arg.parse().unwrap();
+        assert_eq!(doc["developer_instructions"].as_str(), Some(text));
     }
 }

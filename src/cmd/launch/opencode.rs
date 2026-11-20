@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::common::write_json_merged;
+use super::optimizer::Optimizer;
 use super::{
     exec_with_env, find_on_path, server, thinking_choices, xdg_dir, HostedModel, Thinking,
     WINDOWS_PATH_EXTS,
@@ -24,15 +25,17 @@ pub(super) fn launch_opencode(
     context_window: Option<u64>,
     max_output: Option<u32>,
     extra_args: &[String],
+    optimizer: Optimizer,
     hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
+    let added = optimizer.addition("opencode")?;
 
     let effective_model = if model.is_empty() { "default" } else { model };
     let variants = opencode_variants(thinking);
     let options = variant.and_then(|v| variants.iter().find(|(name, _)| *name == v));
     let config = opencode_config(
-        &server(),
+        added.server.as_deref().unwrap_or(&server()),
         effective_model,
         api_key,
         &variants,
@@ -42,11 +45,60 @@ pub(super) fn launch_opencode(
         max_output,
         hosted,
     );
+    let config = with_added_config(&config, added.config.as_ref());
     if let Some(variant) = variant {
         write_opencode_variant(&opencode_state_dir()?, effective_model, variant)?;
     }
 
+    if let Some(notice) = optimizer.notice("opencode") {
+        eprintln!("{notice}");
+    }
     exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
+}
+
+/// `config` (a JSON object) with the keys of `added` appended, so the order
+/// the rest of it was written in (the variants') is kept.
+fn with_added_config(config: &str, added: Option<&serde_json::Value>) -> String {
+    let Some(added) = added.and_then(serde_json::Value::as_object) else {
+        return config.to_string();
+    };
+    let mut out = config.trim_end().trim_end_matches('}').to_string();
+    for (key, value) in added {
+        out.push_str(&format!(
+            ",{}:{value}",
+            serde_json::Value::from(key.as_str())
+        ));
+    }
+    out.push('}');
+    out
+}
+
+/// Refuses an opencode before 2, which has not the plugins `tk` adds.
+pub(super) fn ensure_plugins() -> anyhow::Result<()> {
+    let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
+    let out = std::process::Command::new(&bin)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("run {} --version", bin.display()))?;
+    let version = String::from_utf8_lossy(&out.stdout);
+    anyhow::ensure!(
+        major_version(&version).is_some_and(|major| major >= 2),
+        "--optimizer tk needs opencode 2 or later, which has the plugin hook it uses; \
+         this is {}.\nUpgrade opencode, or launch without --optimizer.",
+        version.trim()
+    );
+    Ok(())
+}
+
+/// The major version in `opencode --version`'s output (`opencode v2.3.0`).
+fn major_version(output: &str) -> Option<u64> {
+    let version = output.trim().rsplit(' ').next()?;
+    version
+        .trim_start_matches('v')
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// opencode's state directory, where its `xdg-basedir` puts it.
@@ -164,8 +216,9 @@ fn opencode_output_reserve(context: u64) -> u64 {
 /// `hosted` is every model `--provider` serves (see [`HostedModel`]); with
 /// it, the config lists all of them, so opencode's own model picker can
 /// switch between them mid-session. The launched model keeps the variants,
-/// `--variant` options and window this launch resolved for it; each other
-/// model takes what the provider's catalog says about it.
+/// `--variant` options, window and image input this launch resolved for
+/// it; each other model takes what the provider's catalog says about it —
+/// its own thinking levels, window, output ceiling and image input.
 #[allow(clippy::too_many_arguments)]
 fn opencode_config(
     server: &str,
@@ -239,7 +292,10 @@ fn opencode_config(
     }
 
     /// One row of `provider.ollama.models`, owned so the whole list can
-    /// borrow from it after the loop that fills it.
+    /// borrow from it after the loop that fills it. Each row carries
+    /// its own variants, options, window and image input: the launched
+    /// model's, what this launch resolved; any other model's, what
+    /// the provider's catalog says about it.
     struct Row<'a> {
         /// The map key: the reference the daemon routes a request on.
         reference: String,
@@ -247,15 +303,22 @@ fn opencode_config(
         name: String,
         variants: Vec<(&'a str, serde_json::Value)>,
         options: Option<serde_json::Value>,
+        /// Image input for a model that takes images in, from its own
+        /// catalog row; a text-only model gets neither key.
+        modalities: Option<Modalities>,
+        /// Whether opencode may attach images to this model.
+        attachment: Option<bool>,
         limit: Option<Limit>,
     }
 
-    // Declare image input for a vision model so opencode will attach
-    // images; a text-only model gets neither key.
-    let modalities = vision.then_some(Modalities {
-        input: &["text", "image"],
-        output: &["text"],
-    });
+    // Image input (and text output) for a model that takes images in;
+    // a text-only model gets neither key.
+    let modalities_for = |vision: bool| {
+        vision.then_some(Modalities {
+            input: &["text", "image"],
+            output: &["text"],
+        })
+    };
 
     // Without `limit`, opencode normalizes a config-defined model to
     // `{context: 0, output: 0}` and then skips overflow detection
@@ -277,65 +340,70 @@ fn opencode_config(
         })
         .unwrap_or_default();
 
-    let rows: Vec<Row<'_>> = match &hosted {
-        // A local launch describes the one model it resolved.
-        None => vec![Row {
-            reference: model.to_string(),
-            name: model.to_string(),
-            variants: variants.to_vec(),
-            options: options.cloned(),
-            limit,
-        }],
-        Some(hosted) => {
-            let mut rows: Vec<Row<'_>> = Vec::with_capacity(hosted.len());
-            for (m, thinking) in hosted.iter().zip(&thinkings) {
-                let launched = m.reference == model;
-                rows.push(Row {
-                    reference: m.reference.clone(),
-                    name: m.id.clone(),
-                    variants: if launched {
-                        variants.to_vec()
-                    } else {
-                        opencode_variants(thinking.as_ref())
-                    },
-                    options: if launched { options.cloned() } else { None },
-                    limit: if launched {
-                        limit
-                    } else {
-                        m.context.map(|context| model_limit(context, m.output))
-                    },
-                });
-            }
-            // The launched model belongs in its own config even if the
-            // list somehow lacks it: opencode is started on it.
-            if !rows.iter().any(|row| row.reference == model) {
-                rows.insert(
-                    0,
-                    Row {
-                        reference: model.to_string(),
-                        name: model.to_string(),
-                        variants: variants.to_vec(),
-                        options: options.cloned(),
-                        limit,
-                    },
-                );
-            }
-            rows
+    // One path builds every row from the shared hosted list: a local
+    // launch has no list, so the launched model is the whole config.
+    // Each row carries its own variants, options, window and image
+    // input — the launched model keeps what this launch resolved for
+    // it, every other model what the provider's catalog says about
+    // it. The launched model belongs in its own config even if the
+    // list somehow lacks it: opencode is started on it.
+    let mut rows: Vec<Row<'_>> = Vec::with_capacity(hosted.map_or(1, |h| h.len()));
+    if let Some(hosted) = hosted {
+        for (m, thinking) in hosted.iter().zip(&thinkings) {
+            let launched = m.reference == model;
+            // This row's own image input: the launch's, for the
+            // launched model, the catalog's for any other (unknown
+            // reads as no image input rather than a guess).
+            let row_vision = if launched {
+                vision
+            } else {
+                m.vision.unwrap_or(false)
+            };
+            rows.push(Row {
+                reference: m.reference.clone(),
+                name: m.id.clone(),
+                variants: if launched {
+                    variants.to_vec()
+                } else {
+                    opencode_variants(thinking.as_ref())
+                },
+                options: if launched { options.cloned() } else { None },
+                modalities: modalities_for(row_vision),
+                attachment: row_vision.then_some(true),
+                limit: if launched {
+                    limit
+                } else {
+                    m.context.map(|context| model_limit(context, m.output))
+                },
+            });
         }
-    };
+    }
+    if !rows.iter().any(|row| row.reference == model) {
+        rows.insert(
+            0,
+            Row {
+                reference: model.to_string(),
+                name: model.to_string(),
+                variants: variants.to_vec(),
+                options: options.cloned(),
+                modalities: modalities_for(vision),
+                attachment: vision.then_some(true),
+                limit,
+            },
+        );
+    }
 
     let models: Vec<(&str, Model<'_>)> = rows
         .iter()
         .map(|row| {
-            let launched = row.reference == model;
             (
                 row.reference.as_str(),
                 Model {
                     name: &row.name,
                     variants: &row.variants,
                     options: row.options.as_ref(),
-                    modalities: launched.then_some(modalities).flatten(),
-                    attachment: (launched && vision).then_some(true),
+                    modalities: row.modalities,
+                    attachment: row.attachment,
                     limit: row.limit.as_ref(),
                 },
             )
@@ -506,6 +574,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Each provider row carries its own model's image input, not just
+    /// the launched model's: a vision model declares `modalities` and
+    /// `attachment` from its own catalog row, a text-only one gets
+    /// neither — and the launched model keeps what the launch resolved
+    /// for it even where its catalog row says otherwise.
+    #[test]
+    fn opencode_config_carries_each_models_own_modalities() {
+        let hosted = vec![
+            HostedModel {
+                reference: "llmman.provider/p/alpha".into(),
+                id: "alpha".into(),
+                context: Some(128_000),
+                output: Some(8_192),
+                thinking: Some(vec!["low".into(), "high".into()]),
+                // The catalog says vision; the launch resolved none.
+                vision: Some(true),
+            },
+            HostedModel {
+                reference: "llmman.provider/p/beta".into(),
+                id: "beta".into(),
+                context: Some(65_536),
+                output: None,
+                thinking: None,
+                vision: Some(true),
+            },
+            HostedModel {
+                reference: "llmman.provider/p/gamma".into(),
+                id: "gamma".into(),
+                context: None,
+                output: None,
+                thinking: None,
+                // The catalog is silent: no image input.
+                vision: None,
+            },
+        ];
+        let variants = opencode_variants(None);
+        let text = opencode_config(
+            "http://h",
+            "llmman.provider/p/alpha",
+            "k",
+            &variants,
+            None,
+            false,
+            Some(128_000),
+            Some(8_192),
+            Some(&hosted),
+        );
+        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let models = &config["provider"]["ollama"]["models"];
+
+        // The launched model keeps what the launch resolved: no image
+        // input, even though its catalog row says vision.
+        let alpha = &models["llmman.provider/p/alpha"];
+        assert_eq!(alpha["name"], "alpha");
+        assert!(alpha.get("modalities").is_none(), "{alpha}");
+        assert!(alpha.get("attachment").is_none(), "{alpha}");
+
+        // beta declares image input from its own catalog row, with its
+        // own thinking levels and window beside it.
+        let beta = &models["llmman.provider/p/beta"];
+        assert_eq!(beta["name"], "beta");
+        assert_eq!(
+            beta["modalities"],
+            serde_json::json!({ "input": ["text", "image"], "output": ["text"] })
+        );
+        assert_eq!(beta["attachment"], true);
+        assert_eq!(beta["limit"]["context"], 65_536);
+        assert_eq!(beta["limit"]["output"], 16_384);
+        assert_eq!(
+            beta["variants"]["low"],
+            serde_json::json!({ "reasoningEffort": "low" })
+        );
+        assert_eq!(
+            beta["variants"]["high"],
+            serde_json::json!({ "reasoningEffort": "high" })
+        );
+
+        // gamma: the catalog is silent, so neither key appears.
+        let gamma = &models["llmman.provider/p/gamma"];
+        assert!(gamma.get("modalities").is_none(), "{gamma}");
+        assert!(gamma.get("attachment").is_none(), "{gamma}");
+        assert!(gamma.get("limit").is_none(), "{gamma}");
+
+        // The rows stay in the shared list's order, launched first:
+        // match the map keys, not the top-level `model` field, which
+        // also names the launched model.
+        let positions: Vec<usize> = ["alpha", "beta", "gamma"]
+            .iter()
+            .map(|id| text.find(&format!("\"llmman.provider/p/{id}\":")).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
+    }
+
+    /// A local launch's single row still declares image input from
+    /// the launch, as before — the per-model change is only that a
+    /// hosted model no longer has to be the launched one to get it.
     #[test]
     fn opencode_config_declares_image_input_only_for_a_vision_model() {
         let text = opencode_config("http://h", "m", "k", &[], None, true, None, None, None);
@@ -638,6 +802,8 @@ mod tests {
             thinks: true,
             enable_thinking: true,
             efforts: vec![],
+            default_on: false,
+            default_effort: None,
         };
         assert_eq!(
             opencode_variants(Some(&Thinking::Template(gemma4.clone()))),
@@ -698,5 +864,26 @@ mod tests {
         );
         assert!(opencode_variants(Some(&Thinking::Listed(Vec::new()))).is_empty());
         assert!(claude.template().is_none());
+    }
+
+    #[test]
+    fn added_config_is_appended_and_keeps_the_order_of_the_rest() {
+        let base = r#"{"variants":{"none":1,"low":2,"high":3},"model":"a"}"#;
+        let added = serde_json::json!({ "instructions": ["y.md"], "plugins": ["/p"] });
+        let merged = with_added_config(base, Some(&added));
+        assert_eq!(
+            merged,
+            r#"{"variants":{"none":1,"low":2,"high":3},"model":"a","instructions":["y.md"],"plugins":["/p"]}"#
+        );
+        assert_eq!(with_added_config(base, None), base);
+    }
+
+    #[test]
+    fn the_major_version_is_read_from_the_version_output() {
+        assert_eq!(major_version("opencode v2.3.0\n"), Some(2));
+        assert_eq!(major_version("1.18.29\n"), Some(1));
+        assert_eq!(major_version("v10.0.1"), Some(10));
+        assert_eq!(major_version(""), None);
+        assert_eq!(major_version("opencode dev"), None);
     }
 }

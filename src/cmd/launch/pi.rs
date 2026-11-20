@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 
 use super::common;
-use super::{exec_with_env, find_on_path, server};
+use super::{exec_with_env, find_on_path, server, HostedModel};
 
 /// pi: register llmman as an OpenAI-compatible provider in `models.json`
 /// and point `settings.json` at it. pi runs with the caller's own
@@ -17,15 +17,21 @@ use super::{exec_with_env, find_on_path, server};
 /// literal placeholder codex and hermes also write. An environment
 /// reference (`"$VAR"`, which pi does interpolate) would read as
 /// "unresolved" outside `llmman launch` and take the provider down.
+///
+/// `hosted` is every model `--provider` serves (see [`HostedModel`]):
+/// each becomes an entry in the provider's `models`, so pi's own model
+/// picker can switch between them mid-session; the launched model stays
+/// the one `settings.json` selects.
 pub(super) fn launch_pi(
     model: &str,
     reasons: bool,
     vision: bool,
     context_window: Option<u64>,
     extra_args: &[String],
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     let bin = find_on_path("pi").ok_or_else(|| anyhow::anyhow!("pi is not installed"))?;
-    write_pi_config(model, reasons, vision, context_window)?;
+    write_pi_config(model, reasons, vision, context_window, hosted)?;
     exec_with_env(&bin, extra_args, &[])
 }
 
@@ -57,15 +63,69 @@ fn write_pi_config(
     reasons: bool,
     vision: bool,
     context_window: Option<u64>,
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     let dir = pi_agent_dir()?;
-    let entry = common::pi_model_entry(model, reasons, vision, context_window);
+    let entries = pi_model_entries(model, reasons, vision, context_window, hosted);
     common::write_json_merged(&dir.join("models.json"), "pi", |existing| {
-        pi_models_merged(existing, &server(), &entry)
+        entries.iter().fold(existing.clone(), |acc, entry| {
+            pi_models_merged(&acc, &server(), entry)
+        })
     })?;
     common::write_json_merged(&dir.join("settings.json"), "pi", |existing| {
         pi_settings_merged(existing, model)
     })
+}
+
+/// The model entries the provider lists: the one model this launch
+/// resolved, or — under `--provider` — every model the provider serves,
+/// the launched one first, each with what the catalog says about it.
+/// A non-launched model reasons when the catalog lists thinking levels
+/// for it, and takes image input when the catalog says it does; unknown
+/// reads as text-only, as [`common::pi_model_entry`] does for a local
+/// model with no window to declare.
+fn pi_model_entries(
+    model: &str,
+    reasons: bool,
+    vision: bool,
+    context_window: Option<u64>,
+    hosted: Option<&[HostedModel]>,
+) -> Vec<serde_json::Value> {
+    let Some(hosted) = hosted else {
+        return vec![common::pi_model_entry(
+            model,
+            reasons,
+            vision,
+            context_window,
+        )];
+    };
+    let mut entries: Vec<serde_json::Value> = hosted
+        .iter()
+        .map(|m| {
+            if m.reference == model {
+                common::pi_model_entry(model, reasons, vision, context_window)
+            } else {
+                common::pi_model_entry(
+                    &m.reference,
+                    m.thinking.as_ref().is_some_and(|levels| !levels.is_empty()),
+                    m.vision.unwrap_or(false),
+                    m.context,
+                )
+            }
+        })
+        .collect();
+    // The launched model belongs in its own config even if the list
+    // somehow lacks it: pi is started on it.
+    if !entries
+        .iter()
+        .any(|entry| entry["id"].as_str() == Some(model))
+    {
+        entries.insert(
+            0,
+            common::pi_model_entry(model, reasons, vision, context_window),
+        );
+    }
+    entries
 }
 
 /// `existing` with llmman's provider updated around `entry`, keeping
@@ -206,6 +266,110 @@ mod tests {
             .map(|m| m["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    fn hosted_pair() -> Vec<HostedModel> {
+        vec![
+            HostedModel {
+                reference: "llmman.provider/openrouter/qwen3-coder".into(),
+                id: "qwen3-coder".into(),
+                context: Some(262_144),
+                output: Some(8_192),
+                thinking: Some(vec!["low".into(), "high".into()]),
+                vision: Some(false),
+            },
+            HostedModel {
+                reference: "llmman.provider/openrouter/llama-4-scout".into(),
+                id: "llama-4-scout".into(),
+                context: None,
+                output: None,
+                thinking: None,
+                vision: Some(true),
+            },
+        ]
+    }
+
+    /// A `--provider` launch lists every model the provider serves, so
+    /// pi's own model picker can switch between them without a relaunch:
+    /// the launched model first, with the window and image input this
+    /// launch resolved for it, and each other model with what its own
+    /// catalog entry says.
+    #[test]
+    fn pi_model_entries_list_every_model_the_provider_serves() {
+        let entries = pi_model_entries(
+            "llmman.provider/openrouter/qwen3-coder",
+            false,
+            false,
+            Some(262_144),
+            Some(&hosted_pair()),
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["id"], "llmman.provider/openrouter/qwen3-coder");
+        assert_eq!(entries[0]["contextWindow"], 262_144);
+        assert_eq!(entries[0]["input"], serde_json::json!(["text"]));
+        // The launched entry keeps the launch's own reasoning, not the
+        // catalog's levels: a `--variant` is what marks it as reasoning.
+        assert_eq!(entries[0].get("reasoning"), None);
+        assert_eq!(entries[1]["id"], "llmman.provider/openrouter/llama-4-scout");
+        assert_eq!(entries[1]["input"], serde_json::json!(["text", "image"]));
+        assert_eq!(entries[1].get("contextWindow"), None);
+        assert_eq!(entries[1].get("reasoning"), None);
+
+        // A model the catalog lists thinking levels for reasons.
+        let thinking = vec![HostedModel {
+            thinking: Some(vec!["low".into()]),
+            ..hosted_pair().into_iter().nth(1).unwrap()
+        }];
+        let entries = pi_model_entries("m", false, false, None, Some(&thinking));
+        assert_eq!(entries[0]["id"], "m");
+        assert_eq!(entries[1]["reasoning"], true);
+    }
+
+    /// The launched model belongs in the list even if the provider's
+    /// list somehow lacks it, ahead of the rest.
+    #[test]
+    fn pi_model_entries_keep_the_launched_model_when_the_list_lacks_it() {
+        let others = vec![hosted_pair().into_iter().nth(1).unwrap()];
+        let entries = pi_model_entries("m", false, true, Some(8_192), Some(&others));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["id"], "m");
+        assert_eq!(entries[0]["input"], serde_json::json!(["text", "image"]));
+        assert_eq!(entries[0]["contextWindow"], 8_192);
+        assert_eq!(entries[1]["id"], "llmman.provider/openrouter/llama-4-scout");
+    }
+
+    /// Merging the entries keeps models a previous launch registered.
+    #[test]
+    fn pi_model_entries_merge_beside_a_previously_launched_model() {
+        let existing = pi_models_merged(
+            &serde_json::json!({}),
+            "http://s",
+            &pi_model_entry("earlier", false, false, None),
+        );
+        let entries = pi_model_entries(
+            "llmman.provider/openrouter/qwen3-coder",
+            false,
+            false,
+            Some(262_144),
+            Some(&hosted_pair()),
+        );
+        let merged = entries.iter().fold(existing, |acc, entry| {
+            pi_models_merged(&acc, "http://s", entry)
+        });
+        let ids: Vec<&str> = merged["providers"]["llmman"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "earlier",
+                "llmman.provider/openrouter/qwen3-coder",
+                "llmman.provider/openrouter/llama-4-scout"
+            ]
+        );
     }
 
     #[test]

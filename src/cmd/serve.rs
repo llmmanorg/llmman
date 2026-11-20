@@ -43,6 +43,7 @@ mod managed;
 mod messages;
 mod ollama;
 mod openai;
+mod realtime;
 mod refusal;
 mod relay;
 mod responses;
@@ -67,9 +68,10 @@ use backend::{
 };
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
 use config::{
-    backend_ctx_size, container_cpu_limit, effective_num_parallel, embedding_model_ctx,
-    flash_attention_from_env, gguf_trained_ctx, initial_ctx_size, kv_cache_type_from_env,
-    looks_like_oom, max_loaded_models_from_env, max_queue_from_env, metrics_enabled_from_env,
+    backend_ctx_size, container_cpu_limit, effective_num_parallel,
+    embedding_context_length_from_env, embedding_model_ctx, flash_attention_from_env,
+    gguf_trained_ctx, initial_ctx_size, kv_cache_type_from_env, looks_like_oom,
+    max_loaded_models_from_env, max_queue_from_env, metrics_enabled_from_env,
     next_ctx_size_after_oom, num_parallel_from_env, sched_spread_from_env, supports_context_shift,
     threads_from_env_or_host, tls_from_env, whole_prompt_batch, MAX_CTX_SHRINK_ATTEMPTS,
 };
@@ -84,11 +86,12 @@ use ollama::{
 use openai::{
     handle_openai_chat, handle_openai_completions, handle_openai_embeddings, handle_openai_images,
     handle_openai_models, handle_openai_speech, handle_openai_systemone,
-    handle_openai_transcriptions, handle_openai_video_get, handle_openai_videos, local_engine,
-    SYSTEMONE_BODY_LIMIT_BYTES, TRANSCRIPTION_BODY_LIMIT_BYTES,
+    handle_openai_transcriptions, handle_openai_video_get, handle_openai_videos, handle_tts,
+    local_engine, TRANSCRIPTION_BODY_LIMIT_BYTES,
 };
 use relay::proxy;
 pub use runtime::Runtime;
+use runtime::Workload;
 use sched::{
     begin_activity, default_keep_alive, reap_idle_models, refresh_activity, ActivityGuard,
 };
@@ -114,6 +117,7 @@ Environment Variables:
       LLMMAN_TLS_KEY                 PEM private key for LLMMAN_TLS_CERT
       LLMMAN_TLS_CA                  PEM bundle of extra roots to trust when reaching peers (and, for the CLI, the daemon)
       LLMMAN_CONTEXT_LENGTH          Context size for llama-server/vLLM/SGLang when set (default 262144 for llama-server)
+      LLMMAN_EMBEDDING_CONTEXT_LENGTH  Context size for embedding models, over LLMMAN_CONTEXT_LENGTH (0: trained context)
       LLMMAN_HYBRID_LOCAL_BYTES      Largest request a hybrid pair serves locally, in bytes (0 disables; default: from the context length)
       LLMMAN_KEEP_ALIVE              The duration that models stay loaded in memory (default \"5m\")
       LLMMAN_MAX_LOADED_MODELS       Maximum number of loaded models (default: unbounded)
@@ -140,6 +144,7 @@ Environment Variables:
       LLMMAN_FLASH_ATTENTION         Enable flash attention
       LLMMAN_KV_CACHE_TYPE           Quantization type for the K/V cache (default: f16)
       LLMMAN_RUNTIME                 Where the inference engine comes from: auto (default), docker, podman, bin or path — same as --runtime
+      LLMMAN_NO_HARDENED             Run the engine containers without the hardened flags (read-only rootfs, every capability dropped), same as --no-hardened
       LLMMAN_LLM_LIBRARY             Set backend (cpu/cuda/cuda13/rocm/opencl/vulkan/metal) to bypass GPU autodetection
       LLMMAN_IGPU_ENABLE             Enable integrated GPUs
       LLMMAN_LOAD_TIMEOUT            How long to allow model loads to stall before giving up (default \"20m\")
@@ -174,6 +179,17 @@ pub struct ServeArgs {
     /// `vllm`/`sglang` come from PATH.
     #[arg(long, value_enum, default_value = "auto", env = "LLMMAN_RUNTIME")]
     pub runtime: Runtime,
+
+    /// Run the engine containers without the hardened flags they get by
+    /// default (`--runtime docker`/`podman` only): read-only rootfs with
+    /// a tmpfs per engine scratch path, every capability dropped and no
+    /// new privileges; see `container::hardened_args`. Under `bin`/`path`
+    /// there is no container and neither setting has an effect.
+    /// `LLMMAN_NO_HARDENED` is the same switch as an environment
+    /// variable, read once at startup like `LLMMAN_NOHISTORY` (see
+    /// [`hardened_from`]).
+    #[arg(long)]
+    pub no_hardened: bool,
 
     /// The llama.cpp release to run, as a `b<N>` tag: the GitHub release
     /// `bin` downloads and the `-b<N>` image tag suffix the container
@@ -240,6 +256,16 @@ pub struct ServeArgs {
 #[derive(Clone)]
 struct AppState(Arc<Inner>);
 
+/// Whether the engine containers run hardened: on unless `--no-hardened`
+/// (`no_hardened`) or `LLMMAN_NO_HARDENED` (`env`, its value, in the
+/// spellings [`crate::parse_env_flag`] accepts) turns it off. `env` is
+/// injected so the table test needs no process environment; the daemon
+/// passes `LLMMAN_NO_HARDENED` once at startup, like
+/// `promptlog::enabled_from_env` does for `LLMMAN_NOHISTORY`.
+pub(crate) fn hardened_from(no_hardened: bool, env: Option<&str>) -> bool {
+    !(no_hardened || crate::parse_env_flag(env))
+}
+
 struct Inner {
     manager: Mutex<ModelManager>,
     // This daemon's own executable path, canonicalized at startup (while
@@ -268,6 +294,8 @@ struct Inner {
     // auto-shrinks the latter (mirrors Ollama's numCtxAuto gate): a
     // user's explicit choice isn't silently overridden.
     ctx_size_explicit: bool,
+    // See embedding_context_length_from_env's doc comment.
+    embedding_ctx_size: Option<u32>,
     // Largest request a hybrid pair serves locally (see
     // crate::hybrid::local_budget_bytes). Resolved once at startup, so
     // it is only the fallback for a pair whose local half is not loaded
@@ -301,6 +329,10 @@ struct Inner {
     // `--cpus`. Snapshotted with `threads` so a later cgroup change
     // cannot leave the two disagreeing.
     cpu_limit: Option<f64>,
+    // On unless `--no-hardened`/`LLMMAN_NO_HARDENED`: passed to every
+    // container spawn (see `container::hardened_args`); nothing under
+    // `bin`/`path`.
+    hardened: bool,
     // See max_queue_from_env's doc comment; enforced by try_admit.
     max_queue: usize,
     // See max_loaded_models_from_env's doc comment.
@@ -322,6 +354,16 @@ struct Inner {
     // Presented to peers — see `aggregation`; `None` sends the hop alone.
     peer_key: Option<String>,
     client: Client,
+}
+
+impl Inner {
+    /// The `(ctx_size, explicit)` a load without a `num_ctx` starts from.
+    fn ctx_setting(&self, embedding: bool) -> (Option<u32>, bool) {
+        match self.embedding_ctx_size.filter(|_| embedding) {
+            Some(n) => (Some(n), true),
+            None => (self.ctx_size, self.ctx_size_explicit),
+        }
+    }
 }
 
 struct ModelManager {
@@ -369,6 +411,9 @@ struct RunningModel {
     /// `ActivityGuard`'s doc comment for why a generation slower than its
     /// own `keep_alive` must not be killed mid-stream.
     in_flight: u32,
+    /// llama-server's slot count when llmman knows it, so `in_flight`
+    /// beyond it is queued. `None` otherwise.
+    parallel_slots: Option<u32>,
     /// The `"model"` field a request must carry to reach this model on
     /// its backend when that differs from the canonical reference — see
     /// `backend_wire_model`. `Some(<absolute model directory>)` for
@@ -394,6 +439,9 @@ struct RunningModel {
     effort_budget: bool,
     /// Send llmman's budget message: the user set no `--reasoning-budget-message`.
     effort_budget_message: bool,
+    /// What `/api/show` reports and `think` is resolved against; `None`
+    /// off llama-server or with a user's template.
+    thinking: Option<crate::chat_template::Thinking>,
     /// The GGUF header's trained context, if any: what `num_ctx` is cut to.
     trained_ctx: Option<u32>,
     /// Set while [`retire_for_context`] waits on this model: nothing new joins.
@@ -840,80 +888,86 @@ fn ffi_pull_ref<'a>(progress_key: &'a str, classified: &str) -> &'a str {
 /// registry as something signed; see `cmd::transfer`.
 fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<Vec<String>> {
     let lock = model_lock(model);
-    let result = (|| {
+    let result = {
         let _guard = lock.blocking_lock();
-        let existing = OciStore::open(store_path).and_then(|s| s.find(model)).ok();
-        // In the store is not the same as trusted: it may predate the
-        // policy, or have come in under `warn`. Classification first so
-        // a malformed llmman.conf can't break a cached non-OCI model no
-        // policy could apply to; then an in-memory policy lookup, which
-        // returns immediately when nothing is configured.
-        if let Some(desc) = existing {
-            if !crate::verify::is_registry_reference(model) {
-                return Ok(Vec::new());
-            }
-            if !crate::verify::is_enabled_for(model)? {
-                return Ok(Vec::new());
-            }
-            return verify_stored(store_path, model, &desc.digest);
-        }
-        let layout_dir = store_path
-            .to_str()
-            .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
         // Safe from a spawn_blocking'd OS thread: this reuses the
         // current (already-running) tokio runtime rather than trying to
         // start a second, nested one.
-        tokio::runtime::Handle::current().block_on(async {
-            match crate::hf::classify(model).await {
-                crate::hf::ClassifiedRef::Hf(reference) => {
-                    // classify routes by a live /v2/ probe, which fails
-                    // *open* into this branch — and this branch applies
-                    // no policy. So a reference the policy covers must
-                    // not be pulled here just because the probe could
-                    // not reach the registry.
-                    if crate::verify::is_registry_reference(model)
-                        && crate::verify::is_enabled_for(model)?
-                    {
-                        return Err(anyhow!(concat!(
-                            "is covered by a signature policy but could not be confirmed ",
-                            "to be an OCI registry (the /v2/ probe failed); refusing to ",
-                            "pull it as a HuggingFace repository unchecked",
-                        ))
-                        .context(model.to_string()));
-                    }
-                    crate::hf::pull::pull(&reference, store_path, model)
-                        .await
-                        .map(|()| Vec::new())
-                }
-                crate::hf::ClassifiedRef::Source(reference) => {
-                    crate::sources::pull(&reference, store_path, model)
-                        .await
-                        .map(|()| Vec::new())
-                }
-                crate::hf::ClassifiedRef::Other(normalized) => {
-                    // Checked before a single layer is fetched, so a
-                    // model the policy will reject costs one manifest
-                    // lookup instead of a multi-gigabyte download...
-                    let guard = crate::verify::PullGuard::check(&normalized)?;
-                    crate::ffi::pull(ffi_pull_ref(model, &normalized), layout_dir)?;
-                    // ...and confirmed afterwards against what actually
-                    // landed, so a tag repointed mid-pull can't slip
-                    // past the check that just passed.
-                    let stored = OciStore::open(store_path)?.find(&normalized)?;
-                    match guard.confirm(&stored.digest) {
-                        // Relayed to the client rather than logged here:
-                        // this runs in the daemon, whose stderr is a log
-                        // file nobody is watching. See verify::Verdict.
-                        Ok(notices) => Ok(notices),
-                        Err(e) => Err(reject_stored(store_path, &normalized, e)),
-                    }
-                }
-            }
-        })
-    })();
+        tokio::runtime::Handle::current().block_on(pull_checked(store_path, model))
+    };
     drop(lock);
     release_model_lock(model);
     result
+}
+
+/// [`pull_serialized`] without the in-process lock, so `llmman resolve`
+/// enforces `[verify]` as `llmman pull` does. Returns the verdicts' notices.
+pub(crate) async fn pull_checked(
+    store_path: &std::path::Path,
+    model: &str,
+) -> anyhow::Result<Vec<String>> {
+    let existing = OciStore::open(store_path).and_then(|s| s.find(model)).ok();
+    // In the store is not the same as trusted: it may predate the
+    // policy, or have come in under `warn`. Classification first so
+    // a malformed llmman.conf can't break a cached non-OCI model no
+    // policy could apply to; then an in-memory policy lookup, which
+    // returns immediately when nothing is configured.
+    if let Some(desc) = existing {
+        if !crate::verify::is_registry_reference(model) {
+            return Ok(Vec::new());
+        }
+        if !crate::verify::is_enabled_for(model)? {
+            return Ok(Vec::new());
+        }
+        return verify_stored(store_path, model, &desc.digest);
+    }
+    let layout_dir = store_path
+        .to_str()
+        .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
+    match crate::hf::classify(model).await {
+        crate::hf::ClassifiedRef::Hf(reference) => {
+            // classify routes by a live /v2/ probe, which fails
+            // *open* into this branch — and this branch applies
+            // no policy. So a reference the policy covers must
+            // not be pulled here just because the probe could
+            // not reach the registry.
+            if crate::verify::is_registry_reference(model) && crate::verify::is_enabled_for(model)?
+            {
+                return Err(anyhow!(concat!(
+                    "is covered by a signature policy but could not be confirmed ",
+                    "to be an OCI registry (the /v2/ probe failed); refusing to ",
+                    "pull it as a HuggingFace repository unchecked",
+                ))
+                .context(model.to_string()));
+            }
+            crate::hf::pull::pull(&reference, store_path, model)
+                .await
+                .map(|()| Vec::new())
+        }
+        crate::hf::ClassifiedRef::Source(reference) => {
+            crate::sources::pull(&reference, store_path, model)
+                .await
+                .map(|()| Vec::new())
+        }
+        crate::hf::ClassifiedRef::Other(normalized) => {
+            // Checked before a single layer is fetched, so a
+            // model the policy will reject costs one manifest
+            // lookup instead of a multi-gigabyte download...
+            let guard = crate::verify::PullGuard::check(&normalized)?;
+            crate::ffi::pull(ffi_pull_ref(model, &normalized), layout_dir)?;
+            // ...and confirmed afterwards against what actually
+            // landed, so a tag repointed mid-pull can't slip
+            // past the check that just passed.
+            let stored = OciStore::open(store_path)?.find(&normalized)?;
+            match guard.confirm(&stored.digest) {
+                // Relayed to the client rather than logged here:
+                // this runs in the daemon, whose stderr is a log
+                // file nobody is watching. See verify::Verdict.
+                Ok(notices) => Ok(notices),
+                Err(e) => Err(reject_stored(store_path, &normalized, e)),
+            }
+        }
+    }
 }
 
 /// A failed on-demand pull as the caller sees it: a 404 when the source says
@@ -949,6 +1003,43 @@ fn verify_stored(
         Err(e) if crate::verify::is_indeterminate(&e) => Err(e),
         Err(e) => Err(reject_stored(store_path, model, e)),
     }
+}
+
+/// Re-hashes the stored manifest, config and layer blobs of `desc`,
+/// the descriptor the caller resolved for `reference`, under the
+/// `[verify] layers` mode (see `verify::verify_layers`). The caller
+/// does the one `OciStore::find`; this function never finds again, so
+/// the manifest checked here is the manifest the load then opens. The
+/// mode is resolved first, so every caller, `llmman resolve` of a
+/// cached HF model included, loads the policy here and an unparsable
+/// `LLMMAN_VERIFY` or `LLMMAN_VERIFY_LAYERS` fails there as it does in
+/// the daemon. Blocking: it reads every stored blob of the model, so
+/// run it off the async executor. Unlike `verify_stored`, a mismatch
+/// never removes the reference: the blob may be the operator's only copy.
+///
+/// Returns the reference the caller must load alongside the notices:
+/// `reference` pinned to `desc`'s digest (see `verify::pinned_reference`),
+/// under `off` as well, so the load cannot resolve a tag repointed since
+/// the find. An absolute path or a URI cannot carry a digest
+/// (`split_ref_digest`), so it comes back as given and is loaded by
+/// name: a pointer rewritten between the find and the load is not
+/// caught for that reference class. `modelpack::resolve_model` and
+/// `resolve_model_tree` use their reference only for `OciStore::find`
+/// and error text, so the pinned spelling changes which manifest they
+/// load and nothing else.
+pub(crate) fn verify_layers_found(
+    store_path: &std::path::Path,
+    reference: &str,
+    desc: &crate::storage::oci::Descriptor,
+) -> anyhow::Result<(String, Vec<String>)> {
+    let mode = crate::verify::layers_mode()?;
+    let notices = if mode == crate::verify::Mode::Off {
+        Vec::new()
+    } else {
+        let store = OciStore::open(store_path)?;
+        crate::verify::verify_layers(mode, &store, reference, desc)?
+    };
+    Ok((crate::verify::pinned_reference(reference, desc), notices))
 }
 
 /// Drops a reference the policy refused, so a later pull cannot find it
@@ -1653,10 +1744,13 @@ struct RemoteTarget {
     max_output: Option<u32>,
     /// The catalog's price, for the usage ledger.
     cost: Option<crate::providers::Cost>,
-    /// API key for this request, or `None` for a provider that takes
-    /// none (see `Provider::key_optional`). See [`resolve_remote_target`]
-    /// for where it comes from.
-    api_key: Option<String>,
+    /// The credential for this request, or `None` for a provider that
+    /// takes none (see `Provider::key_optional`). See
+    /// [`resolve_remote_target`] for where it comes from.
+    credential: Option<crate::credentials::Resolved>,
+    /// How it is attached, and what else the provider wants sent
+    /// ([`crate::authscheme`]).
+    auth: crate::authscheme::Auth,
     /// The caller's own `x-opencode-session` if it sent one. Populated only
     /// for an opencode-go target (via [`RemoteTarget::adopt_session`]) and
     /// `None` otherwise. When `None` for opencode-go, a stable daemon-wide
@@ -1699,7 +1793,7 @@ impl std::fmt::Debug for RemoteTarget {
             .field("base_url", &self.base_url)
             .field("wire", &self.wire)
             .field("model", &self.model)
-            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("credential", &self.credential)
             .field("session", &self.session.as_ref().map(|_| "<redacted>"))
             .finish()
     }
@@ -1734,17 +1828,13 @@ impl Target {
             Self::Local(_) => req,
             Self::Peer(peer) => aggregation::hop(req, peer.api_key.as_deref()),
             Self::Remote(remote) => {
-                let req = match (remote.wire, remote.api_key.as_deref()) {
-                    (Wire::OpenAi, Some(key)) => req.bearer_auth(key),
-                    (Wire::OpenAi, None) => req,
-                    (Wire::Anthropic, key) => {
-                        let req = req.header("anthropic-version", anthropic::VERSION);
-                        match key {
-                            Some(key) => req.header("x-api-key", key),
-                            None => req,
-                        }
-                    }
+                let req = match remote.wire {
+                    Wire::OpenAi => req,
+                    Wire::Anthropic => req.header("anthropic-version", anthropic::VERSION),
                 };
+                let req = remote
+                    .auth
+                    .apply(remote.wire, req, remote.credential.as_ref());
                 if remote.sends_opencode_session() {
                     req.header(
                         OPENCODE_SESSION_HEADER,
@@ -1756,6 +1846,18 @@ impl Target {
                 }
             }
         }
+    }
+
+    /// Sends `req`, which [`Target::authorize`] was applied to. A credential
+    /// that signs its requests (AWS SigV4) signs this one here, once its
+    /// URL, headers and body are final, because the signature covers
+    /// exactly the bytes that go out; every other target sends as before.
+    async fn send(&self, req: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
+        let signer = match self {
+            Self::Remote(remote) => remote.credential.as_ref().and_then(|c| c.signer.clone()),
+            _ => None,
+        };
+        crate::authscheme::send(req, signer.as_deref()).await
     }
 
     fn is_remote(&self) -> bool {
@@ -1915,14 +2017,36 @@ async fn catalog_blocking(
         .map_err(|e| AppError(e, StatusCode::BAD_GATEWAY))
 }
 
+/// The credential the daemon itself would spend on `provider`, resolved
+/// off the runtime: an OAuth login may be refreshed and a key command run.
+/// A login that can no longer be used is a 401 saying to log in again;
+/// anything else a 500, since the cause is this daemon's own setup.
+async fn provider_credential(
+    provider: &crate::providers::Provider,
+) -> Result<Option<crate::credentials::Resolved>, AppError> {
+    let provider = provider.clone();
+    tokio::task::spawn_blocking(move || provider.credential())
+        .await
+        .context("credential task panicked")?
+        .map_err(|e| {
+            let status = if e.is::<crate::credentials::ReloginRequired>() {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            AppError(e, status)
+        })
+}
+
 /// Resolves a [`crate::providers::REMOTE_PREFIX`] reference into a
 /// [`Target::Remote`], or `None` for any ordinary local reference.
 ///
-/// The API key is the caller's own (see [`client_api_key`]) when it sent
-/// one, else the provider's variable from this daemon's environment — so
-/// both `llmman launch --provider`, which puts the real key in the
-/// integration's requests, and a daemon started with the key already
-/// exported work.
+/// The credential is the caller's own key (see [`client_api_key`]) when it
+/// sent one, else this daemon's own ([`crate::providers::Provider::credential`]:
+/// the provider's variable, a stored login, `llmman.conf`) — so both
+/// `llmman launch --provider`, which puts the real key in the integration's
+/// requests, and a daemon started with the key already exported or logged
+/// in work.
 async fn resolve_remote_target(
     state: &AppState,
     model_ref: &str,
@@ -1947,9 +2071,13 @@ async fn resolve_remote_target(
     // network can reach, or a browser acting for another site. That is a
     // blast-radius bound, not authentication — see `daemon_key_spendable`.
     let trusted = daemon_key_spendable(state, headers);
-    let own_key = || trusted.then(|| provider.api_key()).flatten();
-    let api_key = match client_api_key(headers).or_else(own_key) {
-        Some(key) => Some(key),
+    let credential = match client_api_key(headers) {
+        Some(key) => Some(crate::credentials::Resolved::from_key(key, "request")),
+        None if trusted => provider_credential(provider).await?,
+        None => None,
+    };
+    let credential = match credential {
+        Some(credential) => Some(credential),
         // A configured provider that takes no key goes up bare.
         None if provider.key_optional => None,
         None => {
@@ -1963,8 +2091,14 @@ async fn resolve_remote_target(
                             .to_string()
                     } else if trusted {
                         format!(
-                            ", or give llmman serve a key of its own: {}",
-                            crate::providers::key_hint(&provider.id, provider.key_env.as_deref())
+                            ", or give llmman serve a key of its own: {}{}",
+                            crate::providers::key_hint(&provider.id, provider.key_env.as_deref()),
+                            // A provider with no variable already got it from
+                            // `key_hint`.
+                            crate::providers::login_hint(&provider.id)
+                                .filter(|_| provider.key_env.is_some())
+                                .map(|h| format!(", or {h}"))
+                                .unwrap_or_default()
                         )
                     } else {
                         ". llmman serve is not bound to loopback, so its own environment is \
@@ -1980,23 +2114,31 @@ async fn resolve_remote_target(
     let listed = provider.models.iter().find(|m| m.id == model);
     let mut target = RemoteTarget {
         provider: provider_id,
-        base_url: provider.base_url.clone(),
+        base_url: credential
+            .as_ref()
+            .map_or_else(|| provider.base_url.clone(), |c| provider.base_url_for(c)),
         wire: provider.wire,
         max_output: listed.and_then(|m| m.max_output),
         cost: listed.and_then(|m| m.cost.clone()),
-        model,
-        api_key,
+        model: provider.wire_model(&model),
+        credential,
+        auth: if trusted {
+            provider.auth.clone()
+        } else {
+            provider.auth.scheme_only()
+        },
         session: None,
     };
     target.adopt_session(headers);
-    // No key on this line: it is the one piece of a remote target that
-    // must never reach a log file.
+    // Only the kind of credential on this line: the credential is the one
+    // piece of a remote target that must never reach a log file.
     eprintln!(
-        "[llmman] routing {} to provider {} ({}, {} wire)",
+        "[llmman] routing {} to provider {} ({}, {} wire, credential: {})",
         target.model,
         target.provider,
         target.base_url,
-        target.wire.as_str()
+        target.wire.as_str(),
+        target.credential.as_ref().map_or("none", |c| c.kind)
     );
     Ok(Some(Target::Remote(Arc::new(target))))
 }
@@ -2285,30 +2427,56 @@ async fn resolve_target(
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
-    // Best-effort — used to populate `llmman ps`'s ID/SIZE columns and
-    // for the check right below; `resolve_model` after them establishes
-    // the model exists, so a failure here (e.g. a race with a concurrent
-    // `rm`) just means those columns show as empty/zero rather than
-    // failing the whole request.
-    let (digest, size) = OciStore::open(&state.0.store_path)
-        .and_then(|s| {
-            s.find(model_ref).map(|d| {
-                let size = s.total_size(&d);
-                (d.digest, size)
-            })
-        })
-        .unwrap_or_default();
+    // The one resolution of this load. The descriptor feeds the
+    // running-digest check, `llmman ps`'s ID/SIZE columns, the layer
+    // check and, through `load_ref`, `resolve_model` and the worker
+    // spawns, so a tag repointed by a concurrent pull or `rm` between
+    // any two of them cannot hand the load a manifest nobody checked.
+    // A failed find fails the load: `resolve_model` finds by the same
+    // reference and would have failed with "model not found in store".
+    let desc = OciStore::open(&state.0.store_path)?
+        .find(model_ref)
+        .with_context(|| format!("model not found in store: {model_ref}"))?;
     // The content may be running already under a key this spelling does
     // not resolve to; see `check_running_by_digest`'s doc comment for the
     // order that produces one.
-    if !digest.is_empty() {
-        if let Some((key, port, guard)) =
-            check_running_by_digest(state, model_ref, &digest, opts.ctx).await
-        {
-            return Ok((key, Target::Local(port), guard));
-        }
+    if let Some((key, port, guard)) =
+        check_running_by_digest(state, model_ref, &desc.digest, opts.ctx).await
+    {
+        return Ok((key, Target::Local(port), guard));
     }
-    let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
+    // Layer digests, once per cold load: after every running-process
+    // reuse check above (a tag for content already loaded by digest
+    // must not re-hash the model) and ahead of every format arm below,
+    // so GGUF, safetensors trees, diffusion and Omni all pass through
+    // it. Off by default; an enforce mismatch fails the load with the
+    // reference and digests in the error. It checks `desc`, found once
+    // above, and `resolve_model` loads that same manifest through
+    // `load_ref`; `model_ref` stays the spelling for the running-process
+    // keys and logs.
+    let load_ref = {
+        let store_path = state.0.store_path.clone();
+        let model_ref_owned = model_ref.to_owned();
+        let desc = desc.clone();
+        let (load_ref, notices) = tokio::task::spawn_blocking(move || {
+            verify_layers_found(&store_path, &model_ref_owned, &desc)
+        })
+        .await
+        .context("layer verification task panicked")?
+        .with_context(|| format!("verify layers of {model_ref}"))?;
+        for notice in notices {
+            eprintln!("[llmman] {notice}");
+        }
+        load_ref
+    };
+    // Read the manifest for the size only now: `total_size` is a plain
+    // read, so before the layer check a FIFO or a link to `/dev/zero`
+    // at the manifest's blob path would stall the load instead of
+    // being reported as a mismatch.
+    let size = OciStore::open(&state.0.store_path)?.total_size(&desc);
+    let digest = desc.digest;
+
+    let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, &load_ref)
         .with_context(|| format!("resolve model {model_ref}"))?;
     let context_shift = supports_context_shift(model_ref);
     // One header read feeds initial_ctx_size, embedding_model_ctx and
@@ -2324,12 +2492,10 @@ async fn resolve_target(
     // Both refused before anything is evicted or spawned.
     let decision = gguf_info.as_ref().is_some_and(|info| info.is_decision());
     let speech = gguf_info.as_ref().is_some_and(is_speech_model);
-    let thinks_without_levels = gguf_info
+    let thinking_controls = gguf_info
         .as_ref()
         .and_then(|info| info.str("tokenizer.chat_template"))
-        .is_some_and(|template| {
-            crate::chat_template::thinking_controls(template).thinks_without_levels()
-        });
+        .map(crate::chat_template::thinking_controls);
     if decision {
         if let Some(refusal) = task.refuse_decision(model_ref) {
             return Err(refusal);
@@ -2368,7 +2534,7 @@ async fn resolve_target(
     // A request's `num_ctx` is explicit, so never auto-shrunk below.
     let (ctx_configured, ctx_explicit) = match load_ctx {
         Some(num_ctx) => (Some(effective_ctx(num_ctx, trained_ctx)), true),
-        None => (state.0.ctx_size, state.0.ctx_size_explicit),
+        None => state.0.ctx_setting(embedding_ctx.is_some()),
     };
     let mut ctx_size = initial_ctx_size(
         ctx_configured,
@@ -2421,6 +2587,7 @@ async fn resolve_target(
             // full precedence chain this `.or` implements.
             threads: opts.threads.or(state.0.threads),
             cpus: state.0.cpu_limit,
+            hardened: state.0.hardened,
             extra_args: &llama_extra_args,
         };
         // Every piped child gets an output tail for crash reasons; only
@@ -2433,8 +2600,12 @@ async fn resolve_target(
         let safetensors_engine = safetensors_engine_from_env();
         // May fetch llama.cpp if startup could not (runtime::Lazy).
         // Skipped for ds4, which uses neither llama.cpp nor a container.
+        // A speech model has its own answer: its container needs no GPU,
+        // so under `auto` it can run in one where llama-server cannot.
         let ociman = if ds4 {
             None
+        } else if speech {
+            state.0.runtime.ociman_for(Workload::CpuOnly).await?
         } else {
             state.0.runtime.ociman().await?
         };
@@ -2454,23 +2625,27 @@ async fn resolve_target(
                     // A Canary GGUF runs in this binary's speech worker,
                     // spawned the way the media backend is but from the
                     // CPU image (see SPEECH_BACKEND). Not OOM-retryable
-                    // either.
+                    // either. The worker re-resolves its reference, so it
+                    // gets `load_ref`, the manifest verified above.
                     (GgufArm::Speech { container: true }, Some(ociman)) => {
                         let mut child = crate::container::spawn_mediagen(
                             ociman,
                             crate::container::SPEECH_BACKEND,
-                            model_ref,
+                            &load_ref,
                             &state.0.store_path,
                             &state.0.cache_path,
                             state.0.llama_cpp_version.as_deref(),
                             port,
                             state.0.cpu_limit,
+                            state.0.hardened,
                         )?;
                         stderr_tail = Some(tail_child_output(&mut child));
                         ModelProcess::Container(ociman, Engine::Speech, child)
                     }
                     (GgufArm::Speech { .. }, _) => {
-                        let (child, tail) = spawn_mediagen_backend(model_ref, port, state).await?;
+                        let (child, tail) =
+                            spawn_mediagen_backend(&load_ref, port, state, Workload::CpuOnly)
+                                .await?;
                         stderr_tail = Some(tail);
                         ModelProcess::Local(Engine::Speech, child, None)
                     }
@@ -2496,24 +2671,28 @@ async fn resolve_target(
                     }
                 }
             }
-            // diffusion models run in this binary (see mediagen_backend)
+            // diffusion models run in this binary (see mediagen_backend).
+            // The worker re-resolves its reference, so it gets `load_ref`:
+            // the manifest verified above, not a tag that may have moved.
             (ModelPath::Diffusion(_), Some(ociman)) => {
                 let mut child = crate::container::spawn_mediagen(
                     ociman,
                     crate::container::detect_backend(),
-                    model_ref,
+                    &load_ref,
                     &state.0.store_path,
                     &state.0.cache_path,
                     state.0.llama_cpp_version.as_deref(),
                     port,
                     state.0.cpu_limit,
+                    state.0.hardened,
                 )?;
                 stderr_tail = Some(tail_child_output(&mut child));
                 oom_retryable = true;
                 ModelProcess::Container(ociman, Engine::LlamaServer, child)
             }
             (ModelPath::Diffusion(_), None) => {
-                let (child, tail) = spawn_mediagen_backend(model_ref, port, state).await?;
+                let (child, tail) =
+                    spawn_mediagen_backend(&load_ref, port, state, Workload::General).await?;
                 stderr_tail = Some(tail);
                 oom_retryable = true;
                 ModelProcess::Local(Engine::LlamaServer, child, None)
@@ -2544,6 +2723,7 @@ async fn resolve_target(
                     state.0.vllm_image.as_deref(),
                     port,
                     state.0.cpu_limit,
+                    state.0.hardened,
                     |model_dir, host| {
                         if sglang {
                             sglang_serve_args_from_env(
@@ -2579,6 +2759,7 @@ async fn resolve_target(
                     None,
                     port,
                     state.0.cpu_limit,
+                    state.0.hardened,
                     |model_dir, host| {
                         vllm_omni_serve_args_from_env(model_dir, host, port, model_ref)
                     },
@@ -2620,6 +2801,34 @@ async fn resolve_target(
             Err(e) => {
                 let looks_oom = oom_retryable && looks_like_oom(&e.to_string());
                 if !looks_oom {
+                    // A container that only fails hardened (a store
+                    // written with umask 077 behind `--cap-drop all`)
+                    // must name the flags and `--no-hardened`, or the
+                    // crash reads as the engine's own.
+                    if let (true, ModelProcess::Container(ociman, engine, _)) =
+                        (state.0.hardened, &process)
+                    {
+                        use crate::container::HardenedSpawn;
+                        let spawn = match engine {
+                            Engine::Vllm | Engine::VllmOmni => HardenedSpawn::Vllm,
+                            Engine::Sglang => HardenedSpawn::Sglang,
+                            Engine::Speech => HardenedSpawn::Speech,
+                            _ => HardenedSpawn::LlamaServer,
+                        };
+                        // The directory each spawn mounted and resolved
+                        // its `--user` against: the GGUF's parent for
+                        // llama-server, the extracted model directory
+                        // for an engine, the store for a mediagen worker.
+                        let mounted: &std::path::Path = match &model_path {
+                            ModelPath::Gguf(path, _) if spawn != HardenedSpawn::Speech => {
+                                path.parent().unwrap_or(&state.0.store_path)
+                            }
+                            ModelPath::SafeTensors(dir) | ModelPath::Omni(dir) => dir,
+                            ModelPath::Gguf(..) | ModelPath::Diffusion(_) => &state.0.store_path,
+                        };
+                        let note = crate::container::spawn_hardened_note(spawn, *ociman, mounted);
+                        return Err(anyhow!("{e:#}; {note}").into());
+                    }
                     return Err(e.into());
                 }
                 // See ModelProcess::stop_and_wait's own doc comment.
@@ -2711,26 +2920,29 @@ async fn resolve_target(
         _ => configured_window,
     };
     // A container gets LLMMAN_LLAMA_ARGS but not this environment.
-    let inherited = |var| matches!(process, ModelProcess::Local(..)).then_some(var);
-    // The user's template replaces the one `thinks_without_levels` read.
-    let user_template = ["--chat-template", "--chat-template-file"]
-        .iter()
-        .zip(["LLAMA_ARG_CHAT_TEMPLATE", "LLAMA_ARG_CHAT_TEMPLATE_FILE"])
-        .any(|(flag, env)| backend::llama_sets(&llama_extra_args, flag, inherited(env)));
-    let effort_budget = thinks_without_levels
-        && !user_template
-        && process.engine() == Engine::LlamaServer
-        && !backend::llama_sets(
-            &llama_extra_args,
-            "--reasoning-budget",
-            inherited("LLAMA_ARG_THINK_BUDGET"),
-        );
+    let inherits_env = matches!(process, ModelProcess::Local(..));
+    let (thinking, budgeted) = match (&thinking_controls, process.engine()) {
+        (Some(controls), Engine::LlamaServer) => {
+            backend::llama_thinking(controls, &llama_extra_args, inherits_env)
+        }
+        _ => (None, false),
+    };
+    let effort_budget = budgeted
+        && thinking_controls
+            .as_ref()
+            .is_some_and(|c| c.thinks_without_levels());
     let effort_budget_message = !backend::llama_sets(
         &llama_extra_args,
         "--reasoning-budget-message",
-        inherited("LLAMA_ARG_THINK_BUDGET_MESSAGE"),
+        inherits_env.then_some("LLAMA_ARG_THINK_BUDGET_MESSAGE"),
     );
 
+    // Not diffusion (one generation at a time) or a user-set `--parallel`.
+    let parallel_slots = num_parallel.filter(|_| {
+        process.engine() == Engine::LlamaServer
+            && !matches!(model_path, ModelPath::Diffusion(_))
+            && !backend::llama_sets_parallel(&llama_extra_args, inherits_env)
+    });
     let mut mgr = state.0.manager.lock().await;
     mgr.running.insert(
         model_ref.to_string(),
@@ -2747,9 +2959,11 @@ async fn resolve_target(
             keep_alive: default_keep_alive(),
             // 1, not 0 — see this function's own doc comment.
             in_flight: 1,
+            parallel_slots,
             decision,
             effort_budget,
             effort_budget_message,
+            thinking,
             trained_ctx,
             retiring: Default::default(),
         },
@@ -3093,8 +3307,7 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
 ) -> Result<ChatUpstream, AppError> {
     let Target::Remote(remote) = target else {
         let resp = target
-            .authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)).json(req))
-            .send()
+            .send(target.authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)).json(req)))
             .await
             .with_context(|| format!("send to {}", target.describe()))?;
         let upstream = ChatUpstream::relay(resp);
@@ -3108,8 +3321,7 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
     provider_compat(remote, &mut req);
     if remote.wire == Wire::OpenAi {
         let resp = target
-            .authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)).json(&req))
-            .send()
+            .send(target.authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)).json(&req)))
             .await
             .with_context(|| format!("send to {}", target.describe()))?;
         return Ok(ChatUpstream::relay(resp));
@@ -3139,9 +3351,8 @@ async fn send_chat_completion<T: Serialize + ?Sized>(
     if anthropic::manual_thinking(&messages_req) {
         upstream = upstream.header("anthropic-beta", anthropic::INTERLEAVED_THINKING_BETA);
     }
-    let resp = upstream
-        .json(&messages_req)
-        .send()
+    let resp = target
+        .send(upstream.json(&messages_req))
         .await
         .with_context(|| format!("send to {}", target.describe()))?;
     if !resp.status().is_success() {
@@ -3220,10 +3431,12 @@ async fn retry_merging_roles<T: Serialize + ?Sized>(
     let sent = serde_json::to_vec(req).context("serialize chat request")?;
     if let Some(merged) = openai::merged_after_refusal(target, status, &reply, &sent) {
         let resp = target
-            .authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(merged)
-            .send()
+            .send(
+                target
+                    .authorize(client.post(target.url(CHAT_COMPLETIONS_ROUTE)))
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(merged),
+            )
             .await
             .with_context(|| format!("send to {}", target.describe()))?;
         return Ok(ChatUpstream::relay(resp));
@@ -3530,8 +3743,9 @@ struct ProviderSummary {
     /// What is spoken at `base_url`: `openai` or `anthropic` (see
     /// [`crate::providers::Wire`]).
     wire: &'static str,
-    /// Whether this daemon holds a key for it, in its environment or its
-    /// `llmman.conf`.
+    /// Whether this daemon holds a credential for it: a key in its
+    /// environment or `llmman.conf`, a stored login, or a key command or
+    /// file.
     key_set: bool,
     /// Whether it would actually spend it for a request that presents no
     /// key of its own — `key_set` plus this daemon's own bind check, which
@@ -3542,6 +3756,13 @@ struct ProviderSummary {
     /// Whether a keyless request is forwarded anyway (see
     /// `Provider::key_optional`).
     key_optional: bool,
+    /// What the daemon would spend and whether it works; absent when it
+    /// holds none. No secret, ever.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential: Option<crate::credentials::Status>,
+    /// How a credential is attached: `default` (the wire's own), `bearer`,
+    /// `x-api-key`, `header` or `query`.
+    auth: &'static str,
     models: usize,
 }
 
@@ -3553,9 +3774,11 @@ impl ProviderSummary {
             base_url: p.base_url.clone(),
             key_env: p.key_env.clone(),
             wire: p.wire.as_str(),
-            key_set: p.api_key().is_some(),
+            key_set: p.has_credential(),
             key_usable: daemon_key_usable(state, p),
             key_optional: p.key_optional,
+            credential: p.credential_status(),
+            auth: p.auth.scheme.as_str(),
             models: p.models.len(),
         }
     }
@@ -3566,7 +3789,7 @@ impl ProviderSummary {
 /// (see `daemon_key_spendable`), minus the per-request cross-site check
 /// no CLI can trip.
 fn daemon_key_usable(state: &AppState, provider: &crate::providers::Provider) -> bool {
-    provider.api_key().is_some() && daemon_key_spendable(state, None)
+    provider.has_credential() && daemon_key_spendable(state, None)
 }
 
 /// `GET /llmman/providers`.
@@ -3591,6 +3814,11 @@ struct ProviderResponse {
     key_usable: bool,
     /// See [`ProviderSummary::key_optional`].
     key_optional: bool,
+    /// See [`ProviderSummary::credential`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential: Option<crate::credentials::Status>,
+    /// See [`ProviderSummary::auth`].
+    auth: &'static str,
     models: Vec<ProviderModelResponse>,
 }
 
@@ -3613,6 +3841,10 @@ struct ProviderModelResponse {
     /// catalog names no ceiling.
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<u32>,
+    /// See [`crate::providers::Model::vision`]; absent where the
+    /// catalog publishes no modalities.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vision: Option<bool>,
 }
 
 /// US dollars per million tokens, models.dev's own unit (see
@@ -3637,9 +3869,11 @@ impl ProviderResponse {
             base_url: p.base_url.clone(),
             key_env: p.key_env.clone(),
             wire: p.wire.as_str(),
-            key_set: p.api_key().is_some(),
+            key_set: p.has_credential(),
             key_usable: daemon_key_usable(state, p),
             key_optional: p.key_optional,
+            credential: p.credential_status(),
+            auth: p.auth.scheme.as_str(),
             models: p
                 .models
                 .iter()
@@ -3655,6 +3889,7 @@ impl ProviderResponse {
                     thinking: m.thinking.clone(),
                     context: m.max_context,
                     output: m.max_output,
+                    vision: m.vision,
                 })
                 .collect(),
         }
@@ -3719,14 +3954,15 @@ async fn handle_llmman_provider(
             .await
             .into_iter()
             // A provider defined in llmman.conf: its models come from
-            // the endpoint's own /v1/models, which names no window and
-            // no output ceiling.
+            // the endpoint's own /v1/models, which names no window, no
+            // output ceiling and no image input.
             .map(|id| ProviderModelResponse {
                 id,
                 cost: None,
                 thinking: None,
                 context: None,
                 output: None,
+                vision: None,
             })
             .collect();
     }
@@ -3879,15 +4115,26 @@ async fn configured_provider_models(
         return Vec::new();
     }
     let url = provider.url("/v1/models");
-    let mut req = state.0.client.get(&url).timeout(CONFIGURED_MODELS_TIMEOUT);
-    if daemon_key_usable(state, provider) {
-        if let Some(key) = provider.api_key() {
-            req = req.bearer_auth(key);
-        }
-    }
-    let listed = async {
-        let resp = req.send().await?.error_for_status()?;
-        resp.json::<ModelsResponse>().await
+    let req = state.0.client.get(&url).timeout(CONFIGURED_MODELS_TIMEOUT);
+    // A credential that cannot be resolved is a listing without one.
+    let credential = if daemon_key_usable(state, provider) {
+        provider_credential(provider).await.ok().flatten()
+    } else {
+        None
+    };
+    let auth = if daemon_key_spendable(state, None) {
+        provider.auth.clone()
+    } else {
+        provider.auth.scheme_only()
+    };
+    let req = auth.apply(provider.wire, req, credential.as_ref());
+    let signer = credential.as_ref().and_then(|c| c.signer.clone());
+    let listed: anyhow::Result<ModelsResponse> = async {
+        let resp = crate::authscheme::send(req, signer.as_deref())
+            .await?
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?;
+        Ok(resp.json::<ModelsResponse>().await?)
     }
     .await;
     match listed {
@@ -4140,17 +4387,38 @@ async fn record_prompt(State(state): State<AppState>, req: Request, next: Next) 
 /// outright, since `/api/blobs` reads a raw body and `/api/pull` or
 /// `/api/create` would otherwise be drivable from any page.
 async fn accept_any_content_type(mut req: Request, next: Next) -> Response {
+    if forged_cross_site(req.headers()) {
+        return cross_site_refused().into_response();
+    }
     if !has_json_content_type(req.headers()) {
-        if foreign_origin(req.headers()) {
-            let body = serde_json::json!({ "error": "cross-site request refused" });
-            return (StatusCode::FORBIDDEN, Json(body)).into_response();
-        }
         req.headers_mut().insert(
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("application/json"),
         );
     }
     next.run(req).await
+}
+
+/// The 403 for a request from a page `cors_layer` wouldn't allow.
+fn cross_site_refused() -> AppError {
+    AppError::status(StatusCode::FORBIDDEN, "cross-site request refused")
+}
+
+/// A POST route that takes an upload (up to [`TRANSCRIPTION_BODY_LIMIT_BYTES`]).
+/// A forged cross-site request is refused before its body is buffered.
+fn upload_route<H, T>(handler: H) -> axum::routing::MethodRouter<AppState>
+where
+    H: axum::handler::Handler<T, AppState>,
+    T: 'static,
+{
+    post(handler)
+        .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES))
+        .layer(middleware::from_fn(|req: Request, next: Next| async move {
+            if forged_cross_site(req.headers()) {
+                return cross_site_refused().into_response();
+            }
+            next.run(req).await
+        }))
 }
 
 fn has_json_content_type(headers: &HeaderMap) -> bool {
@@ -4221,6 +4489,10 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
                 // only notices a dead backend when a request arrives for
                 // that model, so `models_loaded` counts it until then.
                 up: m.process.is_alive(),
+                requests_in_flight: u64::from(m.in_flight),
+                requests_queued: m
+                    .parallel_slots
+                    .map(|slots| u64::from(m.in_flight.saturating_sub(slots))),
             })
             .collect();
         (mgr.running.len() as u64, mgr.pending_loads as u64, models)
@@ -4267,6 +4539,9 @@ impl ServeArgs {
     /// The child is an ordinary foreground `serve`, never another `--detach`.
     fn detached_child_args(&self) -> Vec<&str> {
         let mut args = vec!["--runtime", self.runtime.as_str()];
+        if self.no_hardened {
+            args.push("--no-hardened");
+        }
         for (flag, value) in [
             ("--llama-cpp-version", self.llama_cpp_version.as_deref()),
             ("--vllm-version", self.vllm_version.as_deref()),
@@ -4297,21 +4572,6 @@ pub fn llama_libs(
         )
     })?;
     Ok((source, dir))
-}
-
-/// How the mediagen backend checks the identity of the libraries it
-/// loads. Strict only for llmman's own download of the tested release:
-/// a `bin` source pinned to the default release. A user-chosen release,
-/// `latest`, or a `path` build (which the pin never selects) is logged.
-fn identity_check_for(
-    source: Runtime,
-    pinned: Option<&str>,
-) -> crate::mediagen::ffi::IdentityCheck {
-    if source == Runtime::Bin && pinned == Some(crate::llama_release::default_release()) {
-        crate::mediagen::ffi::IdentityCheck::Strict(&crate::llama_release::PINNED_GGML)
-    } else {
-        crate::mediagen::ffi::IdentityCheck::Log
-    }
 }
 
 /// `llmman serve MODEL --port PORT`: the backend the daemon spawns in
@@ -4348,18 +4608,12 @@ async fn load_ggml_api(
     args: &ServeArgs,
 ) -> anyhow::Result<(&'static crate::mediagen::ffi::Api, PathBuf)> {
     let pinned = runtime::llama_cpp_pin(args.llama_cpp_version.as_deref());
-    // `identity_check_for` holds the rule. The daemon forwards its
-    // resolved runtime and pin (`spawn_mediagen_backend`), so a default
-    // daemon on its own download makes this child strict too.
     let runtime = args.runtime;
-    let (lib_dir, check) = tokio::task::spawn_blocking(move || {
-        let (source, lib_dir) = llama_libs(runtime, pinned.as_deref())?;
-        anyhow::Ok((lib_dir, identity_check_for(source, pinned.as_deref())))
+    let lib_dir = tokio::task::spawn_blocking(move || {
+        llama_libs(runtime, pinned.as_deref()).map(|(_, lib_dir)| lib_dir)
     })
     .await??;
-    let api = Box::leak(Box::new(crate::mediagen::ffi::Api::load_with(
-        &lib_dir, check,
-    )?));
+    let api = Box::leak(Box::new(crate::mediagen::ffi::Api::load(&lib_dir)?));
     Ok((api, lib_dir))
 }
 
@@ -4457,20 +4711,35 @@ async fn speech_backend(
     crate::mediagen::http::serve("speech", router, (args.host, port).into()).await
 }
 
+/// The `serve MODEL --port PORT` head of a worker's argv. `model_ref`
+/// is passed through verbatim: the child resolves it on its own, so
+/// the caller hands it the digest-pinned spelling `verify_layers_found`
+/// returned and the worker loads the manifest that was verified.
+fn mediagen_backend_args(model_ref: &str, port: u16) -> [String; 4] {
+    [
+        "serve".into(),
+        model_ref.into(),
+        "--port".into(),
+        port.to_string(),
+    ]
+}
+
 /// Spawns this binary as `model_ref`'s backend, `llmman serve MODEL --port
 /// PORT` (see `run`): the media backend of a diffusion model, the speech
-/// worker of a Canary GGUF.
+/// worker of a Canary GGUF. `workload` is whose runtime answer the child
+/// inherits (see `runtime::Workload`).
 async fn spawn_mediagen_backend(
     model_ref: &str,
     port: u16,
     state: &AppState,
+    workload: Workload,
 ) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
     let exe = std::env::current_exe().context("locating the llmman binary")?;
     let mut cmd = tokio::process::Command::new(&exe);
-    cmd.args(["serve", model_ref, "--port", &port.to_string()]);
+    cmd.args(mediagen_backend_args(model_ref, port));
     // Explicit, so the child lands on the same build as this daemon
     // rather than re-resolving `auto`/the default pin/LLMMAN_RUNTIME.
-    let runtime = state.0.runtime.resolve().await?.runtime();
+    let runtime = state.0.runtime.resolve_for(workload).await?.runtime();
     cmd.args(["--runtime", runtime.as_str()]);
     cmd.args([
         "--llama-cpp-version",
@@ -4495,6 +4764,9 @@ async fn spawn_mediagen_backend(
     let tail = tail_child_output(&mut child);
     Ok((child, tail))
 }
+
+/// Allows base64 images and long prompts while keeping request memory bounded.
+const GENERATION_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 /// The daemon's routes and the layers over them, split out of
 /// [`serve_async`] so `the_scrape_endpoint_is_outside_the_cors_layer` can
@@ -4524,27 +4796,18 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .merge(ollama_router())
         // OpenAI API
         .route("/v1/models", get(handle_openai_models))
-        .route("/v1/chat/completions", post(handle_openai_chat))
-        .route("/v1/completions", post(handle_openai_completions))
         .route("/v1/embeddings", post(handle_openai_embeddings))
         .route(
             "/v1/systemone",
-            post(handle_openai_systemone).layer(DefaultBodyLimit::max(SYSTEMONE_BODY_LIMIT_BYTES)),
+            post(handle_openai_systemone).layer(DefaultBodyLimit::max(GENERATION_BODY_LIMIT_BYTES)),
         )
         .route(
             "/v1/audio/transcriptions",
-            post(handle_openai_transcriptions)
-                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
+            upload_route(handle_openai_transcriptions),
         )
         .route(
             "/audio/transcriptions",
-            post(handle_openai_transcriptions)
-                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
-        )
-        .route("/v1/responses", post(responses::handle_openai_responses))
-        .route(
-            "/v1/responses/input_tokens",
-            post(responses::handle_openai_responses_input_tokens),
+            upload_route(handle_openai_transcriptions),
         )
         // OpenAI media generation (crate::mediagen::server)
         .route("/v1/images/generations", post(handle_openai_images))
@@ -4552,12 +4815,11 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .route("/v1/videos/:id", get(handle_openai_video_get))
         .route("/v1/videos/:id/content", get(handle_openai_video_get))
         .route("/v1/audio/speech", post(handle_openai_speech))
-        // Native Gemini compatibility. The public route accepts a model in
-        // Gemini's normal API path; the AGY route pins AGY's auxiliary calls
-        // to the model chosen by `llmman launch agy`.
-        .route("/gemini/:model/*gemini_path", post(handle_pinned_gemini))
-        // Anthropic API
-        .route("/v1/messages", post(anthropic::handle_anthropic_messages));
+        // llama-server's own text to speech: voices, voice cloning from a
+        // reference clip, raw PCM, streaming (a clip arrives as multipart)
+        .route("/tts", upload_route(handle_tts))
+        // Live transcription and spoken conversation, over a WebSocket
+        .route(realtime::REALTIME_ROUTE, get(realtime::handle_realtime));
 
     // Applied only when the operator asked for metrics. Nothing can read
     // the store while the endpoint is absent — enabling it needs a
@@ -4574,15 +4836,39 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
     // Innermost, so `track_metrics` times its body read as the handler's
     // and CORS answers preflights before it.
     // `record_usage` inside `record_prompt`, to read the prompt's id.
-    let app = app
-        .layer(middleware::from_fn_with_state(
-            app_state.clone(),
-            usage::record_usage,
-        ))
-        .layer(middleware::from_fn_with_state(
-            app_state.clone(),
-            record_prompt,
-        ));
+    let log_requests = |router: Router<AppState>| {
+        router
+            .layer(middleware::from_fn_with_state(
+                app_state.clone(),
+                usage::record_usage,
+            ))
+            .layer(middleware::from_fn_with_state(
+                app_state.clone(),
+                record_prompt,
+            ))
+    };
+    let generation = Router::new()
+        .route("/v1/chat/completions", post(handle_openai_chat))
+        .route("/v1/completions", post(handle_openai_completions))
+        .route("/v1/messages", post(anthropic::handle_anthropic_messages))
+        .route("/v1/responses", post(responses::handle_openai_responses))
+        .route(
+            "/v1/responses/input_tokens",
+            post(responses::handle_openai_responses_input_tokens),
+        )
+        // Native Gemini compatibility. The public route accepts a model in
+        // Gemini's normal API path; the AGY route pins AGY's auxiliary calls
+        // to the model chosen by `llmman launch agy`.
+        .route("/gemini/:model/*gemini_path", post(handle_pinned_gemini))
+        .merge(
+            Router::new()
+                .route("/api/chat", post(handle_ollama_chat))
+                .route("/api/generate", post(handle_ollama_generate))
+                .layer(middleware::from_fn(accept_any_content_type)),
+        );
+    // Outside logging: record_prompt reads the body before the handler.
+    let app = log_requests(app)
+        .merge(log_requests(generation).layer(DefaultBodyLimit::max(GENERATION_BODY_LIMIT_BYTES)));
 
     let app = if metrics_enabled {
         app.layer(middleware::from_fn(track_metrics))
@@ -4619,8 +4905,6 @@ fn ollama_router() -> Router<AppState> {
                 .post(handle_blob_upload)
                 .layer(DefaultBodyLimit::disable()),
         )
-        .route("/api/chat", post(handle_ollama_chat))
-        .route("/api/generate", post(handle_ollama_generate))
         .route("/api/embed", post(handle_embed))
         .route("/api/embeddings", post(handle_embeddings))
         .layer(middleware::from_fn(accept_any_content_type))
@@ -4648,6 +4932,34 @@ fn metrics_router(enabled: bool) -> Router<AppState> {
     Router::new()
         .route("/metrics", get(handle_metrics))
         .layer(middleware::from_fn(track_metrics))
+}
+
+/// What `--pull-only` still has to do once the runtime resolved: nothing
+/// for a local llama.cpp, whatever the model is; for a container engine,
+/// `classify` the model (its error, such as a model not yet in the store,
+/// surfaces here and nowhere earlier) and then pull that engine's image,
+/// or run the CPU-only resolution for a Canary GGUF, which pulls the CPU
+/// image. The matrix of runtimes and stored or unstored models is tested
+/// on this function.
+#[derive(Debug, PartialEq, Eq)]
+enum PullOnlyStep {
+    Done,
+    ResolveCpuOnly,
+    PullEngine(crate::container::ContainerEngine),
+}
+
+fn pull_only_step(
+    resolved: &runtime::Resolved,
+    classify: impl FnOnce() -> anyhow::Result<crate::container::ContainerEngine>,
+) -> anyhow::Result<PullOnlyStep> {
+    if resolved.ociman().is_none() {
+        return Ok(PullOnlyStep::Done);
+    }
+    Ok(match classify()? {
+        crate::container::ContainerEngine::Speech => PullOnlyStep::ResolveCpuOnly,
+        crate::container::ContainerEngine::LlamaServer => PullOnlyStep::Done,
+        engine => PullOnlyStep::PullEngine(engine),
+    })
 }
 
 /// Which image `--pull-only` warms up under a container runtime: the one
@@ -4711,7 +5023,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     }
     // Before the store is touched, so a bad value has no side effects.
     backend::check_extra_args_env()?;
-    let shell_token = shell::new_token()?;
+    let shell_token = shell::token_for(&crate::daemon::bind_addr())?;
     let shell = shell::Policy::from_env(&shell_token)?;
     let llama_cpp_version = runtime::llama_cpp_pin(_args.llama_cpp_version.as_deref());
 
@@ -4721,9 +5033,13 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // `--pull-only` is this step alone. A failure is fatal only there:
     // otherwise the daemon starts and the first load that needs llama.cpp
     // retries (runtime::Lazy).
+    let hardened = hardened_from(
+        _args.no_hardened,
+        std::env::var("LLMMAN_NO_HARDENED").ok().as_deref(),
+    );
     let resolved = {
         let pin = llama_cpp_version.clone();
-        tokio::task::spawn_blocking(move || runtime::resolve(requested, pin.as_deref()))
+        tokio::task::spawn_blocking(move || runtime::resolve(requested, pin.as_deref(), hardened))
             .await
             .context("resolve runtime task panicked")?
     };
@@ -4738,7 +5054,12 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             None
         }
     };
-    let runtime = runtime::Lazy::new(requested, llama_cpp_version.clone(), resolved);
+    let runtime = runtime::Lazy::new(
+        requested,
+        llama_cpp_version.clone(),
+        hardened,
+        resolved.clone(),
+    );
 
     // Likewise uv and mlx-lm, with the same failure policy.
     if let Some(fallback) = installs_mlx {
@@ -4757,21 +5078,28 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     }
 
     if _args.pull_only {
-        // Resolved for certain: a failure returned above.
-        if let Some(ociman) = runtime.known().and_then(|r| r.ociman()) {
-            // resolve() pulled the llama.cpp image; a safetensors MODEL
-            // needs vLLM's (or SGLang's) too, a Canary GGUF the CPU one.
-            let engine = pull_only_engine(_args.model.as_deref())?;
-            let version = match engine {
-                crate::container::ContainerEngine::LlamaServer => None,
-                crate::container::ContainerEngine::Speech => Some(llama_cpp_version.as_deref()),
-                crate::container::ContainerEngine::Sglang => Some(_args.sglang_version.as_deref()),
-                crate::container::ContainerEngine::Vllm
-                | crate::container::ContainerEngine::VllmOmni => {
-                    Some(_args.vllm_version.as_deref())
-                }
-            };
-            if let Some(version) = version {
+        // Resolved for certain: a failure returned above. resolve() pulled
+        // the llama-server image when it picked a container engine; what
+        // is left depends on the model, see `pull_only_step`.
+        let resolved = resolved
+            .as_ref()
+            .expect("a pull-only failure returned above");
+        match pull_only_step(resolved, || pull_only_engine(_args.model.as_deref()))? {
+            PullOnlyStep::Done => {}
+            PullOnlyStep::ResolveCpuOnly => {
+                let pin = llama_cpp_version.clone();
+                tokio::task::spawn_blocking(move || {
+                    runtime::resolve_for(Workload::CpuOnly, requested, pin.as_deref(), hardened)
+                })
+                .await
+                .context("resolve runtime task panicked")??;
+            }
+            PullOnlyStep::PullEngine(engine) => {
+                let ociman = resolved.ociman().expect("a container engine was picked");
+                let version = match engine {
+                    crate::container::ContainerEngine::Sglang => _args.sglang_version.as_deref(),
+                    _ => _args.vllm_version.as_deref(),
+                };
                 crate::container::pull_image(ociman, engine, version, _args.vllm_image.as_deref())?;
             }
         }
@@ -4793,16 +5121,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // Gated by the same LLMMAN_NOPRUNE escape hatch as `rm`.
     if !crate::storage::gc::noprune_from_env() {
         if let Ok(store) = OciStore::open(&store_path) {
-            if let Ok(live) = crate::storage::gc::referenced_digests(&store) {
-                let grace = crate::storage::gc::GC_GRACE_PERIOD;
-                if let Err(e) = crate::storage::gc::prune_blobs_and_cache(
-                    &store_path,
-                    &cache_path,
-                    &live,
-                    grace,
-                ) {
-                    eprintln!("[llmman] GC sweep failed: {e:#}");
-                }
+            if let Err(e) = crate::storage::gc::sweep(&store, &cache_path) {
+                eprintln!("[llmman] GC sweep failed: {e:#}");
             }
         }
     }
@@ -4848,6 +5168,25 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     }
     if let (Some(n), Some(_)) = (cpu_limit, runtime.known().and_then(|r| r.ociman())) {
         eprintln!("[llmman] backend container gets --cpus {n} (this daemon's own CPU limit)");
+    }
+    // Reported against the resolved runtime: `auto` may have settled on
+    // `bin`/`path`, where there is no container to harden, so a
+    // `--no-hardened` there is noise worth a warning while the default
+    // needs none.
+    if let Some(resolved) = runtime.known() {
+        match (resolved.ociman(), hardened) {
+            (Some(_), true) => eprintln!(
+                "[llmman] backend containers run hardened (read-only rootfs except behind --gpus, all capabilities dropped, no new privileges)"
+            ),
+            (Some(_), false) => eprintln!(
+                "[llmman] warning: backend containers run without the hardened flags (--no-hardened)"
+            ),
+            (None, true) => {}
+            (None, false) => eprintln!(
+                "[llmman] warning: --no-hardened has no effect under --runtime {}: the engine runs on the host, not in a container",
+                resolved.runtime().as_str()
+            ),
+        }
     }
 
     // Logged at startup so a typo is reported before the first request.
@@ -4906,6 +5245,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
 
     // Outbound: peers and providers. `LLMMAN_TLS_CA` is trusted for both.
     let client = crate::auth::trusted_client()?
+        .redirect(crate::authscheme::same_origin_redirects())
         .build()
         .context("build http client")?;
 
@@ -4927,6 +5267,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         sglang_version: _args.sglang_version.clone(),
         ctx_size,
         ctx_size_explicit: ctx_size_explicit.is_some(),
+        embedding_ctx_size: embedding_context_length_from_env(),
         hybrid_local_bytes: crate::hybrid::local_budget_bytes(
             ctx_size,
             hybrid_local_bytes_env.as_deref(),
@@ -4941,6 +5282,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         num_parallel: num_parallel_from_env(),
         threads,
         cpu_limit,
+        hardened,
         max_queue: max_queue_from_env(),
         max_loaded_models: max_loaded_models_from_env(),
         peers,
@@ -4976,12 +5318,13 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
+    let addr = crate::daemon::bound_addr(listener.local_addr().context("listener address")?.port());
     eprintln!(
         "llmman serve listening on http{}://{addr}",
         if tls.is_some() { "s" } else { "" }
     );
     // After the bind: a second daemon that fails it leaves the first's token alone.
-    shell::announce(&state.0.shell, &shell_token, tls.is_some());
+    shell::announce(&state.0.shell, &shell_token, tls.is_some(), &addr);
 
     // Background idle-unload reaper — see reap_idle_models's doc comment.
     tokio::spawn(reap_idle_models(state.clone()));
@@ -5102,6 +5445,9 @@ async fn shutdown_signal() {
     }
     eprintln!("llmman serve shutting down");
 }
+
+#[cfg(test)]
+mod credential_tests;
 
 #[cfg(test)]
 mod test_support;

@@ -11,10 +11,12 @@
 //!
 //! Only a *subset* is exposed as [`Provider`]s, because `llmman serve`
 //! reaches an upstream exactly two ways, one per [`Wire`]: an HTTPS POST
-//! of an OpenAI Chat Completions body with `Authorization: Bearer <key>`,
-//! or an HTTPS POST of an Anthropic Messages body with `x-api-key: <key>`
-//! (see `Target::Remote` in `cmd::serve`). An entry is offered only if
-//! llmman can be *sure* it speaks one of those:
+//! of an OpenAI Chat Completions body, or an HTTPS POST of an Anthropic
+//! Messages body (see `Target::Remote` in `cmd::serve`), each carrying one
+//! credential the provider's [`crate::authscheme::Auth`] says how to attach
+//! — `Authorization: Bearer` and `x-api-key` by default, a named header or
+//! query parameter where the provider wants one. An entry is offered only
+//! if llmman can be *sure* it speaks one of those:
 //!
 //! * its `npm` driver is one of [`OPENAI_COMPATIBLE_NPM`], or it is a
 //!   [`BUILTIN_ENDPOINTS`] entry vetted by hand (the one way onto the
@@ -24,13 +26,34 @@
 //! * it has one concrete `https` base URL. models.dev leaves `api` unset
 //!   where the SDK hardcodes the endpoint — recovered from
 //!   [`BUILTIN_ENDPOINTS`] — and templated (`${VAR}`) where it is
-//!   per-account, which llmman has nothing to interpolate from;
-//! * exactly one of its `env` entries is an API key. Multi-variable auth
-//!   (`CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_KEY`, ...) is not "one
-//!   API key".
+//!   per-account (Cloudflare, Snowflake, Databricks, Azure's resource):
+//!   those are offered when every variable has a value, from the
+//!   environment or `[providers.<id>] vars` in `llmman.conf`, and the
+//!   value fits where it lands ([`crate::authscheme::expand`]); an unset
+//!   one leaves the provider absent, as before;
+//! * exactly one of its `env` entries that is not a variable of the URL is
+//!   an API key. `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_KEY` is "one
+//!   API key" and a locator; `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`
+//!   (request signing) is not.
 //!
-//! Everything filtered out is deliberately *absent* rather than
-//! half-supported: a provider llmman offers is one it can actually reach.
+//! Offered on top of those, when the daemon reads the catalog with logins on
+//! ([`Sources::logins`]): Amazon Bedrock (OpenAI-compatible route, SigV4 or a
+//! Bedrock API key) and Google Vertex AI (OpenAI-compatible endpoint, ADC),
+//! built from their models.dev entries by [`cloud_providers`]; their
+//! credentials, and Azure's Entra ID, Databricks', watsonx's and SAP AI
+//! Core's, are the chains of [`crate::chains`].
+//!
+//! Still absent: every `npm` driver that is neither OpenAI-compatible nor
+//! vetted by hand, GitLab's and watsonx's and SAP AI Core's own APIs (their
+//! credentials work for an endpoint defined in `llmman.conf`), Bedrock's
+//! Converse-only models, Vertex's Claude and Mistral. Everything filtered
+//! out is deliberately *absent* rather than half-supported: a provider
+//! llmman offers is one it can actually reach.
+//!
+//! `github-copilot` and the two subscription providers (`openai-chatgpt`,
+//! `xai-supergrok`) need a login rather than a variable, and are offered
+//! where `llmman serve` can use one ([`Sources::logins`]); see
+//! [`crate::logins`].
 //!
 //! The one way past the filter is `llmman.conf`: a `[providers.<id>]`
 //! with a `base_url` defines a provider by hand and is merged into the
@@ -116,10 +139,9 @@ struct Builtin {
 ///
 /// Not a second registry: an entry here must still be present in the
 /// fetched catalog to be offered, and supplies only the one field
-/// models.dev omits. The rest (`amazon-bedrock`, `azure`,
-/// `google-vertex`, `watsonx`, ...) are left out because their auth is
-/// not an API key, their endpoint is per-account, or their wire format
-/// is neither of [`Wire`]'s. `v0` is left out for a third reason: nothing
+/// models.dev omits. The rest (`amazon-bedrock`, `google-vertex`,
+/// `watsonx`, ...) are left out because their auth is not an API key, or
+/// their wire format is neither of [`Wire`]'s. `v0` is left out for a third reason: nothing
 /// answers at its documented `https://api.v0.dev/v1`, so llmman has no
 /// endpoint it can vouch for.
 const BUILTIN_ENDPOINTS: &[Builtin] = &[
@@ -207,6 +229,16 @@ const BUILTIN_ENDPOINTS: &[Builtin] = &[
         key_env: "AI_GATEWAY_API_KEY",
         wire: Wire::OpenAi,
     },
+    // Per-resource, so a template: filled in from AZURE_RESOURCE_NAME (the
+    // catalog's own `env` entry for it) or `[providers.azure] vars`.
+    // opencode `packages/ai/src/providers/azure.ts:50,122-131`: the
+    // resource's `/openai/v1` route.
+    Builtin {
+        id: "azure",
+        base_url: "https://${AZURE_RESOURCE_NAME}.openai.azure.com/openai/v1",
+        key_env: "AZURE_API_KEY",
+        wire: Wire::OpenAi,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -291,6 +323,10 @@ pub struct Provider {
     /// --provider`; the id is never sent upstream verbatim. Empty for a
     /// configured provider, whose endpoint is asked instead.
     pub models: Vec<Model>,
+    /// How a credential travels to it, and the extra headers and query
+    /// parameters it wants; the default is the wire's own scheme and
+    /// nothing else. See [`crate::authscheme`].
+    pub auth: crate::authscheme::Auth,
 }
 
 /// One model a provider serves.
@@ -314,6 +350,11 @@ pub struct Model {
     /// [`thinking_levels_of`]). Empty for a model that does not reason;
     /// `None` where the catalog does not say.
     pub thinking: Option<Vec<String>>,
+    /// Whether models.dev's `modalities.input` lists `image` — the
+    /// model takes images in. `None` where the catalog publishes no
+    /// modalities, and for a provider defined in `llmman.conf`, which
+    /// has no catalog entry at all.
+    pub vision: Option<bool>,
 }
 
 /// US dollars per million tokens — models.dev's own unit, unconverted so
@@ -359,6 +400,17 @@ impl Provider {
         key_for(&self.id, self.key_env.as_deref())
     }
 
+    /// The model id upstream is sent: the catalog's, except where the
+    /// provider spells it differently (Vertex's OpenAI-compatible endpoint
+    /// wants Google's models as `google/<id>`; see [`crate::gcp::wire_model`]).
+    pub fn wire_model(&self, model: &str) -> String {
+        if self.id == crate::chains::VERTEX {
+            crate::gcp::wire_model(model)
+        } else {
+            model.to_string()
+        }
+    }
+
     /// Appends an OpenAI route to this provider's base URL. See
     /// [`rebase_url`].
     pub fn url(&self, route: &str) -> String {
@@ -376,26 +428,175 @@ impl Provider {
             wire: conf.wire,
             key_optional: true,
             models: Vec::new(),
+            auth: crate::config::provider_auth(&conf.id),
+        }
+    }
+
+    /// Whether this daemon holds a credential for it, of any kind: a key
+    /// in the environment or `llmman.conf`, a stored login, or a command
+    /// or file that yields one. Never runs the command or refreshes.
+    ///
+    /// One that has run out for good (`expired`: a token past its date)
+    /// does not count: it cannot be spent, and saying so lets the caller
+    /// point at `llmman login`.
+    pub fn has_credential(&self) -> bool {
+        self.credential_status()
+            .is_some_and(|status| status.state != "expired")
+    }
+
+    /// The kind and health of the credential [`Provider::credential`]
+    /// would spend, without spending it — no secret, no network, no
+    /// command: `env`, `config`, or what the store holds
+    /// ([`crate::credentials::Credential::kind`]).
+    pub fn credential_status(&self) -> Option<crate::credentials::Status> {
+        use crate::credentials::Status;
+        let ready = |kind| {
+            Some(Status {
+                kind,
+                state: "ready",
+                expires_at_ms: None,
+            })
+        };
+        if self.key_env.as_deref().and_then(key_from_env).is_some() {
+            return ready("env");
+        }
+        if let Some(stored) = crate::credentials::Store::user().and_then(|s| s.get(&self.id)) {
+            return Some(stored.status(crate::credentials::now_ms()));
+        }
+        if crate::config::provider_api_key(&self.id).is_some() {
+            return ready("config");
+        }
+        if let Some(source) = crate::config::provider_external(&self.id) {
+            return match source {
+                crate::credentials::ExternalSource::Command { .. } => ready("command"),
+                crate::credentials::ExternalSource::File { .. } => ready("file"),
+                crate::credentials::ExternalSource::CliLogin { .. } => ready("cli_login"),
+            };
+        }
+        // Last, as a request looks last: the cloud chain, if the machine
+        // says there is one ([`crate::chains`]).
+        crate::chains::chain_for(&self.id)?.status(&self.id)
+    }
+
+    /// The credential to spend, in the order environment variable, stored
+    /// credential, `llmman.conf` (`api_key`, then `api_key_command` /
+    /// `api_key_file`). The environment wins as it always has: it is the
+    /// deliberate this-session override. A stored login outranks the file
+    /// because it is the newer, explicit act (`llmman login`), and a
+    /// `llmman.conf` key may be a leftover from before it.
+    ///
+    /// Blocking: an OAuth credential is refreshed here and a command run.
+    /// `Ok(None)` when there is none; a stored login that can no longer
+    /// be used is an error ([`crate::credentials::ReloginRequired`]), not
+    /// a silent fall back to a lesser credential.
+    ///
+    /// A login's token is only handed back for a destination that login
+    /// owns ([`crate::logins::destination_allowed`]): `llmman.conf` can
+    /// point a provider anywhere, and a subscription token must not follow.
+    pub fn credential(&self) -> anyhow::Result<Option<crate::credentials::Resolved>> {
+        let Some(mut resolved) = self.unshaped_credential()? else {
+            return Ok(None);
+        };
+        crate::logins::shape(&mut resolved);
+        if let Some(flow) = resolved.flow.as_deref() {
+            let to = self.base_url_for(&resolved);
+            anyhow::ensure!(
+                !crate::logins::fixed_host(flow)
+                    || crate::logins::destination_allowed_with(flow, &to, &resolved.metadata),
+                "the {flow} login for provider {:?} is only sent to its own https host, and this provider's base URL is {to}",
+                self.id
+            );
+        }
+        Ok(Some(resolved))
+    }
+
+    /// Where requests spending `credential` go: the base URL, unless the
+    /// login learned a better one (Copilot's per-plan API host).
+    pub fn base_url_for(&self, credential: &crate::credentials::Resolved) -> String {
+        credential
+            .flow
+            .as_deref()
+            .and_then(|flow| crate::logins::endpoint_for(flow, &credential.metadata))
+            .unwrap_or_else(|| self.base_url.clone())
+    }
+
+    fn unshaped_credential(&self) -> anyhow::Result<Option<crate::credentials::Resolved>> {
+        use crate::credentials::Resolved;
+        let plain = Resolved::from_key;
+        if let Some(key) = self.key_env.as_deref().and_then(key_from_env) {
+            return Ok(Some(plain(key, "env")));
+        }
+        if let Some(store) = crate::credentials::Store::user() {
+            let refresher = crate::logins::Live::new();
+            if let Some(resolved) =
+                store.resolve(&self.id, &refresher, crate::credentials::now_ms())?
+            {
+                return Ok(Some(resolved));
+            }
+            // A stored chain selection ranks as a login does.
+            if matches!(
+                store.get(&self.id),
+                Some(crate::credentials::Credential::Chain(_))
+            ) {
+                if let Some(chain) = crate::chains::chain_for(&self.id) {
+                    return chain.resolve(&self.id, &self.base_url);
+                }
+            }
+        }
+        if let Some(key) = crate::config::provider_api_key(&self.id)
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+        {
+            return Ok(Some(plain(key, "config")));
+        }
+        if let Some(source) = crate::config::provider_external(&self.id) {
+            let (secret, kind) = crate::credentials::read_external(&source)?;
+            return Ok(Some(plain(secret.expose().to_string(), kind)));
+        }
+        match crate::chains::chain_for(&self.id) {
+            Some(chain) => chain.resolve(&self.id, &self.base_url),
+            None => Ok(None),
         }
     }
 }
 
-/// The API key for provider `id`: `var` from the environment, else the
-/// `[providers.<id>]` entry in `llmman.conf` (see [`crate::config`]).
-/// `None` when neither has one.
+/// `run \`llmman login --provider <id>\``, for a provider that has a login
+/// of its own, to put in a missing-credential message.
+pub fn login_hint(id: &str) -> Option<String> {
+    crate::logins::profile(id).map(|_| format!("run `llmman login --provider {id}`"))
+}
+
+/// The API key for provider `id` that *this process* can send with a
+/// request: `var` from the environment, else the `[providers.<id>]` entry
+/// in `llmman.conf` (see [`crate::config`]). `None` when neither has one.
 ///
 /// The environment wins, as it does for `aws` and `gh`: the file is the
 /// standing answer, an `export` the deliberate this-session-only
 /// override. The reverse would make `OPENAI_API_KEY=... llmman run`
 /// silently spend the wrong key.
 ///
+/// A stored login, or a key command or file, is not a string this process
+/// should put in a request: the daemon holds it and resolves it itself
+/// ([`Provider::credential`]). When one exists the `llmman.conf` key is
+/// not sent either — the login outranks it — so `None` here does not
+/// mean "no credential"; ask [`Provider::has_credential`].
+///
 /// Free-standing because a `/llmman/providers` client learns only the id
 /// and the variable's *name* from the daemon, never a [`Provider`].
 pub fn key_for(id: &str, var: Option<&str>) -> Option<String> {
-    resolve_key(
-        var.and_then(key_from_env),
-        crate::config::provider_api_key(id).as_deref(),
-    )
+    let from_env = var.and_then(key_from_env);
+    if from_env.is_none() && held_by_the_daemon(id) {
+        return None;
+    }
+    resolve_key(from_env, crate::config::provider_api_key(id).as_deref())
+}
+
+/// Whether a stored login or a key command/file outranks `llmman.conf`'s
+/// `api_key` for `id`.
+fn held_by_the_daemon(id: &str) -> bool {
+    crate::credentials::Store::user().is_some_and(|s| s.get(id).is_some())
+        || crate::config::provider_external(id).is_some()
+        || crate::chains::chain_for(id).is_some_and(|c| c.status(id).is_some())
 }
 
 /// Split out so the precedence is testable without touching the process
@@ -420,6 +621,12 @@ pub(crate) fn key_from_env(var: &str) -> Option<String> {
 /// `config set` rather than a hand edit: it rejects a misspelt key and
 /// makes the file owner-only, without which the key is ignored.
 pub fn key_hint(id: &str, var: Option<&str>) -> String {
+    // A subscription provider has no key to set: it has a login.
+    if var.is_none() {
+        if let Some(login) = login_hint(id) {
+            return login;
+        }
+    }
     let key = shell_word(&format!(
         "providers.{}.api_key",
         crate::config::toml_key(id)
@@ -615,13 +822,32 @@ impl Catalog {
     /// catches up. Split out from the fetch/cache plumbing so the
     /// filtering rules are unit-testable with no network or disk at all.
     pub fn from_json(raw: &[u8]) -> anyhow::Result<Self> {
+        Self::from_json_with(raw, &Sources::none())
+    }
+
+    /// [`Catalog::from_json`] read with `sources`: the variables a
+    /// templated base URL is filled from, and whether the providers that
+    /// need a login are offered. `llmman serve` loads with
+    /// [`Sources::live`].
+    pub fn from_json_with(raw: &[u8], sources: &Sources<'_>) -> anyhow::Result<Self> {
         let raw: BTreeMap<String, serde_json::Value> =
             serde_json::from_slice(raw).context("parse models.dev api.json")?;
-        let providers: BTreeMap<_, _> = raw
+        let cloud: Vec<(String, RawProvider)> = if sources.logins {
+            CLOUD_ENTRIES
+                .iter()
+                .filter_map(|id| {
+                    let entry = serde_json::from_value(raw.get(*id)?.clone()).ok()?;
+                    Some((id.to_string(), entry))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut providers: BTreeMap<_, _> = raw
             .into_iter()
             .filter_map(|(id, provider)| {
                 let provider = serde_json::from_value(provider).ok()?;
-                Some((id.clone(), routable(&id, provider)?))
+                Some((id.clone(), routable(&id, provider, sources)?))
             })
             .collect();
         // An empty result is a failed load, not a catalog with nothing in
@@ -633,6 +859,15 @@ impl Catalog {
             !providers.is_empty(),
             "models.dev returned no provider llmman can route to"
         );
+        if sources.logins {
+            let chatgpt = chatgpt_subscription(providers.get("openai"));
+            providers.insert(chatgpt.id.clone(), chatgpt);
+            let grok = xai_subscription(providers.get("xai"));
+            providers.insert(grok.id.clone(), grok);
+            for provider in cloud_providers(cloud, sources) {
+                providers.entry(provider.id.clone()).or_insert(provider);
+            }
+        }
         Ok(Self { providers })
     }
 
@@ -646,9 +881,16 @@ impl Catalog {
     /// `api.openai.com`. A plain-http `base_url` with a key behind it is
     /// warned about once per load, not refused: the URL is the user's own.
     pub fn with_configured(mut self, configured: &[crate::config::ConfiguredProvider]) -> Self {
+        // `llmman.conf` can change how a catalog provider authenticates
+        // (a header, a scheme) without defining it.
+        for provider in self.providers.values_mut() {
+            provider.auth = provider
+                .auth
+                .overlaid(&crate::config::provider_auth(&provider.id));
+        }
         for conf in configured {
             let provider = Provider::from_configured(conf);
-            if provider.base_url.starts_with("http://") && provider.api_key().is_some() {
+            if provider.base_url.starts_with("http://") && provider.has_credential() {
                 eprintln!(
                     "[llmman] warning: provider {} has an API key and a plain-http base_url \
                      ({}); the key will cross the network in cleartext",
@@ -698,6 +940,9 @@ struct RawModel {
     /// Untyped for the same reason; `output` and `context` are read.
     #[serde(default)]
     limit: Option<serde_json::Value>,
+    /// Untyped for the same reason; `input` is read for `image`.
+    #[serde(default)]
+    modalities: Option<serde_json::Value>,
     /// Untyped for the same reason.
     #[serde(default)]
     reasoning: Option<serde_json::Value>,
@@ -717,6 +962,14 @@ fn max_output_of(raw: &serde_json::Value) -> Option<u32> {
 /// [`max_output_of`]'s sibling for `limit.context`.
 fn max_context_of(raw: &serde_json::Value) -> Option<u64> {
     raw.get("context")?.as_u64().filter(|&n| n > 0)
+}
+
+/// Whether a models.dev `modalities.input` takes images: `Some(true)`
+/// when it lists `image`, `Some(false)` when it lists inputs without
+/// one, `None` where the catalog publishes no modalities at all.
+fn vision_of(raw: &serde_json::Value) -> Option<bool> {
+    let input = raw.get("input")?.as_array()?;
+    Some(input.iter().any(|m| m.as_str() == Some("image")))
 }
 
 /// The levels opencode derives from a models.dev entry
@@ -805,22 +1058,114 @@ fn flat_cost_of(raw: &serde_json::Value) -> Option<Cost> {
     })
 }
 
-/// Providers that pass every rule below but still cannot be driven with
-/// the variable models.dev names, because the real credential is minted
-/// by an OAuth exchange rather than exported by hand.
+/// Providers whose catalog entry is only offered where a login can
+/// actually drive them ([`Sources::logins`]), because what the catalog
+/// advertises is not enough.
 ///
 /// `github-copilot` is the case: it advertises `@ai-sdk/openai-compatible`
-/// and `GITHUB_TOKEN`, but `api.githubcopilot.com` 401s a `GITHUB_TOKEN`
-/// bearer — opencode has a whole plugin that trades it through
-/// `login/oauth/access_token` first, and adds `X-GitHub-Api-Version` and
-/// friends. Offering it would mean a user exports the documented variable
-/// and gets an unexplained 401.
-const OAUTH_ONLY: &[&str] = &["github-copilot"];
+/// and `GITHUB_TOKEN`, but `api.githubcopilot.com` 401s a plain
+/// `GITHUB_TOKEN` bearer. What it takes is the token `llmman login
+/// --provider github-copilot` obtains with GitHub's device flow — sent as
+/// is, with Copilot's own headers (see [`copilot_headers`]) — or one
+/// exported as `COPILOT_GITHUB_TOKEN` (the variable opencode and OpenClaw
+/// read). Offering it without that would mean a user exports the
+/// documented variable and gets an unexplained 401.
+const LOGIN_ONLY: &[&str] = &["github-copilot"];
+
+/// The variable a [`LOGIN_ONLY`] provider reads instead of the one the
+/// catalog names. opencode github-copilot.ts:258-261 (`COPILOT_GITHUB_TOKEN`);
+/// openclaw extensions/github-copilot/index.ts:43.
+fn login_only_key_env(id: &str) -> Option<&'static str> {
+    (id == "github-copilot").then_some("COPILOT_GITHUB_TOKEN")
+}
+
+/// The headers Copilot's API wants, which the OpenAI-compatible wire does
+/// not send on its own. litellm
+/// `litellm/llms/github_copilot/common_utils.py:15-22,73-92` (the set that
+/// goes with the `Iv1.b507a08c87ecfe98` client `llmman login` uses); the
+/// per-request `x-initiator` and `Copilot-Vision-Request` it also sends
+/// depend on the body and are not sent here.
+fn copilot_headers() -> Vec<(String, String)> {
+    [
+        ("copilot-integration-id", "vscode-chat"),
+        ("editor-version", "vscode/1.95.0"),
+        ("editor-plugin-version", "copilot-chat/0.26.7"),
+        ("user-agent", "GitHubCopilotChat/0.26.7"),
+        ("openai-intent", "conversation-panel"),
+        ("x-github-api-version", "2025-04-01"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+/// What a provider's own auth looks like before `llmman.conf` is asked.
+///
+/// Azure takes the key in `api-key` and the version in the query: opencode
+/// `packages/ai/src/providers/azure.ts:50,107,122-131` and litellm
+/// `llms/azure/common_utils.py:697-709`; the v1 route's `api-version` is
+/// `v1` (azure.ts:50).
+fn builtin_auth(id: &str) -> crate::authscheme::Auth {
+    use crate::authscheme::{Auth, Scheme};
+    match id {
+        "azure" => Auth {
+            scheme: Scheme::Header("api-key".into()),
+            query: vec![("api-version".into(), "v1".into())],
+            ..Auth::default()
+        },
+        "github-copilot" => Auth {
+            headers: copilot_headers(),
+            ..Auth::default()
+        },
+        _ => Auth::default(),
+    }
+}
+
+/// What a catalog is read with: where a `${VAR}` in a base URL gets its
+/// value, and whether providers that need a login to be driven are
+/// offered.
+///
+/// [`Sources::none`] is the catalog on a machine with no variables and no
+/// logins — deterministic, so a fixture means the same thing on every
+/// developer's machine. [`Sources::live`] is what `llmman serve` loads.
+pub struct Sources<'a> {
+    vars: &'a dyn Fn(&str, &str) -> Option<String>,
+    logins: bool,
+}
+
+impl Sources<'static> {
+    pub fn none() -> Self {
+        Self {
+            vars: &|_, _| None,
+            logins: false,
+        }
+    }
+
+    /// Variables from the environment, then `[providers.<id>] vars`;
+    /// login-driven providers on.
+    pub fn live() -> Self {
+        Self {
+            vars: &|id, var| {
+                key_from_env(var)
+                    .or_else(|| crate::config::provider_var(id, var))
+                    .or_else(|| crate::logins::browser::login_var(id, var))
+            },
+            logins: true,
+        }
+    }
+}
+
+impl<'a> Sources<'a> {
+    /// A custom lookup, for tests of the templating rules.
+    pub fn with_vars(vars: &'a dyn Fn(&str, &str) -> Option<String>, logins: bool) -> Self {
+        Self { vars, logins }
+    }
+}
 
 /// Applies this module's reachability rules to one catalog entry,
 /// returning `None` for anything llmman cannot talk to.
-fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
-    if OAUTH_ONLY.contains(&id) {
+fn routable(id: &str, raw: RawProvider, sources: &Sources<'_>) -> Option<Provider> {
+    if LOGIN_ONLY.contains(&id) && !sources.logins {
         return None;
     }
     let builtin = BUILTIN_ENDPOINTS.iter().find(|b| b.id == id);
@@ -837,10 +1182,27 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
     // `privatemode-ai`, `atomic-chat`) — not a loss, since `--provider`
     // is for models llmman does not serve itself, and a local one is
     // llmman's own job.
-    let base_url = match raw.api.as_deref().map(str::trim) {
-        Some(api) if api.starts_with("https://") && !api.contains("${") => api,
-        _ => builtin?.base_url,
+    //
+    // A templated one (`https://${CLOUDFLARE_ACCOUNT_ID}...`) is filled in
+    // from the environment or `[providers.<id>] vars`, and the provider
+    // is dropped when a variable is unset or holds something its position
+    // does not take (see [`crate::authscheme::expand`]).
+    let expand = |template: &str| -> Option<String> {
+        if !template.contains("${") {
+            return Some(template.to_string());
+        }
+        crate::authscheme::expand(template, &|var| (sources.vars)(id, var)).ok()
     };
+    let api = raw
+        .api
+        .as_deref()
+        .map(str::trim)
+        .filter(|api| api.starts_with("https://") || api.starts_with("${"));
+    let (template, base_url) = api.and_then(|api| Some((api, expand(api)?))).or_else(|| {
+        let b = builtin?;
+        Some((b.base_url, expand(b.base_url)?))
+    })?;
+    let template_vars = crate::authscheme::template_vars(template);
 
     // `npm` is the wire-format signal. A builtin has already been vetted
     // by hand, so its own `wire` stands in for a driver package this
@@ -854,38 +1216,257 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
 
     // One API key, and llmman must know which variable holds it. A
     // builtin names it explicitly (`google` lists three aliases); for
-    // everything else a single-entry `env` is the only unambiguous case.
-    let key_env = match builtin {
-        Some(b) => b.key_env.to_string(),
-        None => match raw.env.as_slice() {
-            [only] if !only.trim().is_empty() => only.trim().to_string(),
-            _ => return None,
-        },
+    // everything else it is the one `env` entry that is not a variable of
+    // the base URL — `CLOUDFLARE_ACCOUNT_ID` locates the account,
+    // `CLOUDFLARE_API_KEY` is the key.
+    let key_env = match (login_only_key_env(id), builtin) {
+        (Some(var), _) => var.to_string(),
+        (None, Some(b)) => b.key_env.to_string(),
+        (None, None) => {
+            let keys: Vec<&str> = raw
+                .env
+                .iter()
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty() && !template_vars.iter().any(|t| t == v))
+                .collect();
+            match keys.as_slice() {
+                [only] => only.to_string(),
+                _ => return None,
+            }
+        }
     };
 
     Some(Provider {
         id: id.to_string(),
         name: raw.name,
-        base_url: base_url_of(base_url),
+        base_url: base_url_of(&base_url),
         key_env: Some(key_env),
         wire,
         key_optional: false,
         // Sorted by id, since `models` came out of a BTreeMap.
-        models: raw
-            .models
-            .into_iter()
-            .map(|(id, model)| {
-                let max_output = model.limit.as_ref().and_then(max_output_of);
-                Model {
-                    cost: model.cost.as_ref().and_then(cost_of),
-                    thinking: thinking_levels_of(&model, wire, max_output),
-                    max_context: model.limit.as_ref().and_then(max_context_of),
-                    max_output,
-                    id,
-                }
-            })
-            .collect(),
+        models: models_of(raw.models, wire, |_| true),
+        auth: builtin_auth(id),
     })
+}
+
+/// A catalog entry's models as [`Model`]s, those `keep` says to, sorted by id
+/// (the input is a `BTreeMap`).
+fn models_of(
+    models: BTreeMap<String, RawModel>,
+    wire: Wire,
+    keep: impl Fn(&str) -> bool,
+) -> Vec<Model> {
+    models
+        .into_iter()
+        .filter(|(id, _)| keep(id))
+        .map(|(id, model)| {
+            let max_output = model.limit.as_ref().and_then(max_output_of);
+            Model {
+                cost: model.cost.as_ref().and_then(cost_of),
+                thinking: thinking_levels_of(&model, wire, max_output),
+                max_context: model.limit.as_ref().and_then(max_context_of),
+                max_output,
+                vision: model.modalities.as_ref().and_then(vision_of),
+                id,
+            }
+        })
+        .collect()
+}
+
+/// The models.dev entries the cloud providers are built from, when this
+/// catalog is read with logins on ([`Sources::logins`]); see
+/// [`cloud_providers`].
+const CLOUD_ENTRIES: &[&str] = &["amazon-bedrock", "google-vertex"];
+
+/// The cloud providers a catalog entry stands for, each reachable only
+/// through a credential chain ([`crate::chains`]) and an endpoint that
+/// models.dev leaves to its SDK. Offered when the entry is in the catalog:
+///
+/// * `amazon-bedrock` — Bedrock's OpenAI-compatible Chat Completions route
+///   on `bedrock-runtime`, in the region [`crate::aws`] resolves. Its models
+///   are the ones that route serves: OpenAI's and xAI's (litellm
+///   `llms/bedrock/chat/chat_completions/transformation.py`: "Grok, gpt-oss
+///   and GPT 5.6 and newer"). The others are Converse-only, which is neither
+///   of llmman's wires. The key is `AWS_BEARER_TOKEN_BEDROCK`; without it
+///   requests are SigV4-signed.
+/// * `google-vertex` — Vertex AI's OpenAI-compatible endpoint, in the project
+///   and location [`crate::gcp`] resolves; absent when no project is named.
+///   Its models are Google's and the Model Garden's `publisher/model-maas`
+///   ids; Claude and Mistral are called by `rawPredict` on a model-specific
+///   URL, which a fixed route cannot.
+fn cloud_providers(entries: Vec<(String, RawProvider)>, sources: &Sources<'_>) -> Vec<Provider> {
+    let mut out = Vec::new();
+    for (id, raw) in entries {
+        match id.as_str() {
+            "amazon-bedrock" => {
+                let region = bedrock_region(sources);
+                out.push(Provider {
+                    id: id.clone(),
+                    name: if raw.name.is_empty() {
+                        "Amazon Bedrock".into()
+                    } else {
+                        raw.name.clone()
+                    },
+                    base_url: crate::aws::runtime_base(&region),
+                    key_env: Some("AWS_BEARER_TOKEN_BEDROCK".into()),
+                    wire: Wire::OpenAi,
+                    key_optional: false,
+                    models: models_of(raw.models, Wire::OpenAi, |m| {
+                        ["openai.", "xai."].iter().any(|p| m.starts_with(p))
+                    }),
+                    auth: crate::authscheme::Auth::default(),
+                });
+            }
+            "google-vertex" => {
+                let Some((project, location)) = vertex_target(sources) else {
+                    continue;
+                };
+                out.push(Provider {
+                    id: id.clone(),
+                    name: if raw.name.is_empty() {
+                        "Google Vertex AI".into()
+                    } else {
+                        raw.name.clone()
+                    },
+                    base_url: crate::gcp::openapi_base(&project, &location),
+                    key_env: None,
+                    wire: Wire::OpenAi,
+                    key_optional: false,
+                    models: models_of(raw.models, Wire::OpenAi, |m| {
+                        !["claude", "mistral", "codestral"]
+                            .iter()
+                            .any(|p| m.starts_with(p))
+                    }),
+                    auth: crate::authscheme::Auth::default(),
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Bedrock's region: `AWS_REGION` / `AWS_DEFAULT_REGION` (or `[providers.
+/// amazon-bedrock] vars`), else what [`crate::aws`] finds in the profile.
+fn bedrock_region(sources: &Sources<'_>) -> String {
+    let id = crate::chains::BEDROCK;
+    ["AWS_REGION", "AWS_DEFAULT_REGION"]
+        .iter()
+        .find_map(|v| (sources.vars)(id, v).filter(|r| crate::aws::region_ok(r).is_ok()))
+        .unwrap_or_else(|| {
+            // Tests never read the real AWS configuration.
+            if cfg!(test) {
+                return crate::aws::DEFAULT_REGION.to_string();
+            }
+            let chain = match crate::chains::chain_for(id) {
+                Some(crate::chains::Chain::Aws(c)) => c,
+                _ => crate::aws::AwsChain::default(),
+            };
+            chain.region(&crate::aws::Runtime::live())
+        })
+}
+
+/// Vertex's project and location, or `None` without a project: the `gcp`
+/// table, then the variables ([`crate::gcp::GcpChain::project`]).
+fn vertex_target(sources: &Sources<'_>) -> Option<(String, String)> {
+    let id = crate::chains::VERTEX;
+    let chain = match crate::chains::chain_for(id) {
+        Some(crate::chains::Chain::Gcp(c)) => c,
+        _ => crate::gcp::GcpChain::default(),
+    };
+    let rt = crate::gcp::Runtime::live();
+    let var = |names: &[&str]| names.iter().find_map(|v| (sources.vars)(id, v));
+    let project = chain
+        .project
+        .clone()
+        .or_else(|| {
+            var(&[
+                "GOOGLE_VERTEX_PROJECT",
+                "GOOGLE_CLOUD_PROJECT",
+                "GCP_PROJECT",
+                "GCLOUD_PROJECT",
+            ])
+        })
+        // gcloud's own configuration and the credentials file; tests never
+        // read the real ones.
+        .or_else(|| (!cfg!(test)).then(|| chain.project(&rt)).flatten())
+        .filter(|p| crate::gcp::project_ok(p).is_ok())?;
+    let location = chain
+        .location
+        .clone()
+        .or_else(|| {
+            var(&[
+                "GOOGLE_VERTEX_LOCATION",
+                "GOOGLE_CLOUD_LOCATION",
+                "VERTEX_LOCATION",
+            ])
+        })
+        .filter(|l| crate::gcp::location_ok(l).is_ok())
+        .unwrap_or_else(|| "global".into());
+    Some((project, location))
+}
+
+/// The ChatGPT/Codex subscription, as a provider of its own.
+///
+/// It is not the OpenAI API: a different host (`chatgpt.com`), the
+/// Responses route only (so `codex` and `/v1/responses` clients, not chat
+/// completions), no API key, and a login instead. Folding it into `openai`
+/// would make `OPENAI_API_KEY` and a ChatGPT login fight over one id and
+/// one base URL; as `openai-chatgpt` each keeps meaning one thing. Base
+/// URL: opencode `plugin/provider/openai.ts:25`, litellm
+/// `llms/chatgpt/common_utils.py:36`, openclaw `extensions/openai/base-url.ts:3`.
+///
+/// Its models are `openai`'s, unpriced: a subscription is not billed per
+/// token, so the API's rates would misstate what a request cost.
+fn chatgpt_subscription(openai: Option<&Provider>) -> Provider {
+    Provider {
+        id: "openai-chatgpt".into(),
+        name: "OpenAI (ChatGPT subscription)".into(),
+        base_url: "https://chatgpt.com/backend-api/codex".into(),
+        key_env: None,
+        wire: Wire::OpenAi,
+        key_optional: false,
+        models: openai
+            .map(|p| {
+                p.models
+                    .iter()
+                    .map(|m| Model {
+                        cost: None,
+                        ..m.clone()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        auth: crate::authscheme::Auth::default(),
+    }
+}
+
+/// The SuperGrok subscription, a provider of its own for the same reason
+/// as [`chatgpt_subscription`]: OpenClaw sends a SuperGrok login to
+/// `cli-chat-proxy.grok.com/v1` (`extensions/xai/provider-catalog.ts`
+/// `XAI_GROK_OAUTH_BASE_URL`) and only there, over the Responses route,
+/// not to `api.x.ai` with an API key. Its models are `xai`'s, unpriced.
+fn xai_subscription(xai: Option<&Provider>) -> Provider {
+    Provider {
+        id: "xai-supergrok".into(),
+        name: "xAI (SuperGrok subscription)".into(),
+        base_url: "https://cli-chat-proxy.grok.com/v1".into(),
+        key_env: None,
+        wire: Wire::OpenAi,
+        key_optional: false,
+        models: xai
+            .map(|p| {
+                p.models
+                    .iter()
+                    .map(|m| Model {
+                        cost: None,
+                        ..m.clone()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        auth: crate::authscheme::Auth::default(),
+    }
 }
 
 /// Normalizes a models.dev `api` into a base URL that a route can be
@@ -1001,7 +1582,28 @@ static CATALOG: Mutex<Option<Cached>> = Mutex::new(None);
 /// looks a provider up does not reach models.dev.
 #[cfg(test)]
 pub(crate) fn hold_catalog_for_tests(json: &str) {
-    let catalog = Catalog::from_json(json.as_bytes()).expect("test catalog parses");
+    hold_catalog_with_for_tests(json, &Sources::none());
+}
+
+/// Holds exactly `providers` as the catalog, for a test that needs one
+/// pointed at a local server over plain http, which no catalog entry may
+/// be.
+#[cfg(test)]
+pub(crate) fn hold_providers_for_tests(providers: Vec<Provider>) {
+    let catalog = Catalog {
+        providers: providers.into_iter().map(|p| (p.id.clone(), p)).collect(),
+    };
+    *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+        Instant::now(),
+        Duration::from_secs(3600),
+        Ok(Arc::new(catalog)),
+    ));
+}
+
+/// [`hold_catalog_for_tests`], read with `sources`.
+#[cfg(test)]
+pub(crate) fn hold_catalog_with_for_tests(json: &str, sources: &Sources<'_>) {
+    let catalog = Catalog::from_json_with(json.as_bytes(), sources).expect("test catalog parses");
     *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some((
         Instant::now(),
         Duration::from_secs(3600),
@@ -1169,7 +1771,7 @@ fn load() -> anyhow::Result<Loaded> {
 
     if let Some(path) = path.as_deref().filter(|p| is_fresh(p)) {
         if let Ok(raw) = std::fs::read(path) {
-            if let Ok(catalog) = Catalog::from_json(&raw) {
+            if let Ok(catalog) = Catalog::from_json_with(&raw, &Sources::live()) {
                 crate::debug_log!("provider catalog: {} cached", path.display());
                 return Ok(Loaded::Fresh(catalog));
             }
@@ -1182,7 +1784,7 @@ fn load() -> anyhow::Result<Loaded> {
             let stale = path
                 .as_deref()
                 .and_then(|p| std::fs::read(p).ok())
-                .and_then(|raw| Catalog::from_json(&raw).ok());
+                .and_then(|raw| Catalog::from_json_with(&raw, &Sources::live()).ok());
             match stale {
                 Some(catalog) => {
                     eprintln!("[llmman] using cached provider list ({err:#})");
@@ -1205,7 +1807,7 @@ fn refresh(path: Option<&std::path::Path>) -> anyhow::Result<Catalog> {
     let fetched = fetch(CATALOG_URL);
     GATE.record();
     let raw = fetched?;
-    let catalog = Catalog::from_json(&raw)?;
+    let catalog = Catalog::from_json_with(&raw, &Sources::live())?;
     // Best-effort: an unwritable cache costs a fetch next time, nothing
     // more, so it must not fail the load.
     if let Some(path) = path {
@@ -1479,7 +2081,8 @@ mod tests {
                     "npm": "@openrouter/ai-sdk-provider",
                     "env": ["OPENROUTER_API_KEY"],
                     "models": {
-                        "z-model": { "cost": { "input": 2.5, "output": 10 }, "limit": { "context": 200000, "output": 32000 } },
+                        "z-model": { "cost": { "input": 2.5, "output": 10 }, "limit": { "context": 200000, "output": 32000 }, "modalities": { "input": ["text", "image"], "output": ["text"] } },
+                        "m-model": { "modalities": { "input": ["text"], "output": ["text"] } },
                         "a-model": {}
                     }
                 }
@@ -1500,6 +2103,17 @@ mod tests {
                     max_output: None,
                     max_context: None,
                     thinking: None,
+                    // No modalities published: unknown, not text-only.
+                    vision: None,
+                },
+                Model {
+                    id: "m-model".into(),
+                    cost: None,
+                    max_output: None,
+                    max_context: None,
+                    thinking: None,
+                    // `modalities.input` without `image`: text-only.
+                    vision: Some(false),
                 },
                 Model {
                     id: "z-model".into(),
@@ -1508,6 +2122,8 @@ mod tests {
                     // The fixture's `limit.context`, now carried too.
                     max_context: Some(200_000),
                     thinking: None,
+                    // The fixture's `modalities.input` lists `image`.
+                    vision: Some(true),
                 },
             ]
         );
@@ -1700,7 +2316,7 @@ mod tests {
         assert!(catalog.get("snowflake-cortex").is_none());
         assert!(catalog.get("cloudflare-workers-ai").is_none());
         // Advertises a plain bearer variable, but the real credential is
-        // minted by an OAuth exchange. See OAUTH_ONLY.
+        // minted by an OAuth exchange. See LOGIN_ONLY.
         assert!(catalog.get("github-copilot").is_none());
         // The one entry llmman can actually drive, so the filter is doing
         // the dropping rather than the catalog being unusable outright.
@@ -1969,6 +2585,7 @@ mod tests {
             key_optional: false,
             wire: Wire::OpenAi,
             models: vec![],
+            auth: Default::default(),
         };
         assert_eq!(
             p.url("/v1/chat/completions"),
@@ -2009,6 +2626,7 @@ mod tests {
             key_optional: false,
             wire: Wire::OpenAi,
             models: vec![],
+            auth: Default::default(),
         };
         assert_eq!(p.api_key(), None);
     }
@@ -2427,5 +3045,713 @@ mod tests {
             suggestions(&pad(MAX_SUGGESTION_LEN + 1), &catalog).is_empty(),
             "one byte over the limit was still searched"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Templated URLs, logins and credentials
+    // -----------------------------------------------------------------
+
+    fn catalog_with_vars(json: &str, vars: &[(&str, &str)], logins: bool) -> Catalog {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let lookup =
+            move |_: &str, name: &str| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+        Catalog::from_json_with(json.as_bytes(), &Sources::with_vars(&lookup, logins))
+            .expect("fixture parses")
+    }
+
+    const TEMPLATED: &str = r#"{
+        "openrouter": {
+            "id": "openrouter", "name": "OpenRouter",
+            "api": "https://openrouter.ai/api/v1",
+            "npm": "@openrouter/ai-sdk-provider", "env": ["OPENROUTER_API_KEY"],
+            "models": { "gpt-5": {} }
+        },
+        "cloudflare-workers-ai": {
+            "id": "cloudflare-workers-ai", "name": "Cloudflare Workers AI",
+            "api": "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1",
+            "npm": "@ai-sdk/openai-compatible",
+            "env": ["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_KEY"],
+            "models": { "llama": {} }
+        },
+        "snowflake-cortex": {
+            "id": "snowflake-cortex", "name": "Snowflake Cortex",
+            "api": "https://${SNOWFLAKE_ACCOUNT}.snowflakecomputing.com/api/v2/cortex/v1",
+            "npm": "@ai-sdk/openai-compatible",
+            "env": ["SNOWFLAKE_ACCOUNT", "SNOWFLAKE_CORTEX_PAT"],
+            "models": { "claude": {} }
+        },
+        "databricks": {
+            "id": "databricks", "name": "Databricks",
+            "api": "https://${DATABRICKS_HOST}/ai-gateway/mlflow/v1",
+            "npm": "@ai-sdk/openai-compatible",
+            "env": ["DATABRICKS_HOST", "DATABRICKS_TOKEN"],
+            "models": { "dbrx": {} }
+        },
+        "neon": {
+            "id": "neon", "name": "Neon",
+            "api": "${NEON_AI_GATEWAY_BASE_URL}/v1",
+            "npm": "@ai-sdk/openai-compatible",
+            "env": ["NEON_AI_GATEWAY_BASE_URL", "NEON_AI_GATEWAY_TOKEN"],
+            "models": { "m": {} }
+        },
+        "amazon-bedrock": {
+            "id": "amazon-bedrock", "name": "Amazon Bedrock",
+            "npm": "@ai-sdk/amazon-bedrock",
+            "env": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+            "models": { "claude": {} }
+        },
+        "google-vertex": {
+            "id": "google-vertex", "name": "Vertex",
+            "npm": "@ai-sdk/google-vertex",
+            "env": ["GOOGLE_VERTEX_PROJECT", "GOOGLE_VERTEX_LOCATION"],
+            "models": { "gemini": {} }
+        }
+    }"#;
+
+    /// What blocked these was a `${VAR}` and a second `env` entry that
+    /// only locates the account. With the variables, they route.
+    #[test]
+    fn templated_providers_are_offered_when_their_variables_resolve() {
+        let vars = [
+            ("CLOUDFLARE_ACCOUNT_ID", "0af3"),
+            ("SNOWFLAKE_ACCOUNT", "myorg-acct"),
+            ("DATABRICKS_HOST", "https://adb-1.azuredatabricks.net/"),
+            ("NEON_AI_GATEWAY_BASE_URL", "https://gw.example.com"),
+        ];
+        let catalog = catalog_with_vars(TEMPLATED, &vars, false);
+        let get = |id: &str| {
+            catalog
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} is routable"))
+        };
+        assert_eq!(
+            get("cloudflare-workers-ai").base_url,
+            "https://api.cloudflare.com/client/v4/accounts/0af3/ai/v1"
+        );
+        assert_eq!(
+            get("cloudflare-workers-ai").key_env.as_deref(),
+            Some("CLOUDFLARE_API_KEY"),
+            "the account id locates; the other variable is the key"
+        );
+        assert_eq!(
+            get("snowflake-cortex").base_url,
+            "https://myorg-acct.snowflakecomputing.com/api/v2/cortex/v1"
+        );
+        assert_eq!(
+            get("snowflake-cortex").key_env.as_deref(),
+            Some("SNOWFLAKE_CORTEX_PAT")
+        );
+        assert_eq!(
+            get("databricks").base_url,
+            "https://adb-1.azuredatabricks.net/ai-gateway/mlflow/v1"
+        );
+        assert_eq!(
+            get("databricks").key_env.as_deref(),
+            Some("DATABRICKS_TOKEN")
+        );
+        assert_eq!(get("neon").base_url, "https://gw.example.com/v1");
+        assert_eq!(
+            get("neon").key_env.as_deref(),
+            Some("NEON_AI_GATEWAY_TOKEN")
+        );
+        // Request signing and GCP credentials are still not an API key.
+        assert!(catalog.get("amazon-bedrock").is_none());
+        assert!(catalog.get("google-vertex").is_none());
+        assert_eq!(catalog.len(), 5);
+
+        // Without the variables, as before: absent.
+        let bare = catalog_with_vars(TEMPLATED, &[], false);
+        assert_eq!(bare.ids().collect::<Vec<_>>(), ["openrouter"]);
+        // One missing drops only its provider.
+        let some = catalog_with_vars(TEMPLATED, &vars[..1], false);
+        assert_eq!(
+            some.ids().collect::<Vec<_>>(),
+            ["cloudflare-workers-ai", "openrouter"]
+        );
+    }
+
+    /// A value that would change which host receives the key is a reason
+    /// to drop the provider, not to interpolate it.
+    #[test]
+    fn a_variable_that_would_redirect_the_key_drops_the_provider() {
+        for (var, value) in [
+            ("CLOUDFLARE_ACCOUNT_ID", "../../evil"),
+            ("CLOUDFLARE_ACCOUNT_ID", "a/b"),
+            ("SNOWFLAKE_ACCOUNT", "evil.example/"),
+            ("SNOWFLAKE_ACCOUNT", "x@evil.example"),
+            ("DATABRICKS_HOST", "evil.example/x?y"),
+            ("NEON_AI_GATEWAY_BASE_URL", "http://gw.example.com"),
+        ] {
+            let catalog = catalog_with_vars(TEMPLATED, &[(var, value)], false);
+            assert_eq!(
+                catalog.ids().collect::<Vec<_>>(),
+                ["openrouter"],
+                "{var}={value} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_takes_its_key_in_api_key_and_a_version_in_the_query() {
+        let json = r#"{"openrouter": {
+            "id": "openrouter", "name": "OpenRouter",
+            "api": "https://openrouter.ai/api/v1",
+            "npm": "@openrouter/ai-sdk-provider", "env": ["OPENROUTER_API_KEY"],
+            "models": { "gpt-5": {} }
+        }, "azure": {
+            "id": "azure", "name": "Azure", "npm": "@ai-sdk/azure",
+            "env": ["AZURE_RESOURCE_NAME", "AZURE_API_KEY"],
+            "models": { "gpt-5": {} }
+        }}"#;
+        let catalog = catalog_with_vars(json, &[("AZURE_RESOURCE_NAME", "my-resource")], false);
+        let azure = catalog.get("azure").expect("azure is routable");
+        assert_eq!(
+            azure.base_url,
+            "https://my-resource.openai.azure.com/openai/v1"
+        );
+        assert_eq!(azure.key_env.as_deref(), Some("AZURE_API_KEY"));
+        assert_eq!(azure.wire, Wire::OpenAi);
+        assert_eq!(
+            azure.auth.scheme,
+            crate::authscheme::Scheme::Header("api-key".into())
+        );
+        assert_eq!(
+            azure.auth.query,
+            vec![("api-version".to_string(), "v1".to_string())]
+        );
+        assert!(catalog_with_vars(json, &[], false).get("azure").is_none());
+        // Not a hostname.
+        assert!(
+            catalog_with_vars(json, &[("AZURE_RESOURCE_NAME", "a.evil.com/")], false)
+                .get("azure")
+                .is_none()
+        );
+    }
+
+    const SUBSCRIPTIONS: &str = r#"{
+        "openai": {"id": "openai", "name": "OpenAI", "npm": "@ai-sdk/openai",
+            "env": ["OPENAI_API_KEY"],
+            "models": {"gpt-5": {"cost": {"input": 1.0, "output": 2.0}}}},
+        "xai": {"id": "xai", "name": "xAI", "npm": "@ai-sdk/xai",
+            "env": ["XAI_API_KEY"],
+            "models": {"grok-4": {"cost": {"input": 1.0, "output": 2.0}}}},
+        "github-copilot": {"id": "github-copilot", "name": "GitHub Copilot",
+            "api": "https://api.githubcopilot.com",
+            "npm": "@ai-sdk/openai-compatible", "env": ["GITHUB_TOKEN"],
+            "models": {"gpt-5": {}}}
+    }"#;
+
+    #[test]
+    fn subscription_providers_exist_only_where_a_login_can_drive_them() {
+        let without = catalog_with_vars(SUBSCRIPTIONS, &[], false);
+        assert_eq!(without.ids().collect::<Vec<_>>(), ["openai", "xai"]);
+
+        let with = catalog_with_vars(SUBSCRIPTIONS, &[], true);
+        let chatgpt = with
+            .get("openai-chatgpt")
+            .expect("the ChatGPT subscription");
+        assert_eq!(chatgpt.base_url, "https://chatgpt.com/backend-api/codex");
+        assert_eq!(chatgpt.key_env, None);
+        assert!(!chatgpt.key_optional);
+        // The API's models, but not the API's prices.
+        assert_eq!(
+            chatgpt
+                .models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-5"]
+        );
+        assert!(chatgpt.models.iter().all(|m| m.cost.is_none()));
+        assert!(with.get("openai").unwrap().models[0].cost.is_some());
+
+        let grok = with
+            .get("xai-supergrok")
+            .expect("the SuperGrok subscription");
+        assert_eq!(grok.base_url, "https://cli-chat-proxy.grok.com/v1");
+        assert!(grok.models.iter().all(|m| m.cost.is_none()));
+
+        // Copilot reads the variable its own CLI does, and sends its headers.
+        let copilot = with.get("github-copilot").expect("copilot with a login");
+        assert_eq!(copilot.key_env.as_deref(), Some("COPILOT_GITHUB_TOKEN"));
+        let names: Vec<_> = copilot
+            .auth
+            .headers
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert!(names.contains(&"copilot-integration-id") && names.contains(&"editor-version"));
+        // The default catalog (no logins, no variables) is unchanged.
+        assert!(Catalog::from_json(SUBSCRIPTIONS.as_bytes())
+            .unwrap()
+            .get("openai-chatgpt")
+            .is_none());
+    }
+
+    #[test]
+    fn a_missing_credential_points_at_the_login_for_a_provider_that_has_one() {
+        assert_eq!(
+            key_hint("openai-chatgpt", None),
+            "run `llmman login --provider openai-chatgpt`"
+        );
+        // A provider with a variable keeps its hint exactly.
+        assert_eq!(
+            key_hint("openrouter", Some("OPENROUTER_API_KEY")),
+            "set OPENROUTER_API_KEY in the environment, or run \
+             `llmman config set providers.openrouter.api_key <key>`"
+        );
+    }
+
+    #[test]
+    fn llmman_conf_overlays_a_catalog_providers_auth() {
+        let _fx = crate::config::CredentialsFixture::new();
+        // No `llmman.conf` in tests: `with_configured` with nothing changes
+        // nothing, and the built-in auth stays.
+        let catalog = catalog_with_vars(SUBSCRIPTIONS, &[], true).with_configured(&[]);
+        assert!(!catalog
+            .get("github-copilot")
+            .unwrap()
+            .auth
+            .headers
+            .is_empty());
+        assert_eq!(
+            catalog.get("openai").unwrap().auth,
+            crate::authscheme::Auth::default()
+        );
+    }
+
+    fn provider_for(id: &str, base_url: &str, key_env: Option<&str>) -> Provider {
+        Provider {
+            id: id.into(),
+            name: id.into(),
+            base_url: base_url.into(),
+            key_env: key_env.map(str::to_string),
+            wire: Wire::OpenAi,
+            key_optional: false,
+            models: vec![],
+            auth: Default::default(),
+        }
+    }
+
+    fn oauth_login(flow: &str, access: &str) -> crate::credentials::Credential {
+        crate::credentials::Credential::OAuth(crate::credentials::OAuth {
+            flow: flow.into(),
+            access: access.into(),
+            refresh: "r".into(),
+            expires_ms: crate::credentials::now_ms() + 3_600_000,
+            metadata: Default::default(),
+        })
+    }
+
+    /// Environment variable, then a stored credential, then `llmman.conf`:
+    /// each one shadows the next, and `key_for` — what a client process
+    /// sends per request — never sends a `llmman.conf` key a login outranks.
+    #[cfg(unix)]
+    #[test]
+    fn credentials_are_chosen_env_then_stored_then_conf() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _keys = crate::config::PROVIDER_KEYS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fx = crate::config::CredentialsFixture::new();
+        let dir = fx.store.path().parent().unwrap().to_path_buf();
+        let conf = dir.join("llmman.conf");
+        std::fs::write(&conf, "[providers.prec-test]\napi_key = \"sk-conf\"\n").unwrap();
+        std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o600)).unwrap();
+        *crate::config::TEST_PROVIDER_FILES.lock().unwrap() = vec![conf];
+        crate::config::reload_provider_keys().unwrap();
+
+        let var = "LLMMAN_TEST_PRECEDENCE_KEY";
+        let p = provider_for("prec-test", "https://api.example.test/v1", Some(var));
+        let spend = |p: &Provider| {
+            p.credential()
+                .unwrap()
+                .map(|c| (c.secret.expose().to_string(), c.kind))
+        };
+
+        // llmman.conf alone: as it has always been.
+        std::env::remove_var(var);
+        assert_eq!(spend(&p), Some(("sk-conf".into(), "config")));
+        assert_eq!(p.api_key().as_deref(), Some("sk-conf"));
+        assert_eq!(p.credential_status().map(|s| s.kind), Some("config"));
+
+        // A stored login outranks the file…
+        fx.store
+            .put(
+                "prec-test",
+                crate::credentials::Credential::ApiKey {
+                    key: "sk-stored".into(),
+                    flow: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(spend(&p), Some(("sk-stored".into(), "api_key")));
+        assert_eq!(p.credential_status().map(|s| s.kind), Some("api_key"));
+        // …and a client process does not send the file's key past it.
+        assert_eq!(p.api_key(), None);
+        assert!(p.has_credential());
+
+        // The environment outranks both.
+        std::env::set_var(var, "sk-env");
+        assert_eq!(spend(&p), Some(("sk-env".into(), "env")));
+        assert_eq!(p.api_key().as_deref(), Some("sk-env"));
+        std::env::remove_var(var);
+
+        // Logging out falls back to the file.
+        fx.store.remove("prec-test").unwrap();
+        assert_eq!(spend(&p), Some(("sk-conf".into(), "config")));
+
+        crate::config::TEST_PROVIDER_FILES.lock().unwrap().clear();
+        crate::config::reload_provider_keys().unwrap();
+        assert_eq!(spend(&p), None);
+        assert!(!p.has_credential());
+        assert_eq!(p.credential_status(), None);
+    }
+
+    /// A token that cannot be renewed is not "a key": the provider counts
+    /// as having none, and spending it is an error that says to log in.
+    #[test]
+    fn a_lapsed_token_is_not_a_credential_and_says_to_log_in() {
+        let fx = crate::config::CredentialsFixture::new();
+        let p = provider_for("anthropic", "https://api.anthropic.com/v1", None);
+        fx.store
+            .put(
+                "anthropic",
+                crate::credentials::Credential::Token {
+                    token: "sk-ant-oat01-x".into(),
+                    expires_ms: Some(1),
+                    flow: Some(crate::logins::FLOW_SETUP_TOKEN.into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(p.credential_status().map(|s| s.state), Some("expired"));
+        assert!(!p.has_credential());
+        let err = p.credential().unwrap_err();
+        assert!(err.is::<crate::credentials::ReloginRequired>(), "{err:#}");
+        assert!(
+            err.to_string()
+                .contains("llmman login --provider anthropic"),
+            "{err}"
+        );
+    }
+
+    /// The subscription token goes to its own host, however the provider
+    /// came to point elsewhere.
+    #[test]
+    fn a_login_is_refused_for_a_base_url_that_is_not_its_hosts() {
+        let fx = crate::config::CredentialsFixture::new();
+        fx.store
+            .put(
+                "openai-chatgpt",
+                oauth_login(crate::logins::FLOW_CHATGPT, "at-secret"),
+            )
+            .unwrap();
+        let own = provider_for(
+            "openai-chatgpt",
+            "https://chatgpt.com/backend-api/codex",
+            None,
+        );
+        let got = own.credential().unwrap().unwrap();
+        assert_eq!(got.secret.expose(), "at-secret");
+        assert_eq!(got.style, crate::credentials::Style::Bearer);
+
+        for elsewhere in [
+            "https://chatgpt.com.evil.example/backend-api/codex",
+            "http://chatgpt.com/backend-api/codex",
+            "https://api.openai.com/v1",
+            "http://127.0.0.1:9/v1",
+        ] {
+            let moved = provider_for("openai-chatgpt", elsewhere, None);
+            let err = moved.credential().unwrap_err();
+            assert!(
+                err.to_string().contains("only sent to its own https host"),
+                "{err:#}"
+            );
+            assert!(!format!("{err:#}").contains("at-secret"));
+        }
+        // A key someone pasted has no such restriction: it is theirs to point.
+        fx.store
+            .put(
+                "local",
+                crate::credentials::Credential::ApiKey {
+                    key: "k".into(),
+                    flow: None,
+                },
+            )
+            .unwrap();
+        provider_for("local", "http://127.0.0.1:9/v1", None)
+            .credential()
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Copilot's API host is whatever `copilot_internal/user` said at login,
+    /// but only if it is GitHub's.
+    #[test]
+    fn copilot_goes_to_the_endpoint_its_login_learned() {
+        let fx = crate::config::CredentialsFixture::new();
+        let mut login = oauth_login(crate::logins::FLOW_COPILOT, "gho");
+        if let crate::credentials::Credential::OAuth(o) = &mut login {
+            o.expires_ms = 0;
+            o.metadata.insert(
+                "api_endpoint".into(),
+                "https://api.individual.githubcopilot.com".into(),
+            );
+        }
+        fx.store.put("github-copilot", login).unwrap();
+        let p = provider_for("github-copilot", "https://api.githubcopilot.com", None);
+        let got = p.credential().unwrap().unwrap();
+        assert_eq!(
+            p.base_url_for(&got),
+            "https://api.individual.githubcopilot.com"
+        );
+
+        // A hand-edited store pointing it elsewhere is ignored, not obeyed.
+        let mut login = oauth_login(crate::logins::FLOW_COPILOT, "gho");
+        if let crate::credentials::Credential::OAuth(o) = &mut login {
+            o.expires_ms = 0;
+            o.metadata
+                .insert("api_endpoint".into(), "https://evil.example".into());
+        }
+        fx.store.put("github-copilot", login).unwrap();
+        let got = p.credential().unwrap().unwrap();
+        assert_eq!(p.base_url_for(&got), "https://api.githubcopilot.com");
+    }
+
+    // -----------------------------------------------------------------
+    // Cloud providers and their chains
+    // -----------------------------------------------------------------
+
+    const CLOUD: &str = r#"{
+        "openrouter": {"name": "OpenRouter", "npm": "@openrouter/ai-sdk-provider",
+            "api": "https://openrouter.ai/api/v1", "env": ["OPENROUTER_API_KEY"], "models": {}},
+        "amazon-bedrock": {"name": "Amazon Bedrock", "npm": "@ai-sdk/amazon-bedrock",
+            "env": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION", "AWS_BEARER_TOKEN_BEDROCK"],
+            "models": {
+                "openai.gpt-oss-120b-1:0": {"cost": {"input": 0.15, "output": 0.6}},
+                "xai.grok-4": {},
+                "anthropic.claude-sonnet-4-20250514-v1:0": {},
+                "amazon.nova-pro-v1:0": {}
+            }},
+        "google-vertex": {"name": "Vertex", "npm": "@ai-sdk/google-vertex",
+            "env": ["GOOGLE_VERTEX_PROJECT", "GOOGLE_VERTEX_LOCATION", "GOOGLE_APPLICATION_CREDENTIALS"],
+            "models": {
+                "gemini-2.5-flash": {},
+                "claude-sonnet-4@20250514": {},
+                "mistral-medium-3": {},
+                "meta/llama-4-scout-17b-16e-instruct-maas": {}
+            }}
+    }"#;
+
+    #[test]
+    fn bedrock_and_vertex_are_offered_where_their_endpoint_can_be_named() {
+        let ids = |c: &Catalog| c.ids().map(str::to_string).collect::<Vec<_>>();
+        // Never without logins on: a fixture means the same everywhere.
+        let off = catalog_with_vars(
+            CLOUD,
+            &[
+                ("AWS_REGION", "eu-west-1"),
+                ("GOOGLE_VERTEX_PROJECT", "p-1"),
+            ],
+            false,
+        );
+        assert_eq!(ids(&off), ["openrouter"]);
+
+        let catalog = catalog_with_vars(
+            CLOUD,
+            &[
+                ("AWS_REGION", "eu-west-1"),
+                ("GOOGLE_VERTEX_PROJECT", "p-1"),
+                ("GOOGLE_VERTEX_LOCATION", "us-central1"),
+            ],
+            true,
+        );
+        let bedrock = catalog.get("amazon-bedrock").expect("bedrock");
+        assert_eq!(
+            bedrock.base_url,
+            "https://bedrock-runtime.eu-west-1.amazonaws.com/openai/v1"
+        );
+        assert_eq!(bedrock.wire, Wire::OpenAi);
+        // The bearer token is its key; the SigV4 chain stands behind it.
+        assert_eq!(bedrock.key_env.as_deref(), Some("AWS_BEARER_TOKEN_BEDROCK"));
+        let served: Vec<&str> = bedrock.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(served, ["openai.gpt-oss-120b-1:0", "xai.grok-4"]);
+        assert!(bedrock.models[0].cost.is_some());
+
+        let vertex = catalog.get("google-vertex").expect("vertex");
+        assert_eq!(
+            vertex.base_url,
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/p-1/locations/us-central1/endpoints/openapi"
+        );
+        assert_eq!(vertex.key_env, None, "express-mode keys do not work here");
+        let served: Vec<&str> = vertex.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            served,
+            [
+                "gemini-2.5-flash",
+                "meta/llama-4-scout-17b-16e-instruct-maas"
+            ]
+        );
+        assert_eq!(
+            vertex.wire_model("gemini-2.5-flash"),
+            "google/gemini-2.5-flash"
+        );
+        assert_eq!(
+            vertex.wire_model("meta/llama-4-scout-17b-16e-instruct-maas"),
+            "meta/llama-4-scout-17b-16e-instruct-maas"
+        );
+        assert_eq!(
+            bedrock.wire_model("openai.gpt-oss-120b-1:0"),
+            "openai.gpt-oss-120b-1:0"
+        );
+
+        // Vertex without a project is absent, Bedrock without a region uses
+        // the default; the global location has the plain host.
+        let bare = catalog_with_vars(CLOUD, &[], true);
+        assert!(bare.get("google-vertex").is_none());
+        assert_eq!(
+            bare.get("amazon-bedrock").unwrap().base_url,
+            "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"
+        );
+        let global = catalog_with_vars(CLOUD, &[("GCP_PROJECT", "p-2")], true);
+        assert_eq!(
+            global.get("google-vertex").unwrap().base_url,
+            "https://aiplatform.googleapis.com/v1/projects/p-2/locations/global/endpoints/openapi"
+        );
+        // A value that would move the request is no region or project.
+        let hostile = catalog_with_vars(
+            CLOUD,
+            &[
+                ("AWS_REGION", "x.evil.com/"),
+                ("GOOGLE_VERTEX_PROJECT", "a/../b"),
+            ],
+            true,
+        );
+        assert!(hostile.get("google-vertex").is_none());
+        assert!(hostile
+            .get("amazon-bedrock")
+            .unwrap()
+            .base_url
+            .contains("us-east-1"));
+    }
+
+    fn token_provider(id: &str) -> Provider {
+        Provider {
+            id: id.into(),
+            name: id.into(),
+            base_url: "https://gw.example/v1".into(),
+            key_env: None,
+            wire: Wire::OpenAi,
+            key_optional: false,
+            models: Vec::new(),
+            auth: crate::authscheme::Auth::default(),
+        }
+    }
+
+    /// A stored token service stands behind a provider: its status says so
+    /// without a secret or a request, and a request resolves a bearer from
+    /// it.
+    #[test]
+    fn a_stored_token_service_is_a_providers_credential() {
+        use crate::chains::Chain;
+        use crate::credentials::Credential;
+        use crate::tokensvc::TokenService;
+        let fx = crate::config::CredentialsFixture::new();
+        let server = crate::testserver::server();
+        server.fake.on(
+            "/prov-token",
+            vec![(
+                200,
+                serde_json::json!({"access_token": "minted-1", "expires_in": 3600}),
+            )],
+        );
+        let provider = token_provider("provider-chain-1");
+        assert_eq!(provider.credential_status(), None);
+        assert!(!provider.has_credential());
+        fx.store
+            .put(
+                "provider-chain-1",
+                Credential::Chain(Chain::Token(TokenService {
+                    token_url: Some(format!("{}/prov-token", server.origin)),
+                    client_id: Some("c".into()),
+                    client_secret: Some("provider-secret".into()),
+                    ..TokenService::default()
+                })),
+            )
+            .unwrap();
+        let status = provider.credential_status().unwrap();
+        assert_eq!((status.kind, status.state), ("client_credentials", "ready"));
+        assert!(provider.has_credential());
+        assert!(
+            server.fake.hits("/prov-token").is_empty(),
+            "status asks nobody"
+        );
+        assert!(!serde_json::to_string(&status)
+            .unwrap()
+            .contains("provider-secret"));
+        // The daemon holds it: a client keeps no key of its own for it.
+        assert_eq!(key_for("provider-chain-1", None), None);
+
+        let got = provider.credential().unwrap().unwrap();
+        assert_eq!(got.secret.expose(), "minted-1");
+        assert_eq!(got.kind, "client_credentials");
+        assert_eq!(got.style, crate::credentials::Style::Bearer);
+        provider.credential().unwrap();
+        assert_eq!(
+            server.fake.hits("/prov-token").len(),
+            1,
+            "the token is cached"
+        );
+
+        // A key in the store, or the provider's variable, still comes first.
+        fx.store
+            .put(
+                "provider-chain-1",
+                Credential::ApiKey {
+                    key: "sk-first".into(),
+                    flow: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            provider.credential().unwrap().unwrap().secret.expose(),
+            "sk-first"
+        );
+    }
+
+    /// A chain with nothing set up is no credential: the ordinary "no key"
+    /// answer, not a request to anywhere.
+    #[test]
+    fn a_chain_with_nothing_to_go_on_is_no_credential() {
+        let _fx = crate::config::CredentialsFixture::new();
+        // watsonx's profile reads WATSONX_API_KEY; unset, it is not configured.
+        if std::env::var_os("WATSONX_API_KEY").is_none() {
+            let provider = token_provider("watsonx");
+            assert_eq!(provider.credential_status(), None);
+            assert!(provider.credential().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn a_stored_aws_selection_shows_as_a_signing_credential() {
+        use crate::chains::Chain;
+        use crate::credentials::Credential;
+        let fx = crate::config::CredentialsFixture::new();
+        fx.store
+            .put(
+                "amazon-bedrock",
+                Credential::Chain(Chain::Aws(crate::aws::AwsChain {
+                    profile: Some("work".into()),
+                    ..Default::default()
+                })),
+            )
+            .unwrap();
+        let provider = token_provider("amazon-bedrock");
+        let status = provider.credential_status().unwrap();
+        assert_eq!((status.kind, status.state), ("aws_sigv4", "ready"));
+        assert!(provider.has_credential());
     }
 }

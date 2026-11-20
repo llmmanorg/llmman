@@ -40,6 +40,7 @@ mod gemini;
 mod goose;
 mod goose_desktop;
 mod grok;
+mod hdrm;
 mod hermes;
 mod kimi;
 mod omp;
@@ -49,6 +50,7 @@ mod optimizer;
 mod pi;
 mod qwen;
 mod sandbox;
+mod vibe;
 
 pub use optimizer::Optimizer;
 pub use sandbox::Sandbox;
@@ -70,8 +72,9 @@ pub struct LaunchArgs {
 
     /// Serve --model from this provider (openai, anthropic, openrouter, …)
     /// instead of locally; with no --model, the provider's first model.
-    /// claude, codex and opencode are given every model the provider
-    /// lists, to switch between inside the agent.
+    /// claude, codex, opencode, pi, droid, hermes, qwen, dsh, vibe and
+    /// docker-agent are given every model the provider lists, to switch
+    /// between inside the agent.
     /// See `llmman providers`.
     #[arg(long, short = 'p', value_name = "PROVIDER")]
     pub provider: Option<String>,
@@ -105,7 +108,9 @@ pub struct LaunchArgs {
 
     /// What to launch with to make the session cheaper: none (the default)
     /// launches as is; tk compacts the output of the shell commands the
-    /// agent runs (claude only). See docs/optimizers.md.
+    /// agent runs (claude, opencode); cvmn asks for terse replies (claude,
+    /// codex, opencode); hdrm compresses what the agent sends the model
+    /// (claude, codex, opencode). See docs/optimizers.md.
     #[arg(long, value_enum, value_name = "OPTIMIZER", default_value = "none")]
     pub optimizer: Optimizer,
 
@@ -179,7 +184,14 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     }
 
     // Before either arm starts the daemon; see `check_model_flag`.
-    check_model_flag(name, args.model.as_deref(), provider, &args.extra_args)?;
+    let speech = std::env::var(goose_desktop::TRANSCRIPTION_MODEL_ENV).ok();
+    check_model_flag(
+        name,
+        args.model.as_deref(),
+        provider,
+        speech.as_deref(),
+        &args.extra_args,
+    )?;
     if name.eq_ignore_ascii_case("copilot")
         || name.eq_ignore_ascii_case("copilot-cli")
         || name.eq_ignore_ascii_case("droid")
@@ -339,7 +351,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         }
     };
 
-    launch(
+    let launched = launch(
         name,
         &model,
         &api_key,
@@ -351,7 +363,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         &args.extra_args,
         args.optimizer,
         hosted.as_deref(),
-    )
+    );
+    hdrm::stop();
+    launched
 }
 
 /// `args` with `[launch.<name>]` from llmman.conf filled in for the flags
@@ -417,6 +431,7 @@ fn integration_key() -> String {
 /// goose-desktop keeps the same environment, so llmman still owns the
 /// provider and endpoint; only the model name would fall back to
 /// `goose configure`'s, and the daemon would be asked for that one.
+/// It alone may skip `--model`, for dictation: see `check_model_flag`.
 /// Grok Build and Cline have hosted defaults of their own; without an
 /// explicit local model they would send those ids to llmman's endpoint
 /// instead.
@@ -487,19 +502,36 @@ const MODEL_FLAG_FORWARDED: &[&str] = &[
 /// win for the integrations in `MODEL_FLAG_FORWARDED`, but `run`
 /// resolves the top-level one and, locally, preloads it, so that gets
 /// said.
+///
+/// goose-desktop alone may skip `--model` when `speech_model`
+/// (`OPENAI_TRANSCRIPTION_MODEL`) is set: it then launches for dictation
+/// only. `--provider` still needs `--model`.
 fn check_model_flag(
     integration: &str,
     model: Option<&str>,
     provider: Option<&str>,
+    speech_model: Option<&str>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let name = integration.to_lowercase();
     let model = model.map(str::trim).filter(|m| !m.is_empty());
     let Some(model) = model else {
         if MODEL_REQUIRED.contains(&name.as_str()) {
+            let dictation = name == "goose-desktop" && provider.is_none();
+            if dictation && speech_model.is_some_and(|s| !s.trim().is_empty()) {
+                return Ok(());
+            }
             let with_provider = provider.map_or(String::new(), |p| format!(" --provider {p}"));
+            let or_dictate = if dictation {
+                format!(
+                    ", or set {}=<speech model> for dictation only",
+                    goose_desktop::TRANSCRIPTION_MODEL_ENV
+                )
+            } else {
+                String::new()
+            };
             anyhow::bail!(
-                "{name} needs a model: llmman launch {name}{with_provider} --model <model>"
+                "{name} needs a model: llmman launch {name}{with_provider} --model <model>{or_dictate}"
             );
         }
         // No resolved model for a forwarded one to win over.
@@ -606,7 +638,7 @@ const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes", "cline", "pi"];
 fn declares_context_window(integration: &str) -> bool {
     matches!(
         integration.to_lowercase().as_str(),
-        "claude" | "opencode" | "codex" | "pi" | "omp" | "kimi" | "openclaw"
+        "claude" | "opencode" | "codex" | "pi" | "omp" | "kimi" | "openclaw" | "vibe"
     )
 }
 
@@ -692,6 +724,10 @@ pub(super) struct HostedModel {
     /// The thinking levels the catalog lists for it, as
     /// [`Thinking::Listed`] would carry them.
     pub thinking: Option<Vec<String>>,
+    /// Whether the catalog says it takes images in (models.dev
+    /// `modalities.input` lists `image`), `None` where it publishes
+    /// no modalities.
+    pub vision: Option<bool>,
 }
 
 /// Validates `--provider`/`--model` against the running daemon's catalog
@@ -802,6 +838,7 @@ fn resolve_provider_model(
     let thinking = entry.thinking_levels(model);
     let context_window = entry.context_window(model);
     let max_output = entry.max_output(model);
+    let vision = entry.vision(model);
     let reference = providers::format_remote_ref(provider, model);
     let mut models = vec![HostedModel {
         reference: reference.clone(),
@@ -809,6 +846,7 @@ fn resolve_provider_model(
         context: context_window,
         output: max_output,
         thinking: thinking.clone(),
+        vision,
     }];
     models.extend(
         entry
@@ -821,6 +859,7 @@ fn resolve_provider_model(
                 context: m.context,
                 output: m.output,
                 thinking: m.thinking.clone(),
+                vision: m.vision,
             }),
     );
 
@@ -963,6 +1002,11 @@ const INTEGRATIONS: &[Integration] = &[
         name: "docker-agent",
         description: "Docker Agent",
         binary: "docker-agent",
+    },
+    Integration {
+        name: "vibe",
+        description: "Mistral Vibe CLI",
+        binary: "vibe",
     },
 ];
 
@@ -1129,6 +1173,7 @@ const VARIANT_UNSUPPORTED: &[(&str, &str)] = &[
     ("goose", "it sends effort only for OpenAI's models"),
     ("goose-desktop", "it sends effort only for OpenAI's models"),
     ("docker-agent", "it ignores thinking_budget here"),
+    ("vibe", "llmman does not set its thinking yet"),
 ];
 
 const LOW_TO_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
@@ -1298,26 +1343,36 @@ fn launch(
             context_window,
             max_output,
             extra_args,
+            optimizer,
             hosted,
         ),
-        "codex" => codex::launch_codex(model, api_key, vision, context_window, extra_args, hosted),
-        "pi" => pi::launch_pi(model, reasons, vision, context_window, extra_args),
+        "codex" => codex::launch_codex(
+            model,
+            api_key,
+            vision,
+            context_window,
+            extra_args,
+            optimizer,
+            hosted,
+        ),
+        "pi" => pi::launch_pi(model, reasons, vision, context_window, extra_args, hosted),
         "omp" => omp::launch_omp(model, reasons, vision, context_window, extra_args),
         "cline" => cline::launch_cline(model, extra_args),
         "aider" => aider::launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => copilot::launch_copilot(model, api_key, extra_args),
-        "droid" => droid::launch_droid(model, api_key, vision, max_output, extra_args),
+        "droid" => droid::launch_droid(model, api_key, vision, max_output, extra_args, hosted),
         "kimi" => kimi::launch_kimi(model, api_key, context_window, extra_args),
         "gemini" => gemini::launch_gemini(model, api_key, extra_args),
         "agy" => agy::launch_agy(model, api_key, extra_args),
-        "hermes" => hermes::launch_hermes(model, vision, extra_args),
+        "hermes" => hermes::launch_hermes(model, vision, extra_args, hosted),
         "openclaw" => openclaw::launch_openclaw(model, context_window, extra_args),
-        "qwen" => qwen::launch_qwen(model, api_key, vision, listed.as_ref(), extra_args),
-        "dsh" => dsh::launch_dsh(model, api_key, vision, listed.as_ref(), extra_args),
+        "qwen" => qwen::launch_qwen(model, api_key, vision, listed.as_ref(), extra_args, hosted),
+        "dsh" => dsh::launch_dsh(model, api_key, vision, listed.as_ref(), extra_args, hosted),
         "goose" => goose::launch_goose(model, api_key, extra_args),
         "goose-desktop" => goose_desktop::launch_goose_desktop(model, api_key, extra_args),
         "grok" => grok::launch_grok(model, api_key, listed.as_ref(), extra_args),
-        "docker-agent" => docker_agent::launch_docker_agent(model, api_key, extra_args),
+        "docker-agent" => docker_agent::launch_docker_agent(model, api_key, extra_args, hosted),
+        "vibe" => vibe::launch_vibe(model, api_key, context_window, extra_args, hosted),
         other => Err(unknown_integration(other)),
     }
 }
@@ -1391,6 +1446,9 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
         ],
         "droid" => vec![Dir(droid::droid_home()?)],
         "kimi" => vec![Dir(home.join(".kimi"))],
+        "vibe" => vec![Dir(
+            env_dir("VIBE_HOME").unwrap_or_else(|| home.join(".vibe"))
+        )],
         "gemini" => vec![Dir(home.join(".gemini"))],
         "agy" => vec![Dir(agy::agy_settings_dir()?)],
         "hermes" => vec![Dir(hermes::hermes_home()?)],
@@ -1563,13 +1621,21 @@ fn exec_with_env(bin: &Path, args: &[String], extra_env: &[(&str, &str)]) -> any
     exec_with_env_removing(bin, args, extra_env, &[])
 }
 
+/// [`exec_with_env`] for a computed environment.
+fn exec_with_owned_env(bin: &Path, args: &[String], env: &[(&str, String)]) -> anyhow::Result<()> {
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    exec_with_env(bin, args, &env)
+}
+
 fn exec_with_env_removing(
     bin: &Path,
     args: &[String],
     extra_env: &[(&str, &str)],
     remove_env: &[&str],
 ) -> anyhow::Result<()> {
-    std::process::exit(run_with_env_removing(bin, args, extra_env, remove_env)?);
+    let code = run_with_env_removing(bin, args, extra_env, remove_env);
+    hdrm::stop();
+    std::process::exit(code?);
 }
 
 /// Runs the integration — in the `--sandbox`, when there is one — and
@@ -1782,19 +1848,19 @@ mod tests {
         let none: Vec<String> = vec![];
         for id in MODEL_REQUIRED {
             assert!(integration(id).is_some(), "{id} is not an integration");
-            assert!(check_model_flag(id, None, None, &none).is_err());
-            assert!(check_model_flag(id, Some(" "), None, &none).is_err());
-            assert!(check_model_flag(&id.to_uppercase(), None, None, &none).is_err());
-            let err = check_model_flag(id, None, Some("openrouter"), &none).unwrap_err();
+            assert!(check_model_flag(id, None, None, None, &none).is_err());
+            assert!(check_model_flag(id, Some(" "), None, None, &none).is_err());
+            assert!(check_model_flag(&id.to_uppercase(), None, None, None, &none).is_err());
+            let err = check_model_flag(id, None, Some("openrouter"), None, &none).unwrap_err();
             assert!(
                 err.to_string().contains("--provider openrouter --model"),
                 "{err}"
             );
-            assert!(check_model_flag(id, Some("m"), None, &none).is_ok());
+            assert!(check_model_flag(id, Some("m"), None, None, &none).is_ok());
             let forwarded = vec!["--model".to_string(), "theirs".to_string()];
-            assert!(check_model_flag(id, Some("m"), None, &forwarded).is_ok());
+            assert!(check_model_flag(id, Some("m"), None, None, &forwarded).is_ok());
         }
-        assert!(check_model_flag("claude", None, None, &none).is_ok());
+        assert!(check_model_flag("claude", None, None, None, &none).is_ok());
         // The "yours wins" warning is only claimed for launchers that
         // actually yield to it; dsh has no `--model` flag to yield to.
         for id in MODEL_FLAG_FORWARDED {
@@ -1889,7 +1955,33 @@ mod tests {
         assert!(!CONFIGURED_BY_FILE.contains(&"goose-desktop"));
         // It has no --model of its own to yield to.
         assert!(!MODEL_FLAG_FORWARDED.contains(&"goose-desktop"));
+        // Needs a model, bar the dictation-only launch below.
         assert!(MODEL_REQUIRED.contains(&"goose-desktop"));
+    }
+
+    #[test]
+    fn goose_desktop_launches_without_a_model_only_for_dictation() {
+        let none: Vec<String> = vec![];
+        let speech = Some("hf.co/ggml-org/Voxtral-Mini-3B-2507-GGUF:Q4_K_M");
+        for id in ["goose-desktop", "GOOSE-DESKTOP"] {
+            assert!(check_model_flag(id, None, None, speech, &none).is_ok());
+            assert!(check_model_flag(id, Some("m"), None, speech, &none).is_ok());
+            for blank in [None, Some(""), Some(" \t\n")] {
+                let err = check_model_flag(id, None, None, blank, &none).unwrap_err();
+                assert!(err
+                    .to_string()
+                    .contains("--model <model>, or set OPENAI_TRANSCRIPTION_MODEL="));
+            }
+            let err = check_model_flag(id, None, Some("openrouter"), speech, &none).unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("--provider openrouter --model <model>"));
+            assert!(!err.to_string().contains("OPENAI_TRANSCRIPTION_MODEL"));
+        }
+        // No other integration, the goose CLI included, is let off.
+        for id in MODEL_REQUIRED.iter().filter(|id| **id != "goose-desktop") {
+            assert!(check_model_flag(id, None, None, speech, &none).is_err());
+        }
     }
 
     #[test]
@@ -2260,9 +2352,9 @@ mod tests {
         assert_eq!(args.extra_args, ["hi"]);
     }
 
-    /// `--optimizer` defaults to none, and takes none or tk.
+    /// `--optimizer` defaults to none, and takes none, tk, cvmn or hdrm.
     #[test]
-    fn the_optimizer_defaults_to_none_and_takes_none_or_tk() {
+    fn the_optimizer_defaults_to_none_and_takes_none_tk_cvmn_or_hdrm() {
         assert_eq!(launch_args(&["claude"]).optimizer, Optimizer::None);
         assert_eq!(
             launch_args(&["claude", "--optimizer", "none"]).optimizer,
@@ -2275,6 +2367,14 @@ mod tests {
         assert_eq!(
             launch_args(&["claude", "--optimizer=tk", "--", "-p", "hi"]).optimizer,
             Optimizer::Tk
+        );
+        assert_eq!(
+            launch_args(&["claude", "--optimizer", "cvmn"]).optimizer,
+            Optimizer::Cvmn
+        );
+        assert_eq!(
+            launch_args(&["claude", "--optimizer", "hdrm"]).optimizer,
+            Optimizer::Hdrm
         );
         // The flag is not an alias for anything after `--`.
         let args = launch_args(&["claude", "--", "--optimizer", "tk"]);
@@ -2302,6 +2402,8 @@ mod tests {
         assert!(help.contains("--optimizer <OPTIMIZER>"), "{help}");
         assert!(help.contains("none"), "{help}");
         assert!(help.contains("tk"), "{help}");
+        assert!(help.contains("cvmn"), "{help}");
+        assert!(help.contains("hdrm"), "{help}");
         assert!(help.contains("[default: none]"), "{help}");
     }
 
@@ -2310,7 +2412,6 @@ mod tests {
     #[test]
     fn tk_is_refused_for_other_integrations_before_anything_starts() {
         for name in [
-            "opencode",
             "codex",
             "aider",
             "goose",
@@ -2326,8 +2427,22 @@ mod tests {
                 err.contains(&format!("does not work with {canonical}")),
                 "{name}: {err}"
             );
-            assert!(err.contains("only claude can use it"), "{name}: {err}");
+            assert!(
+                err.contains("only claude, opencode can use it"),
+                "{name}: {err}"
+            );
         }
+    }
+
+    #[test]
+    fn cvmn_is_refused_for_other_integrations_before_anything_starts() {
+        let args = launch_args(&["aider", "--model", "m", "--optimizer", "cvmn"]);
+        let err = run(&args).unwrap_err().to_string();
+        assert!(err.contains("does not work with aider"), "{err}");
+        assert!(
+            err.contains("only claude, codex, opencode can use it"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::common;
-use super::{exec_with_env, find_on_path, has_forwarded_model_flag, server};
+use super::{exec_with_env, find_on_path, has_forwarded_model_flag, server, HostedModel};
 
 /// Droid expands this reference in `settings.json` from the child process's
 /// environment, so a real daemon/provider credential is never persisted.
@@ -18,16 +18,22 @@ const DROID_REASONING_EFFORTS: &[&str] = &["high", "medium", "low", "none"];
 /// chat-completions endpoint. Droid resolves custom models by their generated
 /// `custom:<display>-<index>` id, not the wire model name, so the merge writes
 /// that id as the interactive default and returns it for `droid exec`.
+///
+/// `hosted` is every model `--provider` serves (see [`HostedModel`]):
+/// each becomes a `customModels` entry, so Droid's own model picker can
+/// switch between them mid-session; the launched model stays the
+/// session default.
 pub(super) fn launch_droid(
     model: &str,
     api_key: &str,
     vision: bool,
     max_output: Option<u32>,
     extra_args: &[String],
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     let bin = find_droid().ok_or_else(|| anyhow::anyhow!("droid is not installed"))?;
     let base_url = format!("{}/v1", server());
-    let model_id = write_droid_settings(model, &base_url, vision, max_output)?;
+    let model_id = write_droid_settings(model, &base_url, vision, max_output, hosted)?;
     exec_with_env(
         &bin,
         &droid_args(&model_id, extra_args),
@@ -58,6 +64,7 @@ fn write_droid_settings(
     base_url: &str,
     vision: bool,
     max_output: Option<u32>,
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<String> {
     write_droid_settings_at(
         &droid_home()?.join("settings.json"),
@@ -65,6 +72,7 @@ fn write_droid_settings(
         base_url,
         vision,
         max_output,
+        hosted,
     )
 }
 
@@ -74,10 +82,16 @@ fn write_droid_settings_at(
     base_url: &str,
     vision: bool,
     max_output: Option<u32>,
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<String> {
     let selected = RefCell::new(None);
     common::write_json_merged(path, "droid", |existing| {
-        let (merged, id) = droid_settings_merged(existing, model, base_url, vision, max_output);
+        let (merged, id) = match hosted {
+            Some(hosted) => {
+                droid_settings_merged_hosted(existing, model, base_url, vision, max_output, hosted)
+            }
+            None => droid_settings_merged(existing, model, base_url, vision, max_output),
+        };
         *selected.borrow_mut() = Some(id);
         merged
     })?;
@@ -89,73 +103,72 @@ fn write_droid_settings_at(
 /// Merge one llmman-owned model entry without moving or replacing any user
 /// entries. Its position is part of Droid's documented custom model id, so a
 /// matching entry stays at the same index and new entries are appended.
-fn droid_settings_merged(
-    existing: &serde_json::Value,
+/// Returns the entry's generated id.
+fn merge_custom_model(
+    root: &mut serde_json::Map<String, serde_json::Value>,
     model: &str,
     base_url: &str,
     vision: bool,
     max_output: Option<u32>,
-) -> (serde_json::Value, String) {
-    let mut root = existing.clone();
-    let root = root
-        .as_object_mut()
-        .expect("write_json_merged passes an object");
-    let id = {
-        let slot = root
-            .entry("customModels")
-            .or_insert_with(|| serde_json::json!([]));
-        if !slot.is_array() {
-            *slot = serde_json::json!([]);
-        }
-        let models = slot.as_array_mut().expect("set to an array just above");
-        let index = models
-            .iter()
-            .position(|entry| {
-                entry.get("model").and_then(serde_json::Value::as_str) == Some(model)
-                    && entry.get("apiKey").and_then(serde_json::Value::as_str)
-                        == Some(DROID_API_KEY_REF)
-            })
-            .unwrap_or(models.len());
+) -> String {
+    let slot = root
+        .entry("customModels")
+        .or_insert_with(|| serde_json::json!([]));
+    if !slot.is_array() {
+        *slot = serde_json::json!([]);
+    }
+    let models = slot.as_array_mut().expect("set to an array just above");
+    let index = models
+        .iter()
+        .position(|entry| {
+            entry.get("model").and_then(serde_json::Value::as_str) == Some(model)
+                && entry.get("apiKey").and_then(serde_json::Value::as_str)
+                    == Some(DROID_API_KEY_REF)
+        })
+        .unwrap_or(models.len());
 
-        let mut entry = models
-            .get(index)
-            .and_then(serde_json::Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let display = entry
-            .get("displayName")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("{model} [llmman]"));
-        let id = entry
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| droid_model_id(&display, index));
-        entry.insert("model".into(), serde_json::json!(model));
-        entry.insert("displayName".into(), serde_json::json!(display));
-        entry.insert("baseUrl".into(), serde_json::json!(base_url));
-        entry.insert("apiKey".into(), serde_json::json!(DROID_API_KEY_REF));
-        entry.insert(
-            "provider".into(),
-            serde_json::json!("generic-chat-completion-api"),
-        );
-        entry.insert("supportsImages".into(), serde_json::json!(vision));
-        entry.insert("id".into(), serde_json::json!(id));
-        entry.insert("index".into(), serde_json::json!(index));
-        if let Some(max_output) = max_output {
-            entry.insert("maxOutputTokens".into(), serde_json::json!(max_output));
-        }
+    let mut entry = models
+        .get(index)
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let display = entry
+        .get("displayName")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{model} [llmman]"));
+    let id = entry
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| droid_model_id(&display, index));
+    entry.insert("model".into(), serde_json::json!(model));
+    entry.insert("displayName".into(), serde_json::json!(display));
+    entry.insert("baseUrl".into(), serde_json::json!(base_url));
+    entry.insert("apiKey".into(), serde_json::json!(DROID_API_KEY_REF));
+    entry.insert(
+        "provider".into(),
+        serde_json::json!("generic-chat-completion-api"),
+    );
+    entry.insert("supportsImages".into(), serde_json::json!(vision));
+    entry.insert("id".into(), serde_json::json!(id));
+    entry.insert("index".into(), serde_json::json!(index));
+    if let Some(max_output) = max_output {
+        entry.insert("maxOutputTokens".into(), serde_json::json!(max_output));
+    }
 
-        let entry = serde_json::Value::Object(entry);
-        if index == models.len() {
-            models.push(entry);
-        } else {
-            models[index] = entry;
-        }
-        id
-    };
+    let entry = serde_json::Value::Object(entry);
+    if index == models.len() {
+        models.push(entry);
+    } else {
+        models[index] = entry;
+    }
+    id
+}
 
+/// The session default to `id`, keeping a valid `reasoningEffort` the
+/// user already set.
+fn set_session_default(root: &mut serde_json::Map<String, serde_json::Value>, id: &str) {
     let session = root
         .entry("sessionDefaultSettings")
         .or_insert_with(|| serde_json::json!({}));
@@ -173,7 +186,60 @@ fn droid_settings_merged(
     if !valid_effort {
         session.insert("reasoningEffort".into(), serde_json::json!("none"));
     }
+}
+
+fn droid_settings_merged(
+    existing: &serde_json::Value,
+    model: &str,
+    base_url: &str,
+    vision: bool,
+    max_output: Option<u32>,
+) -> (serde_json::Value, String) {
+    let mut root = existing.clone();
+    let root = root
+        .as_object_mut()
+        .expect("write_json_merged passes an object");
+    let id = merge_custom_model(root, model, base_url, vision, max_output);
+    set_session_default(root, &id);
     (root.clone().into(), id)
+}
+
+/// [`droid_settings_merged`] for every model `--provider` serves: each
+/// becomes a `customModels` entry, with what the catalog says about it —
+/// image input from its own `vision`, its own reply ceiling — and the
+/// launched model stays the session default. The launched model belongs
+/// in the list even if the provider's list somehow lacks it, ahead of
+/// the rest.
+fn droid_settings_merged_hosted(
+    existing: &serde_json::Value,
+    model: &str,
+    base_url: &str,
+    vision: bool,
+    max_output: Option<u32>,
+    hosted: &[HostedModel],
+) -> (serde_json::Value, String) {
+    let mut root = existing.clone();
+    let root = root
+        .as_object_mut()
+        .expect("write_json_merged passes an object");
+    let mut launched_id = None;
+    for m in hosted {
+        let (entry_model, entry_vision, entry_output) = if m.reference == model {
+            (model, vision, max_output)
+        } else {
+            (m.reference.as_str(), m.vision.unwrap_or(false), m.output)
+        };
+        let id = merge_custom_model(root, entry_model, base_url, entry_vision, entry_output);
+        if m.reference == model {
+            launched_id = Some(id);
+        }
+    }
+    let launched_id = match launched_id {
+        Some(id) => id,
+        None => merge_custom_model(root, model, base_url, vision, max_output),
+    };
+    set_session_default(root, &launched_id);
+    (root.clone().into(), launched_id)
 }
 
 fn droid_model_id(display_name: &str, index: usize) -> String {
@@ -307,6 +373,7 @@ mod tests {
             "http://127.0.0.1:17434/v1",
             false,
             Some(8192),
+            None,
         )
         .unwrap();
         assert_eq!(id, "custom:docker.io/ai/qwen3.5:0.8b-[llmman]-0");
@@ -329,6 +396,7 @@ mod tests {
             "http://127.0.0.1:17434/v1",
             false,
             Some(8192),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -336,6 +404,115 @@ mod tests {
             original
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn hosted_pair() -> Vec<HostedModel> {
+        vec![
+            HostedModel {
+                reference: "llmman.provider/openrouter/qwen3-coder".into(),
+                id: "qwen3-coder".into(),
+                context: Some(262_144),
+                output: Some(8_192),
+                thinking: Some(vec!["low".into(), "high".into()]),
+                vision: Some(false),
+            },
+            HostedModel {
+                reference: "llmman.provider/openrouter/llama-4-scout".into(),
+                id: "llama-4-scout".into(),
+                context: None,
+                output: None,
+                thinking: None,
+                vision: Some(true),
+            },
+        ]
+    }
+
+    /// A `--provider` launch lists every model the provider serves, so
+    /// Droid's own model picker can switch between them without a
+    /// relaunch: the launched model first, with the image input and
+    /// reply ceiling this launch resolved for it, and each other model
+    /// with what its own catalog entry says. The launched model stays
+    /// the session default, and a matching entry keeps its index — and
+    /// so its generated id — across launches.
+    #[test]
+    fn hosted_models_each_get_a_custom_model_entry() {
+        let existing = serde_json::json!({
+            "theme": "dark",
+            "sessionDefaultSettings": {
+                "model": "custom:llmman.provider-openrouter-qwen3-coder-[llmman]-1",
+                "reasoningEffort": "high"
+            },
+            "customModels": [
+                {
+                    "model": "user/model",
+                    "displayName": "Mine",
+                    "baseUrl": "https://example.test/v1",
+                    "apiKey": "${USER_KEY}",
+                    "provider": "generic-chat-completion-api"
+                },
+                {
+                    "model": "llmman.provider/openrouter/qwen3-coder",
+                    "displayName": "llmman.provider/openrouter/qwen3-coder [llmman]",
+                    "baseUrl": "http://old.test/v1",
+                    "apiKey": DROID_API_KEY_REF,
+                    "provider": "generic-chat-completion-api",
+                    "id": "custom:llmman.provider-openrouter-qwen3-coder-[llmman]-1",
+                    "index": 1
+                }
+            ]
+        });
+        let (merged, id) = droid_settings_merged_hosted(
+            &existing,
+            "llmman.provider/openrouter/qwen3-coder",
+            "http://127.0.0.1:17434/v1",
+            false,
+            Some(8_192),
+            &hosted_pair(),
+        );
+        // The launched entry kept its index, and so its id.
+        assert_eq!(
+            id,
+            "custom:llmman.provider-openrouter-qwen3-coder-[llmman]-1"
+        );
+        assert_eq!(merged["sessionDefaultSettings"]["model"], id);
+        assert_eq!(merged["sessionDefaultSettings"]["reasoningEffort"], "high");
+        assert_eq!(merged["theme"], "dark");
+        assert_eq!(merged["customModels"][0], existing["customModels"][0]);
+        let ours = &merged["customModels"][1];
+        assert_eq!(ours["model"], "llmman.provider/openrouter/qwen3-coder");
+        assert_eq!(ours["baseUrl"], "http://127.0.0.1:17434/v1");
+        assert_eq!(ours["supportsImages"], false);
+        assert_eq!(ours["maxOutputTokens"], 8_192);
+        let scout = &merged["customModels"][2];
+        assert_eq!(scout["model"], "llmman.provider/openrouter/llama-4-scout");
+        assert_eq!(scout["supportsImages"], true);
+        assert_eq!(scout["maxOutputTokens"], serde_json::Value::Null);
+        assert_eq!(scout["index"], 2);
+        assert_eq!(merged["customModels"].as_array().unwrap().len(), 3);
+    }
+
+    /// The launched model belongs in the list even if the provider's
+    /// list somehow lacks it.
+    #[test]
+    fn hosted_merge_keeps_the_launched_model_when_the_list_lacks_it() {
+        let others = vec![hosted_pair().into_iter().nth(1).unwrap()];
+        let (merged, id) = droid_settings_merged_hosted(
+            &serde_json::json!({}),
+            "m",
+            "http://h/v1",
+            true,
+            None,
+            &others,
+        );
+        let models = merged["customModels"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(
+            models[0]["model"],
+            "llmman.provider/openrouter/llama-4-scout"
+        );
+        assert_eq!(models[1]["model"], "m");
+        assert_eq!(merged["sessionDefaultSettings"]["model"], id);
+        assert_eq!(merged["sessionDefaultSettings"]["model"], models[1]["id"]);
     }
 
     #[test]
