@@ -3,7 +3,7 @@
 //! prompt history, provider credential fallback, and peer routing.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -21,15 +21,10 @@ use serde_json::Value;
 use super::{auth, AppError, GENERATION_BODY_LIMIT_BYTES};
 
 const CONNECTION_KEY: &str = "x-api-key";
-const UPSTREAM_IP: &str = "x-llmman-upstream-ip";
 const CAPABILITY: &str = "codex-oauth-forwarding-v2";
 const CLAUDE_CAPABILITY: &str = "claude-oauth-forwarding-v2";
 const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
 const ERROR_LIMIT: usize = 1024 * 1024;
-/// Upstream transports kept warm, one per (profile, pinned IP). The
-/// supervisor pins a handful of resolved addresses, so this is a leak
-/// guard rather than an eviction policy: past it the map starts over.
-const CLIENT_CACHE_LIMIT: usize = 64;
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Profile {
     Codex,
@@ -37,13 +32,6 @@ enum Profile {
 }
 
 impl Profile {
-    fn host(self) -> &'static str {
-        match self {
-            Self::Codex => "chatgpt.com",
-            Self::Claude => "api.anthropic.com",
-        }
-    }
-
     fn base(self) -> &'static str {
         match self {
             Self::Codex => "https://chatgpt.com/backend-api/codex",
@@ -104,41 +92,32 @@ struct ManagedState(Arc<ManagedInner>);
 struct ManagedInner {
     connection_auth: auth::Policy,
     read_timeout: Option<std::time::Duration>,
-    clients: Mutex<HashMap<(Profile, IpAddr), reqwest::Client>>,
+    clients: Mutex<HashMap<Profile, reqwest::Client>>,
     // No production configuration or request may replace the fixed endpoint.
     #[cfg(test)]
     test_base: Option<String>,
 }
 
 impl ManagedInner {
-    /// The transport for `profile` pinned to `ip`, reused across requests
-    /// so each forwarded call does not pay a fresh TCP + TLS handshake.
-    fn upstream_client(&self, profile: Profile, ip: IpAddr) -> Result<reqwest::Client> {
+    /// The transport for `profile`, reused across requests so each
+    /// forwarded call does not pay a fresh TCP + TLS handshake.
+    fn upstream_client(&self, profile: Profile) -> Result<reqwest::Client> {
         let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(client) = clients.get(&(profile, ip)) {
+        if let Some(client) = clients.get(&profile) {
             return Ok(client.clone());
         }
-        let client = upstream_client_builder(profile, ip, self.read_timeout)
+        let client = upstream_client_builder(self.read_timeout)
             .build()
             .context("build managed provider transport")?;
-        if clients.len() >= CLIENT_CACHE_LIMIT {
-            clients.clear();
-        }
-        clients.insert((profile, ip), client.clone());
+        clients.insert(profile, client.clone());
         Ok(client)
     }
 }
 
-/// Pins the supervisor-authorized address while retaining the provider's TLS
-/// name. Never inherit proxy/CA overrides or redirect delegated credentials.
-fn upstream_client_builder(
-    profile: Profile,
-    ip: IpAddr,
-    read_timeout: Option<std::time::Duration>,
-) -> reqwest::ClientBuilder {
+/// Never inherit proxy/CA overrides or redirect delegated credentials.
+fn upstream_client_builder(read_timeout: Option<std::time::Duration>) -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder()
         .no_proxy()
-        .resolve(profile.host(), SocketAddr::new(ip, 443))
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(30));
     match read_timeout {
@@ -203,7 +182,6 @@ async fn capabilities() -> Json<Value> {
 struct Credentials {
     authorization: HeaderValue,
     account: Option<HeaderValue>,
-    upstream_ip: IpAddr,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -231,15 +209,6 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a st
 
 impl Credentials {
     fn parse(headers: &HeaderMap, profile: Profile) -> Result<Self, AppError> {
-        let upstream_ip = single_header(headers, UPSTREAM_IP)?
-            .and_then(|ip| ip.parse::<IpAddr>().ok())
-            .filter(public_upstream_ip)
-            .ok_or_else(|| {
-                error(
-                    StatusCode::BAD_REQUEST,
-                    "managed inference requires a public upstream IP",
-                )
-            })?;
         // One Authorization header, parsed by the same rule as the public
         // listener (`auth::bearer`), then held to this listener's stricter
         // shape: a single printable token that is not the local placeholder.
@@ -277,7 +246,6 @@ impl Credentials {
         Ok(Self {
             authorization,
             account,
-            upstream_ip,
         })
     }
 
@@ -326,34 +294,6 @@ impl Credentials {
                 value.to_string()
             }
             Err(_) => self.redact(String::from_utf8_lossy(bytes).into_owned()),
-        }
-    }
-}
-
-// The caller authorizes this address against its network policy.
-// Refuse special-use space as defense in depth; never re-resolve the host and
-// silently select an address the supervisor did not authorize.
-fn public_upstream_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            let [a, b, c, _] = ip.octets();
-            !(a == 0
-                || a == 10
-                || a == 127
-                || a >= 224
-                || (a == 100 && (64..=127).contains(&b))
-                || (a == 169 && b == 254)
-                || (a == 172 && (16..=31).contains(&b))
-                || (a == 192 && ((b == 0 && (c == 0 || c == 2)) || b == 168))
-                || (a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100)))
-                || (a == 203 && b == 0 && c == 113))
-        }
-        IpAddr::V6(ip) => {
-            let words = ip.segments();
-            words[0] & 0xe000 == 0x2000
-                && words[0] != 0x2002
-                && !(words[0] == 0x2001 && (words[1] < 0x0200 || words[1] == 0x0db8))
-                && !(words[0] == 0x3fff && words[1] & 0xf000 == 0) // RFC 9637: 3fff::/20
         }
     }
 }
@@ -529,19 +469,16 @@ async fn forward(
     let base = profile.base();
     #[cfg(test)]
     let base = state.0.test_base.as_deref().unwrap_or(base);
-    let client = state
-        .0
-        .upstream_client(profile, credentials.upstream_ip)
-        .map_err(|err| {
-            crate::debug_log!(
-                "managed provider transport setup: {}",
-                credentials.redact(err.to_string())
-            );
-            error(
-                StatusCode::BAD_GATEWAY,
-                "provider upstream transport unavailable",
-            )
-        })?;
+    let client = state.0.upstream_client(profile).map_err(|err| {
+        crate::debug_log!(
+            "managed provider transport setup: {}",
+            credentials.redact(err.to_string())
+        );
+        error(
+            StatusCode::BAD_GATEWAY,
+            "provider upstream transport unavailable",
+        )
+    })?;
     let mut forwarded = forward_headers(&headers);
     forwarded.remove("content-type");
     forwarded.remove("content-encoding");

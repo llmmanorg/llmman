@@ -4,6 +4,8 @@ use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
+/// What callers sent before llmman resolved the provider itself.
+const LEGACY_UPSTREAM_IP: &str = "x-llmman-upstream-ip";
 const MODEL: &str = "llmman.provider/openai/gpt-5.6-terra";
 
 struct Server {
@@ -49,7 +51,7 @@ fn profile_request(url: &str, operation: &str, profile: Profile) -> reqwest::Req
         .unwrap()
         .post(format!("{url}{}/{operation}", profile.route_prefix()))
         .header(CONNECTION_KEY, "connection-secret")
-        .header(UPSTREAM_IP, "104.18.2.1")
+        .header(LEGACY_UPSTREAM_IP, "10.0.0.1")
         .bearer_auth("provider-secret")
 }
 
@@ -113,7 +115,7 @@ async fn native_requests_preserve_protocol_and_strip_internal_headers() {
         assert!(!headers.contains_key("originator"));
         assert!(!headers.contains_key("openai-beta"));
         assert_eq!(headers["x-arbitrary"], "future-provider-value");
-        for name in [CONNECTION_KEY, UPSTREAM_IP, "x-api-key"] {
+        for name in [CONNECTION_KEY, LEGACY_UPSTREAM_IP, "x-api-key"] {
             assert!(!headers.contains_key(name));
         }
         let mut expected = body.clone();
@@ -190,7 +192,6 @@ async fn malformed_profiles_tokens_models_never_reach_upstream() {
         let r = client
             .post(format!("{}/api/codex/responses", managed.url))
             .header(CONNECTION_KEY, "connection-secret")
-            .header(UPSTREAM_IP, "104.18.2.1")
             .header("authorization", authorization)
             .json(&json!({"model":MODEL}))
             .send()
@@ -323,7 +324,6 @@ async fn concurrent_accounts_remain_paired_on_each_request() {
                 .unwrap()
                 .post(format!("{url}/api/codex/responses"))
                 .header(CONNECTION_KEY, "connection-secret")
-                .header(UPSTREAM_IP, "104.18.2.1")
                 .bearer_auth(format!("token-{n}"))
                 .header("chatgpt-account-id", format!("account-{n}"))
                 .json(&json!({"model":MODEL}))
@@ -408,97 +408,13 @@ async fn streaming_starts_before_completion_and_disconnect_cancels_upstream() {
 }
 
 #[test]
-fn upstream_clients_are_reused_per_profile_and_ip() {
+fn upstream_clients_are_reused_per_profile() {
     let state = state("http://127.0.0.1:9");
-    let ip: IpAddr = "104.18.2.1".parse().unwrap();
-    let other: IpAddr = "104.18.2.2".parse().unwrap();
-    state.0.upstream_client(Profile::Codex, ip).unwrap();
-    state.0.upstream_client(Profile::Codex, ip).unwrap();
+    state.0.upstream_client(Profile::Codex).unwrap();
+    state.0.upstream_client(Profile::Codex).unwrap();
     assert_eq!(state.0.clients.lock().unwrap().len(), 1);
-    state.0.upstream_client(Profile::Claude, ip).unwrap();
-    state.0.upstream_client(Profile::Codex, other).unwrap();
-    assert_eq!(state.0.clients.lock().unwrap().len(), 3);
-    for n in 0..=CLIENT_CACHE_LIMIT as u8 {
-        state
-            .0
-            .upstream_client(Profile::Codex, IpAddr::from([104, 18, 3, n]))
-            .unwrap();
-    }
-    assert!(
-        state.0.clients.lock().unwrap().len() <= CLIENT_CACHE_LIMIT,
-        "the cache is bounded"
-    );
-}
-
-#[test]
-fn upstream_ip_admission_rejects_special_use_addresses() {
-    for ip in [
-        "0.0.0.0",
-        "10.1.2.3",
-        "100.64.0.1",
-        "127.0.0.1",
-        "169.254.169.254",
-        "172.16.0.1",
-        "192.0.0.1",
-        "192.0.2.1",
-        "192.168.1.1",
-        "198.18.0.1",
-        "198.51.100.1",
-        "203.0.113.1",
-        "224.0.0.1",
-        "255.255.255.255",
-        "::",
-        "::1",
-        "::ffff:127.0.0.1",
-        "::ffff:104.18.2.1",
-        "fe80::1",
-        "fc00::1",
-        "ff02::1",
-        "2001:db8::1",
-        "3fff::",
-        "3fff::1",
-        "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff",
-        "2001::1",
-        "2002:7f00:1::",   // embeds 127.0.0.1
-        "2002:0a00:1::",   // embeds 10.0.0.1
-        "2002:6812:201::", // embeds public 104.18.2.1; all 6to4 is rejected
-    ] {
-        assert!(!public_upstream_ip(&ip.parse().unwrap()), "{ip}");
-    }
-    for ip in ["104.18.2.1", "172.64.1.1", "2606:4700::1", "3fff:1000::"] {
-        assert!(public_upstream_ip(&ip.parse().unwrap()), "{ip}");
-    }
-}
-
-#[tokio::test]
-async fn upstream_ip_is_required_and_not_forwarded_as_a_header() {
-    let managed = serve(router(state("http://127.0.0.1:9"))).await;
-    for ip in [
-        None,
-        Some("127.0.0.1"),
-        Some("104.18.2.1:443"),
-        Some("[2606:4700::1]"),
-        Some("2606:4700::1%en0"),
-        Some("chatgpt.com"),
-        Some("104.18.2.1,1.1.1.1"),
-    ] {
-        let mut request = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap()
-            .post(format!("{}/api/codex/responses", managed.url))
-            .header(CONNECTION_KEY, "connection-secret")
-            .bearer_auth("provider-secret")
-            .json(&json!({"model":MODEL}));
-        if let Some(ip) = ip {
-            request = request.header(UPSTREAM_IP, ip);
-        }
-        assert_eq!(
-            request.send().await.unwrap().status(),
-            StatusCode::BAD_REQUEST,
-            "{ip:?}"
-        );
-    }
+    state.0.upstream_client(Profile::Claude).unwrap();
+    assert_eq!(state.0.clients.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -612,7 +528,7 @@ async fn claude_preserves_native_messages_and_count_tokens() {
         );
         for name in [
             CONNECTION_KEY,
-            UPSTREAM_IP,
+            LEGACY_UPSTREAM_IP,
             "x-api-key",
             "chatgpt-account-id",
             "originator",
@@ -662,8 +578,7 @@ async fn claude_rejects_invalid_credentials_profiles_and_models_before_forwardin
                 .build()
                 .unwrap()
                 .post(format!("{}/api/anthropic/{operation}", managed.url))
-                .header(CONNECTION_KEY, "connection-secret")
-                .header(UPSTREAM_IP, "104.18.2.1");
+                .header(CONNECTION_KEY, "connection-secret");
             if let Some(bearer) = bearer {
                 req = req.header("authorization", bearer);
             }
@@ -676,12 +591,7 @@ async fn claude_rejects_invalid_credentials_profiles_and_models_before_forwardin
                 StatusCode::UNAUTHORIZED
             );
         }
-        for header in [
-            "authorization",
-            "anthropic-version",
-            "anthropic-beta",
-            UPSTREAM_IP,
-        ] {
+        for header in ["authorization", "anthropic-version", "anthropic-beta"] {
             let req = profile_request(&managed.url, operation, Profile::Claude);
             let req = if header.starts_with("anthropic-") {
                 req.header(header, "first")
@@ -738,7 +648,6 @@ async fn concurrent_claude_and_codex_credentials_stay_request_local() {
                 .unwrap()
                 .post(format!("{url}{}/{operation}", profile.route_prefix()))
                 .header(CONNECTION_KEY, "connection-secret")
-                .header(UPSTREAM_IP, "104.18.2.1")
                 .bearer_auth(token)
                 .header("chatgpt-account-id", "codex-account")
                 .json(&json!({"model":model}))
@@ -997,8 +906,8 @@ async fn configured_read_timeout_bounds_header_and_body_stalls_without_total_dea
     }
 }
 
-/// A real TLS socket, also used to check the production transport's DNS pin
-/// and provider hostname verification. No request URL override is needed.
+/// A real TLS socket, also used to check the production transport's provider
+/// hostname verification. No request URL override is needed.
 async fn serve_tls(app: Router, name: &str) -> (Server, reqwest::Certificate, u16) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let rcgen::CertifiedKey { cert, signing_key } =
@@ -1030,8 +939,13 @@ async fn serve_tls(app: Router, name: &str) -> (Server, reqwest::Certificate, u1
 }
 
 #[tokio::test]
-async fn production_transport_pins_ip_and_verifies_provider_tls_hostname() {
+async fn production_transport_verifies_provider_tls_hostname() {
     for profile in [Profile::Codex, Profile::Claude] {
+        let host = reqwest::Url::parse(profile.base())
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_owned();
         let app = Router::new().fallback(|req: Request| async move {
             let authority = req
                 .uri()
@@ -1041,34 +955,32 @@ async fn production_transport_pins_ip_and_verifies_provider_tls_hostname() {
                 .unwrap();
             Json(json!({"host": authority}))
         });
-        let (_server, cert, port) = serve_tls(app, profile.host()).await;
-        let url = format!("https://{}:{port}/responses", profile.host());
-        let client = upstream_client_builder(profile, "127.0.0.1".parse().unwrap(), None)
-            .add_root_certificate(cert.clone())
+        let (_server, cert, port) = serve_tls(app, &host).await;
+        let local = SocketAddr::from(([127, 0, 0, 1], port));
+        let client = |local, cert: Option<reqwest::Certificate>| {
+            let builder = upstream_client_builder(None).resolve(&host, local);
+            match cert {
+                Some(cert) => builder.add_root_certificate(cert),
+                None => builder,
+            }
             .build()
+            .unwrap()
+        };
+        let url = format!("https://{host}:{port}/responses");
+        let body: Value = client(local, Some(cert))
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
             .unwrap();
-        let body: Value = client.get(&url).send().await.unwrap().json().await.unwrap();
-        assert_eq!(body["host"], format!("{}:{port}", profile.host()));
-        let wrong_ip = upstream_client_builder(profile, "127.0.0.2".parse().unwrap(), None)
-            .add_root_certificate(cert.clone())
-            .connect_timeout(std::time::Duration::from_millis(100))
-            .build()
-            .unwrap();
-        assert!(
-            wrong_ip.get(&url).send().await.is_err(),
-            "must not fall back to DNS"
-        );
-        let untrusted = upstream_client_builder(profile, "127.0.0.1".parse().unwrap(), None)
-            .build()
-            .unwrap();
-        assert!(untrusted.get(&url).send().await.is_err());
+        assert_eq!(body["host"], format!("{host}:{port}"));
+        assert!(client(local, None).get(&url).send().await.is_err());
         let (_wrong_server, wrong_cert, port) = serve_tls(Router::new(), "wrong.example").await;
-        let wrong_name = upstream_client_builder(profile, "127.0.0.1".parse().unwrap(), None)
-            .add_root_certificate(wrong_cert)
-            .build()
-            .unwrap();
+        let wrong_name = client(SocketAddr::from(([127, 0, 0, 1], port)), Some(wrong_cert));
         assert!(wrong_name
-            .get(format!("https://{}:{port}/", profile.host()))
+            .get(format!("https://{host}:{port}/"))
             .send()
             .await
             .is_err());
@@ -1121,7 +1033,6 @@ async fn shared_tls_listener_serves_public_and_authenticated_managed_routes() {
     let response = client
         .post(format!("{}/api/codex/responses", server.url))
         .header(CONNECTION_KEY, "connection-secret")
-        .header(UPSTREAM_IP, "104.18.2.1")
         .bearer_auth("provider-secret")
         .json(&json!({"model":MODEL}))
         .send()
@@ -1163,7 +1074,6 @@ async fn escaped_credentials_are_redacted_from_json_error_strings_and_keys() {
             .unwrap()
             .post(format!("{}/api/codex/responses", managed.url))
             .header(CONNECTION_KEY, "connection-secret")
-            .header(UPSTREAM_IP, "104.18.2.1")
             .bearer_auth(token)
             .header("chatgpt-account-id", account)
             .json(&json!({"model":MODEL}))
