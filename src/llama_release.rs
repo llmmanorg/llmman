@@ -735,8 +735,32 @@ pub(crate) fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<()> {
     let mut archive = tar::Archive::new(gz);
     archive
         .unpack(dest)
-        .with_context(|| format!("extract {} into {}", archive_path.display(), dest.display()))
+        .with_context(|| format!("extract {} into {}", archive_path.display(), dest.display()))?;
+    clear_quarantine(dest);
+    Ok(())
 }
+
+/// macOS refuses to load a quarantined dylib ("library load disallowed by
+/// system policy"), so drop the flag from what we just unpacked. Best effort.
+#[cfg(target_os = "macos")]
+fn clear_quarantine(dir: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
+        if let Ok(path) = std::ffi::CString::new(entry.path().as_os_str().as_bytes()) {
+            // SAFETY: both pointers are valid NUL-terminated strings.
+            unsafe {
+                libc::removexattr(
+                    path.as_ptr(),
+                    c"com.apple.quarantine".as_ptr(),
+                    libc::XATTR_NOFOLLOW,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clear_quarantine(_dir: &Path) {}
 
 fn extract_zip(archive_path: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
@@ -783,6 +807,24 @@ pub struct Resolved {
 /// Blocking (network + disk I/O) — callers on an async runtime must run
 /// this via `tokio::task::spawn_blocking` (see `cmd::serve::runtime::resolve`).
 pub fn ensure_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
+    let resolved = resolve_llama_server(pinned_version)?;
+    // Extraction clears quarantine, but a cached install skips extraction.
+    if let Some(dir) = install_root()
+        .ok()
+        .and_then(|root| install_dir_of(&root, &resolved.bin))
+    {
+        clear_quarantine(&dir);
+    }
+    Ok(resolved)
+}
+
+/// The `<root>/<tag>/<label>` install holding `bin`.
+fn install_dir_of(root: &Path, bin: &Path) -> Option<PathBuf> {
+    let rel = bin.strip_prefix(root).ok()?;
+    Some(root.join(rel.components().take(2).collect::<PathBuf>()))
+}
+
+fn resolve_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
     let pinned_version = pinned_version.map(build_tag);
     let query = asset_query();
     let bin_name = if cfg!(target_os = "windows") {
@@ -1006,6 +1048,52 @@ mod tests {
         assert_eq!(release.assets[0].digest.as_deref(), Some("sha256:ab"));
         assert_eq!(release.assets[1].size, 4);
         assert_eq!(release.assets[1].digest, None);
+    }
+
+    #[test]
+    fn install_dir_of_trims_a_binary_to_its_tag_and_label() {
+        let root = Path::new("/data/llama.cpp");
+        let bin = root
+            .join("b9000")
+            .join("metal")
+            .join("llama-b9000")
+            .join("llama-server");
+        assert_eq!(
+            install_dir_of(root, &bin),
+            Some(root.join("b9000").join("metal"))
+        );
+        assert_eq!(
+            install_dir_of(root, Path::new("/usr/bin/llama-server")),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clear_quarantine_drops_the_flag_from_nested_files() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a").join("libggml.dylib");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        let path = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        let name = c"com.apple.quarantine";
+        let value = b"0081;0;x;";
+        let set = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            )
+        };
+        assert_eq!(set, 0);
+        clear_quarantine(dir.path());
+        let got =
+            unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
+        assert_eq!(got, -1);
     }
 
     fn temp_download(name: &str, contents: &[u8]) -> PathBuf {
