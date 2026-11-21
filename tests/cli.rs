@@ -713,3 +713,52 @@ fn llama_cpp_assets_rejects_a_bad_repo_and_latest_from_a_mirror() {
         assert!(out.stdout.is_empty(), "{repo}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn clients_reach_a_serve_on_port_0_at_the_port_it_recorded() {
+    let home = tempfile::tempdir().unwrap();
+    let port_file = home
+        .path()
+        .join(".local/share/llmman/serve-127.0.0.1-0.port");
+    let ps = || {
+        let out = llmman()
+            .arg("ps")
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("LLMMAN_HOST", "127.0.0.1:0")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        (out.status.success(), stdout, stderr)
+    };
+
+    let (mut daemon, log, _) = serve_until_shell_line(home.path(), "127.0.0.1:0", None);
+    let (ok, stdout, stderr) = ps();
+    assert!(ok && stdout.contains("NAME"), "{stdout}{stderr}\n{log}");
+
+    // SIGTERM, not Daemon's SIGKILL: only a graceful stop removes the record.
+    let status = Command::new("kill")
+        .args(["-TERM", &daemon.0.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    daemon.0.wait().unwrap();
+    assert!(!port_file.exists());
+    let (ok, _, stderr) = ps();
+    assert!(!ok && stderr.contains("not running"), "{stderr}");
+
+    // A dead daemon's record, naming a port something else holds now. The
+    // squatter closes each connection, so a client that trusted the record
+    // fails instead of waiting on it.
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let squatter_port = squatter.local_addr().unwrap().port();
+    std::thread::spawn(move || squatter.incoming().for_each(drop));
+    let mut dead = Command::new("true").spawn().unwrap();
+    dead.wait().unwrap();
+    std::fs::write(&port_file, format!("{squatter_port} {}\n", dead.id())).unwrap();
+    let (ok, _, stderr) = ps();
+    assert!(!ok && stderr.contains("not running"), "{stderr}");
+}

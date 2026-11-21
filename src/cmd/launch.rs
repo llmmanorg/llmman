@@ -215,6 +215,12 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             carries_key,
         )?;
     }
+    if crate::daemon::os_picks_port() {
+        eprintln!(
+            "[llmman] warning: LLMMAN_HOST lets the OS pick llmman serve's port, so {name} \
+             loses the daemon if it restarts on another"
+        );
+    }
     // Cline follows the install-on-demand behavior expected by its launch
     // integration. Do this before starting the daemon or pulling a model.
     if name.eq_ignore_ascii_case("cline") {

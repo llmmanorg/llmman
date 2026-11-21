@@ -171,10 +171,126 @@ pub fn bound_addr(port: u16) -> String {
 
 /// The bare `host:port` a client should *connect* to — like `bind_addr`,
 /// but a wildcard host is rewritten to loopback first, since a client
-/// can't connect to "every interface".
+/// can't connect to "every interface", and port 0 is replaced by the port
+/// the running daemon got ([`recorded_port`]).
 fn connect_addr() -> String {
     let (_, host, port) = parsed_host();
-    format_host_port(connectable_host(host), *port)
+    let port = match port {
+        0 => recorded_port().unwrap_or(0),
+        port => *port,
+    };
+    format_host_port(connectable_host(host), port)
+}
+
+/// Whether `LLMMAN_HOST` leaves the port to the OS (`127.0.0.1:0`).
+pub fn os_picks_port() -> bool {
+    parsed_host().2 == 0
+}
+
+/// `addr` (`host:port`) as a file name part: `host-port`, an IPv6 host
+/// without its brackets and with its colons as `_`, since Windows forbids
+/// `:` in file names.
+pub fn file_safe_addr(addr: &str) -> String {
+    let (host, port) = addr.rsplit_once(':').unwrap_or((addr, ""));
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .replace(':', "_");
+    format!("{host}-{port}")
+}
+
+/// Named by the configured address, which every client with the same
+/// `LLMMAN_HOST` knows.
+fn port_file() -> anyhow::Result<std::path::PathBuf> {
+    Ok(crate::data_root()?.join(format!("serve-{}.port", file_safe_addr(&bind_addr()))))
+}
+
+/// Parses `<port> <pid>`; `None` for anything else, or port 0.
+fn read_port_file(path: &std::path::Path) -> Option<(u16, u32)> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut fields = contents.split_whitespace();
+    let port = fields.next()?.parse().ok().filter(|port| *port != 0)?;
+    let pid = fields.next()?.parse().ok()?;
+    fields.next().is_none().then_some((port, pid))
+}
+
+/// The port in [`port_file`], while the process that recorded it still
+/// runs: a daemon holds its listener until it exits, and a file left by
+/// one that crashed may name a port an unrelated process holds now. Read
+/// on every call, since [`ensure_server`] can start the daemon between calls.
+fn recorded_port() -> Option<u16> {
+    let (port, pid) = read_port_file(&port_file().ok()?)?;
+    pid_alive(pid).then_some(port)
+}
+
+/// Removes the port file when the daemon that wrote it exits.
+pub struct PortRecord(std::path::PathBuf);
+
+impl Drop for PortRecord {
+    fn drop(&mut self) {
+        // A daemon started later with the same LLMMAN_HOST may have written
+        // its own record over this one; that record stays.
+        if read_port_file(&self.0).is_some_and(|(_, pid)| pid == std::process::id()) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
+/// Writes the listener's port to [`port_file`] when the OS picked it;
+/// `None` for a configured port, which clients already know.
+pub fn record_port(port: u16) -> anyhow::Result<Option<PortRecord>> {
+    if !os_picks_port() {
+        return Ok(None);
+    }
+    let path = port_file()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    crate::fsutil::write_atomic(&path, format!("{port} {}\n", std::process::id()).as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(Some(PortRecord(path)))
+}
+
+/// `EPERM` means another user's process, which counts as alive. 0 and pids
+/// past `pid_t` are refused: `kill` reads 0 and negatives as process groups.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    let Some(pid) = i32::try_from(pid).ok().filter(|pid| *pid > 0) else {
+        return false;
+    };
+    // SAFETY: kill(2) with signal 0 sends nothing; it only reports
+    // whether the process exists and could be signalled.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    use std::ffi::c_void;
+
+    #[allow(non_snake_case)]
+    extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut c_void;
+        fn GetExitCodeProcess(hProcess: *mut c_void, lpExitCode: *mut u32) -> i32;
+        fn CloseHandle(hObject: *mut c_void) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+
+    // SAFETY: plain kernel32 calls; the handle is checked for null before
+    // use and closed exactly once.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let alive = GetExitCodeProcess(process, &mut code) != 0 && code == STILL_ACTIVE;
+        CloseHandle(process);
+        alive
+    }
 }
 
 /// Rewrites a wildcard host (any `is_unspecified` IP, e.g. `0.0.0.0`/`::`)
@@ -1848,6 +1964,61 @@ mod tests {
             err.contains("http://127.0.0.1:1") && err.contains(NO_AUTOSTART_VAR),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_port_file_holds_a_nonzero_port_and_a_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve-127.0.0.1-0.port");
+        let read = |contents: &str| {
+            std::fs::write(&path, contents).unwrap();
+            read_port_file(&path)
+        };
+        assert_eq!(read("53097 4242\n"), Some((53097, 4242)));
+        assert_eq!(read("0 4242\n"), None);
+        assert_eq!(read("53097\n"), None);
+        assert_eq!(read("53097 4242 extra\n"), None);
+        assert_eq!(read("70000 4242\n"), None);
+        assert_eq!(read(""), None);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read_port_file(&path), None);
+    }
+
+    #[test]
+    fn a_port_record_removes_only_its_own_daemons_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve-127.0.0.1-0.port");
+
+        std::fs::write(&path, format!("53097 {}\n", std::process::id())).unwrap();
+        drop(PortRecord(path.clone()));
+        assert!(!path.exists());
+
+        std::fs::write(&path, format!("53098 {}\n", std::process::id() + 1)).unwrap();
+        drop(PortRecord(path.clone()));
+        assert!(path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pid_alive_sees_this_process_and_not_a_reaped_child() {
+        assert!(pid_alive(std::process::id()));
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(u32::MAX));
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!pid_alive(pid));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn pid_alive_sees_this_process_and_not_an_exited_child() {
+        assert!(pid_alive(std::process::id()));
+        let mut child = Command::new("cmd").args(["/C", "exit"]).spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        drop(child);
+        assert!(!pid_alive(pid));
     }
 
     #[test]

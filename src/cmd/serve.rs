@@ -5330,11 +5330,18 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    let addr = crate::daemon::bound_addr(listener.local_addr().context("listener address")?.port());
+    let port = listener.local_addr().context("listener address")?.port();
+    let addr = crate::daemon::bound_addr(port);
     eprintln!(
         "llmman serve listening on http{}://{addr}",
         if tls.is_some() { "s" } else { "" }
     );
+    // Named, so it lives until serve_async returns; `let _ =` would drop it
+    // at once, and dropping it removes the record.
+    let _port_record = crate::daemon::record_port(port).unwrap_or_else(|e| {
+        eprintln!("[llmman] warning: llmman clients will not find this daemon: {e:#}");
+        None
+    });
     // After the bind: a second daemon that fails it leaves the first's token alone.
     shell::announce(&state.0.shell, &shell_token, tls.is_some(), &addr);
 
