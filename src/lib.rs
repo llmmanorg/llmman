@@ -11,6 +11,7 @@ pub mod config;
 pub mod container;
 pub mod credentials;
 pub mod daemon;
+pub(crate) mod exit_status;
 pub mod ffi;
 pub mod fmt;
 pub mod fsutil;

@@ -17,7 +17,7 @@
 //! skips containers for llama-server; explicit runtimes answer both the
 //! same way.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
@@ -290,9 +290,9 @@ impl Lazy {
     }
 
     /// The local `llama-server` to spawn. Re-resolved (under the same
-    /// mutex as [`resolve`](Self::resolve)) if the file has gone — the
+    /// mutex as [`resolve`](Self::resolve)) if the file has gone â€” the
     /// install that provided it was upgraded or removed while this
-    /// daemon ran — rather than failing every load against a dead path.
+    /// daemon ran â€” rather than failing every load against a dead path.
     pub async fn local_llama_server_bin(&self) -> Result<PathBuf> {
         let local = |resolved: Resolved| match resolved {
             Resolved::Local { source, bin } => Ok((source, bin)),
@@ -516,6 +516,7 @@ fn try_one(
             let bin = crate::llama_release::ensure_llama_server(llama_cpp_version)
                 .context("download of llama.cpp's prebuilt llama-server failed")?
                 .bin;
+            verify_local_llama_server_runs(&bin)?;
             Ok(Resolved::Local {
                 source: Runtime::Bin,
                 bin,
@@ -528,6 +529,62 @@ fn try_one(
                 bin,
             })
         }
+    }
+}
+
+const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Runs `llama-server --version`, like
+/// [`crate::container::verify_llama_server_runs`]: `auto` must not settle on
+/// a build this host cannot start. A failure carries the decoded exit status.
+fn verify_local_llama_server_runs(bin: &Path) -> Result<()> {
+    let mut child = std::process::Command::new(bin)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            let hint = if e.raw_os_error() == Some(crate::exit_status::ERROR_CODE_INTEGRITY) {
+                format!(": {}", crate::exit_status::CODE_INTEGRITY_HINT)
+            } else {
+                String::new()
+            };
+            anyhow::anyhow!("could not run {} --version: {e}{hint}", bin.display())
+        })?;
+    // Drained while waiting, so a chatty child cannot block on a full pipe.
+    let mut pipe = child.stderr.take().expect("stderr is piped");
+    let stderr = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut pipe, &mut text);
+        text
+    });
+    let status = crate::container::wait_with_timeout(&mut child, VERIFY_TIMEOUT)?;
+    let stderr = stderr.join().unwrap_or_default();
+    match status {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => {
+            let lines: Vec<_> = stderr
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            let tail = &lines[lines.len().saturating_sub(3)..];
+            let tail = if tail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", tail.join(" | "))
+            };
+            anyhow::bail!(
+                "{} --version failed ({}){tail}",
+                bin.display(),
+                crate::exit_status::describe(&status)
+            )
+        }
+        None => anyhow::bail!(
+            "{} --version did not exit within {VERIFY_TIMEOUT:?}",
+            bin.display()
+        ),
     }
 }
 
@@ -877,5 +934,49 @@ mod tests {
             bin: PathBuf::from("/x/llama-server"),
         });
         assert_eq!(lazy.resolve().await.unwrap().runtime(), Runtime::Path);
+    }
+
+    /// A stand-in `llama-server` that prints `stderr` and exits `code`.
+    fn fake_llama_server(name: &str, code: i32, stderr: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("llmman-verify-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (file, body) = if cfg!(windows) {
+            (
+                "llama-server.cmd",
+                format!("@echo off\r\necho {stderr} 1>&2\r\nexit /b {code}\r\n"),
+            )
+        } else {
+            (
+                "llama-server",
+                format!("#!/bin/sh\necho '{stderr}' >&2\nexit {code}\n"),
+            )
+        };
+        let bin = dir.join(file);
+        std::fs::write(&bin, body).unwrap();
+        crate::llama_release::mark_executable(&bin).unwrap();
+        bin
+    }
+
+    #[test]
+    fn verify_accepts_a_binary_whose_version_runs() {
+        let bin = fake_llama_server("ok", 0, "version: 1");
+        verify_local_llama_server_runs(&bin).unwrap();
+    }
+
+    #[test]
+    fn verify_reports_the_exit_status_and_stderr_of_a_failing_binary() {
+        let bin = fake_llama_server("fail", 127, "loader says no");
+        let err = format!("{:#}", verify_local_llama_server_runs(&bin).unwrap_err());
+        assert!(err.contains("--version failed"), "{err}");
+        assert!(err.contains("exit code 127"), "{err}");
+        assert!(err.contains("loader says no"), "{err}");
+    }
+
+    #[test]
+    fn verify_reports_a_binary_that_cannot_be_started() {
+        let err = verify_local_llama_server_runs(Path::new("/nonexistent/llama-server"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not run"), "{err}");
     }
 }

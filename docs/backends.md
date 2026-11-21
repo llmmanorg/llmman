@@ -34,8 +34,8 @@ already exists for the model format it finds, and runs it unmodified.
 Under `auto`, a container engine "works" when its CLI is on `PATH`, its
 daemon answers `docker info`/`podman info`, an NVIDIA host has the NVIDIA
 Container Toolkit, and the llama.cpp image pulls; `bin` works when the
-release downloads (or is already cached). Each step skipped is logged
-with the reason. Whatever is chosen is fetched before the listener binds,
+release downloads (or is already cached) and its `llama-server --version`
+runs. Each step skipped is logged with the reason. Whatever is chosen is fetched before the listener binds,
 so the first request is never stuck behind a silent download. On macOS
 `mlx_lm.server` follows the same rule at the same point: `bin` installs
 llmman's own `uv` and `mlx-lm`, `path` uses `PATH`'s, `auto` installs
@@ -170,6 +170,36 @@ split are environment variables; see [configuration.md](configuration.md).
 `LLMMAN_LLAMA_ARGS` appends anything else (`--slot-prompt-similarity
 0.5`) to the `llama-server` command line, local or in a container,
 except `--port` and `--host`, which llmman sets itself.
+
+### When llama-server does not start
+
+`bin` runs `llama-server --version` before settling on a download. A model
+that fails to load reports how `llama-server` exited, decoded where it can
+be (`exit code 0xC0E90002 (blocked by Windows Code Integrity: ...)`,
+`killed by signal 4 (SIGILL: ...)`), on stderr, which is `serve.log` for the
+background daemon. A failed check is not remembered: the download stays and
+is checked again on the next start.
+
+#### Windows: Smart App Control
+
+llama.cpp does not sign its Windows builds, and **Smart App Control**
+(Windows 11) decides whether to run an unsigned file from its cloud
+reputation. Whether `llama-server.exe` starts therefore depends on the
+build, not on how it was downloaded. llmman already downloads without the
+Mark of the Web, like Scoop, and verifies each archive's size and SHA-256;
+neither helps. On one machine, `b11146`, `b11160`, `b12182` and `b12360`
+were blocked and `b11429` and `b12375` ran. A block shows as `0xC0E90002`
+or "An Application Control policy has blocked this file", and as an event in
+Event Viewer > Applications and Services Logs > Microsoft > Windows >
+CodeIntegrity > Operational.
+
+Only a signed build would be reliable. Meanwhile:
+
+- `--runtime auto` falls back to a `llama-server` on `PATH`
+  (`winget install llama.cpp` installs one).
+- Another `--llama-cpp-version` may run, since reputation is per build.
+- Turning Smart App Control off (Windows Security > App & browser control)
+  works, but is one-way: Windows will not turn it back on without a reset.
 
 ### In a container
 
