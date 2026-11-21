@@ -161,9 +161,16 @@ floating latest instead.
 For `bin`, llmman probes for CUDA, ROCm, OpenCL (Windows ARM64 Adreno only),
 Vulkan or Metal (in that order) and downloads the matching prebuilt asset from
 llama.cpp's GitHub releases. `LLMMAN_LLM_LIBRARY` overrides the probe; `LLMMAN_DEBUG=1`
-shows what it found. llama.cpp publishes no prebuilt Linux CUDA binary,
-so an NVIDIA host on Linux gets the CPU build from `bin` — the container
-runtimes (which `auto` prefers for that reason) have CUDA images.
+shows what it found. On Linux and Windows an NVIDIA host gets the CUDA 13
+build, or CUDA 12 for a CUDA 12 driver, together with the matching `cudart`
+runtime libraries. The Linux CUDA builds need glibc 2.38, and arm64 has CUDA
+13 only; a host that does not fit gets the CPU build. `llmman gpu-discover`
+prints what the probe chose.
+
+Under WSL2 install the CUDA *toolkit* only, never the Linux driver (the
+`cuda` or `cuda-drivers` packages): the Windows driver supplies `libcuda`,
+and a native NVIDIA driver in the distro puts its own `libnvidia-*` libraries
+ahead of it, so `llama-server` crashes with a segmentation fault as it starts.
 
 Context length, parallel slots, flash attention, KV-cache type and GPU
 split are environment variables; see [configuration.md](configuration.md).
