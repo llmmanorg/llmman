@@ -645,8 +645,9 @@ selects that command's pager. Supported commands are `providers`, `log`,
 `list`, `search`, and `ps`.
 A command-specific false value disables paging even when `LLMMAN_PAGER` is set.
 Otherwise, the pager command is chosen from `LLMMAN_PAGER`, the command-specific
-setting, `core.pager`, `PAGER`, then `less`, in that order. An empty command
-or `cat` disables paging. `LESS=FRX` and `LV=-c` are supplied only when those
+setting, `core.pager`, `PAGER`, then `less`, in that order; one that isn't
+installed is skipped for the next, and if none is, output goes straight to the
+terminal. An empty command or `cat` disables paging. `LESS=FRX` and `LV=-c` are supplied only when those
 variables are unset.
 
 ## Following prompts

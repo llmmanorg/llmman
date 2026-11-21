@@ -13,13 +13,12 @@
 //! in [`crate::managed`]'s shape and never re-fetched; the release is
 //! [`default_release`] unless `--llama-cpp-version` says otherwise.
 //!
-//! Coverage gap (unavoidable, not an llmman limitation): llama.cpp does
-//! not publish a prebuilt **Linux** CUDA binary at all — only Windows
-//! gets prebuilt CUDA — so an NVIDIA GPU detected on Linux falls back to
-//! the CPU build here, with a message pointing at `llmman serve --runtime
-//! docker` (see `crate::container`, which *does* have a CUDA path via
-//! `ghcr.io/ggml-org/llama.cpp:server-cuda*`) as the GPU-accelerated
-//! alternative.
+//! llama.cpp publishes CUDA builds for Linux (x64: CUDA 12 and 13, arm64:
+//! 13) as well as Windows. Each ships with a `cudart-*` bundle of the CUDA
+//! runtime libraries, extracted next to `llama-server`. A host with no
+//! build for its CUDA major (12 on arm64) or whose glibc is older than they
+//! need falls back to the CPU build, with a message pointing at `llmman
+//! serve --runtime docker` (see `crate::container`).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -222,23 +221,34 @@ fn pattern_version(name: &str, pattern: &str) -> Option<u32> {
 /// `cudart-*` runtime-DLL bundle today), and a short label used for the
 /// on-disk cache directory name and log messages. Both name patterns follow
 /// [`pattern_version`].
+#[derive(Debug)]
 struct AssetQuery {
     must_contain: String,
+    /// May hold `{tag}`, for a companion named after the release (see
+    /// [`AssetQuery::companion`]).
     companion_must_contain: Option<String>,
     label: String,
 }
 
-/// Windows CUDA's companion `cudart-llama-bin-win-cuda-<ver>-<arch>.zip`
-/// embeds the primary's `-bin-win-cuda-<ver>-<arch>.zip`, so a bare match can
-/// pick the runtime-DLL bundle (no llama-server). The primary is the match
-/// that is not the companion, with the highest `*` version (else the first).
+impl AssetQuery {
+    /// The companion's name pattern in the release `tag`.
+    fn companion(&self, tag: &str) -> Option<String> {
+        Some(self.companion_must_contain.as_ref()?.replace("{tag}", tag))
+    }
+}
+
+/// A CUDA companion embeds the primary's own name (`cudart-llama-bin-win-
+/// cuda-<ver>-<arch>.zip` holds `-bin-win-cuda-<ver>-<arch>.zip`), so a bare
+/// match can pick the runtime-library bundle (no llama-server). The primary
+/// is the match that is not the companion, with the highest `*` version
+/// (else the first).
 fn find_primary_asset<'a>(release: &'a Release, query: &AssetQuery) -> Option<&'a Asset> {
+    let companion = query.companion(&release.tag_name);
     release
         .assets
         .iter()
         .filter(|a| {
-            query
-                .companion_must_contain
+            companion
                 .as_ref()
                 .is_none_or(|companion| pattern_version(&a.name, companion).is_none())
         })
@@ -247,16 +257,16 @@ fn find_primary_asset<'a>(release: &'a Release, query: &AssetQuery) -> Option<&'
         .map(|(_, a)| a)
 }
 
-/// The companion of the same `*` version as `primary`, so runtime DLLs never
-/// come from another CUDA minor.
+/// The companion of the same `*` version as `primary`, so runtime libraries
+/// never come from another CUDA minor.
 fn find_companion_asset<'a>(
     release: &'a Release,
     query: &AssetQuery,
     primary: &Asset,
 ) -> Option<&'a Asset> {
-    let companion = query.companion_must_contain.as_deref()?;
+    let companion = query.companion(&release.tag_name)?;
     let version = pattern_version(&primary.name, &query.must_contain)?;
-    let is_companion = |a: &&Asset| pattern_version(&a.name, companion) == Some(version);
+    let is_companion = |a: &&Asset| pattern_version(&a.name, &companion) == Some(version);
     release.assets.iter().find(is_companion)
 }
 
@@ -270,15 +280,79 @@ fn windows_vulkan_query(arch: &str) -> AssetQuery {
     }
 }
 
-/// A Windows CUDA build of any minor of CUDA `major`, and its `cudart-*`
-/// companion. The dot after `major` keeps `13` from matching `130.x`.
-#[cfg(any(target_os = "windows", test))]
-fn windows_cuda_query(major: u32, arch: &str) -> AssetQuery {
+/// A CUDA build of any minor of CUDA `major` for `os` (`win` or `ubuntu`),
+/// and its `cudart-*` companion, which starts `companion` (see
+/// [`AssetQuery::companion`]). The dot after `major` keeps `13` from
+/// matching `130.x`.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+fn cuda_query(major: u32, arch: &str, os: &str, ext: &str, companion: &str) -> AssetQuery {
+    let build = format!("-bin-{os}-cuda-{major}.*-{arch}.{ext}");
     AssetQuery {
-        must_contain: format!("-bin-win-cuda-{major}.*-{arch}.zip"),
-        companion_must_contain: Some(format!("cudart-llama-bin-win-cuda-{major}.*-{arch}.zip")),
+        companion_must_contain: Some(format!("{companion}{build}")),
+        must_contain: build,
         label: format!("cuda-{major}"),
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_cuda_query(major: u32, arch: &str) -> AssetQuery {
+    cuda_query(major, arch, "win", "zip", "cudart-llama")
+}
+
+/// The glibc the Linux CUDA builds need (`GLIBC_2.38`): they are built on
+/// Ubuntu 24.04, where the CPU and Vulkan x64 builds use 22.04's.
+#[cfg(any(target_os = "linux", test))]
+const LINUX_CUDA_MIN_GLIBC: (u32, u32) = (2, 38);
+
+/// The Linux CUDA build for a driver of CUDA `major`, or why there is none.
+/// llama.cpp builds 12 and 13 for x64 but only 13 for arm64, and a CUDA 13
+/// build cannot run on a CUDA 12 driver.
+#[cfg(any(target_os = "linux", test))]
+fn linux_cuda_query(
+    major: u32,
+    arch: &str,
+    glibc: Option<(u32, u32)>,
+) -> Result<AssetQuery, String> {
+    let cuda = if major >= 13 { 13 } else { 12 };
+    if !matches!((arch, cuda), ("x64", _) | ("arm64", 13)) {
+        return Err(format!(
+            "llama.cpp publishes no prebuilt {arch} Linux CUDA {major} binary"
+        ));
+    }
+    if let Some((major, minor)) = glibc.filter(|have| *have < LINUX_CUDA_MIN_GLIBC) {
+        let (need_major, need_minor) = LINUX_CUDA_MIN_GLIBC;
+        return Err(format!(
+            "its prebuilt Linux CUDA binary needs glibc {need_major}.{need_minor} and \
+             this host has {major}.{minor}"
+        ));
+    }
+    Ok(cuda_query(
+        cuda,
+        arch,
+        "ubuntu",
+        "tar.gz",
+        "cudart-llama-{tag}",
+    ))
+}
+
+/// glibc's `(major, minor)` from its `2.39` version string.
+#[cfg(any(target_os = "linux", test))]
+fn parse_glibc(version: &str) -> Option<(u32, u32)> {
+    let (major, rest) = version.split_once('.')?;
+    Some((major.parse().ok()?, rest.split('.').next()?.parse().ok()?))
+}
+
+/// The host's glibc, or `None` without one (musl).
+#[cfg(target_os = "linux")]
+fn host_glibc() -> Option<(u32, u32)> {
+    #[cfg(target_env = "gnu")]
+    {
+        // SAFETY: a static NUL-terminated string.
+        let version = unsafe { std::ffi::CStr::from_ptr(libc::gnu_get_libc_version()) };
+        parse_glibc(version.to_str().ok()?)
+    }
+    #[cfg(not(target_env = "gnu"))]
+    None
 }
 
 fn host_arch_token() -> &'static str {
@@ -294,9 +368,8 @@ fn host_arch_token() -> &'static str {
 /// <https://github.com/ggml-org/llama.cpp/releases> — verified directly
 /// against the `latest` release's own asset list and its release workflow
 /// (`.github/workflows/release.yml`) while writing this, rather than
-/// guessed: e.g. no `ubuntu-cuda` asset exists at all (only Windows gets a
-/// prebuilt CUDA package), and ROCm is x64-only on both Linux and
-/// Windows.
+/// guessed: e.g. ROCm is x64-only on both Linux and Windows, and Linux
+/// CUDA has one build per major plus a `cudart-*` runtime bundle.
 fn asset_query() -> AssetQuery {
     let arch = host_arch_token();
 
@@ -319,6 +392,11 @@ fn asset_query() -> AssetQuery {
 
     #[cfg(target_os = "linux")]
     {
+        let cpu = || AssetQuery {
+            must_contain: format!("-bin-ubuntu-{arch}.tar.gz"),
+            companion_must_contain: None,
+            label: "cpu".into(),
+        };
         match crate::hostgpu::detect() {
             HostGpu::Vulkan => AssetQuery {
                 must_contain: format!("-bin-ubuntu-vulkan-{arch}.tar.gz"),
@@ -330,25 +408,17 @@ fn asset_query() -> AssetQuery {
                 companion_must_contain: None,
                 label: "rocm".into(),
             },
-            HostGpu::Cuda { .. } => {
-                eprintln!(
-                    "[llmman] NVIDIA GPU detected, but llama.cpp does not publish a \
-                     prebuilt Linux CUDA binary — falling back to the CPU build. Use \
-                     `llmman serve --runtime docker` (or `--runtime podman`) for GPU \
-                     acceleration on Linux, or build llama.cpp yourself with \
-                     GGML_CUDA=ON and put llama-server on PATH."
-                );
-                AssetQuery {
-                    must_contain: format!("-bin-ubuntu-{arch}.tar.gz"),
-                    companion_must_contain: None,
-                    label: "cpu".into(),
-                }
+            HostGpu::Cuda { major } => {
+                linux_cuda_query(major, arch, host_glibc()).unwrap_or_else(|why| {
+                    eprintln!(
+                        "[llmman] NVIDIA GPU detected (CUDA {major}), but {why}: using the \
+                         CPU build. `llmman serve --runtime docker` (or podman) has GPU \
+                         acceleration, or put a CUDA llama-server on PATH."
+                    );
+                    cpu()
+                })
             }
-            _ => AssetQuery {
-                must_contain: format!("-bin-ubuntu-{arch}.tar.gz"),
-                companion_must_contain: None,
-                label: "cpu".into(),
-            },
+            _ => cpu(),
         }
     }
 
@@ -760,13 +830,14 @@ fn download_progress_text(label: &str, downloaded: u64, total: u64) -> String {
     }
 }
 
+fn open_tar_gz(path: &Path) -> Result<tar::Archive<flate2::read::GzDecoder<std::fs::File>>> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    Ok(tar::Archive::new(flate2::read::GzDecoder::new(file)))
+}
+
 pub(crate) fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
-    let file = std::fs::File::open(archive_path)
-        .with_context(|| format!("open {}", archive_path.display()))?;
-    let gz = flate2::read::GzDecoder::new(file);
-    let mut archive = tar::Archive::new(gz);
-    archive
+    open_tar_gz(archive_path)?
         .unpack(dest)
         .with_context(|| format!("extract {} into {}", archive_path.display(), dest.display()))?;
     clear_quarantine(dest);
@@ -806,12 +877,54 @@ fn extract_zip(archive_path: &Path, dest: &Path) -> Result<()> {
         .with_context(|| format!("extract {} into {}", archive_path.display(), dest.display()))
 }
 
-fn extract(archive_path: &Path, archive_name: &str, dest: &Path) -> Result<()> {
+/// `flat` drops a tarball's top-level directory: Linux's `cudart-*` bundle
+/// nests its libraries under one named after itself, not the `llama-<tag>/`
+/// whose `$ORIGIN` rpath is where they have to be.
+fn extract(archive_path: &Path, archive_name: &str, dest: &Path, flat: bool) -> Result<()> {
     if archive_name.ends_with(".zip") {
         extract_zip(archive_path, dest)
+    } else if flat {
+        extract_tar_gz_flat(archive_path, dest)
     } else {
         extract_tar_gz(archive_path, dest)
     }
+}
+
+fn extract_tar_gz_flat(archive_path: &Path, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+    let mut archive = open_tar_gz(archive_path)?;
+    for entry in archive
+        .entries()
+        .with_context(|| format!("read {}", archive_path.display()))?
+    {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path()?.into_owned();
+        let relative: PathBuf = path.components().skip(1).collect();
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        anyhow::ensure!(
+            relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))),
+            "{}: unsafe path {}",
+            archive_path.display(),
+            path.display()
+        );
+        let target = dest.join(&relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        entry
+            .unpack(&target)
+            .with_context(|| format!("extract {} into {}", path.display(), dest.display()))?;
+    }
+    clear_quarantine(dest);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -919,7 +1032,8 @@ fn try_ensure_from_network(
         let asset = find_primary_asset(&release, query)
             .with_context(|| {
                 format!(
-                    "no {} llama.cpp release asset found in {tag} (looked for a name matching {:?})",
+                    "no {} llama.cpp release asset found in {tag} (looked for a name matching \
+                     {:?}; LLMMAN_LLM_LIBRARY=cpu selects the CPU build)",
                     query.label, query.must_contain
                 )
             })?
@@ -931,7 +1045,7 @@ fn try_ensure_from_network(
         // One marker for download and extraction; the heartbeat covers
         // extraction, which reports no progress of its own.
         let marker = DownloadMarker::create();
-        let fetch = |asset: &Asset| -> Result<()> {
+        let fetch = |asset: &Asset, unpack: &dyn Fn(&Path) -> Result<()>| -> Result<()> {
             let tmp = tmp_path(&asset.name)?;
             let _cleanup = RemoveOnDrop(&tmp);
             download_to_file(
@@ -943,30 +1057,33 @@ fn try_ensure_from_network(
             )?;
             check_download(&tmp, asset)?;
             marker.set_status(&format!("extracting {}", asset.name));
-            extract(&tmp, &asset.name, dest)
+            unpack(&tmp)
         };
-        marker.keep_alive_during(|| -> Result<()> {
-            fetch(&asset)?;
-            if let Some(companion_substr) = &query.companion_must_contain {
+        let bin = marker.keep_alive_during(|| -> Result<PathBuf> {
+            fetch(&asset, &|tmp| extract(tmp, &asset.name, dest, false))?;
+            let bin = find_binary(dest, bin_name).with_context(|| {
+                format!(
+                    "llama-server binary not found after extracting {}",
+                    asset.name
+                )
+            })?;
+            if let Some(companion_pattern) = query.companion(&tag) {
                 match find_companion_asset(&release, query, &asset) {
                     Some(companion) => {
+                        let bin_dir = bin.parent().unwrap_or(dest);
                         eprintln!("[llmman] downloading {}", companion.name);
-                        fetch(companion)?;
+                        fetch(companion, &|tmp| {
+                            extract(tmp, &companion.name, bin_dir, true)
+                        })?;
                     }
                     None => eprintln!(
-                        "[llmman] warning: expected companion asset matching {companion_substr:?} \
+                        "[llmman] warning: expected companion asset matching {companion_pattern:?} \
                          not found in release {tag} — {} may be missing runtime libraries it needs",
                         query.label
                     ),
                 }
             }
-            Ok(())
-        })?;
-        let bin = find_binary(dest, bin_name).with_context(|| {
-            format!(
-                "llama-server binary not found after extracting {}",
-                asset.name
-            )
+            Ok(bin)
         })?;
         mark_executable(&bin)?;
         Ok(bin)
@@ -1387,6 +1504,134 @@ mod tests {
     fn windows_cuda_label_names_the_major_only() {
         assert_eq!(windows_cuda_query(13, "arm64").label, "cuda-13");
         assert_eq!(windows_cuda_query(12, "x64").label, "cuda-12");
+    }
+
+    /// The Linux CUDA assets of b12359, each runtime bundle before its
+    /// build, and the CPU build they must not be confused with.
+    fn linux_cuda_release() -> Release {
+        let tag = build_tag(default_release());
+        let builds = [("12.8", "x64"), ("13.5", "arm64"), ("13.5", "x64")];
+        let bundles = builds
+            .map(|(ver, arch)| format!("cudart-llama-{tag}-bin-ubuntu-cuda-{ver}-{arch}.tar.gz"));
+        let primaries =
+            builds.map(|(ver, arch)| pinned_asset(&format!("ubuntu-cuda-{ver}-{arch}.tar.gz")));
+        pinned_release(
+            bundles
+                .into_iter()
+                .chain(primaries)
+                .chain([pinned_asset("ubuntu-x64.tar.gz")]),
+        )
+    }
+
+    fn linux_cuda(major: u32, arch: &str) -> Option<(Option<String>, Option<String>)> {
+        let query = linux_cuda_query(major, arch, None).ok()?;
+        Some(selected(&linux_cuda_release(), &query))
+    }
+
+    #[test]
+    fn linux_cuda_selects_each_major_with_its_own_runtime_bundle() {
+        let tag = build_tag(default_release());
+        for (major, ver, arch) in [
+            (12, "12.8", "x64"),
+            (13, "13.5", "x64"),
+            (14, "13.5", "x64"),
+            (13, "13.5", "arm64"),
+        ] {
+            assert_eq!(
+                linux_cuda(major, arch),
+                Some((
+                    Some(pinned_asset(&format!("ubuntu-cuda-{ver}-{arch}.tar.gz"))),
+                    Some(format!(
+                        "cudart-llama-{tag}-bin-ubuntu-cuda-{ver}-{arch}.tar.gz"
+                    ))
+                )),
+                "CUDA {major} on {arch}"
+            );
+        }
+        let label = |major| linux_cuda_query(major, "x64", None).unwrap().label;
+        assert_eq!((label(12), label(13)), ("cuda-12".into(), "cuda-13".into()));
+    }
+
+    #[test]
+    fn linux_cuda_never_substitutes_another_major_or_arch() {
+        // No CUDA 12 build for arm64, and a CUDA 13 build cannot run on a
+        // CUDA 12 driver: such a host gets the CPU build.
+        assert_eq!(linux_cuda(12, "arm64"), None);
+        assert!(linux_cuda_query(12, "s390x", None).is_err());
+        let only_13 = pinned_release([pinned_asset("ubuntu-cuda-13.5-x64.tar.gz")]);
+        let query = linux_cuda_query(12, "x64", None).unwrap();
+        assert_eq!(selected(&only_13, &query), (None, None));
+    }
+
+    /// The CUDA builds need glibc 2.38; the CPU build runs on Ubuntu 22.04's.
+    #[test]
+    fn linux_cuda_needs_a_new_enough_glibc() {
+        let ok = |glibc| linux_cuda_query(13, "x64", glibc).is_ok();
+        assert!(ok(None) && ok(Some((2, 38))) && ok(Some((2, 39))) && ok(Some((3, 0))));
+        assert!(!ok(Some((2, 35))) && !ok(Some((2, 37))));
+        let why = linux_cuda_query(13, "x64", Some((2, 35))).unwrap_err();
+        assert!(why.contains("glibc 2.38") && why.contains("2.35"), "{why}");
+    }
+
+    #[test]
+    fn parse_glibc_reads_the_version_string() {
+        assert_eq!(parse_glibc("2.39"), Some((2, 39)));
+        assert_eq!(parse_glibc("2.17.1"), Some((2, 17)));
+        assert_eq!(parse_glibc("2"), None);
+        assert_eq!(parse_glibc("x.y"), None);
+    }
+    /// The runtime bundle nests its libraries under a directory of its own
+    /// name; they must end up beside `llama-server`, flat.
+    #[test]
+    fn extract_tar_gz_flat_drops_the_top_level_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("cudart.tar.gz");
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            std::fs::File::create(&archive).unwrap(),
+            flate2::Compression::fast(),
+        ));
+        for (path, body) in [
+            ("cudart-llama-b1-bin-ubuntu-cuda-13.5-x64/", None),
+            (
+                "cudart-llama-b1-bin-ubuntu-cuda-13.5-x64/libcudart.so.13",
+                Some(&b"cudart"[..]),
+            ),
+            (
+                "cudart-llama-b1-bin-ubuntu-cuda-13.5-x64/lib/libcublas.so.13",
+                Some(&b"cublas"[..]),
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            match body {
+                Some(body) => {
+                    header.set_size(body.len() as u64);
+                    header.set_entry_type(tar::EntryType::Regular);
+                }
+                None => {
+                    header.set_size(0);
+                    header.set_entry_type(tar::EntryType::Directory);
+                }
+            }
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, path, body.unwrap_or(&[]))
+                .unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+
+        let bin_dir = dir.path().join("llama-b1");
+        extract_tar_gz_flat(&archive, &bin_dir).unwrap();
+        assert_eq!(
+            std::fs::read(bin_dir.join("libcudart.so.13")).unwrap(),
+            b"cudart"
+        );
+        assert_eq!(
+            std::fs::read(bin_dir.join("lib").join("libcublas.so.13")).unwrap(),
+            b"cublas"
+        );
+        assert!(!bin_dir
+            .join("cudart-llama-b1-bin-ubuntu-cuda-13.5-x64")
+            .exists());
     }
 
     #[test]
