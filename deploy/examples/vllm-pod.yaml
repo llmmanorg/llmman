@@ -1,0 +1,31 @@
+# vLLM serving a safetensors ModelPack artifact straight from the volume.
+# The artifact's root holds config.json, the tokenizer files and the weights,
+# which is the directory `vllm serve` takes.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm
+spec:
+  containers:
+    - name: vllm
+      image: vllm/vllm-openai:latest
+      args:
+        - --model=/model
+        - --served-model-name=qwen3-0.6b
+        - --host=0.0.0.0
+        - --port=8000
+      ports:
+        - containerPort: 8000
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+      volumeMounts:
+        - name: model
+          mountPath: /model
+          readOnly: true
+  volumes:
+    - name: model
+      csi:
+        driver: model.csi.modelpack.org
+        volumeAttributes:
+          model.csi.modelpack.org/reference: "registry.example.com/models/qwen3-0.6b:latest"

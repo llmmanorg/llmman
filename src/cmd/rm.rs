@@ -64,17 +64,20 @@ pub fn run(args: &RmArgs) -> anyhow::Result<()> {
     // `rm` being synchronous doesn't protect it — only the grace window
     // does (matches Ollama's layerPruneGracePeriod).
     if any_removed && !gc::noprune_from_env() {
-        let live = gc::referenced_digests(&store)?;
-        let cache_path = crate::default_cache()?;
-        let grace = gc::GC_GRACE_PERIOD;
-        let (blob_stats, cache_stats) =
-            gc::prune_blobs_and_cache(&store_root, &cache_path, &live, grace)?;
+        let (blob_stats, cache_stats) = gc::sweep(&store, &crate::default_cache()?)?;
         if blob_stats.count > 0 || cache_stats.count > 0 {
             println!(
                 "Freed {} ({} blobs, {} cache entries)",
                 crate::fmt::human_size(blob_stats.bytes + cache_stats.bytes),
                 blob_stats.count,
                 cache_stats.count
+            );
+        }
+        if blob_stats.kept_count > 0 {
+            println!(
+                "Kept {} ({} blobs) pulled less than an hour ago, freed by a later rm or serve restart",
+                crate::fmt::human_size(blob_stats.kept_bytes),
+                blob_stats.kept_count
             );
         }
     }

@@ -19,7 +19,11 @@ pub(super) fn remote_target_on(base_url: &str, wire: Wire) -> Target {
         model: "mock-model".into(),
         max_output: None,
         cost: None,
-        api_key: Some("sk-test".into()),
+        credential: Some(crate::credentials::Resolved::from_key(
+            "sk-test".into(),
+            "test",
+        )),
+        auth: Default::default(),
         session: None,
     }))
 }
@@ -69,13 +73,14 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
         }),
         exe: None,
         // `path`, so a resolve could never download.
-        runtime: runtime::Lazy::new(Runtime::Path, None, None),
+        runtime: runtime::Lazy::new(Runtime::Path, None, true, None),
         llama_cpp_version: None,
         vllm_version: None,
         vllm_image: None,
         sglang_version: None,
         ctx_size: None,
         ctx_size_explicit: false,
+        embedding_ctx_size: None,
         hybrid_local_bytes: None,
         hybrid_local_bytes_explicit: false,
         flash_attention: None,
@@ -84,6 +89,7 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
         num_parallel: None,
         threads: None,
         cpu_limit: None,
+        hardened: true,
         // usize::MAX, not 0 — 0 now means "admit almost nothing"
         // (see try_admit_against's doc comment), and no test here
         // calls ensure_model (the only caller of try_admit) directly
@@ -93,7 +99,11 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
         peers: Vec::new(),
         memory: 0,
         store_path,
-        cache_path: std::env::temp_dir(),
+        cache_path: {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::env::temp_dir().join(format!("llmman-test-cache-{}-{n}", std::process::id()))
+        },
         prompt_log: None,
         usage_log: None,
         shell: shell::Policy {
@@ -203,9 +213,11 @@ pub(super) fn running_model_fixture(
         context_window: None,
         keep_alive,
         in_flight,
+        parallel_slots: None,
         decision: false,
         effort_budget: false,
         effort_budget_message: true,
+        thinking: None,
         trained_ctx: None,
         retiring: Default::default(),
     }
@@ -231,9 +243,11 @@ pub(super) fn running_model_fixture_with_engine(
         context_window: None,
         keep_alive: None,
         in_flight: 0,
+        parallel_slots: None,
         decision: false,
         effort_budget: false,
         effort_budget_message: true,
+        thinking: None,
         trained_ctx: None,
         retiring: Default::default(),
     }

@@ -25,6 +25,17 @@ fn parse_context_length(value: Option<&str>) -> Option<u32> {
     value?.trim().parse().ok()
 }
 
+/// An embedding model's context, from `LLMMAN_EMBEDDING_CONTEXT_LENGTH`, in
+/// place of [`context_length_from_env`]: its batch is as large as its
+/// context (llmmanorg/llmman#820). `0` means the trained context.
+pub(super) fn embedding_context_length_from_env() -> Option<u32> {
+    parse_context_length(
+        std::env::var("LLMMAN_EMBEDDING_CONTEXT_LENGTH")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// `--ctx-size` when `LLMMAN_CONTEXT_LENGTH` is unset: 256k regardless
 /// of VRAM, capped per model to its trained context (see
 /// [`initial_ctx_size`]). A load that then OOMs is retried halved (see

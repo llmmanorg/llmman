@@ -6,7 +6,9 @@ use std::sync::OnceLock;
 
 use anyhow::Context;
 
-use super::{before_terminator, exec_with_env, find_on_path, has_flag, sandbox, server};
+use super::{
+    before_terminator, exec_with_env, exec_with_owned_env, find_on_path, has_flag, sandbox, server,
+};
 
 /// The window used when llmman knows none: the Python kimi-cli's own with
 /// no model configured.
@@ -54,8 +56,7 @@ pub(super) fn launch_kimi(
         ),
         KimiCli::Code => {
             let env = kimi_code_env(model, &base_url, api_key, context_window);
-            let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            exec_with_env(&bin, &kimi_code_args(extra_args), &env)
+            exec_with_owned_env(&bin, &kimi_code_args(extra_args), &env)
         }
     }
 }

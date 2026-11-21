@@ -1,0 +1,50 @@
+# The same artifact as a pre-provisioned PersistentVolume, for pods that
+# claim a volume instead of declaring one. The volumeAttributes are the ones
+# an inline volume takes; volumeHandle only has to be unique.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: qwen3-0.6b
+spec:
+  capacity:
+    storage: 1Gi   # required by the API, not used
+  accessModes: [ReadOnlyMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  csi:
+    driver: model.csi.modelpack.org
+    volumeHandle: qwen3-0.6b
+    readOnly: true
+    volumeAttributes:
+      model.csi.modelpack.org/reference: "registry.example.com/models/qwen3-0.6b:latest"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qwen3-0.6b
+spec:
+  accessModes: [ReadOnlyMany]
+  storageClassName: ""
+  volumeName: qwen3-0.6b
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-user
+spec:
+  containers:
+    - name: app
+      image: busybox:1.37
+      command: ["ls", "-lR", "/model"]
+      volumeMounts:
+        - name: model
+          mountPath: /model
+          readOnly: true
+  volumes:
+    - name: model
+      persistentVolumeClaim:
+        claimName: qwen3-0.6b
+        readOnly: true

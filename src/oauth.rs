@@ -23,7 +23,6 @@ use std::io::{BufRead, IsTerminal};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
-use base64::Engine as _;
 use serde::Deserialize;
 
 /// Auth0 tenant host used for Docker Hub's device-authorization flow.
@@ -249,12 +248,7 @@ fn get_auto_pat(client: &reqwest::blocking::Client, access_token: &str) -> anyho
 /// being stored, right before that same token is exchanged for the actual
 /// PAT that does the real authenticating.
 fn username_from_jwt(token: &str) -> Option<String> {
-    let payload_b64 = token.split('.').nth(1)?;
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    claims
+    crate::logins::jwt_payload(token)?
         .get("https://hub.docker.com")?
         .get("username")?
         .as_str()
@@ -264,18 +258,19 @@ fn username_from_jwt(token: &str) -> Option<String> {
 /// Best-effort cross-platform "open a URL in the default browser", mirroring
 /// `github.com/pkg/browser.OpenURL` (used by docker/cli for the same
 /// purpose): `open` on macOS, the first of `xdg-open`/`x-www-browser`/
-/// `www-browser` found on Linux, and `cmd /C start` on Windows. Failure is
+/// `www-browser` found on Linux, and `rundll32` on Windows. Failure is
 /// silently ignored by the caller — the user can still authenticate by
 /// visiting the printed URL manually.
-fn open_browser(url: &str) -> anyhow::Result<()> {
+pub(crate) fn open_browser(url: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open").arg(url).status()?;
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+        // Not `cmd /C start`: it would split the URL at each `&`.
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
             .status()?;
     }
     #[cfg(all(unix, not(target_os = "macos")))]

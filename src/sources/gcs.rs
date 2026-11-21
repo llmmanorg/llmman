@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use super::Target;
+use crate::authscheme::url_encode;
 
 const API_BASE: &str = "https://storage.googleapis.com/storage/v1";
 
@@ -94,7 +95,7 @@ pub(crate) async fn pull(reference: &str, rest: &str, target: &Target<'_>) -> Re
         // has to be escaped rather than left to split the path.
         let url = format!(
             "{API_BASE}/b/{bucket}/o/{}?alt=media",
-            encode_object_name(&obj.name)
+            url_encode(&obj.name)
         );
         let mut req = dl.get(url);
         if let Some(t) = &token {
@@ -124,22 +125,6 @@ pub(crate) async fn pull(reference: &str, rest: &str, target: &Target<'_>) -> Re
         packed,
         format!("no model files found at gs://{bucket}/{prefix}"),
     )
-}
-
-/// Percent-encodes an object name as one path segment (RFC 3986's
-/// unreserved set). Escaping `/` is what makes `…/o/<name>` address a
-/// single object rather than a nested path.
-fn encode_object_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for b in name.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// A GCS bearer token, or `None` for anonymous access to a public
@@ -207,21 +192,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encode_object_name_escapes_the_separators_that_would_split_the_path() {
+    fn url_encode_escapes_the_separators_that_would_split_the_path() {
         assert_eq!(
-            encode_object_name("models/llama/config.json"),
+            url_encode("models/llama/config.json"),
             "models%2Fllama%2Fconfig.json"
         );
     }
 
     #[test]
-    fn encode_object_name_leaves_the_unreserved_set_alone() {
-        assert_eq!(encode_object_name("a-b_c.d~e9"), "a-b_c.d~e9");
+    fn url_encode_leaves_the_unreserved_set_alone() {
+        assert_eq!(url_encode("a-b_c.d~e9"), "a-b_c.d~e9");
     }
 
     #[test]
-    fn encode_object_name_escapes_spaces_and_non_ascii_bytes() {
-        assert_eq!(encode_object_name("my model"), "my%20model");
-        assert_eq!(encode_object_name("é"), "%C3%A9");
+    fn url_encode_escapes_spaces_and_non_ascii_bytes() {
+        assert_eq!(url_encode("my model"), "my%20model");
+        assert_eq!(url_encode("é"), "%C3%A9");
     }
 }

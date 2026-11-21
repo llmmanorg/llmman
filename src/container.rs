@@ -35,6 +35,8 @@ use clap::ValueEnum;
 
 use crate::hostgpu::{self, HostGpu};
 
+pub(crate) mod identity;
+
 /// Container engine to run the picked image with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lower")]
@@ -58,6 +60,18 @@ impl ContainerManager {
     /// says why not, for the log. An explicit `--runtime docker|podman`
     /// skips this and lets the engine report its own errors.
     pub fn probe(self) -> Result<()> {
+        self.probe_with(true)
+    }
+
+    /// [`probe`](Self::probe) for a worker that runs the CPU image
+    /// ([`SPEECH_BACKEND`]) and passes no GPU through: the toolkit is not
+    /// required, so a host whose GPU probe skipped containers for
+    /// llama-server can still run that worker in one.
+    pub fn probe_cpu_only(self) -> Result<()> {
+        self.probe_with(false)
+    }
+
+    fn probe_with(self, require_gpu_toolkit: bool) -> Result<()> {
         let cli = self.binary();
         if crate::find_on_path(cli).is_none() {
             anyhow::bail!("{cli} is not on PATH");
@@ -72,15 +86,37 @@ impl ContainerManager {
             Some(_) => anyhow::bail!("{cli} info failed (is its daemon running?)"),
             None => anyhow::bail!("{cli} info did not answer within {PROBE_TIMEOUT:?}"),
         }
-        let wants_gpus = detect_backend().engine_args().iter().any(|a| a == "--gpus");
-        if wants_gpus && !nvidia_toolkit_present(self) {
-            anyhow::bail!(
-                "an NVIDIA GPU was detected but no NVIDIA Container Toolkit for {cli} \
-                 (`{cli} run --gpus all` would fail)"
-            );
+        if self == ContainerManager::Docker && cfg!(target_os = "linux") {
+            // Settle the rootless question for `HardenedUser::resolve`
+            // here, where `info` already answered, rather than on the
+            // first load.
+            let _ = identity::docker_is_rootless();
         }
-        Ok(())
+        let wants_gpus = detect_backend().engine_args().iter().any(|a| a == "--gpus");
+        gpu_gate(require_gpu_toolkit, wants_gpus, cli, || {
+            nvidia_toolkit_present(self)
+        })
     }
+}
+
+/// The toolkit rule of [`ContainerManager::probe`]: when the detected
+/// backend wants `--gpus` and the run would need it, the NVIDIA Container
+/// Toolkit must be present. A CPU-only run (`require_gpu_toolkit` false)
+/// passes whatever the host has; `toolkit_present` is only consulted when
+/// the rule applies.
+fn gpu_gate(
+    require_gpu_toolkit: bool,
+    wants_gpus: bool,
+    cli: &str,
+    toolkit_present: impl FnOnce() -> bool,
+) -> Result<()> {
+    if require_gpu_toolkit && wants_gpus && !toolkit_present() {
+        anyhow::bail!(
+            "an NVIDIA GPU was detected but no NVIDIA Container Toolkit for {cli} \
+             (`{cli} run --gpus all` would fail)"
+        );
+    }
+    Ok(())
 }
 
 /// How long [`ContainerManager::probe`] waits on `docker info`/`podman
@@ -93,7 +129,15 @@ fn run_with_timeout(
     mut cmd: std::process::Command,
     timeout: std::time::Duration,
 ) -> Result<Option<std::process::ExitStatus>> {
-    let mut child = cmd.spawn()?;
+    wait_with_timeout(&mut cmd.spawn()?, timeout)
+}
+
+/// [`run_with_timeout`] for an already spawned `child`, whose pipes the
+/// caller drains afterwards.
+pub(crate) fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Result<Option<std::process::ExitStatus>> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
@@ -669,7 +713,12 @@ const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// reachable systemd fails every `run` in crun), and `--runtime auto`
 /// must not settle on an engine every model load would then fail on.
 /// The engine's own error goes to stderr, like [`pull_image`]'s progress.
-pub fn verify_llama_server_runs(ociman: ContainerManager, version: Option<&str>) -> Result<()> {
+pub(crate) fn verify_llama_server_runs(
+    ociman: ContainerManager,
+    backend: GpuBackend,
+    version: Option<&str>,
+    hardened: bool,
+) -> Result<()> {
     let cli = ociman.binary();
     let name = format!(
         "llmman-verify-{}-{}",
@@ -678,13 +727,38 @@ pub fn verify_llama_server_runs(ociman: ContainerManager, version: Option<&str>)
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos())
     );
+    // The verify run mounts nothing, so no owner to read as: the
+    // daemon's own ids, as a model load of a store it owns would get.
+    let user = hardened
+        .then(|| HardenedUser::resolve(ociman, None))
+        .flatten();
     let mut cmd = std::process::Command::new(cli);
-    cmd.args(verify_args(detect_backend(), version, &name))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null());
+    cmd.args(verify_args(
+        backend,
+        version,
+        &name,
+        hardened,
+        user.as_ref(),
+    ))
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null());
+    let engine_args = backend.engine_args();
+    let suffix = if hardened {
+        format!(
+            "; {}",
+            hardened_note(
+                &hardened_flags(&engine_args, &llama_tmpfs(&engine_args), user.as_ref()),
+                None,
+            )
+        )
+    } else {
+        String::new()
+    };
     match run_with_timeout(cmd, VERIFY_TIMEOUT).with_context(|| format!("run {cli} run"))? {
         Some(status) if status.success() => Ok(()),
-        Some(status) => anyhow::bail!("{cli} could not start a llama.cpp container ({status})"),
+        Some(status) => {
+            anyhow::bail!("{cli} could not start a llama.cpp container ({status}){suffix}")
+        }
         None => {
             // Killing the attached CLI leaves its container running; --rm
             // only acts once the container exits.
@@ -694,14 +768,22 @@ pub fn verify_llama_server_runs(ociman: ContainerManager, version: Option<&str>)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
             let _ = run_with_timeout(rm, PROBE_TIMEOUT);
-            anyhow::bail!("{cli} did not start a llama.cpp container within {VERIFY_TIMEOUT:?}")
+            anyhow::bail!(
+                "{cli} did not start a llama.cpp container within {VERIFY_TIMEOUT:?}{suffix}"
+            )
         }
     }
 }
 
-/// The GPU passthrough and GPU-visibility environment match what [`spawn`]
-/// serves with.
-fn verify_args(backend: GpuBackend, version: Option<&str>, name: &str) -> Vec<String> {
+/// The GPU passthrough, GPU-visibility environment and `hardened` flags
+/// match what [`spawn`] serves with.
+fn verify_args(
+    backend: GpuBackend,
+    version: Option<&str>,
+    name: &str,
+    hardened: bool,
+    user: Option<&HardenedUser>,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
         "--rm".into(),
@@ -709,7 +791,15 @@ fn verify_args(backend: GpuBackend, version: Option<&str>, name: &str) -> Vec<St
         "--name".into(),
         name.into(),
     ];
-    args.extend(backend.engine_args());
+    let engine_args = backend.engine_args();
+    if hardened {
+        args.extend(hardened_flags(
+            &engine_args,
+            &llama_tmpfs(&engine_args),
+            user,
+        ));
+    }
+    args.extend(engine_args);
     args.extend(forwarded_env_args(&[]));
     args.push(backend.image_ref(version));
     args.push("--version".into());
@@ -779,6 +869,10 @@ pub struct LlamaOptions<'a> {
     /// always agree.
     pub cpus: Option<f64>,
 
+    /// [`hardened_args`] on the container (no effect on a local child);
+    /// on unless `--no-hardened`.
+    pub hardened: bool,
+
     /// The split `LLMMAN_LLAMA_ARGS`, after every flag above.
     pub extra_args: &'a [String],
 }
@@ -815,6 +909,10 @@ pub fn spawn(
     );
     let (model_dir, model_file) = mount_split(model_path, "model")?;
     let mmproj = mmproj_path.map(|p| mount_split(p, "mmproj")).transpose()?;
+    let user = opts
+        .hardened
+        .then(|| HardenedUser::resolve(ociman, Some(Path::new(&model_dir))))
+        .flatten();
     let args = llama_run_args(
         backend,
         image,
@@ -823,6 +921,7 @@ pub fn spawn(
         mmproj.as_ref().map(|(d, f)| (d.as_str(), f.as_str())),
         crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS,
         opts,
+        user.as_ref(),
     );
     run(ociman, args)
 }
@@ -842,7 +941,9 @@ fn mount_split(path: &Path, what: &str) -> Result<(String, String)> {
 
 /// [`spawn`]'s argv, split out so the flags are testable without an
 /// engine. `mmproj` is the mmproj's `(mount dir, file name)`, mounted
-/// as its own `/mmproj` volume.
+/// as its own `/mmproj` volume. `user` is the [`HardenedUser`] the
+/// caller resolved for the store, if any.
+#[allow(clippy::too_many_arguments)]
 fn llama_run_args(
     backend: GpuBackend,
     image: String,
@@ -851,6 +952,7 @@ fn llama_run_args(
     mmproj: Option<(&str, &str)>,
     passthrough_vars: &[&str],
     opts: LlamaOptions<'_>,
+    user: Option<&HardenedUser>,
 ) -> Vec<String> {
     let LlamaOptions {
         port,
@@ -864,9 +966,20 @@ fn llama_run_args(
         batch_size,
         threads,
         cpus,
+        hardened,
         extra_args,
     } = opts;
-    let mut args = run_args(backend.engine_args(), port, passthrough_vars, cpus);
+    let engine_args = backend.engine_args();
+    let tmpfs = llama_tmpfs(&engine_args);
+    let mut args = run_args(
+        engine_args,
+        port,
+        passthrough_vars,
+        cpus,
+        hardened,
+        user,
+        &tmpfs,
+    );
     args.push("-v".into());
     args.push(format!("{model_dir}:/models:ro"));
     if let Some((dir, _)) = mmproj {
@@ -950,11 +1063,20 @@ fn llama_run_args(
 /// (no limit binds) adds nothing. It is a CFS quota even when the
 /// daemon's limit is an affinity mask: the budget is what matters, and
 /// it is the one form both engines share.
+///
+/// `hardened`: [`hardened_args`] with `tmpfs`, between the prefix and
+/// `engine_args` so an engine's own `--cap-add`/`--security-opt` lands
+/// after the drop, then `user`'s [`HardenedUser::args`] (its
+/// `--group-add`s only when `engine_args` passes a device). `false` adds
+/// nothing, `user` included.
 fn run_args(
     engine_args: Vec<String>,
     port: u16,
     passthrough_vars: &[&str],
     cpus: Option<f64>,
+    hardened: bool,
+    user: Option<&HardenedUser>,
+    tmpfs: &[&str],
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -968,8 +1090,416 @@ fn run_args(
         args.push("--cpus".into());
         args.push(n.to_string());
     }
+    if hardened {
+        args.extend(hardened_flags(&engine_args, tmpfs, user));
+    }
     args.extend(engine_args);
     args.extend(forwarded_env_args(passthrough_vars));
+    args
+}
+
+/// The writable paths a hardened `llama-server` container needs on the
+/// CPU; [`llama_tmpfs`] adds the driver caches when a GPU is passed.
+const LLAMA_TMPFS: &[&str] = &["/tmp"];
+
+/// The GPU drivers' shader cache root inside the image, as root: Mesa
+/// RADV writes `~/.cache/mesa_shader_cache` and MIOpen `~/.cache/miopen`.
+const GPU_CACHE_TMPFS: &str = "/root/.cache";
+
+/// [`LLAMA_TMPFS`] plus [`GPU_CACHE_TMPFS`] when `engine_args` passes a
+/// GPU ([`passes_devices`]), so the Vulkan and ROCm shader caches work
+/// for the run instead of failing on the read-only rootfs. A numeric
+/// `--user` ([`HardenedUser`]) needs nothing more: its
+/// [`HARDENED_USER_ENV`] already points `XDG_CACHE_HOME` under the `/tmp`
+/// tmpfs, and the extra mount is harmless.
+fn llama_tmpfs(engine_args: &[String]) -> Vec<&'static str> {
+    let mut tmpfs = LLAMA_TMPFS.to_vec();
+    if passes_devices(engine_args) {
+        tmpfs.push(GPU_CACHE_TMPFS);
+    }
+    tmpfs
+}
+
+/// The `--tmpfs` value for a forwarded `VLLM_RPC_BASE_PATH` (`value`),
+/// the directory vLLM's multiprocessing mode puts its IPC sockets in:
+/// under hardening the rootfs is read-only, so the path must be writable
+/// or every request would fail. `None` when the variable is unset or
+/// already under one of `tmpfs_roots` ([`ENGINE_TMPFS`]); `Some("<value>:exec")`
+/// for another absolute path; `Err` for a relative or empty value, which
+/// vLLM would resolve against its working directory on the read-only
+/// rootfs, for one containing `:` or `,`, which `--tmpfs` would read as
+/// mount options, and for one with a `..` segment, which could resolve
+/// under a `tmpfs_roots` entry after the check here said it did not.
+pub(crate) fn vllm_rpc_tmpfs(
+    value: Option<&str>,
+    tmpfs_roots: &[&str],
+) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !value.starts_with('/') {
+        return Err(format!(
+            "VLLM_RPC_BASE_PATH must be an absolute path under hardening, got {value:?}; \
+             unset it or pass --no-hardened"
+        ));
+    }
+    // `--tmpfs` splits the path from its options at ':' (podman at every
+    // ':') and the options at ',', so either character would be read as
+    // options or truncate the mount.
+    if value.contains([':', ',']) || value.split('/').any(|s| s == "..") {
+        return Err(format!(
+            "VLLM_RPC_BASE_PATH must not contain ':', ',' or a '..' segment under hardening, \
+             got {value:?}; unset it or pass --no-hardened"
+        ));
+    }
+    let mounted = tmpfs_roots.iter().any(|root| {
+        value == *root
+            || value
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/'))
+    });
+    Ok((!mounted).then(|| format!("{value}:exec")))
+}
+
+/// [`vllm_rpc_tmpfs`] for [`spawn_engine`]: `VLLM_RPC_BASE_PATH` (read
+/// by `rpc_base`) only reaches a container whose forwarded prefix
+/// (`env_prefix`, from [`ContainerEngine::launcher`]) is `VLLM_`, so an
+/// SGLang container neither needs the tmpfs nor can fail on the value;
+/// `None` too when not `hardened`, where the rootfs is writable.
+fn engine_rpc_tmpfs(
+    env_prefix: &str,
+    hardened: bool,
+    rpc_base: impl FnOnce() -> Option<String>,
+) -> Result<Option<String>, String> {
+    if !hardened || env_prefix != "VLLM_" {
+        return Ok(None);
+    }
+    vllm_rpc_tmpfs(rpc_base().as_deref(), ENGINE_TMPFS)
+}
+
+/// The writable paths a hardened vLLM or SGLang container needs: the
+/// vLLM cache root and RPC sockets (`/root/.cache`, `/tmp`), Triton's
+/// kernel cache (`/root/.triton`) and vLLM's usage-stats file
+/// (`/root/.config`). The last two go beyond the task's `/tmp` and
+/// `/root/.cache`: Triton and vLLM's usage reporter write them on a
+/// read-only rootfs and would abort the first request otherwise.
+const ENGINE_TMPFS: &[&str] = &["/tmp", "/root/.cache", "/root/.triton", "/root/.config"];
+
+/// Whether `engine_args` passes a GPU through with `--gpus` (the NVIDIA
+/// toolkit path).
+fn passes_gpus(engine_args: &[String]) -> bool {
+    engine_args.iter().any(|a| a == "--gpus")
+}
+
+/// Whether `engine_args` passes any GPU through: `--gpus` or a
+/// `--device` node (ROCm's `/dev/kfd`, Vulkan's `/dev/dri`). Wider than
+/// [`passes_gpus`], which gates only the `--read-only` skip (the crun
+/// hook bug is NVIDIA's).
+fn passes_devices(engine_args: &[String]) -> bool {
+    engine_args.iter().any(|a| a == "--gpus" || a == "--device")
+}
+
+/// The uid a hardened container reads the store as, when the image's
+/// root cannot. `--cap-drop all` removes CAP_DAC_OVERRIDE, so the
+/// container's root reads a `0700` store directory or `0600` blob (umask
+/// 077) only when it *is* the owner. The rule, per
+/// [`identity::Identity`]:
+///
+/// - rootful docker on Linux: the daemon's root is the host's, so
+///   `--user <uid>:<gid>` of the mounted store's owner (the daemon's own
+///   ids when it is not readable, or nothing is mounted) makes the
+///   container the owner;
+/// - rootless docker on Linux: container uid 0 already maps to the host
+///   user, so `--user 0:0` keeps it there (a host uid would be remapped
+///   to a subordinate id and own nothing), and no `--group-add`: a host
+///   gid would be remapped the same way, so `device_gids` is left empty;
+/// - rootless podman (`euid != 0`): root in the container is the invoking
+///   user by default, so no `--user`;
+/// - rootful podman (`euid == 0`): there is no daemon, llmman itself is
+///   root, so the store it wrote is root's and container root (host
+///   root) owns it; a store another user owns (`LLMMAN_MODELS` pointing
+///   at one) is left to the `chmod` in [`hardened_note`] rather than
+///   mapped, since nothing here says which of its users should run;
+/// - Docker Desktop and non-unix hosts: no `--user`.
+///
+/// A numeric `--user` has no `/etc/passwd` entry in the image, so docker
+/// gives it `HOME=/` and no supplementary groups: `--group-add` with the
+/// numeric host gid of each GPU node (the image's group *names* resolve
+/// against its own `/etc/group`, so ROCm's `--group-add video` may name
+/// another gid) keeps the devices readable, and `HOME` and the XDG and
+/// Triton cache roots move under the `/tmp` tmpfs so vLLM, Triton, Mesa
+/// and MIOpen do not write to the read-only root. `/dev/nvidia*` nodes
+/// are out of scope: the NVIDIA toolkit injects them behind `--gpus`,
+/// world-readable (`0666`) as the driver creates them, so a `0660` node
+/// a site chmod'ed is not covered by [`device_gids`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HardenedUser {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    /// Host gids of the existing GPU device nodes, sorted and deduplicated.
+    pub(crate) device_gids: Vec<u32>,
+}
+
+impl HardenedUser {
+    /// The rule above for the host, with `mounted` the store or cache
+    /// directory the container will read (`None` mounts nothing).
+    pub(crate) fn resolve(ociman: ContainerManager, mounted: Option<&Path>) -> Option<Self> {
+        let linux = cfg!(target_os = "linux");
+        let rootless =
+            ociman == ContainerManager::Docker && linux && identity::docker_is_rootless();
+        let identity =
+            identity::Identity::from_parts(Some(ociman), linux, rootless, identity::user_ids());
+        Self::from_parts(
+            &identity,
+            rootless,
+            mounted.and_then(path_owner),
+            device_gids(),
+        )
+    }
+
+    /// The pure mapping behind [`HardenedUser::resolve`]: `identity` as
+    /// [`identity::Identity::from_parts`] gave it, `owner` the mounted
+    /// directory's `(uid, gid)` when readable, `device_gids` from
+    /// [`device_gids`]. `rootless` pins the docker `0:0` case, where the
+    /// host owner must not override it and the device gids are dropped.
+    pub(crate) fn from_parts(
+        identity: &identity::Identity,
+        rootless: bool,
+        owner: Option<(u32, u32)>,
+        device_gids: Vec<u32>,
+    ) -> Option<Self> {
+        match *identity {
+            identity::Identity::User { uid, gid } => {
+                let (uid, gid, device_gids) = if rootless {
+                    (uid, gid, Vec::new())
+                } else {
+                    let (uid, gid) = owner.unwrap_or((uid, gid));
+                    (uid, gid, device_gids)
+                };
+                Some(Self {
+                    uid,
+                    gid,
+                    device_gids,
+                })
+            }
+            identity::Identity::Image | identity::Identity::KeepId => None,
+        }
+    }
+
+    /// The `run` flags: `--user`, a `--group-add` per device gid when
+    /// `devices` are passed, and the cache roots under `/tmp`.
+    fn args(&self, devices: bool) -> Vec<String> {
+        let mut args = vec![
+            "--user".to_string(),
+            identity::Identity::user_arg(self.uid, self.gid),
+        ];
+        if devices {
+            args.extend(
+                self.device_gids
+                    .iter()
+                    .flat_map(|gid| ["--group-add".to_string(), gid.to_string()]),
+            );
+        }
+        args.extend(
+            HARDENED_USER_ENV
+                .iter()
+                .flat_map(|pair| ["-e".to_string(), pair.to_string()]),
+        );
+        args
+    }
+}
+
+/// The environment a numeric `--user` gets so every cache lands on the
+/// `/tmp` tmpfs: `HOME` (docker's default for an unknown uid is `/`),
+/// vLLM's and Mesa's cache root, vLLM's and MIOpen's config root and
+/// Triton's kernel cache.
+const HARDENED_USER_ENV: &[&str] = &[
+    "HOME=/tmp",
+    "XDG_CACHE_HOME=/tmp/.cache",
+    "XDG_CONFIG_HOME=/tmp/.config",
+    "TRITON_CACHE_DIR=/tmp/.triton",
+];
+
+/// `(uid, gid)` owning `path`, when readable.
+#[cfg(unix)]
+fn path_owner(path: &Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.uid(), meta.gid()))
+}
+
+#[cfg(not(unix))]
+fn path_owner(_path: &Path) -> Option<(u32, u32)> {
+    None
+}
+
+/// The host gid of each existing GPU device node a backend passes:
+/// `/dev/kfd` (ROCm) and `/dev/dri/renderD*`, `/dev/dri/card*` (ROCm,
+/// Vulkan); sorted and deduplicated.
+#[cfg(unix)]
+fn device_gids() -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let mut nodes = vec![std::path::PathBuf::from("/dev/kfd")];
+    if let Ok(dir) = std::fs::read_dir("/dev/dri") {
+        nodes.extend(dir.flatten().map(|e| e.path()).filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("renderD") || n.starts_with("card"))
+        }));
+    }
+    let mut gids: Vec<u32> = nodes
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.gid())
+        .collect();
+    gids.sort_unstable();
+    gids.dedup();
+    gids
+}
+
+#[cfg(not(unix))]
+fn device_gids() -> Vec<u32> {
+    Vec::new()
+}
+
+/// The hardened block of a `run` argv: [`hardened_args`] for
+/// `engine_args` (read-only unless they pass `--gpus`) and `tmpfs`, then
+/// `user`'s flags ([`HardenedUser::args`], with the device groups when
+/// `engine_args` pass a device).
+fn hardened_flags(
+    engine_args: &[String],
+    tmpfs: &[&str],
+    user: Option<&HardenedUser>,
+) -> Vec<String> {
+    let mut args = hardened_args(!passes_gpus(engine_args), tmpfs);
+    if let Some(user) = user {
+        args.extend(user.args(passes_devices(engine_args)));
+    }
+    args
+}
+
+/// The suffix a hardened container's failure carries, so one that exits
+/// only because of the flags (a store written with umask 077 is
+/// unreadable once `--cap-drop all` removes CAP_DAC_OVERRIDE from the
+/// container's root) names them and the fixes: `flags` the hardened
+/// part of the argv the container was run with ([`hardened_flags`], plus
+/// the [`vllm_rpc_tmpfs`] mount when one was added), `mounted` the store
+/// or cache directory it read (`None` for a run mounting nothing),
+/// loosened with `chmod -R go+rX` when the engine cannot run as its owner.
+pub(crate) fn hardened_note(flags: &[String], mounted: Option<&str>) -> String {
+    let fix = match mounted {
+        Some(path) => format!("chmod -R go+rX {path} lets the container read it as any user, and "),
+        None => String::new(),
+    };
+    format!(
+        "started hardened ({}); {fix}--no-hardened turns these flags off",
+        flags.join(" ")
+    )
+}
+
+/// Which hardened container a [`spawn_hardened_note`] describes: vLLM
+/// ([`spawn_engine`] with a `VLLM_` prefix) mounts [`ENGINE_TMPFS`] plus
+/// the [`vllm_rpc_tmpfs`] and follows the host backend's `--gpus`;
+/// SGLang the same without the RPC tmpfs; a llama.cpp container
+/// ([`spawn`], or [`spawn_mediagen`] with the detected backend) mounts
+/// [`LLAMA_TMPFS`] and follows the same probe; the speech worker
+/// ([`spawn_mediagen`] with [`SPEECH_BACKEND`]) never passes a GPU, so
+/// it is read-only on every host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HardenedSpawn {
+    LlamaServer,
+    Speech,
+    Vllm,
+    Sglang,
+}
+
+impl HardenedSpawn {
+    /// [`hardened_note`] with the flags [`run_args`] applied for this
+    /// container on a host whose probe returned `host`, run as `user`
+    /// ([`HardenedUser::resolve`]), with `rpc_tmpfs` the
+    /// [`vllm_rpc_tmpfs`] value (used by [`HardenedSpawn::Vllm`] only),
+    /// reading `mounted`.
+    fn note(
+        self,
+        host: GpuBackend,
+        user: Option<&HardenedUser>,
+        rpc_tmpfs: Option<&str>,
+        mounted: &str,
+    ) -> String {
+        let mut flags = match self {
+            Self::Vllm | Self::Sglang => hardened_flags(
+                &VllmBackend::from_gpu(host).engine_args(),
+                ENGINE_TMPFS,
+                user,
+            ),
+            Self::LlamaServer => {
+                let engine_args = host.engine_args();
+                hardened_flags(&engine_args, &llama_tmpfs(&engine_args), user)
+            }
+            Self::Speech => {
+                let engine_args = SPEECH_BACKEND.engine_args();
+                hardened_flags(&engine_args, &llama_tmpfs(&engine_args), user)
+            }
+        };
+        if let (Self::Vllm, Some(tmpfs)) = (self, rpc_tmpfs) {
+            flags.extend(["--tmpfs".to_string(), tmpfs.to_string()]);
+        }
+        hardened_note(&flags, Some(mounted))
+    }
+}
+
+/// [`hardened_note`] for a container `ociman` started on this host,
+/// naming the flags `spawn` was run with (`--read-only` follows the
+/// backend the container was given at spawn time, not only the host
+/// probe; the `--user` block is resolved again for `mounted`, the
+/// directory the spawn mounted and resolved its own `--user` against;
+/// the RPC tmpfs follows `VLLM_RPC_BASE_PATH` as [`spawn_engine`] read
+/// it).
+pub(crate) fn spawn_hardened_note(
+    spawn: HardenedSpawn,
+    ociman: ContainerManager,
+    mounted: &Path,
+) -> String {
+    let user = HardenedUser::resolve(ociman, Some(mounted));
+    let rpc_tmpfs = vllm_rpc_tmpfs(
+        std::env::var("VLLM_RPC_BASE_PATH").ok().as_deref(),
+        ENGINE_TMPFS,
+    )
+    .ok()
+    .flatten();
+    spawn.note(
+        detect_backend(),
+        user.as_ref(),
+        rpc_tmpfs.as_deref(),
+        &mounted.display().to_string(),
+    )
+}
+
+/// The hardened `run` flags: every capability dropped, no privilege
+/// gain through setuid binaries, and (`read_only`) a read-only rootfs
+/// with a tmpfs on each of `tmpfs`. Each tmpfs gets `exec`: docker and
+/// podman both mount `--tmpfs` `noexec` by default, and vLLM's
+/// inductor and Triton load compiled `.so` files out of their caches.
+///
+/// `read_only` is off for a container that passes `--gpus`: crun before
+/// 1.26 applies the read-only remount before the NVIDIA toolkit's
+/// createContainer hooks write `/etc` and `/usr/lib64`
+/// (NVIDIA/nvidia-container-toolkit#2131, containers/crun#1924).
+pub(crate) fn hardened_args(read_only: bool, tmpfs: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "--cap-drop".into(),
+        "all".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+    ];
+    if read_only {
+        args.push("--read-only".into());
+    }
+    args.extend(
+        tmpfs
+            .iter()
+            .flat_map(|path| ["--tmpfs".to_string(), format!("{path}:exec")]),
+    );
     args
 }
 
@@ -1018,6 +1548,7 @@ pub fn spawn_engine(
     vllm_image: Option<&str>,
     port: u16,
     cpus: Option<f64>,
+    hardened: bool,
     serve_args: impl FnOnce(&str, &str) -> Vec<String>,
 ) -> Result<tokio::process::Child> {
     let backend = VllmBackend::detect();
@@ -1039,10 +1570,32 @@ pub fn spawn_engine(
         })
         .collect();
     let vars: Vec<&str> = vars.iter().map(String::as_str).collect();
-    let prefix = run_args(backend.engine_args(), port, &vars, cpus);
+    let rpc_tmpfs = engine_rpc_tmpfs(env_prefix, hardened, || {
+        std::env::var("VLLM_RPC_BASE_PATH").ok()
+    })
+    .map_err(anyhow::Error::msg)?;
+    let user = hardened
+        .then(|| HardenedUser::resolve(ociman, Some(Path::new(&model_dir))))
+        .flatten();
+    let prefix = run_args(
+        backend.engine_args(),
+        port,
+        &vars,
+        cpus,
+        hardened,
+        user.as_ref(),
+        ENGINE_TMPFS,
+    );
     run(
         ociman,
-        engine_run_args(prefix, image, launcher, &model_dir, serve_args),
+        engine_run_args(
+            prefix,
+            rpc_tmpfs.as_deref(),
+            image,
+            launcher,
+            &model_dir,
+            serve_args,
+        ),
     )
 }
 
@@ -1058,15 +1611,20 @@ fn mount_source(dir: &Path) -> Result<String> {
 }
 
 /// [`spawn_engine`]'s argv after [`run_args`]'s `run` prefix, split out
-/// so the ordering (`-v`/`--entrypoint` before the image, the launcher's
-/// rest and serve flags after) is testable without an engine.
+/// so the ordering (`rpc_tmpfs` from [`vllm_rpc_tmpfs`], then
+/// `-v`/`--entrypoint` before the image, the launcher's rest and serve
+/// flags after) is testable without an engine.
 fn engine_run_args(
     mut args: Vec<String>,
+    rpc_tmpfs: Option<&str>,
     image: String,
     launcher: &[&str],
     model_dir: &str,
     serve_args: impl FnOnce(&str, &str) -> Vec<String>,
 ) -> Vec<String> {
+    if let Some(tmpfs) = rpc_tmpfs {
+        args.extend(["--tmpfs".to_string(), tmpfs.to_string()]);
+    }
     args.extend([
         "-v".into(),
         format!("{model_dir}:/models:ro"),
@@ -1110,6 +1668,7 @@ pub(crate) fn spawn_mediagen(
     llama_cpp_version: Option<&str>,
     port: u16,
     cpus: Option<f64>,
+    hardened: bool,
 ) -> Result<tokio::process::Child> {
     let image = backend.image_ref(llama_cpp_version);
     eprintln!(
@@ -1125,12 +1684,55 @@ pub(crate) fn spawn_mediagen(
             .with_context(|| format!("{} is not valid UTF-8", p.display()))
     };
     let (exe, store, cache) = (utf8(&exe)?, utf8(store_path)?, utf8(cache_path)?);
+    let user = hardened
+        .then(|| HardenedUser::resolve(ociman, Some(store_path)))
+        .flatten();
+    let args = mediagen_run_args(
+        backend,
+        image,
+        &exe,
+        &store,
+        &cache,
+        model_ref,
+        port,
+        cpus,
+        hardened,
+        user.as_ref(),
+    );
+    run(ociman, args)
+}
+
+/// [`spawn_mediagen`]'s full argv, split out so the worker's mounts, env
+/// and hardened block are testable without an engine.
+#[allow(clippy::too_many_arguments)]
+fn mediagen_run_args(
+    backend: GpuBackend,
+    image: String,
+    exe: &str,
+    store: &str,
+    cache: &str,
+    model_ref: &str,
+    port: u16,
+    cpus: Option<f64>,
+    hardened: bool,
+    user: Option<&HardenedUser>,
+) -> Vec<String> {
     let passthrough = [
         crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS,
         crate::cmd::serve::MEDIAGEN_ENV_PASSTHROUGH_VARS,
     ]
     .concat();
-    let mut args = run_args(backend.engine_args(), port, &passthrough, cpus);
+    let engine_args = backend.engine_args();
+    let tmpfs = llama_tmpfs(&engine_args);
+    let mut args = run_args(
+        engine_args,
+        port,
+        &passthrough,
+        cpus,
+        hardened,
+        user,
+        &tmpfs,
+    );
     args.extend([
         "-v".into(),
         format!("{exe}:/usr/local/bin/llmman:ro"),
@@ -1155,7 +1757,7 @@ pub(crate) fn spawn_mediagen(
         "--runtime".into(),
         "path".into(),
     ]);
-    run(ociman, args)
+    args
 }
 
 /// Gracefully stops a container started by [`spawn`] by sending SIGTERM to
@@ -1286,6 +1888,27 @@ mod tests {
         assert_eq!(GpuBackend::Cuda13.image_tag(), "server-cuda13");
         assert_eq!(GpuBackend::Rocm.image_tag(), "server-rocm");
         assert_eq!(GpuBackend::Vulkan.image_tag(), "server-vulkan");
+    }
+
+    /// A GPU host without the toolkit refuses the engine for llama-server
+    /// and accepts it for the CPU-only worker; without a GPU, or with the
+    /// toolkit, both pass and the toolkit is not even looked for.
+    #[test]
+    fn the_cpu_only_probe_passes_where_the_toolkit_alone_refuses() {
+        let err = gpu_gate(true, true, "docker", || false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("NVIDIA Container Toolkit"), "{err}");
+        gpu_gate(false, true, "docker", || false).unwrap();
+        gpu_gate(true, true, "docker", || true).unwrap();
+        gpu_gate(true, false, "docker", || {
+            unreachable!("no GPU, no toolkit check")
+        })
+        .unwrap();
+        gpu_gate(false, false, "docker", || {
+            unreachable!("no GPU, no toolkit check")
+        })
+        .unwrap();
     }
 
     /// Whatever GPU this host has, the speech worker's image is the CPU
@@ -1604,7 +2227,16 @@ mod tests {
     fn sglang_run_args_launch_the_module_after_the_image_and_flags_after_that() {
         let (launcher, _) = ContainerEngine::Sglang.launcher().unwrap();
         let args = engine_run_args(
-            run_args(VllmBackend::Cuda13.engine_args(), 30000, &[], None),
+            run_args(
+                VllmBackend::Cuda13.engine_args(),
+                30000,
+                &[],
+                None,
+                false,
+                None,
+                &[],
+            ),
+            None,
             "docker.io/lmsysorg/sglang:latest".into(),
             launcher,
             "/cache/abc/model",
@@ -1667,7 +2299,16 @@ mod tests {
     fn vllm_run_args_put_the_mount_and_entrypoint_before_the_image_and_serve_after() {
         let (launcher, _) = ContainerEngine::Vllm.launcher().unwrap();
         let args = engine_run_args(
-            run_args(VllmBackend::Cuda13.engine_args(), 8000, &[], None),
+            run_args(
+                VllmBackend::Cuda13.engine_args(),
+                8000,
+                &[],
+                None,
+                false,
+                None,
+                &[],
+            ),
+            None,
             "docker.io/vllm/vllm-openai:latest-x86_64".into(),
             launcher,
             "/cache/abc/model",
@@ -1711,13 +2352,13 @@ mod tests {
     fn run_args_forward_only_the_requested_passthrough_vars() {
         const VAR: &str = "LLMMAN_TEST_RUN_ARGS_PASSTHROUGH";
         std::env::set_var(VAR, "1");
-        let args = run_args(vec![], 8080, &[], None);
+        let args = run_args(vec![], 8080, &[], None, false, None, &[]);
         assert_eq!(
             &args[..6],
             &["run", "--rm", "--init", "-t", "-p", "127.0.0.1:8080:8080"]
         );
         assert!(!args.contains(&VAR.to_string()), "{args:?}");
-        let args = run_args(vec![], 8080, &[VAR], None);
+        let args = run_args(vec![], 8080, &[VAR], None, false, None, &[]);
         assert!(args.windows(2).any(|w| w == ["-e", VAR]), "{args:?}");
         // The value stays out of argv (it may be a secret).
         assert!(!args.iter().any(|a| a.starts_with(&format!("{VAR}="))));
@@ -1732,7 +2373,7 @@ mod tests {
                 "ghcr.io/ggml-org/llama.cpp:server-cuda13-b9994",
             ),
         ] {
-            let args = verify_args(backend, Some("b9994"), "llmman-verify-1");
+            let args = verify_args(backend, Some("b9994"), "llmman-verify-1", false, None);
             assert_eq!(
                 &args[..5],
                 ["run", "--rm", "--init", "--name", "llmman-verify-1"]
@@ -1745,17 +2386,583 @@ mod tests {
         }
     }
 
+    /// `args[prefix_len..]` starts with [`hardened_args`] for `tmpfs`
+    /// and continues with `engine_args`.
+    fn assert_hardened_between(
+        args: &[String],
+        prefix_len: usize,
+        read_only: bool,
+        tmpfs: &[&str],
+        engine_args: &[String],
+    ) {
+        let mut expected = hardened_args(read_only, tmpfs);
+        expected.extend(engine_args.iter().cloned());
+        assert_eq!(
+            &args[prefix_len..prefix_len + expected.len()],
+            expected.as_slice(),
+            "{args:?}"
+        );
+    }
+
+    fn user(device_gids: &[u32]) -> HardenedUser {
+        HardenedUser {
+            uid: 1000,
+            gid: 1000,
+            device_gids: device_gids.to_vec(),
+        }
+    }
+
+    #[test]
+    fn hardened_user_follows_the_engine_the_owner_and_rootlessness() {
+        use identity::Identity;
+        let me = Identity::User {
+            uid: 1000,
+            gid: 1000,
+        };
+        // Rootful docker: the mounted store's owner wins over the daemon's ids.
+        assert_eq!(
+            HardenedUser::from_parts(&me, false, Some((1001, 1002)), vec![44]),
+            Some(HardenedUser {
+                uid: 1001,
+                gid: 1002,
+                device_gids: vec![44]
+            })
+        );
+        // No readable owner (or nothing mounted): the daemon's own ids.
+        assert_eq!(
+            HardenedUser::from_parts(&me, false, None, vec![]),
+            Some(user(&[]))
+        );
+        // Rootless docker: `0:0` is the host user; the host owner must not
+        // remap it, and host gids would be subordinate ids, so none are added.
+        let root = Identity::User { uid: 0, gid: 0 };
+        assert_eq!(
+            HardenedUser::from_parts(&root, true, Some((1000, 1000)), vec![44]),
+            Some(HardenedUser {
+                uid: 0,
+                gid: 0,
+                device_gids: vec![]
+            })
+        );
+        // Rootless podman and the image's own user: no `--user`.
+        assert_eq!(
+            HardenedUser::from_parts(&Identity::KeepId, false, Some((1000, 1000)), vec![44]),
+            None
+        );
+        assert_eq!(
+            HardenedUser::from_parts(&Identity::Image, false, Some((1000, 1000)), vec![44]),
+            None
+        );
+    }
+
+    #[test]
+    fn hardened_user_args_add_the_user_device_groups_and_tmp_caches() {
+        // Devices passed: one numeric `--group-add` per host gid.
+        assert_eq!(
+            user(&[44, 993]).args(true),
+            [
+                "--user",
+                "1000:1000",
+                "--group-add",
+                "44",
+                "--group-add",
+                "993",
+                "-e",
+                "HOME=/tmp",
+                "-e",
+                "XDG_CACHE_HOME=/tmp/.cache",
+                "-e",
+                "XDG_CONFIG_HOME=/tmp/.config",
+                "-e",
+                "TRITON_CACHE_DIR=/tmp/.triton",
+            ]
+        );
+        // No devices: no `--group-add`, even with gids resolved.
+        let cpu = user(&[44]).args(false);
+        assert!(!cpu.contains(&"--group-add".to_string()), "{cpu:?}");
+        assert_eq!(&cpu[..2], ["--user", "1000:1000"]);
+        assert_eq!(cpu.len(), 2 + 2 * HARDENED_USER_ENV.len());
+        // Rootless docker's `0:0`.
+        let root = HardenedUser {
+            uid: 0,
+            gid: 0,
+            device_gids: vec![],
+        };
+        assert_eq!(&root.args(true)[..2], ["--user", "0:0"]);
+    }
+
+    #[test]
+    fn passes_devices_covers_device_nodes_while_the_read_only_skip_is_gpus_only() {
+        for (backend, gpus, devices) in [
+            (GpuBackend::Cpu, false, false),
+            (GpuBackend::Cuda13, true, true),
+            (GpuBackend::Rocm, false, true),
+        ] {
+            let engine_args = backend.engine_args();
+            assert_eq!(passes_gpus(&engine_args), gpus, "{backend:?}");
+            assert_eq!(passes_devices(&engine_args), devices, "{backend:?}");
+            // `--read-only` is skipped only behind `--gpus`: ROCm's
+            // `--device` nodes keep the read-only rootfs.
+            let args = run_args(engine_args, 8080, &[], None, true, None, LLAMA_TMPFS);
+            assert_eq!(
+                args.contains(&"--read-only".to_string()),
+                !gpus,
+                "{backend:?}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hardened_user_lands_after_the_block_and_before_the_engine_args_in_every_builder() {
+        let gpu_user = user(&[44, 993]);
+        // ROCm: `--device` nodes, so the device groups come along, ahead of the
+        // engine's own `--group-add video`.
+        let engine_args = GpuBackend::Rocm.engine_args();
+        let args = run_args(
+            engine_args.clone(),
+            8080,
+            &[],
+            None,
+            true,
+            Some(&gpu_user),
+            LLAMA_TMPFS,
+        );
+        let mut expected = hardened_args(true, LLAMA_TMPFS);
+        expected.extend(gpu_user.args(true));
+        expected.extend(engine_args);
+        assert_eq!(
+            &args[6..6 + expected.len()],
+            expected.as_slice(),
+            "{args:?}"
+        );
+        let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+        assert!(at("--user") < at("--device"), "{args:?}");
+        assert!(at("--group-add") < at("--device"), "{args:?}");
+        // CPU: no device, so `--user` and the caches but no `--group-add`.
+        let args = run_args(
+            GpuBackend::Cpu.engine_args(),
+            8080,
+            &[],
+            None,
+            true,
+            Some(&gpu_user),
+            LLAMA_TMPFS,
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--user", "1000:1000"]),
+            "{args:?}"
+        );
+        assert!(!args.contains(&"--group-add".to_string()), "{args:?}");
+        assert!(
+            args.windows(2).any(|w| w == ["-e", "HOME=/tmp"]),
+            "{args:?}"
+        );
+        // `--no-hardened` drops the user with the block.
+        let args = run_args(
+            GpuBackend::Cpu.engine_args(),
+            8080,
+            &[],
+            None,
+            false,
+            Some(&gpu_user),
+            LLAMA_TMPFS,
+        );
+        assert!(!args.contains(&"--user".to_string()), "{args:?}");
+        assert!(!args.iter().any(|a| a == "HOME=/tmp"), "{args:?}");
+        // The verify run and the worker take the same value.
+        let args = verify_args(GpuBackend::Cuda13, None, "v", true, Some(&gpu_user));
+        let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+        assert!(
+            at("--cap-drop") < at("--user") && at("--user") < at("--gpus"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--group-add", "44"]),
+            "{args:?}"
+        );
+        let args = verify_args(GpuBackend::Cuda13, None, "v", true, None);
+        assert!(!args.contains(&"--user".to_string()), "{args:?}");
+        let args = mediagen_run_args(
+            GpuBackend::Cpu,
+            "image".into(),
+            "/usr/bin/llmman",
+            "/store",
+            "/cache",
+            "a-model",
+            8090,
+            None,
+            true,
+            Some(&user(&[])),
+        );
+        let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+        assert!(at("--user") < at("-v"), "{args:?}");
+        assert_eq!(args[at("--user") + 1], "1000:1000");
+    }
+
+    #[test]
+    fn hardened_note_names_the_flags_and_the_opt_out() {
+        assert_eq!(
+            hardened_note(&hardened_args(true, LLAMA_TMPFS), None),
+            "started hardened (--cap-drop all --security-opt no-new-privileges --read-only --tmpfs /tmp:exec); --no-hardened turns these flags off"
+        );
+        assert_eq!(
+            hardened_note(&hardened_args(false, LLAMA_TMPFS), Some("/srv/store")),
+            "started hardened (--cap-drop all --security-opt no-new-privileges --tmpfs /tmp:exec); chmod -R go+rX /srv/store lets the container read it as any user, and --no-hardened turns these flags off"
+        );
+    }
+
+    #[test]
+    fn speech_worker_note_is_read_only_on_a_gpu_host() {
+        for host in [GpuBackend::Cuda13, GpuBackend::Vulkan] {
+            let speech = HardenedSpawn::Speech.note(host, None, None, "/srv/store");
+            assert!(speech.contains("--read-only"), "{host:?}: {speech}");
+            assert_eq!(
+                speech,
+                hardened_note(
+                    &hardened_args(true, &llama_tmpfs(&SPEECH_BACKEND.engine_args())),
+                    Some("/srv/store")
+                )
+            );
+            assert!(speech.contains("chmod -R go+rX /srv/store"), "{speech}");
+            let llama = HardenedSpawn::LlamaServer.note(host, None, None, "/srv/store");
+            assert_eq!(
+                llama.contains("--read-only"),
+                !passes_gpus(&host.engine_args()),
+                "{host:?}: {llama}"
+            );
+            let vllm = HardenedSpawn::Vllm.note(host, None, None, "/srv/store");
+            assert!(vllm.contains("/root/.triton:exec"), "{host:?}: {vllm}");
+        }
+    }
+
+    #[test]
+    fn spawn_note_carries_the_user_block_and_the_rpc_tmpfs_the_argv_had() {
+        let gpu_user = user(&[44]);
+        // ROCm passes `--device`, so the note has the group too; the RPC
+        // tmpfs lands after the user block, as in `engine_run_args`.
+        let vllm = HardenedSpawn::Vllm.note(
+            GpuBackend::Rocm,
+            Some(&gpu_user),
+            Some("/run/vllm:exec"),
+            "/srv/store",
+        );
+        let expected = format!(
+            "started hardened ({} --user 1000:1000 --group-add 44 -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e XDG_CONFIG_HOME=/tmp/.config -e TRITON_CACHE_DIR=/tmp/.triton --tmpfs /run/vllm:exec); chmod -R go+rX /srv/store lets the container read it as any user, and --no-hardened turns these flags off",
+            hardened_args(true, ENGINE_TMPFS).join(" ")
+        );
+        assert_eq!(vllm, expected);
+        // SGLang never gets the RPC tmpfs; the CPU backend passes no device.
+        let sglang = HardenedSpawn::Sglang.note(
+            GpuBackend::Cpu,
+            Some(&gpu_user),
+            Some("/run/vllm:exec"),
+            "/srv/store",
+        );
+        assert!(!sglang.contains("/run/vllm"), "{sglang}");
+        assert!(!sglang.contains("--group-add"), "{sglang}");
+        assert!(sglang.contains("--user 1000:1000 -e HOME=/tmp"), "{sglang}");
+        // The verify run's note is the same block for its argv.
+        let engine_args = GpuBackend::Rocm.engine_args();
+        let flags = hardened_flags(&engine_args, &llama_tmpfs(&engine_args), Some(&gpu_user));
+        let verify = verify_args(GpuBackend::Rocm, None, "x", true, Some(&gpu_user));
+        assert_eq!(&verify[5..5 + flags.len()], flags.as_slice(), "{verify:?}");
+    }
+
+    #[test]
+    fn hardened_args_drop_caps_and_mount_each_tmpfs() {
+        assert_eq!(
+            hardened_args(true, &["/tmp", "/root/.cache"]),
+            [
+                "--cap-drop",
+                "all",
+                "--security-opt",
+                "no-new-privileges",
+                "--read-only",
+                "--tmpfs",
+                "/tmp:exec",
+                "--tmpfs",
+                "/root/.cache:exec",
+            ]
+        );
+        let gpu = hardened_args(false, &["/tmp"]);
+        assert!(!gpu.contains(&"--read-only".to_string()), "{gpu:?}");
+        assert_eq!(
+            &gpu[..4],
+            ["--cap-drop", "all", "--security-opt", "no-new-privileges"]
+        );
+        assert_eq!(&gpu[4..], ["--tmpfs", "/tmp:exec"]);
+    }
+
+    #[test]
+    fn hardened_llama_container_is_read_only_on_cpu_but_not_behind_gpus() {
+        let opts = |hardened| LlamaOptions {
+            port: 8080,
+            ctx_size: None,
+            flash_attention: None,
+            kv_cache_type: None,
+            context_shift: true,
+            split_mode: None,
+            num_parallel: None,
+            embeddings: false,
+            batch_size: None,
+            threads: None,
+            cpus: Some(2.0),
+            hardened,
+            extra_args: &[],
+        };
+        let argv = |backend: GpuBackend, hardened| {
+            llama_run_args(
+                backend,
+                backend.image_ref(None),
+                "/cache/blobs",
+                "sha256-abc",
+                None,
+                &[],
+                opts(hardened),
+                None,
+            )
+        };
+        // `run --rm --init -t -p ADDR --cpus 2`, then the hardened block.
+        let args = argv(GpuBackend::Cpu, true);
+        assert_hardened_between(&args, 8, true, LLAMA_TMPFS, &GpuBackend::Cpu.engine_args());
+        let image = args.iter().position(|a| a.starts_with("ghcr.io/")).unwrap();
+        assert!(
+            args[..image].contains(&"--read-only".to_string()),
+            "{args:?}"
+        );
+        let args = argv(GpuBackend::Cuda13, true);
+        assert_hardened_between(
+            &args,
+            8,
+            false,
+            &llama_tmpfs(&GpuBackend::Cuda13.engine_args()),
+            &GpuBackend::Cuda13.engine_args(),
+        );
+        assert!(!args.contains(&"--read-only".to_string()), "{args:?}");
+        assert!(
+            args.windows(2).any(|w| w == ["--cap-drop", "all"]),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--tmpfs", "/tmp:exec"]),
+            "{args:?}"
+        );
+        assert!(args.windows(2).any(|w| w == ["--gpus", "all"]), "{args:?}");
+        // Off: nothing of the block appears.
+        let args = argv(GpuBackend::Cpu, false);
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--cap-drop" || a == "--read-only" || a == "--tmpfs"),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn hardened_engine_containers_keep_their_own_grants_after_the_drop() {
+        let serve =
+            |dir: &str, host: &str| vec!["serve".into(), dir.into(), "--host".into(), host.into()];
+        let (vllm, _) = ContainerEngine::Vllm.launcher().unwrap();
+        let (sglang, _) = ContainerEngine::Sglang.launcher().unwrap();
+        for (backend, launcher, read_only) in [
+            (VllmBackend::Cpu, vllm, true),
+            (VllmBackend::Cuda13, vllm, false),
+            (VllmBackend::Cuda13, sglang, false),
+        ] {
+            let engine_args = backend.engine_args();
+            let args = engine_run_args(
+                run_args(
+                    engine_args.clone(),
+                    8000,
+                    &[],
+                    None,
+                    true,
+                    None,
+                    ENGINE_TMPFS,
+                ),
+                None,
+                "image:tag".into(),
+                launcher,
+                "/cache/abc/model",
+                serve,
+            );
+            // `run --rm --init -t -p ADDR`, then the hardened block, then the engine's own flags.
+            assert_hardened_between(&args, 6, read_only, ENGINE_TMPFS, &engine_args);
+            assert_eq!(
+                args.contains(&"--read-only".to_string()),
+                read_only,
+                "{args:?}"
+            );
+            assert_eq!(
+                args.iter().filter(|a| *a == "--tmpfs").count(),
+                ENGINE_TMPFS.len()
+            );
+            assert!(args.contains(&"--ipc=host".to_string()), "{args:?}");
+            let image = args.iter().position(|a| a == "image:tag").unwrap();
+            assert_eq!(&args[image - 2..image - 1], &["--entrypoint"]);
+        }
+        // `--no-hardened`: no part of the block, for either launcher.
+        for launcher in [vllm, sglang] {
+            let args = engine_run_args(
+                run_args(
+                    VllmBackend::Cuda13.engine_args(),
+                    8000,
+                    &[],
+                    None,
+                    false,
+                    None,
+                    &[],
+                ),
+                None,
+                "image:tag".into(),
+                launcher,
+                "/cache/abc/model",
+                serve,
+            );
+            for flag in ["--cap-drop", "--security-opt", "--read-only", "--tmpfs"] {
+                assert!(!args.contains(&flag.to_string()), "{args:?}");
+            }
+        }
+        // vLLM CPU: `--cap-add SYS_NICE` and the seccomp opt-out come after `--cap-drop all`.
+        let args = run_args(
+            VllmBackend::Cpu.engine_args(),
+            8000,
+            &[],
+            None,
+            true,
+            None,
+            ENGINE_TMPFS,
+        );
+        let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+        assert!(at("--cap-drop") < at("--cap-add"), "{args:?}");
+        assert_eq!(args[at("--cap-add") + 1], "SYS_NICE");
+        assert!(args.contains(&"seccomp=unconfined".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn hardened_verify_runs_with_the_same_block_as_spawn() {
+        for (backend, read_only) in [(GpuBackend::Cpu, true), (GpuBackend::Cuda13, false)] {
+            let args = verify_args(backend, Some("b9994"), "llmman-verify-1", true, None);
+            assert_eq!(
+                &args[..5],
+                ["run", "--rm", "--init", "--name", "llmman-verify-1"]
+            );
+            assert_hardened_between(
+                &args,
+                5,
+                read_only,
+                &llama_tmpfs(&backend.engine_args()),
+                &backend.engine_args(),
+            );
+            let at = args
+                .iter()
+                .position(|a| a == &backend.image_ref(Some("b9994")))
+                .unwrap();
+            assert_eq!(&args[at + 1..], ["--version"]);
+        }
+    }
+
+    fn worker_args(backend: GpuBackend, hardened: bool) -> Vec<String> {
+        mediagen_run_args(
+            backend,
+            backend.image_ref(Some("b9994")),
+            "/usr/bin/llmman",
+            "/store",
+            "/cache",
+            "a-model",
+            8090,
+            None,
+            hardened,
+            None,
+        )
+    }
+
+    #[test]
+    fn worker_run_args_mount_the_binary_store_and_cache_read_only_then_serve() {
+        // The media worker (CPU and CUDA) and the speech worker share
+        // this shape; `--no-hardened` carries no hardened flag.
+        for backend in [GpuBackend::Cpu, GpuBackend::Cuda12, SPEECH_BACKEND] {
+            let args = worker_args(backend, false);
+            let engine_args = backend.engine_args();
+            assert_eq!(
+                &args[..6],
+                ["run", "--rm", "--init", "-t", "-p", "127.0.0.1:8090:8090"]
+            );
+            assert_eq!(&args[6..6 + engine_args.len()], engine_args.as_slice());
+            for flag in ["--cap-drop", "--read-only", "--tmpfs"] {
+                assert!(!args.contains(&flag.to_string()), "{backend:?}: {args:?}");
+            }
+            let image = backend.image_ref(Some("b9994"));
+            let at = args.iter().position(|a| a == &image).unwrap();
+            assert_eq!(
+                &args[at - 12..at],
+                [
+                    "-v",
+                    "/usr/bin/llmman:/usr/local/bin/llmman:ro",
+                    "-v",
+                    "/store:/store:ro",
+                    "-v",
+                    "/cache:/cache:ro",
+                    "-e",
+                    "LLMMAN_MODELS=/store",
+                    "-e",
+                    "PATH=/app:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    "--entrypoint",
+                    "/usr/local/bin/llmman",
+                ]
+            );
+            assert_eq!(
+                &args[at + 1..],
+                [
+                    "serve",
+                    "a-model",
+                    "--port",
+                    "8090",
+                    "--host",
+                    "0.0.0.0",
+                    "--runtime",
+                    "path"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn hardened_workers_drop_caps_and_otherwise_match_the_opt_out() {
+        for (backend, read_only) in [
+            (GpuBackend::Cpu, true),
+            (GpuBackend::Cuda12, false),
+            (SPEECH_BACKEND, true),
+        ] {
+            let args = worker_args(backend, true);
+            let tmpfs = llama_tmpfs(&backend.engine_args());
+            assert_hardened_between(&args, 6, read_only, &tmpfs, &backend.engine_args());
+            // Only the hardened flags differ from the `--no-hardened` argv.
+            let mut off = worker_args(backend, false);
+            off.splice(6..6, hardened_args(read_only, &tmpfs));
+            assert_eq!(args, off, "{backend:?}");
+        }
+    }
+
     #[test]
     fn cpus_is_forwarded_as_a_run_flag_only_when_a_limit_binds() {
-        let args = run_args(vec![], 8080, &[], None);
+        let args = run_args(vec![], 8080, &[], None, false, None, &[]);
         assert!(!args.contains(&"--cpus".to_string()), "{args:?}");
-        let args = run_args(vec!["--gpus".into(), "all".into()], 8080, &[], Some(2.0));
+        let args = run_args(
+            vec!["--gpus".into(), "all".into()],
+            8080,
+            &[],
+            Some(2.0),
+            false,
+            None,
+            &[],
+        );
         let cpus = args.iter().position(|a| a == "--cpus").unwrap();
         assert_eq!(args[cpus + 1], "2");
         // A `run` flag: before the engine args, image and engine argv.
         assert!(cpus < args.iter().position(|a| a == "--gpus").unwrap());
         // A fractional cgroup quota is kept, not rounded to a whole CPU.
-        let args = run_args(vec![], 8080, &[], Some(0.5));
+        let args = run_args(vec![], 8080, &[], Some(0.5), false, None, &[]);
         assert!(args.windows(2).any(|w| w == ["--cpus", "0.5"]), "{args:?}");
     }
 
@@ -1773,6 +2980,7 @@ mod tests {
             batch_size: None,
             threads,
             cpus,
+            hardened: false,
             extra_args: &[],
         };
         let image = "ghcr.io/ggml-org/llama.cpp:server";
@@ -1785,6 +2993,7 @@ mod tests {
                 None,
                 &[],
                 o,
+                None,
             )
         };
         let args = argv(opts(Some(2), Some(2.0)));
@@ -1814,6 +3023,7 @@ mod tests {
             batch_size: None,
             threads: Some(2),
             cpus: None,
+            hardened: false,
             extra_args: &["--slot-prompt-similarity".into(), "0.5".into()],
         };
         let args = llama_run_args(
@@ -1824,6 +3034,7 @@ mod tests {
             None,
             &[],
             opts,
+            None,
         );
         assert_eq!(
             args[args.len() - 4..],
@@ -1835,7 +3046,16 @@ mod tests {
     fn vllm_containers_get_cpus_too() {
         let (launcher, _) = ContainerEngine::Vllm.launcher().unwrap();
         let args = engine_run_args(
-            run_args(VllmBackend::Cpu.engine_args(), 8000, &[], Some(3.0)),
+            run_args(
+                VllmBackend::Cpu.engine_args(),
+                8000,
+                &[],
+                Some(3.0),
+                false,
+                None,
+                &[],
+            ),
+            None,
             "docker.io/vllm/vllm-openai-cpu:latest-x86_64".into(),
             launcher,
             "/cache/abc/model",
@@ -1857,6 +3077,178 @@ mod tests {
         println!(
             "container::detect_backend() -> {backend:?} ({})",
             backend.image_ref(None)
+        );
+    }
+    #[test]
+    fn gpu_llama_containers_get_the_shader_cache_tmpfs() {
+        let opts = LlamaOptions {
+            port: 8080,
+            ctx_size: None,
+            flash_attention: None,
+            kv_cache_type: None,
+            context_shift: true,
+            split_mode: None,
+            num_parallel: None,
+            embeddings: false,
+            batch_size: None,
+            threads: None,
+            cpus: None,
+            hardened: true,
+            extra_args: &[],
+        };
+        let argv = |backend: GpuBackend| {
+            llama_run_args(
+                backend,
+                backend.image_ref(None),
+                "/cache/blobs",
+                "sha256-abc",
+                None,
+                &[],
+                opts,
+                None,
+            )
+        };
+        let cache = |args: &[String]| {
+            args.windows(2)
+                .filter(|w| w == &["--tmpfs", "/root/.cache:exec"])
+                .count()
+        };
+        // ROCm's `--device /dev/kfd`: the cache tmpfs, ahead of the image.
+        let args = argv(GpuBackend::Rocm);
+        assert!(args.contains(&"/dev/kfd".to_string()), "{args:?}");
+        let image = args.iter().position(|a| a.starts_with("ghcr.io/")).unwrap();
+        assert_eq!(cache(&args[..image]), 1, "{args:?}");
+        assert_eq!(cache(&args[image..]), 0, "{args:?}");
+        // Vulkan's `--device /dev/dri` (built by hand: the backend's argv
+        // depends on the host's /dev).
+        let vulkan = ["--device", "/dev/dri"].map(String::from);
+        assert_eq!(llama_tmpfs(&vulkan), ["/tmp", "/root/.cache"]);
+        let args = run_args(
+            vulkan.to_vec(),
+            8080,
+            &[],
+            None,
+            true,
+            None,
+            &llama_tmpfs(&vulkan),
+        );
+        assert_eq!(cache(&args), 1, "{args:?}");
+        assert!(args.contains(&"--read-only".to_string()), "{args:?}");
+        // No device: `/tmp` only.
+        let args = argv(GpuBackend::Cpu);
+        assert_eq!(cache(&args), 0, "{args:?}");
+        assert_eq!(
+            args.iter().filter(|a| *a == "--tmpfs").count(),
+            1,
+            "{args:?}"
+        );
+        assert_eq!(llama_tmpfs(&GpuBackend::Cpu.engine_args()), ["/tmp"]);
+        // The verify run follows the same rule.
+        let args = verify_args(GpuBackend::Rocm, None, "v", true, None);
+        assert_eq!(cache(&args), 1, "{args:?}");
+        let args = verify_args(GpuBackend::Cpu, None, "v", true, None);
+        assert_eq!(cache(&args), 0, "{args:?}");
+    }
+
+    #[test]
+    fn vllm_rpc_tmpfs_mounts_an_absolute_path_outside_the_engine_tmpfs() {
+        for (value, expected) in [
+            (None, Ok(None)),
+            (Some("/run/vllm"), Ok(Some("/run/vllm:exec".to_string()))),
+            (Some("/tmp/vllm"), Ok(None)),
+            (Some("/tmp"), Ok(None)),
+            (Some("/root/.cache/rpc"), Ok(None)),
+            // A sibling that merely shares the prefix is not under the root.
+            (Some("/tmpfs"), Ok(Some("/tmpfs:exec".to_string()))),
+            (Some("relative/path"), Err(())),
+            (Some(""), Err(())),
+            // `--tmpfs` would read the tail as mount options.
+            (Some("/run/rpc:rw"), Err(())),
+            (Some("/run/rpc,exec"), Err(())),
+            // A `..` segment could land under a tmpfs root after the check.
+            (Some("/run/../tmp/rpc"), Err(())),
+            (Some("/run/.."), Err(())),
+            // Dots inside a name are not a segment.
+            (Some("/run/..rpc"), Ok(Some("/run/..rpc:exec".to_string()))),
+        ] {
+            let got = vllm_rpc_tmpfs(value, ENGINE_TMPFS);
+            match expected {
+                Ok(expected) => assert_eq!(got, Ok(expected), "{value:?}"),
+                Err(()) => {
+                    let err = got.expect_err(&format!("{value:?}"));
+                    assert!(err.contains("VLLM_RPC_BASE_PATH"), "{err}");
+                    assert!(err.contains(&format!("{:?}", value.unwrap())), "{err}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn engine_rpc_tmpfs_only_applies_to_a_hardened_vllm_container() {
+        let relative = || Some("relative/path".to_string());
+        let absolute = || Some("/run/vllm".to_string());
+        for engine in [ContainerEngine::Vllm, ContainerEngine::VllmOmni] {
+            let (_, prefix) = engine.launcher().unwrap();
+            assert_eq!(
+                engine_rpc_tmpfs(prefix, true, absolute),
+                Ok(Some("/run/vllm:exec".to_string()))
+            );
+            assert!(engine_rpc_tmpfs(prefix, true, relative).is_err());
+            assert_eq!(engine_rpc_tmpfs(prefix, false, relative), Ok(None));
+        }
+        // SGLang never receives the variable, so neither value matters.
+        let (_, prefix) = ContainerEngine::Sglang.launcher().unwrap();
+        assert_eq!(engine_rpc_tmpfs(prefix, true, absolute), Ok(None));
+        assert_eq!(engine_rpc_tmpfs(prefix, true, relative), Ok(None));
+    }
+
+    #[test]
+    fn engine_run_args_mount_the_rpc_tmpfs_before_the_model() {
+        let (launcher, _) = ContainerEngine::Vllm.launcher().unwrap();
+        let engine_args = VllmBackend::Cpu.engine_args();
+        let rpc = vllm_rpc_tmpfs(Some("/run/vllm"), ENGINE_TMPFS).unwrap();
+        let args = engine_run_args(
+            run_args(engine_args, 8000, &[], None, true, None, ENGINE_TMPFS),
+            rpc.as_deref(),
+            "image:tag".into(),
+            launcher,
+            "/cache/abc/model",
+            |dir, host| vec!["serve".into(), dir.into(), "--host".into(), host.into()],
+        );
+        let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+        assert!(
+            args.windows(2).any(|w| w == ["--tmpfs", "/run/vllm:exec"]),
+            "{args:?}"
+        );
+        assert!(at("/run/vllm:exec") < at("-v"), "{args:?}");
+        assert_eq!(
+            args.iter().filter(|a| *a == "--tmpfs").count(),
+            ENGINE_TMPFS.len() + 1
+        );
+        // SGLang gets no rpc tmpfs (see `engine_rpc_tmpfs`): only the
+        // engine's own.
+        let (launcher, prefix) = ContainerEngine::Sglang.launcher().unwrap();
+        let rpc = engine_rpc_tmpfs(prefix, true, || Some("/run/vllm".to_string())).unwrap();
+        let args = engine_run_args(
+            run_args(
+                VllmBackend::Cpu.engine_args(),
+                8000,
+                &[],
+                None,
+                true,
+                None,
+                ENGINE_TMPFS,
+            ),
+            rpc.as_deref(),
+            "image:tag".into(),
+            launcher,
+            "/cache/abc/model",
+            |dir, host| vec!["serve".into(), dir.into(), "--host".into(), host.into()],
+        );
+        assert!(!args.iter().any(|a| a == "/run/vllm:exec"), "{args:?}");
+        assert_eq!(
+            args.iter().filter(|a| *a == "--tmpfs").count(),
+            ENGINE_TMPFS.len()
         );
     }
 }

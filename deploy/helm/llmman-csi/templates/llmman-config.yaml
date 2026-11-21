@@ -1,0 +1,18 @@
+{{- if or .Values.llmman.config .Values.llmman.keys }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "llmman-csi.fullname" . }}-llmman
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "llmman-csi.labels" . | nindent 4 }}
+data:
+  {{- with .Values.llmman.config }}
+  llmman.conf: |
+    {{- . | nindent 4 }}
+  {{- end }}
+  {{- range $name, $key := .Values.llmman.keys }}
+  {{ printf "key-%s" $name | quote }}: |
+    {{- $key | nindent 4 }}
+  {{- end }}
+{{- end }}

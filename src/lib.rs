@@ -1,21 +1,29 @@
 #![recursion_limit = "256"]
 
 pub mod auth;
+pub mod authscheme;
+pub mod aws;
+pub mod azure;
+pub mod chains;
 pub mod chat_template;
 pub mod cmd;
 pub mod config;
 pub mod container;
+pub mod credentials;
 pub mod daemon;
 pub mod ffi;
 pub mod fmt;
 pub mod fsutil;
+pub mod gcp;
 pub mod gguf;
 pub mod harmony;
 pub mod hf;
 pub mod hostgpu;
 pub mod hybrid;
 pub mod imagegen;
+pub mod jwt;
 pub mod llama_release;
+pub mod logins;
 pub(crate) mod managed;
 pub mod mediagen;
 pub mod metrics;
@@ -30,8 +38,11 @@ pub mod shortnames;
 pub mod sources;
 pub mod speech;
 pub mod storage;
+#[cfg(test)]
+pub(crate) mod testserver;
 pub mod thinking;
 pub mod tk;
+pub mod tokensvc;
 pub mod usage;
 pub mod verify;
 pub mod webui;
@@ -128,7 +139,7 @@ pub fn env_flag_set(name: &str) -> bool {
     parse_env_flag(std::env::var(name).ok().as_deref())
 }
 
-fn parse_env_flag(value: Option<&str>) -> bool {
+pub(crate) fn parse_env_flag(value: Option<&str>) -> bool {
     let Some(v) = value else { return false };
     let v = v.trim();
     if v.is_empty() {

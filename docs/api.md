@@ -7,7 +7,7 @@ Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
 | API | Endpoints |
 |-----|-----------|
 | Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/pull`, `/api/push`, `/api/copy`, `/api/create`, `/api/blobs/{digest}`, `/api/ps`, `/api/delete`, `/api/version` |
-| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`), `/v1/systemone` (llama-server's own API for decision models) |
+| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`), `/v1/audio/speech`, `/tts` (llama-server's own text to speech), `/v1/realtime` (WebSocket), `/v1/systemone` (llama-server's own API for decision models) |
 | Anthropic | `/v1/messages` |
 | llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/providers/{id}/key`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/shell` |
 | Web UI | `/`, `/ui/*` and, for a browser, any other path outside the prefixes above (`/models`, `/c/<id>`) — see [webui.md](webui.md) |
@@ -52,7 +52,7 @@ since llmman leaves templating to the backend.
 Of `options`, `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stop`,
 `num_predict`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`,
 `num_thread` and `num_ctx` apply. `num_ctx` is the window a llama-server
-model is loaded with, over `LLMMAN_CONTEXT_LENGTH` and cut to its trained
+model is loaded with, over `LLMMAN_CONTEXT_LENGTH` (`LLMMAN_EMBEDDING_CONTEXT_LENGTH` for an embedding model) and cut to its trained
 context. As in Ollama, a model loaded with another window is reloaded once
 its requests finish, and requests that arrive meanwhile wait. A request with
 no `num_ctx` uses whichever window is loaded. The `done`
@@ -78,9 +78,14 @@ once per model.
 `high`, `xhigh`, `max`), forwarded as llama-server's
 `chat_template_kwargs`. `/api/show` returns `capabilities` and, for a
 local model with one, `template`. They are `completion` (`embedding` for a
-pooling model, `decision` for a decision model), `vision` with a projector,
-`tools` when the chat template renders a request's `tools`, and `thinking`
-when it handles reasoning.
+pooling model, `decision` for a decision model), `vision` or `audio` with a projector
+that has that encoder, `tools` when the chat template renders a request's
+`tools`, and `thinking` when it handles reasoning. A llama-server model that thinks also gets Ollama's
+`thinking: {"values": [...], "default": ...}`: `false` plus the levels its
+template names (Qwen3.8: `low`, `medium`, `xhigh`), or `minimal`, `low`, `medium`
+and `high` for a switch-only template (Qwen3.5, Gemma 4). On `/api/chat` and
+`/api/generate` a `think` level outside `values` becomes the `default`, as in
+Ollama; a `think` that is not a boolean or string is a `400`.
 
 On `/api/chat` and `/api/generate`, `think: "minimal"` and `"low"` also
 get the thinking budget a local `/v1/chat/completions` gives those
@@ -116,11 +121,15 @@ size a model by (`meta.n_ctx_train` is OpenClaw's context window). A loaded
 llama-server's own are passed through, `meta.n_ctx` included. Before a model
 is loaded, `meta.n_ctx_train` comes from the GGUF header, `meta.n_ctx` is the
 per-slot context the llama-server a load starts would report (from
-`LLMMAN_CONTEXT_LENGTH` and `LLMMAN_NUM_PARALLEL`, never past `n_ctx_train`; a
+`LLMMAN_CONTEXT_LENGTH` (`LLMMAN_EMBEDDING_CONTEXT_LENGTH` for an embedding model) and `LLMMAN_NUM_PARALLEL`, never past `n_ctx_train`; a
 request's `num_ctx` or an out-of-memory retry can still change it), and
-`architecture.input_modalities` comes from what the model can do (`text`, plus
-`image` with a vision projector); a model that does not generate text has no
-`architecture`. `meta.n_ctx` is left out for a model llama-server does not
+`architecture.input_modalities` and `output_modalities` come from what the
+model can do, as llama-server reports it before a load: `text`, plus `image`
+or `audio` when the projector (`--mmproj`) has a vision or audio encoder; out,
+`text`, plus `audio` when it generates speech, or `audio` alone for text to
+speech without a chat template (Soprano, Qwen3-TTS). A loaded model's own list
+is passed through. A model that does not generate text has no `architecture`.
+`meta.n_ctx` is left out for a model llama-server does not
 serve (media, or a GGUF that goes to ds4-server), and when `LLMMAN_LLAMA_ARGS`
 or a `LLAMA_ARG_*` variable sets llama-server's context size, slots or KV
 unification itself.
@@ -182,6 +191,23 @@ carries one). Bodies up to 200 MiB are accepted. A llama-server is given
 a transcription `prompt` if the request has none (not for LFM2 models,
 which have their own).
 
+`/v1/audio/speech` and `/tts` are pass-throughs to the text-to-speech models
+llama-server serves: LFM3-Omni, LFM3-Audio, Soprano, Qwen3-TTS, Chatterbox,
+ZONOS3 (llama.cpp `b12425` or later), Drama 3 and the rest of
+[ggml-org's TTS collection](https://huggingface.co/collections/ggml-org/tts-models).
+`/tts` is llama-server's own route and takes more: `voice`, `lang`,
+`n_predict`, `stream`, raw PCM (`response_format`: `pcm16`) and a reference
+clip to clone a voice from, as `speaker_ref_b64` in JSON or a `speaker_ref`
+upload in a `multipart/form-data` request (routed by its `model` field, up to
+200 MiB). Neither goes to a provider.
+
+`/v1/realtime?model=<model>` is llama-server's realtime WebSocket, relayed to
+the model's llama-server once loaded: live transcription (`&intent=transcription`)
+and a spoken conversation with LFM3-Omni or LFM3-Audio. Events pass through
+unread, but for the `model` of a `session.*` event, which is the one the request
+named. Only a model served here or by a peer has the route. A page on an origin
+`LLMMAN_ORIGINS` does not allow is refused, here and on `/tts` and transcription.
+
 `/v1/systemone` answers typed questions about a `state` with a decision model
 (a GGUF with a `<arch>.decision.type`, such as Clef), with a probability for
 each answer; `llmman run MODEL --ask ...` is its client. It is
@@ -231,6 +257,37 @@ no price), including `cache_read`/`cache_write`/`reasoning` where it publishes t
 (at most every five minutes). `llmman providers`, `list --provider`, `run --provider` and
 `launch --provider` are all clients of it, so the catalog is fetched and
 cached in one process: the one that forwards the request upstream.
+
+Each provider also reports what credential the daemon would spend, and
+never the secret:
+
+```json
+{ "id": "openai-chatgpt", "name": "OpenAI (ChatGPT subscription)",
+  "base_url": "https://chatgpt.com/backend-api/codex", "wire": "openai",
+  "key_set": true, "key_usable": true, "key_optional": false,
+  "credential": { "kind": "oauth", "state": "ready", "expires_at_ms": 1790000000000 },
+  "auth": "default", "models": 21 }
+```
+
+`credential.kind` is `env` or `config` (a key in the daemon's environment
+or `llmman.conf`), `api_key`, `oauth`, `token`, `command`, `file` or
+`cli_login` (a stored [login](providers.md#logging-in)), or, for a
+[cloud credential chain](providers.md#cloud-credentials), `aws_sigv4`,
+`adc` (Google Application Default Credentials), `entra`,
+`client_credentials`, `jwt_bearer` or `ibm_iam`. For a chain `ready` means
+only that the machine says the chain is there (an environment variable, a
+profile, a credentials file, a stored selection): nothing is asked of AWS,
+Google or Azure to report it, so a chain that will fail when asked is still
+`ready` until a request finds out. `expires_at_ms` is then the expiry of the
+token in hand, when there is one. `credential.state`
+is `ready`; `refresh` (an OAuth access token that has lapsed and is renewed
+by the next request); or `expired` (it cannot be renewed: log in again —
+`key_set` and `key_usable` are then `false`). `expires_at_ms` is present for
+a credential that expires. `credential` is absent when the daemon has none.
+`key_set` means "has a credential of any kind" and equals what it always did
+for a provider keyed only by variable or file. `auth` is how a credential is
+attached: `default` (the wire's own), `bearer`, `x-api-key`, `header` or
+`query`. Older clients ignore both fields.
 
 A provider [defined in `llmman.conf`](providers.md#your-own-endpoints)
 appears alongside the catalog ones with `key_optional: true`, no
@@ -330,7 +387,7 @@ connection the process makes, providers included.
 `/metrics` is a Prometheus scrape target, off by default because an
 open daemon has no authentication; with keys configured it requires one
 like every other route. `LLMMAN_METRICS=1 llmman serve` turns it on;
-the fifteen metric families and how to read them are in
+the seventeen metric families and how to read them are in
 [metrics.md](metrics.md).
 
 ## CORS

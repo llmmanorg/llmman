@@ -25,7 +25,7 @@ scrape_configs:
 
 ## Metric families
 
-Fifteen metric families:
+Seventeen metric families:
 
 | Metric | Type | Labels | What it tells you |
 |--------|------|--------|-------------------|
@@ -37,6 +37,8 @@ Fifteen metric families:
 | `llmman_models_loaded` | gauge | — | Backends currently running, the set `/api/ps` reports. |
 | `llmman_models_loading` | gauge | — | Loads under way; `loaded + loading` is what `LLMMAN_MAX_LOADED_MODELS` caps. |
 | `llmman_model_up` | gauge | `model`, `engine` | 1 while the backend process is alive, 0 once it has died but llmman has not noticed. |
+| `llmman_requests_in_flight` | gauge | `model` | Requests a loaded model is serving or holding, including responses still being sent. |
+| `llmman_requests_queued` | gauge | `model` | Estimate of those waiting for a free `LLMMAN_NUM_PARALLEL` slot. Absent where llmman does not know the slot count (diffusion, `--parallel` in `LLMMAN_LLAMA_ARGS`, no `--ctx-size`). |
 | `llmman_model_loads_total` | counter | `model` | Cold starts per model — the churn a too-small `LLMMAN_MAX_LOADED_MODELS` produces. |
 | `llmman_model_load_duration_seconds` | histogram | `model` | How long a cold start takes, from admission to ready. |
 | `llmman_model_load_oom_retries_total` | counter | `model`, `strategy` | Loads that hit an out-of-memory failure and retried: `evict_others`, `split_mode`, `ctx_shrink`. |

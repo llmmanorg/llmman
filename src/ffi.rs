@@ -35,6 +35,8 @@ extern "C" {
         reference: *const c_char,
         digest: *const c_char,
         keys_json: *const c_char,
+        claims: *const c_char,
+        identity_json: *const c_char,
     ) -> *mut c_char;
     fn llmman_sign(
         reference: *const c_char,
@@ -344,10 +346,33 @@ pub fn transfer(source: &str, destination: &str) -> anyhow::Result<TransferOutco
     serde_json::from_str(&data).context("decode transfer outcome")
 }
 
-/// One signature that verified, and the trusted key that accepted it.
+/// A keyless trust rule as the shim reads it (go-shim/sigstore.go's
+/// `identityPolicy`): the OIDC issuer and the certificate SAN a signing
+/// certificate must carry, and the Sigstore TrustedRoot to anchor it
+/// to. Unset fields are omitted rather than sent as `null`, which the
+/// Go side cannot tell from an empty string anyway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Identity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted_root: Option<String>,
+}
+
+/// One signature that verified, and the trusted key or identity that
+/// accepted it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignatureMatch {
+    /// What accepted it, as a label fit for a report: the key path for
+    /// a key match, the rule's issuer and subject for an identity match.
+    pub signer: String,
+    /// The trusted key file that accepted it; empty for an identity
+    /// match.
+    #[serde(default)]
     pub key_path: String,
     /// The `docker-reference` the signer claimed to be signing.
     pub identity: String,
@@ -371,15 +396,32 @@ pub struct VerifyReport {
 }
 
 /// Check the signatures published for `reference` against the PEM public
-/// keys at `keys`. `digest` may be `""` to resolve `reference` first.
+/// keys at `keys` and, when set, the keyless `identity`. `digest` may be
+/// `""` to resolve `reference` first. `claims` is the glob the
+/// signature's claimed repository must match, or `""` to require it to
+/// equal the pulled repository. An unset `identity` crosses as `""`, the
+/// same convention `digest` and `claims` use.
 ///
 /// "Not verified" comes back as `Ok` with `verified` false; `Err` means
 /// no answer could be reached. `crate::verify` decides what each means.
-pub fn verify(reference: &str, digest: &str, keys: &[String]) -> anyhow::Result<VerifyReport> {
+pub fn verify(
+    reference: &str,
+    digest: &str,
+    keys: &[String],
+    claims: &str,
+    identity: Option<&Identity>,
+) -> anyhow::Result<VerifyReport> {
     let r = cstr(reference)?;
     let d = cstr(digest)?;
     let k = cstr(&serde_json::to_string(keys).context("encode trusted key list")?)?;
-    let data = registry_call(|| unsafe { llmman_verify(r.as_ptr(), d.as_ptr(), k.as_ptr()) })?;
+    let c = cstr(claims)?;
+    let i = cstr(&match identity {
+        Some(identity) => serde_json::to_string(identity).context("encode identity policy")?,
+        None => String::new(),
+    })?;
+    let data = registry_call(|| unsafe {
+        llmman_verify(r.as_ptr(), d.as_ptr(), k.as_ptr(), c.as_ptr(), i.as_ptr())
+    })?;
     serde_json::from_str(&data).context("decode verification report")
 }
 
@@ -625,5 +667,27 @@ mod tests {
     #[test]
     fn push_stream_open_rejects_garbage() {
         assert!(PushStreamOpen::decode("not json").is_err());
+    }
+
+    #[test]
+    fn identity_crosses_as_camel_case_without_unset_fields() {
+        let identity = Identity {
+            issuer: Some("https://issuer".into()),
+            subject: None,
+            trusted_root: Some("/etc/llmman/root.json".into()),
+        };
+        assert_eq!(
+            serde_json::to_string(&identity).unwrap(),
+            r#"{"issuer":"https://issuer","trustedRoot":"/etc/llmman/root.json"}"#
+        );
+    }
+
+    #[test]
+    fn a_signature_match_without_a_key_path_decodes() {
+        let m: SignatureMatch =
+            serde_json::from_str(r#"{"signer":"https://issuer me@x","identity":"docker.io/a/b"}"#)
+                .unwrap();
+        assert_eq!(m.signer, "https://issuer me@x");
+        assert_eq!(m.key_path, "");
     }
 }

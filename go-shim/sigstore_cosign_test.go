@@ -76,7 +76,7 @@ func TestABundleSignedManifestIsReportedAsSuchNotAsUnsigned(t *testing.T) {
 		t.Skipf("this cosign build could not sign against the test registry: %v", err)
 	}
 
-	report, err := verifySignatures(ctx, ref, target, []string{filepath.Join(keys, "cosign.pub")})
+	report, err := verifySignatures(ctx, ref, target, []string{filepath.Join(keys, "cosign.pub")}, nil, "")
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}

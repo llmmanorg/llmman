@@ -98,10 +98,8 @@ pub(super) fn from_responses_request(req: &Value) -> anyhow::Result<Value> {
     }
 
     match req.get("input") {
-        Some(Value::String(prompt)) => {
-            if !prompt.is_empty() {
-                messages.push(json!({ "role": "user", "content": prompt }));
-            }
+        Some(Value::String(prompt)) if !prompt.is_empty() => {
+            messages.push(json!({ "role": "user", "content": prompt }));
         }
         Some(Value::Array(items)) => {
             for (i, item) in items.iter().enumerate() {
@@ -1172,8 +1170,8 @@ pub(super) async fn remote_responses(
         if let Some(ct) = headers.get("content-type") {
             native = native.header("content-type", ct);
         }
-        let resp = native
-            .send()
+        let resp = target
+            .send(native)
             .await
             .with_context(|| format!("proxy request to {}", target.describe()))?;
         let status = resp.status();

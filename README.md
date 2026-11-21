@@ -212,6 +212,26 @@ A `[verify]` trust policy turns that into an automatic check on every
 there is nothing to check against until you have said whom you trust.
 See [docs/verification.md](docs/verification.md).
 
+### Mount a model in Kubernetes
+
+`llmman-csi` is a CSI driver that mounts a ModelPack artifact into a pod,
+read-only, as the whole model directory, so vLLM, SGLang or llama.cpp can
+read it from a path. It takes the same `model.csi.modelpack.org` volume as
+[modelpack/model-csi-driver](https://github.com/modelpack/model-csi-driver)
+and pulls each model once per node, under the same signature policy:
+
+```yaml
+volumes:
+  - name: model
+    csi:
+      driver: model.csi.modelpack.org
+      volumeAttributes:
+        model.csi.modelpack.org/reference: "registry.example.com/models/qwen3-0.6b:latest"
+```
+
+See [docs/kubernetes.md](docs/kubernetes.md) for the Helm chart, registry
+credentials and what it does not do.
+
 ### Compared with Ollama
 
 Ollama stores models in its own blob layout behind its own registry
@@ -319,7 +339,7 @@ llmman launch grok --model qwen3.8 -- -p "Explain this repository"
 Run `llmman launch` with no arguments to list the supported integrations
 (Claude Code, OpenCode, Codex, GitHub Copilot CLI, Factory Droid, Pi, OMP, Cline, Aider,
 Qwen Code, Gemini CLI, Grok Build, AGY, DeepSeek Harness, Docker Agent,
-goose, goose Desktop, ...) and whether
+Mistral Vibe, goose, goose Desktop, ...) and whether
 each is installed. Installing an
 integration is up to you; llmman only execs what is already on your
 machine, except that a missing Cline can be installed with npm after an
@@ -331,10 +351,14 @@ To stop retyping flags, set them once, e.g. `llmman config set
 launch.opencode.model claude-sonnet-5-5` (also `.provider`, `.variant`);
 flags you type still win. See [launch defaults](docs/configuration.md#launch-defaults).
 
-`--optimizer tk` (`claude` only) compacts the output of the shell commands the agent
+`--optimizer tk` (`claude`, `opencode`) compacts the output of the shell commands the agent
 runs (`git status`, `cargo test`, ...) before the agent reads it, preserving
-exit codes and keeping error text; `--optimizer none` is the default and
-changes nothing. See [docs/optimizers.md](docs/optimizers.md).
+exit codes and keeping error text; `--optimizer cvmn` (`claude`, `codex`,
+`opencode`) asks the model for terse replies: answer first, no filler, code and
+errors verbatim; `--optimizer hdrm` (`claude`, `codex`, `opencode`) compresses
+what the agent sends the model (tool output, logs, history) with a local proxy
+that lives as long as the session. `--optimizer none` is the default and changes nothing. See
+[docs/optimizers.md](docs/optimizers.md).
 
 ```
 llmman launch claude --model qwen3.8 --optimizer tk
@@ -375,6 +399,21 @@ packages differ in that capital alone. Windows ships as a zip with no
 installer: add the unpacked folder to `PATH` and its `Goose.exe` is found
 there, told apart from the `goose` CLI — the same name to Windows — by the
 Electron files beside it.
+
+`goose-desktop` also runs without `--model` for dictation only: set
+`OPENAI_TRANSCRIPTION_MODEL` to a speech model and goose's microphone button
+posts to llmman's `/v1/audio/transcriptions`. goose gets only `OPENAI_HOST` and
+`OPENAI_API_KEY`, so its chat provider stays your choice in its settings.
+
+```sh
+OPENAI_TRANSCRIPTION_MODEL=hf.co/ggml-org/Voxtral-Mini-3B-2507-GGUF:Q4_K_M \
+  llmman launch goose-desktop
+```
+
+The launch does not pull the speech model, so `llmman pull` it first or the
+first dictation waits for the download. `OPENAI_HOST` is also goose's OpenAI
+chat provider's host, so choosing "OpenAI" for chat sends it to llmman too.
+`--provider` still needs `--model`.
 
 Docker Agent is found on `PATH` or in `~/.docker/cli-plugins`, where Docker
 Desktop and `brew install docker-agent` put it. llmman generates its own
@@ -459,9 +498,10 @@ in [docs/sandbox.md](docs/sandbox.md).
 | [docs/android.md](docs/android.md) | The Android app: install, what runs on the phone, building the APK |
 | [docs/backends.md](docs/backends.md) | llama.cpp, vLLM, SGLang, MLX, containers, and building from source |
 | [docs/compose.md](docs/compose.md) | Compose deployment behind a gateway, with persistent model storage |
+| [docs/kubernetes.md](docs/kubernetes.md) | The CSI driver that mounts ModelPack models into pods, and its Helm chart |
 | [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, registry mirrors, environment variables, store layout |
 | [docs/providers.md](docs/providers.md) | Hosted providers, API keys, and which integrations can use them |
 | [docs/sandbox.md](docs/sandbox.md) | `launch --sandbox`: what each sandbox shares and how it reaches the daemon |
-| [docs/optimizers.md](docs/optimizers.md) | `launch --optimizer`: what `none` and `tk` do, what `tk` filters, and its limits |
+| [docs/optimizers.md](docs/optimizers.md) | `launch --optimizer`: what `none`, `tk`, `cvmn` and `hdrm` do, what `tk` filters, and their limits |
 | [docs/verification.md](docs/verification.md) | Signing models and pull-time trust policy |
 | [docs/metrics.md](docs/metrics.md) | The Prometheus `/metrics` families |

@@ -42,6 +42,31 @@ pub(crate) fn ensure<T>(
     cached: impl Fn(&Path) -> Option<T>,
     install: impl FnOnce(&Path) -> Result<T>,
 ) -> Result<T> {
+    ensure_in(root, dest, what, cached, install, true)
+}
+
+/// [`ensure`] for a `dest` whose siblings under `root` are not other versions
+/// of it, so nothing is pruned.
+pub(crate) fn ensure_dir<T>(
+    root: &Path,
+    dest: &Path,
+    what: &str,
+    cached: impl Fn(&Path) -> Option<T>,
+    install: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
+    ensure_in(root, dest, what, cached, install, false)
+}
+
+/// The protocol of [`ensure`]; `prune` deletes the other versions, under the
+/// lock so another installer's directory is not swept away.
+fn ensure_in<T>(
+    root: &Path,
+    dest: &Path,
+    what: &str,
+    cached: impl Fn(&Path) -> Option<T>,
+    install: impl FnOnce(&Path) -> Result<T>,
+    prune: bool,
+) -> Result<T> {
     if let Some(found) = cached(dest) {
         return Ok(found);
     }
@@ -57,7 +82,9 @@ pub(crate) fn ensure<T>(
     let out = install(dest)?;
     std::fs::write(dest.join(COMPLETE_SENTINEL), b"")
         .with_context(|| format!("write {}", dest.join(COMPLETE_SENTINEL).display()))?;
-    prune_others(root, dest);
+    if prune {
+        prune_others(root, dest);
+    }
     Ok(out)
 }
 
@@ -95,12 +122,20 @@ fn prune_others(root: &Path, keep: &Path) {
 }
 
 /// An exclusive advisory lock on `<root>/.lock`, released on drop.
-struct InstallLock {
+pub(crate) struct InstallLock {
     _file: std::fs::File,
 }
 
 impl InstallLock {
     fn acquire(root: &Path, what: &str) -> Result<InstallLock> {
+        Self::acquire_noting(
+            root,
+            &format!("another llmman process is installing {what}; waiting for it to finish"),
+        )
+    }
+
+    /// Takes the lock, printing `waiting` first if another process holds it.
+    pub(crate) fn acquire_noting(root: &Path, waiting: &str) -> Result<InstallLock> {
         std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
         let path = root.join(".lock");
         let file =
@@ -108,9 +143,7 @@ impl InstallLock {
         match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
-                eprintln!(
-                    "[llmman] another llmman process is installing {what}; waiting for it to finish"
-                );
+                eprintln!("[llmman] {waiting}");
                 file.lock()
                     .with_context(|| format!("lock {}", path.display()))?;
             }
@@ -166,6 +199,25 @@ mod tests {
 
         // Complete: the installer is not called again.
         ensure(&root, &dest, "test", cached, |_| panic!("reinstalled")).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_dir_installs_once_and_prunes_nothing() {
+        let root = temp_root("ensure-dir");
+        // not a version of `dest`: a layer's files, next to its extraction
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        let dest = root.join("files");
+        let cached = |d: &Path| is_complete(d).then(|| d.to_path_buf());
+        let got = ensure_dir(&root, &dest, "test", cached, |d| {
+            std::fs::write(d.join("a"), b"a")?;
+            Ok(d.to_path_buf())
+        })
+        .unwrap();
+        assert_eq!(got, dest);
+        assert!(root.join("other").is_dir(), "ensure_dir pruned a sibling");
+        // complete: not installed again
+        ensure_dir(&root, &dest, "test", cached, |_| panic!("reinstalled")).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 

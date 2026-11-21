@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{bail, Context};
 use clap::Args;
 
@@ -9,8 +11,10 @@ pub struct VerifyArgs {
     #[arg(value_name = "REFERENCE")]
     pub reference: String,
 
-    /// PEM public key to trust, repeatable. Overrides whatever
-    /// the `[verify]` policy would have selected for this reference.
+    /// PEM public key to trust, repeatable. Only these keys are
+    /// checked: the keys and the keyless identity the `[verify]`
+    /// policy would have selected for this reference are set aside.
+    /// The matching rule's `claims` still applies.
     #[arg(long = "key", value_name = "PATH")]
     pub keys: Vec<String>,
 
@@ -38,30 +42,33 @@ pub fn run(args: &VerifyArgs) -> anyhow::Result<()> {
     crate::shortnames::validate_reference(&args.reference)?;
     let reference = crate::shortnames::resolve(&args.reference)?;
 
-    let keys: Vec<String> = if !args.keys.is_empty() {
-        args.keys.clone()
-    } else {
-        // Whatever the policy selects for this reference; failing that,
-        // every key it names anywhere. An explicit ask deserves a real
-        // attempt — "here are the keys I know about, none signed it" is
-        // more useful than "no rule matched".
-        let mut keys = crate::verify::decide(&reference)?.keys;
-        if keys.is_empty() {
-            keys = crate::verify::all_configured_keys()?;
-        }
-        keys.iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect()
-    };
-    if keys.is_empty() {
+    // See `select_trust` for how explicit keys replace the rule's acceptors.
+    let decision = crate::verify::decide(&reference)?;
+    let (keys, claims, identity) =
+        select_trust(&args.keys, decision, crate::verify::all_configured_keys)?;
+    let keys: Vec<String> = keys
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    if keys.is_empty() && identity.is_none() {
         bail!(
             "no trusted public keys to check {reference} against — pass --key PATH, \
              or add a [[verify.trust]] rule to llmman.conf"
         );
     }
+    if keys.is_empty()
+        && identity
+            .as_ref()
+            .is_some_and(|identity| identity.trusted_root.is_none())
+    {
+        bail!(
+            "cannot verify {reference}: the matching [[verify.trust]] rule names an identity \
+             but no `trusted_root` is configured under [verify]"
+        );
+    }
 
-    let report =
-        ffi::verify(&reference, "", &keys).with_context(|| format!("verify {reference}"))?;
+    let report = ffi::verify(&reference, "", &keys, &claims, identity.as_ref())
+        .with_context(|| format!("verify {reference}"))?;
 
     if args.json {
         println!(
@@ -81,6 +88,38 @@ pub fn run(args: &VerifyArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Keys, claims and identity to check a reference against. With
+/// explicit keys, those keys alone plus the matching rule's `claims`;
+/// the rule's identity is dropped, since the user asked about the
+/// keys. Otherwise whatever the matching rule selects; failing that, every
+/// key the policy names anywhere (`all_keys`). An explicit ask deserves
+/// a real attempt: "here are the keys I know about, none signed it" is
+/// more useful than "no rule matched". The rule's `claims` applies
+/// either way, so the fallback keys are held to the identity the rule
+/// names.
+///
+/// A keyless rule has no keys by construction and is not widened to
+/// every configured key: it chose an identity, and that is what gets
+/// checked.
+fn select_trust(
+    explicit_keys: &[String],
+    decision: crate::verify::Decision,
+    all_keys: impl FnOnce() -> anyhow::Result<Vec<PathBuf>>,
+) -> anyhow::Result<(Vec<PathBuf>, String, Option<ffi::Identity>)> {
+    if !explicit_keys.is_empty() {
+        let keys = explicit_keys.iter().map(PathBuf::from).collect();
+        return Ok((keys, decision.claims.unwrap_or_default(), None));
+    }
+    let identity = decision.identity();
+    let claims = decision.claims.unwrap_or_default();
+    let keys = if decision.keys.is_empty() && identity.is_none() {
+        all_keys()?
+    } else {
+        decision.keys
+    };
+    Ok((keys, claims, identity))
+}
+
 fn print_human(report: &ffi::VerifyReport) {
     println!("Reference:  {}", report.reference);
     println!("Digest:     {}", report.digest);
@@ -88,7 +127,7 @@ fn print_human(report: &ffi::VerifyReport) {
     if report.verified {
         println!("Verified:   yes");
         for m in &report.matches {
-            println!("  signed by {} claiming {}", m.key_path, m.identity);
+            println!("  signed by {} claiming {}", m.signer, m.identity);
         }
     } else {
         println!("Verified:   no");
@@ -117,6 +156,8 @@ struct JsonReport<'a> {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonMatch<'a> {
+    signer: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
     key_path: &'a str,
     identity: &'a str,
 }
@@ -132,11 +173,100 @@ impl<'a> From<&'a ffi::VerifyReport> for JsonReport<'a> {
                 .matches
                 .iter()
                 .map(|m| JsonMatch {
+                    signer: &m.signer,
                     key_path: &m.key_path,
                     identity: &m.identity,
                 })
                 .collect(),
             reason: &r.reason,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::verify::{Decision, Mode};
+
+    #[test]
+    fn select_trust_keeps_claims_when_falling_back_to_all_keys() {
+        let decision = Decision {
+            mode: Mode::Warn,
+            keys: vec![],
+            claims: Some("docker.io/myorg/**".into()),
+            issuer: None,
+            subject: None,
+            trusted_root: None,
+        };
+        let (keys, claims, identity) =
+            select_trust(&[], decision, || Ok(vec![PathBuf::from("/k.pub")])).unwrap();
+        assert_eq!(keys, vec![PathBuf::from("/k.pub")]);
+        assert_eq!(claims, "docker.io/myorg/**");
+        assert_eq!(identity, None);
+
+        // A rule with keys uses them and never consults the fallback.
+        let decision = Decision {
+            mode: Mode::Warn,
+            keys: vec![PathBuf::from("/rule.pub")],
+            claims: None,
+            issuer: None,
+            subject: None,
+            trusted_root: None,
+        };
+        let (keys, claims, identity) =
+            select_trust(&[], decision, || panic!("fallback consulted")).unwrap();
+        assert_eq!(keys, vec![PathBuf::from("/rule.pub")]);
+        assert_eq!(claims, "");
+        assert_eq!(identity, None);
+    }
+
+    #[test]
+    fn select_trust_passes_an_identity_rule_through_without_widening_to_all_keys() {
+        let decision = Decision {
+            mode: Mode::Enforce,
+            keys: vec![],
+            claims: None,
+            issuer: Some("https://issuer".into()),
+            subject: Some("me@example.com".into()),
+            trusted_root: Some(PathBuf::from("/etc/llmman/root.json")),
+        };
+        let (keys, claims, identity) =
+            select_trust(&[], decision, || panic!("fallback consulted")).unwrap();
+        assert!(keys.is_empty());
+        assert_eq!(claims, "");
+        assert_eq!(
+            identity,
+            Some(ffi::Identity {
+                issuer: Some("https://issuer".into()),
+                subject: Some("me@example.com".into()),
+                trusted_root: Some("/etc/llmman/root.json".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn select_trust_with_explicit_keys_checks_only_those_keys() {
+        // The rule's identity is dropped whether or not a trusted root
+        // backs it, so `run` never bails on a missing root here and the
+        // shim is never asked to accept a certificate the user did not
+        // mention. Only `claims` carries over.
+        for trusted_root in [Some(PathBuf::from("/etc/llmman/root.json")), None] {
+            let decision = Decision {
+                mode: Mode::Enforce,
+                keys: vec![PathBuf::from("/rule.pub")],
+                claims: Some("docker.io/myorg/**".into()),
+                issuer: Some("https://issuer".into()),
+                subject: Some("me@example.com".into()),
+                trusted_root,
+            };
+            let (keys, claims, identity) =
+                select_trust(&["/other.pub".to_string()], decision, || {
+                    panic!("fallback consulted")
+                })
+                .unwrap();
+            assert_eq!(keys, vec![PathBuf::from("/other.pub")]);
+            assert_eq!(claims, "docker.io/myorg/**");
+            assert_eq!(identity, None);
         }
     }
 }

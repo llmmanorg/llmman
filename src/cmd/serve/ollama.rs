@@ -19,7 +19,7 @@ use tokio::time::{sleep, Duration, Instant};
 
 use super::backend::*;
 use super::hybrid::send_with_hybrid_fallback;
-use super::openai::{effort_budget_for, effort_budget_tokens, EFFORT_BUDGET_MESSAGE};
+use super::openai::{effort_budget_for, effort_budget_tokens, thinking_for, EFFORT_BUDGET_MESSAGE};
 use super::refusal::wire_refusal;
 use super::sched::*;
 use super::stream::*;
@@ -29,6 +29,7 @@ use super::{
     pull_serialized, release_model_lock, remote_status, unload_everywhere, AppError, AppState,
     LoadOptions, Target, Task,
 };
+use crate::fsutil::HashingWriter;
 use crate::metrics::{self, UnloadReason};
 use crate::storage::OciStore;
 
@@ -125,6 +126,11 @@ pub(super) struct ModelFacts {
     capabilities: Vec<String>,
     /// The GGUF's `general.architecture`, if it has one.
     architecture: Option<String>,
+    /// What the projector takes in and gives out; `None` without a readable one.
+    projector: Option<crate::gguf::ProjectorCaps>,
+    /// A projector that generates audio on a model without one is text to
+    /// speech only.
+    has_chat_template: bool,
 }
 
 impl ModelFacts {
@@ -165,26 +171,23 @@ impl ModelFacts {
         ) {
             return None;
         }
-        let ctx_size = super::initial_ctx_size(
-            state.0.ctx_size,
-            state.0.ctx_size_explicit,
-            Some(trained),
-            embedding,
-        );
+        let (configured, explicit) = state.0.ctx_setting(embedding);
+        let ctx_size = super::initial_ctx_size(configured, explicit, Some(trained), embedding);
         let num_parallel = super::effective_num_parallel(ctx_size, state.0.num_parallel, embedding);
         let window = super::loaded_context_window(
             super::Engine::LlamaServer,
             ctx_size,
             Some(trained),
             num_parallel,
-            state.0.ctx_size_explicit,
+            explicit,
         )?;
         Some(window.min(trained))
     }
 
-    /// `architecture.input_modalities` as llama-server reports it: `text`,
-    /// plus `image` with vision. `None` for a model that does not generate
-    /// text (embedding, media, decision).
+    /// `architecture.input_modalities` as llama-server reports it before a
+    /// load: `text`, plus `image` with vision and `audio` with an audio
+    /// encoder (video is left to a loaded model). `None` for a model that does
+    /// not generate text (embedding, media, decision).
     pub(super) fn input_modalities(&self) -> Option<Vec<&'static str>> {
         let has = |c: &str| self.capabilities.iter().any(|have| have == c);
         has(crate::modelpack::CAPABILITY_COMPLETION).then(|| {
@@ -192,8 +195,26 @@ impl ModelFacts {
             if has(crate::modelpack::CAPABILITY_VISION) {
                 modalities.push("image");
             }
+            if self.projector.is_some_and(|p| p.audio) {
+                modalities.push("audio");
+            }
             modalities
         })
+    }
+
+    /// `architecture.output_modalities`: `text`, plus `audio` when the projector
+    /// generates speech; `audio` alone for text to speech without a chat
+    /// template.
+    pub(super) fn output_modalities(&self) -> Vec<&'static str> {
+        let gen_audio = self.projector.is_some_and(|p| p.gen_audio);
+        let mut modalities = Vec::new();
+        if !gen_audio || self.has_chat_template {
+            modalities.push("text");
+        }
+        if gen_audio {
+            modalities.push("audio");
+        }
+        modalities
     }
 }
 
@@ -224,12 +245,16 @@ pub(super) fn listed_model_facts(
                 return Arc::default();
             };
             let gguf = crate::modelpack::gguf_info(store_path, cache_path, &manifest);
+            let projector = crate::modelpack::projector_info(store_path, cache_path, &manifest);
             let facts = Arc::new(ModelFacts {
                 format: served_format(store, &manifest),
                 header: HeaderDetails::read(gguf.as_ref(), &manifest),
                 context_length: gguf.as_ref().and_then(crate::gguf::Info::context_length),
                 capabilities: crate::modelpack::model_capabilities(
-                    crate::modelpack::capabilities(store, &manifest),
+                    crate::modelpack::with_projector_caps(
+                        crate::modelpack::capabilities(store, &manifest),
+                        projector.as_ref(),
+                    ),
                     gguf.as_ref(),
                     None,
                 ),
@@ -237,8 +262,15 @@ pub(super) fn listed_model_facts(
                     .as_ref()
                     .and_then(|info| info.architecture())
                     .map(str::to_string),
+                projector: projector.as_ref().map(crate::gguf::Info::projector_caps),
+                has_chat_template: gguf
+                    .as_ref()
+                    .is_some_and(|info| info.str("tokenizer.chat_template").is_some()),
             });
-            if gguf.is_some() {
+            // Not cached while a tar-layer projector is unextracted.
+            let projector_pending =
+                projector.is_none() && crate::modelpack::has_projector_layer(&manifest);
+            if gguf.is_some() && !projector_pending {
                 MODEL_FACTS
                     .lock()
                     .unwrap()
@@ -439,6 +471,7 @@ pub(super) async fn handle_show(
             // Nothing local to inspect.
             capabilities: Vec::new(),
             template: None,
+            thinking: None,
         }));
     }
     // Resolve the same way handle_pull stored it — otherwise a bare name
@@ -465,18 +498,22 @@ pub(super) async fn handle_show(
     let capabilities = crate::modelpack::capabilities(&store, &manifest);
     // Off the worker: parsing a GGUF header is 30-50ms of blocking reads
     // on this host's models, and every /api/show pays it.
-    let gguf = {
+    let (gguf, projector) = {
         let (store_path, cache_path, manifest) = (
             state.0.store_path.clone(),
             state.0.cache_path.clone(),
             manifest.clone(),
         );
         tokio::task::spawn_blocking(move || {
-            crate::modelpack::gguf_info(&store_path, &cache_path, &manifest)
+            (
+                crate::modelpack::gguf_info(&store_path, &cache_path, &manifest),
+                crate::modelpack::projector_info(&store_path, &cache_path, &manifest),
+            )
         })
         .await
         .map_err(|e| AppError::from(anyhow::anyhow!("reading GGUF metadata: {e}")))?
     };
+    let capabilities = crate::modelpack::with_projector_caps(capabilities, projector.as_ref());
     // Read from the header already in hand rather than reading it twice;
     // a checkout-layout model has no header and takes the longer route.
     let template = match &gguf {
@@ -490,6 +527,26 @@ pub(super) async fn handle_show(
     };
     let capabilities =
         crate::modelpack::model_capabilities(capabilities, gguf.as_ref(), template.as_deref());
+    // Only where `think` is resolved against it: llama-server's own template.
+    let thinking = template
+        .as_deref()
+        .zip(gguf.as_ref())
+        .filter(|(_, info)| {
+            capabilities
+                .iter()
+                .any(|c| c == crate::modelpack::CAPABILITY_THINKING)
+                && !ds4_serves_gguf(
+                    gguf_engine_from_env(),
+                    info.architecture(),
+                    false,
+                    false,
+                    ds4_server_on_path,
+                )
+        })
+        .and_then(|(template, _)| {
+            let controls = crate::chat_template::thinking_controls(template);
+            llama_thinking(&controls, &extra_args_from_env(LLAMA_ARGS_VAR), true).0
+        });
     Ok(Json(OllamaShowResponse {
         model_info: gguf
             .as_ref()
@@ -498,6 +555,7 @@ pub(super) async fn handle_show(
             .details(served_format(&store, &manifest)),
         capabilities,
         template,
+        thinking,
     }))
 }
 
@@ -913,9 +971,26 @@ pub(super) async fn handle_copy(
             format!("model '{}' not found", req.source),
         ));
     }
-    let digest = crate::cmd::cp::copy(&store, &source, &destination)?;
+    let digest = copy_blocking(&state, source, destination.clone()).await?;
     evict_if_retagged(&state, &destination, &digest).await;
     Ok(StatusCode::OK)
+}
+
+/// [`crate::cmd::cp::copy`] off the request workers: replacing a tag sweeps
+/// the store.
+async fn copy_blocking(
+    state: &AppState,
+    source: String,
+    destination: String,
+) -> Result<String, AppError> {
+    let (store_path, cache_path) = (state.0.store_path.clone(), state.0.cache_path.clone());
+    tokio::task::spawn_blocking(move || {
+        let store = OciStore::open(store_path)?;
+        crate::cmd::cp::copy(&store, &cache_path, &source, &destination)
+    })
+    .await
+    .context("copy task panicked")?
+    .map_err(AppError::from)
 }
 
 /// Drops a loaded model whose tag `/api/copy` or `/api/create` just
@@ -995,7 +1070,6 @@ pub(super) async fn handle_blob_upload(
     UrlPath(digest): UrlPath<String>,
     body: Body,
 ) -> Result<StatusCode, AppError> {
-    use sha2::Digest as _;
     use tokio::io::AsyncWriteExt as _;
 
     let dest = staged_blob_path(&state, &digest)?;
@@ -1005,13 +1079,11 @@ pub(super) async fn handle_blob_upload(
     let dir = blob_staging_dir(&state);
     tokio::fs::create_dir_all(&dir).await?;
     let tmp = dir.join(staging_temp_name("tmp"));
-    let mut file = tokio::fs::File::create(&tmp).await?;
-    let mut hasher = sha2::Sha256::new();
+    let mut file = HashingWriter::new(tokio::fs::File::create(&tmp).await?);
     let mut stream = body.into_data_stream();
     let written = async {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("read upload body")?;
-            hasher.update(&chunk);
             file.write_all(&chunk).await?;
         }
         file.flush().await?;
@@ -1022,7 +1094,7 @@ pub(super) async fn handle_blob_upload(
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(e.into());
     }
-    let actual = format!("sha256:{}", hex::encode(hasher.finalize()));
+    let actual = format!("sha256:{}", file.finish().1);
     if !actual.eq_ignore_ascii_case(&digest) {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(AppError::status(
@@ -1112,7 +1184,7 @@ pub(super) async fn handle_create(
                     format!("model '{from}' not found"),
                 ));
             }
-            let digest = crate::cmd::cp::copy(&store, &source, model)?;
+            let digest = copy_blocking(&state, source.clone(), model.to_string()).await?;
             evict_if_retagged(&state, model, &digest).await;
             vec![format!("using existing layer {source}")]
         }
@@ -1126,10 +1198,11 @@ pub(super) async fn handle_create(
                 .map(|(name, digest)| Ok((name.clone(), staged_file(&state, name, digest)?)))
                 .collect::<Result<Vec<_>, AppError>>()?;
             let store_path = state.0.store_path.clone();
+            let cache_path = state.0.cache_path.clone();
             let staging = blob_staging_dir(&state);
             let model_owned = model.to_string();
             let (digest, statuses) = tokio::task::spawn_blocking(move || {
-                create_from_staged_blobs(&store_path, &staging, &model_owned, &staged)
+                create_from_staged_blobs(&store_path, &cache_path, &staging, &model_owned, &staged)
             })
             .await
             .context("create task panicked")??;
@@ -1190,6 +1263,7 @@ fn staged_file(state: &AppState, name: &str, digest: &str) -> Result<PathBuf, Ap
 /// on it as `llmman build <dir>` would.
 fn create_from_staged_blobs(
     store_path: &Path,
+    cache_path: &Path,
     staging: &Path,
     model: &str,
     files: &[(String, PathBuf)],
@@ -1217,7 +1291,9 @@ fn create_from_staged_blobs(
             statuses.push(format!("using sha256:{digest} as {name}"));
         }
         let store = OciStore::open(store_path)?;
-        let desc = store.build(&tmp, model, &HashMap::new())?;
+        let desc = crate::storage::gc::after_retag(&store, cache_path, model, || {
+            store.build(&tmp, model, &HashMap::new(), false)
+        })?;
         statuses.push(format!("writing manifest {}", desc.digest));
         Ok((desc.digest, statuses))
     })();
@@ -1245,6 +1321,20 @@ fn empty_chat_chunk(model: String, done_reason: &str) -> OllamaChatChunk {
     }
 }
 
+/// Ollama's 400 for a `think` that is neither a boolean nor a string.
+fn check_think(think: &Option<serde_json::Value>) -> Result<(), AppError> {
+    match think {
+        None
+        | Some(
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::String(_),
+        ) => Ok(()),
+        Some(_) => Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            "think must be a boolean or string",
+        )),
+    }
+}
+
 pub(super) async fn handle_ollama_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1255,6 +1345,7 @@ pub(super) async fn handle_ollama_chat(
         req.model,
         req.messages.len()
     );
+    check_think(&req.think)?;
 
     // Empty messages are ollama's unload request when paired with
     // `keep_alive: 0`, and its load-only request on their own — the same
@@ -1323,16 +1414,17 @@ async fn ollama_chat_to(
     // response chunk's own `model` field below (which must keep echoing
     // back `model` as-is).
     let wire_model = backend_wire_model(state, &target, &model).await;
+    let think = resolve_think(&req.think, thinking_for(state, &target).await.as_ref());
     let mut oai = OAIChatRequest {
         model: wire_model,
         messages: req.messages.iter().map(ollama_message_to_oai).collect(),
         stream: true,
-        chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
+        chat_template_kwargs: think_to_chat_template_kwargs(&think),
         tools: req.tools.clone(),
         response_format: format_to_response_format(&req.format),
         ..options_to_oai(&req.options)
     };
-    apply_think_budget(state, &target, &req.think, &mut oai).await;
+    apply_think_budget(state, &target, &think, &mut oai).await;
     stream_ollama(
         req.stream,
         state.0.client.clone(),
@@ -1428,6 +1520,7 @@ pub(super) async fn handle_ollama_generate(
         req.model,
         req.prompt.len()
     );
+    check_think(&req.think)?;
 
     // Empty prompt + keep_alive:0 = unload request (ollama server/routes.go:354).
     // is_explicit_unload, not resolve_keep_alive: it still accepts every
@@ -1539,16 +1632,17 @@ async fn ollama_generate_to(
         .into_iter()
         .chain(std::iter::once(ollama_message_to_oai(&user)))
         .collect();
+    let think = resolve_think(&req.think, thinking_for(state, &target).await.as_ref());
     let mut oai = OAIChatRequest {
         model: wire_model,
         messages,
         stream: true,
-        chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
+        chat_template_kwargs: think_to_chat_template_kwargs(&think),
         tools: None,
         response_format: format_to_response_format(&req.format),
         ..options_to_oai(&req.options)
     };
-    apply_think_budget(state, &target, &req.think, &mut oai).await;
+    apply_think_budget(state, &target, &think, &mut oai).await;
     stream_ollama(
         req.stream,
         state.0.client.clone(),
@@ -1745,13 +1839,14 @@ async fn post_embeddings(
     text: &str,
 ) -> Result<(Vec<f32>, u64), (StatusCode, String)> {
     let resp = target
-        .authorize(
-            client
-                .post(target.url("/v1/embeddings"))
-                .timeout(EMBEDDINGS_TIMEOUT)
-                .json(&serde_json::json!({ "model": wire_model, "input": text })),
+        .send(
+            target.authorize(
+                client
+                    .post(target.url("/v1/embeddings"))
+                    .timeout(EMBEDDINGS_TIMEOUT)
+                    .json(&serde_json::json!({ "model": wire_model, "input": text })),
+            ),
         )
-        .send()
         .await
         .map_err(|e| {
             (
@@ -1988,6 +2083,53 @@ mod tests {
             capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
             ..ModelFacts::default()
         }
+    }
+
+    fn speaking(projector: crate::gguf::ProjectorCaps, has_chat_template: bool) -> ModelFacts {
+        ModelFacts {
+            projector: Some(projector),
+            has_chat_template,
+            ..facts_with(&["completion"])
+        }
+    }
+
+    /// What llama-server's router reports before a load, from the projector's
+    /// header and the chat template.
+    #[test]
+    fn modalities_follow_the_projector_and_the_chat_template() {
+        use crate::gguf::ProjectorCaps;
+        let omni = ModelFacts {
+            capabilities: vec!["completion".into(), "vision".into()],
+            ..speaking(
+                ProjectorCaps {
+                    vision: true,
+                    audio: true,
+                    gen_audio: true,
+                },
+                true,
+            )
+        };
+        assert_eq!(omni.input_modalities().unwrap(), ["text", "image", "audio"]);
+        assert_eq!(omni.output_modalities(), ["text", "audio"]);
+
+        let tts = speaking(
+            ProjectorCaps {
+                gen_audio: true,
+                ..ProjectorCaps::default()
+            },
+            false,
+        );
+        assert_eq!(tts.input_modalities().unwrap(), ["text"]);
+        assert_eq!(tts.output_modalities(), ["audio"]);
+
+        // A text model, with or without a projector, only writes text.
+        assert_eq!(facts_with(&["completion"]).output_modalities(), ["text"]);
+        assert_eq!(
+            speaking(ProjectorCaps::default(), true).output_modalities(),
+            ["text"]
+        );
+        // No text in, none out: an embedding model lists neither.
+        assert!(facts_with(&["embedding"]).input_modalities().is_none());
     }
 
     /// ds4-server picks its own window, so a GGUF sent there has none; an

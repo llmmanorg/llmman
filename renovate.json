@@ -8,7 +8,26 @@
     "go.podman.io/common",
     "go.podman.io/image/v5"
   ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "LLAMA_CPP_RELEASE: the newest llama.cpp major release with a server image on ghcr.io (v<X.Y.Z>, or v<X.Y.Z>-b<N>-<sha> as upstream sometimes tags it)",
+      "managerFilePatterns": ["/^LLAMA_CPP_RELEASE$/"],
+      "matchStrings": ["^(?<currentValue>v\\d+\\.\\d+\\.\\d+(?:-b\\d+-[0-9a-f]+)?)\\s*$"],
+      "depNameTemplate": "ggml-org/llama.cpp",
+      "packageNameTemplate": "ghcr.io/ggml-org/llama.cpp",
+      "datasourceTemplate": "docker",
+      "extractVersionTemplate": "^server-(?<version>v\\d+\\.\\d+\\.\\d+(?:-b\\d+-[0-9a-f]+)?)$",
+      "versioningTemplate": "regex:^v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(?:-b\\d+-[0-9a-f]+)?$"
+    }
+  ],
   "packageRules": [
+    {
+      "description": "Own PR; group:all's inherited groupSlug would merge it into the rest",
+      "matchDepNames": ["ggml-org/llama.cpp"],
+      "groupName": "llama.cpp",
+      "groupSlug": "llama-cpp"
+    },
     {
       "description": "reqwest 0.13 switches to platform TLS verifier; not validated on Android",
       "matchManagers": ["cargo"],
@@ -40,7 +59,7 @@
       "allowedVersions": "<0.9.0"
     },
     {
-      "description": "tokio-tungstenite 0.25+ changed Message payloads (Vec<u8> -> Payload/Bytes); test client must match axum 0.7's ws pin (0.24)",
+      "description": "tokio-tungstenite 0.25+ changed Message payloads (Vec<u8> -> Payload/Bytes); the /v1/realtime relay and test client must match axum 0.7's ws pin (0.24)",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["tokio-tungstenite"],
       "allowedVersions": "<0.25.0"

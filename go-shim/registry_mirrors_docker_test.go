@@ -245,7 +245,7 @@ func TestSignaturesBypassMirrors(t *testing.T) {
 	if err := signManifest(signCtx, ref, target, privPath, nil); err != nil {
 		t.Fatalf("sign: %v", err)
 	}
-	report, err := verifySignatures(signCtx, ref, target, []string{pubPath})
+	report, err := verifySignatures(signCtx, ref, target, []string{pubPath}, nil, "")
 	if err != nil || !report.Verified {
 		t.Fatalf("verify: %v, %+v", err, report)
 	}

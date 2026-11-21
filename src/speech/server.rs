@@ -360,10 +360,18 @@ impl Worker {
 
     /// Mel features, encoder and decoder over one clip.
     fn transcribe_clip(&mut self, samples: &[i16], language: &str) -> Result<String, Error> {
-        let mel = self.mel.features(samples).map_err(|e| match e {
-            MelError::TooShort => Error::Invalid(format!("the audio is too short: {e}")),
-            MelError::InvalidConfig(_) => Error::Failed(e.to_string()),
-        })?;
+        // The mel stage asks the backend's abort flag between frame
+        // blocks, so a client that left stops the work here too, not only
+        // in the encoder and decoder computes.
+        let be = &self.be;
+        let mel = self
+            .mel
+            .features(samples, &mut || be.cancelled())
+            .map_err(|e| match e {
+                MelError::TooShort => Error::Invalid(format!("the audio is too short: {e}")),
+                MelError::InvalidConfig(_) => Error::Failed(e.to_string()),
+                MelError::Cancelled => Error::Cancelled,
+            })?;
         let run = self
             .enc
             .run(&self.model, &self.be, &mel, &[])

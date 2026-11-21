@@ -11,6 +11,11 @@
 //! can shell out to, without needing `llmman serve`'s HTTP daemon or its
 //! opinions about which inference backend to launch.
 //!
+//! [`resolve_model`] finds the one file or directory a server is started on;
+//! [`resolve_model_tree`] lays out *every* layer as the model directory, for
+//! `llmman resolve --dir` and the Kubernetes CSI driver. Both unpack every
+//! layer encoding the ModelPack spec lists (see [`layers`]).
+//!
 //! Everything here assumes the reference has already been pulled into the
 //! local `OciStore` at `store_path` (see `crate::ffi::pull`) — this module
 //! only resolves+extracts, it never talks to a registry itself.
@@ -20,6 +25,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context};
 
 use crate::storage::OciStore;
+
+mod layers;
+use layers::{Compression, Encoding};
 
 const HF_GGUF_MEDIA_TYPE: &str = "application/vnd.docker.ai.gguf.v3";
 
@@ -101,14 +109,11 @@ impl ModelPath {
     }
 }
 
-/// Splits an OCI digest ("sha256:abcd...") down to just its hex portion,
-/// which is what the blob store's on-disk layout uses as the filename.
+/// The hex portion of an OCI digest ("sha256:abcd..."), which is what
+/// the blob store's on-disk layout uses as the filename. One parser
+/// with the store: `split_digest` accepts only what the store writes.
 fn digest_hex(digest: &str) -> anyhow::Result<&str> {
-    digest
-        .split_once(':')
-        .map(|(_, hex)| hex)
-        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
-        .ok_or_else(|| anyhow!("malformed digest: {digest}"))
+    crate::storage::oci::split_digest(digest).map(|(_, hex)| hex)
 }
 
 fn layer_filepath(l: &crate::storage::oci::Descriptor) -> Option<&str> {
@@ -184,7 +189,6 @@ fn is_mmproj_layer(l: &crate::storage::oci::Descriptor) -> bool {
 /// GGUF and, when present, a companion `--mmproj` GGUF (see
 /// [`is_mmproj_layer`]), since both are extracted exactly the same way.
 fn extract_gguf_layer(
-    store: &OciStore,
     store_path: &Path,
     cache_path: &Path,
     layer: &crate::storage::oci::Descriptor,
@@ -210,33 +214,35 @@ fn extract_gguf_layer(
     if let Some(p) = cached_gguf(cache_path, layer_hex) {
         return Ok(p);
     }
-    let cached_dir = cache_path.join(layer_hex);
-    std::fs::create_dir_all(&cached_dir)?;
-    let blob = store
-        .read_blob(&layer.digest)
-        .with_context(|| format!("read blob {}", layer.digest))?;
-    if blob.len() >= 4 && &blob[..4] == b"GGUF" {
+    let blob_path = raw_blob_path(store_path, layer)?;
+    // a GGUF stored whole under a tar media type
+    if blob_is_gguf(&blob_path) {
         let name = Path::new(&title)
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("model.gguf"));
-        let p = cached_dir.join(name);
-        std::fs::write(&p, &blob)?;
-        return Ok(p);
+        let dest = cache_path.join(layer_hex).join(name);
+        cache_layer_file(&blob_path, &dest, layer.size)?;
+        return Ok(dest);
     }
-    let mut archive = tar::Archive::new(std::io::Cursor::new(&blob));
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let ep = entry.path()?.to_path_buf();
-        if ep.extension().and_then(|e| e.to_str()) == Some("gguf") {
-            let name = ep
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("model.gguf"));
-            let d = cached_dir.join(name);
-            entry.unpack(&d)?;
-            return Ok(d);
-        }
-    }
-    Err(anyhow!("no .gguf in tar layer {}", layer.digest))
+    let dir = layers::extract_tar_layer(
+        store_path,
+        cache_path,
+        layer,
+        layers::tar_compression(layer),
+    )?;
+    find_gguf(&dir).ok_or_else(|| anyhow!("no .gguf in tar layer {}", layer.digest))
+}
+
+/// The first `.gguf` file under `dir`, in name order.
+fn find_gguf(dir: &Path) -> Option<PathBuf> {
+    walkdir::WalkDir::new(dir)
+        .sort_by_file_name()
+        .into_iter()
+        .flatten()
+        .find(|e| {
+            e.file_type().is_file() && e.path().extension().and_then(|x| x.to_str()) == Some("gguf")
+        })
+        .map(walkdir::DirEntry::into_path)
 }
 
 /// True if the file at `path` starts with the GGUF magic.
@@ -249,7 +255,7 @@ fn blob_is_gguf(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The content-addressed blob of a raw (non-tar) layer, used as-is.
+/// The content-addressed blob of a layer, as stored.
 fn raw_blob_path(
     store_path: &Path,
     layer: &crate::storage::oci::Descriptor,
@@ -352,10 +358,9 @@ pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) 
 
     let mut caps = vec![CAPABILITY_COMPLETION.to_string()];
 
-    let has_mmproj = gguf_layers(manifest).is_some_and(|(_, mmproj)| mmproj.is_some());
     let config_says_image = config_types("inputTypes").iter().any(|t| t == "image");
 
-    if has_mmproj || config_says_image {
+    if has_projector_layer(manifest) || config_says_image {
         caps.push(CAPABILITY_VISION.to_string());
     }
     caps
@@ -399,6 +404,36 @@ pub fn model_capabilities(
     caps
 }
 
+/// `caps` (from [`capabilities`]) as the projector's own header says: without
+/// `"vision"` when it reads no images ([`capabilities`] takes any projector for
+/// vision), and with `"audio"` when it reads audio. `None` (no readable header)
+/// leaves `caps` as they are.
+pub fn with_projector_caps(
+    mut caps: Vec<String>,
+    projector: Option<&crate::gguf::Info>,
+) -> Vec<String> {
+    let Some(projector) = projector.map(crate::gguf::Info::projector_caps) else {
+        return caps;
+    };
+    if !projector.vision {
+        caps.retain(|c| c != CAPABILITY_VISION);
+    }
+    if projector.audio && !caps.iter().any(|c| c == CAPABILITY_AUDIO) {
+        let at = caps
+            .iter()
+            .position(|c| c == CAPABILITY_VISION)
+            .or_else(|| caps.iter().position(|c| c == CAPABILITY_COMPLETION))
+            .map_or(caps.len(), |i| i + 1);
+        caps.insert(at, CAPABILITY_AUDIO.to_string());
+    }
+    caps
+}
+
+/// Whether the manifest holds a companion mmproj layer, extracted or not.
+pub fn has_projector_layer(manifest: &crate::storage::oci::Manifest) -> bool {
+    gguf_layers(manifest).is_some_and(|(_, mmproj)| mmproj.is_some())
+}
+
 /// How many primary GGUF layers the manifest holds. More than one is a
 /// `gguf-split` set, whose tensors are spread across the shards, so no
 /// single header's tensor list describes the whole model.
@@ -433,6 +468,23 @@ pub fn gguf_info(
         .ok()
         .filter(|p| blob_is_gguf(p))
         .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))?;
+    crate::gguf::read_info(&path).ok()
+}
+
+/// The GGUF header of the companion mmproj layer, read like [`gguf_info`].
+/// `None` without a projector, for one in a tar layer not extracted yet, or
+/// for a header that will not parse.
+pub fn projector_info(
+    store_path: &Path,
+    cache_path: &Path,
+    manifest: &crate::storage::oci::Manifest,
+) -> Option<crate::gguf::Info> {
+    let (_, projector) = gguf_layers(manifest)?;
+    let projector = projector?;
+    let path = raw_blob_path(store_path, projector)
+        .ok()
+        .filter(|p| blob_is_gguf(p))
+        .or_else(|| cached_gguf(cache_path, digest_hex(&projector.digest).ok()?))?;
     crate::gguf::read_info(&path).ok()
 }
 
@@ -493,7 +545,17 @@ pub fn read_layer_text(
     layer: &crate::storage::oci::Descriptor,
 ) -> anyhow::Result<String> {
     use std::io::Read as _;
-    let blob = store.read_blob(&layer.digest)?;
+    let blob = match layers::tar_compression(layer) {
+        Compression::None => store.read_blob(&layer.digest)?,
+        compression => {
+            // bounded: the layer does not decide how far it inflates
+            let mut text = Vec::new();
+            layers::open_layer(store.root(), layer, compression)?
+                .take(MAX_COMPRESSED_TEXT)
+                .read_to_end(&mut text)?;
+            text
+        }
+    };
     if blob.len() >= 512 {
         let mut archive = tar::Archive::new(std::io::Cursor::new(&blob));
         if let Ok(entries) = archive.entries() {
@@ -508,13 +570,18 @@ pub fn read_layer_text(
     Ok(String::from_utf8_lossy(&blob).into_owned())
 }
 
+/// The most [`read_layer_text`] reads out of a compressed layer.
+const MAX_COMPRESSED_TEXT: u64 = 64 << 20;
+
 /// The GGUF a tar layer was already extracted to, if any.
 fn cached_gguf(cache_path: &Path, layer_hex: &str) -> Option<PathBuf> {
-    std::fs::read_dir(cache_path.join(layer_hex))
+    let layer_dir = cache_path.join(layer_hex);
+    std::fs::read_dir(&layer_dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
         .find(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf"))
+        .or_else(|| find_gguf(&layers::extracted_files(&layer_dir)?))
 }
 
 /// The manifest's primary GGUF layer and its companion mmproj layer, if
@@ -587,8 +654,8 @@ fn is_native_diffusers(store: &OciStore, manifest: &crate::storage::oci::Manifes
         .layers
         .iter()
         .find(|l| is_diffusers_index_layer(l))
-        .and_then(|l| store.read_blob(&l.digest).ok())
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|l| read_layer_text(store, l).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|v| {
             v.get("_class_name")?
                 .as_str()
@@ -661,14 +728,19 @@ pub fn resolve_model(
 
     // ── Diffusers pipeline → crate::mediagen ──────────────────────────────
     if format == ModelFormat::Diffusion && manifest_format(&manifest) == Some(ModelFormat::Omni) {
-        extract_safetensors_dir(store_path, cache_path, &desc.digest, &manifest)?;
-        let root = cache_path.join(digest_hex(&desc.digest)?);
-        let files: std::collections::BTreeMap<String, PathBuf> = manifest
-            .layers
-            .iter()
-            .filter_map(layer_filepath)
-            .filter(|p| crate::sources::is_safe_relative_path(p) && root.join(p).is_file())
-            .map(|p| (p.to_string(), root.join(p)))
+        let (root, placed) = extract_model_tree(
+            store_path,
+            cache_path,
+            &desc.digest,
+            &manifest,
+            TreeScope::Servable,
+        )?;
+        let files: std::collections::BTreeMap<String, PathBuf> = placed
+            .into_iter()
+            .map(|p| {
+                let path = root.join(&p);
+                (p, path)
+            })
             .collect();
         let model = files
             .get(DIFFUSERS_MODEL_INDEX)
@@ -690,7 +762,7 @@ pub fn resolve_model(
         let named = |l: &crate::storage::oci::Descriptor| -> anyhow::Result<PathBuf> {
             let raw = raw_blob_path(store_path, l);
             if is_gguf_layer(l) && !raw.as_ref().is_ok_and(|p| blob_is_gguf(p)) {
-                extract_gguf_layer(&store, store_path, cache_path, l)
+                extract_gguf_layer(store_path, cache_path, l)
             } else if raw.is_ok()
                 && (is_gguf_layer(l) || l.media_type == crate::hf::oci::MEDIA_TYPE_MODEL_WEIGHT_RAW)
             {
@@ -733,9 +805,9 @@ pub fn resolve_model(
 
     // ── GGUF → llama-server ────────────────────────────────────────────────
     if let Some((primary, mmproj)) = gguf_layers(&manifest) {
-        let primary_path = extract_gguf_layer(&store, store_path, cache_path, primary)?;
+        let primary_path = extract_gguf_layer(store_path, cache_path, primary)?;
         let mmproj_path = mmproj
-            .map(|l| extract_gguf_layer(&store, store_path, cache_path, l))
+            .map(|l| extract_gguf_layer(store_path, cache_path, l))
             .transpose()
             .context("extracting companion mmproj file")?;
         if mmproj_path.is_some() {
@@ -775,6 +847,68 @@ fn safetensors_model_dir(cache_dir: &Path, rel_paths: &[&str]) -> PathBuf {
         .unwrap_or_else(|| cache_dir.to_path_buf())
 }
 
+/// Which of a manifest's layers [`extract_model_tree`] places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeScope {
+    /// Weights and their config files: what serving needs.
+    Servable,
+    /// Every layer, docs, code and datasets too.
+    Full,
+}
+
+/// Places `manifest`'s ModelPack layers under `<cache>/<manifest hex>/` and
+/// returns that directory with the paths placed, relative to it. A raw layer
+/// goes to its `org.cncf.model.filepath`, a tar layer to the paths its entries
+/// name; both as hardlinks. Two layers placing one path is an error.
+/// Idempotent, and safe to call concurrently.
+pub fn extract_model_tree(
+    store_path: &Path,
+    cache_path: &Path,
+    manifest_digest: &str,
+    manifest: &crate::storage::oci::Manifest,
+    scope: TreeScope,
+) -> anyhow::Result<(PathBuf, Vec<String>)> {
+    let root = cache_path.join(digest_hex(manifest_digest)?);
+    let mut placed = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for layer in &manifest.layers {
+        let Some((servable, encoding)) = layers::parse_media_type(&layer.media_type) else {
+            continue;
+        };
+        if scope == TreeScope::Servable && !servable {
+            continue;
+        }
+        let paths = match encoding {
+            Encoding::Tar(_) => layers::place_tar_layer(store_path, cache_path, layer, &root)?,
+            Encoding::Raw => {
+                let Some(rel_path) = layer_filepath(layer) else {
+                    continue;
+                };
+                // The annotation is untrusted: "../../id_rsa" would escape the root.
+                if !crate::sources::is_safe_relative_path(rel_path) {
+                    eprintln!("[llmman] skipping layer with unsafe filepath {rel_path:?}");
+                    continue;
+                }
+                let dest = root.join(rel_path);
+                if !cached_layer_file_matches(&dest, layer.size) {
+                    let blob = raw_blob_path(store_path, layer)?;
+                    cache_layer_file(&blob, &dest, layer.size)
+                        .with_context(|| format!("cache {rel_path} from blob store"))?;
+                    eprintln!("[llmman] cached {rel_path}");
+                }
+                vec![rel_path.to_owned()]
+            }
+        };
+        for path in paths {
+            // Which layer wins would otherwise depend on the files' sizes.
+            anyhow::ensure!(seen.insert(path.clone()), "two layers place {path}");
+            placed.push(path);
+        }
+    }
+    Ok((root, placed))
+}
+
 /// Extract CNCF-format safetensors layers to a cache directory and return the
 /// model directory (see [`safetensors_model_dir`]).
 fn extract_safetensors_dir(
@@ -783,50 +917,57 @@ fn extract_safetensors_dir(
     manifest_digest: &str,
     manifest: &crate::storage::oci::Manifest,
 ) -> anyhow::Result<PathBuf> {
-    let hex = digest_hex(manifest_digest)?;
-    let cache_dir = cache_path.join(hex);
-
-    for layer in &manifest.layers {
-        // Only extract config and weight files; skip code/docs.
-        let include = matches!(
-            layer.media_type.as_str(),
-            "application/vnd.cncf.model.weight.config.v1.raw"
-                | "application/vnd.cncf.model.weight.v1.raw"
-        );
-        if !include {
-            continue;
-        }
-
-        let Some(rel_path) = layer_filepath(layer) else {
-            continue;
-        };
-        // The annotation came from whatever produced the manifest, so it
-        // is not this process's to trust: joining "../../id_rsa" onto
-        // cache_dir would escape it and overwrite an arbitrary file.
-        // `crate::sources` rejects these at pack time; this covers a
-        // layer already in the store, or pulled by any other path.
-        if !crate::sources::is_safe_relative_path(rel_path) {
-            eprintln!("[llmman] skipping layer with unsafe filepath {rel_path:?}");
-            continue;
-        }
-        let dest = cache_dir.join(rel_path);
-        if cached_layer_file_matches(&dest, layer.size) {
-            continue;
-        }
-
-        let blob = raw_blob_path(store_path, layer)?;
-        cache_layer_file(&blob, &dest, layer.size)
-            .with_context(|| format!("cache {rel_path} from blob store"))?;
-        eprintln!("[llmman] cached {rel_path}");
-    }
-
-    let rel_paths: Vec<&str> = manifest
-        .layers
-        .iter()
-        .filter_map(layer_filepath)
-        .filter(|p| crate::sources::is_safe_relative_path(p))
-        .collect();
+    let (cache_dir, placed) = extract_model_tree(
+        store_path,
+        cache_path,
+        manifest_digest,
+        manifest,
+        TreeScope::Servable,
+    )?;
+    let rel_paths: Vec<&str> = placed.iter().map(String::as_str).collect();
     Ok(safetensors_model_dir(&cache_dir, &rel_paths))
+}
+
+/// A model's complete directory, as [`resolve_model_tree`] returns it.
+#[derive(Debug)]
+pub struct ModelTree {
+    /// `<cache>/<manifest hex>`: every layer at its path in the artifact.
+    pub root: PathBuf,
+    /// The manifest the tree was built from.
+    pub digest: String,
+    /// What llmman would serve it as; `None` if it cannot (an ONNX export).
+    pub format: Option<ModelFormat>,
+}
+
+/// Lays out every layer of `model_ref` (already in the store) as the model
+/// directory under `cache_path` and returns it. See [`extract_model_tree`].
+pub fn resolve_model_tree(
+    store_path: &Path,
+    cache_path: &Path,
+    model_ref: &str,
+) -> anyhow::Result<ModelTree> {
+    let store = OciStore::open(store_path)?;
+    let desc = store
+        .find(model_ref)
+        .with_context(|| format!("model not found in store: {model_ref}"))?;
+    let manifest = store.read_manifest(&desc.digest)?;
+    let (root, placed) = extract_model_tree(
+        store_path,
+        cache_path,
+        &desc.digest,
+        &manifest,
+        TreeScope::Full,
+    )?;
+    anyhow::ensure!(
+        !placed.is_empty(),
+        "{model_ref} has no ModelPack file layers to extract"
+    );
+    let format = stored_manifest_format(&store, &manifest);
+    Ok(ModelTree {
+        root,
+        digest: desc.digest,
+        format,
+    })
 }
 
 fn cached_layer_file_matches(dest: &Path, layer_size: u64) -> bool {
@@ -840,31 +981,34 @@ fn cache_layer_file(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result<
         return Ok(());
     }
     std::fs::create_dir_all(dest.parent().context("no parent")?)?;
-    match std::fs::remove_file(dest) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("remove {}", dest.display())),
-    }
     link_or_copy_file(src, dest, layer_size)
 }
 
+/// Puts `src` at `dest`, replacing whatever is there: a hardlink, or a copy
+/// where the filesystem cannot link. Renamed into place from a temporary
+/// name, so a concurrent caller never finds `dest` missing or half done.
 fn link_or_copy_file(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result<()> {
-    match std::fs::hard_link(src, dest) {
-        Ok(()) if cached_layer_file_matches(dest, layer_size) => Ok(()),
+    let tmp = cache_copy_temp_path(dest);
+    match std::fs::hard_link(src, &tmp) {
         Ok(()) => {
-            let actual_size = dest
-                .symlink_metadata()
-                .with_context(|| format!("inspect hardlink {}", dest.display()))
-                .map(|meta| meta.len());
-            std::fs::remove_file(dest)
-                .with_context(|| format!("remove invalid hardlink {}", dest.display()))?;
-            let actual_size = actual_size?;
-            anyhow::bail!(
-                "blob {} is {actual_size} bytes, expected {layer_size}",
-                src.display()
-            );
+            let result = (|| {
+                let actual_size = tmp
+                    .symlink_metadata()
+                    .with_context(|| format!("inspect hardlink {}", tmp.display()))?
+                    .len();
+                if actual_size != layer_size {
+                    anyhow::bail!(
+                        "blob {} is {actual_size} bytes, expected {layer_size}",
+                        src.display()
+                    );
+                }
+                std::fs::rename(&tmp, dest)
+                    .with_context(|| format!("rename {} to {}", tmp.display(), dest.display()))
+            })();
+            // `rename` between two links of one file leaves `tmp` behind
+            let _ = std::fs::remove_file(&tmp);
+            result
         }
-        Err(_) if cached_layer_file_matches(dest, layer_size) => Ok(()),
         Err(hardlink_error) => copy_file_atomic(src, dest, layer_size).with_context(|| {
             format!(
                 "hardlink {} to {} failed: {hardlink_error}; copy failed",
@@ -1125,6 +1269,46 @@ mod tests {
         );
     }
 
+    /// A projector's header with the given `clip.has_<flag>_encoder` flags.
+    fn projector_header(flags: &[&str]) -> crate::gguf::Info {
+        let mut info = crate::gguf::Info::default();
+        for flag in flags {
+            info.metadata.insert(
+                format!("clip.has_{flag}_encoder"),
+                crate::gguf::Value::Bool(true),
+            );
+        }
+        info
+    }
+
+    /// A speech-only projector (Soprano) is not vision; LFM3-Omni's is; one that
+    /// only hears is audio. An unreadable header changes nothing.
+    #[test]
+    fn with_projector_caps_follows_the_projectors_own_header() {
+        let caps = || vec!["completion".to_string(), "vision".to_string()];
+        assert_eq!(
+            with_projector_caps(caps(), Some(&projector_header(&["gen_audio"]))),
+            ["completion"]
+        );
+        assert_eq!(
+            with_projector_caps(caps(), Some(&projector_header(&["audio"]))),
+            ["completion", "audio"]
+        );
+        assert_eq!(
+            with_projector_caps(
+                caps(),
+                Some(&projector_header(&["vision", "audio", "gen_audio"]))
+            ),
+            ["completion", "vision", "audio"]
+        );
+        assert_eq!(with_projector_caps(caps(), None), ["completion", "vision"]);
+        // Nothing to take away from a model that never had it.
+        assert_eq!(
+            with_projector_caps(vec!["completion".into()], Some(&projector_header(&[]))),
+            ["completion"]
+        );
+    }
+
     #[test]
     fn capabilities_adds_vision_when_a_companion_mmproj_layer_is_present() {
         // Mirrors ollama's projectorCapabilities: any projector ⇒ vision.
@@ -1133,12 +1317,14 @@ mod tests {
             descriptor("sha256:b", "model.Q4_K_M.gguf"),
         ]);
         assert_eq!(capabilities(&store, &m), vec!["completion", "vision"]);
+        assert!(has_projector_layer(&m));
     }
 
     #[test]
     fn capabilities_a_lone_mmproj_named_gguf_is_the_model_not_a_projector() {
         let (store, m) = manifest_with(vec![descriptor("sha256:a", "mmproj-only.gguf")]);
         assert_eq!(capabilities(&store, &m), vec!["completion"]);
+        assert!(!has_projector_layer(&m));
     }
 
     #[test]
@@ -1339,6 +1525,22 @@ mod tests {
             Some(ModelFormat::Diffusion)
         );
         assert_eq!(with_index("Cosmos3OmniPipeline"), Some(ModelFormat::Omni));
+        // the index in a tar layer is read the same, compressed or not
+        for suffix in ["tar", "tar+gzip", "tar+zstd"] {
+            let (store, mut m) = manifest_with(cosmos3_layers());
+            let index = br#"{"_class_name": "QwenImage21Pipeline"}"#;
+            m.layers[1] = tar_layer(
+                &store,
+                "weight.config",
+                suffix,
+                &[("model_index.json", index)],
+            );
+            assert_eq!(
+                stored_manifest_format(&store, &m),
+                Some(ModelFormat::Diffusion),
+                "{suffix}"
+            );
+        }
         // an index missing from the store leaves it to vLLM-Omni
         let (store, m) = manifest_with(cosmos3_layers());
         assert_eq!(stored_manifest_format(&store, &m), Some(ModelFormat::Omni));
@@ -1547,6 +1749,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Concurrent placers of one file, as two `llmman resolve`s: all succeed.
+    #[test]
+    fn concurrent_callers_placing_one_file_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("blob");
+        std::fs::write(&src, b"complete-weights-bytes").unwrap();
+        for round in 0..150 {
+            let dest = dir
+                .path()
+                .join(format!("tree-{round}"))
+                .join("model.safetensors");
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| s.spawn(|| cache_layer_file(&src, &dest, 22)))
+                    .collect();
+                for h in handles {
+                    h.join().unwrap().unwrap();
+                }
+            });
+            assert_eq!(std::fs::read(&dest).unwrap(), b"complete-weights-bytes");
+            let leftovers: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n != "model.safetensors")
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
+    }
+
     #[test]
     fn link_or_copy_file_rejects_a_short_blob() {
         let dir = std::env::temp_dir().join(format!(
@@ -1566,6 +1798,532 @@ mod tests {
         );
         assert!(!dest.exists(), "short linked dest should be removed");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ── ModelPack tar layers (what `llmman build` and modctl write) ────────
+
+    /// A tar archive of `(name, body)` files.
+    fn tar_archive(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, body) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            builder.append_data(&mut header, name, *body).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    pub(super) fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// A layer of `store` holding `files` as `<category>.v1.<suffix>`, with
+    /// the first file's path as its `org.cncf.model.filepath`.
+    fn tar_layer(
+        store: &OciStore,
+        category: &str,
+        suffix: &str,
+        files: &[(&str, &[u8])],
+    ) -> crate::storage::oci::Descriptor {
+        let archive = tar_archive(files);
+        let blob = match suffix {
+            "tar+gzip" => gzip(&archive),
+            "tar+zstd" => zstd::encode_all(&archive[..], 3).unwrap(),
+            _ => archive,
+        };
+        let media = format!("application/vnd.cncf.model.{category}.v1.{suffix}");
+        let mut layer = store.write_blob(&media, &blob).unwrap();
+        layer.annotations = Some(
+            [(
+                "org.cncf.model.filepath".to_string(),
+                files[0].0.to_string(),
+            )]
+            .into(),
+        );
+        layer
+    }
+
+    fn raw_layer(
+        store: &OciStore,
+        media: &str,
+        path: &str,
+        body: &[u8],
+    ) -> crate::storage::oci::Descriptor {
+        let mut layer = store.write_blob(media, body).unwrap();
+        layer.annotations =
+            Some([("org.cncf.model.filepath".to_string(), path.to_string())].into());
+        layer
+    }
+
+    fn manifest_digest(store: &OciStore, manifest: &crate::storage::oci::Manifest) -> String {
+        store.write_manifest(manifest).unwrap().digest
+    }
+
+    #[test]
+    fn a_built_model_directory_resolves_to_its_files() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("tokenizer")).unwrap();
+        std::fs::write(src.path().join("config.json"), br#"{"model_type":"llama"}"#).unwrap();
+        std::fs::write(src.path().join("model.safetensors"), b"weights").unwrap();
+        std::fs::write(src.path().join("tokenizer/tokenizer.json"), b"{}").unwrap();
+        std::fs::write(src.path().join("README.md"), b"# docs").unwrap();
+        let (store, _) = manifest_with(vec![]);
+        store
+            .build(
+                src.path(),
+                "example.invalid/m:v1",
+                &Default::default(),
+                false,
+            )
+            .unwrap();
+        let cache = store.root().join("cache");
+
+        let ModelPath::SafeTensors(dir) =
+            resolve_model(store.root(), &cache, "example.invalid/m:v1").unwrap()
+        else {
+            panic!("not a safetensors model");
+        };
+        assert_eq!(
+            std::fs::read(dir.join("model.safetensors")).unwrap(),
+            b"weights"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("tokenizer/tokenizer.json")).unwrap(),
+            b"{}"
+        );
+        assert!(dir.join("config.json").is_file());
+        // serving does not need the docs
+        assert!(!dir.join("README.md").exists());
+
+        // the whole directory does
+        let tree = resolve_model_tree(store.root(), &cache, "example.invalid/m:v1").unwrap();
+        assert_eq!(tree.root, dir);
+        assert_eq!(tree.format, Some(ModelFormat::SafeTensors));
+        assert_eq!(
+            std::fs::read(tree.root.join("README.md")).unwrap(),
+            b"# docs"
+        );
+    }
+
+    #[test]
+    fn the_tree_places_every_category_and_encoding_at_its_path() {
+        let (store, mut m) = manifest_with(vec![]);
+        const RAW_W: &str = "application/vnd.cncf.model.weight.v1.raw";
+        const RAW_DOC: &str = "application/vnd.cncf.model.doc.v1.raw";
+        m.layers = vec![
+            tar_layer(&store, "weight", "tar", &[("model-1.safetensors", b"one")]),
+            raw_layer(&store, RAW_W, "model-2.safetensors", b"two"),
+            tar_layer(
+                &store,
+                "weight.config",
+                "tar+gzip",
+                &[("config.json", b"{}")],
+            ),
+            tar_layer(
+                &store,
+                "weight.config",
+                "tar+zstd",
+                &[
+                    ("tokenizer/tokenizer.json", b"tok"),
+                    ("tokenizer/merges.txt", b"m"),
+                ],
+            ),
+            tar_layer(&store, "doc", "tar", &[("docs/README.md", b"readme")]),
+            raw_layer(&store, RAW_DOC, "LICENSE", b"license"),
+            tar_layer(&store, "code", "tar+gzip", &[("handler.py", b"print(1)")]),
+            tar_layer(&store, "dataset", "tar+zstd", &[("data/a.jsonl", b"{}")]),
+        ];
+        let digest = manifest_digest(&store, &m);
+        let cache = store.root().join("cache");
+
+        let (root, placed) =
+            extract_model_tree(store.root(), &cache, &digest, &m, TreeScope::Full).unwrap();
+        let read = |p: &str| std::fs::read(root.join(p)).unwrap();
+        assert_eq!(read("model-1.safetensors"), b"one");
+        assert_eq!(read("model-2.safetensors"), b"two");
+        assert_eq!(read("config.json"), b"{}");
+        assert_eq!(read("tokenizer/tokenizer.json"), b"tok");
+        assert_eq!(read("tokenizer/merges.txt"), b"m");
+        assert_eq!(read("docs/README.md"), b"readme");
+        assert_eq!(read("LICENSE"), b"license");
+        assert_eq!(read("handler.py"), b"print(1)");
+        assert_eq!(read("data/a.jsonl"), b"{}");
+        assert_eq!(placed.len(), 9);
+
+        // Idempotent: a second call places the same files.
+        let (root2, placed2) =
+            extract_model_tree(store.root(), &cache, &digest, &m, TreeScope::Full).unwrap();
+        assert_eq!((root2, placed2), (root.clone(), placed));
+
+        // Nothing else lives in the tree.
+        let mut on_disk: Vec<_> = walkdir::WalkDir::new(&root)
+            .min_depth(1)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+            .map(|e| {
+                e.path()
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        on_disk.sort();
+        assert_eq!(
+            on_disk,
+            [
+                "LICENSE",
+                "config.json",
+                "data/a.jsonl",
+                "docs/README.md",
+                "handler.py",
+                "model-1.safetensors",
+                "model-2.safetensors",
+                "tokenizer/merges.txt",
+                "tokenizer/tokenizer.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn two_layers_placing_one_path_fail_the_tree() {
+        const RAW_W: &str = "application/vnd.cncf.model.weight.v1.raw";
+        let (store, mut m) = manifest_with(vec![]);
+        m.layers = vec![
+            raw_layer(&store, RAW_W, "config.json", b"one"),
+            tar_layer(&store, "weight.config", "tar", &[("config.json", b"two")]),
+        ];
+        let digest = manifest_digest(&store, &m);
+        let err = extract_model_tree(
+            store.root(),
+            &store.root().join("cache"),
+            &digest,
+            &m,
+            TreeScope::Full,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("two layers place config.json"));
+    }
+
+    #[test]
+    fn the_serving_directory_is_picked_from_what_was_placed() {
+        let (store, mut m) = manifest_with(vec![]);
+        m.layers = vec![
+            // not placed when serving, so its path must not pick the root
+            raw_layer(
+                &store,
+                "application/vnd.cncf.model.doc.v1.raw",
+                "config.json",
+                b"doc",
+            ),
+            tar_layer(
+                &store,
+                "weight",
+                "tar",
+                &[("runtime/model.safetensors", b"w")],
+            ),
+            tar_layer(
+                &store,
+                "weight.config",
+                "tar",
+                &[("runtime/config.json", b"{}")],
+            ),
+        ];
+        let digest = manifest_digest(&store, &m);
+        let cache = store.root().join("cache");
+        let dir = extract_safetensors_dir(store.root(), &cache, &digest, &m).unwrap();
+        assert_eq!(
+            dir,
+            cache.join(digest_hex(&digest).unwrap()).join("runtime")
+        );
+    }
+
+    #[test]
+    fn a_servable_tree_leaves_out_docs_code_and_datasets() {
+        let (store, mut m) = manifest_with(vec![]);
+        m.layers = vec![
+            tar_layer(&store, "weight", "tar", &[("model.safetensors", b"w")]),
+            tar_layer(&store, "weight.config", "tar", &[("config.json", b"{}")]),
+            tar_layer(&store, "doc", "tar", &[("README.md", b"r")]),
+            tar_layer(&store, "code", "tar+gzip", &[("run.py", b"c")]),
+            tar_layer(&store, "dataset", "tar", &[("d.csv", b"d")]),
+        ];
+        let digest = manifest_digest(&store, &m);
+        let (root, placed) = extract_model_tree(
+            store.root(),
+            &store.root().join("cache"),
+            &digest,
+            &m,
+            TreeScope::Servable,
+        )
+        .unwrap();
+        assert_eq!(placed, ["model.safetensors", "config.json"]);
+        assert!(!root.join("README.md").exists());
+        assert!(!root.join("run.py").exists());
+        assert!(!root.join("d.csv").exists());
+    }
+
+    #[test]
+    fn a_raw_layer_with_an_unsafe_filepath_stays_out_of_the_tree() {
+        let (store, mut m) = manifest_with(vec![]);
+        m.layers = vec![
+            raw_layer(
+                &store,
+                "application/vnd.cncf.model.weight.v1.raw",
+                "../../escape.bin",
+                b"x",
+            ),
+            raw_layer(
+                &store,
+                "application/vnd.cncf.model.weight.v1.raw",
+                "ok.bin",
+                b"y",
+            ),
+        ];
+        let digest = manifest_digest(&store, &m);
+        let cache = store.root().join("cache");
+        let (root, placed) =
+            extract_model_tree(store.root(), &cache, &digest, &m, TreeScope::Full).unwrap();
+        assert_eq!(placed, ["ok.bin"]);
+        assert!(!cache.join("escape.bin").exists());
+        assert!(!store.root().join("escape.bin").exists());
+        assert!(root.join("ok.bin").is_file());
+    }
+
+    #[test]
+    fn a_tar_layer_cannot_write_outside_the_tree() {
+        let (store, mut m) = manifest_with(vec![]);
+        let evil = {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            let name = b"../../escape.bin";
+            header.as_old_mut().name[..name.len()].copy_from_slice(name);
+            header.set_cksum();
+            let mut tar = header.as_bytes().to_vec();
+            tar.push(b'x');
+            tar.resize(tar.len() + 511 + 1024, 0);
+            tar
+        };
+        let mut layer = store
+            .write_blob("application/vnd.cncf.model.weight.v1.tar", &evil)
+            .unwrap();
+        layer.annotations = Some(
+            [(
+                "org.cncf.model.filepath".to_string(),
+                "model.bin".to_string(),
+            )]
+            .into(),
+        );
+        m.layers = vec![layer];
+        let digest = manifest_digest(&store, &m);
+        let cache = store.root().join("cache");
+        let err =
+            extract_model_tree(store.root(), &cache, &digest, &m, TreeScope::Full).unwrap_err();
+        assert!(format!("{err:#}").contains("unsafe path"), "{err:#}");
+        assert!(!cache.join("escape.bin").exists());
+        assert!(!store.root().join("escape.bin").exists());
+    }
+
+    #[test]
+    fn gguf_in_compressed_tar_layers_resolves_with_its_projector() {
+        let gguf = |tail: &[u8]| [b"GGUF".as_slice(), &[3, 0, 0, 0], tail].concat();
+        let main = gguf(b"model");
+        let proj = gguf(b"proj");
+        let (store, mut m) = manifest_with(vec![]);
+        m.layers = vec![
+            tar_layer(
+                &store,
+                "weight",
+                "tar+gzip",
+                &[("model.Q4_K_M.gguf", &main)],
+            ),
+            tar_layer(&store, "weight", "tar+zstd", &[("mmproj-F16.gguf", &proj)]),
+        ];
+        let desc = store.write_manifest(&m).unwrap();
+        store.tag(desc, "example.invalid/gguf:v1").unwrap();
+        let cache = store.root().join("cache");
+        let ModelPath::Gguf(path, Some(mmproj)) =
+            resolve_model(store.root(), &cache, "example.invalid/gguf:v1").unwrap()
+        else {
+            panic!("not a gguf model with a projector");
+        };
+        assert_eq!(std::fs::read(&path).unwrap(), main);
+        assert_eq!(std::fs::read(&mmproj).unwrap(), proj);
+        // resolved again from what is cached
+        let ModelPath::Gguf(again, _) =
+            resolve_model(store.root(), &cache, "example.invalid/gguf:v1").unwrap()
+        else {
+            panic!("not a gguf model");
+        };
+        assert_eq!(again, path);
+    }
+
+    #[test]
+    fn build_raw_stores_each_file_whole_and_resolves_the_gguf() {
+        use sha2::Digest as _;
+        let gguf = [b"GGUF".as_slice(), &[3, 0, 0, 0], b"raw model"].concat();
+        let (store, _) = manifest_with(vec![]);
+        let context = store.root().join("context");
+        std::fs::create_dir_all(&context).unwrap();
+        std::fs::write(context.join("model.gguf"), &gguf).unwrap();
+        std::fs::write(context.join("config.json"), b"{}").unwrap();
+
+        let desc = store
+            .build(
+                &context,
+                "example.invalid/raw:v1",
+                &std::collections::HashMap::new(),
+                true,
+            )
+            .unwrap();
+
+        let m = store.read_manifest(&desc.digest).unwrap();
+        let mut media_types: Vec<&str> = m.layers.iter().map(|l| l.media_type.as_str()).collect();
+        media_types.sort_unstable();
+        assert_eq!(
+            media_types,
+            vec![
+                crate::hf::oci::MEDIA_TYPE_MODEL_WEIGHT_CONFIG_RAW,
+                crate::hf::oci::MEDIA_TYPE_MODEL_WEIGHT_RAW,
+            ]
+        );
+        let weight = m
+            .layers
+            .iter()
+            .find(|l| l.media_type == crate::hf::oci::MEDIA_TYPE_MODEL_WEIGHT_RAW)
+            .unwrap();
+        assert_eq!(
+            weight.digest,
+            format!("sha256:{}", hex::encode(sha2::Sha256::digest(&gguf)))
+        );
+        assert_eq!(weight.size, gguf.len() as u64);
+        assert_eq!(
+            weight.annotations.as_ref().unwrap()["org.cncf.model.filepath"],
+            "model.gguf"
+        );
+
+        let config: crate::storage::oci::CncfModelConfig =
+            serde_json::from_slice(&store.read_blob(&m.config.digest).unwrap()).unwrap();
+        assert_eq!(config.config.format.as_deref(), Some("gguf"));
+        assert_eq!(manifest_format(&m), Some(ModelFormat::Gguf));
+        let digests: Vec<String> = m.layers.iter().map(|l| l.digest.clone()).collect();
+        assert_eq!(
+            config.modelfs.diff_ids, digests,
+            "diffIds follow layer order"
+        );
+        assert_eq!(config.modelfs.fs_type, "layers");
+
+        let cache = store.root().join("cache");
+        let ModelPath::Gguf(path, None) =
+            resolve_model(store.root(), &cache, "example.invalid/raw:v1").unwrap()
+        else {
+            panic!("not a gguf model without a projector");
+        };
+        assert_eq!(std::fs::read(&path).unwrap(), gguf);
+    }
+
+    #[test]
+    fn a_gguf_cached_by_an_earlier_release_is_still_found() {
+        let (store, _) = manifest_with(vec![]);
+        let layer = tar_layer(&store, "weight", "tar", &[("old.gguf", b"GGUFxxxx")]);
+        let hex = digest_hex(&layer.digest).unwrap();
+        let cache = store.root().join("cache");
+        std::fs::create_dir_all(cache.join(hex)).unwrap();
+        std::fs::write(cache.join(hex).join("old.gguf"), b"already here").unwrap();
+        let path = extract_gguf_layer(store.root(), &cache, &layer).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"already here");
+    }
+
+    #[test]
+    fn a_gguf_stored_whole_under_a_tar_media_type_is_cached_by_name() {
+        let (store, _) = manifest_with(vec![]);
+        let mut layer = store
+            .write_blob("application/vnd.cncf.model.weight.v1.tar", b"GGUF-whole")
+            .unwrap();
+        layer.annotations = Some(
+            [(
+                "org.cncf.model.filepath".to_string(),
+                "dir/m.gguf".to_string(),
+            )]
+            .into(),
+        );
+        let cache = store.root().join("cache");
+        let path = extract_gguf_layer(store.root(), &cache, &layer).unwrap();
+        assert_eq!(path.file_name().unwrap(), "m.gguf");
+        assert_eq!(std::fs::read(path).unwrap(), b"GGUF-whole");
+    }
+
+    #[test]
+    fn read_layer_text_reads_a_single_file_layer_in_any_encoding() {
+        let (store, _) = manifest_with(vec![]);
+        let body = vec![b'x'; 600];
+        for suffix in ["tar", "tar+gzip", "tar+zstd"] {
+            let layer = tar_layer(&store, "weight.config", suffix, &[("a.json", &body)]);
+            assert_eq!(
+                read_layer_text(&store, &layer).unwrap().as_bytes(),
+                body.as_slice(),
+                "{suffix}"
+            );
+        }
+        let raw = raw_layer(
+            &store,
+            "application/vnd.cncf.model.weight.config.v1.raw",
+            "a.json",
+            b"{}",
+        );
+        assert_eq!(read_layer_text(&store, &raw).unwrap(), "{}");
+    }
+
+    #[test]
+    fn a_tree_needs_layers_it_can_place() {
+        let (store, mut m) = manifest_with(vec![]);
+        // Docker's own artifact format is not ModelPack: no layers to place.
+        let mut layer = store.write_blob(HF_GGUF_MEDIA_TYPE, b"GGUF").unwrap();
+        layer.annotations =
+            Some([("org.cncf.model.filepath".to_string(), "m.gguf".to_string())].into());
+        m.layers = vec![layer];
+        let desc = store.write_manifest(&m).unwrap();
+        store.tag(desc, "example.invalid/docker:v1").unwrap();
+        let err = resolve_model_tree(
+            store.root(),
+            &store.root().join("cache"),
+            "example.invalid/docker:v1",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("no ModelPack file layers"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_tree_of_an_artifact_llmman_cannot_serve_is_still_a_tree() {
+        let (store, mut m) = manifest_with(vec![]);
+        m.layers = vec![tar_layer(
+            &store,
+            "weight",
+            "tar",
+            &[("model.onnx", b"onnx")],
+        )];
+        let desc = store.write_manifest(&m).unwrap();
+        store.tag(desc, "example.invalid/onnx:v1").unwrap();
+        let tree = resolve_model_tree(
+            store.root(),
+            &store.root().join("cache"),
+            "example.invalid/onnx:v1",
+        )
+        .unwrap();
+        assert_eq!(tree.format, None);
+        assert_eq!(
+            std::fs::read(tree.root.join("model.onnx")).unwrap(),
+            b"onnx"
+        );
     }
 
     #[test]

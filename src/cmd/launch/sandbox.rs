@@ -23,6 +23,8 @@ use std::sync::OnceLock;
 use anyhow::Context;
 use clap::ValueEnum;
 
+use crate::container::identity::{docker_is_rootless, Identity};
+
 /// Where `--sandbox` runs the integration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Sandbox {
@@ -52,6 +54,15 @@ impl Sandbox {
             Sandbox::AppleContainer => "apple-container",
             Sandbox::Microsandbox => "microsandbox",
             Sandbox::Openshell => "openshell",
+        }
+    }
+
+    /// The engine behind a container sandbox, `None` for the rest.
+    fn container_manager(self) -> Option<crate::container::ContainerManager> {
+        match self {
+            Sandbox::Docker => Some(crate::container::ContainerManager::Docker),
+            Sandbox::Podman => Some(crate::container::ContainerManager::Podman),
+            _ => None,
         }
     }
 
@@ -134,6 +145,7 @@ const PASSTHROUGH_ENV: &[&str] = &[
     "PI_CODING_AGENT_DIR",
     "PI_CONFIG_DIR",
     "QWEN_HOME",
+    "VIBE_HOME",
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
@@ -961,43 +973,10 @@ fn guest_env(
     Ok(out)
 }
 
-/// Who the guest writes files as. A Linux bind mount keeps the guest's
-/// uid; Docker Desktop and the VM backends map it to the host user.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Identity {
-    Image,
-    /// `docker run --user`: the user, or root for a rootless daemon.
-    User(String),
-    /// Rootless podman.
-    KeepId,
-}
-
+/// [`Identity`] for `sandbox`: the shared rule applies to the docker and
+/// podman sandboxes; the others run as the image's user.
 fn identity(sandbox: Sandbox, linux: bool) -> Identity {
-    let Some((uid, gid, euid)) = user_ids() else {
-        return Identity::Image;
-    };
-    match sandbox {
-        Sandbox::Docker if linux && docker_is_rootless() => Identity::User("0:0".to_string()),
-        Sandbox::Docker if linux => Identity::User(format!("{uid}:{gid}")),
-        Sandbox::Podman if euid != 0 => Identity::KeepId,
-        _ => Identity::Image,
-    }
-}
-
-#[cfg(unix)]
-fn user_ids() -> Option<(u32, u32, u32)> {
-    // SAFETY: these cannot fail and touch no memory.
-    Some(unsafe { (libc::getuid(), libc::getgid(), libc::geteuid()) })
-}
-
-#[cfg(not(unix))]
-fn user_ids() -> Option<(u32, u32, u32)> {
-    None
-}
-
-fn docker_is_rootless() -> bool {
-    output("docker", &["info", "--format", "{{json .SecurityOptions}}"])
-        .is_ok_and(|out| out.contains("rootless"))
+    crate::container::identity::identity(sandbox.container_manager(), linux)
 }
 
 /// On Linux, docker/podman also get the host network and no SELinux
@@ -1026,7 +1005,9 @@ fn image_args(
     }
     match identity {
         Identity::Image => {}
-        Identity::User(user) => args.extend(["--user".into(), user.clone()]),
+        Identity::User { uid, gid } => {
+            args.extend(["--user".into(), Identity::user_arg(*uid, *gid)])
+        }
         Identity::KeepId => args.push("--userns=keep-id".into()),
     }
     for Mount {
@@ -2128,7 +2109,10 @@ mod tests {
             &sample_plan(),
             true,
             true,
-            &Identity::User("1000:1000".into()),
+            &Identity::User {
+                uid: 1000,
+                gid: 1000,
+            },
         );
         assert_eq!(
             args,

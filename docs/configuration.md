@@ -48,11 +48,25 @@ api_key = "sk-or-..."
 base_url = "http://inferencebox:8000/v1"
 
 [verify]
-default = "off"
+default      = "off"
+layers       = "off"               # hash stored layers on a cold load
+trusted_root = "sigstore/trusted_root.json"   # for keyless rules, relative to this file
 
 [[verify.trust]]
 pattern = "docker.io/myorg/**"
 keys    = ["keys/myorg.pub"]   # relative to this file's directory
+mode    = "enforce"
+
+[[verify.trust]]
+pattern = "docker.io/myorg/ci/**"  # keyless: an identity instead of keys
+issuer  = "https://token.actions.githubusercontent.com"
+subject = "https://github.com/myorg/models/.github/workflows/sign.yml@refs/heads/main"
+mode    = "enforce"
+
+[[verify.trust]]
+pattern = "mirror.corp/**"         # pulled reference selects the rule
+claims  = "docker.io/myorg/**"     # repository the signature may name
+keys    = ["keys/myorg.pub"]
 mode    = "enforce"
 
 [aggregation]
@@ -222,7 +236,10 @@ which is models.dev's naming rather than llmman's.
 
 The environment wins where both have a key, as it does for `aws` and
 `gh`: the file is the standing answer and an `export` is the deliberate,
-this-session-only override. An id that is not a bare TOML key must be
+this-session-only override. A login stored by `llmman login --provider`
+(see [providers.md](providers.md#logging-in)) sits between them: it
+outranks the file, so `llmman logout --provider <id>` is what makes the
+file's key apply again. An id that is not a bare TOML key must be
 quoted — `[providers."wafer.ai"]` — since `[providers.wafer.ai]` is two
 nested tables. Setting `api_key = ""` blanks out a key `/etc` supplied.
 
@@ -238,6 +255,97 @@ travels per request in an `Authorization` header. A key found by
 `llmman serve` is the fallback for a request that presents none, and is
 only spent for a daemon bound to loopback. `llmman providers` reports
 which of the two has a usable key.
+
+### Provider auth, headers and per-account URLs
+
+Any `[providers.<id>]` — a catalog provider's or one you define — may say
+how its credential is attached and where else it can come from:
+
+```toml
+[providers.azure]
+auth_header = "api-key"                  # `auth` = bearer | x-api-key | header | query
+vars        = { AZURE_RESOURCE_NAME = "my-resource" }
+query       = { api-version = "v1" }
+headers     = { X-Team = "ml" }
+
+[providers.groq]
+api_key_command = "pass show groq"       # or: api_key_file = "~/.secrets/groq"
+```
+
+| Field | Meaning |
+|-------|---------|
+| `auth` | `bearer`, `x-api-key`, `header` or `query`. Absent: the wire's own (`bearer` for `openai`, `x-api-key` for `anthropic`) — what llmman has always sent. |
+| `auth_header` / `auth_query` | The header's or parameter's name. Either alone implies `auth`; with `bearer` or `x-api-key` they are a contradiction and rejected. |
+| `headers` | Extra request headers. `Host`, `Content-Length` and other framing headers are rejected, and values are never printed. Held to the standard of a key: ignored in a group- or world-readable file, and sent only where the daemon's own key may go. |
+| `query` | Extra query parameters, held to the same standard as `headers`. |
+| `vars` | Values for `${VAR}` in a catalog provider's base URL (the environment wins). A value that does not fit where it lands is not used. |
+| `api_key_command` | A shell command whose first line of output is the key, run when needed and cached for five minutes. |
+| `api_key_file` | A file whose first line is the key; it must be owner-only. |
+
+Tables merge field by field across files, later winning; `headers`,
+`query` and `vars` merge by name. The credential-chain tables below merge as
+described there. A file with an `api_key_command` or
+`api_key_file` is held to the standard of a file with a key: on Unix a
+group- or world-readable one is ignored for these with a warning, since a
+command anyone can write is a command anyone can choose, and
+`llmman config set` makes the file owner-only. The order of credentials
+is: the provider's environment variable, a stored login, `api_key`, then
+`api_key_command` / `api_key_file`.
+
+Unlike `wire`, `api_key_env` and `name`, these may be set without a
+`base_url`: they adjust the catalog provider, they do not define one.
+
+### Cloud credential chains
+
+A provider with no key can stand behind a chain: one of the tables below,
+at most one per provider. They are how a provider models.dev does not list
+gets one, and how a built-in one (`amazon-bedrock`, `google-vertex`,
+`azure`, `databricks`, `watsonx`, `sap-ai-core`) is told which profile,
+file, tenant or token endpoint to use. A chain is the *last* credential a
+request looks for — after the provider's variable, a stored login, `api_key`
+and `api_key_command` / `api_key_file` — and writing its table says "try
+it" even where nothing on the machine hints that it will work. See
+[providers.md](providers.md#cloud-credentials) for what each does.
+
+```toml
+[providers.amazon-bedrock]
+aws = { profile = "work", region = "us-west-2" }     # service = "bedrock" is the default
+
+[providers.google-vertex]
+gcp = { project = "my-project", location = "us-central1", credentials_file = "~/keys/vertex.json" }
+
+[providers.azure]
+azure = { tenant_id = "...", client_id = "...", client_secret_env = "AZURE_CLIENT_SECRET" }
+
+[providers.my-gateway]
+base_url = "https://gateway.example/v1"
+oauth2   = { token_url = "https://idp.example/oauth/token", client_id = "llmman",
+             client_secret_file = "~/.secrets/gw", scope = "inference", client_auth = "basic" }
+```
+
+| Table | Fields |
+|-------|--------|
+| `aws` | `profile` (that profile alone, instead of the chain), `region`, `service` (the SigV4 signing name; `bedrock`, or `bedrock-mantle` for the Mantle endpoint). |
+| `gcp` | `credentials_file` (a service-account or `authorized_user` file), `project`, `location`. |
+| `azure` | `tenant_id`, `client_id`, one of `client_secret` / `client_secret_env` / `client_secret_file`, `federated_token_file`, `managed_identity` (bool), `cli` (bool), `scope` (default `https://cognitiveservices.azure.com/.default`), `authority_host`. |
+| `oauth2` | OAuth 2.0 client credentials: `token_url` (https; may hold `${VAR}`), `client_id` / `client_id_env`, one of `client_secret` / `client_secret_env` / `client_secret_file`, `client_auth` (`body` or `basic`), `scope`, `audience`, `resource`, `params` (extra form fields). |
+| `jwt_bearer` | RFC 7523: `token_url`, `issuer` (or `client_id`), `subject`, `audience` (the assertion's `aud`; the token URL if unset), `scope`, `key_file` (a PEM private key, owner-only), `key_id`, `algorithm` (`RS256` or `ES256`), `lifetime_secs`. |
+| `ibm_iam` | IBM Cloud IAM (watsonx): `client_secret` / `_env` / `_file` for the IBM Cloud API key, `token_url` (default `https://iam.cloud.ibm.com/identity/token`). |
+
+Across files a later table of the same kind overlays the earlier field by
+field (the secret's three spellings replace each other as a group); a table
+of another kind replaces it. A secret written in a table is held to the
+standard of an `api_key`: the file must be owner-only.
+
+### Stored logins
+
+`llmman login --provider` keeps credentials in
+`~/.config/llmman/credentials.json`, not in `llmman.conf` — it is rewritten
+on every token refresh, which a file people edit by hand should not be. The
+same rule applies as for a key: on Unix it must be `0600` or it is ignored
+with a warning. A login for a cloud chain stores the selection (a profile, a
+file's path, a tenant and client secret) and never a token. See
+[providers.md](providers.md#where-logins-are-kept).
 
 ### Your own provider endpoints
 
@@ -287,6 +395,38 @@ verification, rather than a silent downgrade to `off` — even though the
 same failure only costs the other two sections their aliases and keys.
 That asymmetry is deliberate: a trust policy llmman cannot read must not
 be mistaken for one that does not exist.
+
+A `[[verify.trust]]` rule trusts either `keys` or a keyless identity,
+`issuer` and `subject`, which are compared exactly against the OIDC
+issuer and a subject alternative name of the Fulcio certificate the
+signature carries. Both are required: a rule setting one without the
+other is rejected when the file is read. A rule that sets `keys` together
+with `issuer` or `subject` is rejected when the file is read, with the
+same fatal outcome as a malformed file. Keyless rules need
+`verify.trusted_root`, a Sigstore TrustedRoot JSON holding the Fulcio
+roots and the Rekor log keys; a relative path resolves against the
+directory of the file that sets it, like `keys`, and a later file's
+value replaces an earlier one. A keyless rule matching a pull with no
+`trusted_root` configured is a broken configuration, never an unsigned
+model: under `enforce` the pull is refused, under `warn` it proceeds
+with a warning naming `trusted_root`, and the model is never reported
+as "not signed".
+
+`verify.layers` is a separate switch: `off` (the default), `warn`, or
+`enforce`. It decides whether a cold load re-hashes the stored manifest,
+its config blob and every stored layer blob and compares each SHA-256
+with the digest the manifest records. `default` and the trust
+rules do not turn it on, and it needs no keys: a signed model whose blob
+was overwritten on disk is exactly what it catches. `warn` logs a notice
+per mismatch and loads anyway; `enforce` fails the load. The manifest
+is resolved once and that one manifest is checked and loaded, pinned
+by digest (a model stored under an absolute path or a URI cannot carry
+a digest and is loaded by name instead); each blob is opened without
+following symlinks and must be a regular file, so a blob replaced by a
+symlink, a directory or a FIFO is a mismatch. It runs once per
+cold load, not per request, and the cost is one sequential read and
+hash of every blob. Later config files override earlier ones, and
+`LLMMAN_VERIFY_LAYERS` overrides them all.
 
 See [verification.md](verification.md) for the format, what is checked,
 and the limitations.
@@ -405,6 +545,11 @@ set to a nonblank value in the daemon's environment and both processes
 resolve the same token file (`HF_TOKEN_PATH`, else `HF_HOME`, else
 `XDG_CACHE_HOME`, else the home directory).
 
+A new Hugging Face pull records the commit the Hub reports, when it
+reports one, in the model config `descriptor.revision` field and in the
+manifest annotation `org.llmman.revision`, which `llmman show` prints
+under Labels. A model pulled before this was recorded is not backfilled.
+
 ## Environment variables
 
 Daemon-wide settings, set before `llmman serve` starts. llmman is a very
@@ -423,6 +568,7 @@ setting may not behave identically.
 | `LLMMAN_TLS_CERT` / `LLMMAN_TLS_KEY` | PEM certificate chain and private key; set both and `llmman serve` terminates TLS itself (rustls). Set `LLMMAN_HOST=https://...` too, so the CLI in the same environment connects accordingly. |
 | `LLMMAN_TLS_CA` | A PEM bundle of extra roots to trust, for a private CA: the daemon uses it to reach peers, and the CLI to reach the daemon. |
 | `LLMMAN_CONTEXT_LENGTH` | Context size for llama-server/vLLM/SGLang/ds4 when set. Defaults to `262144` (256k) for llama-server, capped to each model's trained context; backend-specific forwarding is below. A llama-server model can be given its own with `options.num_ctx` on `/api/chat` and `/api/generate`, which wins over this (see [Ollama API notes](api.md#ollama-api-notes)). |
+| `LLMMAN_EMBEDDING_CONTEXT_LENGTH` | Context size for embedding models, in place of `LLMMAN_CONTEXT_LENGTH`. An embedding model reads its whole input in one batch as large as its context, so at the default it costs memory in proportion to its trained context (3.6 GiB for a 0.6B model trained to 32768); this lets one daemon serve a large-context chat model and a small embedder. Capped to the model's trained context, and `0` means that context. Unset, embedding models follow `LLMMAN_CONTEXT_LENGTH`. |
 | `LLMMAN_HYBRID_LOCAL_BYTES` | Largest request body, in bytes, that a [hybrid model pair](providers.md#hybrid-model-pairs) serves locally; anything larger goes to the hosted half. `0` disables the size rule; a request the local half then refuses as over its context is still retried on the hosted half. Set, it is never overridden by a load; unset, the budget is four bytes per token of the window the local half loaded with, falling back to the daemon's context size until then. |
 | `LLMMAN_KEEP_ALIVE` | The daemon-wide default `keep_alive` (how long an idle, unused model stays loaded before being unloaded). Defaults to 5 minutes. Overridden per-request by `/api/chat`/`/api/generate`'s own `keep_alive` field. |
 | `LLMMAN_MAX_LOADED_MODELS` | Caps how many models this daemon keeps loaded at once, as one flat daemon-wide total (llmman has no per-model memory estimate to size an automatic per-GPU figure against). Once at the cap, the least-recently-used idle model is evicted to make room; if every loaded model is busy, the request gets a `503` instead. Defaults to `0` (unbounded, today's behavior, unchanged). |
@@ -442,7 +588,7 @@ setting may not behave identically.
 | `LLMMAN_PEERS` | Comma-separated peer daemons (`[scheme://]host[:port]`) to pool hardware with, overriding `[aggregation]` in `llmman.conf`. Set but empty takes this daemon out of its aggregation. See [aggregation.md](aggregation.md). |
 | `LLMMAN_REGISTRY_MIRRORS` | Comma-separated mirrors (`[scheme://]host[:port][/path]`) to try before Docker Hub for a `docker.io/...` pull, overriding `[registries."docker.io"]` in `llmman.conf`; set but empty removes Hub's mirrors. Hub only, like dockerd's `--registry-mirror`; other registries take theirs from `llmman.conf`. See [registry mirrors](#registry-mirrors). |
 | `LLMMAN_ORIGINS` | A comma-separated list of extra allowed CORS origins for the HTTP API. A single `*` anywhere in an entry matches any substring (`http://host:*` for any port, `https://*.example.com` for any subdomain, a bare `*` for everything), same as Ollama. Always includes every scheme/port on `localhost`/`127.0.0.1`/`0.0.0.0`/`[::1]` regardless of this variable. |
-| `LLMMAN_SHELL` | The web UI's Shell (`/llmman/shell`, a terminal on the daemon's machine as the daemon's user). `0`/`false`/`no`/`off` removes it; unset (or `1`/`true`/`yes`/`on`) runs the login shell; any other value is the command to run instead, split like `LLMMAN_VLLM_ARGS`, so a quoted argument can hold a space (`tmux new -A -s llmman`, `sh -c 'exec tmux new -A'`); an unclosed quote stops `llmman serve` at startup. Regardless of this variable the shell is off whenever `LLMMAN_HOST` binds beyond loopback, requires the daemon's API key when it has one, requires the token each start writes to `shell-<host>-<port>.token` in llmman's data directory, and a browser page may only open one from an origin `LLMMAN_ORIGINS` allows. See [webui.md](webui.md). |
+| `LLMMAN_SHELL` | The web UI's Shell (`/llmman/shell`, a terminal on the daemon's machine as the daemon's user). `0`/`false`/`no`/`off` removes it; unset (or `1`/`true`/`yes`/`on`) runs the login shell; any other value is the command to run instead, split like `LLMMAN_VLLM_ARGS`, so a quoted argument can hold a space (`tmux new -A -s llmman`, `sh -c 'exec tmux new -A'`); an unclosed quote stops `llmman serve` at startup. Regardless of this variable the shell is off whenever `LLMMAN_HOST` binds beyond loopback, requires the daemon's API key when it has one, requires the token `llmman serve` keeps in `shell-<host>-<port>.token` in llmman's data directory, and a browser page may only open one from an origin `LLMMAN_ORIGINS` allows. See [webui.md](webui.md). |
 | `LLMMAN_WEBUI_DIR` | Serves the web UI from this directory instead of the copy built into the binary, uncompressed and uncached, for working on it (`LLMMAN_WEBUI_DIR=webui llmman serve`). Development only. |
 | `LLMMAN_TK` | `off` makes `llmman tk`, which `llmman launch --optimizer tk` routes the agent's shell commands through, run every command untouched. See [optimizers.md](optimizers.md). |
 | `LLMMAN_SANDBOX_IMAGE` | The image `llmman launch --sandbox` runs the integration from, for `docker`, `podman`, `apple-container`, `microsandbox` and `openshell`. Defaults to Docker Sandboxes' image for the agent (`docker.io/docker/sandbox-templates:<tag>`) where one exists. Other integrations need this set. `seatbelt` runs the installed integration rather than an image. `sbx` ignores this variable and uses its own agent image. See [sandbox.md](sandbox.md#images). |
@@ -450,23 +596,25 @@ setting may not behave identically.
 | `LLMMAN_FLASH_ATTENTION` | Flash Attention mode (`--flash-attn`): `on`, `off`, or `auto` (llama-server's own default). Also accepts `1`/`0`/`true`/`false`. |
 | `LLMMAN_KV_CACHE_TYPE` | KV-cache quantization (`--cache-type-k`/`--cache-type-v`), e.g. `f16` (default), `q8_0`, `q4_0`. Trades output quality for memory at long context lengths. |
 | `LLMMAN_RUNTIME` | Where `llmman serve` gets its inference engine: `auto` (default), `docker`, `podman`, `bin` or `path` — the same setting as `serve --runtime`, as an environment variable so it also reaches the daemon `llmman run`/`launch` start for you. See [backends.md](backends.md#choosing-a-runtime). |
+| `LLMMAN_NO_HARDENED` | When set (to anything other than `0`/`false`/`no`/`off`), `llmman serve` runs its engine containers without the hardened flags they get by default (`--read-only` except behind `--gpus`, `--cap-drop all`, `--security-opt no-new-privileges` and a tmpfs per engine scratch path); the same setting as `serve --no-hardened`. Read once at startup, like `LLMMAN_NOHISTORY`. No effect under `--runtime bin` or `path`. See [backends.md](backends.md#--no-hardened). |
 | `LLMMAN_LLM_LIBRARY` | Forces which GPU backend `llmman serve`/`run` picks (`cpu`, `cuda`/`cuda12`/`cuda_v12`, `cuda13`/`cuda_v13`, `rocm`, `opencl`, `vulkan`, or macOS-only `metal`), bypassing autodetection. Has no effect under `--runtime path` (that binary's backend is fixed), or on macOS's local-binary download (one asset per architecture, no separate choice to make). |
 | `LLMMAN_IGPU_ENABLE` | Counts integrated GPUs (Vulkan only) when probing for an accelerator. Defaults to disabled, since an integrated GPU is usually a worse choice than the discrete/CPU fallback it would otherwise be skipped in favor of. |
 | `LLMMAN_LOAD_TIMEOUT` | How long to allow a model load to stall before giving up. Zero or negative means wait forever. Defaults to 20 minutes (`vllm` and `sglang` can take many minutes to load a large safetensors model: a cold start of a 27B NVFP4 model on a DGX Spark takes about ten). Also passed to vLLM-Omni as `--init-timeout` (a day when unbounded). |
 | `LLMMAN_VLLM_OMNI_GUARDRAILS` | When set (`1`/`true`/`yes`/`on`), a Diffusers-layout model served by vLLM-Omni keeps its safety guardrails on; llmman otherwise passes `--no-guardrails`. See [backends.md](backends.md#vllm-omni-diffusers-pipelines). |
 | `LLMMAN_TMPDIR` | Staging directory for `llama-server` release downloads, overriding the default `tmp` subdirectory of the install root. |
 | `LLMMAN_VERIFY` | Overrides the signature-verification mode (`off`, `warn`, or `enforce`) for every reference, ignoring what `[verify]` selected. Does *not* supply trusted keys — those still come from `llmman.conf`, so `enforce` with no configured keys fails every check rather than passing them. Intended for CI, which can demand `enforce` without editing config files. See [verification.md](verification.md). |
+| `LLMMAN_VERIFY_LAYERS` | Overrides `[verify] layers` (`off`, `warn`, or `enforce`): whether a cold load re-hashes the stored manifest and layer blobs against the digests the manifest records. Independent of `LLMMAN_VERIFY` and of the trust rules. Resolved once when the policy loads; an unparsable value is an error, not a downgrade to `off`. See [verification.md](verification.md#layer-verification-at-load). |
 | `LLMMAN_SIGN_PASSWORD` | Passphrase for the `--sign-key` private key used by `push`/`transfer`, when it is an encrypted PEM. Falls back to `COSIGN_PASSWORD`. Read by the CLI process, which does the signing itself; neither key nor passphrase reaches the daemon. |
 | `LLMMAN_NOHISTORY` | When set (to anything other than `0`/`false`/`no`/`off`), `llmman serve` stops recording prompts for `llmman log`. Otherwise each request to a generation route (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`) appends its time, route, model, `User-Agent` and the last user message's text — not the transcript or the reply — to `prompts.jsonl` beside the store (`~/.local/share/llmman/prompts.jsonl` by default), readable only by its owner. Delete the file to clear the history. |
 | `LLMMAN_NOUSAGE` | When set (to anything other than `0`/`false`/`no`/`off`), `llmman serve` stops recording token usage for `llmman usage`. Otherwise each reply that reports usage appends its time, route, serving model and provider, `User-Agent`, token counts and, for a priced provider model, the rate and cost in US dollars to `usage.jsonl` beside the store, readable only by its owner. No prompt text, so independent of `LLMMAN_NOHISTORY`; the `id` matches the `prompts.jsonl` entry when there is one. |
-| `LLMMAN_NOPRUNE` | When set (to anything other than `0`/`false`/`no`/`off`), skips the garbage-collection sweep that `llmman rm` and `llmman serve` startup otherwise run to delete blobs and extracted-cache entries no longer referenced by any local model. Note this is broader than skipping the daemon-startup catch-all: it also stops `llmman rm` itself from ever freeing disk space, so a removed model's (possibly multi-GB) weights stay on disk until a later sweep runs without this set. Useful for a shared/read-mostly store, or scripts that `rm` in a loop and prune once at the end. |
+| `LLMMAN_NOPRUNE` | When set (to anything other than `0`/`false`/`no`/`off`), skips the garbage-collection sweep that `llmman rm`, `llmman serve` startup, and a `build`/`cp`/`/api/copy`/`/api/create` that replaces a tag's content otherwise run to delete blobs and extracted-cache entries no longer referenced by any local model. Note this is broader than skipping the daemon-startup catch-all: it also stops `llmman rm` itself from ever freeing disk space, so a removed model's (possibly multi-GB) weights stay on disk until a later sweep runs without this set. Useful for a shared/read-mostly store, or scripts that `rm` in a loop and prune once at the end. |
 | `LLAMA_ARG_FIT` / `LLAMA_ARG_FIT_TARGET` / `LLAMA_ARG_THREADS` | llama.cpp's own env-configurable `--fit`/`--fit-target`/`--threads` options. Not something llmman parses itself, just forwarded through to every `llama-server` (local or container) it spawns, same as `CUDA_VISIBLE_DEVICES`/etc. below. |
 
 ### Context length by backend
 
 | Backend | When `LLMMAN_CONTEXT_LENGTH` is set | When unset or invalid |
 |---------|-------------------------------------|-----------------------|
-| `llama-server` | Passed as `--ctx-size` as-is for generation models (llama-server allocates the KV cache at that size and caps each request slot to the model's trained context). Embedding models are always capped to their trained context, and `0` means that context. A decision model reads its whole prompt in one batch of this size (up to the trained context), costing memory in proportion, so unset it is `8192` tokens at most. | `--ctx-size 262144` (256k), or the model's trained context if smaller. If the load then fails with an out-of-memory error, llmman retries with the context halved (down to a 16384 floor) before giving up. |
+| `llama-server` | Passed as `--ctx-size` as-is for generation models (llama-server allocates the KV cache at that size and caps each request slot to the model's trained context). Embedding models are always capped to their trained context, and `0` means that context; `LLMMAN_EMBEDDING_CONTEXT_LENGTH` sets theirs on its own. A decision model reads its whole prompt in one batch of this size (up to the trained context), costing memory in proportion, so unset it is `8192` tokens at most. | `--ctx-size 262144` (256k), or the model's trained context if smaller. If the load then fails with an out-of-memory error, llmman retries with the context halved (down to a 16384 floor) before giving up. |
 | `vLLM` | Positive values are passed as `--max-model-len`; oversized values are rejected by vLLM. `0` is not forwarded. | Uses vLLM's model-derived default. |
 | `vllm serve --omni` | Not forwarded: a diffusion pipeline has no context window. | — |
 | `sglang` | Positive values are passed as `--context-length`, the same rule as vLLM's; oversized values are rejected by SGLang. `0` is not forwarded. | Uses the model's `config.json`. |

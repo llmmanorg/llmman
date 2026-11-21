@@ -212,9 +212,31 @@ pub(super) fn use_mlx_for_safetensors() -> bool {
     cfg!(target_os = "macos") && safetensors_engine_from_env() == SafetensorsEngine::Auto
 }
 
+/// A free port, never one of the last [`RECENT_PORTS`] handed out: the
+/// listener is dropped before the backend binds, so concurrent loads could
+/// otherwise share one.
 pub(super) fn find_free_port() -> anyhow::Result<u16> {
-    let l = TcpListener::bind("127.0.0.1:0")?;
-    Ok(l.local_addr()?.port())
+    static RECENT: StdMutex<VecDeque<u16>> = StdMutex::new(VecDeque::new());
+    for _ in 0..1024 {
+        let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        if claim_port(&mut RECENT.lock().unwrap_or_else(|e| e.into_inner()), port) {
+            return Ok(port);
+        }
+    }
+    anyhow::bail!("no free port that was not just handed out")
+}
+
+const RECENT_PORTS: usize = 256;
+
+fn claim_port(recent: &mut VecDeque<u16>, port: u16) -> bool {
+    if recent.contains(&port) {
+        return false;
+    }
+    if recent.len() == RECENT_PORTS {
+        recent.pop_front();
+    }
+    recent.push_back(port);
+    true
 }
 
 /// Shared handle onto the last few lines a spawned inference backend wrote
@@ -277,8 +299,10 @@ pub(super) async fn spawn_llama_server(
         embeddings,
         batch_size,
         threads,
-        // A local child shares the daemon's cgroup already.
+        // A local child shares the daemon's cgroup already, and
+        // `hardened` is a container `run` flag.
         cpus: _,
+        hardened: _,
         extra_args,
     } = opts;
     let mut cmd = tokio::process::Command::new(bin);
@@ -486,6 +510,31 @@ pub(super) fn llama_sets(extra: &[String], flag: &str, env: Option<&str>) -> boo
     }) || env.is_some_and(|env| std::env::var_os(env).is_some())
 }
 
+/// The `think` values llama-server takes for `controls`, and whether
+/// `minimal` and `low` get a budget (not with the user's `--reasoning-budget`
+/// in `extra` or, if `inherits_env`, the environment). A user's own
+/// template replaces the one `controls` read: no values.
+pub(super) fn llama_thinking(
+    controls: &crate::chat_template::ThinkingControls,
+    extra: &[String],
+    inherits_env: bool,
+) -> (Option<crate::chat_template::Thinking>, bool) {
+    let inherited = |var| inherits_env.then_some(var);
+    let user_template = ["--chat-template", "--chat-template-file"]
+        .iter()
+        .zip(["LLAMA_ARG_CHAT_TEMPLATE", "LLAMA_ARG_CHAT_TEMPLATE_FILE"])
+        .any(|(flag, env)| llama_sets(extra, flag, inherited(env)));
+    if user_template {
+        return (None, false);
+    }
+    let budgeted = !llama_sets(
+        extra,
+        "--reasoning-budget",
+        inherited("LLAMA_ARG_THINK_BUDGET"),
+    );
+    (controls.thinking(budgeted), budgeted)
+}
+
 /// llama-server's flags that size each slot's context, with their env vars.
 const LLAMA_SLOT_CONTEXT_FLAGS: &[(&str, &str)] = &[
     ("-c", "LLAMA_ARG_CTX_SIZE"),
@@ -523,6 +572,15 @@ pub(super) fn check_extra_args_env() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether `extra` or, if `inherits_env`, the environment sets llama-server's
+/// slot count, overriding llmman's `--parallel`.
+pub(super) fn llama_sets_parallel(extra: &[String], inherits_env: bool) -> bool {
+    let env = inherits_env.then_some("LLAMA_ARG_N_PARALLEL");
+    ["-np", "--parallel"]
+        .iter()
+        .any(|flag| llama_sets(extra, flag, env))
 }
 
 /// Appends `extra` (a split `LLMMAN_*_ARGS`), then `--port port --host
@@ -1018,7 +1076,7 @@ const DEFAULT_LOAD_TIMEOUT: Duration = Duration::from_secs(1200);
 
 /// `None` = wait forever, from an `LLMMAN_LOAD_TIMEOUT` of 0 or
 /// negative (mirrors Ollama's `OLLAMA_LOAD_TIMEOUT`).
-fn load_timeout_from_env() -> Option<Duration> {
+pub(super) fn load_timeout_from_env() -> Option<Duration> {
     match std::env::var("LLMMAN_LOAD_TIMEOUT") {
         Ok(v) => parse_load_timeout(&v).unwrap_or(Some(DEFAULT_LOAD_TIMEOUT)),
         Err(_) => Some(DEFAULT_LOAD_TIMEOUT),
@@ -1204,6 +1262,17 @@ pub(super) async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<S
 mod tests {
     use super::*;
     use std::sync::PoisonError;
+
+    #[test]
+    fn a_port_just_handed_out_is_refused_until_it_ages_out() {
+        let mut recent = VecDeque::new();
+        assert!(claim_port(&mut recent, 4000));
+        assert!(!claim_port(&mut recent, 4000));
+        for port in 5000..5000 + RECENT_PORTS as u16 {
+            assert!(claim_port(&mut recent, port));
+        }
+        assert!(claim_port(&mut recent, 4000));
+    }
 
     /// Held by every test that sets or reads an `LLMMAN_*_ARGS` variable,
     /// since the environment is process-wide.
@@ -1595,6 +1664,17 @@ mod tests {
         ] {
             assert!(!sets(args), "{args:?}");
         }
+    }
+
+    #[test]
+    fn llama_sets_parallel_sees_either_spelling() {
+        let sets = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            llama_sets_parallel(&args, false)
+        };
+        assert!(sets(&["-np", "1"]));
+        assert!(sets(&["--parallel=1"]));
+        assert!(!sets(&["--jinja", "--ctx-size", "8192"]));
     }
 
     #[test]

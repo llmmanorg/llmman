@@ -212,7 +212,16 @@ fn parse_key(name: &str) -> Result<Vec<Key>> {
 }
 
 fn is_credential(key: &str) -> bool {
-    key == "api_key" || key.ends_with(".api_key") || key == "auth.api_keys"
+    // A key command or file is held to the standard of a key: llmman
+    // refuses to run or read one from a file others can write.
+    key == "api_key"
+        || key.ends_with(".api_key")
+        || key == "auth.api_keys"
+        || key.ends_with(".api_key_command")
+        || key.ends_with(".api_key_file")
+        || key.ends_with(".client_secret")
+        || key.contains(".headers.")
+        || key.contains(".query.")
 }
 
 /// Whether the document holds a secret — see [`write_atomic`].
@@ -789,6 +798,23 @@ mod tests {
     fn only_a_credential_is_treated_as_one() {
         assert!(carries_key(&doc("[providers.openai]\napi_key = \"sk-x\"")));
         assert!(!carries_key(&doc("[providers.openai]\napi_key = \"\"")));
+        // A key command or file is held to the same standard as a key.
+        assert!(carries_key(&doc(
+            "[providers.openai]\napi_key_command = \"pass show x\""
+        )));
+        assert!(carries_key(&doc(
+            "[providers.openai]\napi_key_file = \"/k\""
+        )));
+        assert!(!carries_key(&doc(
+            "[providers.openai]\napi_key_command = \"\""
+        )));
+        assert!(carries_key(&doc(
+            "[providers.p]\nheaders = { X-Gateway = \"t\" }"
+        )));
+        assert!(carries_key(&doc("[providers.p]\nquery = { key = \"t\" }")));
+        assert!(carries_key(&doc(
+            "[providers.p]\noauth2 = { client_secret = \"s\" }"
+        )));
         assert!(!carries_key(&doc("[aliases]\napi_keyring = \"x\"")));
         assert!(!carries_key(&doc("[verify]\ndefault = \"off\"")));
     }

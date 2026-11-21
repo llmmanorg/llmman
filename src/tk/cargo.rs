@@ -48,7 +48,7 @@ fn without_progress(text: &str) -> String {
 
 pub(super) fn build(run: &Run<'_>) -> Option<Compact> {
     Some(Compact {
-        stdout: run.stdout.to_string(),
+        stdout: without_progress(run.stdout),
         stderr: without_progress(run.stderr),
     })
 }
@@ -101,7 +101,7 @@ pub(super) fn test(run: &Run<'_>) -> Option<Compact> {
     }
     passing.finish_run(&mut out, "passing test lines");
     Some(Compact {
-        stdout: join(&out),
+        stdout: without_progress(&join(&out)),
         stderr: without_progress(run.stderr),
     })
 }
@@ -127,6 +127,14 @@ warning: unused variable: `x`
 warning: `mylib` (lib) generated 1 warning
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.31s
 ";
+
+    #[test]
+    fn build_drops_progress_from_one_merged_stream_too() {
+        let out = build(&run(0, BUILD_OK, "")).unwrap().stdout;
+        assert!(out.len() < BUILD_OK.len());
+        assert!(out.contains("warning: unused variable"));
+        assert!(!out.contains("Compiling"));
+    }
 
     #[test]
     fn build_drops_progress_and_keeps_warnings_whole() {

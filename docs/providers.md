@@ -36,9 +36,20 @@ one command and the key status reported is the daemon's.
 
 ## API keys
 
-The API key comes from the variable models.dev names for that provider,
-or — when that is unset — from `~/.config/llmman/llmman.conf`, keyed by
-provider id:
+The credential `llmman serve` sends comes, in this order, from
+
+1. the variable models.dev names for that provider (an `export` is the
+   deliberate, this-session override, as it is for `aws` and `gh`);
+2. a login stored by [`llmman login --provider`](#logging-in) — an API key
+   you pasted, a subscription login, a key command or file;
+3. `api_key` in `~/.config/llmman/llmman.conf`, keyed by provider id;
+4. `api_key_command` or `api_key_file` there.
+
+A stored login outranks the file because `llmman login` is the newer,
+explicit act, and a leftover `api_key` should not silently win over it.
+`llmman logout --provider <id>` removes the login, and the file's key
+applies again. A request that carries a key of its own (what `launch` and
+`run` send) uses that instead of any of these. The file:
 
 ```toml
 [providers.openrouter]
@@ -68,6 +79,348 @@ key ([api.md](api.md#authentication)) — and since that key takes the
 daemon's provider key rather than carrying one; `run --provider` sends
 its own as `x-api-key`. (`providers` and `list --provider` read the
 catalog only and work against any daemon.)
+
+## Logging in
+
+A key is not the only way into a hosted provider. `llmman login --provider
+<id>` stores a credential for it in `~/.config/llmman/credentials.json` (see
+[Where logins are kept](#where-logins-are-kept)); `llmman serve` spends it
+from the next request, refreshing it as it expires.
+
+```sh
+llmman login --provider openai-chatgpt                  # ChatGPT/Codex subscription, device code
+llmman login --provider github-copilot                  # GitHub Copilot, device code
+llmman login --provider xai-supergrok                   # SuperGrok subscription, device code
+llmman login --provider openrouter                      # browser sign-in; stores the API key it returns
+llmman login --provider anthropic --method setup-token  # paste what `claude setup-token` prints
+llmman login --provider anthropic --method import-claude   # reuse Claude Code's login
+llmman login --provider poe                             # browser sign-in; stores the API key Poe returns
+llmman login --provider digitalocean                    # browser sign-in (implicit grant)
+llmman login --provider chutes --param client_id=cid_.. # browser sign-in with your Chutes OAuth app
+llmman login --provider gitlab                          # GitLab Duo, PKCE (--param instance_url=...)
+llmman login --provider snowflake-cortex --param account=myorg-acct   # PKCE against your account
+llmman login --provider minimax                         # MiniMax account, user code
+llmman login --provider amazon-bedrock --method aws-profile --param profile=work
+llmman login --provider google-vertex --method service-account --file key.json --param project=my-proj
+llmman login --provider azure --method entra --param tenant_id=... --param client_id=...
+llmman login --provider groq                            # paste an API key (the default method)
+llmman login --provider groq --method command --command 'pass show groq'
+llmman login --provider groq --method token-file --file ~/.secrets/groq
+llmman login --provider anthropic --method ?            # what a provider takes
+llmman logout --provider openai-chatgpt
+```
+
+`llmman login [SERVER]` (registries, Hugging Face) is unchanged;
+`--provider` is a different mode, and cannot be combined with `SERVER`,
+`--username` or `--password`. `llmman providers` shows each provider's
+credential in the `KEY` column — `set (oauth)`, `set (command)`,
+`expired (token)` — and never the secret; a key in the environment or
+`llmman.conf` is just `set`, as before.
+
+| Provider | Method | What it does |
+|----------|--------|--------------|
+| `openai-chatgpt` | `device` (default) | ChatGPT account via OpenAI's device-code flow. Refreshes; sends `ChatGPT-Account-Id`. |
+| | `import-codex` | Reuses `~/.codex/auth.json` (`$CODEX_HOME`). |
+| `github-copilot` | `device` (default) | GitHub device flow with `read:user`. The GitHub token is the credential (it does not expire); `copilot_internal/user` names the API host. Also read from `COPILOT_GITHUB_TOKEN`. |
+| `xai-supergrok` | `device` (default) | SuperGrok subscription via xAI's device flow. Refreshes. |
+| `openrouter` | `oauth` (default) | PKCE in the browser, returning to `http://localhost:3000/openrouter-oauth/callback`; OpenRouter answers with an API key, which is what is stored. |
+| `anthropic` | `setup-token` (default) | Paste the `sk-ant-oat01-…` token from `claude setup-token`. |
+| | `import-claude` | Reuses `~/.claude/.credentials.json` (`$CLAUDE_CONFIG_DIR`). Not the macOS Keychain. |
+| `poe` | `browser` (default) | PKCE at `poe.com/oauth/authorize` (scope `apikey:create`), returning to a loopback port; `api.poe.com/token` answers with an API key, stored with its expiry (none when Poe states none). When it lapses the provider reports `expired`; log in again. |
+| `digitalocean` | `browser` (default) | The implicit grant at `cloud.digitalocean.com/v1/oauth/authorize` (scopes `genai:read inference:query`), returning to `http://localhost:1456/auth/callback`. A browser never sends a URL's `#fragment`, so the page the listener serves forwards the token to it; the login stops if the port is busy, since another program could read the token. Stored with its expiry (30 days when none is stated). |
+| `chutes` | `oauth` (default) | PKCE at `api.chutes.ai/idp/authorize` for **your own** OAuth app (`--param client_id=`, or `CHUTES_CLIENT_ID`; `CHUTES_CLIENT_SECRET` is sent too if set), redirect `http://127.0.0.1:1456/oauth-callback`. Refreshes. Sent only to `llm.chutes.ai`. |
+| `gitlab` | `pkce` (default) | PKCE against `--param instance_url=` / `GITLAB_INSTANCE_URL` / gitlab.com, scope `api`, redirect `http://127.0.0.1:8080/callback`. gitlab.com uses opencode's registered application; another instance needs `GITLAB_OAUTH_CLIENT_ID` for yours. The instance is kept with the login; the refresh token rotates. |
+| `snowflake-cortex` | `oauth` (default) | PKCE at `<account>.snowflakecomputing.com/oauth/authorize` as Snowflake's built-in `LOCAL_APPLICATION` client (`--param account=` or `SNOWFLAKE_ACCOUNT`; `--param role=` adds `session:role:<role>`). Refreshes. A programmatic access token is the provider's key: `SNOWFLAKE_CORTEX_PAT`, or `--method key`. The account of a login stands for `SNOWFLAKE_ACCOUNT` when the base URL is built. |
+| `minimax`, `minimax-coding-plan`, `minimax-cn`, `minimax-cn-coding-plan` | `device` (default) | MiniMax's user-code flow at `account.minimax.io` (`account.minimaxi.com` for the `-cn` providers), polled until approved. Refreshes. Sent as a bearer to `api.minimax.io`, `api.minimax.cn` or `api.minimaxi.com`. |
+| `amazon-bedrock`, `amazon-bedrock-mantle` | `aws-chain` (default) | Select the [AWS credential chain](#amazon-bedrock) (`--param region=`). |
+| | `aws-profile` | A named AWS profile (`--param profile=`, `--param region=`). |
+| `google-vertex` | `adc` (default) | Select [Application Default Credentials](#google-vertex-ai) (`--param project=`, `--param location=`). |
+| | `service-account` | `--file key.json`: the path is kept, the key stays in its file. |
+| `azure` | `entra` (default) | A client secret: `--param tenant_id=`, `--param client_id=`, the secret asked for. The token endpoint is asked once before it is stored. |
+| | `managed-identity` | The VM's, App Service's or container's identity (`--param client_id=` for a user-assigned one). |
+| | `federated` | `--file <projected token>`, `--param tenant_id=`, `--param client_id=`. |
+| | `cli` | Whoever is signed in to the Azure CLI. |
+| `databricks` | `oauth-m2m` (default) | A service principal: `--param client_id=`, the secret asked for, `--param host=` (or `DATABRICKS_HOST`) to try it; a personal access token is `DATABRICKS_TOKEN` or `--method key`. |
+| `sap-ai-core` | `service-key` (default) | `--file service-key.json` or pasted: `clientid`, `clientsecret`, `url`. |
+| `watsonx` | `apikey` (default) | An IBM Cloud API key, exchanged for IAM tokens. |
+| any | `client-credentials` | OAuth 2.0 client credentials at `--param token_url=` (`client_id=`, `scope=`, `audience=`, `client_auth=basic\|body`); the secret is asked for. Tried once, then stored. Listed by `--method ?` apart from a provider's own methods. |
+| any | `jwt-bearer` | RFC 7523: `--file key.pem`, `--param token_url=`, `--param issuer=` (also `subject=`, `audience=`, `scope=`, `key_id=`, `algorithm=`). The key's path is stored, not the key. |
+| any | `key` | Paste an API key (not echoed; `--token` to pass it). The default for a provider with no login of its own. |
+| any | `command` | `--command '<cmd>'` prints the key; run through `sh -c` (`cmd /C` on Windows) when needed, output cached for five minutes, stderr discarded, 20-second limit. |
+| any | `token-file` | `--file <path>`; first line is the key; the file must be owner-only. |
+
+### Subscriptions are their own providers
+
+A ChatGPT or SuperGrok login is not an API key for the API behind the
+same name: ChatGPT's goes to `chatgpt.com/backend-api/codex`, SuperGrok's
+to `cli-chat-proxy.grok.com/v1`, both over the **Responses** route
+(`/v1/responses` — what Codex-style clients speak), not Chat Completions.
+Folding them into `openai` and `xai` would make `OPENAI_API_KEY` and a
+ChatGPT login fight over one id and one base URL, so they are
+`openai-chatgpt` and `xai-supergrok`: each keeps meaning one thing, and
+`openai` is untouched. They list `openai`'s and `xai`'s models without
+prices, since a subscription is not billed per token. They exist only in a
+daemon that can use a login (any `llmman serve`). Bodies are forwarded as
+sent: the ChatGPT backend is the Codex one and expects a Codex-style
+Responses request (litellm fills in default instructions and streams for
+clients that send neither), so use them from clients that speak that, such
+as Codex.
+
+`github-copilot` is in the catalog under its own id too, but only on such a
+daemon: models.dev advertises a plain `GITHUB_TOKEN`, which Copilot's API
+rejects. It sends the editor headers Copilot expects. There is no second,
+Copilot-specific token: OpenClaw's `runtime-auth.ts` records that the old
+`/v2/token` exchange was retired, and that the GitHub token is sent as is.
+
+### Importing another CLI's login
+
+Claude Code and Codex rotate their refresh tokens when they use them. A
+copy in llmman's store and the original in the CLI race, and whichever
+refreshes second finds its token spent and is logged out; OpenClaw calls
+the single place that avoids this the "token sink". So an `import-*`
+**reads the other CLI's file on every request and never writes it**
+(`cli_login` in `llmman providers`). It works while the CLI keeps its
+access token current; when it has lapsed, the request fails and says to run
+that CLI, or to log in again. `--copy` moves the login into llmman's store
+instead, with its refresh token, and llmman then renews it; it prints that
+the other CLI may need to log in again, and that is on you. Nothing is
+copied without the flag.
+
+An Anthropic subscription token (`sk-ant-oat…`) is sent as
+`Authorization: Bearer` with `anthropic-beta: oauth-2025-04-20`, not as
+`x-api-key`. Whether Anthropic permits a subscription token outside Claude
+Code is their policy to state and to change; an API key is the safe choice.
+
+### Where logins are kept
+
+`~/.config/llmman/credentials.json`, mode `0600` in a `0700` directory. A
+file group or other can read is ignored with a warning (as a loose
+`llmman.conf` key is) and never written over; one that does not parse is
+left alone, too. Writes go through a temporary file and a rename. A
+refresh takes a lock on the file, so the daemon and a CLI cannot both
+spend one rotating refresh token, and concurrent requests make one refresh,
+not many. An access token is renewed a minute before it expires. If the
+server refuses the refresh token, requests fail with a 401 that says to run
+`llmman login --provider <id>` again — a stored login is never quietly
+replaced by a lesser credential. A temporary network failure keeps using
+the current token while it is still valid.
+
+Nothing prints a secret: the credentials' `Debug` is redacted, headers are
+sensitive, and the daemon's API reports only kind and state
+(`GET /llmman/providers`, [api.md](api.md#llmmans-own-api)).
+
+### What a login may be sent to
+
+A subscription login is only sent to its own https host: ChatGPT's to
+`chatgpt.com`, SuperGrok's to `cli-chat-proxy.grok.com`, Copilot's to
+`*.githubcopilot.com` (the host `copilot_internal/user` named at login,
+checked again on every request), Anthropic's to `api.anthropic.com`,
+Chutes' to `llm.chutes.ai`, GitLab's to the instance it was made on (or
+`gitlab.com`'s hosts), Snowflake's to its account's host, MiniMax's to its
+API hosts. (OpenRouter's and Poe's end in an ordinary API key, and
+DigitalOcean's in a token for the API its catalog entry names; those go
+wherever a pasted key would.) If
+`llmman.conf` points the provider anywhere else the request is refused
+rather than sent. Login and refresh requests themselves are https only and
+follow no redirects, and the daemon follows a redirect from a provider only
+within the same origin, so a key in a header like `x-api-key` cannot be
+carried to another host. The placeholder key (`llmman`) integrations send
+is never forwarded, and a daemon bound beyond loopback spends its own
+credential — a login included — only for a caller that authenticated.
+
+## Cloud credentials
+
+Some providers have no key to paste: the credential is what an AWS, Google
+or Azure account hands out, or a token minted from a client secret. They
+stand behind a **chain** that is the last credential a request looks for,
+after the provider's key variable, a stored login, `api_key` in
+`llmman.conf` and `api_key_command` / `api_key_file`. Each request resolves
+it (off the async runtime, once per expiry: tokens are cached until a
+minute before they expire, temporary AWS credentials until five), sends it
+over https only, follows no redirect to another origin, and prints none of
+it. `llmman providers` shows the kind — `aws_sigv4`, `adc`, `entra`,
+`client_credentials`, `jwt_bearer`, `ibm_iam` — and `ready`, which means
+the machine says the chain is there (an environment variable, a profile, a
+credentials file, a stored selection, or a table in `llmman.conf`); nothing
+is asked of the cloud to report it.
+
+A chain can be written in `llmman.conf`
+([configuration.md](configuration.md#cloud-credential-chains)) or selected
+by `llmman login --provider <id>` (the selection is stored, never a token).
+
+### Amazon Bedrock
+
+`amazon-bedrock` is offered (from models.dev's `amazon-bedrock` entry) on
+Bedrock's OpenAI-compatible Chat Completions route,
+`https://bedrock-runtime.<region>.amazonaws.com/openai/v1` (the AWS guide's
+recommended endpoint; `.amazonaws.com.cn` in China and the other
+partitions' suffixes as LiteLLM maps them). The region is `AWS_REGION`,
+`AWS_DEFAULT_REGION`, the profile's `region`, else `us-east-1`, and it is
+also the region requests are signed for. Its models are the ones that route
+serves — `openai.*` and `xai.*` — since LiteLLM documents "Grok, gpt-oss and
+GPT 5.6 and newer" as native there. Credentials, first match wins:
+
+1. `AWS_BEARER_TOKEN_BEDROCK`, a Bedrock API key, as a bearer (also `--method
+   key`). It wins over SigV4, as in the AWS SDK.
+2. **SigV4**, each request signed over its exact body bytes, with the SDK's
+   own provider chain: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+   `AWS_SESSION_TOKEN`; the shared files (`AWS_PROFILE`,
+   `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CONFIG_FILE`) with static keys,
+   `role_arn` + `source_profile`, `credential_process` and SSO where a
+   cached `aws sso login` token exists; web identity
+   (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`,
+   `AssumeRoleWithWebIdentity`); container credentials
+   (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` / `_FULL_URI`, with
+   `AWS_CONTAINER_AUTHORIZATION_TOKEN[_FILE]`; a full URI must be https or
+   loopback / `169.254.170.2` / `169.254.170.23` / `fd00:ec2::23`); EC2 IMDSv2
+   (`AWS_EC2_METADATA_SERVICE_ENDPOINT`, `AWS_EC2_METADATA_DISABLED`). A
+   named profile (`aws = { profile = ... }` or `aws-profile`) is used alone.
+
+The SigV4 chain is tried when something hints at it — one of those
+variables, a `[default]` profile in the shared files, an EC2 instance, a
+stored selection or an `aws` table — so a machine with no AWS does not pay
+an IMDS timeout per request. A signed request signs `host`, `content-type`,
+`x-amz-date` and `x-amz-security-token`, with the payload hash of the bytes
+sent; a streamed body is refused rather than sent unsigned. The Mantle
+endpoint (`https://bedrock-mantle.<region>.api.aws/v1`, signing name
+`bedrock-mantle` per opencode; LiteLLM signs it as `bedrock`, so
+`aws = { service = ... }` sets either) is not in the catalog: define it with
+`[providers.amazon-bedrock-mantle] base_url = "..."` and it takes the same
+credentials. **Not supported:** the Converse API (an AWS-specific body and a
+binary event stream, neither of llmman's two wires) and so the models that
+are Converse-only.
+
+### Google Vertex AI
+
+`google-vertex` is offered, from models.dev's `google-vertex` entry, on the
+OpenAI-compatible endpoint
+`https://<host>/v1/projects/<project>/locations/<location>/endpoints/openapi`,
+where `<host>` is `aiplatform.googleapis.com` for `global`,
+`aiplatform.us.rep.googleapis.com` / `aiplatform.eu.rep.googleapis.com` for
+`us` / `eu`, and `<region>-aiplatform.googleapis.com` otherwise. The
+project is `GOOGLE_VERTEX_PROJECT`, `GOOGLE_CLOUD_PROJECT`, `GCP_PROJECT`,
+`GCLOUD_PROJECT`, the active `gcloud` configuration's `project`, then the
+credentials file's `project_id` / `quota_project_id`; without one the
+provider is absent. The location is `GOOGLE_VERTEX_LOCATION`,
+`GOOGLE_CLOUD_LOCATION`, `VERTEX_LOCATION`, else `global`. Google's own
+models are sent as `google/<id>` (the endpoint's spelling); `publisher/model-maas`
+ids go as listed.
+
+Credentials are Application Default Credentials, as a bearer for the
+`cloud-platform` scope: the file `GOOGLE_APPLICATION_CREDENTIALS` names — a
+**service account** key (a signed RS256 JWT exchanged at its `token_uri`,
+which must be a `googleapis.com` https URL) or an **authorized user** file
+(its refresh token exchanged at `oauth2.googleapis.com/token`) — else
+`application_default_credentials.json` in `CLOUDSDK_CONFIG` or
+`~/.config/gcloud`, else the **metadata server** of a GCE VM or GKE pod
+(`GCE_METADATA_HOST`, else `metadata.google.internal`, with
+`Metadata-Flavor: Google`). Key files must be owner-only. **Not
+supported:** `external_account` (workload identity federation) files, which
+are refused with a message saying so; the **express-mode API key**
+(`GOOGLE_VERTEX_API_KEY`), because Vertex's OpenAI-compatible endpoint
+"only supports Google Cloud Auth" (Google's guide; opencode's Chat route
+rejects an API key too) and the key works only on the native Gemini routes,
+which are not one of llmman's wires; and **Claude and Mistral on Vertex**
+(`google-vertex-anthropic`, `claude-*`, `mistral-*`), which are called by
+`:rawPredict` on a model-specific URL with the model out of the body.
+
+### Azure OpenAI and AI Foundry
+
+The `azure` provider takes `AZURE_API_KEY` as `api-key` against
+`https://<AZURE_RESOURCE_NAME>.openai.azure.com/openai/v1?api-version=v1`
+(see [Auth schemes](#auth-schemes-and-per-account-urls); covered by the
+provider tests). A Foundry or other per-resource endpoint is a
+`[providers.<id>] base_url` with `auth_header = "api-key"` and the same
+chain. Without a key, a Microsoft Entra ID token for
+`https://cognitiveservices.azure.com/.default` (`AZURE_SCOPE`, or `scope`)
+is sent as a bearer, from the first of:
+
+1. a client secret: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`,
+   `AZURE_CLIENT_SECRET` (`client_credentials` at
+   `<AZURE_AUTHORITY_HOST>/<tenant>/oauth2/v2.0/token`);
+2. a federated / workload identity token: `AZURE_FEDERATED_TOKEN_FILE` with
+   the same tenant and client (`client_assertion`);
+3. a managed identity: App Service / Functions' `IDENTITY_ENDPOINT` +
+   `IDENTITY_HEADER`, else the VM's IMDS at `169.254.169.254`
+   (`AZURE_CLIENT_ID` picks a user-assigned identity);
+4. the Azure CLI: `az account get-access-token --scope <scope> --output
+   json`, run directly (not through a shell) with a 15-second limit.
+
+It is tried when its inputs are set, `az login` has left a profile, or an
+`azure` table says so. Metadata services are asked over plain http only at
+loopback / link-local addresses, with no proxy.
+
+### Token services: Databricks, watsonx, SAP AI Core and your own
+
+One mechanism serves them all: a token endpoint, a grant and a secret.
+
+| Provider | Credential |
+|----------|------------|
+| `databricks` (offered when `DATABRICKS_HOST` is set) | A personal access token, `DATABRICKS_TOKEN`; or OAuth M2M: `DATABRICKS_CLIENT_ID` + `DATABRICKS_CLIENT_SECRET`, `client_credentials` with Basic authentication and `scope=all-apis` at `https://<host>/oidc/v1/token` (LiteLLM). |
+| `snowflake-cortex` (offered when `SNOWFLAKE_ACCOUNT`, or a login's account, is set) | A programmatic access token, `SNOWFLAKE_CORTEX_PAT`; or the OAuth login above. |
+| `cloudflare-workers-ai` | `CLOUDFLARE_ACCOUNT_ID` fills the URL, `CLOUDFLARE_API_KEY` is the token: verified through the per-account URL tests. Cloudflare AI Gateway is not in the catalog (its Anthropic route uses ids that differ from models.dev's); define it with `[providers.cf-gateway] base_url = "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic"`, `wire = "anthropic"`. |
+| `watsonx` | `WATSONX_API_KEY` exchanged at `https://iam.cloud.ibm.com/identity/token` (`grant_type=urn:ibm:params:oauth:grant-type:apikey`). |
+| `sap-ai-core` | `AICORE_CLIENT_ID`, `AICORE_CLIENT_SECRET`, `AICORE_AUTH_URL` (the service key's `url`; `/oauth/token` is appended), or `--method service-key`. A service key that authenticates with a client certificate (`certurl`) is refused. |
+| any `[providers.<id>]` | `oauth2 = {...}` (client credentials) or `jwt_bearer = {...}` (RS256 / ES256 assertion) in `llmman.conf`, or `--method client-credentials` / `jwt-bearer`. |
+
+watsonx and SAP AI Core are **credentials only**: their inference APIs
+(`/ml/v1/text/chat` with `model_id` and `project_id`; the orchestration
+service's `v2/completion`) are neither OpenAI nor Anthropic wires, so they
+are not offered from the catalog. The same credentials work for a provider
+you define at an OpenAI-compatible endpoint in front of them
+(`[providers.watsonx] base_url = "..."`). GitLab Duo's catalog entry
+(`gitlab-ai-provider`) is likewise not a wire llmman speaks: `login --provider
+gitlab` works for a provider you define, with `base_url` on the instance.
+
+**OCI request signing is not supported.** OCI signs requests with an RSA
+HTTP signature (litellm `llms/oci/common_utils.py`), but the routes that
+take it (`/20231130/actions/chat`) use OCI's own body format; the
+OpenAI-compatible `oci` provider takes an API key (`OCI_GENAI_API_KEY`) and
+already works.
+
+## Auth schemes and per-account URLs
+
+By default a key goes as `Authorization: Bearer` (OpenAI wire) or
+`x-api-key` (Anthropic wire). Other providers want it elsewhere, and
+`[providers.<id>]` — on a catalog provider or one you define — says where:
+
+```toml
+[providers.azure]
+auth_header = "api-key"                 # or: auth = "header" + auth_header
+vars        = { AZURE_RESOURCE_NAME = "my-resource" }   # fills the base URL
+query       = { api-version = "v1" }
+
+[providers.openrouter]
+headers = { HTTP-Referer = "https://example.com", X-Title = "my app" }
+
+[providers.gemini-gateway]
+base_url    = "https://gateway.example/v1"
+auth_header = "x-goog-api-key"
+```
+
+| Field | Meaning |
+|-------|---------|
+| `auth` | `bearer`, `x-api-key`, `header` or `query`; absent means the wire's own. |
+| `auth_header` | The header's name; alone it implies `auth = "header"`. |
+| `auth_query` | The query parameter's name; alone it implies `auth = "query"`. A key in a URL is logged by whatever sits on the path, so prefer a header. The daemon removes it from error messages it returns. |
+| `headers` | Extra headers on every request (`{ Name = "value" }`). Values are never printed. Framing headers (`Host`, `Content-Length`, …) are refused. |
+| `query` | Extra query parameters on every request. |
+| `vars` | Values for a catalog provider's `${VAR}` base URL; an environment variable of the same name wins. |
+| `api_key_command` / `api_key_file` | Where to get the key when `api_key` and the login have none, as in `--method command` / `token-file`. Read only from an owner-only `llmman.conf`. |
+
+Azure OpenAI is built in on those terms: `api-key`, `?api-version=v1`, and
+`https://<AZURE_RESOURCE_NAME>.openai.azure.com/openai/v1` (opencode's
+`azure.ts`), so `AZURE_RESOURCE_NAME` and `AZURE_API_KEY` in the
+environment are enough.
+
+models.dev lists providers whose URL is per account — Cloudflare Workers AI
+(`CLOUDFLARE_ACCOUNT_ID`), Snowflake Cortex (`SNOWFLAKE_ACCOUNT`),
+Databricks (`DATABRICKS_HOST`), Infomaniak, Neon, Azure — plus a variable
+that is the key. They are offered when every `${VAR}` has a value, from the
+environment or `vars`, and absent otherwise. A value is checked against
+where it lands (a host label, one path segment, or a whole https URL) and a
+provider whose value would change the host the key goes to is dropped. A
+variable that stands for a host may carry its `https://` and trailing `/`.
 
 ## Your own endpoints
 
@@ -100,6 +453,7 @@ From there it is a provider like any other: `run`, `list`, `launch` and
 | `api_key` | Sent as the wire's credential when set. Most local servers take none, and none is sent. |
 | `api_key_env` | An environment variable to read the key from instead; it wins over `api_key`, as for a catalog provider. `""` clears one an earlier file named. |
 | `name` | Display name for listings. The id when absent. |
+| `auth`, `auth_header`, `auth_query`, `headers`, `query`, `api_key_command`, `api_key_file` | How the credential is attached, and where else it can come from. See [Auth schemes](#auth-schemes-and-per-account-urls). These also apply to a catalog provider. |
 
 The rules the catalog is filtered by do not apply. They vet a list
 fetched from the network at runtime; a URL you wrote into your own
@@ -199,9 +553,10 @@ installed:
 | `qwen` | Qwen Code | yes |
 | `dsh` | DeepSeek Harness | yes |
 | `goose` | Block goose | yes |
-| `goose-desktop` | Block goose Desktop (requires `--model`) | yes |
+| `goose-desktop` | Block goose Desktop (requires `--model`, or `OPENAI_TRANSCRIPTION_MODEL` for dictation only) | yes |
 | `grok` | Grok Build (requires `--model`) | no: its fetched model catalog cannot represent llmman's hosted-provider routing reference |
 | `docker-agent` | Docker Agent (requires `--model`) | yes |
+| `vibe` | Mistral Vibe CLI | yes |
 | `hermes` | Hermes Agent | yes, but the daemon holds the key (below) |
 | `agy` | Antigravity CLI (requires `--model`) | yes |
 | `gemini` | Gemini CLI | no: llmman cannot confirm the key would come here rather than go to Google |
@@ -268,7 +623,7 @@ such as one models.dev does not list yet, takes any effort level.
 
 `thinking` goes to all but opencode as `medium`, which llmman serves as
 thinking on. `kimi`, `openclaw`, `gemini`, `agy`, `goose`,
-`goose-desktop` and `docker-agent` cannot carry a variant here, so they
+`goose-desktop`, `docker-agent` and `vibe` cannot carry a variant here, so they
 refuse one.
 
 ## Wire formats
@@ -340,7 +695,6 @@ Every forwarding request must come from a loopback connection and supply all of:
 ```text
 X-Api-Key: <configured daemon API key>
 Authorization: Bearer <current provider OAuth access token>
-X-LLMMan-Upstream-IP: <policy-authorized public IP for the provider>
 ```
 
 The daemon key is checked separately and removed before forwarding. An OAuth
@@ -364,12 +718,10 @@ are rejected before contacting a provider. Request bodies are bounded to 32 MiB.
 Encoded request bodies are rejected with 415; absent or case-insensitive
 `identity` content coding is accepted and removed before JSON is reserialized.
 
-The supervisor resolves the fixed provider hostname, authorizes a particular
-IP against its network policy, and supplies that numeric address in
-`X-LLMMan-Upstream-IP`. llmman pins the connection to it while verifying the
-provider's TLS hostname. There is no DNS fallback or caller-controlled URL.
-Special-use addresses, including private networks, loopback, and IPv6 6to4,
-are rejected. Redirects and environment proxy/CA overrides are not used.
+llmman resolves the fixed provider hostname with the system resolver and
+verifies its TLS hostname; egress policy is the network layer's. A legacy
+`X-LLMMan-Upstream-IP` header is ignored. There is no caller-controlled URL.
+Redirects and environment proxy/CA overrides are not used.
 
 Provider extension headers pass through in both directions, including repeated
 values. Hop-by-hop headers, fields named by `Connection`, `Host`, internal
@@ -412,3 +764,34 @@ ready file, and managed-key/auth-profile headers have been removed; callers of
 that draft must migrate configuration, paths, authentication, and capability
 checks together. A supervisor must bind readiness to the child it launched and
 invalidate it on exit; a version response alone is not a forwarding handshake.
+
+## How this compares to OpenClaw, opencode and LiteLLM
+
+What the three reference projects accept for a hosted provider, and where
+llmman stands. The reference code each row was checked against is cited in
+the source of the module that implements it ([`src/logins/`](../src/logins/mod.rs),
+[`src/credentials.rs`](../src/credentials.rs),
+[`src/authscheme.rs`](../src/authscheme.rs)).
+
+| Login type | llmman |
+|------------|--------|
+| Static API key (env, `llmman.conf`, pasted) | Yes. |
+| OAuth device code with refresh — ChatGPT/Codex, GitHub Copilot, xAI | Yes (`device`). |
+| OAuth authorization code + PKCE with a loopback callback | Yes: OpenRouter, Poe, Chutes (your OAuth app), GitLab Duo, Snowflake Cortex. DigitalOcean uses the implicit grant (token in the fragment, forwarded by the listener's page). MiniMax uses its user-code device flow. OpenAI's own browser flow is not implemented (the ChatGPT device code is). |
+| Pasted long-lived token (`claude setup-token`) | Yes. |
+| Reuse of Claude Code's / Codex's login file | Yes, read-only by default; `--copy` to take it over. macOS Keychain storage is not read. |
+| Refresh persisted atomically, `0600`, single-flight, 60 s skew, re-login error | Yes. |
+| Credential from a command or a file | Yes (`api_key_command`, `api_key_file`, `--method command`/`token-file`). LiteLLM's secret managers and `os.environ/` references are not reproduced; a command covers `pass`, `op`, `vault` and the cloud CLIs. |
+| Custom header / query scheme, extra headers, per-account URLs | Yes. |
+| GitHub Enterprise (data-residency) Copilot | No. |
+| AWS Bedrock: `AWS_BEARER_TOKEN_BEDROCK`; SigV4 over env, shared files (profile, `role_arn` + `source_profile`, SSO, `credential_process`), web identity, container and IMDSv2 | Yes ([Amazon Bedrock](#amazon-bedrock)), on the OpenAI-compatible routes. The Converse API is not supported. |
+| Google Vertex: service-account JWT, `gcloud` authorized-user file (`CLOUDSDK_CONFIG`), metadata server, project / location variables | Yes ([Google Vertex AI](#google-vertex-ai)). Express-mode API keys, `external_account` files and Claude / Mistral on Vertex are not supported. |
+| Azure: `api-key` + per-resource URL + `api-version` | Yes. |
+| Azure Entra ID: client secret, federated token file, managed identity (IMDS, App Service), `az` CLI | Yes ([Azure](#azure-openai-and-ai-foundry)). Certificate and username/password credentials (LiteLLM) are not. |
+| watsonx IAM API-key exchange; SAP AI Core client credentials | The credentials, yes; the providers' own APIs are not OpenAI or Anthropic wires, so they are reachable only through an endpoint you define. |
+| Databricks PAT and OAuth M2M | Yes. |
+| Snowflake Cortex PAT and OAuth | Yes. |
+| Cloudflare Workers AI / AI Gateway | Workers AI yes (per-account URL variable); AI Gateway by defining its URL. |
+| Generic OAuth 2.0 client credentials and JWT-bearer sources for providers not built in | Yes (`oauth2`, `jwt_bearer`, `--method client-credentials` / `jwt-bearer`). |
+| OCI request signing | Not supported (see above). |
+| LiteLLM's Azure username/password and certificate credentials; Google `external_account` (workload identity federation) files | Not supported. |

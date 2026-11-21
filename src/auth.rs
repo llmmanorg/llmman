@@ -73,15 +73,26 @@ pub fn client_headers() -> anyhow::Result<HeaderMap> {
     Ok(headers)
 }
 
-/// The extra roots `LLMMAN_TLS_CA` names; empty when unset.
-pub fn tls_ca() -> anyhow::Result<Vec<reqwest::Certificate>> {
+/// The extra roots `LLMMAN_TLS_CA` names, as `parse` reads them from the
+/// PEM bundle; empty when unset.
+fn read_tls_ca<T>(parse: impl FnOnce(&[u8]) -> anyhow::Result<Vec<T>>) -> anyhow::Result<Vec<T>> {
     let Some(path) = std::env::var_os("LLMMAN_TLS_CA").filter(|p| !p.is_empty()) else {
         return Ok(Vec::new());
     };
     let pem = std::fs::read(&path)
         .with_context(|| format!("LLMMAN_TLS_CA: read {}", path.to_string_lossy()))?;
-    reqwest::Certificate::from_pem_bundle(&pem)
-        .with_context(|| format!("LLMMAN_TLS_CA: parse {}", path.to_string_lossy()))
+    parse(&pem).with_context(|| format!("LLMMAN_TLS_CA: parse {}", path.to_string_lossy()))
+}
+
+/// [`read_tls_ca`] for reqwest.
+pub fn tls_ca() -> anyhow::Result<Vec<reqwest::Certificate>> {
+    read_tls_ca(|pem| Ok(reqwest::Certificate::from_pem_bundle(pem)?))
+}
+
+/// [`read_tls_ca`] for rustls, for a connection reqwest does not make.
+pub fn tls_ca_der() -> anyhow::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    read_tls_ca(|pem| Ok(CertificateDer::pem_slice_iter(pem).collect::<Result<_, _>>()?))
 }
 
 /// An async client trusting [`tls_ca`]'s roots, for every outbound

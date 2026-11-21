@@ -2,8 +2,8 @@ use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
 use super::hybrid::{request_pin, resolve_hybrid_side, with_hybrid_fallback};
 use super::openai::{
-    apply_default_repeat_penalty, decode_f32s, encode_f32s, DEFAULT_TRANSCRIPTION_PROMPT,
-    EFFORT_BUDGET_MESSAGE,
+    apply_default_repeat_penalty, decode_f32s, encode_f32s, handle_tts,
+    DEFAULT_TRANSCRIPTION_PROMPT, EFFORT_BUDGET_MESSAGE,
 };
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::responses::{
@@ -20,12 +20,26 @@ use super::test_support::{
 };
 use super::*;
 
+/// The diffusion and speech workers re-resolve the reference they are
+/// handed, so `resolve_target` passes them the digest-pinned spelling
+/// `verify_layers_found` returned; the argv must carry it untouched,
+/// or a tag repointed after the parent's check would load unverified.
+#[test]
+fn mediagen_worker_argv_carries_the_pinned_reference_verbatim() {
+    let pinned = "example.com/ai/model:q4@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert_eq!(
+        mediagen_backend_args(pinned, 8_123),
+        ["serve", pinned, "--port", "8123"]
+    );
+}
+
 #[test]
 fn detached_serve_forwards_configuration_without_detaching_the_child() {
     let args = ServeArgs {
         model: Some("docker.io/ai/model:latest".into()),
         detach: true,
         runtime: Runtime::Path,
+        no_hardened: false,
         llama_cpp_version: Some("b1234".into()),
         vllm_version: None,
         vllm_image: Some("example/vllm:1".into()),
@@ -47,6 +61,55 @@ fn detached_serve_forwards_configuration_without_detaching_the_child() {
             "v0.5",
         ]
     );
+}
+
+/// Hardening is on unless `--no-hardened` asks otherwise, and a detached
+/// daemon gets the opt-out forwarded like `--runtime`.
+#[test]
+fn hardened_is_on_by_default_and_the_opt_out_reaches_the_detached_child() {
+    #[derive(clap::Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: ServeArgs,
+    }
+    let parse = |argv: &[&str]| {
+        <Cli as clap::Parser>::try_parse_from(["serve"].iter().chain(argv))
+            .map(|c| c.args)
+            .expect("serve args parse")
+    };
+    let on = parse(&[]);
+    assert!(!on.no_hardened);
+    assert!(test_state().0.hardened);
+    assert_eq!(on.detached_child_args(), ["--runtime", "auto"]);
+    let off = parse(&["--no-hardened"]);
+    assert!(off.no_hardened);
+    assert_eq!(
+        off.detached_child_args(),
+        ["--runtime", "auto", "--no-hardened"]
+    );
+}
+
+/// `LLMMAN_NO_HARDENED` reads like `LLMMAN_NOHISTORY` (`yes` is set,
+/// `off` and a blank are not), and either it or the flag turns the
+/// hardening off. The value is injected: no process environment.
+#[test]
+fn hardened_from_turns_off_on_the_flag_or_the_variable() {
+    for (no_hardened, env, expected) in [
+        (false, None, true),
+        (false, Some(""), true),
+        (false, Some("0"), true),
+        (false, Some("Off"), true),
+        (false, Some("1"), false),
+        (false, Some("yes"), false),
+        (true, None, false),
+        (true, Some("0"), false),
+    ] {
+        assert_eq!(
+            hardened_from(no_hardened, env),
+            expected,
+            "--no-hardened={no_hardened} LLMMAN_NO_HARDENED={env:?}"
+        );
+    }
 }
 
 // -- pull/push progress relay -------------------------------------------
@@ -359,7 +422,11 @@ async fn remote_responses_falls_back_only_on_a_missing_or_broken_route() {
             model: "mock-model".into(),
             max_output: None,
             cost: None,
-            api_key: Some("sk-test".into()),
+            credential: Some(crate::credentials::Resolved::from_key(
+                "sk-test".into(),
+                "test",
+            )),
+            auth: Default::default(),
             session: None,
         }));
         let (status, headers, body) = call_remote_responses_target(target, true).await;
@@ -665,7 +732,11 @@ async fn max_tokens_is_clamped_to_the_catalogs_ceiling_for_an_anthropic_provider
         model: "mock-model".into(),
         max_output: Some(64_000),
         cost: None,
-        api_key: Some("sk-test".into()),
+        credential: Some(crate::credentials::Resolved::from_key(
+            "sk-test".into(),
+            "test",
+        )),
+        auth: Default::default(),
         session: None,
     }));
     let send = |target: &Target, req: serde_json::Value| {
@@ -709,7 +780,11 @@ async fn a_thinking_level_reaches_each_claude_in_its_own_form() {
             model: model.into(),
             max_output: Some(64_000),
             cost: None,
-            api_key: Some("sk-test".into()),
+            credential: Some(crate::credentials::Resolved::from_key(
+                "sk-test".into(),
+                "test",
+            )),
+            auth: Default::default(),
             session: None,
         }));
         let req = serde_json::json!({
@@ -846,7 +921,8 @@ fn remote(provider: &str, model: &str, wire: Wire) -> RemoteTarget {
         model: model.into(),
         max_output: None,
         cost: None,
-        api_key: Some("k".into()),
+        credential: Some(crate::credentials::Resolved::from_key("k".into(), "test")),
+        auth: Default::default(),
         session: None,
     }
 }
@@ -1392,6 +1468,86 @@ async fn a_transcription_pair_takes_its_local_half_whatever_its_size() {
     );
 }
 
+/// A multipart `/tts` is routed by its `model` form field like a
+/// transcription: without one, or with a provider's, it is a 400.
+#[tokio::test]
+async fn a_multipart_tts_request_needs_a_local_model() {
+    let form = |model: Option<&str>| {
+        let field = |name: &str, value: &str| {
+            format!("--B\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+        };
+        let mut body = String::new();
+        if let Some(model) = model {
+            body.push_str(&field("model", model));
+        }
+        body.push_str(&field("input", "hello"));
+        body.push_str("--B--\r\n");
+        Bytes::from(body)
+    };
+    let headers = headers_with(&[("content-type", "multipart/form-data; boundary=B")]);
+    for (model, expected) in [
+        (None, "missing a required \"model\" form field"),
+        (Some(HOSTED), "does not route /tts to a provider"),
+    ] {
+        let response = handle_tts(State(test_state()), headers.clone(), form(model))
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(error.contains(expected), "{body}");
+    }
+}
+
+/// A JSON `/tts` naming a provider's model is a 400 too, before any credential
+/// is looked up.
+#[tokio::test]
+async fn a_json_tts_request_for_a_provider_model_is_a_400() {
+    let headers = headers_with(&[("content-type", "application/json")]);
+    let body = Bytes::from(format!(r#"{{"model":"{HOSTED}","input":"hello"}}"#));
+    let response = handle_tts(State(test_state()), headers, body)
+        .await
+        .unwrap_or_else(IntoResponse::into_response);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A page on another site can send a form or `text/plain` body without a
+/// preflight; neither reaches a model, and the body is not even read.
+#[tokio::test]
+async fn a_cross_site_upload_is_refused() {
+    let url = serve_router(test_state()).await;
+    for path in ["/tts", "/v1/audio/transcriptions", "/audio/transcriptions"] {
+        for content_type in ["multipart/form-data; boundary=B", "text/plain"] {
+            let resp = Client::new()
+                .post(format!("{url}{path}"))
+                .header("content-type", content_type)
+                .header("origin", "https://evil.example")
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{path} {content_type}"
+            );
+        }
+    }
+}
+
+/// Malformed JSON is the client's error.
+#[tokio::test]
+async fn a_malformed_tts_body_is_a_400() {
+    let headers = headers_with(&[("content-type", "application/json")]);
+    let response = handle_tts(State(test_state()), headers, Bytes::from("{"))
+        .await
+        .unwrap_or_else(IntoResponse::into_response);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 /// An unreadable pin is a 400, not a guess. See `hybrid::parse_pin`.
 #[tokio::test]
 async fn an_unreadable_route_header_is_rejected_rather_than_guessed() {
@@ -1674,7 +1830,8 @@ async fn a_local_refusal_is_retried_on_the_hosted_half_unless_pinned() {
                     model: "claude".into(),
                     max_output: None,
                     cost: None,
-                    api_key: Some("k".into()),
+                    credential: Some(crate::credentials::Resolved::from_key("k".into(), "test")),
+                    auth: Default::default(),
                     session: None,
                 }))
             } else {
@@ -2025,7 +2182,8 @@ fn a_keyless_remote_target_sends_no_credential_header() {
             model: "m".into(),
             max_output: None,
             cost: None,
-            api_key: None,
+            credential: None,
+            auth: Default::default(),
             session: None,
         }))
     };
@@ -3808,6 +3966,57 @@ async fn create_needs_exactly_one_of_from_or_files() {
     }
 }
 
+const ABC_DIGEST: &str = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+fn blob_upload_state(cache: &Path) -> AppState {
+    let mut inner = test_inner(cache.to_path_buf());
+    inner.cache_path = cache.to_path_buf();
+    AppState(Arc::new(inner))
+}
+
+fn chunked_body(chunks: &[&'static str]) -> Body {
+    let chunks: Vec<Result<&'static str, std::io::Error>> =
+        chunks.iter().map(|chunk| Ok(*chunk)).collect();
+    Body::from_stream(futures::stream::iter(chunks))
+}
+
+#[tokio::test]
+async fn blob_upload_stores_a_body_that_matches_its_digest() {
+    let cache = tempfile::tempdir().unwrap();
+    let resp = handle_blob_upload(
+        State(blob_upload_state(cache.path())),
+        UrlPath(ABC_DIGEST.to_string()),
+        chunked_body(&["a", "bc"]),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let staging = cache.path().join("blobs");
+    let stored = staging.join(ABC_DIGEST.trim_start_matches("sha256:"));
+    assert_eq!(std::fs::read(stored).unwrap(), b"abc");
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn blob_upload_refuses_a_body_that_does_not_match_and_keeps_nothing() {
+    let cache = tempfile::tempdir().unwrap();
+    let resp = handle_blob_upload(
+        State(blob_upload_state(cache.path())),
+        UrlPath(format!("sha256:{}", "0".repeat(64))),
+        chunked_body(&["a", "bc"]),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains(ABC_DIGEST), "{body}");
+    let staging = cache.path().join("blobs");
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+}
+
 /// Regression test for the Codex tool-type bug described on
 /// `filter_non_function_tools`'s own doc comment.
 #[test]
@@ -4136,6 +4345,21 @@ async fn show_one_model(
     serde_json::from_slice(&body).unwrap()
 }
 
+/// [`show_one_model`] for a GGUF with these header `u32s` and chat `template`.
+async fn show_with_template(name: &str, u32s: &[(&str, u32)], template: &str) -> serde_json::Value {
+    let path =
+        crate::gguf::write_test_gguf_with_strings(u32s, &[("tokenizer.chat_template", template)]);
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    show_one_model(
+        name,
+        "application/vnd.docker.ai.gguf.v3",
+        "model.gguf",
+        &bytes,
+    )
+    .await
+}
+
 /// The whole `/api/show` wiring over a stored GGUF: the fields below are
 /// public API, and a handler that read the architecture into the wrong
 /// one would still pass the unit tests for the pieces.
@@ -4190,24 +4414,14 @@ async fn handle_show_reports_a_safetensors_model_as_safetensors() {
 /// off its pooling key and `decision` off its decision type.
 #[tokio::test]
 async fn handle_show_reports_what_the_chat_template_handles() {
-    let capabilities = |name: &'static str, u32s: &[(&str, u32)], template: &str| {
-        let path = crate::gguf::write_test_gguf_with_strings(
-            u32s,
-            &[("tokenizer.chat_template", template)],
-        );
-        let bytes = std::fs::read(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
-        async move {
-            let v = show_one_model(
-                name,
-                "application/vnd.docker.ai.gguf.v3",
-                "model.gguf",
-                &bytes,
-            )
-            .await;
-            (v["capabilities"].clone(), v["template"].clone())
-        }
-    };
+    async fn capabilities(
+        name: &str,
+        u32s: &[(&str, u32)],
+        template: &str,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let v = show_with_template(name, u32s, template).await;
+        (v["capabilities"].clone(), v["template"].clone())
+    }
     let template = "{%- if tools %}{{- tools | tojson }}{%- endif %}\
                     {%- if enable_thinking %}<think>{%- endif %}";
 
@@ -4238,6 +4452,42 @@ async fn handle_show_reports_what_the_chat_template_handles() {
     )
     .await;
     assert_eq!(v["capabilities"], serde_json::json!(["decision"]));
+}
+
+/// `thinking` is what a client reads to offer a model's levels (#816).
+#[tokio::test]
+async fn handle_show_reports_the_thinking_values_the_template_takes() {
+    async fn thinking(name: &str, template: &str) -> Option<serde_json::Value> {
+        show_with_template(name, &[], template)
+            .await
+            .get("thinking")
+            .cloned()
+    }
+    // Qwen3.5: a switch that starts on; llmman bounds the levels.
+    let qwen3_5 = "{%- if enable_thinking is defined and enable_thinking is false %}\
+                   <think></think>{%- endif %}";
+    assert_eq!(
+        thinking("showqwen35", qwen3_5).await,
+        Some(serde_json::json!({
+            "values": [false, "minimal", "low", "medium", "high"],
+            "default": "medium",
+        }))
+    );
+    // Levels the template names are the only ones.
+    let levels = "{%- if reasoning_effort not in ('low', 'medium', 'xhigh') %}\
+                  {{ raise_exception('think') }}{%- endif %}";
+    assert_eq!(
+        thinking("showlevels", levels).await,
+        Some(serde_json::json!({
+            "values": [false, "low", "medium", "xhigh"],
+            "default": "medium",
+        }))
+    );
+    // No thinking, no field.
+    assert_eq!(
+        thinking("showplainthink", "{{ messages[0].content }}").await,
+        None
+    );
 }
 
 /// `/api/tags` reads each model's format the way `/api/show` does,
@@ -4586,6 +4836,33 @@ async fn the_metrics_route_label_is_the_template_not_the_request_path() {
         "{rendered}"
     );
     assert!(!rendered.contains("abc123"), "{rendered}");
+}
+
+/// Three in flight on one slot means two are queued.
+#[tokio::test]
+async fn the_scrape_shows_requests_queued_behind_the_parallel_slots() {
+    let state = test_state();
+    let mut model = running_model_fixture(None, Duration::ZERO, 3);
+    model.parallel_slots = Some(1);
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .insert("queued-model:latest".into(), model);
+
+    let resp = handle_metrics(State(state)).await.into_response();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let scrape = String::from_utf8(body.to_vec()).unwrap();
+    for expected in [
+        "llmman_requests_in_flight{model=\"queued-model:latest\"} 3\n",
+        "llmman_requests_queued{model=\"queued-model:latest\"} 2\n",
+    ] {
+        assert!(scrape.contains(expected), "{expected} in:\n{scrape}");
+    }
 }
 
 /// Any localhost page is an allowed origin, so one that can reach the
@@ -5038,6 +5315,69 @@ async fn record_prompt_logs_generation_requests_and_hands_the_body_on() {
     assert_eq!(entries[2].model, PAIR);
     assert_eq!(entries[2].prompt, "describe this");
     assert_eq!(entries[2].client.as_deref(), Some("test-agent/1"));
+}
+
+/// Exercise the real router, including the logger that reads before handlers.
+#[tokio::test]
+async fn generation_routes_accept_large_bodies_and_keep_the_32_mib_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    // Malformed JSON reaches parsing only if body extraction succeeds.
+    let body = Bytes::from(vec![b' '; GENERATION_BODY_LIMIT_BYTES + 1]);
+    let client = Client::new();
+    for logging in [false, true] {
+        let mut inner = test_inner(dir.path().to_path_buf());
+        if logging {
+            inner.prompt_log = Some(dir.path().join("prompts.jsonl"));
+        }
+        let url = serve_router(AppState(Arc::new(inner))).await;
+        for route in [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/messages",
+            "/v1/responses",
+            "/v1/responses/input_tokens",
+            "/api/chat",
+            "/api/generate",
+            "/gemini/m/v1beta/models/m:generateContent",
+        ] {
+            for (size, too_large) in [
+                (GENERATION_BODY_LIMIT_BYTES, false),
+                (GENERATION_BODY_LIMIT_BYTES + 1, true),
+            ] {
+                // Stream without Content-Length so rejection follows the upload;
+                // early rejection can reset a still-uploading Windows client.
+                let bytes = body.slice(..size);
+                let response = client
+                    .post(format!("{url}{route}"))
+                    .header("content-type", "application/json")
+                    .body(reqwest::Body::wrap_stream(futures::stream::once(async {
+                        Ok::<_, std::io::Error>(bytes)
+                    })))
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                // Spaces are not JSON, so an accepted body still fails in the
+                // handler (400 or 500, depending on the route). It must not
+                // be the limit's 413. One byte over the limit must be.
+                assert_eq!(
+                    status == StatusCode::PAYLOAD_TOO_LARGE,
+                    too_large,
+                    "{route}, logging={logging}, size={size}, status={status}"
+                );
+            }
+        }
+        let response = client
+            .post(format!("{url}/api/show"))
+            .header("content-type", "application/json")
+            .body(reqwest::Body::wrap_stream(futures::stream::once(async {
+                Ok::<_, std::io::Error>(Bytes::from(vec![b' '; 3 * 1024 * 1024]))
+            })))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }
 
 /// An over-limit body is refused as the extractor would refuse it.
@@ -5860,7 +6200,8 @@ async fn the_usage_ledger_prices_a_provider_reply_and_skips_the_rest() {
             model: "anthropic/claude-sonnet-4".into(),
             max_output: None,
             cost: Some(cost),
-            api_key: None,
+            credential: None,
+            auth: Default::default(),
             session: None,
         }));
         usage::note_target(
@@ -6619,6 +6960,7 @@ impl FakeLlamaServer {
         inner.runtime = runtime::Lazy::new(
             runtime::Runtime::Path,
             None,
+            true,
             Some(runtime::Resolved::Local {
                 source: runtime::Runtime::Path,
                 bin: self.bin.clone(),
@@ -6729,16 +7071,19 @@ async fn an_unloaded_models_n_ctx_is_what_its_load_reports() {
         ("embedding", &[("llama.pooling_type", 1)], &[]),
         ("decision", &[], &[("llama.decision.type", "clef")]),
     ];
-    // (LLMMAN_CONTEXT_LENGTH, explicitly set, LLMMAN_NUM_PARALLEL), for the
-    // fixture's trained context of 4096.
+    // (LLMMAN_CONTEXT_LENGTH, explicitly set, LLMMAN_NUM_PARALLEL,
+    // LLMMAN_EMBEDDING_CONTEXT_LENGTH), for the fixture's trained context
+    // of 4096.
     let configs = [
-        (Some(DEFAULT_CTX_SIZE), false, None),
-        (Some(DEFAULT_CTX_SIZE), false, Some(4)),
-        (Some(2048), true, None),
-        (Some(65536), true, None),
-        (Some(0), true, None),
-        (Some(0), true, Some(2)),
-        (Some(2048), true, Some(4)),
+        (Some(DEFAULT_CTX_SIZE), false, None, None),
+        (Some(DEFAULT_CTX_SIZE), false, Some(4), None),
+        (Some(2048), true, None, None),
+        (Some(65536), true, None, None),
+        (Some(0), true, None, None),
+        (Some(0), true, Some(2), None),
+        (Some(2048), true, Some(4), None),
+        (Some(DEFAULT_CTX_SIZE), false, None, Some(512)),
+        (Some(DEFAULT_CTX_SIZE), false, Some(2), Some(0)),
     ];
     let cases = configs
         .into_iter()
@@ -6750,15 +7095,20 @@ async fn an_unloaded_models_n_ctx_is_what_its_load_reports() {
     // path blocks, and loads of one name queue behind each other.
     let tasks: Vec<_> = cases
         .map(
-            |(i, ((ctx_size, explicit, num_parallel), (kind, u32s, strings)))| {
+            |(
+                i,
+                ((ctx_size, explicit, num_parallel, embedding_ctx_size), (kind, u32s, strings)),
+            )| {
                 let case = format!(
-                    "{kind}: ctx_size {ctx_size:?} explicit {explicit} parallel {num_parallel:?}"
+                    "{kind}: ctx_size {ctx_size:?} explicit {explicit} parallel {num_parallel:?} \
+                     embedding {embedding_ctx_size:?}"
                 );
                 let name = format!("ctxparity{i}");
                 let state = fake.state_with(&name, u32s, strings, |inner| {
                     inner.ctx_size = ctx_size;
                     inner.ctx_size_explicit = explicit;
                     inner.num_parallel = num_parallel;
+                    inner.embedding_ctx_size = embedding_ctx_size;
                 });
                 tokio::spawn(async move {
                     let base = serve_router(state.clone()).await;
@@ -7009,6 +7359,76 @@ async fn ollama_think_levels_get_a_thinking_budget_only_on_a_model_flagged_for_o
             sent.get("reasoning_budget_message").is_none(),
             "{route}: {sent}"
         );
+    }
+}
+
+/// `think` is resolved against the model's `thinking`: a level it does not
+/// take becomes its default; one it takes, and a switch, go through.
+#[tokio::test(flavor = "multi_thread")]
+async fn ollama_think_a_level_the_model_does_not_take_gets_its_default() {
+    for (route, input) in [("/api/chat", "messages"), ("/api/generate", "prompt")] {
+        let standin = RoleStandin::new(None);
+        let (base, state) = serve_over_state("qwen3:0.6b", standin.router.clone(), false).await;
+        change_loaded(&state, "qwen3:0.6b", |m| {
+            m.thinking = Some(crate::chat_template::Thinking {
+                values: vec![false.into(), "low".into(), "medium".into(), "xhigh".into()],
+                default: "medium".into(),
+            });
+        })
+        .await;
+        let body = |think: serde_json::Value| {
+            let mut body = serde_json::json!({ "model": "qwen3:0.6b", "stream": false });
+            body["think"] = think;
+            body[input] = if input == "messages" {
+                serde_json::json!([{ "role": "user", "content": "hi" }])
+            } else {
+                serde_json::json!("hi")
+            };
+            body
+        };
+        let kwargs = |think: serde_json::Value| {
+            let (base, standin, body) = (&base, &standin, body(think));
+            async move {
+                post_with(base, route, body, serde_json::json!({})).await;
+                let sent = standin.seen.lock().unwrap().last().unwrap().clone();
+                sent["chat_template_kwargs"].clone()
+            }
+        };
+        let on =
+            |level: &str| serde_json::json!({ "enable_thinking": true, "reasoning_effort": level });
+
+        assert_eq!(
+            kwargs(serde_json::json!("xhigh")).await,
+            on("xhigh"),
+            "{route}"
+        );
+        assert_eq!(
+            kwargs(serde_json::json!("high")).await,
+            on("medium"),
+            "{route}"
+        );
+        assert_eq!(kwargs(serde_json::json!("low")).await, on("low"), "{route}");
+        assert_eq!(
+            kwargs(serde_json::json!(false)).await,
+            serde_json::json!({ "enable_thinking": false }),
+            "{route}"
+        );
+
+        // Neither a boolean nor a string: refused before anything runs.
+        for think in [serde_json::json!(3), serde_json::json!({ "level": "low" })] {
+            let resp = stand_in_client()
+                .post(format!("{base}{route}"))
+                .json(&body(think))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{route}");
+            assert!(resp
+                .text()
+                .await
+                .unwrap()
+                .contains("think must be a boolean or string"));
+        }
     }
 }
 
@@ -8121,27 +8541,40 @@ async fn v1_models_reports_the_context_an_unloaded_model_would_start_with() {
         image,
     );
 
-    // (LLMMAN_CONTEXT_LENGTH, explicitly set, LLMMAN_NUM_PARALLEL) ->
-    // (text, embedding), for the fixture's trained context of 4096.
+    // (LLMMAN_CONTEXT_LENGTH, explicitly set, LLMMAN_NUM_PARALLEL,
+    // LLMMAN_EMBEDDING_CONTEXT_LENGTH) -> (text, embedding), for the
+    // fixture's trained context of 4096.
     let cases = [
-        ((Some(DEFAULT_CTX_SIZE), false, None), (4096, 4096)),
-        ((Some(DEFAULT_CTX_SIZE), false, Some(4)), (4096, 4096)),
-        ((Some(2048), true, None), (2048, 2048)),
-        ((Some(65536), true, None), (4096, 4096)),
-        ((Some(0), true, None), (4096, 4096)),
+        ((Some(DEFAULT_CTX_SIZE), false, None, None), (4096, 4096)),
+        ((Some(DEFAULT_CTX_SIZE), false, Some(4), None), (4096, 4096)),
+        ((Some(2048), true, None, None), (2048, 2048)),
+        ((Some(65536), true, None, None), (4096, 4096)),
+        ((Some(0), true, None, None), (4096, 4096)),
         // 0 is the trained context split across the slots; an embedding
         // model's 0 becomes the trained context before the slots scale it.
-        ((Some(0), true, Some(2)), (2048, 4096)),
-        ((Some(2048), true, Some(4)), (2048, 2048)),
+        ((Some(0), true, Some(2), None), (2048, 4096)),
+        ((Some(2048), true, Some(4), None), (2048, 2048)),
+        // The embedding variable moves only embedding models.
+        (
+            (Some(DEFAULT_CTX_SIZE), false, None, Some(512)),
+            (4096, 512),
+        ),
+        ((Some(2048), true, None, Some(512)), (2048, 512)),
+        ((Some(2048), true, None, Some(65536)), (2048, 4096)),
+        ((Some(2048), true, None, Some(0)), (2048, 4096)),
     ];
-    for ((ctx_size, explicit, num_parallel), (text, embedding)) in cases {
+    for ((ctx_size, explicit, num_parallel, embedding_ctx), (text, embedding)) in cases {
         let mut inner = test_inner(dir.clone());
         inner.ctx_size = ctx_size;
         inner.ctx_size_explicit = explicit;
         inner.num_parallel = num_parallel;
+        inner.embedding_ctx_size = embedding_ctx;
         let base = serve_router(AppState(Arc::new(inner))).await;
         let (_, v) = get_json(&base, "/v1/models").await;
-        let case = format!("ctx_size {ctx_size:?} ({explicit}), num_parallel {num_parallel:?}");
+        let case = format!(
+            "ctx_size {ctx_size:?} ({explicit}), num_parallel {num_parallel:?}, \
+             embedding {embedding_ctx:?}"
+        );
         assert_eq!(listed(&v, "text")["meta"]["n_ctx"], text, "{case}");
         assert_eq!(listed(&v, "embed")["meta"]["n_ctx"], embedding, "{case}");
         assert_eq!(listed(&v, "image")["meta"].get("n_ctx"), None, "{case}");
@@ -8405,20 +8838,49 @@ async fn handle_tags_reports_the_family_size_and_quantization_of_each_gguf() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--pull-only` after the runtime resolved, over the matrix the review
+/// rounds hit: a local llama.cpp does nothing more and never classifies
+/// the model, so an unstored model is fine under `bin`, `path`, and
+/// `auto` landing local; a container engine classifies, and only there a
+/// classification error surfaces.
 #[test]
-fn identity_check_is_strict_only_for_a_bin_source_pinned_to_the_default_release() {
-    use crate::llama_release::default_release;
-    use crate::mediagen::ffi::IdentityCheck;
-    assert!(matches!(
-        identity_check_for(Runtime::Bin, Some(default_release())),
-        IdentityCheck::Strict(_)
-    ));
-    assert!(matches!(
-        identity_check_for(Runtime::Bin, Some("b1")),
-        IdentityCheck::Log
-    ));
-    assert!(matches!(
-        identity_check_for(Runtime::Path, Some(default_release())),
-        IdentityCheck::Log
-    ));
+fn pull_only_step_classifies_only_after_a_container_engine_was_picked() {
+    use crate::container::{ContainerEngine, ContainerManager};
+    use runtime::{Resolved, Runtime};
+
+    let local = Resolved::Local {
+        source: Runtime::Bin,
+        bin: std::path::PathBuf::from("/tmp/llama-server"),
+    };
+    let container = Resolved::Container(ContainerManager::Docker);
+    let unstored = || anyhow::bail!("--pull-only: pull first");
+
+    assert_eq!(
+        pull_only_step(&local, unstored).unwrap(),
+        PullOnlyStep::Done
+    );
+    assert_eq!(
+        pull_only_step(&local, || panic!("a local answer never classifies")).unwrap(),
+        PullOnlyStep::Done
+    );
+    assert!(pull_only_step(&container, unstored)
+        .unwrap_err()
+        .to_string()
+        .contains("pull first"));
+    assert_eq!(
+        pull_only_step(&container, || Ok(ContainerEngine::Speech)).unwrap(),
+        PullOnlyStep::ResolveCpuOnly
+    );
+    assert_eq!(
+        pull_only_step(&container, || Ok(ContainerEngine::LlamaServer)).unwrap(),
+        PullOnlyStep::Done
+    );
+    assert_eq!(
+        pull_only_step(&container, || Ok(ContainerEngine::Vllm)).unwrap(),
+        PullOnlyStep::PullEngine(ContainerEngine::Vllm)
+    );
+    assert_eq!(
+        pull_only_step(&container, || Ok(ContainerEngine::Sglang)).unwrap(),
+        PullOnlyStep::PullEngine(ContainerEngine::Sglang)
+    );
 }

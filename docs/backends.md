@@ -41,13 +41,28 @@ so the first request is never stuck behind a silent download. On macOS
 llmman's own `uv` and `mlx-lm`, `path` uses `PATH`'s, `auto` installs
 and falls back to `PATH` (see [MLX](#mlx-macos)).
 
+A Canary speech model resolves `auto` on its own, on its first load. Its
+worker computes on the CPU and runs the CPU llama.cpp image, so a
+container engine "works" for it without the NVIDIA Container Toolkit; under
+`auto` the CPU image still has to start, or the engine is skipped. The
+order is the same (`docker`, `podman`, `bin`, `path`), the answer is kept
+for later speech loads, and the general answer for every other model is
+untouched: a host whose GPU probe skipped containers for llama-server
+still runs its speech worker in one. `--pull-only` with a Canary model
+warms the CPU image under this rule, once the general answer picked a
+container engine. An explicit `--runtime` applies to both as written.
+
 Everything llmman installs for itself — llama.cpp, `uv`, `mlx-lm` — has
 one shape on disk: `~/.local/share/llmman/<tool>/<version>/`, a
 `.llmman-complete` sentinel written last (without it the directory is
 rebuilt), one installer at a time across processes (`<tool>/.lock`), and
 earlier versions deleted once a new one completes. The pins are the
 repo-root `LLAMA_CPP_RELEASE`, `UV_RELEASE`, `MLX_LM_RELEASE` and
-`PYTHON_RELEASE` files, which CI tests against.
+`PYTHON_RELEASE` files, which CI tests against. Renovate bumps
+`LLAMA_CPP_RELEASE` for each new llama.cpp major release (v1.1.0, v2.0.0, ...)
+to its `server` image tag, from which `packaging/llama-build.sh` finds the
+`b<N>` build with the binaries; the others are by hand. ZONOS3 needs `b12425` or later: ask for it with `--llama-cpp-version`
+under `bin`.
 
 If that fetch fails, the daemon still starts: the failure is a warning,
 and the first model load that needs llama.cpp retries it and, failing
@@ -61,6 +76,79 @@ as an error.
 with their own progress, then exits — run it once before starting a
 detached daemon. With a container runtime and a safetensors `MODEL`
 argument it pulls the vLLM image as well.
+
+### `--no-hardened`
+
+`llmman serve` tightens every container the daemon starts; `--no-hardened`
+(or `LLMMAN_NO_HARDENED`, read once at startup in the same spellings as
+`LLMMAN_NOHISTORY`) turns that off. Hardening applies only under
+`--runtime docker` or `podman`: under `bin` or `path` there is no
+container, and the daemon logs a warning when `--no-hardened` is given
+there. Each container run gets, before the engine's own flags:
+
+- `--cap-drop all` and `--security-opt no-new-privileges`;
+- `--read-only`, except for a container that passes `--gpus` (see below);
+- one `--tmpfs <path>:exec` per path the engine writes to. The `:exec`
+  suffix is needed on both docker and podman, since both mount a `--tmpfs`
+  `noexec` by default and vLLM's Triton and inductor caches load the `.so`
+  files they compile there.
+
+The tmpfs paths per engine:
+
+| Container | tmpfs | Also |
+|-----------|-------|------|
+| `llama-server` | `/tmp` | |
+| vLLM, SGLang | `/tmp`, `/root/.cache`, `/root/.triton`, `/root/.config` | `--ipc=host` stays; the vLLM CPU image keeps `--cap-add SYS_NICE` and `--security-opt seccomp=unconfined` after the drop |
+| llmman media and speech workers | `/tmp` | |
+
+`/root/.triton` and `/root/.config` go beyond `/tmp` and `/root/.cache`
+because Triton's kernel cache and vLLM's usage reporter write there on
+first request, and a read-only rootfs would abort it. The verify run that
+checks an image's `--version` before serving gets the same block. Under
+`--no-hardened` the argv carries none of it.
+
+A llama-server, media or speech container that passes a GPU (`--gpus` or a
+`--device` node) also gets `--tmpfs /root/.cache:exec`, so the shader
+caches Mesa RADV (`~/.cache/mesa_shader_cache`) and MIOpen
+(`~/.cache/miopen`) write during the run work for that run; vLLM and
+SGLang already mount it. A forwarded `VLLM_RPC_BASE_PATH` (vLLM's IPC
+socket directory) must be an absolute path: one outside the tmpfs list
+above gets its own `--tmpfs <path>:exec`, and a relative or empty value,
+or one containing `:`, `,` or a `..` segment, fails the load with a message
+naming the variable and the value.
+
+**NVIDIA:** `--read-only` is skipped for a backend that passes `--gpus`
+(CUDA, and Vulkan when `/dev/nvidiactl` exists, which adds `--gpus all`
+for NVIDIA's Vulkan ICD). crun before 1.26 applies the read-only remount
+before the NVIDIA Container Toolkit's `createContainer` hooks write `/etc`
+and `/usr/lib64`, so the hooks fail and the container never starts
+(NVIDIA/nvidia-container-toolkit#2131, containers/crun#1924). `--cap-drop
+all`, `no-new-privileges` and the tmpfs mounts still apply to those
+containers.
+
+**Store permissions:** with every capability dropped, root in the
+container no longer bypasses file modes (`CAP_DAC_OVERRIDE` is gone), so
+a store written under umask `077` (`0700` directories, `0600` blobs) is
+readable only by its owner. The daemon therefore runs the container as
+that owner where the engine would otherwise be root on the host: under
+rootful docker on Linux it adds `--user <uid>:<gid>` of the mounted store
+directory (the daemon's own ids when it cannot read them), under rootless
+docker `--user 0:0` (container root is already your user), and under
+rootless podman, Docker Desktop or rootful podman nothing, since root in
+the container is already you or (rootful podman runs llmman itself as
+root) the store's owner. A numeric `--user` has no `/etc/passwd` entry in
+the image, so the same run also sets `HOME=/tmp`, `XDG_CACHE_HOME`,
+`XDG_CONFIG_HOME` and `TRITON_CACHE_DIR` under the `/tmp` tmpfs (vLLM,
+Triton, Mesa and MIOpen caches land there instead of the read-only root)
+and, under rootful docker when the backend passes a GPU (`--gpus` or
+`--device`), one numeric `--group-add <gid>` per existing `/dev/kfd`,
+`/dev/dri/renderD*` and `/dev/dri/card*` host node, since a group *name*
+such as ROCm's `video` resolves against the image's `/etc/group` (under
+rootless docker a host gid would map to a subordinate id, so none is
+added; `/dev/nvidia*` nodes are injected by the NVIDIA toolkit and not
+covered). If an engine still cannot read the store, the load error ends
+with `started hardened (...)` naming the flags that run carried, the
+store path, and offers `chmod -R go+rX <path>` or `--no-hardened`.
 
 ## llama.cpp
 
@@ -151,7 +239,10 @@ with `--vllm-version`; Diffusers models keep `vllm/vllm-omni`.
 `llmman serve --runtime docker --pull-only <model>` pulls the image an
 already-pulled model needs (without a model, the llama.cpp image).
 `CUDA_VISIBLE_DEVICES` and friends plus every `VLLM_*` variable are
-forwarded into the container.
+forwarded into the container, which runs with `--ipc=host`; the CPU image
+also gets `--cap-add SYS_NICE` and `--security-opt seccomp=unconfined`
+for its NUMA thread binding. Both survive the default
+[hardening](#--no-hardened).
 
 ### vLLM-Omni (Diffusers pipelines)
 
@@ -247,7 +338,8 @@ With `--runtime docker` (or `podman`) and `LLMMAN_SAFETENSORS_ENGINE=sglang`,
 `llmman serve --runtime docker --pull-only <model>` pulls it for a pulled
 safetensors model when the variable is set. `CUDA_VISIBLE_DEVICES` and
 friends plus every `SGLANG_*` variable are forwarded into the container,
-which runs with `--ipc=host` like vLLM's.
+which runs with `--ipc=host` like vLLM's, hardened by
+[default](#--no-hardened) too.
 
 ## ds4
 
@@ -273,7 +365,8 @@ llmman run hf.co/antirez/qwen3.8-flash-next-gguf:Q2 "hello"
 `llmman pull` skips files with `imatrix` in their name, which includes
 the DeepSeek V4 Flash builds ds4 recommends. Download one with ds4's
 `./download_model.sh ds4f-q2`, move the file into a directory of its own,
-and package it with `llmman build -t ds4f:q2 <dir>`.
+and package it with `llmman build -t ds4f:q2 <dir>` (add `--raw` to store
+the file without a tar wrapper).
 
 llmman runs `ds4-server -m <gguf> --chdir <dir> ... --port <port> --host
 127.0.0.1`, where `<dir>` is the directory of the binary `PATH`'s

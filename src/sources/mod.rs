@@ -400,7 +400,8 @@ pub(crate) fn pack_as_model_pack(
         format: weight_format(&files).unwrap_or_default().to_string(),
         ..Default::default()
     };
-    let manifest_desc = oci::build_cncf_manifest(target.layout_dir, &meta, model_repo, "", layers)?;
+    let manifest_desc =
+        oci::build_cncf_manifest(target.layout_dir, &meta, model_repo, "", "", layers)?;
     oci::write_manifest_ref(
         target.layout_dir,
         target.store_ref(canonical_ref),

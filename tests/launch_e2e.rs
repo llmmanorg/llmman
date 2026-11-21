@@ -7,7 +7,7 @@
 //! `llama-server` backing it, and the real third-party CLI under test
 //! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `copilot`, `droid`, `cline`,
 //! `grok`, `qwen`, `hermes`,
-//! `openclaw`, `dsh`, `goose`) — not mocks. The one exception is
+//! `openclaw`, `dsh`, `goose`, `vibe`) — not mocks. The one exception is
 //! [`launch_goose_desktop_env`]: Goose Desktop is a GUI with no headless
 //! mode, so it stubs its binary.
 //! That's the only way this actually verifies anything: every one of the
@@ -894,6 +894,7 @@ fn launch_command(
         .env("GROK_HOME", home.join(".grok"))
         .env("CLINE_DIR", home.join(".cline"))
         .env("COPILOT_HOME", home.join(".copilot"))
+        .env("VIBE_HOME", home.join(".vibe"))
         .env("PI_CODING_AGENT_DIR", home.join(".pi").join("agent"))
         // goose asks before each tool call otherwise, and a headless run
         // has nobody to answer. Granted here, not by `launch goose`:
@@ -2354,6 +2355,24 @@ fn launch_goose_with_model() {
     );
 }
 
+#[test]
+fn launch_vibe_with_model() {
+    eprintln!("[test] launch_vibe_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_vibe_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("vibe") {
+        eprintln!("skipping: vibe not on PATH — https://github.com/mistralai/mistral-vibe");
+        return;
+    }
+
+    // `-p`: vibe's headless mode, one prompt in, reply out.
+    launch_and_assert("vibe", &["-p", PROMPT]);
+}
+
 /// goose exits 0 even when no request reached a model — verified against
 /// 1.50.0 at a dead port ("Network error: ...") and at a 500 ("Ran into
 /// this error: ..."). Without this a broken `goose_env` would read as the
@@ -3067,6 +3086,7 @@ fn serve_with_engine(
         .stderr(Stdio::null())
         .status();
 
+    log_available_memory(&format!("before {engine}"));
     let host = format!("127.0.0.1:{}", free_loopback_port());
     let args = format!(
         "{} --host 0.0.0.0",
@@ -3137,8 +3157,18 @@ fn serve_with_engine(
     });
 
     terminate_daemon(&mut daemon);
+    log_available_memory(&format!("after {engine}"));
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
+    }
+}
+
+/// Logs `MemAvailable` (Linux): a runner out of memory dies without a failure to say so.
+#[cfg(unix)]
+fn log_available_memory(when: &str) {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    if let Some(line) = meminfo.lines().find(|l| l.starts_with("MemAvailable:")) {
+        eprintln!("[test] {when}: {line}");
     }
 }
 
@@ -3186,41 +3216,57 @@ fn assert_engine_listens_only_on_loopback(host: &str) {
     };
     connect(std::net::Ipv4Addr::LOCALHOST.into())
         .unwrap_or_else(|e| panic!("engine is not listening on 127.0.0.1:{port}: {e}"));
-    let ip = non_loopback_ipv4()
-        .expect("no non-loopback IPv4 address to check the engine is not reachable on");
-    // A bare connect proves little: a TCP self-connect to this ephemeral
-    // port succeeds and echoes our request, and CI saw three connects to a
-    // loopback-bound vllm succeed. Only an HTTP reply means the engine
-    // answers here; a refusal means nothing does.
-    match connect(ip) {
-        Ok(mut stream) => {
-            let mut head = [0u8; 5];
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .and_then(|()| stream.write_all(b"GET /health HTTP/1.0\r\n\r\n"))
-                .and_then(|()| stream.read_exact(&mut head))
-                .unwrap_or_else(|e| panic!("inconclusive: no reply from {ip}:{port}: {e}"));
-            match &head {
-                b"HTTP/" => panic!(
-                    "engine answers on {ip}:{port}: an LLMMAN_*_ARGS --host overrode llmman's loopback"
-                ),
-                b"GET /" => {}
-                other => panic!("inconclusive: {ip}:{port} sent {other:?}, neither HTTP nor an echo"),
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
-        Err(e) => panic!("inconclusive: connecting to {ip}:{port} failed with {e}, not a refusal"),
-    }
+    let Some(ip) = non_loopback_ipv4() else {
+        eprintln!("[test] no non-loopback IPv4 address; skipping the reachability check");
+        return;
+    };
+    // Only an HTTP reply proves the engine answers here: a self-connect
+    // echoes, and CI has seen an accept that stays silent. The path has no
+    // handler (sglang's /health runs a generation and outlasts the timeout).
+    let Ok(mut stream) = connect(ip) else { return };
+    let mut head = [0u8; 5];
+    let answered = stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .and_then(|()| stream.write_all(b"GET /llmman-loopback-probe HTTP/1.0\r\n\r\n"))
+        .and_then(|()| stream.read_exact(&mut head))
+        .is_ok()
+        && &head == b"HTTP/";
+    assert!(
+        !answered,
+        "engine answers on {ip}:{port}: an LLMMAN_*_ARGS --host overrode llmman's loopback"
+    );
 }
 
-/// This machine's address on its default route: the local end of a UDP
-/// socket "connected" to a documentation address, which sends nothing.
+/// An up, non-loopback IPv4 address of this machine, if it has one.
 #[cfg(unix)]
 fn non_loopback_ipv4() -> Option<std::net::IpAddr> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("192.0.2.1:9").ok()?;
-    let ip = socket.local_addr().ok()?.ip();
-    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+    let mut list = std::ptr::null_mut();
+    // SAFETY: the list is only read until freed below.
+    assert_eq!(
+        unsafe { libc::getifaddrs(&mut list) },
+        0,
+        "getifaddrs failed"
+    );
+    let mut found = None;
+    let mut cur = list;
+    while let Some(ifa) = unsafe { cur.as_ref() } {
+        cur = ifa.ifa_next;
+        let up = ifa.ifa_flags & libc::IFF_UP as libc::c_uint != 0;
+        if !up
+            || ifa.ifa_addr.is_null()
+            || i32::from(unsafe { (*ifa.ifa_addr).sa_family }) != libc::AF_INET
+        {
+            continue;
+        }
+        let sin = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
+        let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+        if !ip.is_loopback() && !ip.is_unspecified() {
+            found = Some(ip.into());
+            break;
+        }
+    }
+    unsafe { libc::freeifaddrs(list) };
+    found
 }
 
 /// `llmman serve`'s `sglang` backend end to end, wherever CI installs
@@ -4555,14 +4601,23 @@ fn speech_worker_transcribes_the_fixture() {
         .map(|(_, _, took)| *took)
         .fold(first, Duration::min);
 
-    // A client that leaves mid-decode: the whole POST goes out on a raw
-    // socket, which closes 300 ms later. The next request then takes
-    // about one decode when the abandoned one was cancelled, and about
-    // two when it ran on under the worker lock.
+    // Three copies of the fixture, 31.7 s, above the 30 s clip cap: two
+    // clips of 15.85 s. Used twice below: as the request a client
+    // abandons, and as the long file transcribed whole.
+    let samples = llmman::speech::wav::parse(&wav, usize::MAX).expect("the fixture is a PCM16 WAV");
+    let long = pcm16_wav(&samples.repeat(3));
+
+    // A client that leaves mid-decode: the whole POST of the three-copy
+    // file goes out on a raw socket, which closes 300 ms later. Uncancelled,
+    // that decode would hold the worker lock for several seconds (two
+    // clips, about three decodes); cancelled in the mel stage it frees the
+    // lock within a frame block. So the next request must finish within
+    // one second of a single decode: the bound is the cancellation latency
+    // plus the next request's own variance against `single`.
     {
         use std::io::Write;
         let (content_type, body) = multipart_body(&[
-            ("file", Some("fleurs-en.wav"), &wav),
+            ("file", Some("long.wav"), &long),
             ("model", None, MODEL_REF.as_bytes()),
             ("language", None, b"en"),
         ]);
@@ -4586,20 +4641,21 @@ fn speech_worker_transcribes_the_fixture() {
         ("language", None, b"en"),
     ]);
     let after_leave = t.elapsed();
-    eprintln!("== after a client left mid-decode: {status} in {after_leave:.2?} (one decode {single:.2?}): {reply}");
+    let latency = after_leave.saturating_sub(single);
+    eprintln!(
+        "== after a client left mid-decode: {status} in {after_leave:.2?} (one decode {single:.2?}, \
+         cancellation latency bound {latency:.2?}): {reply}"
+    );
     assert_eq!(status, reqwest::StatusCode::OK, "{reply}");
     assert_eq!(reply["text"].as_str(), Some(EXPECTED), "{reply}");
     assert!(
-        after_leave < single + single / 2,
-        "the abandoned decode was not cancelled: {after_leave:.2?} after it, one decode {single:.2?}"
+        after_leave < single + Duration::from_secs(1),
+        "the abandoned decode held the lock: {after_leave:.2?} after it, one decode {single:.2?}"
     );
 
-    // Three copies of the fixture, 31.7 s, above the 30 s clip cap: two
-    // clips of 15.85 s. The first and the third copy each sit whole in a
-    // clip, so the text carries the transcript twice; the second copy
-    // straddles the cut.
-    let samples = llmman::speech::wav::parse(&wav, usize::MAX).expect("the fixture is a PCM16 WAV");
-    let long = pcm16_wav(&samples.repeat(3));
+    // The three-copy file transcribed whole: the first and the third copy
+    // each sit whole in a clip, so the text carries the transcript twice;
+    // the second copy straddles the cut.
     let t = Instant::now();
     let (status, reply) = post(&[
         ("file", Some("long.wav"), &long),

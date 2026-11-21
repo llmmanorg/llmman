@@ -22,10 +22,17 @@
 //!
 //! [verify]                             # crate::verify
 //! default = "off"
+//! layers  = "off"                      # hash stored layers on a cold load
 //!
 //! [[verify.trust]]
 //! pattern = "docker.io/myorg/**"
 //! keys    = ["keys/myorg.pub"]         # relative to this file's directory
+//! mode    = "enforce"
+//!
+//! [[verify.trust]]
+//! pattern = "mirror.corp/**"           # pulled reference selects the rule
+//! claims  = "docker.io/myorg/**"       # repository the signature may name
+//! keys    = ["keys/myorg.pub"]
 //! mode    = "enforce"
 //!
 //! [aggregation]                        # cmd::serve::aggregation
@@ -289,6 +296,49 @@ struct ProviderConf {
     /// Display name for listings; the id when absent.
     #[serde(default)]
     name: Option<String>,
+    /// How the credential is attached: `bearer`, `x-api-key`, `header` or
+    /// `query`; the wire's own when absent. Applies to a catalog provider
+    /// too. See [`crate::authscheme`].
+    #[serde(default)]
+    auth: Option<String>,
+    /// The header's name, for `auth = "header"`.
+    #[serde(default)]
+    auth_header: Option<String>,
+    /// The query parameter's name, for `auth = "query"`.
+    #[serde(default)]
+    auth_query: Option<String>,
+    /// Extra headers sent on every request to this provider.
+    #[serde(default)]
+    headers: Option<BTreeMap<String, String>>,
+    /// Extra query parameters sent on every request.
+    #[serde(default)]
+    query: Option<BTreeMap<String, String>>,
+    /// Values for `${VAR}` in a catalog provider's base URL.
+    #[serde(default)]
+    vars: Option<BTreeMap<String, String>>,
+    /// A shell command whose output is the key. Run when a request needs
+    /// it; the key is never copied here.
+    #[serde(default)]
+    api_key_command: Option<String>,
+    /// A file holding the key, which must be owner-only like this one.
+    #[serde(default)]
+    api_key_file: Option<String>,
+    /// What stands behind this provider when it has no key: AWS SigV4
+    /// (`aws`), Google ADC (`gcp`), Entra ID (`azure`), an OAuth 2.0 token
+    /// service (`oauth2`, `jwt_bearer`, `ibm_iam`). One at most. See
+    /// [`crate::chains`].
+    #[serde(default)]
+    aws: Option<crate::aws::AwsChain>,
+    #[serde(default)]
+    gcp: Option<crate::gcp::GcpChain>,
+    #[serde(default)]
+    azure: Option<crate::azure::AzureChain>,
+    #[serde(default)]
+    oauth2: Option<crate::tokensvc::TokenService>,
+    #[serde(default)]
+    jwt_bearer: Option<crate::tokensvc::TokenService>,
+    #[serde(default)]
+    ibm_iam: Option<crate::tokensvc::TokenService>,
 }
 
 /// Hand-written so the key cannot reach a log through the derived
@@ -302,11 +352,152 @@ impl std::fmt::Debug for ProviderConf {
             .field("wire", &self.wire)
             .field("api_key_env", &self.api_key_env)
             .field("name", &self.name)
+            .field("auth", &self.auth)
+            .field("auth_header", &self.auth_header)
+            .field("auth_query", &self.auth_query)
+            .field(
+                "headers",
+                &self.headers.as_ref().map(|h| h.keys().collect::<Vec<_>>()),
+            )
+            .field(
+                "query",
+                &self.query.as_ref().map(|q| q.keys().collect::<Vec<_>>()),
+            )
+            .field("vars", &self.vars)
+            .field("api_key_command", &self.api_key_command)
+            .field("api_key_file", &self.api_key_file)
+            .field("chain", &self.chain().ok().flatten().map(|c| c.kind()))
             .finish()
     }
 }
 
 impl ProviderConf {
+    /// The credential chain this table configures, or an error naming the
+    /// table. At most one of `aws`, `gcp`, `azure`, `oauth2`, `jwt_bearer`,
+    /// `ibm_iam`: they are alternatives. A table written in `llmman.conf`
+    /// marks its chain `forced`, which says "try it" without a hint.
+    fn chain(&self) -> Result<Option<crate::chains::Chain>, String> {
+        use crate::chains::Chain;
+        use crate::tokensvc::Grant;
+        let token = |t: &crate::tokensvc::TokenService, table: &str, grant: Grant| {
+            if t.grant != Grant::default() && t.grant != grant {
+                return Err(format!("{table}: grant cannot be set here"));
+            }
+            let mut t = t.clone();
+            t.grant = grant;
+            t.validate().map_err(|e| format!("{table}: {e}"))?;
+            Ok(Chain::Token(t))
+        };
+        let mut found: Vec<(&str, Chain)> = Vec::new();
+        if let Some(a) = &self.aws {
+            a.validate().map_err(|e| format!("aws: {e}"))?;
+            found.push((
+                "aws",
+                Chain::Aws(crate::aws::AwsChain {
+                    forced: true,
+                    ..a.clone()
+                }),
+            ));
+        }
+        if let Some(g) = &self.gcp {
+            g.validate().map_err(|e| format!("gcp: {e}"))?;
+            found.push((
+                "gcp",
+                Chain::Gcp(crate::gcp::GcpChain {
+                    forced: true,
+                    ..g.clone()
+                }),
+            ));
+        }
+        if let Some(a) = &self.azure {
+            a.validate().map_err(|e| format!("azure: {e}"))?;
+            found.push((
+                "azure",
+                Chain::Azure(crate::azure::AzureChain {
+                    forced: true,
+                    ..a.clone()
+                }),
+            ));
+        }
+        if let Some(t) = &self.oauth2 {
+            found.push(("oauth2", token(t, "oauth2", Grant::ClientCredentials)?));
+        }
+        if let Some(t) = &self.jwt_bearer {
+            found.push(("jwt_bearer", token(t, "jwt_bearer", Grant::JwtBearer)?));
+        }
+        if let Some(t) = &self.ibm_iam {
+            found.push(("ibm_iam", token(t, "ibm_iam", Grant::IbmApikey)?));
+        }
+        if found.len() > 1 {
+            return Err(format!(
+                "{} are alternatives; set one",
+                found.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        Ok(found.pop().map(|(_, c)| c))
+    }
+
+    /// The auth scheme, extra headers and query this table configures, or
+    /// an error naming the field. Used by [`validate`] and
+    /// [`provider_auth`].
+    fn auth(&self) -> Result<crate::authscheme::Auth, String> {
+        let scheme = crate::authscheme::Scheme::from_fields(
+            self.auth.as_deref(),
+            self.auth_header.as_deref(),
+            self.auth_query.as_deref(),
+        )?;
+        let mut headers = Vec::new();
+        for (name, value) in self.headers.iter().flatten() {
+            crate::authscheme::header_name(name).map_err(|e| format!("headers: {e}"))?;
+            crate::authscheme::header_value(name, value).map_err(|e| format!("headers: {e}"))?;
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        }
+        let mut query = Vec::new();
+        for (name, value) in self.query.iter().flatten() {
+            crate::authscheme::query_param(name)?;
+            query.push((name.clone(), value.clone()));
+        }
+        let mut vars = BTreeMap::new();
+        for (name, value) in self.vars.iter().flatten() {
+            if name.is_empty()
+                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                || name.starts_with(|c: char| c.is_ascii_digit())
+            {
+                return Err(format!(
+                    "vars: {name:?} is not a variable name (letters, digits, `_`)"
+                ));
+            }
+            vars.insert(name.clone(), value.trim().to_string());
+        }
+        Ok(crate::authscheme::Auth {
+            scheme,
+            headers,
+            query,
+            vars,
+        })
+    }
+
+    /// `api_key_command` / `api_key_file`, trimmed; blank is `Some("")`
+    /// so a later file can clear one an earlier file set.
+    fn external(&self) -> Result<Option<crate::credentials::ExternalSource>, String> {
+        let command = self.api_key_command.as_deref().map(str::trim);
+        let file = self.api_key_file.as_deref().map(str::trim);
+        match (command, file) {
+            (Some(c), Some(f)) if !c.is_empty() && !f.is_empty() => {
+                Err("api_key_command and api_key_file are alternatives; set one".to_string())
+            }
+            (Some(c), _) if !c.is_empty() => {
+                Ok(Some(crate::credentials::ExternalSource::Command {
+                    command: c.to_string(),
+                }))
+            }
+            (_, Some(f)) if !f.is_empty() => Ok(Some(crate::credentials::ExternalSource::File {
+                path: f.to_string(),
+            })),
+            _ => Ok(None),
+        }
+    }
+
     /// Whether this table defines a provider rather than only keying one.
     fn defines(&self) -> bool {
         self.base_url.is_some()
@@ -351,9 +542,19 @@ pub struct VerifyConf {
     /// Mode for references no rule matches.
     #[serde(default)]
     pub default: Option<String>,
+    /// Mode for hashing the stored manifest and layer blobs on a cold
+    /// load. Independent of `default` and the trust rules: those speak
+    /// about signatures, this about the bytes already on disk.
+    #[serde(default)]
+    pub layers: Option<String>,
     /// `[[verify.trust]]` entries, in the order they appear.
     #[serde(default)]
     pub trust: Vec<TrustConf>,
+    /// Sigstore TrustedRoot JSON (Fulcio roots and Rekor log keys) that
+    /// keyless rules, those with `issuer` or `subject`, are checked
+    /// against. Relative to this file's directory, like `keys`.
+    #[serde(default)]
+    pub trusted_root: Option<String>,
 }
 
 /// One `[[verify.trust]]` entry.
@@ -365,6 +566,18 @@ pub struct TrustConf {
     pub keys: Vec<String>,
     #[serde(default)]
     pub mode: Option<String>,
+    /// Glob the signature's claimed repository must match, in place of
+    /// equality with the pulled one. Same grammar as `pattern`.
+    #[serde(default)]
+    pub claims: Option<String>,
+    /// Keyless rule: the OIDC issuer the signing certificate must name.
+    /// Exclusive with `keys`.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// Keyless rule: the identity (a certificate SAN) that must have
+    /// signed. Exclusive with `keys`.
+    #[serde(default)]
+    pub subject: Option<String>,
 }
 
 impl Conf {
@@ -585,6 +798,9 @@ fn validate(conf: &Conf) -> Result<(), String> {
                 "[providers.{id:?}]: a provider id cannot be empty or contain '/'"
             ));
         }
+        p.auth().map_err(|e| format!("[providers.{id}] {e}"))?;
+        p.external().map_err(|e| format!("[providers.{id}] {e}"))?;
+        p.chain().map_err(|e| format!("[providers.{id}] {e}"))?;
         match &p.base_url {
             Some(url) => {
                 base_url_of(url).map_err(|e| format!("[providers.{id}] base_url: {e}"))?;
@@ -874,6 +1090,226 @@ fn configured_from(files: &[File]) -> Vec<ConfiguredProvider> {
     let mut out: Vec<ConfiguredProvider> = merged.into_values().collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
+}
+
+// ---------------------------------------------------------------------------
+// Provider auth: scheme, extra headers, variables, key commands
+// ---------------------------------------------------------------------------
+
+/// What `[providers.<id>]` says about how to authenticate, merged across
+/// files field by field, later overriding earlier: the scheme if the later
+/// file names one, headers, query parameters and variables key by key.
+/// The default [`crate::authscheme::Auth`] for a provider no file
+/// mentions. Read once for the process, like [`configured_providers`].
+pub fn provider_auth(provider_id: &str) -> crate::authscheme::Auth {
+    static CACHE: OnceLock<HashMap<String, crate::authscheme::Auth>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| auth_from(files().unwrap_or_default()))
+        .get(provider_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn auth_from(files: &[File]) -> HashMap<String, crate::authscheme::Auth> {
+    let mut merged: HashMap<String, crate::authscheme::Auth> = HashMap::new();
+    for file in files {
+        let mut loose = None;
+        for (id, p) in &file.conf.providers {
+            let Ok(mut auth) = p.auth() else { continue };
+            // A static header or query value may be a gateway token: held
+            // to the standard of an `api_key`.
+            if !(auth.headers.is_empty() && auth.query.is_empty()) {
+                let gate = loose.get_or_insert_with(|| owner_readable_only(&file.path));
+                if let Err(e) = gate {
+                    eprintln!(
+                        "[llmman] warning: ignoring the headers and query of provider {id} in {}: {e}",
+                        file.path.display()
+                    );
+                    auth.headers.clear();
+                    auth.query.clear();
+                }
+            }
+            let entry = merged.entry(id.clone()).or_default();
+            if p.auth.is_some() || p.auth_header.is_some() || p.auth_query.is_some() {
+                entry.scheme = auth.scheme;
+            }
+            for (k, v) in auth.headers {
+                entry
+                    .headers
+                    .retain(|(name, _)| !name.eq_ignore_ascii_case(&k));
+                entry.headers.push((k, v));
+            }
+            for (k, v) in auth.query {
+                entry.query.retain(|(name, _)| *name != k);
+                entry.query.push((k, v));
+            }
+            entry.vars.extend(auth.vars);
+        }
+    }
+    merged
+}
+
+/// The value `[providers.<id>] vars` gives `name`. Blank counts as unset.
+pub fn provider_var(provider_id: &str, name: &str) -> Option<String> {
+    provider_auth(provider_id)
+        .vars
+        .get(name)
+        .filter(|v| !v.is_empty())
+        .cloned()
+}
+
+/// The `api_key_command` / `api_key_file` that applies to `provider_id`,
+/// from the last file that sets one, behind the same mode gate as an
+/// `api_key`: a command in a file others can write would be theirs to
+/// choose, and a key file's path is held to the same standard as the key.
+/// A loose file is skipped with a warning.
+pub fn provider_external(provider_id: &str) -> Option<crate::credentials::ExternalSource> {
+    static CACHE: OnceLock<HashMap<String, crate::credentials::ExternalSource>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| externals_in(files().unwrap_or_default()))
+        .get(provider_id)
+        .cloned()
+}
+
+fn externals_in(files: &[File]) -> HashMap<String, crate::credentials::ExternalSource> {
+    let mut merged: HashMap<String, crate::credentials::ExternalSource> = HashMap::new();
+    for file in files {
+        let set: Vec<_> = file
+            .conf
+            .providers
+            .iter()
+            .filter(|(_, p)| p.api_key_command.is_some() || p.api_key_file.is_some())
+            .collect();
+        let holds_one = set.iter().any(|(_, p)| matches!(p.external(), Ok(Some(_))));
+        if holds_one {
+            if let Err(e) = owner_readable_only(&file.path) {
+                eprintln!(
+                    "[llmman] warning: ignoring api_key_command/api_key_file in {}: {e}",
+                    file.path.display()
+                );
+                continue;
+            }
+        }
+        for (id, p) in set {
+            match p.external() {
+                Ok(Some(source)) => {
+                    merged.insert(id.clone(), source);
+                }
+                // Blank: clears one an earlier file set.
+                Ok(None) => {
+                    merged.remove(id);
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    merged
+}
+
+/// The credential chain `[providers.<id>]` configures, merged across files
+/// as [`provider_auth`] is: a later table of the same kind overlays the
+/// earlier field by field, one of another kind replaces it. See
+/// [`crate::chains`].
+pub fn provider_chain(provider_id: &str) -> Option<crate::chains::Chain> {
+    static CACHE: OnceLock<HashMap<String, crate::chains::Chain>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| chains_from(files().unwrap_or_default()))
+        .get(provider_id)
+        .cloned()
+}
+
+fn chains_from(files: &[File]) -> HashMap<String, crate::chains::Chain> {
+    let mut merged: HashMap<String, crate::chains::Chain> = HashMap::new();
+    for file in files {
+        for (id, p) in &file.conf.providers {
+            let Ok(Some(chain)) = p.chain() else { continue };
+            // A secret written in the table is held to the standard of an
+            // `api_key`: a file others can read is not trusted with one.
+            let inline_secret = p.azure.as_ref().is_some_and(|a| a.client_secret.is_some())
+                || [&p.oauth2, &p.jwt_bearer, &p.ibm_iam]
+                    .iter()
+                    .any(|t| t.as_ref().is_some_and(|t| t.client_secret.is_some()));
+            if inline_secret {
+                if let Err(e) = owner_readable_only(&file.path) {
+                    eprintln!(
+                        "[llmman] warning: ignoring the credential chain of provider {id} in {}: {e}",
+                        file.path.display()
+                    );
+                    continue;
+                }
+            }
+            let next = match merged.remove(id) {
+                Some(earlier) => earlier.overlaid(chain),
+                None => chain,
+            };
+            merged.insert(id.clone(), next);
+        }
+    }
+    merged
+}
+
+/// Where the per-user credential store lives: beside `llmman.conf`. See
+/// [`crate::credentials`]. Tests have no store unless one names a path
+/// ([`TEST_CREDENTIALS_FILE`]), for the reason [`load`] reads no real
+/// config.
+#[cfg(not(test))]
+pub fn credentials_path() -> Option<PathBuf> {
+    user_dir().map(|d| d.join("credentials.json"))
+}
+
+#[cfg(test)]
+pub fn credentials_path() -> Option<PathBuf> {
+    TEST_CREDENTIALS_FILE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// The credentials file a test reads and writes, if any.
+#[cfg(test)]
+pub(crate) static TEST_CREDENTIALS_FILE: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Held by every test that points [`TEST_CREDENTIALS_FILE`] somewhere: it
+/// is one process-wide value.
+#[cfg(test)]
+pub(crate) static CREDENTIALS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A temporary credentials store the process's providers read, for as long
+/// as the fixture lives. One at a time, process-wide.
+#[cfg(test)]
+pub(crate) struct CredentialsFixture {
+    pub store: crate::credentials::Store,
+    _dir: tempfile::TempDir,
+    _one: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl CredentialsFixture {
+    pub fn new() -> Self {
+        let one = CREDENTIALS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("credentials.json");
+        *TEST_CREDENTIALS_FILE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(path.clone());
+        Self {
+            store: crate::credentials::Store::at(path),
+            _dir: dir,
+            _one: one,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CredentialsFixture {
+    fn drop(&mut self) {
+        *TEST_CREDENTIALS_FILE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,10 +1710,18 @@ ps = "off""#,
 
             [verify]
             default = "warn"
+            trusted_root = "sigstore/trusted_root.json"
 
             [[verify.trust]]
             pattern = "docker.io/myorg/**"
             keys    = ["keys/myorg.pub"]
+            mode    = "enforce"
+            claims  = "docker.io/myorg/**"
+
+            [[verify.trust]]
+            pattern = "ghcr.io/myorg/**"
+            issuer  = "https://token.actions.githubusercontent.com"
+            subject = "https://github.com/myorg/models/.github/workflows/sign.yml@refs/heads/main"
             mode    = "enforce"
 
             [aggregation]
@@ -1301,8 +1745,27 @@ ps = "off""#,
             Some("sk-or-abc")
         );
         assert_eq!(c.verify.default.as_deref(), Some("warn"));
-        assert_eq!(c.verify.trust.len(), 1);
+        assert_eq!(
+            c.verify.trusted_root.as_deref(),
+            Some("sigstore/trusted_root.json")
+        );
+        assert_eq!(c.verify.trust.len(), 2);
         assert_eq!(c.verify.trust[0].mode.as_deref(), Some("enforce"));
+        assert_eq!(
+            c.verify.trust[0].claims.as_deref(),
+            Some("docker.io/myorg/**")
+        );
+        assert!(c.verify.trust[0].issuer.is_none());
+        assert!(c.verify.trust[0].subject.is_none());
+        assert!(c.verify.trust[1].keys.is_empty());
+        assert_eq!(
+            c.verify.trust[1].issuer.as_deref(),
+            Some("https://token.actions.githubusercontent.com")
+        );
+        assert_eq!(
+            c.verify.trust[1].subject.as_deref(),
+            Some("https://github.com/myorg/models/.github/workflows/sign.yml@refs/heads/main")
+        );
     }
 
     /// A file that sets one section must not need the other two.
@@ -1370,7 +1833,9 @@ ps = "off""#,
         assert!(parse("[providers.openai]\napi_kye = \"x\"").is_err());
         assert!(parse("[alias]\nx = \"y\"").is_err());
         assert!(parse("[verify]\ndefualt = \"off\"").is_err());
+        assert!(parse("[verify]\nlayres = \"off\"").is_err());
         assert!(parse("[[verify.trust]]\npattern = \"a/b\"\nkyes = []").is_err());
+        assert!(parse("[[verify.trust]]\npattern = \"a/b\"\nclaim = \"c/d\"").is_err());
         assert!(parse("[registry.\"docker.io\"]\nmirrors = \"m\"").is_err());
         assert!(parse("[registries.\"docker.io\"]\nmirror = \"m\"").is_err());
         assert!(parse("api_key = \"x\"").is_err());
@@ -1940,5 +2405,314 @@ ps = "off""#,
         assert!(owner_readable_only(&path).is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- provider auth ---------------------------------------------------------
+
+    /// A file on disk, owner-only, for the checks that read its mode.
+    fn private_file(dir: &Path, name: &str, text: &str) -> File {
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        File {
+            path,
+            dir: dir.to_path_buf(),
+            conf: conf(text),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_headers_are_only_trusted_from_an_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[providers.p]\nheaders = { X-Gateway = \"t\" }\n";
+        let loaded = private_file(dir.path(), FILE, text);
+        assert_eq!(
+            auth_from(std::slice::from_ref(&loaded))["p"].headers.len(),
+            1
+        );
+        std::fs::set_permissions(&loaded.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(auth_from(&[loaded])["p"].headers.is_empty());
+    }
+
+    #[test]
+    fn provider_auth_fields_parse_merge_by_name_and_later_files_win() {
+        use crate::authscheme::Scheme;
+        let dir = tempfile::tempdir().unwrap();
+        let system = private_file(
+            dir.path(),
+            "sys.conf",
+            "[providers.azure]\nauth = \"header\"\nauth_header = \"api-key\"\n\
+             headers = { X-A = \"1\", X-B = \"2\" }\nquery = { api-version = \"v1\" }\n\
+             vars = { AZURE_RESOURCE_NAME = \"res\" }\n",
+        );
+        let user = private_file(
+            dir.path(),
+            "user.conf",
+            "[providers.azure]\nheaders = { x-a = \"9\" }\nquery = { api-version = \"2024\" }\n\
+             vars = { OTHER = \"o\" }\n[providers.google]\nauth_header = \"x-goog-api-key\"\n",
+        );
+        let merged = auth_from(&[system, user]);
+        let azure = &merged["azure"];
+        // The user file named no scheme, so the system's stands.
+        assert_eq!(azure.scheme, Scheme::Header("api-key".into()));
+        assert_eq!(
+            azure.headers,
+            vec![
+                ("X-B".to_string(), "2".to_string()),
+                ("x-a".to_string(), "9".to_string())
+            ]
+        );
+        assert_eq!(
+            azure.query,
+            vec![("api-version".to_string(), "2024".to_string())]
+        );
+        assert_eq!(azure.vars.len(), 2);
+        assert_eq!(
+            merged["google"].scheme,
+            Scheme::Header("x-goog-api-key".into())
+        );
+        // Nothing configured: the default, whatever the id.
+        assert_eq!(
+            provider_auth("nobody-configured-this"),
+            crate::authscheme::Auth::default()
+        );
+    }
+
+    #[test]
+    fn provider_auth_mistakes_are_refused_at_load() {
+        for (text, wants) in [
+            ("[providers.p]\nauth = \"basic\"", "not one of"),
+            ("[providers.p]\nauth = \"header\"", "auth_header"),
+            (
+                "[providers.p]\nauth = \"bearer\"\nauth_header = \"x\"",
+                "only go with",
+            ),
+            ("[providers.p]\nauth_header = \"a b\"", "header name"),
+            (
+                "[providers.p]\nauth_header = \"a\"\nauth_query = \"b\"",
+                "alternatives",
+            ),
+            (
+                "[providers.p]\nheaders = { \"bad name\" = \"v\" }",
+                "header name",
+            ),
+            (
+                "[providers.p]\nheaders = { Host = \"evil\" }",
+                "frames the request",
+            ),
+            ("[providers.p]\nquery = { \"a&b\" = \"1\" }", "query"),
+            (
+                "[providers.p]\nvars = { \"1bad\" = \"x\" }",
+                "variable name",
+            ),
+            (
+                "[providers.p]\napi_key_command = \"a\"\napi_key_file = \"b\"",
+                "alternatives",
+            ),
+            ("[providers.p]\ntypo = 1", "unknown field"),
+        ] {
+            let err = parse(text).expect_err(text);
+            assert!(err.contains(wants), "{text}: {err}");
+        }
+        // And a header's value is not echoed.
+        let err = parse("[providers.p]\nheaders = { X = \"line\\nbreak-secret\" }").unwrap_err();
+        assert!(!err.contains("break-secret"), "{err}");
+        // A catalog provider may be given auth without a base_url.
+        parse("[providers.azure]\nauth_header = \"api-key\"\nheaders = { X = \"1\" }").unwrap();
+    }
+
+    /// A command in a file anyone can write is theirs to choose: it is held
+    /// to the standard of a key.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_command_is_only_read_from_an_owner_only_file() {
+        use crate::credentials::ExternalSource;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let text = "[providers.p]\napi_key_command = \"pass show p\"\n[providers.q]\napi_key_file = \"~/q.key\"\n";
+        std::fs::write(&path, text).unwrap();
+        let loaded = |path: &PathBuf| {
+            vec![File {
+                path: path.clone(),
+                dir: dir.path().to_path_buf(),
+                conf: conf(text),
+            }]
+        };
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            externals_in(&loaded(&path)).is_empty(),
+            "a loose file's command is ignored"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let found = externals_in(&loaded(&path));
+        assert_eq!(
+            found["p"],
+            ExternalSource::Command {
+                command: "pass show p".into()
+            }
+        );
+        assert_eq!(
+            found["q"],
+            ExternalSource::File {
+                path: "~/q.key".into()
+            }
+        );
+
+        // A later file blanks one out, as `api_key = ""` does.
+        let blank = File {
+            path: path.clone(),
+            dir: dir.path().to_path_buf(),
+            conf: conf("[providers.p]\napi_key_command = \"\"\n"),
+        };
+        let mut files = loaded(&path);
+        files.push(blank);
+        let found = externals_in(&files);
+        assert!(!found.contains_key("p") && found.contains_key("q"));
+    }
+
+    // -- provider credential chains ---------------------------------------------
+
+    #[test]
+    fn credential_chain_tables_parse_and_mark_the_chain_as_asked_for() {
+        use crate::chains::Chain;
+        use crate::tokensvc::{ClientAuth, Grant};
+        let merged = chains_from(&[file(
+            "[providers.amazon-bedrock]\naws = { profile = \"work\", region = \"us-west-2\" }\n\
+             [providers.google-vertex]\ngcp = { project = \"p\", location = \"eu\" }\n\
+             [providers.azure]\nazure = { tenant_id = \"t\", client_id = \"c\", client_secret_env = \"AZ\", cli = false }\n\
+             [providers.idp]\nbase_url = \"https://gw.example/v1\"\n\
+             oauth2 = { token_url = \"https://idp.example/token\", client_id = \"c\", client_secret_file = \"~/s\", scope = \"a b\", client_auth = \"basic\" }\n\
+             [providers.jwt]\nbase_url = \"https://gw.example/v1\"\n\
+             jwt_bearer = { token_url = \"https://idp.example/token\", issuer = \"me\", key_file = \"/k.pem\", algorithm = \"ES256\" }\n\
+             [providers.watsonx]\nibm_iam = { client_secret_env = \"IBM\" }\n",
+        )]);
+        let Chain::Aws(aws) = &merged["amazon-bedrock"] else {
+            panic!()
+        };
+        assert_eq!(
+            (aws.profile.as_deref(), aws.region.as_deref(), aws.forced),
+            (Some("work"), Some("us-west-2"), true)
+        );
+        let Chain::Gcp(gcp) = &merged["google-vertex"] else {
+            panic!()
+        };
+        assert_eq!(
+            (gcp.project.as_deref(), gcp.location.as_deref(), gcp.forced),
+            (Some("p"), Some("eu"), true)
+        );
+        let Chain::Azure(az) = &merged["azure"] else {
+            panic!()
+        };
+        assert_eq!(
+            (az.client_secret_env.as_deref(), az.cli),
+            (Some("AZ"), Some(false))
+        );
+        let Chain::Token(oauth) = &merged["idp"] else {
+            panic!()
+        };
+        assert_eq!(
+            (oauth.grant, oauth.client_auth),
+            (Grant::ClientCredentials, Some(ClientAuth::Basic))
+        );
+        let Chain::Token(jwt) = &merged["jwt"] else {
+            panic!()
+        };
+        assert_eq!(jwt.grant, Grant::JwtBearer);
+        let Chain::Token(ibm) = &merged["watsonx"] else {
+            panic!()
+        };
+        assert_eq!(ibm.grant, Grant::IbmApikey);
+        assert_eq!(merged["idp"].kind(), "client_credentials");
+        // No table, no chain.
+        assert!(!merged.contains_key("openai"));
+        assert_eq!(provider_chain("nobody-configured-this"), None);
+    }
+
+    #[test]
+    fn credential_chain_mistakes_are_refused_at_load_without_echoing_secrets() {
+        for (text, wants) in [
+            ("[providers.p]\naws = { profile = \"a\" }\ngcp = {}", "alternatives"),
+            ("[providers.p]\noauth2 = { token_url = \"https://x/t\", client_id = \"c\" }", "client_secret"),
+            ("[providers.p]\noauth2 = { token_url = \"http://x/t\", client_id = \"c\", client_secret = \"s\" }", "https"),
+            (
+                "[providers.p]\noauth2 = { token_url = \"https://x/t\", client_id = \"c\", client_secret = \"s\", client_secret_env = \"E\" }",
+                "alternatives",
+            ),
+            (
+                "[providers.p]\noauth2 = { token_url = \"https://x/t\", client_id = \"c\", client_secret = \"s\", grant = \"jwt_bearer\" }",
+                "grant",
+            ),
+            ("[providers.p]\njwt_bearer = { token_url = \"https://x/t\", issuer = \"i\" }", "key_file"),
+            ("[providers.p]\naws = { region = \"a.b\" }", "region"),
+            ("[providers.p]\ngcp = { project = \"a/b\" }", "project"),
+            ("[providers.p]\nazure = { tenant_id = \"a/b\" }", "tenant_id"),
+            ("[providers.p]\naws = { typo = 1 }", "unknown field"),
+        ] {
+            let err = parse(text).expect_err(text);
+            assert!(err.contains(wants), "{text}: {err}");
+            assert!(!err.contains("\"s\""), "{err}");
+        }
+        // A secret written in a table is not printed by the provider's Debug.
+        let conf = conf("[providers.p]\nbase_url = \"https://x/v1\"\noauth2 = { token_url = \"https://x/t\", client_id = \"c\", client_secret = \"table-secret\" }\n");
+        let printed = format!("{:?}", conf.providers["p"]);
+        assert!(!printed.contains("table-secret"), "{printed}");
+        assert!(printed.contains("client_credentials"), "{printed}");
+    }
+
+    #[test]
+    fn a_later_chain_table_overlays_an_earlier_one_of_its_kind_and_replaces_another() {
+        use crate::chains::Chain;
+        let merged = chains_from(&[
+            file("[providers.a]\naws = { profile = \"one\", service = \"bedrock\" }\n[providers.b]\naws = { profile = \"x\" }\n"),
+            file("[providers.a]\naws = { region = \"us-west-2\" }\n[providers.b]\ngcp = { project = \"p\" }\n"),
+        ]);
+        let Chain::Aws(a) = &merged["a"] else {
+            panic!()
+        };
+        assert_eq!(
+            (
+                a.profile.as_deref(),
+                a.region.as_deref(),
+                a.service.as_deref()
+            ),
+            (Some("one"), Some("us-west-2"), Some("bedrock"))
+        );
+        assert_eq!(merged["b"].kind(), "adc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_in_a_chain_table_is_only_trusted_from_an_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let text = "[providers.p]\nbase_url = \"https://x/v1\"\noauth2 = { token_url = \"https://x/t\", client_id = \"c\", client_secret = \"inline\" }\n[providers.q]\nbase_url = \"https://x/v1\"\noauth2 = { token_url = \"https://x/t\", client_id = \"c\", client_secret_env = \"ENV\" }\n";
+        std::fs::write(&path, text).unwrap();
+        let loaded = |path: &PathBuf| {
+            vec![File {
+                path: path.clone(),
+                dir: dir.path().to_path_buf(),
+                conf: conf(text),
+            }]
+        };
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let found = chains_from(&loaded(&path));
+        assert!(
+            !found.contains_key("p"),
+            "an inline secret in a loose file is ignored"
+        );
+        assert!(found.contains_key("q"), "a variable's name is not a secret");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(chains_from(&loaded(&path)).contains_key("p"));
     }
 }

@@ -50,9 +50,23 @@ pub(crate) fn settings_json(exe: &str) -> String {
 /// `llmman tk hook`: reads the hook input on stdin, and prints the answer
 /// when there is one. Never fails and never panics out.
 pub fn run() {
+    serve(|input, exe| {
+        answer(input, exe, &|cwd| load_rules(&settings_files(cwd)?)).map(|a| a + "\n")
+    });
+}
+
+/// `llmman tk compact`: reads `{"command", "output", "exitCode"}` on stdin
+/// and prints the output compacted, or nothing. For an agent that checks
+/// permissions on the command a hook rewrote; reads no settings.
+pub fn compact() {
+    serve(compact_output);
+}
+
+/// Prints what `answer` makes of stdin. Never fails, never panics out, and
+/// says nothing when `LLMMAN_TK` is off.
+fn serve(answer: impl FnOnce(&str, &str) -> Option<String> + std::panic::UnwindSafe) {
     std::panic::set_hook(Box::new(|_| {}));
     let _ = std::panic::catch_unwind(|| {
-        // Off means off: no rewrite, so nothing about the call changes.
         if super::is_off(std::env::var("LLMMAN_TK").ok().as_deref()) {
             return;
         }
@@ -71,8 +85,8 @@ pub fn run() {
         else {
             return;
         };
-        if let Some(answer) = answer(&input, &exe, &|cwd| load_rules(&settings_files(cwd)?)) {
-            println!("{answer}");
+        if let Some(out) = answer(&input, &exe) {
+            print!("{out}");
         }
     });
 }
@@ -251,6 +265,36 @@ fn is_plain_read_only(words: &[String]) -> bool {
         })
 }
 
+/// `raw` trimmed, and its words, if `llmman tk` would filter it.
+fn candidate(raw: &str) -> Option<(&str, Vec<String>)> {
+    if raw.len() > MAX_COMMAND {
+        return None;
+    }
+    let command = trim(raw);
+    let words = simple_words(command)?;
+    super::is_filtered(&words).then_some((command, words))
+}
+
+/// `command` behind `<exe> tk `, unless that is too long to keep.
+fn wrapped(command: &str, exe: &str) -> Option<String> {
+    let rewritten = format!("{} tk {command}", quote(exe));
+    (rewritten.len() <= MAX_COMMAND).then_some(rewritten)
+}
+
+/// Only a command that succeeded is compacted: the streams arrive as one, so
+/// a filter cannot tell the error text from the rest. `None` if nothing is saved.
+fn compact_output(input: &str, _exe: &str) -> Option<String> {
+    let call: Value = serde_json::from_str(input).ok()?;
+    if call.get("exitCode")?.as_i64()? != 0 {
+        return None;
+    }
+    let output = call.get("output")?.as_str()?;
+    let (_, words) = candidate(call.get("command")?.as_str()?)?;
+    let compact = super::render(super::plan(&words), 0, output, "");
+    let text = compact.stdout + &compact.stderr;
+    (text.len() < output.len()).then_some(text)
+}
+
 /// The hook's stdout for `input`, or `None` to say nothing. `rules` reads
 /// the permission rules given the call's working directory.
 pub(crate) fn answer(
@@ -268,24 +312,14 @@ pub(crate) fn answer(
     }
     let tool_input = call.get("tool_input")?.as_object()?;
     let raw = tool_input.get("command")?.as_str()?;
-    if raw.len() > MAX_COMMAND {
-        return None;
-    }
-    let command = trim(raw);
-    let words = simple_words(command)?;
-    if !super::is_filtered(&words) {
-        return None;
-    }
+    let (command, words) = candidate(raw)?;
     let program = super::program_name(&words[0]);
     let cwd = call.get("cwd").and_then(Value::as_str).map(Path::new);
     let rules = rules(cwd)?;
     if rules.restricts(program) {
         return None;
     }
-    let rewritten = format!("{} tk {command}", quote(exe));
-    if rewritten.len() > MAX_COMMAND {
-        return None;
-    }
+    let rewritten = wrapped(command, exe)?;
     let mut updated = tool_input.clone();
     updated.insert("command".into(), Value::String(rewritten));
     let mut output = json!({
@@ -348,6 +382,26 @@ mod tests {
         assert_eq!(hook["updatedInput"]["timeout"], 5000);
         // Nothing is approved on the user's behalf.
         assert!(hook.get("permissionDecision").is_none());
+    }
+
+    fn compacted(command: &str, output: &str, code: i64) -> Option<String> {
+        let input = json!({ "command": command, "output": output, "exitCode": code });
+        compact_output(&input.to_string(), EXE)
+    }
+
+    const STATUS: &str = "On branch main\nYour branch is up to date with 'origin/main'.\n\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n  (use \"git restore <file>...\" to discard changes in working directory)\n\tmodified:   a.rs\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n";
+
+    #[test]
+    fn compact_shortens_what_a_filtered_command_printed_and_nothing_else() {
+        let text = compacted("git status", STATUS, 0).expect("compacted");
+        assert!(text.len() < STATUS.len());
+        assert!(text.contains("a.rs"), "{text}");
+        assert!(!text.contains("(use \"git add <file>"), "{text}");
+        assert_eq!(compacted("echo hi", "hi\n", 0), None);
+        assert_eq!(compacted("git status", STATUS, 1), None);
+        assert_eq!(compacted("git status | cat", STATUS, 0), None);
+        assert_eq!(compact_output("not json", EXE), None);
+        assert_eq!(compact_output(r#"{"command":"git status"}"#, EXE), None);
     }
 
     #[test]

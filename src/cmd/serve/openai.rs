@@ -104,7 +104,7 @@ pub(super) async fn handle_openai_models(
             if let Some(input) = facts.input_modalities() {
                 entry["architecture"] = serde_json::json!({
                     "input_modalities": input,
-                    "output_modalities": ["text"],
+                    "output_modalities": facts.output_modalities(),
                 });
             }
             if let Some(live) = live {
@@ -450,6 +450,16 @@ pub(super) async fn effort_budget_for(state: &AppState, target: &Target) -> Opti
     .flatten()
 }
 
+/// `RunningModel::thinking` of the model behind `target`.
+pub(super) async fn thinking_for(
+    state: &AppState,
+    target: &Target,
+) -> Option<crate::chat_template::Thinking> {
+    local_model(state, target, |m| m.thinking.clone())
+        .await
+        .flatten()
+}
+
 /// [`effort_budget_tokens`] for a `/v1/chat/completions` request. A
 /// caller's budget, or thinking switched off, is left alone; `message`
 /// adds [`EFFORT_BUDGET_MESSAGE`] unless the caller sent one.
@@ -522,7 +532,12 @@ pub(super) async fn resolve_openai_request(
 }
 
 fn parse_openai_request(body: &Bytes) -> Result<serde_json::Value, AppError> {
-    Ok(serde_json::from_slice(body).context("parse OpenAI request body")?)
+    serde_json::from_slice(body).map_err(|e| {
+        AppError::status(
+            StatusCode::BAD_REQUEST,
+            format!("parse OpenAI request body: {e}"),
+        )
+    })
 }
 
 /// [`resolve_openai_request`] after `ensure_model`, for a caller that
@@ -1055,9 +1070,6 @@ pub(super) async fn handle_openai_embeddings(
 }
 
 // -- Decision models (/v1/systemone) -------------------------------------------
-
-/// Images ride in the body as base64, past axum's 2 MiB default. Ollama's cap.
-pub(super) const SYSTEMONE_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 const SYSTEMONE_ROUTE: &str = "/v1/systemone";
 
@@ -1663,59 +1675,155 @@ pub(super) async fn handle_openai_transcriptions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let Some(model) = multipart_text_field(&body, &headers, "model")
-        .await
-        .filter(|m| !m.is_empty())
-    else {
-        // A malformed request, not a server-side failure — matches
-        // handle_pull's own "missing required field" convention instead
-        // of AppError's blanket 500.
-        let body = serde_json::json!({
-            "error": "transcription request is missing a required \"model\" form field"
-        });
-        return Ok((StatusCode::BAD_REQUEST, Json(body)).into_response());
+    proxy_multipart(
+        &state,
+        &headers,
+        body,
+        &LocalRoute {
+            path: "/v1/audio/transcriptions",
+            what: "transcription",
+            hint: "use a locally served model with audio support",
+            default_prompt: true,
+        },
+    )
+    .await
+}
+
+/// A route llama-server has and a provider does not.
+pub(super) struct LocalRoute {
+    /// The route on the backend, and here.
+    pub(super) path: &'static str,
+    /// What the request is, for messages.
+    pub(super) what: &'static str,
+    /// What to use instead of a provider's model.
+    pub(super) hint: &'static str,
+    /// Whether a request with no `prompt` gets [`DEFAULT_TRANSCRIPTION_PROMPT`].
+    pub(super) default_prompt: bool,
+}
+
+/// `POST /tts`: llama-server's own text to speech. It takes more than
+/// `/v1/audio/speech`: `voice`, `lang`, `n_predict`, `stream`, raw PCM and a
+/// reference clip to clone a voice from (`speaker_ref_b64`, or a multipart
+/// `speaker_ref`). JSON is passed through like `/v1/audio/speech`; multipart
+/// is routed by its `model` field.
+pub(super) async fn handle_tts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    const TTS: LocalRoute = LocalRoute {
+        path: "/tts",
+        what: "text-to-speech",
+        hint: "use a locally served text-to-speech model",
+        default_prompt: false,
     };
-    // A pair takes its local half whatever its size: audio bodies are
-    // past any byte budget, and the check below rules a provider out
-    // anyway. An explicit cloud pin still fails with that same message.
-    let model = match crate::hybrid::split_ref(&model) {
+    let multipart = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().starts_with("multipart/form-data"));
+    if multipart {
+        return proxy_multipart(&state, &headers, body, &TTS).await;
+    }
+    let req = parse_openai_request(&body)?;
+    let model = route_model(&headers, req["model"].as_str().unwrap_or(""), &TTS)?;
+    let (model, target, guard) = ensure_model_for(
+        &state,
+        &model,
+        Some(&headers),
+        LoadOptions::default(),
+        Task::Forward,
+    )
+    .await?;
+    let (req, target, activity, response_model_override) =
+        prepare_openai_request(&state, req, model, target, guard).await?;
+    forward_openai_request(
+        &state,
+        &headers,
+        req,
+        target,
+        activity,
+        response_model_override,
+        TTS.path,
+    )
+    .await
+}
+
+/// The 400 for a request to `path` that names a provider's model.
+pub(super) fn provider_refusal(path: &str, hint: &str) -> AppError {
+    AppError::status(
+        StatusCode::BAD_REQUEST,
+        format!("llmman does not route {path} to a provider: {hint}"),
+    )
+}
+
+/// `model` as `route` serves it: a hybrid pair takes its local half whatever
+/// the request's size, and a provider is refused in llmman's own words (these
+/// bodies are relayed as they came, so it would be handed a reference it has
+/// never heard of).
+pub(super) fn route_model(
+    headers: &HeaderMap,
+    model: &str,
+    route: &LocalRoute,
+) -> Result<String, AppError> {
+    let model = match crate::hybrid::split_ref(model) {
         Some(pair) => {
-            let side = match request_pin(Some(&headers))? {
+            let side = match request_pin(Some(headers))? {
                 Some(crate::hybrid::Side::Cloud) => crate::hybrid::Side::Cloud,
                 _ => crate::hybrid::Side::Local,
             };
             eprintln!(
-                "[llmman] hybrid {:?} + {:?} -> {} (transcription)",
+                "[llmman] hybrid {:?} + {:?} -> {} ({})",
                 pair.local,
                 pair.remote_ref(),
-                side.as_str()
+                side.as_str(),
+                route.what
             );
             pair.side_ref(side)
         }
-        None => model,
+        None => model.to_string(),
     };
-    // Every other surface rewrites `model` to the provider's own id
-    // before forwarding, but this body is multipart, not JSON: the raw
-    // relay below would hand the provider a reference it has never heard
-    // of. Refuse in llmman's own words rather than let that surface as
-    // someone else's "unknown model".
     if crate::providers::is_remote_ref(&model) {
-        let body = serde_json::json!({
-            "error": "llmman does not route /v1/audio/transcriptions to a provider — \
-                      use a locally served model with audio support"
-        });
-        return Ok((StatusCode::BAD_REQUEST, Json(body)).into_response());
+        return Err(provider_refusal(route.path, route.hint));
     }
-    let (_, target, guard) = ensure_model(&state, &model, Some(&headers), None).await?;
+    Ok(model)
+}
+
+/// A `multipart/form-data` request for `route`, relayed untouched (but for the
+/// default transcription prompt) to the backend of the model its `model` field
+/// names.
+async fn proxy_multipart(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Bytes,
+    route: &LocalRoute,
+) -> Result<Response, AppError> {
+    let Some(model) = multipart_text_field(&body, headers, "model")
+        .await
+        .filter(|m| !m.is_empty())
+    else {
+        return Err(AppError::status(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} request is missing a required \"model\" form field",
+                route.what
+            ),
+        ));
+    };
+    let model = route_model(headers, &model, route)?;
+    let (_, target, guard) = ensure_model(state, &model, Some(headers), None).await?;
     // No `keep_alive` field on this API surface either — see
     // resolve_openai_request's own comment on the same choice.
     let activity = begin_activity(guard, None).await;
-    let body = with_default_transcription_prompt(&state, &target, &headers, body).await;
+    let body = if route.default_prompt {
+        with_default_transcription_prompt(state, &target, headers, body).await
+    } else {
+        body
+    };
     proxy(
         &state.0.client,
         &target,
-        "/v1/audio/transcriptions",
-        &headers,
+        route.path,
+        headers,
         body,
         activity,
     )
