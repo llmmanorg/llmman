@@ -32,7 +32,7 @@ pub enum HostGpu {
     None,
     /// `major` is the CUDA driver's own reported major version (from
     /// `cuDriverGetVersion`) — used to decide between llama.cpp's
-    /// separately published CUDA 12 vs. CUDA 13 Windows builds (see
+    /// separately published CUDA 12 vs. CUDA 13 builds (see
     /// `llama_release::asset_query`).
     Cuda {
         major: u32,

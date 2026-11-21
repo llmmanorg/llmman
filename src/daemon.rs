@@ -229,6 +229,29 @@ impl DaemonIdentity {
             && self.exe.as_deref().is_some_and(|exe| !exe.is_empty())
             && self.pid.is_some_and(|pid| pid > 0)
     }
+
+    /// Whether the daemon runs on another OS than this client, such as a
+    /// Linux one in WSL2 behind a forwarded port. Its exe is a path in a
+    /// filesystem this process cannot see and its pid is from another pid
+    /// namespace, so neither says anything about staleness, and signalling
+    /// the pid would hit an unrelated process. Only a path in the other
+    /// OS's style is recognised.
+    fn is_foreign(&self) -> bool {
+        let Some(exe) = self.exe.as_deref() else {
+            return false;
+        };
+        let bytes = exe.as_bytes();
+        let drive = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/');
+        let windows_style = drive || exe.starts_with("\\\\");
+        if cfg!(windows) {
+            exe.starts_with('/')
+        } else {
+            windows_style
+        }
+    }
 }
 
 fn daemon_identity() -> anyhow::Result<DaemonIdentity> {
@@ -329,9 +352,13 @@ fn is_local_host(host: &str) -> bool {
 ///
 /// Returns None both for a healthy daemon and when /api/version can't be
 /// fetched/parsed at all — whatever is holding the port in that case,
-/// killing processes based on it would be a guess.
+/// killing processes based on it would be a guess. A daemon on another OS
+/// (see [`DaemonIdentity::is_foreign`]) is reused like a remote one.
 fn stale_daemon() -> Option<DaemonIdentity> {
     let identity = daemon_identity().ok()?;
+    if identity.is_foreign() {
+        return None;
+    }
     match (&identity.version, &identity.exe) {
         (Some(version), Some(exe))
             if version == env!("LLMMAN_VERSION") && std::path::Path::new(exe).exists() =>
@@ -607,11 +634,7 @@ fn kill_daemon(identity: &DaemonIdentity, _force: bool) {
     // process, so the graceful/forceful distinction collapses here.
     match identity.pid {
         // /T takes the daemon's llama-server children down with it.
-        Some(pid) => {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .status();
-        }
+        Some(pid) => taskkill(pid, true),
         None => {
             let _ = Command::new("powershell")
                 .args([
@@ -621,9 +644,28 @@ fn kill_daemon(identity: &DaemonIdentity, _force: bool) {
                      Where-Object { $_.CommandLine -match ' serve' } | \
                      ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
                 ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status();
         }
     }
+}
+
+/// `taskkill /PID <pid> /T`, plus `/F` when `force`. Stdio is nulled because
+/// it prints "ERROR: The process "1544" not found." for a pid that has
+/// already gone; callers poll the port instead of its exit code.
+#[cfg(windows)]
+fn taskkill(pid: u32, force: bool) {
+    let pid = pid.to_string();
+    let mut args = vec!["/PID", pid.as_str(), "/T"];
+    if force {
+        args.push("/F");
+    }
+    let _ = Command::new("taskkill")
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Starts `llmman serve` as a background process if one isn't already
@@ -1049,17 +1091,7 @@ fn signal_group(pid: u32, force: bool) -> bool {
 /// tree, and fails harmlessly on an already-dead pid.
 #[cfg(windows)]
 fn signal_group(pid: u32, force: bool) -> bool {
-    let mut args = vec!["/PID".to_string(), pid.to_string(), "/T".to_string()];
-    if force {
-        args.push("/F".to_string());
-    }
-    // Stdio nulled like the Unix branch: taskkill reports a missing PID
-    // loudly, which would land in front of the real startup error.
-    let _ = Command::new("taskkill")
-        .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    taskkill(pid, force);
     // taskkill's exit codes don't reliably separate "no such pid" from
     // "needs /F" (a windowless process rejects the graceful form), so
     // always report possible survivors and let stop_group escalate.
@@ -2037,6 +2069,34 @@ mod tests {
         identity.version = Some("0.1.0".into());
         identity.exe = None;
         assert!(!identity.is_llmman());
+    }
+
+    /// A WSL2 daemon seen from Windows (or a Windows one from WSL) is not
+    /// this OS's to judge stale or to signal: its exe never exists here and
+    /// its pid names nothing here.
+    #[test]
+    fn daemon_on_another_os_is_foreign() {
+        let identity = |exe: Option<&str>| DaemonIdentity {
+            version: Some("0.1.0".into()),
+            exe: exe.map(Into::into),
+            pid: Some(1544),
+        };
+        let posix = "/home/linuxbrew/.linuxbrew/Cellar/llmman/0.1.691/bin/llmman";
+        let windows = r"C:\Users\me\scoop\apps\llmman\current\llmman.exe";
+        assert_eq!(identity(Some(posix)).is_foreign(), cfg!(windows));
+        assert_eq!(identity(Some(windows)).is_foreign(), !cfg!(windows));
+        assert_eq!(
+            identity(Some("c:/tools/llmman.exe")).is_foreign(),
+            !cfg!(windows)
+        );
+        assert_eq!(
+            identity(Some(r"\\server\share\llmman.exe")).is_foreign(),
+            !cfg!(windows)
+        );
+        assert!(!identity(None).is_foreign());
+        assert!(!identity(Some("")).is_foreign());
+        let own = std::env::current_exe().unwrap();
+        assert!(!identity(own.to_str()).is_foreign());
     }
 
     fn show_response(body: serde_json::Value) -> ShowResponse {
