@@ -7,7 +7,7 @@ use anyhow::Context;
 use super::common;
 use super::{
     before_terminator, exec_with_env, find_on_path, has_flag, has_forwarded_model_flag, server,
-    Effort, WINDOWS_PATH_EXTS,
+    Effort, HostedModel, WINDOWS_PATH_EXTS,
 };
 
 /// qwen: Qwen Code's OpenAI-compatible mode, pointed at our /v1 by the
@@ -21,18 +21,24 @@ use super::{
 /// any other. Ollama's `cmd/launch/qwen.go` does the same three. A
 /// `--model` after `--` is the one Qwen Code uses, so the settings and
 /// `OPENAI_MODEL` follow it.
+///
+/// `hosted` is every model `--provider` serves (see [`HostedModel`]):
+/// each becomes a `modelProviders.openai` entry, so Qwen Code's `/model`
+/// can switch between them mid-session; the launched model stays the
+/// one `model` selects.
 pub(super) fn launch_qwen(
     model: &str,
     api_key: &str,
     vision: bool,
     effort: Option<&Effort>,
     extra_args: &[String],
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     let bin = find_qwen().ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
     let (model, vision) = qwen_model_and_vision(model, vision, extra_args);
     // After the lookup, so nothing is written for an integration that is
     // not there; `check_model_flag` has made sure there is a model.
-    write_qwen_settings(model, vision, effort)?;
+    write_qwen_settings(model, vision, effort, hosted)?;
 
     let base_url = format!("{}/v1", server());
     let mut env = vec![
@@ -203,13 +209,19 @@ pub(super) fn qwen_home() -> anyhow::Result<PathBuf> {
 /// Records llmman as the `openai` provider for `model` in Qwen Code's
 /// `settings.json`, as `codex::write_codex_config` and `hermes::write_hermes_config` do
 /// for theirs. See `qwen_settings_merged` for what goes in.
-fn write_qwen_settings(model: &str, vision: bool, effort: Option<&Effort>) -> anyhow::Result<()> {
+fn write_qwen_settings(
+    model: &str,
+    vision: bool,
+    effort: Option<&Effort>,
+    hosted: Option<&[HostedModel]>,
+) -> anyhow::Result<()> {
     write_qwen_settings_at(
         &qwen_home()?,
         model,
         &format!("{}/v1", server()),
         vision,
         effort,
+        hosted,
     )
 }
 
@@ -225,9 +237,10 @@ fn write_qwen_settings_at(
     base_url: &str,
     vision: bool,
     effort: Option<&Effort>,
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     common::write_json_merged(&dir.join("settings.json"), "qwen", |existing| {
-        qwen_settings_merged(existing, model, base_url, vision, effort)
+        qwen_settings_merged(existing, model, base_url, vision, effort, hosted)
     })
 }
 
@@ -235,10 +248,10 @@ fn write_qwen_settings_at(
 /// as llmman's: a user can rename it in `/model`, but not re-key it.
 pub(super) const QWEN_ENV_KEY: &str = "LLMMAN_API_KEY";
 
-/// `existing` with llmman's entry merged in, pure so a test can hand it
+/// `existing` with llmman's entries merged in, pure so a test can hand it
 /// a literal. The keys follow Qwen Code's own `/auth` and `/model` and
-/// ollama's `applyQwenOllamaConfig` in `cmd/launch/qwen.go`: the entry
-/// first in `modelProviders.openai`, an earlier one of llmman's replaced,
+/// ollama's `applyQwenOllamaConfig` in `cmd/launch/qwen.go`: the entries
+/// first in `modelProviders.openai`, earlier ones of llmman's replaced,
 /// the rest kept and a `{ protocol, models }` wrapper unwrapped with
 /// `$version` set to 4; `security.auth`; `model.name` and `model.baseUrl`.
 /// A vision model's entry declares image input, which Qwen Code reads
@@ -252,39 +265,10 @@ fn qwen_settings_merged(
     base_url: &str,
     vision: bool,
     effort: Option<&Effort>,
+    hosted: Option<&[HostedModel]>,
 ) -> serde_json::Value {
     let mut doc = existing.as_object().cloned().unwrap_or_default();
-    let mut ours = serde_json::json!({
-        "id": model,
-        "name": format!("{model} (llmman)"),
-        "baseUrl": base_url,
-        "envKey": QWEN_ENV_KEY,
-    });
-    if vision {
-        ours["generationConfig"] = serde_json::json!({ "modalities": { "image": true } });
-    }
-    if let Some(effort) = effort {
-        let efforts: Vec<&str> = effort
-            .levels
-            .iter()
-            .copied()
-            .filter(|l| *l != "none")
-            .collect();
-        let mut reasoning = serde_json::json!({
-            "thinking": true,
-            "disableField": "reasoning_effort",
-            "profile": "openai-effort",
-            "efforts": efforts,
-        });
-        ours["generationConfig"]["reasoning"] = match effort.default {
-            "none" => serde_json::json!(false),
-            level => {
-                reasoning["defaultEffort"] = level.into();
-                serde_json::json!({ "effort": level })
-            }
-        };
-        ours["capabilities"] = serde_json::json!({ "reasoning": reasoning });
-    }
+    let ours = qwen_entries(model, base_url, vision, effort, hosted);
     let openai = common::object_under(&mut doc, "modelProviders")
         .entry("openai")
         .or_insert_with(|| serde_json::json!([]));
@@ -299,7 +283,7 @@ fn qwen_settings_merged(
             .cloned()
             .collect()
     });
-    *openai = serde_json::Value::Array(std::iter::once(ours).chain(kept).collect());
+    *openai = serde_json::Value::Array(ours.into_iter().chain(kept).collect());
     if unwrapped {
         doc.insert("$version".into(), 4.into());
     }
@@ -313,6 +297,86 @@ fn qwen_settings_merged(
         model_cfg.remove("reasoningEffort");
     }
     serde_json::Value::Object(doc)
+}
+
+/// The `modelProviders.openai` entries llmman owns: the one model this
+/// launch resolved, or — under `--provider` — every model the provider
+/// serves, the launched one first. Each other model takes what the
+/// catalog says about it: image input from its own `vision`, and no
+/// reasoning levels — only the launched model is started at a `--variant`,
+/// and its entry carries the effort that declares.
+fn qwen_entries(
+    model: &str,
+    base_url: &str,
+    vision: bool,
+    effort: Option<&Effort>,
+    hosted: Option<&[HostedModel]>,
+) -> Vec<serde_json::Value> {
+    let Some(hosted) = hosted else {
+        return vec![qwen_entry(model, base_url, vision, effort)];
+    };
+    let mut entries: Vec<serde_json::Value> = hosted
+        .iter()
+        .map(|m| {
+            if m.reference == model {
+                qwen_entry(model, base_url, vision, effort)
+            } else {
+                qwen_entry(&m.reference, base_url, m.vision.unwrap_or(false), None)
+            }
+        })
+        .collect();
+    // The launched model belongs in its own settings even if the list
+    // somehow lacks it: Qwen Code is started on it.
+    if !entries
+        .iter()
+        .any(|entry| entry["id"].as_str() == Some(model))
+    {
+        entries.insert(0, qwen_entry(model, base_url, vision, effort));
+    }
+    entries
+}
+
+/// One `modelProviders.openai` entry: the model at this daemon, keyed by
+/// [`QWEN_ENV_KEY`], with image input declared for a vision model and the
+/// reasoning levels for a `--variant`.
+fn qwen_entry(
+    model: &str,
+    base_url: &str,
+    vision: bool,
+    effort: Option<&Effort>,
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "id": model,
+        "name": format!("{model} (llmman)"),
+        "baseUrl": base_url,
+        "envKey": QWEN_ENV_KEY,
+    });
+    if vision {
+        entry["generationConfig"] = serde_json::json!({ "modalities": { "image": true } });
+    }
+    if let Some(effort) = effort {
+        let efforts: Vec<&str> = effort
+            .levels
+            .iter()
+            .copied()
+            .filter(|l| *l != "none")
+            .collect();
+        let mut reasoning = serde_json::json!({
+            "thinking": true,
+            "disableField": "reasoning_effort",
+            "profile": "openai-effort",
+            "efforts": efforts,
+        });
+        entry["generationConfig"]["reasoning"] = match effort.default {
+            "none" => serde_json::json!(false),
+            level => {
+                reasoning["defaultEffort"] = level.into();
+                serde_json::json!({ "effort": level })
+            }
+        };
+        entry["capabilities"] = serde_json::json!({ "reasoning": reasoning });
+    }
+    entry
 }
 
 /// An entry llmman wrote: `QWEN_ENV_KEY` as its key, at this daemon's
@@ -492,7 +556,8 @@ mod tests {
             "model": { "name": "gemini-2.5-pro", "generationConfig": { "temperature": 0.1 } }
         });
         let url = "http://127.0.0.1:17434/v1";
-        let merged = qwen_settings_merged(&existing, "docker.io/ai/m:latest", url, false, None);
+        let merged =
+            qwen_settings_merged(&existing, "docker.io/ai/m:latest", url, false, None, None);
         assert_eq!(merged["$version"], 4);
         assert_eq!(merged["ui"]["theme"], "keep-me");
         assert_eq!(
@@ -525,7 +590,7 @@ mod tests {
     #[test]
     fn qwen_settings_merge_is_complete_from_nothing_and_idempotent() {
         let url = "http://127.0.0.1:17434/v1";
-        let once = qwen_settings_merged(&serde_json::json!({}), "m:latest", url, false, None);
+        let once = qwen_settings_merged(&serde_json::json!({}), "m:latest", url, false, None, None);
         assert_eq!(
             once,
             serde_json::json!({
@@ -537,7 +602,7 @@ mod tests {
             })
         );
         assert_eq!(
-            qwen_settings_merged(&once, "m:latest", url, false, None),
+            qwen_settings_merged(&once, "m:latest", url, false, None, None),
             once
         );
         let text = once.to_string();
@@ -581,14 +646,14 @@ mod tests {
     #[test]
     fn qwen_settings_declare_image_input_only_for_a_vision_model() {
         let url = "http://h/v1";
-        let vision = qwen_settings_merged(&serde_json::json!({}), "m", url, true, None);
+        let vision = qwen_settings_merged(&serde_json::json!({}), "m", url, true, None, None);
         assert_eq!(
             vision["modelProviders"]["openai"][0]["generationConfig"],
             serde_json::json!({ "modalities": { "image": true } })
         );
         assert!(vision["model"].get("generationConfig").is_none());
 
-        let text_only = qwen_settings_merged(&vision, "m", url, false, None);
+        let text_only = qwen_settings_merged(&vision, "m", url, false, None, None);
         assert!(!text_only.to_string().contains("modalities"), "{text_only}");
     }
 
@@ -600,12 +665,18 @@ mod tests {
         let existing = serde_json::json!({
             "security": 3, "modelProviders": { "openai": "x" }, "model": []
         });
-        let merged = qwen_settings_merged(&existing, "m", "http://h/v1", false, None);
+        let merged = qwen_settings_merged(&existing, "m", "http://h/v1", false, None, None);
         assert_eq!(merged["security"]["auth"]["selectedType"], "openai");
         assert_eq!(merged["modelProviders"]["openai"][0]["id"], "m");
         assert_eq!(merged["model"]["name"], "m");
-        let from_null =
-            qwen_settings_merged(&serde_json::json!(null), "m", "http://h/v1", false, None);
+        let from_null = qwen_settings_merged(
+            &serde_json::json!(null),
+            "m",
+            "http://h/v1",
+            false,
+            None,
+            None,
+        );
         assert_eq!(from_null["model"]["name"], "m");
 
         let wrapped = serde_json::json!({
@@ -614,7 +685,7 @@ mod tests {
                 { "id": "gpt-5", "baseUrl": "https://api.openai.com/v1", "envKey": "MY_KEY" }
             ] } }
         });
-        let merged = qwen_settings_merged(&wrapped, "m", "http://h/v1", false, None);
+        let merged = qwen_settings_merged(&wrapped, "m", "http://h/v1", false, None, None);
         let openai = merged["modelProviders"]["openai"].as_array().unwrap();
         assert_eq!(openai.len(), 2);
         assert_eq!(openai[1]["id"], "gpt-5");
@@ -665,12 +736,12 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
         };
 
-        write_qwen_settings_at(&dir, "m:latest", url, false, None).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false, None, None).unwrap();
         assert_eq!(read()["model"]["name"], "m:latest");
         assert!(!bak.exists(), "nothing to back up on a first write");
         let written = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        write_qwen_settings_at(&dir, "m:latest", url, false, None).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false, None, None).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             written
@@ -678,11 +749,11 @@ mod tests {
 
         let commented = "{\n  // mine\n  \"ui\": { \"theme\": \"x\" }\n}\n";
         std::fs::write(&path, commented).unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url, false, None).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false, None, None).unwrap();
         assert_eq!(read()["ui"]["theme"], "x");
         assert_eq!(read()["model"]["name"], "m:latest");
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), commented);
-        write_qwen_settings_at(&dir, "other:latest", url, false, None).unwrap();
+        write_qwen_settings_at(&dir, "other:latest", url, false, None, None).unwrap();
         assert_eq!(read()["model"]["name"], "other:latest");
         assert_eq!(
             std::fs::read_to_string(&bak).unwrap(),
@@ -691,20 +762,121 @@ mod tests {
         );
         let edited = "{\n  // edited by hand\n  \"ui\": { \"theme\": \"y\" }\n}\n";
         std::fs::write(&path, edited).unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url, false, None).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false, None, None).unwrap();
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), edited);
 
         std::fs::write(&path, "  \n").unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url, false, None).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false, None, None).unwrap();
         assert_eq!(read()["model"]["name"], "m:latest");
 
         std::fs::write(&path, "{ not json").unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url, false, None).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false, None, None).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
         std::fs::write(&path, "[]").unwrap();
-        write_qwen_settings_at(&dir, "m:latest", url, false, None).unwrap();
+        write_qwen_settings_at(&dir, "m:latest", url, false, None, None).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn hosted_pair() -> Vec<HostedModel> {
+        vec![
+            HostedModel {
+                reference: "llmman.provider/openrouter/qwen3-coder".into(),
+                id: "qwen3-coder".into(),
+                context: Some(262_144),
+                output: Some(8_192),
+                thinking: Some(vec!["low".into(), "high".into()]),
+                vision: Some(false),
+            },
+            HostedModel {
+                reference: "llmman.provider/openrouter/llama-4-scout".into(),
+                id: "llama-4-scout".into(),
+                context: None,
+                output: None,
+                thinking: None,
+                vision: Some(true),
+            },
+        ]
+    }
+
+    /// A `--provider` launch lists every model the provider serves, so
+    /// Qwen Code's `/model` can switch between them without a relaunch:
+    /// the launched model first, with the image input and `--variant`
+    /// levels this launch resolved for it, and each other model with
+    /// what its own catalog entry says. An earlier llmman entry for this
+    /// daemon is replaced, whatever it named; anything else stays.
+    #[test]
+    fn qwen_settings_list_every_model_the_provider_serves() {
+        let url = "http://127.0.0.1:17434/v1";
+        let existing = serde_json::json!({
+            "modelProviders": {
+                "openai": [
+                    { "id": "old:latest", "name": "renamed by the user",
+                      "baseUrl": url, "envKey": "LLMMAN_API_KEY" },
+                    { "id": "other:latest", "name": "other:latest (llmman)",
+                      "baseUrl": "http://10.0.0.2:17434/v1", "envKey": "LLMMAN_API_KEY" }
+                ]
+            },
+            "model": { "name": "old:latest", "baseUrl": url }
+        });
+        let high = Effort {
+            default: "high",
+            levels: vec!["none", "low", "high"],
+        };
+        let merged = qwen_settings_merged(
+            &existing,
+            "llmman.provider/openrouter/qwen3-coder",
+            url,
+            false,
+            Some(&high),
+            Some(&hosted_pair()),
+        );
+        let openai = merged["modelProviders"]["openai"].as_array().unwrap();
+        assert_eq!(openai.len(), 3);
+        assert_eq!(openai[0]["id"], "llmman.provider/openrouter/qwen3-coder");
+        assert_eq!(
+            openai[0]["name"],
+            "llmman.provider/openrouter/qwen3-coder (llmman)"
+        );
+        assert_eq!(openai[0]["baseUrl"], url);
+        assert_eq!(openai[0]["envKey"], "LLMMAN_API_KEY");
+        // The launched entry keeps the variant's levels; the other takes
+        // image input from its own catalog entry, and no reasoning levels.
+        assert_eq!(
+            openai[0]["capabilities"]["reasoning"]["efforts"],
+            serde_json::json!(["low", "high"])
+        );
+        assert_eq!(
+            openai[0]["generationConfig"]["reasoning"],
+            serde_json::json!({ "effort": "high" })
+        );
+        assert_eq!(openai[1]["id"], "llmman.provider/openrouter/llama-4-scout");
+        assert_eq!(
+            openai[1]["generationConfig"],
+            serde_json::json!({ "modalities": { "image": true } })
+        );
+        assert!(openai[1].get("capabilities").is_none());
+        // The stale llmman entry for this daemon is gone; the
+        // hand-written one at another daemon stays.
+        assert_eq!(openai[2]["id"], "other:latest");
+        assert_eq!(
+            merged["model"]["name"],
+            "llmman.provider/openrouter/qwen3-coder"
+        );
+
+        // The launched model belongs in its own settings even if the
+        // provider's list somehow lacks it, ahead of the rest.
+        let others = vec![hosted_pair().into_iter().nth(1).unwrap()];
+        let merged =
+            qwen_settings_merged(&serde_json::json!({}), "m", url, true, None, Some(&others));
+        let openai = merged["modelProviders"]["openai"].as_array().unwrap();
+        assert_eq!(openai.len(), 2);
+        assert_eq!(openai[0]["id"], "m");
+        assert_eq!(
+            openai[0]["generationConfig"],
+            serde_json::json!({ "modalities": { "image": true } })
+        );
+        assert_eq!(openai[1]["id"], "llmman.provider/openrouter/llama-4-scout");
     }
 
     #[test]
@@ -715,7 +887,7 @@ mod tests {
             levels: vec!["none", "low", "high"],
         };
         let saved = serde_json::json!({ "model": { "reasoningEffort": "low" } });
-        let doc = qwen_settings_merged(&saved, "m", url, true, Some(&high));
+        let doc = qwen_settings_merged(&saved, "m", url, true, Some(&high), None);
         assert!(doc["model"]["reasoningEffort"].is_null());
         let ours = &doc["modelProviders"]["openai"][0];
         assert_eq!(
@@ -737,7 +909,7 @@ mod tests {
             default: "none",
             ..high
         };
-        let doc = qwen_settings_merged(&serde_json::json!({}), "m", url, false, Some(&off));
+        let doc = qwen_settings_merged(&serde_json::json!({}), "m", url, false, Some(&off), None);
         let ours = &doc["modelProviders"]["openai"][0];
         assert_eq!(ours["generationConfig"]["reasoning"], false);
         assert!(ours["capabilities"]["reasoning"]["defaultEffort"].is_null());

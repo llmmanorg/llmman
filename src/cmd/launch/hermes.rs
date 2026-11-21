@@ -5,19 +5,31 @@ use std::path::PathBuf;
 use anyhow::Context;
 
 use super::common;
-use super::{exec_with_env, find_on_path, server};
+use super::{exec_with_env, find_on_path, server, HostedModel};
 
 /// hermes: writes its own `~/.hermes/config.yaml` provider entry
 /// pointing at our /v1 endpoint, skipping the messaging-gateway/
 /// desktop-build setup a full wizard would also handle, which llmman's
 /// own launch has no equivalent for.
+///
+/// `hosted` is every model `--provider` serves (see [`HostedModel`]):
+/// each is listed under the provider's `models`, so hermes's own model
+/// picker can switch between them mid-session; the launched model stays
+/// the `model.default`. The list carries references only — the surface
+/// has no per-model field for vision or limits, so `supports_vision`
+/// still describes the launched model alone.
 pub(super) fn launch_hermes(
     model: &str,
     vision: bool,
     extra_args: &[String],
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     let bin = find_on_path("hermes").ok_or_else(|| anyhow::anyhow!("hermes is not installed"))?;
-    write_hermes_config(if model.is_empty() { "default" } else { model }, vision)?;
+    write_hermes_config(
+        if model.is_empty() { "default" } else { model },
+        vision,
+        hosted,
+    )?;
     exec_with_env(&bin, extra_args, &[])
 }
 
@@ -50,7 +62,11 @@ pub(super) fn hermes_home() -> anyhow::Result<PathBuf> {
 /// providers, toolsets, etc.) is preserved, the same way
 /// `codex::write_codex_config`/`codex::strip_legacy_llmman_profile` avoid clobbering
 /// unrelated `config.toml` content.
-fn write_hermes_config(model: &str, vision: bool) -> anyhow::Result<()> {
+fn write_hermes_config(
+    model: &str,
+    vision: bool,
+    hosted: Option<&[HostedModel]>,
+) -> anyhow::Result<()> {
     let config_dir = hermes_home()?;
     std::fs::create_dir_all(&config_dir)?;
     let config_path = config_dir.join("config.yaml");
@@ -58,7 +74,7 @@ fn write_hermes_config(model: &str, vision: bool) -> anyhow::Result<()> {
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
     let preserved =
         strip_yaml_top_level_key(&strip_yaml_top_level_key(&existing, "model"), "providers");
-    let ours = hermes_config_blocks(model, &format!("{}/v1", server()), vision);
+    let ours = hermes_config_blocks(model, &format!("{}/v1", server()), vision, hosted);
     std::fs::write(&config_path, format!("{preserved}{ours}"))?;
     Ok(())
 }
@@ -67,20 +83,42 @@ fn write_hermes_config(model: &str, vision: bool) -> anyhow::Result<()> {
 /// vision model gets `model.supports_vision`, the override hermes's
 /// image routing reads before its own catalog, which lists no local
 /// model and so routes every image through a describe-it tool instead.
-fn hermes_config_blocks(model: &str, base_url: &str, vision: bool) -> String {
+///
+/// `hosted` lists every model the provider serves under the provider's
+/// `models`, the launched one first; without it the list holds the one
+/// model this launch resolved.
+fn hermes_config_blocks(
+    model: &str,
+    base_url: &str,
+    vision: bool,
+    hosted: Option<&[HostedModel]>,
+) -> String {
     // Double-quoted (not bare) so a model name that happens to be a YAML
     // keyword (`null`, `true`, ...) or contain metacharacters (`:`, `#`,
     // ...) still parses back as the literal string it is.
-    let model = common::yaml_quote(model);
+    let quoted_model = common::yaml_quote(model);
     let base_url = common::yaml_quote(base_url);
     let vision = if vision {
         "  supports_vision: true\n"
     } else {
         ""
     };
+    let mut models: Vec<&str> = match hosted {
+        Some(hosted) => hosted.iter().map(|m| m.reference.as_str()).collect(),
+        None => Vec::new(),
+    };
+    // The launched model belongs in its own config even if the list
+    // somehow lacks it: hermes is started on it.
+    if !models.contains(&model) {
+        models.insert(0, model);
+    }
+    let mut list = String::new();
+    for entry in models {
+        list.push_str(&format!("      - {}\n", common::yaml_quote(entry)));
+    }
     format!(
-        "model:\n  provider: llmman\n  default: {model}\n  base_url: {base_url}\n  api_key: llmman\n{vision}\
-         providers:\n  llmman:\n    name: llmman\n    api: {base_url}\n    default_model: {model}\n    models:\n      - {model}\n"
+        "model:\n  provider: llmman\n  default: {quoted_model}\n  base_url: {base_url}\n  api_key: llmman\n{vision}\
+         providers:\n  llmman:\n    name: llmman\n    api: {base_url}\n    default_model: {quoted_model}\n    models:\n{list}"
     )
 }
 
@@ -144,16 +182,83 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
 
     #[test]
     fn hermes_config_declares_image_input_only_for_a_vision_model() {
-        let vision = hermes_config_blocks("m", "http://h/v1", true);
+        let vision = hermes_config_blocks("m", "http://h/v1", true, None);
         let model_block = strip_yaml_top_level_key(&vision, "providers");
         assert!(
             model_block.contains("\n  supports_vision: true\n"),
             "{vision}"
         );
 
-        let text_only = hermes_config_blocks("m", "http://h/v1", false);
+        let text_only = hermes_config_blocks("m", "http://h/v1", false, None);
         assert!(!text_only.contains("supports_vision"), "{text_only}");
         assert_eq!(text_only, vision.replace("  supports_vision: true\n", ""));
+    }
+
+    #[test]
+    fn hermes_config_lists_every_model_the_provider_serves() {
+        let hosted = vec![
+            HostedModel {
+                reference: "llmman.provider/openrouter/qwen3-coder".into(),
+                id: "qwen3-coder".into(),
+                context: Some(262_144),
+                output: Some(8_192),
+                thinking: None,
+                vision: Some(false),
+            },
+            HostedModel {
+                reference: "llmman.provider/openrouter/llama-4-scout".into(),
+                id: "llama-4-scout".into(),
+                context: None,
+                output: None,
+                thinking: None,
+                vision: Some(true),
+            },
+        ];
+        let text = hermes_config_blocks(
+            "llmman.provider/openrouter/qwen3-coder",
+            "http://h/v1",
+            false,
+            Some(&hosted),
+        );
+        let parsed: serde_json::Value = yaml_serde::from_str(&text).expect("valid YAML");
+        assert_eq!(
+            parsed["model"]["default"],
+            "llmman.provider/openrouter/qwen3-coder"
+        );
+        assert_eq!(
+            parsed["providers"]["llmman"]["default_model"],
+            "llmman.provider/openrouter/qwen3-coder"
+        );
+        assert_eq!(
+            parsed["providers"]["llmman"]["models"],
+            serde_json::json!([
+                "llmman.provider/openrouter/qwen3-coder",
+                "llmman.provider/openrouter/llama-4-scout"
+            ])
+        );
+        // The list carries references only: no per-model vision field
+        // exists on this surface, so the launched model's
+        // `supports_vision` is still the only one declared.
+        assert!(parsed["model"].get("supports_vision").is_none());
+
+        // A local launch lists the one model, as before.
+        let local = hermes_config_blocks("m", "http://h/v1", false, None);
+        let parsed: serde_json::Value = yaml_serde::from_str(&local).expect("valid YAML");
+        assert_eq!(
+            parsed["providers"]["llmman"]["models"],
+            serde_json::json!(["m"])
+        );
+
+        // The launched model belongs in the list even if the provider's
+        // list somehow lacks it, ahead of the rest.
+        let others = vec![hosted.into_iter().nth(1).unwrap()];
+        let text = hermes_config_blocks("m", "http://h/v1", true, Some(&others));
+        let parsed: serde_json::Value = yaml_serde::from_str(&text).expect("valid YAML");
+        assert_eq!(
+            parsed["providers"]["llmman"]["models"],
+            serde_json::json!(["m", "llmman.provider/openrouter/llama-4-scout"])
+        );
+        assert_eq!(parsed["model"]["supports_vision"], true);
     }
 
     #[test]

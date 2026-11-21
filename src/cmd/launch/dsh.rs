@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::common;
-use super::{exec_with_env, find_on_path, has_flag, server, Effort};
+use super::{exec_with_env, find_on_path, has_flag, server, Effort, HostedModel};
 
 /// The env var dsh's generated provider entry reads its key from, so no
 /// key value is ever written to disk (same role as `qwen::QWEN_ENV_KEY`).
@@ -30,12 +30,18 @@ pub(super) const DSH_MISSING: &str =
 /// deliberately, since a per-launch directory costs a cleanup hook on
 /// every exit path (signals included) for a case that needs two
 /// simultaneous sessions on different models to bite at all.
+///
+/// `hosted` is every model `--provider` serves (see [`HostedModel`]):
+/// each becomes a `models` entry under the `llmman` provider route, so
+/// dsh's own model picker can switch between them mid-session; the
+/// launched model stays the `agent-default-model`.
 pub(super) fn launch_dsh(
     model: &str,
     api_key: &str,
     vision: bool,
     effort: Option<&Effort>,
     extra_args: &[String],
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     let launcher = dsh_launcher(extra_args);
     if has_flag(launcher.args, "--patch", None) {
@@ -52,7 +58,7 @@ pub(super) fn launch_dsh(
 
     let dir = dsh_config_dir()?;
     let settings_path = dir.join("settings.yaml");
-    write_dsh_settings(&settings_path, model, vision, effort)?;
+    write_dsh_settings(&settings_path, model, vision, effort, hosted)?;
     let patch_path = dir.join("llmman.cordis.yml");
     write_dsh_patch(&patch_path, &settings_path)?;
 
@@ -178,31 +184,86 @@ fn write_dsh_settings(
     model: &str,
     vision: bool,
     effort: Option<&Effort>,
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     let quoted_model = common::yaml_quote(model);
     let base_url = common::yaml_quote(&format!("{}/v1", server()));
-    // Claiming image input a text-only model can't serve would have dsh
-    // attach what the daemon then rejects.
-    let input = if vision { "[text, image]" } else { "[text]" };
-    let (reasoning, efforts) = effort.map_or_else(Default::default, |e| {
-        let map: Vec<String> = (e.levels.iter())
-            .map(|&l| format!("{l}: {}", if l == "off" { "none" } else { l }))
-            .collect();
-        (
-            format!("      reasoning: {}\n", e.default),
-            format!("          reasoningEfforts: {{ {} }}\n", map.join(", ")),
-        )
-    });
+    let reasoning =
+        effort.map_or_else(String::new, |e| format!("      reasoning: {}\n", e.default));
+    let models = dsh_models_block(model, vision, effort, hosted);
     let contents = format!(
         "# Written by `llmman launch dsh`; edits are overwritten.\n\
          agent-default-model:\n  provider: llmman\n  model: {quoted_model}\n\
          llm-pi-ai:\n  providers:\n    llmman:\n      displayName: llmman\n      \
          apiKeyEnv: {DSH_API_KEY_ENV}\n      api: openai-completions\n      baseURL: {base_url}\n\
-         {reasoning}      \
-         models:\n        - id: {quoted_model}\n          name: {quoted_model}\n          input: {input}\n\
-         {efforts}"
+         {reasoning}{models}"
     );
     write_dsh_file(path, &contents)
+}
+
+/// The `models:` list under the `llmman` provider route: the one model
+/// this launch resolved, or — under `--provider` — every model the
+/// provider serves, the launched one first, each with its own image
+/// input and reasoning levels. The launched entry keeps the `--variant`
+/// levels this launch resolved for it; each other model takes the
+/// levels its own catalog entry lists, and none where the catalog
+/// lists none.
+fn dsh_models_block(
+    model: &str,
+    vision: bool,
+    effort: Option<&Effort>,
+    hosted: Option<&[HostedModel]>,
+) -> String {
+    // (id, vision, levels): the launch's levels for the launched model,
+    // the catalog's for every other.
+    let mut entries: Vec<(&str, bool, Option<Vec<&str>>)> = match hosted {
+        Some(hosted) => hosted
+            .iter()
+            .map(|m| {
+                if m.reference == model {
+                    (model, vision, effort.map(|e| e.levels.clone()))
+                } else {
+                    (
+                        m.reference.as_str(),
+                        m.vision.unwrap_or(false),
+                        m.thinking
+                            .as_ref()
+                            .map(|levels| levels.iter().map(String::as_str).collect()),
+                    )
+                }
+            })
+            .collect(),
+        None => vec![(model, vision, effort.map(|e| e.levels.clone()))],
+    };
+    // The launched model belongs in its own settings even if the list
+    // somehow lacks it: dsh is started on it.
+    if !entries.iter().any(|(id, _, _)| *id == model) {
+        entries.insert(0, (model, vision, effort.map(|e| e.levels.clone())));
+    }
+    let mut block = String::from("      models:\n");
+    for (id, vision, levels) in entries {
+        let quoted = common::yaml_quote(id);
+        // Claiming image input a text-only model can't serve would have
+        // dsh attach what the daemon then rejects.
+        let input = if vision { "[text, image]" } else { "[text]" };
+        block.push_str(&format!(
+            "        - id: {quoted}\n          name: {quoted}\n          input: {input}\n"
+        ));
+        if let Some(levels) = levels.filter(|levels| !levels.is_empty()) {
+            block.push_str(&dsh_reasoning_efforts_line(&levels));
+        }
+    }
+    block
+}
+
+/// The `reasoningEfforts` line for a model entry, from its levels: each
+/// level maps to itself, except `off`, which dsh spells `none`.
+fn dsh_reasoning_efforts_line(levels: &[&str]) -> String {
+    let map: Vec<String> = levels
+        .iter()
+        .map(|&l| format!("{l}: {}", if l == "off" { "none" } else { l }))
+        .collect();
+    format!("          reasoningEfforts: {{ {} }}\n", map.join(", "))
 }
 
 /// dsh's patch shape: points its `settings` provider at the document above.
@@ -247,7 +308,7 @@ mod tests {
                 .as_nanos()
         ));
         let path = dir.join("settings.yaml");
-        write_dsh_settings(&path, "qwen3.5:0.8b", false, None).unwrap();
+        write_dsh_settings(&path, "qwen3.5:0.8b", false, None, None).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("provider: llmman"));
         assert!(contents.contains("model: \"qwen3.5:0.8b\""));
@@ -272,11 +333,11 @@ mod tests {
                 .as_nanos()
         ));
         let path = dir.join("settings.yaml");
-        write_dsh_settings(&path, "m", true, None).unwrap();
+        write_dsh_settings(&path, "m", true, None, None).unwrap();
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("input: [text, image]"));
-        write_dsh_settings(&path, "m", false, None).unwrap();
+        write_dsh_settings(&path, "m", false, None, None).unwrap();
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("input: [text]"));
@@ -420,7 +481,7 @@ mod tests {
         for command in ["web", "plugin"] {
             let via_command = args(&[command, "--port", "8080"]);
             assert_eq!(dsh_launcher(&via_command).command, Some(command));
-            let err = launch_dsh("m", "k", false, None, &via_command).unwrap_err();
+            let err = launch_dsh("m", "k", false, None, &via_command, None).unwrap_err();
             assert!(err.to_string().contains("--profile"), "{err}");
         }
         // `--profile web`'s *value* is not the `web` command — refusing
@@ -452,10 +513,10 @@ mod tests {
     #[test]
     fn launch_dsh_refuses_a_conflicting_patch_flag() {
         let word = vec!["--patch".to_string(), "/tmp/x.yml".to_string()];
-        let err = launch_dsh("m", "k", false, None, &word).unwrap_err();
+        let err = launch_dsh("m", "k", false, None, &word, None).unwrap_err();
         assert!(err.to_string().contains("--patch"), "{err}");
         let joined = vec!["--patch=/tmp/x.yml".to_string()];
-        let err = launch_dsh("m", "k", false, None, &joined).unwrap_err();
+        let err = launch_dsh("m", "k", false, None, &joined, None).unwrap_err();
         assert!(err.to_string().contains("--patch"), "{err}");
     }
 
@@ -499,6 +560,102 @@ mod tests {
         );
     }
 
+    /// A `--provider` launch lists every model the provider serves, so
+    /// dsh's own model picker can switch between them without a
+    /// relaunch: the launched model first, with the `--variant` levels
+    /// this launch resolved for it, and each other model with its own
+    /// image input and the levels its own catalog entry lists.
+    #[test]
+    fn dsh_settings_list_every_model_the_provider_serves() {
+        let path = std::env::temp_dir()
+            .join(format!("llmman-dsh-hosted-{}", std::process::id()))
+            .join("settings.yaml");
+        let hosted = vec![
+            HostedModel {
+                reference: "llmman.provider/openrouter/qwen3-coder".into(),
+                id: "qwen3-coder".into(),
+                context: Some(262_144),
+                output: Some(8_192),
+                thinking: Some(vec!["low".into(), "high".into()]),
+                vision: Some(false),
+            },
+            HostedModel {
+                reference: "llmman.provider/openrouter/llama-4-scout".into(),
+                id: "llama-4-scout".into(),
+                context: None,
+                output: None,
+                thinking: Some(vec!["low".into(), "medium".into(), "high".into()]),
+                vision: Some(true),
+            },
+            HostedModel {
+                reference: "llmman.provider/openrouter/plain".into(),
+                id: "plain".into(),
+                context: None,
+                output: None,
+                thinking: None,
+                vision: None,
+            },
+        ];
+        let effort = Effort {
+            default: "low",
+            levels: vec!["off", "low", "high"],
+        };
+        write_dsh_settings(
+            &path,
+            "llmman.provider/openrouter/qwen3-coder",
+            false,
+            Some(&effort),
+            Some(&hosted),
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let doc: serde_json::Value = yaml_serde::from_str(&contents).expect("valid YAML");
+        assert_eq!(
+            doc["agent-default-model"]["model"],
+            "llmman.provider/openrouter/qwen3-coder"
+        );
+        let route = &doc["llm-pi-ai"]["providers"]["llmman"];
+        assert_eq!(route["reasoning"], "low");
+        let models = route["models"].as_array().unwrap();
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0]["id"], "llmman.provider/openrouter/qwen3-coder");
+        assert_eq!(models[0]["input"], serde_json::json!(["text"]));
+        assert_eq!(
+            models[0]["reasoningEfforts"],
+            serde_json::json!({ "off": "none", "low": "low", "high": "high" })
+        );
+        assert_eq!(models[1]["id"], "llmman.provider/openrouter/llama-4-scout");
+        assert_eq!(models[1]["input"], serde_json::json!(["text", "image"]));
+        assert_eq!(
+            models[1]["reasoningEfforts"],
+            serde_json::json!({ "low": "low", "medium": "medium", "high": "high" })
+        );
+        // Unknown vision reads as text-only, and no levels means no
+        // `reasoningEfforts` key rather than a guess.
+        assert_eq!(models[2]["id"], "llmman.provider/openrouter/plain");
+        assert_eq!(models[2]["input"], serde_json::json!(["text"]));
+        assert!(models[2].get("reasoningEfforts").is_none());
+
+        // The launched model belongs in its own settings even if the
+        // provider's list somehow lacks it, ahead of the rest.
+        let path = std::env::temp_dir()
+            .join(format!("llmman-dsh-hosted-missing-{}", std::process::id()))
+            .join("settings.yaml");
+        let others = vec![hosted.into_iter().nth(1).unwrap()];
+        write_dsh_settings(&path, "m", true, None, Some(&others)).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let doc: serde_json::Value = yaml_serde::from_str(&contents).expect("valid YAML");
+        let models = doc["llm-pi-ai"]["providers"]["llmman"]["models"]
+            .as_array()
+            .unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["id"], "m");
+        assert_eq!(models[0]["input"], serde_json::json!(["text", "image"]));
+        assert_eq!(models[1]["id"], "llmman.provider/openrouter/llama-4-scout");
+    }
+
     #[test]
     fn dsh_settings_start_the_route_at_the_variant() {
         let path = std::env::temp_dir()
@@ -508,7 +665,7 @@ mod tests {
             default: "low",
             levels: vec!["off", "low", "high"],
         };
-        write_dsh_settings(&path, "m", false, Some(&effort)).unwrap();
+        write_dsh_settings(&path, "m", false, Some(&effort), None).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let doc: serde_json::Value = yaml_serde::from_str(&contents).expect("valid YAML");

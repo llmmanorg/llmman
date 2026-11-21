@@ -7,7 +7,7 @@ use anyhow::Context;
 use crate::daemon;
 
 use super::common;
-use super::{before_terminator, exec_with_env, find_on_path, has_flag, server};
+use super::{before_terminator, exec_with_env, find_on_path, has_flag, server, HostedModel};
 
 /// The env var the generated `token_key` names, so no key reaches disk
 /// (same role as `qwen::QWEN_ENV_KEY` and `dsh::DSH_API_KEY_ENV`).
@@ -23,10 +23,16 @@ const DOCKER_AGENT_MODEL_NAME: &str = "llmman";
 /// a `models:` map there is ignored, and the entry cannot then be
 /// selected. Writing one llmman owns also leaves `~/.config/cagent`
 /// alone.
+///
+/// `hosted` is every model `--provider` serves (see [`HostedModel`]):
+/// each becomes a `models:` entry, so docker-agent's own model picker
+/// can switch between them mid-session; the launched model keeps the
+/// `llmman` entry `root` selects.
 pub(super) fn launch_docker_agent(
     model: &str,
     api_key: &str,
     extra_args: &[String],
+    hosted: Option<&[HostedModel]>,
 ) -> anyhow::Result<()> {
     // `run` has already rejected these arguments before starting the
     // daemon; repeated so a direct call to `launch` rejects them too.
@@ -34,7 +40,7 @@ pub(super) fn launch_docker_agent(
     let bin = find_docker_agent().ok_or_else(docker_agent_missing)?;
 
     let path = docker_agent_agent_file(&docker_agent_config_dir()?, model);
-    write_docker_agent_file(&path, model, &format!("{}/v1", server()))?;
+    write_docker_agent_file(&path, model, &format!("{}/v1", server()), hosted)?;
 
     let args = docker_agent_args(&path, extra_args);
     exec_with_env(&bin, &args, &[(DOCKER_AGENT_API_KEY_ENV, api_key)])
@@ -145,11 +151,16 @@ fn docker_agent_file_stem(model: &str) -> String {
     format!("{safe}-{}", &digest[..8])
 }
 
-fn write_docker_agent_file(path: &Path, model: &str, base_url: &str) -> anyhow::Result<()> {
+fn write_docker_agent_file(
+    path: &Path,
+    model: &str,
+    base_url: &str,
+    hosted: Option<&[HostedModel]>,
+) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
-    let contents = docker_agent_document(model, base_url);
+    let contents = docker_agent_document(model, base_url, hosted);
     crate::fsutil::write_atomic(path, contents.as_bytes())
         .with_context(|| format!("write {}", path.display()))
 }
@@ -168,20 +179,67 @@ fn write_docker_agent_file(path: &Path, model: &str, base_url: &str) -> anyhow::
 /// daemon merges them (`consolidate_chat_system_messages`), so the
 /// agent that reaches the model carries one leading system message
 /// whatever the template accepts.
-fn docker_agent_document(model: &str, base_url: &str) -> String {
-    let quoted_model = common::yaml_quote(model);
+///
+/// `hosted` lists every model the provider serves in `models:`, the
+/// launched one first under the `llmman` entry `root` selects; each
+/// other is keyed by the id the provider knows it by — the reference
+/// itself where that id would collide with the launched entry's name.
+/// Without it the map holds the one model this launch resolved.
+fn docker_agent_document(model: &str, base_url: &str, hosted: Option<&[HostedModel]>) -> String {
     let quoted_base_url = common::yaml_quote(base_url);
+    let mut models = String::new();
+    for (key, reference) in docker_agent_model_entries(model, hosted) {
+        let quoted_key = if key == DOCKER_AGENT_MODEL_NAME {
+            key.to_string()
+        } else {
+            common::yaml_quote(key)
+        };
+        let quoted_model = common::yaml_quote(reference);
+        models.push_str(&format!(
+            "  {quoted_key}:\n    provider: openai\n    model: {quoted_model}\n    \
+             base_url: {quoted_base_url}\n    token_key: {DOCKER_AGENT_API_KEY_ENV}\n"
+        ));
+    }
     format!(
         "# Written by `llmman launch docker-agent`; edits are overwritten.\n\
          version: \"2\"\n\
-         models:\n  {DOCKER_AGENT_MODEL_NAME}:\n    provider: openai\n    model: {quoted_model}\n    \
-         base_url: {quoted_base_url}\n    token_key: {DOCKER_AGENT_API_KEY_ENV}\n\
+         models:\n{models}\
          agents:\n  root:\n    model: {DOCKER_AGENT_MODEL_NAME}\n    \
          description: The agent `llmman launch docker-agent` runs.\n    \
          instruction: You are a helpful AI assistant with access to the shell and \
          the filesystem.\n    \
          toolsets:\n      - type: shell\n      - type: filesystem\n"
     )
+}
+
+/// The `(key, model)` rows of the agent file's `models:` map: the one
+/// model this launch resolved, or — under `--provider` — every model
+/// the provider serves, the launched one first.
+fn docker_agent_model_entries<'a>(
+    model: &'a str,
+    hosted: Option<&'a [HostedModel]>,
+) -> Vec<(&'a str, &'a str)> {
+    let Some(hosted) = hosted else {
+        return vec![(DOCKER_AGENT_MODEL_NAME, model)];
+    };
+    let mut entries: Vec<(&str, &str)> = hosted
+        .iter()
+        .map(|m| {
+            if m.reference == model {
+                (DOCKER_AGENT_MODEL_NAME, model)
+            } else if m.id == DOCKER_AGENT_MODEL_NAME {
+                (m.reference.as_str(), m.reference.as_str())
+            } else {
+                (m.id.as_str(), m.reference.as_str())
+            }
+        })
+        .collect();
+    // The launched model belongs in its own agent file even if the list
+    // somehow lacks it: docker-agent is started on it.
+    if !entries.iter().any(|(_, reference)| *reference == model) {
+        entries.insert(0, (DOCKER_AGENT_MODEL_NAME, model));
+    }
+    entries
 }
 
 /// `run`, then the generated agent file, then the caller's arguments.
@@ -264,11 +322,70 @@ mod tests {
         );
     }
 
+    /// A `--provider` launch lists every model the provider serves, so
+    /// docker-agent's own model picker can switch between them without a
+    /// relaunch: the launched model first, under the `llmman` entry
+    /// `root` selects, and each other keyed by the id the provider knows
+    /// it by.
+    #[test]
+    fn docker_agent_document_lists_every_model_the_provider_serves() {
+        let hosted = vec![
+            HostedModel {
+                reference: "llmman.provider/openrouter/qwen3-coder".into(),
+                id: "qwen3-coder".into(),
+                context: Some(262_144),
+                output: Some(8_192),
+                thinking: None,
+                vision: Some(false),
+            },
+            HostedModel {
+                reference: "llmman.provider/openrouter/llama-4-scout".into(),
+                id: "llama-4-scout".into(),
+                context: None,
+                output: None,
+                thinking: None,
+                vision: Some(true),
+            },
+        ];
+        let document = docker_agent_document(
+            "llmman.provider/openrouter/qwen3-coder",
+            "http://127.0.0.1:17434/v1",
+            Some(&hosted),
+        );
+        let parsed: serde_json::Value = yaml_serde::from_str(&document).expect("valid YAML");
+        let models = parsed["models"].as_object().unwrap();
+        assert_eq!(models.len(), 2);
+        let launched = &parsed["models"]["llmman"];
+        assert_eq!(launched["provider"], "openai");
+        assert_eq!(launched["model"], "llmman.provider/openrouter/qwen3-coder");
+        assert_eq!(launched["base_url"], "http://127.0.0.1:17434/v1");
+        assert_eq!(launched["token_key"], "LLMMAN_API_KEY");
+        let scout = &parsed["models"]["llama-4-scout"];
+        assert_eq!(scout["provider"], "openai");
+        assert_eq!(scout["model"], "llmman.provider/openrouter/llama-4-scout");
+        assert_eq!(scout["base_url"], "http://127.0.0.1:17434/v1");
+        assert_eq!(scout["token_key"], "LLMMAN_API_KEY");
+        assert_eq!(parsed["agents"]["root"]["model"], "llmman");
+
+        // The launched model belongs in its own agent file even if the
+        // provider's list somehow lacks it, ahead of the rest.
+        let others = vec![hosted.into_iter().nth(1).unwrap()];
+        let document = docker_agent_document("m", "http://127.0.0.1:17434/v1", Some(&others));
+        let parsed: serde_json::Value = yaml_serde::from_str(&document).expect("valid YAML");
+        let models = parsed["models"].as_object().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(parsed["models"]["llmman"]["model"], "m");
+        assert_eq!(
+            parsed["models"]["llama-4-scout"]["model"],
+            "llmman.provider/openrouter/llama-4-scout"
+        );
+    }
+
     /// `base_url` is what makes an `openai`-provider model reach this
     /// daemon instead of api.openai.com.
     #[test]
     fn docker_agent_document_routes_an_openai_provider_model_at_the_daemon() {
-        let document = docker_agent_document("m", "http://127.0.0.1:17434/v1");
+        let document = docker_agent_document("m", "http://127.0.0.1:17434/v1", None);
         assert!(document.contains("provider: openai"), "{document}");
         assert!(document.contains("model: \"m\""), "{document}");
         assert!(
@@ -291,7 +408,7 @@ mod tests {
     /// `dsh::write_dsh_settings` also promise.
     #[test]
     fn docker_agent_document_names_the_key_variable_rather_than_a_key() {
-        let document = docker_agent_document("m", "http://127.0.0.1:17434/v1");
+        let document = docker_agent_document("m", "http://127.0.0.1:17434/v1", None);
         assert!(
             document.contains(&format!("token_key: {DOCKER_AGENT_API_KEY_ENV}")),
             "{document}"
@@ -305,7 +422,7 @@ mod tests {
     /// (`consolidate_chat_system_messages`), not by leaving them out.
     #[test]
     fn docker_agent_document_gives_the_agent_shell_and_filesystem() {
-        let document = docker_agent_document("m", "http://127.0.0.1:17434/v1");
+        let document = docker_agent_document("m", "http://127.0.0.1:17434/v1", None);
         assert!(document.contains("instruction:"), "{document}");
         assert!(document.contains("toolsets:"), "{document}");
         assert!(document.contains("- type: shell"), "{document}");
@@ -316,7 +433,7 @@ mod tests {
     /// colon rather than as the model's name.
     #[test]
     fn docker_agent_document_quotes_the_values_it_interpolates() {
-        let document = docker_agent_document("docker.io/ai/qwen3.5:0.8b", "http://h:1/v1");
+        let document = docker_agent_document("docker.io/ai/qwen3.5:0.8b", "http://h:1/v1", None);
         assert!(
             document.contains("model: \"docker.io/ai/qwen3.5:0.8b\""),
             "{document}"
@@ -477,7 +594,7 @@ mod tests {
     fn docker_agent_refuses_a_forwarded_model_flag() {
         for spelling in ["--model", "--model=openai/gpt-5"] {
             let extra = [spelling.to_string(), "openai/gpt-5".to_string()];
-            let error = launch_docker_agent("m", "k", &extra)
+            let error = launch_docker_agent("m", "k", &extra, None)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("api.openai.com"), "{spelling}: {error}");
@@ -521,7 +638,7 @@ mod tests {
         ));
         std::fs::write(&path, "agents: {}\n").unwrap();
         let named = path.to_string_lossy().into_owned();
-        let error = launch_docker_agent("m", "k", std::slice::from_ref(&named))
+        let error = launch_docker_agent("m", "k", std::slice::from_ref(&named), None)
             .unwrap_err()
             .to_string();
         let _ = std::fs::remove_file(&path);

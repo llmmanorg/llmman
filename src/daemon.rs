@@ -1868,6 +1868,11 @@ pub struct ProviderModel {
     /// `limit.output`), `None` on the same terms as `context`.
     #[serde(default)]
     pub output: Option<u32>,
+    /// Whether models.dev's `modalities.input` lists `image` for this
+    /// model. `None` from an older daemon, and for a provider defined
+    /// in `llmman.conf`, which has no catalog entry.
+    #[serde(default)]
+    pub vision: Option<bool>,
 }
 
 /// US dollars per million tokens (see [`crate::providers::Cost`]).
@@ -1932,6 +1937,16 @@ impl ProviderDetail {
             .iter()
             .find(|m| m.id == model)
             .and_then(|m| m.output)
+    }
+
+    /// Whether the catalog says `model` takes images in (models.dev
+    /// `modalities.input` lists `image`), on the same terms as
+    /// [`Self::context_window`].
+    pub fn vision(&self, model: &str) -> Option<bool> {
+        self.models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.vision)
     }
 
     /// Where a key for this provider would go (see

@@ -350,6 +350,11 @@ pub struct Model {
     /// [`thinking_levels_of`]). Empty for a model that does not reason;
     /// `None` where the catalog does not say.
     pub thinking: Option<Vec<String>>,
+    /// Whether models.dev's `modalities.input` lists `image` — the
+    /// model takes images in. `None` where the catalog publishes no
+    /// modalities, and for a provider defined in `llmman.conf`, which
+    /// has no catalog entry at all.
+    pub vision: Option<bool>,
 }
 
 /// US dollars per million tokens — models.dev's own unit, unconverted so
@@ -935,6 +940,9 @@ struct RawModel {
     /// Untyped for the same reason; `output` and `context` are read.
     #[serde(default)]
     limit: Option<serde_json::Value>,
+    /// Untyped for the same reason; `input` is read for `image`.
+    #[serde(default)]
+    modalities: Option<serde_json::Value>,
     /// Untyped for the same reason.
     #[serde(default)]
     reasoning: Option<serde_json::Value>,
@@ -954,6 +962,14 @@ fn max_output_of(raw: &serde_json::Value) -> Option<u32> {
 /// [`max_output_of`]'s sibling for `limit.context`.
 fn max_context_of(raw: &serde_json::Value) -> Option<u64> {
     raw.get("context")?.as_u64().filter(|&n| n > 0)
+}
+
+/// Whether a models.dev `modalities.input` takes images: `Some(true)`
+/// when it lists `image`, `Some(false)` when it lists inputs without
+/// one, `None` where the catalog publishes no modalities at all.
+fn vision_of(raw: &serde_json::Value) -> Option<bool> {
+    let input = raw.get("input")?.as_array()?;
+    Some(input.iter().any(|m| m.as_str() == Some("image")))
 }
 
 /// The levels opencode derives from a models.dev entry
@@ -1250,6 +1266,7 @@ fn models_of(
                 thinking: thinking_levels_of(&model, wire, max_output),
                 max_context: model.limit.as_ref().and_then(max_context_of),
                 max_output,
+                vision: model.modalities.as_ref().and_then(vision_of),
                 id,
             }
         })
@@ -2064,7 +2081,8 @@ mod tests {
                     "npm": "@openrouter/ai-sdk-provider",
                     "env": ["OPENROUTER_API_KEY"],
                     "models": {
-                        "z-model": { "cost": { "input": 2.5, "output": 10 }, "limit": { "context": 200000, "output": 32000 } },
+                        "z-model": { "cost": { "input": 2.5, "output": 10 }, "limit": { "context": 200000, "output": 32000 }, "modalities": { "input": ["text", "image"], "output": ["text"] } },
+                        "m-model": { "modalities": { "input": ["text"], "output": ["text"] } },
                         "a-model": {}
                     }
                 }
@@ -2085,6 +2103,17 @@ mod tests {
                     max_output: None,
                     max_context: None,
                     thinking: None,
+                    // No modalities published: unknown, not text-only.
+                    vision: None,
+                },
+                Model {
+                    id: "m-model".into(),
+                    cost: None,
+                    max_output: None,
+                    max_context: None,
+                    thinking: None,
+                    // `modalities.input` without `image`: text-only.
+                    vision: Some(false),
                 },
                 Model {
                     id: "z-model".into(),
@@ -2093,6 +2122,8 @@ mod tests {
                     // The fixture's `limit.context`, now carried too.
                     max_context: Some(200_000),
                     thinking: None,
+                    // The fixture's `modalities.input` lists `image`.
+                    vision: Some(true),
                 },
             ]
         );
