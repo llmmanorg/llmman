@@ -43,6 +43,11 @@ pub(super) async fn handle_version(State(state): State<AppState>) -> impl IntoRe
         "version": env!("LLMMAN_VERSION"),
         "exe": state.0.exe.as_ref().map(|p| p.to_string_lossy()),
         "pid": std::process::id(),
+        // What `serve --detach` compares its engine flags with.
+        "llama_cpp_version": state.0.llama_cpp_version.as_deref().unwrap_or("latest"),
+        "vllm_version": state.0.vllm_version,
+        "vllm_image": state.0.vllm_image,
+        "sglang_version": state.0.sglang_version,
     }))
 }
 

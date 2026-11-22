@@ -49,7 +49,7 @@ pub fn default_release() -> &'static str {
 /// `v1.0.0-b12359-b1b770d` names the `b<N>` build it was made from (as
 /// `packaging/llama-build.sh` does); any other pin, such as `v1.1.0`, is its
 /// own release tag, which `resolve_release` follows to its build.
-fn build_tag(pin: &str) -> &str {
+pub(crate) fn build_tag(pin: &str) -> &str {
     pin.strip_prefix('v')
         .and_then(|_| pin.split('-').nth(1))
         .unwrap_or(pin)

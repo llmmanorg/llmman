@@ -4907,6 +4907,38 @@ async fn the_scrape_endpoint_is_outside_the_cors_layer() {
     );
 }
 
+/// `latest` when unpinned, beside the identity fields older clients read.
+#[tokio::test]
+async fn api_version_reports_the_engine_settings_the_daemon_started_with() {
+    let version_of = |inner: Inner| async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(AppState(Arc::new(inner)), false);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Client::new()
+            .get(format!("http://127.0.0.1:{}/api/version", addr.port()))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    };
+
+    let mut pinned = test_inner(std::env::temp_dir());
+    pinned.llama_cpp_version = Some("b12503".into());
+    pinned.sglang_version = Some("v0.5.19".into());
+    let body = version_of(pinned).await;
+    assert_eq!(body["llama_cpp_version"], "b12503");
+    assert_eq!(body["sglang_version"], "v0.5.19");
+    assert!(body["vllm_version"].is_null());
+    assert_eq!(body["version"], env!("LLMMAN_VERSION"));
+    assert_eq!(body["pid"], std::process::id());
+
+    let body = version_of(test_inner(std::env::temp_dir())).await;
+    assert_eq!(body["llama_cpp_version"], "latest");
+}
+
 /// A 404 rather than a 403, so a disabled endpoint is indistinguishable
 /// from a build that never had one; and nothing is recorded either.
 #[tokio::test]

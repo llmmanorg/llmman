@@ -156,7 +156,10 @@ The release is pinned: unless `--llama-cpp-version <tag>` says otherwise,
 both `bin` and the container images use the llama.cpp build llmman's own
 CI tested (the `LLAMA_CPP_RELEASE` file in the repository), so what runs
 is what was tested. `--llama-cpp-version latest` takes upstream's
-floating latest instead.
+floating latest instead. `llmman serve --detach --llama-cpp-version <tag>`
+restarts a local daemon running another release, unloading its models; a
+remote or service-managed daemon is left running (for the latter, change the
+service's arguments and restart it).
 
 For `bin`, llmman probes for CUDA, ROCm, OpenCL (Windows ARM64 Adreno only),
 Vulkan or Metal (in that order) and downloads the matching prebuilt asset from

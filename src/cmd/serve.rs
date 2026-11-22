@@ -4521,9 +4521,15 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         if crate::daemon::server_alive() {
             crate::daemon::check_server_identity()?;
         }
-        crate::daemon::ensure_server_with_args(
+        crate::daemon::ensure_server_with_engines(
             args.model.as_deref().unwrap_or(""),
             &args.detached_child_args(),
+            &crate::daemon::RequestedEngines {
+                llama_cpp_version: args.llama_cpp_version.as_deref(),
+                vllm_version: args.vllm_version.as_deref(),
+                vllm_image: args.vllm_image.as_deref(),
+                sglang_version: args.sglang_version.as_deref(),
+            },
         )?;
         return crate::daemon::check_server_identity();
     }

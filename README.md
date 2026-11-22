@@ -257,6 +257,8 @@ llmman serve
 To start the daemon only if needed and return once it is listening, use
 `llmman serve --detach`. The daemon keeps running after the command exits;
 `--runtime` and other serve options are applied when it starts a new daemon.
+An explicit `--llama-cpp-version` that differs from the running daemon's
+restarts it, unloading its models (unless a service manager owns it).
 
 One endpoint on `127.0.0.1:17434` that speaks Ollama, OpenAI and Anthropic:
 

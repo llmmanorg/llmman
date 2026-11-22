@@ -27,6 +27,12 @@ reference; this is the one-line summary of each subcommand.
 | `logout`  | Log out from a container registry, HuggingFace, or (`--provider`) a hosted provider |
 | `config`  | Read and write `llmman.conf` settings (aliases, API keys, trust policy, aggregation peers) |
 
+`serve --detach` reuses a running daemon, except that an explicit
+`--llama-cpp-version` (or `--vllm-version`, `--vllm-image`,
+`--sglang-version`) differing from the daemon's restarts it, unloading its
+models. A remote daemon, or one a service manager (systemd, launchd) owns, is
+left running; for the latter the command to restart it is printed.
+
 `resolve` is not listed above because `--help` hides it: it is the hook other
 programs call. `llmman resolve REFERENCE` pulls the reference if needed (under
 the `[verify]` policy, as `pull`) and prints one line of JSON with the path to
