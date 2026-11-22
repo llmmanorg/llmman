@@ -749,6 +749,7 @@ pub(crate) fn verify_llama_server_runs(
             hardened_note(
                 &hardened_flags(&engine_args, &llama_tmpfs(&engine_args), user.as_ref()),
                 None,
+                user.as_ref(),
             )
         )
     } else {
@@ -1218,7 +1219,7 @@ fn passes_devices(engine_args: &[String]) -> bool {
 /// - rootful podman (`euid == 0`): there is no daemon, llmman itself is
 ///   root, so the store it wrote is root's and container root (host
 ///   root) owns it; a store another user owns (`LLMMAN_MODELS` pointing
-///   at one) is left to the `chmod` in [`hardened_note`] rather than
+///   at one) is left to the ACL hint in [`hardened_note`] rather than
 ///   mapped, since nothing here says which of its users should run;
 /// - Docker Desktop and non-unix hosts: no `--user`.
 ///
@@ -1384,12 +1385,24 @@ fn hardened_flags(
 /// container's root) names them and the fixes: `flags` the hardened
 /// part of the argv the container was run with ([`hardened_flags`], plus
 /// the [`vllm_rpc_tmpfs`] mount when one was added), `mounted` the store
-/// or cache directory it read (`None` for a run mounting nothing),
-/// loosened with `chmod -R go+rX` when the engine cannot run as its owner.
-pub(crate) fn hardened_note(flags: &[String], mounted: Option<&str>) -> String {
-    let fix = match mounted {
-        Some(path) => format!("chmod -R go+rX {path} lets the container read it as any user, and "),
-        None => String::new(),
+/// or cache directory it read (`None` for a run mounting nothing), and
+/// `user` the `--user` the run carried: a non-root uid gets a `setfacl`
+/// hint granting that uid read access; no `--user` or uid 0 (which
+/// rootless docker maps to the host user) is told the path must be
+/// readable by the user the container runs as.
+pub(crate) fn hardened_note(
+    flags: &[String],
+    mounted: Option<&str>,
+    user: Option<&HardenedUser>,
+) -> String {
+    let fix = match (mounted, user) {
+        (Some(path), Some(HardenedUser { uid, .. })) if *uid != 0 => {
+            format!("setfacl -R -m u:{uid}:rX {path} lets the container read it as uid {uid}, and ")
+        }
+        (Some(path), _) => {
+            format!("{path} must be readable by the user the container runs as, and ")
+        }
+        (None, _) => String::new(),
     };
     format!(
         "started hardened ({}); {fix}--no-hardened turns these flags off",
@@ -1444,7 +1457,7 @@ impl HardenedSpawn {
         if let (Self::Vllm, Some(tmpfs)) = (self, rpc_tmpfs) {
             flags.extend(["--tmpfs".to_string(), tmpfs.to_string()]);
         }
-        hardened_note(&flags, Some(mounted))
+        hardened_note(&flags, Some(mounted), user)
     }
 }
 
@@ -2602,12 +2615,34 @@ mod tests {
     #[test]
     fn hardened_note_names_the_flags_and_the_opt_out() {
         assert_eq!(
-            hardened_note(&hardened_args(true, LLAMA_TMPFS), None),
+            hardened_note(&hardened_args(true, LLAMA_TMPFS), None, Some(&user(&[]))),
             "started hardened (--cap-drop all --security-opt no-new-privileges --read-only --tmpfs /tmp:exec); --no-hardened turns these flags off"
         );
         assert_eq!(
-            hardened_note(&hardened_args(false, LLAMA_TMPFS), Some("/srv/store")),
-            "started hardened (--cap-drop all --security-opt no-new-privileges --tmpfs /tmp:exec); chmod -R go+rX /srv/store lets the container read it as any user, and --no-hardened turns these flags off"
+            hardened_note(&hardened_args(false, LLAMA_TMPFS), Some("/srv/store"), Some(&user(&[]))),
+            "started hardened (--cap-drop all --security-opt no-new-privileges --tmpfs /tmp:exec); setfacl -R -m u:1000:rX /srv/store lets the container read it as uid 1000, and --no-hardened turns these flags off"
+        );
+    }
+
+    #[test]
+    fn hardened_note_without_a_user_or_as_root_names_the_image_user() {
+        let image_user = "started hardened (--cap-drop all --security-opt no-new-privileges --tmpfs /tmp:exec); /srv/store must be readable by the user the container runs as, and --no-hardened turns these flags off";
+        assert_eq!(
+            hardened_note(&hardened_args(false, LLAMA_TMPFS), Some("/srv/store"), None),
+            image_user
+        );
+        let root = HardenedUser {
+            uid: 0,
+            gid: 0,
+            device_gids: vec![],
+        };
+        assert_eq!(
+            hardened_note(
+                &hardened_args(false, LLAMA_TMPFS),
+                Some("/srv/store"),
+                Some(&root)
+            ),
+            image_user
         );
     }
 
@@ -2620,10 +2655,14 @@ mod tests {
                 speech,
                 hardened_note(
                     &hardened_args(true, &llama_tmpfs(&SPEECH_BACKEND.engine_args())),
-                    Some("/srv/store")
+                    Some("/srv/store"),
+                    None
                 )
             );
-            assert!(speech.contains("chmod -R go+rX /srv/store"), "{speech}");
+            assert!(
+                speech.contains("/srv/store must be readable by the user the container runs as"),
+                "{speech}"
+            );
             let llama = HardenedSpawn::LlamaServer.note(host, None, None, "/srv/store");
             assert_eq!(
                 llama.contains("--read-only"),
@@ -2647,7 +2686,7 @@ mod tests {
             "/srv/store",
         );
         let expected = format!(
-            "started hardened ({} --user 1000:1000 --group-add 44 -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e XDG_CONFIG_HOME=/tmp/.config -e TRITON_CACHE_DIR=/tmp/.triton --tmpfs /run/vllm:exec); chmod -R go+rX /srv/store lets the container read it as any user, and --no-hardened turns these flags off",
+            "started hardened ({} --user 1000:1000 --group-add 44 -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e XDG_CONFIG_HOME=/tmp/.config -e TRITON_CACHE_DIR=/tmp/.triton --tmpfs /run/vllm:exec); setfacl -R -m u:1000:rX /srv/store lets the container read it as uid 1000, and --no-hardened turns these flags off",
             hardened_args(true, ENGINE_TMPFS).join(" ")
         );
         assert_eq!(vllm, expected);
