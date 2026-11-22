@@ -903,10 +903,22 @@ fn queue_event(
 /// request carrying an `Origin` is refused with 403 before the upgrade
 /// ([`direct_hit`]).
 async fn realtime(State(s): State<Shared>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
-    if direct_hit(&headers) {
+    upgrade_or_refuse(&headers, ws, move |socket| run_realtime(s, socket))
+}
+
+/// The one step between the request and the session: a direct hit
+/// ([`direct_hit`]) is refused with 403, anything else is upgraded with
+/// the frame cap ([`capped`]) and handed to `session`. Shared with the
+/// tests so they exercise the handler's own path.
+fn upgrade_or_refuse<F, Fut>(headers: &HeaderMap, ws: WebSocketUpgrade, session: F) -> Response
+where
+    F: FnOnce(WebSocket) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    if direct_hit(headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    capped(ws).on_upgrade(move |socket| run_realtime(s, socket))
+    capped(ws).on_upgrade(session)
 }
 
 /// Whether a request reached the worker port from a browser: the worker
@@ -1723,10 +1735,7 @@ mod tests {
         let app = Router::new().route(
             "/v1/realtime",
             get(|headers: HeaderMap, ws: WebSocketUpgrade| async move {
-                if direct_hit(&headers) {
-                    return StatusCode::FORBIDDEN.into_response();
-                }
-                capped(ws).on_upgrade(|socket| async move {
+                upgrade_or_refuse(&headers, ws, |socket| async move {
                     let _ = conn(socket).send(json!({"type": "upgraded"})).await;
                 })
             }),
