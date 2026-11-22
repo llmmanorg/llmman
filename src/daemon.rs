@@ -305,20 +305,26 @@ impl DaemonIdentity {
     /// the pid would hit an unrelated process. Only a path in the other
     /// OS's style is recognised.
     fn is_foreign(&self) -> bool {
-        let Some(exe) = self.exe.as_deref() else {
-            return false;
-        };
-        let bytes = exe.as_bytes();
-        let drive = bytes.len() >= 3
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && matches!(bytes[2], b'\\' | b'/');
-        let windows_style = drive || exe.starts_with("\\\\");
-        if cfg!(windows) {
-            exe.starts_with('/')
-        } else {
-            windows_style
-        }
+        self.exe
+            .as_deref()
+            .is_some_and(|exe| exe_is_foreign(exe, cfg!(windows)))
+    }
+}
+
+/// [`DaemonIdentity::is_foreign`] for an exe path and the client's OS, so
+/// both path syntaxes are testable on any host. A Windows path is a drive
+/// letter or a `\\` prefix (UNC, or the `\\?\` verbatim form).
+fn exe_is_foreign(exe: &str, windows_host: bool) -> bool {
+    let bytes = exe.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    let windows_style = drive || exe.starts_with("\\\\");
+    if windows_host {
+        exe.starts_with('/')
+    } else {
+        windows_style
     }
 }
 
@@ -418,13 +424,24 @@ fn is_local_host(host: &str) -> bool {
 ///   the one still serving — the installed binary wins), or
 /// - it predates identity reporting entirely.
 ///
-/// Returns None both for a healthy daemon and when /api/version can't be
-/// fetched/parsed at all — whatever is holding the port in that case,
-/// killing processes based on it would be a guess. A daemon on another OS
-/// (see [`DaemonIdentity::is_foreign`]) is reused like a remote one.
+/// Only a llmman daemon is ever stale (see [`is_llmman_daemon`]): any other
+/// server, Ollama included, is reused. Returns None both for a healthy
+/// daemon and when /api/version can't be fetched/parsed at all — whatever
+/// is holding the port in that case, killing processes based on it would
+/// be a guess. A daemon on another OS (see [`DaemonIdentity::is_foreign`])
+/// is reused like a remote one.
 fn stale_daemon() -> Option<DaemonIdentity> {
-    let identity = daemon_identity().ok()?;
-    if identity.is_foreign() {
+    stale_identity(daemon_identity(), llmman_api_answers)
+}
+
+/// [`stale_daemon`] for the outcome of `/api/version`, with the llmman-only
+/// probe injected.
+fn stale_identity(
+    identity: anyhow::Result<DaemonIdentity>,
+    probe: impl FnOnce() -> bool,
+) -> Option<DaemonIdentity> {
+    let identity = identity.ok()?;
+    if identity.is_foreign() || !is_llmman_daemon(&identity, probe) {
         return None;
     }
     match (&identity.version, &identity.exe) {
@@ -435,6 +452,45 @@ fn stale_daemon() -> Option<DaemonIdentity> {
         }
         _ => Some(identity),
     }
+}
+
+/// Whether the server that answered /api/version is a llmman daemon, the
+/// only kind this module may stop. Every daemon since identity reporting
+/// sends `version`, `exe` and `pid`; Ollama and other servers send at most
+/// a `version`. One that sends no executable path is a llmman daemon only
+/// if the llmman-only `/llmman/providers` (`probe`) answers, which is what
+/// lets a daemon from before identity existed still be replaced.
+fn is_llmman_daemon(identity: &DaemonIdentity, probe: impl FnOnce() -> bool) -> bool {
+    let has_exe = identity.exe.as_deref().is_some_and(|exe| !exe.is_empty());
+    identity.is_llmman() || has_exe || probe()
+}
+
+/// Whether the server at `LLMMAN_HOST` positively answers as something
+/// other than a llmman daemon, such as Ollama. One that cannot be asked
+/// (down, or behind API keys) is not known to be foreign.
+pub fn server_is_foreign() -> bool {
+    daemon_identity().is_ok_and(|identity| !is_llmman_daemon(&identity, llmman_api_answers))
+}
+
+/// Whether `body`, from `GET /llmman/providers`, is a llmman daemon's:
+/// an object with a `providers` list.
+fn is_providers_list(body: &serde_json::Value) -> bool {
+    body.get("providers").is_some_and(|p| p.is_array())
+}
+
+/// Whether `GET /llmman/providers` answers the way a llmman daemon does.
+/// Ollama answers 404.
+fn llmman_api_answers() -> bool {
+    let answer = || -> anyhow::Result<serde_json::Value> {
+        Ok(client_builder()?
+            .timeout(Some(Duration::from_secs(2)))
+            .build()?
+            .get(format!("{}/llmman/providers", server()))
+            .send()?
+            .error_for_status()?
+            .json()?)
+    };
+    answer().is_ok_and(|body| is_providers_list(&body))
 }
 
 /// The running daemon and [`engine_change_reason`] to restart it.
@@ -1436,10 +1492,10 @@ pub fn disable_std_handle_inheritance() {
 
 /// A single line of Ollama's streamed NDJSON progress protocol (see
 /// api.ProgressResponse) — status text plus an optional error, and
-/// (unlike real Ollama's per-layer digest/total/completed) our own
-/// aggregate total/completed byte counts across the whole pull/push, once
-/// cmd::serve::ollama's stream_ffi_progress has one to report — see that
-/// function's own doc comment for where these come from.
+/// either our own aggregate total/completed byte counts across the whole
+/// pull/push (no digest), once cmd::serve::ollama's stream_ffi_progress has
+/// one to report — see that function's own doc comment for where these
+/// come from — or real Ollama's per-layer digest/total/completed.
 #[derive(Deserialize)]
 struct ProgressLine {
     status: Option<String>,
@@ -1452,6 +1508,7 @@ struct ProgressLine {
     notice: Option<String>,
     /// The manifest digest a push landed on, for `--sign-key` to sign
     /// here rather than in the daemon. See `cmd::serve::ollama`'s `push_impl`.
+    /// With a `total`, the layer an Ollama pull line is about instead.
     #[serde(default)]
     digest: Option<String>,
     #[serde(default)]
@@ -1543,39 +1600,109 @@ pub fn stream_progress_with(path: &str, reference: &str) -> anyhow::Result<Optio
         anyhow::bail!("{path} {reference}: server returned {status}: {body}");
     }
 
-    let mut saw_success = false;
-    let mut pushed_digest: Option<String> = None;
-    let mut last_status = String::new();
-    let mut bar: Option<ProgressBar> = None;
-    // Set once we've printed the "already have it" shortcut line (see this
-    // function's own doc comment), so a pull whose bytes were all
-    // instant-credited doesn't print that line again on every further
-    // completed==total poll before "success" finally arrives.
-    let mut printed_instant_complete = false;
+    let mut progress = PullProgress::new(reference, ProgressDrawTarget::stderr);
+    let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
     for line in std::io::BufReader::new(resp).lines() {
         let line = line.context("read response stream")?;
+        progress.line(&line, &mut out, &mut err)?;
+    }
+    progress.finish(&mut out)
+}
+
+/// The state [`stream_progress_with`] keeps across a pull/push stream's
+/// lines, apart from the HTTP so it can be fed fake streams.
+struct PullProgress<'a> {
+    reference: &'a str,
+    draw_target: fn() -> ProgressDrawTarget,
+    saw_success: bool,
+    pushed_digest: Option<String>,
+    last_status: String,
+    bar: Option<ProgressBar>,
+    // Set once we've printed the "already have it" shortcut line (see
+    // `stream_progress`'s doc comment), so a pull whose bytes were all
+    // instant-credited doesn't print that line again on every further
+    // completed==total poll before "success" finally arrives.
+    printed_instant_complete: bool,
+    // Ollama's per-layer progress, by digest. llmman's daemon sends one
+    // aggregate with no digest, which bypasses this.
+    layers: std::collections::HashMap<String, (u64, u64)>,
+    // The total of an instant-credited first byte line not yet announced.
+    // From a layer-by-layer stream it waits for the end of the layers, as
+    // the first layer on its own can be complete while the next is not.
+    instant_total: Option<u64>,
+    had_bar: bool,
+}
+
+impl<'a> PullProgress<'a> {
+    fn new(reference: &'a str, draw_target: fn() -> ProgressDrawTarget) -> Self {
+        Self {
+            reference,
+            draw_target,
+            saw_success: false,
+            pushed_digest: None,
+            last_status: String::new(),
+            bar: None,
+            printed_instant_complete: false,
+            layers: std::collections::HashMap::new(),
+            instant_total: None,
+            had_bar: false,
+        }
+    }
+
+    /// Prints the pending "already have it" line, if any.
+    fn announce_instant(&mut self, out: &mut dyn std::io::Write) {
+        let Some(total) = self.instant_total.take() else {
+            return;
+        };
+        if !self.printed_instant_complete {
+            let _ = writeln!(
+                out,
+                "Already have {} ({})",
+                self.reference,
+                crate::fmt::human_size(total)
+            );
+            self.printed_instant_complete = true;
+        }
+        self.last_status = "pulling".to_string(); // suppress a redundant plain "pulling" line
+    }
+
+    /// Handles one line of the stream; `out` is stdout and `err` stderr.
+    fn line(
+        &mut self,
+        line: &str,
+        out: &mut dyn std::io::Write,
+        err: &mut dyn std::io::Write,
+    ) -> anyhow::Result<()> {
         let line = line.trim();
         if line.is_empty() {
-            continue;
+            return Ok(());
         }
         let Ok(msg) = serde_json::from_str::<ProgressLine>(line) else {
-            continue; // tolerate stray non-JSON keepalive output
+            return Ok(()); // tolerate stray non-JSON keepalive output
         };
-        if let Some(d) = msg.digest.filter(|d| !d.is_empty()) {
-            pushed_digest = Some(d);
-            continue;
+        let digest = msg.digest.filter(|d| !d.is_empty());
+        let total = msg.total.filter(|&t| t > 0);
+        // A digest alone is a push's result; with a total it is one layer
+        // of an Ollama pull.
+        if let (Some(d), None) = (&digest, total) {
+            self.pushed_digest = Some(d.clone());
+            return Ok(());
         }
         if let Some(notice) = msg.notice.filter(|n| !n.is_empty()) {
             // suspend(), so the message doesn't land in the middle of a
             // half-drawn bar and get overwritten by the next frame.
-            match &bar {
-                Some(b) => b.suspend(|| eprintln!("[llmman] {notice}")),
-                None => eprintln!("[llmman] {notice}"),
+            match &self.bar {
+                Some(b) => b.suspend(|| {
+                    let _ = writeln!(err, "[llmman] {notice}");
+                }),
+                None => {
+                    let _ = writeln!(err, "[llmman] {notice}");
+                }
             }
-            continue;
+            return Ok(());
         }
-        if let Some(err) = msg.error.filter(|e| !e.is_empty()) {
-            if let Some(b) = bar.take() {
+        if let Some(e) = msg.error.filter(|e| !e.is_empty()) {
+            if let Some(b) = self.bar.take() {
                 b.abandon(); // leave whatever was drawn in place instead of clearing it
             }
             // Only prefix with `reference` if the error doesn't already
@@ -1583,16 +1710,25 @@ pub fn stream_progress_with(path: &str, reference: &str) -> anyhow::Result<Optio
             // found") already embed the exact reference themselves, and
             // piling this prefix on unconditionally produced the same
             // reference two or three times over in one error line.
-            if err.contains(reference) {
-                anyhow::bail!("{err}");
+            if e.contains(self.reference) {
+                anyhow::bail!("{e}");
             }
-            anyhow::bail!("{reference}: {err}");
+            anyhow::bail!("{}: {e}", self.reference);
         }
 
-        if let Some(total) = msg.total.filter(|&t| t > 0) {
+        if let Some(total) = total {
             let completed = msg.completed.unwrap_or(0).min(total);
+            let (total, completed) = match digest {
+                Some(d) => {
+                    self.layers.insert(d, (total, completed));
+                    self.layers
+                        .values()
+                        .fold((0, 0), |(t, c), (lt, lc)| (t + lt, c + lc))
+                }
+                None => (total, completed),
+            };
 
-            // Instant-credit shortcut (see this function's own doc
+            // Instant-credit shortcut (see `stream_progress`'s doc
             // comment): the *first* poll this function ever sees a
             // nonzero total on is already ≥99% complete, so whatever
             // sliver (if any) is still outstanding isn't a real,
@@ -1614,48 +1750,55 @@ pub fn stream_progress_with(path: &str, reference: &str) -> anyhow::Result<Optio
             // genuinely tiny) transfer hadn't landed yet on that same
             // poll — 99.99996% done, not 100.000% done, but just as
             // clearly "nothing left worth animating" either way.
-            if bar.is_none() && completed * 100 >= total * 99 {
-                if !printed_instant_complete {
-                    println!(
-                        "Already have {reference} ({})",
-                        crate::fmt::human_size(total)
-                    );
-                    printed_instant_complete = true;
+            let layered = !self.layers.is_empty();
+            if self.bar.is_none() && completed * 100 >= total * 99 && !(layered && self.had_bar) {
+                self.instant_total = Some(total);
+                if !layered {
+                    self.announce_instant(out);
                 }
-                last_status = "pulling".to_string(); // suppress a redundant plain "pulling" line below
-                continue;
+                return Ok(());
             }
 
             // A byte-level progress line: render/update the bar instead of
             // printing a new line for every update.
-            let pb = bar.get_or_insert_with(|| {
-                new_pull_bar(total, reference, ProgressDrawTarget::stderr())
-            });
+            self.instant_total = None;
+            self.had_bar = true;
+            let (reference, draw_target) = (self.reference, self.draw_target);
+            let pb = self
+                .bar
+                .get_or_insert_with(|| new_pull_bar(total, reference, draw_target()));
             pb.set_length(total);
             pb.set_position(completed);
-            continue;
+            return Ok(());
         }
         // No byte counts on this line: finish/clear any bar in progress
         // before falling back to plain status text, so the two don't
         // interleave on the same terminal lines.
-        if let Some(b) = bar.take() {
+        self.announce_instant(out);
+        if let Some(b) = self.bar.take() {
             b.finish_and_clear();
         }
         if let Some(status) = msg.status {
-            if !status.is_empty() && status != last_status {
-                println!("{status}");
-                last_status = status;
+            if !status.is_empty() && status != self.last_status {
+                let _ = writeln!(out, "{status}");
+                self.last_status = status;
             }
-            saw_success = last_status == "success";
+            self.saw_success = self.last_status == "success";
         }
+        Ok(())
     }
-    if let Some(b) = bar.take() {
-        b.finish_and_clear();
+
+    /// The end of the stream: the manifest digest it reported, if it did.
+    fn finish(mut self, out: &mut dyn std::io::Write) -> anyhow::Result<Option<String>> {
+        self.announce_instant(out);
+        if let Some(b) = self.bar.take() {
+            b.finish_and_clear();
+        }
+        if !self.saw_success {
+            anyhow::bail!("{}: stream ended without a success status", self.reference);
+        }
+        Ok(self.pushed_digest)
     }
-    if !saw_success {
-        anyhow::bail!("{reference}: stream ended without a success status");
-    }
-    Ok(pushed_digest)
 }
 
 /// The part of Ollama's `api.ShowResponse` that `llmman run` and
@@ -2207,22 +2350,37 @@ mod tests {
             pid: Some(1544),
             ..Default::default()
         };
-        let posix = "/home/linuxbrew/.linuxbrew/Cellar/llmman/0.1.691/bin/llmman";
-        let windows = r"C:\Users\me\scoop\apps\llmman\current\llmman.exe";
-        assert_eq!(identity(Some(posix)).is_foreign(), cfg!(windows));
-        assert_eq!(identity(Some(windows)).is_foreign(), !cfg!(windows));
-        assert_eq!(
-            identity(Some("c:/tools/llmman.exe")).is_foreign(),
-            !cfg!(windows)
-        );
-        assert_eq!(
-            identity(Some(r"\\server\share\llmman.exe")).is_foreign(),
-            !cfg!(windows)
-        );
+        for exe in other_os_exes() {
+            assert!(identity(Some(exe)).is_foreign(), "{exe}");
+        }
+        for exe in missing_exes() {
+            assert!(!identity(Some(exe)).is_foreign(), "{exe}");
+        }
         assert!(!identity(None).is_foreign());
         assert!(!identity(Some("")).is_foreign());
         let own = std::env::current_exe().unwrap();
         assert!(!identity(own.to_str()).is_foreign());
+    }
+
+    /// Both path syntaxes are told apart the same way on every host.
+    #[test]
+    fn exe_syntax_is_foreign_only_across_operating_systems() {
+        let posix = "/home/linuxbrew/.linuxbrew/Cellar/llmman/0.1.691/bin/llmman";
+        for exe in [
+            r"C:\Users\x\llmman.exe",
+            r"c:/tools/llmman.exe",
+            r"\\?\C:\Users\x\llmman.exe",
+            r"\\server\share\llmman.exe",
+        ] {
+            assert!(!exe_is_foreign(exe, true), "{exe}");
+            assert!(exe_is_foreign(exe, false), "{exe}");
+        }
+        assert!(exe_is_foreign(posix, true));
+        assert!(!exe_is_foreign(posix, false));
+        for exe in ["", "llmman", "llmman.exe", r"C:", r"relative\llmman.exe"] {
+            assert!(!exe_is_foreign(exe, true), "{exe}");
+            assert!(!exe_is_foreign(exe, false), "{exe}");
+        }
     }
 
     fn running(llama: Option<&str>) -> DaemonIdentity {
@@ -3156,5 +3314,456 @@ mod tests {
         let out = Command::new("systemctl").args(args).output().ok()?;
         let pid = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
         (pid > 0).then_some(pid)
+    }
+
+    fn identity_from(body: &str) -> anyhow::Result<DaemonIdentity> {
+        Ok(serde_json::from_str(body)?)
+    }
+
+    /// What this client counts as an installed, current daemon.
+    fn current_llmman() -> String {
+        let exe = std::env::current_exe().unwrap();
+        serde_json::json!({
+            "version": env!("LLMMAN_VERSION"),
+            "exe": exe.to_string_lossy(),
+            "pid": 4242,
+        })
+        .to_string()
+    }
+
+    fn never_probed() -> bool {
+        panic!("a daemon that identifies itself needs no probe")
+    }
+
+    /// Ollama answers a bare version, and its 404 for llmman's own routes
+    /// means nothing may stop it, whatever version it reports.
+    #[test]
+    fn an_ollama_like_server_is_never_stale() {
+        for body in [
+            r#"{"version":"0.40.17"}"#,
+            r#"{"version":"0.1.0"}"#,
+            r#"{"version":""}"#,
+            r#"{}"#,
+            r#"{"pid":7}"#,
+        ] {
+            assert!(
+                stale_identity(identity_from(body), || false).is_none(),
+                "{body}"
+            );
+        }
+    }
+
+    /// Exe paths that name no file, in this OS's syntax.
+    fn missing_exes() -> &'static [&'static str] {
+        if cfg!(windows) {
+            &[
+                r"C:\nonexistent\llmman.exe",
+                r"c:/nonexistent/llmman.exe",
+                r"\\?\C:\nonexistent\llmman.exe",
+            ]
+        } else {
+            &["/nonexistent/llmman", "/old/llmman"]
+        }
+    }
+
+    /// Exe paths in the other OS's syntax: a daemon seen across WSL2.
+    fn other_os_exes() -> &'static [&'static str] {
+        if cfg!(windows) {
+            &["/usr/bin/llmman", "/old/llmman"]
+        } else {
+            &[
+                r"C:\Users\x\llmman.exe",
+                r"c:/tools/llmman.exe",
+                r"\\?\C:\Users\x\llmman.exe",
+                r"\\server\share\llmman.exe",
+            ]
+        }
+    }
+
+    fn identity_json(version: &str, exe: &str, pid: Option<u32>) -> String {
+        serde_json::json!({"version": version, "exe": exe, "pid": pid}).to_string()
+    }
+
+    #[test]
+    fn a_current_llmman_daemon_is_reused_and_a_superseded_one_is_stale() {
+        assert!(stale_identity(identity_from(&current_llmman()), never_probed).is_none());
+
+        let exe = std::env::current_exe().unwrap();
+        let other_version = identity_json("0.0.1-old", &exe.to_string_lossy(), Some(4242));
+        assert!(stale_identity(identity_from(&other_version), never_probed).is_some());
+
+        for exe in missing_exes() {
+            let gone = identity_json(env!("LLMMAN_VERSION"), exe, Some(4242));
+            assert!(
+                stale_identity(identity_from(&gone), never_probed).is_some(),
+                "{exe}"
+            );
+        }
+    }
+
+    /// A daemon from before identity existed answers only a version, and is
+    /// told from Ollama by llmman's own route answering.
+    #[test]
+    fn an_old_llmman_daemon_without_identity_is_stale_only_when_it_answers_llmman_routes() {
+        let old = r#"{"version":"0.1.300"}"#;
+        let found = stale_identity(identity_from(old), || true).expect("stale");
+        assert_eq!(found.version.as_deref(), Some("0.1.300"));
+        assert!(found.pid.is_none());
+        assert!(stale_identity(identity_from(old), || false).is_none());
+
+        // Reported an exe but not a pid: still llmman's, with no probe.
+        for exe in missing_exes() {
+            let no_pid = identity_json("0.1.350", exe, None);
+            let found = stale_identity(identity_from(&no_pid), never_probed).expect("stale");
+            assert!(found.pid.is_none(), "{exe}");
+        }
+    }
+
+    #[test]
+    fn an_unreachable_or_unparseable_server_is_never_stale() {
+        let failed = || Err(anyhow::anyhow!("request /api/version: connection refused"));
+        assert!(stale_identity(failed(), never_probed).is_none());
+        assert!(stale_identity(identity_from("not json"), || true).is_none());
+        assert!(stale_identity(identity_from("404 page not found"), || true).is_none());
+    }
+
+    #[test]
+    fn a_daemon_on_another_os_is_not_stale_even_if_the_probe_answers() {
+        for exe in other_os_exes() {
+            for pid in [Some(9), None] {
+                let other = identity_json("0.0.1", exe, pid);
+                assert!(
+                    stale_identity(identity_from(&other), never_probed).is_none(),
+                    "{exe}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_providers_list_marks_a_llmman_daemon() {
+        let json = |body: &str| serde_json::from_str::<serde_json::Value>(body).unwrap();
+        assert!(is_providers_list(&json(r#"{"providers":[]}"#)));
+        assert!(is_providers_list(&json(
+            r#"{"providers":[{"id":"openai"}]}"#
+        )));
+        assert!(!is_providers_list(&json(r#"{"providers":"x"}"#)));
+        assert!(!is_providers_list(&json(r#"{"error":"not found"}"#)));
+        assert!(!is_providers_list(&json(r#"[]"#)));
+        assert!(!is_providers_list(&json(r#""404 page not found""#)));
+    }
+
+    #[test]
+    fn an_ollama_like_server_is_never_restarted_for_engine_settings() {
+        let ollama = identity_from(r#"{"version":"0.40.17"}"#).unwrap();
+        let ask = RequestedEngines {
+            llama_cpp_version: Some("b12503"),
+            vllm_version: Some("v0.1"),
+            vllm_image: Some("img"),
+            sglang_version: Some("v0.5"),
+        };
+        assert_eq!(engine_change_reason(&ollama, &ask), None);
+    }
+
+    /// The stream of lines through [`PullProgress`]: stdout, stderr, the bar
+    /// (position, length) after each line, and the outcome.
+    struct Pulled {
+        out: String,
+        err: String,
+        bars: Vec<Option<(u64, u64)>>,
+        result: anyhow::Result<Option<String>>,
+    }
+
+    fn pull_stream(reference: &str, lines: &[&str]) -> Pulled {
+        let mut progress = PullProgress::new(reference, ProgressDrawTarget::hidden);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut bars = Vec::new();
+        for line in lines {
+            let step = progress.line(line, &mut out, &mut err);
+            bars.push(
+                progress
+                    .bar
+                    .as_ref()
+                    .map(|bar| (bar.position(), bar.length().unwrap())),
+            );
+            if let Err(error) = step {
+                return Pulled {
+                    out: String::from_utf8(out).unwrap(),
+                    err: String::from_utf8(err).unwrap(),
+                    bars,
+                    result: Err(error),
+                };
+            }
+        }
+        let result = progress.finish(&mut out);
+        Pulled {
+            out: String::from_utf8(out).unwrap(),
+            err: String::from_utf8(err).unwrap(),
+            bars,
+            result,
+        }
+    }
+
+    /// llmman's own daemon: one aggregate, no digest on a progress line.
+    #[test]
+    fn a_llmman_daemon_stream_draws_one_bar_from_its_aggregate() {
+        let pulled = pull_stream(
+            "qwen3:0.6b",
+            &[
+                r#"{"status":"pulling manifest"}"#,
+                r#"{"status":"pulling","total":1000,"completed":0}"#,
+                r#"{"status":"pulling","total":1000,"completed":400}"#,
+                "",
+                "keepalive, not json",
+                r#"{"status":"pulling","total":2000,"completed":2000}"#,
+                r#"{"status":"success"}"#,
+            ],
+        );
+        assert_eq!(pulled.out, "pulling manifest\nsuccess\n");
+        assert_eq!(pulled.err, "");
+        assert_eq!(
+            pulled.bars,
+            [
+                None,
+                Some((0, 1000)),
+                Some((400, 1000)),
+                Some((400, 1000)),
+                Some((400, 1000)),
+                Some((2000, 2000)),
+                None,
+            ]
+        );
+        assert_eq!(pulled.result.unwrap(), None);
+    }
+
+    #[test]
+    fn a_llmman_daemon_stream_already_complete_prints_one_line_and_no_bar() {
+        for (total, completed) in [(5_000_000, 5_000_000), (1_000_000, 990_000)] {
+            let progress =
+                format!(r#"{{"status":"pulling","total":{total},"completed":{completed}}}"#);
+            let pulled = pull_stream(
+                "m:1",
+                &[
+                    r#"{"status":"pulling manifest"}"#,
+                    &progress,
+                    &progress,
+                    r#"{"status":"pulling"}"#,
+                    r#"{"status":"success"}"#,
+                ],
+            );
+            assert_eq!(
+                pulled.out,
+                format!(
+                    "pulling manifest\nAlready have m:1 ({})\nsuccess\n",
+                    crate::fmt::human_size(total)
+                ),
+                "{total}/{completed}"
+            );
+            assert!(pulled.bars.iter().all(Option::is_none));
+            pulled.result.unwrap();
+        }
+        // Under 99% is a real transfer.
+        let pulled = pull_stream(
+            "m:1",
+            &[
+                r#"{"status":"pulling","total":1000000,"completed":980000}"#,
+                r#"{"status":"success"}"#,
+            ],
+        );
+        assert_eq!(pulled.bars[0], Some((980_000, 1_000_000)));
+        assert_eq!(pulled.out, "success\n");
+    }
+
+    #[test]
+    fn a_llmman_daemon_stream_ending_complete_after_a_bar_keeps_updating_it() {
+        let pulled = pull_stream(
+            "m:1",
+            &[
+                r#"{"status":"pulling","total":100,"completed":10}"#,
+                r#"{"status":"pulling","total":100,"completed":100}"#,
+                r#"{"status":"success"}"#,
+            ],
+        );
+        assert_eq!(pulled.bars[1], Some((100, 100)));
+        assert_eq!(pulled.out, "success\n");
+    }
+
+    #[test]
+    fn a_push_digest_without_a_total_is_the_result_not_progress() {
+        let pulled = pull_stream(
+            "reg.example/m:1",
+            &[
+                r#"{"status":"pushing manifest"}"#,
+                r#"{"status":"pushing","total":500,"completed":100}"#,
+                r#"{"digest":"sha256:abc"}"#,
+                r#"{"status":"success"}"#,
+            ],
+        );
+        assert_eq!(pulled.out, "pushing manifest\nsuccess\n");
+        assert_eq!(pulled.bars[2], Some((100, 500)));
+        assert_eq!(pulled.result.unwrap().as_deref(), Some("sha256:abc"));
+        // A zero total is no progress either.
+        let pulled = pull_stream(
+            "m:1",
+            &[
+                r#"{"digest":"sha256:abc","total":0,"completed":0}"#,
+                r#"{"status":"success"}"#,
+            ],
+        );
+        assert!(pulled.bars.iter().all(Option::is_none));
+        assert_eq!(pulled.result.unwrap().as_deref(), Some("sha256:abc"));
+    }
+
+    #[test]
+    fn notices_and_errors_are_handled_as_before() {
+        let pulled = pull_stream(
+            "m:1",
+            &[
+                r#"{"notice":"unsigned"}"#,
+                r#"{"status":"pulling","total":100,"completed":1}"#,
+                r#"{"notice":"verified"}"#,
+                r#"{"error":"disk full"}"#,
+            ],
+        );
+        assert_eq!(pulled.err, "[llmman] unsigned\n[llmman] verified\n");
+        assert_eq!(pulled.result.unwrap_err().to_string(), "m:1: disk full");
+        // An error that already names the reference is not prefixed.
+        let pulled = pull_stream("m:1", &[r#"{"error":"pull m:1: not found"}"#]);
+        assert_eq!(
+            pulled.result.unwrap_err().to_string(),
+            "pull m:1: not found"
+        );
+        // No success status.
+        let pulled = pull_stream("m:1", &[r#"{"status":"pulling manifest"}"#]);
+        assert_eq!(
+            pulled.result.unwrap_err().to_string(),
+            "m:1: stream ended without a success status"
+        );
+        let pulled = pull_stream("m:1", &[]);
+        assert!(pulled.result.is_err());
+    }
+
+    /// Ollama's layer-by-layer stream, with concurrent layers.
+    #[test]
+    fn an_ollama_stream_draws_one_bar_summing_its_layers() {
+        let pulled = pull_stream(
+            "all-minilm:22m",
+            &[
+                r#"{"status":"pulling manifest"}"#,
+                r#"{"status":"pulling aaaa","digest":"sha256:aaaa","total":100,"completed":0}"#,
+                r#"{"status":"pulling bbbb","digest":"sha256:bbbb","total":50,"completed":0}"#,
+                r#"{"status":"pulling aaaa","digest":"sha256:aaaa","total":100,"completed":60}"#,
+                r#"{"status":"pulling bbbb","digest":"sha256:bbbb","total":50,"completed":50}"#,
+                r#"{"status":"pulling aaaa","digest":"sha256:aaaa","total":100,"completed":100}"#,
+                r#"{"status":"verifying sha256 digest"}"#,
+                r#"{"status":"writing manifest"}"#,
+                r#"{"status":"success"}"#,
+            ],
+        );
+        assert_eq!(
+            pulled.out,
+            "pulling manifest\nverifying sha256 digest\nwriting manifest\nsuccess\n"
+        );
+        assert_eq!(
+            pulled.bars,
+            [
+                None,
+                Some((0, 100)),
+                Some((0, 150)),
+                Some((60, 150)),
+                Some((110, 150)),
+                Some((150, 150)),
+                None,
+                None,
+                None,
+            ]
+        );
+        assert_eq!(pulled.result.unwrap(), None);
+    }
+
+    #[test]
+    fn an_ollama_layer_cannot_complete_past_its_total() {
+        let pulled = pull_stream(
+            "m:1",
+            &[
+                r#"{"status":"pulling a","digest":"sha256:a","total":100,"completed":40}"#,
+                r#"{"status":"pulling a","digest":"sha256:a","total":100,"completed":900}"#,
+                r#"{"status":"success"}"#,
+            ],
+        );
+        assert_eq!(pulled.bars[1], Some((100, 100)));
+    }
+
+    /// A pull of layers already stored is one "Already have" line, and
+    /// only once all layers are in: the first one alone is complete in
+    /// every pull that has a stored layer.
+    #[test]
+    fn an_ollama_pull_of_stored_layers_prints_already_have_once_after_the_layers() {
+        let pulled = pull_stream(
+            "m:1",
+            &[
+                r#"{"status":"pulling manifest"}"#,
+                r#"{"status":"pulling a","digest":"sha256:a","total":100,"completed":100}"#,
+                r#"{"status":"pulling b","digest":"sha256:b","total":50,"completed":50}"#,
+                r#"{"status":"pulling a","digest":"sha256:a","total":100,"completed":100}"#,
+                r#"{"status":"verifying sha256 digest"}"#,
+                r#"{"status":"writing manifest"}"#,
+                r#"{"status":"success"}"#,
+            ],
+        );
+        assert_eq!(
+            pulled.out,
+            "pulling manifest\nAlready have m:1 (150 B)\n\
+             verifying sha256 digest\nwriting manifest\nsuccess\n"
+        );
+        assert!(pulled.bars.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn an_ollama_pull_with_a_stored_first_layer_still_draws_the_bar() {
+        let pulled = pull_stream(
+            "m:1",
+            &[
+                r#"{"status":"pulling a","digest":"sha256:a","total":100,"completed":100}"#,
+                r#"{"status":"pulling b","digest":"sha256:b","total":5000,"completed":0}"#,
+                r#"{"status":"pulling b","digest":"sha256:b","total":5000,"completed":2500}"#,
+                r#"{"status":"verifying sha256 digest"}"#,
+                r#"{"status":"success"}"#,
+            ],
+        );
+        assert_eq!(pulled.bars[0], None);
+        assert_eq!(pulled.bars[1], Some((100, 5100)));
+        assert_eq!(pulled.bars[2], Some((2600, 5100)));
+        assert!(!pulled.out.contains("Already have"), "{}", pulled.out);
+    }
+
+    #[test]
+    fn a_late_ollama_layer_line_after_the_bar_closed_does_not_announce() {
+        let pulled = pull_stream(
+            "m:1",
+            &[
+                r#"{"status":"pulling a","digest":"sha256:a","total":100,"completed":10}"#,
+                r#"{"status":"verifying sha256 digest"}"#,
+                r#"{"status":"pulling a","digest":"sha256:a","total":100,"completed":100}"#,
+                r#"{"status":"success"}"#,
+            ],
+        );
+        assert!(!pulled.out.contains("Already have"), "{}", pulled.out);
+        pulled.result.unwrap();
+    }
+
+    #[test]
+    fn an_ollama_error_line_fails_the_pull_and_a_failed_pull_has_no_success() {
+        let pulled = pull_stream(
+            "nope:1",
+            &[
+                r#"{"status":"pulling manifest"}"#,
+                r#"{"error":"pull model manifest: file does not exist"}"#,
+            ],
+        );
+        assert_eq!(
+            pulled.result.unwrap_err().to_string(),
+            "nope:1: pull model manifest: file does not exist"
+        );
     }
 }

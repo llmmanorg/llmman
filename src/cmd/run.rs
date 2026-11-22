@@ -308,6 +308,13 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
             (model, key, false)
         }
         Route::Local(model) => {
+            // Only llmman resolves a bare name to a registry reference; an
+            // Ollama knows the name as typed.
+            let model = if crate::daemon::server_is_foreign() {
+                args.model.clone()
+            } else {
+                model
+            };
             // Fail fast on a bad/unresolvable reference — mirrors ollama's
             // RunHandler, which resolves (Show, falling back to Pull) the
             // model before ever showing its interactive prompt. Without
