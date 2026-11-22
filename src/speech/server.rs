@@ -64,6 +64,13 @@ pub const IDLE_SECONDS: u64 = 60;
 /// reading cannot hold its session slot once the socket buffers fill.
 pub const WRITE_SECONDS: u64 = 10;
 
+/// Seconds a realtime commit may spend queued for the worker lock and
+/// decoding before the worker gives up on it. The 30 s buffer decodes in
+/// well under 10 s on CPU, so two minutes is a stalled backend, not a
+/// slow host: the session is told so and closed, and the compute is
+/// aborted at its next check.
+pub const COMMIT_SECONDS: u64 = 120;
+
 /// Room `max_body` leaves above `max_file` for the multipart framing and
 /// the other fields.
 const FRAMING_ALLOWANCE: usize = 64 << 10;
@@ -113,9 +120,17 @@ pub enum Error {
     /// 400: a realtime `input_audio_buffer.commit` with nothing buffered;
     /// its own error type on the wire (`input_audio_buffer_commit_empty`).
     CommitEmpty,
+    /// 504: a realtime commit did not finish within the deadline
+    /// ([`COMMIT_SECONDS`] outside tests); `commit_timeout` on the wire.
+    CommitTimeout(std::time::Duration),
 }
 
 impl Error {
+    /// The message of [`Error::CommitTimeout`].
+    fn commit_timeout_message(limit: std::time::Duration) -> String {
+        format!("the commit did not finish within {limit:?}, closing the session")
+    }
+
     pub fn status(&self) -> StatusCode {
         match self {
             Error::Invalid(_) | Error::CommitEmpty => StatusCode::BAD_REQUEST,
@@ -124,6 +139,7 @@ impl Error {
             // Outside the registered range, so built from the number.
             Error::Cancelled => StatusCode::from_u16(499).expect("499 is a valid status code"),
             Error::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Error::CommitTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
         }
     }
 }
@@ -138,6 +154,7 @@ impl IntoResponse for Error {
             Error::Cancelled => ("server_error", "the request was cancelled".to_string()),
             Error::Failed(m) => ("server_error", m),
             Error::CommitEmpty => ("input_audio_buffer_commit_empty", COMMIT_EMPTY.to_string()),
+            Error::CommitTimeout(limit) => ("server_error", Error::commit_timeout_message(limit)),
         };
         http::error_response(status, ty, &msg)
     }
@@ -452,6 +469,9 @@ pub struct Server {
     /// How long one outbound frame may take; [`WRITE_SECONDS`] outside
     /// tests.
     write: std::time::Duration,
+    /// How long one commit may take, lock wait included;
+    /// [`COMMIT_SECONDS`] outside tests.
+    commit: std::time::Duration,
 }
 
 type Shared = Arc<Server>;
@@ -598,7 +618,8 @@ impl ClientEvent {
 /// item counter.
 pub struct Session {
     pub buffer: Vec<i16>,
-    /// Validated against the model's languages, `en` to begin with.
+    /// Validated against the model's languages; `en` to begin with, or
+    /// the model's first language when it lacks `en` ([`Session::open`]).
     pub language: String,
     /// Always [`SAMPLE_RATE`]; `update` refuses any other.
     pub rate: u32,
@@ -618,15 +639,19 @@ impl Default for Session {
 }
 
 impl Session {
-    /// A new session over a model speaking `languages`, or the error a
-    /// model without [`DEFAULT_LANGUAGE`] gets before `session.created`:
-    /// the default is checked as the one-shot route checks its request.
+    /// A new session over a model speaking `languages`: its language is
+    /// [`DEFAULT_LANGUAGE`] when the model has it, else the model's first,
+    /// so `session.created` always names one the client may keep. A model
+    /// with no language gets the error before `session.created`.
     pub fn open(languages: &[String]) -> Result<Session, Error> {
-        let session = Session::default();
+        let mut session = Session::default();
         if !languages.contains(&session.language) {
-            return Err(Error::Invalid(
-                PromptError::UnsupportedLanguage(session.language).to_string(),
-            ));
+            let Some(first) = languages.first() else {
+                return Err(Error::Invalid(
+                    PromptError::UnsupportedLanguage(session.language).to_string(),
+                ));
+            };
+            session.language = first.clone();
         }
         Ok(session)
     }
@@ -708,18 +733,27 @@ fn event_id() -> String {
 /// The `error` event for `e`, in llama-server's shape, or `None` for a
 /// cancellation: the client is gone and nothing is sent.
 pub fn error_event(e: &Error) -> Option<Value> {
-    let (ty, message) = match e {
+    let (ty, code, message) = match e {
         Error::Invalid(m) | Error::TooLarge(m) | Error::UnsupportedMedia(m) => {
-            ("invalid_request_error", m.as_str())
+            ("invalid_request_error", None, m.clone())
         }
-        Error::Failed(m) => ("server_error", m.as_str()),
-        Error::CommitEmpty => ("input_audio_buffer_commit_empty", COMMIT_EMPTY),
+        Error::Failed(m) => ("server_error", None, m.clone()),
+        Error::CommitEmpty => (
+            "input_audio_buffer_commit_empty",
+            None,
+            COMMIT_EMPTY.to_string(),
+        ),
+        Error::CommitTimeout(limit) => (
+            "server_error",
+            Some("commit_timeout"),
+            Error::commit_timeout_message(*limit),
+        ),
         Error::Cancelled => return None,
     };
     Some(json!({
         "type": "error",
         "event_id": event_id(),
-        "error": {"type": ty, "code": null, "message": message, "param": null},
+        "error": {"type": ty, "code": code, "message": message, "param": null},
     }))
 }
 
@@ -1125,7 +1159,8 @@ async fn run_realtime(s: Shared, socket: WebSocket) {
                     previous_item = Some(item.clone());
                     let server = s.clone();
                     let work = move |gone: Arc<AtomicBool>| run_locked(&server, &gone, &req);
-                    let Some(result) = run_commit(&permit, &mut conn, &mut queued, work).await
+                    let Some(result) =
+                        run_commit(&permit, &mut conn, &mut queued, s.commit, work).await
                     else {
                         return;
                     };
@@ -1152,18 +1187,21 @@ async fn run_realtime(s: Shared, socket: WebSocket) {
 
 /// Runs one commit's `work` (the request under the worker lock,
 /// [`run_locked`]) on a blocking thread while reading the socket. `None`
-/// means the client left: the [`Guard`] dropped, its flag is the one
-/// `work` was given, and the compute stops at its next abort check. The
-/// blocking task holds a clone of the session `permit`: a commit whose
-/// client left while it waits for the worker lock keeps its session slot
-/// until it exits, so disconnecting clients cannot queue more blocking
-/// tasks, and their buffered PCM, than [`MAX_SESSIONS`]. The idle clock
-/// is the caller's: a session with a commit in flight is exempt from the
-/// idle close, and the clock starts over once the reply is written.
+/// means the session is over: the client left, or the commit missed
+/// `commit` ([`COMMIT_SECONDS`]) and the client was told so and closed.
+/// Either way the [`Guard`] dropped, its flag is the one `work` was
+/// given, and the compute stops at its next abort check. The blocking
+/// task holds a clone of the session `permit`: a commit whose session
+/// ended while it waits for the worker lock keeps its session slot until
+/// it exits, so abandoned commits cannot queue more blocking tasks, and
+/// their buffered PCM, than [`MAX_SESSIONS`]. The idle clock is the
+/// caller's: a session with a commit in flight is exempt from the idle
+/// close, and the clock starts over once the reply is written.
 async fn run_commit(
     permit: &Arc<OwnedSemaphorePermit>,
     conn: &mut Conn,
     queued: &mut VecDeque<String>,
+    commit: std::time::Duration,
     work: impl FnOnce(Arc<AtomicBool>) -> Result<String, Error> + Send + 'static,
 ) -> Option<Result<String, Error>> {
     let guard = Guard {
@@ -1176,6 +1214,8 @@ async fn run_commit(
         work(gone)
     });
     let mut queued_bytes: usize = queued.iter().map(|t| t.len() + QUEUE_EVENT_OVERHEAD).sum();
+    let deadline = tokio::time::sleep(commit);
+    tokio::pin!(deadline);
     loop {
         tokio::select! {
             joined = &mut task => {
@@ -1184,6 +1224,13 @@ async fn run_commit(
                     .and_then(|r| r);
                 drop(guard);
                 return Some(result);
+            }
+            () = &mut deadline => {
+                // Flag first, so the compute is aborted even if the
+                // refusal below waits out the write deadline.
+                drop(guard);
+                conn.refuse(&Error::CommitTimeout(commit)).await;
+                return None;
             }
             frame = conn.recv() => {
                 let refused = match frame {
@@ -1197,7 +1244,10 @@ async fn run_commit(
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return None,
                 };
                 if let Some(e) = refused {
-                    if conn.send_error(&e).await.is_err() {
+                    // Bounded by the commit deadline too, so a client
+                    // that stops reading cannot hold the deadline arm.
+                    let sent = tokio::time::timeout_at(deadline.deadline(), conn.send_error(&e)).await;
+                    if !matches!(sent, Ok(Ok(()))) {
                         return None;
                     }
                 }
@@ -1220,6 +1270,7 @@ pub fn router(worker: Worker, model_name: String, model_path: String) -> Router 
         sessions: Arc::new(Semaphore::new(MAX_SESSIONS)),
         idle: std::time::Duration::from_secs(IDLE_SECONDS),
         write: std::time::Duration::from_secs(WRITE_SECONDS),
+        commit: std::time::Duration::from_secs(COMMIT_SECONDS),
     });
     Router::new()
         .route(
@@ -1865,6 +1916,10 @@ mod tests {
         drop(stalled);
     }
 
+    /// The commit deadline for the handler tests, beyond what any of them
+    /// but the one for it waits.
+    const COMMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// A served `/v1/realtime` whose commit waits for a worker lock the
     /// test holds: the client leaves, the handler ends, and the session
     /// permit stays taken until the lock is free and the blocking task
@@ -1900,7 +1955,8 @@ mod tests {
                                 }
                                 Ok("done".to_string())
                             };
-                            let outcome = run_commit(&permit, &mut conn, &mut queued, work).await;
+                            let outcome =
+                                run_commit(&permit, &mut conn, &mut queued, COMMIT, work).await;
                             ended.send(outcome.is_none()).unwrap();
                         })
                     }
@@ -1943,6 +1999,115 @@ mod tests {
         );
         drop(release);
         holder.join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sessions.available_permits() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            sessions.clone().try_acquire_owned().is_ok(),
+            "the slot was not released once the blocking task exited"
+        );
+    }
+
+    /// A commit that misses the deadline closes the session: the client
+    /// reads a `commit_timeout` error, then the close frame, the blocking
+    /// task is flagged to abort, and the slot stays taken only until the
+    /// lock frees and the task exits.
+    #[tokio::test]
+    async fn a_stuck_commit_is_refused_at_the_deadline_and_the_slot_frees_with_the_lock() {
+        use std::time::Duration;
+
+        let commit = Duration::from_millis(200);
+        let sessions = Arc::new(Semaphore::new(1));
+        let worker = Arc::new(Mutex::new(()));
+        let (ended, mut has_ended) = tokio::sync::mpsc::unbounded_channel::<bool>();
+        let (aborted, mut was_aborted) = tokio::sync::mpsc::unbounded_channel::<bool>();
+        let app = {
+            let (sessions, worker) = (sessions.clone(), worker.clone());
+            Router::new().route(
+                "/v1/realtime",
+                get(move |ws: WebSocketUpgrade| {
+                    let (sessions, worker) = (sessions.clone(), worker.clone());
+                    let (ended, aborted) = (ended.clone(), aborted.clone());
+                    async move {
+                        capped(ws).on_upgrade(move |socket| async move {
+                            let mut conn = conn(socket);
+                            let Some(permit) = admit(&mut conn, &sessions).await else {
+                                return;
+                            };
+                            let permit = Arc::new(permit);
+                            let mut queued = VecDeque::new();
+                            let work = move |gone: Arc<AtomicBool>| {
+                                let _lock = worker.lock().unwrap_or_else(|e| e.into_inner());
+                                aborted.send(gone.load(Ordering::SeqCst)).unwrap();
+                                Ok("done".to_string())
+                            };
+                            let outcome =
+                                run_commit(&permit, &mut conn, &mut queued, commit, work).await;
+                            ended.send(outcome.is_none()).unwrap();
+                        })
+                    }
+                }),
+            )
+        };
+        let addr = serve(app).await;
+
+        // A thread holds the worker lock past the deadline, as a stalled
+        // backend would, until the test lets it go.
+        let (locked, is_locked) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let worker = worker.clone();
+            std::thread::spawn(move || {
+                let _lock = worker.lock().unwrap_or_else(|e| e.into_inner());
+                locked.send(()).unwrap();
+                let _ = released.recv();
+            })
+        };
+        is_locked.recv().unwrap();
+        let mut ws = connect(addr).await;
+        let event: Value = serde_json::from_str(&next_text(&mut ws).await).unwrap();
+        assert_eq!(event["type"], "error", "{event}");
+        assert_eq!(event["error"]["code"], "commit_timeout", "{event}");
+        assert!(
+            event["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("within 200ms"),
+            "the message does not name the limit: {event}"
+        );
+        let after = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("the socket stayed open after the error");
+        assert!(
+            matches!(
+                after,
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))
+            ),
+            "expected the close, got {after:?}"
+        );
+        let timed_out = tokio::time::timeout(Duration::from_secs(5), has_ended.recv())
+            .await
+            .expect("the handler did not end at the deadline")
+            .unwrap();
+        assert!(
+            timed_out,
+            "run_commit returned a result for a timed out commit"
+        );
+        assert!(
+            sessions.clone().try_acquire_owned().is_err(),
+            "the slot was released while the commit waited for the worker lock"
+        );
+        drop(release);
+        holder.join().unwrap();
+        let flagged = tokio::time::timeout(Duration::from_secs(5), was_aborted.recv())
+            .await
+            .expect("the blocking task never took the lock")
+            .unwrap();
+        assert!(
+            flagged,
+            "the compute was not flagged to abort at the deadline"
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while sessions.available_permits() == 0 && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2228,11 +2393,18 @@ mod tests {
     }
 
     #[test]
-    fn a_session_opens_only_over_a_model_with_the_default_language() {
-        let s = Session::open(&["de".to_string(), "en".to_string()]).unwrap();
+    fn a_session_opens_in_en_or_the_models_first_language_and_says_which() {
+        let s = Session::open(&["fr".to_string(), "en".to_string()]).unwrap();
         assert_eq!(s.language, "en");
-        let Err(err) = Session::open(&["de".to_string()]) else {
-            panic!("a model without en opened a session");
+        let s = Session::open(&["de".to_string(), "fr".to_string()]).unwrap();
+        assert_eq!(s.language, "de");
+        let created = session_created("sess_0", "canary", &s);
+        assert_eq!(
+            created["session"]["audio"]["input"]["transcription"]["language"],
+            "de"
+        );
+        let Err(err) = Session::open(&[]) else {
+            panic!("a model with no language opened a session");
         };
         assert!(matches!(err, Error::Invalid(_)), "{err:?}");
         assert_eq!(
