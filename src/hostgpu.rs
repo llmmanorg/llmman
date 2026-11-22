@@ -67,11 +67,35 @@ pub fn detect() -> HostGpu {
     }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
-        detect_gpu_api_isolated()
+        let gpu = detect_gpu_api_isolated();
+        warn_once_if_nvidia_probe_failed(gpu);
+        gpu
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         HostGpu::None
+    }
+}
+
+/// NVIDIA device nodes exist but no usable accelerator was found. OpenCL
+/// counts as none: on Linux llmman falls back to the CPU build for it.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn nvidia_probe_failed(nvidia_device_present: bool, gpu: HostGpu) -> bool {
+    nvidia_device_present && matches!(gpu, HostGpu::None | HostGpu::Opencl)
+}
+
+/// Warns once per process when [`nvidia_probe_failed`] (Linux only).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn warn_once_if_nvidia_probe_failed(gpu: HostGpu) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let nvidia_nodes = cfg!(target_os = "linux") && std::path::Path::new("/dev/nvidiactl").exists();
+    if nvidia_probe_failed(nvidia_nodes, gpu) {
+        WARNED.call_once(|| {
+            eprintln!(
+                "[llmman] warning: an NVIDIA GPU was found but the CUDA probe failed; inference \
+                 will run on the CPU"
+            );
+        });
     }
 }
 
@@ -414,6 +438,24 @@ mod tests {
         assert_eq!(parse_meminfo_total(meminfo), Some(7864320 * 1024));
         assert_eq!(parse_meminfo_total("MemFree: 1 kB\n"), None);
         assert_eq!(parse_meminfo_total("MemTotal: lots\n"), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn nvidia_probe_failure_warns_only_for_an_nvidia_host_with_no_accelerator() {
+        for gpu in [HostGpu::None, HostGpu::Opencl] {
+            assert!(nvidia_probe_failed(true, gpu), "{gpu:?}");
+            assert!(!nvidia_probe_failed(false, gpu), "{gpu:?}");
+        }
+        for gpu in [
+            HostGpu::Cuda { major: 12 },
+            HostGpu::Rocm,
+            HostGpu::Vulkan,
+            HostGpu::Metal,
+        ] {
+            assert!(!nvidia_probe_failed(true, gpu), "{gpu:?}");
+            assert!(!nvidia_probe_failed(false, gpu), "{gpu:?}");
+        }
     }
 
     #[test]
