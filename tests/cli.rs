@@ -397,3 +397,144 @@ fn a_serve_on_port_0_reports_the_port_it_got() {
         101
     );
 }
+
+/// A stand-in for a real Ollama: `/api/version` answers a bare version,
+/// anything llmman-only is a 404, and `/api/pull` streams one line per
+/// layer. Returns its address and the `METHOD /path` of every request.
+fn fake_ollama() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{BufRead, Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let log = log.clone();
+            std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = String::new();
+                reader
+                    .by_ref()
+                    .take(length)
+                    .read_to_string(&mut body)
+                    .unwrap();
+                let mut parts = request_line.split_whitespace();
+                let (method, path) = (parts.next().unwrap(), parts.next().unwrap());
+                log.lock().unwrap().push(format!("{method} {path} {body}"));
+                let (status, body) = match (method, path) {
+                    ("POST", "/api/show") => ("200 OK", "{\"capabilities\":[\"completion\"]}\n".to_string()),
+                    ("POST", "/api/chat") => (
+                        "200 OK",
+                        [
+                            r#"{"message":{"role":"assistant","content":"hi"},"done":false}"#,
+                            r#"{"message":{"role":"assistant","content":""},"done":true}"#,
+                        ]
+                        .join("\n")
+                            + "\n",
+                    ),
+                    ("GET", "/api/version") => ("200 OK", "{\"version\":\"0.40.17\"}\n".to_string()),
+                    ("POST", "/api/pull") => (
+                        "200 OK",
+                        [
+                            r#"{"status":"pulling manifest"}"#,
+                            r#"{"status":"pulling aaaa","digest":"sha256:aaaa","total":100,"completed":0}"#,
+                            r#"{"status":"pulling bbbb","digest":"sha256:bbbb","total":50,"completed":50}"#,
+                            r#"{"status":"pulling aaaa","digest":"sha256:aaaa","total":100,"completed":100}"#,
+                            r#"{"status":"verifying sha256 digest"}"#,
+                            r#"{"status":"writing manifest"}"#,
+                            r#"{"status":"success"}"#,
+                        ]
+                        .join("\n")
+                            + "\n",
+                    ),
+                    _ => ("404 Not Found", "404 page not found\n".to_string()),
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+        }
+    });
+    (addr, seen)
+}
+
+/// `LLMMAN_HOST` at an Ollama: `pull` reuses it as is, never calling it a
+/// stale llmman daemon or starting one, and relays the layers.
+#[test]
+fn pull_reuses_an_ollama_at_llmman_host() {
+    let home = tempfile::tempdir().unwrap();
+    let (addr, seen) = fake_ollama();
+    let out = llmman()
+        .args(["pull", "all-minilm:22m"])
+        .env("LLMMAN_HOST", &addr)
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .output()
+        .expect("spawn llmman");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(
+        stdout,
+        "pulling manifest\nverifying sha256 digest\nwriting manifest\nsuccess\nPulled all-minilm:22m\n"
+    );
+    assert!(!stderr.contains("stale"), "{stderr}");
+    assert!(!stderr.contains("stopping"), "{stderr}");
+    let seen = seen.lock().unwrap();
+    assert!(seen[0].starts_with("GET /api/version"), "{seen:?}");
+    assert!(
+        seen.iter().any(|r| r.starts_with("POST /api/pull ")),
+        "{seen:?}"
+    );
+    assert!(seen.iter().all(|r| !r.starts_with("DELETE")), "{seen:?}");
+}
+
+/// `run` hands an Ollama the model name as typed: llmman's own bare-name
+/// default (`docker.io/ai/...`) means nothing to it.
+#[test]
+fn run_uses_the_model_name_as_typed_with_an_ollama_at_llmman_host() {
+    let home = tempfile::tempdir().unwrap();
+    let (addr, seen) = fake_ollama();
+    let out = llmman()
+        .args(["run", "smollm2:135m", "say hi"])
+        .env("LLMMAN_HOST", &addr)
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn llmman");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("hi"), "{stdout}");
+    assert!(!stderr.contains("stale"), "{stderr}");
+    let seen = seen.lock().unwrap();
+    for request in seen.iter().filter(|r| r.starts_with("POST /api/")) {
+        assert!(!request.contains("docker.io/ai"), "{request}");
+    }
+    assert!(
+        seen.iter()
+            .any(|r| r.starts_with("POST /api/chat ") && r.contains("\"smollm2:135m\"")),
+        "{seen:?}"
+    );
+}
