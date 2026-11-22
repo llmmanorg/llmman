@@ -209,18 +209,28 @@ fn write_dsh_settings(
 /// The launched entry keeps the `--variant` levels this launch
 /// resolved for it; each other model takes the levels its own catalog
 /// entry lists, and none where the catalog lists none.
+/// One row of the `models:` list `dsh_models_block` renders, as
+/// (id, vision, reasoning levels, context limit, output limit) —
+/// limits omitted where the catalog publishes none.
+type DshModelEntry<'a> = (
+    &'a str,
+    bool,
+    Option<Vec<&'a str>>,
+    Option<u64>,
+    Option<u32>,
+);
+
 fn dsh_models_block(
     model: &str,
     vision: bool,
     effort: Option<&Effort>,
     hosted: Option<&[HostedModel]>,
 ) -> String {
-    // (id, vision, levels, context, output): the launch's levels for
-    // the launched model, the catalog's for every other; the catalog's
-    // limits for every row, launched included — `launch_dsh` receives
+    // The launched entry keeps the launch's levels; every other entry
+    // takes its own catalog levels and limits — `launch_dsh` receives
     // no launch-resolved limits, and the catalog values are the ones
     // the resolver read for the launched model too.
-    let mut entries: Vec<(&str, bool, Option<Vec<&str>>, Option<u64>, Option<u32>)> = match hosted {
+    let mut entries: Vec<DshModelEntry<'_>> = match hosted {
         Some(hosted) => hosted
             .iter()
             .map(|m| {

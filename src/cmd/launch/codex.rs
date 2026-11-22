@@ -338,6 +338,30 @@ fn codex_reasoning_description(level: &str) -> &'static str {
         .expect("level came from CODEX_REASONING_LEVELS")
 }
 
+/// One entry of codex's catalog, from the values its own row resolves
+/// to: the model codex selects with, the plain id it shows, the window
+/// (the launch's for the launched model, the catalog row's for every
+/// other), image input, and the row's reasoning levels. The window
+/// falls back on the same guess codex cannot do without, since its
+/// catalog cannot omit it. Used for every row of the hosted list and
+/// for the fallback entry where the list somehow lacks the launched
+/// model, so the two spell the same entry the same way.
+fn codex_catalog_entry(
+    slug: &str,
+    display_name: &str,
+    context_window: Option<u64>,
+    vision: bool,
+    thinking: Option<&[String]>,
+) -> CodexCatalogModel {
+    CodexCatalogModel {
+        slug: slug.to_string(),
+        display_name: display_name.to_string(),
+        context_window: codex_context_window(context_window),
+        vision,
+        supported_reasoning_levels: codex_reasoning_levels(thinking),
+    }
+}
+
 /// What codex's catalog lists: every model `--provider` serves, so `/model`
 /// inside codex can switch between them, or — for a local launch — the one
 /// model this launch resolved.
@@ -362,18 +386,14 @@ fn codex_catalog_models(
         .iter()
         .map(|m| {
             let launched = m.reference == model;
-            CodexCatalogModel {
-                slug: m.reference.clone(),
-                display_name: m.id.clone(),
-                context_window: if launched {
-                    codex_context_window(context_window)
-                } else {
-                    m.context.unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
-                },
+            codex_catalog_entry(
+                &m.reference,
+                &m.id,
                 // What the provider's catalog says about this model
                 // (see `HostedModel::vision`); unknown reads as no
                 // image input rather than a guess.
-                vision: if launched {
+                if launched { context_window } else { m.context },
+                if launched {
                     vision
                 } else {
                     m.vision.unwrap_or(false)
@@ -381,8 +401,8 @@ fn codex_catalog_models(
                 // The launched model's row carries the same levels
                 // `launch` resolved for it (see
                 // `resolve_provider_model`); every other row its own.
-                supported_reasoning_levels: codex_reasoning_levels(m.thinking.as_deref()),
-            }
+                m.thinking.as_deref(),
+            )
         })
         .collect();
     // The launched model belongs in its own catalog even if the list
@@ -392,13 +412,7 @@ fn codex_catalog_models(
     if !models.iter().any(|m| m.slug == model) {
         models.insert(
             0,
-            CodexCatalogModel {
-                slug: model.to_string(),
-                display_name: model.to_string(),
-                context_window: codex_context_window(context_window),
-                vision,
-                supported_reasoning_levels: Vec::new(),
-            },
+            codex_catalog_entry(model, model, context_window, vision, None),
         );
     }
     models
