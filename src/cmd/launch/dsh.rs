@@ -204,24 +204,34 @@ fn write_dsh_settings(
 /// The `models:` list under the `llmman` provider route: the one model
 /// this launch resolved, or — under `--provider` — every model the
 /// provider serves, the launched one first, each with its own image
-/// input and reasoning levels. The launched entry keeps the `--variant`
-/// levels this launch resolved for it; each other model takes the
-/// levels its own catalog entry lists, and none where the catalog
-/// lists none.
+/// input, reasoning levels, and the context and output limits its own
+/// catalog entry publishes, omitted where the catalog publishes none.
+/// The launched entry keeps the `--variant` levels this launch
+/// resolved for it; each other model takes the levels its own catalog
+/// entry lists, and none where the catalog lists none.
 fn dsh_models_block(
     model: &str,
     vision: bool,
     effort: Option<&Effort>,
     hosted: Option<&[HostedModel]>,
 ) -> String {
-    // (id, vision, levels): the launch's levels for the launched model,
-    // the catalog's for every other.
-    let mut entries: Vec<(&str, bool, Option<Vec<&str>>)> = match hosted {
+    // (id, vision, levels, context, output): the launch's levels for
+    // the launched model, the catalog's for every other; the catalog's
+    // limits for every row, launched included — `launch_dsh` receives
+    // no launch-resolved limits, and the catalog values are the ones
+    // the resolver read for the launched model too.
+    let mut entries: Vec<(&str, bool, Option<Vec<&str>>, Option<u64>, Option<u32>)> = match hosted {
         Some(hosted) => hosted
             .iter()
             .map(|m| {
                 if m.reference == model {
-                    (model, vision, effort.map(|e| e.levels.clone()))
+                    (
+                        model,
+                        vision,
+                        effort.map(|e| e.levels.clone()),
+                        m.context,
+                        m.output,
+                    )
                 } else {
                     (
                         m.reference.as_str(),
@@ -229,19 +239,24 @@ fn dsh_models_block(
                         m.thinking
                             .as_ref()
                             .map(|levels| levels.iter().map(String::as_str).collect()),
+                        m.context,
+                        m.output,
                     )
                 }
             })
             .collect(),
-        None => vec![(model, vision, effort.map(|e| e.levels.clone()))],
+        None => vec![(model, vision, effort.map(|e| e.levels.clone()), None, None)],
     };
     // The launched model belongs in its own settings even if the list
     // somehow lacks it: dsh is started on it.
-    if !entries.iter().any(|(id, _, _)| *id == model) {
-        entries.insert(0, (model, vision, effort.map(|e| e.levels.clone())));
+    if !entries.iter().any(|(id, _, _, _, _)| *id == model) {
+        entries.insert(
+            0,
+            (model, vision, effort.map(|e| e.levels.clone()), None, None),
+        );
     }
     let mut block = String::from("      models:\n");
-    for (id, vision, levels) in entries {
+    for (id, vision, levels, context, output) in entries {
         let quoted = common::yaml_quote(id);
         // Claiming image input a text-only model can't serve would have
         // dsh attach what the daemon then rejects.
@@ -251,6 +266,12 @@ fn dsh_models_block(
         ));
         if let Some(levels) = levels.filter(|levels| !levels.is_empty()) {
             block.push_str(&dsh_reasoning_efforts_line(&levels));
+        }
+        if let Some(context) = context {
+            block.push_str(&format!("          contextWindow: {context}\n"));
+        }
+        if let Some(output) = output {
+            block.push_str(&format!("          maxTokens: {output}\n"));
         }
     }
     block
@@ -625,17 +646,27 @@ mod tests {
             models[0]["reasoningEfforts"],
             serde_json::json!({ "off": "none", "low": "low", "high": "high" })
         );
+        // The fixture publishes a 262,144-token window and an 8,192-token
+        // output ceiling for the launched model; both reach the entry.
+        assert_eq!(models[0]["contextWindow"], 262_144);
+        assert_eq!(models[0]["maxTokens"], 8_192);
         assert_eq!(models[1]["id"], "llmman.provider/openrouter/llama-4-scout");
         assert_eq!(models[1]["input"], serde_json::json!(["text", "image"]));
         assert_eq!(
             models[1]["reasoningEfforts"],
             serde_json::json!({ "low": "low", "medium": "medium", "high": "high" })
         );
+        // The catalog publishes no limits for the other two, so none are
+        // written rather than a guess.
+        assert!(models[1].get("contextWindow").is_none());
+        assert!(models[1].get("maxTokens").is_none());
         // Unknown vision reads as text-only, and no levels means no
         // `reasoningEfforts` key rather than a guess.
         assert_eq!(models[2]["id"], "llmman.provider/openrouter/plain");
         assert_eq!(models[2]["input"], serde_json::json!(["text"]));
         assert!(models[2].get("reasoningEfforts").is_none());
+        assert!(models[2].get("contextWindow").is_none());
+        assert!(models[2].get("maxTokens").is_none());
 
         // The launched model belongs in its own settings even if the
         // provider's list somehow lacks it, ahead of the rest.

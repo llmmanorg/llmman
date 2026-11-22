@@ -1,10 +1,11 @@
 //! `llmman launch claude`.
 
+use std::path::PathBuf;
+
 use super::common;
 use super::optimizer::{Addition, Optimizer};
 use super::{
-    before_terminator, exec_with_env_removing, find_on_path, has_flag, has_forwarded_model_flag,
-    server, HostedModel,
+    before_terminator, find_on_path, has_flag, has_forwarded_model_flag, server, HostedModel,
 };
 
 /// Inherited variables that point claude at another provider or credential.
@@ -60,12 +61,15 @@ pub(super) fn launch_claude(
     // so the picker is folded into that one instead (see
     // `place_model_picker`).
     let owned_extra_args;
+    let mut settings_file = None;
+    let mut kept_callers_picker = false;
     let extra_args: &[String] = match model_picker(hosted) {
         Some(picker) => {
-            let (args, rewritten) =
-                place_model_picker(std::mem::take(&mut added.args), extra_args, picker)?;
-            added.args = args;
-            owned_extra_args = rewritten;
+            let placed = place_model_picker(std::mem::take(&mut added.args), extra_args, picker)?;
+            added.args = placed.added_args;
+            settings_file = placed.settings_file;
+            kept_callers_picker = placed.kept_callers_picker;
+            owned_extra_args = placed.extra_args;
             &owned_extra_args
         }
         None => extra_args,
@@ -73,7 +77,7 @@ pub(super) fn launch_claude(
     let server = added.server.clone().unwrap_or_else(server);
     let session_model = session_model(model, extra_args);
     let window = claude_context_window(
-        hosted_context_bound(hosted, context_window),
+        hosted_context_bound(hosted, context_window, kept_callers_picker),
         runs_model(model, extra_args),
         std::env::var_os(CLAUDE_MAX_CONTEXT_ENV).is_some(),
     )
@@ -87,7 +91,17 @@ pub(super) fn launch_claude(
     if let Some(notice) = optimizer.notice("claude") {
         eprintln!("{notice}");
     }
-    exec_with_env_removing(&bin, &args, &env, CLAUDE_ENV_TO_CLEAR)
+    // [`super::exec_with_env_removing`] never returns — it spawns claude,
+    // waits, then exits this process — so a per-launch settings file
+    // cannot be removed after that call. Spawn and wait here instead,
+    // remove the file once claude has exited (or failed to start), then
+    // leave exactly as that helper would: stop hdrm and exit with the code.
+    let code = super::run_with_env_removing(&bin, &args, &env, CLAUDE_ENV_TO_CLEAR);
+    if let Some(path) = settings_file {
+        let _ = std::fs::remove_file(path);
+    }
+    super::hdrm::stop();
+    std::process::exit(code?);
 }
 
 /// `args` and `env` with what an optimizer adds: its arguments first, its
@@ -149,8 +163,8 @@ fn claude_context_window(
 }
 
 /// Split out so a test can assert what claude is handed:
-/// [`super::exec_with_env_removing`] never returns, so calling
-/// [`launch_claude`] would take the test runner with it.
+/// [`launch_claude`] never returns — it exits the process once claude
+/// does — so calling it would take the test runner with it.
 fn claude_args(model: &str, extra_args: &[String]) -> Vec<String> {
     let mut args = Vec::new();
     // Absent, not empty: claude reads "" as a model actually named "".
@@ -220,7 +234,19 @@ fn claude_env<'a>(
 /// offered model publishing a window leaves the launch model's window
 /// as the only bound there is. Without a hosted list the launch model's
 /// window stands as today.
-fn hosted_context_bound(hosted: Option<&[HostedModel]>, window: Option<u64>) -> Option<u64> {
+///
+/// When the caller's own picker was kept (`caller_picker_kept`), the
+/// offered list was discarded — the session cannot switch to any of
+/// it — so the bound is the launch model's window, not the minimum of
+/// a list the session will never see.
+fn hosted_context_bound(
+    hosted: Option<&[HostedModel]>,
+    window: Option<u64>,
+    caller_picker_kept: bool,
+) -> Option<u64> {
+    if caller_picker_kept {
+        return window;
+    }
     match hosted {
         Some(hosted) if !hosted.is_empty() => {
             hosted.iter().filter_map(|m| m.context).min().or(window)
@@ -270,11 +296,60 @@ fn model_picker(hosted: Option<&[HostedModel]>) -> Option<serde_json::Value> {
     }))
 }
 
+/// `settings` written to a private per-launch file, and its path: the
+/// file-based handoff for `--settings` (see [`place_model_picker`]).
+/// Inline JSON in the argument would expose anything the settings hold
+/// — a secret in `env`, say — on the process command line, and a
+/// settings file whose compact JSON exceeds 128 KiB would not launch
+/// at all: the kernel rejects the oversized argument with E2BIG.
+///
+/// The file is 0600, under the system temp dir, named for this process
+/// and launch so one launch never shares another's; the caller removes
+/// it once claude exits or fails to start. `tempfile` is a dev-only
+/// dependency here, so this follows the codebase's own pattern
+/// (`std::env::temp_dir` plus the process id) instead.
+fn write_settings_file(settings: &serde_json::Value) -> anyhow::Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!(
+        "llmman-claude-settings-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let json = serde_json::to_string(settings).expect("settings serialize");
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        // `mode` is masked by the umask on create, so set it again.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(json.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, json)?;
+    }
+    Ok(path)
+}
+
 /// `args` with `picker` added to the `--settings` argument: claude keeps
 /// only the last one, so a lineup that landed beside the optimizer's own
 /// settings would silently drop its hook. There the picker is one key of
 /// that object; with no settings yet, it is the argument.
-fn with_model_picker(args: Vec<String>, picker: serde_json::Value) -> Vec<String> {
+///
+/// The settings reach claude as a file, not as inline JSON in the
+/// argument (see [`write_settings_file`]); the returned path is the
+/// per-launch file, for the caller to remove once claude exits.
+fn with_model_picker(
+    args: Vec<String>,
+    picker: serde_json::Value,
+) -> anyhow::Result<(Vec<String>, PathBuf)> {
     let mut args = args;
     let existing = args
         .iter()
@@ -287,17 +362,48 @@ fn with_model_picker(args: Vec<String>, picker: serde_json::Value) -> Vec<String
                 .filter(serde_json::Value::is_object)
                 .unwrap_or_else(|| serde_json::json!({}));
             settings["modelPicker"] = picker;
-            args[at + 1] = serde_json::to_string(&settings).expect("settings serialize");
-            args
+            let path = write_settings_file(&settings)?;
+            args[at + 1] = path.to_string_lossy().into_owned();
+            Ok((args, path))
         }
         None => {
             let settings = serde_json::json!({ "modelPicker": picker });
-            let json = serde_json::to_string(&settings).expect("settings serialize");
-            let mut with = vec!["--settings".to_string(), json];
+            let path = write_settings_file(&settings)?;
+            let mut with = vec![
+                "--settings".to_string(),
+                path.to_string_lossy().into_owned(),
+            ];
             with.append(&mut args);
-            with
+            Ok((with, path))
         }
     }
+}
+
+/// Where the picker ended up, and the per-launch settings file when
+/// one was written for it (see [`write_settings_file`]).
+#[derive(Debug)]
+struct PlacedPicker {
+    added_args: Vec<String>,
+    extra_args: Vec<String>,
+    /// The caller's own forwarded `modelPicker` was kept, so the
+    /// session's picker is not llmman's lineup: size the session from
+    /// the launch model, not from the discarded list (see
+    /// [`hosted_context_bound`]).
+    kept_callers_picker: bool,
+    /// A private file holding merged settings, to delete once claude
+    /// exits or fails to start.
+    settings_file: Option<PathBuf>,
+}
+
+/// What a forwarded `--settings` did with the picker.
+#[derive(Debug)]
+enum ForwardedPicker {
+    /// No forwarded `--settings`: the picker still needs a home.
+    Absent,
+    /// Folded into the forwarded settings, now in the per-launch file.
+    Merged(PathBuf),
+    /// The caller's own `modelPicker` was kept; nothing was rewritten.
+    KeptCallers,
 }
 
 /// `added_args` and `extra_args` with `picker` placed: folded into a
@@ -309,18 +415,26 @@ fn place_model_picker(
     added_args: Vec<String>,
     extra_args: &[String],
     picker: serde_json::Value,
-) -> anyhow::Result<(Vec<String>, Vec<String>)> {
-    let (extra_args, placed) = merge_picker_into_forwarded_settings(extra_args, &picker)?;
-    let added_args = if placed {
-        added_args
-    } else {
-        with_model_picker(added_args, picker)
+) -> anyhow::Result<PlacedPicker> {
+    let (extra_args, forwarded) = merge_picker_into_forwarded_settings(extra_args, &picker)?;
+    let (added_args, settings_file, kept_callers_picker) = match forwarded {
+        ForwardedPicker::Absent => {
+            let (added_args, path) = with_model_picker(added_args, picker)?;
+            (added_args, Some(path), false)
+        }
+        ForwardedPicker::Merged(path) => (added_args, Some(path), false),
+        ForwardedPicker::KeptCallers => (added_args, None, true),
     };
-    Ok((added_args, extra_args))
+    Ok(PlacedPicker {
+        added_args,
+        extra_args,
+        kept_callers_picker,
+        settings_file,
+    })
 }
 
 /// `extra_args` with `picker` folded into a forwarded `--settings`
-/// when there is one, and whether it was folded there.
+/// when there is one, and what happened to it.
 ///
 /// The forwarded value is the caller's settings as JSON, or the file
 /// holding them: claude takes either as a `--settings` value (the
@@ -340,9 +454,9 @@ fn place_model_picker(
 fn merge_picker_into_forwarded_settings(
     extra_args: &[String],
     picker: &serde_json::Value,
-) -> anyhow::Result<(Vec<String>, bool)> {
+) -> anyhow::Result<(Vec<String>, ForwardedPicker)> {
     let Some((at, value)) = forwarded_settings(extra_args) else {
-        return Ok((extra_args.to_vec(), false));
+        return Ok((extra_args.to_vec(), ForwardedPicker::Absent));
     };
     let Some(value) = value else {
         anyhow::bail!(
@@ -356,17 +470,23 @@ fn merge_picker_into_forwarded_settings(
             "[llmman] claude: keeping your own modelPicker from --settings; \
              the provider's models are not listed in this session's picker."
         );
-        return Ok((extra_args.to_vec(), true));
+        return Ok((extra_args.to_vec(), ForwardedPicker::KeptCallers));
     }
     settings["modelPicker"] = picker.clone();
-    let merged = serde_json::to_string(&settings).expect("settings serialize");
+    // The merged settings reach claude as a file, not as inline JSON in
+    // the argument: the caller's settings can hold secrets in `env`,
+    // which an inline argument would expose on the command line, and a
+    // large settings file would exceed the kernel's single-argument
+    // limit (E2BIG). The file is removed once claude exits.
+    let path = write_settings_file(&settings)?;
     let mut rewritten = extra_args.to_vec();
+    let arg = path.to_string_lossy().into_owned();
     if rewritten[at] == "--settings" {
-        rewritten[at + 1] = merged;
+        rewritten[at + 1] = arg;
     } else {
-        rewritten[at] = format!("--settings={merged}");
+        rewritten[at] = format!("--settings={arg}");
     }
-    Ok((rewritten, true))
+    Ok((rewritten, ForwardedPicker::Merged(path)))
 }
 
 /// A forwarded `--settings` in `extra_args` (before any `--`, past
@@ -403,7 +523,8 @@ fn read_settings_object(value: &str) -> anyhow::Result<serde_json::Value> {
                 "--settings after --: llmman could not read its value as settings JSON, \
                  or as a file holding settings JSON, so the provider model picker \
                  cannot be added to it.\n\
-                 Put your settings in .claude/settings.json, or launch without --settings."
+                 Fix the forwarded settings path, or pass the settings as a readable \
+                 inline JSON object instead."
             )
         })
 }
@@ -726,12 +847,12 @@ mod tests {
             hosted("small", Some(200_000), Some(false)),
         ];
         assert_eq!(
-            hosted_context_bound(Some(&offered), Some(1_000_000)),
+            hosted_context_bound(Some(&offered), Some(1_000_000), false),
             Some(200_000)
         );
         assert_eq!(
             claude_context_window(
-                hosted_context_bound(Some(&offered), Some(1_000_000)),
+                hosted_context_bound(Some(&offered), Some(1_000_000), false),
                 true,
                 false
             )
@@ -741,7 +862,7 @@ mod tests {
         // A caller-set variable still wins over the bound.
         assert_eq!(
             claude_context_window(
-                hosted_context_bound(Some(&offered), Some(1_000_000)),
+                hosted_context_bound(Some(&offered), Some(1_000_000), false),
                 true,
                 true
             ),
@@ -750,26 +871,42 @@ mod tests {
         // A forwarded `--model` has a window of its own, bound or not.
         assert_eq!(
             claude_context_window(
-                hosted_context_bound(Some(&offered), Some(1_000_000)),
+                hosted_context_bound(Some(&offered), Some(1_000_000), false),
                 false,
                 false
             ),
             None
         );
+        // The caller's own picker is kept: the offered list is discarded,
+        // so the launch model's window stands, not the minimum of a list
+        // the session cannot switch to.
+        assert_eq!(
+            hosted_context_bound(Some(&offered), Some(1_000_000), true),
+            Some(1_000_000)
+        );
         // No offered model publishing a window leaves the launch
         // model's window as the only bound there is.
         let unknown = [hosted("mystery", None, None)];
         assert_eq!(
-            hosted_context_bound(Some(&unknown), Some(262_144)),
+            hosted_context_bound(Some(&unknown), Some(262_144), false),
             Some(262_144)
         );
         // No hosted list: the launch model's window stands as today.
-        assert_eq!(hosted_context_bound(None, Some(262_144)), Some(262_144));
         assert_eq!(
-            hosted_context_bound(Some(&[]), Some(262_144)),
+            hosted_context_bound(None, Some(262_144), false),
             Some(262_144)
         );
-        assert_eq!(hosted_context_bound(None, None), None);
+        assert_eq!(
+            hosted_context_bound(Some(&[]), Some(262_144), false),
+            Some(262_144)
+        );
+        assert_eq!(hosted_context_bound(None, None, false), None);
+    }
+
+    /// The settings a `--settings` argument value names: merged settings
+    /// always travel as a file, never as inline JSON.
+    fn settings_at(value: &str) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(value).unwrap()).unwrap()
     }
 
     #[test]
@@ -780,16 +917,17 @@ mod tests {
         let path = file.to_str().unwrap().to_string();
         let picker = picker();
         // `--settings <file>`: the caller's settings survive, with the
-        // picker folded in, and nothing else moves.
-        let (rewritten, placed) = merge_picker_into_forwarded_settings(
+        // picker folded in, and nothing else moves. The merged settings
+        // reach claude as a file, not inline in the argument.
+        let (rewritten, forwarded) = merge_picker_into_forwarded_settings(
             &strings(&["-p", "hi", "--settings", &path]),
             &picker,
         )
         .unwrap();
-        assert!(placed);
+        assert!(matches!(forwarded, ForwardedPicker::Merged(_)));
         assert_eq!(&rewritten[..3], ["-p", "hi", "--settings"]);
         assert_eq!(rewritten.len(), 4);
-        let settings: serde_json::Value = serde_json::from_str(&rewritten[3]).unwrap();
+        let settings = settings_at(&rewritten[3]);
         assert_eq!(settings["model"], "other");
         assert!(settings["hooks"].is_object());
         assert_eq!(
@@ -800,26 +938,30 @@ mod tests {
             settings["modelPicker"]["options"][1]["context"],
             serde_json::json!(200_000)
         );
+        let _ = std::fs::remove_file(&rewritten[3]);
         // `--settings=<file>` keeps its joined form.
         let joined = format!("--settings={path}");
-        let (rewritten, placed) = merge_picker_into_forwarded_settings(&[joined], &picker).unwrap();
-        assert!(placed);
+        let (rewritten, forwarded) =
+            merge_picker_into_forwarded_settings(&[joined], &picker).unwrap();
+        assert!(matches!(forwarded, ForwardedPicker::Merged(_)));
         assert_eq!(rewritten.len(), 1);
         assert!(rewritten[0].starts_with("--settings="));
-        let settings: serde_json::Value =
-            serde_json::from_str(rewritten[0].trim_start_matches("--settings=")).unwrap();
+        let value = rewritten[0].trim_start_matches("--settings=").to_string();
+        let settings = settings_at(&value);
         assert_eq!(settings["model"], "other");
         assert_eq!(settings["modelPicker"]["options"][0]["label"], "big");
+        let _ = std::fs::remove_file(&value);
         // Inline JSON (the form the optimizer passes) merges the same way.
-        let (rewritten, placed) = merge_picker_into_forwarded_settings(
+        let (rewritten, forwarded) = merge_picker_into_forwarded_settings(
             &strings(&["--settings", r#"{"model": "other"}"#]),
             &picker,
         )
         .unwrap();
-        assert!(placed);
-        let settings: serde_json::Value = serde_json::from_str(&rewritten[1]).unwrap();
+        assert!(matches!(forwarded, ForwardedPicker::Merged(_)));
+        let settings = settings_at(&rewritten[1]);
         assert_eq!(settings["model"], "other");
         assert!(settings["modelPicker"].is_object());
+        let _ = std::fs::remove_file(&rewritten[1]);
     }
 
     #[test]
@@ -830,26 +972,39 @@ mod tests {
         let path = file.to_str().unwrap().to_string();
         let picker = picker();
         // With a forwarded `--settings`, the optimizer's args gain none.
-        let (added, extra) =
+        let placed =
             place_model_picker(vec![], &strings(&["--settings", &path]), picker.clone()).unwrap();
-        assert!(added.is_empty());
-        assert_eq!(extra[0], "--settings");
-        let settings: serde_json::Value = serde_json::from_str(&extra[1]).unwrap();
+        assert!(placed.added_args.is_empty());
+        assert!(!placed.kept_callers_picker);
+        let settings_file = placed.settings_file.expect("a merged settings file");
+        assert_eq!(placed.extra_args[0], "--settings");
+        assert_eq!(placed.extra_args[1], settings_file.to_string_lossy());
+        let settings = settings_at(&placed.extra_args[1]);
         assert_eq!(settings["model"], "other");
         assert!(settings["modelPicker"].is_object());
+        let _ = std::fs::remove_file(&settings_file);
         // Without one, it lands in the optimizer's settings, ahead of
-        // the rest, and the caller's args are untouched.
-        let (added, extra) = place_model_picker(
+        // the rest, and the caller's args are untouched — again as a
+        // file, never as inline JSON in the argument.
+        let placed = place_model_picker(
             vec!["--append-system-prompt".into(), "x".into()],
             &strings(&["-p", "hi"]),
             picker,
         )
         .unwrap();
-        assert_eq!(added[0], "--settings");
-        let settings: serde_json::Value = serde_json::from_str(&added[1]).unwrap();
+        assert!(!placed.kept_callers_picker);
+        let settings_file = placed.settings_file.expect("a generated settings file");
+        assert_eq!(placed.added_args[0], "--settings");
+        assert_eq!(placed.added_args[1], settings_file.to_string_lossy());
+        assert!(placed
+            .added_args
+            .iter()
+            .all(|arg| !arg.contains("modelPicker")));
+        let settings = settings_at(&placed.added_args[1]);
         assert!(settings["modelPicker"].is_object());
-        assert_eq!(&added[2..], ["--append-system-prompt", "x"]);
-        assert_eq!(extra, strings(&["-p", "hi"]));
+        assert_eq!(&placed.added_args[2..], ["--append-system-prompt", "x"]);
+        assert_eq!(placed.extra_args, strings(&["-p", "hi"]));
+        let _ = std::fs::remove_file(&settings_file);
     }
 
     #[test]
@@ -863,8 +1018,9 @@ mod tests {
         .unwrap();
         let path = file.to_str().unwrap().to_string();
         let args = strings(&["--settings", &path]);
-        let (rewritten, placed) = merge_picker_into_forwarded_settings(&args, &picker()).unwrap();
-        assert!(placed);
+        let (rewritten, forwarded) =
+            merge_picker_into_forwarded_settings(&args, &picker()).unwrap();
+        assert!(matches!(forwarded, ForwardedPicker::KeptCallers));
         // Nothing is rewritten: the caller's file is passed through as it was.
         assert_eq!(rewritten, args);
         let settings: serde_json::Value =
@@ -899,20 +1055,117 @@ mod tests {
     fn forwarded_settings_are_untouched_without_a_picker_or_past_a_terminator() {
         let picker = picker();
         // No forwarded `--settings`: nothing is rewritten.
-        let (rewritten, placed) =
+        let (rewritten, forwarded) =
             merge_picker_into_forwarded_settings(&strings(&["-p", "hi"]), &picker).unwrap();
-        assert!(!placed);
+        assert!(matches!(forwarded, ForwardedPicker::Absent));
         assert_eq!(rewritten, strings(&["-p", "hi"]));
         // Past a `--` it is a message, not a flag.
-        let (rewritten, placed) = merge_picker_into_forwarded_settings(
+        let (rewritten, forwarded) = merge_picker_into_forwarded_settings(
             &strings(&["-p", "x", "--", "--settings", "mine.json"]),
             &picker,
         )
         .unwrap();
-        assert!(!placed);
+        assert!(matches!(forwarded, ForwardedPicker::Absent));
         assert_eq!(
             rewritten,
             strings(&["-p", "x", "--", "--settings", "mine.json"])
+        );
+    }
+
+    #[test]
+    fn a_secret_in_forwarded_settings_never_reaches_the_spawned_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mine.json");
+        std::fs::write(
+            &file,
+            r#"{"env": {"MY_API_KEY": "sk-live-do-not-leak"}, "model": "other"}"#,
+        )
+        .unwrap();
+        let path = file.to_str().unwrap().to_string();
+        // These are the arguments `launch_claude` hands to the spawn:
+        // nothing in them may carry the secret.
+        let placed =
+            place_model_picker(vec![], &strings(&["--settings", &path]), picker()).unwrap();
+        let settings_file = placed.settings_file.expect("a merged settings file");
+        for arg in placed.added_args.iter().chain(placed.extra_args.iter()) {
+            assert!(!arg.contains("sk-live-do-not-leak"), "{arg}");
+        }
+        assert_eq!(placed.extra_args[1], settings_file.to_string_lossy());
+        // The secret lives only in the private file, with the picker merged in.
+        let settings = settings_at(&placed.extra_args[1]);
+        assert_eq!(settings["env"]["MY_API_KEY"], "sk-live-do-not-leak");
+        assert!(settings["modelPicker"].is_object());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&settings_file)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // The caller's own file is never rewritten in place.
+        let original = std::fs::read_to_string(&file).unwrap();
+        assert!(!original.contains("modelPicker"));
+        let _ = std::fs::remove_file(&settings_file);
+    }
+
+    #[test]
+    fn a_large_forwarded_settings_file_still_launches_via_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("big.json");
+        // Past the kernel's 128 KiB single-argument limit as compact JSON.
+        let big = "x".repeat(200_000);
+        std::fs::write(&file, format!(r#"{{"notes": "{big}"}}"#)).unwrap();
+        let path = file.to_str().unwrap().to_string();
+        let placed =
+            place_model_picker(vec![], &strings(&["--settings", &path]), picker()).unwrap();
+        let settings_file = placed.settings_file.expect("a merged settings file");
+        // The argument is a short path, not the 200 KiB of JSON.
+        assert!(placed.extra_args[1].len() < 1024);
+        let settings = settings_at(&placed.extra_args[1]);
+        assert_eq!(settings["notes"], big);
+        assert!(settings["modelPicker"].is_object());
+        assert!(
+            serde_json::to_string(&settings).unwrap().len() > 128 * 1024,
+            "the merged settings really are past the arg limit"
+        );
+        let _ = std::fs::remove_file(&settings_file);
+    }
+
+    #[test]
+    fn the_context_bound_keeps_the_launch_cap_when_the_callers_picker_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mine.json");
+        std::fs::write(
+            &file,
+            r#"{"modelPicker": {"options": [{"model": "mine", "label": "mine"}]}}"#,
+        )
+        .unwrap();
+        let path = file.to_str().unwrap().to_string();
+        // The offered list holds an 8k model the caller's picker excludes.
+        let offered = [
+            hosted("big", Some(200_000), None),
+            hosted("tiny", Some(8_000), None),
+        ];
+        let placed = place_model_picker(
+            vec![],
+            &strings(&["--settings", &path]),
+            model_picker(Some(&offered)).expect("a hosted list makes a picker"),
+        )
+        .unwrap();
+        assert!(placed.kept_callers_picker);
+        assert!(placed.settings_file.is_none());
+        // The session is sized from the launch model, not from the
+        // discarded 8k row.
+        assert_eq!(
+            hosted_context_bound(Some(&offered), Some(200_000), placed.kept_callers_picker),
+            Some(200_000)
+        );
+        // And the discarded list on its own would have capped it at 8k.
+        assert_eq!(
+            hosted_context_bound(Some(&offered), Some(200_000), false),
+            Some(8_000)
         );
     }
 }

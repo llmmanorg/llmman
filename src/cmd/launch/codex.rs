@@ -280,6 +280,62 @@ struct CodexCatalogModel {
     display_name: String,
     context_window: u64,
     vision: bool,
+    /// The reasoning levels this model offers, as codex's
+    /// `supported_reasoning_levels` presets: the catalog's levels
+    /// codex accepts (see [`CODEX_REASONING_LEVELS`]), empty when it
+    /// publishes none usable.
+    supported_reasoning_levels: Vec<&'static str>,
+}
+
+/// The reasoning levels codex accepts, with the description its own
+/// catalog shows beside each (`openai/codex`,
+/// `codex-rs/models-manager/models.json`, e.g. gpt-6.2-sol): `low` to
+/// `max` carry codex's own wording there. `minimal` has no preset in
+/// that catalog, so a plain wording of llmman's own. Anything else a
+/// provider publishes — `none` (a switch, not a level, here as in
+/// `chat_template`), `thinking`, `ultra` (codex's multi-agent mode,
+/// not a request effort) — is not a level codex offers for a model, so
+/// it is left out rather than guessed.
+const CODEX_REASONING_LEVELS: &[(&str, &str)] = &[
+    ("minimal", "Minimal reasoning effort"),
+    ("low", "Fast responses with lighter reasoning"),
+    (
+        "medium",
+        "Balances speed and reasoning depth for everyday tasks",
+    ),
+    ("high", "Greater reasoning depth for complex problems"),
+    ("xhigh", "Extra high reasoning depth for complex problems"),
+    ("max", "Maximum reasoning depth for the hardest problems"),
+];
+
+/// The levels of `thinking` codex accepts, in the catalog's order:
+/// the ones in [`CODEX_REASONING_LEVELS`], each once. `None` — the
+/// catalog says nothing — and a list with no usable level both mean no
+/// reasoning levels, not a guess.
+fn codex_reasoning_levels(thinking: Option<&[String]>) -> Vec<&'static str> {
+    let mut levels = Vec::new();
+    for level in thinking.into_iter().flatten() {
+        if let Some((accepted, _)) = CODEX_REASONING_LEVELS
+            .iter()
+            .find(|(accepted, _)| *accepted == level.as_str())
+        {
+            if !levels.contains(accepted) {
+                levels.push(*accepted);
+            }
+        }
+    }
+    levels
+}
+
+/// The description [`CODEX_REASONING_LEVELS`] shows beside `level`.
+/// Only ever called with a level `codex_reasoning_levels` kept, so
+/// every call finds its row.
+fn codex_reasoning_description(level: &str) -> &'static str {
+    CODEX_REASONING_LEVELS
+        .iter()
+        .find(|(accepted, _)| *accepted == level)
+        .map(|(_, description)| *description)
+        .expect("level came from CODEX_REASONING_LEVELS")
 }
 
 /// What codex's catalog lists: every model `--provider` serves, so `/model`
@@ -288,13 +344,13 @@ struct CodexCatalogModel {
 ///
 /// One path builds every entry from the shared hosted list (a local
 /// launch has no list, so the launched model is the whole catalog).
-/// Each entry carries the window and image input of its own row: the
-/// launched model keeps what this launch resolved for it (a catalog
-/// window, or a local one read off the loaded runner), every other
-/// model what the provider's catalog says, falling back on the same
-/// guess codex cannot do without, since its catalog cannot omit the
-/// window. Each entry is shown under its plain model id, not the
-/// reference codex selects with.
+/// Each entry carries the window, image input and reasoning levels of
+/// its own row: the launched model keeps what this launch resolved for
+/// it (a catalog window, or a local one read off the loaded runner),
+/// every other model what the provider's catalog says, falling back on
+/// the same guess codex cannot do without, since its catalog cannot
+/// omit the window. Each entry is shown under its plain model id, not
+/// the reference codex selects with.
 fn codex_catalog_models(
     model: &str,
     vision: bool,
@@ -322,6 +378,10 @@ fn codex_catalog_models(
                 } else {
                     m.vision.unwrap_or(false)
                 },
+                // The launched model's row carries the same levels
+                // `launch` resolved for it (see
+                // `resolve_provider_model`); every other row its own.
+                supported_reasoning_levels: codex_reasoning_levels(m.thinking.as_deref()),
             }
         })
         .collect();
@@ -337,6 +397,7 @@ fn codex_catalog_models(
                 display_name: model.to_string(),
                 context_window: codex_context_window(context_window),
                 vision,
+                supported_reasoning_levels: Vec::new(),
             },
         );
     }
@@ -344,10 +405,13 @@ fn codex_catalog_models(
 }
 
 /// The `model_catalog_json` for `models`, declaring image input in
-/// `input_modalities` where a model has any, and showing each under
-/// its plain model id in `display_name` rather than the reference
-/// codex selects with. The other fields are ones codex requires,
-/// valued as ollama's `buildCodexModelEntry` does.
+/// `input_modalities` where a model has any, its reasoning levels as
+/// codex's `supported_reasoning_levels` presets (`{effort,
+/// description}` objects, as in codex's own `models.json` — not bare
+/// strings), and showing each under its plain model id in
+/// `display_name` rather than the reference codex selects with. The
+/// other fields are ones codex requires, valued as ollama's
+/// `buildCodexModelEntry` does.
 fn codex_model_catalog(models: &[CodexCatalogModel]) -> String {
     let entries: Vec<serde_json::Value> = models
         .iter()
@@ -357,6 +421,16 @@ fn codex_model_catalog(models: &[CodexCatalogModel]) -> String {
             } else {
                 &["text"]
             };
+            let reasoning: Vec<serde_json::Value> = model
+                .supported_reasoning_levels
+                .iter()
+                .map(|level| {
+                    serde_json::json!({
+                        "effort": level,
+                        "description": codex_reasoning_description(level),
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "slug": model.slug,
                 "display_name": model.display_name,
@@ -372,7 +446,7 @@ fn codex_model_catalog(models: &[CodexCatalogModel]) -> String {
                 "default_verbosity": "low",
                 "supports_parallel_tool_calls": false,
                 "supports_reasoning_summaries": false,
-                "supported_reasoning_levels": [],
+                "supported_reasoning_levels": reasoning,
                 "experimental_supported_tools": [],
             })
         })
@@ -715,6 +789,7 @@ model = \"gpt-5\"
             display_name: display_name.to_string(),
             context_window: 32768,
             vision,
+            supported_reasoning_levels: vec![],
         };
         let catalog: serde_json::Value = serde_json::from_str(&codex_model_catalog(&[entry(
             "llmman.provider/p/m",
@@ -767,6 +842,7 @@ model = \"gpt-5\"
             display_name: "qwen3-coder".into(),
             context_window: 262_144,
             vision: false,
+            supported_reasoning_levels: vec![],
         }];
         let catalog: serde_json::Value =
             serde_json::from_str(&codex_model_catalog(&models)).expect("valid JSON");
@@ -818,6 +894,7 @@ model = \"gpt-5\"
                     // resolved; codex's catalog cannot omit it.
                     context_window: CODEX_FALLBACK_CONTEXT_WINDOW,
                     vision: false,
+                    supported_reasoning_levels: vec![],
                 },
                 CodexCatalogModel {
                     slug: "llmman.provider/ollama-cloud/llama-4-scout".into(),
@@ -826,6 +903,7 @@ model = \"gpt-5\"
                     // A vision model the catalog names declares image
                     // input even though it is not the launched one.
                     vision: true,
+                    supported_reasoning_levels: vec![],
                 },
             ]
         );
@@ -865,6 +943,7 @@ model = \"gpt-5\"
                 display_name: "m".into(),
                 context_window: 8_192,
                 vision: true,
+                supported_reasoning_levels: vec![],
             }]
         );
     }
@@ -909,6 +988,7 @@ model = \"gpt-5\"
                     display_name: "other".into(),
                     context_window: 4_096,
                     vision: true,
+                    supported_reasoning_levels: vec![],
                 },
                 CodexCatalogModel {
                     slug: "llmman.provider/p/launched".into(),
@@ -917,6 +997,7 @@ model = \"gpt-5\"
                     // catalog row's 1_000 / vision.
                     context_window: 262_144,
                     vision: false,
+                    supported_reasoning_levels: vec![],
                 },
             ]
         );
@@ -959,14 +1040,93 @@ model = \"gpt-5\"
                     display_name: "llmman.provider/p/launched".into(),
                     context_window: 8_192,
                     vision: true,
+                    supported_reasoning_levels: vec![],
                 },
                 CodexCatalogModel {
                     slug: "llmman.provider/p/other".into(),
                     display_name: "other".into(),
                     context_window: 4_096,
                     vision: false,
+                    supported_reasoning_levels: vec![],
                 },
             ]
+        );
+    }
+
+    /// A secondary model that publishes `low` and `high` reaches the
+    /// launcher with both, so the catalog must advertise both — as
+    /// codex's `{effort, description}` presets, not bare strings — and
+    /// a model the catalog says nothing about advertises an empty list,
+    /// not a guess. A list with no usable level advertises nothing
+    /// either: `none` is a switch, not a level, and the rest is not a
+    /// level codex spells.
+    #[test]
+    fn codex_catalog_advertises_the_published_reasoning_levels() {
+        let hosted = vec![
+            HostedModel {
+                reference: "llmman.provider/p/alpha".into(),
+                id: "alpha".into(),
+                context: None,
+                output: None,
+                thinking: Some(vec!["low".into(), "high".into()]),
+                vision: None,
+            },
+            HostedModel {
+                reference: "llmman.provider/p/beta".into(),
+                id: "beta".into(),
+                context: None,
+                output: None,
+                thinking: None,
+                vision: None,
+            },
+            HostedModel {
+                reference: "llmman.provider/p/gamma".into(),
+                id: "gamma".into(),
+                context: None,
+                output: None,
+                thinking: Some(vec!["none".into(), "thinking".into(), "ultra".into()]),
+                vision: None,
+            },
+        ];
+        let models = codex_catalog_models("llmman.provider/p/alpha", false, None, Some(&hosted));
+        assert_eq!(models[0].supported_reasoning_levels, ["low", "high"]);
+        assert!(models[1].supported_reasoning_levels.is_empty());
+        assert!(models[2].supported_reasoning_levels.is_empty());
+
+        let catalog: serde_json::Value =
+            serde_json::from_str(&codex_model_catalog(&models)).expect("valid JSON");
+        let entries = catalog["models"].as_array().unwrap();
+        assert_eq!(
+            entries[0]["supported_reasoning_levels"],
+            serde_json::json!([
+                {"effort": "low", "description": "Fast responses with lighter reasoning"},
+                {"effort": "high", "description": "Greater reasoning depth for complex problems"},
+            ])
+        );
+        assert_eq!(
+            entries[1]["supported_reasoning_levels"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            entries[2]["supported_reasoning_levels"],
+            serde_json::json!([])
+        );
+    }
+
+    /// The table is the levels codex takes, as this codebase spells
+    /// them (`spell_variant` for codex takes `EFFORT_LEVELS`, plus
+    /// `none` for off): if either side gains a level, the other must
+    /// too, or the catalog would advertise a level codex cannot start
+    /// at — or hide one it can.
+    #[test]
+    fn codex_reasoning_levels_are_the_levels_codex_takes() {
+        use crate::chat_template::EFFORT_LEVELS;
+        assert_eq!(
+            CODEX_REASONING_LEVELS
+                .iter()
+                .map(|(level, _)| *level)
+                .collect::<Vec<_>>(),
+            EFFORT_LEVELS,
         );
     }
 

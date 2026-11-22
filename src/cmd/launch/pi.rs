@@ -83,7 +83,10 @@ fn write_pi_config(
 /// A non-launched model reasons when the catalog lists thinking levels
 /// for it, and takes image input when the catalog says it does; unknown
 /// reads as text-only, as [`common::pi_model_entry`] does for a local
-/// model with no window to declare.
+/// model with no window to declare. Every entry also carries the
+/// catalog's published output ceiling as `maxTokens`, the launched
+/// model included — `pi_model_entry` cannot emit an output limit, so
+/// it rides beside it, omitted where the catalog publishes none.
 fn pi_model_entries(
     model: &str,
     reasons: bool,
@@ -102,7 +105,7 @@ fn pi_model_entries(
     let mut entries: Vec<serde_json::Value> = hosted
         .iter()
         .map(|m| {
-            if m.reference == model {
+            let mut entry = if m.reference == model {
                 common::pi_model_entry(model, reasons, vision, context_window)
             } else {
                 common::pi_model_entry(
@@ -111,7 +114,11 @@ fn pi_model_entries(
                     m.vision.unwrap_or(false),
                     m.context,
                 )
+            };
+            if let Some(output) = m.output {
+                entry["maxTokens"] = serde_json::json!(output);
             }
+            entry
         })
         .collect();
     // The launched model belongs in its own config even if the list
@@ -306,6 +313,9 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0]["id"], "llmman.provider/openrouter/qwen3-coder");
         assert_eq!(entries[0]["contextWindow"], 262_144);
+        // The fixture publishes an 8,192-token output ceiling for the
+        // launched model; it reaches the entry as `maxTokens`.
+        assert_eq!(entries[0]["maxTokens"], 8_192);
         assert_eq!(entries[0]["input"], serde_json::json!(["text"]));
         // The launched entry keeps the launch's own reasoning, not the
         // catalog's levels: a `--variant` is what marks it as reasoning.
@@ -314,6 +324,9 @@ mod tests {
         assert_eq!(entries[1]["input"], serde_json::json!(["text", "image"]));
         assert_eq!(entries[1].get("contextWindow"), None);
         assert_eq!(entries[1].get("reasoning"), None);
+        // The catalog publishes no output ceiling for the scout, so none
+        // is written rather than a guess.
+        assert_eq!(entries[1].get("maxTokens"), None);
 
         // A model the catalog lists thinking levels for reasons.
         let thinking = vec![HostedModel {
@@ -322,6 +335,9 @@ mod tests {
         }];
         let entries = pi_model_entries("m", false, false, None, Some(&thinking));
         assert_eq!(entries[0]["id"], "m");
+        // The inserted launched model has no catalog row, so it carries
+        // no output ceiling either.
+        assert_eq!(entries[0].get("maxTokens"), None);
         assert_eq!(entries[1]["reasoning"], true);
     }
 

@@ -270,6 +270,10 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // the only ones, and the ones the provider enforces.
             context_window = resolved.context_window;
             max_output = resolved.max_output;
+            // The selected model's own capability: the launcher below
+            // uses this flag for the launched row, and the secondary
+            // rows already carry each model's own (see `HostedModel`).
+            vision = provider_vision(resolved.vision);
             // Every model the provider serves, so the integration can
             // offer them beside this one (see `HostedModel`).
             (resolved.reference, resolved.api_key, Some(resolved.models))
@@ -443,6 +447,8 @@ fn integration_key() -> String {
 /// Copilot's BYOK mode also requires an explicit model.
 /// Droid needs one to create and select its custom-model entry.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
+/// Local launches only: under `--provider` the catalog resolves the
+/// model instead (see `check_model_flag`).
 const MODEL_REQUIRED: &[&str] = &[
     "qwen",
     "dsh",
@@ -497,15 +503,19 @@ const MODEL_FLAG_FORWARDED: &[&str] = &[
     "droid",
 ];
 
-/// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
-/// `--provider` too. A second `--model` after `--` is the caller's to
-/// win for the integrations in `MODEL_FLAG_FORWARDED`, but `run`
+/// Refuses a local launch of one of `MODEL_REQUIRED` without a model.
+/// A `--provider` launch instead resolves its model from the catalog
+/// (see `resolve_provider_model`): the provider's first model when none
+/// was named, or a refusal naming some when it lists none — so this
+/// guard lets it through. A second `--model` after `--` is the caller's
+/// to win for the integrations in `MODEL_FLAG_FORWARDED`, but `run`
 /// resolves the top-level one and, locally, preloads it, so that gets
 /// said.
 ///
 /// goose-desktop alone may skip `--model` when `speech_model`
 /// (`OPENAI_TRANSCRIPTION_MODEL`) is set: it then launches for dictation
-/// only. `--provider` still needs `--model`.
+/// only. That exception is local too: under `--provider` the resolver
+/// picks the model, speech model or not.
 fn check_model_flag(
     integration: &str,
     model: Option<&str>,
@@ -516,6 +526,11 @@ fn check_model_flag(
     let name = integration.to_lowercase();
     let model = model.map(str::trim).filter(|m| !m.is_empty());
     let Some(model) = model else {
+        if provider.is_some() {
+            // The resolver picks the provider's first model, or refuses
+            // when it lists none (see `default_provider_model`).
+            return Ok(());
+        }
         if MODEL_REQUIRED.contains(&name.as_str()) {
             let dictation = name == "goose-desktop" && provider.is_none();
             if dictation && speech_model.is_some_and(|s| !s.trim().is_empty()) {
@@ -697,6 +712,10 @@ struct ResolvedProvider {
     /// The most the catalog says it will emit in one reply (see
     /// [`crate::daemon::ProviderDetail::max_output`]).
     max_output: Option<u32>,
+    /// Whether the catalog says the selected model takes images in
+    /// (see [`HostedModel::vision`]), `None` where it publishes no
+    /// modalities.
+    vision: Option<bool>,
     /// Every model the provider serves — the launched one first — so an
     /// integration can list them for the session to switch between
     /// (see [`HostedModel`]).
@@ -869,6 +888,7 @@ fn resolve_provider_model(
         thinking,
         context_window,
         max_output,
+        vision,
         models,
     })
 }
@@ -1410,6 +1430,7 @@ const CONFIGURED_BY_FILE: &[&str] = &[
     "hermes",
     "omp",
     "openclaw",
+    "opencode",
     "pi",
     "qwen",
 ];
@@ -1585,6 +1606,15 @@ fn pair_context_window(local: Option<u64>, hosted: Option<u64>) -> Option<u64> {
         (Some(local), Some(hosted)) => Some(local.max(hosted)),
         (window, None) | (None, window) => window,
     }
+}
+
+/// The `vision` flag a provider launch starts with, from what the
+/// catalog says about the selected model: `false` where it publishes
+/// no modalities, which is not the same as saying the model takes no
+/// images — only that nothing is known (see [`HostedModel::vision`]).
+/// The local arm has no unknown case: `info.vision()` is a plain bool.
+fn provider_vision(vision: Option<bool>) -> bool {
+    vision.unwrap_or(false)
 }
 
 /// The window the daemon would serve, predicted rather than read,
@@ -1841,8 +1871,11 @@ mod tests {
     }
 
     /// Every integration `check_model_flag` holds to a model must be one
-    /// `launch` dispatches; it is refused without one, under `--provider`
-    /// too, and a `--model` after `--` is let through.
+    /// `launch` dispatches; it is refused without one on a local launch,
+    /// while a `--provider` launch is let through to the resolver, which
+    /// picks the provider's first model or refuses when it lists none
+    /// (see `default_provider_model`); and a `--model` after `--` is
+    /// let through.
     #[test]
     fn model_required_integrations_are_refused_without_a_model() {
         let none: Vec<String> = vec![];
@@ -1851,11 +1884,9 @@ mod tests {
             assert!(check_model_flag(id, None, None, None, &none).is_err());
             assert!(check_model_flag(id, Some(" "), None, None, &none).is_err());
             assert!(check_model_flag(&id.to_uppercase(), None, None, None, &none).is_err());
-            let err = check_model_flag(id, None, Some("openrouter"), None, &none).unwrap_err();
-            assert!(
-                err.to_string().contains("--provider openrouter --model"),
-                "{err}"
-            );
+            // Under --provider the guard lets it through: the resolver,
+            // not this check, decides whether the launch has a model.
+            assert!(check_model_flag(id, None, Some("openrouter"), None, &none).is_ok());
             assert!(check_model_flag(id, Some("m"), None, None, &none).is_ok());
             let forwarded = vec!["--model".to_string(), "theirs".to_string()];
             assert!(check_model_flag(id, Some("m"), None, None, &forwarded).is_ok());
@@ -1871,6 +1902,47 @@ mod tests {
         // depend on `MODEL_REQUIRED`.
         assert!(MODEL_FLAG_FORWARDED.contains(&"claude"));
         assert!(!MODEL_REQUIRED.contains(&"claude"));
+    }
+
+    /// A `--provider` launch that named no model starts on the
+    /// provider's first model; a provider that lists none is refused
+    /// with the same `--model` wording the guard used to give, naming
+    /// that it lists none — so `llmman launch pi --provider
+    /// ollama-cloud` reaches this instead of the guard.
+    #[test]
+    fn default_provider_model_picks_the_first_listed_or_refuses() {
+        let entry = |ids: &[&str]| crate::daemon::ProviderDetail {
+            id: "ollama-cloud".to_string(),
+            name: "ollama-cloud".to_string(),
+            base_url: "https://ollama.com".to_string(),
+            key_env: None,
+            key_set: false,
+            key_usable: false,
+            key_optional: false,
+            models: ids
+                .iter()
+                .map(|id| crate::daemon::ProviderModel {
+                    id: id.to_string(),
+                    cost: None,
+                    thinking: None,
+                    context: None,
+                    output: None,
+                    vision: None,
+                })
+                .collect(),
+        };
+        assert_eq!(
+            default_provider_model("ollama-cloud", &entry(&["qwen3-coder", "llama4-scout"]))
+                .unwrap(),
+            "qwen3-coder"
+        );
+        let err = default_provider_model("ollama-cloud", &entry(&[])).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--provider ollama-cloud also needs --model"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("lists no models"), "{err}");
     }
 
     /// goose carries the key in its own environment, so `--provider`
@@ -1972,11 +2044,9 @@ mod tests {
                     .to_string()
                     .contains("--model <model>, or set OPENAI_TRANSCRIPTION_MODEL="));
             }
-            let err = check_model_flag(id, None, Some("openrouter"), speech, &none).unwrap_err();
-            assert!(err
-                .to_string()
-                .contains("--provider openrouter --model <model>"));
-            assert!(!err.to_string().contains("OPENAI_TRANSCRIPTION_MODEL"));
+            // Under --provider the resolver picks the model, speech
+            // model or not, so the guard lets it through there too.
+            assert!(check_model_flag(id, None, Some("openrouter"), speech, &none).is_ok());
         }
         // No other integration, the goose CLI included, is let off.
         for id in MODEL_REQUIRED.iter().filter(|id| **id != "goose-desktop") {
@@ -2090,6 +2160,42 @@ mod tests {
         assert_eq!(pair_context_window(Some(262_144), None), Some(262_144));
         assert_eq!(pair_context_window(None, Some(200_000)), Some(200_000));
         assert_eq!(pair_context_window(None, None), None);
+    }
+
+    /// The launch flag follows the selected provider model's own
+    /// capability — the same value the offered row carries — so a
+    /// model the catalog says takes images starts with vision on,
+    /// and one it says nothing about starts with it off rather than
+    /// refusing.
+    #[test]
+    fn provider_launch_vision_comes_from_the_selected_model() {
+        let resolved = |vision| ResolvedProvider {
+            reference: "llmman.provider/ollama-cloud/qwen3-coder".to_string(),
+            api_key: String::new(),
+            thinking: None,
+            context_window: None,
+            max_output: None,
+            vision,
+            models: vec![HostedModel {
+                reference: "llmman.provider/ollama-cloud/qwen3-coder".to_string(),
+                id: "qwen3-coder".to_string(),
+                context: None,
+                output: None,
+                thinking: None,
+                vision,
+            }],
+        };
+        for vision in [Some(true), Some(false), None] {
+            let selected = resolved(vision);
+            assert_eq!(
+                provider_vision(selected.vision),
+                provider_vision(selected.models[0].vision),
+                "launch flag disagrees with the selected row for {vision:?}"
+            );
+        }
+        assert!(provider_vision(resolved(Some(true)).vision));
+        assert!(!provider_vision(resolved(Some(false)).vision));
+        assert!(!provider_vision(resolved(None).vision));
     }
 
     /// The same precedence, minus codex's guess: the launchers that may

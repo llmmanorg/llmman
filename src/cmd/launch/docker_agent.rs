@@ -182,13 +182,20 @@ fn write_docker_agent_file(
 ///
 /// `hosted` lists every model the provider serves in `models:`, the
 /// launched one first under the `llmman` entry `root` selects; each
-/// other is keyed by the id the provider knows it by — the reference
-/// itself where that id would collide with the launched entry's name.
-/// Without it the map holds the one model this launch resolved.
+/// other is keyed by its full routing reference — the provider id
+/// alone is not unique: a provider listing `llmman` and
+/// `llmman.provider/p/llmman` as secondary ids gives both rows the
+/// key `llmman.provider/p/llmman`. References are unique per catalog
+/// (the daemon routes on them), so they are unique keys, and `llmman`
+/// stays reserved for the startup row. Each entry also carries the
+/// limits the catalog publishes for it (`provider_opts.context_size`
+/// for the window, `max_tokens` for the output budget), omitted
+/// where the catalog publishes none. Without it the map holds the one
+/// model this launch resolved.
 fn docker_agent_document(model: &str, base_url: &str, hosted: Option<&[HostedModel]>) -> String {
     let quoted_base_url = common::yaml_quote(base_url);
     let mut models = String::new();
-    for (key, reference) in docker_agent_model_entries(model, hosted) {
+    for (key, reference, context, output) in docker_agent_model_entries(model, hosted) {
         let quoted_key = if key == DOCKER_AGENT_MODEL_NAME {
             key.to_string()
         } else {
@@ -199,6 +206,14 @@ fn docker_agent_document(model: &str, base_url: &str, hosted: Option<&[HostedMod
             "  {quoted_key}:\n    provider: openai\n    model: {quoted_model}\n    \
              base_url: {quoted_base_url}\n    token_key: {DOCKER_AGENT_API_KEY_ENV}\n"
         ));
+        if let Some(context) = context {
+            models.push_str(&format!(
+                "    provider_opts:\n      context_size: {context}\n"
+            ));
+        }
+        if let Some(output) = output {
+            models.push_str(&format!("    max_tokens: {output}\n"));
+        }
     }
     format!(
         "# Written by `llmman launch docker-agent`; edits are overwritten.\n\
@@ -212,32 +227,42 @@ fn docker_agent_document(model: &str, base_url: &str, hosted: Option<&[HostedMod
     )
 }
 
-/// The `(key, model)` rows of the agent file's `models:` map: the one
-/// model this launch resolved, or — under `--provider` — every model
-/// the provider serves, the launched one first.
+/// The `(key, model, context, output)` rows of the agent file's
+/// `models:` map: the one model this launch resolved, or — under
+/// `--provider` — every model the provider serves, the launched one
+/// first. A row's context and output are what the catalog publishes
+/// for it, `None` where it publishes none — and `None` for the
+/// launched model too when the list somehow lacks it, since there is
+/// no catalog row to read them from.
 fn docker_agent_model_entries<'a>(
     model: &'a str,
     hosted: Option<&'a [HostedModel]>,
-) -> Vec<(&'a str, &'a str)> {
+) -> Vec<(&'a str, &'a str, Option<u64>, Option<u32>)> {
     let Some(hosted) = hosted else {
-        return vec![(DOCKER_AGENT_MODEL_NAME, model)];
+        return vec![(DOCKER_AGENT_MODEL_NAME, model, None, None)];
     };
-    let mut entries: Vec<(&str, &str)> = hosted
+    let mut entries: Vec<(&str, &str, Option<u64>, Option<u32>)> = hosted
         .iter()
         .map(|m| {
             if m.reference == model {
-                (DOCKER_AGENT_MODEL_NAME, model)
-            } else if m.id == DOCKER_AGENT_MODEL_NAME {
-                (m.reference.as_str(), m.reference.as_str())
+                (DOCKER_AGENT_MODEL_NAME, model, m.context, m.output)
             } else {
-                (m.id.as_str(), m.reference.as_str())
+                (
+                    m.reference.as_str(),
+                    m.reference.as_str(),
+                    m.context,
+                    m.output,
+                )
             }
         })
         .collect();
     // The launched model belongs in its own agent file even if the list
     // somehow lacks it: docker-agent is started on it.
-    if !entries.iter().any(|(_, reference)| *reference == model) {
-        entries.insert(0, (DOCKER_AGENT_MODEL_NAME, model));
+    if !entries
+        .iter()
+        .any(|(_, reference, _, _)| *reference == model)
+    {
+        entries.insert(0, (DOCKER_AGENT_MODEL_NAME, model, None, None));
     }
     entries
 }
@@ -325,8 +350,8 @@ mod tests {
     /// A `--provider` launch lists every model the provider serves, so
     /// docker-agent's own model picker can switch between them without a
     /// relaunch: the launched model first, under the `llmman` entry
-    /// `root` selects, and each other keyed by the id the provider knows
-    /// it by.
+    /// `root` selects, and each other keyed by its full routing
+    /// reference, carrying the limits the catalog publishes for it.
     #[test]
     fn docker_agent_document_lists_every_model_the_provider_serves() {
         let hosted = vec![
@@ -360,11 +385,19 @@ mod tests {
         assert_eq!(launched["model"], "llmman.provider/openrouter/qwen3-coder");
         assert_eq!(launched["base_url"], "http://127.0.0.1:17434/v1");
         assert_eq!(launched["token_key"], "LLMMAN_API_KEY");
-        let scout = &parsed["models"]["llama-4-scout"];
+        // The fixture publishes a 262,144-token window and an 8,192-token
+        // output ceiling for the launched model; both reach the file.
+        assert_eq!(launched["provider_opts"]["context_size"], 262_144);
+        assert_eq!(launched["max_tokens"], 8_192);
+        let scout = &parsed["models"]["llmman.provider/openrouter/llama-4-scout"];
         assert_eq!(scout["provider"], "openai");
         assert_eq!(scout["model"], "llmman.provider/openrouter/llama-4-scout");
         assert_eq!(scout["base_url"], "http://127.0.0.1:17434/v1");
         assert_eq!(scout["token_key"], "LLMMAN_API_KEY");
+        // The catalog publishes no limits for the scout, so none are
+        // written rather than a guess.
+        assert!(scout.get("provider_opts").is_none());
+        assert!(scout.get("max_tokens").is_none());
         assert_eq!(parsed["agents"]["root"]["model"], "llmman");
 
         // The launched model belongs in its own agent file even if the
@@ -376,8 +409,51 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert_eq!(parsed["models"]["llmman"]["model"], "m");
         assert_eq!(
-            parsed["models"]["llama-4-scout"]["model"],
+            parsed["models"]["llmman.provider/openrouter/llama-4-scout"]["model"],
             "llmman.provider/openrouter/llama-4-scout"
+        );
+    }
+
+    /// Two hosted rows must not share one YAML key. Provider `p`
+    /// listing `llmman` and `llmman.provider/p/llmman` as secondary ids
+    /// gives both rows the key `llmman.provider/p/llmman` under an
+    /// id-keyed scheme, and the map holds only one of them.
+    #[test]
+    fn docker_agent_model_keys_stay_unique_when_an_id_looks_like_a_reference() {
+        let hosted = vec![
+            HostedModel {
+                reference: "llmman.provider/p/llmman".into(),
+                id: "llmman".into(),
+                context: None,
+                output: None,
+                thinking: None,
+                vision: None,
+            },
+            HostedModel {
+                reference: "llmman.provider/p/llmman.provider/p/llmman".into(),
+                id: "llmman.provider/p/llmman".into(),
+                context: None,
+                output: None,
+                thinking: None,
+                vision: None,
+            },
+        ];
+        let document = docker_agent_document(
+            "llmman.provider/p/other",
+            "http://127.0.0.1:17434/v1",
+            Some(&hosted),
+        );
+        let parsed: serde_json::Value = yaml_serde::from_str(&document).expect("valid YAML");
+        let models = parsed["models"].as_object().unwrap();
+        assert_eq!(models.len(), 3);
+        assert_eq!(models["llmman"]["model"], "llmman.provider/p/other");
+        assert_eq!(
+            models["llmman.provider/p/llmman"]["model"],
+            "llmman.provider/p/llmman"
+        );
+        assert_eq!(
+            models["llmman.provider/p/llmman.provider/p/llmman"]["model"],
+            "llmman.provider/p/llmman.provider/p/llmman"
         );
     }
 

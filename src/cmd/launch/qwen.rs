@@ -302,9 +302,12 @@ fn qwen_settings_merged(
 /// The `modelProviders.openai` entries llmman owns: the one model this
 /// launch resolved, or — under `--provider` — every model the provider
 /// serves, the launched one first. Each other model takes what the
-/// catalog says about it: image input from its own `vision`, and no
-/// reasoning levels — only the launched model is started at a `--variant`,
-/// and its entry carries the effort that declares.
+/// catalog says about it: image input from its own `vision`, its own
+/// reasoning levels starting at the first level listed, and its own
+/// context and output limits. Only the launched model is started at a
+/// `--variant`, so only its entry carries the launch-selected default
+/// effort; a model need not be the startup model to expose the levels
+/// it supports.
 fn qwen_entries(
     model: &str,
     base_url: &str,
@@ -313,15 +316,33 @@ fn qwen_entries(
     hosted: Option<&[HostedModel]>,
 ) -> Vec<serde_json::Value> {
     let Some(hosted) = hosted else {
-        return vec![qwen_entry(model, base_url, vision, effort)];
+        return vec![qwen_entry(model, base_url, vision, effort, None, None)];
     };
     let mut entries: Vec<serde_json::Value> = hosted
         .iter()
         .map(|m| {
             if m.reference == model {
-                qwen_entry(model, base_url, vision, effort)
+                qwen_entry(model, base_url, vision, effort, m.context, m.output)
             } else {
-                qwen_entry(&m.reference, base_url, m.vision.unwrap_or(false), None)
+                // The catalog's levels, starting at the first one
+                // listed: the default here is the entry's own starting
+                // effort, never the launch-selected one. Both borrow
+                // from the catalog entry, not from the levels list
+                // built beside them.
+                let catalog_effort = m.thinking.as_ref().and_then(|levels| {
+                    levels.first().map(|default| Effort {
+                        default: default.as_str(),
+                        levels: levels.iter().map(String::as_str).collect(),
+                    })
+                });
+                qwen_entry(
+                    &m.reference,
+                    base_url,
+                    m.vision.unwrap_or(false),
+                    catalog_effort.as_ref(),
+                    m.context,
+                    m.output,
+                )
             }
         })
         .collect();
@@ -331,19 +352,24 @@ fn qwen_entries(
         .iter()
         .any(|entry| entry["id"].as_str() == Some(model))
     {
-        entries.insert(0, qwen_entry(model, base_url, vision, effort));
+        entries.insert(0, qwen_entry(model, base_url, vision, effort, None, None));
     }
     entries
 }
 
 /// One `modelProviders.openai` entry: the model at this daemon, keyed by
 /// [`QWEN_ENV_KEY`], with image input declared for a vision model and the
-/// reasoning levels for a `--variant`.
+/// reasoning levels for a `--variant`, plus the context window and output
+/// cap the catalog publishes for it, omitted where the catalog publishes
+/// none — the no-catalog path passes neither, so its entries are
+/// unchanged.
 fn qwen_entry(
     model: &str,
     base_url: &str,
     vision: bool,
     effort: Option<&Effort>,
+    context: Option<u64>,
+    output: Option<u32>,
 ) -> serde_json::Value {
     let mut entry = serde_json::json!({
         "id": model,
@@ -353,6 +379,12 @@ fn qwen_entry(
     });
     if vision {
         entry["generationConfig"] = serde_json::json!({ "modalities": { "image": true } });
+    }
+    if let Some(context) = context {
+        entry["generationConfig"]["contextWindowSize"] = serde_json::json!(context);
+    }
+    if let Some(output) = output {
+        entry["generationConfig"]["samplingParams"]["max_tokens"] = serde_json::json!(output);
     }
     if let Some(effort) = effort {
         let efforts: Vec<&str> = effort
@@ -850,6 +882,13 @@ mod tests {
             openai[0]["generationConfig"]["reasoning"],
             serde_json::json!({ "effort": "high" })
         );
+        // The fixture publishes a 262,144-token window and an 8,192-token
+        // output ceiling for the launched model; both reach its entry.
+        assert_eq!(openai[0]["generationConfig"]["contextWindowSize"], 262_144);
+        assert_eq!(
+            openai[0]["generationConfig"]["samplingParams"]["max_tokens"],
+            8_192
+        );
         assert_eq!(openai[1]["id"], "llmman.provider/openrouter/llama-4-scout");
         assert_eq!(
             openai[1]["generationConfig"],
@@ -877,6 +916,80 @@ mod tests {
             serde_json::json!({ "modalities": { "image": true } })
         );
         assert_eq!(openai[1]["id"], "llmman.provider/openrouter/llama-4-scout");
+    }
+
+    /// A model that is not the startup model still exposes the reasoning
+    /// levels its own catalog entry lists, and its own capacity limits:
+    /// the launch-selected default stays with the launched entry alone.
+    #[test]
+    fn qwen_settings_carry_a_secondary_models_reasoning_and_limits() {
+        let url = "http://127.0.0.1:17434/v1";
+        let hosted = vec![
+            HostedModel {
+                reference: "llmman.provider/openrouter/qwen3-coder".into(),
+                id: "qwen3-coder".into(),
+                context: Some(262_144),
+                output: Some(8_192),
+                thinking: Some(vec!["low".into(), "high".into()]),
+                vision: Some(false),
+            },
+            HostedModel {
+                reference: "llmman.provider/openrouter/scout".into(),
+                id: "scout".into(),
+                context: Some(32_768),
+                output: Some(4_096),
+                thinking: Some(vec!["medium".into(), "high".into()]),
+                vision: Some(false),
+            },
+        ];
+        let high = Effort {
+            default: "high",
+            levels: vec!["none", "low", "high"],
+        };
+        let merged = qwen_settings_merged(
+            &serde_json::json!({}),
+            "llmman.provider/openrouter/qwen3-coder",
+            url,
+            false,
+            Some(&high),
+            Some(&hosted),
+        );
+        let openai = merged["modelProviders"]["openai"].as_array().unwrap();
+        assert_eq!(openai.len(), 2);
+        // The launched entry keeps the variant's default, and its own
+        // limits rather than a guess.
+        assert_eq!(openai[0]["generationConfig"]["contextWindowSize"], 262_144);
+        assert_eq!(
+            openai[0]["generationConfig"]["samplingParams"]["max_tokens"],
+            8_192
+        );
+        assert_eq!(
+            openai[0]["generationConfig"]["reasoning"],
+            serde_json::json!({ "effort": "high" })
+        );
+        // The other entry starts at the first level its own catalog
+        // lists, and carries its own limits — not the launched model's.
+        let other = &openai[1];
+        assert_eq!(other["id"], "llmman.provider/openrouter/scout");
+        assert_eq!(other["generationConfig"]["contextWindowSize"], 32_768);
+        assert_eq!(
+            other["generationConfig"]["samplingParams"]["max_tokens"],
+            4_096
+        );
+        assert_eq!(
+            other["capabilities"]["reasoning"],
+            serde_json::json!({
+                "thinking": true,
+                "disableField": "reasoning_effort",
+                "profile": "openai-effort",
+                "efforts": ["medium", "high"],
+                "defaultEffort": "medium",
+            })
+        );
+        assert_eq!(
+            other["generationConfig"]["reasoning"],
+            serde_json::json!({ "effort": "medium" })
+        );
     }
 
     #[test]

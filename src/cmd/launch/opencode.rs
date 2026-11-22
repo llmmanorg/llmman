@@ -4,17 +4,24 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use super::common::write_json_merged;
+use super::common::{write_if_changed, write_json_merged};
 use super::optimizer::Optimizer;
 use super::{
     exec_with_env, find_on_path, server, thinking_choices, xdg_dir, HostedModel, Thinking,
     WINDOWS_PATH_EXTS,
 };
 
-/// opencode: a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
-/// /v1 endpoint, with the model's thinking variants, its window and, for
-/// a vision model, image input. `--variant` becomes the model's default
-/// options and its selection in opencode's state.
+/// opencode: a JSON config pointing at our /v1 endpoint, with the
+/// model's thinking variants, its window and, for a vision model,
+/// image input. `--variant` becomes the model's default options and
+/// its selection in opencode's state.
+///
+/// The config travels in two pieces (see `launch_opencode`): the model
+/// catalog in a file opencode reads via `OPENCODE_CONFIG`, and the
+/// launch itself — the model, the provider endpoint and the key — in a
+/// small `OPENCODE_CONFIG_CONTENT` override. The catalog is unbounded
+/// (a provider with 1,000 models is over the 128 KiB a single
+/// environment value may hold), the override is not.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn launch_opencode(
     model: &str,
@@ -34,10 +41,12 @@ pub(super) fn launch_opencode(
     let effective_model = if model.is_empty() { "default" } else { model };
     let variants = opencode_variants(thinking);
     let options = variant.and_then(|v| variants.iter().find(|(name, _)| *name == v));
+    let server = added.server.clone().unwrap_or_else(server);
+    let state_dir = opencode_state_dir()?;
     let config = opencode_config(
-        added.server.as_deref().unwrap_or(&server()),
+        &server,
         effective_model,
-        api_key,
+        None,
         &variants,
         options.map(|(_, options)| options),
         vision,
@@ -45,15 +54,27 @@ pub(super) fn launch_opencode(
         max_output,
         hosted,
     );
-    let config = with_added_config(&config, added.config.as_ref());
+    let config_path = write_opencode_config_file(&state_dir, &config)?;
+    let inline = with_added_config(
+        &opencode_inline_config(&server, effective_model, api_key),
+        added.config.as_ref(),
+    );
     if let Some(variant) = variant {
-        write_opencode_variant(&opencode_state_dir()?, effective_model, variant)?;
+        write_opencode_variant(&state_dir, effective_model, variant)?;
     }
 
     if let Some(notice) = optimizer.notice("opencode") {
         eprintln!("{notice}");
     }
-    exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
+    let config_path = config_path.to_string_lossy().into_owned();
+    exec_with_env(
+        &bin,
+        extra_args,
+        &[
+            ("OPENCODE_CONFIG", config_path.as_str()),
+            ("OPENCODE_CONFIG_CONTENT", &inline),
+        ],
+    )
 }
 
 /// `config` (a JSON object) with the keys of `added` appended, so the order
@@ -209,9 +230,15 @@ fn opencode_output_reserve(context: u64) -> u64 {
     (context / 4).clamp(1, OPENCODE_OUTPUT_TOKEN_MAX)
 }
 
-/// opencode's `OPENCODE_CONFIG_CONTENT` for `model` at `server`. Structs rather
-/// than `json!`, whose map sorts keys: opencode cycles variants in the
+/// opencode's config for `model` at `server`. Structs rather than
+/// `json!`, whose map sorts keys: opencode cycles variants in the
 /// order listed. No variants leaves the key out.
+///
+/// `api_key` is `None` in the copy written to a file (see
+/// `launch_opencode`): the key travels in the small inline override
+/// instead, so it never lands in a file — and so the file copy, the
+/// one that carries the unbounded model catalog, is never an
+/// environment value either.
 ///
 /// `hosted` is every model `--provider` serves (see [`HostedModel`]); with
 /// it, the config lists all of them, so opencode's own model picker can
@@ -223,7 +250,7 @@ fn opencode_output_reserve(context: u64) -> u64 {
 fn opencode_config(
     server: &str,
     model: &str,
-    api_key: &str,
+    api_key: Option<&str>,
     variants: &[(&str, serde_json::Value)],
     options: Option<&serde_json::Value>,
     vision: bool,
@@ -268,8 +295,8 @@ fn opencode_config(
     struct Options<'a> {
         #[serde(rename = "baseURL")]
         base_url: String,
-        #[serde(rename = "apiKey")]
-        api_key: &'a str,
+        #[serde(rename = "apiKey", skip_serializing_if = "Option::is_none")]
+        api_key: Option<&'a str>,
     }
     #[derive(serde::Serialize)]
     struct Model<'a> {
@@ -431,6 +458,64 @@ fn opencode_config(
     serde_json::to_string(&config).expect("opencode config serializes")
 }
 
+/// The file llmman's opencode config is written to for a launch:
+/// `llmman-config.json` beside the `model.json` variant selection in
+/// opencode's state directory — session-scoped, not the user's global
+/// or project config, and already among the directories `--sandbox`
+/// lets opencode use (see `sandbox_state`). One path, rewritten each
+/// launch, as codex's `llmman-model.json` is: opencode reads its
+/// config once at startup, so a later launch rewriting it cannot
+/// disturb a running session.
+fn opencode_config_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("llmman-config.json")
+}
+
+/// Writes `config` to [`opencode_config_path`] (creating the
+/// directory), returning the path to point `OPENCODE_CONFIG` at. The
+/// config holds no API key — see `opencode_inline_config` — so the
+/// file needs no tighter permissions than the state directory's own.
+fn write_opencode_config_file(state_dir: &Path, config: &str) -> anyhow::Result<PathBuf> {
+    let path = opencode_config_path(state_dir);
+    write_if_changed(&path, config)?;
+    Ok(path)
+}
+
+/// The small `OPENCODE_CONFIG_CONTENT` override for a launch: the
+/// model to start on, and the provider that serves it — its name, the
+/// endpoint and the key — nothing else. The model catalog itself rides
+/// in the file [`write_opencode_config_file`] writes, so this stays a
+/// few hundred bytes however many models the provider serves.
+///
+/// Both pieces reach opencode, and it deep-merges its config layers
+/// (later layers override earlier ones field by field, providers
+/// merged per provider), so the file's `models` survive beside the
+/// inline's `options` — and the inline, the highest-precedence layer,
+/// keeps a project config from retargeting the launched model or the
+/// provider that serves it. The key never lands in the file: it
+/// travels in this value alone.
+///
+/// One thing the split does not preserve: a caller who already had
+/// `OPENCODE_CONFIG` set loses that file — the variable now names
+/// llmman's file, and opencode loads exactly one custom config path.
+/// It used to load below the inline config, so nothing llmman set
+/// changes; only the caller's own custom file stops loading.
+fn opencode_inline_config(server: &str, model: &str, api_key: &str) -> String {
+    serde_json::json!({
+        "model": opencode_model_ref(model),
+        "provider": {
+            "ollama": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "llmman",
+                "options": {
+                    "baseURL": format!("{server}/v1"),
+                    "apiKey": api_key,
+                },
+            },
+        },
+    })
+    .to_string()
+}
+
 /// opencode's `limit` for a model with a known window: the catalog's own
 /// ceiling wherever there is one, derived where it names none.
 fn model_limit(context: u64, output: Option<u32>) -> Limit {
@@ -461,7 +546,7 @@ mod tests {
         let text = opencode_config(
             "http://127.0.0.1:17434",
             "qwen3.5:0.8b",
-            "k",
+            Some("k"),
             &variants,
             None,
             false,
@@ -492,7 +577,17 @@ mod tests {
             .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
 
-        let bare = opencode_config("http://h", "m", "k", &[], None, false, None, None, None);
+        let bare = opencode_config(
+            "http://h",
+            "m",
+            Some("k"),
+            &[],
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
         assert!(!bare.contains("variants"), "{bare}");
     }
 
@@ -505,7 +600,7 @@ mod tests {
         let text = opencode_config(
             "http://h",
             "m",
-            "k",
+            Some("k"),
             &variants,
             Some(&high.1),
             false,
@@ -521,7 +616,15 @@ mod tests {
         );
 
         let text = opencode_config(
-            "http://h", "m", "k", &variants, None, false, None, None, None,
+            "http://h",
+            "m",
+            Some("k"),
+            &variants,
+            None,
+            false,
+            None,
+            None,
+            None,
         );
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert!(config["provider"]["ollama"]["models"]["m"]["options"].is_null());
@@ -596,7 +699,10 @@ mod tests {
                 id: "beta".into(),
                 context: Some(65_536),
                 output: None,
-                thinking: None,
+                // A level the portable defaults never offer, so the
+                // assertions below can only pass if the generator
+                // reads beta's own published levels.
+                thinking: Some(vec!["xhigh".into()]),
                 vision: Some(true),
             },
             HostedModel {
@@ -613,7 +719,7 @@ mod tests {
         let text = opencode_config(
             "http://h",
             "llmman.provider/p/alpha",
-            "k",
+            Some("k"),
             &variants,
             None,
             false,
@@ -632,7 +738,8 @@ mod tests {
         assert!(alpha.get("attachment").is_none(), "{alpha}");
 
         // beta declares image input from its own catalog row, with its
-        // own thinking levels and window beside it.
+        // own thinking levels and window beside it — exactly the one
+        // level it publishes, and no portable default.
         let beta = &models["llmman.provider/p/beta"];
         assert_eq!(beta["name"], "beta");
         assert_eq!(
@@ -643,12 +750,8 @@ mod tests {
         assert_eq!(beta["limit"]["context"], 65_536);
         assert_eq!(beta["limit"]["output"], 16_384);
         assert_eq!(
-            beta["variants"]["low"],
-            serde_json::json!({ "reasoningEffort": "low" })
-        );
-        assert_eq!(
-            beta["variants"]["high"],
-            serde_json::json!({ "reasoningEffort": "high" })
+            beta["variants"],
+            serde_json::json!({ "xhigh": { "reasoningEffort": "xhigh" } })
         );
 
         // gamma: the catalog is silent, so neither key appears.
@@ -667,12 +770,152 @@ mod tests {
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
     }
 
+    /// The file copy of the config carries no API key: the key travels
+    /// in the small inline override alone (see `opencode_inline_config`),
+    /// so it never lands in a file.
+    #[test]
+    fn opencode_config_without_a_key_omits_it() {
+        let variants = opencode_variants(None);
+        let text = opencode_config(
+            "http://h",
+            "m",
+            None,
+            &variants,
+            None,
+            false,
+            Some(8_192),
+            None,
+            None,
+        );
+        assert!(!text.contains("apiKey"), "{text}");
+        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let provider = &config["provider"]["ollama"];
+        assert_eq!(provider["options"]["baseURL"], "http://h/v1");
+        assert_eq!(provider["models"]["m"]["limit"]["context"], 8_192);
+    }
+
+    /// The inline override names the launch — the model, the provider,
+    /// the endpoint and the key — and nothing of the catalog: its size
+    /// does not grow with the provider's model list.
+    #[test]
+    fn opencode_inline_config_carries_the_launch_not_the_catalog() {
+        let inline = opencode_inline_config("http://h", "m", "k");
+        let parsed: serde_json::Value = serde_json::from_str(&inline).expect("valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "model": "ollama/m",
+                "provider": {
+                    "ollama": {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "name": "llmman",
+                        "options": {
+                            "baseURL": "http://h/v1",
+                            "apiKey": "k",
+                        },
+                    },
+                },
+            })
+        );
+    }
+
+    /// A provider with 1,000 models and four variants each used to ride
+    /// in one `OPENCODE_CONFIG_CONTENT` value — over the 128 KiB a
+    /// single environment string may hold, so the kernel refused the
+    /// launch (E2BIG) before opencode started. The file now holds that
+    /// catalog, and the environment carries only the file's path and
+    /// the small inline override.
+    #[test]
+    fn opencode_handoff_stays_bounded_for_a_large_catalog() {
+        let hosted: Vec<HostedModel> = (0..1000)
+            .map(|i| HostedModel {
+                reference: format!("llmman.provider/p/model-{i:04}"),
+                id: format!("model-{i:04}"),
+                context: Some(128_000),
+                output: Some(8_192),
+                thinking: Some(vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                ]),
+                vision: Some(true),
+            })
+            .collect();
+        let variants = opencode_variants(None);
+        let file = opencode_config(
+            "http://h",
+            "llmman.provider/p/model-0000",
+            None,
+            &variants,
+            None,
+            false,
+            Some(128_000),
+            Some(8_192),
+            Some(&hosted),
+        );
+        // The old handoff would have put this in one environment
+        // value; it no longer fits in one.
+        assert!(file.len() > 128 * 1024, "file is {} bytes", file.len());
+        assert!(!file.contains("apiKey"), "the key never lands in the file");
+        let parsed: serde_json::Value = serde_json::from_str(&file).expect("valid JSON");
+        assert_eq!(
+            parsed["provider"]["ollama"]["models"]
+                .as_object()
+                .map(|m| m.len()),
+            Some(1000)
+        );
+
+        // The new handoff's environment values: a path, and this.
+        let inline = opencode_inline_config("http://h", "llmman.provider/p/model-0000", "k");
+        assert!(inline.len() < 1024, "inline is {} bytes", inline.len());
+        assert!(!inline.contains("model-0001"), "{inline}");
+    }
+
+    /// The config file is written beside the variant selection, in
+    /// opencode's state directory, and a second write of the same
+    /// config leaves it alone.
+    #[test]
+    fn write_opencode_config_file_writes_beside_the_variant_selection() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-opencode-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = dir.join("state").join("opencode");
+        let path = write_opencode_config_file(&state, r#"{"model":"ollama/m"}"#).unwrap();
+        assert_eq!(path, state.join("llmman-config.json"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"model":"ollama/m"}"#
+        );
+        write_opencode_config_file(&state, r#"{"model":"ollama/m"}"#).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"model":"ollama/m"}"#
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A local launch's single row still declares image input from
     /// the launch, as before — the per-model change is only that a
     /// hosted model no longer has to be the launched one to get it.
     #[test]
     fn opencode_config_declares_image_input_only_for_a_vision_model() {
-        let text = opencode_config("http://h", "m", "k", &[], None, true, None, None, None);
+        let text = opencode_config(
+            "http://h",
+            "m",
+            Some("k"),
+            &[],
+            None,
+            true,
+            None,
+            None,
+            None,
+        );
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         let model = &config["provider"]["ollama"]["models"]["m"];
         assert_eq!(
@@ -681,7 +924,17 @@ mod tests {
         );
         assert_eq!(model["attachment"], true);
 
-        let text_only = opencode_config("http://h", "m", "k", &[], None, false, None, None, None);
+        let text_only = opencode_config(
+            "http://h",
+            "m",
+            Some("k"),
+            &[],
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
         assert!(!text_only.contains("modalities"), "{text_only}");
         assert!(!text_only.contains("attachment"), "{text_only}");
     }
@@ -712,7 +965,7 @@ mod tests {
         let text = opencode_config(
             "http://h",
             "m",
-            "k",
+            Some("k"),
             &[],
             None,
             false,
@@ -727,7 +980,17 @@ mod tests {
         assert_eq!(limit["output"], 2048);
 
         // No window: the key stays out and opencode keeps its defaults.
-        let unknown = opencode_config("http://h", "m", "k", &[], None, false, None, None, None);
+        let unknown = opencode_config(
+            "http://h",
+            "m",
+            Some("k"),
+            &[],
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
         assert!(!unknown.contains("limit"), "{unknown}");
     }
 
@@ -739,7 +1002,7 @@ mod tests {
         let hosted = opencode_config(
             "http://h",
             "m",
-            "k",
+            Some("k"),
             &[],
             None,
             false,
@@ -760,7 +1023,7 @@ mod tests {
         let local = opencode_config(
             "http://h",
             "m",
-            "k",
+            Some("k"),
             &[],
             None,
             false,
@@ -781,7 +1044,7 @@ mod tests {
         let config: serde_json::Value = serde_json::from_str(&opencode_config(
             "http://h",
             model,
-            "k",
+            Some("k"),
             &[],
             None,
             false,
