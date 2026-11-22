@@ -112,10 +112,13 @@ A llama-server, media or speech container that passes a GPU (`--gpus` or a
 caches Mesa RADV (`~/.cache/mesa_shader_cache`) and MIOpen
 (`~/.cache/miopen`) write during the run work for that run; vLLM and
 SGLang already mount it. A forwarded `VLLM_RPC_BASE_PATH` (vLLM's IPC
-socket directory) must be an absolute path: one outside the tmpfs list
-above gets its own `--tmpfs <path>:exec`, and a relative or empty value,
-or one containing `:`, `,` or a `..` segment, fails the load with a message
-naming the variable and the value.
+socket directory), `VLLM_CACHE_ROOT` (its cache root) or `VLLM_CONFIG_ROOT`
+(its config root) must be an absolute path: one outside the tmpfs list
+above gets its own `--tmpfs <path>:exec` (repeated slashes and `.`
+segments are cleaned, and two variables on one path share a mount), and a
+relative or empty value, `/`, one at or under `/models` (the read-only
+model mount), or one containing `:`, `,` or a `..` segment, fails the load
+with a message naming the variable and the value.
 
 **NVIDIA:** `--read-only` is skipped for a backend that passes `--gpus`
 (CUDA, and Vulkan when `/dev/nvidiactl` exists, which adds `--gpus all`
