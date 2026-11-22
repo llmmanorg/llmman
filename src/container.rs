@@ -28,7 +28,7 @@
 //! `--device`/`--gpus` flags* to run, which `crate::hostgpu` has no
 //! reason to know about.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
@@ -56,7 +56,9 @@ impl ContainerManager {
     /// Whether `--runtime auto` should try this engine: its CLI is on
     /// `PATH`, `<cli> info` answers within [`PROBE_TIMEOUT`] (a wedged
     /// daemon socket can hang it), and when [`GpuBackend::engine_args`]
-    /// will pass `--gpus`, the NVIDIA Container Toolkit is present. `Err`
+    /// will pass `--gpus`, the NVIDIA Container Toolkit is present (or a
+    /// CUDA backend can pass the driver through without it, see
+    /// [`GpuBackend::container_args`]). `Err`
     /// says why not, for the log. An explicit `--runtime docker|podman`
     /// skips this and lets the engine report its own errors.
     pub fn probe(self) -> Result<()> {
@@ -92,25 +94,33 @@ impl ContainerManager {
             // first load.
             let _ = identity::docker_is_rootless();
         }
-        let wants_gpus = detect_backend().engine_args().iter().any(|a| a == "--gpus");
-        gpu_gate(require_gpu_toolkit, wants_gpus, cli, || {
-            nvidia_toolkit_present(self)
-        })
+        let backend = detect_backend();
+        let wants_gpus = backend.engine_args().iter().any(|a| a == "--gpus");
+        gpu_gate(
+            require_gpu_toolkit,
+            wants_gpus,
+            cli,
+            || nvidia_toolkit_present(self),
+            || backend.is_cuda() && host_nvidia_direct_args().is_some(),
+        )
     }
 }
 
 /// The toolkit rule of [`ContainerManager::probe`]: when the detected
 /// backend wants `--gpus` and the run would need it, the NVIDIA Container
-/// Toolkit must be present. A CPU-only run (`require_gpu_toolkit` false)
-/// passes whatever the host has; `toolkit_present` is only consulted when
-/// the rule applies.
+/// Toolkit must be present, or (`direct_feasible`) the CUDA backend can
+/// pass the driver through without it ([`direct_nvidia_args`]). A
+/// CPU-only run (`require_gpu_toolkit` false) passes whatever the host
+/// has; `toolkit_present` and `direct_feasible` are only consulted when
+/// the rule applies, the second only when the toolkit is absent.
 fn gpu_gate(
     require_gpu_toolkit: bool,
     wants_gpus: bool,
     cli: &str,
     toolkit_present: impl FnOnce() -> bool,
+    direct_feasible: impl FnOnce() -> bool,
 ) -> Result<()> {
-    if require_gpu_toolkit && wants_gpus && !toolkit_present() {
+    if require_gpu_toolkit && wants_gpus && !toolkit_present() && !direct_feasible() {
         anyhow::bail!(
             "an NVIDIA GPU was detected but no NVIDIA Container Toolkit for {cli} \
              (`{cli} run --gpus all` would fail)"
@@ -191,6 +201,141 @@ fn nvidia_toolkit_present(ociman: ContainerManager) -> bool {
     false
 }
 
+/// The Debian-style multiarch directory for `arch` (a
+/// `std::env::consts::ARCH`), where the CUDA images look for driver
+/// libraries.
+fn multiarch_dir(arch: &str) -> Option<&'static str> {
+    match arch {
+        "x86_64" => Some("x86_64-linux-gnu"),
+        "aarch64" => Some("aarch64-linux-gnu"),
+        _ => None,
+    }
+}
+
+/// The NVIDIA device nodes under `dev`, in the order they are passed:
+/// the fixed control nodes that exist, then every `nvidia<N>` by number.
+fn nvidia_device_nodes(dev: &Path) -> Vec<PathBuf> {
+    let mut nodes: Vec<PathBuf> = [
+        "nvidiactl",
+        "nvidia-uvm",
+        "nvidia-uvm-tools",
+        "nvidia-modeset",
+    ]
+    .iter()
+    .map(|n| dev.join(n))
+    .filter(|p| p.exists())
+    .collect();
+    let mut gpus: Vec<(u32, PathBuf)> = std::fs::read_dir(dev)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let digits = name.to_str()?.strip_prefix("nvidia")?;
+            if !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some((digits.parse().ok()?, e.path()))
+        })
+        .collect();
+    gpus.sort();
+    nodes.extend(gpus.into_iter().map(|(_, p)| p));
+    nodes
+}
+
+/// Whether `name` is an NVIDIA user-space driver library:
+/// `libcuda.so*` or `libnvidia-*.so*`, but not the toolkit's own
+/// `libnvidia-container*`.
+fn is_nvidia_driver_lib(name: &str) -> bool {
+    name.starts_with("libcuda.so")
+        || (name.starts_with("libnvidia-")
+            && !name.starts_with("libnvidia-container")
+            && name.contains(".so"))
+}
+
+/// Where the driver's libraries live on a host, in precedence order.
+fn nvidia_lib_dirs(multiarch: &str) -> Vec<PathBuf> {
+    [
+        "/usr/lib64".to_string(),
+        format!("/usr/lib/{multiarch}"),
+        "/usr/lib".to_string(),
+        "/lib64".to_string(),
+        format!("/lib/{multiarch}"),
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
+/// Every [`is_nvidia_driver_lib`] entry of `dirs`, in order, as its own
+/// name and the real file it resolves to (a soname symlink such as
+/// `libcuda.so.1` keeps its name but binds the file behind it). An entry
+/// that does not resolve to a file is skipped.
+fn scan_nvidia_libs(dirs: &[PathBuf]) -> Vec<(String, PathBuf)> {
+    let mut libs = Vec::new();
+    for dir in dirs {
+        let mut found: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                if !is_nvidia_driver_lib(&name) {
+                    return None;
+                }
+                let real = std::fs::canonicalize(e.path()).ok()?;
+                real.is_file().then_some((name, real))
+            })
+            .collect();
+        found.sort();
+        libs.extend(found);
+    }
+    libs
+}
+
+/// The `run` arguments for NVIDIA passthrough without the container
+/// toolkit: `--device` for each of `devices`, and a read-only bind mount
+/// of each of `libs` (name, host file) into `/usr/lib/<multiarch>/`
+/// under its own name, the first of a name winning. `None` unless the
+/// driver is usable that way: `nvidiactl` among `devices` and
+/// `libcuda.so.1` among `libs`. The image keeps its own CUDA runtime.
+fn direct_nvidia_args(
+    devices: &[PathBuf],
+    libs: &[(String, PathBuf)],
+    multiarch: &str,
+) -> Option<Vec<String>> {
+    let mut names = std::collections::HashSet::new();
+    let libs: Vec<&(String, PathBuf)> = libs
+        .iter()
+        .filter(|(name, _)| is_nvidia_driver_lib(name) && names.insert(name.as_str()))
+        .collect();
+    let has_ctl = devices
+        .iter()
+        .any(|d| d.file_name().is_some_and(|n| n == "nvidiactl"));
+    if !has_ctl || !names.contains("libcuda.so.1") {
+        return None;
+    }
+    let mut args: Vec<String> = devices
+        .iter()
+        .flat_map(|d| ["--device".to_string(), d.display().to_string()])
+        .collect();
+    for (name, path) in libs {
+        args.push("-v".into());
+        args.push(format!("{}:/usr/lib/{multiarch}/{name}:ro", path.display()));
+    }
+    Some(args)
+}
+
+/// [`direct_nvidia_args`] for this host's `/dev` and driver libraries.
+fn host_nvidia_direct_args() -> Option<Vec<String>> {
+    let multiarch = multiarch_dir(std::env::consts::ARCH)?;
+    direct_nvidia_args(
+        &nvidia_device_nodes(Path::new("/dev")),
+        &scan_nvidia_libs(&nvidia_lib_dirs(multiarch)),
+        multiarch,
+    )
+}
+
 /// Container GPU backends this module can run with a matching
 /// `ghcr.io/ggml-org/llama.cpp:server-*` image for. Deliberately a subset
 /// of every tag llama.cpp publishes (musa/intel/openvino are skipped): as
@@ -266,6 +411,31 @@ impl GpuBackend {
                 args
             }
         }
+    }
+
+    fn is_cuda(self) -> bool {
+        matches!(self, GpuBackend::Cuda12 | GpuBackend::Cuda13)
+    }
+
+    /// [`engine_args`](Self::engine_args) for a run on `ociman`: a CUDA
+    /// backend on a host without the NVIDIA Container Toolkit passes the
+    /// driver through directly ([`host_nvidia_direct_args`]) when it can,
+    /// where `--gpus all` would fail.
+    fn container_args(self, ociman: ContainerManager) -> Vec<String> {
+        self.container_args_with(|| nvidia_toolkit_present(ociman), host_nvidia_direct_args)
+    }
+
+    fn container_args_with(
+        self,
+        toolkit_present: impl FnOnce() -> bool,
+        direct_args: impl FnOnce() -> Option<Vec<String>>,
+    ) -> Vec<String> {
+        if self.is_cuda() && !toolkit_present() {
+            if let Some(args) = direct_args() {
+                return args;
+            }
+        }
+        self.engine_args()
     }
 }
 
@@ -732,9 +902,11 @@ pub(crate) fn verify_llama_server_runs(
     let user = hardened
         .then(|| HardenedUser::resolve(ociman, None))
         .flatten();
+    let engine_args = backend.container_args(ociman);
     let mut cmd = std::process::Command::new(cli);
     cmd.args(verify_args(
         backend,
+        engine_args.clone(),
         version,
         &name,
         hardened,
@@ -742,7 +914,6 @@ pub(crate) fn verify_llama_server_runs(
     ))
     .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::null());
-    let engine_args = backend.engine_args();
     let suffix = if hardened {
         format!(
             "; {}",
@@ -775,10 +946,12 @@ pub(crate) fn verify_llama_server_runs(
     }
 }
 
-/// The GPU passthrough, GPU-visibility environment and `hardened` flags
-/// match what [`spawn`] serves with.
+/// The GPU passthrough (`engine_args`, from [`GpuBackend::container_args`]),
+/// GPU-visibility environment and `hardened` flags match what [`spawn`]
+/// serves with.
 fn verify_args(
     backend: GpuBackend,
+    engine_args: Vec<String>,
     version: Option<&str>,
     name: &str,
     hardened: bool,
@@ -791,7 +964,6 @@ fn verify_args(
         "--name".into(),
         name.into(),
     ];
-    let engine_args = backend.engine_args();
     if hardened {
         args.extend(hardened_flags(
             &engine_args,
@@ -914,7 +1086,7 @@ pub fn spawn(
         .then(|| HardenedUser::resolve(ociman, Some(Path::new(&model_dir))))
         .flatten();
     let args = llama_run_args(
-        backend,
+        backend.container_args(ociman),
         image,
         &model_dir,
         &model_file,
@@ -942,10 +1114,11 @@ fn mount_split(path: &Path, what: &str) -> Result<(String, String)> {
 /// [`spawn`]'s argv, split out so the flags are testable without an
 /// engine. `mmproj` is the mmproj's `(mount dir, file name)`, mounted
 /// as its own `/mmproj` volume. `user` is the [`HardenedUser`] the
-/// caller resolved for the store, if any.
+/// caller resolved for the store, if any. `engine_args` is the backend's
+/// [`GpuBackend::container_args`].
 #[allow(clippy::too_many_arguments)]
 fn llama_run_args(
-    backend: GpuBackend,
+    engine_args: Vec<String>,
     image: String,
     model_dir: &str,
     model_file: &str,
@@ -969,7 +1142,6 @@ fn llama_run_args(
         hardened,
         extra_args,
     } = opts;
-    let engine_args = backend.engine_args();
     let tmpfs = llama_tmpfs(&engine_args);
     let mut args = run_args(
         engine_args,
@@ -1418,10 +1590,13 @@ impl HardenedSpawn {
     /// container on a host whose probe returned `host`, run as `user`
     /// ([`HardenedUser::resolve`]), with `rpc_tmpfs` the
     /// [`vllm_rpc_tmpfs`] value (used by [`HardenedSpawn::Vllm`] only),
-    /// reading `mounted`.
+    /// reading `mounted`. `llama_args` yields the llama.cpp container's
+    /// [`GpuBackend::container_args`] (used by [`HardenedSpawn::LlamaServer`]
+    /// only).
     fn note(
         self,
         host: GpuBackend,
+        llama_args: impl FnOnce() -> Vec<String>,
         user: Option<&HardenedUser>,
         rpc_tmpfs: Option<&str>,
         mounted: &str,
@@ -1433,7 +1608,7 @@ impl HardenedSpawn {
                 user,
             ),
             Self::LlamaServer => {
-                let engine_args = host.engine_args();
+                let engine_args = llama_args();
                 hardened_flags(&engine_args, &llama_tmpfs(&engine_args), user)
             }
             Self::Speech => {
@@ -1467,8 +1642,10 @@ pub(crate) fn spawn_hardened_note(
     )
     .ok()
     .flatten();
+    let host = detect_backend();
     spawn.note(
-        detect_backend(),
+        host,
+        || host.container_args(ociman),
         user.as_ref(),
         rpc_tmpfs.as_deref(),
         &mounted.display().to_string(),
@@ -1688,7 +1865,7 @@ pub(crate) fn spawn_mediagen(
         .then(|| HardenedUser::resolve(ociman, Some(store_path)))
         .flatten();
     let args = mediagen_run_args(
-        backend,
+        backend.container_args(ociman),
         image,
         &exe,
         &store,
@@ -1706,7 +1883,7 @@ pub(crate) fn spawn_mediagen(
 /// and hardened block are testable without an engine.
 #[allow(clippy::too_many_arguments)]
 fn mediagen_run_args(
-    backend: GpuBackend,
+    engine_args: Vec<String>,
     image: String,
     exe: &str,
     store: &str,
@@ -1722,7 +1899,6 @@ fn mediagen_run_args(
         crate::cmd::serve::MEDIAGEN_ENV_PASSTHROUGH_VARS,
     ]
     .concat();
-    let engine_args = backend.engine_args();
     let tmpfs = llama_tmpfs(&engine_args);
     let mut args = run_args(
         engine_args,
@@ -1895,20 +2071,318 @@ mod tests {
     /// toolkit, both pass and the toolkit is not even looked for.
     #[test]
     fn the_cpu_only_probe_passes_where_the_toolkit_alone_refuses() {
-        let err = gpu_gate(true, true, "docker", || false)
+        let err = gpu_gate(true, true, "docker", || false, || false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("NVIDIA Container Toolkit"), "{err}");
-        gpu_gate(false, true, "docker", || false).unwrap();
-        gpu_gate(true, true, "docker", || true).unwrap();
-        gpu_gate(true, false, "docker", || {
-            unreachable!("no GPU, no toolkit check")
-        })
+        gpu_gate(false, true, "docker", || false, || false).unwrap();
+        gpu_gate(true, true, "docker", || true, || false).unwrap();
+        gpu_gate(
+            true,
+            false,
+            "docker",
+            || unreachable!("no GPU, no toolkit check"),
+            || unreachable!("no GPU, no direct check"),
+        )
         .unwrap();
-        gpu_gate(false, false, "docker", || {
-            unreachable!("no GPU, no toolkit check")
-        })
+        gpu_gate(
+            false,
+            false,
+            "docker",
+            || unreachable!("no GPU, no toolkit check"),
+            || unreachable!("no GPU, no direct check"),
+        )
         .unwrap();
+    }
+
+    #[test]
+    fn the_gate_passes_without_the_toolkit_when_direct_passthrough_is_feasible() {
+        gpu_gate(true, true, "docker", || false, || true).unwrap();
+        let err = gpu_gate(true, true, "docker", || false, || false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "an NVIDIA GPU was detected but no NVIDIA Container Toolkit for docker \
+             (`docker run --gpus all` would fail)"
+        );
+        gpu_gate(
+            true,
+            true,
+            "docker",
+            || true,
+            || unreachable!("the toolkit is present: direct passthrough is not consulted"),
+        )
+        .unwrap();
+        gpu_gate(
+            false,
+            true,
+            "docker",
+            || unreachable!("a CPU-only run needs no toolkit"),
+            || unreachable!("a CPU-only run needs no passthrough"),
+        )
+        .unwrap();
+    }
+
+    fn pb(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    fn lib(name: &str, path: &str) -> (String, PathBuf) {
+        (name.to_string(), PathBuf::from(path))
+    }
+
+    #[test]
+    fn direct_nvidia_args_pass_devices_then_read_only_driver_libs() {
+        let args = direct_nvidia_args(
+            &pb(&["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia0"]),
+            &[
+                lib("libcuda.so.1", "/usr/lib/libcuda.so.580.1"),
+                lib("libnvidia-ml.so.1", "/usr/lib/libnvidia-ml.so.580.1"),
+            ],
+            "x86_64-linux-gnu",
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            [
+                "--device",
+                "/dev/nvidiactl",
+                "--device",
+                "/dev/nvidia-uvm",
+                "--device",
+                "/dev/nvidia0",
+                "-v",
+                "/usr/lib/libcuda.so.580.1:/usr/lib/x86_64-linux-gnu/libcuda.so.1:ro",
+                "-v",
+                "/usr/lib/libnvidia-ml.so.580.1:/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:ro",
+            ]
+        );
+        assert!(!passes_gpus(&args));
+        assert!(passes_devices(&args));
+    }
+
+    #[test]
+    fn direct_nvidia_args_use_the_multiarch_dir_of_the_host() {
+        for (arch, multiarch) in [
+            ("x86_64", "x86_64-linux-gnu"),
+            ("aarch64", "aarch64-linux-gnu"),
+        ] {
+            assert_eq!(multiarch_dir(arch), Some(multiarch));
+            let args = direct_nvidia_args(
+                &pb(&["/dev/nvidiactl"]),
+                &[lib("libcuda.so.1", "/usr/lib64/libcuda.so.1")],
+                multiarch,
+            )
+            .unwrap();
+            assert_eq!(
+                args.last().unwrap(),
+                &format!("/usr/lib64/libcuda.so.1:/usr/lib/{multiarch}/libcuda.so.1:ro")
+            );
+        }
+        assert_eq!(multiarch_dir("riscv64"), None);
+    }
+
+    #[test]
+    fn direct_nvidia_args_skip_the_toolkit_libs_and_dedup_by_name() {
+        let args = direct_nvidia_args(
+            &pb(&["/dev/nvidiactl"]),
+            &[
+                lib("libcuda.so.1", "/usr/lib64/libcuda.so.580.1"),
+                lib(
+                    "libnvidia-container.so.1",
+                    "/usr/lib64/libnvidia-container.so.1",
+                ),
+                lib(
+                    "libnvidia-container-go.so.1",
+                    "/usr/lib64/libnvidia-container-go.so.1",
+                ),
+                lib("libcuda.so.1", "/usr/lib/libcuda.so.1"),
+                lib("libnvidia-ml.so.1", "/usr/lib/libnvidia-ml.so.1"),
+            ],
+            "x86_64-linux-gnu",
+        )
+        .unwrap();
+        let mounts: Vec<&String> = args.iter().filter(|a| a.contains(":/usr/lib/")).collect();
+        assert_eq!(
+            mounts,
+            [
+                "/usr/lib64/libcuda.so.580.1:/usr/lib/x86_64-linux-gnu/libcuda.so.1:ro",
+                "/usr/lib/libnvidia-ml.so.1:/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:ro",
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_nvidia_args_need_nvidiactl_and_libcuda() {
+        let libcuda = [lib("libcuda.so.1", "/usr/lib/libcuda.so.1")];
+        let m = "x86_64-linux-gnu";
+        assert!(direct_nvidia_args(&pb(&["/dev/nvidia0"]), &libcuda, m).is_none());
+        assert!(direct_nvidia_args(&[], &libcuda, m).is_none());
+        assert!(direct_nvidia_args(&pb(&["/dev/nvidiactl"]), &[], m).is_none());
+        let only_dev_symlink = [lib("libcuda.so", "/usr/lib/libcuda.so")];
+        assert!(direct_nvidia_args(&pb(&["/dev/nvidiactl"]), &only_dev_symlink, m).is_none());
+        let only_container = [lib("libnvidia-container.so.1", "/usr/lib/x.so")];
+        assert!(direct_nvidia_args(&pb(&["/dev/nvidiactl"]), &only_container, m).is_none());
+    }
+
+    #[test]
+    fn nvidia_driver_lib_names() {
+        for name in [
+            "libcuda.so",
+            "libcuda.so.1",
+            "libcuda.so.580.1",
+            "libnvidia-ml.so.1",
+            "libnvidia-nvvm.so.4",
+            "libnvidia-gpucomp.so.580.1",
+        ] {
+            assert!(is_nvidia_driver_lib(name), "{name}");
+        }
+        for name in [
+            "libnvidia-container.so.1",
+            "libnvidia-container-go.so.1",
+            "libcudart.so.12",
+            "libcudadebugger.so.1",
+            "libnvidia-ml.a",
+            "libc.so.6",
+        ] {
+            assert!(!is_nvidia_driver_lib(name), "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_nvidia_libs_follows_symlinks_but_keeps_each_name() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("lib64"), dir.path().join("lib"));
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("libcuda.so.580.1"), "x").unwrap();
+        symlink("libcuda.so.580.1", first.join("libcuda.so.1")).unwrap();
+        std::fs::write(first.join("libnvidia-ml.so.580.1"), "x").unwrap();
+        std::fs::write(first.join("libnvidia-container.so.1"), "x").unwrap();
+        std::fs::write(first.join("libcudart.so.12"), "x").unwrap();
+        symlink("missing.so", first.join("libnvidia-gone.so.1")).unwrap();
+        std::fs::write(second.join("libcuda.so.1"), "other").unwrap();
+
+        let real = std::fs::canonicalize(first.join("libcuda.so.580.1")).unwrap();
+        let libs = scan_nvidia_libs(&[first.clone(), dir.path().join("absent"), second.clone()]);
+        let names: Vec<&str> = libs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "libcuda.so.1",
+                "libcuda.so.580.1",
+                "libnvidia-ml.so.580.1",
+                "libcuda.so.1"
+            ]
+        );
+        assert_eq!(libs[0].1, real);
+        assert_eq!(libs[1].1, real);
+        assert_eq!(
+            libs[3].1,
+            std::fs::canonicalize(second.join("libcuda.so.1")).unwrap()
+        );
+
+        let args =
+            direct_nvidia_args(&pb(&["/dev/nvidiactl"]), &libs, "aarch64-linux-gnu").unwrap();
+        assert!(
+            args.contains(&format!(
+                "{}:/usr/lib/aarch64-linux-gnu/libcuda.so.1:ro",
+                real.display()
+            )),
+            "{args:?}"
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|a| a.ends_with("/libcuda.so.1:ro"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn nvidia_device_nodes_are_the_control_nodes_then_each_gpu_by_number() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "nvidia10",
+            "nvidia2",
+            "nvidia0",
+            "nvidiactl",
+            "nvidia-uvm-tools",
+            "nvidia-uvm",
+            "nvidia-caps",
+            "nvidia",
+            "null",
+        ] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let names: Vec<String> = nvidia_device_nodes(dir.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "nvidiactl",
+                "nvidia-uvm",
+                "nvidia-uvm-tools",
+                "nvidia0",
+                "nvidia2",
+                "nvidia10"
+            ]
+        );
+        assert!(nvidia_device_nodes(&dir.path().join("absent")).is_empty());
+    }
+
+    #[test]
+    fn cuda_container_args_fall_back_to_direct_passthrough_only_without_the_toolkit() {
+        let direct = || Some(vec!["--device".to_string(), "/dev/nvidiactl".to_string()]);
+        for backend in [GpuBackend::Cuda12, GpuBackend::Cuda13] {
+            assert_eq!(
+                backend.container_args_with(|| true, || unreachable!("toolkit present")),
+                ["--gpus", "all"]
+            );
+            assert_eq!(
+                backend.container_args_with(|| false, direct),
+                ["--device", "/dev/nvidiactl"]
+            );
+            assert_eq!(
+                backend.container_args_with(|| false, || None),
+                ["--gpus", "all"]
+            );
+        }
+        for backend in [GpuBackend::Cpu, GpuBackend::Rocm, GpuBackend::Vulkan] {
+            assert_eq!(
+                backend.container_args_with(
+                    || unreachable!("only CUDA consults the toolkit"),
+                    || unreachable!("only CUDA passes the driver through"),
+                ),
+                backend.engine_args()
+            );
+        }
+    }
+
+    #[test]
+    fn a_direct_passthrough_run_stays_read_only_and_keeps_the_gpu_cache_tmpfs() {
+        let direct = direct_nvidia_args(
+            &pb(&["/dev/nvidiactl", "/dev/nvidia0"]),
+            &[lib("libcuda.so.1", "/usr/lib/libcuda.so.1")],
+            "x86_64-linux-gnu",
+        )
+        .unwrap();
+        let flags = hardened_flags(&direct, &llama_tmpfs(&direct), None);
+        assert!(flags.contains(&"--read-only".to_string()), "{flags:?}");
+        assert!(
+            flags
+                .windows(2)
+                .any(|w| w == ["--tmpfs", "/root/.cache:exec"]),
+            "{flags:?}"
+        );
+        let toolkit = GpuBackend::Cuda12.engine_args();
+        assert!(!hardened_flags(&toolkit, &llama_tmpfs(&toolkit), None)
+            .contains(&"--read-only".to_string()));
     }
 
     /// Whatever GPU this host has, the speech worker's image is the CPU
@@ -2373,7 +2847,14 @@ mod tests {
                 "ghcr.io/ggml-org/llama.cpp:server-cuda13-b9994",
             ),
         ] {
-            let args = verify_args(backend, Some("b9994"), "llmman-verify-1", false, None);
+            let args = verify_args(
+                backend,
+                backend.engine_args(),
+                Some("b9994"),
+                "llmman-verify-1",
+                false,
+                None,
+            );
             assert_eq!(
                 &args[..5],
                 ["run", "--rm", "--init", "--name", "llmman-verify-1"]
@@ -2570,7 +3051,14 @@ mod tests {
         assert!(!args.contains(&"--user".to_string()), "{args:?}");
         assert!(!args.iter().any(|a| a == "HOME=/tmp"), "{args:?}");
         // The verify run and the worker take the same value.
-        let args = verify_args(GpuBackend::Cuda13, None, "v", true, Some(&gpu_user));
+        let args = verify_args(
+            GpuBackend::Cuda13,
+            GpuBackend::Cuda13.engine_args(),
+            None,
+            "v",
+            true,
+            Some(&gpu_user),
+        );
         let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
         assert!(
             at("--cap-drop") < at("--user") && at("--user") < at("--gpus"),
@@ -2580,10 +3068,17 @@ mod tests {
             args.windows(2).any(|w| w == ["--group-add", "44"]),
             "{args:?}"
         );
-        let args = verify_args(GpuBackend::Cuda13, None, "v", true, None);
+        let args = verify_args(
+            GpuBackend::Cuda13,
+            GpuBackend::Cuda13.engine_args(),
+            None,
+            "v",
+            true,
+            None,
+        );
         assert!(!args.contains(&"--user".to_string()), "{args:?}");
         let args = mediagen_run_args(
-            GpuBackend::Cpu,
+            GpuBackend::Cpu.engine_args(),
             "image".into(),
             "/usr/bin/llmman",
             "/store",
@@ -2614,7 +3109,7 @@ mod tests {
     #[test]
     fn speech_worker_note_is_read_only_on_a_gpu_host() {
         for host in [GpuBackend::Cuda13, GpuBackend::Vulkan] {
-            let speech = HardenedSpawn::Speech.note(host, None, None, "/srv/store");
+            let speech = HardenedSpawn::Speech.note(host, Vec::new, None, None, "/srv/store");
             assert!(speech.contains("--read-only"), "{host:?}: {speech}");
             assert_eq!(
                 speech,
@@ -2624,13 +3119,19 @@ mod tests {
                 )
             );
             assert!(speech.contains("chmod -R go+rX /srv/store"), "{speech}");
-            let llama = HardenedSpawn::LlamaServer.note(host, None, None, "/srv/store");
+            let llama = HardenedSpawn::LlamaServer.note(
+                host,
+                || host.engine_args(),
+                None,
+                None,
+                "/srv/store",
+            );
             assert_eq!(
                 llama.contains("--read-only"),
                 !passes_gpus(&host.engine_args()),
                 "{host:?}: {llama}"
             );
-            let vllm = HardenedSpawn::Vllm.note(host, None, None, "/srv/store");
+            let vllm = HardenedSpawn::Vllm.note(host, Vec::new, None, None, "/srv/store");
             assert!(vllm.contains("/root/.triton:exec"), "{host:?}: {vllm}");
         }
     }
@@ -2642,6 +3143,7 @@ mod tests {
         // tmpfs lands after the user block, as in `engine_run_args`.
         let vllm = HardenedSpawn::Vllm.note(
             GpuBackend::Rocm,
+            Vec::new,
             Some(&gpu_user),
             Some("/run/vllm:exec"),
             "/srv/store",
@@ -2654,6 +3156,7 @@ mod tests {
         // SGLang never gets the RPC tmpfs; the CPU backend passes no device.
         let sglang = HardenedSpawn::Sglang.note(
             GpuBackend::Cpu,
+            Vec::new,
             Some(&gpu_user),
             Some("/run/vllm:exec"),
             "/srv/store",
@@ -2664,7 +3167,14 @@ mod tests {
         // The verify run's note is the same block for its argv.
         let engine_args = GpuBackend::Rocm.engine_args();
         let flags = hardened_flags(&engine_args, &llama_tmpfs(&engine_args), Some(&gpu_user));
-        let verify = verify_args(GpuBackend::Rocm, None, "x", true, Some(&gpu_user));
+        let verify = verify_args(
+            GpuBackend::Rocm,
+            GpuBackend::Rocm.engine_args(),
+            None,
+            "x",
+            true,
+            Some(&gpu_user),
+        );
         assert_eq!(&verify[5..5 + flags.len()], flags.as_slice(), "{verify:?}");
     }
 
@@ -2712,7 +3222,7 @@ mod tests {
         };
         let argv = |backend: GpuBackend, hardened| {
             llama_run_args(
-                backend,
+                backend.engine_args(),
                 backend.image_ref(None),
                 "/cache/blobs",
                 "sha256-abc",
@@ -2842,7 +3352,14 @@ mod tests {
     #[test]
     fn hardened_verify_runs_with_the_same_block_as_spawn() {
         for (backend, read_only) in [(GpuBackend::Cpu, true), (GpuBackend::Cuda13, false)] {
-            let args = verify_args(backend, Some("b9994"), "llmman-verify-1", true, None);
+            let args = verify_args(
+                backend,
+                backend.engine_args(),
+                Some("b9994"),
+                "llmman-verify-1",
+                true,
+                None,
+            );
             assert_eq!(
                 &args[..5],
                 ["run", "--rm", "--init", "--name", "llmman-verify-1"]
@@ -2864,7 +3381,7 @@ mod tests {
 
     fn worker_args(backend: GpuBackend, hardened: bool) -> Vec<String> {
         mediagen_run_args(
-            backend,
+            backend.engine_args(),
             backend.image_ref(Some("b9994")),
             "/usr/bin/llmman",
             "/store",
@@ -2986,7 +3503,7 @@ mod tests {
         let image = "ghcr.io/ggml-org/llama.cpp:server";
         let argv = |o| {
             llama_run_args(
-                GpuBackend::Cpu,
+                GpuBackend::Cpu.engine_args(),
                 image.into(),
                 "/cache/blobs",
                 "sha256-abc",
@@ -3027,7 +3544,7 @@ mod tests {
             extra_args: &["--slot-prompt-similarity".into(), "0.5".into()],
         };
         let args = llama_run_args(
-            GpuBackend::Cpu,
+            GpuBackend::Cpu.engine_args(),
             "ghcr.io/ggml-org/llama.cpp:server".into(),
             "/cache/blobs",
             "sha256-abc",
@@ -3098,7 +3615,7 @@ mod tests {
         };
         let argv = |backend: GpuBackend| {
             llama_run_args(
-                backend,
+                backend.engine_args(),
                 backend.image_ref(None),
                 "/cache/blobs",
                 "sha256-abc",
@@ -3144,9 +3661,23 @@ mod tests {
         );
         assert_eq!(llama_tmpfs(&GpuBackend::Cpu.engine_args()), ["/tmp"]);
         // The verify run follows the same rule.
-        let args = verify_args(GpuBackend::Rocm, None, "v", true, None);
+        let args = verify_args(
+            GpuBackend::Rocm,
+            GpuBackend::Rocm.engine_args(),
+            None,
+            "v",
+            true,
+            None,
+        );
         assert_eq!(cache(&args), 1, "{args:?}");
-        let args = verify_args(GpuBackend::Cpu, None, "v", true, None);
+        let args = verify_args(
+            GpuBackend::Cpu,
+            GpuBackend::Cpu.engine_args(),
+            None,
+            "v",
+            true,
+            None,
+        );
         assert_eq!(cache(&args), 0, "{args:?}");
     }
 

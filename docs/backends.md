@@ -33,7 +33,8 @@ already exists for the model format it finds, and runs it unmodified.
 
 Under `auto`, a container engine "works" when its CLI is on `PATH`, its
 daemon answers `docker info`/`podman info`, an NVIDIA host has the NVIDIA
-Container Toolkit, and the llama.cpp image pulls; `bin` works when the
+Container Toolkit (or, for CUDA, the direct passthrough described under
+`--no-hardened` below), and the llama.cpp image pulls; `bin` works when the
 release downloads (or is already cached) and its `llama-server --version`
 runs. Each step skipped is logged with the reason. Whatever is chosen is fetched before the listener binds,
 so the first request is never stuck behind a silent download. On macOS
@@ -125,6 +126,16 @@ and `/usr/lib64`, so the hooks fail and the container never starts
 (NVIDIA/nvidia-container-toolkit#2131, containers/crun#1924). `--cap-drop
 all`, `no-new-privileges` and the tmpfs mounts still apply to those
 containers.
+
+Without the toolkit, a CUDA llama-server or media container does not use
+`--gpus`. If `/dev/nvidiactl` and the driver's `libcuda.so.1` exist (a GPU
+passed into a microVM sandbox, say), it gets a `--device` for each NVIDIA
+node (`/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`,
+`/dev/nvidia-modeset`, `/dev/nvidia<N>`) and a read-only bind mount of each
+driver library (`libcuda.so*`, `libnvidia-*.so*`, found in `/usr/lib64`,
+`/usr/lib/<multiarch>`, `/usr/lib`, `/lib64` and `/lib/<multiarch>`) into
+`/usr/lib/<multiarch>/`; the image keeps its own CUDA runtime. No toolkit
+hook runs, so `--read-only` stays on. vLLM and SGLang still need the toolkit.
 
 **Store permissions:** with every capability dropped, root in the
 container no longer bypasses file modes (`CAP_DAC_OVERRIDE` is gone), so
