@@ -74,32 +74,72 @@ pub(crate) fn user_ids() -> Option<(u32, u32, u32)> {
     None
 }
 
-/// The answer of the first [`docker_is_rootless`] probe that reached the
-/// daemon: it cannot change under a running process, and the hardened
-/// spawns ask on every model load from the async request path, so only
-/// the first pays for `docker info`.
+/// The answer of the first [`docker_is_rootless`] probe, whether or not
+/// it reached the daemon: the daemon cannot change under a running
+/// process, and the hardened spawns ask on every model load from the
+/// async request path, so only the first pays for `docker info`.
 static DOCKER_ROOTLESS: OnceLock<bool> = OnceLock::new();
 
 /// Whether the reachable docker daemon is rootless, per the
 /// `SecurityOptions` of `docker info`, waiting at most
 /// [`PROBE_TIMEOUT`](super::PROBE_TIMEOUT) as [`ContainerManager::probe`]
-/// does. A daemon that does not answer counts as rootful for this call
-/// only, with a note on stderr, so a later call can still get the real
-/// answer.
+/// does. A daemon that does not answer in time counts as rootful for the
+/// rest of the process, with one note on stderr: a request-path caller
+/// must never wait out the timeout a second time. A daemon that fails
+/// fast (not running, `docker` missing) is asked again next time, so a
+/// daemon that comes up after the first load is still recognised.
 pub(crate) fn docker_is_rootless() -> bool {
-    if let Some(known) = DOCKER_ROOTLESS.get() {
-        return *known;
+    if let Some(rootless) = DOCKER_ROOTLESS.get() {
+        return *rootless;
     }
-    match probe_docker_rootless() {
-        Ok(rootless) => *DOCKER_ROOTLESS.get_or_init(|| rootless),
-        Err(err) => {
+    match rootless_from_probe(probe_docker_rootless()) {
+        Some(rootless) => *DOCKER_ROOTLESS.get_or_init(|| rootless),
+        None => false,
+    }
+}
+
+/// The outcome of one `docker info` probe.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    /// The daemon answered; `true` when its security options say rootless.
+    Answered(bool),
+    /// No answer within the timeout.
+    TimedOut,
+    /// The command failed at once (no daemon, no binary, non-zero exit).
+    Failed(String),
+}
+
+/// The decision behind [`docker_is_rootless`]: `Some` is kept for the
+/// process (the answer, or rootful after a timeout, with a note); `None`
+/// is a fast failure, reported once per call and not kept.
+fn rootless_from_probe(result: Probe) -> Option<bool> {
+    match result {
+        Probe::Answered(rootless) => Some(rootless),
+        Probe::TimedOut => {
+            eprintln!(
+                "[llmman] docker info gave no answer within {:?}; assuming the daemon is not rootless",
+                super::PROBE_TIMEOUT
+            );
+            Some(false)
+        }
+        Probe::Failed(err) => {
             eprintln!("[llmman] docker info did not say whether the daemon is rootless ({err}); assuming not");
-            false
+            None
         }
     }
 }
 
-fn probe_docker_rootless() -> Result<bool, String> {
+fn probe_docker_rootless() -> Probe {
+    match run_docker_info() {
+        Ok(Some(rootless)) => Probe::Answered(rootless),
+        Ok(None) => Probe::TimedOut,
+        Err(err) => Probe::Failed(err),
+    }
+}
+
+/// `Ok(Some(rootless))` on an answer, `Ok(None)` on a timeout, `Err` on a
+/// fast failure.
+fn run_docker_info() -> Result<Option<bool>, String> {
     let mut cmd = Command::new("docker");
     cmd.args(["info", "--format", "{{json .SecurityOptions}}"])
         .stdin(Stdio::null())
@@ -109,17 +149,30 @@ fn probe_docker_rootless() -> Result<bool, String> {
     match super::wait_with_timeout(&mut child, super::PROBE_TIMEOUT) {
         Ok(Some(status)) if status.success() => {}
         Ok(Some(status)) => return Err(format!("exited with {status}")),
-        Ok(None) => return Err(format!("no answer within {:?}", super::PROBE_TIMEOUT)),
+        Ok(None) => return Ok(None),
         Err(e) => return Err(e.to_string()),
     }
     // The child has exited, so this only drains the pipe.
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&out.stdout).contains("rootless"))
+    Ok(Some(
+        String::from_utf8_lossy(&out.stdout).contains("rootless"),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An answer and a timeout are kept for the process (a timeout as
+    /// rootful); a fast failure is not, so a daemon that comes up later
+    /// is still asked.
+    #[test]
+    fn a_timeout_is_kept_as_rootful_and_a_fast_failure_is_asked_again() {
+        assert_eq!(rootless_from_probe(Probe::Answered(true)), Some(true));
+        assert_eq!(rootless_from_probe(Probe::Answered(false)), Some(false));
+        assert_eq!(rootless_from_probe(Probe::TimedOut), Some(false));
+        assert_eq!(rootless_from_probe(Probe::Failed("no daemon".into())), None);
+    }
 
     #[test]
     fn identity_follows_the_engine_and_who_runs_it() {

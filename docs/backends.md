@@ -139,9 +139,11 @@ the container is already you or (rootful podman runs llmman itself as
 root) the store's owner. A numeric `--user` has no `/etc/passwd` entry in
 the image, so the same run also sets `HOME=/tmp`, `XDG_CACHE_HOME`,
 `XDG_CONFIG_HOME` and `TRITON_CACHE_DIR` under the `/tmp` tmpfs (vLLM,
-Triton, Mesa and MIOpen caches land there instead of the read-only root)
-and, under rootful docker when the backend passes a GPU (`--gpus` or
-`--device`), one numeric `--group-add <gid>` per existing `/dev/kfd`,
+Triton, Mesa and MIOpen caches land there instead of the read-only root),
+`USER=llmman` and `LOGNAME=llmman` (vLLM asks `getpass.getuser()`, which
+fails for a uid with no passwd entry when both are unset) and, under
+rootful docker when the backend passes a GPU (`--gpus` or `--device`),
+one numeric `--group-add <gid>` per existing `/dev/kfd`,
 `/dev/dri/renderD*` and `/dev/dri/card*` host node, since a group *name*
 such as ROCm's `video` resolves against the image's `/etc/group` (under
 rootless docker a host gid would map to a subordinate id, so none is

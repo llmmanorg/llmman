@@ -481,7 +481,7 @@ fn try_one(
                     Workload::CpuOnly => ociman.probe_cpu_only()?,
                 }
             }
-            prime_docker_identity(candidate, explicit, hardened, || {
+            prime_docker_identity(candidate, hardened, || {
                 crate::container::identity::docker_is_rootless();
             });
             // Under `auto` both answers check that the engine can start
@@ -589,13 +589,13 @@ fn verify_local_llama_server_runs(bin: &Path) -> Result<()> {
 }
 
 /// Settles the rootless question of the first hardened spawn here, on
-/// the blocking resolve path, for an explicit `--runtime docker` on
-/// Linux: `probe` skipped [`ContainerManager::probe`], which primes it
-/// under `auto`, and the spawns run on the async request path where a
-/// `docker info` waiting out `PROBE_TIMEOUT` would stall the runtime.
-/// Nothing runs under `--no-hardened`: no spawn reads the answer then.
-fn prime_docker_identity(candidate: Runtime, explicit: bool, hardened: bool, probe: impl FnOnce()) {
-    if hardened && explicit && candidate == Runtime::Docker && cfg!(target_os = "linux") {
+/// the blocking resolve path, for `--runtime docker` on Linux under
+/// both `auto` and an explicit choice: the spawns run on the async
+/// request path, where a `docker info` waiting out `PROBE_TIMEOUT`
+/// would stall the runtime. Nothing runs under `--no-hardened`: no
+/// spawn reads the answer then.
+fn prime_docker_identity(candidate: Runtime, hardened: bool, probe: impl FnOnce()) {
+    if hardened && candidate == Runtime::Docker && cfg!(target_os = "linux") {
         probe();
     }
 }
@@ -780,22 +780,21 @@ mod tests {
         assert_eq!(*tried.borrow(), [Runtime::Docker]);
     }
 
-    /// An explicit `--runtime docker` primes the rootless answer while
-    /// still on the blocking resolve path; `auto` gets it from the
-    /// engine probe, podman never asks, and `--no-hardened` skips it.
+    /// A hardened docker candidate, explicit or under `auto`, primes the
+    /// rootless answer while still on the blocking resolve path; podman
+    /// never asks, and `--no-hardened` skips it.
     #[test]
-    fn explicit_docker_primes_the_rootless_answer_before_any_spawn() {
-        let probed = |candidate, explicit, hardened| {
+    fn hardened_docker_primes_the_rootless_answer_before_any_spawn() {
+        let probed = |candidate, hardened| {
             let hit = std::cell::Cell::new(false);
-            prime_docker_identity(candidate, explicit, hardened, || hit.set(true));
+            prime_docker_identity(candidate, hardened, || hit.set(true));
             hit.get()
         };
         let linux = cfg!(target_os = "linux");
-        assert_eq!(probed(Runtime::Docker, true, true), linux);
-        assert!(!probed(Runtime::Docker, true, false));
-        assert!(!probed(Runtime::Docker, false, true));
-        assert!(!probed(Runtime::Podman, true, true));
-        assert!(!probed(Runtime::Bin, true, true));
+        assert_eq!(probed(Runtime::Docker, true), linux);
+        assert!(!probed(Runtime::Docker, false));
+        assert!(!probed(Runtime::Podman, true));
+        assert!(!probed(Runtime::Bin, true));
     }
 
     /// An explicit runtime has one candidate and its own error; `auto`
