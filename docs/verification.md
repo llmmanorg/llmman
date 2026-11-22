@@ -113,11 +113,23 @@ A rule may name a signing identity instead of keys. The signature is then
 one a Fulcio certificate made (`cosign sign` without `--key`), and the
 layer carries that certificate, its chain and a Rekor bundle in the three
 `dev.sigstore.cosign/*` annotations above. cosign v3 publishes a Sigstore
-bundle by default rather than this layout; to publish what llmman reads,
-pass `--new-bundle-format=false` to `cosign sign` (the flag is marked
-deprecated there, and reading the bundle format is a second PR). The
-roots the certificate and the bundle are checked against come from a
-Sigstore TrustedRoot file named once under `[verify]`:
+bundle by default, and this layout needs two flags, both marked deprecated
+there (reading the bundle format is a second PR):
+
+```sh
+cosign sign --new-bundle-format=false --use-signing-config=false <ref>
+```
+
+The roots the certificate and the bundle are checked against come from a
+Sigstore TrustedRoot file named once under `[verify]`. For the public-good
+instance, `cosign trusted-root create --with-default-services --out
+trusted_root.json` writes the current file from the Sigstore TUF
+repository, and the same JSON is distributed as `trusted_root.json` in
+[sigstore/root-signing](https://github.com/sigstore/root-signing).
+The file keeps each earlier Fulcio CA and Rekor key with its validity
+window, and llmman uses the ones valid at the signing time, so a signature
+made while an earlier key was current still verifies as long as the file
+still lists that key.
 
 ```toml
 [verify]
@@ -313,7 +325,8 @@ These are real and worth stating plainly.
   timestamp verified against the log key in `trusted_root`, so a stale or
   wrong trusted root file is the weak point. There is no keyless
   *signing*: `llmman push --sign-key` is key-based, and the keyless
-  signatures llmman verifies are the ones `cosign sign` publishes.
+  signatures llmman verifies are the ones `cosign sign` publishes with
+  the two legacy flags shown above.
 
 - **The newer sigstore *bundle* format is not verified.** Current cosign
   publishes a bundle
@@ -322,7 +335,7 @@ These are real and worth stating plainly.
   reads. llmman detects this and says so explicitly rather than
   misreporting the model as unsigned, and still refuses it under
   `enforce`. To produce something llmman verifies, use
-  `llmman push --sign-key`.
+  `llmman push --sign-key`, or `cosign sign` with the two legacy flags.
 
 - **`--sign-key` takes a standard PEM private key** (plain or PKCS#8
   encrypted, via `LLMMAN_SIGN_PASSWORD` / `COSIGN_PASSWORD`). cosign's own
