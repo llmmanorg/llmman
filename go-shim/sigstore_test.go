@@ -787,18 +787,27 @@ func (f *sigstoreFixture) trustedRootDoc(t *testing.T) map[string]any {
 				"end":   f.integrated.Add(5 * time.Hour).UTC().Format(time.RFC3339),
 			},
 		}},
-		"tlogs": []map[string]any{{
-			"baseUrl":       "https://rekor.test",
-			"hashAlgorithm": "SHA2_256",
-			"publicKey": map[string]any{
-				"rawBytes":   base64.StdEncoding.EncodeToString(spki),
-				"keyDetails": "PKIX_ECDSA_P256_SHA_256",
-				"validFor":   map[string]any{"start": f.integrated.Add(-5 * time.Hour).UTC().Format(time.RFC3339)},
-			},
-			"logId": map[string]any{"keyId": base64.StdEncoding.EncodeToString(keyID)},
-		}},
+		"tlogs": []map[string]any{tlogDoc("https://rekor.test", spki, "PKIX_ECDSA_P256_SHA_256", keyID,
+			map[string]any{"start": f.integrated.Add(-5 * time.Hour).UTC().Format(time.RFC3339)})},
 	}
 	return doc
+}
+
+// tlogDoc is one tlogs[] entry of a TrustedRoot: the log at baseURL
+// signing with the key spki (DER SPKI) of family keyDetails, named by
+// keyID, in use for validFor. A root may list the same keyID with
+// several keys and windows.
+func tlogDoc(baseURL string, spki []byte, keyDetails string, keyID []byte, validFor map[string]any) map[string]any {
+	return map[string]any{
+		"baseUrl":       baseURL,
+		"hashAlgorithm": "SHA2_256",
+		"publicKey": map[string]any{
+			"rawBytes":   base64.StdEncoding.EncodeToString(spki),
+			"keyDetails": keyDetails,
+			"validFor":   validFor,
+		},
+		"logId": map[string]any{"keyId": base64.StdEncoding.EncodeToString(keyID)},
+	}
 }
 
 // writeTrustedRoot marshals doc to a file and returns its path.
@@ -1164,16 +1173,8 @@ func TestParseTrustedRootKeepsNonECDSALogKeys(t *testing.T) {
 	}
 	edID := sha256.Sum256(edSPKI)
 	doc := f.trustedRootDoc(t)
-	doc["tlogs"] = append(doc["tlogs"].([]map[string]any), map[string]any{
-		"baseUrl":       "https://log2025-1.rekor.test",
-		"hashAlgorithm": "SHA2_256",
-		"publicKey": map[string]any{
-			"rawBytes":   base64.StdEncoding.EncodeToString(edSPKI),
-			"keyDetails": "PKIX_ED25519",
-			"validFor":   map[string]any{"start": f.integrated.Add(-time.Hour).UTC().Format(time.RFC3339)},
-		},
-		"logId": map[string]any{"keyId": base64.StdEncoding.EncodeToString(edID[:])},
-	})
+	doc["tlogs"] = append(doc["tlogs"].([]map[string]any), tlogDoc("https://log2025-1.rekor.test", edSPKI, "PKIX_ED25519", edID[:],
+		map[string]any{"start": f.integrated.Add(-time.Hour).UTC().Format(time.RFC3339)}))
 	path := writeTrustedRoot(t, doc)
 
 	raw, err := os.ReadFile(path)
@@ -1185,9 +1186,13 @@ func TestParseTrustedRootKeepsNonECDSALogKeys(t *testing.T) {
 		t.Fatalf("parseTrustedRoot: %v", err)
 	}
 	if len(root.logKeys) != 2 {
-		t.Fatalf("parsed %d log keys, want 2", len(root.logKeys))
+		t.Fatalf("parsed %d log IDs, want 2", len(root.logKeys))
 	}
-	if _, ok := root.logKeys[hex.EncodeToString(edID[:])].key.(ed25519.PublicKey); !ok {
+	edLogs := root.logKeys[hex.EncodeToString(edID[:])]
+	if len(edLogs) != 1 {
+		t.Fatalf("parsed %d keys for the ed25519 log, want 1", len(edLogs))
+	}
+	if _, ok := edLogs[0].key.(ed25519.PublicKey); !ok {
 		t.Errorf("ed25519 log key not kept as ed25519.PublicKey")
 	}
 
@@ -1301,6 +1306,79 @@ func TestVerifyKeylessHonoursLogKeyValidFor(t *testing.T) {
 			doc["tlogs"].([]map[string]any)[0]["publicKey"].(map[string]any)["validFor"] = tc.validFor
 			identity := &identityPolicy{Issuer: keylessIssuer, Subject: keylessSubject, TrustedRoot: writeTrustedRoot(t, doc)}
 			_, err := verifySignatureLayer(payload, annotations, keylessRef, digest.Digest(targetA), verifyPolicy{identity: identity}, "")
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("err = %v, want verified", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("err = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// A log that rotated its key is listed once per key under the same log
+// ID, each with its own validFor window. Every entry is kept and the
+// bundle's integrated time picks the key: an entry signed by either key
+// inside that key's window verifies, one outside both windows is
+// refused naming the log and the time, and when the windows overlap
+// during the rotation every covering key is tried, so the entry signed
+// by the second key is accepted even though the first key covers too.
+func TestVerifyKeylessSelectsRotatedLogKeyByIntegratedTime(t *testing.T) {
+	f := newSigstoreFixture(t)
+	key2, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate second rekor key: %v", err)
+	}
+	spki2, err := x509.MarshalPKIXPublicKey(&key2.PublicKey)
+	if err != nil {
+		t.Fatalf("marshal second rekor key: %v", err)
+	}
+	keyID, err := hex.DecodeString(f.logID)
+	if err != nil {
+		t.Fatalf("decode log id: %v", err)
+	}
+	stamp := func(d time.Duration) string { return f.integrated.Add(d).UTC().Format(time.RFC3339) }
+	// A leaf valid across both windows, so only the SET decides.
+	cert, signer := f.leaf(t, keylessIssuer, keylessSubject, f.integrated.Add(-3*time.Hour), f.integrated.Add(3*time.Hour))
+	payload, b64 := signedPayload(t, signer, keylessRef, targetA)
+	// layer signs the bundle with key at offset d from f.integrated,
+	// under the fixture's log ID.
+	layer := func(key *ecdsa.PrivateKey, d time.Duration) map[string]string {
+		g := *f
+		g.rekorKey, g.integrated = key, f.integrated.Add(d)
+		return f.keylessAnnotations(b64, cert, g.bundle(t, b64, cert, payload))
+	}
+	rootWith := func(window1, window2 map[string]any) string {
+		doc := f.trustedRootDoc(t)
+		doc["tlogs"].([]map[string]any)[0]["publicKey"].(map[string]any)["validFor"] = window1
+		doc["tlogs"] = append(doc["tlogs"].([]map[string]any), tlogDoc("https://rekor.test", spki2, "PKIX_ECDSA_P256_SHA_256", keyID, window2))
+		return writeTrustedRoot(t, doc)
+	}
+	adjacent := rootWith(
+		map[string]any{"start": stamp(-2 * time.Hour), "end": stamp(-time.Hour)},
+		map[string]any{"start": stamp(-time.Hour), "end": stamp(time.Hour)},
+	)
+	overlap := rootWith(
+		map[string]any{"start": stamp(-2 * time.Hour), "end": stamp(time.Hour)},
+		map[string]any{"start": stamp(-time.Hour), "end": stamp(time.Hour)},
+	)
+	for _, tc := range []struct {
+		name        string
+		root        string
+		annotations map[string]string
+		wantErr     string
+	}{
+		{"key 1 inside window 1", adjacent, layer(f.rekorKey, -90*time.Minute), ""},
+		{"key 2 inside window 2", adjacent, layer(key2, 0), ""},
+		{"key 2 inside window 1", adjacent, layer(key2, -90*time.Minute), "does not verify under the log key"},
+		{"outside both windows", adjacent, layer(f.rekorKey, 2*time.Hour),
+			"bundle integrated time " + stamp(2*time.Hour) + " is outside the validity window of every key of log \"" + f.logID + "\""},
+		{"key 2 where both windows cover", overlap, layer(key2, 0), ""},
+		{"key 1 where both windows cover", overlap, layer(f.rekorKey, 0), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			identity := &identityPolicy{Issuer: keylessIssuer, Subject: keylessSubject, TrustedRoot: tc.root}
+			_, err := verifySignatureLayer(payload, tc.annotations, keylessRef, digest.Digest(targetA), verifyPolicy{identity: identity}, "")
 			switch {
 			case tc.wantErr == "" && err != nil:
 				t.Fatalf("err = %v, want verified", err)

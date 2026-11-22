@@ -331,8 +331,11 @@ type identityPolicy struct {
 type trustedRoot struct {
 	authorities []trustedAuthority
 	// logKeys maps hex(sha256(DER SPKI)), which is how a Rekor bundle
-	// names its log, to the key that signs that log's entries.
-	logKeys map[string]transparencyLog
+	// names its log, to the keys that sign that log's entries. A root
+	// may list the same log ID with several keys, each with its own
+	// validFor window, so every entry is kept, in file order, and the
+	// bundle's integratedTime picks among them.
+	logKeys map[string][]transparencyLog
 }
 
 // transparencyLog is one tlogs[] entry: the key that signs the log's
@@ -436,7 +439,7 @@ func parseTrustedRoot(raw []byte) (*trustedRoot, error) {
 	if err := protojson.Unmarshal(raw, &tr); err != nil {
 		return nil, err
 	}
-	root := &trustedRoot{logKeys: map[string]transparencyLog{}}
+	root := &trustedRoot{logKeys: map[string][]transparencyLog{}}
 	for i, ca := range tr.GetCertificateAuthorities() {
 		certs := ca.GetCertChain().GetCertificates()
 		if len(certs) == 0 {
@@ -488,7 +491,8 @@ func parseTrustedRoot(raw []byte) (*trustedRoot, error) {
 		if hash, ok := logKeyHash(log.keyDetails, pub); ok {
 			log.hash = hash
 		}
-		root.logKeys[hex.EncodeToString(keyID)] = log
+		id := hex.EncodeToString(keyID)
+		root.logKeys[id] = append(root.logKeys[id], log)
 	}
 	// Both lists are needed: with no authority nothing anchors a
 	// certificate, with no log nothing anchors a signing time, and a
@@ -497,7 +501,7 @@ func parseTrustedRoot(raw []byte) (*trustedRoot, error) {
 	if len(root.authorities) == 0 {
 		return nil, errors.New("no certificate authorities")
 	}
-	if len(root.logKeys) == 0 {
+	if len(tr.GetTlogs()) == 0 {
 		return nil, errors.New("no transparency logs")
 	}
 	return root, nil
@@ -506,7 +510,9 @@ func parseTrustedRoot(raw []byte) (*trustedRoot, error) {
 // pools returns the roots and intermediates of every authority whose
 // validFor window covers at, which is the integrated time of the
 // signature being checked: a Fulcio root rotated out before then did not
-// issue the certificate, however long-lived the root itself is.
+// issue the certificate, however long-lived the root itself is. The
+// pools are shared across the covering authorities, so a path may still
+// cross two of them when their windows overlap.
 func (r *trustedRoot) pools(at time.Time) (roots, intermediates *x509.CertPool) {
 	roots, intermediates = x509.NewCertPool(), x509.NewCertPool()
 	for _, a := range r.authorities {
@@ -519,6 +525,42 @@ func (r *trustedRoot) pools(at time.Time) (roots, intermediates *x509.CertPool) 
 		}
 	}
 	return roots, intermediates
+}
+
+// verifySET checks the signed entry timestamp set over canonical, the
+// RFC 8785 form of the bundle payload, under the keys of log logID that
+// were in use at integrated. A root may list several keys for one log,
+// and their windows may overlap while a rotation is under way, so every
+// covering entry is tried in root order and the first whose signature
+// verifies wins; the error of the last attempt is returned when none
+// does. When no entry covers integrated, the error names the log ID and
+// the time.
+func verifySET(logs []transparencyLog, logID string, integrated time.Time, set, canonical []byte) error {
+	err := fmt.Errorf("bundle integrated time %s is outside the validity window of every key of log %q", integrated.UTC().Format(time.RFC3339), logID)
+	for _, log := range logs {
+		if !log.covers(integrated) {
+			continue
+		}
+		// The hash comes from the root's keyDetails for this log, not
+		// from an assumption about Rekor; LoadVerifier dispatches on the
+		// key type (ECDSA, Ed25519, RSA) the way sigstore-go's SET check
+		// does.
+		if log.hash == 0 {
+			err = fmt.Errorf("log %q key details %s are not supported for verifying a signed entry timestamp", logID, log.keyDetails)
+			continue
+		}
+		logVerifier, loadErr := signature.LoadVerifier(log.key, log.hash)
+		if loadErr != nil {
+			err = fmt.Errorf("log %q key: %w", logID, loadErr)
+			continue
+		}
+		if verifyErr := logVerifier.VerifySignature(bytes.NewReader(set), bytes.NewReader(canonical)); verifyErr != nil {
+			err = fmt.Errorf("bundle signed entry timestamp does not verify under the log key: %w", verifyErr)
+			continue
+		}
+		return nil
+	}
+	return err
 }
 
 // rekorBundle is the dev.sigstore.cosign/bundle annotation: Rekor's
@@ -699,24 +741,11 @@ func verifyKeyless(payload, rawSig []byte, b64sig string, annotations map[string
 	if err := json.Unmarshal([]byte(bundleJSON), &bundle); err != nil {
 		return nil, fmt.Errorf("parse bundle: %w", err)
 	}
-	log, ok := root.logKeys[bundle.Payload.LogID]
+	logs, ok := root.logKeys[bundle.Payload.LogID]
 	if !ok {
 		return nil, fmt.Errorf("bundle names log %q, which the trusted root does not list", bundle.Payload.LogID)
 	}
 	integrated := time.Unix(bundle.Payload.IntegratedTime, 0)
-	if !log.covers(integrated) {
-		return nil, fmt.Errorf("bundle integrated time %s is outside the validity window of log %q's key", integrated.UTC().Format(time.RFC3339), bundle.Payload.LogID)
-	}
-	// The hash comes from the root's keyDetails for this log, not from
-	// an assumption about Rekor; LoadVerifier dispatches on the key type
-	// (ECDSA, Ed25519, RSA) the way sigstore-go's SET check does.
-	if log.hash == 0 {
-		return nil, fmt.Errorf("log %q key details %s are not supported for verifying a signed entry timestamp", bundle.Payload.LogID, log.keyDetails)
-	}
-	logVerifier, err := signature.LoadVerifier(log.key, log.hash)
-	if err != nil {
-		return nil, fmt.Errorf("log %q key: %w", bundle.Payload.LogID, err)
-	}
 	payloadJSON, err := json.Marshal(bundle.Payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal bundle payload: %w", err)
@@ -725,8 +754,8 @@ func verifyKeyless(payload, rawSig []byte, b64sig string, annotations map[string
 	if err != nil {
 		return nil, fmt.Errorf("canonicalize bundle payload: %w", err)
 	}
-	if err := logVerifier.VerifySignature(bytes.NewReader(bundle.SignedEntryTimestamp), bytes.NewReader(canonical)); err != nil {
-		return nil, fmt.Errorf("bundle signed entry timestamp does not verify under the log key: %w", err)
+	if err := verifySET(logs, bundle.Payload.LogID, integrated, bundle.SignedEntryTimestamp, canonical); err != nil {
+		return nil, err
 	}
 
 	// 2. Certificate path.
