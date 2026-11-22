@@ -218,6 +218,74 @@ struct DaemonIdentity {
     exe: Option<String>,
     #[serde(default)]
     pid: Option<u32>,
+    /// `latest` when unpinned; absent on daemons that predate reporting it.
+    #[serde(default)]
+    llama_cpp_version: Option<String>,
+    #[serde(default)]
+    vllm_version: Option<String>,
+    #[serde(default)]
+    vllm_image: Option<String>,
+    #[serde(default)]
+    sglang_version: Option<String>,
+}
+
+/// The engine settings `serve --detach` was explicitly given; `None` is a
+/// flag not passed, which never asks for a restart.
+#[derive(Default)]
+pub struct RequestedEngines<'a> {
+    pub llama_cpp_version: Option<&'a str>,
+    pub vllm_version: Option<&'a str>,
+    pub vllm_image: Option<&'a str>,
+    pub sglang_version: Option<&'a str>,
+}
+
+impl RequestedEngines<'_> {
+    fn is_empty(&self) -> bool {
+        self.llama_cpp_version.is_none()
+            && self.vllm_version.is_none()
+            && self.vllm_image.is_none()
+            && self.sglang_version.is_none()
+    }
+}
+
+/// Why `identity`, a healthy daemon, should be restarted to honour
+/// `requested`: the first explicit setting it does not run, or `None` to
+/// reuse it. A llama.cpp pin is compared by its build, so an image tag and
+/// the `b<N>` it was made from agree; an unset image tag is `latest`.
+fn engine_change_reason(identity: &DaemonIdentity, requested: &RequestedEngines) -> Option<String> {
+    if !identity.is_llmman() || identity.is_foreign() {
+        return None;
+    }
+    let build = crate::llama_release::build_tag;
+    let rows = [
+        (
+            "llama.cpp",
+            requested.llama_cpp_version.map(build),
+            identity
+                .llama_cpp_version
+                .as_deref()
+                .map_or("an unknown version", build),
+        ),
+        (
+            "the vLLM image tag",
+            requested.vllm_version,
+            identity.vllm_version.as_deref().unwrap_or("latest"),
+        ),
+        (
+            "the vLLM image",
+            requested.vllm_image,
+            identity.vllm_image.as_deref().unwrap_or("unset"),
+        ),
+        (
+            "the SGLang image tag",
+            requested.sglang_version,
+            identity.sglang_version.as_deref().unwrap_or("latest"),
+        ),
+    ];
+    rows.into_iter().find_map(|(what, asked, running)| {
+        let asked = asked?;
+        (running != asked).then(|| format!("it runs {what} {running}, you asked for {asked}"))
+    })
 }
 
 impl DaemonIdentity {
@@ -369,6 +437,16 @@ fn stale_daemon() -> Option<DaemonIdentity> {
     }
 }
 
+/// The running daemon and [`engine_change_reason`] to restart it.
+fn engine_change(requested: &RequestedEngines) -> Option<(DaemonIdentity, String)> {
+    if requested.is_empty() {
+        return None;
+    }
+    let identity = daemon_identity().ok()?;
+    let reason = engine_change_reason(&identity, requested)?;
+    Some((identity, reason))
+}
+
 /// The systemd unit managing `pid` — `None` when none does. Sitting in a
 /// unit's cgroup is not being the unit's process: `detach` changes the
 /// process group and not the cgroup, so a daemon llmman spawned inside a
@@ -376,16 +454,47 @@ fn stale_daemon() -> Option<DaemonIdentity> {
 /// instead, for the unit holding the pid and the process that unit was
 /// started for — see [`owning_unit`] and [`managing_unit`].
 ///
-/// Linux only: launchd keeps no equivalent, so a Homebrew service on
-/// macOS is not recognised and still gets superseded.
+/// On macOS, the launchd job whose own process `pid` is, which is what
+/// `launchctl list` shows; a daemon llmman spawned is not listed.
 fn service_unit(pid: Option<u32>) -> Option<String> {
+    let pid = pid?;
+    if cfg!(target_os = "macos") {
+        let list = Command::new("launchctl").arg("list").output().ok()?;
+        return launchd_job(&String::from_utf8_lossy(&list.stdout), pid);
+    }
     if !cfg!(target_os = "linux") {
         return None;
     }
-    let pid = pid?;
     let (object, user) = owning_unit(pid)?;
     let unit = unit_id(&object, user)?;
     managing_unit(pid, &unit, user, || main_pid(&object, user))
+}
+
+/// The label of the job `launchctl list` (`PID Status Label` rows) shows
+/// running `pid`.
+fn launchd_job(list: &str, pid: u32) -> Option<String> {
+    list.lines().find_map(|row| {
+        let mut cols = row.split_whitespace();
+        (cols.next()?.parse() == Ok(pid)).then(|| cols.nth(1).map(Into::into))?
+    })
+}
+
+/// Leaves a daemon a service manager owns running, saying how to restart
+/// it: killing it leaves the unit dead or respawned with its old
+/// arguments, and the port held by an unmanaged process.
+fn leave_to_manager(pid: Option<u32>, what: impl std::fmt::Display) -> bool {
+    let Some(unit) = service_unit(pid) else {
+        return false;
+    };
+    let restart = if cfg!(target_os = "macos") {
+        format!("launchctl kickstart -k gui/$(id -u)/{unit}")
+    } else {
+        format!("systemctl [--user] restart {unit}")
+    };
+    eprintln!(
+        "[llmman] {what}, but it is managed by {unit}; leaving it alone. To restart it: {restart}"
+    );
+    true
 }
 
 /// Whether the unit holding the daemon is the unit running it, by what
@@ -539,6 +648,11 @@ fn quoted(body: &str) -> Option<String> {
 /// wait before giving up entirely.
 fn stop_stale_daemon(identity: &DaemonIdentity) -> anyhow::Result<()> {
     eprintln!("stopping stale llmman serve daemon (superseded by this install); restarting");
+    stop_daemon(identity)
+}
+
+/// The stop sequence of [`stop_stale_daemon`], for any replaced daemon.
+fn stop_daemon(identity: &DaemonIdentity) -> anyhow::Result<()> {
     kill_daemon(identity, false);
     if wait_for_port_free() {
         return Ok(());
@@ -699,6 +813,16 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
 /// Like [`ensure_server`], forwarding additional `serve` options only when
 /// spawning a new daemon. The caller must not pass `--detach` back to the child.
 pub fn ensure_server_with_args(preload_model: &str, serve_args: &[&str]) -> anyhow::Result<()> {
+    ensure_server_with_engines(preload_model, serve_args, &RequestedEngines::default())
+}
+
+/// Like [`ensure_server_with_args`], but a healthy local daemon not running
+/// the `requested` engine settings is restarted rather than reused.
+pub fn ensure_server_with_engines(
+    preload_model: &str,
+    serve_args: &[&str],
+    requested: &RequestedEngines,
+) -> anyhow::Result<()> {
     if server_alive() {
         // A remote LLMMAN_HOST: reuse whatever's there, and never touch
         // its PID (see host_is_local) or spawn a "replacement" over it.
@@ -709,26 +833,27 @@ pub fn ensure_server_with_args(preload_model: &str, serve_args: &[&str]) -> anyh
         // (see stale_daemon): reusing that one means serving with a
         // long-obsolete build whose llama-server (and bug fixes) are gone.
         match stale_daemon() {
-            None => return Ok(()),
-            // A daemon a service manager started is that manager's to
-            // stop: killing it here leaves the unit dead and the port
-            // held by an unmanaged process, which `systemctl --user
-            // start` then fights over. Keep serving with the older build
-            // — the tradeoff the comment above names — and say what to
-            // run to replace it.
-            Some(identity) => match service_unit(identity.pid) {
-                Some(unit) => {
-                    eprintln!(
-                        "[llmman] {} is serving {} and is managed by {unit}; \
-                         leaving it alone. To restart it, which runs the unit's own \
-                         executable: systemctl [--user] restart {unit}",
-                        identity.version.as_deref().unwrap_or("an older daemon"),
-                        bind_addr()
-                    );
+            None => {
+                let Some((identity, reason)) = engine_change(requested) else {
+                    return Ok(());
+                };
+                if leave_to_manager(identity.pid, &reason) {
                     return Ok(());
                 }
-                None => stop_stale_daemon(&identity)?,
-            },
+                eprintln!("restarting the llmman serve daemon: {reason}");
+                stop_daemon(&identity)?;
+            }
+            Some(identity) => {
+                let what = format!(
+                    "{} is serving {}",
+                    identity.version.as_deref().unwrap_or("an older daemon"),
+                    bind_addr()
+                );
+                if leave_to_manager(identity.pid, what) {
+                    return Ok(());
+                }
+                stop_stale_daemon(&identity)?;
+            }
         }
     } else if !host_is_local() {
         anyhow::bail!(
@@ -2080,6 +2205,7 @@ mod tests {
             version: Some("0.1.0".into()),
             exe: exe.map(Into::into),
             pid: Some(1544),
+            ..Default::default()
         };
         let posix = "/home/linuxbrew/.linuxbrew/Cellar/llmman/0.1.691/bin/llmman";
         let windows = r"C:\Users\me\scoop\apps\llmman\current\llmman.exe";
@@ -2097,6 +2223,108 @@ mod tests {
         assert!(!identity(Some("")).is_foreign());
         let own = std::env::current_exe().unwrap();
         assert!(!identity(own.to_str()).is_foreign());
+    }
+
+    fn running(llama: Option<&str>) -> DaemonIdentity {
+        DaemonIdentity {
+            version: Some("0.1.0".into()),
+            exe: std::env::current_exe().unwrap().to_str().map(Into::into),
+            pid: Some(1544),
+            llama_cpp_version: llama.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_older_daemon_identity_still_parses_without_engine_settings() {
+        let identity: DaemonIdentity =
+            serde_json::from_str(r#"{"version":"0.1.0","exe":"/bin/llmman","pid":42}"#).unwrap();
+        assert!(identity.llama_cpp_version.is_none());
+        let identity: DaemonIdentity = serde_json::from_str(
+            r#"{"version":"0.1.0","exe":"/bin/llmman","pid":42,"llama_cpp_version":"latest"}"#,
+        )
+        .unwrap();
+        assert_eq!(identity.llama_cpp_version.as_deref(), Some("latest"));
+    }
+
+    #[test]
+    fn a_daemon_is_restarted_only_for_an_explicit_llama_cpp_pin_it_does_not_run() {
+        let ask = |v| RequestedEngines {
+            llama_cpp_version: v,
+            ..Default::default()
+        };
+        // No flag given: reuse, whatever the daemon runs.
+        assert_eq!(engine_change_reason(&running(Some("b1")), &ask(None)), None);
+        assert_eq!(engine_change_reason(&running(None), &ask(None)), None);
+        // The same value, spelled as the daemon's pin or by its build.
+        assert_eq!(
+            engine_change_reason(&running(Some("b12503")), &ask(Some("b12503"))),
+            None
+        );
+        assert_eq!(
+            engine_change_reason(&running(Some("latest")), &ask(Some("latest"))),
+            None
+        );
+        assert_eq!(
+            engine_change_reason(
+                &running(Some("v1.0.0-b12359-b1b770d")),
+                &ask(Some("b12359"))
+            ),
+            None
+        );
+        // A different value.
+        assert_eq!(
+            engine_change_reason(&running(Some("b12359")), &ask(Some("latest"))).as_deref(),
+            Some("it runs llama.cpp b12359, you asked for latest")
+        );
+        // A daemon too old to report its pin.
+        assert_eq!(
+            engine_change_reason(&running(None), &ask(Some("b12503"))).as_deref(),
+            Some("it runs llama.cpp an unknown version, you asked for b12503")
+        );
+    }
+
+    #[test]
+    fn launchd_job_finds_the_job_running_a_pid() {
+        let list = "PID\tStatus\tLabel\n-\t0\tcom.apple.x\n1544\t0\thomebrew.mxcl.llmman\n";
+        assert_eq!(
+            launchd_job(list, 1544).as_deref(),
+            Some("homebrew.mxcl.llmman")
+        );
+        assert_eq!(launchd_job(list, 15), None);
+    }
+
+    #[test]
+    fn a_foreign_or_unidentified_daemon_is_never_restarted_for_its_settings() {
+        let ask = RequestedEngines {
+            llama_cpp_version: Some("latest"),
+            ..Default::default()
+        };
+        let mut foreign = running(Some("b1"));
+        foreign.exe = Some(if cfg!(windows) {
+            "/usr/bin/llmman".into()
+        } else {
+            r"C:\llmman\llmman.exe".into()
+        });
+        assert_eq!(engine_change_reason(&foreign, &ask), None);
+        assert_eq!(engine_change_reason(&DaemonIdentity::default(), &ask), None);
+    }
+
+    #[test]
+    fn the_other_engine_flags_ask_for_a_restart_the_same_way() {
+        let mut identity = running(Some("latest"));
+        identity.sglang_version = Some("v0.5.19".into());
+        let ask = RequestedEngines {
+            sglang_version: Some("v0.5.19"),
+            vllm_version: Some("v0.28.0"),
+            ..Default::default()
+        };
+        assert_eq!(
+            engine_change_reason(&identity, &ask).as_deref(),
+            Some("it runs the vLLM image tag latest, you asked for v0.28.0")
+        );
+        identity.vllm_version = Some("v0.28.0".into());
+        assert_eq!(engine_change_reason(&identity, &ask), None);
     }
 
     fn show_response(body: serde_json::Value) -> ShowResponse {
