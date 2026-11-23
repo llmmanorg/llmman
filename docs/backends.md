@@ -157,8 +157,13 @@ to that uid.
 The release is pinned: unless `--llama-cpp-version <tag>` says otherwise,
 both `bin` and the container images use the llama.cpp build llmman's own
 CI tested (the `LLAMA_CPP_RELEASE` file in the repository), so what runs
-is what was tested. `--llama-cpp-version latest` takes upstream's
-floating latest instead. The option applies only when `serve` starts a new
+is what was tested. A release build pulls the default pin's container
+images by the digest CI resolved from their tags when it built the binary
+(`ghcr.io/ggml-org/llama.cpp:server-<tag>@sha256:<hex>`), so a re-tagged
+image upstream cannot change what runs; a development build, or an
+explicit `--llama-cpp-version` (the default's own tag included), pulls by
+tag alone, and `--llama-cpp-version latest` takes upstream's floating
+latest instead. The option applies only when `serve` starts a new
 daemon: one that is already running keeps its release.
 
 For `bin`, llmman probes for CUDA, ROCm, OpenCL (Windows ARM64 Adreno only),
