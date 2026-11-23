@@ -8394,11 +8394,16 @@ async fn a_speech_workers_realtime_session_is_relayed_from_its_port() {
     let state = test_state();
     mark_loaded(&state, "canary", Engine::Speech, port).await;
     let base = serve_router(state).await;
-    let ws_url = format!(
-        "{}/v1/realtime?model=canary",
-        base.replace("http://", "ws://")
-    );
-    let request = ws_url.into_client_request().unwrap();
+    // The daemon's own loopback socket; TLS does not apply.
+    let authority = base.trim_start_matches("http://").to_string();
+    let request = axum::http::Uri::builder()
+        .scheme("ws")
+        .authority(authority)
+        .path_and_query("/v1/realtime?model=canary")
+        .build()
+        .unwrap()
+        .into_client_request()
+        .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
 
     let deadline = tokio::time::sleep(Duration::from_secs(30));
