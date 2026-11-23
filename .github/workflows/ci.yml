@@ -285,6 +285,39 @@ jobs:
           mkdir -p dist-docker
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist-docker/${{ matrix.binary }}"
 
+      # The ubuntu-24.04 runner links against glibc 2.39, which hosts like
+      # RHEL 8 (2.28) lack. Rebuild the shipped binary in manylinux_2_28
+      # (pinned by digest, in a container with its own HOME and target dir),
+      # fail on any newer glibc symbol, and start it on a few distros.
+      - name: Rebuild docker binary for glibc 2.28 (Linux)
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+          x86_64) goarch=amd64 image=quay.io/pypa/manylinux_2_28_x86_64@sha256:55a36963bc0504cdf004011001c1072306402f0b8b83be5a5eba7068f93eec53 ;;
+          aarch64) goarch=arm64 image=quay.io/pypa/manylinux_2_28_aarch64@sha256:126d9eea9d6b1717f3e17b2b3ac51da04ef159a5f935dac36fe92d621dc8f246 ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/portable"
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -v "$RUNNER_TEMP/portable:/p" -w /work \
+            -e HOME=/p -e CARGO_TARGET_DIR=/p/target -e GOTOOLCHAIN=local -e GOARCH="$goarch" \
+            -e CARGO_BUILD_JOBS -e LLMMAN_GIT_DESCRIBE -e LLMMAN_LLAMA_IMAGE_DIGESTS "$image" bash -euxc '
+              go=go$(awk "\$1 == \"go\" { print \$2; exit }" go-shim/go.mod)
+              url=https://dl.google.com/go/$go.linux-$GOARCH.tar.gz
+              curl -fsSL --retry 5 -o /p/go.tgz "$url"
+              echo "$(curl -fsSL --retry 5 "$url.sha256")  /p/go.tgz" | sha256sum -c -
+              tar -C /p -xzf /p/go.tgz
+              curl --proto "=https" --tlsv1.2 -fsSL --retry 5 https://sh.rustup.rs |
+                sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+              PATH=/p/go/bin:/p/.cargo/bin:$PATH cargo build --release'
+          cp "$RUNNER_TEMP/portable/target/release/${{ matrix.binary }}" "dist-docker/${{ matrix.binary }}"
+          max="$(objdump -T dist-docker/llmman | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          echo "newest glibc symbol: $max"
+          [ "$(printf '%s\nGLIBC_2.28\n' "$max" | sort -V | tail -1)" = GLIBC_2.28 ] || { echo "::error::needs $max, not 2.28"; exit 1; }
+          for img in rockylinux:8 ubuntu:22.04 debian:12; do
+            docker run --rm -v "$PWD/dist-docker/llmman:/llmman:ro" "$img" /llmman --version
+          done
+
       # ── Build (Podman backend) ────────────────────────────────────────────
       # Skipped on Windows: containers/image has no Windows support.
       - name: Build (podman backend)

@@ -6,7 +6,7 @@
 # Build with this directory as the context. Next to the Go sources it holds
 # the executable llmman-amd64 and llmman-arm64 (TARGETARCH names) from the
 # build job, as packaging/Dockerfile's context does; nothing compiles
-# llmman here. Ubuntu 24.04 is the glibc those binaries are built against.
+# llmman here. The binaries need glibc 2.28+.
 #
 #   cp ../target/release/llmman llmman-amd64
 #   docker build -t llmman-csi .
