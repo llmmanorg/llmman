@@ -34,6 +34,7 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 
 use crate::hostgpu::{self, HostGpu};
+use crate::llama_release::LlamaPin;
 
 pub(crate) mod identity;
 
@@ -220,17 +221,38 @@ impl GpuBackend {
         }
     }
 
-    /// The full `ghcr.io/ggml-org/llama.cpp:<tag>` reference. `version`,
-    /// when given, pins to that release (e.g. `server-b9994` instead of
+    /// The full `ghcr.io/ggml-org/llama.cpp:<tag>` reference. A pinned
+    /// release selects its versioned tag (e.g. `server-b9994` instead of
     /// the floating `server`) — ghcr.io/ggml-org/llama.cpp publishes a
     /// versioned tag alongside every floating one, built from the same
-    /// release. Which pin is cmd::serve's decision (normally
-    /// `crate::llama_release::default_release`, or `--llama-cpp-version`);
-    /// `None` is the floating tag, for `--llama-cpp-version latest`.
-    fn image_ref(self, version: Option<&str>) -> String {
-        match version {
-            Some(v) => format!("ghcr.io/ggml-org/llama.cpp:{}-{v}", self.image_tag()),
-            None => format!("ghcr.io/ggml-org/llama.cpp:{}", self.image_tag()),
+    /// release. Which pin is cmd::serve's decision (`LlamaPin::Default`
+    /// unless `--llama-cpp-version` says otherwise); `Latest` is the
+    /// floating tag. The implicit default also carries the `@sha256:<hex>`
+    /// digest CI resolved for this image when it built the binary
+    /// (`llama_release::IMAGE_DIGESTS`), so a re-tagged image upstream
+    /// cannot change what runs; an explicit version, even the default's
+    /// own tag, and `latest` stay tag-only, and so does a build without
+    /// digests.
+    fn image_ref(self, pin: &LlamaPin) -> String {
+        self.image_ref_with(pin, crate::llama_release::IMAGE_DIGESTS)
+    }
+
+    /// [`image_ref`](Self::image_ref) over `digests`, in
+    /// `llama_release::IMAGE_DIGESTS`'s format.
+    fn image_ref_with(self, pin: &LlamaPin, digests: &str) -> String {
+        let tag = self.image_tag();
+        match pin {
+            LlamaPin::Latest => format!("ghcr.io/ggml-org/llama.cpp:{tag}"),
+            LlamaPin::Explicit(v) => format!("ghcr.io/ggml-org/llama.cpp:{tag}-{v}"),
+            LlamaPin::Default => {
+                let release = crate::llama_release::default_release();
+                let mut image = format!("ghcr.io/ggml-org/llama.cpp:{tag}-{release}");
+                if let Some(digest) = crate::llama_release::image_digest_in(digests, tag) {
+                    image.push('@');
+                    image.push_str(digest);
+                }
+                image
+            }
         }
     }
 
@@ -496,15 +518,18 @@ pub enum ContainerEngine {
     Speech,
 }
 
-/// The image [`spawn`] / [`spawn_engine`] would run here for `engine`.
+/// The image [`spawn`] / [`spawn_engine`] would run here for `engine`:
+/// `llama_pin` selects the llama.cpp images, `version` and `vllm_image`
+/// the others.
 fn image_for(
     engine: ContainerEngine,
+    llama_pin: &LlamaPin,
     version: Option<&str>,
     vllm_image: Option<&str>,
 ) -> Result<String> {
     match engine {
-        ContainerEngine::LlamaServer => Ok(detect_backend().image_ref(version)),
-        ContainerEngine::Speech => Ok(SPEECH_BACKEND.image_ref(version)),
+        ContainerEngine::LlamaServer => Ok(detect_backend().image_ref(llama_pin)),
+        ContainerEngine::Speech => Ok(SPEECH_BACKEND.image_ref(llama_pin)),
         _ => VllmBackend::detect().engine_image(engine, version, vllm_image),
     }
 }
@@ -537,9 +562,10 @@ fn image_for(
 /// Pulls the image [`spawn`] or [`spawn_engine`] would run for `engine` on
 /// this host, with the pull's own progress output (a real `docker pull`/
 /// `podman pull` progress bar — not something llmman re-implements)
-/// inherited directly to this process's stdout/stderr. `version` is the
-/// engine's pin (`--llama-cpp-version` / `--vllm-version`), if any, and
-/// `vllm_image` is `--vllm-image`.
+/// inherited directly to this process's stdout/stderr. `llama_pin` is
+/// `--llama-cpp-version` as settled for the llama.cpp images, `version`
+/// the other engines' pin (`--vllm-version` / `--sglang-version`), if
+/// any, and `vllm_image` is `--vllm-image`.
 ///
 /// `spawn`'s underlying `docker run`/`podman run` would pull an image that
 /// isn't already cached locally on its own, but silently and without any
@@ -552,12 +578,13 @@ fn image_for(
 pub fn pull_image(
     ociman: ContainerManager,
     engine: ContainerEngine,
+    llama_pin: &LlamaPin,
     version: Option<&str>,
     vllm_image: Option<&str>,
 ) -> Result<()> {
     use std::io::Write;
 
-    let image = image_for(engine, version, vllm_image)?;
+    let image = image_for(engine, llama_pin, version, vllm_image)?;
     let cli = ociman.binary();
     let header = format!("[llmman] {cli}: pulling {image}...");
     eprintln!("{header}");
@@ -716,7 +743,7 @@ const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 pub(crate) fn verify_llama_server_runs(
     ociman: ContainerManager,
     backend: GpuBackend,
-    version: Option<&str>,
+    pin: &LlamaPin,
     hardened: bool,
 ) -> Result<()> {
     let cli = ociman.binary();
@@ -733,15 +760,9 @@ pub(crate) fn verify_llama_server_runs(
         .then(|| HardenedUser::resolve(ociman, None))
         .flatten();
     let mut cmd = std::process::Command::new(cli);
-    cmd.args(verify_args(
-        backend,
-        version,
-        &name,
-        hardened,
-        user.as_ref(),
-    ))
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::null());
+    cmd.args(verify_args(backend, pin, &name, hardened, user.as_ref()))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
     let engine_args = backend.engine_args();
     let suffix = if hardened {
         format!(
@@ -780,7 +801,7 @@ pub(crate) fn verify_llama_server_runs(
 /// match what [`spawn`] serves with.
 fn verify_args(
     backend: GpuBackend,
-    version: Option<&str>,
+    pin: &LlamaPin,
     name: &str,
     hardened: bool,
     user: Option<&HardenedUser>,
@@ -802,7 +823,7 @@ fn verify_args(
     }
     args.extend(engine_args);
     args.extend(forwarded_env_args(&[]));
-    args.push(backend.image_ref(version));
+    args.push(backend.image_ref(pin));
     args.push("--version".into());
     args
 }
@@ -884,8 +905,8 @@ pub struct LlamaOptions<'a> {
 /// forwarded by the CLI process at all (that's what SIGKILL means), so
 /// it was also verified live to leave the container running.
 ///
-/// `llama_cpp_version`, when given, pins the image to that release tag
-/// (see [`GpuBackend::image_ref`]) instead of the floating one.
+/// `llama_cpp_version` selects the image's release tag, and the digest
+/// at the default (see [`GpuBackend::image_ref`]).
 ///
 /// `opts` carries every `llama-server` flag this forwards into the
 /// container — see [`LlamaOptions`].
@@ -897,7 +918,7 @@ pub fn spawn(
     ociman: ContainerManager,
     model_path: &Path,
     mmproj_path: Option<&Path>,
-    llama_cpp_version: Option<&str>,
+    llama_cpp_version: &LlamaPin,
     opts: LlamaOptions<'_>,
 ) -> Result<tokio::process::Child> {
     let backend = detect_backend();
@@ -1678,7 +1699,7 @@ pub(crate) fn spawn_mediagen(
     model_ref: &str,
     store_path: &Path,
     cache_path: &Path,
-    llama_cpp_version: Option<&str>,
+    llama_cpp_version: &LlamaPin,
     port: u16,
     cpus: Option<f64>,
     hardened: bool,
@@ -1807,6 +1828,11 @@ pub fn stop(_pid: u32) {
 mod tests {
     use super::*;
 
+    /// An explicit `--llama-cpp-version <tag>`.
+    fn pin(tag: &str) -> LlamaPin {
+        LlamaPin::Explicit(tag.to_owned())
+    }
+
     #[test]
     fn last_output_line_drops_control_sequences_and_redraws() {
         let out = b"Pulling\r\n\x1b[1A\x1b[2K\rabc: Downloading  1MB/3MB\r\x1b[1B\x1b[1A\x1b[2K\rError response from daemon: denied \r\n\r\n";
@@ -1929,23 +1955,27 @@ mod tests {
     #[test]
     fn speech_image_is_the_cpu_image_on_any_host() {
         assert_eq!(
-            image_for(ContainerEngine::Speech, Some("b9994"), None).unwrap(),
-            GpuBackend::Cpu.image_ref(Some("b9994"))
+            image_for(ContainerEngine::Speech, &pin("b9994"), None, None).unwrap(),
+            GpuBackend::Cpu.image_ref(&pin("b9994"))
         );
         assert_eq!(
-            image_for(ContainerEngine::Speech, None, None).unwrap(),
-            GpuBackend::Cpu.image_ref(None)
+            image_for(ContainerEngine::Speech, &LlamaPin::Latest, None, None).unwrap(),
+            GpuBackend::Cpu.image_ref(&LlamaPin::Latest)
+        );
+        assert_eq!(
+            image_for(ContainerEngine::Speech, &LlamaPin::Default, None, None).unwrap(),
+            GpuBackend::Cpu.image_ref(&LlamaPin::Default)
         );
     }
 
     #[test]
-    fn image_ref_uses_floating_tag_when_no_version_given() {
+    fn image_ref_uses_floating_tag_for_latest() {
         assert_eq!(
-            GpuBackend::Cpu.image_ref(None),
+            GpuBackend::Cpu.image_ref(&LlamaPin::Latest),
             "ghcr.io/ggml-org/llama.cpp:server"
         );
         assert_eq!(
-            GpuBackend::Cuda13.image_ref(None),
+            GpuBackend::Cuda13.image_ref(&LlamaPin::Latest),
             "ghcr.io/ggml-org/llama.cpp:server-cuda13"
         );
     }
@@ -1953,12 +1983,47 @@ mod tests {
     #[test]
     fn image_ref_pins_to_the_given_version() {
         assert_eq!(
-            GpuBackend::Cpu.image_ref(Some("b9994")),
+            GpuBackend::Cpu.image_ref(&pin("b9994")),
             "ghcr.io/ggml-org/llama.cpp:server-b9994"
         );
         assert_eq!(
-            GpuBackend::Cuda13.image_ref(Some("b9994")),
+            GpuBackend::Cuda13.image_ref(&pin("b9994")),
             "ghcr.io/ggml-org/llama.cpp:server-cuda13-b9994"
+        );
+    }
+
+    /// Only the implicit default is pulled by digest: the same tag named
+    /// on the command line, `latest` and any other release stay tag-only,
+    /// as does the default when the build carried no digest for the image.
+    #[test]
+    fn image_ref_adds_the_digest_only_for_the_implicit_default() {
+        let release = crate::llama_release::default_release();
+        let digest = "sha256:e3032ea0712da96dec820c770626385de4322dd06619fb5829256a504bbc9375";
+        let digests = format!("server={digest}");
+        assert_eq!(
+            GpuBackend::Cpu.image_ref_with(&LlamaPin::Default, &digests),
+            format!("ghcr.io/ggml-org/llama.cpp:server-{release}@{digest}")
+        );
+        assert_eq!(
+            GpuBackend::Cpu.image_ref_with(&pin(release), &digests),
+            format!("ghcr.io/ggml-org/llama.cpp:server-{release}")
+        );
+        assert_eq!(
+            GpuBackend::Cpu.image_ref_with(&pin("b9994"), &digests),
+            "ghcr.io/ggml-org/llama.cpp:server-b9994"
+        );
+        assert_eq!(
+            GpuBackend::Cpu.image_ref_with(&LlamaPin::Latest, &digests),
+            "ghcr.io/ggml-org/llama.cpp:server"
+        );
+        // No entry for this image, and no list at all.
+        assert_eq!(
+            GpuBackend::Cuda13.image_ref_with(&LlamaPin::Default, &digests),
+            format!("ghcr.io/ggml-org/llama.cpp:server-cuda13-{release}")
+        );
+        assert_eq!(
+            GpuBackend::Cpu.image_ref_with(&LlamaPin::Default, ""),
+            format!("ghcr.io/ggml-org/llama.cpp:server-{release}")
         );
     }
 
@@ -2386,7 +2451,7 @@ mod tests {
                 "ghcr.io/ggml-org/llama.cpp:server-cuda13-b9994",
             ),
         ] {
-            let args = verify_args(backend, Some("b9994"), "llmman-verify-1", false, None);
+            let args = verify_args(backend, &pin("b9994"), "llmman-verify-1", false, None);
             assert_eq!(
                 &args[..5],
                 ["run", "--rm", "--init", "--name", "llmman-verify-1"]
@@ -2583,7 +2648,13 @@ mod tests {
         assert!(!args.contains(&"--user".to_string()), "{args:?}");
         assert!(!args.iter().any(|a| a == "HOME=/tmp"), "{args:?}");
         // The verify run and the worker take the same value.
-        let args = verify_args(GpuBackend::Cuda13, None, "v", true, Some(&gpu_user));
+        let args = verify_args(
+            GpuBackend::Cuda13,
+            &LlamaPin::Latest,
+            "v",
+            true,
+            Some(&gpu_user),
+        );
         let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
         assert!(
             at("--cap-drop") < at("--user") && at("--user") < at("--gpus"),
@@ -2593,7 +2664,7 @@ mod tests {
             args.windows(2).any(|w| w == ["--group-add", "44"]),
             "{args:?}"
         );
-        let args = verify_args(GpuBackend::Cuda13, None, "v", true, None);
+        let args = verify_args(GpuBackend::Cuda13, &LlamaPin::Latest, "v", true, None);
         assert!(!args.contains(&"--user".to_string()), "{args:?}");
         let args = mediagen_run_args(
             GpuBackend::Cpu,
@@ -2703,7 +2774,13 @@ mod tests {
         // The verify run's note is the same block for its argv.
         let engine_args = GpuBackend::Rocm.engine_args();
         let flags = hardened_flags(&engine_args, &llama_tmpfs(&engine_args), Some(&gpu_user));
-        let verify = verify_args(GpuBackend::Rocm, None, "x", true, Some(&gpu_user));
+        let verify = verify_args(
+            GpuBackend::Rocm,
+            &LlamaPin::Latest,
+            "x",
+            true,
+            Some(&gpu_user),
+        );
         assert_eq!(&verify[5..5 + flags.len()], flags.as_slice(), "{verify:?}");
     }
 
@@ -2752,7 +2829,7 @@ mod tests {
         let argv = |backend: GpuBackend, hardened| {
             llama_run_args(
                 backend,
-                backend.image_ref(None),
+                backend.image_ref(&LlamaPin::Latest),
                 "/cache/blobs",
                 "sha256-abc",
                 None,
@@ -2881,7 +2958,7 @@ mod tests {
     #[test]
     fn hardened_verify_runs_with_the_same_block_as_spawn() {
         for (backend, read_only) in [(GpuBackend::Cpu, true), (GpuBackend::Cuda13, false)] {
-            let args = verify_args(backend, Some("b9994"), "llmman-verify-1", true, None);
+            let args = verify_args(backend, &pin("b9994"), "llmman-verify-1", true, None);
             assert_eq!(
                 &args[..5],
                 ["run", "--rm", "--init", "--name", "llmman-verify-1"]
@@ -2895,7 +2972,7 @@ mod tests {
             );
             let at = args
                 .iter()
-                .position(|a| a == &backend.image_ref(Some("b9994")))
+                .position(|a| a == &backend.image_ref(&pin("b9994")))
                 .unwrap();
             assert_eq!(&args[at + 1..], ["--version"]);
         }
@@ -2904,7 +2981,7 @@ mod tests {
     fn worker_args(backend: GpuBackend, hardened: bool) -> Vec<String> {
         mediagen_run_args(
             backend,
-            backend.image_ref(Some("b9994")),
+            backend.image_ref(&pin("b9994")),
             "/usr/bin/llmman",
             "/store",
             "/cache",
@@ -2931,7 +3008,7 @@ mod tests {
             for flag in ["--cap-drop", "--read-only", "--tmpfs"] {
                 assert!(!args.contains(&flag.to_string()), "{backend:?}: {args:?}");
             }
-            let image = backend.image_ref(Some("b9994"));
+            let image = backend.image_ref(&pin("b9994"));
             let at = args.iter().position(|a| a == &image).unwrap();
             assert_eq!(
                 &args[at - 12..at],
@@ -3115,7 +3192,7 @@ mod tests {
         let backend = detect_backend();
         println!(
             "container::detect_backend() -> {backend:?} ({})",
-            backend.image_ref(None)
+            backend.image_ref(&LlamaPin::Latest)
         );
     }
     #[test]
@@ -3138,7 +3215,7 @@ mod tests {
         let argv = |backend: GpuBackend| {
             llama_run_args(
                 backend,
-                backend.image_ref(None),
+                backend.image_ref(&LlamaPin::Latest),
                 "/cache/blobs",
                 "sha256-abc",
                 None,
@@ -3183,9 +3260,9 @@ mod tests {
         );
         assert_eq!(llama_tmpfs(&GpuBackend::Cpu.engine_args()), ["/tmp"]);
         // The verify run follows the same rule.
-        let args = verify_args(GpuBackend::Rocm, None, "v", true, None);
+        let args = verify_args(GpuBackend::Rocm, &LlamaPin::Latest, "v", true, None);
         assert_eq!(cache(&args), 1, "{args:?}");
-        let args = verify_args(GpuBackend::Cpu, None, "v", true, None);
+        let args = verify_args(GpuBackend::Cpu, &LlamaPin::Latest, "v", true, None);
         assert_eq!(cache(&args), 0, "{args:?}");
     }
 

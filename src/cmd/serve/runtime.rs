@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 
 use crate::container::{ContainerEngine, ContainerManager};
-use crate::llama_release::DownloadMarker;
+use crate::llama_release::{DownloadMarker, LlamaPin};
 
 /// `--runtime` / `LLMMAN_RUNTIME`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -190,7 +190,7 @@ impl Slot {
 /// the same way; it never touches the general one.
 pub struct Lazy {
     requested: Runtime,
-    llama_cpp_version: Option<String>,
+    llama_cpp_version: LlamaPin,
     hardened: bool,
     general: Slot,
     cpu_only: Slot,
@@ -200,7 +200,7 @@ impl Lazy {
     /// `resolved` is startup's general result, `None` if that failed.
     pub fn new(
         requested: Runtime,
-        llama_cpp_version: Option<String>,
+        llama_cpp_version: LlamaPin,
         hardened: bool,
         resolved: Option<Resolved>,
     ) -> Self {
@@ -257,12 +257,13 @@ impl Lazy {
         let requested = self.requested;
         let pin = self.llama_cpp_version.clone();
         let hardened = self.hardened;
-        let resolved = tokio::task::spawn_blocking(move || {
-            resolve_for(workload, requested, pin.as_deref(), hardened)
-        })
-        .await
-        .context("resolve runtime task panicked")?
-        .context("the llama.cpp runtime could not be set up (this daemon started without it)")?;
+        let resolved =
+            tokio::task::spawn_blocking(move || resolve_for(workload, requested, &pin, hardened))
+                .await
+                .context("resolve runtime task panicked")?
+                .context(
+                    "the llama.cpp runtime could not be set up (this daemon started without it)",
+                )?;
         slot.set(resolved.clone());
         Ok(resolved)
     }
@@ -315,7 +316,7 @@ impl Lazy {
             bin.display()
         );
         let pin = self.llama_cpp_version.clone();
-        let (_, bin) = tokio::task::spawn_blocking(move || resolve_local(source, pin.as_deref()))
+        let (_, bin) = tokio::task::spawn_blocking(move || resolve_local(source, &pin))
             .await
             .context("resolve llama-server task panicked")??;
         self.set(Resolved::Local {
@@ -327,18 +328,14 @@ impl Lazy {
 }
 
 /// Settles `runtime` on this host and acquires its llama.cpp (image or
-/// release build, pinned to `llama_cpp_version`; `None` is upstream's
-/// floating latest), so the result is known to work before the listener
-/// binds and `--pull-only` has nothing left to do. `hardened` is the
-/// daemon's setting (on unless `--no-hardened`): the verify run under `auto` starts the image
-/// with the same `container::hardened_args` block the real spawn will.
-/// Under `auto` each failing step is logged and the next tried; off
-/// Linux the container steps are skipped. Blocking; call from `spawn_blocking`.
-pub fn resolve(
-    runtime: Runtime,
-    llama_cpp_version: Option<&str>,
-    hardened: bool,
-) -> Result<Resolved> {
+/// release build, pinned by `llama_cpp_version`), so the result is known
+/// to work before the listener binds and `--pull-only` has nothing left
+/// to do. `hardened` is the daemon's setting (on unless `--no-hardened`):
+/// the verify run under `auto` starts the image with the same
+/// `container::hardened_args` block the real spawn will. Under `auto`
+/// each failing step is logged and the next tried; off Linux the
+/// container steps are skipped. Blocking; call from `spawn_blocking`.
+pub fn resolve(runtime: Runtime, llama_cpp_version: &LlamaPin, hardened: bool) -> Result<Resolved> {
     resolve_for(Workload::General, runtime, llama_cpp_version, hardened)
 }
 
@@ -347,7 +344,7 @@ pub fn resolve(
 pub fn resolve_for(
     workload: Workload,
     runtime: Runtime,
-    llama_cpp_version: Option<&str>,
+    llama_cpp_version: &LlamaPin,
     hardened: bool,
 ) -> Result<Resolved> {
     resolve_with(workload, runtime, llama_cpp_version, hardened, false)
@@ -359,7 +356,7 @@ pub fn resolve_for(
 fn resolve_with(
     workload: Workload,
     runtime: Runtime,
-    llama_cpp_version: Option<&str>,
+    llama_cpp_version: &LlamaPin,
     hardened: bool,
     local_only: bool,
 ) -> Result<Resolved> {
@@ -379,10 +376,7 @@ fn resolve_with(
 /// Returns the source (`Bin` or `Path`) with the binary: only `Bin` is
 /// selected by `llama_cpp_version`; a `Path` binary is whatever is
 /// installed, whatever the pin says.
-pub fn resolve_local(
-    runtime: Runtime,
-    llama_cpp_version: Option<&str>,
-) -> Result<(Runtime, PathBuf)> {
+pub fn resolve_local(runtime: Runtime, llama_cpp_version: &LlamaPin) -> Result<(Runtime, PathBuf)> {
     if let Some(m) = runtime.ociman() {
         anyhow::bail!(
             "--runtime {} runs llama-server in a container; there is no local binary",
@@ -461,7 +455,7 @@ fn resolve_from(
 fn try_one(
     workload: Workload,
     candidate: Runtime,
-    llama_cpp_version: Option<&str>,
+    llama_cpp_version: &LlamaPin,
     hardened: bool,
     explicit: bool,
 ) -> Result<Resolved> {
@@ -498,6 +492,7 @@ fn try_one(
                             workload.engine(),
                             llama_cpp_version,
                             None,
+                            None,
                         )
                     },
                     (!explicit).then_some(|| {
@@ -513,7 +508,7 @@ fn try_one(
             Ok(Resolved::Container(ociman))
         }
         Runtime::Bin => {
-            let bin = crate::llama_release::ensure_llama_server(llama_cpp_version)
+            let bin = crate::llama_release::ensure_llama_server(llama_cpp_version.tag())
                 .context("download of llama.cpp's prebuilt llama-server failed")?
                 .bin;
             verify_local_llama_server_runs(&bin)?;
@@ -626,13 +621,16 @@ fn prepare_container(
     Ok(())
 }
 
-/// `--llama-cpp-version` as a pin: unset is
-/// [`crate::llama_release::default_release`], `latest` is `None`.
-pub fn llama_cpp_pin(arg: Option<&str>) -> Option<String> {
+/// `--llama-cpp-version` as a pin: unset is [`LlamaPin::Default`] (the
+/// release [`crate::llama_release::default_release`] names), `latest` is
+/// [`LlamaPin::Latest`], anything else [`LlamaPin::Explicit`], the
+/// default's own tag included: only the implicit default is pulled by
+/// digest (see `container::GpuBackend::image_ref`).
+pub fn llama_cpp_pin(arg: Option<&str>) -> LlamaPin {
     match arg {
-        Some("latest") => None,
-        Some(v) => Some(v.to_owned()),
-        None => Some(crate::llama_release::default_release().to_owned()),
+        Some("latest") => LlamaPin::Latest,
+        Some(v) => LlamaPin::Explicit(v.to_owned()),
+        None => LlamaPin::Default,
     }
 }
 
@@ -667,9 +665,20 @@ mod tests {
     fn pin_defaults_to_the_ci_release_and_latest_unpins() {
         let default = crate::llama_release::default_release();
         assert!(default.starts_with('v'), "{default}");
-        assert_eq!(llama_cpp_pin(None).as_deref(), Some(default));
-        assert_eq!(llama_cpp_pin(Some("latest")), None);
-        assert_eq!(llama_cpp_pin(Some("b9994")).as_deref(), Some("b9994"));
+        assert_eq!(llama_cpp_pin(None), LlamaPin::Default);
+        assert_eq!(llama_cpp_pin(None).tag(), Some(default));
+        assert_eq!(llama_cpp_pin(Some("latest")), LlamaPin::Latest);
+        assert_eq!(llama_cpp_pin(Some("latest")).tag(), None);
+        assert_eq!(
+            llama_cpp_pin(Some("b9994")),
+            LlamaPin::Explicit("b9994".into())
+        );
+        // The default's own tag, spelled out, is explicit: tag-only pulls.
+        assert_eq!(
+            llama_cpp_pin(Some(default)),
+            LlamaPin::Explicit(default.to_owned())
+        );
+        assert_ne!(llama_cpp_pin(Some(default)), LlamaPin::Default);
     }
 
     /// The marker file the client polls, at a path of this test's own.
@@ -828,7 +837,7 @@ mod tests {
     async fn the_two_answers_are_kept_apart() {
         let lazy = Lazy::new(
             Runtime::Path,
-            None,
+            LlamaPin::Latest,
             true,
             Some(Resolved::Local {
                 source: Runtime::Path,
@@ -854,7 +863,7 @@ mod tests {
         }
         // Refused before any docker/podman binary is looked for, so this
         // is deterministic on a macOS/Windows developer machine too.
-        let err = resolve(Runtime::Docker, None, true)
+        let err = resolve(Runtime::Docker, &LlamaPin::Latest, true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("only supported on Linux"), "{err}");
@@ -885,7 +894,12 @@ mod tests {
             bin: PathBuf::from("/nonexistent/llama-server"),
         };
         // A resolve would fail on this path, proving none is made.
-        let lazy = Lazy::new(Runtime::Bin, Some("b0".into()), true, Some(startup));
+        let lazy = Lazy::new(
+            Runtime::Bin,
+            LlamaPin::Explicit("b0".into()),
+            true,
+            Some(startup),
+        );
         assert_eq!(lazy.known().unwrap().runtime(), Runtime::Path);
         assert_eq!(lazy.ociman().await.unwrap(), None);
         assert_eq!(
@@ -897,12 +911,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn lazy_answers_ociman_without_fetching_under_a_local_runtime() {
         for requested in [Runtime::Bin, Runtime::Path] {
-            let lazy = Lazy::new(requested, Some("b0".into()), true, None);
+            let lazy = Lazy::new(requested, LlamaPin::Explicit("b0".into()), true, None);
             assert_eq!(lazy.ociman().await.unwrap(), None);
             assert!(lazy.known().is_none(), "{requested:?}");
         }
         if !cfg!(target_os = "linux") {
-            let lazy = Lazy::new(Runtime::Auto, Some("b0".into()), true, None);
+            let lazy = Lazy::new(Runtime::Auto, LlamaPin::Explicit("b0".into()), true, None);
             assert_eq!(lazy.ociman().await.unwrap(), None);
             assert!(lazy.known().is_none());
         }
@@ -914,7 +928,7 @@ mod tests {
             return;
         }
         // Refused before any probe off Linux, so deterministic.
-        let lazy = Lazy::new(Runtime::Docker, None, true, None);
+        let lazy = Lazy::new(Runtime::Docker, LlamaPin::Latest, true, None);
         let err = lazy.ociman().await.unwrap_err().to_string();
         assert!(err.contains("could not be set up"), "{err}");
         assert!(lazy.known().is_none(), "a failure must not be remembered");
@@ -926,7 +940,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn lazy_set_replaces_the_resolution() {
-        let lazy = Lazy::new(Runtime::Path, None, true, None);
+        let lazy = Lazy::new(Runtime::Path, LlamaPin::Latest, true, None);
         lazy.set(Resolved::Container(ContainerManager::Docker));
         assert_eq!(lazy.ociman().await.unwrap(), Some(ContainerManager::Docker));
         lazy.set(Resolved::Local {

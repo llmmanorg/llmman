@@ -27,6 +27,7 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 
 use crate::default_store;
+use crate::llama_release::LlamaPin;
 use crate::metrics::{self, UnloadReason};
 use crate::modelpack::{resolve_model, ModelPath};
 use crate::providers::{Wire, PLACEHOLDER_API_KEY};
@@ -275,8 +276,8 @@ struct Inner {
     // `--runtime`, settled with its llama.cpp fetched — at startup, or on
     // the first load that needs it if that failed.
     runtime: runtime::Lazy,
-    // The llama.cpp pin; None only for `--llama-cpp-version latest`.
-    llama_cpp_version: Option<String>,
+    // The llama.cpp pin, as `--llama-cpp-version` settled it.
+    llama_cpp_version: LlamaPin,
     // --vllm-version; only meaningful with a container runtime.
     vllm_version: Option<String>,
     // --vllm-image.
@@ -2636,7 +2637,7 @@ async fn resolve_target(
                             &load_ref,
                             &state.0.store_path,
                             &state.0.cache_path,
-                            state.0.llama_cpp_version.as_deref(),
+                            &state.0.llama_cpp_version,
                             port,
                             state.0.cpu_limit,
                             state.0.hardened,
@@ -2656,7 +2657,7 @@ async fn resolve_target(
                             ociman,
                             path,
                             mmproj.as_deref(),
-                            state.0.llama_cpp_version.as_deref(),
+                            &state.0.llama_cpp_version,
                             llama_opts,
                         )?;
                         stderr_tail = Some(tail_child_output(&mut child));
@@ -2683,7 +2684,7 @@ async fn resolve_target(
                     &load_ref,
                     &state.0.store_path,
                     &state.0.cache_path,
-                    state.0.llama_cpp_version.as_deref(),
+                    &state.0.llama_cpp_version,
                     port,
                     state.0.cpu_limit,
                     state.0.hardened,
@@ -4558,7 +4559,7 @@ impl ServeArgs {
 /// came from.
 pub fn llama_libs(
     runtime: Runtime,
-    pinned_version: Option<&str>,
+    pinned_version: &LlamaPin,
 ) -> anyhow::Result<(Runtime, PathBuf)> {
     let (source, bin) = runtime::resolve_local(runtime, pinned_version)?;
     let dir = crate::mediagen::ffi::lib_dir_of(&bin).ok_or_else(|| {
@@ -4606,7 +4607,7 @@ async fn load_ggml_api(
     let pinned = runtime::llama_cpp_pin(args.llama_cpp_version.as_deref());
     let runtime = args.runtime;
     let lib_dir = tokio::task::spawn_blocking(move || {
-        llama_libs(runtime, pinned.as_deref()).map(|(_, lib_dir)| lib_dir)
+        llama_libs(runtime, &pinned).map(|(_, lib_dir)| lib_dir)
     })
     .await??;
     let api = Box::leak(Box::new(crate::mediagen::ffi::Api::load(&lib_dir)?));
@@ -4734,13 +4735,20 @@ async fn spawn_mediagen_backend(
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.args(mediagen_backend_args(model_ref, port));
     // Explicit, so the child lands on the same build as this daemon
-    // rather than re-resolving `auto`/the default pin/LLMMAN_RUNTIME.
+    // rather than re-resolving `auto`/LLMMAN_RUNTIME. The llama.cpp pin
+    // is forwarded as given: the child is this same binary, so an omitted
+    // flag settles on the same default (and its digest).
     let runtime = state.0.runtime.resolve_for(workload).await?.runtime();
     cmd.args(["--runtime", runtime.as_str()]);
-    cmd.args([
-        "--llama-cpp-version",
-        state.0.llama_cpp_version.as_deref().unwrap_or("latest"),
-    ]);
+    match &state.0.llama_cpp_version {
+        LlamaPin::Default => {}
+        LlamaPin::Explicit(tag) => {
+            cmd.args(["--llama-cpp-version", tag]);
+        }
+        LlamaPin::Latest => {
+            cmd.args(["--llama-cpp-version", "latest"]);
+        }
+    }
     for var in GPU_VISIBLE_DEVICE_VARS
         .iter()
         .chain(LLAMA_CPP_ENV_PASSTHROUGH_VARS)
@@ -5035,7 +5043,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     );
     let resolved = {
         let pin = llama_cpp_version.clone();
-        tokio::task::spawn_blocking(move || runtime::resolve(requested, pin.as_deref(), hardened))
+        tokio::task::spawn_blocking(move || runtime::resolve(requested, &pin, hardened))
             .await
             .context("resolve runtime task panicked")?
     };
@@ -5085,7 +5093,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             PullOnlyStep::ResolveCpuOnly => {
                 let pin = llama_cpp_version.clone();
                 tokio::task::spawn_blocking(move || {
-                    runtime::resolve_for(Workload::CpuOnly, requested, pin.as_deref(), hardened)
+                    runtime::resolve_for(Workload::CpuOnly, requested, &pin, hardened)
                 })
                 .await
                 .context("resolve runtime task panicked")??;
@@ -5096,7 +5104,13 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
                     crate::container::ContainerEngine::Sglang => _args.sglang_version.as_deref(),
                     _ => _args.vllm_version.as_deref(),
                 };
-                crate::container::pull_image(ociman, engine, version, _args.vllm_image.as_deref())?;
+                crate::container::pull_image(
+                    ociman,
+                    engine,
+                    &llama_cpp_version,
+                    version,
+                    _args.vllm_image.as_deref(),
+                )?;
             }
         }
         return Ok(());

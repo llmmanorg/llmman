@@ -73,8 +73,13 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
         }),
         exe: None,
         // `path`, so a resolve could never download.
-        runtime: runtime::Lazy::new(Runtime::Path, None, true, None),
-        llama_cpp_version: None,
+        runtime: runtime::Lazy::new(
+            Runtime::Path,
+            crate::llama_release::LlamaPin::Latest,
+            true,
+            None,
+        ),
+        llama_cpp_version: crate::llama_release::LlamaPin::Latest,
         vllm_version: None,
         vllm_image: None,
         sglang_version: None,

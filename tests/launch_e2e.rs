@@ -3507,7 +3507,11 @@ fn llama_libs_on_path() -> Option<PathBuf> {
         eprintln!("skipping: llama-server not on PATH");
         return None;
     }
-    let (_, dir) = llmman::cmd::serve::llama_libs(llmman::cmd::serve::Runtime::Path, None).unwrap();
+    let (_, dir) = llmman::cmd::serve::llama_libs(
+        llmman::cmd::serve::Runtime::Path,
+        &llmman::llama_release::LlamaPin::Latest,
+    )
+    .unwrap();
     Some(dir)
 }
 

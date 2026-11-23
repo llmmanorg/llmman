@@ -25,9 +25,10 @@ env:
   # the llmman binary's default pin, src/llama_release.rs); steps read it
   # with `LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"`
   # since a workflow-level env can't read a file. It is the ghcr image tag
-  # of a llama.cpp major release, v<X.Y.Z> or v<X.Y.Z>-b<N>-<sha> (the build
-  # job checks all five server images exist); packaging/llama-build.sh gives
-  # the b<N> release with the binaries.
+  # of a llama.cpp major release, v<X.Y.Z> or v<X.Y.Z>-b<N>-<sha> (the
+  # llama-digests job checks all five server images exist and resolves
+  # their digests into the release binaries); packaging/llama-build.sh
+  # gives the b<N> release with the binaries.
   #
   # vLLM version the e2e job's "Install vLLM (e2e)" step installs, for
   # vllm-plugin/tests/test_e2e.py's real `vllm serve` test. Moves with
@@ -87,6 +88,56 @@ env:
 
 jobs:
   # --------------------------------------------------------------------------
+  # The digests of the five ghcr.io/ggml-org/llama.cpp server images at
+  # LLAMA_CPP_RELEASE, resolved from their tags once per run so a release
+  # binary pulls the default pin by digest (src/llama_release.rs reads
+  # LLMMAN_LLAMA_IMAGE_DIGESTS at build time; src/container.rs appends it
+  # to the image reference). Resolved here, on Linux, rather than in each
+  # build leg: the macOS and Windows runners have no docker. On a PR the
+  # output is empty and the binaries pull by tag, as a dev build does.
+  # --------------------------------------------------------------------------
+  llama-digests:
+    name: Resolve llama.cpp image digests
+    runs-on: ubuntu-24.04
+    # Five tags, each retried up to five times a minute apart when ghcr
+    # lags a fresh bump, so the budget covers the worst case.
+    timeout-minutes: 30
+    outputs:
+      digests: ${{ steps.resolve.outputs.digests }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: github.event_name != 'pull_request'
+        with:
+          persist-credentials: false
+
+      - name: Resolve the server image digests
+        id: resolve
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"
+          # ghcr can lag a fresh llama.cpp bump ("manifest unknown", #824).
+          digests=""
+          for tag in server server-cuda server-cuda13 server-rocm server-vulkan; do
+            ref="ghcr.io/ggml-org/llama.cpp:$tag-$LLAMA_CPP_RELEASE"
+            digest=""
+            for attempt in 1 2 3 4 5 6; do
+              [ "$attempt" -eq 1 ] || sleep 60
+              if digest="$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')"; then
+                break
+              fi
+            done
+            case "$digest" in
+            sha256:????????????????????????????????????????????????????????????????) ;;
+            *) echo "::error::$ref did not resolve to a digest (got '$digest')"; exit 1 ;;
+            esac
+            echo "$ref is $digest"
+            digests="${digests:+$digests,}$tag=$digest"
+          done
+          echo "digests=$digests" >> "$GITHUB_OUTPUT"
+
+  # --------------------------------------------------------------------------
   # Build + unit tests, one job per target: same profile/target/features,
   # so deps, the Go shim (build.rs) and the non-test lib compile once.
   # The binary uploads before clippy/test so it stays downloadable for
@@ -104,6 +155,7 @@ jobs:
   # --------------------------------------------------------------------------
   build:
     name: Build + test (${{ matrix.target }})
+    needs: [llama-digests]
     runs-on: ${{ matrix.runner }}
     # Bounds a wedged runner (CI 33613527281 stalled 46 min); legs are
     # far shorter warm.
@@ -111,6 +163,9 @@ jobs:
     env: &build-env
       RUSTFLAGS: ${{ matrix.rustflags }}
       CARGO_PROFILE_DEV_DEBUG: "0"
+      # Baked into the release binaries by src/llama_release.rs; empty on
+      # a PR (see llama-digests).
+      LLMMAN_LLAMA_IMAGE_DIGESTS: ${{ needs.llama-digests.outputs.digests }}
       PROFILE_FLAG: ${{ github.event_name != 'pull_request' && '--release' || '' }}
     strategy:
       fail-fast: false
@@ -260,22 +315,13 @@ jobs:
       # What publish-images ships, built and run on PRs so a broken
       # Dockerfile or glibc mismatch fails before release. Only the CPU
       # variant is built (the others differ in base tag alone, and run to
-      # 7 GiB), but every base publish-images needs must exist.
+      # 7 GiB); llama-digests, which this job needs, has already checked
+      # that every base publish-images needs exists.
       - name: Build and run the container image
         if: matrix.target == 'x86_64-unknown-linux-gnu' && github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           LLAMA_CPP_RELEASE="$(tr -d '[:space:]' < LLAMA_CPP_RELEASE)"
-          # ghcr can lag a fresh llama.cpp bump ("manifest unknown", #824).
-          for tag in server server-cuda server-cuda13 server-rocm server-vulkan; do
-            ref="ghcr.io/ggml-org/llama.cpp:$tag-$LLAMA_CPP_RELEASE"
-            for attempt in 1 2 3 4 5 6; do
-              [ "$attempt" -eq 1 ] || sleep 60
-              docker manifest inspect "$ref" >/dev/null && continue 2
-            done
-            echo "::error::$ref is not published"
-            exit 1
-          done
           cp dist-docker/llmman packaging/llmman-amd64
           docker build packaging -t llmman-check \
             --build-arg "BASE=ghcr.io/ggml-org/llama.cpp:server-$LLAMA_CPP_RELEASE"
@@ -350,6 +396,7 @@ jobs:
   build-windows-arm:
     name: Build + test (${{ matrix.target }})
     if: github.event_name != 'pull_request'
+    needs: [llama-digests]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env: *build-env

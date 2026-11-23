@@ -45,6 +45,56 @@ pub fn default_release() -> &'static str {
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/LLAMA_CPP_RELEASE")).trim()
 }
 
+/// `--llama-cpp-version` as `cmd::serve` settled it. `Default` is
+/// [`default_release`] left implicit, the only pin the container images
+/// are pulled by digest for ([`IMAGE_DIGESTS`]); `Explicit` is a tag the
+/// user named, even when it spells the default; `Latest` is upstream's
+/// floating tag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LlamaPin {
+    Default,
+    Explicit(String),
+    Latest,
+}
+
+impl LlamaPin {
+    /// The release tag to run, `None` for `Latest`.
+    pub fn tag(&self) -> Option<&str> {
+        match self {
+            LlamaPin::Default => Some(default_release()),
+            LlamaPin::Explicit(tag) => Some(tag),
+            LlamaPin::Latest => None,
+        }
+    }
+}
+
+/// The server image digests CI resolved from [`default_release`]'s tags
+/// when it built this binary (ci.yml's `llama-digests` job, via the
+/// `LLMMAN_LLAMA_IMAGE_DIGESTS` build-time variable): a comma-separated
+/// `server[-<backend>]=sha256:<hex>` list, such as
+/// `server=sha256:ab..,server-cuda13=sha256:cd..`. Empty when the variable
+/// was unset, as in a dev build or `cargo test`.
+pub(crate) const IMAGE_DIGESTS: &str = match option_env!("LLMMAN_LLAMA_IMAGE_DIGESTS") {
+    Some(list) => list,
+    None => "",
+};
+
+/// The `sha256:<hex>` digest `list`, in the [`IMAGE_DIGESTS`] format,
+/// records for `image_tag` (`server`, `server-cuda13`, ...); `None` when
+/// it has no entry for it, in which case the image is pulled by tag
+/// alone. An entry without `=` or whose digest is not `sha256:` and 64
+/// lowercase hex digits is skipped: a tag-only pull beats an image
+/// reference the engine would reject.
+pub(crate) fn image_digest_in<'a>(list: &'a str, image_tag: &str) -> Option<&'a str> {
+    list.split(',').find_map(|entry| {
+        let (tag, digest) = entry.trim().split_once('=')?;
+        let hex = digest.strip_prefix("sha256:")?;
+        let well_formed =
+            hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        (tag == image_tag && well_formed).then_some(digest)
+    })
+}
+
 /// The release to download for `pin`. An image tag like
 /// `v1.0.0-b12359-b1b770d` names the `b<N>` build it was made from (as
 /// `packaging/llama-build.sh` does); any other pin, such as `v1.1.0`, is its
@@ -1159,6 +1209,39 @@ fn newest_cached(label: &str, bin_name: &str) -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DIGEST_A: &str =
+        "sha256:e3032ea0712da96dec820c770626385de4322dd06619fb5829256a504bbc9375";
+    const DIGEST_B: &str =
+        "sha256:a8cf841eef4e9d6ea28bb4d88eea1004032a2bf0d1302bff7b8d2100e801ed16";
+
+    #[test]
+    fn image_digest_in_reads_the_entry_for_the_tag() {
+        let list = format!("server={DIGEST_A}, server-cuda13={DIGEST_B}");
+        assert_eq!(image_digest_in(&list, "server"), Some(DIGEST_A));
+        assert_eq!(image_digest_in(&list, "server-cuda13"), Some(DIGEST_B));
+        assert_eq!(image_digest_in(&list, "server-cuda"), None);
+        assert_eq!(image_digest_in("", "server"), None);
+    }
+
+    #[test]
+    fn image_digest_in_skips_malformed_entries() {
+        let short = "sha256:abc";
+        let upper = DIGEST_A.to_uppercase();
+        let list = format!("server,server-cuda={short},server-rocm={upper},server-vulkan=,{DIGEST_A},server-cuda13={DIGEST_B}");
+        assert_eq!(image_digest_in(&list, "server"), None);
+        assert_eq!(image_digest_in(&list, "server-cuda"), None);
+        assert_eq!(image_digest_in(&list, "server-rocm"), None);
+        assert_eq!(image_digest_in(&list, "server-vulkan"), None);
+        assert_eq!(image_digest_in(&list, "server-cuda13"), Some(DIGEST_B));
+    }
+
+    #[test]
+    fn llama_pin_tag_is_the_release_except_for_latest() {
+        assert_eq!(LlamaPin::Default.tag(), Some(default_release()));
+        assert_eq!(LlamaPin::Explicit("b9994".into()).tag(), Some("b9994"));
+        assert_eq!(LlamaPin::Latest.tag(), None);
+    }
 
     #[test]
     fn parse_tmp_dir_returns_none_when_unset_or_blank() {

@@ -4926,7 +4926,7 @@ async fn api_version_reports_the_engine_settings_the_daemon_started_with() {
     };
 
     let mut pinned = test_inner(std::env::temp_dir());
-    pinned.llama_cpp_version = Some("b12503".into());
+    pinned.llama_cpp_version = crate::llama_release::LlamaPin::Explicit("b12503".into());
     pinned.sglang_version = Some("v0.5.19".into());
     let body = version_of(pinned).await;
     assert_eq!(body["llama_cpp_version"], "b12503");
@@ -6991,7 +6991,7 @@ impl FakeLlamaServer {
         let mut inner = test_inner(store);
         inner.runtime = runtime::Lazy::new(
             runtime::Runtime::Path,
-            None,
+            crate::llama_release::LlamaPin::Latest,
             true,
             Some(runtime::Resolved::Local {
                 source: runtime::Runtime::Path,
