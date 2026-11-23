@@ -1,5 +1,6 @@
-//! The speech worker's HTTP server: `POST /v1/audio/transcriptions` over
-//! one loaded Canary model, with the discovery routes the daemon polls
+//! The speech worker's HTTP server: `POST /v1/audio/transcriptions` and
+//! the `GET /v1/realtime` WebSocket transcription session over one loaded
+//! Canary model, with the discovery routes the daemon polls
 //! after a spawn (`/health`, `/v1/models`, `/props`). Requests are
 //! parsed and bounded before the model is touched, then run one at a
 //! time under the [`Worker`] mutex: mel features, encoder, decoder, per
@@ -17,7 +18,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
@@ -26,12 +27,13 @@ use super::encoder::Encoder;
 use super::mel::{FeatureExtractor, MelConfig, MelError, Normalize};
 use super::model::{CanaryModel, Frontend};
 use super::prompt::PromptError;
+use super::realtime::{realtime, COMMIT_SECONDS, IDLE_SECONDS, MAX_SESSIONS, WRITE_SECONDS};
 use super::wav::{self, WavError};
 use crate::mediagen::backend::Backend;
 use crate::mediagen::http::{self, Discovery};
 
 /// Samples per second of the one accepted WAV encoding.
-const SAMPLE_RATE: usize = 16_000;
+pub(crate) const SAMPLE_RATE: usize = 16_000;
 
 /// Longest clip the model sees at once. Canary 1B v2 was trained on
 /// utterances up to 40 s; longer audio is cut into equal clips of at most
@@ -42,7 +44,7 @@ pub const CLIP_SECONDS: usize = 30;
 
 /// Room `max_body` leaves above `max_file` for the multipart framing and
 /// the other fields.
-const FRAMING_ALLOWANCE: usize = 64 << 10;
+pub(crate) const FRAMING_ALLOWANCE: usize = 64 << 10;
 
 /// Caps a request before any audio is decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,17 +88,29 @@ pub enum Error {
     Cancelled,
     /// 500: the pipeline failed.
     Failed(String),
+    /// 400: a realtime `input_audio_buffer.commit` with nothing buffered;
+    /// its own error type on the wire (`input_audio_buffer_commit_empty`).
+    CommitEmpty,
+    /// 504: a realtime commit did not finish within the deadline
+    /// ([`COMMIT_SECONDS`] outside tests); `commit_timeout` on the wire.
+    CommitTimeout(std::time::Duration),
 }
 
 impl Error {
+    /// The message of [`Error::CommitTimeout`].
+    pub(crate) fn commit_timeout_message(limit: std::time::Duration) -> String {
+        format!("the commit did not finish within {limit:?}, closing the session")
+    }
+
     pub fn status(&self) -> StatusCode {
         match self {
-            Error::Invalid(_) => StatusCode::BAD_REQUEST,
+            Error::Invalid(_) | Error::CommitEmpty => StatusCode::BAD_REQUEST,
             Error::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Error::UnsupportedMedia(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             // Outside the registered range, so built from the number.
             Error::Cancelled => StatusCode::from_u16(499).expect("499 is a valid status code"),
             Error::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Error::CommitTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
         }
     }
 }
@@ -110,10 +124,18 @@ impl IntoResponse for Error {
             Error::UnsupportedMedia(m) => ("invalid_request_error", m),
             Error::Cancelled => ("server_error", "the request was cancelled".to_string()),
             Error::Failed(m) => ("server_error", m),
+            Error::CommitEmpty => ("input_audio_buffer_commit_empty", COMMIT_EMPTY.to_string()),
+            Error::CommitTimeout(limit) => ("server_error", Error::commit_timeout_message(limit)),
         };
         http::error_response(status, ty, &msg)
     }
 }
+
+/// The language of a request or session that names none.
+pub(crate) const DEFAULT_LANGUAGE: &str = "en";
+
+/// Message of [`Error::CommitEmpty`], llama-server's wording.
+pub(crate) const COMMIT_EMPTY: &str = "input audio buffer is empty";
 
 /// A parsed transcription request, ready for the mel front end.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,7 +224,7 @@ pub async fn parse_transcription(
     }
     let language = language
         .filter(|l| !l.is_empty())
-        .unwrap_or_else(|| "en".to_owned());
+        .unwrap_or_else(|| DEFAULT_LANGUAGE.to_owned());
 
     let samples = wav::parse(&file, limits.max_file).map_err(|e| match e {
         WavError::TooLarge => {
@@ -406,17 +428,31 @@ pub struct Server {
     /// the blocking task so a client that leaves does not free one early.
     inflight: Arc<Semaphore>,
     /// `general.languages`, checked before a request waits for the lock.
-    languages: Vec<String>,
+    pub(crate) languages: Vec<String>,
+    /// The loaded model's name, carried by the session events.
+    pub(crate) model: String,
+    /// [`MAX_SESSIONS`] permits, one per open `/v1/realtime` session for
+    /// its whole life. Separate from `inflight`: a session never queues
+    /// behind the one-shot route's admission, it is refused at once.
+    pub(crate) sessions: Arc<Semaphore>,
+    /// How long a session may stay silent; [`IDLE_SECONDS`] outside tests.
+    pub(crate) idle: std::time::Duration,
+    /// How long one outbound frame may take; [`WRITE_SECONDS`] outside
+    /// tests.
+    pub(crate) write: std::time::Duration,
+    /// How long one commit may take, lock wait included;
+    /// [`COMMIT_SECONDS`] outside tests.
+    pub(crate) commit: std::time::Duration,
 }
 
-type Shared = Arc<Server>;
+pub(crate) type Shared = Arc<Server>;
 
 /// Lives in the handler future for as long as its request. Dropping it,
 /// which axum does when the client goes away, sets this request's own
 /// flag: the compute it is registered with stops, a compute not yet
 /// started sees it and is skipped, and no other request shares it.
-struct Guard {
-    gone: Arc<AtomicBool>,
+pub(crate) struct Guard {
+    pub(crate) gone: Arc<AtomicBool>,
 }
 
 impl Drop for Guard {
@@ -427,7 +463,11 @@ impl Drop for Guard {
 
 /// Takes the worker lock and runs the pipeline with `gone` as its abort
 /// flag, unless the client already left.
-fn run_locked(s: &Server, gone: &Arc<AtomicBool>, req: &Request) -> Result<String, Error> {
+pub(crate) fn run_locked(
+    s: &Server,
+    gone: &Arc<AtomicBool>,
+    req: &Request,
+) -> Result<String, Error> {
     let mut worker = s.worker.lock().unwrap_or_else(|e| e.into_inner());
     if gone.load(Ordering::SeqCst) {
         return Err(Error::Cancelled);
@@ -532,6 +572,11 @@ pub fn router(worker: Worker, model_name: String, model_path: String) -> Router 
         worker: Mutex::new(worker),
         limits,
         inflight: Arc::new(Semaphore::new(limits.max_inflight)),
+        model: model_name.clone(),
+        sessions: Arc::new(Semaphore::new(MAX_SESSIONS)),
+        idle: std::time::Duration::from_secs(IDLE_SECONDS),
+        write: std::time::Duration::from_secs(WRITE_SECONDS),
+        commit: std::time::Duration::from_secs(COMMIT_SECONDS),
     });
     Router::new()
         .route(
@@ -539,13 +584,14 @@ pub fn router(worker: Worker, model_name: String, model_path: String) -> Router 
             // `read_body` applies the cap itself, with the JSON reply.
             post(transcriptions).layer(DefaultBodyLimit::disable()),
         )
+        .route("/v1/realtime", get(realtime))
         .with_state(s)
         .merge(http::discovery_routes(discovery(model_name, model_path)))
         .merge(http::text_routes_refused(NOT_SUPPORTED))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const BOUNDARY: &str = "llmman-test-boundary";
@@ -911,9 +957,7 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let addr = serve(app).await;
 
         let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
         sock.write_all(b"POST /slow HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n")
@@ -934,6 +978,14 @@ mod tests {
             gone.load(Ordering::SeqCst),
             "the handler kept running after its client left"
         );
+    }
+
+    /// Serves `app` on a loopback port and returns its address.
+    pub(crate) async fn serve(app: Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
     }
 
     #[tokio::test]

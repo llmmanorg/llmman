@@ -161,7 +161,8 @@ fn check_format(body: &[u8]) -> Result<(), WavError> {
     Ok(())
 }
 
-fn decode_pcm16(body: &[u8]) -> Result<Vec<i16>, WavError> {
+/// Little-endian PCM16 bytes as samples; an odd count is `Truncated`.
+pub(super) fn decode_pcm16(body: &[u8]) -> Result<Vec<i16>, WavError> {
     if !body.len().is_multiple_of(BYTES_PER_SAMPLE) {
         return Err(WavError::Truncated);
     }

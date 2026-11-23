@@ -17,6 +17,7 @@ pub mod encoder;
 pub mod mel;
 pub mod model;
 pub mod prompt;
+pub mod realtime;
 pub mod server;
 pub mod wav;
 
