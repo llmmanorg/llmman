@@ -148,7 +148,9 @@ rootless docker a host gid would map to a subordinate id, so none is
 added; `/dev/nvidia*` nodes are injected by the NVIDIA toolkit and not
 covered). If an engine still cannot read the store, the load error ends
 with `started hardened (...)` naming the flags that run carried, the
-store path, and offers `chmod -R go+rX <path>` or `--no-hardened`.
+store path, and offers `--no-hardened`; when the run carried a `--user`
+it also offers `setfacl -R -m u:<uid>:rX <path>`, which grants read access
+to that uid.
 
 ## llama.cpp
 
