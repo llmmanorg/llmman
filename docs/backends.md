@@ -175,6 +175,12 @@ runtime libraries. The Linux CUDA builds need glibc 2.38, and arm64 has CUDA
 13 only; a host that does not fit gets the CPU build. `llmman gpu-discover`
 prints what the probe chose.
 
+The `llmman` binary needs glibc 2.28+. `bin` also needs what llama.cpp's
+prebuilt builds need: glibc 2.34 and libstdc++ `GLIBCXX_3.4.30` (x64 CPU and
+Vulkan), or glibc 2.38 and `GLIBCXX_3.4.32` (arm64, ROCm, CUDA), measured on
+the pinned release. An older host cannot start the downloaded `llama-server`:
+use `--runtime docker` or `path`.
+
 Under WSL2 install the CUDA *toolkit* only, never the Linux driver (the
 `cuda` or `cuda-drivers` packages): the Windows driver supplies `libcuda`,
 and a native NVIDIA driver in the distro puts its own `libnvidia-*` libraries

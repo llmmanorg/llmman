@@ -349,6 +349,7 @@ fn llmman_api_answers() -> bool {
 /// kill(0) hits the caller's own process group and kill(-1) every process
 /// the user owns, so 0 and 1 are refused, and a pid past `pid_t` names
 /// nothing.
+#[cfg(unix)]
 fn signalable_pid(pid: u32) -> Option<i32> {
     i32::try_from(pid).ok().filter(|pid| *pid > 1)
 }

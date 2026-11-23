@@ -529,6 +529,15 @@ fn try_one(
 
 const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Points a glibc/libstdc++ load failure at the runtimes that avoid it.
+fn old_libc_hint(stderr: &str) -> &'static str {
+    if stderr.contains("GLIBC") {
+        ". glibc or libstdc++ is too old for this build; use `--runtime docker` or `path`"
+    } else {
+        ""
+    }
+}
+
 /// Runs `llama-server --version`, like
 /// [`crate::container::verify_llama_server_runs`]: `auto` must not settle on
 /// a build this host cannot start. A failure carries the decoded exit status.
@@ -571,9 +580,10 @@ fn verify_local_llama_server_runs(bin: &Path) -> Result<()> {
                 format!(": {}", tail.join(" | "))
             };
             anyhow::bail!(
-                "{} --version failed ({}){tail}",
+                "{} --version failed ({}){tail}{}",
                 bin.display(),
-                crate::exit_status::describe(&status)
+                crate::exit_status::describe(&status),
+                old_libc_hint(&stderr)
             )
         }
         None => anyhow::bail!(
@@ -984,6 +994,13 @@ mod tests {
         assert!(err.contains("--version failed"), "{err}");
         assert!(err.contains("exit code 127"), "{err}");
         assert!(err.contains("loader says no"), "{err}");
+    }
+
+    #[test]
+    fn old_libc_hint_names_the_runtimes_to_use_instead() {
+        let hint = old_libc_hint("version `GLIBCXX_3.4.30' not found");
+        assert!(hint.contains("--runtime docker"));
+        assert_eq!(old_libc_hint("loader says no"), "");
     }
 
     #[test]

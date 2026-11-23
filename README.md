@@ -63,6 +63,9 @@ landing in your local store.
 curl -fsSL https://llmmanorg.github.io/install.sh | sh
 ```
 
+**Linux:** glibc 2.28 or newer. `--runtime bin` needs more
+([docs/backends.md](docs/backends.md#llamacpp)); on an older host use `--runtime docker`.
+
 **Windows (PowerShell):**
 
 ```
