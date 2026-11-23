@@ -158,10 +158,8 @@ The release is pinned: unless `--llama-cpp-version <tag>` says otherwise,
 both `bin` and the container images use the llama.cpp build llmman's own
 CI tested (the `LLAMA_CPP_RELEASE` file in the repository), so what runs
 is what was tested. `--llama-cpp-version latest` takes upstream's
-floating latest instead. `llmman serve --detach --llama-cpp-version <tag>`
-restarts a local daemon running another release, unloading its models; a
-remote or service-managed daemon is left running (for the latter, change the
-service's arguments and restart it).
+floating latest instead. The option applies only when `serve` starts a new
+daemon: one that is already running keeps its release.
 
 For `bin`, llmman probes for CUDA, ROCm, OpenCL (Windows ARM64 Adreno only),
 Vulkan or Metal (in that order) and downloads the matching prebuilt asset from
@@ -244,6 +242,9 @@ docker run -p 127.0.0.1:17434:17434 -e LLMMAN_API_KEYS=<key> \
   -v llmman:/root/.local/share/llmman --gpus all \
   --entrypoint llmman ai/llmman:server-cuda serve
 ```
+
+To upgrade, pull the image and recreate the container with the same options and
+environment: `docker restart` reuses the old image.
 
 ## vLLM
 

@@ -36,6 +36,10 @@ variant, with `LLMMAN_TAG`:
 LLMMAN_TAG=server-0.1.400 docker compose -f examples/compose/compose.yaml up
 ```
 
+To upgrade, run `docker compose -f examples/compose/compose.yaml pull` then
+`up -d`, which recreates the service with its environment; `restart` reuses the
+old image.
+
 The `llmman-data` volume is mounted at `/root/.local/share/llmman`, the store
 and cache's default location. Remove the deployment while retaining its models
 with `docker compose -f examples/compose/compose.yaml down`. Add `--volumes`

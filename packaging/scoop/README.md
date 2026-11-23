@@ -49,10 +49,11 @@ it talks to the daemon instead of starting its own:
 [Environment]::SetEnvironmentVariable('LLMMAN_HOST', '0.0.0.0:17434', 'User')
 ```
 
-After `scoop update llmman`, run `Stop-ScheduledTask llmman` and
-`Start-ScheduledTask llmman` before any other `llmman` command: the CLI replaces
-a daemon of another version with a detached one, which would leave the task's
-`llmman serve` unable to bind. Remove it with
+The running daemon keeps the old build until the task is restarted
+(`Stop-ScheduledTask llmman`, `Start-ScheduledTask llmman`) or you log off and
+on. `scoop update` skips an app while a process runs from its directory
+("Running process detected"), so run `Stop-ScheduledTask llmman` before updating
+if the daemon is running. Remove the task with
 `Unregister-ScheduledTask -TaskName llmman -Confirm:$false`.
 
 ## Versions

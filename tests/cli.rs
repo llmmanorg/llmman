@@ -398,10 +398,18 @@ fn a_serve_on_port_0_reports_the_port_it_got() {
     );
 }
 
+/// The `METHOD /path` of every request a fake server saw.
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
 /// A stand-in for a real Ollama: `/api/version` answers a bare version,
 /// anything llmman-only is a 404, and `/api/pull` streams one line per
 /// layer. Returns its address and the `METHOD /path` of every request.
-fn fake_ollama() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+fn fake_ollama() -> (String, Seen) {
+    fake_server(r#"{"version":"0.40.17"}"#.to_string())
+}
+
+/// [`fake_ollama`] with `version` as the body of `/api/version`.
+fn fake_server(version: String) -> (String, Seen) {
     use std::io::{BufRead, Read, Write};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -412,6 +420,7 @@ fn fake_ollama() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let log = log.clone();
+            let version = version.clone();
             std::thread::spawn(move || {
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                 let mut request_line = String::new();
@@ -450,7 +459,7 @@ fn fake_ollama() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
                         .join("\n")
                             + "\n",
                     ),
-                    ("GET", "/api/version") => ("200 OK", "{\"version\":\"0.40.17\"}\n".to_string()),
+                    ("GET", "/api/version") => ("200 OK", format!("{version}\n")),
                     ("POST", "/api/pull") => (
                         "200 OK",
                         [
@@ -478,35 +487,104 @@ fn fake_ollama() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     (addr, seen)
 }
 
-/// `LLMMAN_HOST` at an Ollama: `pull` reuses it as is, never calling it a
-/// stale llmman daemon or starting one, and relays the layers.
-#[test]
-fn pull_reuses_an_ollama_at_llmman_host() {
+/// `llmman` against the server at `addr`, keeping everything it would write
+/// under `home`: a daemon it started would put `serve.log` there.
+fn llmman_at(addr: &str, home: &std::path::Path) -> Command {
+    let mut cmd = llmman();
+    cmd.env("LLMMAN_HOST", addr)
+        .env("LLMMAN_MODELS", home.join("store"))
+        .env("HOME", home)
+        .env("USERPROFILE", home);
+    cmd
+}
+
+/// Whether the CLI started a daemon: `serve.log` beside the store, which
+/// `llmman_at` points at `home`, is the first thing a spawn creates.
+fn spawned_a_daemon(home: &std::path::Path) -> bool {
+    home.join("serve.log").exists()
+}
+
+/// `pull` against the server at `addr` reuses it as is: it relays the layers,
+/// sends nothing but the pull, and starts no daemon.
+fn assert_pull_reuses(addr: &str, seen: &Seen, what: &str) {
     let home = tempfile::tempdir().unwrap();
-    let (addr, seen) = fake_ollama();
-    let out = llmman()
+    let out = llmman_at(addr, home.path())
         .args(["pull", "all-minilm:22m"])
-        .env("LLMMAN_HOST", &addr)
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
         .output()
         .expect("spawn llmman");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(out.status.success(), "{what}: {stdout}\n{stderr}");
     assert_eq!(
         stdout,
-        "pulling manifest\nverifying sha256 digest\nwriting manifest\nsuccess\nPulled all-minilm:22m\n"
+        "pulling manifest\nverifying sha256 digest\nwriting manifest\nsuccess\nPulled all-minilm:22m\n",
+        "{what}"
     );
-    assert!(!stderr.contains("stale"), "{stderr}");
-    assert!(!stderr.contains("stopping"), "{stderr}");
-    let seen = seen.lock().unwrap();
-    assert!(seen[0].starts_with("GET /api/version"), "{seen:?}");
-    assert!(
-        seen.iter().any(|r| r.starts_with("POST /api/pull ")),
-        "{seen:?}"
+    assert!(!spawned_a_daemon(home.path()), "{what}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["POST /api/pull {\"model\":\"all-minilm:22m\"}"],
+        "{what}"
     );
-    assert!(seen.iter().all(|r| !r.starts_with("DELETE")), "{seen:?}");
+}
+
+#[test]
+fn pull_reuses_an_ollama_at_llmman_host() {
+    let (addr, seen) = fake_ollama();
+    assert_pull_reuses(&addr, &seen, "an Ollama");
+}
+
+/// Stands for the daemon a fake server claims to be: dies if the CLI
+/// signals the pid it reports.
+#[cfg(unix)]
+struct Bystander(std::process::Child);
+
+#[cfg(unix)]
+impl Bystander {
+    fn start() -> Bystander {
+        use std::os::unix::process::CommandExt;
+        let mut sleeper = Command::new("sleep");
+        sleeper.arg("60").process_group(0);
+        Bystander(sleeper.spawn().expect("spawn sleep"))
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    fn alive(&mut self) -> bool {
+        self.0.try_wait().unwrap().is_none()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Bystander {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A llmman daemon of another version, or whose exe is gone, is reused like
+/// an Ollama: not signalled, and no second daemon is started.
+#[cfg(unix)]
+#[test]
+fn pull_reuses_whatever_daemon_answers_at_llmman_host() {
+    let own_exe = std::env::current_exe().unwrap();
+    for (what, exe, version) in [
+        ("an old version", own_exe.to_str().unwrap(), "0.0.1-old"),
+        (
+            "a missing exe",
+            "/nonexistent/llmman",
+            env!("CARGO_PKG_VERSION"),
+        ),
+    ] {
+        let mut daemon = Bystander::start();
+        let identity = serde_json::json!({"version": version, "exe": exe, "pid": daemon.pid()});
+        let (addr, seen) = fake_server(identity.to_string());
+        assert_pull_reuses(&addr, &seen, what);
+        assert!(daemon.alive(), "{what}: the daemon was signalled");
+    }
 }
 
 /// `run` hands an Ollama the model name as typed: llmman's own bare-name
@@ -515,11 +593,8 @@ fn pull_reuses_an_ollama_at_llmman_host() {
 fn run_uses_the_model_name_as_typed_with_an_ollama_at_llmman_host() {
     let home = tempfile::tempdir().unwrap();
     let (addr, seen) = fake_ollama();
-    let out = llmman()
+    let out = llmman_at(&addr, home.path())
         .args(["run", "smollm2:135m", "say hi"])
-        .env("LLMMAN_HOST", &addr)
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
         .stdin(std::process::Stdio::null())
         .output()
         .expect("spawn llmman");
@@ -527,7 +602,7 @@ fn run_uses_the_model_name_as_typed_with_an_ollama_at_llmman_host() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stdout}\n{stderr}");
     assert!(stdout.contains("hi"), "{stdout}");
-    assert!(!stderr.contains("stale"), "{stderr}");
+    assert!(!spawned_a_daemon(home.path()));
     let seen = seen.lock().unwrap();
     for request in seen.iter().filter(|r| r.starts_with("POST /api/")) {
         assert!(!request.contains("docker.io/ai"), "{request}");

@@ -39,10 +39,8 @@ and logs to `$(brew --prefix)/var/log/llmman.log`. It listens on
 set), restart the service, and export the same variables in your shell so
 the CLI talks to it rather than starting its own daemon.
 
-Run `brew services restart llmman` after `brew upgrade llmman`. Homebrew
-does not restart services on upgrade, and the CLI replaces a daemon whose
-version differs from its own, which leaves the service unable to bind
-until it is restarted.
+`brew upgrade llmman` does not touch the running service, which keeps the old
+build until `brew services restart llmman` or a reboot.
 
 ## Versions
 

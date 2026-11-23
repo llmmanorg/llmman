@@ -185,8 +185,7 @@ fn emit_version() {
     // `HEAD` only changes on a checkout/branch switch; an ordinary `git
     // commit` on the current branch instead updates `logs/HEAD` (the
     // reflog) — without watching that too, `--dirty`'s output (and so
-    // LLMMAN_VERSION) can go stale across a commit, defeating
-    // stale_daemon's version comparison in daemon.rs. Resolved via
+    // LLMMAN_VERSION) can go stale across a commit. Resolved via
     // `git rev-parse --git-path` rather than a hardcoded `.git/...` path
     // so this also reruns correctly from a linked worktree, where the
     // real HEAD/logs live under `.git/worktrees/<name>/` instead.

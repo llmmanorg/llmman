@@ -270,9 +270,7 @@ struct Inner {
     manager: Mutex<ModelManager>,
     // This daemon's own executable path, canonicalized at startup (while
     // it still exists on disk). Reported by /api/version so clients — the
-    // CLI's daemon::ensure_server, sbx — can detect a daemon left running
-    // after the install that provided its binary was deleted, instead of
-    // blindly reusing it.
+    // CLI, sbx — can tell a llmman daemon from another server.
     exe: Option<PathBuf>,
     // `--runtime`, settled with its llama.cpp fetched — at startup, or on
     // the first load that needs it if that failed.
@@ -4521,15 +4519,9 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         if crate::daemon::server_alive() {
             crate::daemon::check_server_identity()?;
         }
-        crate::daemon::ensure_server_with_engines(
+        crate::daemon::ensure_server_with_args(
             args.model.as_deref().unwrap_or(""),
             &args.detached_child_args(),
-            &crate::daemon::RequestedEngines {
-                llama_cpp_version: args.llama_cpp_version.as_deref(),
-                vllm_version: args.vllm_version.as_deref(),
-                vllm_image: args.vllm_image.as_deref(),
-                sglang_version: args.sglang_version.as_deref(),
-            },
         )?;
         return crate::daemon::check_server_identity();
     }
@@ -5421,11 +5413,10 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
 /// Resolves when the daemon is asked to shut down: SIGINT (Ctrl-C) on all
 /// platforms, plus SIGTERM on Unix — the same pair `ollama serve` traps
 /// (see server/routes.go) and the graceful signal every supervisor sends
-/// first (Ollama's app on darwin, llmman's own daemon::stop_stale_daemon,
-/// sbx). Trapping it means an in-flight request gets a chance to finish
-/// (axum stops accepting and drains) and loaded models are unloaded
-/// deliberately, instead of the whole process group being torn down
-/// mid-write.
+/// first (Ollama's app on darwin, sbx). Trapping it means an in-flight
+/// request gets a chance to finish (axum stops accepting and drains) and
+/// loaded models are unloaded deliberately, instead of the whole process
+/// group being torn down mid-write.
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;

@@ -206,11 +206,9 @@ pub fn server_alive() -> bool {
     addrs.any(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok())
 }
 
-/// The daemon's self-identity from GET /api/version — the identity fields
-/// are absent on daemons built before they were reported (which is itself
-/// the strongest possible staleness signal: only a long-forgotten daemon
-/// from an old install still runs such a build).
-#[derive(Deserialize, Default)]
+/// The daemon's self-identity from GET /api/version, which tells a llmman
+/// daemon from another server such as Ollama.
+#[derive(Deserialize)]
 struct DaemonIdentity {
     #[serde(default)]
     version: Option<String>,
@@ -218,113 +216,14 @@ struct DaemonIdentity {
     exe: Option<String>,
     #[serde(default)]
     pid: Option<u32>,
-    /// `latest` when unpinned; absent on daemons that predate reporting it.
-    #[serde(default)]
-    llama_cpp_version: Option<String>,
-    #[serde(default)]
-    vllm_version: Option<String>,
-    #[serde(default)]
-    vllm_image: Option<String>,
-    #[serde(default)]
-    sglang_version: Option<String>,
-}
-
-/// The engine settings `serve --detach` was explicitly given; `None` is a
-/// flag not passed, which never asks for a restart.
-#[derive(Default)]
-pub struct RequestedEngines<'a> {
-    pub llama_cpp_version: Option<&'a str>,
-    pub vllm_version: Option<&'a str>,
-    pub vllm_image: Option<&'a str>,
-    pub sglang_version: Option<&'a str>,
-}
-
-impl RequestedEngines<'_> {
-    fn is_empty(&self) -> bool {
-        self.llama_cpp_version.is_none()
-            && self.vllm_version.is_none()
-            && self.vllm_image.is_none()
-            && self.sglang_version.is_none()
-    }
-}
-
-/// Why `identity`, a healthy daemon, should be restarted to honour
-/// `requested`: the first explicit setting it does not run, or `None` to
-/// reuse it. A llama.cpp pin is compared by its build, so an image tag and
-/// the `b<N>` it was made from agree; an unset image tag is `latest`.
-fn engine_change_reason(identity: &DaemonIdentity, requested: &RequestedEngines) -> Option<String> {
-    if !identity.is_llmman() || identity.is_foreign() {
-        return None;
-    }
-    let build = crate::llama_release::build_tag;
-    let rows = [
-        (
-            "llama.cpp",
-            requested.llama_cpp_version.map(build),
-            identity
-                .llama_cpp_version
-                .as_deref()
-                .map_or("an unknown version", build),
-        ),
-        (
-            "the vLLM image tag",
-            requested.vllm_version,
-            identity.vllm_version.as_deref().unwrap_or("latest"),
-        ),
-        (
-            "the vLLM image",
-            requested.vllm_image,
-            identity.vllm_image.as_deref().unwrap_or("unset"),
-        ),
-        (
-            "the SGLang image tag",
-            requested.sglang_version,
-            identity.sglang_version.as_deref().unwrap_or("latest"),
-        ),
-    ];
-    rows.into_iter().find_map(|(what, asked, running)| {
-        let asked = asked?;
-        (running != asked).then(|| format!("it runs {what} {running}, you asked for {asked}"))
-    })
 }
 
 impl DaemonIdentity {
-    /// Any nonzero pid counts: a daemon that is a container's entrypoint
-    /// (the documented `docker run` deployment) reports pid 1, which is
-    /// only unsafe to *signal* (see [`signalable_pid`]), not to recognise.
+    /// Any nonzero pid counts: a containerised daemon reports pid 1.
     fn is_llmman(&self) -> bool {
         self.version.as_deref().is_some_and(|v| !v.is_empty())
             && self.exe.as_deref().is_some_and(|exe| !exe.is_empty())
             && self.pid.is_some_and(|pid| pid > 0)
-    }
-
-    /// Whether the daemon runs on another OS than this client, such as a
-    /// Linux one in WSL2 behind a forwarded port. Its exe is a path in a
-    /// filesystem this process cannot see and its pid is from another pid
-    /// namespace, so neither says anything about staleness, and signalling
-    /// the pid would hit an unrelated process. Only a path in the other
-    /// OS's style is recognised.
-    fn is_foreign(&self) -> bool {
-        self.exe
-            .as_deref()
-            .is_some_and(|exe| exe_is_foreign(exe, cfg!(windows)))
-    }
-}
-
-/// [`DaemonIdentity::is_foreign`] for an exe path and the client's OS, so
-/// both path syntaxes are testable on any host. A Windows path is a drive
-/// letter or a `\\` prefix (UNC, or the `\\?\` verbatim form).
-fn exe_is_foreign(exe: &str, windows_host: bool) -> bool {
-    let bytes = exe.as_bytes();
-    let drive = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/');
-    let windows_style = drive || exe.starts_with("\\\\");
-    if windows_host {
-        exe.starts_with('/')
-    } else {
-        windows_style
     }
 }
 
@@ -409,57 +308,9 @@ fn is_local_host(host: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
 }
 
-/// Returns the running daemon's identity if it should be stopped and
-/// replaced rather than reused, matching how Ollama's app never lets a
-/// server from a superseded install keep serving (its supervisor stops the
-/// previous server on startup and after every update — see ollama's
-/// app/server cleanup/killOtherInstances). A daemon is stale when:
-///
-/// - its own executable no longer exists on disk (the install that
-///   provided it was upgraded or removed — e.g. a Homebrew cask upgrade
-///   deleting the old version directory out from under a daemon it left
-///   running),
-/// - its version differs from this client's (the binary was replaced in
-///   place by an update, so the same path now holds a newer build than
-///   the one still serving — the installed binary wins), or
-/// - it predates identity reporting entirely.
-///
-/// Only a llmman daemon is ever stale (see [`is_llmman_daemon`]): any other
-/// server, Ollama included, is reused. Returns None both for a healthy
-/// daemon and when /api/version can't be fetched/parsed at all — whatever
-/// is holding the port in that case, killing processes based on it would
-/// be a guess. A daemon on another OS (see [`DaemonIdentity::is_foreign`])
-/// is reused like a remote one.
-fn stale_daemon() -> Option<DaemonIdentity> {
-    stale_identity(daemon_identity(), llmman_api_answers)
-}
-
-/// [`stale_daemon`] for the outcome of `/api/version`, with the llmman-only
-/// probe injected.
-fn stale_identity(
-    identity: anyhow::Result<DaemonIdentity>,
-    probe: impl FnOnce() -> bool,
-) -> Option<DaemonIdentity> {
-    let identity = identity.ok()?;
-    if identity.is_foreign() || !is_llmman_daemon(&identity, probe) {
-        return None;
-    }
-    match (&identity.version, &identity.exe) {
-        (Some(version), Some(exe))
-            if version == env!("LLMMAN_VERSION") && std::path::Path::new(exe).exists() =>
-        {
-            None
-        }
-        _ => Some(identity),
-    }
-}
-
-/// Whether the server that answered /api/version is a llmman daemon, the
-/// only kind this module may stop. Every daemon since identity reporting
-/// sends `version`, `exe` and `pid`; Ollama and other servers send at most
-/// a `version`. One that sends no executable path is a llmman daemon only
-/// if the llmman-only `/llmman/providers` (`probe`) answers, which is what
-/// lets a daemon from before identity existed still be replaced.
+/// Whether the server that answered /api/version is a llmman daemon: it sent
+/// an exe, or (a daemon from before identity existed) llmman-only
+/// `/llmman/providers` answers to `probe`. Ollama sends at most a `version`.
 fn is_llmman_daemon(identity: &DaemonIdentity, probe: impl FnOnce() -> bool) -> bool {
     let has_exe = identity.exe.as_deref().is_some_and(|exe| !exe.is_empty());
     identity.is_llmman() || has_exe || probe()
@@ -467,7 +318,8 @@ fn is_llmman_daemon(identity: &DaemonIdentity, probe: impl FnOnce() -> bool) -> 
 
 /// Whether the server at `LLMMAN_HOST` positively answers as something
 /// other than a llmman daemon, such as Ollama. One that cannot be asked
-/// (down, or behind API keys) is not known to be foreign.
+/// (down, or behind API keys) is not known to be foreign. `llmman run` asks
+/// to send a bare model name as typed.
 pub fn server_is_foreign() -> bool {
     daemon_identity().is_ok_and(|identity| !is_llmman_daemon(&identity, llmman_api_answers))
 }
@@ -493,240 +345,6 @@ fn llmman_api_answers() -> bool {
     answer().is_ok_and(|body| is_providers_list(&body))
 }
 
-/// The running daemon and [`engine_change_reason`] to restart it.
-fn engine_change(requested: &RequestedEngines) -> Option<(DaemonIdentity, String)> {
-    if requested.is_empty() {
-        return None;
-    }
-    let identity = daemon_identity().ok()?;
-    let reason = engine_change_reason(&identity, requested)?;
-    Some((identity, reason))
-}
-
-/// The systemd unit managing `pid` — `None` when none does. Sitting in a
-/// unit's cgroup is not being the unit's process: `detach` changes the
-/// process group and not the cgroup, so a daemon llmman spawned inside a
-/// unit sits under it unknown to the manager. The manager is asked
-/// instead, for the unit holding the pid and the process that unit was
-/// started for — see [`owning_unit`] and [`managing_unit`].
-///
-/// On macOS, the launchd job whose own process `pid` is, which is what
-/// `launchctl list` shows; a daemon llmman spawned is not listed.
-fn service_unit(pid: Option<u32>) -> Option<String> {
-    let pid = pid?;
-    if cfg!(target_os = "macos") {
-        let list = Command::new("launchctl").arg("list").output().ok()?;
-        return launchd_job(&String::from_utf8_lossy(&list.stdout), pid);
-    }
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    let (object, user) = owning_unit(pid)?;
-    let unit = unit_id(&object, user)?;
-    managing_unit(pid, &unit, user, || main_pid(&object, user))
-}
-
-/// The label of the job `launchctl list` (`PID Status Label` rows) shows
-/// running `pid`.
-fn launchd_job(list: &str, pid: u32) -> Option<String> {
-    list.lines().find_map(|row| {
-        let mut cols = row.split_whitespace();
-        (cols.next()?.parse() == Ok(pid)).then(|| cols.nth(1).map(Into::into))?
-    })
-}
-
-/// Leaves a daemon a service manager owns running, saying how to restart
-/// it: killing it leaves the unit dead or respawned with its old
-/// arguments, and the port held by an unmanaged process.
-fn leave_to_manager(pid: Option<u32>, what: impl std::fmt::Display) -> bool {
-    let Some(unit) = service_unit(pid) else {
-        return false;
-    };
-    let restart = if cfg!(target_os = "macos") {
-        format!("launchctl kickstart -k gui/$(id -u)/{unit}")
-    } else {
-        format!("systemctl [--user] restart {unit}")
-    };
-    eprintln!(
-        "[llmman] {what}, but it is managed by {unit}; leaving it alone. To restart it: {restart}"
-    );
-    true
-}
-
-/// Whether the unit holding the daemon is the unit running it, by what
-/// `main` reports as the process that unit was started for.
-fn managing_unit(
-    pid: u32,
-    unit: &str,
-    user: bool,
-    main: impl FnOnce() -> Option<u32>,
-) -> Option<String> {
-    // A scope holds processes its manager never started, a shell's among
-    // them, and no manager restarts one.
-    if !unit.ends_with(".service") {
-        return None;
-    }
-    // A per-user manager llmman could not ask holds this daemon, so it
-    // is not llmman's to stop — see [`owning_unit`] for why that is the
-    // system manager's answer for it.
-    if !user && unit.starts_with("user@") {
-        return Some(unit.to_string());
-    }
-    match main() {
-        // Started for another process, which makes this daemon one
-        // llmman spawned inside the unit rather than the unit's own.
-        Some(main) if main != pid => None,
-        _ => Some(unit.to_string()),
-    }
-}
-
-/// The bus object of the unit holding `pid`, and whether this user's own
-/// manager named it. Asked for rather than read off the cgroup path,
-/// where the names below a unit are the payload's own once it has
-/// `Delegate=` and no segment is reliably a unit.
-///
-/// This user's manager is asked first, being the only one that knows its
-/// own units: the system manager answers for every process below a
-/// per-user manager with that manager's unit instead. A manager asked
-/// about a process outside its cgroup refuses the question rather than
-/// guessing, which is what keeps `sudo llmman` from reading root's own
-/// manager as having answered about another user's daemon.
-fn owning_unit(pid: u32) -> Option<(String, bool)> {
-    [true, false]
-        .into_iter()
-        .find_map(|user| Some((unit_holding(pid, user)?, user)))
-}
-
-/// The bus object of the unit holding `pid`, as the manager asked says;
-/// `None` when it holds no such process.
-fn unit_holding(pid: u32, user: bool) -> Option<String> {
-    let object = ask_manager(
-        user,
-        &[
-            "call",
-            SYSTEMD,
-            SYSTEMD_MANAGER,
-            "org.freedesktop.systemd1.Manager",
-            "GetUnitByPID",
-            "u",
-            &pid.to_string(),
-        ],
-    )?;
-    quoted(&object)
-}
-
-/// The name of the unit at `object`, asked of the manager rather than
-/// decoded out of the object path, where systemd escapes every character
-/// outside `[A-Za-z0-9]` (`docker_2eservice`).
-fn unit_id(object: &str, user: bool) -> Option<String> {
-    let name = ask_manager(
-        user,
-        &[
-            "get-property",
-            SYSTEMD,
-            object,
-            "org.freedesktop.systemd1.Unit",
-            "Id",
-        ],
-    )?;
-    quoted(&name)
-}
-
-/// The process the unit at `object` was started for, `None` where its
-/// manager never identified one: a `Type=forking` unit with no
-/// `PIDFile=` answers `0` once a second process is left, measured on
-/// systemd 255. The unit is running the daemon either way, so that is
-/// not read as a process the daemon is not — see [`managing_unit`].
-///
-/// No deadline, as with this module's other process calls: a manager
-/// this unresponsive has already stopped managing.
-fn main_pid(object: &str, user: bool) -> Option<u32> {
-    let pid = ask_manager(
-        user,
-        &[
-            "get-property",
-            SYSTEMD,
-            object,
-            "org.freedesktop.systemd1.Service",
-            "MainPID",
-        ],
-    )?;
-    main_pid_from(&pid)
-}
-
-/// The pid in busctl's `u <pid>` line for a `MainPID`, `0` being no pid
-/// at all — see [`main_pid`].
-fn main_pid_from(body: &str) -> Option<u32> {
-    let pid = body.split_whitespace().nth(1)?.parse::<u32>().ok()?;
-    (pid > 0).then_some(pid)
-}
-
-/// systemd's bus name and the manager object the calls above start from.
-const SYSTEMD: &str = "org.freedesktop.systemd1";
-const SYSTEMD_MANAGER: &str = "/org/freedesktop/systemd1";
-
-/// One read-only call on systemd's bus, to this user's manager or to the
-/// system one. `None` for anything but an answer: a manager holding no
-/// such process, or none there to ask, exits non-zero.
-///
-/// Only an object path a manager itself returned is ever passed back,
-/// never a name read off a cgroup, so nothing here can carry an option
-/// or a glob into the call.
-fn ask_manager(user: bool, args: &[&str]) -> Option<String> {
-    let mut call = Command::new("busctl");
-    if user {
-        call.arg("--user");
-    }
-    let out = call.args(args).output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// The value in a busctl line for a string or an object path, both of
-/// which it prints quoted (`s "docker.service"`). busctl escapes what it
-/// prints, so the `\x2d` in a unit's own name comes back as `\\x2d`.
-fn quoted(body: &str) -> Option<String> {
-    let (_, value) = body.split_once('"')?;
-    let (value, _) = value.rsplit_once('"')?;
-    Some(value.replace("\\\\", "\\"))
-}
-
-/// Best-effort stop of a stale daemon (see `stale_daemon`), then waits for
-/// the port to actually free up. Kills the daemon's whole process group —
-/// it was started as a group leader (see `detach`/sbx's equivalent), so
-/// this takes its spawned llama-server children down with it instead of
-/// orphaning them with models still loaded in memory.
-///
-/// The stop sequence mirrors Ollama's app supervisor (app/server's
-/// `stop()`): ask nicely first, poll for the port to free within a 5s
-/// deadline, and only then escalate to a forceful kill — with one more 5s
-/// wait before giving up entirely.
-fn stop_stale_daemon(identity: &DaemonIdentity) -> anyhow::Result<()> {
-    eprintln!("stopping stale llmman serve daemon (superseded by this install); restarting");
-    stop_daemon(identity)
-}
-
-/// The stop sequence of [`stop_stale_daemon`], for any replaced daemon.
-fn stop_daemon(identity: &DaemonIdentity) -> anyhow::Result<()> {
-    kill_daemon(identity, false);
-    if wait_for_port_free() {
-        return Ok(());
-    }
-    // Graceful stop timed out — force-kill, like Ollama's supervisor
-    // hard-killing a server that ignored its graceful signal for 5s.
-    kill_daemon(identity, true);
-    if wait_for_port_free() {
-        return Ok(());
-    }
-    // Not `identity.pid`: that was read before the two kill attempts, so
-    // the process it named may be gone and its pid already reused. Name
-    // only one `/api/version` still reports — and nothing, when whatever
-    // holds the port does not answer (see [`stale_daemon`]).
-    let pid = stale_daemon().and_then(|current| current.pid);
-    anyhow::bail!("{}", stale_daemon_message(&bind_addr(), pid))
-}
-
 /// `pid` as a `pid_t` that names one daemon, or `None` for one that cannot.
 /// kill(0) hits the caller's own process group and kill(-1) every process
 /// the user owns, so 0 and 1 are refused, and a pid past `pid_t` names
@@ -735,95 +353,9 @@ fn signalable_pid(pid: u32) -> Option<i32> {
     i32::try_from(pid).ok().filter(|pid| *pid > 1)
 }
 
-/// [`stop_stale_daemon`]'s give-up message, naming the daemon's own pid,
-/// which it publishes on `/api/version` for exactly this.
-///
-/// The earlier suggestion, `pkill -f 'llmman serve'`, matches whole
-/// command lines — including the one of the shell it is typed into, which
-/// it then kills along with the daemon. A daemon too old to report a pid
-/// gets no suggestion rather than that one, and so does one reporting a
-/// pid [`signalable_pid`] refuses, which is the same footgun again. The
-/// command is the one this module stops a daemon with on the platform it
-/// is printed on.
-fn stale_daemon_message(addr: &str, pid: Option<u32>) -> String {
-    let hint = pid
-        .and_then(signalable_pid)
-        .map_or_else(String::new, |pid| {
-            if cfg!(windows) {
-                format!(" (taskkill /PID {pid} /T /F)")
-            } else {
-                format!(" (kill {pid})")
-            }
-        });
-    format!(
-        "a stale llmman serve daemon is still holding {addr} after being \
-         asked to stop; stop it manually{hint} and retry"
-    )
-}
-
-/// Polls for the daemon port to free up, every 100ms for up to 5s.
-fn wait_for_port_free() -> bool {
-    for _ in 0..50 {
-        if !server_alive() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
-}
-
-#[cfg(unix)]
-fn kill_daemon(identity: &DaemonIdentity, force: bool) {
-    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
-    match identity.pid {
-        // The daemon's whole process group, falling back to the bare pid
-        // — which /api/version just proved alive — if it leads no group.
-        Some(pid) => {
-            if !kill_group(pid, signal) {
-                if let Some(pid) = signalable_pid(pid) {
-                    // SAFETY: see kill_group.
-                    unsafe { libc::kill(pid, signal) };
-                }
-            }
-        }
-        // A daemon too old to report its pid: match on the command line
-        // ("<path>/llmman serve ..."), which no plain llmman CLI client
-        // invocation shares.
-        None => {
-            let _ = Command::new("pkill")
-                .args([if force { "-KILL" } else { "-TERM" }, "-f", "llmman serve"])
-                .status();
-        }
-    }
-}
-
-#[cfg(windows)]
-fn kill_daemon(identity: &DaemonIdentity, _force: bool) {
-    // taskkill /F and Stop-Process -Force are already forceful — Windows
-    // has no in-between graceful signal for a detached, windowless
-    // process, so the graceful/forceful distinction collapses here.
-    match identity.pid {
-        // /T takes the daemon's llama-server children down with it.
-        Some(pid) => taskkill(pid, true),
-        None => {
-            let _ = Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-Command",
-                    "Get-CimInstance Win32_Process -Filter \"Name='llmman.exe'\" | \
-                     Where-Object { $_.CommandLine -match ' serve' } | \
-                     ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-    }
-}
-
 /// `taskkill /PID <pid> /T`, plus `/F` when `force`. Stdio is nulled because
 /// it prints "ERROR: The process "1544" not found." for a pid that has
-/// already gone; callers poll the port instead of its exit code.
+/// already gone, and the exit code is ignored.
 #[cfg(windows)]
 fn taskkill(pid: u32, force: bool) {
     let pid = pid.to_string();
@@ -868,50 +400,16 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
 
 /// Like [`ensure_server`], forwarding additional `serve` options only when
 /// spawning a new daemon. The caller must not pass `--detach` back to the child.
+///
+/// Whatever answers at `LLMMAN_HOST` is reused as is, a llmman daemon or an
+/// Ollama alike: this never judges, stops or replaces a running server.
+/// Nothing answering on a remote host is an error, since a daemon cannot be
+/// started there.
 pub fn ensure_server_with_args(preload_model: &str, serve_args: &[&str]) -> anyhow::Result<()> {
-    ensure_server_with_engines(preload_model, serve_args, &RequestedEngines::default())
-}
-
-/// Like [`ensure_server_with_args`], but a healthy local daemon not running
-/// the `requested` engine settings is restarted rather than reused.
-pub fn ensure_server_with_engines(
-    preload_model: &str,
-    serve_args: &[&str],
-    requested: &RequestedEngines,
-) -> anyhow::Result<()> {
     if server_alive() {
-        // A remote LLMMAN_HOST: reuse whatever's there, and never touch
-        // its PID (see host_is_local) or spawn a "replacement" over it.
-        if !host_is_local() {
-            return Ok(());
-        }
-        // Reuse the running daemon — unless it outlived its own install
-        // (see stale_daemon): reusing that one means serving with a
-        // long-obsolete build whose llama-server (and bug fixes) are gone.
-        match stale_daemon() {
-            None => {
-                let Some((identity, reason)) = engine_change(requested) else {
-                    return Ok(());
-                };
-                if leave_to_manager(identity.pid, &reason) {
-                    return Ok(());
-                }
-                eprintln!("restarting the llmman serve daemon: {reason}");
-                stop_daemon(&identity)?;
-            }
-            Some(identity) => {
-                let what = format!(
-                    "{} is serving {}",
-                    identity.version.as_deref().unwrap_or("an older daemon"),
-                    bind_addr()
-                );
-                if leave_to_manager(identity.pid, what) {
-                    return Ok(());
-                }
-                stop_stale_daemon(&identity)?;
-            }
-        }
-    } else if !host_is_local() {
+        return Ok(());
+    }
+    if !host_is_local() {
         anyhow::bail!(
             "LLMMAN_HOST={} is unreachable, and llmman can't start a daemon on a remote host",
             server()
@@ -1281,10 +779,9 @@ fn signal_group(pid: u32, force: bool) -> bool {
 
 /// Best-effort stop of the daemon's whole process group: TERM first, then
 /// escalate to a group KILL after a short grace so a slow-to-exit child
-/// is actually stopped too (the same two phases as stop_stale_daemon).
-/// The escalation is skipped when the TERM found nothing to signal (an
-/// already-empty group), which keeps bail_if_exited's fast-fail path free
-/// of the grace sleep.
+/// is actually stopped too. The escalation is skipped when the TERM found
+/// nothing to signal (an already-empty group), which keeps bail_if_exited's
+/// fast-fail path free of the grace sleep.
 fn stop_group(pid: u32) {
     if signal_group(pid, false) {
         std::thread::sleep(Duration::from_millis(500));
@@ -2339,152 +1836,6 @@ mod tests {
         assert!(!identity.is_llmman());
     }
 
-    /// A WSL2 daemon seen from Windows (or a Windows one from WSL) is not
-    /// this OS's to judge stale or to signal: its exe never exists here and
-    /// its pid names nothing here.
-    #[test]
-    fn daemon_on_another_os_is_foreign() {
-        let identity = |exe: Option<&str>| DaemonIdentity {
-            version: Some("0.1.0".into()),
-            exe: exe.map(Into::into),
-            pid: Some(1544),
-            ..Default::default()
-        };
-        for exe in other_os_exes() {
-            assert!(identity(Some(exe)).is_foreign(), "{exe}");
-        }
-        for exe in missing_exes() {
-            assert!(!identity(Some(exe)).is_foreign(), "{exe}");
-        }
-        assert!(!identity(None).is_foreign());
-        assert!(!identity(Some("")).is_foreign());
-        let own = std::env::current_exe().unwrap();
-        assert!(!identity(own.to_str()).is_foreign());
-    }
-
-    /// Both path syntaxes are told apart the same way on every host.
-    #[test]
-    fn exe_syntax_is_foreign_only_across_operating_systems() {
-        let posix = "/home/linuxbrew/.linuxbrew/Cellar/llmman/0.1.691/bin/llmman";
-        for exe in [
-            r"C:\Users\x\llmman.exe",
-            r"c:/tools/llmman.exe",
-            r"\\?\C:\Users\x\llmman.exe",
-            r"\\server\share\llmman.exe",
-        ] {
-            assert!(!exe_is_foreign(exe, true), "{exe}");
-            assert!(exe_is_foreign(exe, false), "{exe}");
-        }
-        assert!(exe_is_foreign(posix, true));
-        assert!(!exe_is_foreign(posix, false));
-        for exe in ["", "llmman", "llmman.exe", r"C:", r"relative\llmman.exe"] {
-            assert!(!exe_is_foreign(exe, true), "{exe}");
-            assert!(!exe_is_foreign(exe, false), "{exe}");
-        }
-    }
-
-    fn running(llama: Option<&str>) -> DaemonIdentity {
-        DaemonIdentity {
-            version: Some("0.1.0".into()),
-            exe: std::env::current_exe().unwrap().to_str().map(Into::into),
-            pid: Some(1544),
-            llama_cpp_version: llama.map(Into::into),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn an_older_daemon_identity_still_parses_without_engine_settings() {
-        let identity: DaemonIdentity =
-            serde_json::from_str(r#"{"version":"0.1.0","exe":"/bin/llmman","pid":42}"#).unwrap();
-        assert!(identity.llama_cpp_version.is_none());
-        let identity: DaemonIdentity = serde_json::from_str(
-            r#"{"version":"0.1.0","exe":"/bin/llmman","pid":42,"llama_cpp_version":"latest"}"#,
-        )
-        .unwrap();
-        assert_eq!(identity.llama_cpp_version.as_deref(), Some("latest"));
-    }
-
-    #[test]
-    fn a_daemon_is_restarted_only_for_an_explicit_llama_cpp_pin_it_does_not_run() {
-        let ask = |v| RequestedEngines {
-            llama_cpp_version: v,
-            ..Default::default()
-        };
-        // No flag given: reuse, whatever the daemon runs.
-        assert_eq!(engine_change_reason(&running(Some("b1")), &ask(None)), None);
-        assert_eq!(engine_change_reason(&running(None), &ask(None)), None);
-        // The same value, spelled as the daemon's pin or by its build.
-        assert_eq!(
-            engine_change_reason(&running(Some("b12503")), &ask(Some("b12503"))),
-            None
-        );
-        assert_eq!(
-            engine_change_reason(&running(Some("latest")), &ask(Some("latest"))),
-            None
-        );
-        assert_eq!(
-            engine_change_reason(
-                &running(Some("v1.0.0-b12359-b1b770d")),
-                &ask(Some("b12359"))
-            ),
-            None
-        );
-        // A different value.
-        assert_eq!(
-            engine_change_reason(&running(Some("b12359")), &ask(Some("latest"))).as_deref(),
-            Some("it runs llama.cpp b12359, you asked for latest")
-        );
-        // A daemon too old to report its pin.
-        assert_eq!(
-            engine_change_reason(&running(None), &ask(Some("b12503"))).as_deref(),
-            Some("it runs llama.cpp an unknown version, you asked for b12503")
-        );
-    }
-
-    #[test]
-    fn launchd_job_finds_the_job_running_a_pid() {
-        let list = "PID\tStatus\tLabel\n-\t0\tcom.apple.x\n1544\t0\thomebrew.mxcl.llmman\n";
-        assert_eq!(
-            launchd_job(list, 1544).as_deref(),
-            Some("homebrew.mxcl.llmman")
-        );
-        assert_eq!(launchd_job(list, 15), None);
-    }
-
-    #[test]
-    fn a_foreign_or_unidentified_daemon_is_never_restarted_for_its_settings() {
-        let ask = RequestedEngines {
-            llama_cpp_version: Some("latest"),
-            ..Default::default()
-        };
-        let mut foreign = running(Some("b1"));
-        foreign.exe = Some(if cfg!(windows) {
-            "/usr/bin/llmman".into()
-        } else {
-            r"C:\llmman\llmman.exe".into()
-        });
-        assert_eq!(engine_change_reason(&foreign, &ask), None);
-        assert_eq!(engine_change_reason(&DaemonIdentity::default(), &ask), None);
-    }
-
-    #[test]
-    fn the_other_engine_flags_ask_for_a_restart_the_same_way() {
-        let mut identity = running(Some("latest"));
-        identity.sglang_version = Some("v0.5.19".into());
-        let ask = RequestedEngines {
-            sglang_version: Some("v0.5.19"),
-            vllm_version: Some("v0.28.0"),
-            ..Default::default()
-        };
-        assert_eq!(
-            engine_change_reason(&identity, &ask).as_deref(),
-            Some("it runs the vLLM image tag latest, you asked for v0.28.0")
-        );
-        identity.vllm_version = Some("v0.28.0".into());
-        assert_eq!(engine_change_reason(&identity, &ask), None);
-    }
-
     fn show_response(body: serde_json::Value) -> ShowResponse {
         serde_json::from_value(body).expect("a ShowResponse")
     }
@@ -3100,344 +2451,33 @@ mod tests {
         }
     }
 
-    /// The whole message, not just its hint: a `pkill -f` pattern put
-    /// back at the call site has to fail here — see
-    /// [`stale_daemon_message`] for why that pattern is the bug.
-    #[test]
-    fn the_stale_daemon_message_names_the_pid_rather_than_a_pkill_pattern() {
-        // The command this module would itself use on this platform.
-        let stop = if cfg!(windows) {
-            " (taskkill /PID 931970 /T /F)"
-        } else {
-            " (kill 931970)"
-        };
-        let with_pid = stale_daemon_message("127.0.0.1:17434", Some(931970));
-        assert!(
-            with_pid.contains("still holding 127.0.0.1:17434"),
-            "{with_pid}"
-        );
-        assert!(
-            with_pid.ends_with(&format!("stop it manually{stop} and retry")),
-            "{with_pid}"
-        );
-        assert!(!with_pid.contains("pkill"), "{with_pid}");
-        // The no-pid case, for the reason the function gives.
-        let without = stale_daemon_message("127.0.0.1:17434", None);
-        assert!(without.ends_with("stop it manually and retry"), "{without}");
-        assert!(!without.contains("pkill"), "{without}");
-    }
-
-    /// The pids `kill_group` refuses are the ones that would signal the
-    /// caller's own group or everything the user owns, so the message
-    /// must not hand them over either.
-    #[test]
-    fn the_stale_daemon_message_omits_pids_kill_group_would_refuse() {
-        for pid in [0, 1, u32::MAX] {
-            let message = stale_daemon_message("127.0.0.1:17434", Some(pid));
-            assert!(
-                message.ends_with("stop it manually and retry"),
-                "pid {pid}: {message}"
-            );
-            // No parenthetical at all, so no command to copy.
-            assert!(!message.contains('('), "pid {pid}: {message}");
-        }
-    }
-
-    /// The decision [`service_unit`] rests on: what the manager holding
-    /// the daemon says about the unit holding it.
-    #[test]
-    fn managing_unit_trusts_the_manager_holding_the_daemon() {
-        let brew = "sh.brew.llmman.service";
-        let managing =
-            |unit: &str, user: bool, main: Option<u32>| managing_unit(42, unit, user, || main);
-        // The process the unit was started for: the manager runs this
-        // daemon, under either manager.
-        assert_eq!(managing(brew, true, Some(42)).as_deref(), Some(brew));
-        assert_eq!(
-            managing("docker.service", false, Some(42)).as_deref(),
-            Some("docker.service")
-        );
-        // Started for something else, so llmman spawned this daemon
-        // inside the unit and may replace it.
-        assert_eq!(managing(brew, true, Some(7)), None);
-        assert_eq!(managing("docker.service", false, Some(7)), None);
-        // No process identified, the unit running the daemon all the
-        // same — see [`main_pid`].
-        assert_eq!(managing(brew, true, None).as_deref(), Some(brew));
-        // A scope holds what its manager never started, a shell's daemon
-        // among them, and nothing restarts one: not even asked about.
-        for unit in ["tmux-spawn-0e9dd425.scope", "session-2084.scope"] {
-            assert_eq!(
-                managing_unit(42, unit, true, || panic!("asked about {unit}")),
-                None
-            );
-        }
-        // The system manager's answer for anything a per-user manager
-        // holds, that manager having been asked first — see
-        // [`owning_unit`].
-        assert_eq!(
-            managing_unit(42, "user@1000.service", false, || panic!("asked")).as_deref(),
-            Some("user@1000.service")
-        );
-        // Under the manager that holds it, a unit of that name is a unit
-        // like any other, judged by the process it was started for.
-        assert_eq!(
-            managing("user@2000.service", true, Some(42)).as_deref(),
-            Some("user@2000.service")
-        );
-        assert_eq!(managing("user@2000.service", true, Some(7)), None);
-    }
-
-    /// busctl's own output for the answers this reads, as systemd 255
-    /// prints them — see [`quoted`] and [`main_pid_from`].
-    #[test]
-    fn quoted_values_and_main_pids_come_out_of_busctl_lines() {
-        assert_eq!(
-            quoted("o \"/org/freedesktop/systemd1/unit/docker_2eservice\"\n").as_deref(),
-            Some("/org/freedesktop/systemd1/unit/docker_2eservice")
-        );
-        assert_eq!(
-            quoted("s \"sh.brew.llmman.service\"\n").as_deref(),
-            Some("sh.brew.llmman.service")
-        );
-        // A unit's own backslash comes back doubled.
-        assert_eq!(
-            quoted("s \"wg-quick@a\\\\x2db.service\"\n").as_deref(),
-            Some("wg-quick@a\\x2db.service")
-        );
-        // Unquoted, so not a value this reads.
-        assert_eq!(quoted("u 2608\n"), None);
-        assert_eq!(quoted(""), None);
-        assert_eq!(main_pid_from("u 2608\n"), Some(2608));
-        // No process identified, which is not a pid to compare.
-        assert_eq!(main_pid_from("u 0\n"), None);
-        assert_eq!(main_pid_from("u\n"), None);
-        assert_eq!(main_pid_from(""), None);
-    }
-
-    /// Nothing is claimed for this process, a child of the test harness
-    /// that no unit was started for, whether it sits in a shell's scope
-    /// or in the unit of a CI runner — see [`service_unit`].
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn service_unit_claims_nothing_for_this_process() {
-        // Below a per-user manager that cannot be asked (`sudo`, no user
-        // bus) the system manager names `user@<uid>.service`, which is
-        // left alone on purpose, see [`owning_unit`].
-        let claimed = service_unit(Some(std::process::id()));
-        assert!(
-            claimed
-                .as_deref()
-                .is_none_or(|unit| unit.starts_with("user@")),
-            "{claimed:?}"
-        );
-        assert_eq!(service_unit(None), None);
-        // A pid no manager can be holding.
-        assert_eq!(service_unit(Some(u32::MAX)), None);
-    }
-
-    /// The refusal [`owning_unit`]'s doc comment rests its `sudo` case
-    /// on, live: a manager asked about a process outside its own cgroup
-    /// answers nothing at all.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_manager_holds_no_process_outside_its_own_cgroup() {
-        // Pid 1 is the system manager's own process, so no per-user
-        // manager holds it, and no manager holds a pid that cannot be.
-        assert_eq!(unit_holding(1, true), None);
-        assert_eq!(unit_holding(u32::MAX, false), None);
-    }
-
-    /// The live half, against the services this host is running: the
-    /// process a unit was started for is found to be managed, and by the
-    /// unit systemd names. Vacuous where there is no manager to ask, or
-    /// no busctl to ask it with — see [`owning_unit`].
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn service_unit_names_the_unit_a_running_service_was_started_for() {
-        let mut judged = 0;
-        for user in [true, false] {
-            for unit in running_services(user) {
-                // A per-user manager's own process sits in that
-                // manager's `init.scope`, the way pid 1 sits in the
-                // system manager's, and a process is asked about of the
-                // manager holding it — see [`owning_unit`]. So the unit
-                // that starts a manager is not the unit its own process
-                // comes back as.
-                if unit.starts_with("user@") {
-                    continue;
-                }
-                let Some(pid) = reported_main_pid(&unit, user) else {
-                    continue;
-                };
-                let named = service_unit(Some(pid));
-                // A unit that restarted between the two reads answers
-                // differently the second time; only a steady one is
-                // judged.
-                if reported_main_pid(&unit, user) == Some(pid) {
-                    assert_eq!(named.as_deref(), Some(unit.as_str()));
-                    judged += 1;
-                }
-            }
-        }
-        assert!(judged > 0 || owning_unit(std::process::id()).is_none());
-    }
-
-    /// The services a manager reports as running, for the live test to
-    /// have units this host really has.
-    #[cfg(target_os = "linux")]
-    fn running_services(user: bool) -> Vec<String> {
-        let mut args = if user { vec!["--user"] } else { vec![] };
-        args.extend([
-            "list-units",
-            "--type=service",
-            "--state=running",
-            "--no-legend",
-            "--plain",
-            "--no-pager",
-        ]);
-        let Ok(out) = Command::new("systemctl").args(args).output() else {
-            return Vec::new();
-        };
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|line| line.split_whitespace().next().map(str::to_string))
-            .collect()
-    }
-
-    /// The main pid `systemctl` reports for a named unit, which is the
-    /// pid [`service_unit`] has to come back to that same unit from.
-    #[cfg(target_os = "linux")]
-    fn reported_main_pid(unit: &str, user: bool) -> Option<u32> {
-        let mut args = if user { vec!["--user"] } else { vec![] };
-        args.extend(["show", "-p", "MainPID", "--value", "--", unit]);
-        let out = Command::new("systemctl").args(args).output().ok()?;
-        let pid = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
-        (pid > 0).then_some(pid)
-    }
-
     fn identity_from(body: &str) -> anyhow::Result<DaemonIdentity> {
         Ok(serde_json::from_str(body)?)
     }
 
-    /// What this client counts as an installed, current daemon.
-    fn current_llmman() -> String {
-        let exe = std::env::current_exe().unwrap();
-        serde_json::json!({
-            "version": env!("LLMMAN_VERSION"),
-            "exe": exe.to_string_lossy(),
-            "pid": 4242,
-        })
-        .to_string()
-    }
-
-    fn never_probed() -> bool {
-        panic!("a daemon that identifies itself needs no probe")
-    }
-
-    /// Ollama answers a bare version, and its 404 for llmman's own routes
-    /// means nothing may stop it, whatever version it reports.
+    /// Ollama answers a bare version and a 404 for llmman's own routes; a
+    /// daemon from before identity existed answers only a version too, and
+    /// is told from it by llmman's own route answering.
     #[test]
-    fn an_ollama_like_server_is_never_stale() {
+    fn a_server_is_llmman_by_its_identity_or_by_answering_llmman_routes() {
+        let current = identity_from(r#"{"version":"0.1.0","exe":"/bin/llmman","pid":42}"#).unwrap();
+        let never_probed = || panic!("a daemon that identifies itself needs no probe");
+        assert!(is_llmman_daemon(&current, never_probed));
+        // An exe without a pid is still llmman's.
+        let no_pid = identity_from(r#"{"version":"0.1.350","exe":"/bin/llmman"}"#).unwrap();
+        assert!(is_llmman_daemon(&no_pid, never_probed));
         for body in [
             r#"{"version":"0.40.17"}"#,
-            r#"{"version":"0.1.0"}"#,
             r#"{"version":""}"#,
             r#"{}"#,
             r#"{"pid":7}"#,
         ] {
-            assert!(
-                stale_identity(identity_from(body), || false).is_none(),
-                "{body}"
-            );
+            let bare = identity_from(body).unwrap();
+            assert!(is_llmman_daemon(&bare, || true), "{body}");
+            assert!(!is_llmman_daemon(&bare, || false), "{body}");
         }
-    }
-
-    /// Exe paths that name no file, in this OS's syntax.
-    fn missing_exes() -> &'static [&'static str] {
-        if cfg!(windows) {
-            &[
-                r"C:\nonexistent\llmman.exe",
-                r"c:/nonexistent/llmman.exe",
-                r"\\?\C:\nonexistent\llmman.exe",
-            ]
-        } else {
-            &["/nonexistent/llmman", "/old/llmman"]
-        }
-    }
-
-    /// Exe paths in the other OS's syntax: a daemon seen across WSL2.
-    fn other_os_exes() -> &'static [&'static str] {
-        if cfg!(windows) {
-            &["/usr/bin/llmman", "/old/llmman"]
-        } else {
-            &[
-                r"C:\Users\x\llmman.exe",
-                r"c:/tools/llmman.exe",
-                r"\\?\C:\Users\x\llmman.exe",
-                r"\\server\share\llmman.exe",
-            ]
-        }
-    }
-
-    fn identity_json(version: &str, exe: &str, pid: Option<u32>) -> String {
-        serde_json::json!({"version": version, "exe": exe, "pid": pid}).to_string()
-    }
-
-    #[test]
-    fn a_current_llmman_daemon_is_reused_and_a_superseded_one_is_stale() {
-        assert!(stale_identity(identity_from(&current_llmman()), never_probed).is_none());
-
-        let exe = std::env::current_exe().unwrap();
-        let other_version = identity_json("0.0.1-old", &exe.to_string_lossy(), Some(4242));
-        assert!(stale_identity(identity_from(&other_version), never_probed).is_some());
-
-        for exe in missing_exes() {
-            let gone = identity_json(env!("LLMMAN_VERSION"), exe, Some(4242));
-            assert!(
-                stale_identity(identity_from(&gone), never_probed).is_some(),
-                "{exe}"
-            );
-        }
-    }
-
-    /// A daemon from before identity existed answers only a version, and is
-    /// told from Ollama by llmman's own route answering.
-    #[test]
-    fn an_old_llmman_daemon_without_identity_is_stale_only_when_it_answers_llmman_routes() {
-        let old = r#"{"version":"0.1.300"}"#;
-        let found = stale_identity(identity_from(old), || true).expect("stale");
-        assert_eq!(found.version.as_deref(), Some("0.1.300"));
-        assert!(found.pid.is_none());
-        assert!(stale_identity(identity_from(old), || false).is_none());
-
-        // Reported an exe but not a pid: still llmman's, with no probe.
-        for exe in missing_exes() {
-            let no_pid = identity_json("0.1.350", exe, None);
-            let found = stale_identity(identity_from(&no_pid), never_probed).expect("stale");
-            assert!(found.pid.is_none(), "{exe}");
-        }
-    }
-
-    #[test]
-    fn an_unreachable_or_unparseable_server_is_never_stale() {
-        let failed = || Err(anyhow::anyhow!("request /api/version: connection refused"));
-        assert!(stale_identity(failed(), never_probed).is_none());
-        assert!(stale_identity(identity_from("not json"), || true).is_none());
-        assert!(stale_identity(identity_from("404 page not found"), || true).is_none());
-    }
-
-    #[test]
-    fn a_daemon_on_another_os_is_not_stale_even_if_the_probe_answers() {
-        for exe in other_os_exes() {
-            for pid in [Some(9), None] {
-                let other = identity_json("0.0.1", exe, pid);
-                assert!(
-                    stale_identity(identity_from(&other), never_probed).is_none(),
-                    "{exe}"
-                );
-            }
-        }
+        assert!(identity_from("not json").is_err());
+        assert!(identity_from("404 page not found").is_err());
     }
 
     #[test]
@@ -3451,18 +2491,6 @@ mod tests {
         assert!(!is_providers_list(&json(r#"{"error":"not found"}"#)));
         assert!(!is_providers_list(&json(r#"[]"#)));
         assert!(!is_providers_list(&json(r#""404 page not found""#)));
-    }
-
-    #[test]
-    fn an_ollama_like_server_is_never_restarted_for_engine_settings() {
-        let ollama = identity_from(r#"{"version":"0.40.17"}"#).unwrap();
-        let ask = RequestedEngines {
-            llama_cpp_version: Some("b12503"),
-            vllm_version: Some("v0.1"),
-            vllm_image: Some("img"),
-            sglang_version: Some("v0.5"),
-        };
-        assert_eq!(engine_change_reason(&ollama, &ask), None);
     }
 
     /// The stream of lines through [`PullProgress`]: stdout, stderr, the bar
