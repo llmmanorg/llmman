@@ -179,6 +179,22 @@ mod docker {
                         .await?;
                         layers.push(api::sidecar_layer(d, file, role));
                     }
+                    for &(role, from, path) in &plan.external {
+                        let d = transfer_external_sidecar(
+                            &api_client,
+                            &dl_client,
+                            &head_client,
+                            &host,
+                            from,
+                            path,
+                            role,
+                            token.as_deref(),
+                            &session,
+                            &mut changed,
+                        )
+                        .await?;
+                        layers.push(d);
+                    }
                     if let Some(te_ref) = plan.text_encoder {
                         let d = transfer_text_encoder(
                             &api_client,
@@ -294,6 +310,49 @@ mod docker {
 
     fn basename(path: &str) -> String {
         path.rsplit('/').next().unwrap_or(path).to_string()
+    }
+
+    /// A sidecar the model's repo lacks, `path` in the repository `from`, as a `role` layer.
+    #[allow(clippy::too_many_arguments)]
+    async fn transfer_external_sidecar(
+        api_client: &reqwest::Client,
+        dl_client: &reqwest::Client,
+        head_client: &reqwest::Client,
+        host: &str,
+        from: &str,
+        path: &str,
+        role: &str,
+        token: Option<&str>,
+        session: &crate::ffi::PushSession,
+        changed: &mut bool,
+    ) -> Result<Descriptor> {
+        let (_, owner, repo, _) = api::parse_hf_ref(&format!("{host}/{from}"))?;
+        let endpoint = super::super::hf_endpoint(host);
+        let info = api::fetch_model_info(api_client, &endpoint, &owner, &repo, token)
+            .await
+            .with_context(|| format!("{role} from {from}"))?;
+        let commit = info.commit().to_string();
+        let files = api::fetch_files(api_client, &endpoint, &owner, &repo, &commit, token)
+            .await
+            .with_context(|| format!("{role} from {from}"))?;
+        let file = files
+            .iter()
+            .find(|f| f.kind == "file" && f.path == path)
+            .ok_or_else(|| anyhow::anyhow!("{from} has no {path}"))?;
+        let d = transfer_layer(
+            dl_client,
+            head_client,
+            &endpoint,
+            &owner,
+            &repo,
+            &commit,
+            file,
+            token,
+            session,
+            changed,
+        )
+        .await?;
+        Ok(api::sidecar_layer(d, file, role))
     }
 
     /// The text encoder GGUF from its own repository, as a `text_encoder` layer.

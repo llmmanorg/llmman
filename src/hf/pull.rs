@@ -138,6 +138,23 @@ async fn pull_from(
                     .await?;
                     layers.push(api::sidecar_layer(d, file, role));
                 }
+                for &(role, from, path) in &plan.external {
+                    layers.push(
+                        pull_external_sidecar(
+                            &api_client,
+                            &dl_client,
+                            &head_client,
+                            &host,
+                            from,
+                            path,
+                            role,
+                            token.as_deref(),
+                            layout_dir,
+                            progress_key,
+                        )
+                        .await?,
+                    );
+                }
                 if let Some(te_ref) = plan.text_encoder {
                     let mut d = pull_text_encoder(
                         &api_client,
@@ -317,6 +334,51 @@ fn basename(path: &str) -> String {
 /// repository (`owner/repo[:quant]`) into the same blob store, returning
 /// its layer descriptor. Blobs are content-addressed, so a text encoder
 /// shared by several diffusion models is stored once.
+/// A sidecar the model's repo lacks, `path` in the repository `from`
+/// (`owner/repo`), as a `role` layer.
+#[allow(clippy::too_many_arguments)]
+async fn pull_external_sidecar(
+    api_client: &reqwest::Client,
+    dl_client: &reqwest::Client,
+    head_client: &reqwest::Client,
+    host: &str,
+    from: &str,
+    path: &str,
+    role: &str,
+    token: Option<&str>,
+    layout_dir: &Path,
+    progress_key: &str,
+) -> Result<Descriptor> {
+    let (_, owner, repo, _) = api::parse_hf_ref(&format!("{host}/{from}"))?;
+    let endpoint = super::hf_endpoint(host);
+    let info = api::fetch_model_info(api_client, &endpoint, &owner, &repo, token)
+        .await
+        .with_context(|| format!("{role} from {from}"))?;
+    let commit = info.commit().to_string();
+    let files = api::fetch_files(api_client, &endpoint, &owner, &repo, &commit, token)
+        .await
+        .with_context(|| format!("{role} from {from}"))?;
+    let file = files
+        .iter()
+        .find(|f| f.kind == "file" && f.path == path)
+        .ok_or_else(|| anyhow::anyhow!("{from} has no {path}"))?;
+    ensure_room(from, layout_dir, &[file])?;
+    let d = download_layer(
+        dl_client,
+        head_client,
+        &endpoint,
+        &owner,
+        &repo,
+        &commit,
+        file,
+        token,
+        layout_dir,
+        progress_key,
+    )
+    .await?;
+    Ok(api::sidecar_layer(d, file, role))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn pull_text_encoder(
     api_client: &reqwest::Client,

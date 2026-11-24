@@ -676,19 +676,7 @@ fn image_positions(n_text: i64, lh: i64, lw: i64) -> Vec<[f64; 3]> {
 /// cos/sin tables `[n][head_dim/2]`: the frame, height and width axes' frequencies
 /// (`1 / 10000^(2i/dim)` over each axis' dims) one after the other.
 fn rope_tables(hp: &Hparams, positions: &[[f64; 3]]) -> (Vec<f32>, Vec<f32>) {
-    let half = (hp.head_dim / 2) as usize;
-    let mut cos = Vec::with_capacity(positions.len() * half);
-    let mut sin = Vec::with_capacity(positions.len() * half);
-    for p in positions {
-        for (a, &dim) in hp.axes.iter().enumerate() {
-            for i in 0..dim / 2 {
-                let angle = p[a] / 10000f64.powf(2.0 * i as f64 / dim as f64);
-                cos.push(angle.cos() as f32);
-                sin.push(angle.sin() as f32);
-            }
-        }
-    }
-    (cos, sin)
+    super::zimage::rope_tables(&hp.axes, 10000.0, positions)
 }
 
 /// The shared modulation: `silu(temb)` and `[scale1, tanh(gate1), scale2, tanh(gate2)]`.
@@ -716,7 +704,7 @@ fn modulation<'g>(
 
 /// Interleaved rotary pairs `(2i, 2i+1)` of each head moved to `(i, i + hd/2)`.
 /// Queries and keys only meet in dot products, so they stay permuted.
-fn halves<'g>(g: &'g Graph<'g>, x: Tensor<'g>, hd: i64) -> Tensor<'g> {
+pub(super) fn halves<'g>(g: &'g Graph<'g>, x: Tensor<'g>, hd: i64) -> Tensor<'g> {
     let [dim, t, ..] = x.shape();
     let x4 = g.reshape_4d(g.cont(x), 2, hd / 2, dim / hd, t);
     g.reshape_2d(g.cont(g.permute(x4, 1, 0, 2, 3)), dim, t)
