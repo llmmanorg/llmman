@@ -24,6 +24,8 @@ const MAX_STEPS: i64 = 200;
 /// Output pixels per request (width x height x frames): 3 GiB of RGB.
 const MAX_PIXELS: i64 = 1 << 30;
 const MAX_REFERENCE_IMAGES: usize = 8;
+/// The daemon's own limit for generation requests (`GENERATION_BODY_LIMIT_BYTES`).
+const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 struct Video {
     id: String,
@@ -641,6 +643,8 @@ pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
     Router::new()
         .route("/v1/images/generations", post(images))
         .route("/v1/videos", post(videos))
+        // reference images and conditioning video ride in the JSON body, as base64
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .route("/v1/videos/:id", get(video_get))
         .route("/v1/videos/:id/content", get(video_content))
         .route("/v1/audio/speech", post(speech))
