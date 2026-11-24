@@ -233,6 +233,21 @@ pub fn is_diffusion_model(path: &Path) -> bool {
     })
 }
 
+/// Environment the backend process running `path` needs, set by its parent
+/// (setting it here, with the runtime's threads up, would race their reads).
+///
+/// FLUX.2: ggml's Metal graph optimizer (node reordering for concurrency)
+/// miscomputes the transformer graph into noise on Apple GPUs, while the
+/// same graph is right on CPU and with the optimizer off (M3 Max, llama.cpp
+/// b12359), at no measurable cost; one process hosts one model.
+pub fn backend_env(path: &Path) -> &'static [(&'static str, &'static str)] {
+    if cfg!(target_os = "macos") && weights::read_index(path).is_ok_and(|i| flux2::is_flux2(&i)) {
+        &[("GGML_METAL_GRAPH_OPTIMIZE_DISABLE", "1")]
+    } else {
+        &[]
+    }
+}
+
 /// Does this Diffusers `_class_name` run here (rather than on vLLM-Omni)?
 pub fn is_native_pipeline(class: &str) -> bool {
     class == qwen_image::PIPELINE

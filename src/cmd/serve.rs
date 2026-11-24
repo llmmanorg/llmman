@@ -2649,7 +2649,7 @@ async fn resolve_target(
                     }
                     (GgufArm::Speech { .. }, _) => {
                         let (child, tail) =
-                            spawn_mediagen_backend(&load_ref, port, state, Workload::CpuOnly)
+                            spawn_mediagen_backend(&load_ref, None, port, state, Workload::CpuOnly)
                                 .await?;
                         stderr_tail = Some(tail);
                         ModelProcess::Local(Engine::Speech, child, None)
@@ -2695,9 +2695,15 @@ async fn resolve_target(
                 oom_retryable = true;
                 ModelProcess::Container(ociman, Engine::LlamaServer, child)
             }
-            (ModelPath::Diffusion(_), None) => {
-                let (child, tail) =
-                    spawn_mediagen_backend(&load_ref, port, state, Workload::General).await?;
+            (ModelPath::Diffusion(paths), None) => {
+                let (child, tail) = spawn_mediagen_backend(
+                    &load_ref,
+                    Some(&paths.model),
+                    port,
+                    state,
+                    Workload::General,
+                )
+                .await?;
                 stderr_tail = Some(tail);
                 oom_retryable = true;
                 ModelProcess::Local(Engine::LlamaServer, child, None)
@@ -4727,8 +4733,11 @@ fn mediagen_backend_args(model_ref: &str, port: u16) -> [String; 4] {
 /// PORT` (see `run`): the media backend of a diffusion model, the speech
 /// worker of a Canary GGUF. `workload` is whose runtime answer the child
 /// inherits (see `runtime::Workload`).
+/// `model` (a diffusion model's file) adds the environment it needs
+/// ([`crate::mediagen::backend_env`]).
 async fn spawn_mediagen_backend(
     model_ref: &str,
+    model: Option<&std::path::Path>,
     port: u16,
     state: &AppState,
     workload: Workload,
@@ -4757,6 +4766,11 @@ async fn spawn_mediagen_backend(
         .chain(MEDIAGEN_ENV_PASSTHROUGH_VARS)
     {
         if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+    if let Some(model) = model {
+        for (var, val) in crate::mediagen::backend_env(model) {
             cmd.env(var, val);
         }
     }
