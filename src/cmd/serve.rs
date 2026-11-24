@@ -4816,8 +4816,15 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
             upload_route(handle_openai_transcriptions),
         )
         // OpenAI media generation (crate::mediagen::server)
-        .route("/v1/images/generations", post(handle_openai_images))
-        .route("/v1/videos", post(handle_openai_videos))
+        // reference images / conditioning video arrive as base64 in the body
+        .route(
+            "/v1/images/generations",
+            post(handle_openai_images).layer(DefaultBodyLimit::max(GENERATION_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/v1/videos",
+            post(handle_openai_videos).layer(DefaultBodyLimit::max(GENERATION_BODY_LIMIT_BYTES)),
+        )
         .route("/v1/videos/:id", get(handle_openai_video_get))
         .route("/v1/videos/:id/content", get(handle_openai_video_get))
         .route("/v1/audio/speech", post(handle_openai_speech))
