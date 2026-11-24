@@ -716,12 +716,19 @@ fn llama_cpp_assets_rejects_a_bad_repo_and_latest_from_a_mirror() {
 
 #[cfg(unix)]
 #[test]
-fn clients_reach_a_serve_on_port_0_while_it_holds_its_lock() {
+fn clients_reach_a_serve_on_port_0_while_it_holds_its_record() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let home = tempfile::tempdir().unwrap();
     let data_dir = home.path().join(".local/share/llmman");
-    let port_file = data_dir.join("serve-127.0.0.1-0.port");
+    let record = |port: u16| data_dir.join(format!("serve-127.0.0.1-0-{port}.port"));
+    let records = || {
+        std::fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".port"))
+            .count()
+    };
     let llmman_here = || {
         let mut cmd = llmman();
         cmd.env_clear()
@@ -730,13 +737,12 @@ fn clients_reach_a_serve_on_port_0_while_it_holds_its_lock() {
             .env("LLMMAN_HOST", "127.0.0.1:0");
         cmd
     };
-    let output = |cmd: &mut Command| {
-        let out = cmd.output().unwrap();
+    let ps = || {
+        let out = llmman_here().arg("ps").output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         (out.status.success(), stdout, stderr)
     };
-    let ps = || output(llmman_here().arg("ps"));
     let reachable = || {
         let (ok, stdout, stderr) = ps();
         assert!(ok && stdout.contains("NAME"), "{stdout}{stderr}");
@@ -745,9 +751,32 @@ fn clients_reach_a_serve_on_port_0_while_it_holds_its_lock() {
         let (ok, _, stderr) = ps();
         assert!(!ok && stderr.contains("not running"), "{stderr}");
     };
-    let start = || serve_until_shell_line(home.path(), "127.0.0.1:0", None);
+    let start = || {
+        let (daemon, log, _) = serve_until_shell_line(home.path(), "127.0.0.1:0", None);
+        let port: u16 = log
+            .lines()
+            .find_map(|l| l.strip_prefix("llmman serve listening on http://127.0.0.1:"))
+            .unwrap_or_else(|| panic!("no listening line in {log}"))
+            .parse()
+            .unwrap();
+        (daemon, port)
+    };
+    // Closes each connection, so a client that trusted a stale record fails
+    // instead of waiting on it.
+    let squat = |port: u16| {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = connections.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        connections
+    };
 
-    let (mut daemon, _, _) = start();
+    let (mut daemon, _) = start();
     reachable();
 
     // A second daemon for the same LLMMAN_HOST refuses to start. Waited on
@@ -779,48 +808,49 @@ fn clients_reach_a_serve_on_port_0_while_it_holds_its_lock() {
     );
     reachable();
 
-    // SIGTERM, not Daemon's SIGKILL: a graceful stop removes the port file.
+    // SIGTERM, not Daemon's SIGKILL: a graceful stop removes the record.
     let status = Command::new("kill")
         .args(["-TERM", &daemon.0.id().to_string()])
         .status()
         .unwrap();
     assert!(status.success());
     daemon.0.wait().unwrap();
-    assert!(!port_file.exists());
+    assert_eq!(records(), 0);
     unreachable();
 
-    // A crash leaves the port file, and something else takes the port. The
-    // squatter closes each connection, so a client that trusted the file
-    // fails instead of waiting on it.
-    let (daemon, log, _) = start();
-    let port: u16 = log
-        .lines()
-        .find_map(|l| l.strip_prefix("llmman serve listening on http://127.0.0.1:"))
-        .unwrap_or_else(|| panic!("no listening line in {log}"))
-        .parse()
-        .unwrap();
+    // A crash leaves the record, and something else takes the port.
+    let (daemon, port) = start();
     drop(daemon);
-    assert!(port_file.exists());
-    let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-    let connections = std::sync::Arc::new(AtomicUsize::new(0));
-    let counted = connections.clone();
-    std::thread::spawn(move || {
-        for stream in squatter.incoming() {
-            counted.fetch_add(1, Ordering::SeqCst);
-            drop(stream);
-        }
-    });
+    assert!(record(port).exists());
+    let connections = squat(port);
     unreachable();
+
+    // Still ignored while a new daemon holds the lock but has not published
+    // yet; the test takes the lock in its place.
+    let lock = std::fs::File::open(data_dir.join("serve-127.0.0.1-0.lock")).unwrap();
+    lock.try_lock().unwrap();
+    unreachable();
+    drop(lock);
     assert_eq!(connections.load(Ordering::SeqCst), 0);
 
-    // A directory in the port file's place fails startup at once, instead of
-    // leaving the client to wait out its timeout.
-    std::fs::remove_file(&port_file).unwrap();
-    std::fs::create_dir(&port_file).unwrap();
+    // The next daemon removes it.
+    let (daemon, new_port) = start();
+    assert!(!record(port).exists() && record(new_port).exists());
+    drop(daemon);
+
+    // A lock that cannot be taken fails startup at once, instead of leaving
+    // the client to wait out its timeout.
+    let lock_path = data_dir.join("serve-127.0.0.1-0.lock");
+    std::fs::remove_file(&lock_path).unwrap();
+    std::fs::create_dir(&lock_path).unwrap();
     let started = std::time::Instant::now();
-    let (ok, _, stderr) = output(llmman_here().args(["serve", "--detach", "--runtime", "path"]));
+    let out = llmman_here()
+        .args(["serve", "--detach", "--runtime", "path"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !ok && stderr.contains(&port_file.display().to_string()),
+        !out.status.success() && stderr.contains(&lock_path.display().to_string()),
         "{stderr}"
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(30));

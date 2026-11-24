@@ -200,51 +200,57 @@ pub fn file_safe_addr(addr: &str) -> String {
     format!("{host}-{port}")
 }
 
-/// The daemon's lock and port files, named by the configured address so
-/// every client with the same `LLMMAN_HOST` finds them.
-fn port_paths() -> anyhow::Result<(PathBuf, PathBuf)> {
-    let dir = crate::data_root()?;
-    let name = format!("serve-{}", file_safe_addr(&bind_addr()));
+/// The directory and name prefix (`serve-<host>-0`) of the daemon's lock
+/// and port records, from the configured address every client with the
+/// same `LLMMAN_HOST` knows.
+fn port_files() -> anyhow::Result<(PathBuf, String)> {
     Ok((
-        dir.join(format!("{name}.lock")),
-        dir.join(format!("{name}.port")),
+        crate::data_root()?,
+        format!("serve-{}", file_safe_addr(&bind_addr())),
     ))
 }
 
-/// The recorded port, while a daemon holds the lock beside it. The OS
-/// releases a lock when its holder exits, so a port file left by a daemon
-/// that crashed is never trusted, whatever holds that port now.
-fn locked_port(lock: &Path, port_file: &Path) -> Option<u16> {
-    let probe = std::fs::File::open(lock).ok()?;
-    if !matches!(
-        probe.try_lock_shared(),
-        Err(std::fs::TryLockError::WouldBlock)
-    ) {
-        return None;
-    }
-    let port = std::fs::read_to_string(port_file)
-        .ok()?
-        .trim()
+/// The port in a record's name, `<name>-<port>.port`.
+fn record_port(file_name: &str, name: &str) -> Option<u16> {
+    let port: u16 = file_name
+        .strip_prefix(name)?
+        .strip_prefix('-')?
+        .strip_suffix(".port")?
         .parse()
         .ok()?;
     (port != 0).then_some(port)
 }
 
+/// The port in the record its daemon holds a lock on. The OS releases a
+/// lock when its holder exits, so a record left by a daemon that crashed
+/// is never used, even while another daemon is starting.
+fn held_port(dir: &Path, name: &str) -> Option<u16> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let port = record_port(entry.file_name().to_str()?, name)?;
+            let record = std::fs::File::open(entry.path()).ok()?;
+            matches!(
+                record.try_lock_shared(),
+                Err(std::fs::TryLockError::WouldBlock)
+            )
+            .then_some(port)
+        })
+}
+
 /// Read on every call, since [`ensure_server`] can start the daemon
 /// between calls.
 fn recorded_port() -> Option<u16> {
-    let (lock, port_file) = port_paths().ok()?;
-    locked_port(&lock, &port_file)
+    let (dir, name) = port_files().ok()?;
+    held_port(&dir, &name)
 }
 
-/// How long a starting daemon waits for its port lock: a client checking
-/// for a daemon holds the lock for a moment.
-const PORT_LOCK_PATIENCE: Duration = Duration::from_secs(1);
-
 /// Held by a daemon whose port the OS picked, from before its bind until it
-/// exits. Only the holder writes the port file.
+/// exits, so a second daemon for the same `LLMMAN_HOST` cannot start.
 pub struct PortLock {
-    port_file: PathBuf,
+    dir: PathBuf,
+    name: String,
     _lock: std::fs::File,
 }
 
@@ -254,62 +260,78 @@ impl PortLock {
         if !os_picks_port() {
             return Ok(None);
         }
-        let (lock, port_file) = port_paths()?;
-        Self::acquire_at(&lock, port_file, PORT_LOCK_PATIENCE).map(Some)
+        let (dir, name) = port_files()?;
+        Self::acquire_in(dir, name).map(Some)
     }
 
-    fn acquire_at(lock: &Path, port_file: PathBuf, patience: Duration) -> anyhow::Result<PortLock> {
-        if let Some(dir) = lock.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        }
+    fn acquire_in(dir: PathBuf, name: String) -> anyhow::Result<PortLock> {
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let path = dir.join(format!("{name}.lock"));
         // Never removed: a daemon that deleted and recreated it would lock a
         // new file while a running daemon still holds the old one.
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(lock)
-            .with_context(|| format!("open {}", lock.display()))?;
-        let started = std::time::Instant::now();
-        loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < patience => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-                    "another llmman serve is running for this LLMMAN_HOST: it holds {}",
-                    lock.display()
-                ),
-                Err(std::fs::TryLockError::Error(e)) => {
-                    return Err(e).with_context(|| format!("lock {}", lock.display()));
-                }
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+                "another llmman serve is running for this LLMMAN_HOST: it holds {}",
+                path.display()
+            ),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("lock {}", path.display()));
             }
-        }
-        // Left by a daemon that crashed.
-        match std::fs::remove_file(&port_file) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(e).with_context(|| format!("remove {}", port_file.display()));
-            }
-            _ => {}
         }
         Ok(PortLock {
-            port_file,
+            dir,
+            name,
             _lock: file,
         })
     }
 
-    pub fn record(&self, port: u16) -> anyhow::Result<()> {
-        crate::fsutil::write_atomic(&self.port_file, format!("{port}\n").as_bytes())
-            .with_context(|| format!("write {}", self.port_file.display()))
+    /// Records the port the listener got, for clients to use while the
+    /// returned record lives, and removes records left by daemons that
+    /// crashed.
+    pub fn publish(&self, port: u16) -> anyhow::Result<PortRecord> {
+        let path = self.dir.join(format!("{}-{port}.port", self.name));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("create {}", path.display()))?;
+        // Blocking: only clients checking the record contend for it, and
+        // each holds it for a moment.
+        file.lock()
+            .with_context(|| format!("lock {}", path.display()))?;
+        let entries =
+            std::fs::read_dir(&self.dir).with_context(|| format!("read {}", self.dir.display()))?;
+        for entry in entries.filter_map(Result::ok) {
+            let stale = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| record_port(n, &self.name))
+                .is_some_and(|p| p != port);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        Ok(PortRecord { path, _lock: file })
     }
 }
 
-impl Drop for PortLock {
+/// A daemon's published port. Dropping it removes the record.
+pub struct PortRecord {
+    path: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl Drop for PortRecord {
     fn drop(&mut self) {
-        // Runs before `_lock` is released, so no other daemon has written
-        // the file yet.
-        let _ = std::fs::remove_file(&self.port_file);
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -1986,66 +2008,81 @@ mod tests {
         );
     }
 
-    fn port_lock_paths() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    const NAME: &str = "serve-127.0.0.1-0";
+
+    #[test]
+    fn a_record_is_named_by_the_address_and_the_port() {
+        assert_eq!(
+            record_port("serve-127.0.0.1-0-53097.port", NAME),
+            Some(53097)
+        );
+        assert_eq!(record_port("serve-127.0.0.1-0-0.port", NAME), None);
+        assert_eq!(record_port("serve-127.0.0.1-0-x.port", NAME), None);
+        assert_eq!(record_port("serve-127.0.0.1-0.lock", NAME), None);
+        assert_eq!(record_port("serve-127.0.0.10-0-53097.port", NAME), None);
+    }
+
+    #[test]
+    fn clients_use_a_record_only_while_its_daemon_holds_it() {
         let dir = tempfile::tempdir().unwrap();
-        let lock = dir.path().join("serve-127.0.0.1-0.lock");
-        let port_file = dir.path().join("serve-127.0.0.1-0.port");
-        (dir, lock, port_file)
+        // A new daemon holds the lock; the record of one that crashed is still there.
+        let stale = dir.path().join(format!("{NAME}-53097.port"));
+        std::fs::write(&stale, "").unwrap();
+        let lock = PortLock::acquire_in(dir.path().to_path_buf(), NAME.into()).unwrap();
+        assert_eq!(held_port(dir.path(), NAME), None);
+
+        let record = lock.publish(53098).unwrap();
+        assert_eq!(held_port(dir.path(), NAME), Some(53098));
+        assert!(!stale.exists());
+
+        drop(record);
+        assert_eq!(held_port(dir.path(), NAME), None);
+        assert!(!dir.path().join(format!("{NAME}-53098.port")).exists());
     }
 
     #[test]
-    fn clients_trust_the_recorded_port_only_while_the_lock_is_held() {
-        let (_dir, lock, port_file) = port_lock_paths();
-        // What a daemon that crashed leaves: a port file, and a lock nobody holds.
-        std::fs::write(&lock, "").unwrap();
-        std::fs::write(&port_file, "53097\n").unwrap();
-        assert_eq!(locked_port(&lock, &port_file), None);
-
-        let held = PortLock::acquire_at(&lock, port_file.clone(), Duration::ZERO).unwrap();
-        assert!(!port_file.exists());
-        assert_eq!(locked_port(&lock, &port_file), None);
-        held.record(53098).unwrap();
-        assert_eq!(locked_port(&lock, &port_file), Some(53098));
-
-        drop(held);
-        assert!(!port_file.exists());
-        assert_eq!(locked_port(&lock, &port_file), None);
-    }
-
-    #[test]
-    fn a_port_file_that_cannot_be_written_is_an_error() {
-        let (dir, lock, _) = port_lock_paths();
-        let unwritable = dir.path().join("missing").join("serve-127.0.0.1-0.port");
-        let held = PortLock::acquire_at(&lock, unwritable.clone(), Duration::ZERO).unwrap();
-        let err = format!("{:#}", held.record(53097).unwrap_err());
-        assert!(err.contains(&unwritable.display().to_string()), "{err}");
-    }
-
-    #[test]
-    fn a_second_daemon_takes_the_port_lock_only_once_the_first_lets_go() {
-        let (_dir, lock, port_file) = port_lock_paths();
-        let first = PortLock::acquire_at(&lock, port_file.clone(), Duration::ZERO).unwrap();
-        let refused = PortLock::acquire_at(&lock, port_file.clone(), Duration::from_millis(50));
-        let err = refused.err().unwrap().to_string();
+    fn a_second_daemon_takes_the_lock_only_once_the_first_lets_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let acquire = || PortLock::acquire_in(dir.path().to_path_buf(), NAME.into());
+        let first = acquire().unwrap();
+        let err = acquire().err().unwrap().to_string();
         assert!(err.contains("another llmman serve"), "{err}");
         drop(first);
         // A child another test forked holds a copy of the descriptor, and so
         // the lock, until it execs.
-        PortLock::acquire_at(&lock, port_file, Duration::from_secs(2)).unwrap();
+        let released = (0..200).any(|_| {
+            acquire().is_ok() || {
+                std::thread::sleep(Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(released);
     }
 
     #[test]
-    fn a_client_checking_the_port_lock_does_not_stop_a_daemon_taking_it() {
-        let (_dir, lock, port_file) = port_lock_paths();
-        std::fs::write(&lock, "").unwrap();
-        let probe = std::fs::File::open(&lock).unwrap();
+    fn a_client_checking_a_record_does_not_stop_its_daemon_publishing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{NAME}-53097.port"));
+        std::fs::write(&path, "").unwrap();
+        let probe = std::fs::File::open(&path).unwrap();
         probe.try_lock_shared().unwrap();
         let release = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
             drop(probe);
         });
-        PortLock::acquire_at(&lock, port_file, Duration::from_secs(2)).unwrap();
+        let lock = PortLock::acquire_in(dir.path().to_path_buf(), NAME.into()).unwrap();
+        let _record = lock.publish(53097).unwrap();
         release.join().unwrap();
+        assert_eq!(held_port(dir.path(), NAME), Some(53097));
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_created_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = PortLock::acquire_in(dir.path().to_path_buf(), NAME.into()).unwrap();
+        std::fs::create_dir(dir.path().join(format!("{NAME}-53097.port"))).unwrap();
+        let err = format!("{:#}", lock.publish(53097).err().unwrap());
+        assert!(err.contains(&format!("{NAME}-53097.port")), "{err}");
     }
 
     #[test]

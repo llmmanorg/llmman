@@ -5334,9 +5334,10 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("bind {addr}"))?;
     let port = listener.local_addr().context("listener address")?.port();
-    if let Some(lock) = &port_lock {
-        lock.record(port)?;
-    }
+    let port_record = port_lock
+        .as_ref()
+        .map(|lock| lock.publish(port))
+        .transpose()?;
     let addr = crate::daemon::bound_addr(port);
     eprintln!(
         "llmman serve listening on http{}://{addr}",
@@ -5386,13 +5387,19 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         }
     }
 
+    // Owns the port record, so clients stop using the port as soon as
+    // shutdown begins, before the listener closes.
+    let shutdown = async move {
+        shutdown_signal().await;
+        drop(port_record);
+    };
     match tls {
         None => {
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(shutdown)
             .await?
         }
         Some((cert, key)) => {
@@ -5412,7 +5419,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             tokio::spawn({
                 let handle = handle.clone();
                 async move {
-                    shutdown_signal().await;
+                    shutdown.await;
                     handle.graceful_shutdown(Some(Duration::from_secs(30)));
                 }
             });
