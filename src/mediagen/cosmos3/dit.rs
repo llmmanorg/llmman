@@ -215,7 +215,25 @@ fn text_decoder<'g>(
     w: &'g Weights,
     gr: &'g Graph<'g>,
     ids: &[u32],
+    on_layer: impl FnMut(&'g Graph<'g>, Tensor<'g>, Tensor<'g>),
+) -> Result<Tensor<'g>> {
+    let mask = causal_mask(ids.len() as i64);
+    text_decoder_ext(hp, w, gr, ids, &mask, hp.n_layers, on_layer, |_, _| {})
+}
+
+/// [`text_decoder`] with an explicit `[Tk, Tq]` mask, stopping after
+/// `n_layers` layers and handing `on_hidden(i, x)` each layer's output
+/// (hidden state `i`, the embeddings being state 0).
+#[allow(clippy::too_many_arguments)]
+fn text_decoder_ext<'g>(
+    hp: &Hparams,
+    w: &'g Weights,
+    gr: &'g Graph<'g>,
+    ids: &[u32],
+    mask: &[f32],
+    n_layers: i64,
     mut on_layer: impl FnMut(&'g Graph<'g>, Tensor<'g>, Tensor<'g>),
+    mut on_hidden: impl FnMut(usize, Tensor<'g>),
 ) -> Result<Tensor<'g>> {
     let n = ids.len() as i64;
     if n == 0 || n > MAX_PROMPT_TOKENS {
@@ -227,13 +245,16 @@ fn text_decoder<'g>(
     let half = hp.head_dim / 2;
     let cos_t = gr.input_f32(&[half, n], &cos, "cos");
     let sin_t = gr.input_f32(&[half, n], &sin, "sin");
-    let mask_t = gr.input_f32(&[n, n], &causal_mask(n), "mask");
+    if mask.len() as i64 != n * n {
+        bail!("the attention mask must be {n}x{n}");
+    }
+    let mask_t = gr.input_f32(&[n, n], mask, "mask");
 
     let g = &gr;
     let eps = hp.rms_eps;
     let hd = hp.head_dim;
     let mut x = g.get_rows(w.get("embed_tokens.weight")?, ids_t);
-    for l in 0..hp.n_layers {
+    for l in 0..n_layers.min(hp.n_layers) {
         let p = format!("layers.{l}");
         let h = rms(
             g,
@@ -280,6 +301,7 @@ fn text_decoder<'g>(
             Some(w.get(&format!("{p}.post_attention_layernorm.weight"))?),
         );
         x = g.add(x, mlp(g, w, &format!("{p}.mlp"), h2, hp.relu2)?);
+        on_hidden(l as usize + 1, x);
     }
     Ok(x)
 }
@@ -325,6 +347,59 @@ pub fn text_hidden(hp: &Hparams, w: &Weights, be: &Backend, ids: &[u32]) -> Resu
     gr.mark_output(x);
     gr.compute(be)?;
     Ok(gr.output_f32(x))
+}
+
+/// `[Tk, Tq]`: [`causal_mask`] with the keys from `n_real` on (right padding) hidden too.
+pub fn padded_causal_mask(n: i64, n_real: i64) -> Vec<f32> {
+    let mut mask = causal_mask(n);
+    let n = n as usize;
+    let real = (n_real as usize).min(n);
+    for q in real..n {
+        // a padding query still sees the prompt, but no padding, itself included
+        mask[q * n + real..q * n + q + 1].fill(f32::NEG_INFINITY);
+    }
+    mask
+}
+
+/// Hidden states `states` (`i` = after `i` layers) `[n][hidden]` each, under `mask`.
+pub fn text_hidden_states(
+    hp: &Hparams,
+    w: &Weights,
+    be: &Backend,
+    ids: &[u32],
+    mask: &[f32],
+    states: &[usize],
+) -> Result<Vec<Vec<f32>>> {
+    let last = states.iter().copied().max().unwrap_or(0);
+    if last == 0 || last as i64 > hp.n_layers {
+        bail!("hidden states {states:?} out of 1..={}", hp.n_layers);
+    }
+    let gr = text_graph(be, hp)?;
+    let mut outs: Vec<(usize, Tensor<'_>)> = Vec::new();
+    text_decoder_ext(
+        hp,
+        w,
+        &gr,
+        ids,
+        mask,
+        last as i64,
+        |_, _, _| {},
+        |i, x| {
+            if states.contains(&i) {
+                let x = gr.cont(x);
+                gr.mark_output(x);
+                outs.push((i, x));
+            }
+        },
+    )?;
+    gr.compute(be)?;
+    Ok(states
+        .iter()
+        .map(|s| {
+            let t = outs.iter().find(|(i, _)| i == s).expect("state captured").1;
+            gr.output_f32(t)
+        })
+        .collect())
 }
 
 /// One modality's tokens of the generation stream for a denoising step.
@@ -627,6 +702,18 @@ pub fn unpatchify(hp: &Hparams, tokens: &[f32], t: i64, h: i64, w: i64) -> Vec<f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padded_causal_mask_hides_the_padding() {
+        let m = padded_causal_mask(4, 2);
+        let inf = f32::NEG_INFINITY;
+        // rows are queries, columns keys
+        assert_eq!(&m[0..4], &[0.0, inf, inf, inf]);
+        assert_eq!(&m[4..8], &[0.0, 0.0, inf, inf]);
+        assert_eq!(&m[8..12], &[0.0, 0.0, inf, inf]);
+        assert_eq!(&m[12..16], &[0.0, 0.0, inf, inf]);
+        assert_eq!(padded_causal_mask(3, 3), causal_mask(3));
+    }
 
     #[test]
     fn patchify_roundtrip() {

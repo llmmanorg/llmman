@@ -23,6 +23,7 @@ const MAX_FRAMES: i64 = 1025;
 const MAX_STEPS: i64 = 200;
 /// Output pixels per request (width x height x frames): 3 GiB of RGB.
 const MAX_PIXELS: i64 = 1 << 30;
+const MAX_REFERENCE_IMAGES: usize = 8;
 
 struct Video {
     id: String,
@@ -36,11 +37,12 @@ pub struct Server {
     videos: Mutex<VecDeque<Video>>,
     counter: AtomicU32,
     supports_image: bool,
+    supports_refs: bool,
     supports_video: bool,
     supports_audio: bool,
     /// Frame counts are `stride * k + 1`.
     temporal_stride: i64,
-    /// `"ltx"`, `"cosmos3"` or `"qwen-image"`.
+    /// `"ltx"`, `"cosmos3"`, `"qwen-image"`, `"z-image"` or `"flux2"`.
     family: &'static str,
     /// The model's own defaults when a request leaves them out.
     default_steps: i32,
@@ -137,6 +139,34 @@ fn common_params(body: &Value, default_size: (i64, i64)) -> Result<GenParams, Er
 }
 
 /// A base64 field, with or without a `data:...;base64,` prefix.
+/// Reference images of `/v1/images/generations`: `image` (one) or `images`
+/// (a list), each PNG or JPEG as base64 or a data URL.
+fn reference_images(body: &Value) -> Result<Vec<super::Frames>, Error> {
+    let items: Vec<Value> = match (body.get("image"), body.get("images")) {
+        (Some(_), Some(_)) => {
+            return Err(Error::Invalid(
+                "pass \"image\" or \"images\", not both".into(),
+            ))
+        }
+        (Some(v), None) => vec![v.clone()],
+        (None, Some(Value::Array(a))) => a.clone(),
+        (None, Some(_)) => return Err(Error::Invalid("\"images\" must be a list".into())),
+        (None, None) => Vec::new(),
+    };
+    if items.len() > MAX_REFERENCE_IMAGES {
+        return Err(Error::Invalid(format!(
+            "at most {MAX_REFERENCE_IMAGES} reference images"
+        )));
+    }
+    items
+        .into_iter()
+        .map(|v| {
+            let bytes = get_b64(&json!({ "image": v }), "image")?.unwrap_or_default();
+            encode::decode_image(&bytes).map_err(|e| Error::Invalid(e.to_string()))
+        })
+        .collect()
+}
+
 fn get_b64(body: &Value, k: &str) -> Result<Option<Vec<u8>>, Error> {
     let Some(v) = body.get(k) else {
         return Ok(None);
@@ -304,7 +334,8 @@ async fn generate(
     .map_err(|e| Error::Failed(e.to_string()))
 }
 
-/// POST /v1/images/generations: OpenAI fields plus negative_prompt, seed, steps, cfg_scale, width, height.
+/// POST /v1/images/generations: OpenAI fields plus negative_prompt, seed, steps, cfg_scale, width,
+/// height, and `image`/`images` (reference images, for models that edit).
 async fn images(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Response, Error> {
     if !s.supports_image {
         return Err(Error::Invalid(
@@ -328,9 +359,21 @@ async fn images(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
             "only response_format=b64_json is supported".into(),
         ));
     }
-    let mut p = common_params(&body, s.default_size)?;
+    let refs = reference_images(&body)?;
+    if !refs.is_empty() && !s.supports_refs {
+        return Err(Error::Invalid(
+            "the loaded model does not take reference images".into(),
+        ));
+    }
+    // without a size, an edit keeps its first reference's
+    let default_size = refs
+        .first()
+        .filter(|_| body.get("size").is_none())
+        .map_or(s.default_size, |r| (r.width, r.height));
+    let mut p = common_params(&body, default_size)?;
     p.prompt = prompt;
     p.n_frames = 1;
+    p.ref_images = refs;
     check_pixels(&p)?;
     let stream = get_bool(&body, "stream", false);
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -581,6 +624,7 @@ async fn speech(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
 pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
     let s = Arc::new(Server {
         supports_image: ctx.supports_image(),
+        supports_refs: ctx.supports_reference_images(),
         supports_video: ctx.supports_video(),
         supports_audio: ctx.supports_audio(),
         temporal_stride: ctx.temporal_stride(),

@@ -179,10 +179,10 @@ fn positions(n_cap_pad: i64, ph: i64, pw: i64, n_img_pad: i64) -> Vec<[f64; 3]> 
 }
 
 /// cos/sin tables `[n][head_dim/2]`: each axis' `1 / theta^(2i/dim)` frequencies in turn.
-pub(super) fn rope_tables(
-    axes: &[i64],
+pub(super) fn rope_tables<const N: usize>(
+    axes: &[i64; N],
     theta: f64,
-    positions: &[[f64; 3]],
+    positions: &[[f64; N]],
 ) -> (Vec<f32>, Vec<f32>) {
     let half: i64 = axes.iter().sum::<i64>() / 2;
     let mut cos = Vec::with_capacity(positions.len() * half as usize);
@@ -670,7 +670,7 @@ impl Model {
         super::cosmos3::noise_from_env("MEDIAGEN_LATENTS", &mut z)?;
 
         let t0 = Instant::now();
-        let img = flux_vae::decode(&self.vae, be, &z, lh, lw);
+        let img = flux_vae::decode(&self.vae, be, &flux_vae::from_flux1(&z), lh, lw);
         be.release_compute()?;
         let img = img?;
         eprintln!(

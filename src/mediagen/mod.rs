@@ -9,9 +9,11 @@ pub mod backend;
 pub mod cosmos3;
 pub mod encode;
 pub mod ffi;
+pub mod flux2;
 pub mod flux_vae;
 pub mod http;
 pub mod ltx;
+pub mod qwen3_text;
 pub mod qwen_image;
 pub mod server;
 pub mod wan_vae;
@@ -76,6 +78,8 @@ pub struct GenParams {
     pub action: Option<ActionParams>,
     /// Scheduler flow shift override (Cosmos3: Karras sigmas when `None`).
     pub flow_shift: Option<f32>,
+    /// Reference images an image model edits or draws from (FLUX.2).
+    pub ref_images: Vec<Frames>,
 }
 
 /// Decoded RGB frames, `[f][h][w][3]` bytes.
@@ -151,6 +155,7 @@ impl Default for GenParams {
             condition_keep_last: false,
             action: None,
             flow_shift: None,
+            ref_images: Vec::new(),
         }
     }
 }
@@ -192,6 +197,7 @@ enum Inner {
     Cosmos3(Box<cosmos3::Model>),
     QwenImage(Box<qwen_image::Model>),
     ZImage(Box<zimage::Model>),
+    Flux2(Box<flux2::Model>),
 }
 
 pub struct Context {
@@ -219,10 +225,12 @@ fn is_ltx(arch: &str) -> bool {
 
 /// Is this GGUF a diffusion transformer we can run?
 pub fn is_diffusion_model(path: &Path) -> bool {
-    weights::read_index(path)
-        .ok()
-        .and_then(|i| i.metadata.get("general.architecture").cloned())
-        .is_some_and(|a| is_ltx(&a) || cosmos3::is_cosmos3(&a) || zimage::is_zimage(&a))
+    weights::read_index(path).ok().is_some_and(|i| {
+        flux2::is_flux2(&i)
+            || i.metadata
+                .get("general.architecture")
+                .is_some_and(|a| is_ltx(a) || cosmos3::is_cosmos3(a) || zimage::is_zimage(a))
+    })
 }
 
 /// Does this Diffusers `_class_name` run here (rather than on vLLM-Omni)?
@@ -364,6 +372,18 @@ impl Context {
             )?;
             be.release_compute()?;
             Inner::ZImage(Box::new(m))
+        } else if flux2::is_flux2(&idx) {
+            let m = flux2::Model::load(
+                api,
+                &be,
+                &idx,
+                &p.model,
+                p.vae.as_deref(),
+                p.text_model.as_deref(),
+                p.flash_attn,
+            )?;
+            be.release_compute()?;
+            Inner::Flux2(Box::new(m))
         } else {
             bail!("unsupported diffusion architecture {arch:?}");
         };
@@ -373,15 +393,20 @@ impl Context {
     pub fn supports_image(&self) -> bool {
         match &self.inner {
             Inner::Ltx(l) => l.has_video_vae,
-            Inner::Cosmos3(_) | Inner::QwenImage(_) | Inner::ZImage(_) => true,
+            Inner::Cosmos3(_) | Inner::QwenImage(_) | Inner::ZImage(_) | Inner::Flux2(_) => true,
         }
+    }
+
+    /// Takes reference images (`GenParams::ref_images`) for image generation.
+    pub fn supports_reference_images(&self) -> bool {
+        matches!(self.inner, Inner::Flux2(_))
     }
 
     pub fn supports_video(&self) -> bool {
         match &self.inner {
             Inner::Ltx(l) => l.has_video_vae,
             Inner::Cosmos3(_) => true,
-            Inner::QwenImage(_) | Inner::ZImage(_) => false,
+            Inner::QwenImage(_) | Inner::ZImage(_) | Inner::Flux2(_) => false,
         }
     }
 
@@ -389,7 +414,7 @@ impl Context {
         match &self.inner {
             Inner::Ltx(l) => l.ltx.hp.has_audio && l.has_audio_vae,
             Inner::Cosmos3(m) => m.sound.is_some(),
-            Inner::QwenImage(_) | Inner::ZImage(_) => false,
+            Inner::QwenImage(_) | Inner::ZImage(_) | Inner::Flux2(_) => false,
         }
     }
 
@@ -399,6 +424,7 @@ impl Context {
             Inner::Cosmos3(_) => "cosmos3",
             Inner::QwenImage(_) => "qwen-image",
             Inner::ZImage(_) => "z-image",
+            Inner::Flux2(_) => "flux2",
         }
     }
 
@@ -409,12 +435,14 @@ impl Context {
             Inner::Cosmos3(_) => cosmos3::DEFAULT_STEPS,
             Inner::QwenImage(_) => qwen_image::DEFAULT_STEPS,
             Inner::ZImage(_) => zimage::DEFAULT_STEPS,
+            Inner::Flux2(m) => m.default_steps(),
         }
     }
 
     pub fn default_cfg(&self) -> f32 {
         match &self.inner {
             Inner::Ltx(_) | Inner::QwenImage(_) | Inner::ZImage(_) => 1.0,
+            Inner::Flux2(m) => m.default_cfg(),
             Inner::Cosmos3(_) => cosmos3::DEFAULT_CFG,
         }
     }
@@ -425,6 +453,7 @@ impl Context {
             Inner::Ltx(_) | Inner::Cosmos3(_) => (768, 512),
             Inner::QwenImage(_) => (qwen_image::DEFAULT_SIZE, qwen_image::DEFAULT_SIZE),
             Inner::ZImage(_) => (zimage::DEFAULT_SIZE, zimage::DEFAULT_SIZE),
+            Inner::Flux2(_) => (flux2::DEFAULT_SIZE, flux2::DEFAULT_SIZE),
         }
     }
 
@@ -433,7 +462,7 @@ impl Context {
         match &self.inner {
             Inner::Ltx(l) => l.ltx.hp.vae_scale_t,
             Inner::Cosmos3(m) => m.hp.vae_scale_t,
-            Inner::QwenImage(_) | Inner::ZImage(_) => 1,
+            Inner::QwenImage(_) | Inner::ZImage(_) | Inner::Flux2(_) => 1,
         }
     }
 
@@ -448,6 +477,7 @@ impl Context {
             Inner::Cosmos3(m) => m.generate(&mut self.be, p, progress),
             Inner::QwenImage(m) => m.generate(&mut self.be, p, progress),
             Inner::ZImage(m) => m.generate(&mut self.be, p, progress),
+            Inner::Flux2(m) => m.generate(&mut self.be, p, progress),
         };
         // frees the compute buffers; recreates the GPU backend after a failure
         self.be.release_compute()?;

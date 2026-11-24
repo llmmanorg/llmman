@@ -79,6 +79,10 @@ fn read_safetensors(f: &mut File, path: &Path) -> Result<Index> {
             }
             continue;
         }
+        // BatchNorm's step counter (FLUX.2's VAE): an integer no graph reads
+        if name.ends_with(".num_batches_tracked") {
+            continue;
+        }
         let dtype = v["dtype"].as_str().unwrap_or("");
         let ty = match dtype {
             "BF16" => ffi::ty::BF16,
