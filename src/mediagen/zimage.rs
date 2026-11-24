@@ -36,6 +36,10 @@ const AXES: [i64; 3] = [32, 48, 48];
 const NORM_EPS: f32 = 1e-5;
 const FINAL_EPS: f32 = 1e-6;
 const QK_EPS: f32 = 1e-6;
+/// Overflow guards (see [`Model::block`]): stable-diffusion.cpp's factors.
+const V_SCALE: f32 = 128.0;
+const OUT_SCALE: f32 = 16.0;
+const W2_SCALE: f32 = 128.0;
 /// `ZImagePipeline(max_sequence_length=512)`.
 const MAX_PROMPT_TOKENS: usize = 512;
 /// The adaLN input width (`ADALN_EMBED_DIM`).
@@ -540,8 +544,20 @@ impl Model {
             sin,
             hp.kv_heads,
         );
-        let a = qwen3::sdpa_gqa(g, q, k, v, hp.heads, hp.kv_heads, None, self.flash);
-        let mut a = rms(g.linear(a, wt("attention.out")?, None), "attention_norm2")?;
+        // Z-Image's activations outgrow F16 (flash attention's keys/values,
+        // Metal's quantized matmuls): values, the output projection's input
+        // and w2's input are scaled down and the results back up, as
+        // stable-diffusion.cpp does; exact in F32.
+        let v = g.scale(v, 1.0 / V_SCALE);
+        let a = g.scale(
+            qwen3::sdpa_gqa(g, q, k, v, hp.heads, hp.kv_heads, None, self.flash),
+            V_SCALE,
+        );
+        let a = g.scale(
+            g.linear(g.scale(a, 1.0 / OUT_SCALE), wt("attention.out")?, None),
+            OUT_SCALE,
+        );
+        let mut a = rms(a, "attention_norm2")?;
         if let Some(m) = &mods {
             a = g.mul(a, m[1]);
         }
@@ -552,10 +568,14 @@ impl Model {
         }
         let gate = g.silu(g.linear(h, wt("feed_forward.w1")?, None));
         let f = g.linear(
-            g.mul(gate, g.linear(h, wt("feed_forward.w3")?, None)),
+            g.scale(
+                g.mul(gate, g.linear(h, wt("feed_forward.w3")?, None)),
+                1.0 / W2_SCALE,
+            ),
             wt("feed_forward.w2")?,
             None,
         );
+        let f = g.scale(f, W2_SCALE);
         let mut f = rms(f, "ffn_norm2")?;
         if let Some(m) = &mods {
             f = g.mul(f, m[3]);
@@ -628,6 +648,12 @@ impl Model {
                 if i == 0 {
                     dump("pred0", &v);
                 }
+                if v.iter().any(|v| !v.is_finite()) {
+                    bail!(
+                        "the Z-Image transformer produced non-finite values at step {}",
+                        i + 1
+                    );
+                }
                 for (x, v) in x.iter_mut().zip(&v) {
                     *x += dt * v;
                 }
@@ -649,7 +675,7 @@ impl Model {
         super::cosmos3::noise_from_env("MEDIAGEN_LATENTS", &mut z)?;
 
         let t0 = Instant::now();
-        let img = flux_vae::decode(&self.vae, be, &z, lh, lw, self.flash);
+        let img = flux_vae::decode(&self.vae, be, &z, lh, lw);
         be.release_compute()?;
         let img = img?;
         eprintln!(

@@ -69,7 +69,6 @@ struct Dec<'g> {
     g: &'g Graph<'g>,
     w: &'g Weights,
     direct: bool,
-    flash: bool,
 }
 
 impl<'g> Dec<'g> {
@@ -129,7 +128,8 @@ impl<'g> Dec<'g> {
             Ok(g.linear(t, g.reshape_2d(k, c, c), Some(b)))
         };
         let (q, k, v) = (proj("q")?, proj("k")?, proj("v")?);
-        let a = super::cosmos3::dit::sdpa_gqa(g, q, k, v, 1, 1, None, self.flash);
+        // F32 attention: flash attention's F16 keys/values can overflow here
+        let a = super::cosmos3::dit::sdpa_gqa(g, q, k, v, 1, 1, None, false);
         let ko = self.w.get(&format!("{p}.proj_out.weight"))?;
         let bo = self.w.get(&format!("{p}.proj_out.bias"))?;
         let o = g.linear(a, g.reshape_2d(ko, c, c), Some(bo));
@@ -161,7 +161,7 @@ impl<'g> Dec<'g> {
 
 /// Decodes latents `[16][h][w]` (as the transformer sees them, before
 /// `SCALE_FACTOR`/`SHIFT_FACTOR`) to an `8h x 8w` image.
-pub fn decode(w: &Weights, be: &Backend, z: &[f32], h: i64, wd: i64, flash: bool) -> Result<Image> {
+pub fn decode(w: &Weights, be: &Backend, z: &[f32], h: i64, wd: i64) -> Result<Image> {
     let c = w.get("decoder.conv_in.weight")?.shape()[2];
     if z.len() as i64 != c * h * wd {
         bail!("expected {c}x{h}x{wd} latents, got {}", z.len());
@@ -178,13 +178,16 @@ pub fn decode(w: &Weights, be: &Backend, z: &[f32], h: i64, wd: i64, flash: bool
     let dec = Dec {
         g: &gr,
         w,
-        direct: be.supports_direct_conv(),
-        flash,
+        // the same choice as the Wan VAE: im2col unless asked, or on Vulkan
+        direct: super::wan_vae::direct_conv(be),
     };
     let out = gr.cont(dec.decode(zt)?);
     gr.mark_output(out);
     gr.compute(be)?;
     let planar = gr.output_f32(out);
+    if planar.iter().any(|v| !v.is_finite()) {
+        bail!("the VAE decoder produced non-finite values");
+    }
     let [ow, oh, oc, _] = out.shape();
     if oc != 3 {
         bail!("the decoder produced {oc} channels");

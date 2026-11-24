@@ -616,7 +616,7 @@ impl<'a> Build<'a, '_> {
 
 /// `ggml_conv_2d_direct` is 4x faster than im2col on Vulkan and 10-30x slower
 /// on Metal and CUDA; `MEDIAGEN_DIRECT_CONV=0|1` overrides.
-fn direct_conv(be: &Backend) -> bool {
+pub(super) fn direct_conv(be: &Backend) -> bool {
     let wanted = match std::env::var("MEDIAGEN_DIRECT_CONV").as_deref() {
         Ok("1") => true,
         Ok("0") => false,
