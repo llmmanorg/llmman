@@ -716,30 +716,70 @@ fn llama_cpp_assets_rejects_a_bad_repo_and_latest_from_a_mirror() {
 
 #[cfg(unix)]
 #[test]
-fn clients_reach_a_serve_on_port_0_at_the_port_it_recorded() {
+fn clients_reach_a_serve_on_port_0_while_it_holds_its_lock() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     let home = tempfile::tempdir().unwrap();
-    let port_file = home
-        .path()
-        .join(".local/share/llmman/serve-127.0.0.1-0.port");
-    let ps = || {
-        let out = llmman()
-            .arg("ps")
-            .env_clear()
+    let data_dir = home.path().join(".local/share/llmman");
+    let port_file = data_dir.join("serve-127.0.0.1-0.port");
+    let llmman_here = || {
+        let mut cmd = llmman();
+        cmd.env_clear()
             .env("HOME", home.path())
             .env("PATH", "/usr/bin:/bin")
-            .env("LLMMAN_HOST", "127.0.0.1:0")
-            .output()
-            .unwrap();
+            .env("LLMMAN_HOST", "127.0.0.1:0");
+        cmd
+    };
+    let output = |cmd: &mut Command| {
+        let out = cmd.output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         (out.status.success(), stdout, stderr)
     };
+    let ps = || output(llmman_here().arg("ps"));
+    let reachable = || {
+        let (ok, stdout, stderr) = ps();
+        assert!(ok && stdout.contains("NAME"), "{stdout}{stderr}");
+    };
+    let unreachable = || {
+        let (ok, _, stderr) = ps();
+        assert!(!ok && stderr.contains("not running"), "{stderr}");
+    };
+    let start = || serve_until_shell_line(home.path(), "127.0.0.1:0", None);
 
-    let (mut daemon, log, _) = serve_until_shell_line(home.path(), "127.0.0.1:0", None);
-    let (ok, stdout, stderr) = ps();
-    assert!(ok && stdout.contains("NAME"), "{stdout}{stderr}\n{log}");
+    let (mut daemon, _, _) = start();
+    reachable();
 
-    // SIGTERM, not Daemon's SIGKILL: only a graceful stop removes the record.
+    // A second daemon for the same LLMMAN_HOST refuses to start. Waited on
+    // with a deadline, since one that started would serve until killed.
+    let mut second = Daemon(
+        llmman_here()
+            .args(["serve", "--runtime", "path"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = second.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a second daemon started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut second.0.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(
+        !status.success() && stderr.contains("another llmman serve"),
+        "{stderr}"
+    );
+    reachable();
+
+    // SIGTERM, not Daemon's SIGKILL: a graceful stop removes the port file.
     let status = Command::new("kill")
         .args(["-TERM", &daemon.0.id().to_string()])
         .status()
@@ -747,18 +787,41 @@ fn clients_reach_a_serve_on_port_0_at_the_port_it_recorded() {
     assert!(status.success());
     daemon.0.wait().unwrap();
     assert!(!port_file.exists());
-    let (ok, _, stderr) = ps();
-    assert!(!ok && stderr.contains("not running"), "{stderr}");
+    unreachable();
 
-    // A dead daemon's record, naming a port something else holds now. The
-    // squatter closes each connection, so a client that trusted the record
+    // A crash leaves the port file, and something else takes the port. The
+    // squatter closes each connection, so a client that trusted the file
     // fails instead of waiting on it.
-    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let squatter_port = squatter.local_addr().unwrap().port();
-    std::thread::spawn(move || squatter.incoming().for_each(drop));
-    let mut dead = Command::new("true").spawn().unwrap();
-    dead.wait().unwrap();
-    std::fs::write(&port_file, format!("{squatter_port} {}\n", dead.id())).unwrap();
-    let (ok, _, stderr) = ps();
-    assert!(!ok && stderr.contains("not running"), "{stderr}");
+    let (daemon, log, _) = start();
+    let port: u16 = log
+        .lines()
+        .find_map(|l| l.strip_prefix("llmman serve listening on http://127.0.0.1:"))
+        .unwrap_or_else(|| panic!("no listening line in {log}"))
+        .parse()
+        .unwrap();
+    drop(daemon);
+    assert!(port_file.exists());
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let connections = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = connections.clone();
+    std::thread::spawn(move || {
+        for stream in squatter.incoming() {
+            counted.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    unreachable();
+    assert_eq!(connections.load(Ordering::SeqCst), 0);
+
+    // A directory in the port file's place fails startup at once, instead of
+    // leaving the client to wait out its timeout.
+    std::fs::remove_file(&port_file).unwrap();
+    std::fs::create_dir(&port_file).unwrap();
+    let started = std::time::Instant::now();
+    let (ok, _, stderr) = output(llmman_here().args(["serve", "--detach", "--runtime", "path"]));
+    assert!(
+        !ok && stderr.contains(&port_file.display().to_string()),
+        "{stderr}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
 }
