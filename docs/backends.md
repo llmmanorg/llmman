@@ -181,6 +181,31 @@ Vulkan), or glibc 2.38 and `GLIBCXX_3.4.32` (arm64, ROCm, CUDA), measured on
 the pinned release. An older host cannot start the downloaded `llama-server`:
 use `--runtime docker` or `path`.
 
+### Mirroring the llama.cpp release
+
+`LLMMAN_LLAMA_CPP_REPO=<owner>/<repo>` makes `bin` fetch the release assets
+from that GitHub repo instead of `ggml-org/llama.cpp`. A mirror holds many
+releases, so build `b12359` is the release tagged `llama.cpp-b12359` there
+(`--llama-cpp-version` still takes `b12359` or the default's tag). Its assets
+keep the upstream names, and llmman checks each download against the digest
+GitHub lists for it, as for upstream. Mirrors are pinned: `latest` is an
+error, and a missing release fails with the repo, the tag and the variable
+named. A mirror's builds are installed apart from upstream's and from other mirrors'.
+
+`llmman llama-cpp-assets [--llama-cpp-version V] [--json]` resolves the pin
+as `serve` does and prints the build tag, then every asset name (the builds
+and their `cudart` companions) that any supported host would pick from that
+release of the selected repo: macOS arm64 and x64; Linux x64 and arm64 (CPU,
+Vulkan), s390x (CPU), x64 ROCm, CUDA 12 and 13 on x64 and CUDA 13 on arm64 (DGX Spark);
+Windows x64 and arm64 (CPU, Vulkan), CUDA 12 and 13 on x64, CUDA 13 on arm64,
+ROCm on x64 and OpenCL (Adreno) on arm64. A mirror job copies exactly that
+list. With `--json` it prints `{"repo", "release", "tag", "assets",
+"missing"}`: `release` is the GitHub tag, `tag` the build tag, and `missing`
+the hosts (`linux-arm64-vulkan`; `<host>/companion` for a missing `cudart`
+bundle) the release has no asset for, which upstream does not publish in every
+release. Each also gets a note on stderr. The command fails only when no asset
+matched at all.
+
 Under WSL2 install the CUDA *toolkit* only, never the Linux driver (the
 `cuda` or `cuda-drivers` packages): the Windows driver supplies `libcuda`,
 and a native NVIDIA driver in the distro puts its own `libnvidia-*` libraries

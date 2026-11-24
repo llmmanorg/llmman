@@ -25,11 +25,14 @@ reference; this is the one-line summary of each subcommand.
 | `verify`  | Check a registry model's signatures against trusted public keys |
 | `login`   | Log in to a container registry, HuggingFace, or (`--provider`) a [hosted provider](providers.md#logging-in); `--param KEY=VALUE` passes a method its settings |
 | `logout`  | Log out from a container registry, HuggingFace, or (`--provider`) a hosted provider |
+| `llama-cpp-assets` | List the llama.cpp release assets any supported host would download, to [mirror them](backends.md#mirroring-the-llamacpp-release) |
 | `config`  | Read and write `llmman.conf` settings (aliases, API keys, trust policy, aggregation peers) |
 
 A client command talks to whatever answers at `LLMMAN_HOST`, a llmman daemon
 or an Ollama alike, whatever its version, and starts a local `llmman serve`
-only when nothing does. `serve`'s options (`--runtime`, `--llama-cpp-version`,
+only when nothing does (with `LLMMAN_NO_AUTOSTART` set, never: a command
+that finds no server fails instead of starting one, for a daemon someone
+else manages). `serve`'s options (`--runtime`, `--llama-cpp-version`,
 `--vllm-version`, ...) apply only to a daemon that `serve` starts; a running
 daemon keeps its build and options until it is restarted.
 

@@ -54,6 +54,9 @@ enum Commands {
     Usage(cmd::usage::UsageArgs),
     /// List the hosted providers `--provider` can route to
     Providers(cmd::providers::ProvidersArgs),
+    /// List the llama.cpp release assets any supported host would download
+    /// (for mirroring them, see LLMMAN_LLAMA_CPP_REPO)
+    LlamaCppAssets(cmd::llama_cpp_assets::LlamaCppAssetsArgs),
     /// Read and write llmman.conf settings
     Config(cmd::config::ConfigArgs),
     /// Copy a local image to a new reference
@@ -147,6 +150,7 @@ fn main() {
         Commands::Log(a) => cmd::log::run(a),
         Commands::Usage(a) => cmd::usage::run(a),
         Commands::Providers(a) => cmd::providers::run(a),
+        Commands::LlamaCppAssets(a) => cmd::llama_cpp_assets::run(a),
         Commands::Config(a) => cmd::config::run(a),
         Commands::Cp(a) => cmd::cp::run(a),
         Commands::Rm(a) => cmd::rm::run(a),

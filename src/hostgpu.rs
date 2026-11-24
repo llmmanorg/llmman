@@ -528,6 +528,25 @@ mod tests {
         assert_eq!(parse_probe_output("cuda:not-a-number\n"), None);
     }
 
+    /// What the probe subprocess prints for a DGX Spark (GB10: compute
+    /// capability 12.1, CUDA 13 driver, ~120 GiB of unified memory) and for a
+    /// Blackwell laptop GPU: `cuda:13` (see `vendor::cuda_major_from_driver_version`
+    /// for the driver encoding), which is `Cuda { major: 13 }`.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn blackwell_probe_output_is_cuda_13() {
+        let spark_memory = 128_000_000_000u64;
+        assert_eq!(
+            parse_probe_output_with_vram(&format!("cuda:13\n{spark_memory}\n")),
+            Some((HostGpu::Cuda { major: 13 }, spark_memory))
+        );
+        let laptop_memory = 6 * GIB;
+        assert_eq!(
+            parse_probe_output_with_vram(&format!("cuda:13\n{laptop_memory}\n")),
+            Some((HostGpu::Cuda { major: 13 }, laptop_memory))
+        );
+    }
+
     #[test]
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn parse_probe_output_with_vram_reads_the_second_line() {

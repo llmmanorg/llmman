@@ -29,13 +29,107 @@ use serde::Deserialize;
 
 use crate::fmt::human_size;
 use crate::fsutil::sha256_of_file;
-// Only the Linux/Windows arms of `asset_query` below branch on the
-// detected accelerator; macOS publishes exactly one asset per
-// architecture, so this would be an unused import there.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::hostgpu::HostGpu;
 
-const REPO_API: &str = "https://api.github.com/repos/ggml-org/llama.cpp";
+const API_BASE: &str = "https://api.github.com";
+
+/// The repo the release assets come from unless [`REPO_VAR`] names another.
+const DEFAULT_REPO: &str = "ggml-org/llama.cpp";
+
+/// `LLMMAN_LLAMA_CPP_REPO=<owner>/<repo>`: fetch the llama.cpp release
+/// assets from that GitHub repo instead of [`DEFAULT_REPO`]. Such a mirror
+/// holds many releases, so its release for build `b12359` is tagged
+/// `llama.cpp-b12359` ([`release_tag`]), carries the upstream asset names
+/// and is always pinned (`latest` is an error).
+pub const REPO_VAR: &str = "LLMMAN_LLAMA_CPP_REPO";
+
+/// Prefix of a mirror's release tags.
+const MIRROR_TAG_PREFIX: &str = "llama.cpp-";
+
+/// The validated repo from [`REPO_VAR`]'s value (`None` or blank: the
+/// default). GitHub names are case-insensitive, so the value is kept as
+/// typed.
+fn parse_repo(value: Option<&str>) -> Result<String> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(DEFAULT_REPO.into());
+    };
+    let part_ok = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    match value.split_once('/') {
+        Some((owner, repo)) if part_ok(owner) && part_ok(repo) => Ok(value.into()),
+        _ => anyhow::bail!(
+            "{REPO_VAR} must be <owner>/<repo> (letters, digits, '-', '_' and '.'), got {value:?}"
+        ),
+    }
+}
+
+/// The repo to fetch release assets from, per [`REPO_VAR`].
+pub fn llama_cpp_repo() -> Result<String> {
+    parse_repo(std::env::var(REPO_VAR).ok().as_deref())
+}
+
+fn is_mirror(repo: &str) -> bool {
+    !repo.eq_ignore_ascii_case(DEFAULT_REPO)
+}
+
+/// The GitHub release tag of build tag `build` in `repo`: `build` itself
+/// upstream, `llama.cpp-<build>` in a mirror.
+pub(crate) fn release_tag(repo: &str, build: &str) -> String {
+    if is_mirror(repo) && !build.starts_with(MIRROR_TAG_PREFIX) {
+        format!("{MIRROR_TAG_PREFIX}{build}")
+    } else {
+        build.to_owned()
+    }
+}
+
+/// The build tag a `release_tag` of `repo` names.
+fn strip_release_tag<'a>(repo: &str, tag: &'a str) -> &'a str {
+    if is_mirror(repo) {
+        tag.strip_prefix(MIRROR_TAG_PREFIX).unwrap_or(tag)
+    } else {
+        tag
+    }
+}
+
+/// Mirrors are pinned: there is no `latest` to ask them for.
+fn check_pin(repo: &str, pinned_version: Option<&str>) -> Result<()> {
+    if is_mirror(repo) && pinned_version.is_none() {
+        anyhow::bail!(
+            "{REPO_VAR}={repo} is a mirror and mirrors are pinned: `latest` is not available. \
+             Pass --llama-cpp-version <build tag> (a mirror release is tagged \
+             {MIRROR_TAG_PREFIX}<build tag>) or unset {REPO_VAR}"
+        );
+    }
+    Ok(())
+}
+
+/// The release API URL of `repo` at build tag `version`, or its latest.
+fn release_url(api_base: &str, repo: &str, version: Option<&str>) -> Result<String> {
+    check_pin(repo, version)?;
+    Ok(match version {
+        Some(v) => format!(
+            "{api_base}/repos/{repo}/releases/tags/{}",
+            release_tag(repo, v)
+        ),
+        None => format!("{api_base}/repos/{repo}/releases/latest"),
+    })
+}
+
+/// The error for a missing mirror release.
+fn release_not_found(repo: &str, build: &str) -> anyhow::Error {
+    anyhow!(
+        "no release {} in GitHub repo {repo} (HTTP 404). {REPO_VAR} selects the repo and a \
+         mirror must publish each build as a release tagged {MIRROR_TAG_PREFIX}<build tag>; \
+         check the repo, the tag and --llama-cpp-version",
+        release_tag(repo, build)
+    )
+}
 
 /// The default `--llama-cpp-version`: the image tag suffix `crate::container`
 /// runs, and (via [`build_tag`]) the release [`ensure_llama_server`]
@@ -143,28 +237,50 @@ fn http_get(
     url: &str,
     what: &str,
 ) -> Result<reqwest::blocking::Response> {
-    let resp = client
+    check_status(http_send(client, url)?, url, what)
+}
+
+fn http_send(client: &reqwest::blocking::Client, url: &str) -> Result<reqwest::blocking::Response> {
+    client
         .get(url)
         .header("user-agent", "llmman")
         .send()
-        .with_context(|| format!("query {url}"))?;
+        .with_context(|| format!("query {url}"))
+}
+
+fn check_status(
+    resp: reqwest::blocking::Response,
+    url: &str,
+    what: &str,
+) -> Result<reqwest::blocking::Response> {
     if !resp.status().is_success() {
         anyhow::bail!("{what} {url} returned {}", resp.status());
     }
     Ok(resp)
 }
 
-/// Fetches release metadata for `version` (an exact tag, e.g. "b10360"),
-/// or the latest release if `None` — mirroring how a caller of Ollama's
-/// own installer can pin `OLLAMA_VERSION` instead of always taking latest.
-fn fetch_release(client: &reqwest::blocking::Client, version: Option<&str>) -> Result<Release> {
-    let url = match version {
-        Some(v) => format!("{REPO_API}/releases/tags/{v}"),
-        None => format!("{REPO_API}/releases/latest"),
-    };
-    http_get(client, &url, "GitHub API")?
+/// Fetches release metadata for build tag `version` (e.g. "b10360"), or the
+/// latest release if `None` (never in a mirror), from `repo` at `api_base`.
+/// The returned `tag_name` is always the build tag, a mirror's prefix removed.
+fn fetch_release(
+    client: &reqwest::blocking::Client,
+    api_base: &str,
+    repo: &str,
+    version: Option<&str>,
+) -> Result<Release> {
+    let url = release_url(api_base, repo, version)?;
+    let resp = http_send(client, &url)?;
+    match version {
+        Some(build) if resp.status() == reqwest::StatusCode::NOT_FOUND && is_mirror(repo) => {
+            return Err(release_not_found(repo, build));
+        }
+        _ => {}
+    }
+    let mut release = check_status(resp, &url, "GitHub API")?
         .json::<Release>()
-        .with_context(|| format!("parse release metadata from {url}"))
+        .with_context(|| format!("parse release metadata from {url}"))?;
+    release.tag_name = strip_release_tag(repo, &release.tag_name).to_owned();
+    Ok(release)
 }
 
 /// Name of the pointer asset llama.cpp attaches to its stable semver
@@ -199,9 +315,13 @@ fn parse_pointer_tag(content: &str) -> Option<&str> {
 /// naming the `b<number>` release that actually carries the binaries.
 /// One hop only: a pointer chain longer than that is a publishing bug
 /// upstream and gets reported rather than followed.
-fn resolve_release(client: &reqwest::blocking::Client, version: Option<&str>) -> Result<Release> {
+fn resolve_release(
+    client: &reqwest::blocking::Client,
+    repo: &str,
+    version: Option<&str>,
+) -> Result<Release> {
     resolve_release_with(
-        |v| fetch_release(client, v),
+        |v| fetch_release(client, API_BASE, repo, v),
         |url| fetch_text(client, url),
         version,
     )
@@ -320,21 +440,10 @@ fn find_companion_asset<'a>(
     release.assets.iter().find(is_companion)
 }
 
-/// llama.cpp publishes a Windows Vulkan build for both x64 and arm64.
-#[cfg(any(target_os = "windows", test))]
-fn windows_vulkan_query(arch: &str) -> AssetQuery {
-    AssetQuery {
-        must_contain: format!("-bin-win-vulkan-{arch}.zip"),
-        companion_must_contain: None,
-        label: "vulkan".into(),
-    }
-}
-
 /// A CUDA build of any minor of CUDA `major` for `os` (`win` or `ubuntu`),
 /// and its `cudart-*` companion, which starts `companion` (see
 /// [`AssetQuery::companion`]). The dot after `major` keeps `13` from
 /// matching `130.x`.
-#[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn cuda_query(major: u32, arch: &str, os: &str, ext: &str, companion: &str) -> AssetQuery {
     let build = format!("-bin-{os}-cuda-{major}.*-{arch}.{ext}");
     AssetQuery {
@@ -344,25 +453,14 @@ fn cuda_query(major: u32, arch: &str, os: &str, ext: &str, companion: &str) -> A
     }
 }
 
-#[cfg(any(target_os = "windows", test))]
-fn windows_cuda_query(major: u32, arch: &str) -> AssetQuery {
-    cuda_query(major, arch, "win", "zip", "cudart-llama")
-}
-
 /// The glibc the Linux CUDA builds need (`GLIBC_2.38`): they are built on
 /// Ubuntu 24.04, where the CPU and Vulkan x64 builds use 22.04's.
-#[cfg(any(target_os = "linux", test))]
 const LINUX_CUDA_MIN_GLIBC: (u32, u32) = (2, 38);
 
-/// The Linux CUDA build for a driver of CUDA `major`, or why there is none.
-/// llama.cpp builds 12 and 13 for x64 but only 13 for arm64, and a CUDA 13
-/// build cannot run on a CUDA 12 driver.
-#[cfg(any(target_os = "linux", test))]
-fn linux_cuda_query(
-    major: u32,
-    arch: &str,
-    glibc: Option<(u32, u32)>,
-) -> Result<AssetQuery, String> {
+/// The CUDA major of the Linux build for a driver of CUDA `major`, or why
+/// there is none. llama.cpp builds 12 and 13 for x64 but only 13 for arm64,
+/// and a CUDA 13 build cannot run on a CUDA 12 driver.
+fn linux_cuda_major(major: u32, arch: &str, glibc: Option<(u32, u32)>) -> Result<u32, String> {
     let cuda = if major >= 13 { 13 } else { 12 };
     if !matches!((arch, cuda), ("x64", _) | ("arm64", 13)) {
         return Err(format!(
@@ -376,13 +474,7 @@ fn linux_cuda_query(
              this host has {major}.{minor}"
         ));
     }
-    Ok(cuda_query(
-        cuda,
-        arch,
-        "ubuntu",
-        "tar.gz",
-        "cudart-llama-{tag}",
-    ))
+    Ok(cuda)
 }
 
 /// glibc's `(major, minor)` from its `2.39` version string.
@@ -405,6 +497,11 @@ fn host_glibc() -> Option<(u32, u32)> {
     None
 }
 
+#[cfg(not(target_os = "linux"))]
+fn host_glibc() -> Option<(u32, u32)> {
+    None
+}
+
 fn host_arch_token() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "x64",
@@ -414,121 +511,264 @@ fn host_arch_token() -> &'static str {
     }
 }
 
-/// See the real asset names published at
-/// <https://github.com/ggml-org/llama.cpp/releases> — verified directly
-/// against the `latest` release's own asset list and its release workflow
-/// (`.github/workflows/release.yml`) while writing this, rather than
-/// guessed: e.g. ROCm is x64-only on both Linux and Windows, and Linux
-/// CUDA has one build per major plus a `cudart-*` runtime bundle.
-fn asset_query() -> AssetQuery {
-    let arch = host_arch_token();
+/// The OS of a [`HostDescriptor`], independent of the OS llmman runs on.
+/// Every other OS uses the Linux (Ubuntu) builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostOs {
+    Macos,
+    Linux,
+    Windows,
+    Android,
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        if arch == "arm64" {
-            AssetQuery {
-                must_contain: "-bin-macos-arm64.tar.gz".into(),
-                companion_must_contain: None,
-                label: "metal".into(),
-            }
+impl HostOs {
+    fn current() -> HostOs {
+        if cfg!(target_os = "macos") {
+            HostOs::Macos
+        } else if cfg!(target_os = "windows") {
+            HostOs::Windows
+        } else if cfg!(target_os = "android") {
+            HostOs::Android
         } else {
-            AssetQuery {
-                must_contain: "-bin-macos-x64.tar.gz".into(),
-                companion_must_contain: None,
-                label: "cpu".into(),
-            }
+            HostOs::Linux
         }
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        let cpu = || AssetQuery {
-            must_contain: format!("-bin-ubuntu-{arch}.tar.gz"),
+    fn name(self) -> &'static str {
+        match self {
+            HostOs::Macos => "macos",
+            HostOs::Linux => "linux",
+            HostOs::Windows => "windows",
+            HostOs::Android => "android",
+        }
+    }
+}
+
+/// The accelerator a build targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Accel {
+    Cpu,
+    Metal,
+    Vulkan,
+    Rocm,
+    Opencl,
+    /// A CUDA major, 12 or 13.
+    Cuda(u32),
+}
+
+impl Accel {
+    fn name(self) -> String {
+        match self {
+            Accel::Cpu => "cpu".into(),
+            Accel::Metal => "metal".into(),
+            Accel::Vulkan => "vulkan".into(),
+            Accel::Rocm => "rocm".into(),
+            Accel::Opencl => "opencl".into(),
+            Accel::Cuda(major) => format!("cuda-{major}"),
+        }
+    }
+}
+
+/// One OS, architecture and accelerator llmman can select a build for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostDescriptor {
+    os: HostOs,
+    arch: &'static str,
+    accel: Accel,
+}
+
+const fn host(os: HostOs, arch: &'static str, accel: Accel) -> HostDescriptor {
+    HostDescriptor { os, arch, accel }
+}
+
+/// Every host [`asset_query`] can select for, as published by llama.cpp's
+/// release workflow (`.github/workflows/release.yml`): ROCm is x64-only,
+/// CUDA 12 is x64-only, OpenCL (Adreno) is Windows arm64-only, s390x is
+/// Linux CPU-only. Android is
+/// not listed: it is not a host the mirrored builds are for.
+const HOSTS: &[HostDescriptor] = &[
+    host(HostOs::Macos, "arm64", Accel::Metal),
+    host(HostOs::Macos, "x64", Accel::Cpu),
+    host(HostOs::Linux, "x64", Accel::Cpu),
+    host(HostOs::Linux, "arm64", Accel::Cpu),
+    host(HostOs::Linux, "s390x", Accel::Cpu),
+    host(HostOs::Linux, "x64", Accel::Vulkan),
+    host(HostOs::Linux, "arm64", Accel::Vulkan),
+    host(HostOs::Linux, "x64", Accel::Rocm),
+    host(HostOs::Linux, "x64", Accel::Cuda(12)),
+    host(HostOs::Linux, "x64", Accel::Cuda(13)),
+    host(HostOs::Linux, "arm64", Accel::Cuda(13)),
+    host(HostOs::Windows, "x64", Accel::Cpu),
+    host(HostOs::Windows, "arm64", Accel::Cpu),
+    host(HostOs::Windows, "x64", Accel::Vulkan),
+    host(HostOs::Windows, "arm64", Accel::Vulkan),
+    host(HostOs::Windows, "x64", Accel::Cuda(12)),
+    host(HostOs::Windows, "x64", Accel::Cuda(13)),
+    host(HostOs::Windows, "arm64", Accel::Cuda(13)),
+    host(HostOs::Windows, "x64", Accel::Rocm),
+    host(HostOs::Windows, "arm64", Accel::Opencl),
+];
+
+impl HostDescriptor {
+    /// `linux-x64-cuda-13`, for messages and the `missing` list.
+    fn name(&self) -> String {
+        format!("{}-{}-{}", self.os.name(), self.arch, self.accel.name())
+    }
+
+    /// The one table of name patterns, see
+    /// <https://github.com/ggml-org/llama.cpp/releases>. `None` for an
+    /// OS and accelerator no build exists for.
+    fn query(&self) -> Option<AssetQuery> {
+        let arch = self.arch;
+        let plain = |must_contain: String| AssetQuery {
+            must_contain,
             companion_must_contain: None,
-            label: "cpu".into(),
+            label: self.accel.name(),
         };
-        match crate::hostgpu::detect() {
-            HostGpu::Vulkan => AssetQuery {
-                must_contain: format!("-bin-ubuntu-vulkan-{arch}.tar.gz"),
-                companion_must_contain: None,
-                label: "vulkan".into(),
-            },
-            HostGpu::Rocm if arch == "x64" => AssetQuery {
-                must_contain: "-bin-ubuntu-rocm-".into(),
-                companion_must_contain: None,
-                label: "rocm".into(),
-            },
-            HostGpu::Cuda { major } => {
-                linux_cuda_query(major, arch, host_glibc()).unwrap_or_else(|why| {
-                    eprintln!(
-                        "[llmman] NVIDIA GPU detected (CUDA {major}), but {why}: using the \
-                         CPU build. `llmman serve --runtime docker` (or podman) has GPU \
-                         acceleration, or put a CUDA llama-server on PATH."
-                    );
-                    cpu()
-                })
+        Some(match (self.os, self.accel) {
+            (HostOs::Macos, Accel::Metal | Accel::Cpu) => {
+                plain(format!("-bin-macos-{arch}.tar.gz"))
             }
-            _ => cpu(),
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        match crate::hostgpu::detect() {
-            HostGpu::Cuda { major } => {
-                // x64 has CUDA 12 and 13 builds, arm64 only 13. Select by
-                // major: the minor changes between releases.
-                let cuda = if arch == "arm64" || major >= 13 {
-                    13
-                } else {
-                    12
-                };
-                windows_cuda_query(cuda, arch)
+            (HostOs::Linux, Accel::Cpu) => plain(format!("-bin-ubuntu-{arch}.tar.gz")),
+            (HostOs::Linux, Accel::Vulkan) => plain(format!("-bin-ubuntu-vulkan-{arch}.tar.gz")),
+            (HostOs::Linux, Accel::Rocm) => plain("-bin-ubuntu-rocm-".into()),
+            (HostOs::Linux, Accel::Cuda(major)) => {
+                cuda_query(major, arch, "ubuntu", "tar.gz", "cudart-llama-{tag}")
             }
-            HostGpu::Rocm if arch == "x64" => AssetQuery {
-                must_contain: "-bin-win-rocm-".into(),
-                companion_must_contain: None,
-                label: "rocm".into(),
-            },
-            HostGpu::Opencl if arch == "arm64" => AssetQuery {
-                must_contain: "-bin-win-opencl-adreno-arm64.zip".into(),
-                companion_must_contain: None,
-                label: "opencl".into(),
-            },
-            HostGpu::Vulkan => windows_vulkan_query(arch),
-            _ => AssetQuery {
-                must_contain: format!("-bin-win-cpu-{arch}.zip"),
-                companion_must_contain: None,
-                label: "cpu".into(),
-            },
-        }
+            (HostOs::Windows, Accel::Cpu) => plain(format!("-bin-win-cpu-{arch}.zip")),
+            (HostOs::Windows, Accel::Vulkan) => plain(format!("-bin-win-vulkan-{arch}.zip")),
+            (HostOs::Windows, Accel::Rocm) => plain("-bin-win-rocm-".into()),
+            (HostOs::Windows, Accel::Opencl) => plain(format!("-bin-win-opencl-adreno-{arch}.zip")),
+            (HostOs::Windows, Accel::Cuda(major)) => {
+                cuda_query(major, arch, "win", "zip", "cudart-llama")
+            }
+            // One Android build (NDK, arm64, CPU with runtime dispatch across
+            // armv8.x/armv9 ggml-cpu variants). Its shared objects carry no
+            // RUNPATH, so spawn_llama_server sets LD_LIBRARY_PATH for it.
+            (HostOs::Android, Accel::Cpu) => plain(format!("-bin-android-{arch}.tar.gz")),
+            _ => return None,
+        })
     }
+}
 
-    // llama.cpp publishes one Android build (NDK, arm64, CPU with runtime
-    // dispatch across armv8.x/armv9 ggml-cpu variants). Its shared objects
-    // carry no RUNPATH, so spawn_llama_server sets LD_LIBRARY_PATH for it.
-    #[cfg(target_os = "android")]
-    {
-        AssetQuery {
-            must_contain: format!("-bin-android-{arch}.tar.gz"),
-            companion_must_contain: None,
-            label: "cpu".into(),
+/// The build for a host of `os` and `arch` whose best accelerator is `gpu`
+/// (and glibc `glibc`, on Linux), and, when a CUDA build was wanted but
+/// there is none, why the CPU build is used instead.
+fn select_host(
+    os: HostOs,
+    arch: &'static str,
+    gpu: HostGpu,
+    glibc: Option<(u32, u32)>,
+) -> (HostDescriptor, Option<String>) {
+    let mut why = None;
+    let accel = match (os, gpu) {
+        (HostOs::Macos, _) if arch == "arm64" => Accel::Metal,
+        (HostOs::Linux | HostOs::Windows, HostGpu::Vulkan) => Accel::Vulkan,
+        (HostOs::Linux | HostOs::Windows, HostGpu::Rocm) if arch == "x64" => Accel::Rocm,
+        (HostOs::Windows, HostGpu::Opencl) if arch == "arm64" => Accel::Opencl,
+        // x64 has CUDA 12 and 13 builds, arm64 only 13. Select by major: the
+        // minor changes between releases.
+        (HostOs::Windows, HostGpu::Cuda { major }) => {
+            Accel::Cuda(if arch == "arm64" || major >= 13 {
+                13
+            } else {
+                12
+            })
         }
-    }
+        (HostOs::Linux, HostGpu::Cuda { major }) => match linux_cuda_major(major, arch, glibc) {
+            Ok(cuda) => Accel::Cuda(cuda),
+            Err(e) => {
+                why = Some(e);
+                Accel::Cpu
+            }
+        },
+        _ => Accel::Cpu,
+    };
+    (host(os, arch, accel), why)
+}
 
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "linux",
-        target_os = "windows",
-        target_os = "android"
-    )))]
-    {
-        AssetQuery {
-            must_contain: format!("-bin-ubuntu-{arch}.tar.gz"),
-            companion_must_contain: None,
-            label: "cpu".into(),
+/// Which release asset(s) this host wants: [`select_host`] for the
+/// detected GPU, then [`HostDescriptor::query`].
+fn asset_query() -> AssetQuery {
+    let os = HostOs::current();
+    let gpu = match os {
+        HostOs::Linux | HostOs::Windows => crate::hostgpu::detect(),
+        HostOs::Macos | HostOs::Android => HostGpu::None,
+    };
+    let (descriptor, why) = select_host(os, host_arch_token(), gpu, host_glibc());
+    if let (Some(why), HostGpu::Cuda { major }) = (why, gpu) {
+        eprintln!(
+            "[llmman] NVIDIA GPU detected (CUDA {major}), but {why}: using the CPU build. \
+             `llmman serve --runtime docker` (or podman) has GPU acceleration, or put a CUDA \
+             llama-server on PATH."
+        );
+    }
+    descriptor
+        .query()
+        .expect("select_host only returns hosts that have a build")
+}
+
+// ---------------------------------------------------------------------------
+// Every asset any host could select
+// ---------------------------------------------------------------------------
+
+/// The assets of one release that some [`HOSTS`] entry selects, for
+/// `llmman llama-cpp-assets`.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct AssetListing {
+    /// The GitHub repo, as [`REPO_VAR`] selects it.
+    pub repo: String,
+    /// The release's GitHub tag in `repo` (`llama.cpp-b12359` in a mirror).
+    pub release: String,
+    /// The llama.cpp build tag (`b12359`).
+    pub tag: String,
+    /// Primary and companion asset names, sorted, without duplicates.
+    pub assets: Vec<String>,
+    /// Hosts (`linux-arm64-vulkan`) with no matching primary asset, and
+    /// `<host>/companion` for a primary whose companion is absent.
+    pub missing: Vec<String>,
+}
+
+/// What [`HOSTS`] select from `release` of `repo`. A host with no match is
+/// listed in `missing`, not an error: upstream does not publish every build
+/// in every release.
+fn list_assets(repo: &str, release: &Release) -> AssetListing {
+    let mut assets = std::collections::BTreeSet::new();
+    let mut missing = Vec::new();
+    for host in HOSTS {
+        let query = host.query().expect("every listed host has a build");
+        let Some(primary) = find_primary_asset(release, &query) else {
+            missing.push(host.name());
+            continue;
+        };
+        assets.insert(primary.name.clone());
+        if query.companion(&release.tag_name).is_some() {
+            match find_companion_asset(release, &query, primary) {
+                Some(companion) => {
+                    assets.insert(companion.name.clone());
+                }
+                None => missing.push(format!("{}/companion", host.name())),
+            }
         }
     }
+    AssetListing {
+        repo: repo.to_owned(),
+        release: release_tag(repo, &release.tag_name),
+        tag: release.tag_name.clone(),
+        assets: assets.into_iter().collect(),
+        missing,
+    }
+}
+
+/// The [`AssetListing`] of the release `pinned_version` (as `llmman serve`
+/// resolves it; `None` is upstream's latest) names in the repo
+/// [`REPO_VAR`] selects. Blocking (network).
+pub fn host_assets(pinned_version: Option<&str>) -> Result<AssetListing> {
+    let repo = llama_cpp_repo()?;
+    let pinned_version = pinned_version.map(|v| strip_release_tag(&repo, build_tag(v)));
+    check_pin(&repo, pinned_version)?;
+    let release = resolve_release(&http_client()?, &repo, pinned_version)?;
+    Ok(list_assets(&repo, &release))
 }
 
 // ---------------------------------------------------------------------------
@@ -541,9 +781,25 @@ fn install_root() -> Result<PathBuf> {
     Ok(crate::data_root()?.join("llama.cpp"))
 }
 
-/// `<tag>/<label>`: one archive per GPU backend per release.
-fn install_dir(tag: &str, label: &str) -> Result<PathBuf> {
-    Ok(install_root()?.join(tag).join(label))
+/// `<key>/<label>`: one archive per GPU backend per release.
+fn install_dir(key: &str, label: &str) -> Result<PathBuf> {
+    Ok(install_root()?.join(key).join(label))
+}
+
+/// The directory name of build `tag` from `repo`: the tag itself upstream,
+/// `<owner>-<repo>-<hash>-<tag>` for a mirror, so a mirror's (signed)
+/// binaries never share an install with upstream's or another mirror's.
+/// The hash is of the lowercased `owner/repo`: joining the names with `-`
+/// alone would map `a-b/c` and `a/b-c` to one directory.
+fn cache_key(repo: &str, tag: &str) -> String {
+    if is_mirror(repo) {
+        use sha2::{Digest, Sha256};
+        let repo = repo.to_ascii_lowercase();
+        let hash = hex::encode(&Sha256::digest(repo.as_bytes())[..6]);
+        format!("{}-{hash}-{tag}", repo.replace('/', "-"))
+    } else {
+        tag.to_owned()
+    }
 }
 
 /// Staging directory for a downloaded release archive, before it's
@@ -1021,7 +1277,11 @@ fn install_dir_of(root: &Path, bin: &Path) -> Option<PathBuf> {
 }
 
 fn resolve_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
-    let pinned_version = pinned_version.map(build_tag);
+    let repo = llama_cpp_repo()?;
+    let pinned_version = pinned_version.map(|v| strip_release_tag(&repo, build_tag(v)));
+    // Before any cache lookup: an unpinned mirror must not fall back to
+    // whatever build happens to be cached.
+    check_pin(&repo, pinned_version)?;
     let query = asset_query();
     let bin_name = if cfg!(target_os = "windows") {
         "llama-server.exe"
@@ -1033,7 +1293,7 @@ fn resolve_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
     // reuse it without touching the network at all — pinned or not, a
     // given release's assets never change after being published.
     if let Some(tag) = pinned_version {
-        let tag_dir = install_root()?.join(tag);
+        let tag_dir = install_root()?.join(cache_key(&repo, tag));
         if let Some(bin) = cached_in_tag(&tag_dir, &query.label, bin_name) {
             return Ok(Resolved {
                 bin,
@@ -1048,7 +1308,7 @@ fn resolve_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
         if let Some(bin) = newest_cached(&query.label, bin_name)? {
             // Still try to reach GitHub for a possibly newer release below;
             // fall back to this cached copy if that fails.
-            match try_ensure_from_network(pinned_version, &query, bin_name) {
+            match try_ensure_from_network(&repo, pinned_version, &query, bin_name) {
                 Ok(resolved) => return Ok(resolved),
                 Err(e) => {
                     eprintln!(
@@ -1064,18 +1324,19 @@ fn resolve_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
         }
     }
 
-    try_ensure_from_network(pinned_version, &query, bin_name)
+    try_ensure_from_network(&repo, pinned_version, &query, bin_name)
 }
 
 fn try_ensure_from_network(
+    repo: &str,
     pinned_version: Option<&str>,
     query: &AssetQuery,
     bin_name: &str,
 ) -> Result<Resolved> {
     let client = http_client()?;
-    let release = resolve_release(&client, pinned_version)?;
+    let release = resolve_release(&client, repo, pinned_version)?;
     let tag = release.tag_name.clone();
-    let dest = install_dir(&tag, &query.label)?;
+    let dest = install_dir(&cache_key(repo, &tag), &query.label)?;
 
     let cached = |dest: &Path| crate::managed::completed_binary(dest, bin_name);
     let bin = crate::managed::ensure(&install_root()?, &dest, "llama.cpp", cached, |dest| {
@@ -1214,6 +1475,27 @@ mod tests {
         "sha256:e3032ea0712da96dec820c770626385de4322dd06619fb5829256a504bbc9375";
     const DIGEST_B: &str =
         "sha256:a8cf841eef4e9d6ea28bb4d88eea1004032a2bf0d1302bff7b8d2100e801ed16";
+
+    fn host_query(os: HostOs, arch: &'static str, accel: Accel) -> AssetQuery {
+        host(os, arch, accel).query().unwrap()
+    }
+
+    fn windows_cuda_query(major: u32, arch: &'static str) -> AssetQuery {
+        host_query(HostOs::Windows, arch, Accel::Cuda(major))
+    }
+
+    fn windows_vulkan_query(arch: &'static str) -> AssetQuery {
+        host_query(HostOs::Windows, arch, Accel::Vulkan)
+    }
+
+    fn linux_cuda_query(
+        major: u32,
+        arch: &'static str,
+        glibc: Option<(u32, u32)>,
+    ) -> Result<AssetQuery, String> {
+        let cuda = linux_cuda_major(major, arch, glibc)?;
+        Ok(host_query(HostOs::Linux, arch, Accel::Cuda(cuda)))
+    }
 
     #[test]
     fn image_digest_in_reads_the_entry_for_the_tag() {
@@ -1606,7 +1888,7 @@ mod tests {
         )
     }
 
-    fn linux_cuda(major: u32, arch: &str) -> Option<(Option<String>, Option<String>)> {
+    fn linux_cuda(major: u32, arch: &'static str) -> Option<(Option<String>, Option<String>)> {
         let query = linux_cuda_query(major, arch, None).ok()?;
         Some(selected(&linux_cuda_release(), &query))
     }
@@ -2060,15 +2342,19 @@ mod tests {
         marker.set_status("extracting llama.tar.gz");
         backdate(&path);
         assert_eq!(status_of(&path), None);
+        // Wait for the heartbeat itself, not a fixed time: a loaded runner
+        // may not schedule its thread for a while.
         let out = marker.keep_alive_every(Duration::from_millis(5), || {
-            std::thread::sleep(Duration::from_millis(60));
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while status_of(&path).is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             7
         });
         assert_eq!(out, 7);
         assert_eq!(status_of(&path).as_deref(), Some("extracting llama.tar.gz"));
-        // No heartbeat outside the closure: a backdated marker stays stale.
+        // The heartbeat stopped with the closure: a backdated marker stays stale.
         backdate(&path);
-        std::thread::sleep(Duration::from_millis(30));
         assert_eq!(status_of(&path), None);
         drop(marker);
         assert!(!path.exists());
@@ -2118,6 +2404,674 @@ mod tests {
         assert_eq!(found, Some(legacy.join("llama-server")));
         assert_eq!(cached_in_tag(&tag, "cuda-13", "llama-server"), None);
         std::fs::remove_dir_all(&tag).unwrap();
+    }
+
+    // ----- repo, tag convention and release URLs -----
+
+    const MIRROR: &str = "docker/sbx-releases";
+
+    #[test]
+    fn parse_repo_defaults_and_validates() {
+        for unset in [None, Some(""), Some("  ")] {
+            assert_eq!(parse_repo(unset).unwrap(), "ggml-org/llama.cpp");
+        }
+        for ok in [MIRROR, " docker/sbx-releases ", "a/b", "Foo_1/bar.baz-2"] {
+            assert_eq!(parse_repo(Some(ok)).unwrap(), ok.trim());
+        }
+        for bad in [
+            "llama.cpp",
+            "/repo",
+            "owner/",
+            "a/b/c",
+            "a b/c",
+            "a/b c",
+            "../x",
+            "a/..",
+            "./.",
+            "a/b?x=1",
+            "https://github.com/a/b",
+            "a/b%2F",
+            "a\\b/c",
+        ] {
+            let err = parse_repo(Some(bad)).unwrap_err().to_string();
+            assert!(
+                err.contains(REPO_VAR) && err.contains("<owner>/<repo>"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_tag_is_prefixed_in_a_mirror_only() {
+        assert_eq!(release_tag(DEFAULT_REPO, "b12359"), "b12359");
+        assert_eq!(release_tag("GGML-org/Llama.cpp", "b12359"), "b12359");
+        assert_eq!(release_tag(MIRROR, "b12359"), "llama.cpp-b12359");
+        // Already a mirror tag: not prefixed twice.
+        assert_eq!(release_tag(MIRROR, "llama.cpp-b12359"), "llama.cpp-b12359");
+        assert_eq!(strip_release_tag(MIRROR, "llama.cpp-b12359"), "b12359");
+        assert_eq!(strip_release_tag(MIRROR, "b12359"), "b12359");
+        assert_eq!(strip_release_tag(DEFAULT_REPO, "b12359"), "b12359");
+    }
+
+    #[test]
+    fn release_urls_follow_the_repo_and_tag_convention() {
+        let url = |repo, v| release_url("https://api.example", repo, v);
+        assert_eq!(
+            url(DEFAULT_REPO, Some("b12359")).unwrap(),
+            "https://api.example/repos/ggml-org/llama.cpp/releases/tags/b12359"
+        );
+        assert_eq!(
+            url(DEFAULT_REPO, None).unwrap(),
+            "https://api.example/repos/ggml-org/llama.cpp/releases/latest"
+        );
+        assert_eq!(
+            url(MIRROR, Some("b12359")).unwrap(),
+            "https://api.example/repos/docker/sbx-releases/releases/tags/llama.cpp-b12359"
+        );
+        let err = url(MIRROR, None).unwrap_err().to_string();
+        assert!(
+            err.contains(REPO_VAR)
+                && err.contains(MIRROR)
+                && err.contains("latest")
+                && err.contains("pinned"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_missing_mirror_release_names_the_repo_tag_and_variable() {
+        let err = release_not_found(MIRROR, "b12359").to_string();
+        for needle in [MIRROR, "llama.cpp-b12359", REPO_VAR, "404"] {
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+    }
+
+    #[test]
+    fn mirrors_and_upstream_never_share_an_install_dir() {
+        assert_eq!(cache_key(DEFAULT_REPO, "b12359"), "b12359");
+        let key = cache_key(MIRROR, "b12359");
+        assert!(key.starts_with("docker-sbx-releases-"), "{key}");
+        assert!(key.ends_with("-b12359"), "{key}");
+        assert_ne!(key, "b12359");
+        assert_eq!(build_number(&key), None);
+    }
+
+    #[test]
+    fn mirrors_whose_names_join_alike_get_different_keys() {
+        let (a, b) = (cache_key("a-b/c", "b12359"), cache_key("a/b-c", "b12359"));
+        assert_ne!(a, b);
+        assert_ne!(cache_key("a-b/c", "b1"), cache_key("a-b/c", "b2"));
+        for key in [a, b] {
+            assert!(!key.contains(['/', '\\', ':']), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_same_mirror_reuses_its_key_whatever_the_case() {
+        assert_eq!(
+            cache_key(MIRROR, "b12359"),
+            cache_key("Docker/SBX-Releases", "b12359")
+        );
+    }
+
+    /// Serves one canned response on a loopback port; returns the API base
+    /// URL and a handle yielding the request line.
+    fn serve_once(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                conn.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            conn.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap()
+                .to_owned()
+        });
+        (base, handle)
+    }
+
+    fn local_client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn fetching_a_mirror_release_asks_for_its_prefixed_tag_and_returns_the_build_tag() {
+        let (base, request) = serve_once(
+            "200 OK",
+            r#"{"tag_name": "llama.cpp-b12359", "assets": []}"#,
+        );
+        let release = fetch_release(&local_client(), &base, MIRROR, Some("b12359")).unwrap();
+        assert_eq!(release.tag_name, "b12359");
+        assert_eq!(
+            request.join().unwrap(),
+            "GET /repos/docker/sbx-releases/releases/tags/llama.cpp-b12359 HTTP/1.1"
+        );
+    }
+
+    #[test]
+    fn fetching_upstream_keeps_the_plain_tag() {
+        let (base, request) = serve_once("200 OK", r#"{"tag_name": "b12359", "assets": []}"#);
+        let release = fetch_release(&local_client(), &base, DEFAULT_REPO, Some("b12359")).unwrap();
+        assert_eq!(release.tag_name, "b12359");
+        assert_eq!(
+            request.join().unwrap(),
+            "GET /repos/ggml-org/llama.cpp/releases/tags/b12359 HTTP/1.1"
+        );
+    }
+
+    #[test]
+    fn a_mirror_404_is_an_actionable_error() {
+        let (base, _request) = serve_once("404 Not Found", r#"{"message": "Not Found"}"#);
+        let err = fetch_release(&local_client(), &base, MIRROR, Some("b12359"))
+            .unwrap_err()
+            .to_string();
+        for needle in [MIRROR, "llama.cpp-b12359", REPO_VAR] {
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_upstream_404_and_other_mirror_failures_stay_plain_http_errors() {
+        let (base, _request) = serve_once("404 Not Found", "{}");
+        let err = fetch_release(&local_client(), &base, DEFAULT_REPO, Some("b1"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("returned 404"), "{err}");
+        let (base, _request) = serve_once("500 Internal Server Error", "{}");
+        let err = fetch_release(&local_client(), &base, MIRROR, Some("b1"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("returned 500"), "{err}");
+    }
+
+    #[test]
+    fn latest_from_a_mirror_fails_before_any_request() {
+        // Nothing listens on the discard port: reaching the network would
+        // be a different error.
+        let err = fetch_release(&local_client(), "http://127.0.0.1:9", MIRROR, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mirrors are pinned"), "{err}");
+        assert!(check_pin(DEFAULT_REPO, None).is_ok());
+        assert!(check_pin(MIRROR, Some("b1")).is_ok());
+        assert!(check_pin(MIRROR, None).is_err());
+    }
+
+    /// A pointer pin resolves to the real build in a mirror too: the
+    /// dereference asks for the build tag, which the fetch prefixes.
+    #[test]
+    fn a_pointer_pin_dereferences_to_the_build_tag_in_a_mirror() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let release = resolve_release_with(
+            |v| {
+                asked.borrow_mut().push(v.map(str::to_owned));
+                Ok(if v == Some("v1.0.0") {
+                    pointer_release("v1.0.0")
+                } else {
+                    binary_release("b12359")
+                })
+            },
+            |_| Ok("b12359\n".into()),
+            Some("v1.0.0"),
+        )
+        .unwrap();
+        assert_eq!(release.tag_name, "b12359");
+        assert_eq!(
+            *asked.borrow(),
+            [Some("v1.0.0".into()), Some("b12359".into())]
+        );
+        assert_eq!(
+            release_url("", MIRROR, Some("b12359")).unwrap(),
+            "/repos/docker/sbx-releases/releases/tags/llama.cpp-b12359"
+        );
+    }
+
+    // ----- the host table -----
+
+    /// The asset names of the real b12359 release.
+    const B12359_ASSETS: &[&str] = &[
+        "cudart-llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz",
+        "cudart-llama-b12359-bin-ubuntu-cuda-13.5-arm64.tar.gz",
+        "cudart-llama-b12359-bin-ubuntu-cuda-13.5-x64.tar.gz",
+        "cudart-llama-bin-win-cuda-12.4-x64.zip",
+        "cudart-llama-bin-win-cuda-13.5-arm64.zip",
+        "cudart-llama-bin-win-cuda-13.5-x64.zip",
+        "llama-b12359-bin-android-arm64-snapdragon.tar.gz",
+        "llama-b12359-bin-android-arm64.tar.gz",
+        "llama-b12359-bin-linux-arm64-snapdragon.tar.gz",
+        "llama-b12359-bin-macos-arm64.tar.gz",
+        "llama-b12359-bin-macos-x64.tar.gz",
+        "llama-b12359-bin-ubuntu-26.04-s390x.tar.gz",
+        "llama-b12359-bin-ubuntu-arm64.tar.gz",
+        "llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz",
+        "llama-b12359-bin-ubuntu-cuda-13.5-arm64.tar.gz",
+        "llama-b12359-bin-ubuntu-cuda-13.5-x64.tar.gz",
+        "llama-b12359-bin-ubuntu-openvino-2026.4.1-x64.tar.gz",
+        "llama-b12359-bin-ubuntu-rocm-10.0-x64.tar.gz",
+        "llama-b12359-bin-ubuntu-s390x.tar.gz",
+        "llama-b12359-bin-ubuntu-sycl-fp16-x64.tar.gz",
+        "llama-b12359-bin-ubuntu-sycl-fp32-x64.tar.gz",
+        "llama-b12359-bin-ubuntu-vulkan-arm64.tar.gz",
+        "llama-b12359-bin-ubuntu-vulkan-x64.tar.gz",
+        "llama-b12359-bin-ubuntu-x64.tar.gz",
+        "llama-b12359-bin-ubuntu-zdnn-s390x.tar.gz",
+        "llama-b12359-bin-win-cpu-arm64.zip",
+        "llama-b12359-bin-win-cpu-x64.zip",
+        "llama-b12359-bin-win-cuda-12.4-x64.zip",
+        "llama-b12359-bin-win-cuda-13.5-arm64.zip",
+        "llama-b12359-bin-win-cuda-13.5-x64.zip",
+        "llama-b12359-bin-win-opencl-adreno-arm64.zip",
+        "llama-b12359-bin-win-openvino-2026.4.1-x64.zip",
+        "llama-b12359-bin-win-rocm-10.0-x64.zip",
+        "llama-b12359-bin-win-sycl-x64.zip",
+        "llama-b12359-bin-win-vulkan-arm64.zip",
+        "llama-b12359-bin-win-vulkan-x64.zip",
+        "llama-b12359-ui.tar.gz",
+        "llama-b12359-xcframework.zip",
+    ];
+
+    fn b12359_without(skip: impl Fn(&str) -> bool) -> Release {
+        Release {
+            tag_name: "b12359".into(),
+            assets: B12359_ASSETS
+                .iter()
+                .filter(|name| !skip(name))
+                .map(|name| Asset {
+                    name: (*name).into(),
+                    browser_download_url: String::new(),
+                    size: 0,
+                    digest: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn b12359() -> Release {
+        b12359_without(|_| false)
+    }
+
+    #[test]
+    fn every_host_has_a_query_a_distinct_name_and_a_match_in_b12359() {
+        let release = b12359();
+        let mut names = std::collections::HashSet::new();
+        for host in HOSTS {
+            assert!(names.insert(host.name()), "{} listed twice", host.name());
+            let query = host.query().unwrap_or_else(|| panic!("{}", host.name()));
+            let (primary, companion) = selected(&release, &query);
+            assert!(primary.is_some(), "no primary asset for {}", host.name());
+            assert_eq!(
+                companion.is_some(),
+                matches!(host.accel, Accel::Cuda(_)),
+                "{}",
+                host.name()
+            );
+            assert_eq!(query.label, host.accel.name());
+        }
+        assert_eq!(HOSTS.len(), 20);
+    }
+
+    #[test]
+    fn host_assets_of_b12359_are_every_selectable_build_sorted() {
+        let listing = list_assets(DEFAULT_REPO, &b12359());
+        assert_eq!(listing.repo, "ggml-org/llama.cpp");
+        assert_eq!(
+            (listing.release.as_str(), listing.tag.as_str()),
+            ("b12359", "b12359")
+        );
+        assert!(listing.missing.is_empty(), "{:?}", listing.missing);
+        assert_eq!(
+            listing.assets,
+            [
+                "cudart-llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                "cudart-llama-b12359-bin-ubuntu-cuda-13.5-arm64.tar.gz",
+                "cudart-llama-b12359-bin-ubuntu-cuda-13.5-x64.tar.gz",
+                "cudart-llama-bin-win-cuda-12.4-x64.zip",
+                "cudart-llama-bin-win-cuda-13.5-arm64.zip",
+                "cudart-llama-bin-win-cuda-13.5-x64.zip",
+                "llama-b12359-bin-macos-arm64.tar.gz",
+                "llama-b12359-bin-macos-x64.tar.gz",
+                "llama-b12359-bin-ubuntu-arm64.tar.gz",
+                "llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                "llama-b12359-bin-ubuntu-cuda-13.5-arm64.tar.gz",
+                "llama-b12359-bin-ubuntu-cuda-13.5-x64.tar.gz",
+                "llama-b12359-bin-ubuntu-rocm-10.0-x64.tar.gz",
+                "llama-b12359-bin-ubuntu-s390x.tar.gz",
+                "llama-b12359-bin-ubuntu-vulkan-arm64.tar.gz",
+                "llama-b12359-bin-ubuntu-vulkan-x64.tar.gz",
+                "llama-b12359-bin-ubuntu-x64.tar.gz",
+                "llama-b12359-bin-win-cpu-arm64.zip",
+                "llama-b12359-bin-win-cpu-x64.zip",
+                "llama-b12359-bin-win-cuda-12.4-x64.zip",
+                "llama-b12359-bin-win-cuda-13.5-arm64.zip",
+                "llama-b12359-bin-win-cuda-13.5-x64.zip",
+                "llama-b12359-bin-win-opencl-adreno-arm64.zip",
+                "llama-b12359-bin-win-rocm-10.0-x64.zip",
+                "llama-b12359-bin-win-vulkan-arm64.zip",
+                "llama-b12359-bin-win-vulkan-x64.zip",
+            ]
+        );
+    }
+
+    #[test]
+    fn host_assets_do_not_depend_on_the_order_of_the_release_listing() {
+        let mut reversed = b12359();
+        reversed.assets.reverse();
+        assert_eq!(
+            list_assets(DEFAULT_REPO, &reversed),
+            list_assets(DEFAULT_REPO, &b12359())
+        );
+    }
+
+    #[test]
+    fn a_mirror_listing_reports_the_prefixed_release_and_the_build_tag() {
+        let listing = list_assets(MIRROR, &b12359());
+        assert_eq!(listing.repo, MIRROR);
+        assert_eq!(listing.release, "llama.cpp-b12359");
+        assert_eq!(listing.tag, "b12359");
+        assert_eq!(listing.assets, list_assets(DEFAULT_REPO, &b12359()).assets);
+    }
+
+    #[test]
+    fn a_host_without_a_build_is_missing_not_an_error() {
+        let release =
+            b12359_without(|n| n.contains("ubuntu-vulkan-arm64") || n.contains("win-rocm"));
+        let listing = list_assets(DEFAULT_REPO, &release);
+        assert_eq!(listing.missing, ["linux-arm64-vulkan", "windows-x64-rocm"]);
+        assert_eq!(listing.assets.len(), 24);
+    }
+
+    #[test]
+    fn a_cuda_build_without_its_runtime_bundle_is_listed_as_missing_a_companion() {
+        let release = b12359_without(|n| n == "cudart-llama-bin-win-cuda-13.5-arm64.zip");
+        let listing = list_assets(DEFAULT_REPO, &release);
+        assert_eq!(listing.missing, ["windows-arm64-cuda-13/companion"]);
+        assert!(listing
+            .assets
+            .contains(&"llama-b12359-bin-win-cuda-13.5-arm64.zip".to_string()));
+    }
+
+    #[test]
+    fn a_release_with_none_of_the_assets_lists_every_host_as_missing() {
+        let release = b12359_without(|_| true);
+        let listing = list_assets(DEFAULT_REPO, &release);
+        assert!(listing.assets.is_empty());
+        assert_eq!(listing.missing.len(), HOSTS.len());
+    }
+
+    #[test]
+    fn the_listing_serializes_with_the_documented_keys() {
+        let json = serde_json::to_value(list_assets(MIRROR, &b12359())).unwrap();
+        let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["assets", "missing", "release", "repo", "tag"]);
+        assert_eq!(json["missing"], serde_json::json!([]));
+    }
+
+    // ----- per-host selection -----
+
+    /// The (primary, companion) names a host of `os`/`arch` with `gpu`
+    /// downloads from b12359.
+    fn pick(
+        os: HostOs,
+        arch: &'static str,
+        gpu: HostGpu,
+        glibc: Option<(u32, u32)>,
+    ) -> (Option<String>, Option<String>) {
+        let (descriptor, _) = select_host(os, arch, gpu, glibc);
+        selected(&b12359(), &descriptor.query().unwrap())
+    }
+
+    fn picked(primary: &str, companion: Option<&str>) -> (Option<String>, Option<String>) {
+        (Some(primary.into()), companion.map(str::to_owned))
+    }
+
+    /// DGX Spark (GB10: aarch64, CUDA 13 driver) gets the arm64 CUDA 13
+    /// build and its runtime bundle.
+    #[test]
+    fn a_dgx_spark_gets_the_ubuntu_cuda_13_arm64_build_and_cudart() {
+        let gpu = HostGpu::Cuda { major: 13 };
+        for glibc in [None, Some((2, 39))] {
+            assert_eq!(
+                pick(HostOs::Linux, "arm64", gpu, glibc),
+                picked(
+                    "llama-b12359-bin-ubuntu-cuda-13.5-arm64.tar.gz",
+                    Some("cudart-llama-b12359-bin-ubuntu-cuda-13.5-arm64.tar.gz")
+                )
+            );
+        }
+        let (descriptor, why) = select_host(HostOs::Linux, "arm64", gpu, Some((2, 39)));
+        assert_eq!(descriptor.accel, Accel::Cuda(13));
+        assert_eq!(why, None);
+    }
+
+    /// An arm64 CUDA 12 driver has no build; it falls back to the CPU one.
+    #[test]
+    fn an_arm64_cuda_12_linux_host_falls_back_to_cpu_with_a_reason() {
+        let (descriptor, why) =
+            select_host(HostOs::Linux, "arm64", HostGpu::Cuda { major: 12 }, None);
+        assert_eq!(descriptor.accel, Accel::Cpu);
+        assert!(why.unwrap().contains("arm64 Linux CUDA 12"));
+        let (descriptor, why) = select_host(
+            HostOs::Linux,
+            "x64",
+            HostGpu::Cuda { major: 13 },
+            Some((2, 35)),
+        );
+        assert_eq!(descriptor.accel, Accel::Cpu);
+        assert!(why.unwrap().contains("glibc 2.38"));
+    }
+
+    /// A Blackwell laptop GPU (RTX PRO 500: CUDA 13 driver) on Windows x64.
+    #[test]
+    fn a_windows_blackwell_laptop_gets_the_win_cuda_13_x64_build_and_cudart() {
+        assert_eq!(
+            pick(HostOs::Windows, "x64", HostGpu::Cuda { major: 13 }, None),
+            picked(
+                "llama-b12359-bin-win-cuda-13.5-x64.zip",
+                Some("cudart-llama-bin-win-cuda-13.5-x64.zip")
+            )
+        );
+    }
+
+    #[test]
+    fn host_selection_per_os_arch_and_gpu() {
+        use HostGpu::*;
+        let linux = HostOs::Linux;
+        let win = HostOs::Windows;
+        let cuda = |major| Cuda { major };
+        for (os, arch, gpu, want) in [
+            (
+                HostOs::Macos,
+                "arm64",
+                None,
+                "llama-b12359-bin-macos-arm64.tar.gz",
+            ),
+            (
+                HostOs::Macos,
+                "arm64",
+                Metal,
+                "llama-b12359-bin-macos-arm64.tar.gz",
+            ),
+            (
+                HostOs::Macos,
+                "x64",
+                None,
+                "llama-b12359-bin-macos-x64.tar.gz",
+            ),
+            (linux, "x64", None, "llama-b12359-bin-ubuntu-x64.tar.gz"),
+            (linux, "arm64", None, "llama-b12359-bin-ubuntu-arm64.tar.gz"),
+            (linux, "s390x", None, "llama-b12359-bin-ubuntu-s390x.tar.gz"),
+            (
+                linux,
+                "x64",
+                Vulkan,
+                "llama-b12359-bin-ubuntu-vulkan-x64.tar.gz",
+            ),
+            (
+                linux,
+                "arm64",
+                Vulkan,
+                "llama-b12359-bin-ubuntu-vulkan-arm64.tar.gz",
+            ),
+            (
+                linux,
+                "x64",
+                Rocm,
+                "llama-b12359-bin-ubuntu-rocm-10.0-x64.tar.gz",
+            ),
+            (linux, "arm64", Rocm, "llama-b12359-bin-ubuntu-arm64.tar.gz"),
+            (linux, "x64", Opencl, "llama-b12359-bin-ubuntu-x64.tar.gz"),
+            (
+                linux,
+                "x64",
+                cuda(12),
+                "llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz",
+            ),
+            (
+                linux,
+                "x64",
+                cuda(13),
+                "llama-b12359-bin-ubuntu-cuda-13.5-x64.tar.gz",
+            ),
+            (
+                linux,
+                "x64",
+                cuda(14),
+                "llama-b12359-bin-ubuntu-cuda-13.5-x64.tar.gz",
+            ),
+            (
+                linux,
+                "arm64",
+                cuda(12),
+                "llama-b12359-bin-ubuntu-arm64.tar.gz",
+            ),
+            (win, "x64", None, "llama-b12359-bin-win-cpu-x64.zip"),
+            (win, "arm64", None, "llama-b12359-bin-win-cpu-arm64.zip"),
+            (win, "x64", Vulkan, "llama-b12359-bin-win-vulkan-x64.zip"),
+            (
+                win,
+                "arm64",
+                Vulkan,
+                "llama-b12359-bin-win-vulkan-arm64.zip",
+            ),
+            (win, "x64", Rocm, "llama-b12359-bin-win-rocm-10.0-x64.zip"),
+            (win, "arm64", Rocm, "llama-b12359-bin-win-cpu-arm64.zip"),
+            (
+                win,
+                "arm64",
+                Opencl,
+                "llama-b12359-bin-win-opencl-adreno-arm64.zip",
+            ),
+            (win, "x64", Opencl, "llama-b12359-bin-win-cpu-x64.zip"),
+            (
+                win,
+                "x64",
+                cuda(12),
+                "llama-b12359-bin-win-cuda-12.4-x64.zip",
+            ),
+            (
+                win,
+                "x64",
+                cuda(13),
+                "llama-b12359-bin-win-cuda-13.5-x64.zip",
+            ),
+            (
+                win,
+                "arm64",
+                cuda(12),
+                "llama-b12359-bin-win-cuda-13.5-arm64.zip",
+            ),
+            (
+                win,
+                "arm64",
+                cuda(13),
+                "llama-b12359-bin-win-cuda-13.5-arm64.zip",
+            ),
+            (
+                HostOs::Android,
+                "arm64",
+                None,
+                "llama-b12359-bin-android-arm64.tar.gz",
+            ),
+            (
+                HostOs::Android,
+                "arm64",
+                Vulkan,
+                "llama-b12359-bin-android-arm64.tar.gz",
+            ),
+        ] {
+            let got = pick(os, arch, gpu, Option::None).0;
+            assert_eq!(got.as_deref(), Some(want), "{os:?} {arch} {gpu:?}");
+        }
+    }
+
+    /// The patterns the table produced before it was shared, per host.
+    #[test]
+    fn host_queries_keep_their_patterns_and_labels() {
+        let q = |os, arch, accel| {
+            let q = host_query(os, arch, accel);
+            (q.must_contain, q.companion_must_contain, q.label)
+        };
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            q(HostOs::Macos, "arm64", Accel::Metal),
+            ("-bin-macos-arm64.tar.gz".into(), None, "metal".into())
+        );
+        assert_eq!(
+            q(HostOs::Macos, "x64", Accel::Cpu),
+            ("-bin-macos-x64.tar.gz".into(), None, "cpu".into())
+        );
+        assert_eq!(
+            q(HostOs::Linux, "x64", Accel::Rocm),
+            ("-bin-ubuntu-rocm-".into(), None, "rocm".into())
+        );
+        assert_eq!(
+            q(HostOs::Linux, "arm64", Accel::Cuda(13)),
+            (
+                "-bin-ubuntu-cuda-13.*-arm64.tar.gz".into(),
+                some("cudart-llama-{tag}-bin-ubuntu-cuda-13.*-arm64.tar.gz"),
+                "cuda-13".into()
+            )
+        );
+        assert_eq!(
+            q(HostOs::Windows, "x64", Accel::Cuda(12)),
+            (
+                "-bin-win-cuda-12.*-x64.zip".into(),
+                some("cudart-llama-bin-win-cuda-12.*-x64.zip"),
+                "cuda-12".into()
+            )
+        );
+        assert_eq!(
+            q(HostOs::Windows, "arm64", Accel::Opencl),
+            (
+                "-bin-win-opencl-adreno-arm64.zip".into(),
+                None,
+                "opencl".into()
+            )
+        );
+        assert_eq!(
+            q(HostOs::Android, "arm64", Accel::Cpu),
+            ("-bin-android-arm64.tar.gz".into(), None, "cpu".into())
+        );
+        assert!(host(HostOs::Macos, "arm64", Accel::Rocm).query().is_none());
     }
 
     /// Real end-to-end check against the actual GitHub API and a real

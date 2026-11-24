@@ -2406,6 +2406,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "toml_edit",
+ "tower",
  "tower-http",
  "walkdir",
  "webpki-roots",
