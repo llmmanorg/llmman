@@ -544,6 +544,24 @@ mod tests {
         assert_eq!(cuda_major_from_driver_version(0), 0);
     }
 
+    /// `cuDriverGetVersion` on the hosts whose builds llmman must pick: a
+    /// DGX Spark (GB10, aarch64) with driver 580+ reports CUDA 13.0 or later
+    /// (`nvidia-smi` shows "CUDA Version: 13.0"), and a Blackwell laptop
+    /// GPU (RTX PRO 500) on a current Windows driver reports 13.x.
+    #[test]
+    fn blackwell_drivers_report_cuda_13() {
+        for (host, driver_version) in [
+            ("DGX Spark GB10, driver 580", 13000),
+            ("DGX Spark GB10, driver 590", 13010),
+            ("RTX PRO 500 Blackwell laptop, Windows", 13020),
+            ("a driver of CUDA 13.5", 13050),
+        ] {
+            assert_eq!(cuda_major_from_driver_version(driver_version), 13, "{host}");
+        }
+        // The last driver generation before 13 still gets the CUDA 12 build.
+        assert_eq!(cuda_major_from_driver_version(12090), 12);
+    }
+
     #[test]
     fn vk_make_api_version_matches_the_vulkan_header_macro() {
         // VK_API_VERSION_1_2 per vulkan_core.h: VK_MAKE_API_VERSION(0, 1, 2, 0)

@@ -5349,66 +5349,122 @@ async fn record_prompt_logs_generation_requests_and_hands_the_body_on() {
     assert_eq!(entries[2].client.as_deref(), Some("test-agent/1"));
 }
 
+/// Every route that takes a generation body.
+const GENERATION_ROUTES: [&str; 8] = [
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/messages",
+    "/v1/responses",
+    "/v1/responses/input_tokens",
+    "/api/chat",
+    "/api/generate",
+    "/gemini/m/v1beta/models/m:generateContent",
+];
+
+/// The router answering `body` posted to `route` in memory, no socket.
+///
+/// A refused body must never cross loopback: the server answers 413 and
+/// closes with the rest of the upload unread, which resets the connection
+/// and, on Windows, discards the 413 the client has not read yet (a
+/// `send()` error on the 32 MiB test). The extractor and the logging
+/// middleware, which enforce the cap, run the same without a transport.
+async fn post_in_memory(
+    app: &Router,
+    route: &str,
+    body: axum::body::Body,
+) -> axum::http::StatusCode {
+    use tower::ServiceExt as _;
+    let mut request = axum::http::Request::builder()
+        .method("POST")
+        .uri(route)
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            1,
+        ))));
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
 /// Exercise the real router, including the logger that reads before handlers.
 #[tokio::test]
 async fn generation_routes_accept_large_bodies_and_keep_the_32_mib_cap() {
     let dir = tempfile::tempdir().unwrap();
     // Malformed JSON reaches parsing only if body extraction succeeds.
     let body = Bytes::from(vec![b' '; GENERATION_BODY_LIMIT_BYTES + 1]);
-    let client = Client::new();
+    for logging in [false, true] {
+        let mut inner = test_inner(dir.path().to_path_buf());
+        if logging {
+            inner.prompt_log = Some(dir.path().join("prompts.jsonl"));
+        }
+        let app = build_router(AppState(Arc::new(inner)), false);
+        for route in GENERATION_ROUTES {
+            for (size, too_large) in [
+                (GENERATION_BODY_LIMIT_BYTES, false),
+                (GENERATION_BODY_LIMIT_BYTES + 1, true),
+            ] {
+                // A known length is refused up front, an unknown one only
+                // once the stream passes the cap.
+                let bytes = body.slice(..size);
+                let streamed = axum::body::Body::from_stream(futures::stream::once({
+                    let bytes = bytes.clone();
+                    async { Ok::<_, std::io::Error>(bytes) }
+                }));
+                for (how, body) in [
+                    ("sized", axum::body::Body::from(bytes)),
+                    ("streamed", streamed),
+                ] {
+                    let status = post_in_memory(&app, route, body).await;
+                    // Spaces are not JSON, so an accepted body still fails in
+                    // the handler (400 or 500, depending on the route). It
+                    // must not be the limit's 413. One byte over must be.
+                    assert_eq!(
+                        status == StatusCode::PAYLOAD_TOO_LARGE,
+                        too_large,
+                        "{route}, logging={logging}, size={size}, {how}, status={status}"
+                    );
+                }
+            }
+        }
+        let show_body = || axum::body::Body::from(vec![b' '; 3 * 1024 * 1024]);
+        assert_eq!(
+            post_in_memory(&app, "/api/show", show_body()).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+}
+
+/// A body of exactly the cap crosses a real socket, which the in-memory
+/// test above does not exercise. Only accepted bodies go over the wire:
+/// the server reads all of them, so no connection is closed with upload
+/// left. Each request gets a fresh connection, never a pooled one the
+/// server may be closing.
+#[tokio::test]
+async fn a_body_of_the_32_mib_cap_is_accepted_over_a_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = Bytes::from(vec![b' '; GENERATION_BODY_LIMIT_BYTES]);
     for logging in [false, true] {
         let mut inner = test_inner(dir.path().to_path_buf());
         if logging {
             inner.prompt_log = Some(dir.path().join("prompts.jsonl"));
         }
         let url = serve_router(AppState(Arc::new(inner))).await;
-        for route in [
-            "/v1/chat/completions",
-            "/v1/completions",
-            "/v1/messages",
-            "/v1/responses",
-            "/v1/responses/input_tokens",
-            "/api/chat",
-            "/api/generate",
-            "/gemini/m/v1beta/models/m:generateContent",
-        ] {
-            for (size, too_large) in [
-                (GENERATION_BODY_LIMIT_BYTES, false),
-                (GENERATION_BODY_LIMIT_BYTES + 1, true),
-            ] {
-                // Stream without Content-Length so rejection follows the upload;
-                // early rejection can reset a still-uploading Windows client.
-                let bytes = body.slice(..size);
-                let response = client
-                    .post(format!("{url}{route}"))
-                    .header("content-type", "application/json")
-                    .body(reqwest::Body::wrap_stream(futures::stream::once(async {
-                        Ok::<_, std::io::Error>(bytes)
-                    })))
-                    .send()
-                    .await
-                    .unwrap();
-                let status = response.status();
-                // Spaces are not JSON, so an accepted body still fails in the
-                // handler (400 or 500, depending on the route). It must not
-                // be the limit's 413. One byte over the limit must be.
-                assert_eq!(
-                    status == StatusCode::PAYLOAD_TOO_LARGE,
-                    too_large,
-                    "{route}, logging={logging}, size={size}, status={status}"
-                );
-            }
-        }
-        let response = client
-            .post(format!("{url}/api/show"))
+        let client = Client::builder().pool_max_idle_per_host(0).build().unwrap();
+        let bytes = body.clone();
+        let status = client
+            .post(format!("{url}/v1/chat/completions"))
             .header("content-type", "application/json")
             .body(reqwest::Body::wrap_stream(futures::stream::once(async {
-                Ok::<_, std::io::Error>(Bytes::from(vec![b' '; 3 * 1024 * 1024]))
+                Ok::<_, std::io::Error>(bytes)
             })))
             .send()
             .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            .unwrap()
+            .status();
+        assert_ne!(status, StatusCode::PAYLOAD_TOO_LARGE, "logging={logging}");
     }
 }
 

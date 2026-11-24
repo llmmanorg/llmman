@@ -152,6 +152,8 @@ aws-smithy-types = "1"
 # Shared-listener and pinned-upstream TLS tests generate short-lived identities
 # instead of storing a private key in the repository.
 rcgen = "0.14"
+# `oneshot` drives the router in memory (serve tests that must not cross a socket).
+tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
 flate2 = "1"

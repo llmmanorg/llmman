@@ -395,8 +395,28 @@ fn taskkill(pid: u32, force: bool) {
 /// stays a plain, model-agnostic `llmman serve` (only `launch` still
 /// preloads, since its whole point is warming up one model for the
 /// integration it's about to hand off to).
+///
+/// With `LLMMAN_NO_AUTOSTART` set, a server that does not answer is an error
+/// instead of a spawn: whoever manages the daemon (sbx) must never get a
+/// second one with this process's environment.
 pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
+    if crate::env_flag_set(NO_AUTOSTART_VAR) {
+        return require_server(server_alive(), &server());
+    }
     ensure_server_with_args(preload_model, &[])
+}
+
+/// `LLMMAN_NO_AUTOSTART`: client commands only talk to a running server.
+pub const NO_AUTOSTART_VAR: &str = "LLMMAN_NO_AUTOSTART";
+
+fn require_server(alive: bool, server: &str) -> anyhow::Result<()> {
+    if alive {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "no llmman server answers at {server} and {NO_AUTOSTART_VAR} is set, so none is \
+         started. Start `llmman serve` (or unset {NO_AUTOSTART_VAR})"
+    )
 }
 
 /// Like [`ensure_server`], forwarding additional `serve` options only when
@@ -1817,6 +1837,18 @@ fn encode_path_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_autostart_turns_a_missing_server_into_an_error_naming_the_address() {
+        assert!(require_server(true, "http://127.0.0.1:1").is_ok());
+        let err = require_server(false, "http://127.0.0.1:1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("http://127.0.0.1:1") && err.contains(NO_AUTOSTART_VAR),
+            "{err}"
+        );
+    }
 
     #[test]
     fn daemon_identity_requires_llmman_fields() {

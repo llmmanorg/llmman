@@ -151,6 +151,8 @@ Environment Variables:
       LLMMAN_LOAD_TIMEOUT            How long to allow model loads to stall before giving up (default \"20m\")
       LLMMAN_VLLM_OMNI_GUARDRAILS    Keep a Diffusers-layout model's vLLM-Omni safety guardrails on (default: off)
       LLMMAN_TMPDIR                  Staging directory for llama-server release downloads
+      LLMMAN_LLAMA_CPP_REPO          GitHub <owner>/<repo> to download llama.cpp release assets from (default ggml-org/llama.cpp); a mirror tags build b12359 as llama.cpp-b12359 and has no `latest`
+      LLMMAN_NO_AUTOSTART            Client commands never start a daemon: they fail when no server answers
       LLAMA_ARG_FIT                  Enable llama.cpp automatic fit of unset memory options (default \"on\")
       LLAMA_ARG_FIT_TARGET           Target free VRAM margin per device for llama.cpp fit (MiB)
       LLAMA_ARG_THREADS              Thread count for llama-server (default: half the available CPUs above 8, else all of them)

@@ -613,3 +613,103 @@ fn run_uses_the_model_name_as_typed_with_an_ollama_at_llmman_host() {
         "{seen:?}"
     );
 }
+
+/// A loopback address nothing listens on.
+fn closed_addr() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().to_string()
+}
+
+/// With `LLMMAN_NO_AUTOSTART` set, client commands fail when no server
+/// answers instead of starting a daemon of their own.
+#[test]
+fn no_autostart_makes_client_commands_fail_without_spawning_a_daemon() {
+    let addr = closed_addr();
+    for args in [
+        &["pull", "all-minilm:22m"][..],
+        &["push", "all-minilm:22m"],
+        &["list", "--provider", "openai"],
+        &["providers"],
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let out = llmman_at(&addr, home.path())
+            .args(args)
+            .env("LLMMAN_NO_AUTOSTART", "1")
+            .output()
+            .expect("spawn llmman");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("LLMMAN_NO_AUTOSTART") && stderr.contains(&addr),
+            "{args:?}: {stderr}"
+        );
+        assert!(!spawned_a_daemon(home.path()), "{args:?}");
+        assert!(
+            std::net::TcpStream::connect(&addr).is_err(),
+            "{args:?}: something started listening"
+        );
+    }
+}
+
+/// `LLMMAN_NO_AUTOSTART` only forbids starting: a running server is used.
+#[test]
+fn no_autostart_still_uses_a_running_server() {
+    let home = tempfile::tempdir().unwrap();
+    let (addr, seen) = fake_ollama();
+    let out = llmman_at(&addr, home.path())
+        .args(["pull", "all-minilm:22m"])
+        .env("LLMMAN_NO_AUTOSTART", "1")
+        .output()
+        .expect("spawn llmman");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["POST /api/pull {\"model\":\"all-minilm:22m\"}"]
+    );
+}
+
+#[test]
+fn llama_cpp_assets_is_listed_in_the_help() {
+    let out = llmman().arg("--help").output().expect("spawn llmman");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.trim_start().starts_with("llama-cpp-assets ")),
+        "{stdout}"
+    );
+    let out = llmman()
+        .args(["llama-cpp-assets", "--help"])
+        .output()
+        .expect("spawn llmman");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("--llama-cpp-version") && stdout.contains("--json"),
+        "{stdout}"
+    );
+}
+
+/// Repo and pin errors come before any network access.
+#[test]
+fn llama_cpp_assets_rejects_a_bad_repo_and_latest_from_a_mirror() {
+    for (repo, args, needle) in [
+        ("not-a-repo", &[][..], "<owner>/<repo>"),
+        ("a/b/c", &["--json"][..], "<owner>/<repo>"),
+        (
+            "docker/sbx-releases",
+            &["--llama-cpp-version", "latest"][..],
+            "mirrors are pinned",
+        ),
+    ] {
+        let out = llmman()
+            .arg("llama-cpp-assets")
+            .args(args)
+            .env("LLMMAN_LLAMA_CPP_REPO", repo)
+            .output()
+            .expect("spawn llmman");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{repo}: {stderr}");
+        assert!(stderr.contains(needle), "{repo}: {stderr}");
+        assert!(out.stdout.is_empty(), "{repo}");
+    }
+}
