@@ -189,6 +189,11 @@ pub fn sdpa_gqa<'g>(
     }
 }
 
+/// `silu(gate) * up`.
+pub fn swiglu<'g>(g: &'g Graph<'g>, gate: Tensor<'g>, up: Tensor<'g>) -> Tensor<'g> {
+    g.mul(g.silu(gate), up)
+}
+
 /// `Cosmos3VLTextMLP`: `down(silu(gate) * up)` or `down(relu(up)^2)`.
 fn mlp<'g>(
     g: &'g Graph<'g>,
@@ -202,7 +207,7 @@ fn mlp<'g>(
         g.sqr(g.clamp(up, 0.0, f32::INFINITY))
     } else {
         let gate = g.linear(x, w.get(&format!("{prefix}.gate_proj.weight"))?, None);
-        g.mul(g.silu(gate), up)
+        swiglu(g, gate, up)
     };
     Ok(g.linear(h, w.get(&format!("{prefix}.down_proj.weight"))?, None))
 }
