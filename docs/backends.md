@@ -87,6 +87,10 @@ container, and the daemon logs a warning when `--no-hardened` is given
 there. Each container run gets, before the engine's own flags:
 
 - `--cap-drop all` and `--security-opt no-new-privileges`;
+- on Linux, `--security-opt label=disable` as well, so an SELinux host lets
+  the container read the mounted store and model, as the
+  [sandbox](sandbox.md) does (relabelling with `:z` would rewrite the
+  labels of your own files instead);
 - `--read-only`, except for a container that passes `--gpus` (see below);
 - one `--tmpfs <path>:exec` per path the engine writes to. The `:exec`
   suffix is needed on both docker and podman, since both mount a `--tmpfs`

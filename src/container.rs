@@ -1426,16 +1426,20 @@ fn device_gids() -> Vec<u32> {
     Vec::new()
 }
 
+/// Whether the daemon runs on Linux, where the container engine may sit
+/// behind SELinux: the `linux` of [`hardened_args`].
+const LINUX: bool = cfg!(target_os = "linux");
+
 /// The hardened block of a `run` argv: [`hardened_args`] for
-/// `engine_args` (read-only unless they pass `--gpus`) and `tmpfs`, then
-/// `user`'s flags ([`HardenedUser::args`], with the device groups when
-/// `engine_args` pass a device).
+/// `engine_args` (read-only unless they pass `--gpus`) and `tmpfs` on
+/// this host, then `user`'s flags ([`HardenedUser::args`], with the
+/// device groups when `engine_args` pass a device).
 fn hardened_flags(
     engine_args: &[String],
     tmpfs: &[&str],
     user: Option<&HardenedUser>,
 ) -> Vec<String> {
-    let mut args = hardened_args(!passes_gpus(engine_args), tmpfs);
+    let mut args = hardened_args(!passes_gpus(engine_args), LINUX, tmpfs);
     if let Some(user) = user {
         args.extend(user.args(passes_devices(engine_args)));
     }
@@ -1550,22 +1554,31 @@ pub(crate) fn spawn_hardened_note(
 }
 
 /// The hardened `run` flags: every capability dropped, no privilege
-/// gain through setuid binaries, and (`read_only`) a read-only rootfs
-/// with a tmpfs on each of `tmpfs`. Each tmpfs gets `exec`: docker and
-/// podman both mount `--tmpfs` `noexec` by default, and vLLM's
-/// inductor and Triton load compiled `.so` files out of their caches.
+/// gain through setuid binaries, (`linux`) no SELinux labelling, and
+/// (`read_only`) a read-only rootfs with a tmpfs on each of `tmpfs`.
+/// Each tmpfs gets `exec`: docker and podman both mount `--tmpfs`
+/// `noexec` by default, and vLLM's inductor and Triton load compiled
+/// `.so` files out of their caches.
+///
+/// `--security-opt label=disable` lets a container on an SELinux host
+/// read the read-only model and store mounts without relabelling the
+/// user's files (`:z`), as the launch sandbox does (`docs/sandbox.md`,
+/// SELinux). It goes on docker and podman alike, as there.
 ///
 /// `read_only` is off for a container that passes `--gpus`: crun before
 /// 1.26 applies the read-only remount before the NVIDIA toolkit's
 /// createContainer hooks write `/etc` and `/usr/lib64`
 /// (NVIDIA/nvidia-container-toolkit#2131, containers/crun#1924).
-pub(crate) fn hardened_args(read_only: bool, tmpfs: &[&str]) -> Vec<String> {
+pub(crate) fn hardened_args(read_only: bool, linux: bool, tmpfs: &[&str]) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--cap-drop".into(),
         "all".into(),
         "--security-opt".into(),
         "no-new-privileges".into(),
     ];
+    if linux {
+        args.extend(["--security-opt".into(), "label=disable".into()]);
+    }
     if read_only {
         args.push("--read-only".into());
     }
@@ -2511,7 +2524,7 @@ mod tests {
         tmpfs: &[&str],
         engine_args: &[String],
     ) {
-        let mut expected = hardened_args(read_only, tmpfs);
+        let mut expected = hardened_args(read_only, LINUX, tmpfs);
         expected.extend(engine_args.iter().cloned());
         assert_eq!(
             &args[prefix_len..prefix_len + expected.len()],
@@ -2647,7 +2660,7 @@ mod tests {
             Some(&gpu_user),
             LLAMA_TMPFS,
         );
-        let mut expected = hardened_args(true, LLAMA_TMPFS);
+        let mut expected = hardened_args(true, LINUX, LLAMA_TMPFS);
         expected.extend(gpu_user.args(true));
         expected.extend(engine_args);
         assert_eq!(
@@ -2728,11 +2741,11 @@ mod tests {
     #[test]
     fn hardened_note_names_the_flags_and_the_opt_out() {
         assert_eq!(
-            hardened_note(&hardened_args(true, LLAMA_TMPFS), None, Some(&user(&[]))),
+            hardened_note(&hardened_args(true, false, LLAMA_TMPFS), None, Some(&user(&[]))),
             "started hardened (--cap-drop all --security-opt no-new-privileges --read-only --tmpfs /tmp:exec); --no-hardened turns these flags off"
         );
         assert_eq!(
-            hardened_note(&hardened_args(false, LLAMA_TMPFS), Some("/srv/store"), Some(&user(&[]))),
+            hardened_note(&hardened_args(false, false, LLAMA_TMPFS), Some("/srv/store"), Some(&user(&[]))),
             "started hardened (--cap-drop all --security-opt no-new-privileges --tmpfs /tmp:exec); setfacl -R -m u:1000:rX /srv/store lets the container read it as uid 1000, and --no-hardened turns these flags off"
         );
     }
@@ -2741,7 +2754,11 @@ mod tests {
     fn hardened_note_without_a_user_or_as_root_names_the_image_user() {
         let image_user = "started hardened (--cap-drop all --security-opt no-new-privileges --tmpfs /tmp:exec); /srv/store must be readable by the user the container runs as, and --no-hardened turns these flags off";
         assert_eq!(
-            hardened_note(&hardened_args(false, LLAMA_TMPFS), Some("/srv/store"), None),
+            hardened_note(
+                &hardened_args(false, false, LLAMA_TMPFS),
+                Some("/srv/store"),
+                None
+            ),
             image_user
         );
         let root = HardenedUser {
@@ -2751,7 +2768,7 @@ mod tests {
         };
         assert_eq!(
             hardened_note(
-                &hardened_args(false, LLAMA_TMPFS),
+                &hardened_args(false, false, LLAMA_TMPFS),
                 Some("/srv/store"),
                 Some(&root)
             ),
@@ -2767,7 +2784,7 @@ mod tests {
             assert_eq!(
                 speech,
                 hardened_note(
-                    &hardened_args(true, &llama_tmpfs(&SPEECH_BACKEND.engine_args())),
+                    &hardened_args(true, LINUX, &llama_tmpfs(&SPEECH_BACKEND.engine_args())),
                     Some("/srv/store"),
                     None
                 )
@@ -2798,7 +2815,7 @@ mod tests {
             HardenedSpawn::Vllm.note(GpuBackend::Rocm, Some(&gpu_user), &scratch, "/srv/store");
         let expected = format!(
             "started hardened ({} --user 1000:1000 --group-add 44 -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e XDG_CONFIG_HOME=/tmp/.config -e TRITON_CACHE_DIR=/tmp/.triton -e USER=llmman -e LOGNAME=llmman --tmpfs /run/vllm:exec --tmpfs /var/vllm:exec); setfacl -R -m u:1000:rX /srv/store lets the container read it as uid 1000, and --no-hardened turns these flags off",
-            hardened_args(true, ENGINE_TMPFS).join(" ")
+            hardened_args(true, LINUX, ENGINE_TMPFS).join(" ")
         );
         assert_eq!(vllm, expected);
         // SGLang never gets the scratch tmpfs; the CPU backend passes no device.
@@ -2823,7 +2840,7 @@ mod tests {
     #[test]
     fn hardened_args_drop_caps_and_mount_each_tmpfs() {
         assert_eq!(
-            hardened_args(true, &["/tmp", "/root/.cache"]),
+            hardened_args(true, false, &["/tmp", "/root/.cache"]),
             [
                 "--cap-drop",
                 "all",
@@ -2836,13 +2853,47 @@ mod tests {
                 "/root/.cache:exec",
             ]
         );
-        let gpu = hardened_args(false, &["/tmp"]);
+        let gpu = hardened_args(false, false, &["/tmp"]);
         assert!(!gpu.contains(&"--read-only".to_string()), "{gpu:?}");
         assert_eq!(
             &gpu[..4],
             ["--cap-drop", "all", "--security-opt", "no-new-privileges"]
         );
         assert_eq!(&gpu[4..], ["--tmpfs", "/tmp:exec"]);
+    }
+
+    /// On Linux the block also disables SELinux labelling, right after
+    /// `no-new-privileges` so the rest keeps its shape; elsewhere the
+    /// flag is absent.
+    #[test]
+    fn hardened_args_disable_selinux_labelling_on_linux_only() {
+        assert_eq!(
+            hardened_args(true, true, &["/tmp"]),
+            [
+                "--cap-drop",
+                "all",
+                "--security-opt",
+                "no-new-privileges",
+                "--security-opt",
+                "label=disable",
+                "--read-only",
+                "--tmpfs",
+                "/tmp:exec",
+            ]
+        );
+        let other = hardened_args(true, false, &["/tmp"]);
+        assert!(!other.contains(&"label=disable".to_string()), "{other:?}");
+        assert_eq!(
+            hardened_args(false, true, &[]),
+            [
+                "--cap-drop",
+                "all",
+                "--security-opt",
+                "no-new-privileges",
+                "--security-opt",
+                "label=disable",
+            ]
+        );
     }
 
     #[test]
@@ -3091,7 +3142,7 @@ mod tests {
             assert_hardened_between(&args, 6, read_only, &tmpfs, &backend.engine_args());
             // Only the hardened flags differ from the `--no-hardened` argv.
             let mut off = worker_args(backend, false);
-            off.splice(6..6, hardened_args(read_only, &tmpfs));
+            off.splice(6..6, hardened_args(read_only, LINUX, &tmpfs));
             assert_eq!(args, off, "{backend:?}");
         }
     }
