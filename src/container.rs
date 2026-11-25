@@ -1136,17 +1136,29 @@ fn llama_tmpfs(engine_args: &[String]) -> Vec<&'static str> {
     tmpfs
 }
 
-/// The `--tmpfs` value for a forwarded `VLLM_RPC_BASE_PATH` (`value`),
-/// the directory vLLM's multiprocessing mode puts its IPC sockets in:
-/// under hardening the rootfs is read-only, so the path must be writable
-/// or every request would fail. `None` when the variable is unset or
-/// already under one of `tmpfs_roots` ([`ENGINE_TMPFS`]); `Some("<value>:exec")`
-/// for another absolute path; `Err` for a relative or empty value, which
-/// vLLM would resolve against its working directory on the read-only
-/// rootfs, for one containing `:` or `,`, which `--tmpfs` would read as
-/// mount options, and for one with a `..` segment, which could resolve
-/// under a `tmpfs_roots` entry after the check here said it did not.
-pub(crate) fn vllm_rpc_tmpfs(
+/// The vLLM variables naming a directory it writes at run time: the IPC
+/// socket directory of its multiprocessing mode, its download and
+/// compile cache root, and its config root (the usage-stats file). Each
+/// gets a [`vllm_scratch_tmpfs`] mount under hardening.
+pub(crate) const VLLM_SCRATCH_VARS: [&str; 3] =
+    ["VLLM_RPC_BASE_PATH", "VLLM_CACHE_ROOT", "VLLM_CONFIG_ROOT"];
+
+/// The `--tmpfs` value for a forwarded scratch variable `name` (one of
+/// [`VLLM_SCRATCH_VARS`]) set to `value`: under hardening the rootfs is
+/// read-only, so the directory must be writable or vLLM fails at start
+/// or on every request. `None` when the variable is unset or already
+/// under one of `tmpfs_roots` ([`ENGINE_TMPFS`]); `Some("<value>:exec")`
+/// for another absolute path, cleaned of repeated slashes and `.`
+/// segments so two spellings of one directory dedupe (the runtimes clean
+/// the path and refuse a duplicate); `Err` for a relative or empty value,
+/// which vLLM would resolve against its working directory on the
+/// read-only rootfs, for one containing `:` or `,`, which `--tmpfs` would
+/// read as mount options, for one with a `..` segment, which could
+/// resolve under a `tmpfs_roots` entry after the check here said it did
+/// not, for `/` itself, and for one under [`ENGINE_MODEL_DIR`], which is
+/// mounted read-only.
+pub(crate) fn vllm_scratch_tmpfs(
+    name: &str,
     value: Option<&str>,
     tmpfs_roots: &[&str],
 ) -> Result<Option<String>, String> {
@@ -1155,7 +1167,7 @@ pub(crate) fn vllm_rpc_tmpfs(
     };
     if !value.starts_with('/') {
         return Err(format!(
-            "VLLM_RPC_BASE_PATH must be an absolute path under hardening, got {value:?}; \
+            "{name} must be an absolute path under hardening, got {value:?}; \
              unset it or pass --no-hardened"
         ));
     }
@@ -1164,34 +1176,66 @@ pub(crate) fn vllm_rpc_tmpfs(
     // options or truncate the mount.
     if value.contains([':', ',']) || value.split('/').any(|s| s == "..") {
         return Err(format!(
-            "VLLM_RPC_BASE_PATH must not contain ':', ',' or a '..' segment under hardening, \
+            "{name} must not contain ':', ',' or a '..' segment under hardening, \
              got {value:?}; unset it or pass --no-hardened"
         ));
     }
-    let mounted = tmpfs_roots.iter().any(|root| {
-        value == *root
-            || value
+    let segments: Vec<&str> = value
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    if segments.is_empty() {
+        return Err(format!(
+            "{name} must not be the root directory under hardening, got {value:?}; \
+             unset it or pass --no-hardened"
+        ));
+    }
+    let path = format!("/{}", segments.join("/"));
+    let under = |root: &str| {
+        path == root
+            || path
                 .strip_prefix(root)
                 .is_some_and(|rest| rest.starts_with('/'))
-    });
-    Ok((!mounted).then(|| format!("{value}:exec")))
+    };
+    if under(ENGINE_MODEL_DIR) {
+        return Err(format!(
+            "{name} must not point under {ENGINE_MODEL_DIR}, the read-only model mount, \
+             got {value:?}; unset it or point it elsewhere"
+        ));
+    }
+    let mounted = tmpfs_roots.iter().any(|root| under(root));
+    Ok((!mounted).then(|| format!("{path}:exec")))
 }
 
-/// [`vllm_rpc_tmpfs`] for [`spawn_engine`]: `VLLM_RPC_BASE_PATH` (read
-/// by `rpc_base`) only reaches a container whose forwarded prefix
-/// (`env_prefix`, from [`ContainerEngine::launcher`]) is `VLLM_`, so an
-/// SGLang container neither needs the tmpfs nor can fail on the value;
-/// `None` too when not `hardened`, where the rootfs is writable.
-fn engine_rpc_tmpfs(
+/// The [`vllm_scratch_tmpfs`] mounts of [`VLLM_SCRATCH_VARS`] (each read
+/// through `env`) in list order, one per distinct path: two variables
+/// pointing at the same directory share a mount, as podman refuses a
+/// duplicate mount destination. Empty when not `hardened`, where the
+/// rootfs is writable, or when the forwarded prefix (`env_prefix`, from
+/// [`ContainerEngine::launcher`]) is not `VLLM_`: the variables never
+/// reach an SGLang container, so it neither needs a mount nor can fail
+/// on a value. The first malformed value fails the whole list.
+fn engine_scratch_tmpfs(
     env_prefix: &str,
     hardened: bool,
-    rpc_base: impl FnOnce() -> Option<String>,
-) -> Result<Option<String>, String> {
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<String>, String> {
+    let mut mounts = Vec::new();
     if !hardened || env_prefix != "VLLM_" {
-        return Ok(None);
+        return Ok(mounts);
     }
-    vllm_rpc_tmpfs(rpc_base().as_deref(), ENGINE_TMPFS)
+    for name in VLLM_SCRATCH_VARS {
+        if let Some(mount) = vllm_scratch_tmpfs(name, env(name).as_deref(), ENGINE_TMPFS)? {
+            if !mounts.contains(&mount) {
+                mounts.push(mount);
+            }
+        }
+    }
+    Ok(mounts)
 }
+
+/// Where a vLLM or SGLang container sees the model directory (read-only).
+const ENGINE_MODEL_DIR: &str = "/models";
 
 /// The writable paths a hardened vLLM or SGLang container needs: the
 /// vLLM cache root and RPC sockets (`/root/.cache`, `/tmp`), Triton's
@@ -1403,12 +1447,12 @@ fn hardened_flags(
 /// unreadable once `--cap-drop all` removes CAP_DAC_OVERRIDE from the
 /// container's root) names them and the fixes: `flags` the hardened
 /// part of the argv the container was run with ([`hardened_flags`], plus
-/// the [`vllm_rpc_tmpfs`] mount when one was added), `mounted` the store
-/// or cache directory it read (`None` for a run mounting nothing), and
-/// `user` the `--user` the run carried: a non-root uid gets a `setfacl`
-/// hint granting that uid read access; no `--user` or uid 0 (which
-/// rootless docker maps to the host user) is told the path must be
-/// readable by the user the container runs as.
+/// the [`engine_scratch_tmpfs`] mounts when any were added), `mounted`
+/// the store or cache directory it read (`None` for a run mounting
+/// nothing), and `user` the `--user` the run carried: a non-root uid
+/// gets a `setfacl` hint granting that uid read access; no `--user` or
+/// uid 0 (which rootless docker maps to the host user) is told the path
+/// must be readable by the user the container runs as.
 pub(crate) fn hardened_note(
     flags: &[String],
     mounted: Option<&str>,
@@ -1431,8 +1475,8 @@ pub(crate) fn hardened_note(
 
 /// Which hardened container a [`spawn_hardened_note`] describes: vLLM
 /// ([`spawn_engine`] with a `VLLM_` prefix) mounts [`ENGINE_TMPFS`] plus
-/// the [`vllm_rpc_tmpfs`] and follows the host backend's `--gpus`;
-/// SGLang the same without the RPC tmpfs; a llama.cpp container
+/// the [`engine_scratch_tmpfs`] and follows the host backend's `--gpus`;
+/// SGLang the same without the scratch tmpfs; a llama.cpp container
 /// ([`spawn`], or [`spawn_mediagen`] with the detected backend) mounts
 /// [`LLAMA_TMPFS`] and follows the same probe; the speech worker
 /// ([`spawn_mediagen`] with [`SPEECH_BACKEND`]) never passes a GPU, so
@@ -1448,14 +1492,14 @@ pub(crate) enum HardenedSpawn {
 impl HardenedSpawn {
     /// [`hardened_note`] with the flags [`run_args`] applied for this
     /// container on a host whose probe returned `host`, run as `user`
-    /// ([`HardenedUser::resolve`]), with `rpc_tmpfs` the
-    /// [`vllm_rpc_tmpfs`] value (used by [`HardenedSpawn::Vllm`] only),
-    /// reading `mounted`.
+    /// ([`HardenedUser::resolve`]), with `scratch_tmpfs` the
+    /// [`engine_scratch_tmpfs`] mounts (used by [`HardenedSpawn::Vllm`]
+    /// only), reading `mounted`.
     fn note(
         self,
         host: GpuBackend,
         user: Option<&HardenedUser>,
-        rpc_tmpfs: Option<&str>,
+        scratch_tmpfs: &[String],
         mounted: &str,
     ) -> String {
         let mut flags = match self {
@@ -1473,8 +1517,10 @@ impl HardenedSpawn {
                 hardened_flags(&engine_args, &llama_tmpfs(&engine_args), user)
             }
         };
-        if let (Self::Vllm, Some(tmpfs)) = (self, rpc_tmpfs) {
-            flags.extend(["--tmpfs".to_string(), tmpfs.to_string()]);
+        if self == Self::Vllm {
+            for tmpfs in scratch_tmpfs {
+                flags.extend(["--tmpfs".to_string(), tmpfs.clone()]);
+            }
         }
         hardened_note(&flags, Some(mounted), user)
     }
@@ -1485,24 +1531,20 @@ impl HardenedSpawn {
 /// backend the container was given at spawn time, not only the host
 /// probe; the `--user` block is resolved again for `mounted`, the
 /// directory the spawn mounted and resolved its own `--user` against;
-/// the RPC tmpfs follows `VLLM_RPC_BASE_PATH` as [`spawn_engine`] read
-/// it).
+/// the scratch tmpfs follow [`VLLM_SCRATCH_VARS`] as [`spawn_engine`]
+/// read them, a malformed value dropping that run's list).
 pub(crate) fn spawn_hardened_note(
     spawn: HardenedSpawn,
     ociman: ContainerManager,
     mounted: &Path,
 ) -> String {
     let user = HardenedUser::resolve(ociman, Some(mounted));
-    let rpc_tmpfs = vllm_rpc_tmpfs(
-        std::env::var("VLLM_RPC_BASE_PATH").ok().as_deref(),
-        ENGINE_TMPFS,
-    )
-    .ok()
-    .flatten();
+    let scratch_tmpfs =
+        engine_scratch_tmpfs("VLLM_", true, |name| std::env::var(name).ok()).unwrap_or_default();
     spawn.note(
         detect_backend(),
         user.as_ref(),
-        rpc_tmpfs.as_deref(),
+        &scratch_tmpfs,
         &mounted.display().to_string(),
     )
 }
@@ -1602,10 +1644,8 @@ pub fn spawn_engine(
         })
         .collect();
     let vars: Vec<&str> = vars.iter().map(String::as_str).collect();
-    let rpc_tmpfs = engine_rpc_tmpfs(env_prefix, hardened, || {
-        std::env::var("VLLM_RPC_BASE_PATH").ok()
-    })
-    .map_err(anyhow::Error::msg)?;
+    let scratch_tmpfs = engine_scratch_tmpfs(env_prefix, hardened, |name| std::env::var(name).ok())
+        .map_err(anyhow::Error::msg)?;
     let user = hardened
         .then(|| HardenedUser::resolve(ociman, Some(Path::new(&model_dir))))
         .flatten();
@@ -1622,7 +1662,7 @@ pub fn spawn_engine(
         ociman,
         engine_run_args(
             prefix,
-            rpc_tmpfs.as_deref(),
+            &scratch_tmpfs,
             image,
             launcher,
             &model_dir,
@@ -1643,29 +1683,29 @@ fn mount_source(dir: &Path) -> Result<String> {
 }
 
 /// [`spawn_engine`]'s argv after [`run_args`]'s `run` prefix, split out
-/// so the ordering (`rpc_tmpfs` from [`vllm_rpc_tmpfs`], then
+/// so the ordering (`scratch_tmpfs` from [`engine_scratch_tmpfs`], then
 /// `-v`/`--entrypoint` before the image, the launcher's rest and serve
 /// flags after) is testable without an engine.
 fn engine_run_args(
     mut args: Vec<String>,
-    rpc_tmpfs: Option<&str>,
+    scratch_tmpfs: &[String],
     image: String,
     launcher: &[&str],
     model_dir: &str,
     serve_args: impl FnOnce(&str, &str) -> Vec<String>,
 ) -> Vec<String> {
-    if let Some(tmpfs) = rpc_tmpfs {
-        args.extend(["--tmpfs".to_string(), tmpfs.to_string()]);
+    for tmpfs in scratch_tmpfs {
+        args.extend(["--tmpfs".to_string(), tmpfs.clone()]);
     }
     args.extend([
         "-v".into(),
-        format!("{model_dir}:/models:ro"),
+        format!("{model_dir}:{ENGINE_MODEL_DIR}:ro"),
         "--entrypoint".into(),
         launcher[0].into(),
         image,
     ]);
     args.extend(launcher[1..].iter().map(|a| a.to_string()));
-    args.extend(serve_args("/models", "0.0.0.0"));
+    args.extend(serve_args(ENGINE_MODEL_DIR, "0.0.0.0"));
     args
 }
 
@@ -2312,7 +2352,7 @@ mod tests {
                 None,
                 &[],
             ),
-            None,
+            &[],
             "docker.io/lmsysorg/sglang:latest".into(),
             launcher,
             "/cache/abc/model",
@@ -2384,7 +2424,7 @@ mod tests {
                 None,
                 &[],
             ),
-            None,
+            &[],
             "docker.io/vllm/vllm-openai:latest-x86_64".into(),
             launcher,
             "/cache/abc/model",
@@ -2722,7 +2762,7 @@ mod tests {
     #[test]
     fn speech_worker_note_is_read_only_on_a_gpu_host() {
         for host in [GpuBackend::Cuda13, GpuBackend::Vulkan] {
-            let speech = HardenedSpawn::Speech.note(host, None, None, "/srv/store");
+            let speech = HardenedSpawn::Speech.note(host, None, &[], "/srv/store");
             assert!(speech.contains("--read-only"), "{host:?}: {speech}");
             assert_eq!(
                 speech,
@@ -2736,40 +2776,34 @@ mod tests {
                 speech.contains("/srv/store must be readable by the user the container runs as"),
                 "{speech}"
             );
-            let llama = HardenedSpawn::LlamaServer.note(host, None, None, "/srv/store");
+            let llama = HardenedSpawn::LlamaServer.note(host, None, &[], "/srv/store");
             assert_eq!(
                 llama.contains("--read-only"),
                 !passes_gpus(&host.engine_args()),
                 "{host:?}: {llama}"
             );
-            let vllm = HardenedSpawn::Vllm.note(host, None, None, "/srv/store");
+            let vllm = HardenedSpawn::Vllm.note(host, None, &[], "/srv/store");
             assert!(vllm.contains("/root/.triton:exec"), "{host:?}: {vllm}");
         }
     }
 
     #[test]
-    fn spawn_note_carries_the_user_block_and_the_rpc_tmpfs_the_argv_had() {
+    fn spawn_note_carries_the_user_block_and_the_scratch_tmpfs_the_argv_had() {
         let gpu_user = user(&[44]);
-        // ROCm passes `--device`, so the note has the group too; the RPC
-        // tmpfs lands after the user block, as in `engine_run_args`.
-        let vllm = HardenedSpawn::Vllm.note(
-            GpuBackend::Rocm,
-            Some(&gpu_user),
-            Some("/run/vllm:exec"),
-            "/srv/store",
-        );
+        let scratch = ["/run/vllm:exec".to_string(), "/var/vllm:exec".to_string()];
+        // ROCm passes `--device`, so the note has the group too; the
+        // scratch tmpfs land after the user block, in list order, as in
+        // `engine_run_args`.
+        let vllm =
+            HardenedSpawn::Vllm.note(GpuBackend::Rocm, Some(&gpu_user), &scratch, "/srv/store");
         let expected = format!(
-            "started hardened ({} --user 1000:1000 --group-add 44 -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e XDG_CONFIG_HOME=/tmp/.config -e TRITON_CACHE_DIR=/tmp/.triton -e USER=llmman -e LOGNAME=llmman --tmpfs /run/vllm:exec); setfacl -R -m u:1000:rX /srv/store lets the container read it as uid 1000, and --no-hardened turns these flags off",
+            "started hardened ({} --user 1000:1000 --group-add 44 -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e XDG_CONFIG_HOME=/tmp/.config -e TRITON_CACHE_DIR=/tmp/.triton -e USER=llmman -e LOGNAME=llmman --tmpfs /run/vllm:exec --tmpfs /var/vllm:exec); setfacl -R -m u:1000:rX /srv/store lets the container read it as uid 1000, and --no-hardened turns these flags off",
             hardened_args(true, ENGINE_TMPFS).join(" ")
         );
         assert_eq!(vllm, expected);
-        // SGLang never gets the RPC tmpfs; the CPU backend passes no device.
-        let sglang = HardenedSpawn::Sglang.note(
-            GpuBackend::Cpu,
-            Some(&gpu_user),
-            Some("/run/vllm:exec"),
-            "/srv/store",
-        );
+        // SGLang never gets the scratch tmpfs; the CPU backend passes no device.
+        let sglang =
+            HardenedSpawn::Sglang.note(GpuBackend::Cpu, Some(&gpu_user), &scratch, "/srv/store");
         assert!(!sglang.contains("/run/vllm"), "{sglang}");
         assert!(!sglang.contains("--group-add"), "{sglang}");
         assert!(sglang.contains("--user 1000:1000 -e HOME=/tmp"), "{sglang}");
@@ -2898,7 +2932,7 @@ mod tests {
                     None,
                     ENGINE_TMPFS,
                 ),
-                None,
+                &[],
                 "image:tag".into(),
                 launcher,
                 "/cache/abc/model",
@@ -2931,7 +2965,7 @@ mod tests {
                     None,
                     &[],
                 ),
-                None,
+                &[],
                 "image:tag".into(),
                 launcher,
                 "/cache/abc/model",
@@ -3173,7 +3207,7 @@ mod tests {
                 None,
                 &[],
             ),
-            None,
+            &[],
             "docker.io/vllm/vllm-openai-cpu:latest-x86_64".into(),
             launcher,
             "/cache/abc/model",
@@ -3269,7 +3303,7 @@ mod tests {
     }
 
     #[test]
-    fn vllm_rpc_tmpfs_mounts_an_absolute_path_outside_the_engine_tmpfs() {
+    fn vllm_scratch_tmpfs_mounts_an_absolute_path_outside_the_engine_tmpfs() {
         for (value, expected) in [
             (None, Ok(None)),
             (Some("/run/vllm"), Ok(Some("/run/vllm:exec".to_string()))),
@@ -3288,46 +3322,142 @@ mod tests {
             (Some("/run/.."), Err(())),
             // Dots inside a name are not a segment.
             (Some("/run/..rpc"), Ok(Some("/run/..rpc:exec".to_string()))),
+            // Other spellings of one directory clean to the same mount.
+            (Some("/run/vllm/"), Ok(Some("/run/vllm:exec".to_string()))),
+            (Some("//run//vllm"), Ok(Some("/run/vllm:exec".to_string()))),
+            (Some("/run/./vllm"), Ok(Some("/run/vllm:exec".to_string()))),
+            (Some("/./tmp/vllm"), Ok(None)),
+            // The root and the read-only model mount are not scratch roots.
+            (Some("/"), Err(())),
+            (Some("///"), Err(())),
+            (Some("/."), Err(())),
+            (Some("/models"), Err(())),
+            (Some("/./models/cache"), Err(())),
+            (Some("//models//cache"), Err(())),
+            // A sibling that merely shares the prefix is not under it.
+            (Some("/models2"), Ok(Some("/models2:exec".to_string()))),
         ] {
-            let got = vllm_rpc_tmpfs(value, ENGINE_TMPFS);
-            match expected {
-                Ok(expected) => assert_eq!(got, Ok(expected), "{value:?}"),
-                Err(()) => {
-                    let err = got.expect_err(&format!("{value:?}"));
-                    assert!(err.contains("VLLM_RPC_BASE_PATH"), "{err}");
-                    assert!(err.contains(&format!("{:?}", value.unwrap())), "{err}");
+            for name in VLLM_SCRATCH_VARS {
+                let got = vllm_scratch_tmpfs(name, value, ENGINE_TMPFS);
+                match &expected {
+                    Ok(expected) => assert_eq!(got, Ok(expected.clone()), "{name} {value:?}"),
+                    Err(()) => {
+                        let err = got.expect_err(&format!("{name} {value:?}"));
+                        assert!(err.contains(name), "{err}");
+                        assert!(err.contains(&format!("{:?}", value.unwrap())), "{err}");
+                    }
                 }
             }
         }
+        // The cache and config roots default under `/root/.cache` and
+        // `/root/.config` (or `/tmp` under `--user`), which the engine
+        // tmpfs already cover; only another location gets its own mount.
+        for (name, under) in [
+            ("VLLM_CACHE_ROOT", "/root/.cache/vllm"),
+            ("VLLM_CONFIG_ROOT", "/root/.config/vllm"),
+            ("VLLM_CACHE_ROOT", "/tmp/.cache/vllm"),
+        ] {
+            assert_eq!(
+                vllm_scratch_tmpfs(name, Some(under), ENGINE_TMPFS),
+                Ok(None)
+            );
+        }
+        let err = vllm_scratch_tmpfs("VLLM_CACHE_ROOT", Some("cache"), ENGINE_TMPFS).unwrap_err();
+        assert!(err.starts_with("VLLM_CACHE_ROOT must"), "{err}");
+        assert!(!err.contains("VLLM_RPC_BASE_PATH"), "{err}");
     }
 
     #[test]
-    fn engine_rpc_tmpfs_only_applies_to_a_hardened_vllm_container() {
-        let relative = || Some("relative/path".to_string());
-        let absolute = || Some("/run/vllm".to_string());
+    fn engine_scratch_tmpfs_mounts_each_distinct_scratch_root_in_list_order() {
+        let (_, prefix) = ContainerEngine::Vllm.launcher().unwrap();
+        let all = |name: &str| {
+            Some(match name {
+                "VLLM_RPC_BASE_PATH" => "/run/vllm".to_string(),
+                "VLLM_CACHE_ROOT" => "/var/cache/vllm".to_string(),
+                "VLLM_CONFIG_ROOT" => "/etc/vllm".to_string(),
+                _ => unreachable!("{name}"),
+            })
+        };
+        assert_eq!(
+            engine_scratch_tmpfs(prefix, true, all),
+            Ok(vec![
+                "/run/vllm:exec".to_string(),
+                "/var/cache/vllm:exec".to_string(),
+                "/etc/vllm:exec".to_string(),
+            ])
+        );
+        // Two variables on one directory share a mount, a trailing slash
+        // included.
+        let shared = |name: &str| match name {
+            "VLLM_CACHE_ROOT" => Some("/var/vllm".to_string()),
+            "VLLM_CONFIG_ROOT" => Some("/var/vllm/".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            engine_scratch_tmpfs(prefix, true, shared),
+            Ok(vec!["/var/vllm:exec".to_string()])
+        );
+        let dotted = |name: &str| match name {
+            "VLLM_CACHE_ROOT" => Some("/var/vllm".to_string()),
+            "VLLM_CONFIG_ROOT" => Some("/var/./vllm".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            engine_scratch_tmpfs(prefix, true, dotted),
+            Ok(vec!["/var/vllm:exec".to_string()])
+        );
+        // The read-only model mount is not a scratch root.
+        let err =
+            vllm_scratch_tmpfs("VLLM_CACHE_ROOT", Some("/models/cache"), ENGINE_TMPFS).unwrap_err();
+        assert!(
+            err.contains("VLLM_CACHE_ROOT") && err.contains("/models"),
+            "{err}"
+        );
+        // A malformed value anywhere in the list fails it.
+        let bad_cache = |name: &str| match name {
+            "VLLM_RPC_BASE_PATH" => Some("/run/vllm".to_string()),
+            "VLLM_CACHE_ROOT" => Some("cache".to_string()),
+            _ => None,
+        };
+        let err = engine_scratch_tmpfs(prefix, true, bad_cache).unwrap_err();
+        assert!(err.contains("VLLM_CACHE_ROOT"), "{err}");
+    }
+
+    #[test]
+    fn engine_scratch_tmpfs_only_applies_to_a_hardened_vllm_container() {
+        let only_rpc = |value: &'static str| {
+            move |name: &str| (name == "VLLM_RPC_BASE_PATH").then(|| value.to_string())
+        };
+        let relative = only_rpc("relative/path");
+        let absolute = only_rpc("/run/vllm");
         for engine in [ContainerEngine::Vllm, ContainerEngine::VllmOmni] {
             let (_, prefix) = engine.launcher().unwrap();
             assert_eq!(
-                engine_rpc_tmpfs(prefix, true, absolute),
-                Ok(Some("/run/vllm:exec".to_string()))
+                engine_scratch_tmpfs(prefix, true, absolute),
+                Ok(vec!["/run/vllm:exec".to_string()])
             );
-            assert!(engine_rpc_tmpfs(prefix, true, relative).is_err());
-            assert_eq!(engine_rpc_tmpfs(prefix, false, relative), Ok(None));
+            assert!(engine_scratch_tmpfs(prefix, true, relative).is_err());
+            assert_eq!(engine_scratch_tmpfs(prefix, false, relative), Ok(vec![]));
         }
-        // SGLang never receives the variable, so neither value matters.
+        // SGLang never receives the variables, so neither value matters.
         let (_, prefix) = ContainerEngine::Sglang.launcher().unwrap();
-        assert_eq!(engine_rpc_tmpfs(prefix, true, absolute), Ok(None));
-        assert_eq!(engine_rpc_tmpfs(prefix, true, relative), Ok(None));
+        assert_eq!(engine_scratch_tmpfs(prefix, true, absolute), Ok(vec![]));
+        assert_eq!(engine_scratch_tmpfs(prefix, true, relative), Ok(vec![]));
     }
 
     #[test]
-    fn engine_run_args_mount_the_rpc_tmpfs_before_the_model() {
-        let (launcher, _) = ContainerEngine::Vllm.launcher().unwrap();
+    fn engine_run_args_mount_the_scratch_tmpfs_before_the_model() {
+        let (launcher, prefix) = ContainerEngine::Vllm.launcher().unwrap();
         let engine_args = VllmBackend::Cpu.engine_args();
-        let rpc = vllm_rpc_tmpfs(Some("/run/vllm"), ENGINE_TMPFS).unwrap();
+        let scratch = engine_scratch_tmpfs(prefix, true, |name| match name {
+            "VLLM_RPC_BASE_PATH" => Some("/run/vllm".to_string()),
+            "VLLM_CACHE_ROOT" => Some("/var/cache/vllm".to_string()),
+            _ => None,
+        })
+        .unwrap();
         let args = engine_run_args(
             run_args(engine_args, 8000, &[], None, true, None, ENGINE_TMPFS),
-            rpc.as_deref(),
+            &scratch,
             "image:tag".into(),
             launcher,
             "/cache/abc/model",
@@ -3338,15 +3468,21 @@ mod tests {
             args.windows(2).any(|w| w == ["--tmpfs", "/run/vllm:exec"]),
             "{args:?}"
         );
-        assert!(at("/run/vllm:exec") < at("-v"), "{args:?}");
+        assert!(
+            at("/run/vllm:exec") < at("/var/cache/vllm:exec"),
+            "{args:?}"
+        );
+        assert!(at("/var/cache/vllm:exec") < at("-v"), "{args:?}");
         assert_eq!(
             args.iter().filter(|a| *a == "--tmpfs").count(),
-            ENGINE_TMPFS.len() + 1
+            ENGINE_TMPFS.len() + scratch.len()
         );
-        // SGLang gets no rpc tmpfs (see `engine_rpc_tmpfs`): only the
-        // engine's own.
+        assert_eq!(scratch.len(), 2);
+        // SGLang gets no scratch tmpfs (see `engine_scratch_tmpfs`): only
+        // the engine's own.
         let (launcher, prefix) = ContainerEngine::Sglang.launcher().unwrap();
-        let rpc = engine_rpc_tmpfs(prefix, true, || Some("/run/vllm".to_string())).unwrap();
+        let scratch =
+            engine_scratch_tmpfs(prefix, true, |_| Some("/run/vllm".to_string())).unwrap();
         let args = engine_run_args(
             run_args(
                 VllmBackend::Cpu.engine_args(),
@@ -3357,7 +3493,7 @@ mod tests {
                 None,
                 ENGINE_TMPFS,
             ),
-            rpc.as_deref(),
+            &scratch,
             "image:tag".into(),
             launcher,
             "/cache/abc/model",
