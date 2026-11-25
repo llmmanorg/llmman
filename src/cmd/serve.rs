@@ -4634,6 +4634,34 @@ fn backend_threads() -> i32 {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() as i32))
 }
 
+/// Restarts this process with the [`crate::mediagen::backend_env`] `model`
+/// needs when it lacks it (`llmman serve MODEL` run directly; the daemon
+/// sets it on the workers it spawns): ggml reads it from threads already up.
+fn reexec_with_backend_env(model: &std::path::Path) -> anyhow::Result<()> {
+    let missing: Vec<_> = crate::mediagen::backend_env(model)
+        .iter()
+        .filter(|(var, val)| std::env::var(var).as_deref() != Ok(*val))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe().context("locating the llmman binary")?;
+        let err = std::process::Command::new(&exe)
+            .args(std::env::args_os().skip(1))
+            .envs(missing.iter().map(|&&(var, val)| (var, val)))
+            .exec();
+        Err(err).with_context(|| format!("restarting {} with {missing:?}", exe.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        // backend_env is macOS-only
+        Ok(())
+    }
+}
+
 /// The media backend of a diffusion model, resolved to `paths` by
 /// [`model_backend`].
 async fn mediagen_backend(
@@ -4645,6 +4673,7 @@ async fn mediagen_backend(
     if paths.text_encoder.is_none() && crate::mediagen::needs_text_encoder(&paths.model) {
         anyhow::bail!("{model_ref}: no text encoder in the model pack");
     }
+    reexec_with_backend_env(&paths.model)?;
     let (api, lib_dir) = load_ggml_api(args).await?;
     let params = crate::mediagen::ContextParams {
         model: paths.model.clone(),
