@@ -169,7 +169,6 @@ pub fn mp4(res: &Output) -> Result<Vec<u8>> {
     out
 }
 
-/// A PNG/JPEG (or a data URL) as one RGB frame.
 /// `(width, height)` of a PNG or JPEG from its header, without decoding it.
 pub fn image_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
     image::ImageReader::new(std::io::Cursor::new(bytes))
@@ -179,6 +178,7 @@ pub fn image_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
         .context("reading the image size (PNG or JPEG)")
 }
 
+/// A PNG/JPEG (or a data URL) as one RGB frame.
 pub fn decode_image(bytes: &[u8]) -> Result<super::Frames> {
     let img = image::load_from_memory(bytes)
         .context("decoding the conditioning image (PNG or JPEG)")?

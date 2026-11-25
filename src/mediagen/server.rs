@@ -146,9 +146,9 @@ fn common_params(body: &Value, default_size: (i64, i64)) -> Result<GenParams, Er
     Ok(p)
 }
 
-/// Reference images of `/v1/images/generations`: `image` (one) or `images`
-/// (a list), each PNG or JPEG as base64 or a data URL.
-fn reference_images(body: &Value) -> Result<Vec<super::Frames>, Error> {
+/// The reference images of `/v1/images/generations`, still encoded:
+/// `image` (one) or `images` (a list), each PNG or JPEG as base64 or a data URL.
+fn reference_items(body: &Value) -> Result<Vec<Value>, Error> {
     let items: Vec<Value> = match (body.get("image"), body.get("images")) {
         (Some(_), Some(_)) => {
             return Err(Error::Invalid(
@@ -165,6 +165,13 @@ fn reference_images(body: &Value) -> Result<Vec<super::Frames>, Error> {
             "at most {MAX_REFERENCE_IMAGES} reference images"
         )));
     }
+    Ok(items)
+}
+
+/// [`reference_items`] decoded, after their headers pass the size limits:
+/// [`MAX_DIM`] a side (resizing allocates a row of the source width) and
+/// [`MAX_REFERENCE_PIXELS`] together. CPU-bound: run it off the async runtime.
+fn decode_references(items: Vec<Value>) -> Result<Vec<super::Frames>, Error> {
     let encoded = items
         .into_iter()
         .map(|v| Ok(get_b64(&json!({ "image": v }), "image")?.unwrap_or_default()))
@@ -172,6 +179,11 @@ fn reference_images(body: &Value) -> Result<Vec<super::Frames>, Error> {
     let mut pixels = 0u64;
     for bytes in &encoded {
         let (w, h) = encode::image_dimensions(bytes).map_err(|e| Error::Invalid(e.to_string()))?;
+        if w as i64 > MAX_DIM || h as i64 > MAX_DIM {
+            return Err(Error::Invalid(format!(
+                "a reference image is {w}x{h}, at most {MAX_DIM} a side"
+            )));
+        }
         pixels += w as u64 * h as u64;
     }
     if pixels > MAX_REFERENCE_PIXELS {
@@ -389,20 +401,30 @@ async fn images(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
             "only response_format=b64_json is supported".into(),
         ));
     }
-    let refs = reference_images(&body)?;
-    if !refs.is_empty() && !s.supports_refs {
+    let items = reference_items(&body)?;
+    if !items.is_empty() && !s.supports_refs {
         return Err(Error::Invalid(
             "the loaded model does not take reference images".into(),
         ));
     }
+    let refs = tokio::task::spawn_blocking(move || decode_references(items))
+        .await
+        .map_err(|e| Error::Failed(e.to_string()))??;
     // without a size, an edit keeps its first reference's, within the model's limits
+    let size = get_str(&body, "size");
     let default_size = refs
         .first()
-        .filter(|_| body.get("size").is_none())
+        .filter(|_| size.is_empty() || size == "auto")
         .map_or(s.default_size, |r| {
             fit_size(r.width, r.height, s.max_image_pixels)
         });
     let mut p = common_params(&body, default_size)?;
+    if p.width * p.height > s.max_image_pixels {
+        return Err(Error::Invalid(format!(
+            "{}x{} is over the model's {} pixels",
+            p.width, p.height, s.max_image_pixels
+        )));
+    }
     p.prompt = prompt;
     p.n_frames = 1;
     p.ref_images = refs;
@@ -689,6 +711,22 @@ pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn png_b64(w: u32, h: u32) -> Value {
+        let mut png = Vec::new();
+        image::RgbImage::new(w, h)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        Value::String(b64(&png))
+    }
+
+    #[test]
+    fn references_over_max_dim_a_side_are_refused_before_decoding() {
+        let ok = decode_references(vec![png_b64(64, 32)]).ok().unwrap();
+        assert_eq!((ok[0].width, ok[0].height), (64, 32));
+        let wide = decode_references(vec![png_b64(MAX_DIM as u32 + 1, 1)]);
+        assert!(matches!(wide, Err(Error::Invalid(m)) if m.contains("a side")));
+    }
 
     #[test]
     fn fit_size_bounds_a_large_reference() {
