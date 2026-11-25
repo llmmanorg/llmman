@@ -17,6 +17,8 @@ const EPS: f32 = 1e-6;
 const CH_MULT: [i64; 4] = [1, 2, 4, 4];
 const CH: i64 = 128;
 const BLOCKS: usize = 3;
+/// Query tokens per VAE attention chunk.
+const ATTN_CHUNK: i64 = 4096;
 
 /// Decoded pixels `[h][w][3]` in about `[-1, 1]`.
 pub struct Image {
@@ -128,8 +130,20 @@ impl<'g> Dec<'g> {
             Ok(g.linear(t, g.reshape_2d(k, c, c), Some(b)))
         };
         let (q, k, v) = (proj("q")?, proj("k")?, proj("v")?);
-        // F32 attention: flash attention's F16 keys/values can overflow here
-        let a = super::cosmos3::dit::sdpa_gqa(g, q, k, v, 1, 1, None, false);
+        // F32 attention (flash attention's F16 keys/values can overflow here), in query chunks
+        // so the score matrix stays at ATTN_CHUNK x tokens (1 GiB at 2048x2048, not 16 GiB)
+        let n = w * h;
+        let nb = q.strides()[1];
+        let mut a: Option<Tensor<'g>> = None;
+        for s in (0..n).step_by(ATTN_CHUNK as usize) {
+            let qs = g.view_2d(q, c, ATTN_CHUNK.min(n - s), nb, s as usize * nb);
+            let part = super::cosmos3::dit::sdpa_gqa(g, qs, k, v, 1, 1, None, false);
+            a = Some(match a {
+                Some(prev) => g.concat(prev, part, 1),
+                None => part,
+            });
+        }
+        let a = a.expect("at least one token");
         let ko = self.w.get(&format!("{p}.proj_out.weight"))?;
         let bo = self.w.get(&format!("{p}.proj_out.bias"))?;
         let o = g.linear(a, g.reshape_2d(ko, c, c), Some(bo));
