@@ -385,6 +385,7 @@ api! {
     fn ggml_mul_mat(ctx: *mut GgmlContext, a: TensorPtr, b: TensorPtr) -> TensorPtr;
     fn ggml_rms_norm(ctx: *mut GgmlContext, a: TensorPtr, eps: f32) -> TensorPtr;
     fn ggml_norm(ctx: *mut GgmlContext, a: TensorPtr, eps: f32) -> TensorPtr;
+    fn ggml_group_norm(ctx: *mut GgmlContext, a: TensorPtr, n_groups: c_int, eps: f32) -> TensorPtr;
     fn ggml_silu(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
     fn ggml_relu(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
     fn ggml_gelu(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;

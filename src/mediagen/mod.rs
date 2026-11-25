@@ -9,12 +9,14 @@ pub mod backend;
 pub mod cosmos3;
 pub mod encode;
 pub mod ffi;
+pub mod flux_vae;
 pub mod http;
 pub mod ltx;
 pub mod qwen_image;
 pub mod server;
 pub mod wan_vae;
 pub mod weights;
+pub mod zimage;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -189,6 +191,7 @@ enum Inner {
     Ltx(Box<LtxCtx>),
     Cosmos3(Box<cosmos3::Model>),
     QwenImage(Box<qwen_image::Model>),
+    ZImage(Box<zimage::Model>),
 }
 
 pub struct Context {
@@ -219,7 +222,7 @@ pub fn is_diffusion_model(path: &Path) -> bool {
     weights::read_index(path)
         .ok()
         .and_then(|i| i.metadata.get("general.architecture").cloned())
-        .is_some_and(|a| is_ltx(&a) || cosmos3::is_cosmos3(&a))
+        .is_some_and(|a| is_ltx(&a) || cosmos3::is_cosmos3(&a) || zimage::is_zimage(&a))
 }
 
 /// Does this Diffusers `_class_name` run here (rather than on vLLM-Omni)?
@@ -347,6 +350,20 @@ impl Context {
             )?;
             be.release_compute()?;
             Inner::Cosmos3(Box::new(m))
+        } else if zimage::is_zimage(&arch) {
+            let m = zimage::Model::load(
+                api,
+                &be,
+                &idx,
+                &p.model,
+                p.vae.as_deref(),
+                p.text_model.as_deref(),
+                p.text_gpu_layers,
+                p.n_threads,
+                p.flash_attn,
+            )?;
+            be.release_compute()?;
+            Inner::ZImage(Box::new(m))
         } else {
             bail!("unsupported diffusion architecture {arch:?}");
         };
@@ -356,7 +373,7 @@ impl Context {
     pub fn supports_image(&self) -> bool {
         match &self.inner {
             Inner::Ltx(l) => l.has_video_vae,
-            Inner::Cosmos3(_) | Inner::QwenImage(_) => true,
+            Inner::Cosmos3(_) | Inner::QwenImage(_) | Inner::ZImage(_) => true,
         }
     }
 
@@ -364,7 +381,7 @@ impl Context {
         match &self.inner {
             Inner::Ltx(l) => l.has_video_vae,
             Inner::Cosmos3(_) => true,
-            Inner::QwenImage(_) => false,
+            Inner::QwenImage(_) | Inner::ZImage(_) => false,
         }
     }
 
@@ -372,7 +389,7 @@ impl Context {
         match &self.inner {
             Inner::Ltx(l) => l.ltx.hp.has_audio && l.has_audio_vae,
             Inner::Cosmos3(m) => m.sound.is_some(),
-            Inner::QwenImage(_) => false,
+            Inner::QwenImage(_) | Inner::ZImage(_) => false,
         }
     }
 
@@ -381,6 +398,7 @@ impl Context {
             Inner::Ltx(_) => "ltx",
             Inner::Cosmos3(_) => "cosmos3",
             Inner::QwenImage(_) => "qwen-image",
+            Inner::ZImage(_) => "z-image",
         }
     }
 
@@ -390,12 +408,13 @@ impl Context {
             Inner::Ltx(_) => 0,
             Inner::Cosmos3(_) => cosmos3::DEFAULT_STEPS,
             Inner::QwenImage(_) => qwen_image::DEFAULT_STEPS,
+            Inner::ZImage(_) => zimage::DEFAULT_STEPS,
         }
     }
 
     pub fn default_cfg(&self) -> f32 {
         match &self.inner {
-            Inner::Ltx(_) | Inner::QwenImage(_) => 1.0,
+            Inner::Ltx(_) | Inner::QwenImage(_) | Inner::ZImage(_) => 1.0,
             Inner::Cosmos3(_) => cosmos3::DEFAULT_CFG,
         }
     }
@@ -405,6 +424,7 @@ impl Context {
         match &self.inner {
             Inner::Ltx(_) | Inner::Cosmos3(_) => (768, 512),
             Inner::QwenImage(_) => (qwen_image::DEFAULT_SIZE, qwen_image::DEFAULT_SIZE),
+            Inner::ZImage(_) => (zimage::DEFAULT_SIZE, zimage::DEFAULT_SIZE),
         }
     }
 
@@ -413,7 +433,7 @@ impl Context {
         match &self.inner {
             Inner::Ltx(l) => l.ltx.hp.vae_scale_t,
             Inner::Cosmos3(m) => m.hp.vae_scale_t,
-            Inner::QwenImage(_) => 1,
+            Inner::QwenImage(_) | Inner::ZImage(_) => 1,
         }
     }
 
@@ -427,6 +447,7 @@ impl Context {
             Inner::Ltx(l) => l.generate_inner(&mut self.be, p, progress),
             Inner::Cosmos3(m) => m.generate(&mut self.be, p, progress),
             Inner::QwenImage(m) => m.generate(&mut self.be, p, progress),
+            Inner::ZImage(m) => m.generate(&mut self.be, p, progress),
         };
         // frees the compute buffers; recreates the GPU backend after a failure
         self.be.release_compute()?;

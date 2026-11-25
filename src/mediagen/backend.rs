@@ -310,6 +310,7 @@ ops! {
     mul_mat => ggml_mul_mat(a: Tensor<'o>, b: Tensor<'o>);
     rms_norm => ggml_rms_norm(a: Tensor<'o>, eps: f32);
     norm => ggml_norm(a: Tensor<'o>, eps: f32);
+    group_norm => ggml_group_norm(a: Tensor<'o>, n_groups: c_int, eps: f32);
     silu => ggml_silu(a: Tensor<'o>);
     relu => ggml_relu(a: Tensor<'o>);
     gelu => ggml_gelu(a: Tensor<'o>);

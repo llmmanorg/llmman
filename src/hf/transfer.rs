@@ -179,19 +179,49 @@ mod docker {
                         .await?;
                         layers.push(api::sidecar_layer(d, file, role));
                     }
-                    if let Some(te_ref) = plan.text_encoder {
-                        let d = transfer_text_encoder(
+                    for &(role, from, path) in &plan.external {
+                        let b = super::super::resolve_external(
                             &api_client,
-                            &dl_client,
-                            &head_client,
+                            &host,
+                            from,
+                            path,
+                            role,
+                            token.as_deref(),
+                        )
+                        .await?;
+                        layers.push(
+                            transfer_borrowed(
+                                &dl_client,
+                                &head_client,
+                                &b,
+                                role,
+                                token.as_deref(),
+                                &session,
+                                &mut changed,
+                            )
+                            .await?,
+                        );
+                    }
+                    if let Some(te_ref) = plan.text_encoder {
+                        let b = super::super::resolve_text_encoder(
+                            &api_client,
                             &host,
                             te_ref,
                             token.as_deref(),
-                            &session,
-                            &mut changed,
                         )
                         .await?;
-                        layers.push(d);
+                        layers.push(
+                            transfer_borrowed(
+                                &dl_client,
+                                &head_client,
+                                &b,
+                                "text_encoder",
+                                token.as_deref(),
+                                &session,
+                                &mut changed,
+                            )
+                            .await?,
+                        );
                     }
                 } else if let Some(mmproj) = api::select_mmproj(&files) {
                     layers.push(
@@ -296,52 +326,31 @@ mod docker {
         path.rsplit('/').next().unwrap_or(path).to_string()
     }
 
-    /// The text encoder GGUF from its own repository, as a `text_encoder` layer.
-    #[allow(clippy::too_many_arguments)]
-    async fn transfer_text_encoder(
-        api_client: &reqwest::Client,
+    /// A file taken from another repository (`borrowed` resolved by
+    /// [`super::super::resolve_repo_file`]) as a `role` layer.
+    async fn transfer_borrowed(
         dl_client: &reqwest::Client,
         head_client: &reqwest::Client,
-        host: &str,
-        reference: &str,
+        b: &super::super::RepoFile,
+        role: &str,
         token: Option<&str>,
         session: &crate::ffi::PushSession,
         changed: &mut bool,
     ) -> Result<Descriptor> {
-        let (_, owner, repo, tag) = api::parse_hf_ref(&format!("{host}/{reference}"))?;
-        let endpoint = super::super::hf_endpoint(host);
-        let info = api::fetch_model_info(api_client, &endpoint, &owner, &repo, token)
-            .await
-            .with_context(|| format!("text encoder {reference}"))?;
-        let commit = info.commit().to_string();
-        let files = api::fetch_files(api_client, &endpoint, &owner, &repo, &commit, token)
-            .await
-            .with_context(|| format!("text encoder {reference}"))?;
-        let shards = api::select_gguf(&files, &tag)?;
-        if shards.len() != 1 {
-            anyhow::bail!("text encoder {reference}: split GGUFs are not supported");
-        }
-        let mut d = transfer_layer(
+        let d = transfer_layer(
             dl_client,
             head_client,
-            &endpoint,
-            &owner,
-            &repo,
-            &commit,
-            &shards[0],
+            &b.endpoint,
+            &b.owner,
+            &b.repo,
+            &b.commit,
+            &b.file,
             token,
             session,
             changed,
         )
         .await?;
-        d.annotations = Some(std::collections::BTreeMap::from([
-            (
-                oci::ANNOTATION_FILEPATH.to_string(),
-                basename(&shards[0].path),
-            ),
-            (oci::ANNOTATION_ROLE.to_string(), "text_encoder".to_string()),
-        ]));
-        Ok(d)
+        Ok(api::borrowed_layer(d, &b.file, role))
     }
 
     /// Fetches one file and streams it directly into a registry push,

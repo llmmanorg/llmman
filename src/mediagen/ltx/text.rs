@@ -228,21 +228,11 @@ impl TextEncoder {
         Ok(tokens)
     }
 
-    /// Runs the model and returns the packed, per-token RMS-normalized hidden
-    /// states `out[t * (H * L) + h * L + l]`, with `(n_tokens, n_hidden, n_states)`.
-    pub fn encode(&mut self, prompt: &str, max_tokens: i64) -> Result<(Vec<f32>, i64, i64, i64)> {
+    /// Decodes `tokens` once, capturing every hidden state: index 0 the
+    /// embeddings (when the graph names them), `i` the output of layer
+    /// `i - 1`, the last one the final norm output.
+    fn run(&mut self, tokens: &[i32]) -> Result<Box<Capture>> {
         self.ensure_context()?;
-        let mut tokens = self.tokenize(prompt.trim(), true, false)?;
-        if tokens.is_empty() {
-            bail!("empty prompt");
-        }
-        if tokens.len() as i64 > max_tokens {
-            eprintln!(
-                "[llmman] mediagen: prompt has {} tokens, truncating to {max_tokens}",
-                tokens.len()
-            );
-            tokens.truncate(max_tokens as usize);
-        }
         let n = tokens.len();
         let n_layers = unsafe { (self.api.llama_model_n_layer)(self.model) };
         let mut cap = Box::new(Capture {
@@ -290,6 +280,58 @@ impl TextEncoder {
             cap.n_hidden = h;
             *cap.got.last_mut().unwrap() = true;
         }
+        Ok(cap)
+    }
+
+    pub fn n_layers(&self) -> i32 {
+        unsafe { (self.api.llama_model_n_layer)(self.model) }
+    }
+
+    /// Hidden state `state` (as numbered by [`Self::run`]) of `text`, tokenized
+    /// as is: special tokens parsed, no BOS added. Returns `([T][hidden], T)`.
+    /// At most `max_tokens` tokens are read.
+    pub fn hidden_state(
+        &mut self,
+        text: &str,
+        state: usize,
+        max_tokens: usize,
+    ) -> Result<(Vec<f32>, i64)> {
+        let mut tokens = self.tokenize(text, false, true)?;
+        if tokens.is_empty() {
+            bail!("empty prompt");
+        }
+        if tokens.len() > max_tokens {
+            eprintln!(
+                "[llmman] mediagen: prompt has {} tokens, truncating to {max_tokens}",
+                tokens.len()
+            );
+            tokens.truncate(max_tokens);
+        }
+        let n = tokens.len() as i64;
+        let mut cap = self.run(&tokens)?;
+        if !cap.got.get(state).copied().unwrap_or(false) {
+            bail!("hidden state {state} of the text encoder was not captured");
+        }
+        Ok((std::mem::take(&mut cap.states[state]), n))
+    }
+
+    /// Runs the model and returns the packed, per-token RMS-normalized hidden
+    /// states `out[t * (H * L) + h * L + l]`, with `(n_tokens, n_hidden, n_states)`.
+    pub fn encode(&mut self, prompt: &str, max_tokens: i64) -> Result<(Vec<f32>, i64, i64, i64)> {
+        let mut tokens = self.tokenize(prompt.trim(), true, false)?;
+        if tokens.is_empty() {
+            bail!("empty prompt");
+        }
+        if tokens.len() as i64 > max_tokens {
+            eprintln!(
+                "[llmman] mediagen: prompt has {} tokens, truncating to {max_tokens}",
+                tokens.len()
+            );
+            tokens.truncate(max_tokens as usize);
+        }
+        let n = tokens.len();
+        let cap = self.run(&tokens)?;
+        let n_layers = cap.n_layers;
         if let Some(i) = cap.got.iter().position(|g| !g) {
             bail!("hidden state {i} was not captured");
         }

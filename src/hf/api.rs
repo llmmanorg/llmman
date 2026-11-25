@@ -414,14 +414,25 @@ fn is_weights_file(lower: &str) -> bool {
 /// True when the repo ships a diffusion model: a transformer GGUF next to
 /// VAE / text projection sidecars (e.g. `unsloth/LTX-2.3-GGUF`).
 pub fn is_diffusion_repo(files: &[HfFile]) -> bool {
-    files.iter().any(|f| {
-        let name = basename_lower(&f.path);
-        f.kind == "file"
-            && is_weights_file(&name)
-            && (name.contains("video_vae")
-                || name.contains("_vae.")
-                || name.contains("embeddings_connectors"))
-    })
+    // Z-Image GGUFs ship without sidecars; their family is in the file name
+    let zimage = files
+        .iter()
+        .any(|f| f.kind == "file" && is_model_gguf(&f.path) && is_zimage_file(&f.path));
+    zimage
+        || files.iter().any(|f| {
+            let name = basename_lower(&f.path);
+            f.kind == "file"
+                && is_weights_file(&name)
+                && (name.contains("video_vae")
+                    || name.contains("_vae.")
+                    || name.contains("embeddings_connectors"))
+        })
+}
+
+/// A Z-Image (Tongyi-MAI, `lumina2` architecture) transformer file.
+fn is_zimage_file(path: &str) -> bool {
+    let name = basename_lower(path);
+    name.contains("z-image") || name.contains("z_image")
 }
 
 fn basename_lower(path: &str) -> String {
@@ -551,7 +562,16 @@ pub struct DiffusionPlan {
     pub outputs: Vec<&'static str>,
     /// `owner/repo:quant` of the text encoder the family was trained with.
     pub text_encoder: Option<&'static str>,
+    /// Sidecars the repo lacks, from the family's own repository:
+    /// `(role, owner/repo, path)`.
+    pub external: Vec<(&'static str, &'static str, &'static str)>,
 }
+
+/// The official Z-Image-Turbo repository's FLUX.1 VAE (Diffusers layout, not gated).
+const ZIMAGE_VAE: (&str, &str) = (
+    "Tongyi-MAI/Z-Image-Turbo",
+    "vae/diffusion_pytorch_model.safetensors",
+);
 
 /// See llama.cpp's `common_download_get_hf_plan` for the same resolution.
 pub fn diffusion_plan(files: &[HfFile], model_path: &str) -> DiffusionPlan {
@@ -569,7 +589,17 @@ pub fn diffusion_plan(files: &[HfFile], model_path: &str) -> DiffusionPlan {
         sidecars: Vec::new(),
         outputs: Vec::new(),
         text_encoder: diffusion_default_text_encoder(model_path),
+        external: Vec::new(),
     };
+    if is_zimage_file(model_path) {
+        // images only; the VAE comes from the official repository unless the repo has one
+        match candidates.into_iter().find(|(role, _)| *role == "vae") {
+            Some((_, Some(file))) => plan.sidecars.push(("vae", file)),
+            _ => plan.external.push(("vae", ZIMAGE_VAE.0, ZIMAGE_VAE.1)),
+        }
+        plan.outputs.push("image");
+        return plan;
+    }
     for (role, file) in candidates {
         let Some(file) = file else { continue };
         match role {
@@ -593,6 +623,20 @@ pub fn sidecar_layer(mut d: oci::Descriptor, file: &HfFile, role: &str) -> oci::
         .to_string();
     d.annotations = Some(BTreeMap::from([
         (oci::ANNOTATION_FILEPATH.to_string(), name),
+        (oci::ANNOTATION_ROLE.to_string(), role.to_string()),
+    ]));
+    d
+}
+
+/// The layer of a file taken from another repository: a text encoder keeps
+/// its GGUF media type, anything else is a [`sidecar_layer`].
+pub fn borrowed_layer(mut d: oci::Descriptor, file: &HfFile, role: &str) -> oci::Descriptor {
+    if role != "text_encoder" {
+        return sidecar_layer(d, file, role);
+    }
+    let name = file.path.rsplit('/').next().unwrap_or(&file.path);
+    d.annotations = Some(BTreeMap::from([
+        (oci::ANNOTATION_FILEPATH.to_string(), name.to_string()),
         (oci::ANNOTATION_ROLE.to_string(), role.to_string()),
     ]));
     d
@@ -630,6 +674,10 @@ pub fn select_diffusion_sidecar(
 /// ships with the model, so there is no generic default for it.
 pub fn diffusion_default_text_encoder(model_path: &str) -> Option<&'static str> {
     let name = basename_lower(model_path);
+    if is_zimage_file(model_path) {
+        // Z-Image's text encoder is Qwen3-4B (its second-to-last hidden state)
+        return Some("unsloth/Qwen3-4B-GGUF:Q8_0");
+    }
     if name.contains("ltx-2.5") || name.contains("ltx-2-5") {
         return None;
     }
@@ -984,6 +1032,41 @@ mod tests {
             select_diffusion_sidecar(&files, "ltx-2.3-22b-dev-Q8_0.gguf", "audio_vae").unwrap();
         assert_eq!(dev_vae.path, "vae/ltx-2.3-22b-dev_audio_vae.safetensors");
         assert!(select_diffusion_sidecar(&files, model, "nothing").is_none());
+    }
+
+    fn zimage_repo() -> Vec<HfFile> {
+        vec![
+            file("README.md", 1),
+            file("z-image-turbo-BF16.gguf", 3),
+            file("z-image-turbo-Q4_K_M.gguf", 2),
+            file("z-image-turbo-Q8_0.gguf", 2),
+        ]
+    }
+
+    #[test]
+    fn zimage_repo_is_a_diffusion_repo_without_sidecars() {
+        let files = zimage_repo();
+        assert!(is_diffusion_repo(&files));
+        let picked = select_diffusion_gguf(&files, "Q8_0").unwrap();
+        assert_eq!(picked[0].path, "z-image-turbo-Q8_0.gguf");
+        let plan = diffusion_plan(&files, &picked[0].path);
+        assert!(plan.sidecars.is_empty());
+        assert_eq!(plan.outputs, ["image"]);
+        assert_eq!(plan.text_encoder, Some("unsloth/Qwen3-4B-GGUF:Q8_0"));
+        assert_eq!(
+            plan.external,
+            [(
+                "vae",
+                "Tongyi-MAI/Z-Image-Turbo",
+                "vae/diffusion_pytorch_model.safetensors"
+            )]
+        );
+        // a repo that ships its own VAE keeps it
+        let mut with_vae = files.clone();
+        with_vae.push(file("z-image-turbo_vae.safetensors", 1));
+        let plan = diffusion_plan(&with_vae, "z-image-turbo-Q8_0.gguf");
+        assert_eq!(plan.sidecars.len(), 1);
+        assert!(plan.external.is_empty());
     }
 
     #[test]
