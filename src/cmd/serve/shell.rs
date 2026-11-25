@@ -209,15 +209,8 @@ fn token_path(bind_addr: &str) -> anyhow::Result<PathBuf> {
     Ok(crate::data_root()?.join(token_file_name(bind_addr)))
 }
 
-/// `shell-<host>-<port>.token`. An IPv6 host loses its brackets and its
-/// colons become `_`: Windows forbids `:` in file names.
 fn token_file_name(bind_addr: &str) -> String {
-    let (host, port) = bind_addr.rsplit_once(':').unwrap_or((bind_addr, ""));
-    let host = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .replace(':', "_");
-    format!("shell-{host}-{port}.token")
+    format!("shell-{}.token", crate::daemon::file_safe_addr(bind_addr))
 }
 
 /// Logs whether the shell is on, and saves the token when it is. The

@@ -5326,11 +5326,19 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // then failing every pull with a config error.
     crate::verify::Policy::load().context("signature trust policy")?;
 
+    // Before the bind, so a second daemon for the same port-0 LLMMAN_HOST
+    // stops here, as a second one for a configured port stops at the bind.
+    let port_lock = crate::daemon::PortLock::acquire()?;
     let addr = crate::daemon::bind_addr();
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    let addr = crate::daemon::bound_addr(listener.local_addr().context("listener address")?.port());
+    let port = listener.local_addr().context("listener address")?.port();
+    let port_record = port_lock
+        .as_ref()
+        .map(|lock| lock.publish(port))
+        .transpose()?;
+    let addr = crate::daemon::bound_addr(port);
     eprintln!(
         "llmman serve listening on http{}://{addr}",
         if tls.is_some() { "s" } else { "" }
@@ -5379,13 +5387,19 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         }
     }
 
+    // Owns the port record, so clients stop using the port as soon as
+    // shutdown begins, before the listener closes.
+    let shutdown = async move {
+        shutdown_signal().await;
+        drop(port_record);
+    };
     match tls {
         None => {
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(shutdown)
             .await?
         }
         Some((cert, key)) => {
@@ -5405,7 +5419,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             tokio::spawn({
                 let handle = handle.clone();
                 async move {
-                    shutdown_signal().await;
+                    shutdown.await;
                     handle.graceful_shutdown(Some(Duration::from_secs(30)));
                 }
             });

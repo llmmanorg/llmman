@@ -217,6 +217,11 @@ pub fn prepare(
         "--sandbox openshell takes the integration's environment only on its command line, \
          so it cannot be given an API key (--provider, --overflow-provider, LLMMAN_API_KEY)"
     );
+    anyhow::ensure!(
+        !crate::daemon::os_picks_port(),
+        "--sandbox needs llmman serve on a fixed port: LLMMAN_HOST lets the OS pick one, which \
+         is not known until the daemon starts"
+    );
     let daemon = crate::daemon::server();
     check_host(sandbox, &daemon)?;
     let image = sandbox
