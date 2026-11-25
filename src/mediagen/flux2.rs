@@ -69,31 +69,8 @@ pub struct Hparams {
 
 impl Hparams {
     pub fn from_index(idx: &Index) -> Result<Hparams> {
-        // dimension `i` of tensor `n`
-        let ne = |n: &str, i: usize| -> Result<i64> {
-            let d = idx
-                .tensors
-                .iter()
-                .find(|d| d.name == n)
-                .ok_or_else(|| anyhow!("no {n}"))?;
-            d.ne.get(i)
-                .copied()
-                .ok_or_else(|| anyhow!("{n} has rank {}, expected more than {i}", d.ne.len()))
-        };
-        let count = |prefix: &str| -> i64 {
-            idx.tensors
-                .iter()
-                .filter_map(|d| {
-                    d.name
-                        .strip_prefix(prefix)?
-                        .split('.')
-                        .next()?
-                        .parse::<i64>()
-                        .ok()
-                })
-                .max()
-                .map_or(0, |m| m + 1)
-        };
+        let ne = |n: &str, i: usize| idx.dim(n, i);
+        let count = |prefix: &str| idx.count(prefix);
         let hidden = ne("img_in.weight", 1)?;
         let head_dim = ne("double_blocks.0.img_attn.norm.key_norm.scale", 0)?;
         let hp = Hparams {

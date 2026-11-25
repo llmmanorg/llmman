@@ -69,40 +69,23 @@ pub struct Hparams {
 
 impl Hparams {
     pub fn from_index(idx: &Index) -> Result<Hparams> {
-        let names: Vec<(String, &Vec<i64>)> = idx
-            .tensors
-            .iter()
-            .filter_map(|d| Some((dit_name(&d.name)?, &d.ne)))
-            .collect();
-        let shape = |n: &str| -> Option<Vec<i64>> {
-            names
-                .iter()
-                .find(|(m, _)| m == n)
-                .map(|(_, s)| (*s).clone())
-        };
-        let count = |prefix: &str| -> i64 {
-            names
-                .iter()
-                .filter_map(|(name, _)| {
-                    let rest = name.strip_prefix(prefix)?;
-                    rest.split('.').next()?.parse::<i64>().ok()
-                })
-                .max()
-                .map_or(0, |m| m + 1)
-        };
-        let x_emb = shape("x_embedder.weight").ok_or_else(|| anyhow!("no x_embedder.weight"))?;
-        let cap =
-            shape("cap_embedder.1.weight").ok_or_else(|| anyhow!("no cap_embedder.1.weight"))?;
-        let head_dim = shape("layers.0.attention.q_norm.weight")
-            .or_else(|| shape("layers.0.attention.norm_q.weight"))
-            .map_or(128, |s| s[0]);
-        let (dim, patch_in) = (x_emb[1], x_emb[0]);
+        let idx = idx.renamed(dit_name);
+        let (dim, patch_in) = (
+            idx.dim("x_embedder.weight", 1)?,
+            idx.dim("x_embedder.weight", 0)?,
+        );
+        let cap_dim = idx.dim("cap_embedder.1.weight", 0)?;
+        let head_dim = idx
+            .dim("layers.0.attention.q_norm.weight", 0)
+            .or_else(|_| idx.dim("layers.0.attention.norm_q.weight", 0))
+            .unwrap_or(128);
         let heads = dim / head_dim;
-        let (fused_qkv, kv_heads) = match shape("layers.0.attention.qkv.weight") {
-            Some(s) => (true, ((s[1] / head_dim - heads) / 2).max(1)),
-            None => (
+        let (fused_qkv, kv_heads) = match idx.dim("layers.0.attention.qkv.weight", 1) {
+            Ok(n) => (true, ((n / head_dim - heads) / 2).max(1)),
+            Err(_) => (
                 false,
-                shape("layers.0.attention.to_k.weight").map_or(heads, |s| s[1] / head_dim),
+                idx.dim("layers.0.attention.to_k.weight", 1)
+                    .map_or(heads, |n| n / head_dim),
             ),
         };
         let hp = Hparams {
@@ -110,10 +93,12 @@ impl Hparams {
             heads,
             kv_heads,
             head_dim,
-            layers: count("layers."),
-            refiner_layers: count("noise_refiner.").max(count("context_refiner.")),
+            layers: idx.count("layers."),
+            refiner_layers: idx
+                .count("noise_refiner.")
+                .max(idx.count("context_refiner.")),
             in_channels: patch_in / (PATCH * PATCH),
-            cap_dim: cap[0],
+            cap_dim,
             fused_qkv,
         };
         if hp.layers == 0
