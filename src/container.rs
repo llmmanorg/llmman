@@ -87,12 +87,6 @@ impl ContainerManager {
             Some(_) => anyhow::bail!("{cli} info failed (is its daemon running?)"),
             None => anyhow::bail!("{cli} info did not answer within {PROBE_TIMEOUT:?}"),
         }
-        if self == ContainerManager::Docker && cfg!(target_os = "linux") {
-            // Settle the rootless question for `HardenedUser::resolve`
-            // here, where `info` already answered, rather than on the
-            // first load.
-            let _ = identity::docker_is_rootless();
-        }
         let wants_gpus = detect_backend().engine_args().iter().any(|a| a == "--gpus");
         gpu_gate(require_gpu_toolkit, wants_gpus, cli, || {
             nvidia_toolkit_present(self)
@@ -1334,12 +1328,16 @@ impl HardenedUser {
 /// The environment a numeric `--user` gets so every cache lands on the
 /// `/tmp` tmpfs: `HOME` (docker's default for an unknown uid is `/`),
 /// vLLM's and Mesa's cache root, vLLM's and MIOpen's config root and
-/// Triton's kernel cache.
+/// Triton's kernel cache. `USER` and `LOGNAME` are set because vLLM calls
+/// `getpass.getuser()`, which raises for a uid with no passwd entry once
+/// both are unset.
 const HARDENED_USER_ENV: &[&str] = &[
     "HOME=/tmp",
     "XDG_CACHE_HOME=/tmp/.cache",
     "XDG_CONFIG_HOME=/tmp/.config",
     "TRITON_CACHE_DIR=/tmp/.triton",
+    "USER=llmman",
+    "LOGNAME=llmman",
 ];
 
 /// `(uid, gid)` owning `path`, when readable.
@@ -2553,6 +2551,10 @@ mod tests {
                 "XDG_CONFIG_HOME=/tmp/.config",
                 "-e",
                 "TRITON_CACHE_DIR=/tmp/.triton",
+                "-e",
+                "USER=llmman",
+                "-e",
+                "LOGNAME=llmman",
             ]
         );
         // No devices: no `--group-add`, even with gids resolved.
@@ -2757,7 +2759,7 @@ mod tests {
             "/srv/store",
         );
         let expected = format!(
-            "started hardened ({} --user 1000:1000 --group-add 44 -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e XDG_CONFIG_HOME=/tmp/.config -e TRITON_CACHE_DIR=/tmp/.triton --tmpfs /run/vllm:exec); setfacl -R -m u:1000:rX /srv/store lets the container read it as uid 1000, and --no-hardened turns these flags off",
+            "started hardened ({} --user 1000:1000 --group-add 44 -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e XDG_CONFIG_HOME=/tmp/.config -e TRITON_CACHE_DIR=/tmp/.triton -e USER=llmman -e LOGNAME=llmman --tmpfs /run/vllm:exec); setfacl -R -m u:1000:rX /srv/store lets the container read it as uid 1000, and --no-hardened turns these flags off",
             hardened_args(true, ENGINE_TMPFS).join(" ")
         );
         assert_eq!(vllm, expected);
