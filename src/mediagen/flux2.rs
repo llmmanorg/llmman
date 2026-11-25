@@ -35,7 +35,7 @@ const PROMPT_TOKENS: usize = 512;
 const TEXT_STATES: [usize; 3] = [9, 18, 27];
 /// The largest output (2048x2048, 16384 tokens before the prompt and references).
 pub const MAX_PIXELS: i64 = 2048 * 2048;
-/// Image and reference tokens of one sequence: what attention materializes
+/// Caption, image and reference tokens of one sequence: what attention materializes
 /// without flash attention (`[n, n]` scores per head) is bounded by this.
 const MAX_TOKENS_FLASH: i64 = 32768;
 const MAX_TOKENS_DENSE: i64 = 8192;
@@ -69,12 +69,16 @@ pub struct Hparams {
 
 impl Hparams {
     pub fn from_index(idx: &Index) -> Result<Hparams> {
-        let ne = |n: &str| -> Result<Vec<i64>> {
-            idx.tensors
+        // dimension `i` of tensor `n`
+        let ne = |n: &str, i: usize| -> Result<i64> {
+            let d = idx
+                .tensors
                 .iter()
                 .find(|d| d.name == n)
-                .map(|d| d.ne.clone())
-                .ok_or_else(|| anyhow!("no {n}"))
+                .ok_or_else(|| anyhow!("no {n}"))?;
+            d.ne.get(i)
+                .copied()
+                .ok_or_else(|| anyhow!("{n} has rank {}, expected more than {i}", d.ne.len()))
         };
         let count = |prefix: &str| -> i64 {
             idx.tensors
@@ -90,18 +94,17 @@ impl Hparams {
                 .max()
                 .map_or(0, |m| m + 1)
         };
-        let img_in = ne("img_in.weight")?;
-        let hidden = img_in[1];
-        let head_dim = ne("double_blocks.0.img_attn.norm.key_norm.scale")?[0];
+        let hidden = ne("img_in.weight", 1)?;
+        let head_dim = ne("double_blocks.0.img_attn.norm.key_norm.scale", 0)?;
         let hp = Hparams {
             hidden,
             heads: hidden / head_dim,
             head_dim,
             double: count("double_blocks."),
             single: count("single_blocks."),
-            mlp: ne("double_blocks.0.img_mlp.0.weight")?[1] / 2,
-            in_channels: img_in[0],
-            ctx_dim: ne("txt_in.weight")?[0],
+            mlp: ne("double_blocks.0.img_mlp.0.weight", 1)? / 2,
+            in_channels: ne("img_in.weight", 0)?,
+            ctx_dim: ne("txt_in.weight", 0)?,
         };
         if AXES.iter().sum::<i64>() != hp.head_dim || hp.double == 0 || hp.single == 0 {
             bail!("unsupported FLUX.2 transformer {hp:?}");
@@ -207,7 +210,16 @@ fn pack(z: &[f32], c: usize, h: usize, w: usize) -> Vec<f32> {
 fn ref_size(w: i64, h: i64) -> (i64, i64) {
     let scale = ((MAX_REF_PIXELS as f64) / (w * h) as f64).sqrt().min(1.0);
     let fit = |v: i64| ((v as f64 * scale) as i64 / SCALE * SCALE).max(SCALE);
-    (fit(w), fit(h))
+    let (mut w, mut h) = (fit(w), fit(h));
+    // a side raised to SCALE can push the area over: trim the longer one
+    while w * h > MAX_REF_PIXELS {
+        if w >= h {
+            w -= SCALE;
+        } else {
+            h -= SCALE;
+        }
+    }
+    (w, h)
 }
 
 pub struct Model {
@@ -550,6 +562,12 @@ impl Model {
         let (lh, lw) = (h / SCALE, w / SCALE);
         let c = self.hp.in_channels as usize;
         let n = (lh * lw) as usize;
+        if !c.is_multiple_of(4) || z.len() != c * n {
+            bail!(
+                "the VAE encoded {} values, expected {c} channels x {n} tokens",
+                z.len()
+            );
+        }
         let mut z = pack(&z, c / 4, lh as usize, lw as usize);
         for (ci, row) in z.chunks_mut(n).enumerate() {
             let (m, s) = (self.bn_mean[ci], self.bn_std[ci]);
@@ -663,7 +681,9 @@ impl Model {
         if use_cfg {
             prompts.push(p.negative_prompt.as_str());
         }
-        let tokens = (w / SCALE) * (h / SCALE)
+        // the caption, the output and every reference attend together
+        let tokens = PROMPT_TOKENS as i64
+            + (w / SCALE) * (h / SCALE)
             + p.ref_images
                 .iter()
                 .map(|f| {
@@ -678,7 +698,7 @@ impl Model {
         };
         if tokens > max_tokens {
             bail!(
-                "the output and reference images make {tokens} tokens, at most {max_tokens}{}; \
+                "the prompt, output and reference images make {tokens} tokens, at most {max_tokens}{}; \
                  use a smaller size or fewer references",
                 if self.flash {
                     ""
@@ -837,5 +857,8 @@ mod tests {
         let (w, h) = ref_size(4000, 3000);
         assert!(w * h <= MAX_REF_PIXELS && w % 16 == 0 && h % 16 == 0);
         assert_eq!(ref_size(8, 8), (16, 16));
+        // a side raised to 16 does not lift the area over the budget
+        let (w, h) = ref_size(8, 81920);
+        assert!(w * h <= MAX_REF_PIXELS && (w, h) == (16, 65536));
     }
 }

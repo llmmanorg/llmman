@@ -277,7 +277,7 @@ impl Model {
             vae_path,
             be.weight_buft(),
             &LoadOpts {
-                rename: Some(Box::new(flux_vae::tensor_name)),
+                rename: Some(Box::new(flux_vae::decoder_name)),
                 transform: None,
             },
         )?;

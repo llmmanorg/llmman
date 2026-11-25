@@ -222,6 +222,7 @@ fn text_decoder<'g>(
     ids: &[u32],
     on_layer: impl FnMut(&'g Graph<'g>, Tensor<'g>, Tensor<'g>),
 ) -> Result<Tensor<'g>> {
+    check_prompt_len(ids.len())?;
     let mask = causal_mask(ids.len() as i64);
     text_decoder_ext(hp, w, gr, ids, &mask, hp.n_layers, on_layer, |_, _| {})
 }
@@ -240,10 +241,8 @@ fn text_decoder_ext<'g>(
     mut on_layer: impl FnMut(&'g Graph<'g>, Tensor<'g>, Tensor<'g>),
     mut on_hidden: impl FnMut(usize, Tensor<'g>),
 ) -> Result<Tensor<'g>> {
+    check_prompt_len(ids.len())?;
     let n = ids.len() as i64;
-    if n == 0 || n > MAX_PROMPT_TOKENS {
-        bail!("the prompt must be 1 to {MAX_PROMPT_TOKENS} tokens, got {n}");
-    }
     let ids_i32: Vec<i32> = ids.iter().map(|&i| i as i32).collect();
     let ids_t = gr.input_i32(&[n], &ids_i32, "ids");
     let (cos, sin) = mrope_tables(hp, &text_positions(n));
@@ -311,6 +310,14 @@ fn text_decoder_ext<'g>(
     Ok(x)
 }
 
+/// Prompts run with an `n x n` mask: 1 to [`MAX_PROMPT_TOKENS`] tokens.
+fn check_prompt_len(n: usize) -> Result<()> {
+    if n == 0 || n as i64 > MAX_PROMPT_TOKENS {
+        bail!("the prompt must be 1 to {MAX_PROMPT_TOKENS} tokens, got {n}");
+    }
+    Ok(())
+}
+
 /// `[Tk, Tq]`: -inf where the key follows the query.
 pub fn causal_mask(n: i64) -> Vec<f32> {
     let n = n as usize;
@@ -376,7 +383,7 @@ pub fn text_hidden_states(
     states: &[usize],
 ) -> Result<Vec<Vec<f32>>> {
     let last = states.iter().copied().max().unwrap_or(0);
-    if last == 0 || last as i64 > hp.n_layers {
+    if states.is_empty() || states.iter().any(|&s| s == 0 || s as i64 > hp.n_layers) {
         bail!("hidden states {states:?} out of 1..={}", hp.n_layers);
     }
     let gr = text_graph(be, hp)?;

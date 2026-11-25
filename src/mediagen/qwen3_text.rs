@@ -55,15 +55,23 @@ impl Qwen3Text {
         if arch != Some("qwen3") {
             bail!("{}: expected a qwen3 GGUF, got {arch:?}", path.display());
         }
-        let ne = |n: &str| -> Result<Vec<i64>> {
-            idx.tensors
+        // dimension `i` of tensor `n`
+        let ne = |n: &str, i: usize| -> Result<i64> {
+            let d = idx
+                .tensors
                 .iter()
                 .find(|d| d.name == n)
-                .map(|d| d.ne.clone())
-                .ok_or_else(|| anyhow!("{}: no {n}", path.display()))
+                .ok_or_else(|| anyhow!("{}: no {n}", path.display()))?;
+            d.ne.get(i).copied().ok_or_else(|| {
+                anyhow!(
+                    "{}: {n} has rank {}, expected more than {i}",
+                    path.display(),
+                    d.ne.len()
+                )
+            })
         };
-        let hidden = ne("token_embd.weight")?[0];
-        let head_dim = ne("blk.0.attn_q_norm.weight")?[0];
+        let hidden = ne("token_embd.weight", 0)?;
+        let head_dim = ne("blk.0.attn_q_norm.weight", 0)?;
         let n_layers = idx
             .tensors
             .iter()
@@ -80,8 +88,8 @@ impl Qwen3Text {
         let hp = cosmos3::Hparams::from_config(&json!({
             "hidden_size": hidden,
             "num_hidden_layers": n_layers,
-            "num_attention_heads": ne("blk.0.attn_q.weight")?[1] / head_dim,
-            "num_key_value_heads": ne("blk.0.attn_k.weight")?[1] / head_dim,
+            "num_attention_heads": ne("blk.0.attn_q.weight", 1)? / head_dim,
+            "num_key_value_heads": ne("blk.0.attn_k.weight", 1)? / head_dim,
             "head_dim": head_dim,
             "rms_norm_eps": 1e-6,
             "rope_theta": ROPE_THETA,

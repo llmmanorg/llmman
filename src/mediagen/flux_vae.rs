@@ -27,9 +27,14 @@ pub struct Image {
     pub rgb: Vec<f32>,
 }
 
-/// Only the decoder is ever loaded, under the original (`ae.safetensors`)
-/// names; a Diffusers `AutoencoderKL` (`vae/diffusion_pytorch_model.safetensors`,
-/// whose `up_blocks` run in the opposite order) is renamed to them.
+/// [`tensor_name`] for the decoder alone (Z-Image only decodes).
+pub fn decoder_name(n: &str) -> Option<String> {
+    tensor_name(n).filter(|m| m.starts_with("decoder.") || m.starts_with("post_quant_conv."))
+}
+
+/// The VAE under the original (`ae.safetensors`) names; a Diffusers
+/// `AutoencoderKL` (`vae/diffusion_pytorch_model.safetensors`, whose
+/// `up_blocks` run in the opposite order) is renamed to them.
 pub fn tensor_name(n: &str) -> Option<String> {
     let n = n.strip_prefix("vae.").unwrap_or(n);
     if n.starts_with("post_quant_conv.")

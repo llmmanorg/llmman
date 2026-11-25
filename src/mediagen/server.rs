@@ -186,12 +186,13 @@ fn reference_images(body: &Value) -> Result<Vec<super::Frames>, Error> {
 }
 
 /// `(w, h)` scaled down to at most `max_pixels` and [`MAX_DIM`] a side,
-/// sides rounded down to multiples of 16, aspect kept.
+/// sides rounded down to multiples of 32 (the request alignment, so
+/// [`common_params`] keeps them), aspect kept.
 fn fit_size(w: i64, h: i64, max_pixels: i64) -> (i64, i64) {
     let scale = ((max_pixels as f64 / (w * h) as f64).sqrt())
         .min(MAX_DIM as f64 / w.max(h) as f64)
         .min(1.0);
-    let fit = |v: i64| ((v as f64 * scale) as i64 / 16 * 16).max(16);
+    let fit = |v: i64| ((v as f64 * scale) as i64 / 32 * 32).max(32);
     (fit(w), fit(h))
 }
 
@@ -692,8 +693,11 @@ mod tests {
     #[test]
     fn fit_size_bounds_a_large_reference() {
         let (w, h) = fit_size(4000, 3000, 2048 * 2048);
-        assert!(w * h <= 2048 * 2048 && w % 16 == 0 && h % 16 == 0);
+        assert!(w * h <= 2048 * 2048 && w % 32 == 0 && h % 32 == 0);
         assert!((w as f64 / h as f64 - 4.0 / 3.0).abs() < 0.02);
+        // just over the limit: rounding to 32 does not push it back over
+        let (w, h) = fit_size(2064, 2032, 2048 * 2048);
+        assert!(w * h <= 2048 * 2048 && w % 32 == 0 && h % 32 == 0);
         assert_eq!(fit_size(640, 480, 2048 * 2048), (640, 480));
         // a side longer than MAX_DIM
         assert_eq!(fit_size(9000, 100, MAX_PIXELS).0, MAX_DIM);
