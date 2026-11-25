@@ -28,6 +28,7 @@ use tokio::time::{sleep, Duration, Instant};
 
 use crate::default_store;
 use crate::llama_release::LlamaPin;
+use crate::mediagen::server::GENERATION_BODY_LIMIT_BYTES;
 use crate::metrics::{self, UnloadReason};
 use crate::modelpack::{resolve_model, ModelPath};
 use crate::providers::{Wire, PLACEHOLDER_API_KEY};
@@ -4784,9 +4785,6 @@ async fn spawn_mediagen_backend(
     let tail = tail_child_output(&mut child);
     Ok((child, tail))
 }
-
-/// Allows base64 images and long prompts while keeping request memory bounded.
-const GENERATION_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 /// The daemon's routes and the layers over them, split out of
 /// [`serve_async`] so `the_scrape_endpoint_is_outside_the_cors_layer` can

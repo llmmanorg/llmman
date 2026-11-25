@@ -24,8 +24,9 @@ const MAX_STEPS: i64 = 200;
 /// Output pixels per request (width x height x frames): 3 GiB of RGB.
 const MAX_PIXELS: i64 = 1 << 30;
 const MAX_REFERENCE_IMAGES: usize = 8;
-/// The daemon's own limit for generation requests (`GENERATION_BODY_LIMIT_BYTES`).
-const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Allows base64 images and long prompts while keeping request memory bounded;
+/// the daemon's generation routes use it too.
+pub const GENERATION_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 struct Video {
     id: String,
@@ -140,7 +141,6 @@ fn common_params(body: &Value, default_size: (i64, i64)) -> Result<GenParams, Er
     Ok(p)
 }
 
-/// A base64 field, with or without a `data:...;base64,` prefix.
 /// Reference images of `/v1/images/generations`: `image` (one) or `images`
 /// (a list), each PNG or JPEG as base64 or a data URL.
 fn reference_images(body: &Value) -> Result<Vec<super::Frames>, Error> {
@@ -169,6 +169,7 @@ fn reference_images(body: &Value) -> Result<Vec<super::Frames>, Error> {
         .collect()
 }
 
+/// A base64 field, with or without a `data:...;base64,` prefix.
 fn get_b64(body: &Value, k: &str) -> Result<Option<Vec<u8>>, Error> {
     let Some(v) = body.get(k) else {
         return Ok(None);
@@ -644,7 +645,9 @@ pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
         .route("/v1/images/generations", post(images))
         .route("/v1/videos", post(videos))
         // reference images and conditioning video ride in the JSON body, as base64
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            GENERATION_BODY_LIMIT_BYTES,
+        ))
         .route("/v1/videos/:id", get(video_get))
         .route("/v1/videos/:id/content", get(video_content))
         .route("/v1/audio/speech", post(speech))
