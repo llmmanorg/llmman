@@ -1,6 +1,6 @@
 //! `llmman launch claude`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::common;
 use super::optimizer::{Addition, Optimizer};
@@ -65,7 +65,12 @@ pub(super) fn launch_claude(
     let mut kept_callers_picker = false;
     let extra_args: &[String] = match model_picker(hosted) {
         Some(picker) => {
-            let placed = place_model_picker(std::mem::take(&mut added.args), extra_args, picker)?;
+            let placed = place_model_picker(
+                &claude_settings_dir()?,
+                std::mem::take(&mut added.args),
+                extra_args,
+                picker,
+            )?;
             added.args = placed.added_args;
             settings_file = placed.settings_file;
             kept_callers_picker = placed.kept_callers_picker;
@@ -225,7 +230,9 @@ fn claude_env<'a>(
 }
 
 /// The window [`CLAUDE_MAX_CONTEXT_ENV`] may declare when a hosted list
-/// is offered: the smallest context any offered model publishes. The
+/// is offered: the smallest context any offered model publishes — only
+/// chat models are offered (see `offered_models`), so no embedding or
+/// transcription window drags it down to a few thousand tokens. The
 /// picker lets the session switch to any of them, and the variable is
 /// set once, at launch, so the launch model's own window would let a
 /// switch land on a model whose window it overruns — claude would keep
@@ -255,10 +262,10 @@ fn hosted_context_bound(
     }
 }
 
-/// The `modelPicker` lineup for `hosted`: every model the provider
-/// serves, in the order the catalog lists them, under the id the
-/// provider knows them by. `replaceBuiltInOptions` leaves the picker
-/// these models and nothing else — the built-in rows would each resolve
+/// The `modelPicker` lineup for `hosted`: every chat model the provider
+/// serves (see `offered_models`), in the order the catalog lists them,
+/// under the id the provider knows them by. `replaceBuiltInOptions`
+/// leaves the picker these models and nothing else — the built-in rows would each resolve
 /// to the one model [`claude_env`] pins every alias to, so listing them
 /// beside the provider's would offer the same model several times.
 ///
@@ -303,14 +310,15 @@ fn model_picker(hosted: Option<&[HostedModel]>) -> Option<serde_json::Value> {
 /// settings file whose compact JSON exceeds 128 KiB would not launch
 /// at all: the kernel rejects the oversized argument with E2BIG.
 ///
-/// The file is 0600, under the system temp dir, named for this process
-/// and launch so one launch never shares another's; the caller removes
-/// it once claude exits or fails to start. `tempfile` is a dev-only
-/// dependency here, so this follows the codebase's own pattern
-/// (`std::env::temp_dir` plus the process id) instead.
-fn write_settings_file(settings: &serde_json::Value) -> anyhow::Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!(
-        "llmman-claude-settings-{}-{}",
+/// The file is 0600, under `dir` — [`claude_settings_dir`] for a launch
+/// — named for this process and launch so one launch never shares
+/// another's; the caller removes it once claude exits or fails to
+/// start. `tempfile` is a dev-only dependency here, so this follows the
+/// codebase's own pattern (the process id plus a timestamp) instead.
+fn write_settings_file(dir: &Path, settings: &serde_json::Value) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!(
+        "settings-{}-{}.json",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -338,6 +346,22 @@ fn write_settings_file(settings: &serde_json::Value) -> anyhow::Result<PathBuf> 
     Ok(path)
 }
 
+/// Where a launch's settings file goes (see [`write_settings_file`]):
+/// `llmman/` under claude's own config directory, `CLAUDE_CONFIG_DIR`
+/// or `~/.claude`. Not the host temp dir: a container `--sandbox` runs
+/// claude from an image that mounts claude's config directory (see
+/// `sandbox_state`) but not the host's `/tmp`, so a `--settings` path
+/// there would name a file claude cannot open.
+pub(super) fn claude_settings_dir() -> anyhow::Result<PathBuf> {
+    let config = match super::env_dir("CLAUDE_CONFIG_DIR") {
+        Some(dir) => dir,
+        None => dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("no home directory"))?
+            .join(".claude"),
+    };
+    Ok(config.join("llmman"))
+}
+
 /// `args` with `picker` added to the `--settings` argument: claude keeps
 /// only the last one, so a lineup that landed beside the optimizer's own
 /// settings would silently drop its hook. There the picker is one key of
@@ -347,6 +371,7 @@ fn write_settings_file(settings: &serde_json::Value) -> anyhow::Result<PathBuf> 
 /// argument (see [`write_settings_file`]); the returned path is the
 /// per-launch file, for the caller to remove once claude exits.
 fn with_model_picker(
+    dir: &Path,
     args: Vec<String>,
     picker: serde_json::Value,
 ) -> anyhow::Result<(Vec<String>, PathBuf)> {
@@ -362,13 +387,13 @@ fn with_model_picker(
                 .filter(serde_json::Value::is_object)
                 .unwrap_or_else(|| serde_json::json!({}));
             settings["modelPicker"] = picker;
-            let path = write_settings_file(&settings)?;
+            let path = write_settings_file(dir, &settings)?;
             args[at + 1] = path.to_string_lossy().into_owned();
             Ok((args, path))
         }
         None => {
             let settings = serde_json::json!({ "modelPicker": picker });
-            let path = write_settings_file(&settings)?;
+            let path = write_settings_file(dir, &settings)?;
             let mut with = vec![
                 "--settings".to_string(),
                 path.to_string_lossy().into_owned(),
@@ -412,14 +437,15 @@ enum ForwardedPicker {
 /// beside the picker's own would win — claude keeps only the last one —
 /// and the picker would silently disappear.
 fn place_model_picker(
+    dir: &Path,
     added_args: Vec<String>,
     extra_args: &[String],
     picker: serde_json::Value,
 ) -> anyhow::Result<PlacedPicker> {
-    let (extra_args, forwarded) = merge_picker_into_forwarded_settings(extra_args, &picker)?;
+    let (extra_args, forwarded) = merge_picker_into_forwarded_settings(dir, extra_args, &picker)?;
     let (added_args, settings_file, kept_callers_picker) = match forwarded {
         ForwardedPicker::Absent => {
-            let (added_args, path) = with_model_picker(added_args, picker)?;
+            let (added_args, path) = with_model_picker(dir, added_args, picker)?;
             (added_args, Some(path), false)
         }
         ForwardedPicker::Merged(path) => (added_args, Some(path), false),
@@ -452,6 +478,7 @@ fn place_model_picker(
 /// Only the last `--settings` is folded into: claude keeps that one,
 /// so an earlier one is dropped by claude either way.
 fn merge_picker_into_forwarded_settings(
+    dir: &Path,
     extra_args: &[String],
     picker: &serde_json::Value,
 ) -> anyhow::Result<(Vec<String>, ForwardedPicker)> {
@@ -478,7 +505,7 @@ fn merge_picker_into_forwarded_settings(
     // which an inline argument would expose on the command line, and a
     // large settings file would exceed the kernel's single-argument
     // limit (E2BIG). The file is removed once claude exits.
-    let path = write_settings_file(&settings)?;
+    let path = write_settings_file(dir, &settings)?;
     let mut rewritten = extra_args.to_vec();
     let arg = path.to_string_lossy().into_owned();
     if rewritten[at] == "--settings" {
@@ -707,6 +734,12 @@ mod tests {
         }
     }
 
+    /// Where these tests' settings files go: a scratch directory, not
+    /// the real [`claude_settings_dir`] under the home directory.
+    fn settings_dir() -> PathBuf {
+        std::env::temp_dir().join("llmman-claude-settings-test")
+    }
+
     fn strings(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
     }
@@ -920,6 +953,7 @@ mod tests {
         // picker folded in, and nothing else moves. The merged settings
         // reach claude as a file, not inline in the argument.
         let (rewritten, forwarded) = merge_picker_into_forwarded_settings(
+            &settings_dir(),
             &strings(&["-p", "hi", "--settings", &path]),
             &picker,
         )
@@ -942,7 +976,7 @@ mod tests {
         // `--settings=<file>` keeps its joined form.
         let joined = format!("--settings={path}");
         let (rewritten, forwarded) =
-            merge_picker_into_forwarded_settings(&[joined], &picker).unwrap();
+            merge_picker_into_forwarded_settings(&settings_dir(), &[joined], &picker).unwrap();
         assert!(matches!(forwarded, ForwardedPicker::Merged(_)));
         assert_eq!(rewritten.len(), 1);
         assert!(rewritten[0].starts_with("--settings="));
@@ -953,6 +987,7 @@ mod tests {
         let _ = std::fs::remove_file(&value);
         // Inline JSON (the form the optimizer passes) merges the same way.
         let (rewritten, forwarded) = merge_picker_into_forwarded_settings(
+            &settings_dir(),
             &strings(&["--settings", r#"{"model": "other"}"#]),
             &picker,
         )
@@ -972,8 +1007,13 @@ mod tests {
         let path = file.to_str().unwrap().to_string();
         let picker = picker();
         // With a forwarded `--settings`, the optimizer's args gain none.
-        let placed =
-            place_model_picker(vec![], &strings(&["--settings", &path]), picker.clone()).unwrap();
+        let placed = place_model_picker(
+            &settings_dir(),
+            vec![],
+            &strings(&["--settings", &path]),
+            picker.clone(),
+        )
+        .unwrap();
         assert!(placed.added_args.is_empty());
         assert!(!placed.kept_callers_picker);
         let settings_file = placed.settings_file.expect("a merged settings file");
@@ -987,6 +1027,7 @@ mod tests {
         // the rest, and the caller's args are untouched — again as a
         // file, never as inline JSON in the argument.
         let placed = place_model_picker(
+            &settings_dir(),
             vec!["--append-system-prompt".into(), "x".into()],
             &strings(&["-p", "hi"]),
             picker,
@@ -1019,7 +1060,7 @@ mod tests {
         let path = file.to_str().unwrap().to_string();
         let args = strings(&["--settings", &path]);
         let (rewritten, forwarded) =
-            merge_picker_into_forwarded_settings(&args, &picker()).unwrap();
+            merge_picker_into_forwarded_settings(&settings_dir(), &args, &picker()).unwrap();
         assert!(matches!(forwarded, ForwardedPicker::KeptCallers));
         // Nothing is rewritten: the caller's file is passed through as it was.
         assert_eq!(rewritten, args);
@@ -1034,21 +1075,31 @@ mod tests {
         let picker = picker();
         // No such file.
         assert!(merge_picker_into_forwarded_settings(
+            &settings_dir(),
             &strings(&["--settings", "no-such-file.json"]),
             &picker
         )
         .is_err());
         // Not JSON, and JSON that is not an object.
-        assert!(
-            merge_picker_into_forwarded_settings(&strings(&["--settings", "{oops"]), &picker)
-                .is_err()
-        );
-        assert!(
-            merge_picker_into_forwarded_settings(&strings(&["--settings=[1, 2]"]), &picker)
-                .is_err()
-        );
+        assert!(merge_picker_into_forwarded_settings(
+            &settings_dir(),
+            &strings(&["--settings", "{oops"]),
+            &picker
+        )
+        .is_err());
+        assert!(merge_picker_into_forwarded_settings(
+            &settings_dir(),
+            &strings(&["--settings=[1, 2]"]),
+            &picker
+        )
+        .is_err());
         // No value at all.
-        assert!(merge_picker_into_forwarded_settings(&strings(&["--settings"]), &picker).is_err());
+        assert!(merge_picker_into_forwarded_settings(
+            &settings_dir(),
+            &strings(&["--settings"]),
+            &picker
+        )
+        .is_err());
     }
 
     #[test]
@@ -1056,11 +1107,13 @@ mod tests {
         let picker = picker();
         // No forwarded `--settings`: nothing is rewritten.
         let (rewritten, forwarded) =
-            merge_picker_into_forwarded_settings(&strings(&["-p", "hi"]), &picker).unwrap();
+            merge_picker_into_forwarded_settings(&settings_dir(), &strings(&["-p", "hi"]), &picker)
+                .unwrap();
         assert!(matches!(forwarded, ForwardedPicker::Absent));
         assert_eq!(rewritten, strings(&["-p", "hi"]));
         // Past a `--` it is a message, not a flag.
         let (rewritten, forwarded) = merge_picker_into_forwarded_settings(
+            &settings_dir(),
             &strings(&["-p", "x", "--", "--settings", "mine.json"]),
             &picker,
         )
@@ -1084,8 +1137,13 @@ mod tests {
         let path = file.to_str().unwrap().to_string();
         // These are the arguments `launch_claude` hands to the spawn:
         // nothing in them may carry the secret.
-        let placed =
-            place_model_picker(vec![], &strings(&["--settings", &path]), picker()).unwrap();
+        let placed = place_model_picker(
+            &settings_dir(),
+            vec![],
+            &strings(&["--settings", &path]),
+            picker(),
+        )
+        .unwrap();
         let settings_file = placed.settings_file.expect("a merged settings file");
         for arg in placed.added_args.iter().chain(placed.extra_args.iter()) {
             assert!(!arg.contains("sk-live-do-not-leak"), "{arg}");
@@ -1118,8 +1176,13 @@ mod tests {
         let big = "x".repeat(200_000);
         std::fs::write(&file, format!(r#"{{"notes": "{big}"}}"#)).unwrap();
         let path = file.to_str().unwrap().to_string();
-        let placed =
-            place_model_picker(vec![], &strings(&["--settings", &path]), picker()).unwrap();
+        let placed = place_model_picker(
+            &settings_dir(),
+            vec![],
+            &strings(&["--settings", &path]),
+            picker(),
+        )
+        .unwrap();
         let settings_file = placed.settings_file.expect("a merged settings file");
         // The argument is a short path, not the 200 KiB of JSON.
         assert!(placed.extra_args[1].len() < 1024);
@@ -1149,6 +1212,7 @@ mod tests {
             hosted("tiny", Some(8_000), None),
         ];
         let placed = place_model_picker(
+            &settings_dir(),
             vec![],
             &strings(&["--settings", &path]),
             model_picker(Some(&offered)).expect("a hosted list makes a picker"),

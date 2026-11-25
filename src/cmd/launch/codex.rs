@@ -7,7 +7,7 @@ use toml_edit::{value, DocumentMut, Item, Table};
 
 use super::common::write_if_changed;
 use super::optimizer::Optimizer;
-use super::{exec_with_env, find_on_path, server, HostedModel};
+use super::{exec_with_env, find_on_path, map_offered, server, HostedModel};
 
 /// codex: write the `llmman` profile overlay (`~/.codex/llmman.config.toml`,
 /// a provider named `llmman` at our /v1 endpoint), then run codex with
@@ -339,13 +339,11 @@ fn codex_reasoning_description(level: &str) -> &'static str {
 }
 
 /// One entry of codex's catalog, from the values its own row resolves
-/// to: the model codex selects with, the plain id it shows, the window
-/// (the launch's for the launched model, the catalog row's for every
-/// other), image input, and the row's reasoning levels. The window
-/// falls back on the same guess codex cannot do without, since its
-/// catalog cannot omit it. Used for every row of the hosted list and
-/// for the fallback entry where the list somehow lacks the launched
-/// model, so the two spell the same entry the same way.
+/// to: the model codex selects with, the plain id it shows, the window,
+/// image input, and the row's reasoning levels. The window falls back
+/// on the same guess codex cannot do without, since its catalog cannot
+/// omit it. Used for every row of the hosted list and for a local
+/// launch's one entry, so the two spell an entry the same way.
 fn codex_catalog_entry(
     slug: &str,
     display_name: &str,
@@ -362,60 +360,42 @@ fn codex_catalog_entry(
     }
 }
 
-/// What codex's catalog lists: every model `--provider` serves, so `/model`
-/// inside codex can switch between them, or — for a local launch — the one
-/// model this launch resolved.
+/// What codex's catalog lists: every model `--provider` offers, so
+/// `/model` inside codex can switch between them, or — for a local
+/// launch — the one model this launch resolved (a catalog window, or a
+/// local one read off the loaded runner).
 ///
-/// One path builds every entry from the shared hosted list (a local
-/// launch has no list, so the launched model is the whole catalog).
-/// Each entry carries the window, image input and reasoning levels of
-/// its own row: the launched model keeps what this launch resolved for
-/// it (a catalog window, or a local one read off the loaded runner),
-/// every other model what the provider's catalog says, falling back on
-/// the same guess codex cannot do without, since its catalog cannot
-/// omit the window. Each entry is shown under its plain model id, not
-/// the reference codex selects with.
+/// Every hosted entry is mapped alike from its own row (see
+/// [`map_offered`]), the launched one first: the window, image input
+/// and reasoning levels the provider's catalog says — unknown image
+/// input reads as none rather than a guess — falling back on the same
+/// window guess codex cannot do without, since its catalog cannot omit
+/// the window. Each entry is shown under its plain model id, not the
+/// reference codex selects with.
 fn codex_catalog_models(
     model: &str,
     vision: bool,
     context_window: Option<u64>,
     hosted: Option<&[HostedModel]>,
 ) -> Vec<CodexCatalogModel> {
-    let mut models: Vec<CodexCatalogModel> = hosted
-        .unwrap_or_default()
-        .iter()
-        .map(|m| {
-            let launched = m.reference == model;
-            codex_catalog_entry(
-                &m.reference,
-                &m.id,
-                // What the provider's catalog says about this model
-                // (see `HostedModel::vision`); unknown reads as no
-                // image input rather than a guess.
-                if launched { context_window } else { m.context },
-                if launched {
-                    vision
-                } else {
-                    m.vision.unwrap_or(false)
-                },
-                // The launched model's row carries the same levels
-                // `launch` resolved for it (see
-                // `resolve_provider_model`); every other row its own.
-                m.thinking.as_deref(),
-            )
-        })
-        .collect();
-    // The launched model belongs in its own catalog even if the list
-    // somehow lacks it: codex is started with `--model` naming it.
-    // No catalog row names a plainer id for it, so the reference is
-    // its display name, as a local launch's model is.
-    if !models.iter().any(|m| m.slug == model) {
-        models.insert(
-            0,
-            codex_catalog_entry(model, model, context_window, vision, None),
-        );
-    }
-    models
+    let Some(hosted) = hosted else {
+        return vec![codex_catalog_entry(
+            model,
+            model,
+            context_window,
+            vision,
+            None,
+        )];
+    };
+    map_offered(hosted, |m, _| {
+        codex_catalog_entry(
+            &m.reference,
+            &m.id,
+            m.context,
+            m.vision.unwrap_or(false),
+            m.thinking.as_deref(),
+        )
+    })
 }
 
 /// The `model_catalog_json` for `models`, declaring image input in
@@ -867,9 +847,8 @@ model = \"gpt-5\"
 
     /// A `--provider` launch lists every model the provider serves, so
     /// codex's `/model` can switch between them without a relaunch: the
-    /// launched model first, with the window and image input this launch
-    /// resolved for it, and each other model with what its own catalog
-    /// entry says.
+    /// launched model first, each with what its own catalog entry says,
+    /// and a model with no window named takes codex's fallback.
     #[test]
     fn codex_catalog_lists_every_model_the_provider_serves() {
         let hosted = || {
@@ -904,9 +883,9 @@ model = \"gpt-5\"
                 CodexCatalogModel {
                     slug: "llmman.provider/ollama-cloud/qwen3-coder".into(),
                     display_name: "qwen3-coder".into(),
-                    // The launched model keeps the window the launch
-                    // resolved; codex's catalog cannot omit it.
-                    context_window: CODEX_FALLBACK_CONTEXT_WINDOW,
+                    // The launched model's own row: the window the
+                    // catalog names for it travels as it is.
+                    context_window: 262_144,
                     vision: false,
                     supported_reasoning_levels: vec![],
                 },
@@ -936,15 +915,6 @@ model = \"gpt-5\"
                 "llmman.provider/ollama-cloud/llama-4-scout"
             ]
         );
-        // A window the provider's catalog names travels as it is.
-        let with_window = codex_catalog_models(
-            "llmman.provider/ollama-cloud/qwen3-coder",
-            false,
-            Some(262_144),
-            Some(&hosted()),
-        );
-        assert_eq!(with_window[0].context_window, 262_144);
-        assert_eq!(with_window[1].context_window, CODEX_FALLBACK_CONTEXT_WINDOW);
     }
 
     /// A local launch's catalog is the one model it always was.
@@ -962,23 +932,12 @@ model = \"gpt-5\"
         );
     }
 
-    /// The dedup: launched and other entries come out of the one path,
-    /// differing only in their own values — the launched model keeps
-    /// the window and image input this launch resolved for it even
-    /// where its catalog row says otherwise, and even when it is not
-    /// first in the list; every other entry keeps what its own row
-    /// says; every entry is shown under its plain id.
+    /// The dedup: every entry comes out of the one path, mapped alike
+    /// from its own row — the launched one, first, included — and is
+    /// shown under its plain id.
     #[test]
     fn codex_catalog_builds_launched_and_other_entries_the_same_way() {
         let hosted = vec![
-            HostedModel {
-                reference: "llmman.provider/p/other".into(),
-                id: "other".into(),
-                context: Some(4_096),
-                output: Some(1_024),
-                thinking: None,
-                vision: Some(true),
-            },
             HostedModel {
                 reference: "llmman.provider/p/launched".into(),
                 id: "launched".into(),
@@ -987,29 +946,36 @@ model = \"gpt-5\"
                 thinking: None,
                 vision: Some(true),
             },
+            HostedModel {
+                reference: "llmman.provider/p/other".into(),
+                id: "other".into(),
+                context: Some(4_096),
+                output: Some(1_024),
+                thinking: None,
+                vision: None,
+            },
         ];
         let models = codex_catalog_models(
             "llmman.provider/p/launched",
-            false,
-            Some(262_144),
+            true,
+            Some(1_000),
             Some(&hosted),
         );
         assert_eq!(
             models,
             vec![
                 CodexCatalogModel {
-                    slug: "llmman.provider/p/other".into(),
-                    display_name: "other".into(),
-                    context_window: 4_096,
+                    slug: "llmman.provider/p/launched".into(),
+                    display_name: "launched".into(),
+                    context_window: 1_000,
                     vision: true,
                     supported_reasoning_levels: vec![],
                 },
                 CodexCatalogModel {
-                    slug: "llmman.provider/p/launched".into(),
-                    display_name: "launched".into(),
-                    // The launch's window and image input, not the
-                    // catalog row's 1_000 / vision.
-                    context_window: 262_144,
+                    slug: "llmman.provider/p/other".into(),
+                    display_name: "other".into(),
+                    context_window: 4_096,
+                    // Unknown image input reads as none.
                     vision: false,
                     supported_reasoning_levels: vec![],
                 },
@@ -1020,51 +986,10 @@ model = \"gpt-5\"
         let catalog: serde_json::Value =
             serde_json::from_str(&codex_model_catalog(&models)).expect("valid JSON");
         let entries = catalog["models"].as_array().unwrap();
-        assert_eq!(entries[0]["slug"], "llmman.provider/p/other");
-        assert_eq!(entries[0]["display_name"], "other");
-        assert_eq!(entries[1]["slug"], "llmman.provider/p/launched");
-        assert_eq!(entries[1]["display_name"], "launched");
-    }
-
-    /// A list that somehow lacks the launched model gains it first,
-    /// with the window and image input this launch resolved for it —
-    /// and, with no catalog row to name a plainer id, the reference
-    /// as its display name.
-    #[test]
-    fn codex_catalog_inserts_a_missing_launched_model_first() {
-        let hosted = vec![HostedModel {
-            reference: "llmman.provider/p/other".into(),
-            id: "other".into(),
-            context: Some(4_096),
-            output: None,
-            thinking: None,
-            vision: Some(false),
-        }];
-        let models = codex_catalog_models(
-            "llmman.provider/p/launched",
-            true,
-            Some(8_192),
-            Some(&hosted),
-        );
-        assert_eq!(
-            models,
-            vec![
-                CodexCatalogModel {
-                    slug: "llmman.provider/p/launched".into(),
-                    display_name: "llmman.provider/p/launched".into(),
-                    context_window: 8_192,
-                    vision: true,
-                    supported_reasoning_levels: vec![],
-                },
-                CodexCatalogModel {
-                    slug: "llmman.provider/p/other".into(),
-                    display_name: "other".into(),
-                    context_window: 4_096,
-                    vision: false,
-                    supported_reasoning_levels: vec![],
-                },
-            ]
-        );
+        assert_eq!(entries[0]["slug"], "llmman.provider/p/launched");
+        assert_eq!(entries[0]["display_name"], "launched");
+        assert_eq!(entries[1]["slug"], "llmman.provider/p/other");
+        assert_eq!(entries[1]["display_name"], "other");
     }
 
     /// A secondary model that publishes `low` and `high` reaches the

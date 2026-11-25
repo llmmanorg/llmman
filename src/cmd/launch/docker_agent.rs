@@ -7,7 +7,9 @@ use anyhow::Context;
 use crate::daemon;
 
 use super::common;
-use super::{before_terminator, exec_with_env, find_on_path, has_flag, server, HostedModel};
+use super::{
+    before_terminator, exec_with_env, find_on_path, has_flag, map_offered, server, HostedModel,
+};
 
 /// The env var the generated `token_key` names, so no key reaches disk
 /// (same role as `qwen::QWEN_ENV_KEY` and `dsh::DSH_API_KEY_ENV`).
@@ -229,11 +231,10 @@ fn docker_agent_document(model: &str, base_url: &str, hosted: Option<&[HostedMod
 
 /// The `(key, model, context, output)` rows of the agent file's
 /// `models:` map: the one model this launch resolved, or — under
-/// `--provider` — every model the provider serves, the launched one
-/// first. A row's context and output are what the catalog publishes
-/// for it, `None` where it publishes none — and `None` for the
-/// launched model too when the list somehow lacks it, since there is
-/// no catalog row to read them from.
+/// `--provider` — every model the provider offers, the launched one
+/// first under the `llmman` key `root` selects, each mapped alike from
+/// its own row (see [`map_offered`]). A row's context and output are
+/// what the catalog publishes for it, `None` where it publishes none.
 fn docker_agent_model_entries<'a>(
     model: &'a str,
     hosted: Option<&'a [HostedModel]>,
@@ -241,30 +242,14 @@ fn docker_agent_model_entries<'a>(
     let Some(hosted) = hosted else {
         return vec![(DOCKER_AGENT_MODEL_NAME, model, None, None)];
     };
-    let mut entries: Vec<(&str, &str, Option<u64>, Option<u32>)> = hosted
-        .iter()
-        .map(|m| {
-            if m.reference == model {
-                (DOCKER_AGENT_MODEL_NAME, model, m.context, m.output)
-            } else {
-                (
-                    m.reference.as_str(),
-                    m.reference.as_str(),
-                    m.context,
-                    m.output,
-                )
-            }
-        })
-        .collect();
-    // The launched model belongs in its own agent file even if the list
-    // somehow lacks it: docker-agent is started on it.
-    if !entries
-        .iter()
-        .any(|(_, reference, _, _)| *reference == model)
-    {
-        entries.insert(0, (DOCKER_AGENT_MODEL_NAME, model, None, None));
-    }
-    entries
+    map_offered(hosted, |m, launched| {
+        let key = if launched {
+            DOCKER_AGENT_MODEL_NAME
+        } else {
+            m.reference.as_str()
+        };
+        (key, m.reference.as_str(), m.context, m.output)
+    })
 }
 
 /// `run`, then the generated agent file, then the caller's arguments.
@@ -399,19 +384,6 @@ mod tests {
         assert!(scout.get("provider_opts").is_none());
         assert!(scout.get("max_tokens").is_none());
         assert_eq!(parsed["agents"]["root"]["model"], "llmman");
-
-        // The launched model belongs in its own agent file even if the
-        // provider's list somehow lacks it, ahead of the rest.
-        let others = vec![hosted.into_iter().nth(1).unwrap()];
-        let document = docker_agent_document("m", "http://127.0.0.1:17434/v1", Some(&others));
-        let parsed: serde_json::Value = yaml_serde::from_str(&document).expect("valid YAML");
-        let models = parsed["models"].as_object().unwrap();
-        assert_eq!(models.len(), 2);
-        assert_eq!(parsed["models"]["llmman"]["model"], "m");
-        assert_eq!(
-            parsed["models"]["llmman.provider/openrouter/llama-4-scout"]["model"],
-            "llmman.provider/openrouter/llama-4-scout"
-        );
     }
 
     /// Two hosted rows must not share one YAML key. Provider `p`
@@ -421,6 +393,14 @@ mod tests {
     #[test]
     fn docker_agent_model_keys_stay_unique_when_an_id_looks_like_a_reference() {
         let hosted = vec![
+            HostedModel {
+                reference: "llmman.provider/p/other".into(),
+                id: "other".into(),
+                context: None,
+                output: None,
+                thinking: None,
+                vision: None,
+            },
             HostedModel {
                 reference: "llmman.provider/p/llmman".into(),
                 id: "llmman".into(),

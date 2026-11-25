@@ -355,6 +355,14 @@ pub struct Model {
     /// modalities, and for a provider defined in `llmman.conf`, which
     /// has no catalog entry at all.
     pub vision: Option<bool>,
+    /// Whether this is a chat model — one a coding agent can talk to —
+    /// rather than an embedding, transcription, speech, image or video
+    /// model (see [`chat_of`]). `None` where the catalog says nothing
+    /// either way, and for a provider defined in `llmman.conf`.
+    pub chat: Option<bool>,
+    /// models.dev's `tool_call`: whether the model calls tools. `None`
+    /// where the catalog does not say.
+    pub tools: Option<bool>,
 }
 
 /// US dollars per million tokens — models.dev's own unit, unconverted so
@@ -943,6 +951,13 @@ struct RawModel {
     /// Untyped for the same reason; `input` is read for `image`.
     #[serde(default)]
     modalities: Option<serde_json::Value>,
+    /// Untyped for the same reason, e.g. `"embedding"`; absent for most
+    /// chat models (see [`chat_of`]).
+    #[serde(default, rename = "type")]
+    kind: Option<serde_json::Value>,
+    /// Untyped for the same reason.
+    #[serde(default)]
+    tool_call: Option<serde_json::Value>,
     /// Untyped for the same reason.
     #[serde(default)]
     reasoning: Option<serde_json::Value>,
@@ -970,6 +985,26 @@ fn max_context_of(raw: &serde_json::Value) -> Option<u64> {
 fn vision_of(raw: &serde_json::Value) -> Option<bool> {
     let input = raw.get("input")?.as_array()?;
     Some(input.iter().any(|m| m.as_str() == Some("image")))
+}
+
+/// Whether a models.dev entry is a chat model. Its `type` says so where
+/// it is published — `chat`, against `embedding`, `transcription`,
+/// `speech`, `image`, `video`, `reranking` or `realtime` — and most chat
+/// models publish none, so without one a model that takes text in and
+/// gives text out is a chat model and one that does not is not.
+/// `None` where the entry publishes neither.
+fn chat_of(raw: &RawModel) -> Option<bool> {
+    if let Some(kind) = raw.kind.as_ref().and_then(serde_json::Value::as_str) {
+        return Some(kind == "chat");
+    }
+    let modalities = raw.modalities.as_ref()?;
+    let takes = |side: &str| {
+        modalities
+            .get(side)
+            .and_then(serde_json::Value::as_array)
+            .map(|list| list.iter().any(|m| m.as_str() == Some("text")))
+    };
+    Some(takes("input")? && takes("output")?)
 }
 
 /// The levels opencode derives from a models.dev entry
@@ -1267,6 +1302,11 @@ fn models_of(
                 max_context: model.limit.as_ref().and_then(max_context_of),
                 max_output,
                 vision: model.modalities.as_ref().and_then(vision_of),
+                chat: chat_of(&model),
+                tools: model
+                    .tool_call
+                    .as_ref()
+                    .and_then(serde_json::Value::as_bool),
                 id,
             }
         })
@@ -2081,8 +2121,9 @@ mod tests {
                     "npm": "@openrouter/ai-sdk-provider",
                     "env": ["OPENROUTER_API_KEY"],
                     "models": {
-                        "z-model": { "cost": { "input": 2.5, "output": 10 }, "limit": { "context": 200000, "output": 32000 }, "modalities": { "input": ["text", "image"], "output": ["text"] } },
+                        "z-model": { "cost": { "input": 2.5, "output": 10 }, "limit": { "context": 200000, "output": 32000 }, "modalities": { "input": ["text", "image"], "output": ["text"] }, "tool_call": true },
                         "m-model": { "modalities": { "input": ["text"], "output": ["text"] } },
+                        "e-model": { "type": "embedding", "modalities": { "input": ["text"], "output": ["text"] }, "tool_call": false },
                         "a-model": {}
                     }
                 }
@@ -2105,6 +2146,20 @@ mod tests {
                     thinking: None,
                     // No modalities published: unknown, not text-only.
                     vision: None,
+                    // No `type` or modalities: unknown, not "not chat".
+                    chat: None,
+                    tools: None,
+                },
+                Model {
+                    id: "e-model".into(),
+                    cost: None,
+                    max_output: None,
+                    max_context: None,
+                    thinking: None,
+                    vision: Some(false),
+                    // Text in and out, but its `type` says embedding.
+                    chat: Some(false),
+                    tools: Some(false),
                 },
                 Model {
                     id: "m-model".into(),
@@ -2114,6 +2169,9 @@ mod tests {
                     thinking: None,
                     // `modalities.input` without `image`: text-only.
                     vision: Some(false),
+                    // No `type`: text in and out reads as chat.
+                    chat: Some(true),
+                    tools: None,
                 },
                 Model {
                     id: "z-model".into(),
@@ -2124,6 +2182,8 @@ mod tests {
                     thinking: None,
                     // The fixture's `modalities.input` lists `image`.
                     vision: Some(true),
+                    chat: Some(true),
+                    tools: Some(true),
                 },
             ]
         );

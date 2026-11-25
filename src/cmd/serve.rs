@@ -3845,6 +3845,14 @@ struct ProviderModelResponse {
     /// catalog publishes no modalities.
     #[serde(skip_serializing_if = "Option::is_none")]
     vision: Option<bool>,
+    /// See [`crate::providers::Model::chat`]; absent where the catalog
+    /// says nothing either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat: Option<bool>,
+    /// See [`crate::providers::Model::tools`]; absent where the catalog
+    /// does not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<bool>,
 }
 
 /// US dollars per million tokens, models.dev's own unit (see
@@ -3890,6 +3898,8 @@ impl ProviderResponse {
                     context: m.max_context,
                     output: m.max_output,
                     vision: m.vision,
+                    chat: m.chat,
+                    tools: m.tools,
                 })
                 .collect(),
         }
@@ -3955,7 +3965,7 @@ async fn handle_llmman_provider(
             .into_iter()
             // A provider defined in llmman.conf: its models come from
             // the endpoint's own /v1/models, which names no window, no
-            // output ceiling and no image input.
+            // output ceiling, no image input and no model type.
             .map(|id| ProviderModelResponse {
                 id,
                 cost: None,
@@ -3963,6 +3973,8 @@ async fn handle_llmman_provider(
                 context: None,
                 output: None,
                 vision: None,
+                chat: None,
+                tools: None,
             })
             .collect();
     }

@@ -7,8 +7,8 @@ use anyhow::Context;
 use super::common::{write_if_changed, write_json_merged};
 use super::optimizer::Optimizer;
 use super::{
-    exec_with_env, find_on_path, server, thinking_choices, xdg_dir, HostedModel, Thinking,
-    WINDOWS_PATH_EXTS,
+    exec_with_env, find_on_path, map_offered, server, thinking_choices, xdg_dir, HostedModel,
+    Thinking, WINDOWS_PATH_EXTS,
 };
 
 /// opencode: a JSON config pointing at our /v1 endpoint, with the
@@ -242,10 +242,10 @@ fn opencode_output_reserve(context: u64) -> u64 {
 ///
 /// `hosted` is every model `--provider` serves (see [`HostedModel`]); with
 /// it, the config lists all of them, so opencode's own model picker can
-/// switch between them mid-session. The launched model keeps the variants,
-/// `--variant` options, window and image input this launch resolved for
-/// it; each other model takes what the provider's catalog says about it —
-/// its own thinking levels, window, output ceiling and image input.
+/// switch between them mid-session. Every model, the launched one
+/// first, takes what the provider's catalog says about it — its own
+/// thinking levels, window, output ceiling and image input — and the
+/// launched one the `--variant` options this launch resolved for it.
 #[allow(clippy::too_many_arguments)]
 fn opencode_config(
     server: &str,
@@ -319,10 +319,8 @@ fn opencode_config(
     }
 
     /// One row of `provider.ollama.models`, owned so the whole list can
-    /// borrow from it after the loop that fills it. Each row carries
-    /// its own variants, options, window and image input: the launched
-    /// model's, what this launch resolved; any other model's, what
-    /// the provider's catalog says about it.
+    /// borrow from it once it is filled. Each row carries its own
+    /// variants, options, window and image input (see `map_offered`).
     struct Row<'a> {
         /// The map key: the reference the daemon routes a request on.
         reference: String,
@@ -367,58 +365,45 @@ fn opencode_config(
         })
         .unwrap_or_default();
 
-    // One path builds every row from the shared hosted list: a local
-    // launch has no list, so the launched model is the whole config.
-    // Each row carries its own variants, options, window and image
-    // input — the launched model keeps what this launch resolved for
-    // it, every other model what the provider's catalog says about
-    // it. The launched model belongs in its own config even if the
-    // list somehow lacks it: opencode is started on it.
-    let mut rows: Vec<Row<'_>> = Vec::with_capacity(hosted.map_or(1, |h| h.len()));
-    if let Some(hosted) = hosted {
-        for (m, thinking) in hosted.iter().zip(&thinkings) {
-            let launched = m.reference == model;
-            // This row's own image input: the launch's, for the
-            // launched model, the catalog's for any other (unknown
-            // reads as no image input rather than a guess).
-            let row_vision = if launched {
-                vision
-            } else {
-                m.vision.unwrap_or(false)
-            };
-            rows.push(Row {
-                reference: m.reference.clone(),
-                name: m.id.clone(),
-                variants: if launched {
-                    variants.to_vec()
-                } else {
-                    opencode_variants(thinking.as_ref())
-                },
-                options: if launched { options.cloned() } else { None },
-                modalities: modalities_for(row_vision),
-                attachment: row_vision.then_some(true),
-                limit: if launched {
-                    limit
-                } else {
-                    m.context.map(|context| model_limit(context, m.output))
-                },
-            });
+    // Every row of the hosted list is mapped alike from its own catalog
+    // row (see `map_offered`): its variants, window, output ceiling and
+    // image input (unknown reads as no image input rather than a
+    // guess). A `--variant` launch keeps the variants and options it
+    // resolved for the launched model — the levels widened to take a
+    // variant the catalog does not list included. A local launch has
+    // no list, so the launched model is the whole config.
+    let rows: Vec<Row<'_>> = match hosted {
+        Some(hosted) => {
+            let mut thinkings = thinkings.iter();
+            map_offered(hosted, |m, launched| {
+                let thinking = thinkings.next().and_then(Option::as_ref);
+                let chosen = launched && options.is_some();
+                let vision = m.vision.unwrap_or(false);
+                Row {
+                    reference: m.reference.clone(),
+                    name: m.id.clone(),
+                    variants: if chosen {
+                        variants.to_vec()
+                    } else {
+                        opencode_variants(thinking)
+                    },
+                    options: if chosen { options.cloned() } else { None },
+                    modalities: modalities_for(vision),
+                    attachment: vision.then_some(true),
+                    limit: m.context.map(|context| model_limit(context, m.output)),
+                }
+            })
         }
-    }
-    if !rows.iter().any(|row| row.reference == model) {
-        rows.insert(
-            0,
-            Row {
-                reference: model.to_string(),
-                name: model.to_string(),
-                variants: variants.to_vec(),
-                options: options.cloned(),
-                modalities: modalities_for(vision),
-                attachment: vision.then_some(true),
-                limit,
-            },
-        );
-    }
+        None => vec![Row {
+            reference: model.to_string(),
+            name: model.to_string(),
+            variants: variants.to_vec(),
+            options: options.cloned(),
+            modalities: modalities_for(vision),
+            attachment: vision.then_some(true),
+            limit,
+        }],
+    };
 
     let models: Vec<(&str, Model<'_>)> = rows
         .iter()
@@ -680,8 +665,8 @@ mod tests {
     /// Each provider row carries its own model's image input, not just
     /// the launched model's: a vision model declares `modalities` and
     /// `attachment` from its own catalog row, a text-only one gets
-    /// neither — and the launched model keeps what the launch resolved
-    /// for it even where its catalog row says otherwise.
+    /// neither — the launched model included: its row already carries
+    /// what the launch resolved for it.
     #[test]
     fn opencode_config_carries_each_models_own_modalities() {
         let hosted = vec![
@@ -691,7 +676,6 @@ mod tests {
                 context: Some(128_000),
                 output: Some(8_192),
                 thinking: Some(vec!["low".into(), "high".into()]),
-                // The catalog says vision; the launch resolved none.
                 vision: Some(true),
             },
             HostedModel {
@@ -730,12 +714,23 @@ mod tests {
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         let models = &config["provider"]["ollama"]["models"];
 
-        // The launched model keeps what the launch resolved: no image
-        // input, even though its catalog row says vision.
+        // The launched model is mapped like every other row: image
+        // input, levels and window from its own catalog row.
         let alpha = &models["llmman.provider/p/alpha"];
         assert_eq!(alpha["name"], "alpha");
-        assert!(alpha.get("modalities").is_none(), "{alpha}");
-        assert!(alpha.get("attachment").is_none(), "{alpha}");
+        assert_eq!(
+            alpha["modalities"],
+            serde_json::json!({ "input": ["text", "image"], "output": ["text"] })
+        );
+        assert_eq!(alpha["attachment"], true);
+        assert_eq!(alpha["limit"]["context"], 128_000);
+        assert_eq!(
+            alpha["variants"],
+            serde_json::json!({
+                "low": { "reasoningEffort": "low" },
+                "high": { "reasoningEffort": "high" },
+            })
+        );
 
         // beta declares image input from its own catalog row, with its
         // own thinking levels and window beside it — exactly the one

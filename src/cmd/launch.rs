@@ -71,10 +71,11 @@ pub struct LaunchArgs {
     pub model: Option<String>,
 
     /// Serve --model from this provider (openai, anthropic, openrouter, …)
-    /// instead of locally; with no --model, the provider's first model.
+    /// instead of locally; with no --model, the provider's first text
+    /// model that calls tools.
     /// claude, codex, opencode, pi, droid, hermes, qwen, dsh, vibe and
-    /// docker-agent are given every model the provider lists, to switch
-    /// between inside the agent.
+    /// docker-agent are given every chat model the provider lists, to
+    /// switch between inside the agent.
     /// See `llmman providers`.
     #[arg(long, short = 'p', value_name = "PROVIDER")]
     pub provider: Option<String>,
@@ -505,9 +506,9 @@ const MODEL_FLAG_FORWARDED: &[&str] = &[
 
 /// Refuses a local launch of one of `MODEL_REQUIRED` without a model.
 /// A `--provider` launch instead resolves its model from the catalog
-/// (see `resolve_provider_model`): the provider's first model when none
-/// was named, or a refusal naming some when it lists none — so this
-/// guard lets it through. A second `--model` after `--` is the caller's
+/// (see `resolve_provider_model`): the provider's first text model that
+/// calls tools when none was named, or a refusal naming some when it
+/// lists none — so this guard lets it through. A second `--model` after `--` is the caller's
 /// to win for the integrations in `MODEL_FLAG_FORWARDED`, but `run`
 /// resolves the top-level one and, locally, preloads it, so that gets
 /// said.
@@ -527,8 +528,9 @@ fn check_model_flag(
     let model = model.map(str::trim).filter(|m| !m.is_empty());
     let Some(model) = model else {
         if provider.is_some() {
-            // The resolver picks the provider's first model, or refuses
-            // when it lists none (see `default_provider_model`).
+            // The resolver picks the provider's first text model that
+            // calls tools, or refuses when it lists none (see
+            // `default_provider_model`).
             return Ok(());
         }
         if MODEL_REQUIRED.contains(&name.as_str()) {
@@ -716,9 +718,9 @@ struct ResolvedProvider {
     /// (see [`HostedModel::vision`]), `None` where it publishes no
     /// modalities.
     vision: Option<bool>,
-    /// Every model the provider serves — the launched one first — so an
-    /// integration can list them for the session to switch between
-    /// (see [`HostedModel`]).
+    /// Every chat model the provider serves — the launched one always
+    /// first — so an integration can list them for the session to
+    /// switch between (see [`offered_models`] and [`map_offered`]).
     models: Vec<HostedModel>,
 }
 
@@ -747,6 +749,26 @@ pub(super) struct HostedModel {
     /// `modalities.input` lists `image`), `None` where it publishes
     /// no modalities.
     pub vision: Option<bool>,
+}
+
+/// Every row a `--provider` launch offers (see [`offered_models`]),
+/// mapped alike by `row`. The launched model is always `hosted[0]`,
+/// carrying what this launch resolved for it, so each row's window,
+/// output ceiling, image input and thinking levels come from the row
+/// itself, and no fallback row is needed for a launched model the list
+/// lacks. `row` is told which row is the launched one only for what an
+/// integration starts on — the alias, key or session default that
+/// selects it, and a `--variant` chosen for it — never for what the
+/// catalog says about it.
+pub(super) fn map_offered<'a, T>(
+    hosted: &'a [HostedModel],
+    mut row: impl FnMut(&'a HostedModel, bool) -> T,
+) -> Vec<T> {
+    hosted
+        .iter()
+        .enumerate()
+        .map(|(i, m)| row(m, i == 0))
+        .collect()
 }
 
 /// Validates `--provider`/`--model` against the running daemon's catalog
@@ -779,9 +801,10 @@ fn resolve_provider_model(
     // Sent so a catalog that predates the model is refreshed, not warned about.
     let entry = daemon::provider(provider, typed)?;
 
-    // No `--model`: start on the provider's own first model rather than
-    // refuse the launch. Every model it serves travels to the
-    // integration anyway (see `HostedModel`), so the session can switch
+    // No `--model`: start on the provider's first text model that calls
+    // tools (see `default_provider_model`) rather than refuse the
+    // launch. Every chat model it serves travels to the integration
+    // anyway (see `offered_models`), so the session can switch
     // away from this one at once — which is what makes
     // `llmman launch claude --provider ollama-cloud`, the command with
     // no model in it, a launch rather than an error. A provider that
@@ -850,36 +873,22 @@ fn resolve_provider_model(
         (None, true) => anyhow::bail!("no API key for {} — {}", entry.name, entry.key_hint()),
     };
 
-    // The launched model first, with what this launch resolved for it,
-    // then every other model the catalog lists, in its own order: this
-    // list is what an integration offers for switching (see
-    // [`HostedModel`]), and the launched model belongs at the top of it.
     let thinking = entry.thinking_levels(model);
     let context_window = entry.context_window(model);
     let max_output = entry.max_output(model);
     let vision = entry.vision(model);
     let reference = providers::format_remote_ref(provider, model);
-    let mut models = vec![HostedModel {
-        reference: reference.clone(),
-        id: model.to_string(),
-        context: context_window,
-        output: max_output,
-        thinking: thinking.clone(),
-        vision,
-    }];
-    models.extend(
-        entry
-            .models
-            .iter()
-            .filter(|m| m.id != model)
-            .map(|m| HostedModel {
-                reference: providers::format_remote_ref(provider, &m.id),
-                id: m.id.clone(),
-                context: m.context,
-                output: m.output,
-                thinking: m.thinking.clone(),
-                vision: m.vision,
-            }),
+    let models = offered_models(
+        provider,
+        HostedModel {
+            reference: reference.clone(),
+            id: model.to_string(),
+            context: context_window,
+            output: max_output,
+            thinking: thinking.clone(),
+            vision,
+        },
+        &entry,
     );
 
     Ok(ResolvedProvider {
@@ -893,21 +902,68 @@ fn resolve_provider_model(
     })
 }
 
+/// The models a `--provider` launch offers for switching (see
+/// [`HostedModel`]): `launched` first, with what this launch resolved
+/// for it, then every other *chat* model the catalog lists, in its own
+/// order. An embedding, transcription, speech, image or video model
+/// is no model a coding agent can switch to, and its window — a few
+/// thousand tokens for an embedding or whisper model — would drag down
+/// a bound taken over the whole list (claude's
+/// `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, the smallest window offered). A
+/// model the catalog says nothing about either way stays: a provider
+/// defined in `llmman.conf` publishes no types at all. The launched
+/// model stays whatever it is — it was asked for by name.
+fn offered_models(
+    provider: &str,
+    launched: HostedModel,
+    entry: &crate::daemon::ProviderDetail,
+) -> Vec<HostedModel> {
+    let others: Vec<HostedModel> = entry
+        .models
+        .iter()
+        .filter(|m| m.id != launched.id && m.chat != Some(false))
+        .map(|m| HostedModel {
+            reference: providers::format_remote_ref(provider, &m.id),
+            id: m.id.clone(),
+            context: m.context,
+            output: m.output,
+            thinking: m.thinking.clone(),
+            vision: m.vision,
+        })
+        .collect();
+    std::iter::once(launched).chain(others).collect()
+}
+
 /// The model a `--provider` launch that named none starts on: the
-/// provider's own first, said out loud so the choice is not a mystery —
-/// the model is only where the session begins, since every model the
-/// provider serves is listed for it to switch to (see [`HostedModel`]).
-/// A provider that lists none still gets the refusal that names some.
+/// provider's first text model that calls tools — what a coding agent
+/// needs — said out loud so the choice is not a mystery. A catalog
+/// often lists an image or embedding model first, which an agent
+/// cannot work with. Where the catalog says nothing about tools (a
+/// provider defined in `llmman.conf`), the first model not known to be
+/// something other than chat; failing that, the first listed. The
+/// model is only where the session begins, since every chat model the
+/// provider serves is listed for it to switch to (see
+/// [`offered_models`]). A provider that lists none still gets the
+/// refusal that names some.
 fn default_provider_model<'a>(
     provider: &str,
     entry: &'a crate::daemon::ProviderDetail,
 ) -> anyhow::Result<&'a str> {
-    let first = entry.model_ids().first().copied().ok_or_else(|| {
-        anyhow::anyhow!(
-            "--provider {provider} also needs --model\n\n{}",
-            providers::example_models(&entry.name, &entry.model_ids())
-        )
-    })?;
+    let chat = |m: &&crate::daemon::ProviderModel| m.chat != Some(false);
+    let first = entry
+        .models
+        .iter()
+        .filter(chat)
+        .find(|m| m.tools == Some(true))
+        .or_else(|| entry.models.iter().find(chat))
+        .or_else(|| entry.models.first())
+        .map(|m| m.id.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--provider {provider} also needs --model\n\n{}",
+                providers::example_models(&entry.name, &entry.model_ids())
+            )
+        })?;
     eprintln!("[llmman] --provider {provider}: no --model; starting on {first}");
     Ok(first)
 }
@@ -1815,6 +1871,9 @@ mod tests {
             );
         };
         covers("codex", codex::codex_dir().unwrap());
+        // claude is configured through its environment and arguments,
+        // but a `--provider` launch hands it a settings file by path.
+        covers("claude", claude::claude_settings_dir().unwrap());
         covers(
             "opencode",
             opencode::opencode_state_dir().unwrap().join("model.json"),
@@ -1873,9 +1932,9 @@ mod tests {
     /// Every integration `check_model_flag` holds to a model must be one
     /// `launch` dispatches; it is refused without one on a local launch,
     /// while a `--provider` launch is let through to the resolver, which
-    /// picks the provider's first model or refuses when it lists none
-    /// (see `default_provider_model`); and a `--model` after `--` is
-    /// let through.
+    /// picks the provider's first tool-calling text model or refuses
+    /// when it lists none (see `default_provider_model`); and a
+    /// `--model` after `--` is let through.
     #[test]
     fn model_required_integrations_are_refused_without_a_model() {
         let none: Vec<String> = vec![];
@@ -1904,14 +1963,28 @@ mod tests {
         assert!(!MODEL_REQUIRED.contains(&"claude"));
     }
 
-    /// A `--provider` launch that named no model starts on the
-    /// provider's first model; a provider that lists none is refused
-    /// with the same `--model` wording the guard used to give, naming
-    /// that it lists none — so `llmman launch pi --provider
-    /// ollama-cloud` reaches this instead of the guard.
-    #[test]
-    fn default_provider_model_picks_the_first_listed_or_refuses() {
-        let entry = |ids: &[&str]| crate::daemon::ProviderDetail {
+    /// A provider's catalog model for the tests below: `chat` and
+    /// `tools` as models.dev says, `context` its window.
+    fn catalog_model(
+        id: &str,
+        chat: Option<bool>,
+        tools: Option<bool>,
+        context: Option<u64>,
+    ) -> crate::daemon::ProviderModel {
+        crate::daemon::ProviderModel {
+            id: id.to_string(),
+            cost: None,
+            thinking: None,
+            context,
+            output: None,
+            vision: None,
+            chat,
+            tools,
+        }
+    }
+
+    fn catalog(models: Vec<crate::daemon::ProviderModel>) -> crate::daemon::ProviderDetail {
+        crate::daemon::ProviderDetail {
             id: "ollama-cloud".to_string(),
             name: "ollama-cloud".to_string(),
             base_url: "https://ollama.com".to_string(),
@@ -1919,17 +1992,24 @@ mod tests {
             key_set: false,
             key_usable: false,
             key_optional: false,
-            models: ids
-                .iter()
-                .map(|id| crate::daemon::ProviderModel {
-                    id: id.to_string(),
-                    cost: None,
-                    thinking: None,
-                    context: None,
-                    output: None,
-                    vision: None,
-                })
-                .collect(),
+            models,
+        }
+    }
+
+    /// A `--provider` launch that named no model starts on the
+    /// provider's first model when the catalog says nothing about any;
+    /// a provider that lists none is refused with the same `--model`
+    /// wording the guard used to give, naming that it lists none — so
+    /// `llmman launch pi --provider ollama-cloud` reaches this instead
+    /// of the guard.
+    #[test]
+    fn default_provider_model_picks_the_first_listed_or_refuses() {
+        let entry = |ids: &[&str]| {
+            catalog(
+                ids.iter()
+                    .map(|id| catalog_model(id, None, None, None))
+                    .collect(),
+            )
         };
         assert_eq!(
             default_provider_model("ollama-cloud", &entry(&["qwen3-coder", "llama4-scout"]))
@@ -1943,6 +2023,97 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("lists no models"), "{err}");
+    }
+
+    /// A catalog that lists an image or embedding model first, as
+    /// OpenAI's does (`chatgpt-image-latest`, `gpt-image-1`), still
+    /// starts the launch on the first text model that calls tools; with
+    /// no tool-calling one, the first chat model; with nothing but
+    /// non-chat models, the first listed rather than a refusal.
+    #[test]
+    fn default_provider_model_prefers_the_first_tool_calling_text_model() {
+        let entry = catalog(vec![
+            catalog_model("gpt-image-1", Some(false), Some(false), None),
+            catalog_model(
+                "text-embedding-3-small",
+                Some(false),
+                Some(false),
+                Some(8_191),
+            ),
+            catalog_model("gpt-chat-no-tools", Some(true), Some(false), Some(128_000)),
+            catalog_model("gpt-5", Some(true), Some(true), Some(400_000)),
+        ]);
+        assert_eq!(default_provider_model("openai", &entry).unwrap(), "gpt-5");
+        let entry = catalog(vec![
+            catalog_model("whisper-large-v3", Some(false), Some(false), Some(448)),
+            catalog_model("gpt-chat-no-tools", Some(true), Some(false), Some(128_000)),
+        ]);
+        assert_eq!(
+            default_provider_model("openai", &entry).unwrap(),
+            "gpt-chat-no-tools"
+        );
+        let entry = catalog(vec![
+            catalog_model("whisper-large-v3", Some(false), Some(false), Some(448)),
+            catalog_model("gpt-image-1", Some(false), Some(false), None),
+        ]);
+        assert_eq!(
+            default_provider_model("openai", &entry).unwrap(),
+            "whisper-large-v3"
+        );
+    }
+
+    /// The offered list keeps the launched model first and only the chat
+    /// models after it: an embedding or whisper row would otherwise drop
+    /// the smallest-window bound claude sizes the session by to a few
+    /// thousand tokens. A model the catalog says nothing about stays,
+    /// and so does a launched model that is not chat — it was named.
+    #[test]
+    fn offered_models_keep_the_launched_model_first_and_only_chat_models() {
+        let entry = catalog(vec![
+            catalog_model(
+                "text-embedding-3-small",
+                Some(false),
+                Some(false),
+                Some(8_191),
+            ),
+            catalog_model("gpt-5", Some(true), Some(true), Some(400_000)),
+            catalog_model("whisper-large-v3", Some(false), Some(false), Some(448)),
+            catalog_model("unknown", None, None, None),
+            catalog_model("gpt-4.1", Some(true), Some(true), Some(1_047_576)),
+        ]);
+        let launched = |id: &str| HostedModel {
+            reference: providers::format_remote_ref("openai", id),
+            id: id.to_string(),
+            context: None,
+            output: None,
+            thinking: None,
+            vision: None,
+        };
+        let ids = |models: Vec<HostedModel>| -> Vec<String> {
+            models.into_iter().map(|m| m.id).collect()
+        };
+        assert_eq!(
+            ids(offered_models("openai", launched("gpt-4.1"), &entry)),
+            ["gpt-4.1", "gpt-5", "unknown"]
+        );
+        let offered = offered_models("openai", launched("gpt-4.1"), &entry);
+        assert_eq!(
+            offered[1].reference,
+            providers::format_remote_ref("openai", "gpt-5")
+        );
+        assert_eq!(
+            offered.iter().filter_map(|m| m.context).min(),
+            Some(400_000),
+            "no embedding or whisper window bounds the list"
+        );
+        assert_eq!(
+            ids(offered_models(
+                "openai",
+                launched("whisper-large-v3"),
+                &entry
+            )),
+            ["whisper-large-v3", "gpt-5", "unknown", "gpt-4.1"]
+        );
     }
 
     /// goose carries the key in its own environment, so `--provider`

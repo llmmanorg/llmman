@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::common;
-use super::{exec_with_env, find_on_path, has_flag, server, Effort, HostedModel};
+use super::{exec_with_env, find_on_path, has_flag, map_offered, server, Effort, HostedModel};
 
 /// The env var dsh's generated provider entry reads its key from, so no
 /// key value is ever written to disk (same role as `qwen::QWEN_ENV_KEY`).
@@ -201,14 +201,6 @@ fn write_dsh_settings(
     write_dsh_file(path, &contents)
 }
 
-/// The `models:` list under the `llmman` provider route: the one model
-/// this launch resolved, or — under `--provider` — every model the
-/// provider serves, the launched one first, each with its own image
-/// input, reasoning levels, and the context and output limits its own
-/// catalog entry publishes, omitted where the catalog publishes none.
-/// The launched entry keeps the `--variant` levels this launch
-/// resolved for it; each other model takes the levels its own catalog
-/// entry lists, and none where the catalog lists none.
 /// One row of the `models:` list `dsh_models_block` renders, as
 /// (id, vision, reasoning levels, context limit, output limit) —
 /// limits omitted where the catalog publishes none.
@@ -220,51 +212,39 @@ type DshModelEntry<'a> = (
     Option<u32>,
 );
 
+/// The `models:` list under the `llmman` provider route: the one model
+/// this launch resolved, or — under `--provider` — every model the
+/// provider offers, the launched one first, each mapped alike from its
+/// own row (see [`map_offered`]): its own image input, the reasoning
+/// levels its catalog entry lists (none where it lists none), and the
+/// context and output limits it publishes, omitted where it publishes
+/// none. A `--variant` launch starts the launched model at the levels
+/// it resolved for it.
 fn dsh_models_block(
     model: &str,
     vision: bool,
     effort: Option<&Effort>,
     hosted: Option<&[HostedModel]>,
 ) -> String {
-    // The launched entry keeps the launch's levels; every other entry
-    // takes its own catalog levels and limits — `launch_dsh` receives
-    // no launch-resolved limits, and the catalog values are the ones
-    // the resolver read for the launched model too.
-    let mut entries: Vec<DshModelEntry<'_>> = match hosted {
-        Some(hosted) => hosted
-            .iter()
-            .map(|m| {
-                if m.reference == model {
-                    (
-                        model,
-                        vision,
-                        effort.map(|e| e.levels.clone()),
-                        m.context,
-                        m.output,
-                    )
-                } else {
-                    (
-                        m.reference.as_str(),
-                        m.vision.unwrap_or(false),
-                        m.thinking
-                            .as_ref()
-                            .map(|levels| levels.iter().map(String::as_str).collect()),
-                        m.context,
-                        m.output,
-                    )
-                }
-            })
-            .collect(),
+    let entries: Vec<DshModelEntry<'_>> = match hosted {
+        Some(hosted) => map_offered(hosted, |m, launched| {
+            let levels = match effort {
+                Some(effort) if launched => Some(effort.levels.clone()),
+                _ => m
+                    .thinking
+                    .as_ref()
+                    .map(|levels| levels.iter().map(String::as_str).collect()),
+            };
+            (
+                m.reference.as_str(),
+                m.vision.unwrap_or(false),
+                levels,
+                m.context,
+                m.output,
+            )
+        }),
         None => vec![(model, vision, effort.map(|e| e.levels.clone()), None, None)],
     };
-    // The launched model belongs in its own settings even if the list
-    // somehow lacks it: dsh is started on it.
-    if !entries.iter().any(|(id, _, _, _, _)| *id == model) {
-        entries.insert(
-            0,
-            (model, vision, effort.map(|e| e.levels.clone()), None, None),
-        );
-    }
     let mut block = String::from("      models:\n");
     for (id, vision, levels, context, output) in entries {
         let quoted = common::yaml_quote(id);
@@ -593,9 +573,9 @@ mod tests {
 
     /// A `--provider` launch lists every model the provider serves, so
     /// dsh's own model picker can switch between them without a
-    /// relaunch: the launched model first, with the `--variant` levels
-    /// this launch resolved for it, and each other model with its own
-    /// image input and the levels its own catalog entry lists.
+    /// relaunch: every model, the launched one first, with its own image
+    /// input and the levels its own catalog entry lists — the launched
+    /// one with the `--variant` levels this launch resolved for it.
     #[test]
     fn dsh_settings_list_every_model_the_provider_serves() {
         let path = std::env::temp_dir()
@@ -678,23 +658,30 @@ mod tests {
         assert!(models[2].get("contextWindow").is_none());
         assert!(models[2].get("maxTokens").is_none());
 
-        // The launched model belongs in its own settings even if the
-        // provider's list somehow lacks it, ahead of the rest.
+        // Without a `--variant`, the launched row takes its own catalog
+        // levels, as every other row does.
         let path = std::env::temp_dir()
-            .join(format!("llmman-dsh-hosted-missing-{}", std::process::id()))
+            .join(format!("llmman-dsh-hosted-plain-{}", std::process::id()))
             .join("settings.yaml");
-        let others = vec![hosted.into_iter().nth(1).unwrap()];
-        write_dsh_settings(&path, "m", true, None, Some(&others)).unwrap();
+        write_dsh_settings(
+            &path,
+            "llmman.provider/openrouter/qwen3-coder",
+            false,
+            None,
+            Some(&hosted),
+        )
+        .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let doc: serde_json::Value = yaml_serde::from_str(&contents).expect("valid YAML");
         let models = doc["llm-pi-ai"]["providers"]["llmman"]["models"]
             .as_array()
             .unwrap();
-        assert_eq!(models.len(), 2);
-        assert_eq!(models[0]["id"], "m");
-        assert_eq!(models[0]["input"], serde_json::json!(["text", "image"]));
-        assert_eq!(models[1]["id"], "llmman.provider/openrouter/llama-4-scout");
+        assert_eq!(models.len(), 3);
+        assert_eq!(
+            models[0]["reasoningEfforts"],
+            serde_json::json!({ "low": "low", "high": "high" })
+        );
     }
 
     #[test]

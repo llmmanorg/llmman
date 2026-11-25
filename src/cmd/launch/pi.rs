@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 
 use super::common;
-use super::{exec_with_env, find_on_path, server, HostedModel};
+use super::{exec_with_env, find_on_path, map_offered, server, HostedModel};
 
 /// pi: register llmman as an OpenAI-compatible provider in `models.json`
 /// and point `settings.json` at it. pi runs with the caller's own
@@ -78,15 +78,16 @@ fn write_pi_config(
 }
 
 /// The model entries the provider lists: the one model this launch
-/// resolved, or — under `--provider` — every model the provider serves,
-/// the launched one first, each with what the catalog says about it.
-/// A non-launched model reasons when the catalog lists thinking levels
-/// for it, and takes image input when the catalog says it does; unknown
-/// reads as text-only, as [`common::pi_model_entry`] does for a local
-/// model with no window to declare. Every entry also carries the
-/// catalog's published output ceiling as `maxTokens`, the launched
-/// model included — `pi_model_entry` cannot emit an output limit, so
-/// it rides beside it, omitted where the catalog publishes none.
+/// resolved, or — under `--provider` — every model the provider offers,
+/// the launched one first, each with what the catalog says about it
+/// (see [`map_offered`]). A model reasons when the catalog lists
+/// thinking levels for it — the launched one also when a `--variant`
+/// started it reasoning — and takes image input when the catalog says
+/// it does; unknown reads as text-only, as [`common::pi_model_entry`]
+/// does for a local model with no window to declare. Every entry also
+/// carries the catalog's published output ceiling as `maxTokens` —
+/// `pi_model_entry` cannot emit an output limit, so it rides beside
+/// it, omitted where the catalog publishes none.
 fn pi_model_entries(
     model: &str,
     reasons: bool,
@@ -102,37 +103,18 @@ fn pi_model_entries(
             context_window,
         )];
     };
-    let mut entries: Vec<serde_json::Value> = hosted
-        .iter()
-        .map(|m| {
-            let mut entry = if m.reference == model {
-                common::pi_model_entry(model, reasons, vision, context_window)
-            } else {
-                common::pi_model_entry(
-                    &m.reference,
-                    m.thinking.as_ref().is_some_and(|levels| !levels.is_empty()),
-                    m.vision.unwrap_or(false),
-                    m.context,
-                )
-            };
-            if let Some(output) = m.output {
-                entry["maxTokens"] = serde_json::json!(output);
-            }
-            entry
-        })
-        .collect();
-    // The launched model belongs in its own config even if the list
-    // somehow lacks it: pi is started on it.
-    if !entries
-        .iter()
-        .any(|entry| entry["id"].as_str() == Some(model))
-    {
-        entries.insert(
-            0,
-            common::pi_model_entry(model, reasons, vision, context_window),
+    map_offered(hosted, |m, launched| {
+        let mut entry = common::pi_model_entry(
+            &m.reference,
+            (launched && reasons) || m.thinking.as_ref().is_some_and(|levels| !levels.is_empty()),
+            m.vision.unwrap_or(false),
+            m.context,
         );
-    }
-    entries
+        if let Some(output) = m.output {
+            entry["maxTokens"] = serde_json::json!(output);
+        }
+        entry
+    })
 }
 
 /// `existing` with llmman's provider updated around `entry`, keeping
@@ -317,9 +299,9 @@ mod tests {
         // launched model; it reaches the entry as `maxTokens`.
         assert_eq!(entries[0]["maxTokens"], 8_192);
         assert_eq!(entries[0]["input"], serde_json::json!(["text"]));
-        // The launched entry keeps the launch's own reasoning, not the
-        // catalog's levels: a `--variant` is what marks it as reasoning.
-        assert_eq!(entries[0].get("reasoning"), None);
+        // The launched entry reasons as every other row does: the
+        // catalog lists thinking levels for it.
+        assert_eq!(entries[0]["reasoning"], true);
         assert_eq!(entries[1]["id"], "llmman.provider/openrouter/llama-4-scout");
         assert_eq!(entries[1]["input"], serde_json::json!(["text", "image"]));
         assert_eq!(entries[1].get("contextWindow"), None);
@@ -333,25 +315,25 @@ mod tests {
             thinking: Some(vec!["low".into()]),
             ..hosted_pair().into_iter().nth(1).unwrap()
         }];
-        let entries = pi_model_entries("m", false, false, None, Some(&thinking));
-        assert_eq!(entries[0]["id"], "m");
-        // The inserted launched model has no catalog row, so it carries
-        // no output ceiling either.
-        assert_eq!(entries[0].get("maxTokens"), None);
-        assert_eq!(entries[1]["reasoning"], true);
-    }
-
-    /// The launched model belongs in the list even if the provider's
-    /// list somehow lacks it, ahead of the rest.
-    #[test]
-    fn pi_model_entries_keep_the_launched_model_when_the_list_lacks_it() {
-        let others = vec![hosted_pair().into_iter().nth(1).unwrap()];
-        let entries = pi_model_entries("m", false, true, Some(8_192), Some(&others));
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0]["id"], "m");
-        assert_eq!(entries[0]["input"], serde_json::json!(["text", "image"]));
-        assert_eq!(entries[0]["contextWindow"], 8_192);
-        assert_eq!(entries[1]["id"], "llmman.provider/openrouter/llama-4-scout");
+        let entries = pi_model_entries(
+            "llmman.provider/openrouter/llama-4-scout",
+            false,
+            false,
+            None,
+            Some(&thinking),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["reasoning"], true);
+        // A `--variant` marks the launched model as reasoning even where
+        // the catalog lists no levels for it.
+        let entries = pi_model_entries(
+            "llmman.provider/openrouter/llama-4-scout",
+            true,
+            false,
+            None,
+            Some(&hosted_pair()[1..]),
+        );
+        assert_eq!(entries[0]["reasoning"], true);
     }
 
     /// Merging the entries keeps models a previous launch registered.

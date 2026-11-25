@@ -1,7 +1,7 @@
 //! `llmman launch vibe` (Mistral Vibe CLI).
 
 use super::common::daemon_no_proxy_env;
-use super::{exec_with_owned_env, find_on_path, server, HostedModel};
+use super::{exec_with_owned_env, find_on_path, map_offered, server, HostedModel};
 
 const VIBE_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 
@@ -59,11 +59,12 @@ fn vibe_env(
 }
 
 /// The `VIBE_MODELS` presets: the one model this launch resolved, or —
-/// under `--provider` — every model the provider serves, the launched
-/// one first, each with the window the catalog says it holds. The
-/// launched preset keeps the `llmman` alias; each other is selected by
-/// the id the provider knows it by — the reference itself where that id
-/// would collide with the launched alias.
+/// under `--provider` — every model the provider offers, the launched
+/// one first, each with the window the catalog says it holds (see
+/// [`map_offered`]). The launched preset keeps the `llmman` alias;
+/// each other is selected by the id the provider knows it by — the
+/// reference itself where that id would collide with the launched
+/// alias.
 fn vibe_model_presets(
     model: &str,
     context_window: Option<u64>,
@@ -83,30 +84,16 @@ fn vibe_model_presets(
     let Some(hosted) = hosted else {
         return vec![preset(model, VIBE_MODEL_ALIAS, context_window)];
     };
-    let mut presets: Vec<serde_json::Value> = hosted
-        .iter()
-        .map(|m| {
-            if m.reference == model {
-                preset(model, VIBE_MODEL_ALIAS, context_window)
-            } else {
-                let alias = if m.id == VIBE_MODEL_ALIAS {
-                    m.reference.as_str()
-                } else {
-                    m.id.as_str()
-                };
-                preset(&m.reference, alias, m.context)
-            }
-        })
-        .collect();
-    // The launched model belongs in its own presets even if the list
-    // somehow lacks it: Vibe is started on it.
-    if !presets
-        .iter()
-        .any(|preset| preset["name"].as_str() == Some(model))
-    {
-        presets.insert(0, preset(model, VIBE_MODEL_ALIAS, context_window));
-    }
-    presets
+    map_offered(hosted, |m, launched| {
+        let alias = if launched {
+            VIBE_MODEL_ALIAS
+        } else if m.id == VIBE_MODEL_ALIAS {
+            m.reference.as_str()
+        } else {
+            m.id.as_str()
+        };
+        preset(&m.reference, alias, m.context)
+    })
 }
 
 #[cfg(test)]
@@ -201,20 +188,5 @@ mod tests {
         );
         assert_eq!(models[1]["alias"], "llama-4-scout");
         assert!(models[1].get("max_context_length").is_none());
-
-        // The launched model belongs in its own presets even if the
-        // provider's list somehow lacks it, ahead of the rest.
-        let others = vec![hosted.into_iter().nth(1).unwrap()];
-        let env = vibe_env("m", "k", "http://h", Some(8_192), Some(&others));
-        let models: serde_json::Value =
-            serde_json::from_str(get(&env, "VIBE_MODELS").unwrap()).unwrap();
-        assert_eq!(models.as_array().unwrap().len(), 2);
-        assert_eq!(models[0]["name"], "m");
-        assert_eq!(models[0]["alias"], "llmman");
-        assert_eq!(models[0]["max_context_length"], 8_192);
-        assert_eq!(
-            models[1]["name"],
-            "llmman.provider/openrouter/llama-4-scout"
-        );
     }
 }

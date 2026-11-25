@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 
 use super::common;
-use super::{exec_with_env, find_on_path, server, HostedModel};
+use super::{exec_with_env, find_on_path, map_offered, server, HostedModel};
 
 /// hermes: writes its own `~/.hermes/config.yaml` provider entry
 /// pointing at our /v1 endpoint, skipping the messaging-gateway/
@@ -84,9 +84,9 @@ fn write_hermes_config(
 /// image routing reads before its own catalog, which lists no local
 /// model and so routes every image through a describe-it tool instead.
 ///
-/// `hosted` lists every model the provider serves under the provider's
-/// `models`, the launched one first; without it the list holds the one
-/// model this launch resolved.
+/// `hosted` lists every model the provider offers under the provider's
+/// `models`, the launched one first (see [`map_offered`]); without it
+/// the list holds the one model this launch resolved.
 fn hermes_config_blocks(
     model: &str,
     base_url: &str,
@@ -103,15 +103,10 @@ fn hermes_config_blocks(
     } else {
         ""
     };
-    let mut models: Vec<&str> = match hosted {
-        Some(hosted) => hosted.iter().map(|m| m.reference.as_str()).collect(),
-        None => Vec::new(),
+    let models: Vec<&str> = match hosted {
+        Some(hosted) => map_offered(hosted, |m, _| m.reference.as_str()),
+        None => vec![model],
     };
-    // The launched model belongs in its own config even if the list
-    // somehow lacks it: hermes is started on it.
-    if !models.contains(&model) {
-        models.insert(0, model);
-    }
     let mut list = String::new();
     for entry in models {
         list.push_str(&format!("      - {}\n", common::yaml_quote(entry)));
@@ -248,17 +243,6 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
             parsed["providers"]["llmman"]["models"],
             serde_json::json!(["m"])
         );
-
-        // The launched model belongs in the list even if the provider's
-        // list somehow lacks it, ahead of the rest.
-        let others = vec![hosted.into_iter().nth(1).unwrap()];
-        let text = hermes_config_blocks("m", "http://h/v1", true, Some(&others));
-        let parsed: serde_json::Value = yaml_serde::from_str(&text).expect("valid YAML");
-        assert_eq!(
-            parsed["providers"]["llmman"]["models"],
-            serde_json::json!(["m", "llmman.provider/openrouter/llama-4-scout"])
-        );
-        assert_eq!(parsed["model"]["supports_vision"], true);
     }
 
     #[test]

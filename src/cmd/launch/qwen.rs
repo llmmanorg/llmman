@@ -6,8 +6,8 @@ use anyhow::Context;
 
 use super::common;
 use super::{
-    before_terminator, exec_with_env, find_on_path, has_flag, has_forwarded_model_flag, server,
-    Effort, HostedModel, WINDOWS_PATH_EXTS,
+    before_terminator, exec_with_env, find_on_path, has_flag, has_forwarded_model_flag,
+    map_offered, server, Effort, HostedModel, WINDOWS_PATH_EXTS,
 };
 
 /// qwen: Qwen Code's OpenAI-compatible mode, pointed at our /v1 by the
@@ -301,13 +301,13 @@ fn qwen_settings_merged(
 
 /// The `modelProviders.openai` entries llmman owns: the one model this
 /// launch resolved, or — under `--provider` — every model the provider
-/// serves, the launched one first. Each other model takes what the
-/// catalog says about it: image input from its own `vision`, its own
+/// offers, the launched one first, each mapped alike from its own row
+/// (see [`map_offered`]): image input from its own `vision`, its own
 /// reasoning levels starting at the first level listed, and its own
 /// context and output limits. Only the launched model is started at a
-/// `--variant`, so only its entry carries the launch-selected default
-/// effort; a model need not be the startup model to expose the levels
-/// it supports.
+/// `--variant`, so only its entry carries the launch-selected effort;
+/// a model need not be the startup model to expose the levels it
+/// supports.
 fn qwen_entries(
     model: &str,
     base_url: &str,
@@ -318,43 +318,29 @@ fn qwen_entries(
     let Some(hosted) = hosted else {
         return vec![qwen_entry(model, base_url, vision, effort, None, None)];
     };
-    let mut entries: Vec<serde_json::Value> = hosted
-        .iter()
-        .map(|m| {
-            if m.reference == model {
-                qwen_entry(model, base_url, vision, effort, m.context, m.output)
-            } else {
-                // The catalog's levels, starting at the first one
-                // listed: the default here is the entry's own starting
-                // effort, never the launch-selected one. Both borrow
-                // from the catalog entry, not from the levels list
-                // built beside them.
-                let catalog_effort = m.thinking.as_ref().and_then(|levels| {
-                    levels.first().map(|default| Effort {
-                        default: default.as_str(),
-                        levels: levels.iter().map(String::as_str).collect(),
-                    })
-                });
-                qwen_entry(
-                    &m.reference,
-                    base_url,
-                    m.vision.unwrap_or(false),
-                    catalog_effort.as_ref(),
-                    m.context,
-                    m.output,
-                )
-            }
-        })
-        .collect();
-    // The launched model belongs in its own settings even if the list
-    // somehow lacks it: Qwen Code is started on it.
-    if !entries
-        .iter()
-        .any(|entry| entry["id"].as_str() == Some(model))
-    {
-        entries.insert(0, qwen_entry(model, base_url, vision, effort, None, None));
-    }
-    entries
+    map_offered(hosted, |m, launched| {
+        // The catalog's levels, starting at the first one listed: the
+        // entry's own starting effort, unless a `--variant` chose the
+        // launched model's.
+        let catalog_effort = m.thinking.as_ref().and_then(|levels| {
+            levels.first().map(|default| Effort {
+                default: default.as_str(),
+                levels: levels.iter().map(String::as_str).collect(),
+            })
+        });
+        let effort = match effort {
+            Some(effort) if launched => Some(effort),
+            _ => catalog_effort.as_ref(),
+        };
+        qwen_entry(
+            &m.reference,
+            base_url,
+            m.vision.unwrap_or(false),
+            effort,
+            m.context,
+            m.output,
+        )
+    })
 }
 
 /// One `modelProviders.openai` entry: the model at this daemon, keyed by
@@ -833,9 +819,9 @@ mod tests {
 
     /// A `--provider` launch lists every model the provider serves, so
     /// Qwen Code's `/model` can switch between them without a relaunch:
-    /// the launched model first, with the image input and `--variant`
-    /// levels this launch resolved for it, and each other model with
-    /// what its own catalog entry says. An earlier llmman entry for this
+    /// every model, the launched one first, with what its own catalog
+    /// entry says — the launched one at the `--variant` this launch
+    /// resolved for it. An earlier llmman entry for this
     /// daemon is replaced, whatever it named; anything else stays.
     #[test]
     fn qwen_settings_list_every_model_the_provider_serves() {
@@ -902,20 +888,6 @@ mod tests {
             merged["model"]["name"],
             "llmman.provider/openrouter/qwen3-coder"
         );
-
-        // The launched model belongs in its own settings even if the
-        // provider's list somehow lacks it, ahead of the rest.
-        let others = vec![hosted_pair().into_iter().nth(1).unwrap()];
-        let merged =
-            qwen_settings_merged(&serde_json::json!({}), "m", url, true, None, Some(&others));
-        let openai = merged["modelProviders"]["openai"].as_array().unwrap();
-        assert_eq!(openai.len(), 2);
-        assert_eq!(openai[0]["id"], "m");
-        assert_eq!(
-            openai[0]["generationConfig"],
-            serde_json::json!({ "modalities": { "image": true } })
-        );
-        assert_eq!(openai[1]["id"], "llmman.provider/openrouter/llama-4-scout");
     }
 
     /// A model that is not the startup model still exposes the reasoning

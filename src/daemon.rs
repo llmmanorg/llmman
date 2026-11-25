@@ -1873,6 +1873,16 @@ pub struct ProviderModel {
     /// in `llmman.conf`, which has no catalog entry.
     #[serde(default)]
     pub vision: Option<bool>,
+    /// Whether the catalog says this is a chat model, rather than an
+    /// embedding, transcription, image or other non-chat one (see
+    /// `crate::providers::Model::chat`). `None` from an older daemon,
+    /// and where the catalog says nothing either way.
+    #[serde(default)]
+    pub chat: Option<bool>,
+    /// Whether the catalog says this model calls tools (models.dev
+    /// `tool_call`), `None` on the same terms as `chat`.
+    #[serde(default)]
+    pub tools: Option<bool>,
 }
 
 /// US dollars per million tokens (see [`crate::providers::Cost`]).

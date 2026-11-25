@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::common;
-use super::{exec_with_env, find_on_path, has_forwarded_model_flag, server, HostedModel};
+use super::{
+    exec_with_env, find_on_path, has_forwarded_model_flag, map_offered, server, HostedModel,
+};
 
 /// Droid expands this reference in `settings.json` from the child process's
 /// environment, so a real daemon/provider credential is never persisted.
@@ -87,10 +89,11 @@ fn write_droid_settings_at(
     let selected = RefCell::new(None);
     common::write_json_merged(path, "droid", |existing| {
         let (merged, id) = match hosted {
-            Some(hosted) => {
-                droid_settings_merged_hosted(existing, model, base_url, vision, max_output, hosted)
+            // Never empty: the launched model is always offered first.
+            Some(hosted) if !hosted.is_empty() => {
+                droid_settings_merged_hosted(existing, base_url, hosted)
             }
-            None => droid_settings_merged(existing, model, base_url, vision, max_output),
+            _ => droid_settings_merged(existing, model, base_url, vision, max_output),
         };
         *selected.borrow_mut() = Some(id);
         merged
@@ -204,40 +207,33 @@ fn droid_settings_merged(
     (root.clone().into(), id)
 }
 
-/// [`droid_settings_merged`] for every model `--provider` serves: each
-/// becomes a `customModels` entry, with what the catalog says about it —
-/// image input from its own `vision`, its own reply ceiling — and the
-/// launched model stays the session default. The launched model belongs
-/// in the list even if the provider's list somehow lacks it, ahead of
-/// the rest.
+/// [`droid_settings_merged`] for every model `--provider` offers: each
+/// becomes a `customModels` entry, mapped alike from its own row (see
+/// [`map_offered`]) — image input from its own `vision`, its own reply
+/// ceiling — and the launched model, `hosted[0]`, stays the session
+/// default.
 fn droid_settings_merged_hosted(
     existing: &serde_json::Value,
-    model: &str,
     base_url: &str,
-    vision: bool,
-    max_output: Option<u32>,
     hosted: &[HostedModel],
 ) -> (serde_json::Value, String) {
     let mut root = existing.clone();
     let root = root
         .as_object_mut()
         .expect("write_json_merged passes an object");
-    let mut launched_id = None;
-    for m in hosted {
-        let (entry_model, entry_vision, entry_output) = if m.reference == model {
-            (model, vision, max_output)
-        } else {
-            (m.reference.as_str(), m.vision.unwrap_or(false), m.output)
-        };
-        let id = merge_custom_model(root, entry_model, base_url, entry_vision, entry_output);
-        if m.reference == model {
-            launched_id = Some(id);
-        }
-    }
-    let launched_id = match launched_id {
-        Some(id) => id,
-        None => merge_custom_model(root, model, base_url, vision, max_output),
-    };
+    let ids = map_offered(hosted, |m, _| {
+        merge_custom_model(
+            root,
+            &m.reference,
+            base_url,
+            m.vision.unwrap_or(false),
+            m.output,
+        )
+    });
+    let launched_id = ids
+        .into_iter()
+        .next()
+        .expect("write_droid_settings_at passes a non-empty list");
     set_session_default(root, &launched_id);
     (root.clone().into(), launched_id)
 }
@@ -429,9 +425,8 @@ mod tests {
 
     /// A `--provider` launch lists every model the provider serves, so
     /// Droid's own model picker can switch between them without a
-    /// relaunch: the launched model first, with the image input and
-    /// reply ceiling this launch resolved for it, and each other model
-    /// with what its own catalog entry says. The launched model stays
+    /// relaunch: every model, the launched one first, with the image
+    /// input and reply ceiling its own catalog row says. The launched model stays
     /// the session default, and a matching entry keeps its index — and
     /// so its generated id — across launches.
     #[test]
@@ -461,14 +456,8 @@ mod tests {
                 }
             ]
         });
-        let (merged, id) = droid_settings_merged_hosted(
-            &existing,
-            "llmman.provider/openrouter/qwen3-coder",
-            "http://127.0.0.1:17434/v1",
-            false,
-            Some(8_192),
-            &hosted_pair(),
-        );
+        let (merged, id) =
+            droid_settings_merged_hosted(&existing, "http://127.0.0.1:17434/v1", &hosted_pair());
         // The launched entry kept its index, and so its id.
         assert_eq!(
             id,
@@ -489,30 +478,6 @@ mod tests {
         assert_eq!(scout["maxOutputTokens"], serde_json::Value::Null);
         assert_eq!(scout["index"], 2);
         assert_eq!(merged["customModels"].as_array().unwrap().len(), 3);
-    }
-
-    /// The launched model belongs in the list even if the provider's
-    /// list somehow lacks it.
-    #[test]
-    fn hosted_merge_keeps_the_launched_model_when_the_list_lacks_it() {
-        let others = vec![hosted_pair().into_iter().nth(1).unwrap()];
-        let (merged, id) = droid_settings_merged_hosted(
-            &serde_json::json!({}),
-            "m",
-            "http://h/v1",
-            true,
-            None,
-            &others,
-        );
-        let models = merged["customModels"].as_array().unwrap();
-        assert_eq!(models.len(), 2);
-        assert_eq!(
-            models[0]["model"],
-            "llmman.provider/openrouter/llama-4-scout"
-        );
-        assert_eq!(models[1]["model"], "m");
-        assert_eq!(merged["sessionDefaultSettings"]["model"], id);
-        assert_eq!(merged["sessionDefaultSettings"]["model"], models[1]["id"]);
     }
 
     #[test]
