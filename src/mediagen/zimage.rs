@@ -594,7 +594,7 @@ impl Model {
         if w <= 0 || h <= 0 {
             bail!("width and height must be at least {mult}");
         }
-        if w * h > MAX_PIXELS {
+        if w > MAX_PIXELS / h {
             bail!("Z-Image generates at most 2048x2048 pixels, got {w}x{h}");
         }
         let steps = if p.n_steps > 0 {
