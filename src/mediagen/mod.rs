@@ -462,6 +462,14 @@ impl Context {
         }
     }
 
+    /// The largest image the model generates, in pixels, when it has its own limit.
+    pub fn max_image_pixels(&self) -> Option<i64> {
+        match &self.inner {
+            Inner::Flux2(_) => Some(flux2::MAX_PIXELS),
+            _ => None,
+        }
+    }
+
     /// `(width, height)` when a request does not say.
     pub fn default_size(&self) -> (i64, i64) {
         match &self.inner {

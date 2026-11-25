@@ -24,6 +24,9 @@ const MAX_STEPS: i64 = 200;
 /// Output pixels per request (width x height x frames): 3 GiB of RGB.
 const MAX_PIXELS: i64 = 1 << 30;
 const MAX_REFERENCE_IMAGES: usize = 8;
+/// Decoded pixels of all the reference images of a request together
+/// (checked from their headers before decoding): 192 MiB of RGB.
+const MAX_REFERENCE_PIXELS: u64 = 64 << 20;
 /// Allows base64 images and long prompts while keeping request memory bounded;
 /// the daemon's generation routes use it too.
 pub const GENERATION_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
@@ -51,6 +54,8 @@ pub struct Server {
     default_steps: i32,
     default_cfg: f32,
     default_size: (i64, i64),
+    /// The largest image the model generates, in pixels.
+    max_image_pixels: i64,
 }
 
 type Shared = Arc<Server>;
@@ -160,13 +165,34 @@ fn reference_images(body: &Value) -> Result<Vec<super::Frames>, Error> {
             "at most {MAX_REFERENCE_IMAGES} reference images"
         )));
     }
-    items
+    let encoded = items
         .into_iter()
-        .map(|v| {
-            let bytes = get_b64(&json!({ "image": v }), "image")?.unwrap_or_default();
-            encode::decode_image(&bytes).map_err(|e| Error::Invalid(e.to_string()))
-        })
+        .map(|v| Ok(get_b64(&json!({ "image": v }), "image")?.unwrap_or_default()))
+        .collect::<Result<Vec<_>, Error>>()?;
+    let mut pixels = 0u64;
+    for bytes in &encoded {
+        let (w, h) = encode::image_dimensions(bytes).map_err(|e| Error::Invalid(e.to_string()))?;
+        pixels += w as u64 * h as u64;
+    }
+    if pixels > MAX_REFERENCE_PIXELS {
+        return Err(Error::Invalid(format!(
+            "the reference images hold {pixels} pixels, at most {MAX_REFERENCE_PIXELS} together"
+        )));
+    }
+    encoded
+        .iter()
+        .map(|bytes| encode::decode_image(bytes).map_err(|e| Error::Invalid(e.to_string())))
         .collect()
+}
+
+/// `(w, h)` scaled down to at most `max_pixels` and [`MAX_DIM`] a side,
+/// sides rounded down to multiples of 16, aspect kept.
+fn fit_size(w: i64, h: i64, max_pixels: i64) -> (i64, i64) {
+    let scale = ((max_pixels as f64 / (w * h) as f64).sqrt())
+        .min(MAX_DIM as f64 / w.max(h) as f64)
+        .min(1.0);
+    let fit = |v: i64| ((v as f64 * scale) as i64 / 16 * 16).max(16);
+    (fit(w), fit(h))
 }
 
 /// A base64 field, with or without a `data:...;base64,` prefix.
@@ -368,11 +394,13 @@ async fn images(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
             "the loaded model does not take reference images".into(),
         ));
     }
-    // without a size, an edit keeps its first reference's
+    // without a size, an edit keeps its first reference's, within the model's limits
     let default_size = refs
         .first()
         .filter(|_| body.get("size").is_none())
-        .map_or(s.default_size, |r| (r.width, r.height));
+        .map_or(s.default_size, |r| {
+            fit_size(r.width, r.height, s.max_image_pixels)
+        });
     let mut p = common_params(&body, default_size)?;
     p.prompt = prompt;
     p.n_frames = 1;
@@ -635,6 +663,7 @@ pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
         default_steps: ctx.default_steps(),
         default_cfg: ctx.default_cfg(),
         default_size: ctx.default_size(),
+        max_image_pixels: ctx.max_image_pixels().unwrap_or(MAX_PIXELS),
         ctx: Mutex::new(ctx),
         model_name,
         videos: Mutex::new(VecDeque::new()),
@@ -654,4 +683,19 @@ pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
         .with_state(s)
         .merge(http::discovery_routes(discovery))
         .merge(http::text_routes_refused(NOT_SUPPORTED))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_size_bounds_a_large_reference() {
+        let (w, h) = fit_size(4000, 3000, 2048 * 2048);
+        assert!(w * h <= 2048 * 2048 && w % 16 == 0 && h % 16 == 0);
+        assert!((w as f64 / h as f64 - 4.0 / 3.0).abs() < 0.02);
+        assert_eq!(fit_size(640, 480, 2048 * 2048), (640, 480));
+        // a side longer than MAX_DIM
+        assert_eq!(fit_size(9000, 100, MAX_PIXELS).0, MAX_DIM);
+    }
 }

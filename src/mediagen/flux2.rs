@@ -34,7 +34,11 @@ const PROMPT_TOKENS: usize = 512;
 /// Hidden states the caption is made of, side by side.
 const TEXT_STATES: [usize; 3] = [9, 18, 27];
 /// The largest output (2048x2048, 16384 tokens before the prompt and references).
-const MAX_PIXELS: i64 = 2048 * 2048;
+pub const MAX_PIXELS: i64 = 2048 * 2048;
+/// Image and reference tokens of one sequence: what attention materializes
+/// without flash attention (`[n, n]` scores per head) is bounded by this.
+const MAX_TOKENS_FLASH: i64 = 32768;
+const MAX_TOKENS_DENSE: i64 = 8192;
 /// Reference images are scaled down to at most this many pixels.
 const MAX_REF_PIXELS: i64 = 1024 * 1024;
 /// RoPE time index of reference `k`: `REF_INDEX_SCALE * (k + 1)`.
@@ -156,13 +160,7 @@ fn positions(n_txt: i64, h: i64, w: i64, refs: &[(i64, i64)]) -> Vec<[f64; 4]> {
 
 /// `[C][H][W]` -> `[H*W][C]`.
 fn to_tokens(lat: &[f32], c: usize, n: usize) -> Vec<f32> {
-    let mut out = vec![0f32; lat.len()];
-    for ci in 0..c {
-        for i in 0..n {
-            out[i * c + ci] = lat[ci * n + i];
-        }
-    }
-    out
+    super::qwen_image::transpose(lat, c, n)
 }
 
 /// Packed latents `[4C][h][w]` (channel `c * 4 + py * 2 + px`) -> `[C][2h][2w]`.
@@ -665,6 +663,30 @@ impl Model {
         if use_cfg {
             prompts.push(p.negative_prompt.as_str());
         }
+        let tokens = (w / SCALE) * (h / SCALE)
+            + p.ref_images
+                .iter()
+                .map(|f| {
+                    let (rw, rh) = ref_size(f.width, f.height);
+                    (rw / SCALE) * (rh / SCALE)
+                })
+                .sum::<i64>();
+        let max_tokens = if self.flash {
+            MAX_TOKENS_FLASH
+        } else {
+            MAX_TOKENS_DENSE
+        };
+        if tokens > max_tokens {
+            bail!(
+                "the output and reference images make {tokens} tokens, at most {max_tokens}{}; \
+                 use a smaller size or fewer references",
+                if self.flash {
+                    ""
+                } else {
+                    " without flash attention"
+                }
+            );
+        }
         self.prepare(be, &prompts)?;
         let refs = p
             .ref_images
@@ -762,7 +784,7 @@ fn swiglu<'g>(g: &'g Graph<'g>, x: Tensor<'g>) -> Tensor<'g> {
     let es = x.strides()[0];
     let gate = g.view_2d(x, d / 2, t, nb, 0);
     let up = g.view_2d(x, d / 2, t, nb, (d / 2) as usize * es);
-    g.mul(g.silu(g.cont(gate)), g.cont(up))
+    qwen3::swiglu(g, g.cont(gate), g.cont(up))
 }
 
 #[cfg(test)]
@@ -771,13 +793,17 @@ mod tests {
 
     #[test]
     fn sigmas_follow_the_empirical_shift() {
+        // diffusers' compute_empirical_mu(4096, 4) = 2.29118, then
+        // FlowMatchEulerDiscreteScheduler's exponential time shift
+        assert!((empirical_mu(4096, 4) - 2.291180).abs() < 1e-5);
+        let want = [1.0, 0.967384, 0.908144, 0.767200, 0.0];
         let s = sigmas(4, 4096);
-        assert_eq!(s.len(), 5);
-        assert_eq!(s[0], 1.0);
-        assert_eq!(s[4], 0.0);
-        // decreasing, and above the unshifted grid (mu > 0)
-        assert!(s.windows(2).all(|w| w[0] > w[1]));
-        assert!(s[2] > 0.5);
+        assert_eq!(s.len(), want.len());
+        for (g, w) in s.iter().zip(want) {
+            assert!((g - w).abs() < 1e-5, "{s:?} vs {want:?}");
+        }
+        // past 4300 tokens mu is linear in the length alone
+        assert!((empirical_mu(8192, 4) - empirical_mu(8192, 50)).abs() < 1e-12);
     }
 
     #[test]
