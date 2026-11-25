@@ -33,6 +33,8 @@ const EPS: f32 = 1e-6;
 const PROMPT_TOKENS: usize = 512;
 /// Hidden states the caption is made of, side by side.
 const TEXT_STATES: [usize; 3] = [9, 18, 27];
+/// The largest output (2048x2048, 16384 tokens before the prompt and references).
+const MAX_PIXELS: i64 = 2048 * 2048;
 /// Reference images are scaled down to at most this many pixels.
 const MAX_REF_PIXELS: i64 = 1024 * 1024;
 /// RoPE time index of reference `k`: `REF_INDEX_SCALE * (k + 1)`.
@@ -644,6 +646,9 @@ impl Model {
         let (w, h) = (p.width / SCALE * SCALE, p.height / SCALE * SCALE);
         if w <= 0 || h <= 0 {
             bail!("width and height must be at least {SCALE}");
+        }
+        if w > MAX_PIXELS / h {
+            bail!("FLUX.2 generates at most 2048x2048 pixels, got {w}x{h}");
         }
         let steps = if p.n_steps > 0 {
             p.n_steps
