@@ -667,13 +667,14 @@ pub(crate) fn write_test_gguf_with_strings(
     buf.extend_from_slice(&12u32.to_le_bytes()); // ggml_type = Q4_K
     buf.extend_from_slice(&0u64.to_le_bytes()); // offset
 
+    // The pid and a process-wide counter keep parallel tests apart: a
+    // clock alone collides on Windows, whose system time advances in
+    // coarse ticks, so two tests in one tick read each other's file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
         "llmman-gguf-test-{}-{}.gguf",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let mut f = File::create(&path).unwrap();
     f.write_all(&buf).unwrap();
