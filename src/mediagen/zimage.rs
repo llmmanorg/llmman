@@ -715,7 +715,7 @@ mod tests {
         let lat: Vec<f32> = (0..c * h * w).map(|v| v as f32).collect();
         let tok = patchify(&lat, c, h, w);
         // token 0, feature (py=0, px=1, c=2) is lat[c=2][y=0][x=1]
-        assert_eq!(tok[(1 * c + 2) as usize], lat[(2 * h * w + 1) as usize]);
+        assert_eq!(tok[(c + 2) as usize], lat[(2 * h * w + 1) as usize]);
         assert_eq!(unpatchify(&tok, c, h, w), lat);
     }
 
