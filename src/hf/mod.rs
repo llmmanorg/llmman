@@ -488,6 +488,86 @@ pub fn hf_endpoint(host: &str) -> String {
     hf_endpoint_from(|var| std::env::var_os(var), host)
 }
 
+/// A file of a Hugging Face repository resolved to a commit: the text
+/// encoder or a sidecar a diffusion model takes from another repository.
+pub struct RepoFile {
+    pub endpoint: String,
+    pub owner: String,
+    pub repo: String,
+    pub commit: String,
+    pub file: api::HfFile,
+}
+
+/// Resolves `reference` (`owner/repo[:tag]`) on `host` and picks one of its
+/// files with `pick(files, tag)`; `what` names the file in errors.
+pub async fn resolve_repo_file(
+    client: &reqwest::Client,
+    host: &str,
+    reference: &str,
+    token: Option<&str>,
+    what: &str,
+    pick: impl FnOnce(&[api::HfFile], &str) -> anyhow::Result<api::HfFile>,
+) -> anyhow::Result<RepoFile> {
+    use anyhow::Context;
+    let (_, owner, repo, tag) = api::parse_hf_ref(&format!("{host}/{reference}"))?;
+    let endpoint = hf_endpoint(host);
+    let info = api::fetch_model_info(client, &endpoint, &owner, &repo, token)
+        .await
+        .with_context(|| format!("{what} {reference}"))?;
+    let commit = info.commit().to_string();
+    let files = api::fetch_files(client, &endpoint, &owner, &repo, &commit, token)
+        .await
+        .with_context(|| format!("{what} {reference}"))?;
+    let file = pick(&files, &tag).with_context(|| format!("{what} {reference}"))?;
+    Ok(RepoFile {
+        endpoint,
+        owner,
+        repo,
+        commit,
+        file,
+    })
+}
+
+/// A diffusion model's text encoder: the one GGUF of `reference`.
+pub async fn resolve_text_encoder(
+    client: &reqwest::Client,
+    host: &str,
+    reference: &str,
+    token: Option<&str>,
+) -> anyhow::Result<RepoFile> {
+    resolve_repo_file(
+        client,
+        host,
+        reference,
+        token,
+        "text encoder",
+        |files, tag| match <[api::HfFile; 1]>::try_from(api::select_gguf(files, tag)?) {
+            Ok([f]) => Ok(f),
+            Err(_) => anyhow::bail!("split GGUFs are not supported"),
+        },
+    )
+    .await
+}
+
+/// `path` in the repository `from` (`owner/repo`), a sidecar with `role`.
+pub async fn resolve_external(
+    client: &reqwest::Client,
+    host: &str,
+    from: &str,
+    path: &str,
+    role: &str,
+    token: Option<&str>,
+) -> anyhow::Result<RepoFile> {
+    resolve_repo_file(client, host, from, token, role, |files, _| {
+        files
+            .iter()
+            .find(|f| f.kind == "file" && f.path == path)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no {path}"))
+    })
+    .await
+}
+
 /// [`hf_endpoint`] with the environment injected.
 fn hf_endpoint_from(env: impl Fn(&str) -> Option<std::ffi::OsString>, host: &str) -> String {
     match endpoint_override(env, &["MODEL_ENDPOINT", "HF_ENDPOINT"]) {

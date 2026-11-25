@@ -628,6 +628,20 @@ pub fn sidecar_layer(mut d: oci::Descriptor, file: &HfFile, role: &str) -> oci::
     d
 }
 
+/// The layer of a file taken from another repository: a text encoder keeps
+/// its GGUF media type, anything else is a [`sidecar_layer`].
+pub fn borrowed_layer(mut d: oci::Descriptor, file: &HfFile, role: &str) -> oci::Descriptor {
+    if role != "text_encoder" {
+        return sidecar_layer(d, file, role);
+    }
+    let name = file.path.rsplit('/').next().unwrap_or(&file.path);
+    d.annotations = Some(BTreeMap::from([
+        (oci::ANNOTATION_FILEPATH.to_string(), name.to_string()),
+        (oci::ANNOTATION_ROLE.to_string(), role.to_string()),
+    ]));
+    d
+}
+
 /// The sidecar whose file name contains `keyword` and shares the longest
 /// prefix with the chosen transformer's file name — so the `distilled`
 /// VAE goes with the `distilled` transformer.

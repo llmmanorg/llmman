@@ -94,9 +94,33 @@ async fn pull_from(
                 api::select_mmproj(&files)
             };
             let license = api::select_license_file(&files);
+            // what a diffusion model takes from other repositories, resolved before
+            // anything downloads so the space check covers it too
+            let mut borrowed: Vec<(&str, super::RepoFile)> = Vec::new();
+            if let Some(plan) = &plan {
+                for &(role, from, path) in &plan.external {
+                    let f = super::resolve_external(
+                        &api_client,
+                        &host,
+                        from,
+                        path,
+                        role,
+                        token.as_deref(),
+                    )
+                    .await?;
+                    borrowed.push((role, f));
+                }
+                if let Some(te_ref) = plan.text_encoder {
+                    let f =
+                        super::resolve_text_encoder(&api_client, &host, te_ref, token.as_deref())
+                            .await?;
+                    borrowed.push(("text_encoder", f));
+                }
+            }
             let wanted: Vec<&HfFile> = shards
                 .iter()
                 .chain(plan.iter().flat_map(|p| p.sidecars.iter().map(|(_, f)| f)))
+                .chain(borrowed.iter().map(|(_, b)| &b.file))
                 .chain(mmproj.iter())
                 .chain(license.iter())
                 .collect();
@@ -138,39 +162,21 @@ async fn pull_from(
                     .await?;
                     layers.push(api::sidecar_layer(d, file, role));
                 }
-                for &(role, from, path) in &plan.external {
-                    layers.push(
-                        pull_external_sidecar(
-                            &api_client,
-                            &dl_client,
-                            &head_client,
-                            &host,
-                            from,
-                            path,
-                            role,
-                            token.as_deref(),
-                            layout_dir,
-                            progress_key,
-                        )
-                        .await?,
-                    );
-                }
-                if let Some(te_ref) = plan.text_encoder {
-                    let mut d = pull_text_encoder(
-                        &api_client,
+                for (role, b) in &borrowed {
+                    let d = download_layer(
                         &dl_client,
                         &head_client,
-                        &host,
-                        te_ref,
+                        &b.endpoint,
+                        &b.owner,
+                        &b.repo,
+                        &b.commit,
+                        &b.file,
                         token.as_deref(),
                         layout_dir,
                         progress_key,
                     )
                     .await?;
-                    d.annotations
-                        .get_or_insert_with(BTreeMap::new)
-                        .insert(oci::ANNOTATION_ROLE.to_string(), "text_encoder".to_string());
-                    layers.push(d);
+                    layers.push(api::borrowed_layer(d, &b.file, role));
                 }
             } else if let Some(mmproj) = mmproj {
                 layers.push(
@@ -328,100 +334,6 @@ fn bytes_missing(layout_dir: &Path, files: &[&HfFile]) -> u64 {
 
 fn basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
-}
-
-/// Downloads the text encoder GGUF of a diffusion model from its own
-/// repository (`owner/repo[:quant]`) into the same blob store, returning
-/// its layer descriptor. Blobs are content-addressed, so a text encoder
-/// shared by several diffusion models is stored once.
-/// A sidecar the model's repo lacks, `path` in the repository `from`
-/// (`owner/repo`), as a `role` layer.
-#[allow(clippy::too_many_arguments)]
-async fn pull_external_sidecar(
-    api_client: &reqwest::Client,
-    dl_client: &reqwest::Client,
-    head_client: &reqwest::Client,
-    host: &str,
-    from: &str,
-    path: &str,
-    role: &str,
-    token: Option<&str>,
-    layout_dir: &Path,
-    progress_key: &str,
-) -> Result<Descriptor> {
-    let (_, owner, repo, _) = api::parse_hf_ref(&format!("{host}/{from}"))?;
-    let endpoint = super::hf_endpoint(host);
-    let info = api::fetch_model_info(api_client, &endpoint, &owner, &repo, token)
-        .await
-        .with_context(|| format!("{role} from {from}"))?;
-    let commit = info.commit().to_string();
-    let files = api::fetch_files(api_client, &endpoint, &owner, &repo, &commit, token)
-        .await
-        .with_context(|| format!("{role} from {from}"))?;
-    let file = files
-        .iter()
-        .find(|f| f.kind == "file" && f.path == path)
-        .ok_or_else(|| anyhow::anyhow!("{from} has no {path}"))?;
-    ensure_room(from, layout_dir, &[file])?;
-    let d = download_layer(
-        dl_client,
-        head_client,
-        &endpoint,
-        &owner,
-        &repo,
-        &commit,
-        file,
-        token,
-        layout_dir,
-        progress_key,
-    )
-    .await?;
-    Ok(api::sidecar_layer(d, file, role))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn pull_text_encoder(
-    api_client: &reqwest::Client,
-    dl_client: &reqwest::Client,
-    head_client: &reqwest::Client,
-    host: &str,
-    reference: &str,
-    token: Option<&str>,
-    layout_dir: &Path,
-    progress_key: &str,
-) -> Result<Descriptor> {
-    let (_, owner, repo, tag) = api::parse_hf_ref(&format!("{host}/{reference}"))?;
-    let endpoint = super::hf_endpoint(host);
-    let info = api::fetch_model_info(api_client, &endpoint, &owner, &repo, token)
-        .await
-        .with_context(|| format!("text encoder {reference}"))?;
-    let commit = info.commit().to_string();
-    let files = api::fetch_files(api_client, &endpoint, &owner, &repo, &commit, token)
-        .await
-        .with_context(|| format!("text encoder {reference}"))?;
-    let shards = api::select_gguf(&files, &tag)?;
-    if shards.len() != 1 {
-        anyhow::bail!("text encoder {reference}: split GGUFs are not supported");
-    }
-    ensure_room(reference, layout_dir, &[&shards[0]])?;
-    let mut d = download_layer(
-        dl_client,
-        head_client,
-        &endpoint,
-        &owner,
-        &repo,
-        &commit,
-        &shards[0],
-        token,
-        layout_dir,
-        progress_key,
-    )
-    .await?;
-    d.annotations = Some(BTreeMap::from([(
-        oci::ANNOTATION_FILEPATH.to_string(),
-        basename(&shards[0].path),
-    )]));
-    Ok(d)
 }
 
 /// Deletes its `.part` path on drop unless [`disarm`](Self::disarm) was
