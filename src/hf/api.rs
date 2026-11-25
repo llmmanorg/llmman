@@ -645,11 +645,13 @@ pub fn diffusion_plan(files: &[HfFile], model_path: &str) -> DiffusionPlan {
             .find(|f| f.kind == "file" && f.path == path)
             .cloned()
             .or_else(|| {
-                candidates
-                    .into_iter()
-                    .find(|(role, _)| *role == "vae")
-                    .and_then(|(_, f)| f)
+                // only this family's files compete for the VAE
+                let own: Vec<HfFile> = files
+                    .iter()
                     .filter(|f| same_family(&f.path))
+                    .cloned()
+                    .collect();
+                select_diffusion_sidecar(&own, model_path, "vae")
             });
         match local {
             Some(file) => plan.sidecars.push(("vae", file)),
@@ -1150,6 +1152,11 @@ mod tests {
             diffusion_plan(&with_video_vae, "flux-2-klein-9b-Q8_0.gguf").external,
             plan.external
         );
+        // ... even next to FLUX.2's own
+        with_video_vae.push(file("flux2_vae.safetensors", 1));
+        let both = diffusion_plan(&with_video_vae, "flux-2-klein-9b-Q8_0.gguf");
+        assert!(both.external.is_empty());
+        assert_eq!(both.sidecars[0].1.path, "flux2_vae.safetensors");
         // the official file in the repo itself is used as is
         let mut with_vae = files.clone();
         with_vae.push(file("vae/diffusion_pytorch_model.safetensors", 1));

@@ -37,6 +37,15 @@ pub fn decoder_name(n: &str) -> Option<String> {
 /// `up_blocks` run in the opposite order) is renamed to them.
 pub fn tensor_name(n: &str) -> Option<String> {
     let n = n.strip_prefix("vae.").unwrap_or(n);
+    // BFL's own `ae.safetensors` keeps them inside the halves
+    let n = n
+        .strip_prefix("encoder.")
+        .filter(|r| r.starts_with("quant_conv."))
+        .or_else(|| {
+            n.strip_prefix("decoder.")
+                .filter(|r| r.starts_with("post_quant_conv."))
+        })
+        .unwrap_or(n);
     if n.starts_with("post_quant_conv.")
         || n.starts_with("quant_conv.")
         || n.starts_with("bn.running_")
@@ -380,6 +389,19 @@ mod tests {
             Some("encoder.down.2.downsample.conv.bias")
         );
         assert_eq!(m("quant_conv.weight").as_deref(), Some("quant_conv.weight"));
+        // BFL's ae.safetensors nests the quant convs in the halves
+        assert_eq!(
+            m("encoder.quant_conv.bias").as_deref(),
+            Some("quant_conv.bias")
+        );
+        assert_eq!(
+            m("decoder.post_quant_conv.weight").as_deref(),
+            Some("post_quant_conv.weight")
+        );
+        assert_eq!(
+            decoder_name("decoder.post_quant_conv.weight").as_deref(),
+            Some("post_quant_conv.weight")
+        );
         // the original names pass through
         assert_eq!(
             m("decoder.up.3.block.0.conv1.weight").as_deref(),
