@@ -21,10 +21,13 @@ use super::ltx::text::TextEncoder;
 use super::weights::{Index, LoadOpts, Weights};
 use super::{dump, GenParams, Mt19937, Output};
 
-/// `ZImagePipeline` / Z-Image-Turbo defaults: 9 sigmas (8 transformer
-/// evaluations, the last step lands on 0), no guidance, 1024x1024.
-pub const DEFAULT_STEPS: i32 = 9;
+/// Z-Image-Turbo defaults: 8 transformer evaluations (diffusers'
+/// `num_inference_steps=9`, whose last step is from 0 to 0), no guidance, 1024x1024.
+pub const DEFAULT_STEPS: i32 = 8;
 pub const DEFAULT_SIZE: i64 = 1024;
+/// The largest image (2048x2048, 16384 tokens): attention over the joint
+/// sequence grows with its square.
+const MAX_PIXELS: i64 = 2048 * 2048;
 /// `FlowMatchEulerDiscreteScheduler(shift=3.0)`, no dynamic shifting.
 const SHIFT: f64 = 3.0;
 const PATCH: i64 = 2;
@@ -148,21 +151,12 @@ fn dit_name(n: &str) -> Option<String> {
     Some(s)
 }
 
-/// `[n_steps]` sigmas from 1 to 0, shifted, then the closing 0.
+/// `n + 1` sigmas from 1 to 0, shifted: `n` steps.
 fn sigmas(n: usize) -> Vec<f32> {
     let shift = |s: f64| SHIFT * s / (1.0 + (SHIFT - 1.0) * s);
-    let mut v: Vec<f32> = (0..n)
-        .map(|i| {
-            let s = if n > 1 {
-                1.0 - i as f64 / (n - 1) as f64
-            } else {
-                1.0
-            };
-            shift(s) as f32
-        })
-        .collect();
-    v.push(0.0);
-    v
+    (0..=n)
+        .map(|i| shift(1.0 - i as f64 / n as f64) as f32)
+        .collect()
 }
 
 fn pad_to(n: i64, m: i64) -> i64 {
@@ -600,6 +594,9 @@ impl Model {
         if w <= 0 || h <= 0 {
             bail!("width and height must be at least {mult}");
         }
+        if w * h > MAX_PIXELS {
+            bail!("Z-Image generates at most 2048x2048 pixels, got {w}x{h}");
+        }
         let steps = if p.n_steps > 0 {
             p.n_steps
         } else {
@@ -635,36 +632,34 @@ impl Model {
         };
         for i in 0..steps as usize {
             let dt = sig[i + 1] - sig[i];
-            if dt != 0.0 {
-                let t0 = Instant::now();
-                let mut v = self.velocity(be, cap, n_cap, &x, ph, pw, sig[i])?;
-                if use_cfg {
-                    let nc = self.ncond.as_ref().expect("negative prompt encoded");
-                    let u = self.velocity(be, &nc.1, nc.2, &x, ph, pw, sig[i])?;
-                    for (v, u) in v.iter_mut().zip(&u) {
-                        *v = u + cfg * (*v - u);
-                    }
+            let t0 = Instant::now();
+            let mut v = self.velocity(be, cap, n_cap, &x, ph, pw, sig[i])?;
+            if use_cfg {
+                let nc = self.ncond.as_ref().expect("negative prompt encoded");
+                let u = self.velocity(be, &nc.1, nc.2, &x, ph, pw, sig[i])?;
+                for (v, u) in v.iter_mut().zip(&u) {
+                    *v = u + cfg * (*v - u);
                 }
-                if i == 0 {
-                    dump("pred0", &v);
-                }
-                if v.iter().any(|v| !v.is_finite()) {
-                    bail!(
-                        "the Z-Image transformer produced non-finite values at step {}",
-                        i + 1
-                    );
-                }
-                for (x, v) in x.iter_mut().zip(&v) {
-                    *x += dt * v;
-                }
-                eprintln!(
-                    "[llmman] mediagen: step {}/{steps} sigma {:.4} -> {:.4} ({:.2} s)",
-                    i + 1,
-                    sig[i],
-                    sig[i + 1],
-                    t0.elapsed().as_secs_f64()
+            }
+            if i == 0 {
+                dump("pred0", &v);
+            }
+            if v.iter().any(|v| !v.is_finite()) {
+                bail!(
+                    "the Z-Image transformer produced non-finite values at step {}",
+                    i + 1
                 );
             }
+            for (x, v) in x.iter_mut().zip(&v) {
+                *x += dt * v;
+            }
+            eprintln!(
+                "[llmman] mediagen: step {}/{steps} sigma {:.4} -> {:.4} ({:.2} s)",
+                i + 1,
+                sig[i],
+                sig[i + 1],
+                t0.elapsed().as_secs_f64()
+            );
             if !progress(i as i32 + 1, steps) {
                 bail!("cancelled");
             }
@@ -704,13 +699,13 @@ mod tests {
 
     #[test]
     fn sigmas_are_shifted_and_end_at_zero() {
-        let s = sigmas(9);
-        assert_eq!(s.len(), 10);
+        let s = sigmas(8);
+        assert_eq!(s.len(), 9);
         assert_eq!(s[0], 1.0);
         assert_eq!(s[8], 0.0);
-        assert_eq!(s[9], 0.0);
+        assert!(s.windows(2).all(|w| w[0] > w[1]));
         // shift 3 at s = 0.5: 1.5 / 2
-        let mid = sigmas(3)[1];
+        let mid = sigmas(2)[1];
         assert!((mid - 0.75).abs() < 1e-6);
     }
 
