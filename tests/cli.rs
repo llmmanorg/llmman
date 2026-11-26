@@ -855,3 +855,53 @@ fn clients_reach_a_serve_on_port_0_while_it_holds_its_record() {
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
 }
+
+/// A directory served through `LLMMAN_MODEL_DIRS` is not in the store: `cp`
+/// says what it is, as source or destination, rather than that it is missing.
+#[test]
+fn cp_refuses_a_model_directory_served_in_place() {
+    let home = tempfile::tempdir().unwrap();
+    let model = tempfile::tempdir().unwrap();
+    let dirs = format!("qwen={}", model.path().display());
+    for args in [["cp", "qwen", "other"], ["cp", "other", "qwen:latest"]] {
+        let out = llmman()
+            .args(args)
+            .env("LLMMAN_MODEL_DIRS", &dirs)
+            .env("LLMMAN_MODELS", home.path().join("store"))
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .output()
+            .expect("spawn llmman");
+        assert!(!out.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("LLMMAN_MODEL_DIRS") && stderr.contains("model directory"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+/// `rm` says the same, and one malformed entry of the variable does not
+/// stop it for the valid ones.
+#[test]
+fn rm_refuses_a_model_directory_served_in_place() {
+    let home = tempfile::tempdir().unwrap();
+    let model = tempfile::tempdir().unwrap();
+    let out = llmman()
+        .args(["rm", "qwen:latest"])
+        .env(
+            "LLMMAN_MODEL_DIRS",
+            format!("not-an-entry,qwen={}", model.path().display()),
+        )
+        .env("LLMMAN_MODELS", home.path().join("store"))
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .output()
+        .expect("spawn llmman");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LLMMAN_MODEL_DIRS") && stderr.contains("model directory"),
+        "{stderr}"
+    );
+}

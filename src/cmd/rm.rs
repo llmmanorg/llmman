@@ -1,5 +1,6 @@
 use clap::Args;
 
+use crate::cmd::serve;
 use crate::storage::{gc, OciStore};
 
 #[derive(Args, Debug)]
@@ -19,7 +20,13 @@ pub fn run(args: &RmArgs) -> anyhow::Result<()> {
     // not hf.co/<name>, so it must resolve the same way here or `llmman rm
     // <bare-name>` looks for the wrong entry.
     let mut refs = Vec::new();
+    let mounted = serve::mounted::MountedModels::lenient_from_env();
     for raw in &args.references {
+        if let Some(msg) = mounted.refusal(raw, "removed") {
+            eprintln!("Error removing {raw}: {msg}");
+            any_err = true;
+            continue;
+        }
         match crate::shortnames::resolve_ollama_api(raw) {
             Ok(r) => refs.push(r),
             Err(e) => {
