@@ -175,8 +175,8 @@ fn reference_items(body: &Value) -> Result<Vec<Value>, Error> {
 /// [`MAX_REFERENCE_PIXELS`] together. CPU-bound: run it off the async runtime.
 fn decode_references(items: Vec<Value>) -> Result<Vec<super::Frames>, Error> {
     let encoded = items
-        .into_iter()
-        .map(|v| Ok(get_b64(&json!({ "image": v }), "image")?.unwrap_or_default()))
+        .iter()
+        .map(|v| decode_b64(v, "images"))
         .collect::<Result<Vec<_>, Error>>()?;
     let mut pixels = 0u64;
     for bytes in &encoded {
@@ -212,16 +212,17 @@ fn fit_size(w: i64, h: i64, max_pixels: i64) -> (i64, i64) {
 
 /// A base64 field, with or without a `data:...;base64,` prefix.
 fn get_b64(body: &Value, k: &str) -> Result<Option<Vec<u8>>, Error> {
-    let Some(v) = body.get(k) else {
-        return Ok(None);
-    };
+    body.get(k).map(|v| decode_b64(v, k)).transpose()
+}
+
+/// `v` as base64 bytes (a data URL's payload too); `k` names it in errors.
+fn decode_b64(v: &Value, k: &str) -> Result<Vec<u8>, Error> {
     let s = v
         .as_str()
         .ok_or_else(|| Error::Invalid(format!("\"{k}\" must be a base64 string")))?;
     let s = s.rsplit_once(";base64,").map_or(s, |(_, d)| d).trim();
     base64::engine::general_purpose::STANDARD
         .decode(s)
-        .map(Some)
         .map_err(|e| Error::Invalid(format!("\"{k}\": invalid base64: {e}")))
 }
 

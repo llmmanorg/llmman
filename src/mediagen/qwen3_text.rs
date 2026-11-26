@@ -11,7 +11,7 @@ use serde_json::json;
 use super::backend::Backend;
 use super::cosmos3::{self, dit};
 use super::ffi::Api;
-use super::ltx::text::TextEncoder;
+use super::ltx::text::Vocab;
 use super::weights::{read_index, LoadOpts, Weights};
 
 /// Qwen3's `rope_theta` (llama.cpp keeps it as a numeric KV, not read here).
@@ -20,7 +20,7 @@ const ROPE_THETA: f64 = 1_000_000.0;
 pub struct Qwen3Text {
     pub hp: cosmos3::Hparams,
     w: Weights,
-    vocab: Box<TextEncoder>,
+    vocab: Vocab,
 }
 
 /// llama.cpp's tensor names -> the Transformers ones `cosmos3::dit` reads;
@@ -93,7 +93,7 @@ impl Qwen3Text {
                 transform: None,
             },
         )?;
-        let vocab = TextEncoder::load_vocab(api, &path.to_string_lossy())?;
+        let vocab = Vocab::load(api, &path.to_string_lossy())?;
         Ok(Qwen3Text { hp, w, vocab })
     }
 
