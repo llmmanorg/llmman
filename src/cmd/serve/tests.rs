@@ -9152,3 +9152,319 @@ fn pull_only_step_classifies_only_after_a_container_engine_was_picked() {
         PullOnlyStep::PullEngine(ContainerEngine::Sglang)
     );
 }
+
+// -- LLMMAN_MODEL_DIRS: a model directory served in place ---------------------
+
+/// `inner` with `name` mapped to `dir`.
+fn with_mounted(mut inner: Inner, name: &str, dir: &Path) -> AppState {
+    inner.mounted =
+        mounted::MountedModels::parse(Some(&format!("{name}={}", dir.display()))).unwrap();
+    AppState(Arc::new(inner))
+}
+
+/// A state mapping `name` to a safetensors directory of a config and weights.
+fn mounted_state(name: &str) -> (AppState, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+    std::fs::write(dir.path().join("model.safetensors"), b"weights").unwrap();
+    let state = with_mounted(test_inner(fresh_store_dir("mounted")), name, dir.path());
+    (state, dir)
+}
+
+async fn json_body(resp: Response) -> (StatusCode, serde_json::Value) {
+    let status = resp.status();
+    let body = body_bytes(resp).await;
+    (status, serde_json::from_slice(&body).unwrap_or_default())
+}
+
+/// `/api/tags` and `/v1/models` of `state`: the model rows of each.
+async fn both_lists(state: &AppState) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let rows = |v: &serde_json::Value, key: &str| v[key].as_array().unwrap().clone();
+    let (status, tags) = json_body(
+        handle_tags(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, models) = json_body(
+        handle_openai_models(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    (rows(&tags, "models"), rows(&models, "data"))
+}
+
+fn store_safetensors(state: &AppState, name: &str) {
+    store_one_model(
+        &OciStore::open(&state.0.store_path).unwrap(),
+        name,
+        "application/vnd.cncf.model.weight.v1.tar",
+        "model.safetensors",
+        b"weights",
+    );
+}
+
+async fn show_mounted(state: &AppState, name: &str) -> (StatusCode, serde_json::Value) {
+    let resp = handle_show(
+        State(state.clone()),
+        Json(OllamaShowRequest {
+            model: name.to_string(),
+            name: None,
+        }),
+    )
+    .await
+    .into_response();
+    json_body(resp).await
+}
+
+#[tokio::test]
+async fn a_mounted_model_is_listed_beside_the_stored_ones_on_both_lists() {
+    let (state, _dir) = mounted_state("qwen3.8:27b-nvfp4");
+    store_safetensors(&state, "stored");
+
+    let (tags, models) = both_lists(&state).await;
+    use std::collections::HashSet;
+    let names: HashSet<&str> = tags.iter().map(|m| m["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        HashSet::from(["qwen3.8:27b-nvfp4", "docker.io/ai/stored:latest"])
+    );
+    let row = tags.iter().find(|m| m["name"] == "qwen3.8:27b-nvfp4");
+    let row = row.unwrap();
+    assert_eq!(row["details"]["format"], "safetensors");
+    assert_eq!(row["size"], 9);
+
+    let ids: HashSet<&str> = models.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, names);
+    let entry = models.iter().find(|m| m["id"] == "qwen3.8:27b-nvfp4");
+    assert_eq!(entry.unwrap()["status"]["value"], "unloaded");
+    let _ = std::fs::remove_dir_all(&state.0.store_path);
+}
+
+#[tokio::test]
+async fn a_mounted_model_shadows_the_stored_one_of_its_name_on_both_lists() {
+    let (state, _dir) = mounted_state("stored");
+    store_safetensors(&state, "stored");
+
+    let (tags, models) = both_lists(&state).await;
+    assert_eq!(tags.len(), 1, "{tags:?}");
+    assert_eq!(tags[0]["name"], "stored");
+    assert_eq!(tags[0]["size"], 9);
+    assert_eq!(models.len(), 1, "{models:?}");
+    assert_eq!(models[0]["id"], "stored");
+    let _ = std::fs::remove_dir_all(&state.0.store_path);
+}
+
+#[tokio::test]
+async fn nothing_extra_is_listed_without_the_variable() {
+    let state = test_state_at(fresh_store_dir("none"));
+    let (tags, models) = both_lists(&state).await;
+    assert!(tags.is_empty() && models.is_empty());
+    let _ = std::fs::remove_dir_all(&state.0.store_path);
+}
+
+#[tokio::test]
+async fn show_answers_for_a_mounted_model_under_any_spelling() {
+    let (state, _dir) = mounted_state("qwen3.8:27b-nvfp4");
+    for spelling in ["qwen3.8:27b-nvfp4", "docker.io/ai/qwen3.8:27b-nvfp4"] {
+        let (status, body) = show_mounted(&state, spelling).await;
+        assert_eq!(status, StatusCode::OK, "{spelling}");
+        assert_eq!(body["details"]["format"], "safetensors");
+        assert_eq!(body["capabilities"], serde_json::json!(["completion"]));
+    }
+}
+
+/// A mounted GGUF reports what a stored one does: header details, the
+/// projector's capabilities and the chat template's.
+#[tokio::test]
+async fn a_mounted_gguf_reports_its_header_projector_and_template() {
+    let template = "{%- if tools %}{{- tools | tojson }}{%- endif %}\
+                    {%- if enable_thinking %}<think>{%- endif %}";
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, path: PathBuf| {
+        std::fs::copy(&path, dir.path().join(name)).unwrap();
+        let _ = std::fs::remove_file(path);
+    };
+    write(
+        "m.gguf",
+        crate::gguf::write_test_gguf_with_strings(
+            &[("general.file_type", 15)],
+            &[("tokenizer.chat_template", template)],
+        ),
+    );
+    // A projector that reads no images takes `vision` away.
+    write("mmproj-F16.gguf", crate::gguf::write_test_gguf_with(&[]));
+    let state = with_mounted(test_inner(fresh_store_dir("mounted-gguf")), "g", dir.path());
+
+    let (tags, models) = both_lists(&state).await;
+    assert_eq!(
+        tags[0]["details"],
+        serde_json::json!({
+            "parent_model": "",
+            "format": "gguf",
+            "family": "llama",
+            "families": ["llama"],
+            "parameter_size": "32",
+            "quantization_level": "Q4_K_M",
+        })
+    );
+    assert_eq!(models[0]["meta"]["n_ctx_train"], 4096);
+
+    let (status, body) = show_mounted(&state, "g").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["capabilities"],
+        serde_json::json!(["completion", "tools", "thinking"])
+    );
+    assert_eq!(body["template"], template);
+    assert_eq!(body["model_info"]["llama.context_length"], 4096);
+    assert_eq!(body["details"]["quantization_level"], "Q4_K_M");
+    let _ = std::fs::remove_dir_all(&state.0.store_path);
+}
+
+/// Store operations are refused with a 400 that says why; the directory is untouched.
+#[tokio::test]
+async fn a_mounted_model_cannot_be_pulled_pushed_removed_copied_or_created_over() {
+    let (state, dir) = mounted_state("qwen");
+    let refused = |(status, body): (StatusCode, serde_json::Value), action: &str| {
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{action}: {body}");
+        let msg = body["error"].as_str().unwrap();
+        assert!(
+            msg.contains("qwen") && msg.contains("LLMMAN_MODEL_DIRS") && msg.contains(action),
+            "{msg}"
+        );
+    };
+
+    let resp = handle_pull(
+        State(state.clone()),
+        Json(ollama::OllamaPullRequest {
+            model: "qwen".into(),
+            name: String::new(),
+        }),
+    )
+    .await
+    .into_response();
+    refused(json_body(resp).await, "pulled");
+
+    let resp = handle_push(
+        State(state.clone()),
+        Json(ollama::OllamaPushRequest {
+            model: "docker.io/ai/qwen:latest".into(),
+            name: String::new(),
+        }),
+    )
+    .await
+    .into_response();
+    refused(json_body(resp).await, "pushed");
+
+    let resp = handle_delete(
+        State(state.clone()),
+        Json(OllamaDeleteRequest {
+            model: "qwen".into(),
+            name: None,
+        }),
+    )
+    .await
+    .into_response();
+    refused(json_body(resp).await, "removed");
+
+    for (source, destination, action) in [
+        ("qwen", "other", "copied"),
+        ("other", "qwen:latest", "replaced by a copy"),
+    ] {
+        let resp = handle_copy(
+            State(state.clone()),
+            Json(OllamaCopyRequest {
+                source: source.into(),
+                destination: destination.into(),
+            }),
+        )
+        .await
+        .into_response();
+        refused(json_body(resp).await, action);
+    }
+
+    let mut names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["config.json", "model.safetensors"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mounted_model_unloads_like_a_stored_one_and_is_never_a_404() {
+    let (state, _dir) = mounted_state("qwen");
+    unload_model(&state, "docker.io/ai/qwen:latest")
+        .await
+        .expect("not loaded is a success, as for a stored model");
+    state.0.manager.lock().await.running.insert(
+        "qwen".into(),
+        running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+    );
+    assert_eq!(running_key(&state, "qwen:latest"), "qwen");
+    unload_model(&state, "qwen:latest").await.unwrap();
+    assert!(state.0.manager.lock().await.running.is_empty());
+}
+
+/// The spawn fails, not a pull a stored model would start with. Only where the
+/// engine is vLLM and absent: mlx and sglang are set up differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn loading_a_mounted_model_goes_straight_to_the_engine() {
+    let engine = safetensors_engine_from_env();
+    if use_mlx_for_safetensors()
+        || engine == SafetensorsEngine::Sglang
+        || crate::find_on_path("vllm").is_some()
+    {
+        return;
+    }
+    let (state, _dir) = mounted_state("qwen");
+    let err = ensure_model(&state, "qwen", None, None)
+        .await
+        .err()
+        .expect("no vllm to start");
+    let msg = format!("{:#}", err.0);
+    assert!(msg.contains("vllm not found on PATH"), "{msg}");
+    assert!(!msg.contains("pull"), "{msg}");
+    assert!(OciStore::open(&state.0.store_path)
+        .unwrap()
+        .list()
+        .unwrap()
+        .is_empty());
+    let _ = std::fs::remove_dir_all(&state.0.store_path);
+}
+
+/// A directory that is not a model is reported as such, not as a missing store entry.
+#[tokio::test]
+async fn a_directory_that_holds_no_model_fails_the_load_with_what_it_lacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = with_mounted(test_inner(fresh_store_dir("empty-mount")), "m", dir.path());
+    let err = ensure_model(&state, "m", None, None)
+        .await
+        .err()
+        .expect("nothing to serve");
+    let msg = format!("{:#}", err.0);
+    assert!(
+        msg.contains("resolve model m") && msg.contains("holds no model"),
+        "{msg}"
+    );
+    let _ = std::fs::remove_dir_all(&state.0.store_path);
+}
+
+/// A peer that has the name loaded is not asked for a mounted model.
+#[tokio::test]
+async fn a_mounted_model_is_never_routed_to_a_peer() {
+    let (origin, seen) = mock_peer(node(8 << 30, &["qwen"], &[])).await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = with_mounted(inner_with_peers(vec![origin], 0), "qwen", dir.path());
+    let err = ensure_model(&state, "qwen", Some(&HeaderMap::new()), None)
+        .await
+        .err()
+        .expect("loaded here, from an empty directory");
+    assert!(format!("{:#}", err.0).contains("holds no model"));
+    assert!(seen.lock().await.is_empty());
+    let _ = std::fs::remove_dir_all(&state.0.store_path);
+}

@@ -1238,11 +1238,16 @@ pub const LLAMA_CPP_ENV_PASSTHROUGH_VARS: &[&str] = &[
 /// anyway — only ever the very first one, against a model that isn't
 /// locally resolvable at all yet.
 pub(super) async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<String> {
+    let mounted = state.0.mounted.find(model_ref);
     // An invalid reference is never locally resolvable, so treat it like any
     // other unresolvable case: return None and let ensure_model reject it.
-    let model_ref = crate::shortnames::resolve_ollama_api(model_ref).ok()?;
-    let model_ref = crate::storage::default_tag(&model_ref);
-    let model_ref = canonical_ref(&state.0.store_path, &model_ref);
+    let model_ref = match mounted {
+        Some(m) => m.name.clone(),
+        None => {
+            let resolved = crate::shortnames::resolve_ollama_api(model_ref).ok()?;
+            canonical_ref(&state.0.store_path, &crate::storage::default_tag(&resolved))
+        }
+    };
 
     {
         let mgr = state.0.manager.lock().await;
@@ -1258,10 +1263,14 @@ pub(super) async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<S
     let store_path = state.0.store_path.clone();
     let cache_path = state.0.cache_path.clone();
     let lookup_ref = model_ref.clone();
+    let dir = mounted.map(|m| m.dir.clone());
     let is_safetensors = tokio::task::spawn_blocking(move || {
-        resolve_model(&store_path, &cache_path, &lookup_ref)
-            .map(|p| matches!(p, ModelPath::SafeTensors(_)))
-            .unwrap_or(false)
+        match dir {
+            Some(dir) => crate::modelpack::resolve_model_dir(&dir),
+            None => resolve_model(&store_path, &cache_path, &lookup_ref),
+        }
+        .map(|p| matches!(p, ModelPath::SafeTensors(_)))
+        .unwrap_or(false)
     })
     .await
     .unwrap_or(false);

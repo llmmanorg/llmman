@@ -1,0 +1,114 @@
+# llmman serve in a pod, serving a safetensors model from an llmman-csi volume
+# through vLLM. LLMMAN_MODEL_DIRS makes llmman serve the volume where it is,
+# without importing it. The API is on 17434, behind the Service; the model
+# loads on the first request and can take many minutes.
+#
+# The vLLM image is used as published. An init container copies the llmman
+# binary into an emptyDir that the vLLM container runs, and llmman starts the
+# image's own `vllm` (LLMMAN_RUNTIME=path). The image must be Linux with glibc
+# 2.28 or newer and have `vllm` on its PATH (vllm/vllm-openai does).
+#
+# A pod binds every address, so llmman refuses to start without API keys:
+#
+#   kubectl create secret generic llmman-api-keys --from-literal=keys="$(openssl rand -hex 24)"
+#
+# Clients send `Authorization: Bearer <key>` and ask for the model as
+# qwen3.8:27b-nvfp4.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llmman-serve
+spec:
+  replicas: 1
+  # A first rollout pulls the model, then the vLLM image: longer than the
+  # default ten minutes.
+  progressDeadlineSeconds: 3600
+  # One GPU: a rolling update would wait for a second one.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: llmman-serve
+  template:
+    metadata:
+      labels:
+        app: llmman-serve
+    spec:
+      initContainers:
+        # Pin server-<version>, a release that has LLMMAN_MODEL_DIRS.
+        - name: llmman-binary
+          image: docker.io/ai/llmman:server
+          command: ["cp", "/usr/local/bin/llmman", "/llmman/llmman"]
+          volumeMounts:
+            - name: llmman
+              mountPath: /llmman
+      containers:
+        - name: llmman
+          # The vLLM build to use; rocm/vllm needs amd.com/gpu below.
+          image: vllm/vllm-openai:latest
+          # Replaces the image's `vllm serve` entrypoint.
+          command: ["/llmman/llmman", "serve"]
+          env:
+            - name: LLMMAN_RUNTIME
+              value: path
+            # A loopback bind is unreachable through the Service.
+            - name: LLMMAN_HOST
+              value: "0.0.0.0:17434"
+            # llmman's files go on the emptyDir: $HOME may not be writable.
+            - name: LLMMAN_MODELS
+              value: /llmman/store
+            - name: LLMMAN_MODEL_DIRS
+              value: "qwen3.8:27b-nvfp4=/model"
+            # Never unload: a vLLM load takes minutes.
+            - name: LLMMAN_KEEP_ALIVE
+              value: "-1"
+            - name: LLMMAN_VLLM_ARGS
+              value: "--gpu-memory-utilization 0.6"
+            - name: LLMMAN_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: llmman-api-keys
+                  key: keys
+          ports:
+            - name: api
+              containerPort: 17434
+          readinessProbe:
+            tcpSocket:
+              port: api
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: llmman
+              mountPath: /llmman
+            - name: model
+              mountPath: /model
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        # The llmman binary, copied in by the init container, and its files.
+        - name: llmman
+          emptyDir: {}
+        - name: model
+          csi:
+            driver: model.csi.modelpack.org
+            volumeAttributes:
+              model.csi.modelpack.org/reference: "docker.io/ai/qwen3.8:27b-nvfp4"
+        # vLLM's workers share tensors through /dev/shm (64 MiB by default).
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llmman-serve
+spec:
+  selector:
+    app: llmman-serve
+  ports:
+    - name: api
+      port: 17434
+      targetPort: api

@@ -43,6 +43,7 @@ mod gemini;
 mod hybrid;
 mod managed;
 mod messages;
+pub(crate) mod mounted;
 mod ollama;
 mod openai;
 mod realtime;
@@ -346,6 +347,8 @@ struct Inner {
     memory: u64,
     store_path: PathBuf,
     cache_path: PathBuf,
+    // LLMMAN_MODEL_DIRS: model directories served in place.
+    mounted: mounted::MountedModels,
     // `record_prompt`'s file; None under LLMMAN_NOHISTORY (and in tests).
     prompt_log: Option<PathBuf>,
     // `usage::record_usage`'s file; None under LLMMAN_NOUSAGE (and in tests).
@@ -1093,6 +1096,9 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
 /// Best-effort: a spelling that does not resolve is returned unchanged,
 /// so the lookup finds nothing rather than the wrong model.
 fn running_key(state: &AppState, model_ref: &str) -> String {
+    if let Some(m) = state.0.mounted.find(model_ref) {
+        return m.name.clone();
+    }
     let resolved =
         crate::shortnames::resolve_ollama_api(model_ref).unwrap_or_else(|_| model_ref.to_string());
     canonical_ref(&state.0.store_path, &crate::storage::default_tag(&resolved))
@@ -1177,7 +1183,11 @@ fn stored_tag_for_digest(store_path: &std::path::Path, reference: &str) -> Optio
 /// first: by its key, and by the digest it records when the key cannot be
 /// had from the store any more.
 async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
-    let lock_key = load_identity(&state.0.store_path, model).map_err(AppError::bad_request)?;
+    let mounted = state.0.mounted.find(model);
+    let lock_key = match mounted {
+        Some(m) => m.name.clone(),
+        None => load_identity(&state.0.store_path, model).map_err(AppError::bad_request)?,
+    };
     let _guard = acquire_load_lock(&lock_key).await;
     // Only now, with any load of this model excluded: the running key is
     // the store's spelling, which a load in flight may just have changed.
@@ -1185,7 +1195,7 @@ async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
     // `ensure_model` takes before its own `canonical_ref`, and not from
     // the lock key: that has folded the digest onto `:latest`, which is
     // not where the store holds a model tagged otherwise.
-    let canonical = if crate::providers::is_remote_ref(model) {
+    let canonical = if mounted.is_some() || crate::providers::is_remote_ref(model) {
         lock_key
     } else {
         let resolved =
@@ -1206,8 +1216,8 @@ async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
     }
     // Nothing was loaded under that key. A provider-routed model never is,
     // and is absent from the store by definition, so naming one is not the
-    // 404 case.
-    if crate::providers::is_remote_ref(model) {
+    // 404 case. Nor is a mounted directory.
+    if mounted.is_some() || crate::providers::is_remote_ref(model) {
         return Ok(());
     }
     // The key may not be the one the content runs under. The store may
@@ -2378,16 +2388,30 @@ async fn resolve_target(
     // returns. See `load_identity`, which `unload_model` locks on for the
     // same reason; the two have to agree, or an unload by one spelling
     // passes a load by another.
-    let load_id = load_identity(&state.0.store_path, model_ref).map_err(AppError::bad_request)?;
+    //
+    // A mounted directory is keyed by its name and skips the store's steps:
+    // the pull, the signature policy and the layer check.
+    let mounted = state.0.mounted.find(model_ref);
+    if let Some(m) = mounted {
+        m.scan().await;
+    }
+    let load_id = match mounted {
+        Some(m) => m.name.clone(),
+        None => load_identity(&state.0.store_path, model_ref).map_err(AppError::bad_request)?,
+    };
     let requested = model_ref;
-    let model_ref =
-        crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
-    // Default the tag before the store lookups: otherwise "gemma4" and
-    // "gemma4:latest" reach the store, and the pull, as two spellings. A
-    // `@digest` stays on, unlike in the lock key, so `find` can resolve
-    // it to whatever tag holds that content.
-    let model_ref = crate::storage::default_tag(&model_ref);
-    let model_ref = canonical_ref(&state.0.store_path, &model_ref);
+    let model_ref = match mounted {
+        Some(m) => m.name.clone(),
+        None => {
+            let resolved =
+                crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
+            // Default the tag before the store lookups: otherwise "gemma4" and
+            // "gemma4:latest" reach the store, and the pull, as two spellings. A
+            // `@digest` stays on, unlike in the lock key, so `find` can resolve
+            // it to whatever tag holds that content.
+            canonical_ref(&state.0.store_path, &crate::storage::default_tag(&resolved))
+        }
+    };
     let model_ref = model_ref.as_str();
 
     // Already loaded and reusable — bypasses LLMMAN_MAX_QUEUE entirely,
@@ -2402,13 +2426,16 @@ async fn resolve_target(
     }
 
     // Not loaded here: a peer may have it, or more room for it. The
-    // guard is a no-op one, as for a provider.
-    if let Some(peer) = aggregation::route(state, model_ref, headers).await {
-        return Ok((
-            model_ref.to_string(),
-            aggregation::target(state, peer),
-            ActivityGuard::new(state, model_ref),
-        ));
+    // guard is a no-op one, as for a provider. A mounted directory is never
+    // routed to a peer.
+    if mounted.is_none() {
+        if let Some(peer) = aggregation::route(state, model_ref, headers).await {
+            return Ok((
+                model_ref.to_string(),
+                aggregation::target(state, peer),
+                ActivityGuard::new(state, model_ref),
+            ));
+        }
     }
 
     // The cold-start clock. It starts here rather than at the spawn
@@ -2433,7 +2460,7 @@ async fn resolve_target(
     // Pull if missing — and run pull_serialized even when present, so a
     // model already on disk is still subject to the signature policy
     // (it returns immediately when no policy applies). See verify_stored.
-    {
+    if mounted.is_none() {
         let present = crate::storage::OciStore::open(&state.0.store_path)
             .and_then(|s| s.find(model_ref))
             .is_ok();
@@ -2457,7 +2484,10 @@ async fn resolve_target(
 
     // Re-canonicalise after the pull: default_tag already fixed the lock
     // key, so this only refines to a more specific stored form.
-    let model_ref = canonical_ref(&state.0.store_path, model_ref);
+    let model_ref = match mounted {
+        Some(_) => model_ref.to_owned(),
+        None => canonical_ref(&state.0.store_path, model_ref),
+    };
     let model_ref = model_ref.as_str();
 
     // Re-check in case that stored form differs from the key above.
@@ -2472,9 +2502,12 @@ async fn resolve_target(
     // any two of them cannot hand the load a manifest nobody checked.
     // A failed find fails the load: `resolve_model` finds by the same
     // reference and would have failed with "model not found in store".
-    let desc = OciStore::open(&state.0.store_path)?
-        .find(model_ref)
-        .with_context(|| format!("model not found in store: {model_ref}"))?;
+    let desc = match mounted {
+        Some(m) => m.descriptor(),
+        None => OciStore::open(&state.0.store_path)?
+            .find(model_ref)
+            .with_context(|| format!("model not found in store: {model_ref}"))?,
+    };
     // The content may be running already under a key this spelling does
     // not resolve to; see `check_running_by_digest`'s doc comment for the
     // order that produces one.
@@ -2492,7 +2525,9 @@ async fn resolve_target(
     // above, and `resolve_model` loads that same manifest through
     // `load_ref`; `model_ref` stays the spelling for the running-process
     // keys and logs.
-    let load_ref = {
+    let load_ref = if mounted.is_some() {
+        model_ref.to_owned()
+    } else {
         let store_path = state.0.store_path.clone();
         let model_ref_owned = model_ref.to_owned();
         let desc = desc.clone();
@@ -2511,11 +2546,17 @@ async fn resolve_target(
     // read, so before the layer check a FIFO or a link to `/dev/zero`
     // at the manifest's blob path would stall the load instead of
     // being reported as a mismatch.
-    let size = OciStore::open(&state.0.store_path)?.total_size(&desc);
+    let size = match mounted {
+        Some(m) => m.size(),
+        None => OciStore::open(&state.0.store_path)?.total_size(&desc),
+    };
     let digest = desc.digest;
 
-    let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, &load_ref)
-        .with_context(|| format!("resolve model {model_ref}"))?;
+    let model_path = match mounted {
+        Some(m) => m.resolve()?,
+        None => resolve_model(&state.0.store_path, &state.0.cache_path, &load_ref)
+            .with_context(|| format!("resolve model {model_ref}"))?,
+    };
     let context_shift = supports_context_shift(model_ref);
     // One header read feeds initial_ctx_size, embedding_model_ctx and
     // is_decision; unreadable means "generation model, unknown trained
@@ -2647,6 +2688,11 @@ async fn resolve_target(
         } else {
             state.0.runtime.ociman().await?
         };
+        if ociman.is_some() {
+            if let Some(m) = state.0.mounted.find(model_ref) {
+                m.ensure_visible_to_container()?;
+            }
+        }
         process = match (&model_path, ociman) {
             // The GGUF arms, in gguf_arm's order.
             (ModelPath::Gguf(path, mmproj), ociman) => {
@@ -5491,6 +5537,19 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     }
 
     // Before anything binds, so a misconfiguration fails at exec.
+    let mounted = mounted::MountedModels::from_env()?;
+    for m in mounted.iter() {
+        match crate::modelpack::resolve_model_dir(&m.dir) {
+            Ok(path) => eprintln!(
+                "[llmman] serving {} from {} as {} ({})",
+                m.name,
+                m.dir.display(),
+                path.format(),
+                mounted::VAR
+            ),
+            Err(e) => eprintln!("[llmman] warning: {} cannot be loaded: {e:#}", m.name),
+        }
+    }
     let auth = auth::Policy::from_env()?;
     if auth.enforced() {
         eprintln!("[llmman] API key required on every request (LLMMAN_API_KEYS)");
@@ -5563,6 +5622,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         memory,
         store_path,
         cache_path,
+        mounted,
         prompt_log: crate::promptlog::enabled_from_env()
             .then(crate::promptlog::path)
             .transpose()?,

@@ -104,6 +104,7 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
         peers: Vec::new(),
         memory: 0,
         store_path,
+        mounted: Default::default(),
         cache_path: {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
