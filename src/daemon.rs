@@ -270,10 +270,9 @@ impl PortLock {
         // Never removed: a daemon that deleted and recreated it would lock a
         // new file while a running daemon still holds the old one.
         let file = open_owner_only(&path).with_context(|| format!("open {}", path.display()))?;
-        // A holder without a record is about to publish one, or is shutting
-        // down. Wait for the record, so a client that started this daemon
-        // finds the holder once this one exits, or for the holder to exit,
-        // and take over.
+        // A holder without a record is still starting or is shutting down.
+        // Waiting means this daemon refuses only once clients can find the
+        // holder, and starts if the holder exits.
         let deadline = std::time::Instant::now() + holder_wait;
         loop {
             match file.try_lock() {

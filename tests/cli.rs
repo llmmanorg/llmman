@@ -776,8 +776,13 @@ fn clients_reach_a_serve_on_port_0_while_it_holds_its_record() {
         connections
     };
 
-    let (mut daemon, _) = start();
+    let (mut daemon, port) = start();
     reachable();
+    let (_, _, stderr) = ps();
+    assert!(
+        stderr.contains(&format!("http://127.0.0.1:{port}")),
+        "{stderr}"
+    );
 
     // A second daemon for the same LLMMAN_HOST refuses to start. Waited on
     // with a deadline, since one that started would serve until killed.
