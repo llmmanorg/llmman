@@ -1423,10 +1423,8 @@ pub struct Resolved {
 /// when given, fetches that exact release tag (e.g. "b10360") instead of
 /// whatever is currently latest — once cached under that tag it is never
 /// re-fetched, so pinning also makes this fully reproducible across runs.
-/// Only a `b<number>` pin gets that guarantee: pinning a semver pointer
-/// tag (e.g. "v0.3.0") re-resolves through the network each run, since the
-/// cache keys on the `b<number>` tag it dereferences to (see
-/// `resolve_release`) and the pointer file is mutable upstream.
+/// A semver pointer pin (e.g. "v1.1.0") is resolved through the network
+/// once; the `b<number>` build it names is recorded and reused from cache.
 ///
 /// Blocking (network + disk I/O) — callers on an async runtime must run
 /// this via `tokio::task::spawn_blocking` (see `cmd::serve::runtime::resolve`).
@@ -1465,8 +1463,11 @@ fn resolve_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
     // reuse it without touching the network at all — pinned or not, a
     // given release's assets never change after being published.
     if let Some(tag) = pinned_version {
-        let tag_dir = install_root()?.join(cache_key(&repo, tag));
-        if let Some(bin) = cached_in_tag(&tag_dir, &query.label, bin_name) {
+        let root = install_root()?;
+        let tag_dir = root.join(cache_key(&repo, tag));
+        let cached = cached_in_tag(&tag_dir, &query.label, bin_name)
+            .or_else(|| cached_pointer_build(&root, &repo, tag, &query.label, bin_name));
+        if let Some(bin) = cached {
             return Ok(Resolved {
                 bin,
                 backend_label: query.label,
@@ -1584,6 +1585,7 @@ fn try_ensure_from_network(
         mark_executable(&bin)?;
         Ok(bin)
     })?;
+    record_pointer_build(&install_root()?, repo, pinned_version, &tag);
     Ok(Resolved {
         bin,
         backend_label: query.label.clone(),
@@ -1624,6 +1626,44 @@ fn cached_in_tag(tag_dir: &Path, label: &str, bin_name: &str) -> Option<PathBuf>
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with(&legacy))
         .find_map(|e| crate::managed::completed_binary(&e.path(), bin_name))
+}
+
+/// `<root>/.pointer-<key>`: the build a pointer pin resolved to. A dot file
+/// is neither a tag dir to [`newest_cached`] nor a version to prune.
+fn pointer_record(root: &Path, repo: &str, pin: &str) -> PathBuf {
+    root.join(format!(".pointer-{}", cache_key(repo, pin)))
+}
+
+/// Records that `pin` resolved to build `tag`, so later runs skip the network.
+/// Best-effort: without the record the next run just resolves again.
+fn record_pointer_build(root: &Path, repo: &str, pin: Option<&str>, tag: &str) {
+    let Some(pin) = pin.filter(|pin| *pin != tag) else {
+        return;
+    };
+    let path = pointer_record(root, repo, pin);
+    if let Err(e) = crate::fsutil::write_atomic(&path, tag.as_bytes()) {
+        eprintln!(
+            "[llmman] warning: could not {:#}",
+            fs_error("write", &path, e)
+        );
+    }
+}
+
+/// The installed binary of the build a pointer `pin` was recorded to resolve
+/// to. `None` for a `b<number>` pin, an unrecorded pin or a pruned build.
+fn cached_pointer_build(
+    root: &Path,
+    repo: &str,
+    pin: &str,
+    label: &str,
+    bin_name: &str,
+) -> Option<PathBuf> {
+    if build_number(pin).is_some() {
+        return None;
+    }
+    let text = std::fs::read_to_string(pointer_record(root, repo, pin)).ok()?;
+    let tag = parse_pointer_tag(&text).filter(|tag| build_number(tag).is_some())?;
+    cached_in_tag(&root.join(cache_key(repo, tag)), label, bin_name)
 }
 
 /// The newest complete `<tag>/<label>` install under [`install_root`]
@@ -1908,7 +1948,17 @@ mod tests {
         for own in ["b12359", "v1.1.0", "latest"] {
             assert_eq!(build_tag(own), own);
         }
-        assert!(build_tag(default_release()).starts_with('b'));
+        let pin = default_release();
+        let release = pin.split('-').next().unwrap_or(pin);
+        let nums = release.strip_prefix('v').unwrap_or_default().split('.');
+        let nums = nums.map(str::parse::<u32>);
+        assert!(
+            nums.clone().count() == 3 && nums.flatten().count() == 3,
+            "{pin}"
+        );
+        let build = build_tag(pin);
+        let named = pin.matches('-').count() == 2 && build_number(build).is_some();
+        assert!(if release == pin { build == pin } else { named }, "{pin}");
     }
 
     #[test]
@@ -2589,6 +2639,94 @@ mod tests {
         assert_eq!(found, Some(legacy.join("llama-server")));
         assert_eq!(cached_in_tag(&tag, "cuda-13", "llama-server"), None);
         std::fs::remove_dir_all(&tag).unwrap();
+    }
+
+    /// A root holding a complete `<tag>/cpu` install of each of `tags`.
+    fn root_with_builds(name: &str, tags: &[&str]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("llmman-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for tag in tags {
+            let dir = root.join(cache_key(DEFAULT_REPO, tag)).join("cpu");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("llama-server"), b"").unwrap();
+            std::fs::write(dir.join(".llmman-complete"), b"").unwrap();
+        }
+        root
+    }
+
+    fn cached_pointer(root: &Path, pin: &str) -> Option<PathBuf> {
+        cached_pointer_build(root, DEFAULT_REPO, pin, "cpu", "llama-server")
+    }
+
+    #[test]
+    fn a_pointer_resolve_records_its_build_and_later_runs_reuse_it() {
+        let root = root_with_builds("pointer-hit", &["b12774"]);
+        let bin = root.join("b12774/cpu/llama-server");
+        assert_eq!(cached_pointer(&root, "v1.1.0"), None);
+        record_pointer_build(&root, DEFAULT_REPO, Some("v1.1.0"), "b12774");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".pointer-v1.1.0")).unwrap(),
+            "b12774"
+        );
+        assert_eq!(cached_pointer(&root, "v1.1.0"), Some(bin));
+        assert_eq!(cached_pointer(&root, "v1.2.0"), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_mirror_pointer_record_is_keyed_like_its_install() {
+        let root = root_with_builds("pointer-mirror", &[]);
+        let dir = root.join(cache_key(MIRROR, "b12774")).join("cpu");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("llama-server"), b"").unwrap();
+        std::fs::write(dir.join(".llmman-complete"), b"").unwrap();
+        record_pointer_build(&root, MIRROR, Some("v1.1.0"), "b12774");
+        let hit = cached_pointer_build(&root, MIRROR, "v1.1.0", "cpu", "llama-server");
+        assert_eq!(hit, Some(dir.join("llama-server")));
+        assert_eq!(cached_pointer(&root, "v1.1.0"), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_stale_pointer_record_falls_through_to_the_network() {
+        let root = root_with_builds("pointer-stale", &["b12774"]);
+        record_pointer_build(&root, DEFAULT_REPO, Some("v1.1.0"), "b12999");
+        assert_eq!(cached_pointer(&root, "v1.1.0"), None);
+        record_pointer_build(&root, DEFAULT_REPO, Some("v1.1.0"), "b12774");
+        std::fs::remove_file(root.join("b12774/cpu/.llmman-complete")).unwrap();
+        assert_eq!(cached_pointer(&root, "v1.1.0"), None);
+        for junk in ["", "  \n", "../b12774", "latest"] {
+            std::fs::write(root.join(".pointer-v1.1.0"), junk).unwrap();
+            assert_eq!(cached_pointer(&root, "v1.1.0"), None, "{junk:?}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn build_pins_and_unpinned_runs_record_and_reuse_no_pointer() {
+        let root = root_with_builds("pointer-build-pin", &["b12774"]);
+        record_pointer_build(&root, DEFAULT_REPO, Some("b12774"), "b12774");
+        record_pointer_build(&root, DEFAULT_REPO, None, "b12774");
+        assert!(!root.join(".pointer-b12774").exists());
+        std::fs::write(root.join(".pointer-b12000"), "b12774").unwrap();
+        assert_eq!(cached_pointer(&root, "b12000"), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_pointer_record_survives_pruning_the_old_builds() {
+        let root = root_with_builds("pointer-prune", &["b12000"]);
+        record_pointer_build(&root, DEFAULT_REPO, Some("v1.1.0"), "b12774");
+        let dest = root.join("b12774/cpu");
+        let installed = |dest: &Path| -> Result<()> {
+            std::fs::write(dest.join("llama-server"), b"")?;
+            Ok(())
+        };
+        crate::managed::ensure(&root, &dest, "llama.cpp", |_| None::<()>, installed).unwrap();
+        assert!(!root.join("b12000").exists());
+        assert!(root.join(".pointer-v1.1.0").is_file());
+        assert!(cached_pointer(&root, "v1.1.0").is_some());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     // ----- repo, tag convention and release URLs -----
