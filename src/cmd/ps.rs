@@ -162,6 +162,13 @@ pub fn run(args: &PsArgs) -> anyhow::Result<()> {
             started_w = started_w,
         )?;
     }
+    // On stderr, so the table stays as scripts expect.
+    if crate::daemon::os_picks_port() {
+        eprintln!(
+            "[llmman] llmman serve is on {}, the port the OS picked",
+            crate::daemon::server()
+        );
+    }
     crate::pager::emit("ps", &out, !args.no_pager)
 }
 
