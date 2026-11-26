@@ -44,6 +44,9 @@ pub fn run(args: &RmArgs) -> anyhow::Result<()> {
     let store_root = crate::default_store()?;
     let store = OciStore::open(&store_root)?;
 
+    // Snapshot before the untag, to tell its orphans from other unreferenced blobs.
+    let before = (!gc::noprune_from_env()).then(|| gc::held_by_manifests(&store));
+
     let mut any_removed = false;
     for reference in &refs {
         match store.remove(reference) {
@@ -60,32 +63,17 @@ pub fn run(args: &RmArgs) -> anyhow::Result<()> {
         }
     }
 
-    // GC once, after every requested reference is untagged: recompute the
-    // still-referenced digest set from the surviving manifests, then sweep
-    // blobs/cache not in it. Uses the same grace window as serve's startup
-    // sweep, NOT zero: `llmman pull` runs in the long-lived `serve` daemon,
-    // which writes each layer blob to its final path as it downloads and
-    // only writes the manifest + tag at the very end. A concurrent
-    // `rm <unrelated>` would otherwise see that not-yet-tagged blob as an
-    // orphan and delete it mid-pull. The writer is a different process, so
-    // `rm` being synchronous doesn't protect it — only the grace window
-    // does (matches Ollama's layerPruneGracePeriod).
-    if any_removed && !gc::noprune_from_env() {
-        let (blob_stats, cache_stats) = gc::sweep(&store, &crate::default_cache()?)?;
-        if blob_stats.count > 0 || cache_stats.count > 0 {
-            println!(
-                "Freed {} ({} blobs, {} cache entries)",
-                crate::fmt::human_size(blob_stats.bytes + cache_stats.bytes),
-                blob_stats.count,
-                cache_stats.count
-            );
-        }
-        if blob_stats.kept_count > 0 {
-            println!(
-                "Kept {} ({} blobs) pulled less than an hour ago, freed by a later rm or serve restart",
-                crate::fmt::human_size(blob_stats.kept_bytes),
-                blob_stats.kept_count
-            );
+    // Free at once what the removals orphaned. Other unreferenced blobs may be
+    // a pull in flight in `serve`, so they wait for the grace-gated sweep.
+    if let (true, Some(before)) = (any_removed, before) {
+        match before {
+            Ok(before) => {
+                let stats = gc::reclaim_removed(&store, &crate::default_cache()?, &before)?;
+                if let Some((size, counts)) = gc::freed(&stats) {
+                    println!("Freed {size} {counts}");
+                }
+            }
+            Err(e) => eprintln!("[llmman] not freeing disk space after rm: {e:#}"),
         }
     }
 

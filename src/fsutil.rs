@@ -10,6 +10,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// pid does the same across processes.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Sets `path`'s mtime.
+pub fn set_mtime(path: &Path, when: std::time::SystemTime) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_modified(when)
+}
+
+/// Sets `path`'s mtime to now, ignoring failure. A reused blob is touched so
+/// a sweep's grace window and `rm`'s reclaim see it as used just now.
+pub fn touch(path: &Path) {
+    let _ = set_mtime(path, std::time::SystemTime::now());
+}
+
 /// Writes `bytes` to `path` through a temp file beside it and a rename,
 /// so a reader sees the old file or the new one and not a partial one;
 /// the temp name carries the pid and a counter, so no two writers share
