@@ -320,7 +320,7 @@ Pods keep working if the driver pod restarts: their mounts belong to the
 kubelet, not the plugin.
 
 To remove a model from a node, remove it with llmman in the driver pod; that
-also prunes what no other model uses and is more than an hour old. Or delete the
+also frees, at once, what no other model uses. Or delete the
 directory when no pod uses anything in it:
 
 ```console

@@ -42,6 +42,7 @@ func writeBlob(layoutDir string, mediaType string, data []byte) (ocispec.Descrip
 	}
 	dest := filepath.Join(dir, dgst.Hex())
 	if fi, err := os.Stat(dest); err == nil && fi.Size() == int64(len(data)) {
+		touchBlob(dest)
 		return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: int64(len(data))}, nil
 	}
 	tmp := dest + ".tmp"
@@ -116,6 +117,7 @@ func writeBlobStream(layoutDir, mediaType string, r io.Reader, size int64, dgst 
 	}
 	dest := filepath.Join(dir, dgst.Hex())
 	if fi, err := os.Stat(dest); err == nil && (size <= 0 || fi.Size() == size) {
+		touchBlob(dest)
 		return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: fi.Size()}, nil
 	}
 	tmp := dest + ".part"
@@ -156,6 +158,13 @@ func writeBlobStream(layoutDir, mediaType string, r io.Reader, size int64, dgst 
 		return ocispec.Descriptor{}, err
 	}
 	return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: total}, nil
+}
+
+// touchBlob sets a reused blob's mtime to now, so a concurrent sweep or
+// `llmman rm` sees it as used just now. Failure is ignored.
+func touchBlob(path string) {
+	now := time.Now()
+	_ = os.Chtimes(path, now, now)
 }
 
 // blobExists reports whether a blob is already fully stored in the layout.

@@ -334,6 +334,16 @@ impl OciStore {
         Ok(out)
     }
 
+    /// When the tag pointer behind a listed `desc` was last written: the newest
+    /// of its current and legacy files. None if unnamed or unreadable.
+    pub(crate) fn ref_mtime(&self, desc: &Descriptor) -> Option<std::time::SystemTime> {
+        let name = stored_ref_name(desc)?;
+        [self.ref_path(name), self.legacy_ref_path(name)]
+            .iter()
+            .filter_map(|p| fs::metadata(p).ok()?.modified().ok())
+            .max()
+    }
+
     // ------------------------------------------------------------------
     // Blobs
     // ------------------------------------------------------------------
@@ -349,12 +359,7 @@ impl OciStore {
         let digest = format!("sha256:{}", hex);
         let path = self.root.join("blobs").join("sha256").join(&hex);
         if path.exists() {
-            // Reused: refresh its age so a concurrent sweep's grace window
-            // covers it until this build's tag lands.
-            let _ = fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+            crate::fsutil::touch(&path);
         } else {
             let tmp = path.with_extension("tmp");
             fs::write(&tmp, data)?;
