@@ -5390,8 +5390,9 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // Catch-all GC sweep, right after repair: removes blobs/cache orphaned
     // by anything other than `rm` (a crash mid-pull past the grace window,
     // manual store surgery, an old build's leftover cache after a format
-    // change). Grace-gated (unlike `rm`, which frees immediately) so a blob
-    // written moments before its tag during a concurrent pull survives.
+    // change). Grace-gated (unlike `rm`, which immediately frees what its own
+    // removal orphaned) so a blob written moments before its tag during a
+    // concurrent pull survives.
     // Gated by the same LLMMAN_NOPRUNE escape hatch as `rm`.
     if !crate::storage::gc::noprune_from_env() {
         if let Ok(store) = OciStore::open(&store_path) {

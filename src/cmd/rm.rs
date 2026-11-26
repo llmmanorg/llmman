@@ -37,6 +37,10 @@ pub fn run(args: &RmArgs) -> anyhow::Result<()> {
     let store_root = crate::default_store()?;
     let store = OciStore::open(&store_root)?;
 
+    // What every tag held, taken before the untag so the removals' own
+    // orphans can be told apart from any other unreferenced blob.
+    let before = (!gc::noprune_from_env()).then(|| gc::held_by_manifests(&store));
+
     let mut any_removed = false;
     for reference in &refs {
         match store.remove(reference) {
@@ -53,32 +57,35 @@ pub fn run(args: &RmArgs) -> anyhow::Result<()> {
         }
     }
 
-    // GC once, after every requested reference is untagged: recompute the
-    // still-referenced digest set from the surviving manifests, then sweep
-    // blobs/cache not in it. Uses the same grace window as serve's startup
-    // sweep, NOT zero: `llmman pull` runs in the long-lived `serve` daemon,
-    // which writes each layer blob to its final path as it downloads and
-    // only writes the manifest + tag at the very end. A concurrent
-    // `rm <unrelated>` would otherwise see that not-yet-tagged blob as an
-    // orphan and delete it mid-pull. The writer is a different process, so
-    // `rm` being synchronous doesn't protect it — only the grace window
-    // does (matches Ollama's layerPruneGracePeriod).
-    if any_removed && !gc::noprune_from_env() {
-        let (blob_stats, cache_stats) = gc::sweep(&store, &crate::default_cache()?)?;
-        if blob_stats.count > 0 || cache_stats.count > 0 {
-            println!(
-                "Freed {} ({} blobs, {} cache entries)",
-                crate::fmt::human_size(blob_stats.bytes + cache_stats.bytes),
-                blob_stats.count,
-                cache_stats.count
-            );
-        }
-        if blob_stats.kept_count > 0 {
-            println!(
-                "Kept {} ({} blobs) pulled less than an hour ago, freed by a later rm or serve restart",
-                crate::fmt::human_size(blob_stats.kept_bytes),
-                blob_stats.kept_count
-            );
+    // GC once, after every requested reference is untagged, and free at any
+    // age exactly what those removals orphaned: the digests that were held
+    // before and no surviving manifest holds now. Not "every unreferenced
+    // blob", and not behind the grace window either: `llmman pull` runs in
+    // the long-lived `serve` daemon, which writes each layer blob to its
+    // final path as it downloads and only writes the manifest + tag at the
+    // very end, so a blob no removed tag held may be a pull in flight (a
+    // different process, which `rm` being synchronous doesn't protect).
+    // Those are left to the grace-gated sweep (serve startup, retag). A
+    // blob a concurrent writer reused after the removed tag was written is
+    // left too; a writer reusing one in the moments between the scan after
+    // the untag and the delete is the one race left (see
+    // `gc::reclaim_removed`). If the pre-untag scan failed (a corrupt
+    // pointer, perhaps the very one just removed) nothing is deleted.
+    if let (true, Some(before)) = (any_removed, before) {
+        match before {
+            Ok(before) => {
+                let (blob_stats, cache_stats) =
+                    gc::reclaim_removed(&store, &crate::default_cache()?, &before)?;
+                if blob_stats.count > 0 || cache_stats.count > 0 {
+                    println!(
+                        "Freed {} ({} blobs, {} cache entries)",
+                        crate::fmt::human_size(blob_stats.bytes + cache_stats.bytes),
+                        blob_stats.count,
+                        cache_stats.count
+                    );
+                }
+            }
+            Err(e) => eprintln!("[llmman] not freeing disk space after rm: {e:#}"),
         }
     }
 

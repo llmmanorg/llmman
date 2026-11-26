@@ -9,18 +9,23 @@
 //! sync (a crash, a manual edit, an interrupted pull can never desync it,
 //! because the live set is rebuilt fresh on every sweep).
 //!
-//! [`referenced_digests`] builds that live set; [`prune_blobs_and_cache`]
-//! sweeps everything not in it. Both namespaces are grace-gated the same
-//! way [`crate::storage::repair`] gates its stale-temp-file sweep: a
-//! blob is written before its manifest/tag pointer, so a blob can be
-//! legitimately unreferenced for a moment mid-pull — anything younger than
-//! `grace` is left alone. Both `rm` and the `serve` startup catch-all pass
-//! the hour-long [`GC_GRACE_PERIOD`]: `pull` runs in the long-lived `serve`
-//! daemon, so a concurrent `rm` in a separate process can race a pull that
-//! has written a layer blob but not yet tagged its manifest — only the
-//! grace window, not `rm` being synchronous, protects that blob.
+//! Two ways to delete, both over blobs and cache directories:
+//!
+//! * [`sweep`] ([`referenced_digests`] + [`prune_blobs_and_cache`]) removes
+//!   everything not in the live set, grace-gated the same way
+//!   [`crate::storage::repair`] gates its stale-temp-file sweep: a blob is
+//!   written before its manifest/tag pointer, so a blob can be legitimately
+//!   unreferenced for a moment mid-pull, and `pull` runs in the long-lived
+//!   `serve` daemon, a different process from any `rm`. Anything younger
+//!   than [`GC_GRACE_PERIOD`] is left alone. The `serve` startup catch-all
+//!   and [`after_retag`] use this.
+//! * [`reclaim_removed`] is for `rm`: it deletes, at any age, only what the
+//!   removed tags themselves held and no surviving tag does. Those digests
+//!   are known from the manifests, so unrelated unreferenced blobs (an
+//!   in-flight pull's layers) are never candidates and need no grace
+//!   window.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -39,10 +44,15 @@ pub const GC_GRACE_PERIOD: Duration = Duration::from_secs(60 * 60);
 pub struct GcStats {
     pub count: usize,
     pub bytes: u64,
-    /// Unreferenced blobs left because they are younger than the grace
-    /// window, so `rm` can say why they still take up space.
-    pub kept_count: usize,
-    pub kept_bytes: u64,
+}
+
+/// Decides, from a blob file name or cache directory name (the digest hex)
+/// and its path, whether a prune deletes it.
+type Doomed<'a> = &'a dyn Fn(&str, &Path) -> bool;
+
+/// Doomed: not in `live` and at least `grace` old.
+fn unreferenced(live: &HashSet<String>, grace: Duration) -> impl Fn(&str, &Path) -> bool + '_ {
+    move |hex, path| !live.contains(&format!("sha256:{hex}")) && is_older_than(path, grace)
 }
 
 #[cfg(unix)]
@@ -138,16 +148,30 @@ fn file_identity(
 /// destroying blobs shared with other healthy models. When we can't prove
 /// what's still referenced, callers must delete nothing.
 pub fn referenced_digests(store: &OciStore) -> anyhow::Result<HashSet<String>> {
-    let mut live = HashSet::new();
+    Ok(all_digests(&held_by_manifests(store)?))
+}
+
+/// Each surviving manifest's digest mapped to its config and layer digests.
+/// Fails closed exactly as [`referenced_digests`] describes.
+pub fn held_by_manifests(store: &OciStore) -> anyhow::Result<HashMap<String, Vec<String>>> {
+    let mut held = HashMap::new();
     for desc in store.list_refs_strict()? {
-        live.insert(desc.digest.clone());
         let manifest = store
             .read_manifest(&desc.digest)
             .with_context(|| format!("read manifest {} for GC reference scan", desc.digest))?;
-        live.insert(manifest.config.digest.clone());
-        live.extend(manifest.layers.iter().map(|l| l.digest.clone()));
+        let digests = std::iter::once(manifest.config.digest)
+            .chain(manifest.layers.into_iter().map(|l| l.digest))
+            .collect();
+        held.insert(desc.digest, digests);
     }
-    Ok(live)
+    Ok(held)
+}
+
+fn all_digests(held: &HashMap<String, Vec<String>>) -> HashSet<String> {
+    held.iter()
+        .flat_map(|(manifest, digests)| std::iter::once(manifest).chain(digests))
+        .cloned()
+        .collect()
 }
 
 /// Deletes every blob file under `blobs/sha256/` whose `sha256:<name>`
@@ -160,9 +184,10 @@ fn prune_blobs(
     live: &HashSet<String>,
     grace: Duration,
 ) -> anyhow::Result<GcStats> {
+    let doomed = unreferenced(live, grace);
     let mut account = GcFileAccount::default();
-    remember_retained_blobs(store_root, live, grace, &mut account)?;
-    prune_blobs_with_account(store_root, live, grace, &mut account)
+    remember_retained_blobs(store_root, &doomed, &mut account)?;
+    prune_blobs_with_account(store_root, &doomed, &mut account)
 }
 
 /// Prunes blobs and cache with one file-identity account, so hardlinked
@@ -173,18 +198,28 @@ pub fn prune_blobs_and_cache(
     live: &HashSet<String>,
     grace: Duration,
 ) -> anyhow::Result<(GcStats, GcStats)> {
+    prune_doomed(store_root, cache_path, &unreferenced(live, grace), grace)
+}
+
+/// [`prune_blobs_and_cache`] for any `doomed` rule. `grace` only ages out
+/// stale copy temp files inside cache directories that are kept.
+fn prune_doomed(
+    store_root: &Path,
+    cache_path: &Path,
+    doomed: Doomed,
+    grace: Duration,
+) -> anyhow::Result<(GcStats, GcStats)> {
     let mut account = GcFileAccount::default();
-    remember_retained_blobs(store_root, live, grace, &mut account)?;
-    remember_retained_cache_files(cache_path, live, grace, &mut account)?;
-    let blob_stats = prune_blobs_with_account(store_root, live, grace, &mut account)?;
-    let cache_stats = prune_cache_with_account(cache_path, live, grace, &mut account)?;
+    remember_retained_blobs(store_root, doomed, &mut account)?;
+    remember_retained_cache_files(cache_path, doomed, grace, &mut account)?;
+    let blob_stats = prune_blobs_with_account(store_root, doomed, &mut account)?;
+    let cache_stats = prune_cache_with_account(cache_path, doomed, grace, &mut account)?;
     Ok((blob_stats, cache_stats))
 }
 
 fn remember_retained_blobs(
     store_root: &Path,
-    live: &HashSet<String>,
-    grace: Duration,
+    doomed: Doomed,
     account: &mut GcFileAccount,
 ) -> anyhow::Result<()> {
     let blobs_dir = store_root.join("blobs").join("sha256");
@@ -206,7 +241,7 @@ fn remember_retained_blobs(
         if name.starts_with("tmp-") || name.ends_with(".tmp") {
             continue;
         }
-        if live.contains(&format!("sha256:{name}")) || !is_older_than(&path, grace) {
+        if !doomed(name, &path) {
             account.remember(&path)?;
         }
     }
@@ -215,14 +250,10 @@ fn remember_retained_blobs(
 
 fn remember_retained_cache_files(
     cache_path: &Path,
-    live: &HashSet<String>,
+    doomed: Doomed,
     grace: Duration,
     account: &mut GcFileAccount,
 ) -> anyhow::Result<()> {
-    let live_hex: HashSet<&str> = live
-        .iter()
-        .filter_map(|d| d.strip_prefix("sha256:"))
-        .collect();
     let Some(entries) = ignore_not_found(std::fs::read_dir(cache_path))
         .with_context(|| format!("read {}", cache_path.display()))?
     else {
@@ -246,7 +277,7 @@ fn remember_retained_cache_files(
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if live_hex.contains(name) || !is_older_than(&path, grace) {
+        if !doomed(name, &path) {
             remember_cache_dir_files(&path, grace, account)?;
         }
     }
@@ -293,8 +324,7 @@ fn remember_cache_dir_files(
 
 fn prune_blobs_with_account(
     store_root: &Path,
-    live: &HashSet<String>,
-    grace: Duration,
+    doomed: Doomed,
     account: &mut GcFileAccount,
 ) -> anyhow::Result<GcStats> {
     let blobs_dir = store_root.join("blobs").join("sha256");
@@ -314,14 +344,7 @@ fn prune_blobs_with_account(
         if name.starts_with("tmp-") || name.ends_with(".tmp") {
             continue;
         }
-        if live.contains(&format!("sha256:{name}")) {
-            continue;
-        }
-        if !is_older_than(&path, grace) {
-            // Not account.size: remember_retained_blobs already counted
-            // this file as retained, so that would report 0.
-            stats.kept_count += 1;
-            stats.kept_bytes += std::fs::symlink_metadata(&path).map_or(0, |m| m.len());
+        if !doomed(name, &path) {
             continue;
         }
         let size = account.size(&path);
@@ -347,19 +370,20 @@ fn prune_cache(
     live: &HashSet<String>,
     grace: Duration,
 ) -> anyhow::Result<GcStats> {
-    prune_cache_with_account(cache_path, live, grace, &mut GcFileAccount::default())
+    prune_cache_with_account(
+        cache_path,
+        &unreferenced(live, grace),
+        grace,
+        &mut GcFileAccount::default(),
+    )
 }
 
 fn prune_cache_with_account(
     cache_path: &Path,
-    live: &HashSet<String>,
+    doomed: Doomed,
     grace: Duration,
     account: &mut GcFileAccount,
 ) -> anyhow::Result<GcStats> {
-    let live_hex: HashSet<&str> = live
-        .iter()
-        .filter_map(|d| d.strip_prefix("sha256:"))
-        .collect();
     let mut stats = GcStats::default();
     let entries = match std::fs::read_dir(cache_path) {
         Ok(e) => e,
@@ -375,13 +399,7 @@ fn prune_cache_with_account(
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if live_hex.contains(name) {
-            let tmp_stats = prune_stale_cache_temps(&path, grace, account);
-            stats.count += tmp_stats.count;
-            stats.bytes += tmp_stats.bytes;
-            continue;
-        }
-        if !is_older_than(&path, grace) {
+        if !doomed(name, &path) {
             let tmp_stats = prune_stale_cache_temps(&path, grace, account);
             stats.count += tmp_stats.count;
             stats.bytes += tmp_stats.bytes;
@@ -489,6 +507,42 @@ pub fn sweep(store: &OciStore, cache_path: &Path) -> anyhow::Result<(GcStats, Gc
     prune_blobs_and_cache(store.root(), cache_path, &live, GC_GRACE_PERIOD)
 }
 
+/// Deletes, at any age, what only the tags removed since `before` (a
+/// [`held_by_manifests`] taken ahead of the untag) held: the digests of
+/// manifests that no longer survive, and their config and layers that no
+/// surviving manifest uses, plus cache directories named by those digests.
+/// Nothing else is touched, so an unrelated fresh blob (a pull in flight in
+/// another process) stays for [`sweep`]'s grace window. A candidate whose
+/// mtime is newer than the removed manifest's was reused by a writer after
+/// that tag was written (see `write_blob`), so it is kept for [`sweep`] too.
+/// Fails closed: if the surviving set can't be computed, nothing is deleted.
+pub fn reclaim_removed(
+    store: &OciStore,
+    cache_path: &Path,
+    before: &HashMap<String, Vec<String>>,
+) -> anyhow::Result<(GcStats, GcStats)> {
+    let live = all_digests(&held_by_manifests(store)?);
+    let mtime = |digest: &str| {
+        let modified = std::fs::metadata(store.blob_path(digest)?)?.modified()?;
+        anyhow::Ok(modified)
+    };
+    let mut candidates = HashSet::new();
+    for (manifest, digests) in before.iter().filter(|(m, _)| !live.contains(*m)) {
+        let Ok(removed_at) = mtime(manifest) else {
+            continue;
+        };
+        candidates.insert(manifest.clone());
+        candidates.extend(
+            digests
+                .iter()
+                .filter(|d| !live.contains(*d) && mtime(d).map_or(true, |at| at <= removed_at))
+                .cloned(),
+        );
+    }
+    let doomed = |hex: &str, _: &Path| candidates.contains(&format!("sha256:{hex}"));
+    prune_doomed(store.root(), cache_path, &doomed, GC_GRACE_PERIOD)
+}
+
 /// Runs `retag`, which re-points `reference`, then sweeps if that replaced
 /// other content: nothing else a tag write does orphans a blob. The tag has
 /// landed by then, so a failed sweep is logged, not returned.
@@ -557,7 +611,6 @@ mod tests {
 
         let stats = prune_blobs(&root, &live, Duration::ZERO).unwrap();
         assert_eq!(stats.count, 1);
-        assert_eq!(stats.kept_count, 0, "a zero grace window keeps nothing");
         assert!(blobs.join("aaaa").exists(), "referenced blob must survive");
         assert!(!blobs.join("bbbb").exists(), "orphan blob must be removed");
         assert!(
@@ -592,40 +645,11 @@ mod tests {
 
         assert_eq!(stats.count, 1);
         assert_eq!(stats.bytes, b"long-abandoned orphan".len() as u64);
-        assert_eq!(stats.kept_count, 1, "the fresh blob is reported as kept");
-        assert_eq!(
-            stats.kept_bytes,
-            b"just written by an in-flight pull".len() as u64
-        );
         assert!(
             fresh.exists(),
             "a fresh unreferenced blob must survive — it may be a live pull's untagged layer"
         );
         assert!(!stale.exists(), "a stale unreferenced blob must be swept");
-
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// `rm` reports kept blobs as space the grace window holds back, so
-    /// only unreferenced ones count: a fresh blob a tag still uses, or a
-    /// fresh temp write, would never have been freed anyway.
-    #[test]
-    fn prune_blobs_counts_only_unreferenced_fresh_blobs_as_kept() {
-        let root = temp_dir("prune-blobs-kept");
-        let blobs = root.join("blobs").join("sha256");
-        std::fs::create_dir_all(&blobs).unwrap();
-        std::fs::write(blobs.join("eeee"), b"fresh and referenced").unwrap();
-        std::fs::write(blobs.join("ffff"), b"fresh orphan").unwrap();
-        std::fs::write(blobs.join("tmp-456"), b"in-progress write").unwrap();
-
-        let mut live = HashSet::new();
-        live.insert("sha256:eeee".to_string());
-
-        let stats = prune_blobs(&root, &live, GC_GRACE_PERIOD).unwrap();
-
-        assert_eq!(stats.count, 0);
-        assert_eq!(stats.kept_count, 1);
-        assert_eq!(stats.kept_bytes, b"fresh orphan".len() as u64);
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -977,17 +1001,21 @@ mod tests {
         store.root().join("blobs").join("sha256").join(hex)
     }
 
-    /// A one-layer model in `store`, its blobs backdated past the grace window.
+    /// A one-layer model in `store`, just written: layer, then config, then
+    /// manifest, the order a pull writes them in.
     #[cfg(unix)]
-    fn aged_model(store: &OciStore, layer: &[u8]) -> crate::storage::oci::Descriptor {
-        let cfg = store
-            .write_blob(
-                "application/vnd.cncf.model.config.v1+json",
-                &[b"config-", layer].concat(),
-            )
-            .unwrap();
+    fn fresh_model(
+        store: &OciStore,
+        config: &[u8],
+        layer: &[u8],
+    ) -> (
+        crate::storage::oci::Descriptor,
+        crate::storage::oci::Manifest,
+    ) {
         let layer = store.write_blob("application/octet-stream", layer).unwrap();
-        let layer_digest = layer.digest.clone();
+        let cfg = store
+            .write_blob("application/vnd.cncf.model.config.v1+json", config)
+            .unwrap();
         let manifest = crate::storage::oci::Manifest {
             schema_version: 2,
             media_type: "application/vnd.oci.image.manifest.v1+json".into(),
@@ -996,12 +1024,167 @@ mod tests {
             layers: vec![layer],
             annotations: None,
         };
-        let desc = store.write_manifest(&manifest).unwrap();
+        (store.write_manifest(&manifest).unwrap(), manifest)
+    }
+
+    /// A one-layer model in `store`, its blobs backdated past the grace window.
+    #[cfg(unix)]
+    fn aged_model(store: &OciStore, layer: &[u8]) -> crate::storage::oci::Descriptor {
+        let (desc, manifest) = fresh_model(store, &[b"config-", layer].concat(), layer);
         let old = SystemTime::now() - GC_GRACE_PERIOD - Duration::from_secs(60);
-        for digest in [&layer_digest, &desc.digest, &manifest.config.digest] {
+        for digest in [
+            &manifest.layers[0].digest,
+            &desc.digest,
+            &manifest.config.digest,
+        ] {
             filetime_set(&blob(store, digest), old);
         }
         desc
+    }
+
+    /// Takes the pre-untag snapshot, untags `reference`, reclaims.
+    #[cfg(unix)]
+    fn rm_and_reclaim(
+        store: &OciStore,
+        cache: &Path,
+        reference: &str,
+    ) -> anyhow::Result<(GcStats, GcStats)> {
+        let before = held_by_manifests(store)?;
+        store.remove(reference)?;
+        reclaim_removed(store, cache, &before)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rm_frees_a_just_written_model_at_once_counting_hardlinks_once() {
+        let root = temp_dir("rm-fresh");
+        let cache = root.join("cache");
+        let store = OciStore::open(root.join("store")).unwrap();
+        let (desc, manifest) = fresh_model(&store, b"config", b"fresh weights");
+        let reference = "docker.io/ai/m:latest";
+        store.tag(desc.clone(), reference).unwrap();
+        let layer = manifest.layers[0].digest.clone();
+        let layer_cache = cache.join(layer.strip_prefix("sha256:").unwrap());
+        std::fs::create_dir_all(&layer_cache).unwrap();
+        std::fs::hard_link(blob(&store, &layer), layer_cache.join("model.gguf")).unwrap();
+        let on_disk: u64 = [&desc.digest, &manifest.config.digest, &layer]
+            .iter()
+            .map(|d| std::fs::metadata(blob(&store, d)).unwrap().len())
+            .sum();
+
+        let (blobs, caches) = rm_and_reclaim(&store, &cache, reference).unwrap();
+
+        assert_eq!((blobs.count, caches.count), (3, 1));
+        assert_eq!(blobs.bytes + caches.bytes, on_disk);
+        for gone in [&desc.digest, &manifest.config.digest, &layer] {
+            assert!(!blob(&store, gone).exists(), "{gone}");
+        }
+        assert!(!layer_cache.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rm_keeps_what_a_surviving_tag_shares() {
+        let root = temp_dir("rm-shared");
+        let cache = root.join("cache");
+        let store = OciStore::open(root.join("store")).unwrap();
+        let (gone, gone_manifest) = fresh_model(&store, b"config-a", b"shared weights");
+        let (kept, kept_manifest) = fresh_model(&store, b"config-b", b"shared weights");
+        store.tag(gone.clone(), "docker.io/ai/a:latest").unwrap();
+        store.tag(kept.clone(), "docker.io/ai/b:latest").unwrap();
+        let shared = gone_manifest.layers[0].digest.clone();
+        assert_eq!(shared, kept_manifest.layers[0].digest);
+        let shared_cache = cache.join(shared.strip_prefix("sha256:").unwrap());
+        std::fs::create_dir_all(&shared_cache).unwrap();
+
+        let (blobs, caches) = rm_and_reclaim(&store, &cache, "docker.io/ai/a:latest").unwrap();
+
+        assert_eq!((blobs.count, caches.count), (2, 0));
+        assert!(!blob(&store, &gone.digest).exists());
+        assert!(!blob(&store, &gone_manifest.config.digest).exists());
+        assert!(blob(&store, &shared).exists(), "the shared layer survives");
+        assert!(shared_cache.exists(), "so does its cache directory");
+        assert!(blob(&store, &kept.digest).exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rm_leaves_unrelated_fresh_orphans_to_the_grace_sweep() {
+        let root = temp_dir("rm-orphan");
+        let cache = root.join("cache");
+        let store = OciStore::open(root.join("store")).unwrap();
+        let (desc, _) = fresh_model(&store, b"config", b"weights");
+        store.tag(desc, "docker.io/ai/m:latest").unwrap();
+        // What an in-flight pull in another process has written so far.
+        let inflight = store
+            .write_blob("application/octet-stream", b"layer of a pull in flight")
+            .unwrap();
+        let inflight_cache = cache.join(inflight.digest.strip_prefix("sha256:").unwrap());
+        std::fs::create_dir_all(&inflight_cache).unwrap();
+
+        let (blobs, caches) = rm_and_reclaim(&store, &cache, "docker.io/ai/m:latest").unwrap();
+
+        assert_eq!((blobs.count, caches.count), (3, 0));
+        assert!(blob(&store, &inflight.digest).exists());
+        assert!(inflight_cache.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rm_keeps_a_candidate_a_writer_reused_after_the_removed_manifest() {
+        let root = temp_dir("rm-reused");
+        let store = OciStore::open(root.join("store")).unwrap();
+        let (desc, manifest) = fresh_model(&store, b"config", b"weights");
+        store.tag(desc.clone(), "docker.io/ai/m:latest").unwrap();
+        let layer = &manifest.layers[0].digest;
+        // The manifest and config are older than the layer's last touch,
+        // as if a concurrent writer reused the layer after the tag landed.
+        let now = SystemTime::now();
+        filetime_set(&blob(&store, &desc.digest), now - Duration::from_secs(60));
+        filetime_set(
+            &blob(&store, &manifest.config.digest),
+            now - Duration::from_secs(120),
+        );
+
+        let (blobs, _) =
+            rm_and_reclaim(&store, &root.join("cache"), "docker.io/ai/m:latest").unwrap();
+
+        assert_eq!(blobs.count, 2);
+        assert!(blob(&store, layer).exists(), "left for the grace sweep");
+        assert!(!blob(&store, &desc.digest).exists());
+        assert!(!blob(&store, &manifest.config.digest).exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rm_deletes_nothing_when_the_surviving_set_is_unreadable() {
+        let root = temp_dir("rm-fail-closed");
+        let store = OciStore::open(root.join("store")).unwrap();
+        let (desc, manifest) = fresh_model(&store, b"config", b"weights");
+        store.tag(desc.clone(), "docker.io/ai/m:latest").unwrap();
+        let (other, _) = fresh_model(&store, b"other config", b"other weights");
+        store
+            .tag(other.clone(), "docker.io/ai/other:latest")
+            .unwrap();
+        let before = held_by_manifests(&store).unwrap();
+        store.remove("docker.io/ai/m:latest").unwrap();
+        // The surviving manifest becomes unreadable.
+        std::fs::write(blob(&store, &other.digest), b"not json").unwrap();
+
+        assert!(reclaim_removed(&store, &root.join("cache"), &before).is_err());
+
+        for kept in [
+            &desc.digest,
+            &manifest.config.digest,
+            &manifest.layers[0].digest,
+        ] {
+            assert!(blob(&store, kept).exists(), "{kept}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(unix)]
