@@ -185,6 +185,12 @@ runtime libraries. The Linux CUDA builds need glibc 2.38, and arm64 has CUDA
 13 only; a host that does not fit gets the CPU build. `llmman gpu-discover`
 prints what the probe chose.
 
+Finding a release uses GitHub's API, which allows 60 requests per hour per IP
+address without a token and 5000 with one. Set `GITHUB_TOKEN` or `GH_TOKEN`
+(any token, no scopes); it is sent to `api.github.com` only. A rate limit that
+lifts within 30 seconds is waited out; a longer one fails with the reset time.
+Only an unpinned `latest` lookup falls back to a previously downloaded build.
+
 The `llmman` binary needs glibc 2.28+. `bin` also needs what llama.cpp's
 prebuilt builds need: glibc 2.34 and libstdc++ `GLIBCXX_3.4.30` (x64 CPU and
 Vulkan), or glibc 2.38 and `GLIBCXX_3.4.32` (arm64, ROCm, CUDA), measured on

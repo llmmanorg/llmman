@@ -28,7 +28,8 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 use crate::fmt::human_size;
-use crate::fsutil::sha256_of_file;
+use crate::fsutil::{fs_error, retry_fs, retry_transient, retry_transient_op, sha256_of_file};
+use crate::hf::client::parse_delay_seconds;
 use crate::hostgpu::HostGpu;
 
 const API_BASE: &str = "https://api.github.com";
@@ -240,12 +241,167 @@ fn http_get(
     check_status(http_send(client, url)?, url, what)
 }
 
+/// Variables holding a GitHub token, in the order tried (as `gh` does).
+const TOKEN_VARS: [&str; 2] = ["GITHUB_TOKEN", "GH_TOKEN"];
+
+/// A rate limit that lifts within this is waited out, at most
+/// `RATE_LIMIT_RETRIES` times; a longer one fails at once.
+const RATE_LIMIT_MAX_WAIT: Duration = Duration::from_secs(30);
+const RATE_LIMIT_RETRIES: u32 = 2;
+
+/// The first non-blank of the two token values.
+fn pick_token(github_token: Option<&str>, gh_token: Option<&str>) -> Option<String> {
+    [github_token, gh_token]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|t| !t.is_empty())
+        .map(str::to_owned)
+}
+
+fn github_token() -> Option<String> {
+    let [github, gh] = TOKEN_VARS.map(|var| std::env::var(var).ok());
+    pick_token(github.as_deref(), gh.as_deref())
+}
+
+fn is_github_api_url(url: &str) -> bool {
+    url.strip_prefix(API_BASE)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The `authorization` value for `url`: the token goes to the GitHub API
+/// only, never to asset downloads or other hosts.
+fn authorization_for(url: &str, token: Option<&str>) -> Option<reqwest::header::HeaderValue> {
+    let token = token.filter(|_| is_github_api_url(url))?;
+    let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
+    value.set_sensitive(true);
+    Some(value)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RateLimit {
+    status: u16,
+    /// Time until requests are served again, when the headers say.
+    wait: Option<Duration>,
+}
+
+/// A 429, or a 403 with `x-ratelimit-remaining: 0` or `retry-after`
+/// (GitHub's primary and secondary limits). The wait is `retry-after`,
+/// else `x-ratelimit-reset` (unix seconds) less `now`; uncapped, so a
+/// reset an hour away is reported as such.
+fn parse_rate_limit(
+    status: u16,
+    remaining: Option<&str>,
+    retry_after: Option<&str>,
+    reset: Option<&str>,
+    now: u64,
+) -> Option<RateLimit> {
+    let exhausted = remaining.is_some_and(|r| r.trim() == "0");
+    if !(status == 429 || (status == 403 && (exhausted || retry_after.is_some()))) {
+        return None;
+    }
+    let seconds = |v: Option<&str>| v.and_then(parse_delay_seconds).map(|d| d.as_secs());
+    let wait = seconds(retry_after)
+        .or_else(|| seconds(reset).map(|at| at.saturating_sub(now)))
+        .map(Duration::from_secs);
+    Some(RateLimit { status, wait })
+}
+
+fn rate_limit_of(resp: &reqwest::blocking::Response, now: u64) -> Option<RateLimit> {
+    let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok());
+    parse_rate_limit(
+        resp.status().as_u16(),
+        header("x-ratelimit-remaining"),
+        header("retry-after"),
+        header("x-ratelimit-reset"),
+        now,
+    )
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// "in 41 minutes", rounded up.
+fn human_wait(wait: Duration) -> String {
+    let secs = wait.as_secs();
+    let (n, unit) = match secs {
+        0..=59 => (secs, "second"),
+        60..=7199 => (secs.div_ceil(60), "minute"),
+        _ => (secs.div_ceil(3600), "hour"),
+    };
+    format!("in {n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+/// The error for a rate limit that is not waited out. The advice depends
+/// on `token_sent`; the token itself is never in a message.
+fn rate_limit_error(url: &str, limit: &RateLimit, token_sent: bool) -> anyhow::Error {
+    let api = is_github_api_url(url);
+    let who = if api {
+        "the GitHub API is"
+    } else {
+        "the server is"
+    };
+    let resets = match limit.wait {
+        Some(wait) => format!("it resets {}", human_wait(wait)),
+        None => "GitHub did not say when it resets".to_owned(),
+    };
+    let advice = if !api {
+        "try again later"
+    } else if token_sent {
+        "a token from GITHUB_TOKEN or GH_TOKEN was sent; its 5000 requests/hour may be used \
+         up or GitHub may be throttling bursts; wait for the reset"
+    } else {
+        "set GITHUB_TOKEN or GH_TOKEN (any token, no scopes needed) to raise the limit from 60 \
+         to 5000 requests/hour"
+    };
+    anyhow!(
+        "{who} rate limited (HTTP {}) for {url}; {resets}; {advice}",
+        limit.status
+    )
+}
+
 fn http_send(client: &reqwest::blocking::Client, url: &str) -> Result<reqwest::blocking::Response> {
-    client
-        .get(url)
-        .header("user-agent", "llmman")
-        .send()
-        .with_context(|| format!("query {url}"))
+    send_waiting_out_rate_limits(client, url, github_token().as_deref())
+}
+
+/// GETs `url` with the token if it is for the GitHub API, waiting out
+/// short rate limits; a longer one is a [`rate_limit_error`]. Any other
+/// response, whatever its status, is returned for the caller.
+fn send_waiting_out_rate_limits(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    token: Option<&str>,
+) -> Result<reqwest::blocking::Response> {
+    let authorization = authorization_for(url, token);
+    let mut retries = 0;
+    loop {
+        let mut request = client.get(url).header("user-agent", "llmman");
+        if let Some(value) = &authorization {
+            request = request.header(reqwest::header::AUTHORIZATION, value.clone());
+        }
+        let resp = request.send().with_context(|| format!("query {url}"))?;
+        if resp.status().is_success() {
+            return Ok(resp);
+        }
+        let Some(limit) = rate_limit_of(&resp, unix_now()) else {
+            return Ok(resp);
+        };
+        match limit.wait {
+            Some(wait) if wait <= RATE_LIMIT_MAX_WAIT && retries < RATE_LIMIT_RETRIES => {
+                retries += 1;
+                eprintln!(
+                    "[llmman] rate limited (HTTP {}), retrying in {}s ({retries}/{RATE_LIMIT_RETRIES})",
+                    limit.status,
+                    wait.as_secs()
+                );
+                std::thread::sleep(wait);
+            }
+            _ => return Err(rate_limit_error(url, &limit, authorization.is_some())),
+        }
+    }
 }
 
 fn check_status(
@@ -838,7 +994,15 @@ pub(crate) struct RemoveOnDrop<'a>(pub(crate) &'a Path);
 
 impl Drop for RemoveOnDrop<'_> {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.0);
+        match retry_transient(|| std::fs::remove_file(self.0)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "[llmman] warning: could not {:#}",
+                    fs_error("remove", self.0, e)
+                );
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1040,14 +1204,13 @@ pub(crate) fn create_new_file(dest: &Path) -> Result<std::fs::File> {
             .create_new(true)
             .open(dest)
     };
-    match open() {
+    match retry_transient(open) {
         Ok(f) => Ok(f),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::remove_file(dest)
-                .with_context(|| format!("remove stale {}", dest.display()))?;
-            open().with_context(|| format!("create {}", dest.display()))
+            retry_fs("remove stale", dest, || std::fs::remove_file(dest))?;
+            retry_fs("create", dest, open)
         }
-        Err(e) => Err(e).with_context(|| format!("create {}", dest.display())),
+        Err(e) => Err(fs_error("create", dest, e)),
     }
 }
 
@@ -1145,7 +1308,7 @@ pub(crate) fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
     open_tar_gz(archive_path)?
         .unpack(dest)
-        .with_context(|| format!("extract {} into {}", archive_path.display(), dest.display()))?;
+        .map_err(|e| extract_error(archive_path, dest, e))?;
     clear_quarantine(dest);
     Ok(())
 }
@@ -1180,20 +1343,29 @@ fn extract_zip(archive_path: &Path, dest: &Path) -> Result<()> {
         .with_context(|| format!("read zip {}", archive_path.display()))?;
     archive
         .extract(dest)
-        .with_context(|| format!("extract {} into {}", archive_path.display(), dest.display()))
+        .map_err(|e| extract_error(archive_path, dest, e))
+}
+
+fn extract_error(archive: &Path, dest: &Path, e: impl Into<anyhow::Error>) -> anyhow::Error {
+    fs_error(&format!("extract {} into", archive.display()), dest, e)
 }
 
 /// `flat` drops a tarball's top-level directory: Linux's `cudart-*` bundle
 /// nests its libraries under one named after itself, not the `llama-<tag>/`
 /// whose `$ORIGIN` rpath is where they have to be.
+///
+/// A transient Windows lock retries the whole extraction, reopening the
+/// archive; unpacking again overwrites what the failed try wrote.
 fn extract(archive_path: &Path, archive_name: &str, dest: &Path, flat: bool) -> Result<()> {
-    if archive_name.ends_with(".zip") {
-        extract_zip(archive_path, dest)
-    } else if flat {
-        extract_tar_gz_flat(archive_path, dest)
-    } else {
-        extract_tar_gz(archive_path, dest)
-    }
+    retry_transient_op(|| {
+        if archive_name.ends_with(".zip") {
+            extract_zip(archive_path, dest)
+        } else if flat {
+            extract_tar_gz_flat(archive_path, dest)
+        } else {
+            extract_tar_gz(archive_path, dest)
+        }
+    })
 }
 
 fn extract_tar_gz_flat(archive_path: &Path, dest: &Path) -> Result<()> {
@@ -1227,7 +1399,7 @@ fn extract_tar_gz_flat(archive_path: &Path, dest: &Path) -> Result<()> {
         }
         entry
             .unpack(&target)
-            .with_context(|| format!("extract {} into {}", path.display(), dest.display()))?;
+            .map_err(|e| extract_error(&path, dest, e))?;
     }
     clear_quarantine(dest);
     Ok(())
@@ -1305,16 +1477,17 @@ fn resolve_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
         // before hitting the network, so a fully offline second run of
         // `llmman serve` (no pinned version, no PATH llama-server) still
         // works using whatever was last downloaded.
-        if let Some(bin) = newest_cached(&query.label, bin_name)? {
-            // Still try to reach GitHub for a possibly newer release below;
-            // fall back to this cached copy if that fails.
+        if newest_cached(&query.label, bin_name)?.is_some() {
+            // Look for a newer release; fall back to a cached copy if that fails.
             match try_ensure_from_network(&repo, pinned_version, &query, bin_name) {
                 Ok(resolved) => return Ok(resolved),
                 Err(e) => {
-                    eprintln!(
-                        "[llmman] could not check for a newer llama-server release ({e:#}); \
-                         using previously downloaded build"
-                    );
+                    // The lookup may have waited while another process
+                    // pruned the cached build found above.
+                    let Some(bin) = newest_cached(&query.label, bin_name)? else {
+                        return Err(e);
+                    };
+                    eprintln!("[llmman] {}", cached_fallback_note(&e));
                     return Ok(Resolved {
                         bin,
                         backend_label: query.label,
@@ -1327,6 +1500,13 @@ fn resolve_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
     try_ensure_from_network(&repo, pinned_version, &query, bin_name)
 }
 
+fn cached_fallback_note(e: &anyhow::Error) -> String {
+    format!(
+        "could not check for a newer llama-server release ({e:#}); \
+         using previously downloaded build"
+    )
+}
+
 fn try_ensure_from_network(
     repo: &str,
     pinned_version: Option<&str>,
@@ -1334,7 +1514,12 @@ fn try_ensure_from_network(
     bin_name: &str,
 ) -> Result<Resolved> {
     let client = http_client()?;
-    let release = resolve_release(&client, repo, pinned_version)?;
+    // A rate-limit wait can outlast the client's idle budget.
+    let release = {
+        let marker = DownloadMarker::create();
+        marker.set_status("looking up the llama.cpp release");
+        marker.keep_alive_during(|| resolve_release(&client, repo, pinned_version))?
+    };
     let tag = release.tag_name.clone();
     let dest = install_dir(&cache_key(repo, &tag), &query.label)?;
 
@@ -2514,35 +2699,246 @@ mod tests {
         );
     }
 
-    /// Serves one canned response on a loopback port; returns the API base
-    /// URL and a handle yielding the request line.
-    fn serve_once(
-        status: &'static str,
-        body: &'static str,
-    ) -> (String, std::thread::JoinHandle<String>) {
+    // ----- GitHub token and rate limits -----
+
+    const API_RELEASE: &str = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
+
+    #[test]
+    fn the_token_is_sent_to_the_github_api_only() {
+        let value = authorization_for(API_RELEASE, Some("tok")).unwrap();
+        assert_eq!(value.to_str().unwrap(), "Bearer tok");
+        assert!(value.is_sensitive());
+        for url in [
+            "https://github.com/ggml-org/llama.cpp/releases/download/b1/a.zip",
+            "https://api.github.com.evil.example/repos",
+            "https://api.github.com",
+            "http://api.github.com/repos",
+            "http://127.0.0.1:8080/repos/a/b/releases/latest",
+            "https://example.com/https://api.github.com/",
+        ] {
+            assert!(authorization_for(url, Some("tok")).is_none(), "{url}");
+        }
+        assert!(authorization_for(API_RELEASE, None).is_none());
+    }
+
+    #[test]
+    fn github_token_is_the_first_non_blank_of_the_two_variables() {
+        assert_eq!(pick_token(Some("a"), Some("b")).as_deref(), Some("a"));
+        assert_eq!(pick_token(Some("  "), Some(" b \n")).as_deref(), Some("b"));
+        assert_eq!(pick_token(Some(""), Some("")), None);
+        assert_eq!(pick_token(None, None), None);
+    }
+
+    #[test]
+    fn rate_limits_are_told_from_status_and_headers() {
+        let limit = |status, remaining, after, reset| {
+            parse_rate_limit(status, remaining, after, reset, 1_000)
+        };
+        let wait =
+            |status, remaining, after, reset| limit(status, remaining, after, reset).unwrap().wait;
+        let secs = |s| Some(Duration::from_secs(s));
+        // x-ratelimit-reset is unix seconds; retry-after wins over it.
+        assert_eq!(wait(403, Some("0"), None, Some("3460")), secs(2_460));
+        assert_eq!(wait(429, Some("0"), Some("7"), Some("3460")), secs(7));
+        assert_eq!(wait(403, Some("12"), Some(" 5 "), None), secs(5));
+        assert_eq!(wait(403, Some("0"), Some("soon"), Some("1010")), secs(10));
+        // A reset already past is no wait; a 429 may not say.
+        assert_eq!(wait(403, Some("0"), None, Some("900")), secs(0));
+        assert_eq!(
+            limit(429, None, None, None),
+            Some(RateLimit {
+                status: 429,
+                wait: None
+            })
+        );
+        // Not rate limits.
+        assert_eq!(limit(403, Some("59"), None, Some("3460")), None);
+        assert_eq!(limit(403, None, None, None), None);
+        assert_eq!(limit(404, Some("0"), Some("5"), None), None);
+        assert_eq!(limit(503, Some("0"), Some("5"), None), None);
+    }
+
+    fn limited(status: u16, wait: Option<u64>) -> RateLimit {
+        RateLimit {
+            status,
+            wait: wait.map(Duration::from_secs),
+        }
+    }
+
+    #[test]
+    fn a_rate_limit_error_says_when_it_resets_and_what_to_do() {
+        let long = limited(403, Some(41 * 60));
+        let err = rate_limit_error(API_RELEASE, &long, false).to_string();
+        for needle in [
+            "rate limited",
+            "HTTP 403",
+            API_RELEASE,
+            "in 41 minutes",
+            "set GITHUB_TOKEN or GH_TOKEN",
+            "60",
+            "5000",
+            "no scopes",
+        ] {
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        // With a token sent: no advice to set one, and no claim the quota
+        // is used up (a secondary limit throttles bursts).
+        let sent = rate_limit_error(API_RELEASE, &long, true).to_string();
+        assert!(sent.contains("in 41 minutes"), "{sent}");
+        assert!(!sent.contains("set GITHUB_TOKEN"), "{sent}");
+        assert!(sent.contains("may be"), "{sent}");
+
+        let unknown = rate_limit_error(API_RELEASE, &limited(429, None), false).to_string();
+        assert!(unknown.contains("did not say when it resets"), "{unknown}");
+        // Not the API: nothing to say about tokens.
+        let other = rate_limit_error("http://127.0.0.1:1/x", &long, false).to_string();
+        assert!(
+            other.contains("rate limited") && !other.contains("GITHUB_TOKEN"),
+            "{other}"
+        );
+    }
+
+    #[test]
+    fn waits_are_worded_for_people() {
+        let wait = |s| human_wait(Duration::from_secs(s));
+        assert_eq!(wait(0), "in 0 seconds");
+        assert_eq!(wait(1), "in 1 second");
+        assert_eq!(wait(61), "in 2 minutes");
+        assert_eq!(wait(2 * 3600 - 1), "in 120 minutes");
+        assert_eq!(wait(2 * 3600), "in 2 hours");
+    }
+
+    #[test]
+    fn the_cached_build_fallback_carries_the_rate_limit_explanation() {
+        let note = cached_fallback_note(&rate_limit_error(
+            API_RELEASE,
+            &limited(403, Some(41 * 60)),
+            false,
+        ));
+        for needle in [
+            "could not check for a newer llama-server release",
+            "rate limited",
+            "in 41 minutes",
+            "GITHUB_TOKEN or GH_TOKEN",
+            "using previously downloaded build",
+        ] {
+            assert!(note.contains(needle), "{needle}: {note}");
+        }
+    }
+
+    /// One scripted response: status line text, extra headers, body.
+    type Reply = (String, Vec<String>, String);
+
+    fn reply(status: &str, headers: &[&str], body: &str) -> Reply {
+        (
+            status.to_owned(),
+            headers.iter().map(|h| (*h).to_owned()).collect(),
+            body.to_owned(),
+        )
+    }
+
+    /// Serves one reply per connection, in order, on a loopback port;
+    /// returns the base URL and a handle yielding the raw requests seen.
+    fn serve_script(replies: Vec<Reply>) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
-            let (mut conn, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0u8; 1];
-            while !request.ends_with(b"\r\n\r\n") {
-                conn.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
+            let mut seen = Vec::new();
+            for (status, headers, body) in replies {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    conn.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                seen.push(String::from_utf8_lossy(&request).into_owned());
+                let extra: String = headers.iter().map(|h| format!("{h}\r\n")).collect();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{extra}\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                conn.write_all(response.as_bytes()).unwrap();
             }
-            let response = format!(
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
-                 connection: close\r\n\r\n{body}",
-                body.len()
-            );
-            conn.write_all(response.as_bytes()).unwrap();
-            String::from_utf8_lossy(&request)
-                .lines()
-                .next()
-                .unwrap()
-                .to_owned()
+            seen
         });
         (base, handle)
+    }
+
+    /// [`serve_script`] with one reply; the handle yields the request line.
+    fn serve_once(status: &str, body: &str) -> (String, std::thread::JoinHandle<String>) {
+        let (base, seen) = serve_script(vec![reply(status, &[], body)]);
+        let line =
+            std::thread::spawn(move || seen.join().unwrap()[0].lines().next().unwrap().to_owned());
+        (base, line)
+    }
+
+    fn fetch_b1(base: &str) -> Result<Release> {
+        fetch_release(&local_client(), base, DEFAULT_REPO, Some("b1"))
+    }
+
+    const TOO_MANY: &str = "429 Too Many Requests";
+
+    #[test]
+    fn a_short_rate_limit_is_waited_out_and_retried() {
+        let (base, seen) = serve_script(vec![
+            reply(TOO_MANY, &["retry-after: 0"], "{}"),
+            reply(
+                "403 Forbidden",
+                &["x-ratelimit-remaining: 0", "retry-after: 0"],
+                "{}",
+            ),
+            reply("200 OK", &[], r#"{"tag_name": "b1", "assets": []}"#),
+        ]);
+        assert_eq!(fetch_b1(&base).unwrap().tag_name, "b1");
+        assert_eq!(seen.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_rate_limit_that_outlasts_the_retries_is_an_error() {
+        let (base, seen) = serve_script(vec![reply(TOO_MANY, &["retry-after: 0"], "{}"); 3]);
+        let err = fetch_b1(&base).unwrap_err().to_string();
+        assert!(
+            err.contains("rate limited") && err.contains("HTTP 429"),
+            "{err}"
+        );
+        // The first request and two retries, no more.
+        assert_eq!(seen.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_long_rate_limit_fails_at_once_without_retrying() {
+        let reset = format!("x-ratelimit-reset: {}", unix_now() + 41 * 60);
+        let (base, seen) = serve_script(vec![reply(
+            "403 Forbidden",
+            &["x-ratelimit-remaining: 0", &reset],
+            "{}",
+        )]);
+        let err = fetch_b1(&base).unwrap_err().to_string();
+        assert!(err.contains("rate limited"), "{err}");
+        assert!(
+            err.contains("in 41 minutes") || err.contains("in 40 minutes"),
+            "{err}"
+        );
+        assert_eq!(seen.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_ordinary_403_is_still_a_plain_http_error() {
+        let (base, _seen) = serve_script(vec![reply("403 Forbidden", &[], "{}")]);
+        let err = fetch_b1(&base).unwrap_err().to_string();
+        assert!(err.contains("returned 403"), "{err}");
+    }
+
+    #[test]
+    fn the_token_never_goes_to_another_host_on_the_wire() {
+        let (base, seen) = serve_script(vec![reply("200 OK", &[], "ok")]);
+        send_waiting_out_rate_limits(&local_client(), &format!("{base}/x"), Some("s3cret-token"))
+            .unwrap();
+        let request = seen.join().unwrap().remove(0).to_ascii_lowercase();
+        assert!(!request.contains("authorization"), "{request}");
+        assert!(!request.contains("s3cret-token"), "{request}");
     }
 
     fn local_client() -> reqwest::blocking::Client {
